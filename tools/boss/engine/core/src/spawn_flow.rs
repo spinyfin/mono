@@ -312,6 +312,7 @@ async fn start_tmux_worker(
     workspace_path: &Path,
     command: &str,
     env: &[EnvVar],
+    driver_name: &str,
 ) -> Result<i32, StartWorkerError> {
     let spawn_token = crate::engine_control::generate_token();
     let intent_recorded = host
@@ -360,6 +361,17 @@ async fn start_tmux_worker(
         .await
         .context("applying Boss worker tmux session options")
         .map_err(StartWorkerError::Tmux)?;
+    // Driver-specific tmux session config (e.g. codex's `mouse on` for
+    // wheel scrollback — see `crate::driver::tmux_session_config_for`).
+    // Sourced with `-t` so it is scoped to this one session, never the
+    // whole server; see `boss_tmux::Tmux::source_file`.
+    if let Some(config) = crate::driver::tmux_session_config_for(driver_name) {
+        host.tmux
+            .source_file(&host.session_name, config)
+            .await
+            .with_context(|| format!("sourcing {driver_name} tmux session config"))
+            .map_err(StartWorkerError::Tmux)?;
+    }
     host.tmux
         .set_option(&host.session_name, TMUX_SPAWN_TOKEN_OPTION, &spawn_token)
         .await
@@ -732,6 +744,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             &input.workspace_path,
             &input.initial_input,
             &env,
+            input.driver.descriptor().name,
         )
         .await
         {
@@ -1067,6 +1080,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingTmuxRunner {
         calls: std::sync::Mutex<Vec<Vec<String>>>,
+        stdin: std::sync::Mutex<Vec<Vec<u8>>>,
         steps: Arc<RecordingTmuxStore>,
     }
 
@@ -1074,12 +1088,17 @@ mod tests {
         fn new(steps: Arc<RecordingTmuxStore>) -> Self {
             Self {
                 calls: std::sync::Mutex::new(Vec::new()),
+                stdin: std::sync::Mutex::new(Vec::new()),
                 steps,
             }
         }
 
         fn calls(&self) -> Vec<Vec<String>> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn stdin(&self) -> Vec<Vec<u8>> {
+            self.stdin.lock().unwrap().clone()
         }
     }
 
@@ -1122,6 +1141,34 @@ mod tests {
                 success: true,
                 code: Some(0),
                 stdout: stdout.to_owned(),
+                stderr: String::new(),
+            })
+        }
+
+        async fn run_with_stdin(
+            &self,
+            _program: &Path,
+            args: &[OsString],
+            cwd: Option<&Path>,
+            stdin: &[u8],
+        ) -> std::io::Result<CommandOutput> {
+            assert!(cwd.is_none());
+            let args = args
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                args.get(2).map(String::as_str),
+                Some("source-file"),
+                "unexpected tmux stdin command: {args:?}"
+            );
+            self.steps.steps.lock().unwrap().push("source-file");
+            self.stdin.lock().unwrap().push(stdin.to_vec());
+            self.calls.lock().unwrap().push(args);
+            Ok(CommandOutput {
+                success: true,
+                code: Some(0),
+                stdout: String::new(),
                 stderr: String::new(),
             })
         }
@@ -1326,6 +1373,88 @@ mod tests {
                 "-t",
                 "boss-3-run-test",
                 "#{pane_pid}"
+            ]
+        );
+    }
+
+    /// Codex-only tmux mouse fix (see `codex-tmux.conf` / `tmux_session_config_for`):
+    /// a codex tmux-hosted spawn must source the codex tmux session config
+    /// scoped to its own session (`source-file -t <session>`), while the
+    /// claude-driver test above (same tmux-hosted path) proves no such call
+    /// happens for a driver with no `tmux_session_config_for` entry. Written
+    /// as a sync test driving its own current-thread runtime — mirroring
+    /// `codex_spawn_registers_live_worker_state_like_claude` — because
+    /// `codex_homes_override`'s guard must stay held across the `await`.
+    #[test]
+    fn tmux_hosted_codex_spawn_sources_the_codex_mouse_config_scoped_to_its_session() {
+        let homes = TempDir::new().unwrap();
+        let _homes_env = codex_homes_override(homes.path());
+        let transcripts = TempDir::new().unwrap();
+        let _transcripts_env = transcript_store_override(transcripts.path());
+
+        let workspace = TempDir::new().unwrap();
+        let spawner = StubSpawner {
+            registry: WorkerRegistry::new(),
+            spawn_calls: Arc::new(AtomicUsize::new(0)),
+            last_request: std::sync::Mutex::new(None),
+            canned_response: Err(SendToAppError::NotRegistered),
+        };
+        let store = Arc::new(RecordingTmuxStore::default());
+        let runner = Arc::new(RecordingTmuxRunner::new(store.clone()));
+        let tmux = Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH)
+            .unwrap();
+        let mut input = codex_input(&workspace, "run-codex-tmux", 1);
+        input.tmux_host = Some(TmuxWorkerHost::new(
+            tmux,
+            store.clone(),
+            "boss-1-run-codex-tmux".to_owned(),
+        ));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        runtime.block_on(async {
+            start_worker(&spawner, input, StdDuration::from_secs(1))
+                .await
+                .expect("codex tmux-hosted spawn should succeed");
+            spawner.stop_progress_ingress("run-codex-tmux");
+        });
+
+        assert!(
+            store.steps().contains(&"source-file"),
+            "codex spawn must source the codex tmux session config: {:?}",
+            store.steps()
+        );
+        let sourced = runner.stdin();
+        let content = sourced
+            .last()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+            .expect("expected a source-file stdin payload");
+        assert!(content.contains("mouse on"), "unexpected sourced config: {content:?}");
+        let directive_lines: Vec<&str> = content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        assert!(
+            directive_lines.iter().all(|line| !line.contains("-g")),
+            "codex tmux config must be session-scoped, not global: {directive_lines:?}"
+        );
+        let source_file_call = runner
+            .calls()
+            .into_iter()
+            .find(|call| call.get(2).map(String::as_str) == Some("source-file"))
+            .expect("expected a source-file call");
+        assert_eq!(
+            source_file_call,
+            vec![
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
+                "source-file",
+                "-t",
+                "boss-1-run-codex-tmux",
+                "-"
             ]
         );
     }

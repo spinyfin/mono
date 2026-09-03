@@ -129,6 +129,35 @@ pub struct PermissionArtifacts {
     pub env: Vec<(String, String)>,
 }
 
+/// Session-scoped tmux config to `source-file -t <session>` into a driver's
+/// tmux session right after it is created — `None` for a driver whose worker
+/// draws and scrolls its own viewport in-app (unaffected by tmux's `mouse`
+/// option either way).
+///
+/// A driver that instead relies on the *host terminal's* scrollback for the
+/// mouse wheel (today: only [`codex::CODEX_TMUX_SESSION_CONFIG`] — see its
+/// doc comment) needs tmux's own pane history, which needs `mouse on`, but
+/// only for its own session: flipping `mouse` server-wide would change
+/// copy/paste behaviour in every other driver's pane too. The config content
+/// is a real file under `src/`, never a bare Rust string literal, and it is
+/// applied by the spawn path on every session creation — never as a one-off
+/// `tmux set` issued by a human or a sweep after the fact.
+///
+/// A `DriverDescriptor` field was considered so this lived beside each
+/// driver's other static data, but `DriverDescriptor` is constructed as a
+/// plain struct literal at 15+ sites across `engine/core` (production
+/// drivers plus test/fixture descriptors), and every one of those would need
+/// updating for a property exactly one driver uses today. This single
+/// documented conditional is the proportionate choice for now; promote it to
+/// a descriptor field (with `#[builder(default)]`-style ergonomics) if a
+/// second driver ends up needing terminal-scrollback tmux config.
+pub fn tmux_session_config_for(driver_name: &str) -> Option<&'static str> {
+    match driver_name {
+        "codex" => Some(codex::CODEX_TMUX_SESSION_CONFIG),
+        _ => None,
+    }
+}
+
 /// Merge [`PermissionArtifacts::extra_args`] into a pane spawn command line.
 ///
 /// Permission args win over defaults already present on the command: each

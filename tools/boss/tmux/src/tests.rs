@@ -661,6 +661,18 @@ async fn send_keys_pastes_multiline_text_then_submits_once() {
     assert_eq!(runner.stdin(), vec![b"first\nsecond".to_vec()]);
 }
 
+#[tokio::test]
+async fn source_file_sources_stdin_content_scoped_to_the_target_session() {
+    let (tmux, runner) = tmux([success("")]);
+    tmux.source_file("boss-1", "set mouse on\n").await.unwrap();
+    let calls = runner.calls();
+    assert_eq!(
+        calls,
+        vec![vec!["-S", TEST_SOCKET_PATH, "source-file", "-t", "boss-1", "-"]]
+    );
+    assert_eq!(runner.stdin(), vec![b"set mouse on\n".to_vec()]);
+}
+
 #[tokio::test(start_paused = true)]
 async fn send_keys_strips_trailing_newlines_on_single_line_path() {
     let (tmux, runner) = tmux([success(""), success("")]);

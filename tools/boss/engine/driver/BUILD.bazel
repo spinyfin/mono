@@ -7,7 +7,7 @@ exports_files(["Cargo.toml"])
 rust_library(
     name = "driver",
     srcs = glob(["src/**/*.rs"]),
-    compile_data = glob(["src/grok/testdata/**"]),
+    compile_data = glob(["src/grok/testdata/**"]) + ["src/codex-tmux.conf"],
     crate_name = "boss_engine_driver",
     crate_root = "src/lib.rs",
     edition = "2024",
@@ -40,7 +40,7 @@ rust_library(
 rust_test(
     name = "driver_test",
     size = "small",
-    compile_data = glob(["src/grok/testdata/**"]),
+    compile_data = glob(["src/grok/testdata/**"]) + ["src/codex-tmux.conf"],
     crate = ":driver",
     edition = "2024",
     proc_macro_deps = all_crate_deps(

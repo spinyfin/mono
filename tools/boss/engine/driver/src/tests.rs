@@ -893,3 +893,24 @@ fn worst_case_duration_handles_the_degenerate_plans() {
     };
     assert_eq!(zero_attempts.worst_case_duration(), Duration::from_secs(5));
 }
+
+#[test]
+fn tmux_session_config_is_codex_only_and_session_scoped() {
+    let codex_config = tmux_session_config_for("codex").expect("codex must carry a tmux session config");
+    assert!(
+        codex_config.contains("mouse on"),
+        "codex tmux config must enable mouse: {codex_config:?}"
+    );
+    let directive_lines: Vec<&str> = codex_config
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    assert!(
+        directive_lines.iter().all(|line| !line.contains("-g")),
+        "codex tmux config must be session-scoped (no -g directive), or it would flip mouse \
+         capture for every other driver's tmux session too: {directive_lines:?}"
+    );
+    assert_eq!(tmux_session_config_for("claude"), None);
+    assert_eq!(tmux_session_config_for("grok"), None);
+}

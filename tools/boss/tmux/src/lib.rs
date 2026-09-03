@@ -345,6 +345,23 @@ impl Tmux {
         command_failed(&args, &output)
     }
 
+    /// Sources tmux commands from `content` into `session`'s scope, as
+    /// `source-file -t <session> -` with `content` piped over stdin (`-`
+    /// reads the file from stdin — no temp file needed, mirroring how
+    /// [`Self::send_keys`] streams multi-line text through `load-buffer`).
+    ///
+    /// A `set` command in `content` that omits `-g` resolves against the
+    /// `-t` target, so this applies session-scoped options to `session`
+    /// alone rather than the whole server. A `set -g` in `content` still
+    /// means "every session on the server", regardless of `-t` — callers
+    /// that need session scoping must omit `-g` in the sourced content.
+    pub async fn source_file(&self, session: &str, content: &str) -> Result<()> {
+        validate_value("session name", session)?;
+        let mut args = self.server_args();
+        args.extend(["source-file".into(), "-t".into(), session.into(), "-".into()]);
+        self.invoke_with_stdin(args, content.as_bytes()).await.map(|_| ())
+    }
+
     /// Sets a per-session tmux option such as `@boss_spawn_token`.
     pub async fn set_option(&self, session: &str, option: &str, value: &str) -> Result<()> {
         validate_value("session name", session)?;
