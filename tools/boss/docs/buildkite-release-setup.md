@@ -183,7 +183,7 @@ gh release delete boss-v1.0.N --repo spinyfin/mono --yes
 git push origin :refs/tags/boss-v1.0.N
 ```
 
-A scheduled build that finds a draft for the current `HEAD` refuses to resume it on its own (see above) and names this recovery in its failure message, so a cron tick never gets stuck retrying indefinitely. To force a scheduled build to resume a draft instead of abandoning it, set `RELEASE_RESUME_DRAFT=1` on that build.
+A scheduled build that finds a draft for the current `HEAD` refuses to resume it on its own; follow this section to abandon the draft and tag, so a cron tick never gets stuck retrying indefinitely. To force a scheduled build to resume a draft instead of abandoning it, set `RELEASE_RESUME_DRAFT=1` on that build.
 
 ---
 

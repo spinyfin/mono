@@ -30,21 +30,6 @@ echo "[boss-release] agent: $(uname -a)"
 
 [[ -x bin/release ]] || die "bin/release is missing; ci-env.sh should have installed it via repobin (REPOBIN.toml tools.release)"
 
-# prepare: skip/idempotency, next boss-v1.0.N, tag HEAD, draft GitHub Release.
-# Prints the tag on stdout, or nothing when this run is a no-op (exit 0).
-# The tag is pushed before the build so workspace-status.sh can
-# `git describe --exact-match` and stamp the binary with 1.0.N.
-log "[boss-release] prepare"
-TAG="$(bin/release prepare --config "${CONFIG}")"
-if [[ -z "${TAG}" ]]; then
-  exit 0
-fi
-[[ "${TAG}" == boss-v* ]] || die "unexpected release tag '${TAG}'; expected boss-v*"
-
-VERSION="${TAG#boss-v}"
-ARTIFACT="Boss-${VERSION}.zip"
-echo "[boss-release] version: ${TAG}  artifact: ${ARTIFACT}"
-
 # ── read secrets ──────────────────────────────────────────────────────────────
 
 _read_secret() {
@@ -77,6 +62,17 @@ See tools/boss/docs/buildkite-shake-secrets-setup.md for step-by-step instructio
 fi
 
 echo "[boss-release] credentials loaded (APP_ID=[REDACTED])"
+
+# prepare: skip/idempotency, next boss-v1.0.N, tag HEAD, draft GitHub Release.
+# Prints the tag on stdout, or nothing when this run is a no-op (exit 0).
+# The tag is pushed before the build so workspace-status.sh can
+# `git describe --exact-match` and stamp the binary with 1.0.N.
+log "[boss-release] prepare"
+TAG="$(bin/release prepare --config "${CONFIG}")"
+if [[ -z "${TAG}" ]]; then
+  exit 0
+fi
+echo "[boss-release] release tag: ${TAG}"
 
 # ── GhosttyKit stub ───────────────────────────────────────────────────────────
 # swift_deps runs `swift package describe` during Bazel analysis, which needs a
@@ -122,9 +118,9 @@ fi
 [[ -f "${ZIP_PATH}" ]] || die "Boss.zip not found at discovered path: ${ZIP_PATH}"
 echo "[boss-release] Boss.zip: ${ZIP_PATH}"
 
-log "[boss-release] uploading ${ARTIFACT}"
+log "[boss-release] uploading Boss-{version}.zip"
 bin/release upload --config "${CONFIG}" --tag "${TAG}" \
-  --asset "${ARTIFACT}=${ZIP_PATH}"
+  --asset "Boss-{version}.zip=${ZIP_PATH}"
 
 log "[boss-release] publishing ${TAG}"
 bin/release publish --config "${CONFIG}" --tag "${TAG}"
