@@ -808,7 +808,11 @@ impl AgentDriver for ClaudeDriver {
         // this flag is the only lever that actually removes it from the
         // worker's tool surface. A worker that is genuinely blocked already
         // has the right channel: stop and summarize (a real Stop boundary).
-        cmd.push_str(" --disallowedTools AskUserQuestion");
+        // Equals form (`--disallowedTools=AskUserQuestion`), not the
+        // space-separated variadic form: the CLI takes `<tools...>` until the
+        // next `--` token, so a later move of this push in front of the
+        // positional prompt would swallow the prompt as a second tool name.
+        cmd.push_str(" --disallowedTools=AskUserQuestion");
         if let Some(mode) = permission_mode_override {
             // Forced mode (e.g. `dontAsk` for the capability-restricted answer
             // agent). Suppresses BOTH the `auto` and `--dangerously-skip-permissions`
@@ -2090,23 +2094,30 @@ mod tests {
         // spawn_invocation). --disallowedTools is the only lever that
         // removes it from the worker's tool surface — verified present
         // regardless of which --permission-mode branch this spawn takes.
+        // Equals form is required: the CLI flag is variadic and a
+        // space-separated value would consume a following positional as
+        // another tool name. The next token after the flag must still be
+        // another option, not the prompt.
+        const FLAG: &str = "--disallowedTools=AskUserQuestion";
         for model in ["sonnet", "opus"] {
             let cmd = ClaudeDriver.spawn_invocation(spawn_request(model)).command;
+            let Some((_, rest)) = cmd.split_once(FLAG) else {
+                panic!("worker spawn for model {model:?} must disallow AskUserQuestion; got: {cmd}");
+            };
+            let after = rest.trim_start();
             assert!(
-                cmd.contains("--disallowedTools AskUserQuestion"),
-                "worker spawn for model {model:?} must disallow AskUserQuestion; got: {cmd}",
+                after.starts_with("--"),
+                "disallowedTools must be followed by another option, not a positional; got: {cmd}",
             );
         }
     }
 
     #[test]
     fn large_effort_addendum_has_no_human_confirmation_reading() {
-        // Regression for the incident this addendum was reworded over: a
-        // worker read "Confirm the approach against the work item's
-        // description before writing code" as an instruction to ask a
-        // human, and called AskUserQuestion to get an operator to bless a
-        // pure code-organisation choice — holding its slot for ten minutes
-        // to decide something that could not change the deliverable.
+        // Guards the three properties the addendum must hold: no phrasing
+        // that reads as a request for human confirmation, the self-check
+        // retained, and an explicit instruction for what to do when a
+        // decision is genuinely open.
         let addendum = claude_prompt_addendum_for_level(EffortLevel::Large).expect("large effort carries an addendum");
         assert_eq!(
             claude_prompt_addendum_for_level(EffortLevel::Max),

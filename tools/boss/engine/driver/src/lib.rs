@@ -23,22 +23,20 @@ use boss_protocol::{
 pub mod transcript_store;
 
 /// `large`/`max`-effort worker-prompt addendum, shared verbatim across every
-/// driver's `*_prompt_addendum_for_level` table so the wording — and its
-/// regression test in each driver module — cannot drift between drivers.
+/// driver's `*_prompt_addendum_for_level` table so the wording cannot drift
+/// between drivers. `tests::large_effort_addendum_is_shared_across_drivers`
+/// asserts each driver's menu returns this constant rather than a forked
+/// literal; the wording properties themselves live in
+/// `claude::tests::large_effort_addendum_has_no_human_confirmation_reading`.
 ///
-/// Prior wording ("Confirm the approach against the work item's description
-/// before writing code") reads naturally as "ask a human to confirm", and a
-/// worker took it that way: it called `AskUserQuestion` to get an operator to
-/// bless a pure code-organisation choice, holding its slot for ten minutes to
-/// decide something that could not change the deliverable. The self-check is
-/// the useful half of that sentence; only the human-confirmation reading was
-/// the defect. This wording keeps the self-check, makes explicit that the
-/// worker — not the operator — resolves it, and tells the worker what to do
-/// when the work item genuinely leaves a decision open: pick, say why, and
-/// keep going. It deliberately does NOT tell the worker to stay silent when
-/// truly blocked — that escalation path (stop and summarize; see the worker
-/// prompt's "Avoid asking the human for permission" framing) is untouched.
-pub const LARGE_EFFORT_PROMPT_ADDENDUM: &str = "Begin with a written plan. Identify the files you expect to touch \
+/// The wording must stay self-directed: a worker reads any "confirm the
+/// approach" phrasing as an instruction to ask a human, and asking mid-turn
+/// costs a held slot with no Stop boundary to end it. Keep the plan-first
+/// self-check, keep the explicit statement that the worker resolves an open
+/// decision itself, and keep the pick-state-continue instruction so an
+/// underspecified item does not become a silent guess. Escalation for a
+/// genuinely blocked worker (stop and summarize) is intentionally untouched.
+pub(crate) const LARGE_EFFORT_PROMPT_ADDENDUM: &str = "Begin with a written plan. Identify the files you expect to touch \
      and the order you'll touch them in. Check that plan against the work item's description yourself before \
      writing code — do not ask the operator to confirm scope. If the description genuinely leaves a decision \
      open, pick the option consistent with the project's design and conventions, state which you picked and why \

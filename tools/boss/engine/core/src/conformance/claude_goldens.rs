@@ -76,7 +76,7 @@ fn golden_spawn_line_opus_with_settings() {
     );
     assert_eq!(
         plan.command,
-        "claude --model opus --disallowedTools AskUserQuestion --permission-mode auto --settings '/tmp/boss-worker-settings/mono-agent-007.json' \"$(cat .claude/initial-prompt.txt)\"\n",
+        "claude --model opus --disallowedTools=AskUserQuestion --permission-mode auto --settings '/tmp/boss-worker-settings/mono-agent-007.json' \"$(cat .claude/initial-prompt.txt)\"\n",
         "Opus + settings spawn line must match the pre-refactor contract byte-for-byte",
     );
 }
@@ -93,7 +93,7 @@ fn golden_spawn_line_sonnet_skip_permissions() {
     });
     assert_eq!(
         plan.command,
-        "claude --model sonnet --effort low --disallowedTools AskUserQuestion --dangerously-skip-permissions \"$(cat .claude/initial-prompt.txt)\"\n",
+        "claude --model sonnet --effort low --disallowedTools=AskUserQuestion --dangerously-skip-permissions \"$(cat .claude/initial-prompt.txt)\"\n",
     );
 }
 
@@ -109,7 +109,7 @@ fn golden_spawn_line_sonnet_corp_auto_mode() {
     });
     assert_eq!(
         plan.command,
-        "claude --model sonnet --effort high --disallowedTools AskUserQuestion --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
+        "claude --model sonnet --effort high --disallowedTools=AskUserQuestion --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
     );
 }
 
@@ -125,7 +125,7 @@ fn golden_spawn_line_dont_ask_override() {
     });
     assert_eq!(
         plan.command,
-        "claude --model sonnet --disallowedTools AskUserQuestion --permission-mode dontAsk \"$(cat .claude/initial-prompt.txt)\"\n",
+        "claude --model sonnet --disallowedTools=AskUserQuestion --permission-mode dontAsk \"$(cat .claude/initial-prompt.txt)\"\n",
     );
 }
 
