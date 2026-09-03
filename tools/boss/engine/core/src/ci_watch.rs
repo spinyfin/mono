@@ -856,15 +856,28 @@ async fn maybe_spawn_ci_revision(
     let description = ci_revision_description(failures, attempt.failure_kind.as_deref());
     let created_via = format!("{CREATED_VIA_CI_FIX_PREFIX}{}", attempt.id);
 
+    let reasoning = if failures.is_empty() {
+        // No failed check or log excerpt is attached — this is a
+        // queue-side eviction the poller could not pin to a specific
+        // failing build (or ambiguously resolved), so working out whether
+        // anything is actually broken on this PR IS the job, not something
+        // the brief hands the worker pre-solved. Pin `investigation` rather
+        // than `standard`: `failures.is_empty()` is exactly the branch that
+        // is reached *by construction* only when there is no evidence,
+        // which is the one case that is itself a diagnosis.
+        ReasoningMode::Investigation
+    } else {
+        // The failed check and its log excerpt are attached; there is
+        // nothing to diagnose. Pin `standard` rather than inheriting the
+        // chain root's mode.
+        ReasoningMode::Standard
+    };
     let revision = match work_db.create_revision(
         CreateRevisionInput::builder()
             .parent_task_id(candidate.work_item_id.clone())
             .description(description)
             .created_via(created_via)
-            // The failed check and its log excerpt are attached; there is
-            // nothing to diagnose. Pin `standard` rather than inheriting the
-            // chain root's mode.
-            .reasoning(ReasoningMode::Standard)
+            .reasoning(reasoning)
             .build(),
         pr_checker,
     ) {

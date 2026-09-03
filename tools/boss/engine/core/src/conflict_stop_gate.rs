@@ -106,6 +106,35 @@ pub async fn verify_conflict_cleared_from(
     unknown_backoff: Duration,
     initial: Option<PrLifecycleProbe>,
 ) -> ConflictClearance {
+    verify_mergeability_live(probe, pr_url, unknown_backoff, initial, None).await
+}
+
+/// Shared primitive behind [`verify_conflict_cleared_from`] and other
+/// callers (e.g. [`crate::trunk_queue_poller`]) that need a *live*,
+/// definitive mergeability answer from GitHub rather than a locally cached
+/// one. `UNKNOWN` is never read as mergeable — the discipline this module
+/// exists to enforce (see the module doc) — so it is retried with backoff
+/// like every other caller of this loop.
+///
+/// `expected_base_tip`, when given, adds a second "GitHub hasn't caught up
+/// yet" condition alongside `UNKNOWN`: a probe whose `baseRefOid` does not
+/// match it is treated as not-yet-converged and retried too, rather than
+/// accepted at face value. This matters specifically when the base branch
+/// moving is what triggered the check — the same event that can create a
+/// real conflict can also leave a stale `mergeable` computed against the
+/// *previous* base, and a stale `Clean` read that way is not evidence of
+/// anything. Pass `None` to skip this check (the original
+/// [`verify_conflict_cleared_from`] contract, unchanged).
+///
+/// Exhausting the retries without a definitive, non-stale answer returns
+/// [`ConflictClearance::Indeterminate`] — never a guess.
+pub async fn verify_mergeability_live(
+    probe: &dyn MergeProbe,
+    pr_url: &str,
+    unknown_backoff: Duration,
+    initial: Option<PrLifecycleProbe>,
+    expected_base_tip: Option<&str>,
+) -> ConflictClearance {
     let mut initial = initial;
     let mut delay = unknown_backoff;
     for attempt in 0..=UNKNOWN_RETRY_ATTEMPTS {
@@ -118,7 +147,7 @@ pub async fn verify_conflict_cleared_from(
                     tracing::warn!(
                         pr_url,
                         ?err,
-                        "conflict stop gate: PR probe failed; cannot verify the conflict claim",
+                        "conflict stop gate: PR probe failed; cannot verify mergeability",
                     );
                     return ConflictClearance::Unavailable;
                 }
@@ -130,29 +159,35 @@ pub async fn verify_conflict_cleared_from(
             // caller's own merged/closed handling is the right one.
             _ => return ConflictClearance::Unavailable,
         };
+        let base_is_stale = expected_base_tip.is_some_and(|tip| result.base_ref_oid.as_deref() != Some(tip));
         match open.mergeability {
-            OpenPrMergeability::Clean => return ConflictClearance::Cleared,
-            OpenPrMergeability::Conflict => {
+            OpenPrMergeability::Clean if !base_is_stale => return ConflictClearance::Cleared,
+            OpenPrMergeability::Conflict if !base_is_stale => {
                 return ConflictClearance::StillConflicting {
                     raw_mergeable: non_empty_or(&result.raw_mergeable, "CONFLICTING"),
                     raw_merge_state_status: non_empty_or(&result.raw_merge_state_status, "DIRTY"),
                 };
             }
-            OpenPrMergeability::Unknown => {
+            OpenPrMergeability::Unknown | OpenPrMergeability::Clean | OpenPrMergeability::Conflict => {
+                // Either genuinely UNKNOWN, or a definitive-looking result
+                // computed against a base ref that lags what the caller
+                // already knows landed — neither is a trustworthy answer yet.
                 if attempt == UNKNOWN_RETRY_ATTEMPTS {
                     tracing::info!(
                         pr_url,
                         probes = attempt + 1,
-                        "conflict stop gate: mergeability still UNKNOWN after retries; \
-                         refusing the 'already resolved' claim rather than assuming mergeable",
+                        base_is_stale,
+                        "conflict stop gate: no definitive, non-stale mergeability after retries; \
+                         refusing to guess",
                     );
                     return ConflictClearance::Indeterminate;
                 }
                 tracing::debug!(
                     pr_url,
                     attempt,
+                    base_is_stale,
                     backoff_ms = delay.as_millis(),
-                    "conflict stop gate: mergeability UNKNOWN (GitHub recomputing); re-probing",
+                    "conflict stop gate: mergeability not yet trustworthy (UNKNOWN or stale base); re-probing",
                 );
                 tokio::time::sleep(delay).await;
                 delay = delay.saturating_mul(2);
