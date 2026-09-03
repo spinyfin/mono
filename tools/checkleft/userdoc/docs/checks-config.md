@@ -266,6 +266,33 @@ Together these guarantees mean excluded paths:
 
 **`exclude` vs tool-native ignore files** (`.prettierignore`, `.gitignore`): the framework `exclude` is the authoritative mechanism. Because checkleft passes files explicitly to declarative check tools, whether a tool honors its own ignore file for explicitly-passed arguments is tool-specific and not guaranteed. Framework excludes work uniformly regardless of which tool a check wraps and do not depend on any ignore file on disk.
 
+## Checks must not answer "is this file in scope" themselves
+
+Deciding whether a file is a target of a check at all — its file scope — is the framework's job, driven by the check-entry `include` / `exclude` keys documented above. A check's own `config:` block must never re-answer that same question with a field of its own (a bespoke `paths`, `file_globs`, `only`, or similar; or a check parsing the framework's own `include` / `applies_to` keys itself instead of relying on the framework to filter its changeset first).
+
+This is enforced by the built-in check `checkleft/no-check-level-file-scoping`, which inspects every checkleft check implementation's source and fails the build if the check's top-level config struct declares a denylisted file-scoping field. Matching is on effective serde **config keys** (the field's Rust ident, `#[serde(rename)]`, every `#[serde(alias)]`, and container `rename_all`), not bare identifiers alone — so `#[serde(rename = "paths")] my_files: …` is still caught.
+
+The denylist always covers the bespoke words (`paths`, `path`, `path_globs`, `include_globs`, `file_globs`, `files`, `only`, `targets`, `scope`, `globs`). On the **guest** (WASM) surface it also covers the two live framework spellings (`include`, `applies_to`) — a guest that parses the framework's own word for a check-level scope is re-implementing the framework's job under a name that reads as legitimate. On the **built-in** surface those two framework spellings are _not_ denylisted: a built-in may accept them as deliberate framework-key pass-throughs so `deny_unknown_fields` hard-errors on legacy keys still present in the config blob (see `DocStructureConfig`), without the check reading them as its own scope.
+
+A check MAY still declare a selector on a strictly finer axis than "is this file in scope at all" — for example, "which of my several rules applies to this file" when different rules in one check instance genuinely need different scopes. Such a selector must be **nested** under the finer construct it belongs to, and must reuse the framework's own word rather than inventing a new one:
+
+```yaml
+checks:
+  - id: my-forbidden-imports-rule
+    check: forbidden-imports-deps
+    config:
+      rules:
+        - pattern: "legacy_client::*"
+          message: "..."
+          # Finer-axis selector: which rule this applies to, not whether
+          # the check runs on this file at all. Nested under `rules[]` and
+          # spelled `include`, matching the framework's own word.
+          include:
+            - "frontend/src/**/*.ts"
+```
+
+See `src/checks/forbidden_imports_deps.rs`'s `ForbiddenImportsDepsRuleConfig` for the shape this legalizes, and `text/forbidden-pattern`'s `patterns[]` for a nested list that is check subject matter (not scoping at all) and so is unaffected by this rule.
+
 ## Overriding `include` for declarative checks
 
 Declarative checks (format/bazel, format/rust, format/prettier, lint/js, lint/rust, etc.) declare which files they run on via an `include` glob list in their check definition. A consuming repo can restrict or retarget that file set from its CHECKS.yaml without forking the definition — by setting `include` inside the per-check `config` block.

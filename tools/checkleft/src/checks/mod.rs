@@ -3,6 +3,7 @@ mod code_patterns;
 mod doc_structure;
 mod forbidden_imports_deps;
 mod frontend_no_legacy_api;
+mod no_check_level_file_scoping;
 mod repo_visibility;
 mod rust_test_rule_coverage;
 mod todo_expiry;
@@ -24,6 +25,7 @@ pub fn register_builtin_checks(registry: &mut CheckRegistry) -> Result<()> {
     registry.register(doc_structure::DocStructureCheck)?;
     registry.register(forbidden_imports_deps::ForbiddenImportsDepsCheck)?;
     registry.register(frontend_no_legacy_api::FrontendNoLegacyApiCheck)?;
+    registry.register(no_check_level_file_scoping::NoCheckLevelFileScopingCheck)?;
     registry.register(repo_visibility::RepoVisibilityCheck)?;
     registry.register(rust_test_rule_coverage::RustTestRuleCoverageCheck)?;
     registry.register(todo_expiry::TodoExpiryCheck)?;

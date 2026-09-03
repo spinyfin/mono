@@ -74,6 +74,7 @@ Each finding supports:
 - Keep findings stable and actionable.
 - Default check findings to the implementation's intrinsic severity; use `[checks.policy].severity` for per-instance overrides.
 - Use framework policy for bypass behavior (`[checks.policy].allow_bypass`) instead of check-local bypass parsing.
+- **Never give your config struct a top-level field that answers "is this file a target of this check at all"** — that is the framework's job via the check-entry `include` / `exclude` keys (see [Configuring checks](checks-config.md#checks-must-not-answer-is-this-file-in-scope-themselves)), not your check's. The built-in `checkleft/no-check-level-file-scoping` check enforces this at review time against effective serde config keys (ident + `rename` / `alias` / `rename_all`). The denylist always covers bespoke words (`paths`, `file_globs`, `only`, `scope`, etc.); on WASM guest config it also covers the framework spellings `include` / `applies_to`. On built-in doorway structs those two framework spellings may appear as deliberate pass-throughs for `deny_unknown_fields` (they are not denylisted on that surface). If your check genuinely needs a selector finer than "in scope at all" (e.g. per-rule scoping when different rules need different files), nest it under that finer construct using the framework's own word — `rules[].include`, `patterns[].include` — never a new one.
 
 ## Minimal skeleton
 

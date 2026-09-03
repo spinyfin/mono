@@ -90,6 +90,22 @@ checks:
     policy:
       severity: error
 
+  # Guards the include-side-unification project (see
+  # tools/checkleft/docs/designs/checkleft-unify-the-include-side-of-file-scoping-across-check-implementation-types.md,
+  # decision 4): a check must never ship its own top-level answer to "is
+  # this file a target of this check at all" — deciding that is the
+  # framework's job via the check-entry `include` / `exclude` keys, not the
+  # check's own config. Scoped to the two check-authoring surfaces (wasm
+  # guest `lib.rs` and built-in Rust checks) with the framework's own
+  # `include`, dogfooding the key this project unifies.
+  - id: checkleft/no-check-level-file-scoping
+    check: checkleft/no-check-level-file-scoping
+    include:
+      - "tools/checkleft/checks/**/src/lib.rs"
+      - "tools/checkleft/src/checks/**/*.rs"
+    policy:
+      severity: error
+
   - id: format/oxc
     policy:
       severity: error

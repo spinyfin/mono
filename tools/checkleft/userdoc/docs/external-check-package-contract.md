@@ -156,6 +156,10 @@ Not allowed in `declarative` mode:
 1. `artifact_path`, `artifact_sha256`
 2. `executable_path`, `args` (top-level), `[provenance]`
 
+### Component checks must not re-implement file scoping in guest config
+
+The manifest-level rule above (`include` disallowed in `component` mode, required in `declarative` mode) governs the package manifest. A separate, complementary rule governs the guest's own Rust source: a component check's config struct — the type deserialized via `CheckInput::config::<T>()` — must not declare a top-level field that answers "is this file a target of this check at all" either. That is the framework's decision (the check-entry `include` / `exclude` keys in the consuming repo's `CHECKS.yaml`), made before the host ever lowers a changeset into the guest — see [Configuring checks](checks-config.md#checks-must-not-answer-is-this-file-in-scope-themselves) for the full rule, the denylist, and the sanctioned nested finer-axis shape. The built-in `checkleft/no-check-level-file-scoping` check enforces this against every checkleft check's own source (built-in and component alike), scoped to `tools/checkleft/checks/**/src/lib.rs` and `tools/checkleft/src/checks/**/*.rs`.
+
 ## Host API Contract Surface (Names Frozen)
 
 External checks use host calls with these operation names:
