@@ -153,36 +153,17 @@ impl WorkDb {
         spawn_token: &str,
         pane_id: &str,
     ) -> Result<bool> {
-        let mut conn = self.connect()?;
-        let now = boss_engine_utils::epoch_time::now_epoch_secs().to_string();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let matches_token = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM metadata WHERE key = ?1 AND value = ?2)",
-            params![SPAWN_TOKEN_KEY, spawn_token],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !matches_token {
-            return Ok(false);
-        }
-        tx.execute(
-            "UPDATE metadata SET value = 'created' WHERE key = ?1",
-            params![SPAWN_STATE_KEY],
-        )?;
-        for (key, value) in [(PANE_ID_KEY, pane_id), (LIVENESS_PASSED_AT_KEY, now.as_str())] {
-            tx.execute(
-                "INSERT INTO metadata (key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![key, value],
-            )?;
-        }
-        tx.commit()?;
-        Ok(true)
+        self.write_pane_observation(spawn_token, pane_id, true)
     }
 
     /// Persist a successful liveness observation only if it still belongs to
     /// the current coordinator. The caller supplies the pane id it just
     /// observed, so a later session-loss record retains the real old pane.
     pub(crate) fn record_coordinator_tmux_liveness_pass(&self, spawn_token: &str, pane_id: &str) -> Result<bool> {
+        self.write_pane_observation(spawn_token, pane_id, false)
+    }
+
+    fn write_pane_observation(&self, spawn_token: &str, pane_id: &str, mark_created: bool) -> Result<bool> {
         let mut conn = self.connect()?;
         let now = boss_engine_utils::epoch_time::now_epoch_secs().to_string();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -193,6 +174,12 @@ impl WorkDb {
         )?;
         if !matches_token {
             return Ok(false);
+        }
+        if mark_created {
+            tx.execute(
+                "UPDATE metadata SET value = 'created' WHERE key = ?1",
+                params![SPAWN_STATE_KEY],
+            )?;
         }
         for (key, value) in [(PANE_ID_KEY, pane_id), (LIVENESS_PASSED_AT_KEY, now.as_str())] {
             tx.execute(
@@ -274,5 +261,32 @@ mod tests {
             None,
             "a failed/skipped version probe must read back as None, never Some(\"\")"
         );
+    }
+
+    #[test]
+    fn pane_observations_are_token_bound_and_round_trip() {
+        let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+        db.record_coordinator_tmux_spawn_intent("boss-coordinator", "token-a", "opus", None)
+            .unwrap();
+
+        assert!(!db.record_coordinator_tmux_liveness_pass("token-b", "%stale").unwrap());
+        assert!(
+            !db.record_coordinator_tmux_session_created_with_pane("token-b", "%stale")
+                .unwrap()
+        );
+        assert!(db.record_coordinator_tmux_liveness_pass("token-a", "%live").unwrap());
+        let record = db.coordinator_tmux_record().unwrap().unwrap();
+        assert_eq!(record.pane_id.as_deref(), Some("%live"));
+        assert!(record.liveness_passed_at.is_some());
+        assert_eq!(record.spawn_state, "intended");
+
+        assert!(
+            db.record_coordinator_tmux_session_created_with_pane("token-a", "%created")
+                .unwrap()
+        );
+        let record = db.coordinator_tmux_record().unwrap().unwrap();
+        assert_eq!(record.pane_id.as_deref(), Some("%created"));
+        assert!(record.liveness_passed_at.is_some());
+        assert_eq!(record.spawn_state, "created");
     }
 }
