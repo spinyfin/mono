@@ -198,6 +198,26 @@ struct RecordingReaper {
     reaped: StdMutex<Vec<(String, bool)>>,
 }
 
+/// Records cube lease releases made by the auto-reap path; every other cube
+/// operation is unreachable from this sweep.
+#[derive(Default)]
+struct RecordingCube {
+    force_releases: StdMutex<Vec<String>>,
+}
+
+impl RecordingCube {
+    fn force_release_calls(&self) -> Vec<String> {
+        self.force_releases.lock().unwrap().clone()
+    }
+}
+
+crate::stub_cube_client! { RecordingCube {
+    async fn force_release_lease(&self, lease_id: &str, _: Option<&str>) -> anyhow::Result<()> {
+        self.force_releases.lock().unwrap().push(lease_id.to_owned());
+        Ok(())
+    }
+} }
+
 impl RecordingReaper {
     fn new(coordinator: Arc<ExecutionCoordinator>) -> Self {
         Self {
@@ -246,6 +266,27 @@ impl StaleWorkerReaper for RecordingReaper {
             .lock()
             .unwrap()
             .push((execution_id.to_owned(), still_claimed));
+    }
+}
+
+/// Mirrors the production pane reaper's bookkeeping: it frees both the live
+/// entry and pool claim while tearing down the pane, before the sweep's
+/// guarded shared cleanup runs.
+struct ReleasingReaper {
+    coordinator: Arc<ExecutionCoordinator>,
+    live_states: Arc<LiveWorkerStateRegistry>,
+    slot_id: u8,
+    reaped: StdMutex<Vec<String>>,
+}
+
+#[async_trait]
+impl StaleWorkerReaper for ReleasingReaper {
+    async fn reap_worker(&self, execution_id: &str) {
+        self.live_states.release_slot(self.slot_id);
+        self.coordinator
+            .release_worker_and_kick(&worker_id_for_slot(self.slot_id), None)
+            .await;
+        self.reaped.lock().unwrap().push(execution_id.to_owned());
     }
 }
 
@@ -1404,10 +1445,16 @@ async fn two_hour_idle_tmux_worker_is_auto_reaped() {
     let claimed_before = coordinator.worker_pool().claimed_execution_ids().await;
     assert!(claimed_before.contains(&execution_id));
 
-    let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+    let reaper = Arc::new(ReleasingReaper {
+        coordinator: coordinator.clone(),
+        live_states: live_states.clone(),
+        slot_id: 1,
+        reaped: StdMutex::new(Vec::new()),
+    });
     let sink = Arc::new(RecordingDispatchEventSink::new());
     let inspector = StaticTerminalInspector(live_terminal(0));
     let hold_registry = HoldRegistry::new();
+    let cube = RecordingCube::default();
     let outcome = run_one_pass_with_terminal(
         db.as_ref(),
         &live_states,
@@ -1417,7 +1464,7 @@ async fn two_hour_idle_tmux_worker_is_auto_reaped() {
         StaleWorkerSweepControls {
             reaper: reaper.as_ref(),
             hold_registry: &hold_registry,
-            cube_client: &AlwaysSucceedsCube,
+            cube_client: &cube,
         },
         StaleWorkerThresholds {
             stale_threshold_secs: ALWAYS_STALE,
@@ -1435,6 +1482,7 @@ async fn two_hour_idle_tmux_worker_is_auto_reaped() {
         "a successful auto-reap must not also count as a stuck attention"
     );
     assert_eq!(outcome.auto_reap_aborted, 0);
+    assert_eq!(cube.force_release_calls(), vec!["lease-1"]);
 
     let exec = db.get_execution(&execution_id).unwrap();
     assert_eq!(exec.status, ExecutionStatus::Orphaned);
@@ -1445,13 +1493,10 @@ async fn two_hour_idle_tmux_worker_is_auto_reaped() {
         "pool slot must be released after the auto-reap",
     );
 
-    // The reap must run BEFORE the slot/lease is released — the recording
-    // reaper snapshots the slot as still-claimed at reap time.
-    assert_eq!(
-        reaper.reaped(),
-        vec![(execution_id.clone(), true)],
-        "auto-reap must reap the process tree before releasing the slot/lease",
-    );
+    // The production-shaped reaper released bookkeeping itself; the
+    // sweep's guarded cleanup did not fabricate another free signal.
+    assert_eq!(reaper.reaped.lock().unwrap().as_slice(), [execution_id.as_str()],);
+    assert_eq!(live_states.snapshot().len(), 0);
 
     let events = sink.events().await;
     assert_eq!(events.len(), 1);
@@ -1535,6 +1580,50 @@ struct InjectsActivityOnRecheckInspector<'a> {
     live_states: &'a LiveWorkerStateRegistry,
     slot_id: u8,
     calls: StdMutex<u32>,
+}
+
+/// Places an operator hold exactly during the identity recheck, exercising
+/// the destructive action's just-in-time hold gate rather than the initial
+/// per-slot hold check.
+struct HoldsOnRecheckInspector<'a> {
+    hold_registry: &'a HoldRegistry,
+    execution_id: &'a str,
+    calls: StdMutex<u32>,
+}
+
+#[async_trait]
+impl WorkerTerminalInspector for HoldsOnRecheckInspector<'_> {
+    async fn inspect(&self, _execution_id: &str) -> Result<Option<TerminalLiveness>> {
+        let mut calls = self.calls.lock().unwrap();
+        *calls += 1;
+        if *calls == 2 {
+            self.hold_registry
+                .hold(self.execution_id, Some("operator attached".to_owned()), 0);
+        }
+        Ok(Some(live_terminal(0)))
+    }
+}
+
+/// Makes the reap's orphan write fail after initial classification but before
+/// destructive teardown, by terminalizing the execution during the recheck.
+struct TerminalizesOnRecheckInspector<'a> {
+    db: &'a WorkDb,
+    execution_id: &'a str,
+    calls: StdMutex<u32>,
+}
+
+#[async_trait]
+impl WorkerTerminalInspector for TerminalizesOnRecheckInspector<'_> {
+    async fn inspect(&self, _execution_id: &str) -> Result<Option<TerminalLiveness>> {
+        let mut calls = self.calls.lock().unwrap();
+        *calls += 1;
+        if *calls == 2 {
+            self.db
+                .mark_execution_orphaned(self.execution_id, "test terminalizes during recheck")
+                .unwrap();
+        }
+        Ok(Some(live_terminal(0)))
+    }
 }
 
 #[async_trait]
@@ -1696,6 +1785,95 @@ async fn auto_reap_recheck_in_flight_tool_blocks_the_reap() {
     assert_eq!(outcome.auto_reap_aborted, 1);
     assert_eq!(outcome.genuinely_stuck, 1);
     assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
+    assert!(reaper.reaped().is_empty());
+}
+
+#[tokio::test]
+async fn auto_reap_recheck_new_hold_blocks_the_reap() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let db = Arc::new(db);
+    let execution_id = create_old_execution(&db, &work_item_id);
+    let live_states = Arc::new(LiveWorkerStateRegistry::new());
+    register_slot(&live_states, 1, &execution_id, &work_item_id);
+    drive_to_working_idle(&live_states, 1);
+    let coordinator = make_coordinator(db.clone(), 1);
+    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+    let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let hold_registry = HoldRegistry::new();
+    let inspector = HoldsOnRecheckInspector {
+        hold_registry: &hold_registry,
+        execution_id: &execution_id,
+        calls: StdMutex::new(0),
+    };
+    let outcome = run_one_pass_with_terminal(
+        db.as_ref(),
+        &live_states,
+        Some(&inspector),
+        coordinator,
+        sink.as_ref(),
+        StaleWorkerSweepControls {
+            reaper: reaper.as_ref(),
+            hold_registry: &hold_registry,
+            cube_client: &NoopCube,
+        },
+        StaleWorkerThresholds {
+            stale_threshold_secs: ALWAYS_STALE,
+            auto_reap_threshold_secs: ALWAYS_STALE,
+        },
+    )
+    .await;
+
+    assert_eq!(outcome.reaped, 0);
+    assert_eq!(outcome.auto_reap_aborted, 1);
+    assert_eq!(outcome.genuinely_stuck, 1);
+    assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
+    assert!(reaper.reaped().is_empty());
+}
+
+#[tokio::test]
+async fn auto_reap_orphan_write_failure_falls_back_to_stuck_attention() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let db = Arc::new(db);
+    let execution_id = create_old_execution(&db, &work_item_id);
+    let live_states = Arc::new(LiveWorkerStateRegistry::new());
+    register_slot(&live_states, 1, &execution_id, &work_item_id);
+    drive_to_working_idle(&live_states, 1);
+    let coordinator = make_coordinator(db.clone(), 1);
+    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+    let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let hold_registry = HoldRegistry::new();
+    let inspector = TerminalizesOnRecheckInspector {
+        db: db.as_ref(),
+        execution_id: &execution_id,
+        calls: StdMutex::new(0),
+    };
+    let outcome = run_one_pass_with_terminal(
+        db.as_ref(),
+        &live_states,
+        Some(&inspector),
+        coordinator,
+        sink.as_ref(),
+        StaleWorkerSweepControls {
+            reaper: reaper.as_ref(),
+            hold_registry: &hold_registry,
+            cube_client: &NoopCube,
+        },
+        StaleWorkerThresholds {
+            stale_threshold_secs: ALWAYS_STALE,
+            auto_reap_threshold_secs: ALWAYS_STALE,
+        },
+    )
+    .await;
+
+    assert_eq!(outcome.reaped, 0);
+    assert_eq!(outcome.auto_reap_aborted, 1);
+    assert_eq!(outcome.genuinely_stuck, 1);
     assert!(reaper.reaped().is_empty());
 }
 

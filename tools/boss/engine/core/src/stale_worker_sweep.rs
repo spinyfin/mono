@@ -105,7 +105,8 @@
 //!    read, reclassified with [`classify_semantic_staleness`] against
 //!    `DEFAULT_AUTO_REAP_THRESHOLD_SECS`.
 //!
-//! A hold (checked earlier, at the top of the per-slot loop), a new driver
+//! A hold (checked both at the top of the per-slot loop and again just before
+//! destructive action), a new driver
 //! event, a tool going in flight, a durably-unknown tool condition, a
 //! failed probe, or a changed/dead tmux identity all block the reap — the
 //! candidate falls back to the ordinary non-destructive `genuinely_stuck`
@@ -115,8 +116,7 @@
 //! orphaned and appending the `[engine-reconcile]` audit line, tearing down
 //! driver-owned state, the token-verified tmux reap
 //! ([`StaleWorkerReaper::reap_worker`] — the exact teardown `bossctl agents
-//! stop` performs), cube-lease and worker-slot release, and a coordinator
-//! kick so the chore is redispatched.
+//! stop` performs), guarded worker-slot release, then cube-lease release.
 //!
 //! ## Cadence
 //!
@@ -998,6 +998,7 @@ pub async fn run_one_pass_with_terminal(
                         AutoReapContext::builder()
                             .work_db(work_db)
                             .live_states(live_states)
+                            .hold_registry(hold_registry)
                             .coordinator(coordinator.clone())
                             .dispatch_events(dispatch_events)
                             .reaper(reaper)
@@ -1264,6 +1265,7 @@ enum AutoReapDecision {
 struct AutoReapContext<'a> {
     work_db: &'a WorkDb,
     live_states: &'a LiveWorkerStateRegistry,
+    hold_registry: &'a HoldRegistry,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: &'a dyn DispatchEventSink,
     reaper: &'a dyn StaleWorkerReaper,
@@ -1281,7 +1283,7 @@ struct AutoReapContext<'a> {
 /// "token-verified" rather than trusting that earlier snapshot. Returns
 /// [`AutoReapDecision::Reaped`] only if the recheck itself still reads a
 /// confirmed-live, `Stale` candidate — in which case [`execute_auto_reap`]
-/// has already run.
+/// has completed successfully.
 async fn attempt_auto_reap(
     ctx: AutoReapContext<'_>,
     state: &boss_protocol::LiveWorkerState,
@@ -1346,7 +1348,15 @@ async fn attempt_auto_reap(
         return AutoReapDecision::Aborted;
     };
 
-    execute_auto_reap(
+    if ctx.hold_registry.is_held(execution_id) {
+        tracing::warn!(
+            execution_id,
+            "stale-worker sweep: auto-reap recheck found an operator hold; aborting the reap",
+        );
+        return AutoReapDecision::Aborted;
+    }
+
+    if execute_auto_reap(
         ctx,
         state,
         execution,
@@ -1355,8 +1365,12 @@ async fn attempt_auto_reap(
         auto_reap_threshold_secs,
         now_epoch_secs,
     )
-    .await;
-    AutoReapDecision::Reaped
+    .await
+    {
+        AutoReapDecision::Reaped
+    } else {
+        AutoReapDecision::Aborted
+    }
 }
 
 /// Run once [`attempt_auto_reap`]'s recheck has reconfirmed a live,
@@ -1374,10 +1388,11 @@ async fn execute_auto_reap(
     progress_at: &str,
     auto_reap_threshold_secs: i64,
     now_epoch_secs: i64,
-) {
+) -> bool {
     let AutoReapContext {
         work_db,
         live_states,
+        hold_registry: _,
         coordinator,
         dispatch_events,
         reaper,
@@ -1412,7 +1427,7 @@ async fn execute_auto_reap(
             ?err,
             "stale-worker sweep: auto-reap failed to mark execution orphaned; aborting the reap",
         );
-        return;
+        return false;
     }
     resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
     if let Some(work_item_id) = &state.work_item_id
@@ -1450,7 +1465,13 @@ async fn execute_auto_reap(
     //    this call.
     reaper.reap_worker(execution_id).await;
 
-    // 5. Slot and lease release.
+    // 5. Release engine bookkeeping immediately after pane teardown. The
+    // reaper normally does this itself; this guarded shared cleanup covers
+    // test and fallback reapers without releasing a newly re-claimed slot.
+    crate::dead_pid_sweep::release_reaped_execution(live_states, &coordinator, state).await;
+
+    // 6. Lease release comes last: it is a remote RPC and must not leave an
+    // await between the pane reaper's release and this guarded cleanup.
     if let Some(lease_id) = execution.cube_lease_id.as_deref() {
         crate::execution_liveness::force_release_lease_best_effort(
             execution_id,
@@ -1459,11 +1480,6 @@ async fn execute_auto_reap(
         )
         .await;
     }
-    live_states.release_slot(state.slot_id);
-
-    // 6. Coordinator kick.
-    let worker_id = worker_id_for_slot(state.slot_id);
-    coordinator.release_worker_and_kick(&worker_id, None).await;
 
     dispatch_events
         .emit(
@@ -1481,6 +1497,7 @@ async fn execute_auto_reap(
                 })),
         )
         .await;
+    true
 }
 
 /// The conservative cadence-only fallback for a run with no tmux identity.
