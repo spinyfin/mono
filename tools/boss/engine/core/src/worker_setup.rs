@@ -230,6 +230,18 @@ pub struct WorkerSetupInput {
     /// [`WorkerKind::Reviewer`] to enforce the read-only mandate (§9).
     #[builder(default = WorkerKind::Standard)]
     pub worker_kind: WorkerKind,
+    /// Mirrors the `automation_outcome_proposals_seam` feature flag
+    /// (composed with the `worker_proposals` master flag) — gates the
+    /// `boss propose automation-outcome` teaching in
+    /// [`crate::automation_triage::render_triage_claude_md`] for
+    /// [`WorkerKind::Triage`] workers (design implementation task 11).
+    /// Ignored for every other worker kind. The caller must pass the same
+    /// value used to render this triage execution's preamble
+    /// (`runner::worker_spawn::WorkerSpawnOpts::automation_outcome_proposals_seam_enabled`)
+    /// so the preamble and CLAUDE.md never disagree about which
+    /// decision-declaration mechanism is live.
+    #[builder(default = false)]
+    pub automation_outcome_proposals_seam_enabled: bool,
 }
 
 /// Render the worker-facing agent-rules file (CLAUDE.md or equivalent).
@@ -254,7 +266,10 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
         );
     }
     if input.worker_kind == WorkerKind::Triage {
-        return crate::automation_triage::render_triage_claude_md(&input.lease_id);
+        return crate::automation_triage::render_triage_claude_md(
+            &input.lease_id,
+            input.automation_outcome_proposals_seam_enabled,
+        );
     }
     if input.worker_kind == WorkerKind::AnswerAgent {
         return crate::answer_agent::render_answer_agent_claude_md(
