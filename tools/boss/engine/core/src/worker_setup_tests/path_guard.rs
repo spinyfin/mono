@@ -259,6 +259,30 @@ fn path_guard_blocks_a_bash_cd_then_relative_read_of_the_data_dir() {
 }
 
 #[test]
+fn path_guard_blocks_a_bash_command_with_a_hash_in_an_earlier_word() {
+    // Pins the `lexer.commenters = ""` fix above: `shlex.shlex`'s default
+    // `commenters='#'` treats `#` as a comment introducer anywhere inside a
+    // word, not just at the start of one, and would silently truncate the
+    // token stream before ever reaching the data-dir path -- approving a
+    // read that should block. With `commenters` cleared, the `#` is just an
+    // ordinary character and the later `cat <data dir>/state.db` token is
+    // still tokenised and still caught.
+    let data = TempDir::new().unwrap();
+    let target = data.path().join("state.db");
+    std::fs::write(&target, b"x").unwrap();
+    let command = format!("echo a#b && cat {}", target.display());
+    let (decision, reason) = run_path_guard(
+        data.path(),
+        serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}}),
+    );
+    assert_eq!(
+        decision, "block",
+        "a `#` earlier in the command must not truncate the tokenizer before the data-dir path: {reason}"
+    );
+    assert!(reason.contains("engine-owned"), "{reason}");
+}
+
+#[test]
 fn path_guard_blocks_apply_patch_writing_into_the_data_dir() {
     let data = TempDir::new().unwrap();
     let target = data.path().join("state.db");

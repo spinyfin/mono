@@ -995,8 +995,28 @@ fn reviewer_sandbox_extra_args_are_output_only_workspace_write() {
     // reviewer prompt names, not at the `--cd` output root Codex's sandbox
     // cwd is relocated to -- the two are different paths by construction, so
     // a reviewer following the rules file's `jj log -R <path>` guidance
-    // lands on real source, not empty engine scratch.
-    let workspace = Path::new("/tmp/reviewer-workspace-for-jj");
+    // lands on real source, not empty engine scratch. `permission_input`
+    // mirrors the real spawn wiring (`runner::pane_spawn`'s literal
+    // `PermissionInput` construction): its `workspace_path` is the same
+    // field `write_permission_config` feeds into `render_reviewer_claude_md`,
+    // so comparing against it (rather than an unrelated hardcoded literal)
+    // makes the assertion depend on that wiring instead of on two
+    // independently-chosen constants that no spawn ever pairs.
+    let permission_input = PermissionInput {
+        worker_kind: WorkerKind::Reviewer,
+        workspace_path: PathBuf::from("/tmp/reviewer-workspace-for-jj"),
+        events_socket_path: PathBuf::from("/tmp/events.sock"),
+        boss_event_path: PathBuf::from("/tmp/boss-event"),
+        run_id: "run-review-sandbox".into(),
+        lease_id: "lease-1".into(),
+        execution_kind: "chore_implementation".into(),
+        task_kind: None,
+        is_remote: false,
+        path_guard_script: None,
+        checkleft_guard_script: None,
+        codex_sandbox_enforced: false,
+    };
+    let workspace = &permission_input.workspace_path;
     let cd_args = reviewer_output_sandbox_extra_args(&output_dir);
     assert_ne!(
         cd_args[1],
