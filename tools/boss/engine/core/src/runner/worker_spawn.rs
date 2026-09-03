@@ -14,7 +14,7 @@ use crate::structured_output::StructuredOutputKind;
 use crate::work::{
     REASON_ALLOCATION, REASON_LEGACY_PERCENTAGE, WorkDb, WorkExecution, WorkItem, driver_clears_dispatch_gate,
 };
-use boss_protocol::{EffortLevel, ExecutionKind, ReviewBatchMember, TaskKind};
+use boss_protocol::{EffortLevel, ExecutionKind, ReviewBatchMember, ReviewBatchPhase, ReviewBatchStatus, TaskKind};
 
 use super::prompt::{
     ExecutionPromptParams, compose_answer_agent_prompt, compose_execution_prompt, render_merge_order_preservation_lines,
@@ -816,19 +816,40 @@ pub(crate) async fn compose_worker_spawn(
     } else {
         None
     };
-    // Fail closed rather than falling back to the legacy Claude pool: with
-    // the flag on, a `pr_review` execution missing its member row (a leaf
-    // whose row write raced this read, or a legacy execution minted by the
-    // `pr_transition` error fallback) must not silently collapse the
-    // three-way reviewer diversity the batch exists to measure. Gated on
-    // the flag so legacy (flag-off) mode — where every `pr_review`
-    // execution has no member row by design — is unaffected.
+    // Fail closed rather than falling back to the legacy Claude pool, but
+    // ONLY when this execution should have had a member row: a live
+    // (non-terminal) pre_merge batch already exists for the work item, so a
+    // memberless `pr_review` execution here is a genuine race (a leaf whose
+    // member-row write raced this read) rather than one of the other
+    // legacy-dispatch paths. `pr_transition.rs` gates only its own dispatch
+    // on `review_batch_fanout` — `WorkDb::request_pr_review`
+    // (`bossctl review start`), the merge poller's reviewer-fallback re-fire,
+    // pr_review_recovery's legacy loop, and pr_transition's own
+    // batch-metadata-failure fallback all still mint memberless legacy
+    // `pr_review` executions with the flag on, matching
+    // docs/designs/multi-agent-code-review.md's rollout clause that "the old
+    // single-reviewer path remains available behind the batch feature
+    // flag". Keying the gate on "no live batch exists for this work item"
+    // instead of "flag is on" lets those genuine legacy executions keep
+    // resolving `pool_dispatch_policy_for_worker_id` below.
     if review_batch_fanout_enabled && execution.kind == ExecutionKind::PrReview && batch_member.is_none() {
-        anyhow::bail!(
-            "review_batch_fanout is enabled but execution {} (pr_review) has no review batch member row; \
-             refusing to spawn rather than silently falling back to the legacy Claude pool",
-            execution.id
-        );
+        let live_batch_exists = work_db
+            .review_batches_for_cycle_root(&execution.work_item_id)
+            .map_err(|error| anyhow::anyhow!("checking for a live review batch before spawn: {error}"))?
+            .into_iter()
+            .any(|batch| {
+                batch.phase == ReviewBatchPhase::PreMerge
+                    && !matches!(batch.status, ReviewBatchStatus::Completed | ReviewBatchStatus::Failed)
+            });
+        if live_batch_exists {
+            anyhow::bail!(
+                "review_batch_fanout is enabled and a live pre_merge batch already exists for work item {} \
+                 but execution {} (pr_review) has no review batch member row; refusing to spawn rather than \
+                 silently falling back to the legacy Claude pool",
+                execution.work_item_id,
+                execution.id
+            );
+        }
     }
     // Single resolution point for review/automation dispatch policy — see
     // `pool_dispatch_policy_for_worker_id`'s doc comment. `None` for

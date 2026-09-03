@@ -774,15 +774,9 @@ impl HostAdapter for SshHostAdapter {
             // `pr_review` execution never gets the fail-closed check —
             // it keeps today's legacy-pool-fallback behavior rather than
             // gaining it, matching every other flag on this path.
-            WorkerSpawnOpts {
-                editorial_enabled: false,
-                max_embed_diff_lines: self.cfg.work.max_review_embed_diff_lines,
-                worker_signal_proposals_seam_enabled: false,
-                deferred_scope_proposals_seam_enabled: false,
-                followup_proposals_seam_enabled: false,
-                automation_outcome_proposals_seam_enabled: false,
-                review_batch_fanout_enabled: false,
-            },
+            WorkerSpawnOpts::builder()
+                .max_embed_diff_lines(self.cfg.work.max_review_embed_diff_lines)
+                .build(),
         )
         .await?;
         // `compose_execution_prompt` decides the Bazel pre-push gate by

@@ -662,8 +662,10 @@ fn are_same_review_batch_leaves_rejects_cross_batch_and_memberless_pairs() {
 
 /// The flag-off / non-batch path: `create_pre_merge_review_batch` must
 /// treat a genuine legacy (non-batch) non-terminal `pr_review` execution as
-/// owning the target and refuse to create a batch alongside it — the
-/// mode-separation invariant the work item requires.
+/// owning the target and refuse to create a batch alongside it: a target
+/// must be wholly old-mode or wholly batch-mode, so the two finalizers can
+/// never both act on it. (See docs/designs/multi-agent-code-review.md,
+/// "Dispatch three executions, not one execution with subagents".)
 #[test]
 fn create_pre_merge_review_batch_defers_to_a_genuine_legacy_execution() {
     let db = WorkDb::open(temp_db_path("review-batch-legacy-execution")).unwrap();

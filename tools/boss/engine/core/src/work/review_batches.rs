@@ -545,7 +545,12 @@ impl WorkDb {
     /// member still `'pending'`/`'running'` whose execution died without a
     /// Stop hook) ever recovered. `retry_dead_review_batch_member` already
     /// bounds this to one retry per role via `member.attempt >= 2` and the
-    /// existing-retry check.
+    /// existing-retry check; this query mirrors both bounds directly (rather
+    /// than relying solely on the caller's post-hoc "already exhausted its
+    /// one retry" skip) so an attempt that can never be retried again is
+    /// listed at most once — otherwise it would keep costing a `gh pr view`
+    /// probe (see `pr_review_recovery`'s `pr_checker.check` call) on every
+    /// sweep for the remaining life of the PR.
     pub fn list_dead_review_batch_member_candidates(&self) -> Result<Vec<DeadPrReviewCandidate>> {
         let conn = self.connect()?;
         let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
@@ -558,6 +563,14 @@ impl WorkDb {
              WHERE batch.phase = 'pre_merge'
                AND member.role IN ('claude_reviewer', 'codex_reviewer', 'grok_reviewer')
                AND member.status IN ('pending', 'running', 'failed')
+               AND member.attempt < 2
+               AND NOT EXISTS (
+                   SELECT 1 FROM pr_review_batch_members retry
+                   WHERE retry.batch_id = member.batch_id
+                     AND retry.role = member.role
+                     AND retry.attempt = member.attempt + 1
+               )
+               AND batch.status NOT IN ('completed', 'failed')
                AND task.deleted_at IS NULL AND task.status NOT IN ('done', 'archived')
                AND (we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled') OR {unproductive_completed})
              ORDER BY task.updated_at ASC, we.id ASC"

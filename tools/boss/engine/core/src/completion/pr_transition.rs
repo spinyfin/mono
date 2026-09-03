@@ -351,49 +351,71 @@ impl WorkerCompletionHandler {
                                         // already open for this cycle root: if one exists, a legacy
                                         // execution here would let old-mode and batch-mode finalizers act
                                         // on the same target, which must never happen.
-                                        let existing_batch = self
-                                            .work_db
-                                            .review_batches_for_cycle_root(&producing.work_item_id)
-                                            .unwrap_or_default()
-                                            .into_iter()
-                                            .find(|batch| {
-                                                batch.phase == boss_protocol::ReviewBatchPhase::PreMerge
-                                                    && !matches!(
-                                                        batch.status,
-                                                        boss_protocol::ReviewBatchStatus::Completed
-                                                            | boss_protocol::ReviewBatchStatus::Failed
-                                                    )
-                                            });
-                                        if let Some(batch) = existing_batch {
-                                            tracing::info!(
-                                                execution_id,
-                                                batch_id = %batch.id,
-                                                pr_url = %pr_url,
-                                                "batch metadata fetch failed but a live batch already owns \
-                                                 this target; skipping legacy reviewer to preserve mode separation",
-                                            );
-                                            true
-                                        } else {
-                                            match self.work_db.create_pr_review_execution_dedup(
-                                                &producing.work_item_id,
-                                                &producing.repo_remote_url,
-                                            ) {
-                                                Ok((review_exec, _)) => {
-                                                    self.publisher.kick_scheduler();
+                                        match self.work_db.review_batches_for_cycle_root(&producing.work_item_id) {
+                                            Err(error) => {
+                                                // Fail safe, not fail open: a query error must never be
+                                                // read as "no live batch exists", or this fallback would
+                                                // mint a legacy reviewer on top of a batch it simply
+                                                // failed to see, recreating the double-ownership this
+                                                // guard exists to prevent. Leaving the target alone this
+                                                // pass is recoverable — the next `pr_recheck` sweep
+                                                // retries the same check.
+                                                tracing::warn!(
+                                                    execution_id,
+                                                    ?error,
+                                                    pr_url = %pr_url,
+                                                    "failed to query existing review batches for cycle root; \
+                                                     skipping legacy reviewer this pass to avoid double ownership",
+                                                );
+                                                true
+                                            }
+                                            Ok(batches) => {
+                                                let existing_batch = batches.into_iter().find(|batch| {
+                                                    batch.phase == boss_protocol::ReviewBatchPhase::PreMerge
+                                                        && !matches!(
+                                                            batch.status,
+                                                            boss_protocol::ReviewBatchStatus::Completed
+                                                                | boss_protocol::ReviewBatchStatus::Failed
+                                                        )
+                                                });
+                                                if let Some(batch) = existing_batch {
                                                     tracing::info!(
                                                         execution_id,
-                                                        review_execution_id = %review_exec.id,
-                                                        "legacy reviewer enqueued after batch metadata failure",
+                                                        batch_id = %batch.id,
+                                                        batch_target_sha = %batch.target_sha,
+                                                        pr_url = %pr_url,
+                                                        "a live pre_merge batch is open for this cycle root (target \
+                                                         SHA unknown after the failed fetch); skipping the legacy \
+                                                         reviewer to preserve mode separation — the next \
+                                                         pr_recheck pass will create a batch for the current head \
+                                                         if needed",
                                                     );
                                                     true
-                                                }
-                                                Err(legacy_error) => {
-                                                    tracing::warn!(
-                                                        execution_id,
-                                                        ?legacy_error,
-                                                        "failed to create legacy reviewer after batch metadata failure",
-                                                    );
-                                                    false
+                                                } else {
+                                                    match self.work_db.create_pr_review_execution_dedup(
+                                                        &producing.work_item_id,
+                                                        &producing.repo_remote_url,
+                                                    ) {
+                                                        Ok((review_exec, _)) => {
+                                                            self.publisher.kick_scheduler();
+                                                            tracing::info!(
+                                                                execution_id,
+                                                                review_execution_id = %review_exec.id,
+                                                                "legacy reviewer enqueued after batch metadata \
+                                                                 failure",
+                                                            );
+                                                            true
+                                                        }
+                                                        Err(legacy_error) => {
+                                                            tracing::warn!(
+                                                                execution_id,
+                                                                ?legacy_error,
+                                                                "failed to create legacy reviewer after batch \
+                                                                 metadata failure",
+                                                            );
+                                                            false
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }

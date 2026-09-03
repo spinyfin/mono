@@ -666,15 +666,15 @@ impl ExecutionRunner for PaneSpawnRunner {
             work_item,
             workspace_path,
             cube_change_id,
-            WorkerSpawnOpts {
-                editorial_enabled,
-                max_embed_diff_lines: self.cfg.work.max_review_embed_diff_lines,
-                worker_signal_proposals_seam_enabled,
-                deferred_scope_proposals_seam_enabled,
-                followup_proposals_seam_enabled,
-                automation_outcome_proposals_seam_enabled,
-                review_batch_fanout_enabled,
-            },
+            WorkerSpawnOpts::builder()
+                .editorial_enabled(editorial_enabled)
+                .max_embed_diff_lines(self.cfg.work.max_review_embed_diff_lines)
+                .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
+                .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
+                .followup_proposals_seam_enabled(followup_proposals_seam_enabled)
+                .automation_outcome_proposals_seam_enabled(automation_outcome_proposals_seam_enabled)
+                .review_batch_fanout_enabled(review_batch_fanout_enabled)
+                .build(),
         )
         .await
         // Every other fallible step below already names itself in its error
