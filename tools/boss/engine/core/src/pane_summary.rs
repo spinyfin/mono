@@ -151,6 +151,14 @@ const DANGLING_STOPWORDS: &[&str] = &[
     "at", "is", "are", "was", "were", "be",
 ];
 
+/// Clause punctuation that should not sit immediately before an ellipsis,
+/// and that should not mask a dangling stopword (`"for,"`).
+const TRAILING_CLAUSE_PUNCT: [char; 4] = [',', ';', ':', '-'];
+
+fn strip_trailing_clause_punct(word: &str) -> &str {
+    word.trim_end_matches(TRAILING_CLAUSE_PUNCT)
+}
+
 /// A trailing possessive (`"engine's"`) is just as bad a stopping point
 /// as a bare preposition — it reads as a dangling clause fragment.
 fn ends_in_possessive(word: &str) -> bool {
@@ -158,7 +166,8 @@ fn ends_in_possessive(word: &str) -> bool {
 }
 
 fn is_dangling(word: &str) -> bool {
-    ends_in_possessive(word) || DANGLING_STOPWORDS.contains(&word.to_lowercase().as_str())
+    let word = strip_trailing_clause_punct(word);
+    word.is_empty() || ends_in_possessive(word) || DANGLING_STOPWORDS.contains(&word.to_lowercase().as_str())
 }
 
 /// Take up to `max_words` words from `task_name` for embedding in a
@@ -171,7 +180,10 @@ fn is_dangling(word: &str) -> bool {
 /// back off any trailing article, preposition, conjunction, copula, or
 /// possessive (see [`is_dangling`]) so it doesn't stop mid-clause, and
 /// gets a trailing "…" so the shortening reads as a deliberate
-/// abbreviation rather than data cut off by accident.
+/// abbreviation rather than data cut off by accident. Trailing `,`,
+/// `;`, `:`, and `-` on the last kept word are stripped before the
+/// ellipsis, and the same marks are ignored when classifying a word as
+/// dangling.
 ///
 /// Returns `None` when the name is empty or reduces to nothing but
 /// dangling words, so the caller can fall back to its fixed short
@@ -196,7 +208,12 @@ fn name_fragment(task_name: &str, max_words: usize) -> Option<String> {
     if candidate.is_empty() {
         return None;
     }
-    Some(format!("{}…", candidate.join(" ")))
+    let mut fragment = candidate.join(" ");
+    fragment.truncate(fragment.trim_end_matches(TRAILING_CLAUSE_PUNCT).len());
+    if fragment.is_empty() {
+        return None;
+    }
+    Some(format!("{fragment}…"))
 }
 
 /// Splice a fixed verb phrase together with a shortened, case-preserved
@@ -627,11 +644,10 @@ mod tests {
         assert_eq!(pr_review_summary("   ").as_deref(), Some("reviewing a pull request"));
     }
 
-    /// Verification case from the task brief: a long sentence-shaped name
-    /// whose first few words end on a possessive. The old `take(4)` +
-    /// `to_lowercase()` behavior produced `"sessionend from the engine's"`
-    /// — casing destroyed, cut mid-possessive. The fix preserves casing
-    /// and walks the cut back off the dangling possessive.
+    /// A long sentence-shaped name whose first three words end on a
+    /// possessive: the cut point walks back past `the` and `from` so the
+    /// fragment stops on the identifier rather than mid-clause, and the
+    /// identifier's casing survives.
     #[test]
     fn pr_review_summary_walks_back_off_a_trailing_possessive() {
         assert_eq!(
@@ -640,6 +656,26 @@ mod tests {
             )
             .as_deref(),
             Some("reviewing the PR for SessionEnd…"),
+        );
+    }
+
+    #[test]
+    fn pr_review_summary_trims_trailing_punctuation_before_the_ellipsis() {
+        assert_eq!(
+            pr_review_summary("Fix the flake, then rerun CI").as_deref(),
+            Some("reviewing the PR for Fix the flake…"),
+        );
+        assert_eq!(
+            pr_review_summary("Read wire path: movement on the extra words").as_deref(),
+            Some("reviewing the PR for Read wire path…"),
+        );
+    }
+
+    #[test]
+    fn pr_review_summary_treats_punctuated_stopwords_as_dangling() {
+        assert_eq!(
+            pr_review_summary("Ship feature for, extra words remaining").as_deref(),
+            Some("reviewing the PR for Ship feature…"),
         );
     }
 
