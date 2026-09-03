@@ -1512,7 +1512,7 @@ async fn apply_resolved_state(
 /// it dispatched force-pushed an empty commit over the PR's contents.
 ///
 /// The GitHub-native arm has had the equivalent filter since T605
-/// (`merge_poller::merge_queue::parse_dequeue_event_nodes` drops every
+/// (`merge_poller::merge_queue::check_merge_queue_rebounce` drops every
 /// dequeue whose `reason` is not `failed_checks`); this is that filter for
 /// the Trunk arm, reconstructed from the channels that do carry a reason.
 #[derive(Debug, Clone, PartialEq, Eq)]

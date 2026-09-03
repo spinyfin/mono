@@ -25,13 +25,6 @@ pub enum MergeAction {
     /// Direct-path response while GitHub's derived queue/auto-merge state is
     /// still converging; it is accurate without a replica-lagged probe.
     Requested,
-    /// The PR was enqueued in the repository's (GitHub-native) merge queue.
-    Enqueued,
-    /// Auto-merge was enabled; the PR will merge once required checks pass.
-    AutoMergeEnabled,
-    /// The PR was merged directly (all checks were already passing and no
-    /// merge queue was configured for this PR).
-    Merged,
     /// The PR was submitted to a `trunk_queue`-mechanism product's Trunk
     /// merge queue (`POST submitPullRequest`). Produced by
     /// `app::review::handle_merge_when_ready`'s `MergeMechanism::TrunkQueue`
@@ -47,9 +40,6 @@ impl MergeAction {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Requested => "merge_requested",
-            Self::Enqueued => "enqueued",
-            Self::AutoMergeEnabled => "auto_merge_enabled",
-            Self::Merged => "merged",
             Self::TrunkEnqueued => "trunk_enqueued",
         }
     }
@@ -153,23 +143,8 @@ mod tests {
     // --- MergeAction::as_str ---
 
     #[test]
-    fn merge_action_enqueued_as_str() {
-        assert_eq!(MergeAction::Enqueued.as_str(), "enqueued");
-    }
-
-    #[test]
     fn merge_action_requested_as_str() {
         assert_eq!(MergeAction::Requested.as_str(), "merge_requested");
-    }
-
-    #[test]
-    fn merge_action_auto_merge_enabled_as_str() {
-        assert_eq!(MergeAction::AutoMergeEnabled.as_str(), "auto_merge_enabled");
-    }
-
-    #[test]
-    fn merge_action_merged_as_str() {
-        assert_eq!(MergeAction::Merged.as_str(), "merged");
     }
 
     #[test]

@@ -25,17 +25,11 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
         XCTAssertFalse(model.mergingWhenReadyIDs.contains("task_1"), "in-flight guard must clear on any accepted action")
     }
 
-    func testKnownGitHubActionsGetDistinctFeedbackText() {
+    func testGitHubMergeRequestGetsFeedbackText() {
         let model = makeModel()
 
-        model.applyEventForTest(.mergeWhenReadyAccepted(workItemID: "t", prURL: "u", action: "enqueued"))
-        XCTAssertEqual(model.mergeFeedbackNotice?.message, "Submitted to merge queue")
-
-        model.applyEventForTest(.mergeWhenReadyAccepted(workItemID: "t", prURL: "u", action: "auto_merge_enabled"))
-        XCTAssertEqual(model.mergeFeedbackNotice?.message, "Merge When Ready armed")
-
-        model.applyEventForTest(.mergeWhenReadyAccepted(workItemID: "t", prURL: "u", action: "merged"))
-        XCTAssertEqual(model.mergeFeedbackNotice?.message, "Merged")
+        model.applyEventForTest(.mergeWhenReadyAccepted(workItemID: "t", prURL: "u", action: "merge_requested"))
+        XCTAssertEqual(model.mergeFeedbackNotice?.message, "Merge requested")
     }
 
     func testUnrecognisedActionFallsBackRatherThanCrashing() {
@@ -56,10 +50,10 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
     func testSecondAcceptedActionReplacesThePreviousNotice() {
         let model = makeModel()
         model.applyEventForTest(.mergeWhenReadyAccepted(workItemID: "task_1", prURL: "u", action: "trunk_enqueued"))
-        model.applyEventForTest(.mergeWhenReadyAccepted(workItemID: "task_2", prURL: "u", action: "merged"))
+        model.applyEventForTest(.mergeWhenReadyAccepted(workItemID: "task_2", prURL: "u", action: "merge_requested"))
 
         XCTAssertEqual(model.mergeFeedbackNotice?.taskID, "task_2")
-        XCTAssertEqual(model.mergeFeedbackNotice?.message, "Merged")
+        XCTAssertEqual(model.mergeFeedbackNotice?.message, "Merge requested")
     }
 
     // MARK: - Helpers

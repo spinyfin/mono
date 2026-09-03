@@ -4,6 +4,9 @@ use super::*;
 #[derive(Debug, Clone)]
 pub struct MergeQueueDequeueEvent {
     pub reason: String,
+    /// Time GitHub recorded the dequeue event. An intent created after this
+    /// event must not be retired by historical timeline evidence.
+    pub created_at: Option<String>,
     /// PR head that was in effect when this timeline event was emitted.
     /// Derived from the preceding `PullRequestCommit` /
     /// `HeadRefForcePushedEvent` in the same ordered timeline connection.
@@ -28,7 +31,7 @@ pub(crate) const DEQUEUE_EVENTS_FIELDS: &str = concat!(
     "REMOVED_FROM_MERGE_QUEUE_EVENT], last: 20) { nodes { __typename ",
     "... on PullRequestCommit { commit { oid } } ",
     "... on HeadRefForcePushedEvent { afterCommit { oid } } ",
-    "... on RemovedFromMergeQueueEvent { reason beforeCommit { oid } } } }",
+    "... on RemovedFromMergeQueueEvent { reason createdAt beforeCommit { oid } } } }",
 );
 
 /// Batch-fetch merge-queue dequeue events for every PR in `pr_urls` with
@@ -170,6 +173,7 @@ pub(crate) fn parse_dequeue_event_nodes(nodes: &[serde_json::Value]) -> Vec<Merg
         let before_commit_oid = node["beforeCommit"]["oid"].as_str().map(|s| s.to_owned());
         events.push(MergeQueueDequeueEvent {
             reason,
+            created_at: node["createdAt"].as_str().map(str::to_owned),
             pr_head_oid: pr_head_oid.clone(),
             before_commit_oid,
         });
@@ -219,21 +223,39 @@ pub(crate) async fn clear_github_merge_intent_on_observed_dequeue(
         let Some(head_sha) = event.pr_head_oid.as_deref() else {
             continue;
         };
-        let prior =
-            match work_db.retire_github_merge_intent_on_dequeue(&candidate.work_item_id, &candidate.pr_url, head_sha) {
-                Ok(Some(prior)) => prior,
-                Ok(None) => continue,
-                Err(err) => {
-                    tracing::warn!(
-                        work_item_id = %candidate.work_item_id,
-                        pr_url = %candidate.pr_url,
-                        head_sha,
-                        ?err,
-                        "merge poller: failed to retire GitHub merge intent after observed dequeue",
-                    );
-                    return;
-                }
-            };
+        let Some(event_created_at) = event
+            .created_at
+            .as_deref()
+            .and_then(|created_at| chrono::DateTime::parse_from_rfc3339(created_at).ok())
+            .map(|created_at| created_at.timestamp().to_string())
+        else {
+            tracing::debug!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                head_sha,
+                "merge poller: dequeue event has no creation time; skipping intent retirement",
+            );
+            continue;
+        };
+        let prior = match work_db.retire_github_merge_intent_on_dequeue(
+            &candidate.work_item_id,
+            &candidate.pr_url,
+            head_sha,
+            &event_created_at,
+        ) {
+            Ok(Some(prior)) => prior,
+            Ok(None) => continue,
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    head_sha,
+                    ?err,
+                    "merge poller: failed to retire GitHub merge intent after observed dequeue",
+                );
+                return;
+            }
+        };
         if prior.is_none() {
             return;
         }
@@ -295,7 +317,9 @@ pub(crate) async fn check_merge_queue_rebounce(
     for event in events.iter().rev() {
         // Other dequeue reasons are still consumed above as evidence to
         // retire a GitHub merge intent, but only failed checks mint a CI
-        // remediation attempt.
+        // remediation attempt. GitHub returns the lowercase form
+        // `failed_checks` even though the schema declares `FAILED_CHECKS`,
+        // so compare case-insensitively to accept both.
         if !event.reason.eq_ignore_ascii_case("failed_checks") {
             continue;
         }

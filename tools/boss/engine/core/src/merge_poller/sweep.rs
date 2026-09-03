@@ -2157,8 +2157,23 @@ pub(crate) async fn update_pr_poll_state(
     // a positive observation remains the fresh detailed projection, and an
     // observed dequeue timeline event retires the intent separately.
     let preserve_github_merge_queue_state = raw_merge_queue_state.is_none()
-        && match work_db.has_active_github_merge_intent(&candidate.work_item_id, &candidate.pr_url) {
-            Ok(has_intent) => has_intent,
+        && match work_db.get_active_github_merge_intent(&candidate.work_item_id, &candidate.pr_url) {
+            Ok(Some(intent)) if probe.head_ref_oid.as_deref() == Some(intent.head_sha.as_str()) => ci_state != "fail",
+            Ok(Some(_intent)) => {
+                match work_db.retire_github_merge_intent(&candidate.work_item_id, &candidate.pr_url, "head_advanced") {
+                    Ok(_) => false,
+                    Err(err) => {
+                        tracing::warn!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            ?err,
+                            "merge poller: failed to retire GitHub merge intent after head advanced",
+                        );
+                        true
+                    }
+                }
+            }
+            Ok(None) => false,
             Err(err) => {
                 tracing::warn!(
                     work_item_id = %candidate.work_item_id,
@@ -2215,7 +2230,7 @@ pub(crate) async fn update_pr_poll_state(
 
     // Every Merging-lane transition is INFO in both directions. The normal
     // sweep-changed trace is DEBUG and is not emitted in production, so it
-    // cannot diagnose an operator-visible `Some → None` bounce.
+    // cannot diagnose a `Some → None` bounce that is visible on the board.
     if outcome.prior_merge_queue_state.as_deref() != merge_queue_state {
         tracing::info!(
             work_item_id = %candidate.work_item_id,

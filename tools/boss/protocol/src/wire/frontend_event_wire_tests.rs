@@ -1778,7 +1778,7 @@ fn tag_cases() -> Vec<TagCase> {
             event: FrontendEvent::MergeWhenReadyAccepted {
                 work_item_id: "task_1".into(),
                 pr_url: "https://example.test/pr/42".into(),
-                action: "enqueued".into(),
+                action: "merge_requested".into(),
             },
             expected_tag: "merge_when_ready_accepted",
         },

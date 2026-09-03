@@ -148,6 +148,7 @@ impl WorkDb {
         work_item_id: &str,
         pr_url: &str,
         head_sha: &str,
+        event_created_at: &str,
     ) -> Result<Option<Option<String>>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -157,8 +158,9 @@ impl WorkDb {
              WHERE work_item_id = ?1
                AND pr_url = ?2
                AND head_sha = ?3
-               AND status = 'active'",
-            params![work_item_id, pr_url, head_sha],
+               AND status = 'active'
+               AND created_at < ?4",
+            params![work_item_id, pr_url, head_sha, event_created_at],
         )?;
         if retired == 0 {
             tx.commit()?;
@@ -275,9 +277,14 @@ mod tests {
         .unwrap();
 
         assert!(
-            db.retire_github_merge_intent_on_dequeue(&task, "https://github.com/acme/widgets/pull/1", "other-head")
-                .unwrap()
-                .is_none()
+            db.retire_github_merge_intent_on_dequeue(
+                &task,
+                "https://github.com/acme/widgets/pull/1",
+                "other-head",
+                "9999999999",
+            )
+            .unwrap()
+            .is_none()
         );
         assert!(
             db.has_active_github_merge_intent(&task, "https://github.com/acme/widgets/pull/1")
@@ -285,8 +292,13 @@ mod tests {
         );
 
         assert_eq!(
-            db.retire_github_merge_intent_on_dequeue(&task, "https://github.com/acme/widgets/pull/1", "head-1")
-                .unwrap(),
+            db.retire_github_merge_intent_on_dequeue(
+                &task,
+                "https://github.com/acme/widgets/pull/1",
+                "head-1",
+                "9999999999",
+            )
+            .unwrap(),
             Some(Some("queued".to_owned()))
         );
         assert!(
