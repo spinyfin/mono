@@ -1,0 +1,65 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "The design proposes two labelled views: `direct` (a row's own executions) and `inclusive` (direct + revision-child descendants), with board-level totals summing `direct` ONLY. A row's detail view would lead with `inclusive`. Revision children hold ~20% of cache-read and ~21% of output, so ignoring them under-counts a chore by that much, while summing `inclusive` board-wide double-counts that same slice. Confirm the semantics?",
+    "choices": [
+      "Yes — two views, detail leads with `inclusive`, board sums `direct` only (recommended)",
+      "Two views, but the detail view should lead with `direct` and show `inclusive` beside it",
+      "One view only — `direct` everywhere; accept the ~20% under-count on chores",
+      "One view only — `inclusive` everywhere; forbid board-level totals entirely"
+    ],
+    "anchor": "layer-4--roll-up-semantics"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "`pr_review` executions attach to the same work item (118 runs, 140M cache-read). The design counts them as spend but never blends them into a single number: every figure reports an `implementation` / `design` / `overhead` class split alongside the total. Confirm?",
+    "choices": [
+      "Yes — include, always with the three-way class split shown (recommended)",
+      "Include, but as a single blended total with no class split",
+      "Exclude `pr_review` and `automation_triage` from a work item's figure entirely",
+      "Include, but split only two ways: implementation vs everything-else"
+    ],
+    "anchor": "layer-4--roll-up-semantics"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Where should the model rate table live? Since 2026-07-31 an in-code constant table already exists (`engine/core/src/cost_pricing.rs`, `MODEL_PRICING`): three Anthropic families, substring-matched, no source URL, no retrieval date, no effective dating. Rate changes are a human decision with money attached, so the design assumes version-controlled and code-reviewed rather than runtime-editable, and proposes replacing that constant with a dated, provenance-bearing table in its own crate (entry 13).",
+    "choices": [
+      "Version-controlled data file in the repo with provenance fields, loaded by the engine — changes go through PR review; `cost_pricing.rs` is replaced (recommended)",
+      "Keep the in-code constant table, but add `source_url` / `source_retrieved_at` / effective dates to each entry and drop substring matching",
+      "A DB table editable at runtime via a `boss cost rates set` verb",
+      "Version-controlled file as the source of truth, with a runtime DB override for urgent corrections"
+    ],
+    "anchor": "layer-3--a-dated-rate-table-with-a-loud-failure-policy"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "When SOME runs on a work item are unpriceable (unknown model, no rate epoch, capture skipped), what should the row show? The design proposes showing the priced subtotal labelled as a floor, always adjacent to the coverage ratio.",
+    "choices": [
+      "Priced subtotal labelled a lower bound, with the coverage ratio always adjacent (recommended)",
+      "No figure at all unless every run on the row is priceable — refuse anything partial",
+      "Priced subtotal plus an estimated extrapolation over the unpriced runs, clearly marked as an estimate"
+    ],
+    "anchor": "layer-3--a-dated-rate-table-with-a-loud-failure-policy"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Entry 23 in the task breakdown records backfill of the ~4017 pre-instrumentation rows as PERMANENTLY rejected (the provider transcripts are deleted) rather than deferred work. It is tagged `deferred` only because that is the tag that keeps it visible without auto-starting it. Confirm it must never be materialised into a task?",
+    "anchor": "proposed-implementation-task-breakdown"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "`boss cost --usd` (landed in #2596) prices every run as `input × input_rate + cache_read × cache_read_rate`, which is correct for Claude (net input) and double-charges cached input for Codex and Grok (gross input). It is safe today only because no Codex or Grok family is in the pricing table; adding one would silently mis-price every such row under an ESTIMATE label. It also prices all cache writes at one flat rate although the capture layer records the 5m/1h split. Entry 24 proposes making the estimator refuse those rows (`capture_unnormalised`, `unsplit_cache_write`) before Layer 1 lands. Confirm?",
+    "choices": [
+      "Yes — refuse and name the cause, as with unknown models today; no USD figure over an unnormalised or unsplit row (recommended)",
+      "Refuse gross-input rows, but keep flat cache-write pricing as an accepted approximation and document it",
+      "Leave `--usd` as-is until the full pipeline lands; rely on the ESTIMATE label"
+    ],
+    "anchor": "the-landed-boss-cost-surface-new-since-the-original"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Since #2662 (2026-08-04) Codex and Grok session transcripts live under Boss's own state root and this pass found no code path that reclaims them. Entry 25 proposes a bounded re-extraction of those runs once the extractors exist — the only backfill the data supports. The pre-instrumentation / Claude rejection in entry 23 is unchanged. Confirm entry 25 as in-scope, conditional on first confirming nothing reclaims that directory?",
+    "anchor": "proposed-implementation-task-breakdown"
+  }
+]
