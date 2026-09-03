@@ -1964,14 +1964,22 @@ fn tag_cases() -> Vec<TagCase> {
             label: "IdeaGraduated",
             event: FrontendEvent::IdeaGraduated {
                 idea: idea(),
+                // None here exercises the tag/round-trip pin cheaply; the
+                // boxed payload is pinned by the IdeaGraduatedWithChore case.
                 chore: None,
                 project: None,
             },
             expected_tag: "idea_graduated",
         },
-        // chore/project are `None` above only to exercise the tag/round-trip
-        // pin cheaply; the type itself is `Option<Box<Task>>` /
-        // `Option<Box<Project>>` (see the variant's doc comment).
+        TagCase {
+            label: "IdeaGraduatedWithChore",
+            event: FrontendEvent::IdeaGraduated {
+                idea: idea(),
+                chore: Some(Box::new(task())),
+                project: None,
+            },
+            expected_tag: "idea_graduated",
+        },
         TagCase {
             label: "DispatchConcurrencyResult",
             event: FrontendEvent::DispatchConcurrencyResult {

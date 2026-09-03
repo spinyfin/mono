@@ -2,14 +2,11 @@
 //! chore or project. Deliberately **not** a work item — not dispatchable,
 //! no execution, no PR, no attentions, no dependency edges, not on the
 //! kanban. Own table, own `I<n>` short-id namespace.
-//!
-//! Design: the "Ideas: a first-class draft-authoring noun in Boss" project's
-//! design task (D1-D7).
 
 use super::common::default_unknown_created_via;
 use serde::{Deserialize, Serialize};
 
-/// Lifecycle of an `ideas` row (D5).
+/// Lifecycle of an `ideas` row.
 ///
 /// - [`Self::Draft`] — being authored; the only state `graduate` may act on.
 /// - [`Self::Graduated`] — turned into a chore or project. `graduated_to_id`
@@ -56,7 +53,7 @@ impl std::str::FromStr for IdeaStatus {
     }
 }
 
-/// Target kind for [`crate::FrontendRequest::GraduateIdea`] (D4). Graduation
+/// Target kind for [`crate::FrontendRequest::GraduateIdea`]. Graduation
 /// is Ideas-only, deterministic, and not a general promote/convert mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

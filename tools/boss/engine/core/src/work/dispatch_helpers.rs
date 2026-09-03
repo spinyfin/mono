@@ -74,7 +74,7 @@ pub(crate) fn allocate_decision_short_id(conn: &Connection, product_id: &str) ->
 
 /// Parallel to [`allocate_short_id`] for the idea `I<n>` namespace. Reads
 /// and advances `idea_short_id_sequences` for `product_id`. Must be called
-/// inside the same transaction as the `ideas` row insert (D2: own dense
+/// inside the same transaction as the `ideas` row insert (own dense
 /// per-product counter, not the shared `short_id_sequences` tasks/chores/
 /// projects use).
 pub(crate) fn allocate_idea_short_id(conn: &Connection, product_id: &str) -> Result<i64> {

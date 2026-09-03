@@ -244,6 +244,73 @@ fn unique_short_id_index_rejects_manual_duplicate() {
     let _ = std::fs::remove_file(path);
 }
 
+/// Ideas draw from `idea_short_id_sequences`, independent of the shared
+/// tasks/projects `short_id_sequences` counter.
+#[test]
+fn idea_short_ids_use_independent_per_product_sequence() {
+    let path = temp_db_path("idea-short-id-independent");
+    let db = WorkDb::open(path).unwrap();
+    let boss = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
+    let flunge = create_test_product_with_repo(&db, "Flunge", Some("git@example.com:flunge.git"));
+
+    let chore = create_test_chore_manual(&db, boss.id.clone(), "a chore");
+    assert_eq!(chore.short_id, Some(1));
+
+    let i1 = db
+        .create_idea(
+            CreateIdeaInput::builder()
+                .product_id(&boss.id)
+                .name("first idea")
+                .created_via("test")
+                .build(),
+        )
+        .unwrap();
+    let i2 = db
+        .create_idea(
+            CreateIdeaInput::builder()
+                .product_id(&boss.id)
+                .name("second idea")
+                .created_via("test")
+                .build(),
+        )
+        .unwrap();
+    let other = db
+        .create_idea(
+            CreateIdeaInput::builder()
+                .product_id(&flunge.id)
+                .name("other product")
+                .created_via("test")
+                .build(),
+        )
+        .unwrap();
+
+    assert_eq!(i1.short_id, Some(1), "ideas start at 1 even when chores exist");
+    assert_eq!(i2.short_id, Some(2));
+    assert_eq!(other.short_id, Some(1));
+
+    {
+        let conn = db.connect().unwrap();
+        let next: i64 = conn
+            .query_row(
+                "SELECT next_value FROM idea_short_id_sequences WHERE product_id = ?1",
+                [&boss.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(next, 3);
+        let task_next: i64 = conn
+            .query_row(
+                "SELECT next_value FROM short_id_sequences WHERE product_id = ?1",
+                [&boss.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(task_next, 2, "idea inserts must not advance the task sequence");
+        let allocated = allocate_idea_short_id(&conn, &boss.id).unwrap();
+        assert_eq!(allocated, 3);
+    }
+}
+
 /// `create_project` allocates a `short_id` for the project row
 /// AND for the auto-spawned design task, both drawn from the
 /// per-product sequence (Q1: tasks and projects share a counter).

@@ -143,7 +143,6 @@ pub(crate) struct IdeaGraduationOutcome {
     pub(crate) project: Option<Box<Project>>,
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn graduate_idea(
     client: &mut BossClient,
     id: &str,
@@ -312,6 +311,156 @@ pub(crate) async fn run_idea_command(command: IdeaCommand, ctx: &RunContext) -> 
                     }
                 },
             )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parse_idea_selector_accepts_primary_short_and_bare_forms() {
+        match parse_idea_selector("idea_18c55").unwrap() {
+            IdeaSelector::PrimaryId(id) => assert_eq!(id, "idea_18c55"),
+            _ => panic!("expected primary id"),
+        }
+        match parse_idea_selector("I12").unwrap() {
+            IdeaSelector::ShortId(n) => assert_eq!(n, 12),
+            _ => panic!("expected short id"),
+        }
+        match parse_idea_selector("i3").unwrap() {
+            IdeaSelector::ShortId(n) => assert_eq!(n, 3),
+            _ => panic!("expected short id"),
+        }
+        match parse_idea_selector("7").unwrap() {
+            IdeaSelector::ShortId(n) => assert_eq!(n, 7),
+            _ => panic!("expected bare integer short id"),
+        }
+        assert!(parse_idea_selector("I0").is_err());
+        assert!(parse_idea_selector("0").is_err());
+        assert!(parse_idea_selector("-1").is_err());
+        assert!(parse_idea_selector("not-an-idea").is_err());
+    }
+
+    #[test]
+    fn parses_idea_create_command() {
+        let cli = Cli::parse_from([
+            "boss",
+            "idea",
+            "create",
+            "--product",
+            "boss",
+            "--name",
+            "A draft",
+            "--body",
+            "# Hello",
+        ]);
+        match cli.command {
+            Commands::Idea {
+                command: IdeaCommand::Create(args),
+            } => {
+                assert_eq!(args.product.as_deref(), Some("boss"));
+                assert_eq!(args.name.as_deref(), Some("A draft"));
+                assert_eq!(args.body.as_deref(), Some("# Hello"));
+                assert!(args.body_file.is_none());
+            }
+            _ => panic!("expected idea create command"),
+        }
+    }
+
+    #[test]
+    fn parses_idea_list_show_update_delete() {
+        let list = Cli::parse_from(["boss", "idea", "list", "--product", "boss", "--status", "draft"]);
+        match list.command {
+            Commands::Idea {
+                command: IdeaCommand::List(args),
+            } => {
+                assert_eq!(args.product.as_deref(), Some("boss"));
+                assert_eq!(args.status, Some(IdeaStatusArg::Draft));
+            }
+            _ => panic!("expected idea list"),
+        }
+
+        let show = Cli::parse_from(["boss", "idea", "show", "I1", "--product", "boss"]);
+        match show.command {
+            Commands::Idea {
+                command: IdeaCommand::Show(args),
+            } => {
+                assert_eq!(args.selector, "I1");
+                assert_eq!(args.product.as_deref(), Some("boss"));
+            }
+            _ => panic!("expected idea show"),
+        }
+
+        let update = Cli::parse_from([
+            "boss", "idea", "update", "idea_abc", "--name", "Renamed", "--body", "new body",
+        ]);
+        match update.command {
+            Commands::Idea {
+                command: IdeaCommand::Update(args),
+            } => {
+                assert_eq!(args.selector, "idea_abc");
+                assert_eq!(args.name.as_deref(), Some("Renamed"));
+                assert_eq!(args.body.as_deref(), Some("new body"));
+            }
+            _ => panic!("expected idea update"),
+        }
+
+        let delete = Cli::parse_from(["boss", "idea", "delete", "idea_abc"]);
+        match delete.command {
+            Commands::Idea {
+                command: IdeaCommand::Delete(args),
+            } => {
+                assert_eq!(args.selector, "idea_abc");
+                assert!(args.product.is_none());
+            }
+            _ => panic!("expected idea delete"),
+        }
+    }
+
+    #[test]
+    fn parses_idea_graduate_command() {
+        let cli = Cli::parse_from([
+            "boss",
+            "idea",
+            "graduate",
+            "I1",
+            "--product",
+            "boss",
+            "--as",
+            "chore",
+            "--name",
+            "Shipped",
+            "--effort",
+            "small",
+            "--reasoning",
+            "investigation",
+        ]);
+        match cli.command {
+            Commands::Idea {
+                command: IdeaCommand::Graduate(args),
+            } => {
+                assert_eq!(args.selector, "I1");
+                assert_eq!(args.product.as_deref(), Some("boss"));
+                assert_eq!(args.target, IdeaGraduateAsArg::Chore);
+                assert_eq!(args.name.as_deref(), Some("Shipped"));
+                assert_eq!(args.effort, Some(EffortLevelArg::Small));
+                assert_eq!(args.reasoning, Some(ReasoningArg::Investigation));
+            }
+            _ => panic!("expected idea graduate"),
+        }
+
+        let as_project = Cli::parse_from(["boss", "idea", "graduate", "I2", "--as", "project"]);
+        match as_project.command {
+            Commands::Idea {
+                command: IdeaCommand::Graduate(args),
+            } => {
+                assert_eq!(args.target, IdeaGraduateAsArg::Project);
+                assert!(args.effort.is_none());
+            }
+            _ => panic!("expected idea graduate as project"),
         }
     }
 }

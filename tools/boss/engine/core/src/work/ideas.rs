@@ -1,5 +1,5 @@
 //! `ideas` persistence: markdown drafts authored over time and later
-//! graduated into a chore or project (D1-D7). Deliberately **not** a work
+//! graduated into a chore or project. Deliberately **not** a work
 //! item — not dispatchable, no execution, no PR, no attentions, no
 //! dependency edges, not on the kanban.
 
@@ -35,7 +35,7 @@ fn query_idea(conn: &Connection, id: &str) -> Result<Option<Idea>> {
 
 /// List ideas for a product against an existing connection, newest first.
 /// Shared by [`WorkDb::list_ideas`] and by
-/// [`WorkDb::get_work_tree_instrumented`] (D7: `ideas` rides the same
+/// [`WorkDb::get_work_tree_instrumented`] (`ideas` rides the same
 /// worktree fetch and `work.product.<id>` invalidation topic every other
 /// product-scoped entity uses), which already holds the shared connection
 /// guard and cannot re-enter `self.connect()` to call the public method.
@@ -143,9 +143,8 @@ impl WorkDb {
     }
 
     /// Permanently delete an idea. Unconditional — deleting a graduated
-    /// idea does not touch what it graduated into (D5's "never deleted on
-    /// graduation" governs the engine's own `graduate_idea` path, not an
-    /// explicit later human delete).
+    /// idea does not touch what it graduated into. Graduation itself never
+    /// deletes the idea; an explicit later human delete is a separate action.
     pub fn delete_idea(&self, id: &str) -> Result<()> {
         let conn = self.connect()?;
         let _existing = query_idea(&conn, id).require("idea", id)?;
@@ -153,7 +152,7 @@ impl WorkDb {
         Ok(())
     }
 
-    /// Graduate a `draft` idea into a chore or project (D4), atomically:
+    /// Graduate a `draft` idea into a chore or project, atomically:
     /// the target row and the idea's `status = 'graduated'` /
     /// `graduated_to_id` update commit in the same transaction, or neither
     /// does. Refuses non-`draft` ideas — graduation is a one-way transition
@@ -166,7 +165,7 @@ impl WorkDb {
     /// `design_reasoning_effort_xhigh` boolean escalation flag).
     ///
     /// Graduating to a project passes `autostart = false` on the design
-    /// seed task (D4): a gesture on a draft must not silently dispatch a
+    /// seed task: a gesture on a draft must not silently dispatch a
     /// design worker.
     pub fn graduate_idea(
         &self,

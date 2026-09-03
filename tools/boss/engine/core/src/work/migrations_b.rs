@@ -2604,12 +2604,12 @@ pub(crate) fn migrate_product_decisions_table(conn: &Connection) -> Result<()> {
 }
 
 /// Create `ideas` and its own dense per-product `I<n>` short-id sequence
-/// (D1/D2: own table, own namespace — not the shared `short_id_sequences`
+/// (own table, own namespace — not the shared `short_id_sequences`
 /// counter tasks/chores/projects use). Deliberately not a `tasks` row: an
 /// idea is not dispatchable, has no execution, PR, attentions, or
 /// dependency edges, and is not on the kanban.
 ///
-/// `graduated_to_id` (D5) is a soft pointer to the chore/project this idea
+/// `graduated_to_id` is a soft pointer to the chore/project this idea
 /// became once `status = 'graduated'`; never cleared, since a graduated
 /// idea is kept, not deleted.
 ///

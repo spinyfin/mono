@@ -2,7 +2,7 @@ use super::*;
 
 /// Insert a project (and, unless `no_design_task`, its auto-minted design
 /// seed task) inside a caller-supplied transaction. Factored out of
-/// [`WorkDb::create_project`] so idea graduation (D4) can create the
+/// [`WorkDb::create_project`] so idea graduation can create the
 /// project in the SAME transaction that flips the source idea to
 /// `graduated` — an all-or-nothing commit, mirroring how
 /// [`insert_chore_in_tx`] / [`insert_task_in_tx`] let attention-group

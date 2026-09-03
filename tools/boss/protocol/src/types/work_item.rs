@@ -328,9 +328,9 @@ pub struct WorkTree {
     pub task_runtimes: Vec<TaskRuntime>,
 
     pub tasks: Vec<Task>,
-    /// Ideas for this product (D7: zero new subscription machinery — the
+    /// Ideas for this product. Zero new subscription machinery — the
     /// worktree fetch and its `work.product.<id>` invalidation topic are
-    /// the same ones every other product-scoped entity uses). Optional
+    /// the same ones every other product-scoped entity uses. Optional
     /// for backward compatibility with a payload captured before this
     /// field existed.
     #[serde(default)]

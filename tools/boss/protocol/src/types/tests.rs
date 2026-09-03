@@ -700,6 +700,37 @@ fn decision_short_id_label_formats_d_prefix() {
 }
 
 #[test]
+fn idea_status_parses_and_serializes() {
+    for status in IdeaStatus::ALL {
+        assert_eq!(status.as_str().parse::<IdeaStatus>().unwrap(), *status);
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            serde_json::Value::String(status.as_str().to_owned())
+        );
+    }
+    assert!("unknown".parse::<IdeaStatus>().is_err());
+}
+
+#[test]
+fn idea_graduation_kind_parses() {
+    assert_eq!(
+        "chore".parse::<IdeaGraduationKind>().unwrap(),
+        IdeaGraduationKind::Chore
+    );
+    assert_eq!(
+        "project".parse::<IdeaGraduationKind>().unwrap(),
+        IdeaGraduationKind::Project
+    );
+    assert!("task".parse::<IdeaGraduationKind>().is_err());
+}
+
+#[test]
+fn idea_short_id_label_formats_i_prefix() {
+    assert_eq!(idea_short_id_label(Some(12)), Some("I12".to_owned()));
+    assert_eq!(idea_short_id_label(None), None);
+}
+
+#[test]
 fn decision_roundtrips_and_skips_none_optionals() {
     let decision = Decision::builder()
         .id("dec_1")

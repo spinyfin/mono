@@ -4,7 +4,7 @@
 //! `handle_frontend_connection` match. See [`super::Dispatch`] for the
 //! per-request context every handler receives.
 //!
-//! Every mutating handler publishes on `work.product.<id>` (D7): zero new
+//! Every mutating handler publishes on `work.product.<id>`: zero new
 //! subscription machinery — ideas ride the same worktree invalidation
 //! topic every other product-scoped entity uses.
 

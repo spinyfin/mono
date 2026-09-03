@@ -1082,7 +1082,7 @@ pub enum FrontendRequest {
     /// reflecting the latest known state.
     GitHubAuthStatus,
 
-    /// Graduate a `draft` idea into a chore or project (D4): a thin,
+    /// Graduate a `draft` idea into a chore or project: a thin,
     /// deterministic wrapper — not a general promote/convert mechanism —
     /// that inserts the target row and flips the idea to `graduated` with
     /// `graduated_to_id` set, in one transaction. Graduating to a project
@@ -1422,7 +1422,7 @@ pub enum FrontendRequest {
     ListHosts,
 
     /// List ideas for a product, newest first. `status` filters to one
-    /// lifecycle state (D5: draft / graduated / archived); `None` returns
+    /// lifecycle state (draft / graduated / archived); `None` returns
     /// every idea regardless of status. Replies with
     /// [`FrontendEvent::IdeasList`].
     ListIdeas {
