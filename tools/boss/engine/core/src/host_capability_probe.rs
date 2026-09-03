@@ -514,26 +514,30 @@ mod tests {
         // directory before evaluating the requested command. Consume both
         // `-l` and `-i` here — forwarding `-i` to the inner `/bin/sh` makes
         // that shell interactive, so it can source the builder's rc files
-        // (or wait on a TTY) and blow the probe's two-second timeout.
+        // (or wait on a TTY) and blow the probe's timeout.
         // A script rather than zsh-specific setup keeps the regression
         // portable to the Linux Bazel test environment too.
         //
-        // The final `command -v` check runs under `env -i`, wiping every
-        // inherited variable except the `PATH` this test builds by hand.
-        // Without that, the check runs in whatever environment the test
-        // process happened to inherit from the CI host — e.g. a
+        // Both this outer login shell and the inner `/bin/sh` it execs need
+        // protecting: the whole script is started with the test process's
+        // full inherited environment (only PATH is overridden), so a
         // `BASH_FUNC_*%%` export from a dev-tool shell hook (rbenv, nvm,
-        // direnv, ...) can shadow a POSIX builtin like `test` or `command`
-        // for the duration of that one process, which is exactly the kind
-        // of unowned host state this regression exists to keep out. Pinning
-        // the environment here means a failure can only mean the probe
-        // itself regressed, never that some agent happened to have a
-        // different shell setup that run.
+        // direnv, ...) can import a same-named shell *function* that shadows
+        // a POSIX builtin like `test` or `command` for the duration of that
+        // one process — before this script ever reaches the `env -i` line
+        // that scrubs the inner shell's environment. `unset -f` is itself a
+        // POSIX special builtin, so it cannot be shadowed the same way, and
+        // running it first reliably restores `test`/`command` as builtins
+        // before the `-l`/`-i`/PATH guards below rely on them. Pinning the
+        // environment here means a failure can only mean the probe itself
+        // regressed, never that some agent happened to have a different
+        // shell setup that run.
         let login_shell = temp.path().join("profile-login-shell");
         fs::write(
             &login_shell,
             format!(
                 "#!/bin/sh\n\
+                 unset -f test command\n\
                  test \"$1\" = -l || exit 41\n\
                  test \"$2\" = -i || exit 42\n\
                  test \"$PATH\" = \"{}\" || exit 43\n\
@@ -554,6 +558,32 @@ mod tests {
                 .contains(" -l -i -c "),
             "the tmux launcher must use the same interactive login shell mode as the probe"
         );
+        // `local_command_on_path_with` only propagates `status.success()`, so
+        // a bare `assert!` on it below cannot tell a precondition failure
+        // (the fake shell's 41/42/43 sentinels) apart from a genuine
+        // `command -v` regression or a probe timeout. Run the same script
+        // once directly and assert on its actual exit code first, so a
+        // precondition break is reported by its own distinct message
+        // instead of collapsing into the generic assertion.
+        let precondition_status = pane_launch
+            .login_shell_command("command -v profile-only-driver")
+            .status()
+            .expect("could not run the fake login shell directly");
+        match precondition_status.code() {
+            Some(0) => {}
+            Some(41) => panic!("fake login shell did not receive `-l` as its first argument"),
+            Some(42) => panic!("fake login shell did not receive `-i` as its second argument"),
+            Some(43) => panic!(
+                "fake login shell did not receive the sanitized PATH seed ({})",
+                crate::spawn_flow::WORKER_SANITIZED_PATH
+            ),
+            other => panic!(
+                "fake login shell exited with unexpected status {other:?} \
+                 (not a 41/42/43 precondition sentinel — this is a genuine \
+                 driver-resolution regression, not a broken test fixture)"
+            ),
+        }
+
         assert!(
             local_command_on_path_with(&pane_launch, "profile-only-driver"),
             "the probe must resolve binaries added by the pane login shell's profile"
