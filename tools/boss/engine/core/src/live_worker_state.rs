@@ -529,6 +529,32 @@ impl LiveWorkerStateRegistry {
         evidence: ReadoptionEvidence,
     ) {
         let run_id = run_id.into();
+        let retained_existing_state = {
+            let mut guard = self.inner.lock().expect("registry mutex poisoned");
+            match guard.get_mut(&slot_id) {
+                Some(entry) if entry.state.run_id == run_id => {
+                    // The worker already owns this slot. Re-adoption is a
+                    // reconciliation observation, not a new spawn, so retain
+                    // every live-state field (including an operator hold) rather
+                    // than replacing it with the freshly-spawned fiction.
+                    entry.meta.driver_start_expectation = DriverStartExpectation::Readopted;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if retained_existing_state {
+            if evidence == ReadoptionEvidence::DriverHook {
+                self.record_driver_signal(&run_id, DriverSignalKind::HookEvent);
+            }
+            tracing::info!(
+                slot_id,
+                run_id = %run_id,
+                evidence = ?evidence,
+                "live-state registry: re-adoption found the same run already tracked; retained its live state",
+            );
+            return;
+        }
         self.register_spawn_with_capabilities(
             slot_id,
             run_id.clone(),
@@ -2618,6 +2644,34 @@ mod tests {
         );
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
         assert!(reg.unverified_driver_starts(now, DRIVER_START_GRACE_SECS).is_empty());
+    }
+
+    #[test]
+    fn readopting_the_same_run_preserves_its_live_state_and_hold() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-a", "claude-opus-4-7", 123, None);
+        reg.apply_event(1, &pre_tool("Bash"));
+        reg.set_live_status(1, Some("editing the worker registry".into()));
+        assert_eq!(reg.set_held("run-a", true), Some(1));
+        let before = reg.get(1).unwrap();
+
+        reg.register_readoption(
+            1,
+            "run-a",
+            "opus",
+            456,
+            None,
+            false,
+            LiveSpawnRouting::none(),
+            ReadoptionEvidence::LiveShellPid,
+        );
+
+        assert_eq!(
+            reg.get(1).unwrap(),
+            before,
+            "re-adopting the current occupant must retain all live state, including the operator hold",
+        );
+        assert_eq!(reg.driver_start_expectation(1), Some(DriverStartExpectation::Readopted));
     }
 
     /// The exemption belongs to the registration, not the slot: recycling

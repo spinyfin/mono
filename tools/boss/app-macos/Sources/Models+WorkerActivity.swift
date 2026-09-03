@@ -66,6 +66,10 @@ enum WorkerActivity: String, Hashable {
 enum AgentActivityState: Equatable {
     case active
     case waiting(reason: String)
+    /// The worker occupies a slot but has not supplied a hook-derived state.
+    /// This is distinct from both working and waiting: after re-adoption the
+    /// engine knows the process exists, but not what it is currently doing.
+    case unknown(reason: String)
     case errored(reason: String)
     case none
     /// The row is `status=todo, autostart=true` and no worker slot is
@@ -134,7 +138,7 @@ enum AgentActivityState: Equatable {
                     self = .waiting(reason: "Worker idle between turns")
                 }
             case .spawning:
-                self = .waiting(reason: "Worker spawning")
+                self = .unknown(reason: "Worker state not yet reported")
             case .errored:
                 self = .errored(reason: "Worker reported an error")
             case .terminated:
@@ -179,6 +183,9 @@ enum AgentActivityState: Equatable {
         if liveState?.activity == .waitingForInput {
             return .waiting(reason: "Waiting on user input")
         }
+        if liveState?.activity == .spawning {
+            return .unknown(reason: "Worker state not yet reported")
+        }
         if liveState?.slotId != nil {
             return .active
         }
@@ -199,6 +206,8 @@ enum AgentActivityState: Equatable {
         case .active:
             return "Agent is actively working"
         case .waiting(let reason):
+            return reason
+        case .unknown(let reason):
             return reason
         case .errored(let reason):
             return reason

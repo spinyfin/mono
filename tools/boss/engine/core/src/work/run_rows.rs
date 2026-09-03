@@ -9,12 +9,13 @@ const TMUX_RUN_SELECT: &str = "SELECT r.id, r.execution_id, r.agent_id, r.transc
              FROM work_runs r
              JOIN work_executions e ON e.id = r.execution_id";
 
-/// Shared adoptability predicate: an active, local run with durable tmux
-/// identity recorded, backing a non-terminal execution. Kept as a single
-/// constant so a new [`super::ExecutionStatus`] terminal variant only needs
-/// updating in one place.
-const TMUX_RUN_ADOPTABLE_PREDICATE: &str = "r.status = 'active'
-               AND r.host_id = 'local'
+/// Shared adoptability predicate: a local run with durable tmux identity
+/// recorded, backing a non-terminal execution. Liveness belongs to the
+/// execution, not the short-lived dispatch run row: successful tmux spawns
+/// complete their `work_runs` row while their worker remains alive. Kept as a
+/// single constant so a new [`super::ExecutionStatus`] terminal variant only
+/// needs updating in one place.
+const TMUX_RUN_ADOPTABLE_PREDICATE: &str = "r.host_id = 'local'
                AND r.tmux_spawn_token IS NOT NULL
                AND r.tmux_server_label IS NOT NULL
                AND r.tmux_session_name IS NOT NULL
@@ -1011,7 +1012,7 @@ impl WorkDb {
         .map_err(Into::into)
     }
 
-    /// Return the newest active local tmux run for one execution.
+    /// Return the newest local tmux run for one live execution.
     pub fn tmux_run_for_execution(&self, execution_id: &str) -> Result<Option<TmuxRunHandle>> {
         let conn = self.connect()?;
         let sql = format!(
