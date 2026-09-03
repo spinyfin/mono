@@ -26,10 +26,10 @@ final class MarkdownFindState: ObservableObject {
             recomputeMatches()
         }
     }
-    /// All matches, concatenated in document order across chunks. For an
-    /// unchunked document (the common case — every document besides an
-    /// engine-minted revision brief) this is exactly one chunk's matches,
-    /// unchanged from before per-chunk search existed.
+    /// All matches, concatenated in document order across chunks. Documents
+    /// without headings are a single chunk; documents with headings have
+    /// one chunk per heading section (plus a leading prefix if the source
+    /// does not start with a heading).
     @Published private(set) var matches: [Range<Int>] = []
     @Published private(set) var currentIndex: Int?
     /// Bumped on every change that should re-paint highlights and/or
@@ -104,8 +104,8 @@ final class MarkdownFindState: ObservableObject {
     }
 
     /// Re-derives the search corpus from the (possibly newly-loaded) source,
-    /// split into the same chunks `collapsibleHeadings` would produce for
-    /// rendering (see `MarkdownHeadingSections.chunks`). Uses the identical
+    /// split into the same heading chunks rendering uses
+    /// (see `MarkdownHeadingSections.chunks`). Uses the identical
     /// projection comments anchor against (`CommentProjection.plainText`) so
     /// search hits and comment highlights never disagree about where text
     /// lives in the rendered document.

@@ -175,11 +175,12 @@ struct MarkdownDocumentChrome: View {
     /// Exact heading text(s) — level markers and surrounding whitespace
     /// stripped, e.g. `"HARD RULE: no punting — do the actual work"` — that
     /// should render collapsed by default via `CollapsibleMarkdownSection`.
-    /// Empty (the default) leaves `source` rendered exactly as it always
-    /// has been: this is what keeps every other document (design docs,
-    /// chores, postmortems, ...) unaffected. Only a caller that recognizes a
-    /// specific document shape (e.g. `ChatViewModel.openTaskDescription`,
-    /// which opts in for `task.kind == "revision"`) passes a non-empty set.
+    /// Empty (the default) still splits `source` into one `StructuredText`
+    /// per heading so lazy layout can skip off-screen sections. Only a
+    /// caller that recognizes a specific document shape (e.g.
+    /// `ChatViewModel.openTaskDescription`, which opts in for
+    /// `task.kind == "revision"`) passes a non-empty set to fold those
+    /// headings behind a disclosure.
     var collapsedByDefaultHeadings: Set<String> = []
 
     var body: some View {
@@ -235,9 +236,10 @@ private struct StructuredTextHeightKey: PreferenceKey {
 /// render core, over the tokenized document ground. Reads the comment
 /// environment injected by an enclosing `.withComments()` (when present) and
 /// feeds both comment and search highlights to the parser. Kept as a single view
-/// (rather than split render-core / find-bar subviews) because `parseVersion`,
-/// `findState`, and `StructuredText` must coordinate their forced remounts in
-/// one place — the same shape the original kanban viewer used.
+/// (rather than split render-core / find-bar subviews) because highlight
+/// generation, `findState`, and `StructuredText` must coordinate re-parses in
+/// one place — StructuredText only re-parses when its markup string changes,
+/// not when the parser instance is swapped.
 private struct MarkdownDocumentColumn: View {
     let title: String
     let repoLabel: String?
@@ -267,10 +269,18 @@ private struct MarkdownDocumentColumn: View {
     /// toggling a section adds/removes its heading text.
     @State private var expandedSections: Set<String> = []
 
-    /// Monotonically-increasing counter used as the `.id()` for `StructuredText`
-    /// to force a fresh parse when comments/search change. A counter avoids hash
-    /// collisions and guarantees identity changes on every highlight update.
-    @State private var parseVersion: Int = 0
+    /// Bumped when comment or find highlights change. Threaded into each
+    /// chunk's markup via `MarkdownHighlightRefreshParser` so StructuredText
+    /// re-parses in place — it only watches the markup string, not the parser
+    /// instance. Must not be used as a SwiftUI `.id()`: that tears down the
+    /// whole parsed tree and resets scroll.
+    @State private var highlightGeneration: Int = 0
+    /// Heading-split chunks of `source`, refreshed only when `source` or
+    /// `collapsedByDefaultHeadings` changes — not on every `body` evaluation.
+    @State private var cachedChunks: [MarkdownDocumentChunk]? = nil
+    @State private var cachedChunkSource: String? = nil
+    @State private var cachedChunkHeadings: Set<String>? = nil
+    @State private var cachedDocumentMeasure: CGFloat? = nil
     @State private var parseStartTime: Date? = nil
     @State private var parseLogged = false
 
@@ -291,7 +301,11 @@ private struct MarkdownDocumentColumn: View {
                 Divider().overlay(BossMarkdownPalette.hairline)
             }
             ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
+                // LazyVStack must be the ScrollView's document content. Nesting
+                // it inside a regular VStack would ask it for a full ideal
+                // height and instantiate every chunk, which is the stall this
+                // view is trying to avoid.
+                LazyVStack(alignment: .leading, spacing: 12) {
                     // Chrome rows stay at the readable measure even when the
                     // document column widens for a table, and are centered
                     // on that same axis, so the title row and rule share the
@@ -310,9 +324,17 @@ private struct MarkdownDocumentColumn: View {
                 }
                 .padding(.horizontal, MarkdownDocumentLayout.horizontalPadding)
                 .padding(.vertical, MarkdownDocumentLayout.verticalPadding)
-                .frame(maxWidth: MarkdownDocumentMeasure.forSource(source))
+                .frame(maxWidth: cachedDocumentMeasure ?? MarkdownDocumentMeasure.forSource(source))
                 .frame(maxWidth: .infinity)
                 .background(MarkdownScrollViewCapture(controller: scrollController))
+                .background(
+                    GeometryReader { geo in
+                        Color.clear.preference(
+                            key: StructuredTextHeightKey.self,
+                            value: geo.size.height
+                        )
+                    }
+                )
             }
             .textSelection(.enabled)
             .background(viewerBackground)
@@ -321,13 +343,21 @@ private struct MarkdownDocumentColumn: View {
         .onAppear {
             parseStartTime = Date()
             parseLogged = false
+            refreshCachedChunks(source: source, headings: collapsedByDefaultHeadings)
             findState.updateSource(source, baseURL: baseURL, collapsibleHeadings: collapsedByDefaultHeadings)
         }
         .onChange(of: source) { _, newSource in
+            refreshCachedChunks(source: newSource, headings: collapsedByDefaultHeadings)
             findState.updateSource(newSource, baseURL: baseURL, collapsibleHeadings: collapsedByDefaultHeadings)
         }
+        .onChange(of: collapsedByDefaultHeadings) { _, headings in
+            refreshCachedChunks(source: source, headings: headings)
+            findState.updateSource(source, baseURL: baseURL, collapsibleHeadings: headings)
+        }
+        .onChange(of: commentedAnchors) { _, _ in highlightGeneration &+= 1 }
+        .onChange(of: commentFlashAnchor) { _, _ in highlightGeneration &+= 1 }
         .onChange(of: findState.navigationNonce) { _, _ in
-            parseVersion &+= 1
+            highlightGeneration &+= 1
             // Reveal a match that landed inside a still-collapsed section —
             // otherwise the find bar can report a hit whose highlight is
             // never in the view hierarchy to paint.
@@ -436,44 +466,34 @@ private struct MarkdownDocumentColumn: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         } else {
-            VStack(alignment: .leading, spacing: 0) {
-                ForEach(renderedChunks) { entry in
-                    switch entry.chunk {
-                    case .plain(let text):
-                        StructuredText(text, parser: entry.parser)
-                            .textual.textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    case .collapsible(let heading, let body):
-                        CollapsibleMarkdownSection(
-                            heading: heading,
-                            sectionBody: body,
-                            parser: entry.parser,
-                            isExpanded: expandedSectionsBinding(for: heading)
-                        )
-                    }
-                }
+            ForEach(renderedChunks) { entry in
+                chunkView(entry)
+                    // Applied per chunk so BossMarkdownTheme does not wrap the
+                    // ForEach as a single non-lazy child of LazyVStack.
+                    .bossMarkdown()
+                    .environment(\.markdownProseMeasure, MarkdownDocumentMeasure.proseContent)
+                    .environment(\.markdownEditorialStyle, true)
             }
-            .bossMarkdown()
-            // Scoped to this document body only — the transcript viewer,
-            // comment sidebar, and release notes all call `.bossMarkdown()`
-            // bare and must keep rendering prose at its natural width.
-            .environment(\.markdownProseMeasure, MarkdownDocumentMeasure.proseContent)
-            .environment(\.markdownEditorialStyle, true)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            // Force StructuredText recreation when highlight state changes so
-            // the new parser instance re-parses the source. A monotonic
-            // counter (not a hashValue) guarantees a fresh identity on every
-            // comment/search update.
-            .id(parseVersion)
-            .onChange(of: commentedAnchors) { _, _ in bumpParseVersionPreservingScroll() }
-            .onChange(of: commentFlashAnchor) { _, _ in bumpParseVersionPreservingScroll() }
-            .background(
-                GeometryReader { geo in
-                    Color.clear.preference(
-                        key: StructuredTextHeightKey.self,
-                        value: geo.size.height
-                    )
-                }
+        }
+    }
+
+    @ViewBuilder
+    private func chunkView(_ entry: RenderedMarkdownChunk) -> some View {
+        switch entry.chunk {
+        case .plain(let text):
+            DocumentStructuredText(
+                text: text,
+                parser: entry.parser,
+                highlightGeneration: highlightGeneration
+            )
+            .modifier(MarkdownChunkTopSpacing(isFirst: entry.id == 0))
+        case .collapsible(let heading, let body):
+            CollapsibleMarkdownSection(
+                heading: heading,
+                sectionBody: body,
+                parser: entry.parser,
+                highlightGeneration: highlightGeneration,
+                isExpanded: expandedSectionsBinding(for: heading)
             )
         }
     }
@@ -492,14 +512,28 @@ private struct MarkdownDocumentColumn: View {
     }
 
     /// Splits `source` into chunks (see `MarkdownHeadingSections`) and builds
-    /// each chunk's own parser. Precomputed as a plain array rather than
-    /// building parsers inline inside the `ForEach` below, matching the shape
-    /// `ForEach` needs for its `Identifiable` elements.
+    /// each chunk's own parser. The heading split is cached across `body`
+    /// evaluations; parsers are cheap to rebuild when highlight state changes.
     private var renderedChunks: [RenderedMarkdownChunk] {
-        let chunks = MarkdownHeadingSections.chunks(in: source, collapsibleHeadings: collapsedByDefaultHeadings)
-        return chunks.enumerated().map { index, chunk in
+        documentChunks.enumerated().map { index, chunk in
             RenderedMarkdownChunk(id: index, chunk: chunk, parser: markdownParser(forChunkAt: index))
         }
+    }
+
+    private var documentChunks: [MarkdownDocumentChunk] {
+        if let cachedChunks,
+           cachedChunkSource == source,
+           cachedChunkHeadings == collapsedByDefaultHeadings {
+            return cachedChunks
+        }
+        return MarkdownHeadingSections.chunks(in: source, collapsibleHeadings: collapsedByDefaultHeadings)
+    }
+
+    private func refreshCachedChunks(source: String, headings: Set<String>) {
+        cachedChunks = MarkdownHeadingSections.chunks(in: source, collapsibleHeadings: headings)
+        cachedChunkSource = source
+        cachedChunkHeadings = headings
+        cachedDocumentMeasure = MarkdownDocumentMeasure.forSource(source)
     }
 
     /// Builds the parser for one rendered chunk: the same comment-highlighting
@@ -525,22 +559,6 @@ private struct MarkdownDocumentColumn: View {
         let (matches, currentLocalIndex) = findState.chunkMatches(index)
         guard !matches.isEmpty else { return base }
         return SearchHighlightingMarkdownParser(inner: base, matches: matches, currentMatchIndex: currentLocalIndex)
-    }
-
-    /// Bumps `parseVersion` (forcing a `StructuredText` remount with a fresh
-    /// parser) while preserving scroll position across the remount. AppKit resets
-    /// a `NSScrollView`'s document offset to the top when its document view is
-    /// torn down and rebuilt — exactly what SwiftUI does for an `.id()` change —
-    /// so a comment add/remove/flash would otherwise scroll the reader back to
-    /// the top. The offset is captured before the remount and reapplied on the
-    /// next run-loop turn once the new content has laid out.
-    private func bumpParseVersionPreservingScroll() {
-        let offset = scrollController.currentOffset()
-        parseVersion &+= 1
-        guard let offset else { return }
-        DispatchQueue.main.async {
-            scrollController.restoreOffset(offset)
-        }
     }
 
     private func openFindBar() {
@@ -600,10 +618,13 @@ private struct RenderedMarkdownChunk: Identifiable {
     let parser: any MarkupParser
 }
 
-/// Splits a markdown source into `MarkdownDocumentChunk`s at each heading
-/// whose exact text (level markers and surrounding whitespace stripped)
-/// appears in `collapsibleHeadings`. A pure function over `String` — no
-/// Textual/StructuredText involvement — because Textual's block rendering
+/// Splits a markdown source into one `MarkdownDocumentChunk` per heading
+/// so each section can be its own `StructuredText` (bounding layout
+/// recursion and making `LazyVStack` effective). Headings whose exact text
+/// (level markers and surrounding whitespace stripped) appears in
+/// `collapsibleHeadings` become `.collapsible`; every other heading stays
+/// `.plain` and includes its heading line. A pure function over `String` —
+/// no Textual/StructuredText involvement — because Textual's block rendering
 /// has no supported hook for grouping or hiding a run of blocks (see the
 /// `HeadingStyle`/`BlockStyleConfiguration` types in `BossMarkdownStyle.swift`:
 /// each block is styled in isolation, with no source range or sibling
@@ -625,21 +646,22 @@ enum MarkdownHeadingSections {
     /// own prose, stopping at the very next heading" needs no notion of
     /// outline nesting at all.
     static func chunks(in source: String, collapsibleHeadings: Set<String>) -> [MarkdownDocumentChunk] {
-        guard !collapsibleHeadings.isEmpty else { return [.plain(source)] }
         let headings = headingLines(in: source)
-        let matchedIndices = headings.indices.filter { collapsibleHeadings.contains(headings[$0].text) }
-        guard !matchedIndices.isEmpty else { return [.plain(source)] }
+        guard !headings.isEmpty else { return [.plain(source)] }
 
         var chunks: [MarkdownDocumentChunk] = []
         var cursor = source.startIndex
-        for i in matchedIndices {
-            let heading = headings[i]
+        for (i, heading) in headings.enumerated() {
             if heading.lineRange.lowerBound > cursor {
                 chunks.append(.plain(String(source[cursor..<heading.lineRange.lowerBound])))
             }
             let sectionEnd = (i + 1 < headings.count) ? headings[i + 1].lineRange.lowerBound : source.endIndex
-            let body = String(source[heading.lineRange.upperBound..<sectionEnd])
-            chunks.append(.collapsible(heading: heading.text, body: body))
+            if collapsibleHeadings.contains(heading.text) {
+                let body = String(source[heading.lineRange.upperBound..<sectionEnd])
+                chunks.append(.collapsible(heading: heading.text, body: body))
+            } else {
+                chunks.append(.plain(String(source[heading.lineRange.lowerBound..<sectionEnd])))
+            }
             cursor = sectionEnd
         }
         if cursor < source.endIndex {
@@ -705,6 +727,78 @@ enum MarkdownHeadingSections {
     }
 }
 
+/// One on-screen `StructuredText` for a document chunk. StructuredText
+/// re-parses only when its markup string changes, so highlight updates
+/// (comments, find) are expressed by tagging the markup with
+/// `highlightGeneration` and stripping that tag inside the parser — never
+/// by `.id()`, which would discard the parsed tree and reset scroll.
+private struct DocumentStructuredText: View {
+    let text: String
+    let parser: any MarkupParser
+    let highlightGeneration: Int
+
+    var body: some View {
+        StructuredText(
+            MarkdownHighlightRefreshParser.tagged(text, generation: highlightGeneration),
+            parser: MarkdownHighlightRefreshParser(inner: parser)
+        )
+        .textual.textSelection(.enabled)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// Restores the heading top-spacing that `BlockVStack` would have applied
+/// between the previous section's last block and this chunk's first heading.
+/// Collapsible chunks already pad themselves; this is only for `.plain`
+/// chunks after the first.
+private struct MarkdownChunkTopSpacing: ViewModifier {
+    let isFirst: Bool
+    @Environment(\.markdownEditorialStyle) private var isEditorial
+    @ScaledMetric(relativeTo: .body) private var bodySize: CGFloat = BossHeadingStyle.bodyPointSize
+
+    func body(content: Content) -> some View {
+        if isFirst {
+            content
+        } else {
+            content.padding(.top, topGap)
+        }
+    }
+
+    private var topGap: CGFloat {
+        if isEditorial {
+            return bodySize * MarkdownEditorialMetrics.editorialH2Spacing.top
+        }
+        return BossHeadingStyle.headingBlockSpacingTop
+    }
+}
+
+/// StructuredText ignores parser-instance changes. A trailing nonce is
+/// appended to the markup so `onChange(of: markup)` fires, then stripped
+/// here so comment/search character offsets stay aligned with the real
+/// source and the nonce never renders.
+@MainActor
+struct MarkdownHighlightRefreshParser: MarkupParser {
+    let inner: any MarkupParser
+
+    static let marker = "\n\n<!--boss-md-refresh:"
+
+    func attributedString(for input: String) throws -> AttributedString {
+        try inner.attributedString(for: Self.stripNonce(from: input))
+    }
+
+    static func stripNonce(from input: String) -> String {
+        guard let range = input.range(of: marker, options: .backwards),
+              input.hasSuffix("-->")
+        else { return input }
+        return String(input[..<range.lowerBound])
+    }
+
+    static func tagged(_ source: String, generation: Int) -> String {
+        guard generation != 0 else { return source }
+        return source + "\(marker)\(generation)-->"
+    }
+}
+
 /// A heading-delimited section of a markdown document that folds behind a
 /// disclosure affordance. Used only where a caller explicitly opts a
 /// heading in via `MarkdownDocumentChrome.collapsedByDefaultHeadings`. The
@@ -720,6 +814,7 @@ private struct CollapsibleMarkdownSection: View {
     let heading: String
     let sectionBody: String
     let parser: any MarkupParser
+    var highlightGeneration: Int = 0
     @Binding var isExpanded: Bool
     @Environment(\.markdownEditorialStyle) private var isEditorial
     @ScaledMetric(relativeTo: .body) private var bodySize: CGFloat = BossHeadingStyle.bodyPointSize
@@ -735,9 +830,11 @@ private struct CollapsibleMarkdownSection: View {
                 .fill(BossMarkdownPalette.hairline)
                 .frame(height: 1)
             if isExpanded {
-                StructuredText(sectionBody, parser: parser)
-                    .textual.textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                DocumentStructuredText(
+                    text: sectionBody,
+                    parser: parser,
+                    highlightGeneration: highlightGeneration
+                )
             }
         }
         .padding(.top, headingSpacing.top)

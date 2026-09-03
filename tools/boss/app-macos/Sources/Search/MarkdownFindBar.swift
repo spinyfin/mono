@@ -98,11 +98,9 @@ final class MarkdownScrollController {
     weak var scrollView: NSScrollView?
 
     /// Current scroll offset, in the clip view's own (flipped) coordinate
-    /// space. Used to snapshot the viewport position before a forced
-    /// `StructuredText` remount (see `parseVersion` in
-    /// `MarkdownDocumentColumn`) so it
-    /// can be restored once the remount lands, instead of leaving AppKit's
-    /// default post-remount scroll offset (top-of-document) in place.
+    /// space. Used to snapshot the viewport position before a scroll
+    /// restoration (find-in-document jumps, or a rare remount) so AppKit
+    /// does not leave the reader at the top of the document.
     func currentOffset() -> CGPoint? {
         scrollView?.contentView.bounds.origin
     }

@@ -285,28 +285,38 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         )
     }
 
-    /// The default (empty) heading set must leave every document — every
-    /// caller except a revision task's description — split as a single
-    /// unmodified `.plain` chunk, so today's single-`StructuredText`
-    /// rendering path is unaffected.
-    func testHeadingSectionsWithNoCollapsibleHeadingsIsSinglePlainChunk() {
+    /// An empty collapsible set still splits on every heading so each
+    /// section is its own `StructuredText`. Concatenating the `.plain`
+    /// chunks must reconstruct the source exactly.
+    func testHeadingSectionsSplitsOnHeadingsEvenWithoutCollapsibleSet() {
         let chunks = MarkdownHeadingSections.chunks(in: Self.revisionBrief, collapsibleHeadings: [])
-        XCTAssertEqual(chunks.count, 1)
-        guard case .plain(let text) = chunks[0] else {
-            return XCTFail("expected a single .plain chunk")
+        XCTAssertEqual(chunks.count, 3, "prefix + HARD RULE heading + finding heading: \(chunks)")
+        XCTAssertTrue(chunks.allSatisfy { if case .plain = $0 { return true }; return false })
+        XCTAssertEqual(chunks.map(\.renderedText).joined(), Self.revisionBrief)
+        guard case .plain(let hardRule) = chunks[1] else {
+            return XCTFail("expected the HARD RULE heading as a .plain chunk")
         }
-        XCTAssertEqual(text, Self.revisionBrief)
+        XCTAssertTrue(hardRule.hasPrefix("## HARD RULE"))
+        guard case .plain(let finding) = chunks[2] else {
+            return XCTFail("expected the finding heading as a .plain chunk")
+        }
+        XCTAssertTrue(finding.contains("### [high]"))
     }
 
     /// A heading set that names no heading actually present in the source
-    /// must also fall back to a single `.plain` chunk (e.g. a design doc
-    /// that happens to be checked against a heading text it doesn't have).
-    func testHeadingSectionsWithNonMatchingHeadingIsSinglePlainChunk() {
+    /// still splits on real headings; it just never produces a `.collapsible`
+    /// chunk.
+    func testHeadingSectionsWithNonMatchingHeadingStillSplitsOnRealHeadings() {
         let chunks = MarkdownHeadingSections.chunks(in: Self.revisionBrief, collapsibleHeadings: ["Not present anywhere"])
-        XCTAssertEqual(chunks.count, 1)
-        guard case .plain = chunks[0] else {
-            return XCTFail("expected a single .plain chunk")
-        }
+        XCTAssertEqual(chunks.count, 3)
+        XCTAssertTrue(chunks.allSatisfy { if case .plain = $0 { return true }; return false })
+    }
+
+    /// A document with no ATX headings stays a single `.plain` chunk.
+    func testHeadingSectionsWithNoHeadingsIsSinglePlainChunk() {
+        let source = "Just a paragraph.\n\nAnd another.\n"
+        let chunks = MarkdownHeadingSections.chunks(in: source, collapsibleHeadings: [])
+        XCTAssertEqual(chunks, [.plain(source)])
     }
 
     /// The core invariant: the `## HARD RULE ...` section folds, but the
@@ -390,9 +400,15 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         body
         """
         let chunks = MarkdownHeadingSections.chunks(in: doc, collapsibleHeadings: ["not a heading"])
-        XCTAssertEqual(chunks.count, 1, "a '#' line inside a fence must not be treated as a heading/section boundary")
-        guard case .plain(let text) = chunks[0] else { return XCTFail("expected a single .plain chunk") }
-        XCTAssertEqual(text, doc)
+        XCTAssertFalse(
+            chunks.contains(where: {
+                if case .collapsible(let heading, _) = $0 { return heading == "not a heading" }
+                return false
+            }),
+            "a '#' line inside a fence must not be treated as a heading/section boundary"
+        )
+        XCTAssertEqual(chunks.map(\.renderedText).joined(), doc)
+        XCTAssertEqual(chunks.count, 2, "expected Title + Real heading chunks, not a split on the fenced '#': \(chunks)")
     }
 
     /// CommonMark permits up to three leading spaces before an ATX heading's
@@ -479,5 +495,74 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         state.query = "Null pointer"
         XCTAssertEqual(state.matches.count, 1)
         XCTAssertNil(state.currentCollapsibleHeadingToExpand)
+    }
+
+    // MARK: - Highlight refresh (no .id() remount)
+
+    func testHighlightRefreshTagIsStrippedBeforeParse() {
+        let source = "# Title\n\nHello."
+        XCTAssertEqual(MarkdownHighlightRefreshParser.stripNonce(from: source), source)
+        let tagged = MarkdownHighlightRefreshParser.tagged(source, generation: 7)
+        XCTAssertNotEqual(tagged, source)
+        XCTAssertEqual(MarkdownHighlightRefreshParser.stripNonce(from: tagged), source)
+        XCTAssertEqual(MarkdownHighlightRefreshParser.tagged(source, generation: 0), source)
+    }
+
+    // MARK: - Layout cost
+
+    /// Pins that a multi-heading document still hosts, and records scan vs
+    /// one-shot chunking cost. Heavy before/after layout numbers for an
+    /// 80-section fixture were captured locally (see the PR) and are not
+    /// re-run here so this shard stays well inside the small timeout.
+    func testLargeDocumentChunksAndHosts() {
+        let source = Self.largeHeadedDocument(sections: 24)
+        let chunks = MarkdownHeadingSections.chunks(in: source, collapsibleHeadings: [])
+        XCTAssertEqual(chunks.count, 25, "title + 24 sections: \(chunks.count)")
+
+        let scanIterations = 50
+        let scanStart = CFAbsoluteTimeGetCurrent()
+        for _ in 0..<scanIterations {
+            _ = MarkdownHeadingSections.chunks(in: source, collapsibleHeadings: []).count
+        }
+        let scanMs = (CFAbsoluteTimeGetCurrent() - scanStart) * 1000
+        let oneStart = CFAbsoluteTimeGetCurrent()
+        _ = MarkdownHeadingSections.chunks(in: source, collapsibleHeadings: [])
+        let oneMs = (CFAbsoluteTimeGetCurrent() - oneStart) * 1000
+        print(String(
+            format: "MARKDOWN_SCAN_MS iterations=%d total=%.2f one=%.3f chunks=%d bytes=%d",
+            scanIterations, scanMs, oneMs, chunks.count, source.utf8.count
+        ))
+
+        let view = MarkdownDocumentChrome(
+            title: "Large doc",
+            source: source,
+            commentsEnabled: false
+        )
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: 760, height: 640)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+    }
+
+    private static func largeHeadedDocument(sections: Int) -> String {
+        var parts: [String] = ["# Large document\n\nIntro paragraph with **bold** and a [link](https://example.com).\n"]
+        for i in 1...sections {
+            parts.append("""
+
+            ## Section \(i)
+
+            Paragraph \(i) with nested structure:
+
+            - top
+              - nested
+                - deeper still, item \(i)
+
+            ```swift
+            let value = \(i)
+            ```
+
+            """)
+        }
+        return parts.joined()
     }
 }
