@@ -115,6 +115,16 @@ pub struct ApplyOutcome {
     /// item's description once the transaction has committed (see the
     /// module doc for why this can't happen inside the transaction itself).
     pub post_commit_audit_line: Option<String>,
+    /// `review_report`/`review_verdict` only: what
+    /// [`advance_review_batch_quorum_best_effort`] decided while applying
+    /// this proposal, when it decided anything (`None` on a best-effort
+    /// failure, which is already logged loudly there, or for every other
+    /// kind). Threaded out to [`super::SubmitWorkerProposalOutcome`] so its
+    /// caller can `kick_scheduler()` on `SupervisorDispatched` — the report-
+    /// acceptance dispatch path commits inside this same transaction and has
+    /// no publisher of its own, unlike `finalize_passes.rs`'s member-failure
+    /// dispatch, which does.
+    pub review_batch_quorum_outcome: Option<super::ReviewBatchQuorumOutcome>,
 }
 
 /// What [`apply_in_transaction`] decided for an `AutoApply` kind: either it
@@ -245,10 +255,11 @@ fn apply_review_report(
          WHERE id = ?4",
         rusqlite::params![ReviewBatchMemberStatus::Reported.as_str(), proposal_id, now, member_id],
     )?;
-    advance_review_batch_quorum_best_effort(tx, execution_id, &payload.batch_id);
+    let quorum_outcome = advance_review_batch_quorum_best_effort(tx, execution_id, &payload.batch_id);
     Ok(ApplyDecision::Applied(ApplyOutcome {
         applied_ref: Some(member_id),
         post_commit_audit_line: None,
+        review_batch_quorum_outcome: quorum_outcome,
     }))
 }
 
@@ -259,16 +270,24 @@ fn apply_review_report(
 /// loudly instead, since nothing else is guaranteed to retry this exact
 /// transition (unlike a leaf's exhausted retry, which the recovery sweep
 /// revisits on its own schedule).
-fn advance_review_batch_quorum_best_effort(tx: &Transaction<'_>, execution_id: &str, batch_id: &str) {
+fn advance_review_batch_quorum_best_effort(
+    tx: &Transaction<'_>,
+    execution_id: &str,
+    batch_id: &str,
+) -> Option<super::ReviewBatchQuorumOutcome> {
     let registry = crate::driver::DriverRegistry::default();
-    if let Err(error) = super::review_batches::try_advance_review_batch_quorum_in_tx(tx, batch_id, &registry) {
-        tracing::error!(
-            execution_id,
-            batch_id,
-            ?error,
-            "accepted a review-batch report/verdict, but the quorum advance that should follow it failed; \
-             the batch may now be stuck until a human intervenes",
-        );
+    match super::review_batches::try_advance_review_batch_quorum_in_tx(tx, batch_id, &registry) {
+        Ok(outcome) => Some(outcome),
+        Err(error) => {
+            tracing::error!(
+                execution_id,
+                batch_id,
+                ?error,
+                "accepted a review-batch report/verdict, but the quorum advance that should follow it failed; \
+                 the batch may now be stuck until a human intervenes",
+            );
+            None
+        }
     }
 }
 
@@ -279,6 +298,18 @@ fn advance_review_batch_quorum_best_effort(tx: &Transaction<'_>, execution_id: &
 /// complete the batch (application of the verdict's *content* — deciding
 /// what happens to the reviewed work item — is separate, later work; this
 /// only records that the batch's consolidated outcome now exists).
+///
+/// A resubmission from the SAME supervisor member that already completed
+/// this exact batch (`existing_verdict == final_verdict_proposal_id`) is
+/// accepted as a correction rather than rejected: [`supersede_verdict_proposal`]
+/// marks the prior proposal superseded and this call re-points the member
+/// and the batch's `final_verdict_proposal_id` at the new one. This is the
+/// only correction path a supervisor has for a schema-valid but semantically
+/// wrong verdict — the batch has already synchronously completed on the
+/// first schema-valid submission, and nothing else re-opens it. A different
+/// member, or a stale/foreign proposal, can never trigger this path: it is
+/// keyed on the exact prior proposal id this member itself was recorded
+/// against, not merely on role or batch id.
 fn apply_review_verdict(
     tx: &Transaction<'_>,
     execution_id: &str,
@@ -290,7 +321,8 @@ fn apply_review_verdict(
     let member = tx
         .query_row(
             "SELECT members.id, members.role, members.status, members.report_proposal_id,
-                    batches.status, batches.pr_url, batches.target_sha, batches.phase
+                    batches.status, batches.pr_url, batches.target_sha, batches.phase,
+                    batches.final_verdict_proposal_id
              FROM pr_review_batch_members AS members
              JOIN pr_review_batches AS batches ON batches.id = members.batch_id
              WHERE members.execution_id = ?1 AND members.batch_id = ?2",
@@ -305,11 +337,23 @@ fn apply_review_verdict(
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             },
         )
         .optional()?;
-    let Some((member_id, role, status, existing_verdict, batch_status, pr_url, target_sha, phase)) = member else {
+    let Some((
+        member_id,
+        role,
+        status,
+        existing_verdict,
+        batch_status,
+        pr_url,
+        target_sha,
+        phase,
+        final_verdict_proposal_id,
+    )) = member
+    else {
         return Ok(ApplyDecision::Rejected(format!(
             "this execution is not a member of review batch `{}`",
             payload.batch_id
@@ -322,7 +366,15 @@ fn apply_review_verdict(
              supervisor member may submit a review-verdict",
         )));
     }
-    if batch_status != ReviewBatchStatus::Supervising.as_str() {
+    // A correction: this exact member already completed this exact batch
+    // with its previously accepted verdict proposal. Anything else —
+    // another member, a batch this member didn't complete, or a batch some
+    // other event moved to `completed` — falls through to the ordinary
+    // `supervising`-only rule below.
+    let is_own_completed_verdict = batch_status == ReviewBatchStatus::Completed.as_str()
+        && existing_verdict.is_some()
+        && existing_verdict == final_verdict_proposal_id;
+    if batch_status != ReviewBatchStatus::Supervising.as_str() && !is_own_completed_verdict {
         return Ok(ApplyDecision::Rejected(format!(
             "review batch `{}` is `{batch_status}`, not `supervising`; a verdict can only be accepted \
              while the batch is awaiting one",
@@ -338,33 +390,79 @@ fn apply_review_verdict(
             "verdict identity does not match its persisted batch target".to_owned(),
         ));
     }
-    if let Some(existing_verdict) = existing_verdict {
+    if let Some(existing_verdict) = &existing_verdict
+        && !is_own_completed_verdict
+    {
         return Ok(ApplyDecision::Rejected(format!(
             "review batch member `{member_id}` already accepted verdict proposal `{existing_verdict}`",
         )));
     }
     let status: ReviewBatchMemberStatus = status.parse().map_err(anyhow::Error::msg)?;
-    if !matches!(
-        status,
-        ReviewBatchMemberStatus::Pending | ReviewBatchMemberStatus::Running
-    ) {
+    if !is_own_completed_verdict
+        && !matches!(
+            status,
+            ReviewBatchMemberStatus::Pending | ReviewBatchMemberStatus::Running
+        )
+    {
         return Ok(ApplyDecision::Rejected(format!(
             "review batch member `{member_id}` cannot accept a verdict while status is `{status}`",
         )));
     }
 
     let now = now_string();
+    if is_own_completed_verdict {
+        let prior_proposal_id = existing_verdict.expect("is_own_completed_verdict implies existing_verdict is Some");
+        supersede_verdict_proposal(tx, &prior_proposal_id, proposal_id, &now)?;
+        tx.execute(
+            "UPDATE pr_review_batch_members
+             SET report_proposal_id = ?1, terminal_at = ?2, updated_at = ?2
+             WHERE id = ?3",
+            rusqlite::params![proposal_id, now, member_id],
+        )?;
+        tx.execute(
+            "UPDATE pr_review_batches SET final_verdict_proposal_id = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![proposal_id, now, payload.batch_id],
+        )?;
+        return Ok(ApplyDecision::Applied(ApplyOutcome {
+            applied_ref: Some(payload.batch_id),
+            post_commit_audit_line: None,
+            review_batch_quorum_outcome: None,
+        }));
+    }
     tx.execute(
         "UPDATE pr_review_batch_members
          SET status = ?1, report_proposal_id = ?2, terminal_at = ?3, updated_at = ?3
          WHERE id = ?4",
         rusqlite::params![ReviewBatchMemberStatus::Reported.as_str(), proposal_id, now, member_id],
     )?;
-    advance_review_batch_quorum_best_effort(tx, execution_id, &payload.batch_id);
+    let quorum_outcome = advance_review_batch_quorum_best_effort(tx, execution_id, &payload.batch_id);
     Ok(ApplyDecision::Applied(ApplyOutcome {
         applied_ref: Some(payload.batch_id),
         post_commit_audit_line: None,
+        review_batch_quorum_outcome: quorum_outcome,
     }))
+}
+
+/// Mark a prior `review_verdict` proposal superseded by the corrected one
+/// that just replaced it. Restores the supersession precedent
+/// `supersede_prior_review_verdicts` established for the design where
+/// verdict application was asynchronous — here it is scoped to the single
+/// corrected-resubmission case in [`apply_review_verdict`] rather than
+/// running unconditionally before every submission.
+fn supersede_verdict_proposal(
+    tx: &Transaction<'_>,
+    prior_proposal_id: &str,
+    new_proposal_id: &str,
+    now: &str,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE worker_proposals
+         SET state = 'superseded', decided_by = 'policy', decided_at = ?1,
+             decision_reason = 'superseded by a corrected review_verdict resubmission (' || ?2 || ') from the same supervisor'
+         WHERE id = ?3",
+        rusqlite::params![now, new_proposal_id, prior_proposal_id],
+    )?;
+    Ok(())
 }
 
 fn create_attention_item_row(
@@ -384,6 +482,7 @@ fn create_attention_item_row(
     Ok(ApplyOutcome {
         applied_ref: Some(item.id),
         post_commit_audit_line: None,
+        review_batch_quorum_outcome: None,
     })
 }
 
@@ -598,6 +697,7 @@ fn apply_automation_outcome(
         AutomationOutcomeProposalPayload::Skip { .. } => ApplyDecision::Applied(ApplyOutcome {
             applied_ref: None,
             post_commit_audit_line: None,
+            review_batch_quorum_outcome: None,
         }),
         AutomationOutcomeProposalPayload::ProducedTask { task_id } => {
             let execution = query_execution(tx, execution_id).require("execution", execution_id)?;
@@ -636,6 +736,7 @@ fn apply_automation_outcome(
                 Some(Some(actual)) if actual == automation_id => ApplyDecision::Applied(ApplyOutcome {
                     applied_ref: Some(resolved_task_id),
                     post_commit_audit_line: None,
+                    review_batch_quorum_outcome: None,
                 }),
                 Some(_) => ApplyDecision::Rejected(format!(
                     "task {task_id} exists but its source_automation_id does not match automation \
@@ -766,6 +867,7 @@ fn apply_pr_created(tx: &Transaction<'_>, execution_id: &str, payload_json: &str
     Ok(ApplyDecision::Applied(ApplyOutcome {
         applied_ref: Some(task.id),
         post_commit_audit_line: None,
+        review_batch_quorum_outcome: None,
     }))
 }
 
@@ -829,6 +931,7 @@ fn apply_run_done(
         // the completion gate reads — so it is the honest `applied_ref`.
         applied_ref: Some(execution_id.to_owned()),
         post_commit_audit_line: None,
+        review_batch_quorum_outcome: None,
     }))
 }
 

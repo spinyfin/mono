@@ -822,10 +822,16 @@ impl HostAdapter for SshHostAdapter {
         // Mirrors the local pane-spawn path's own lookup: only a review
         // batch's Supervisor-role member gets the supervisor CLAUDE.md.
         let is_review_supervisor = execution.kind == boss_protocol::ExecutionKind::PrReview
-            && matches!(
-                self.work_db.review_batch_member_for_execution(&execution.id),
-                Ok(Some(member)) if member.role == boss_protocol::ReviewBatchMemberRole::Supervisor
-            );
+            && self
+                .work_db
+                .review_batch_member_for_execution(&execution.id)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "determining whether execution {} is a review supervisor: {error}",
+                        execution.id
+                    )
+                })?
+                .is_some_and(|member| member.role == boss_protocol::ReviewBatchMemberRole::Supervisor);
         let settings_input = WorkerSetupInput {
             run_id: run_id.clone(),
             lease_id: lease_id.clone(),

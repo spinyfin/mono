@@ -22,84 +22,48 @@ pub struct SupervisorReportInput {
 /// adjudicate a contradiction between leaves — but must never write, push,
 /// or post to GitHub. The one permitted write is its consolidated verdict,
 /// submitted via `boss propose review-verdict`.
+///
+/// See [`crate::render::render_review_worker_claude_md`] for the shared body
+/// (read-only mandate, `gh --repo` note, workspace section, read-only VCS
+/// section) and the rationale behind its shape — notably why the VCS section
+/// always passes `-R {workspace_path}` explicitly.
 pub fn render_supervisor_claude_md(
     lease_id: &str,
     workspace_path: &str,
     absolute_paths: &str,
     boundaries_and_coordinator: &str,
 ) -> String {
-    format!(
-        "# Boss supervisor rules\n\
-         \n\
-         You are running inside a Boss-managed **review supervisor** session. \
-         The engine spawned you in a leased cube workspace checked out to the \
-         PR head, after at least two of three independent reviewers reported \
-         on this PR.\n\
-         \n\
-         ## Read-only mandate (HARD CONSTRAINT)\n\
-         \n\
-         **You MUST NOT change the PR or its branch in any way.**\n\
-         \n\
-         Forbidden actions (tool calls for these are denied):\n\
-         \n\
-         - Editing any file, or writing any file inside this workspace or any\n\
-           sibling worker workspace (`Edit`, `Write` under the workspaces root).\n\
-         - Committing or pushing (`jj git push`, `git push`).\n\
-         - Opening, merging, closing, editing, or commenting on a PR\n\
-           (`gh pr create/merge/close/edit/comment/review`).\n\
-         - Interacting with GitHub issues in any write capacity.\n\
-         - Running `cube pr create`/`cube pr update` or any Boss PR helper —\n\
-           this does NOT include the `boss propose review-verdict` call named\n\
-           in your task prompt, which is not a Boss PR helper: it records\n\
-           your consolidated verdict, it does not touch the PR.\n\
-         \n\
-         **The one permitted write** is the `boss propose review-verdict`\n\
-         call your task prompt names. Write your verdict JSON to the body\n\
-         file it names, then run exactly that one `boss propose` call to\n\
-         submit it. That call is a local call to the engine control socket,\n\
-         not a write to the PR or repo, so it does not violate the\n\
-         read-only mandate. Do not write anywhere else.\n\
-         \n\
-         You MAY read the checked-out workspace to independently verify a\n\
-         claim two leaves disagree about (e.g. whether a check was actually\n\
-         removed, or moved) — that is exactly what the read-only mandate\n\
-         still permits: reading, never changing.\n\
-         \n\
-         ## `gh` requires `--repo` in this workspace\n\
-         \n\
-         `gh` cannot auto-detect the repo in a jj workspace (there is no\n\
-         `.git` directory at the root — only `.jj/`). Your initial task\n\
-         prompt states the concrete repo slug. Pass `--repo <owner/repo>`\n\
-         on every `gh` command.\n\
-         \n\
-         ## Your workspace\n\
-         \n\
-         - Workspace path: `{workspace_path}`\n\
-         - Cube lease id: `{lease}`\n\
-         \n\
-         The workspace is already checked out to the PR head. Lease held for\n\
-         the lifetime of this run. Do not lease, release, or mutate cube\n\
-         state.\n\
-         \n\
-         {absolute_paths}\
-         \n\
-         ## VCS (read-only)\n\
-         \n\
-         Use `jj` for read-only navigation. Do not push or modify history.\n\
-         Your session's current working directory may not be inside the\n\
-         checkout, so bare `jj log`/`jj show`/`jj diff` can fail with no `.jj`\n\
-         found — always pass `-R {workspace_path}` explicitly:\n\
-         \n\
-         - `jj log -R {workspace_path}`, `jj show -R {workspace_path}`,\n\
-           `jj diff -R {workspace_path}` — browse history and diffs.\n\
-         - `gh pr diff <url>` — fetch the PR diff.\n\
-         - `gh pr view <url>` — read the PR description.\n\
-         \n\
-         {boundaries_and_coordinator}",
-        lease = lease_id,
-        workspace_path = workspace_path,
-        absolute_paths = absolute_paths,
-        boundaries_and_coordinator = boundaries_and_coordinator,
+    crate::render::render_review_worker_claude_md(
+        crate::render::ReviewWorkerRoleRules {
+            role_heading: "supervisor",
+            intro: "You are running inside a Boss-managed **review supervisor** session. \
+                    The engine spawned you in a leased cube workspace checked out to the \
+                    PR head, after at least two of three independent reviewers reported \
+                    on this PR.",
+            last_forbidden_bullet: "Running `cube pr create`/`cube pr update` or any Boss PR helper —\n\
+               this does NOT include the `boss propose review-verdict` call named\n\
+               in your task prompt, which is not a Boss PR helper: it records\n\
+               your consolidated verdict, it does not touch the PR.",
+            permitted_write_section: "**The one permitted write** is the `boss propose review-verdict`\n\
+             call your task prompt names. Write your verdict JSON to the body\n\
+             file it names, then run exactly that one `boss propose` call to\n\
+             submit it. That call is a local call to the engine control socket,\n\
+             not a write to the PR or repo, so it does not violate the\n\
+             read-only mandate. Do not write anywhere else.\n\
+             \n\
+             You MAY read the checked-out workspace to independently verify a\n\
+             claim two leaves disagree about (e.g. whether a check was actually\n\
+             removed, or moved) — that is exactly what the read-only mandate\n\
+             still permits: reading, never changing.\n\
+             \n\
+             Your feedback stays inside Boss — it is never posted to GitHub.\n\
+             \n",
+            workspace_extra: "",
+        },
+        lease_id,
+        workspace_path,
+        absolute_paths,
+        boundaries_and_coordinator,
     )
 }
 

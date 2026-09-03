@@ -336,6 +336,7 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
             proposal,
             already_submitted,
             staged_followup,
+            review_batch_quorum_outcome,
         })) => {
             record_proposal_submitted(&server_state.metrics, kind);
             tracing::info!(
@@ -362,6 +363,16 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                         FrontendEvent::AttentionCreated { attention, group },
                     )
                     .await;
+            }
+            // This report/verdict acceptance dispatched the supervisor and
+            // inserted its `Ready` execution inside the same transaction
+            // that just committed, but that path has no publisher of its
+            // own to kick the scheduler with — mirror
+            // `finalize_passes.rs`'s member-failure dispatch, which does,
+            // so the supervisor execution does not sit `Ready` until the
+            // scheduler's own heartbeat happens to re-kick it.
+            if review_batch_quorum_outcome == Some(crate::work::ReviewBatchQuorumOutcome::SupervisorDispatched) {
+                server_state.publisher.kick_scheduler();
             }
             // Mirror completion.rs's legacy marker-detector paths
             // (`file_worker_signal_attention` / `record_deferred_scope_item`):

@@ -68,6 +68,15 @@ pub struct SubmitWorkerProposalOutcome {
     /// (`app/attentions.rs`, `completion.rs`, `populator.rs`) — see the
     /// design's "no gated kind is invisible while pending".
     pub staged_followup: Option<(Attention, AttentionGroup)>,
+    /// What the quorum advance decided when this was a fresh `review_report`
+    /// or `review_verdict` submission that accepted into a review batch.
+    /// `None` for every other kind, for a replay, or when the best-effort
+    /// quorum advance itself failed (already logged there). The caller
+    /// (`app::proposals::handle_submit_proposal`) kicks the scheduler on
+    /// `SupervisorDispatched` — this dispatch path commits inside the
+    /// submission's own transaction and has no publisher of its own, unlike
+    /// `finalize_passes.rs`'s member-failure dispatch, which does.
+    pub review_batch_quorum_outcome: Option<super::ReviewBatchQuorumOutcome>,
 }
 
 // ---- mapper ----
@@ -167,6 +176,7 @@ impl WorkDb {
             decided_at,
             post_commit_audit_line,
             staged_followup,
+            review_batch_quorum_outcome,
         ) = {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -190,6 +200,7 @@ impl WorkDb {
                     proposal: existing,
                     already_submitted: true,
                     staged_followup: None,
+                    review_batch_quorum_outcome: None,
                 }));
             }
 
@@ -236,26 +247,35 @@ impl WorkDb {
                 )?),
                 ProposalApplyPolicy::Gated => None,
             };
-            let (state, applied_ref, decided_by, decision_reason, decided_at, post_commit_audit_line) =
-                match apply_decision {
-                    Some(ApplyDecision::Applied(outcome)) => (
-                        ProposalState::Applied,
-                        outcome.applied_ref,
-                        Some(ProposalDecider::Policy),
-                        None,
-                        Some(now.clone()),
-                        outcome.post_commit_audit_line,
-                    ),
-                    Some(ApplyDecision::Rejected(reason)) => (
-                        ProposalState::Rejected,
-                        None,
-                        Some(ProposalDecider::Policy),
-                        Some(reason),
-                        Some(now.clone()),
-                        None,
-                    ),
-                    None => (ProposalState::Proposed, None, None, None, None, None),
-                };
+            let (
+                state,
+                applied_ref,
+                decided_by,
+                decision_reason,
+                decided_at,
+                post_commit_audit_line,
+                review_batch_quorum_outcome,
+            ) = match apply_decision {
+                Some(ApplyDecision::Applied(outcome)) => (
+                    ProposalState::Applied,
+                    outcome.applied_ref,
+                    Some(ProposalDecider::Policy),
+                    None,
+                    Some(now.clone()),
+                    outcome.post_commit_audit_line,
+                    outcome.review_batch_quorum_outcome,
+                ),
+                Some(ApplyDecision::Rejected(reason)) => (
+                    ProposalState::Rejected,
+                    None,
+                    Some(ProposalDecider::Policy),
+                    Some(reason),
+                    Some(now.clone()),
+                    None,
+                    None,
+                ),
+                None => (ProposalState::Proposed, None, None, None, None, None, None),
+            };
 
             tx.execute(
                 "INSERT INTO worker_proposals
@@ -289,6 +309,7 @@ impl WorkDb {
                 decided_at,
                 post_commit_audit_line,
                 staged_followup,
+                review_batch_quorum_outcome,
             )
         };
 
@@ -320,6 +341,7 @@ impl WorkDb {
                 .build(),
             already_submitted: false,
             staged_followup,
+            review_batch_quorum_outcome,
         }))
     }
 

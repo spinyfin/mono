@@ -156,6 +156,35 @@ fn leaf_reviewer_role(role: ReviewBatchMemberRole) -> bool {
     )
 }
 
+/// Resolve one member's driver/model policy and build its create input.
+/// Shared by [`leaf_member_inputs`] (three leaf members at batch creation)
+/// and [`try_advance_review_batch_quorum_in_tx`] (the single supervisor
+/// member, added later once the leaves have settled) so the
+/// registry-lookup-then-resolve-tier sequence lives in exactly one place.
+fn resolve_member_input(
+    registry: &crate::driver::DriverRegistry,
+    driver: &str,
+    role: ReviewBatchMemberRole,
+    classification: &ReviewClassification,
+    execution_id: String,
+) -> Result<ReviewBatchMemberCreateInput> {
+    let driver_descriptor = registry
+        .get(driver)
+        .ok_or_else(|| anyhow::anyhow!("review batch driver {driver:?} is not registered"))?
+        .descriptor();
+    Ok(ReviewBatchMemberCreateInput::builder()
+        .attempt(1)
+        .provider_effort("medium")
+        .requested_driver(driver)
+        .resolved_model((driver_descriptor.model_menu.review_model_for_tier)(
+            classification.profile.model_tier(),
+        ))
+        .role(role)
+        .status(ReviewBatchMemberStatus::Pending)
+        .execution_id(execution_id)
+        .build())
+}
+
 fn leaf_member_inputs(
     classification: &ReviewClassification,
     execution_ids: &[String],
@@ -173,21 +202,7 @@ fn leaf_member_inputs(
         .into_iter()
         .zip(execution_ids)
         .map(|((role, driver), execution_id)| {
-            let driver_descriptor = registry
-                .get(driver)
-                .ok_or_else(|| anyhow::anyhow!("review batch driver {driver:?} is not registered"))?
-                .descriptor();
-            Ok(ReviewBatchMemberCreateInput::builder()
-                .attempt(1)
-                .provider_effort("medium")
-                .requested_driver(driver)
-                .resolved_model((driver_descriptor.model_menu.review_model_for_tier)(
-                    classification.profile.model_tier(),
-                ))
-                .role(role)
-                .status(ReviewBatchMemberStatus::Pending)
-                .execution_id(execution_id.clone())
-                .build())
+            resolve_member_input(&registry, driver, role, classification, execution_id.clone())
         })
         .collect()
 }
@@ -430,7 +445,7 @@ fn any_member_repo_remote_url(tx: &Transaction<'_>, members: &[ReviewBatchMember
 }
 
 /// What [`try_advance_review_batch_quorum_in_tx`] did.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewBatchQuorumOutcome {
     /// The batch's members have not all settled yet (still `collecting`
     /// leaves in flight), or the batch is already past `supervising`. Not an
@@ -497,12 +512,6 @@ pub(crate) fn try_advance_review_batch_quorum_in_tx(
 
             if reported >= 2 {
                 let repo_remote_url = any_member_repo_remote_url(tx, &members)?;
-                let supervisor_driver = registry
-                    .get("claude")
-                    .ok_or_else(|| anyhow::anyhow!("supervisor driver \"claude\" is not registered"))?
-                    .descriptor();
-                let resolved_model =
-                    (supervisor_driver.model_menu.review_model_for_tier)(batch.classification.profile.model_tier());
                 let execution = insert_execution(
                     tx,
                     CreateExecutionInput::builder()
@@ -512,15 +521,13 @@ pub(crate) fn try_advance_review_batch_quorum_in_tx(
                         .repo_remote_url(repo_remote_url)
                         .build(),
                 )?;
-                let member_input = ReviewBatchMemberCreateInput::builder()
-                    .attempt(1)
-                    .provider_effort("medium")
-                    .requested_driver("claude")
-                    .resolved_model(resolved_model)
-                    .role(ReviewBatchMemberRole::Supervisor)
-                    .status(ReviewBatchMemberStatus::Pending)
-                    .execution_id(execution.id.clone())
-                    .build();
+                let member_input = resolve_member_input(
+                    registry,
+                    "claude",
+                    ReviewBatchMemberRole::Supervisor,
+                    &batch.classification,
+                    execution.id.clone(),
+                )?;
                 validate_member_input(batch.phase, &member_input)?;
                 insert_batch_member_in_tx(tx, batch_id, &member_input, &now)?;
                 tx.execute(

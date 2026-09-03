@@ -16,7 +16,7 @@ use crate::work::{
 };
 use boss_protocol::{
     EffortLevel, ExecutionKind, ProposalKind, ProposalState, ReviewBatchMember, ReviewBatchMemberRole,
-    ReviewBatchPhase, ReviewBatchStatus, ReviewReportProposalPayload, TaskKind,
+    ReviewBatchMemberStatus, ReviewBatchPhase, ReviewBatchStatus, ReviewReportProposalPayload, TaskKind,
 };
 
 use super::prompt::{
@@ -335,6 +335,11 @@ fn load_batch_leaf_reports(
         )
         .with_context(|| format!("loading accepted review-report proposals for work item {cycle_root_id}"))?;
 
+    let reported_member_count = members
+        .iter()
+        .filter(|member| member.status == ReviewBatchMemberStatus::Reported)
+        .count();
+
     let mut reports = Vec::new();
     for member in &members {
         let role = match member.role {
@@ -347,16 +352,39 @@ fn load_batch_leaf_reports(
             continue;
         };
         let Some(proposal) = proposals.iter().find(|proposal| proposal.id == proposal_id) else {
+            tracing::warn!(
+                member_id = member.id,
+                proposal_id,
+                "review batch member has a report_proposal_id but no matching applied \
+                 review_report proposal was found for its work item; the supervisor prompt \
+                 will not see this leaf's report",
+            );
             continue;
         };
         let payload: ReviewReportProposalPayload = serde_json::from_str(&proposal.payload_json)
             .with_context(|| format!("parsing accepted review-report proposal {proposal_id} payload"))?;
         if payload.batch_id != batch_id {
+            tracing::warn!(
+                member_id = member.id,
+                proposal_id,
+                payload_batch_id = payload.batch_id,
+                expected_batch_id = batch_id,
+                "review batch member's report_proposal_id resolved to a proposal for a \
+                 different batch_id; the supervisor prompt will not see this leaf's report",
+            );
             continue;
         }
         let report: crate::pr_review::ReviewerReport = serde_json::from_value(payload.report)
             .with_context(|| format!("parsing accepted review-report proposal {proposal_id} report body"))?;
         reports.push(crate::pr_review::SupervisorReportInput { role, report });
+    }
+    if reports.len() < reported_member_count {
+        anyhow::bail!(
+            "review batch {batch_id} has {reported_member_count} member(s) with status `reported`, but only \
+             {} of their accepted review-report proposals could be loaded; refusing to render a supervisor \
+             prompt that would misreport a lookup gap as \"that reviewer did not report\"",
+            reports.len(),
+        );
     }
     Ok(reports)
 }

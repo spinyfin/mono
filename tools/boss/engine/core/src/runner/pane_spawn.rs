@@ -874,10 +874,16 @@ impl ExecutionRunner for PaneSpawnRunner {
         // execution (leaf members, and legacy memberless reviewers) keeps
         // the existing reviewer posture unchanged.
         let is_review_supervisor = execution.kind == ExecutionKind::PrReview
-            && matches!(
-                self.work_db.review_batch_member_for_execution(&execution.id),
-                Ok(Some(member)) if member.role == ReviewBatchMemberRole::Supervisor
-            );
+            && self
+                .work_db
+                .review_batch_member_for_execution(&execution.id)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "determining whether execution {} is a review supervisor: {error}",
+                        execution.id
+                    )
+                })?
+                .is_some_and(|member| member.role == ReviewBatchMemberRole::Supervisor);
         // Any environment scrubbing/exporting a driver's spawn needs (e.g.
         // Claude unsetting ANTHROPIC_API_KEY so it authenticates via OAuth
         // credentials instead of a stray shell-profile key) is the driver's
