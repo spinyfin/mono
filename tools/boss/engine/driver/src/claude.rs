@@ -239,6 +239,70 @@ macro_rules! python_command_guard {
     };
 }
 
+/// Tokenizer fragment shared by [`REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND`]
+/// and [`BOSS_LAUNCH_GUARD_COMMAND`]: splits a (possibly multi-line) shell
+/// command string into independent argv groups at shell delimiters, and
+/// strips leading env-assignment / launcher-wrapper / `timeout <n>` tokens to
+/// reach the real program.
+///
+/// `shlex.split` does not tokenize a shell operator written without
+/// surrounding spaces (`cd x&&bazel test //y` is a single token), so this
+/// uses `shlex.shlex(..., punctuation_chars=";&|")` with `whitespace_split =
+/// True`, which splits `a&&b` into `a`, `&&`, `b`. `commenters` is cleared
+/// because `shlex.shlex` otherwise treats `#` as a comment introducer
+/// anywhere in a word, not just at the start of one, silently discarding the
+/// remainder of the line (`shlex.split` does not have this behavior — it
+/// sets `commenters=''` itself). This is the same lexer configuration used
+/// by `boss_engine::worker_setup`'s `PATH_GUARD_SCRIPT` for the
+/// `BOSS_DATA_DIR` path guard, and by
+/// [`crate::codex::tool_surface_guard::CODEX_TOOL_SURFACE_GUARD_SCRIPT`]'s
+/// `command_groups`.
+///
+/// A plain string-literal macro (not a `const`) for the same reason
+/// [`python_command_guard!`] is one: it is spliced into other `concat!`
+/// invocations, which require every argument to be a literal.
+macro_rules! shell_command_tokenizer_fragment {
+    () => {
+        "DELIMS={'&&','||',';','|','&'}\n\
+         WRAPPERS={'env','command','exec','nohup','stdbuf','setsid','caffeinate','sudo','time','xargs'}\n\
+         ASSIGNMENT_RE=re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')\n\
+         def command_groups(command):\n\
+         \x20   groups=[]\n\
+         \x20   for line in command.split(chr(10)):\n\
+         \x20       try:\n\
+         \x20           _lex=shlex.shlex(line,posix=True,punctuation_chars=';&|')\n\
+         \x20           _lex.whitespace_split=True\n\
+         \x20           _lex.commenters=''\n\
+         \x20           toks=list(_lex)\n\
+         \x20       except Exception:\n\
+         \x20           toks=line.split()\n\
+         \x20       cur=[]\n\
+         \x20       for tok in toks:\n\
+         \x20           if tok in DELIMS:\n\
+         \x20               if cur:\n\
+         \x20                   groups.append(cur)\n\
+         \x20               cur=[]\n\
+         \x20           else:\n\
+         \x20               cur.append(tok)\n\
+         \x20       if cur:\n\
+         \x20           groups.append(cur)\n\
+         \x20   return groups\n\
+         def strip_prefixes(group):\n\
+         \x20   i=0\n\
+         \x20   while i<len(group):\n\
+         \x20       tok=group[i]\n\
+         \x20       base=os.path.basename(tok)\n\
+         \x20       if ASSIGNMENT_RE.match(tok) or base in WRAPPERS:\n\
+         \x20           i+=1\n\
+         \x20           continue\n\
+         \x20       if base=='timeout' and i+1<len(group):\n\
+         \x20           i+=2\n\
+         \x20           continue\n\
+         \x20       break\n\
+         \x20   return group[i:]\n"
+    };
+}
+
 /// Inline Python decision hook that blocks workers from launching the Boss
 /// macOS app or a Boss engine. Always applied (matcher `Bash`).
 ///
@@ -292,43 +356,30 @@ macro_rules! python_command_guard {
 /// letting a stale `PATH` copy
 /// win if the launcher ever slipped.
 pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
-    "DELIMS={'&&','||',';','|','&'}\n",
-    "WRAP={'nohup','env','sudo','exec','command','stdbuf','setsid','caffeinate','xargs'}\n",
-    "ASSIGN=re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)=(.*)$', re.S)\n",
+    shell_command_tokenizer_fragment!(),
     "PROD='/tmp/boss-engine.sock'\n",
+    "ASSIGN=re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)=(.*)$', re.S)\n",
     // Resolve single-level shell variables. Assignments are collected as the
     // token stream is walked, so a value defined earlier in the command is
     // substituted into later tokens -- the `APP=...` / `open $APP` split.
+    // This is a separate pass over the groups `command_groups` (from the
+    // shared tokenizer fragment) already produced, so it applies uniformly
+    // whether a group came from before or after a delimiter, and whether it
+    // spans one line or several -- `vars` carries across both.
     "vars={}\n",
     "def expand(t):\n",
     "    for k,v in vars.items():\n",
     "        t=t.replace('$'+'{'+k+'}',v).replace('$'+k,v)\n",
     "    return t\n",
-    // A newline separates commands just as `;` does, and shlex discards it,
-    // so each line is tokenised on its own. `vars` carries across lines
-    // because a value is routinely defined on one line and used on the next.
     "groups=[]\n",
-    "for line in cmd.split(chr(10)):\n",
-    "    try:\n",
-    "        toks=shlex.split(line,posix=True)\n",
-    "    except Exception:\n",
-    "        toks=line.split()\n",
+    "for g in command_groups(cmd):\n",
     "    resolved=[]\n",
-    "    for t in toks:\n",
+    "    for t in g:\n",
     "        m=ASSIGN.match(t)\n",
     "        if m:\n",
     "            vars[m.group(1)]=expand(m.group(2))\n",
     "        resolved.append(expand(t))\n",
-    "    cur=[]\n",
-    "    for t in resolved:\n",
-    "        if t in DELIMS:\n",
-    "            if cur:\n",
-    "                groups.append(cur[:])\n",
-    "            cur=[]\n",
-    "        else:\n",
-    "            cur.append(t)\n",
-    "    if cur:\n",
-    "        groups.append(cur)\n",
+    "    groups.append(resolved)\n",
     "def socket_arg(g):\n",
     "    for j,t in enumerate(g):\n",
     "        if t=='--socket-path' and j+1<len(g):\n",
@@ -348,17 +399,7 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "    return d.endswith('/Contents/Resources/bin')\n",
     "matched=None\n",
     "for g in groups:\n",
-    "    i=0\n",
-    "    while i<len(g):\n",
-    "        b=os.path.basename(g[i])\n",
-    "        if ASSIGN.match(g[i]) or b in WRAP:\n",
-    "            i+=1\n",
-    "            continue\n",
-    "        if b=='timeout' and i+1<len(g):\n",
-    "            i+=2\n",
-    "            continue\n",
-    "        break\n",
-    "    rest=g[i:]\n",
+    "    rest=strip_prefixes(g)\n",
     "    if not rest:\n",
     "        continue\n",
     "    prog=rest[0]\n",
@@ -513,6 +554,43 @@ pub const REVISION_PR_GUARD_COMMAND: &str = python_command_guard!(
     "    sug='cube pr update --branch '+br if br else 'cube pr update --branch <your-pr-bookmark>'\n",
     "    msg='Revision tasks push commits to the existing parent PR; they must not open a new PR (matched command: '+matched+'). Push your commits to the existing PR with: '+sug\n",
     "    _block(msg)\n",
+    "_approve()\n",
+);
+
+/// Inline Python decision hook for static-analysis-only reviewer sessions.
+///
+/// Mutation and publication remain fenced by the existing reviewer deny rules
+/// and driver sandboxes. This complementary guard closes the command surface
+/// those controls intentionally leave open: builds, tests, formatters,
+/// generators, language runners, shell interpreters, and direct execution of
+/// checked-out artifacts. It is shared unchanged by Claude, Codex, and Grok.
+pub const REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND: &str = python_command_guard!(
+    shell_command_tokenizer_fragment!(),
+    "BLOCKED={'make','just','cmake','ninja','meson','buck','xcodebuild','gradle','gradlew','mvn','mvnw','sbt','dotnet','pytest','tox','nox','rustfmt','gofmt','prettier','black','ruff','protoc','buf','codegen','npx','npm','pnpm','yarn','bun','deno','node','python','python3','ruby','perl','php','lua','java','kotlinc','swift','uv','poetry','pipenv','maturin','checkleft'}\n",
+    "matched=None\n",
+    "for group in command_groups(cmd):\n",
+    "    rest=strip_prefixes(group)\n",
+    "    if not rest:\n",
+    "        continue\n",
+    "    prog=rest[0]\n",
+    "    base=os.path.basename(prog)\n",
+    "    subcommands=set(rest[1:])\n",
+    "    if base in ('bash','sh','zsh','fish') or base in ('source','.'):\n",
+    "        matched=base\n",
+    "    elif base in ('bazel','bazelisk') and subcommands.intersection({'build','test','run','coverage'}):\n",
+    "        matched=base+' execution subcommand'\n",
+    "    elif base=='cargo' and subcommands.intersection({'build','test','run','bench','fmt','clippy','install'}):\n",
+    "        matched='cargo execution subcommand'\n",
+    "    elif base=='go' and subcommands.intersection({'build','test','run','generate','install'}):\n",
+    "        matched='go execution subcommand'\n",
+    "    elif base in BLOCKED:\n",
+    "        matched=base\n",
+    "    elif prog.startswith('./') or prog.startswith('../') or '/bazel-bin/' in prog or '/target/' in prog:\n",
+    "        matched=prog\n",
+    "    if matched:\n",
+    "        break\n",
+    "if matched:\n",
+    "    _block('Blocked: reviewers perform static analysis only (matched: '+matched+'). Do not run builds, tests, formatters, generators, language runners, shell interpreters, or checked-out executables. Read source, diffs, and metadata instead. If a claim depends on execution, record it with needs_runtime_verification: true in the review report.')\n",
     "_approve()\n",
 );
 
@@ -842,7 +920,17 @@ impl AgentDriver for ClaudeDriver {
             }));
         }
 
-        // 5. Revision PR guard. Blocks PR creation (`gh pr create`, `cube pr
+        // 5. Static-analysis-only reviewer guard. Existing reviewer deny
+        // rules continue to own mutation and publish fences; this adds the
+        // independent no-execution restriction.
+        if config.is_reviewer {
+            hooks.push(serde_json::json!({
+                "matcher": "Bash",
+                "hooks": [{"type": "command", "command": REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND}],
+            }));
+        }
+
+        // 6. Revision PR guard. Blocks PR creation (`gh pr create`, `cube pr
         //    create`, `cube pr ensure`) for revision workers, which must push
         //    commits to the existing parent PR, never open a new one.
         if config.is_revision {
@@ -1133,6 +1221,8 @@ mod tests {
     use crate::Capability;
     use crate::test_support::home_override;
     use boss_protocol::ReviewModelTier;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
     use tempfile::TempDir;
 
     #[test]
@@ -1382,6 +1472,7 @@ mod tests {
             checkleft_guard_script: Some(PathBuf::from("/tmp/boss-settings/boss-checkleft-push-guard.py")),
             is_revision: false,
             is_standard_worker: true,
+            is_reviewer: false,
             run_id: None,
             workspace_path: None,
         }
@@ -1394,6 +1485,7 @@ mod tests {
             checkleft_guard_script: None,
             is_revision: false,
             is_standard_worker: true,
+            is_reviewer: false,
             run_id: None,
             workspace_path: None,
         }
@@ -1504,15 +1596,16 @@ mod tests {
             checkleft_guard_script: Some(PathBuf::from("/tmp/boss-checkleft-push-guard.py")),
             is_revision: false,
             is_standard_worker: false,
+            is_reviewer: true,
             run_id: None,
             workspace_path: None,
         };
         let wiring = ClaudeDriver.tool_use_interception_wiring(&config);
-        // path guard + boss-launch guard = 2 (no PR redirect, no checkleft)
+        // path guard + boss-launch guard + static-analysis guard (no PR redirect, no checkleft)
         assert_eq!(
             wiring.pre_tool_use_hooks.len(),
-            2,
-            "non-standard (reviewer/triage) worker must get exactly 2 guards: {:?}",
+            3,
+            "reviewer worker must get exactly 3 guards: {:?}",
             wiring.pre_tool_use_hooks,
         );
         let cmds: Vec<&str> = wiring
@@ -1524,6 +1617,56 @@ mod tests {
             !cmds.iter().any(|c| c.contains("jj git push")),
             "non-standard worker must not have the PR redirect guard: {cmds:?}",
         );
+        assert!(
+            cmds.iter().any(|c| c.contains("static analysis only")),
+            "reviewer must have the static-analysis guard: {cmds:?}",
+        );
+    }
+
+    fn reviewer_static_guard_decision(command: &str) -> serde_json::Value {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("start reviewer guard");
+        let payload = serde_json::json!({"tool_input": {"command": command}}).to_string();
+        child
+            .stdin
+            .as_mut()
+            .expect("guard stdin")
+            .write_all(payload.as_bytes())
+            .expect("write hook payload");
+        let output = child.wait_with_output().expect("wait for reviewer guard");
+        assert!(output.status.success(), "guard process failed: {output:?}");
+        serde_json::from_slice(&output.stdout).expect("guard decision JSON")
+    }
+
+    #[test]
+    fn reviewer_static_analysis_guard_blocks_execution_and_allows_reads() {
+        for command in [
+            "bazel test //tools/boss/engine/core:engine_lib_test",
+            "bazel --color=no test //tools/boss/engine/core:engine_lib_test",
+            "cargo fmt",
+            "python3 scripts/check.py",
+            "./bazel-bin/tools/boss/engine/core/engine",
+            "checkleft fix",
+            // Operators glued to the preceding word must still split the
+            // group, so the blocked program after `&&` is seen.
+            "cd tools/boss && bazel test //x",
+            "cd tools/boss&&bazel test //x",
+            // `#` inside a word or after a delimiter must not truncate the
+            // command: the blocked program following it must still be seen.
+            "echo a#b && bazel test //x",
+        ] {
+            assert_eq!(
+                reviewer_static_guard_decision(command)["decision"],
+                "block",
+                "reviewer guard must block {command}",
+            );
+        }
+        assert_eq!(reviewer_static_guard_decision("jj diff --stat")["decision"], "approve");
     }
 
     // ── TranscriptAccess ─────────────────────────────────────────────────────

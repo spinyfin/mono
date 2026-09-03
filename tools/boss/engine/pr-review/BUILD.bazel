@@ -13,6 +13,7 @@ rust_library(
     visibility = [
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/driver:__pkg__",
+        "//tools/boss/engine/proposal-validation:__pkg__",
     ],
     deps = [
         "//tools/boss/engine/structured-output",

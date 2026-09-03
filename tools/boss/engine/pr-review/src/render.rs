@@ -21,6 +21,21 @@ pub struct ReviewOrigin {
     pub pr_number: Option<i64>,
 }
 
+/// Engine-owned identity for a batch reviewer submission.
+///
+/// The leaf repeats these immutable fields in its JSON body. The engine still
+/// derives the execution and member identity from the authenticated socket
+/// peer when it accepts the proposal.
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
+pub struct ReviewerReportDestination {
+    pub batch_id: String,
+    pub pr_url: String,
+    pub target_sha: String,
+    pub phase: boss_protocol::ReviewBatchPhase,
+    pub body_path: String,
+}
+
 impl ReviewOrigin {
     /// Human-readable origin reference, e.g. `"PR #<n> (originating work
     /// item T<short_id>)"`. Degrades gracefully when either half is
@@ -175,6 +190,23 @@ pub fn render_reviewer_claude_md(
     absolute_paths: &str,
     boundaries_and_coordinator: &str,
 ) -> String {
+    // This file is handed to every reviewer regardless of which delivery
+    // contract its task prompt actually uses — the legacy artifact/transcript
+    // path ([`render_reviewer_initial_prompt`]) or the review-batch
+    // `boss propose review-report` path ([`render_batch_reviewer_initial_prompt`]).
+    // It must therefore authorise both here rather than naming only the
+    // legacy `ReviewResult` write as "the one permitted write": a batch
+    // member that took that literally at its word would read `boss propose`
+    // as forbidden by the line below it (`cube pr create`/`cube pr update` or
+    // any Boss PR helper) and could decline to submit its report at all.
+    //
+    // Some Codex reviewer sandboxes also relocate the session's cwd to an
+    // engine-owned scratch directory outside the checkout (`--cd`, see
+    // `codex::reviewer_output_sandbox_extra_args`), so a bare `jj log`/`jj
+    // show`/`jj diff` has no `.jj` in its ancestry there. `-R
+    // {workspace_path}` makes every jj invocation resolve against the
+    // checkout regardless of cwd, and is a harmless no-op when cwd is
+    // already the checkout.
     format!(
         "# Boss reviewer rules\n\
          \n\
@@ -193,18 +225,30 @@ pub fn render_reviewer_claude_md(
          - Opening, merging, closing, editing, or commenting on a PR\n\
            (`gh pr create/merge/close/edit/comment/review`).\n\
          - Interacting with GitHub issues in any write capacity.\n\
-         - Running `cube pr create`/`cube pr update` or any Boss PR helper.\n\
+         - Running `cube pr create`/`cube pr update` or any Boss PR helper —\n\
+           this does NOT include the `boss propose review-report` call named\n\
+           below, which is not a Boss PR helper: it reports findings, it does\n\
+           not touch the PR.\n\
          \n\
-         **The one permitted write** is your `ReviewResult` JSON, which you\n\
-         write to the engine-owned artifact path given in\n\
-         your task prompt (also exported as `$BOSS_STRUCTURED_OUTPUT`). That\n\
-         path is OUTSIDE every worker workspace, so it is not part of the PR or\n\
-         repo — writing it does not violate the read-only mandate. Do not write\n\
-         anywhere else.\n\
+         **The one permitted write** is whichever single delivery your task\n\
+         prompt actually names:\n\
          \n\
-         Anything you would \"fix\", describe as a finding in the\n\
-         `ReviewResult` JSON instead. Your feedback stays inside Boss —\n\
-         **it is never posted to GitHub**.\n\
+         - If it names an engine-owned `ReviewResult` artifact path\n\
+           (also exported as `$BOSS_STRUCTURED_OUTPUT`): write your\n\
+           `ReviewResult` JSON there.\n\
+         - If it instead names a review-report body-file path and a\n\
+           `boss propose review-report` command: write the report JSON to\n\
+           that body file, then run exactly that one `boss propose` call to\n\
+           submit it. `boss propose` is a local call to the engine control\n\
+           socket, not a write to the PR or repo.\n\
+         \n\
+         Either path is OUTSIDE every worker workspace, so making that one\n\
+         write (or write-then-submit) does not violate the read-only mandate.\n\
+         Do not write anywhere else, and do not use any other Boss PR helper.\n\
+         \n\
+         Anything you would \"fix\", describe as a finding in that output\n\
+         instead. Your feedback stays inside Boss — **it is never posted to\n\
+         GitHub**.\n\
          \n\
          Allowed read-only tools: `grep`, `find`, `cat`, `head`, `tail`,\n\
          `Read`, `jj log`, `jj show`, `jj diff`, `gh pr view`, `gh pr diff`,\n\
@@ -224,7 +268,9 @@ pub fn render_reviewer_claude_md(
          \n\
          The workspace is already checked out to the PR head. You can read\n\
          changed files and surrounding context directly — use `Read`, `cat`,\n\
-         `grep`, etc. on files in `{workspace_path}`. No need to use\n\
+         `grep`, etc. on files in `{workspace_path}` (use the absolute path;\n\
+         your session's current working directory is not guaranteed to be\n\
+         inside the checkout — see VCS below). No need to use\n\
          `git show <sha>:<path>` or fetch files via `gh`.\n\
          \n\
          Lease held for the lifetime of this run. Do not lease, release,\n\
@@ -235,8 +281,12 @@ pub fn render_reviewer_claude_md(
          ## VCS (read-only)\n\
          \n\
          Use `jj` for read-only navigation. Do not push or modify history.\n\
+         Your session's current working directory may not be inside the\n\
+         checkout, so bare `jj log`/`jj show`/`jj diff` can fail with no `.jj`\n\
+         found — always pass `-R {workspace_path}` explicitly:\n\
          \n\
-         - `jj log`, `jj show`, `jj diff` — browse history and diffs.\n\
+         - `jj log -R {workspace_path}`, `jj show -R {workspace_path}`,\n\
+           `jj diff -R {workspace_path}` — browse history and diffs.\n\
          - `gh pr diff <url>` — fetch the PR diff (useful for the annotated diff view).\n\
          - `gh pr view <url>` — read the PR description.\n\
          \n\
@@ -273,9 +323,9 @@ pub fn render_reviewer_claude_md(
 /// section covers that case.
 ///
 /// `output_path` is the absolute, engine-owned artifact path the reviewer must
-/// write its `ReviewResult` JSON to (see the engine's structured-output artifact path). It is
-/// the primary output channel; the prompt also asks for a fenced-JSON copy in
-/// the final message as a transitional fallback.
+/// write its legacy `ReviewResult` JSON to (see the engine's structured-output
+/// artifact path). Batch reviewers use [`render_batch_reviewer_initial_prompt`]
+/// instead, which submits a typed report through `boss propose`.
 pub fn render_reviewer_initial_prompt(
     task_name: &str,
     task_description: &str,
@@ -544,6 +594,97 @@ pub fn render_reviewer_initial_prompt(
         schema_head_sha = schema_head_sha,
         rubric = rubric,
         repo_slug = repo_slug,
+    )
+}
+
+/// Render a batch-review leaf prompt. This reuses the complete legacy review
+/// context and rubric while replacing its artifact/transcript delivery
+/// section with the live `boss propose review-report` contract.
+pub fn render_batch_reviewer_initial_prompt(
+    task_name: &str,
+    task_description: &str,
+    destination: &ReviewerReportDestination,
+    scope: ReviewScope,
+    ctx: Option<&PrReviewContext>,
+    repo_slug: &str,
+) -> String {
+    let legacy = render_reviewer_initial_prompt(
+        task_name,
+        task_description,
+        &destination.pr_url,
+        &destination.body_path,
+        scope,
+        ctx,
+        repo_slug,
+    );
+    let (prefix, _) = legacy
+        .split_once("## Required output — CRITICAL")
+        .expect("reviewer prompt contains its output section");
+    let prefix = prefix.replace("ReviewResult", "review report");
+    format!(
+        "{prefix}## Required output — CRITICAL\n\
+         \n\
+         You must submit exactly one structured review report while this session is alive.\n\
+         \n\
+         1. Write the JSON object below to this exact engine-owned body file:\n\
+         \n\
+         `{body_path}`\n\
+         \n\
+         2. Submit it immediately with:\n\
+         \n\
+         ```sh\n\
+         boss propose review-report --batch-id {batch_id} --target-sha {target_sha} --body-file \"{body_path}\"\n\
+         ```\n\
+         \n\
+         The command validates the report immediately. If it rejects the file, correct the\n\
+         reported field errors and submit again before ending your turn. Do not put the JSON\n\
+         in your final response: transcript recovery is intentionally unavailable for batch\n\
+         reviews. The one body-file write and this local `boss propose` call are permitted;\n\
+         do not edit repository files or publish anything.\n\
+         \n\
+         This is static analysis only. Do not run builds, tests, formatters, generators, or\n\
+         executable code. When a finding would need execution to establish conclusively, set\n\
+         `needs_runtime_verification` to `true`.\n\
+         \n\
+         Schema:\n\
+         \n\
+         ```jsonc\n\
+         {{\n\
+           \"batch_id\": \"{batch_id}\",\n\
+           \"pr_url\": \"{pr_url}\",\n\
+           \"target_sha\": \"{target_sha}\",\n\
+           \"phase\": \"{phase}\",\n\
+           \"summary\": \"<one-paragraph overall assessment>\",\n\
+           \"coverage\": {{\n\
+             \"files_inspected\": [\"path/to/file.rs\"],\n\
+             \"files_omitted\": [],\n\
+             \"limitations\": [\"<static-analysis limitation, if any>\"]\n\
+           }},\n\
+           \"findings\": [\n\
+             {{\n\
+               \"severity\": \"critical | high | medium | low\",\n\
+               \"category\": \"correctness | regression | architecture | readability | tests | edgecase | duplication | deferred_scope | agent_isms\",\n\
+               \"confidence\": \"high | medium | low\",\n\
+               \"file\": \"path/to/file.rs\",\n\
+               \"location\": \"fn foo, ~L42\",\n\
+               \"title\": \"<short scannable title>\",\n\
+               \"problem\": \"<concrete defect>\",\n\
+               \"impact\": \"<why the defect matters>\",\n\
+               \"suggested_fix\": \"<specific repair>\",\n\
+               \"static_evidence\": \"<file and code-path evidence>\",\n\
+               \"needs_runtime_verification\": false\n\
+             }}\n\
+           ]\n\
+         }}\n\
+         ```\n\
+         \n\
+         `findings` may be empty. Omit `location` when it does not apply. Report evidence;\n\
+         do not include a `revision_warranted` field and do not decide the final verdict.\n",
+        batch_id = destination.batch_id,
+        pr_url = destination.pr_url,
+        target_sha = destination.target_sha,
+        phase = destination.phase.as_str(),
+        body_path = destination.body_path,
     )
 }
 
@@ -834,6 +975,48 @@ fn render_rubric_section(scope: &ReviewScope) -> String {
 mod tests {
     use crate::*;
 
+    /// The reviewer rules file is handed to every reviewer regardless of
+    /// which delivery contract its task prompt actually uses (legacy
+    /// artifact/transcript, or review-batch `boss propose review-report`),
+    /// so it must authorise whichever one the task prompt names rather than
+    /// naming only the legacy `ReviewResult` write as "the one permitted
+    /// write" — see `render_reviewer_claude_md`'s doc comment.
+    #[test]
+    fn reviewer_claude_md_authorizes_both_report_delivery_contracts() {
+        let rendered = render_reviewer_claude_md("lease-1", "/tmp/ws", "", "");
+        assert!(
+            rendered.contains("ReviewResult"),
+            "reviewer CLAUDE.md must still authorise the legacy ReviewResult artifact write"
+        );
+        assert!(
+            rendered.contains("boss propose review-report"),
+            "reviewer CLAUDE.md must authorise the review-batch boss propose call"
+        );
+        assert!(
+            !rendered.contains("**The one permitted write** is your `ReviewResult`"),
+            "reviewer CLAUDE.md must not categorically name ReviewResult as the only permitted write, \
+             which reads as forbidding the boss propose delivery a batch member's task prompt requires"
+        );
+    }
+
+    #[test]
+    fn reviewer_claude_md_names_the_workspace_for_jj_navigation() {
+        // The reviewer's sandbox cwd is relocated away from the checkout
+        // (Codex's `--cd` points at engine scratch, see
+        // `reviewer_output_sandbox_extra_args` in the codex driver), so a
+        // bare `jj log` would resolve against the wrong workspace. The rules
+        // file must tell the reviewer to name the checkout explicitly.
+        let rendered = render_reviewer_claude_md("lease-1", "/tmp/ws-for-jj", "", "");
+        assert!(
+            rendered.contains("jj log -R /tmp/ws-for-jj"),
+            "reviewer CLAUDE.md must instruct `jj log -R <workspace>`: {rendered}"
+        );
+        assert!(
+            !rendered.contains("- `jj log`"),
+            "reviewer CLAUDE.md must not offer a bare `jj log` as a recommended navigation command: {rendered}"
+        );
+    }
+
     #[test]
     fn reviewer_initial_prompt_contains_rubric_and_pr_url() {
         let prompt = render_reviewer_initial_prompt(
@@ -873,6 +1056,29 @@ mod tests {
             prompt.contains("design-doc citation"),
             "supersession check must demand a design-doc citation",
         );
+    }
+
+    #[test]
+    fn batch_reviewer_prompt_submits_body_file_in_run() {
+        let destination = ReviewerReportDestination::builder()
+            .batch_id("rvb_1")
+            .pr_url("https://github.com/org/repo/pull/1")
+            .target_sha("head_1")
+            .phase(boss_protocol::ReviewBatchPhase::PreMerge)
+            .body_path("/tmp/boss-worker-output/exec_1.review-result.json")
+            .build();
+        let prompt = render_batch_reviewer_initial_prompt(
+            "Review change",
+            "Inspect the implementation.",
+            &destination,
+            ReviewScope::Code,
+            None,
+            "org/repo",
+        );
+        assert!(prompt.contains("boss propose review-report --batch-id rvb_1 --target-sha head_1 --body-file"));
+        assert!(prompt.contains("needs_runtime_verification"));
+        assert!(prompt.contains("transcript recovery is intentionally unavailable"));
+        assert!(!prompt.contains("revision_warranted\": true"));
     }
 
     #[test]

@@ -806,6 +806,7 @@ fn settings_value(
             },
             is_revision,
             is_standard_worker: input.worker_kind == WorkerKind::Standard,
+            is_reviewer: input.worker_kind == WorkerKind::Reviewer,
             run_id: Some(input.run_id.clone()),
             workspace_path: Some(input.workspace_path.clone()),
         });
@@ -1752,6 +1753,7 @@ def main():
         try:
             lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
             lexer.whitespace_split = True
+            lexer.commenters = ""
             tokens = list(lexer)
         except Exception:
             tokens = command.split()

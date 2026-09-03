@@ -186,7 +186,10 @@ def command_groups(command):
     groups = []
     for line in command.split("\n"):
         try:
-            tokens = shlex.split(line, posix=True)
+            lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|")
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            tokens = list(lexer)
         except Exception:
             tokens = line.split()
         current = []
@@ -432,6 +435,17 @@ mod tests {
     #[test]
     fn blocks_stdin_channel_hidden_behind_a_wrapper_or_later_group() {
         for command in ["nohup bash", "FOO=1 sh -s", "echo hi && bash", "timeout 30 python3"] {
+            let (decision, _) = bash(command);
+            assert_eq!(decision, "block", "{command:?} must still be caught");
+        }
+    }
+
+    #[test]
+    fn blocks_stdin_channel_after_an_unspaced_operator() {
+        // An operator glued to the preceding word (no surrounding
+        // whitespace) must still split the group, so the interactive
+        // program after it is seen instead of being fused into one token.
+        for command in ["echo hi&&bash", "echo hi;python3", "echo a#b && bash"] {
             let (decision, _) = bash(command);
             assert_eq!(decision, "block", "{command:?} must still be caught");
         }

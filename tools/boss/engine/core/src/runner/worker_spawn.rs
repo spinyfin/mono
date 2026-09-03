@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use anyhow::Context as _;
 use boss_engine_gh_invocation::gh_output;
 use boss_gh_telemetry::{callers, scope as gh_scope};
 
@@ -658,15 +659,75 @@ pub(crate) async fn compose_worker_spawn(
             };
             let reviewer_repo_slug = crate::completion::parse_repo_slug(&execution.repo_remote_url)
                 .unwrap_or_else(|_| "<owner/repo>".to_owned());
-            crate::pr_review::render_reviewer_initial_prompt(
-                task_name,
-                task_description,
-                pr_url,
-                &crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::ReviewResult),
-                scope,
-                pr_review_context.as_ref(),
-                &reviewer_repo_slug,
-            )
+            // A member row existing is the same signal `finalize_pr_review_pass`
+            // uses to take the batch branch unconditionally (it never falls
+            // back to reading the legacy artifact once a member row exists).
+            // So once we observe a member row here, the batch destination is
+            // the ONLY delivery channel the finalizer will ever read for this
+            // execution: falling back to the legacy prompt in that case would
+            // render a prompt whose artifact/transcript delivery instructions
+            // the finalizer is guaranteed to ignore, silently discarding a
+            // review the worker actually completed. Fail the dispatch instead
+            // so the execution surfaces as a real failure rather than a
+            // reviewer that appears to succeed but whose report vanishes.
+            let report_destination = match work_db.review_batch_member_for_execution(&execution.id) {
+                Ok(Some(member)) => match work_db.review_batch(&member.batch_id) {
+                    Ok(Some(batch)) => Some(
+                        crate::pr_review::ReviewerReportDestination::builder()
+                            .batch_id(batch.id)
+                            .pr_url(batch.pr_url)
+                            .target_sha(batch.target_sha)
+                            .phase(batch.phase)
+                            .body_path(crate::structured_output::default_path_string(
+                                &execution.id,
+                                StructuredOutputKind::ReviewResult,
+                            ))
+                            .build(),
+                    ),
+                    Ok(None) => {
+                        anyhow::bail!(
+                            "pr_review execution {} has review-batch member for batch {} but the batch row is \
+                             missing; refusing to dispatch with the legacy prompt, which finalize_pr_review_pass \
+                             would never read",
+                            execution.id,
+                            member.batch_id,
+                        );
+                    }
+                    Err(err) => {
+                        return Err(err).context(format!(
+                            "loading review batch {} for execution {} member row; refusing to dispatch with the \
+                             legacy prompt, which finalize_pr_review_pass would never read",
+                            member.batch_id, execution.id,
+                        ));
+                    }
+                },
+                Ok(None) => None,
+                Err(err) => {
+                    return Err(err).context(format!(
+                        "determining whether reviewer execution {} belongs to a review batch",
+                        execution.id,
+                    ));
+                }
+            };
+            match report_destination.as_ref() {
+                Some(destination) => crate::pr_review::render_batch_reviewer_initial_prompt(
+                    task_name,
+                    task_description,
+                    destination,
+                    scope,
+                    pr_review_context.as_ref(),
+                    &reviewer_repo_slug,
+                ),
+                None => crate::pr_review::render_reviewer_initial_prompt(
+                    task_name,
+                    task_description,
+                    pr_url,
+                    &crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::ReviewResult),
+                    scope,
+                    pr_review_context.as_ref(),
+                    &reviewer_repo_slug,
+                ),
+            }
         }
     } else if execution.kind == ExecutionKind::AnswerAgent {
         // P3b: an `answer_agent` execution renders the answer-agent prompt

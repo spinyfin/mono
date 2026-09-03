@@ -93,9 +93,10 @@ pub struct PermissionInput {
     /// `false` (the flag's default), Codex's Standard/Triage/AnswerAgent
     /// workers get `--sandbox danger-full-access` instead of the OS-enforced
     /// `workspace-write` seatbelt, matching the Claude driver's no-OS-sandbox
-    /// posture (see `codex::codex_sandbox_for_worker_kind`). Reviewer always
-    /// stays `--sandbox read-only` regardless of this value. Ignored by every
-    /// other driver.
+    /// posture (see `codex::codex_sandbox_for_worker_kind`). Reviewer uses a
+    /// workspace-write sandbox rooted at engine-owned structured output so it
+    /// can submit its report without gaining checkout write access. Ignored by
+    /// every other driver.
     #[builder(default)]
     pub codex_sandbox_enforced: bool,
 }
@@ -133,8 +134,8 @@ pub struct PermissionArtifacts {
 /// Permission args win over defaults already present on the command: each
 /// flag in `extra_args` that already appears in `command` is stripped (with
 /// its value when the next extra_arg is not a flag) and then re-inserted so
-/// Codex's default `--sandbox workspace-write` is replaced by Reviewer's
-/// `--sandbox read-only` rather than duplicated.
+/// Codex's default `--sandbox workspace-write` is replaced or augmented by
+/// the worker policy rather than duplicated.
 ///
 /// Args are shell-quoted for safe insertion into the pane command string.
 /// Empty `extra_args` leaves `command` unchanged (Claude path).
@@ -1400,6 +1401,10 @@ pub struct ToolUseInterceptionConfig {
     /// PR-redirect guard and the checkleft push guard because their deny rules
     /// already block push operations.
     pub is_standard_worker: bool,
+    /// Whether this is a static-analysis reviewer. All drivers add the same
+    /// command guard for these sessions, preventing builds, tests, formatters,
+    /// generators, and execution of checked-out code.
+    pub is_reviewer: bool,
     /// Execution / run id — used by Codex to locate the Boss-owned per-run
     /// `CODEX_HOME` when arming hooks. Claude ignores this.
     pub run_id: Option<String>,

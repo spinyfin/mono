@@ -46,3 +46,73 @@ async fn pr_review_give_up_stays_doing_and_is_owned_by_review_recovery() {
             .any(|candidate| candidate.work_item_id == chore_id && candidate.execution_id == pr_review_exec_id)
     );
 }
+
+#[tokio::test]
+async fn batch_reviewer_without_report_fails_member_without_transcript_recovery() {
+    use boss_protocol::{
+        ReviewBatchMemberRole, ReviewBatchMemberStatus, ReviewBatchPhase, ReviewClassification, ReviewLanguageBucket,
+        ReviewProfile,
+    };
+
+    let workspace = tempdir().unwrap();
+    let pr_url = "https://github.com/spinyfin/mono/pull/88";
+    let legacy_json = clean_review_result_json(pr_url);
+    let (_dir, db, _product_id, chore_id, execution_id, _) =
+        pr_review_exec_fixture(workspace.path(), Some(&legacy_json));
+    let task_status_before = match db.get_work_item(&chore_id).unwrap() {
+        WorkItem::Chore(task) | WorkItem::Task(task) => task.status,
+        other => panic!("expected task/chore, got {other:?}"),
+    };
+    let classification = ReviewClassification::builder()
+        .changed_files(vec!["src/lib.rs".to_owned()])
+        .complexity_flags(vec![])
+        .has_production_code(true)
+        .metadata_missing(vec![])
+        .production_languages(vec![ReviewLanguageBucket::Rust])
+        .profile(ReviewProfile::Light)
+        .subsystem_buckets(vec!["src".to_owned()])
+        .build();
+    let (batch, members) = db
+        .create_review_batch(
+            crate::work::ReviewBatchCreateInput::builder()
+                .cycle_root_id(chore_id.clone())
+                .base_sha("base-sha")
+                .classification(classification)
+                .phase(ReviewBatchPhase::PreMerge)
+                .pr_number(88)
+                .pr_url(pr_url)
+                .target_sha("head-sha")
+                .build(),
+            &[crate::work::ReviewBatchMemberCreateInput::builder()
+                .attempt(1)
+                .provider_effort("medium")
+                .requested_driver("claude")
+                .resolved_model("test-model")
+                .role(ReviewBatchMemberRole::ClaudeReviewer)
+                .status(ReviewBatchMemberStatus::Pending)
+                .execution_id(execution_id.clone())
+                .build()],
+        )
+        .unwrap();
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None)).handler;
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(matches!(outcome, StopOutcome::ReviewPassCompleted { .. }));
+
+    let stored = db.review_batch_members(&batch.id).unwrap();
+    assert_eq!(stored[0].id, members[0].id);
+    assert_eq!(stored[0].status, ReviewBatchMemberStatus::Failed);
+    assert!(stored[0].terminal_at.is_some());
+    assert!(
+        db.review_verdict_for_execution(&execution_id).unwrap().is_none(),
+        "a batch member must not enter the legacy artifact/transcript finalizer",
+    );
+    let task_status_after = match db.get_work_item(&chore_id).unwrap() {
+        WorkItem::Chore(task) | WorkItem::Task(task) => task.status,
+        other => panic!("expected task/chore, got {other:?}"),
+    };
+    assert_eq!(
+        task_status_after, task_status_before,
+        "batch leaf must not advance the task itself"
+    );
+}

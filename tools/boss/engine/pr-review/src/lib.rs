@@ -1,5 +1,5 @@
-//! Reviewer worker: initial-prompt rendering and `ReviewResult` structured
-//! output for the automated reviewer pass that runs on agent-authored PRs.
+//! Reviewer worker: initial-prompt rendering and structured output for the
+//! automated reviewer pass that runs on agent-authored PRs.
 //!
 //! # Role
 //!
@@ -19,15 +19,12 @@
 //!
 //! # Output contract
 //!
-//! The reviewer **writes** exactly one `ReviewResult` JSON object to the
-//! engine-owned artifact path it is handed. The
-//! completion handler reads + schema-validates that file at the Stop
-//! boundary. As a **transitional fallback** (and to keep remote/SSH reviewers
-//! working until the artifact is fetched cross-host), the reviewer also ends
-//! its final message with the same JSON in a fenced ` ```json ` block, which
-//! the legacy [`extract_review_result`] scraper reads when the file is
-//! absent. The `ReviewResult` is the sole deliverable; the reviewer must not
-//! emit any other action.
+//! A batch reviewer writes its `ReviewerReport` JSON to an engine-owned file,
+//! then submits that file through `boss propose review-report`. The engine
+//! validates and accepts the proposal while the reviewer remains alive; Stop
+//! completion reads proposal state rather than scraping a transcript. Legacy
+//! single-reviewer executions retain `ReviewResult` until batch dispatch has
+//! replaced that rollout path.
 //!
 //! # Crate boundary
 //!
@@ -48,10 +45,10 @@ pub use parsing::{
     extract_review_result_verbose, passes_severity_gate, review_result_from_candidates,
 };
 pub use render::{
-    ReviewOrigin, render_reviewer_claude_md, render_reviewer_initial_prompt, render_revision_instructions,
-    render_revision_title,
+    ReviewOrigin, ReviewerReportDestination, render_batch_reviewer_initial_prompt, render_reviewer_claude_md,
+    render_reviewer_initial_prompt, render_revision_instructions, render_revision_title,
 };
 pub use types::{
-    PrReviewContext, RegressionCheck, ReviewFinding, ReviewFindingCategory, ReviewFindingConfidence,
-    ReviewFindingSeverity, ReviewResult, ReviewScope,
+    PrReviewContext, RegressionCheck, ReviewCoverage, ReviewFinding, ReviewFindingCategory, ReviewFindingConfidence,
+    ReviewFindingSeverity, ReviewResult, ReviewScope, ReviewerReport, ReviewerReportFinding,
 };

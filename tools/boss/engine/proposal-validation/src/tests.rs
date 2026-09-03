@@ -57,8 +57,16 @@ fn valid_payload_for(kind: ProposalKind) -> Value {
         ProposalKind::PrCreated => json!({"pr_url": "https://github.com/o/r/pull/123"}),
         ProposalKind::ReviewReport => json!({
             "batch_id": "rvb_123",
-            "member_id": "rvm_123",
-            "report": {"findings": []},
+            "target_sha": "head_123",
+            "report": {
+                "batch_id": "rvb_123",
+                "pr_url": "https://github.com/o/r/pull/123",
+                "target_sha": "head_123",
+                "phase": "pre_merge",
+                "summary": "Clean.",
+                "coverage": {"files_inspected": [], "files_omitted": [], "limitations": []},
+                "findings": [],
+            },
         }),
         ProposalKind::ReviewVerdict => json!({
             "batch_id": "rvb_123",
@@ -116,7 +124,8 @@ fn canonical_payloads_deserialize_as_their_payload_struct() {
     );
     let parsed: ReviewReportProposalPayload = serde_json::from_str(&canonical).unwrap();
     assert_eq!(parsed.batch_id, "rvb_123");
-    assert_eq!(parsed.report, json!({"findings": []}));
+    assert_eq!(parsed.target_sha, "head_123");
+    assert_eq!(parsed.report["batch_id"], "rvb_123");
 
     let canonical = ok(
         ProposalKind::ReviewVerdict,
@@ -131,7 +140,7 @@ fn canonical_payloads_deserialize_as_their_payload_struct() {
 fn review_payloads_require_structured_objects() {
     let errors = errs(
         ProposalKind::ReviewReport,
-        json!({"batch_id": "rvb_123", "member_id": "rvm_123", "report": "not-json"}),
+        json!({"batch_id": "rvb_123", "target_sha": "head_123", "report": "not-json"}),
     );
     assert!(message_for(&errors, "report").contains("expected a JSON object"));
 

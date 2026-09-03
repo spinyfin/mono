@@ -473,6 +473,22 @@ impl WorkerCompletionHandler {
     /// In either case the reviewer execution is completed and its workspace
     /// released — it is always terminal after this handler runs.
     pub(super) async fn finalize_pr_review_pass(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
+        // A persisted batch member uses proposal delivery exclusively. Do
+        // this before reading any artifact or transcript so a batch leaf can
+        // never fall through to the legacy single-reviewer materializer.
+        match self.work_db.review_batch_member_for_execution(&execution.id) {
+            Ok(Some(member)) => return self.finalize_review_batch_member(execution, member).await,
+            Ok(None) => {}
+            Err(err) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "pr_review finalize: could not determine batch membership",
+                );
+                return StopOutcome::DbError;
+            }
+        }
+
         // Captured before `record_worker_pr_completion` below nulls
         // `workspace_path` in the same transaction that terminalizes this
         // execution — this path terminalizes a parked-live execution, so it
@@ -626,17 +642,9 @@ impl WorkerCompletionHandler {
                     // rewriting the entire JSON.
                     //
                     // Driver-agnostic on purpose: the probe must not name a driver-specific
-                    // tool, and must not assume the artifact path is writable. A
-                    // `WorkerKind::Reviewer` Codex worker runs under `--sandbox read-only`
-                    // (`codex_sandbox_for_worker_kind`), which denies writes to every path
-                    // including the engine-owned artifact path outside the workspace;
-                    // `--add-dir` is itself rejected under `read-only` ("Switch to
-                    // workspace-write or danger-full-access to allow them"), so there is no
-                    // writable-root carve-out to grant. The probe therefore offers the
-                    // fenced-JSON-in-final-message channel that the primary prompt already
-                    // names as a fallback (`pr-review/src/render.rs`'s "Also (fallback)"
-                    // section) — `CodexDriver::structured_output_fallback` recovers that
-                    // fenced JSON on the next finalize pass (`driver/src/codex.rs`).
+                    // tool or assume that a previous file operation succeeded. Batch review
+                    // members bypass this fallback entirely and fail explicitly when their
+                    // proposal is absent.
                     let probe = if let Some(ref parse_err) = parse_error {
                         format!(
                             "Your review did not produce a valid ReviewResult. The JSON was \
@@ -1053,6 +1061,106 @@ impl WorkerCompletionHandler {
             "pr_review pass finalised; producing task advanced to in_review",
         );
         StopOutcome::ReviewPassCompleted { pr_url }
+    }
+
+    /// Finalise a review-batch leaf without consulting its artifact or
+    /// transcript. A submitted report was already schema-validated and linked
+    /// to the member by the synchronous proposal applier; no submission is an
+    /// explicit member failure the batch recovery flow can retry by role.
+    async fn finalize_review_batch_member(
+        &self,
+        execution: &crate::work::WorkExecution,
+        member: crate::work::ReviewBatchMember,
+    ) -> StopOutcome {
+        let batch = match self.work_db.review_batch(&member.batch_id) {
+            Ok(Some(batch)) => batch,
+            Ok(None) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    batch_id = %member.batch_id,
+                    "pr_review batch member has no persisted batch",
+                );
+                return StopOutcome::DbError;
+            }
+            Err(err) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    batch_id = %member.batch_id,
+                    ?err,
+                    "pr_review finalize: could not load batch",
+                );
+                return StopOutcome::DbError;
+            }
+        };
+
+        let result_summary = match member.status {
+            boss_protocol::ReviewBatchMemberStatus::Reported => "review report submitted",
+            boss_protocol::ReviewBatchMemberStatus::Pending | boss_protocol::ReviewBatchMemberStatus::Running => {
+                match self.work_db.fail_review_batch_member_for_execution(&execution.id) {
+                    Ok(true) => {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            member_id = %member.id,
+                            batch_id = %member.batch_id,
+                            "reviewer stopped without submitting review-report proposal; member marked failed",
+                        );
+                        "review report proposal missing; member failed"
+                    }
+                    Ok(false) => "review batch member was already terminal",
+                    Err(err) => {
+                        tracing::error!(
+                            execution_id = %execution.id,
+                            member_id = %member.id,
+                            ?err,
+                            "pr_review finalize: could not mark missing proposal as member failure",
+                        );
+                        return StopOutcome::DbError;
+                    }
+                }
+            }
+            boss_protocol::ReviewBatchMemberStatus::Failed => "review batch member already failed",
+        };
+
+        // The report body is only a shell-safe input file for `boss propose`.
+        // Once the proposal is accepted (or the member is failed), retaining a
+        // local copy must not create a second, artifact-based completion path.
+        crate::structured_output::clear_all(&self.structured_output_dir, &execution.id);
+
+        let lease_id = execution.cube_lease_id.clone();
+        let workspace_path = execution.workspace_path.clone();
+        let teardown = self.begin_teardown(&execution.id);
+        match self
+            .work_db
+            .complete_pane_parked_execution(&execution.id, "completed", Some(result_summary))
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => return StopOutcome::AlreadyTerminal,
+            Err(err) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "pr_review finalize: could not complete batch member execution",
+                );
+                return StopOutcome::DbError;
+            }
+        }
+        self.finish_worker_teardown(
+            &execution.id,
+            lease_id.as_deref(),
+            workspace_path.as_deref().map(std::path::Path::new),
+            "pr_review_batch_member",
+            teardown,
+        )
+        .await;
+        self.publisher
+            .publish(
+                &execution.id,
+                &execution.work_item_id,
+                "completed",
+                "pr_review_batch_member",
+            )
+            .await;
+        StopOutcome::ReviewPassCompleted { pr_url: batch.pr_url }
     }
 
     /// incident-002 postmortem: compute the rationale-independent both-parents deletion

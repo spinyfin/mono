@@ -310,6 +310,34 @@ fn launch_guard_still_blocks_direct_boss_app_binary_via_traversal() {
     }
 }
 
+/// The tokenizer this guard shares with the other command-splitting guards
+/// (`shell_command_tokenizer_fragment!`) must still close the two bypasses
+/// the previous per-guard `shlex.split` tokenizer was rewritten to close:
+/// an operator written with no surrounding spaces (`shlex.split` treats
+/// `x&&bossctl stop` as a single opaque token) and a `#` inside a word
+/// (the old `shlex.shlex` default `commenters='#'` silently truncated the
+/// rest of the line at it). Both must still block after the rewrite, and
+/// an operator-adjacent `#` that is unambiguously a comment-marker inside a
+/// legitimate argument (a commit `--grep` value) must still approve, so the
+/// `commenters=''` change cannot regress into over-blocking ordinary
+/// arguments that merely contain a `#`.
+#[test]
+fn launch_guard_blocks_unspaced_and_commented_chains() {
+    for command in [
+        "x&&bossctl stop",
+        "x&&open -a Boss",
+        "echo hi&&open -a Boss",
+        "echo a#b && bossctl stop",
+    ] {
+        assert_eq!(launch_decision(command), "block", "must block: {command}");
+    }
+    assert_eq!(
+        launch_decision("git log --grep=x#123"),
+        "approve",
+        "a `#` inside an ordinary argument must not be treated as a comment or otherwise misparsed"
+    );
+}
+
 /// The reason has to hand the worker the supported commands; a refusal
 /// with no alternative produces a worker that finds its own.
 #[test]

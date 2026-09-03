@@ -57,14 +57,16 @@ fn submit_review_report(
     execution_id: &str,
     work_item_id: &str,
     batch_id: &str,
-    member_id: &str,
+    target_sha: &str,
     idempotency_key: &str,
 ) -> SubmitWorkerProposalOutcome {
     db.submit_worker_proposal(SubmitWorkerProposalInput {
         execution_id,
         work_item_id,
         kind: ProposalKind::ReviewReport,
-        payload_json: &format!(r#"{{"batch_id":"{batch_id}","member_id":"{member_id}","report":{{"findings":[]}}}}"#),
+        payload_json: &format!(
+            r#"{{"batch_id":"{batch_id}","target_sha":"{target_sha}","report":{{"batch_id":"{batch_id}","pr_url":"https://github.com/example/repo/pull/42","target_sha":"{target_sha}","phase":"pre_merge","summary":"Clean.","coverage":{{"files_inspected":[],"files_omitted":[],"limitations":[]}},"findings":[]}}}}"#
+        ),
         idempotency_key,
     })
     .unwrap()
@@ -264,7 +266,7 @@ fn review_report_is_accepted_only_into_its_own_batch_member() {
         .unwrap();
     let member = &members[0];
 
-    let outcome = submit_review_report(&db, &execution.id, &cycle_root.id, &batch.id, &member.id, "report-1");
+    let outcome = submit_review_report(&db, &execution.id, &cycle_root.id, &batch.id, "head-sha", "report-1");
 
     assert_eq!(outcome.proposal.state, ProposalState::Applied);
     assert_eq!(outcome.proposal.decided_by, Some(ProposalDecider::Policy));
@@ -318,25 +320,7 @@ fn review_report_rejections_preserve_batch_members() {
         .unwrap();
     let owned_member = &members[0];
 
-    let missing = submit_review_report(
-        &db,
-        &owner.id,
-        &cycle_root.id,
-        &batch.id,
-        "missing-member",
-        "missing-member",
-    );
-    assert_eq!(missing.proposal.state, ProposalState::Rejected);
-    assert_eq!(
-        missing.proposal.decision_reason.as_deref(),
-        Some("review batch member `missing-member` does not exist")
-    );
-    assert_member_unchanged(
-        &db.review_batch_members(&batch.id).unwrap()[0],
-        ReviewBatchMemberStatus::Pending,
-    );
-
-    let (other_batch, other_members) = db
+    let (other_batch, _) = db
         .create_review_batch(
             batch_input(cycle_root.id.clone(), "other-head-sha", ReviewBatchPhase::PreMerge),
             &[member(ReviewBatchMemberRole::GrokReviewer, Some(other.id.clone()))],
@@ -346,57 +330,38 @@ fn review_report_rejections_preserve_batch_members() {
         &db,
         &owner.id,
         &cycle_root.id,
-        &batch.id,
-        &other_members[0].id,
+        &other_batch.id,
+        "other-head-sha",
         "wrong-batch",
     );
     assert_eq!(wrong_batch.proposal.state, ProposalState::Rejected);
     assert_eq!(
         wrong_batch.proposal.decision_reason.as_deref(),
-        Some(
-            format!(
-                "review batch member `{}` belongs to batch `{}`, not `{}`",
-                other_members[0].id, other_batch.id, batch.id
-            )
-            .as_str()
-        )
+        Some(format!("this execution is not a member of review batch `{}`", other_batch.id).as_str())
     );
     assert_member_unchanged(
         &db.review_batch_members(&other_batch.id).unwrap()[0],
         ReviewBatchMemberStatus::Pending,
     );
 
-    let wrong_owner = submit_review_report(
-        &db,
-        &other.id,
-        &cycle_root.id,
-        &batch.id,
-        &owned_member.id,
-        "wrong-owner",
-    );
+    let wrong_owner = submit_review_report(&db, &other.id, &cycle_root.id, &batch.id, "head-sha", "wrong-owner");
     assert_eq!(wrong_owner.proposal.state, ProposalState::Rejected);
     assert_eq!(
         wrong_owner.proposal.decision_reason.as_deref(),
-        Some(
-            format!(
-                "review batch member `{}` is not owned by this execution",
-                owned_member.id
-            )
-            .as_str()
-        )
+        Some(format!("this execution is not a member of review batch `{}`", batch.id).as_str())
     );
     assert_member_unchanged(
         &db.review_batch_members(&batch.id).unwrap()[0],
         ReviewBatchMemberStatus::Pending,
     );
 
-    let accepted = submit_review_report(&db, &owner.id, &cycle_root.id, &batch.id, &owned_member.id, "accepted");
+    let accepted = submit_review_report(&db, &owner.id, &cycle_root.id, &batch.id, "head-sha", "accepted");
     let repeated = submit_review_report(
         &db,
         &owner.id,
         &cycle_root.id,
         &batch.id,
-        &owned_member.id,
+        "head-sha",
         "second-submission",
     );
     assert_eq!(repeated.proposal.state, ProposalState::Rejected);
@@ -438,7 +403,7 @@ fn review_report_rejections_preserve_batch_members() {
         &failed_owner.id,
         &cycle_root.id,
         &failed_batch.id,
-        &failed_members[0].id,
+        "failed-head-sha",
         "failed-member",
     );
     assert_eq!(failed.proposal.state, ProposalState::Rejected);
@@ -456,6 +421,42 @@ fn review_report_rejections_preserve_batch_members() {
         &db.review_batch_members(&failed_batch.id).unwrap()[0],
         ReviewBatchMemberStatus::Failed,
     );
+}
+
+#[test]
+fn missing_review_report_marks_only_its_member_failed() {
+    let db = WorkDb::open(temp_db_path("missing-review-report")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, members) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[
+                member(ReviewBatchMemberRole::ClaudeReviewer, Some(execution.id.clone())),
+                member(ReviewBatchMemberRole::CodexReviewer, None),
+            ],
+        )
+        .unwrap();
+
+    assert!(db.fail_review_batch_member_for_execution(&execution.id).unwrap());
+    assert!(!db.fail_review_batch_member_for_execution(&execution.id).unwrap());
+
+    let stored = db.review_batch_members(&batch.id).unwrap();
+    let failed = stored.iter().find(|member| member.id == members[0].id).unwrap();
+    let pending = stored.iter().find(|member| member.id == members[1].id).unwrap();
+    assert_eq!(failed.status, ReviewBatchMemberStatus::Failed);
+    assert!(failed.terminal_at.is_some());
+    assert_eq!(pending.status, ReviewBatchMemberStatus::Pending);
+    assert!(pending.terminal_at.is_none());
 }
 
 #[test]

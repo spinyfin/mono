@@ -315,11 +315,13 @@ fn tool_use_interception_config_fields_are_accessible() {
         checkleft_guard_script: Some(PathBuf::from("/tmp/boss-checkleft-push-guard.py")),
         is_revision: true,
         is_standard_worker: true,
+        is_reviewer: false,
         run_id: Some("run-1".into()),
         workspace_path: Some(PathBuf::from("/ws")),
     };
     assert!(config.is_revision);
     assert!(config.is_standard_worker);
+    assert!(!config.is_reviewer);
     assert_eq!(config.data_dir.unwrap(), PathBuf::from("/Library/Boss"));
     assert_eq!(config.run_id.as_deref(), Some("run-1"));
 }

@@ -719,6 +719,7 @@ name = "boss-engine-proposal-validation"
 version = "0.1.0"
 dependencies = [
  "boss-github",
+ "boss-pr-review",
  "boss-protocol",
  "serde",
  "serde_json",
