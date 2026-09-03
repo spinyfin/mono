@@ -1921,9 +1921,10 @@ async fn handle_trunk_queue_eviction(
 /// The eviction is a *symptom*: Trunk could not construct the merge because
 /// the PR itself no longer merges into the target branch. That is head-vs-base
 /// — the exact predicate `conflict_watch` tests on its own sweep — so the
-/// remediation already exists and is already correct (on T792/T793 it produced
-/// "Resolve merge conflict against main" four minutes after the bogus CI
-/// revision). Nothing here duplicates it; this only transfers ownership.
+/// remediation already exists and is already correct: on the incident this
+/// handler was written for, `conflict_watch` produced "Resolve merge conflict
+/// against main" four minutes after the bogus CI revision. Nothing here
+/// duplicates it; this only transfers ownership.
 ///
 /// The transfer has to be explicit rather than left to `conflict_watch`.
 /// `trunk_merge::needs_remediation` counts `last_trunk_state ∈ {failed,

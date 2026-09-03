@@ -2213,13 +2213,25 @@ pub(crate) async fn update_pr_poll_state(
             "section_order": QUEUED_NO_POSITION_SECTION_ORDER,
         })
         .to_string();
-        if let Err(err) = work_db.reassert_github_merge_queue_if_cleared(&candidate.work_item_id, &detail) {
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                ?err,
-                "merge poller: failed to re-assert GitHub merge-queue lane for a live intent",
-            );
+        match work_db.reassert_github_merge_queue_if_cleared(&candidate.work_item_id, &detail) {
+            Ok(true) => {
+                publisher
+                    .publish_work_item_changed(
+                        &candidate.product_id,
+                        &candidate.work_item_id,
+                        "merge_queue_lane_reasserted",
+                    )
+                    .await;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    ?err,
+                    "merge poller: failed to re-assert GitHub merge-queue lane for a live intent",
+                );
+            }
         }
     }
     let preserve_merge_queue_state = preserve_trunk_merge_queue_state || preserve_github_merge_queue_state;
@@ -2269,12 +2281,17 @@ pub(crate) async fn update_pr_poll_state(
     // Every Merging-lane transition is INFO in both directions. The normal
     // sweep-changed trace is DEBUG and is not emitted in production, so it
     // cannot diagnose a `Some → None` bounce that is visible on the board.
-    if outcome.prior_merge_queue_state.as_deref() != merge_queue_state {
+    let effective_merge_queue_state = if preserve_merge_queue_state {
+        outcome.prior_merge_queue_state.as_deref()
+    } else {
+        merge_queue_state
+    };
+    if outcome.prior_merge_queue_state.as_deref() != effective_merge_queue_state {
         tracing::info!(
             work_item_id = %candidate.work_item_id,
             pr_url = %candidate.pr_url,
             prior_merge_queue_state = outcome.prior_merge_queue_state.as_deref(),
-            new_merge_queue_state = merge_queue_state,
+            new_merge_queue_state = effective_merge_queue_state,
             in_merge_queue = probe.in_merge_queue,
             auto_merge_enabled = probe.auto_merge_enabled,
             ci_state,

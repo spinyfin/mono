@@ -1446,6 +1446,15 @@ async fn update_pr_poll_state_keeps_github_intent_queued_through_ci_fail_and_rec
         Some("queued"),
         "a still-live intent must re-assert queued after a prior destructive clear"
     );
+    assert!(
+        publisher
+            .events
+            .lock()
+            .await
+            .iter()
+            .any(|(_, item_id, reason)| item_id == &task && reason == "merge_queue_lane_reasserted"),
+        "re-asserting the Merging lane must notify the board"
+    );
 }
 
 /// Terminal PR observations for human-driven rows clear a stale Merging lane
