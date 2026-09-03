@@ -173,6 +173,10 @@ pub struct RemoteSpawnPlan {
     /// Shell statements rendering the resolved driver's environment
     /// directives, in order, before [`Self::driver_command`] runs.
     pub driver_env: String,
+    /// Designated structured-output payload kind for this run. The remote
+    /// wrapper resolves the actual path from its own temp directory and
+    /// exports it as `BOSS_STRUCTURED_OUTPUT` before starting the driver.
+    pub structured_output_kind: Option<String>,
 }
 
 /// Compose the remote command as an argv vector: an `env VAR=val …`
@@ -192,6 +196,9 @@ pub fn build_remote_command(plan: &RemoteSpawnPlan) -> Vec<String> {
     ];
     if let Some(url) = &plan.repo_remote_url {
         argv.push(format!("BOSS_REPO_REMOTE_URL={url}"));
+    }
+    if let Some(kind) = &plan.structured_output_kind {
+        argv.push(format!("BOSS_STRUCTURED_OUTPUT_KIND={kind}"));
     }
     argv.push(plan.wrapper_path.clone());
     argv
@@ -593,6 +600,7 @@ mod tests {
             driver_binary: "codex".into(),
             driver_command: "codex -m gpt-5.6-sol \"$(cat .codex/initial-prompt.txt)\"".into(),
             driver_env: "export CODEX_HOME='/tmp/codex'; ".into(),
+            structured_output_kind: Some("review-result".into()),
         };
         let argv = build_remote_command(&plan);
         assert_eq!(argv[0], "env");
@@ -607,6 +615,7 @@ mod tests {
                 .any(|arg| arg.starts_with("BOSS_DRIVER_ENV=export CODEX_HOME"))
         );
         assert!(argv.contains(&"BOSS_REPO_REMOTE_URL=git@example.com:me/mono.git".to_owned()));
+        assert!(argv.contains(&"BOSS_STRUCTURED_OUTPUT_KIND=review-result".to_owned()));
         // The wrapper path is always the final token.
         assert_eq!(argv.last().unwrap(), "~/.boss-remote/bin/boss-remote-run");
     }
@@ -623,9 +632,11 @@ mod tests {
             driver_binary: "claude".into(),
             driver_command: "claude --model opus \"$(cat .claude/initial-prompt.txt)\"".into(),
             driver_env: "unset ANTHROPIC_API_KEY; ".into(),
+            structured_output_kind: None,
         };
         let argv = build_remote_command(&plan);
         assert!(!argv.iter().any(|a| a.starts_with("BOSS_REPO_REMOTE_URL=")));
+        assert!(!argv.iter().any(|a| a.starts_with("BOSS_STRUCTURED_OUTPUT_KIND=")));
         // Driver is required — always present even when optionals are not.
         assert!(argv.contains(&"BOSS_DRIVER=claude".to_owned()));
     }
@@ -854,6 +865,7 @@ mod tests {
             driver_binary: "claude".into(),
             driver_command: "claude --model opus \"$(cat .claude/initial-prompt.txt)\"".into(),
             driver_env: "unset ANTHROPIC_API_KEY; ".into(),
+            structured_output_kind: Some("review-result".into()),
         }
     }
 

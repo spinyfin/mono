@@ -240,6 +240,77 @@ mod tests {
     }
 
     #[test]
+    fn wrapper_resolves_and_exports_structured_output_on_the_remote_host() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let bin_dir = temp.path().join("bin");
+        let remote_home = temp.path().join("remote-home");
+        let remote_tmp = temp.path().join("remote-tmp");
+        let output_capture = temp.path().join("output-path");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir(&bin_dir).unwrap();
+        std::fs::create_dir(&remote_home).unwrap();
+        std::fs::create_dir(&remote_tmp).unwrap();
+
+        let wrapper = temp.path().join("boss-remote-run");
+        std::fs::write(&wrapper, rendered_wrapper()).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for (name, body) in [
+            (
+                "claude",
+                "#!/bin/sh\nprintf '%s\\n' \"$BOSS_STRUCTURED_OUTPUT\" > \"$OUTPUT_CAPTURE\"\n",
+            ),
+            ("cube", "#!/bin/sh\nexit 0\n"),
+            ("gh", "#!/bin/sh\nexit 0\n"),
+            ("boss-event", "#!/bin/sh\nexit 0\n"),
+            ("nohup", "#!/bin/sh\nexec \"$@\"\n"),
+        ] {
+            let path = bin_dir.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let output = Command::new("/bin/sh")
+            .arg(&wrapper)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
+            .env("HOME", &remote_home)
+            .env("TMPDIR", &remote_tmp)
+            .env("OUTPUT_CAPTURE", &output_capture)
+            .env("BOSS_RUN_ID", "run-test")
+            .env("BOSS_EVENTS_SOCKET", "/tmp/boss-events-test.sock")
+            .env("BOSS_LEASE_ID", "lease-test")
+            .env("BOSS_WORKSPACE", &workspace)
+            .env("BOSS_DRIVER", "claude")
+            .env("BOSS_DRIVER_COMMAND", "claude")
+            .env("BOSS_DRIVER_ENV", ":")
+            .env("BOSS_STRUCTURED_OUTPUT_KIND", "review-result")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "wrapper stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for _ in 0..1_000 {
+            if output_capture.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let expected = remote_tmp.join("boss-worker-output/run-test.review-result.json");
+        assert_eq!(
+            std::fs::read_to_string(&output_capture).unwrap().trim(),
+            expected.to_str().unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(remote_home.join(".boss-remote/runs/run-test.structured-output-path"))
+                .unwrap()
+                .trim(),
+            expected.to_str().unwrap(),
+        );
+    }
+
+    #[test]
     fn wrapper_source_has_shebang() {
         // The remote ends up running the file directly via
         // `~/.boss-remote/bin/boss-remote-run`, so the shebang is

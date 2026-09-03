@@ -402,6 +402,36 @@ impl SshTransport {
         })
     }
 
+    /// Fetch a remote file over the existing ControlMaster. The caller owns
+    /// validation of `remote`; unlike [`Self::scp_push`], it commonly comes
+    /// from a remote-side descriptor and must be treated as data, not a shell
+    /// fragment.
+    pub async fn scp_pull(&self, remote: &str, local: &Path) -> Result<SshOutput> {
+        let mut cmd = Command::new("scp");
+        cmd.args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            &format!("ControlPath={}", self.control_socket.display()),
+            &format!("{}:{remote}", self.ssh_target),
+            local.to_string_lossy().as_ref(),
+        ]);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
+
+        let output = timeout(SCP_PUSH_TIMEOUT, cmd.output())
+            .await
+            .with_context(|| format!("scp pull timed out for host {} <- {remote}", self.host_id))?
+            .with_context(|| format!("scp pull io error for host {} <- {remote}", self.host_id))?;
+
+        Ok(SshOutput {
+            status: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
     /// Request a reverse Unix-socket forward over the existing master:
     /// connections to `remote_socket` on the remote are forwarded to
     /// `local_socket` on this (engine) host. Routed through

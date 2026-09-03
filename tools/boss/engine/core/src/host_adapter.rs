@@ -215,6 +215,19 @@ pub trait HostAdapter: Send + Sync {
     async fn read_worker_log_tail(&self, _workspace_path: &str, _max_bytes: u64) -> Result<Option<String>> {
         Ok(None)
     }
+
+    /// Collect a structured-output artifact produced on this host into the
+    /// engine-local destination. `Ok(false)` means the worker has not written
+    /// the artifact yet; transport, descriptor, or copy failures are errors
+    /// so a completed remote review cannot be mistaken for an empty one.
+    async fn collect_structured_output(
+        &self,
+        _execution_id: &str,
+        _kind: crate::structured_output::StructuredOutputKind,
+        _destination: &Path,
+    ) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 /// How much of a dead remote worker's `worker.log` to pull. The interesting
@@ -745,7 +758,7 @@ impl HostAdapter for SshHostAdapter {
         //    local one (same task framing, branch name, acceptance
         //    criterion, effort addendum, product preamble).
         let ComposedWorkerSpawn {
-            prompt_text,
+            mut prompt_text,
             spawn_config,
         } = compose_worker_spawn(
             &self.work_db,
@@ -782,6 +795,18 @@ impl HostAdapter for SshHostAdapter {
                 .build(),
         )
         .await?;
+        // The shared composer runs on the engine and therefore embeds its own
+        // temp path in the review prompt. A remote worker cannot write there:
+        // the wrapper resolves a path under *its* temp root and exports it.
+        // Keep the prompt and environment in one contract by referring to the
+        // exported value instead of shipping a coordinator-local pathname.
+        let structured_output_kind = (execution.kind == boss_protocol::ExecutionKind::PrReview)
+            .then(|| crate::runner::designated_output_kind(execution, work_item))
+            .flatten();
+        if let Some(kind) = structured_output_kind {
+            let local_path = crate::structured_output::default_path_string(&run_id, kind);
+            prompt_text = prompt_text.replace(&local_path, "$BOSS_STRUCTURED_OUTPUT");
+        }
         // `compose_execution_prompt` decides the Bazel pre-push gate by
         // probing the LOCAL filesystem, which never matches a remote
         // workspace path — so probe the remote and append it ourselves.
@@ -891,6 +916,7 @@ impl HostAdapter for SshHostAdapter {
                     .map(crate::runner::pane_spawn::render_env_directive)
                     .collect::<String>(),
             )
+            .maybe_structured_output_kind(structured_output_kind.map(|kind| kind.slug().to_owned()))
             .build();
 
         let engine_socket = self.events_socket_path.display().to_string();
@@ -1014,6 +1040,74 @@ impl HostAdapter for SshHostAdapter {
         // look like proof of death).
         let alive = crate::ssh_spawn::probe_worker_liveness(&self.transport, remote_pid, 0).await?;
         Ok(Some(alive))
+    }
+
+    async fn collect_structured_output(
+        &self,
+        execution_id: &str,
+        kind: crate::structured_output::StructuredOutputKind,
+        destination: &Path,
+    ) -> Result<bool> {
+        let descriptor = format!("~/.boss-remote/runs/{execution_id}.structured-output-path");
+        let descriptor_out = self
+            .transport
+            .run_with_remote_paths(&["cat", &descriptor])
+            .await
+            .with_context(|| {
+                format!(
+                    "reading structured-output descriptor for execution {execution_id} on host {}",
+                    self.transport.host_id
+                )
+            })?;
+        if !descriptor_out.success() {
+            bail!(
+                "remote structured-output descriptor unavailable for execution {execution_id} on host {}: {}",
+                self.transport.host_id,
+                non_empty(&descriptor_out.stderr, descriptor_out.status)
+            );
+        }
+        let remote_path = descriptor_out.stdout.trim();
+        if !remote_path.starts_with('/') || remote_path.contains('\n') || remote_path.contains('\r') {
+            bail!(
+                "remote structured-output descriptor for execution {execution_id} on host {} contained an invalid path {:?}",
+                self.transport.host_id,
+                remote_path
+            );
+        }
+        if !remote_path.ends_with(&format!(".{}.json", kind.slug())) {
+            bail!(
+                "remote structured-output descriptor for execution {execution_id} on host {} named {remote_path:?}, not a {} artifact",
+                self.transport.host_id,
+                kind.slug(),
+            );
+        }
+        let exists = self.transport.run(&["test", "-f", remote_path]).await?;
+        if !exists.success() {
+            return Ok(false);
+        }
+        let parent = destination
+            .parent()
+            .context("structured-output destination has no parent")?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating local structured-output dir {}", parent.display()))?;
+        let temporary = destination.with_extension(format!("{}.pulling", kind.slug()));
+        let _ = std::fs::remove_file(&temporary);
+        let pull = self.transport.scp_pull(remote_path, &temporary).await?;
+        if !pull.success() {
+            let _ = std::fs::remove_file(&temporary);
+            bail!(
+                "remote structured-output collection failed for execution {execution_id} on host {} from {remote_path}: {}",
+                self.transport.host_id,
+                non_empty(&pull.stderr, pull.status)
+            );
+        }
+        std::fs::rename(&temporary, destination).with_context(|| {
+            format!(
+                "installing collected remote structured-output for execution {execution_id} at {}",
+                destination.display()
+            )
+        })?;
+        Ok(true)
     }
 }
 
