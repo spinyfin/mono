@@ -1925,6 +1925,23 @@ fn trunk_eviction_prompt_offers_a_terminal_when_no_failing_build_was_captured() 
         !prompt.contains("A Trunk queue eviction almost always means"),
         "the unconditional 'something landed on the target branch' claim must be gone:\n{prompt}",
     );
+    assert!(
+        !prompt.contains("There is no conflict on the head branch to resolve"),
+        "the engine cannot know there is no conflict from an empty failed_checks blob alone; \
+         asserting it as fact is what let a real conflict be dispatched as an unfixable CI failure:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("gh api repos/<owner>/<repo>/issues/77/comments"),
+        "the brief must point the worker at the Trunk bot's own comment to determine the cause:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("gh pr view 77 --json mergeable,mergeStateStatus"),
+        "the brief must point the worker at live GitHub mergeability, read fresh:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("jj workspace update-stale"),
+        "the brief must offer the offline jj conflict check:\n{prompt}",
+    );
 }
 
 /// The other arm: when the engine DID identify the failing construction

@@ -62,8 +62,9 @@ use boss_trunk_client::{
     TrunkPrLookup, TrunkPrRef, TrunkPrState, TrunkPullRequest, TrunkQueue, TrunkQueueState, TrunkRepoRef,
 };
 
+use crate::conflict_stop_gate::{self, ConflictClearance};
 use crate::coordinator::ExecutionPublisher;
-use crate::merge_poller::RequiredCheckFailure;
+use crate::merge_poller::{CommandMergeProbe, RequiredCheckFailure};
 use crate::metrics::Registry;
 use crate::trunk_merge::{TRUNK_INTENT_AWAITING_RESUBMIT, TRUNK_INTENT_SUPERSEDED_BY_CONFLICT, trunk_repo_ref};
 use crate::work::{ActiveTrunkMergeIntent, PendingMergeCheck, WorkDb};
@@ -1606,16 +1607,45 @@ fn classify_trunk_eviction_from_payload(
     None
 }
 
-/// Phrases in a `trunk-io[bot]` comment that positively assert Trunk gave up
-/// *before* testing. The first is the verbatim string Trunk posted on
-/// flunge#1136 and #1137 ("❌ This pull request could not start testing
-/// because there was a merge conflict."); "could not start testing" alone is
-/// already conclusive, since an entry that never started testing cannot have
-/// been evicted by a test result.
-const BOT_MERGE_FAILURE_MARKERS: [&str; 2] = ["could not start testing", "merge conflict"];
+/// What a `trunk-io[bot]` comment's prose says about why Trunk could not
+/// start testing. Trunk's own text distinguishes the two causes cleanly —
+/// a genuine head-vs-base conflict says "because there was a merge
+/// conflict"; a sibling-in-queue rejection names the colliding PR ("because
+/// it conflicted with #N. To resolve, wait for #N to merge, or rebase or
+/// stack on top of #N and resubmit."). Booleanizing that prose into "does
+/// this comment mention a merge failure at all" (the previous
+/// `BOT_MERGE_FAILURE_MARKERS` shape) is what let a vs-base conflict on
+/// flunge#1136/#1137 read as a fixable CI failure: the first marker to match
+/// ("could not start testing") won even though the same comment also
+/// contained the decisive "merge conflict" text, and neither carried its
+/// meaning forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BotCommentClass {
+    /// The comment names a real conflict against the target branch. This is
+    /// authoritative — Trunk read it straight off GitHub before ever
+    /// enqueuing the merge — so it routes to the conflict lane without
+    /// consulting mergeability at all.
+    VsBaseConflict,
+    /// The comment names a colliding sibling entry in the same batch. This
+    /// PR's own head is fine; the remedy is to wait for the sibling and
+    /// resubmit, which is exactly what minting the queue-rejection
+    /// revision (`TrunkEvictionCause::TestFailure`) does.
+    SiblingInQueue,
+    /// The comment asserts *some* pre-testing failure ("could not start
+    /// testing" / "merge conflict") without matching either specific
+    /// pattern above — a wording Trunk has not been observed to use, or a
+    /// future change to its prose. Not enough to route on its own; the
+    /// caller must consult GitHub's live mergeability.
+    Ambiguous,
+}
 
-/// Match a `trunk-io[bot]` comment body against [`BOT_MERGE_FAILURE_MARKERS`],
-/// returning the marker that fired.
+/// Generic fallback markers: a pre-testing failure is asserted, but the
+/// comment matches neither [`BotCommentClass::VsBaseConflict`] nor
+/// [`BotCommentClass::SiblingInQueue`]'s specific phrasing.
+const AMBIGUOUS_MERGE_FAILURE_MARKERS: [&str; 2] = ["could not start testing", "merge conflict"];
+
+/// Classify a `trunk-io[bot]` comment body's prose, returning `None` when it
+/// asserts no pre-testing failure at all.
 ///
 /// Comment text is the *corroborating* channel, never the sole input: it is
 /// consulted only after [`classify_trunk_eviction_from_payload`] came back
@@ -1627,19 +1657,29 @@ const BOT_MERGE_FAILURE_MARKERS: [&str; 2] = ["could not start testing", "merge 
 /// for, not to establish one from prose. It is needed because the structured
 /// channel is not guaranteed: Trunk may omit `readiness` on a terminal
 /// entry, and its `gitHubMergeability` snapshot is not episode-scoped.
-fn bot_comment_merge_failure_marker(body: &str) -> Option<&'static str> {
+fn classify_bot_comment(body: &str) -> Option<BotCommentClass> {
     let lowered = body.to_ascii_lowercase();
-    BOT_MERGE_FAILURE_MARKERS
-        .into_iter()
-        .find(|marker| lowered.contains(marker))
+    if lowered.contains("because there was a merge conflict") {
+        return Some(BotCommentClass::VsBaseConflict);
+    }
+    if lowered.contains("conflicted with #") {
+        return Some(BotCommentClass::SiblingInQueue);
+    }
+    if AMBIGUOUS_MERGE_FAILURE_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+    {
+        return Some(BotCommentClass::Ambiguous);
+    }
+    None
 }
 
 /// The `trunk-io[bot]` login, as it appears in `gh api` comment payloads.
 const TRUNK_BOT_LOGIN: &str = "trunk-io[bot]";
 
-/// The two external channels an eviction's cause is read from. Both leave the
-/// process, so they sit behind a trait: [`CliEvictionEvidence`] in production,
-/// a stub in tests.
+/// The external channels an eviction's cause is read from. All of them leave
+/// the process, so they sit behind a trait: [`CliEvictionEvidence`] in
+/// production, a stub in tests.
 #[async_trait]
 pub trait TrunkEvictionEvidence: Send + Sync {
     /// Failing jobs from the `trunk-merge/pr-<N>/*` construction build, if
@@ -1651,6 +1691,15 @@ pub trait TrunkEvictionEvidence: Send + Sync {
     /// The newest `trunk-io[bot]` comment body on the PR, which is where
     /// Trunk states the eviction reason in prose. `None` when unavailable.
     async fn newest_trunk_bot_comment(&self, repo: &str, pr_number: i64) -> Option<String>;
+
+    /// GitHub's own *live* mergeability for `pr_url` — never a cached
+    /// snapshot — retried past a transient `UNKNOWN`. See
+    /// [`crate::conflict_stop_gate::verify_mergeability_live`], which this
+    /// wraps: the same "never treat UNKNOWN as mergeable" discipline
+    /// `conflict_stop_gate` already enforces for the Stop-verification path
+    /// (mono#1531 / mono#1398 / mono#1764), reused here rather than
+    /// reimplemented so the two call sites can't diverge again.
+    async fn live_mergeability(&self, pr_url: &str) -> ConflictClearance;
 }
 
 /// Production evidence: shells out to `bk` and `gh`.
@@ -1660,7 +1709,7 @@ pub trait TrunkEvictionEvidence: Send + Sync {
 /// [`TrunkEvictionEvidence`] (same injection idea as
 /// `ci_watch::fetch_and_store_log_excerpt`'s [`crate::ci_log_reader::CiLogReaderFactory`]).
 /// The logic these methods wrap lives in pure, covered functions
-/// ([`newest_trunk_bot_comment`], [`bot_comment_merge_failure_marker`], and
+/// ([`newest_trunk_bot_comment`], [`classify_bot_comment`], and
 /// `boss_ci_log_reader`'s own parser); what is left here is argument
 /// assembly and error swallowing.
 pub struct CliEvictionEvidence;
@@ -1710,6 +1759,17 @@ impl TrunkEvictionEvidence for CliEvictionEvidence {
             return None;
         }
         newest_trunk_bot_comment(&output.stdout)
+    }
+
+    async fn live_mergeability(&self, pr_url: &str) -> ConflictClearance {
+        let prober = CommandMergeProbe::new();
+        conflict_stop_gate::verify_mergeability_live(
+            &prober,
+            pr_url,
+            conflict_stop_gate::DEFAULT_UNKNOWN_RETRY_BACKOFF,
+            None,
+        )
+        .await
     }
 }
 
@@ -1799,58 +1859,89 @@ async fn handle_trunk_queue_eviction(
         Some(cause) => cause,
         None => {
             // Bot comment is consulted only when Trunk's structured
-            // readiness did *not* report a vs-base conflict. "could not
-            // start testing" / "merge conflict" here is not itself
-            // decisive: it can mean a genuine vs-base conflict Trunk's
-            // readiness payload missed, or a sibling-in-queue rejection
-            // where GitHub still says MERGEABLE vs main. Below, GitHub's
-            // own last-known mergeability (not Trunk's readiness) decides
-            // between the conflict lane and minting a queue-rejection
-            // revision (TestFailure arm).
-            let bot_marker = evidence
+            // readiness did *not* report a vs-base conflict.
+            let bot_comment = evidence
                 .newest_trunk_bot_comment(&member.intent.repo, member.intent.pr_number)
-                .await
-                .as_deref()
-                .and_then(bot_comment_merge_failure_marker);
-            match bot_marker {
-                Some(marker) => {
-                    // Whether this is a real vs-base conflict (route to
-                    // conflict_watch) or a sibling-in-queue rejection (mint a
-                    // queue-rejection revision) turns on GitHub's own last-known
-                    // mergeability, not Trunk's readiness payload — the latter is
-                    // exactly the source that was incomplete in the incident this
-                    // classification exists to handle. `pr_mergeable_state` is
-                    // the merge poller's independently-observed GitHub state.
-                    let github_mergeable_state = ctx
-                        .work_db
-                        .get_pr_status_snapshot(&member.intent.work_item_id)
-                        .ok()
-                        .flatten()
-                        .and_then(|snapshot| snapshot.mergeable);
-                    if github_mergeable_state.as_deref() == Some("conflicting") {
-                        tracing::info!(
-                            work_item_id = %member.intent.work_item_id,
-                            pr_url = %member.intent.pr_url,
-                            marker,
-                            "trunk queue poller: bot comment names a merge failure and GitHub mergeability \
-                             is CONFLICTING; routing to the conflict lane",
-                        );
-                        TrunkEvictionCause::HeadConflict {
-                            evidence: format!(
-                                "trunk-io[bot] comment named a merge failure (\"{marker}\") and GitHub \
-                                 mergeability is CONFLICTING"
-                            ),
+                .await;
+            match bot_comment.as_deref().and_then(classify_bot_comment) {
+                // Trunk's own prose is authoritative here: it read GitHub
+                // directly before ever enqueuing the merge, so this routes
+                // to the conflict lane without consulting mergeability at
+                // all — no cached snapshot to go stale, no live probe to
+                // race.
+                Some(BotCommentClass::VsBaseConflict) => {
+                    tracing::info!(
+                        work_item_id = %member.intent.work_item_id,
+                        pr_url = %member.intent.pr_url,
+                        "trunk queue poller: bot comment names a vs-base merge conflict; routing to the \
+                         conflict lane without consulting mergeability",
+                    );
+                    TrunkEvictionCause::HeadConflict {
+                        evidence: "trunk-io[bot] comment named a merge conflict against the target branch".to_owned(),
+                    }
+                }
+                // Equally authoritative in the other direction: Trunk named
+                // a colliding sibling, so this PR's own head is fine.
+                Some(BotCommentClass::SiblingInQueue) => {
+                    tracing::info!(
+                        work_item_id = %member.intent.work_item_id,
+                        pr_url = %member.intent.pr_url,
+                        "trunk queue poller: bot comment names a sibling-in-queue collision; minting a \
+                         queue-rejection revision",
+                    );
+                    TrunkEvictionCause::TestFailure
+                }
+                // Neither specific phrasing matched, so the comment alone
+                // cannot decide this. Read GitHub's own *live* mergeability
+                // — never a locally cached snapshot, and never a bare
+                // `UNKNOWN` read as clean (`TrunkEvictionEvidence::
+                // live_mergeability` factors the same discipline
+                // `conflict_stop_gate` already enforces elsewhere).
+                Some(BotCommentClass::Ambiguous) => {
+                    match evidence.live_mergeability(&member.intent.pr_url).await {
+                        ConflictClearance::StillConflicting {
+                            raw_mergeable,
+                            raw_merge_state_status,
+                        } => {
+                            tracing::info!(
+                                work_item_id = %member.intent.work_item_id,
+                                pr_url = %member.intent.pr_url,
+                                raw_mergeable,
+                                raw_merge_state_status,
+                                "trunk queue poller: bot comment is ambiguous but live GitHub mergeability \
+                                 is CONFLICTING; routing to the conflict lane",
+                            );
+                            TrunkEvictionCause::HeadConflict {
+                                evidence: format!(
+                                    "trunk-io[bot] comment named a pre-testing failure and live GitHub \
+                                     mergeability is {raw_mergeable} ({raw_merge_state_status})"
+                                ),
+                            }
                         }
-                    } else {
-                        tracing::info!(
-                            work_item_id = %member.intent.work_item_id,
-                            pr_url = %member.intent.pr_url,
-                            marker,
-                            ?github_mergeable_state,
-                            "trunk queue poller: bot comment names a merge failure but GitHub mergeability \
-                             is not CONFLICTING (sibling-in-queue); minting a queue-rejection revision",
-                        );
-                        TrunkEvictionCause::TestFailure
+                        ConflictClearance::Cleared => {
+                            tracing::info!(
+                                work_item_id = %member.intent.work_item_id,
+                                pr_url = %member.intent.pr_url,
+                                "trunk queue poller: bot comment is ambiguous and live GitHub mergeability \
+                                 is clean (sibling-in-queue); minting a queue-rejection revision",
+                            );
+                            TrunkEvictionCause::TestFailure
+                        }
+                        ConflictClearance::Indeterminate | ConflictClearance::Unavailable => {
+                            // A read that never resolves is not evidence of
+                            // anything — least of all "safe to mint a CI
+                            // revision". Leave the intent active and
+                            // unclassified; the next sweep re-observes this
+                            // same terminal entry and retries from scratch
+                            // rather than guessing.
+                            tracing::error!(
+                                work_item_id = %member.intent.work_item_id,
+                                pr_url = %member.intent.pr_url,
+                                "trunk queue poller: bot comment is ambiguous and live GitHub mergeability \
+                                 never resolved; refusing to classify this sweep, will retry",
+                            );
+                            return;
+                        }
                     }
                 }
                 None => TrunkEvictionCause::TestFailure,
@@ -1868,6 +1959,42 @@ async fn handle_trunk_queue_eviction(
 
     match cause {
         TrunkEvictionCause::TestFailure => {
+            // Last-instant defense against the "bogus revision wins the
+            // race" pattern: only for a queue-rejection with no CI evidence
+            // (a real failing build is settled already and must not be
+            // overridden by an unrelated mergeability hiccup). One more live
+            // read, immediately before minting — if GitHub now says
+            // CONFLICTING, hand this off to the conflict lane instead of a
+            // "Investigate merge-queue rejection" revision that would repeat
+            // the incident this classifier exists to prevent. An
+            // indeterminate or unavailable read deliberately falls through
+            // to minting rather than stranding the eviction.
+            if failures.is_empty()
+                && let ConflictClearance::StillConflicting {
+                    raw_mergeable,
+                    raw_merge_state_status,
+                } = evidence.live_mergeability(&member.intent.pr_url).await
+            {
+                tracing::info!(
+                    work_item_id = %member.intent.work_item_id,
+                    pr_url = %member.intent.pr_url,
+                    raw_mergeable,
+                    raw_merge_state_status,
+                    "trunk queue poller: mint-time recheck found GitHub mergeability CONFLICTING; \
+                     routing to the conflict lane instead of minting a queue-rejection revision",
+                );
+                hand_eviction_to_conflict_lane(
+                    ctx,
+                    member,
+                    &format!(
+                        "mint-time mergeability recheck found GitHub mergeability {raw_mergeable} \
+                         ({raw_merge_state_status})"
+                    ),
+                    outcome,
+                )
+                .await;
+                return;
+            }
             let candidate = PendingMergeCheck {
                 work_item_id: member.intent.work_item_id.clone(),
                 product_id: member.product_id.clone(),

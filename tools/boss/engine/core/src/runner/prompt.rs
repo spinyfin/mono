@@ -15,7 +15,9 @@ use boss_protocol::{EditorialRules, ExecutionKind, TaskKind, TemplatePolicy};
 
 use super::work_item::{project_details, work_item_details, work_item_name, work_item_pr_url};
 
+mod ci_monitoring;
 mod design;
+use ci_monitoring::ci_monitoring_directive;
 use design::{compose_design_directive, compose_design_postmortem_directive};
 
 #[derive(bon::Builder)]
@@ -1413,51 +1415,6 @@ fn revision_no_op_completion_directive(seam_enabled: bool) -> String {
     out
 }
 
-/// Post-PR CI-monitoring directive (issue #899). A worker that opens a
-/// PR and then sits in a `gh pr checks` poll-loop "until every check is
-/// green" never completes under CI models where some required checks are
-/// gated on a human action and never auto-resolve — LinkedIn's
-/// `Owner Approval` is the canonical case. The engine's merge poller
-/// already classifies CI correctly for these orgs: it partitions the
-/// human-gated checks out of the CI rollup
-/// (`merge_poller::review_signal_checks_for_owner`) before deciding the
-/// PR is "effectively green", and auto-transitions the task to Review.
-/// The worker had no share of that knowledge and so polled forever.
-///
-/// This block hands the worker the *same* CI-completion definition the
-/// engine uses, sourced from the *same* table — when the PR's org ships
-/// human-gated checks, they are named verbatim from
-/// `review_signal_checks_for_owner` so the worker's "don't wait on these"
-/// list and the engine's "these don't block CI-clean" set cannot drift.
-fn ci_monitoring_directive(execution: &WorkExecution) -> String {
-    let mut out = String::new();
-    out.push_str("\n## After the PR is open: do not babysit CI\n\n");
-    out.push_str(
-        "Once your branch is pushed and the PR exists, your deliverable is done — print the PR URL and stop. Do NOT sit in a loop polling `gh pr checks` / `gh pr view` waiting for every check to turn green. That loop can run forever and strands your slot.\n\n",
-    );
-    out.push_str(
-        "Why this is safe: the engine polls this PR's CI on its own cadence and auto-transitions the task to Review the moment CI is *effectively green*. \"Effectively green\" matches the engine's own definition — every required CI check has reached a passing terminal state (`SUCCESS`, `NEUTRAL`, or `SKIPPED`). It deliberately does NOT require checks that are gated on a human action and never resolve from CI alone; waiting on those is waiting forever.\n\n",
-    );
-    // Name the human-gated checks for this PR's org from the *same* table
-    // the engine's CI classifier reclassifies on, so the two lists are
-    // sourced once. Empty for orgs without review-signal rules — then the
-    // general guidance above stands on its own.
-    if let Ok(slug) = crate::completion::parse_repo_slug(&execution.repo_remote_url) {
-        let owner = slug.split('/').next().unwrap_or("");
-        let names = crate::merge_poller::review_signal_checks_for_owner(owner);
-        if !names.is_empty() {
-            let rendered = names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ");
-            out.push_str(&format!(
-                "This PR's org (`{owner}`) ships required check(s) that are human-gated and never auto-resolve from CI: {rendered}. The engine's CI-completion check treats them as NOT blocking — they stay pending until a human approves. You must do the same: their pending/running state is not a reason to keep this run alive.\n\n",
-            ));
-        }
-    }
-    out.push_str(
-        "A required CI check that has genuinely *failed* (not merely pending) is different — fix it and push, or escalate per the build-gate rules above. But a still-running or human-gated check never blocks your completion.\n",
-    );
-    out
-}
-
 /// Required (not optional) structured-output instruction for
 /// `design_postmortem` tasks: uncompleted work the review surfaces —
 /// scope claimed but not delivered, a handoff that fell through (e.g. a
@@ -2419,9 +2376,11 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
                      than one pipeline may build the episode branch): \
                      `bk api \"/builds?branch=trunk-merge/pr-{pr_num}/<episode-uuid>\"` if the episode \
                      uuid is known, otherwise `bk api \"/builds?state[]=failed&state[]=failing&per_page=100\"` \
-                     (paginate with `&page=N` if needed) filtered client-side to a branch starting with \
-                     `trunk-merge/pr-{pr_num}/` \
-                     (do NOT match `trunk-temp/*` — that is a different, non-gating branch)._\n",
+                     filtered client-side to a branch starting with `trunk-merge/pr-{pr_num}/` (do NOT \
+                     match `trunk-temp/*` — that is a different, non-gating branch). **A single page — \
+                     especially an empty or truncated one — is not proof no such build exists.** Page \
+                     with `&page=N` until a page comes back with fewer than `per_page` results, or state \
+                     explicitly how many pages you searched, before concluding there is none._\n",
                     pr_num = attempt.pr_number,
                 ));
             } else {
@@ -2448,17 +2407,36 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
     if trunk_eviction_without_evidence {
         out.push_str("### If there is no failing build to find (STOP — do not invent one)\n\n");
         out.push_str(&format!(
-            "The engine could not identify a failing build for this eviction. Trunk reports the same \
-             `failed` state whether a construction build went red **or** it could not construct the \
-             merge at all, so it is entirely possible **nothing is broken on this PR**.\n\n\
-             Search once, using the Buildkite recipe above. If no failing `trunk-merge/pr-{pr_num}/*` \
-             build exists, that is your answer — Trunk never got as far as testing. Record it and stop:\n\n\
+            "The engine could not identify a failing build for this eviction, and its own \
+             classification could not confirm the cause either. Trunk reports the same `failed` state \
+             whether a construction build went red, the PR genuinely conflicts with the target branch, \
+             or it merely collided with a sibling PR in the same batch — so it is entirely possible \
+             **nothing is broken on this PR**, but the engine does not know that, and neither do you \
+             yet. Determine the cause yourself, in this order, before deciding what (if anything) to \
+             do:\n\n\
+             1. **Trunk's newest bot comment** — `gh api repos/<owner>/<repo>/issues/{pr_num}/comments` \
+             (paginate if needed) and read the newest `trunk-io[bot]` entry. Its prose names the cause \
+             directly: \"...because there was a merge conflict\" is a real conflict against the target \
+             branch; \"...because it conflicted with #N\" is a sibling-in-queue collision, not a defect \
+             on this PR.\n\
+             2. **GitHub's live mergeability** — `gh pr view {pr_num} --json mergeable,mergeStateStatus`, \
+             read fresh, not from memory or an earlier command's output. `CONFLICTING` confirms a real \
+             conflict. `UNKNOWN` means GitHub is still recomputing — re-run rather than treat it as an \
+             answer either way.\n\
+             3. **`jj status`** after `jj workspace update-stale` — names conflicted files offline, if \
+             your own workspace copy has any.\n\
+             4. **The Buildkite search above** — exhaustive (every page, or an explicit \"searched N \
+             pages\" claim), not a single possibly-truncated page.\n\n\
+             If every one of these says the PR is clean — no conflict, no sibling-in-queue collision, \
+             and no failing `trunk-merge/pr-{pr_num}/*` build after an exhaustive search — that is your \
+             answer: Trunk never got as far as testing, or the eviction has already cleared. Record it \
+             and stop:\n\n\
              ```\n\
              \"$BOSS_BIN\" engine ci classify --attempt-id {attempt} --class unfixable\n\
              \"$BOSS_BIN\" engine ci mark-failed --attempt-id {attempt} --reason no-failing-build-found\n\
              ```\n\n\
-             **Do NOT** rebase, reset, force-push, or \"resolve\" anything to make this attempt look \
-             addressed. There is no conflict on the head branch to resolve, and a revision whose head \
+             **Do NOT** rebase, reset, force-push, or \"resolve\" anything unless one of the checks \
+             above found something concrete on **this PR** for you to act on. A revision whose head \
              ends up with an empty diff has destroyed the PR's contents, not fixed them. If your work \
              would produce a zero-diff commit, stop and mark the attempt failed instead.\n\n",
             pr_num = attempt.pr_number,

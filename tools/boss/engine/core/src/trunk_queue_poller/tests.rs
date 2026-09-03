@@ -39,6 +39,7 @@ impl StubError {
 }
 
 #[derive(Default, bon::Builder)]
+#[builder(on(String, into))]
 struct StubTrunkApi {
     /// Replies for successive `getQueue` calls. The last entry is sticky,
     /// so a test that only cares about one shape can enqueue it once and
@@ -214,52 +215,95 @@ impl TrunkQueueApi for StubTrunkApi {
 /// against whatever repo/PR number the fixture happens to name.
 #[derive(Default)]
 struct StubEvictionEvidence {
+    answers: StubEvictionEvidenceAnswers,
+    calls: StubEvictionEvidenceCalls,
+}
+
+#[derive(Default)]
+struct StubEvictionEvidenceAnswers {
     /// Returned verbatim from `failing_construction_build`. Empty by default
     /// — the common case, since Trunk usually leaves no build behind.
     failing_jobs: Vec<RequiredCheckFailure>,
     /// Returned from `newest_trunk_bot_comment`. `None` by default.
     bot_comment: Option<String>,
+    /// Returned verbatim from every `live_mergeability` call.
+    /// [`ConflictClearance::Cleared`] when unset (see `live_mergeability`
+    /// below) — the inert default, since most tests never exercise the
+    /// live-read path (the `VsBaseConflict` and `SiblingInQueue` bot-comment
+    /// classes never consult it for their own routing decision).
+    live_mergeability_reply: Option<ConflictClearance>,
+}
+
+#[derive(Default)]
+struct StubEvictionEvidenceCalls {
     /// Calls to `newest_trunk_bot_comment`, so a test can assert the
     /// classifier short-circuits on the structured signal instead of
     /// reaching for the comment.
     bot_comment_calls: Mutex<usize>,
+    /// PR URLs for every `live_mergeability` call, in order — lets a test
+    /// assert both that the ambiguous-comment path
+    /// consulted GitHub live (not a cache) and that the mint-time recheck
+    /// fired a second, independent call.
+    live_mergeability_calls: Mutex<Vec<String>>,
 }
 
 impl StubEvictionEvidence {
     fn with_failing_job() -> Self {
         Self {
-            failing_jobs: vec![RequiredCheckFailure {
-                name: "Trunk merge queue: flunge-ci".to_owned(),
-                conclusion: "failure".to_owned(),
-                target_url: "https://buildkite.com/flunge/flunge-ci/builds/2364#job-uuid".to_owned(),
-                provider: crate::merge_poller::CiProvider::Buildkite,
-                provider_job_id: Some("job-uuid".to_owned()),
-            }],
+            answers: StubEvictionEvidenceAnswers {
+                failing_jobs: vec![RequiredCheckFailure {
+                    name: "Trunk merge queue: flunge-ci".to_owned(),
+                    conclusion: "failure".to_owned(),
+                    target_url: "https://buildkite.com/flunge/flunge-ci/builds/2364#job-uuid".to_owned(),
+                    provider: crate::merge_poller::CiProvider::Buildkite,
+                    provider_job_id: Some("job-uuid".to_owned()),
+                }],
+                ..StubEvictionEvidenceAnswers::default()
+            },
             ..Self::default()
         }
     }
 
     fn with_bot_comment(body: &str) -> Self {
         Self {
-            bot_comment: Some(body.to_owned()),
+            answers: StubEvictionEvidenceAnswers {
+                bot_comment: Some(body.to_owned()),
+                ..StubEvictionEvidenceAnswers::default()
+            },
             ..Self::default()
         }
     }
 
     fn bot_comment_call_count(&self) -> usize {
-        *self.bot_comment_calls.lock().unwrap()
+        *self.calls.bot_comment_calls.lock().unwrap()
+    }
+
+    fn live_mergeability_call_count(&self) -> usize {
+        self.calls.live_mergeability_calls.lock().unwrap().len()
     }
 }
 
 #[async_trait]
 impl TrunkEvictionEvidence for StubEvictionEvidence {
     async fn failing_construction_build(&self, _pr_number: u64) -> Vec<RequiredCheckFailure> {
-        self.failing_jobs.clone()
+        self.answers.failing_jobs.clone()
     }
 
     async fn newest_trunk_bot_comment(&self, _repo: &str, _pr_number: i64) -> Option<String> {
-        *self.bot_comment_calls.lock().unwrap() += 1;
-        self.bot_comment.clone()
+        *self.calls.bot_comment_calls.lock().unwrap() += 1;
+        self.answers.bot_comment.clone()
+    }
+
+    async fn live_mergeability(&self, pr_url: &str) -> ConflictClearance {
+        self.calls
+            .live_mergeability_calls
+            .lock()
+            .unwrap()
+            .push(pr_url.to_owned());
+        self.answers
+            .live_mergeability_reply
+            .clone()
+            .unwrap_or(ConflictClearance::Cleared)
     }
 }
 
@@ -934,14 +978,17 @@ async fn an_eviction_boss_did_not_initiate_is_adopted_and_remediated() {
     );
     // What `bk` returns for `trunk-merge/pr-1156/*`: build 2837, one failed job.
     let evidence = Arc::new(StubEvictionEvidence {
-        failing_jobs: vec![RequiredCheckFailure {
-            name: "Trunk merge queue: flunge-ci".to_owned(),
-            conclusion: "failure".to_owned(),
-            target_url: "https://buildkite.com/flunge/flunge-ci/builds/2837#019fb6c1-0457-482f-9181-3f18f31701e7"
-                .to_owned(),
-            provider: crate::merge_poller::CiProvider::Buildkite,
-            provider_job_id: Some("019fb6c1-0457-482f-9181-3f18f31701e7".to_owned()),
-        }],
+        answers: StubEvictionEvidenceAnswers {
+            failing_jobs: vec![RequiredCheckFailure {
+                name: "Trunk merge queue: flunge-ci".to_owned(),
+                conclusion: "failure".to_owned(),
+                target_url: "https://buildkite.com/flunge/flunge-ci/builds/2837#019fb6c1-0457-482f-9181-3f18f31701e7"
+                    .to_owned(),
+                provider: crate::merge_poller::CiProvider::Buildkite,
+                provider_job_id: Some("019fb6c1-0457-482f-9181-3f18f31701e7".to_owned()),
+            }],
+            ..StubEvictionEvidenceAnswers::default()
+        },
         ..StubEvictionEvidence::default()
     });
     let publisher = RecordingPublisher::default();
@@ -1108,15 +1155,22 @@ async fn a_merge_conflict_eviction_is_handed_to_the_conflict_lane_not_to_ci() {
     );
 }
 
-/// Same outcome via the corroborating channel: Trunk omitted `readiness`, so
-/// the only positive reason signal is its bot comment — the verbatim string
-/// it posted on flunge#1136 and #1137. Consulted only because the Buildkite
-/// search also came back empty. GitHub's own last-known mergeability (not
-/// Trunk's payload) says MERGEABLE, so this is a sibling-in-queue rejection.
+/// Regression test for the re-occurrence this classifier exists to fix
+/// (mono#2354's original fix, undone by the same comment on a later
+/// incident): the bot comment is the verbatim string Trunk posted on
+/// flunge#1136/#1137 and again in this incident's timeline — it contains
+/// BOTH of the old two-marker classifier's strings ("could not start
+/// testing" and "merge conflict"), which is exactly what let the first
+/// marker ("could not start testing", not itself decisive) win instead of
+/// the comment's actual, decisive meaning. The independently-observed
+/// GitHub mergeability cache is deliberately stamped `mergeable` (stale, or
+/// simply wrong) to prove the fix: `VsBaseConflict` routes to the conflict
+/// lane on the comment's own authority, without ever consulting cached *or*
+/// live mergeability.
 #[tokio::test]
-async fn a_merge_conflict_eviction_is_recognised_from_the_trunk_bot_comment() {
+async fn a_vs_base_conflict_comment_routes_to_the_conflict_lane_regardless_of_cached_mergeability() {
     let (_tmp, db) = crate::test_support::open_db();
-    let (_, task_id) = seed_intent(&db, "evicted-bot-comment", 1137);
+    let (_, task_id) = seed_intent(&db, "evicted-vs-base-conflict", 1137);
     set_github_mergeable_state(&db, &task_id, "mergeable");
     let evidence = Arc::new(StubEvictionEvidence::with_bot_comment(
         "❌ This pull request could not start testing because there was a merge conflict.",
@@ -1125,41 +1179,183 @@ async fn a_merge_conflict_eviction_is_recognised_from_the_trunk_bot_comment() {
 
     let outcome = run_eviction(&db, 1137, entry, Arc::clone(&evidence)).await;
 
-    assert_eq!(outcome.merge_side_evictions, 0, "GitHub is not CONFLICTING vs base");
-    assert_eq!(outcome.evictions_detected, 1, "sibling-in-queue rejection still mints");
-    assert_eq!(evidence.bot_comment_call_count(), 1);
-    assert_eq!(ci_ledger_state(&db, &task_id), (1, 1));
-    assert_eq!(revision_count(&db, &task_id), 1);
-}
-
-/// The bot comment names a merge failure AND GitHub's own last-known
-/// mergeability (`tasks.pr_mergeable_state`, independent of Trunk's
-/// readiness payload) says CONFLICTING vs base: this is a genuine head
-/// conflict, not a sibling-in-queue rejection, and must route to the
-/// conflict lane rather than minting a CI-fix revision that sends the
-/// worker hunting a construction build that never ran.
-#[tokio::test]
-async fn a_merge_conflict_eviction_with_github_conflicting_routes_to_conflict_lane() {
-    let (_tmp, db) = crate::test_support::open_db();
-    let (_, task_id) = seed_intent(&db, "evicted-bot-comment-conflicting", 1138);
-    set_github_mergeable_state(&db, &task_id, "conflicting");
-    let evidence = Arc::new(StubEvictionEvidence::with_bot_comment(
-        "❌ This pull request could not start testing because there was a merge conflict.",
-    ));
-    let entry = entry_of_with_state_changed_at(1138, TrunkPrState::Failed, "2026-07-25T03:54:36.000Z");
-
-    let outcome = run_eviction(&db, 1138, entry, Arc::clone(&evidence)).await;
-
     assert_eq!(
         outcome.merge_side_evictions, 1,
-        "GitHub CONFLICTING vs base must route to the conflict lane"
+        "a vs-base conflict comment must route to the conflict lane even though the cached \
+         mergeability snapshot says 'mergeable'"
     );
     assert_eq!(
         outcome.evictions_detected, 0,
         "a merge failure must never reach the CI ledger"
     );
+    assert_eq!(evidence.bot_comment_call_count(), 1);
+    assert_eq!(
+        evidence.live_mergeability_call_count(),
+        0,
+        "the comment's own prose is authoritative; mergeability must never be consulted",
+    );
     assert_eq!(ci_ledger_state(&db, &task_id), (0, 0));
     assert_eq!(revision_count(&db, &task_id), 0, "no 'Fix failing CI' revision");
+}
+
+/// Trunk's other decisive phrasing: the comment names a colliding sibling
+/// PR in the same batch, not a conflict against the target branch. This
+/// PR's own head is fine, so it routes to the CI ledger (which mints the
+/// "Investigate merge-queue rejection" revision) on the comment's own
+/// authority — the classifier must not consult mergeability for this either.
+/// The mint-time recheck (a separate, later defense) does still fire once,
+/// immediately before dispatch.
+#[tokio::test]
+async fn a_sibling_in_queue_comment_mints_a_queue_rejection_revision() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "evicted-sibling-in-queue", 1572);
+    let evidence = Arc::new(StubEvictionEvidence::with_bot_comment(
+        "❌ This pull request could not start testing because it conflicted with #1571. To resolve, \
+         wait for #1571 to merge, or rebase or stack on top of #1571 and resubmit.",
+    ));
+    let entry = entry_of_with_state_changed_at(1572, TrunkPrState::Failed, "2026-09-02T23:16:09.000Z");
+
+    let outcome = run_eviction(&db, 1572, entry, Arc::clone(&evidence)).await;
+
+    assert_eq!(
+        outcome.evictions_detected, 1,
+        "sibling-in-queue rejection mints a revision"
+    );
+    assert_eq!(outcome.merge_side_evictions, 0);
+    assert_eq!(ci_ledger_state(&db, &task_id), (1, 1));
+    assert_eq!(revision_count(&db, &task_id), 1);
+    assert_eq!(
+        evidence.live_mergeability_call_count(),
+        1,
+        "classification never consulted mergeability, but the mint-time recheck does, once",
+    );
+}
+
+/// Neither specific phrasing matched — a generic "merge conflict" mention —
+/// so the classifier reads GitHub's live mergeability. `StillConflicting`
+/// routes to the conflict lane.
+#[tokio::test]
+async fn an_ambiguous_comment_with_live_conflicting_mergeability_routes_to_the_conflict_lane() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, _task_id) = seed_intent(&db, "evicted-ambiguous-conflicting", 1600);
+    let evidence = Arc::new(StubEvictionEvidence {
+        answers: StubEvictionEvidenceAnswers {
+            bot_comment: Some("Blocked: this PR has a Merge Conflict with main.".to_owned()),
+            live_mergeability_reply: Some(ConflictClearance::StillConflicting {
+                raw_mergeable: "CONFLICTING".to_owned(),
+                raw_merge_state_status: "DIRTY".to_owned(),
+            }),
+            ..StubEvictionEvidenceAnswers::default()
+        },
+        ..StubEvictionEvidence::default()
+    });
+    let entry = entry_of_with_state_changed_at(1600, TrunkPrState::Failed, "2026-07-25T03:54:36.000Z");
+
+    let outcome = run_eviction(&db, 1600, entry, Arc::clone(&evidence)).await;
+
+    assert_eq!(outcome.merge_side_evictions, 1);
+    assert_eq!(outcome.evictions_detected, 0);
+    assert!(evidence.live_mergeability_call_count() >= 1);
+}
+
+/// Same ambiguous comment, but GitHub's live mergeability comes back clean —
+/// a sibling-in-queue rejection the comment itself didn't name clearly
+/// enough to route on. Mints the queue-rejection revision.
+#[tokio::test]
+async fn an_ambiguous_comment_with_live_clean_mergeability_mints_a_revision() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "evicted-ambiguous-clean", 1601);
+    let evidence = Arc::new(StubEvictionEvidence {
+        answers: StubEvictionEvidenceAnswers {
+            bot_comment: Some("Blocked: this PR has a Merge Conflict with main.".to_owned()),
+            live_mergeability_reply: Some(ConflictClearance::Cleared),
+            ..StubEvictionEvidenceAnswers::default()
+        },
+        ..StubEvictionEvidence::default()
+    });
+    let entry = entry_of_with_state_changed_at(1601, TrunkPrState::Failed, "2026-07-25T03:54:36.000Z");
+
+    let outcome = run_eviction(&db, 1601, entry, Arc::clone(&evidence)).await;
+
+    assert_eq!(outcome.evictions_detected, 1);
+    assert_eq!(outcome.merge_side_evictions, 0);
+    assert_eq!(ci_ledger_state(&db, &task_id), (1, 1));
+}
+
+/// GitHub's live mergeability never resolves (still `UNKNOWN` after every
+/// retry, or the probe itself failed). This must never fall through to
+/// minting a queue-rejection revision — the exact "treat a cache miss/
+/// UNKNOWN as mergeable" bug this classifier exists to prevent, just at the
+/// live-read layer instead of the cached-snapshot layer. Nothing is minted
+/// and the intent is left active for the next sweep to retry.
+#[tokio::test]
+async fn an_ambiguous_comment_with_indeterminate_mergeability_defers_without_minting() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "evicted-ambiguous-indeterminate", 1602);
+    let evidence = Arc::new(StubEvictionEvidence {
+        answers: StubEvictionEvidenceAnswers {
+            bot_comment: Some("Blocked: this PR has a Merge Conflict with main.".to_owned()),
+            live_mergeability_reply: Some(ConflictClearance::Indeterminate),
+            ..StubEvictionEvidenceAnswers::default()
+        },
+        ..StubEvictionEvidence::default()
+    });
+    let entry = entry_of_with_state_changed_at(1602, TrunkPrState::Failed, "2026-07-25T03:54:36.000Z");
+
+    let outcome = run_eviction(&db, 1602, entry, Arc::clone(&evidence)).await;
+
+    assert_eq!(
+        outcome.evictions_detected, 0,
+        "an indeterminate read must never mint a revision"
+    );
+    assert_eq!(
+        outcome.merge_side_evictions, 0,
+        "nor route to the conflict lane on a guess"
+    );
+    assert_eq!(ci_ledger_state(&db, &task_id), (0, 0));
+    assert_eq!(revision_count(&db, &task_id), 0);
+    let intent = db
+        .get_active_trunk_merge_intent(&task_id)
+        .unwrap()
+        .expect("intent stays active so the next sweep retries classification");
+    assert_ne!(
+        intent.last_trunk_state.as_deref(),
+        Some(TRUNK_INTENT_SUPERSEDED_BY_CONFLICT),
+        "not resolved as a conflict either — genuinely unclassified",
+    );
+}
+
+/// The mint-time recheck (a separate, later defense than classification):
+/// even when nothing about the eviction names a cause at all, one more live
+/// mergeability read happens immediately before dispatch, and a CONFLICTING
+/// result there redirects to the conflict lane instead of minting the
+/// "bogus revision" the original incident dispatched.
+#[tokio::test]
+async fn the_mint_time_recheck_catches_a_freshly_conflicting_pr() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "evicted-mint-time-conflicting", 1700);
+    let evidence = Arc::new(StubEvictionEvidence {
+        answers: StubEvictionEvidenceAnswers {
+            live_mergeability_reply: Some(ConflictClearance::StillConflicting {
+                raw_mergeable: "CONFLICTING".to_owned(),
+                raw_merge_state_status: "DIRTY".to_owned(),
+            }),
+            ..StubEvictionEvidenceAnswers::default()
+        },
+        ..StubEvictionEvidence::default()
+    });
+    let entry = evicted_entry_with_readiness(1700, healthy_readiness());
+
+    let outcome = run_eviction(&db, 1700, entry, Arc::clone(&evidence)).await;
+
+    assert_eq!(
+        outcome.merge_side_evictions, 1,
+        "the mint-time recheck must catch a conflict even with no other evidence at all"
+    );
+    assert_eq!(outcome.evictions_detected, 0, "must not mint the bogus revision");
+    assert_eq!(ci_ledger_state(&db, &task_id), (0, 0));
+    assert_eq!(revision_count(&db, &task_id), 0);
+    assert_eq!(evidence.live_mergeability_call_count(), 1);
 }
 
 /// A PR pointed at a branch this queue does not merge into. No rebase and no
@@ -1375,19 +1571,42 @@ fn a_matching_base_branch_is_compared_case_insensitively() {
 }
 
 #[test]
-fn the_trunk_bot_eviction_phrase_is_recognised() {
+fn the_trunk_bot_vs_base_conflict_phrase_is_recognised() {
+    // The verbatim string Trunk posted on flunge#1136 and #1137. Must
+    // classify as `VsBaseConflict`, not fall through to the generic
+    // `Ambiguous` bucket even though it also contains "could not start
+    // testing" — the specific phrase wins.
     assert_eq!(
-        bot_comment_merge_failure_marker(
-            "❌ This pull request could not start testing because there was a merge conflict."
+        classify_bot_comment("❌ This pull request could not start testing because there was a merge conflict."),
+        Some(BotCommentClass::VsBaseConflict),
+    );
+}
+
+#[test]
+fn the_trunk_bot_sibling_in_queue_phrase_is_recognised() {
+    assert_eq!(
+        classify_bot_comment(
+            "❌ This pull request could not start testing because it conflicted with #1572. To resolve, \
+             wait for #1572 to merge, or rebase or stack on top of #1572 and resubmit."
         ),
-        Some("could not start testing"),
+        Some(BotCommentClass::SiblingInQueue),
     );
+}
+
+#[test]
+fn a_generic_merge_failure_phrase_is_ambiguous() {
+    // Asserts a pre-testing failure without naming which of the two
+    // specific causes it is — must not be routed on directly.
     assert_eq!(
-        bot_comment_merge_failure_marker("Blocked: this PR has a Merge Conflict with main."),
-        Some("merge conflict"),
+        classify_bot_comment("Blocked: this PR has a Merge Conflict with main."),
+        Some(BotCommentClass::Ambiguous),
     );
+}
+
+#[test]
+fn a_comment_with_no_failure_marker_yields_nothing() {
     assert_eq!(
-        bot_comment_merge_failure_marker("⏳ This pull request is queued for testing (position 3)."),
+        classify_bot_comment("⏳ This pull request is queued for testing (position 3)."),
         None,
     );
 }

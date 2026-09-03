@@ -106,6 +106,30 @@ pub async fn verify_conflict_cleared_from(
     unknown_backoff: Duration,
     initial: Option<PrLifecycleProbe>,
 ) -> ConflictClearance {
+    verify_mergeability_live(probe, pr_url, unknown_backoff, initial).await
+}
+
+/// Shared primitive behind [`verify_conflict_cleared_from`] and other
+/// callers (e.g. [`crate::trunk_queue_poller`]) that need a *live*,
+/// definitive mergeability answer from GitHub rather than a locally cached
+/// one. `UNKNOWN` is never read as mergeable — the discipline this module
+/// exists to enforce (see the module doc) — so it is retried with backoff
+/// like every other caller of this loop.
+///
+/// GitHub's `baseRefOid` is fixed when a PR opens and does not follow its
+/// target branch as that branch advances, so it cannot establish whether a
+/// mergeability answer reflects the current base. A raw `UNKNOWN` is the
+/// only convergence signal this gate uses: it is retried, while definitive
+/// `Clean` and `Conflict` answers are accepted immediately.
+///
+/// Exhausting the retries without a definitive answer returns
+/// [`ConflictClearance::Indeterminate`] — never a guess.
+pub async fn verify_mergeability_live(
+    probe: &dyn MergeProbe,
+    pr_url: &str,
+    unknown_backoff: Duration,
+    initial: Option<PrLifecycleProbe>,
+) -> ConflictClearance {
     let mut initial = initial;
     let mut delay = unknown_backoff;
     for attempt in 0..=UNKNOWN_RETRY_ATTEMPTS {
@@ -118,7 +142,7 @@ pub async fn verify_conflict_cleared_from(
                     tracing::warn!(
                         pr_url,
                         ?err,
-                        "conflict stop gate: PR probe failed; cannot verify the conflict claim",
+                        "conflict stop gate: PR probe failed; cannot verify mergeability",
                     );
                     return ConflictClearance::Unavailable;
                 }
@@ -143,8 +167,8 @@ pub async fn verify_conflict_cleared_from(
                     tracing::info!(
                         pr_url,
                         probes = attempt + 1,
-                        "conflict stop gate: mergeability still UNKNOWN after retries; \
-                         refusing the 'already resolved' claim rather than assuming mergeable",
+                        "conflict stop gate: no definitive mergeability after retries; \
+                         refusing to guess",
                     );
                     return ConflictClearance::Indeterminate;
                 }
@@ -152,7 +176,7 @@ pub async fn verify_conflict_cleared_from(
                     pr_url,
                     attempt,
                     backoff_ms = delay.as_millis(),
-                    "conflict stop gate: mergeability UNKNOWN (GitHub recomputing); re-probing",
+                    "conflict stop gate: mergeability is UNKNOWN; re-probing",
                 );
                 tokio::time::sleep(delay).await;
                 delay = delay.saturating_mul(2);
@@ -229,6 +253,7 @@ mod tests {
         states: Mutex<Vec<PrLifecycleState>>,
         calls: Mutex<u32>,
         raw: (String, String),
+        base_ref_oid: Option<String>,
     }
 
     impl ScriptedProbe {
@@ -237,11 +262,17 @@ mod tests {
                 states: Mutex::new(states),
                 calls: Mutex::new(0),
                 raw: (String::new(), String::new()),
+                base_ref_oid: None,
             }
         }
 
         fn with_raw(mut self, mergeable: &str, merge_state_status: &str) -> Self {
             self.raw = (mergeable.to_owned(), merge_state_status.to_owned());
+            self
+        }
+
+        fn with_base_ref_oid(mut self, base_ref_oid: &str) -> Self {
+            self.base_ref_oid = Some(base_ref_oid.to_owned());
             self
         }
 
@@ -269,6 +300,7 @@ mod tests {
                 .review(PrReviewState::Unknown)
                 .raw_mergeable(self.raw.0.clone())
                 .raw_merge_state_status(self.raw.1.clone())
+                .maybe_base_ref_oid(self.base_ref_oid.clone())
                 .build())
         }
     }
@@ -304,6 +336,40 @@ mod tests {
                 raw_mergeable: "CONFLICTING".into(),
                 raw_merge_state_status: "DIRTY".into(),
             },
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pinned_base_ref_oid_does_not_make_a_clean_answer_stale() {
+        let probe = ScriptedProbe::new(vec![PrLifecycleState::Open(OpenPrStatus::clean())])
+            .with_base_ref_oid("base-at-pr-open");
+        assert_eq!(
+            verify_mergeability_live(&probe, PR, Duration::ZERO, None).await,
+            ConflictClearance::Cleared,
+        );
+        assert_eq!(
+            probe.calls(),
+            1,
+            "a definitive answer must not be retried for a pinned base oid"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pinned_base_ref_oid_does_not_make_a_conflict_answer_stale() {
+        let probe = ScriptedProbe::new(vec![PrLifecycleState::Open(OpenPrStatus::conflict_only())])
+            .with_base_ref_oid("base-at-pr-open")
+            .with_raw("CONFLICTING", "DIRTY");
+        assert_eq!(
+            verify_mergeability_live(&probe, PR, Duration::ZERO, None).await,
+            ConflictClearance::StillConflicting {
+                raw_mergeable: "CONFLICTING".into(),
+                raw_merge_state_status: "DIRTY".into(),
+            },
+        );
+        assert_eq!(
+            probe.calls(),
+            1,
+            "a definitive conflict must not be retried for a pinned base oid"
         );
     }
 
