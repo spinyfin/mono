@@ -197,6 +197,7 @@ mod tests {
                 "worker_proposals.fallback_hit.deferred_scope",
                 "worker_proposals.fallback_hit.effort_escalation",
                 "worker_proposals.fallback_hit.followup_task",
+                "worker_proposals.fallback_hit.pr_created",
                 "worker_proposals.rate_limited",
                 "worker_proposals.submitted.attention",
                 "worker_proposals.submitted.automation_outcome",
