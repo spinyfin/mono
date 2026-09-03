@@ -991,6 +991,28 @@ fn reviewer_sandbox_extra_args_are_output_only_workspace_write() {
         reviewer_output_sandbox_extra_args(&output_dir),
         vec!["--cd".to_owned(), output_dir.display().to_string(),]
     );
+    // The rendered rules file must point `jj` navigation at the checkout the
+    // reviewer prompt names, not at the `--cd` output root Codex's sandbox
+    // cwd is relocated to -- the two are different paths by construction, so
+    // a reviewer following the rules file's `jj log -R <path>` guidance
+    // lands on real source, not empty engine scratch.
+    let workspace = Path::new("/tmp/reviewer-workspace-for-jj");
+    let cd_args = reviewer_output_sandbox_extra_args(&output_dir);
+    assert_ne!(
+        cd_args[1],
+        workspace.display().to_string(),
+        "the --cd output root must differ from the checkout the rules file names"
+    );
+    let rules = boss_pr_review::render_reviewer_claude_md("lease-1", &workspace.display().to_string(), "");
+    assert!(
+        rules.contains(&format!("jj log -R {}", workspace.display())),
+        "rules file must instruct jj against the checkout, not the --cd root: {rules}"
+    );
+    assert!(
+        !rules.contains(&cd_args[1]),
+        "rules file must not point jj navigation at the --cd output root: {rules}"
+    );
+
     // Final command preserves workspace-write and moves the sandbox root out
     // of the checkout through the permission artifact's `--cd` argument.
     let plan = CodexDriver::default().spawn_invocation(spawn_request("gpt-5.6-terra", "run-review-sandbox"));
@@ -1014,11 +1036,25 @@ fn reviewer_config_keeps_checkout_out_of_writable_roots() {
     let config = render_reviewer_base_config_toml(workspace, &output_dir);
     // network_access = true is required for the boss propose Unix-socket
     // report channel; exclude_tmpdir_env_var/exclude_slash_tmp keep the
-    // filesystem grant narrowed to the --cd output root despite that.
+    // filesystem grant narrowed to the --cd output root despite that, and
+    // writable_roots grants that root explicitly rather than relying solely
+    // on Codex's cwd default, in case the exclusions are applied as deny
+    // rules over the surrounding $TMPDIR subtree.
     assert!(config.contains("network_access = true"), "{config}");
     assert!(config.contains("exclude_tmpdir_env_var = true"), "{config}");
     assert!(config.contains("exclude_slash_tmp = true"), "{config}");
-    assert!(!config.contains("writable_roots"), "{config}");
+    let writable_roots_line = config
+        .lines()
+        .find(|line| line.starts_with("writable_roots"))
+        .unwrap_or_else(|| panic!("expected a writable_roots line: {config}"));
+    assert!(
+        writable_roots_line.contains(&toml_basic_string(&output_dir.display().to_string())),
+        "writable_roots must grant the --cd output dir: {writable_roots_line}"
+    );
+    assert!(
+        !writable_roots_line.contains(&toml_basic_string(&workspace.display().to_string())),
+        "writable_roots must not grant the checkout: {writable_roots_line}"
+    );
     assert!(
         config.contains(&toml_basic_string(&workspace.display().to_string())),
         "{config}"

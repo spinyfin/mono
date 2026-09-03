@@ -1000,6 +1000,24 @@ mod tests {
     }
 
     #[test]
+    fn reviewer_claude_md_names_the_workspace_for_jj_navigation() {
+        // The reviewer's sandbox cwd is relocated away from the checkout
+        // (Codex's `--cd` points at engine scratch, see
+        // `reviewer_output_sandbox_extra_args` in the codex driver), so a
+        // bare `jj log` would resolve against the wrong workspace. The rules
+        // file must tell the reviewer to name the checkout explicitly.
+        let rendered = render_reviewer_claude_md("lease-1", "/tmp/ws-for-jj", "");
+        assert!(
+            rendered.contains("jj log -R /tmp/ws-for-jj"),
+            "reviewer CLAUDE.md must instruct `jj log -R <workspace>`: {rendered}"
+        );
+        assert!(
+            !rendered.contains("- `jj log`"),
+            "reviewer CLAUDE.md must not offer a bare `jj log` as a recommended navigation command: {rendered}"
+        );
+    }
+
+    #[test]
     fn reviewer_initial_prompt_contains_rubric_and_pr_url() {
         let prompt = render_reviewer_initial_prompt(
             "Fix the auth bug",

@@ -671,7 +671,7 @@ fn render_reviewer_base_config_toml(workspace: &Path, output_dir: &Path) -> Stri
     render_config_toml(
         workspace,
         Some(output_dir),
-        render_reviewer_sandbox_workspace_write_toml(),
+        render_reviewer_sandbox_workspace_write_toml(output_dir),
     )
 }
 
@@ -790,11 +790,11 @@ fn render_sandbox_workspace_write_toml(workspace: &Path) -> String {
     out
 }
 
-/// Reviewer sandbox configuration deliberately has no additional
-/// `writable_roots`. `network_access = true` is required despite the
-/// reviewer's read-only intent: the reviewer's only report-delivery channel
-/// is `boss propose review-report`, a Unix-domain-socket connect to the
-/// engine control socket (`BossClient::connect_socket`), and Codex's seatbelt
+/// Reviewer sandbox configuration grants only `output_dir` for writes.
+/// `network_access = true` is required despite the reviewer's read-only
+/// intent: the reviewer's only report-delivery channel is `boss
+/// propose review-report`, a Unix-domain-socket connect to the engine
+/// control socket (`BossClient::connect_socket`), and Codex's seatbelt
 /// classifies an `AF_UNIX connect()` as a `network-outbound` operation that
 /// `network_access = false` denies — the same class of local-socket denial
 /// this repo already documented for Bazel's TCP handshake (see
@@ -808,11 +808,23 @@ fn render_sandbox_workspace_write_toml(workspace: &Path) -> String {
 /// subdirectory of `std::env::temp_dir()`, keyed by filename) would let the
 /// reviewer overwrite concurrent executions' artifacts and reach the engine
 /// control socket at `/tmp/boss-engine.sock` by filesystem write, not just
-/// the sanctioned `boss propose` connect. With both flags set, the `--cd`
-/// output directory remains the only writable location.
-fn render_reviewer_sandbox_workspace_write_toml() -> String {
-    "[sandbox_workspace_write]\nnetwork_access = true\nexclude_tmpdir_env_var = true\nexclude_slash_tmp = true\n\n"
-        .to_owned()
+/// the sanctioned `boss propose` connect.
+///
+/// `output_dir` (the `--cd` target, see [`reviewer_output_sandbox_extra_args`])
+/// is listed explicitly in `writable_roots` in addition to relying on
+/// Codex's own cwd grant. This repo has not verified, against the installed
+/// Codex build, whether `exclude_tmpdir_env_var`/`exclude_slash_tmp` are
+/// applied as deny rules that could subsume a bare cwd grant nested under
+/// `$TMPDIR`; an explicit `writable_roots` entry is the same defense already
+/// relied on elsewhere in this file to keep a root out from under a
+/// surrounding exclusion (see the `root.join(".git")` entry in
+/// [`render_sandbox_workspace_write_toml`]). If report delivery ever starts
+/// failing with no report and no diagnosis, check this assumption first.
+fn render_reviewer_sandbox_workspace_write_toml(output_dir: &Path) -> String {
+    format!(
+        "[sandbox_workspace_write]\nnetwork_access = true\nexclude_tmpdir_env_var = true\nexclude_slash_tmp = true\nwritable_roots = [{}]\n\n",
+        toml_basic_string(&output_dir.display().to_string())
+    )
 }
 
 /// Resolve the writable roots Bazel needs outside the workspace.

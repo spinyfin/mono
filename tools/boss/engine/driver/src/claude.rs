@@ -239,6 +239,70 @@ macro_rules! python_command_guard {
     };
 }
 
+/// Tokenizer fragment shared by [`REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND`]
+/// and [`BOSS_LAUNCH_GUARD_COMMAND`]: splits a (possibly multi-line) shell
+/// command string into independent argv groups at shell delimiters, and
+/// strips leading env-assignment / launcher-wrapper / `timeout <n>` tokens to
+/// reach the real program.
+///
+/// `shlex.split` does not tokenize a shell operator written without
+/// surrounding spaces (`cd x&&bazel test //y` is a single token), so this
+/// uses `shlex.shlex(..., punctuation_chars=";&|")` with `whitespace_split =
+/// True`, which splits `a&&b` into `a`, `&&`, `b`. `commenters` is cleared
+/// because `shlex.shlex` otherwise treats `#` as a comment introducer
+/// anywhere in a word, not just at the start of one, silently discarding the
+/// remainder of the line (`shlex.split` does not have this behavior — it
+/// sets `commenters=''` itself). This is the same lexer configuration used
+/// by `boss_engine::worker_setup`'s `PATH_GUARD_SCRIPT` for the
+/// `BOSS_DATA_DIR` path guard, and by
+/// [`crate::codex::tool_surface_guard::CODEX_TOOL_SURFACE_GUARD_SCRIPT`]'s
+/// `command_groups`.
+///
+/// A plain string-literal macro (not a `const`) for the same reason
+/// [`python_command_guard!`] is one: it is spliced into other `concat!`
+/// invocations, which require every argument to be a literal.
+macro_rules! shell_command_tokenizer_fragment {
+    () => {
+        "DELIMS={'&&','||',';','|','&'}\n\
+         WRAPPERS={'env','command','exec','nohup','stdbuf','setsid','caffeinate','sudo','time','xargs'}\n\
+         ASSIGNMENT_RE=re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')\n\
+         def command_groups(command):\n\
+         \x20   groups=[]\n\
+         \x20   for line in command.split(chr(10)):\n\
+         \x20       try:\n\
+         \x20           _lex=shlex.shlex(line,posix=True,punctuation_chars=';&|')\n\
+         \x20           _lex.whitespace_split=True\n\
+         \x20           _lex.commenters=''\n\
+         \x20           toks=list(_lex)\n\
+         \x20       except Exception:\n\
+         \x20           toks=line.split()\n\
+         \x20       cur=[]\n\
+         \x20       for tok in toks:\n\
+         \x20           if tok in DELIMS:\n\
+         \x20               if cur:\n\
+         \x20                   groups.append(cur)\n\
+         \x20               cur=[]\n\
+         \x20           else:\n\
+         \x20               cur.append(tok)\n\
+         \x20       if cur:\n\
+         \x20           groups.append(cur)\n\
+         \x20   return groups\n\
+         def strip_prefixes(group):\n\
+         \x20   i=0\n\
+         \x20   while i<len(group):\n\
+         \x20       tok=group[i]\n\
+         \x20       base=os.path.basename(tok)\n\
+         \x20       if ASSIGNMENT_RE.match(tok) or base in WRAPPERS:\n\
+         \x20           i+=1\n\
+         \x20           continue\n\
+         \x20       if base=='timeout' and i+1<len(group):\n\
+         \x20           i+=2\n\
+         \x20           continue\n\
+         \x20       break\n\
+         \x20   return group[i:]\n"
+    };
+}
+
 /// Inline Python decision hook that blocks workers from launching the Boss
 /// macOS app or a Boss engine. Always applied (matcher `Bash`).
 ///
@@ -292,43 +356,30 @@ macro_rules! python_command_guard {
 /// letting a stale `PATH` copy
 /// win if the launcher ever slipped.
 pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
-    "DELIMS={'&&','||',';','|','&'}\n",
-    "WRAP={'nohup','env','sudo','exec','command','stdbuf','setsid','caffeinate','xargs'}\n",
-    "ASSIGN=re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)=(.*)$', re.S)\n",
+    shell_command_tokenizer_fragment!(),
     "PROD='/tmp/boss-engine.sock'\n",
+    "ASSIGN=re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)=(.*)$', re.S)\n",
     // Resolve single-level shell variables. Assignments are collected as the
     // token stream is walked, so a value defined earlier in the command is
     // substituted into later tokens -- the `APP=...` / `open $APP` split.
+    // This is a separate pass over the groups `command_groups` (from the
+    // shared tokenizer fragment) already produced, so it applies uniformly
+    // whether a group came from before or after a delimiter, and whether it
+    // spans one line or several -- `vars` carries across both.
     "vars={}\n",
     "def expand(t):\n",
     "    for k,v in vars.items():\n",
     "        t=t.replace('$'+'{'+k+'}',v).replace('$'+k,v)\n",
     "    return t\n",
-    // A newline separates commands just as `;` does, and shlex discards it,
-    // so each line is tokenised on its own. `vars` carries across lines
-    // because a value is routinely defined on one line and used on the next.
     "groups=[]\n",
-    "for line in cmd.split(chr(10)):\n",
-    "    try:\n",
-    "        toks=shlex.split(line,posix=True)\n",
-    "    except Exception:\n",
-    "        toks=line.split()\n",
+    "for g in command_groups(cmd):\n",
     "    resolved=[]\n",
-    "    for t in toks:\n",
+    "    for t in g:\n",
     "        m=ASSIGN.match(t)\n",
     "        if m:\n",
     "            vars[m.group(1)]=expand(m.group(2))\n",
     "        resolved.append(expand(t))\n",
-    "    cur=[]\n",
-    "    for t in resolved:\n",
-    "        if t in DELIMS:\n",
-    "            if cur:\n",
-    "                groups.append(cur[:])\n",
-    "            cur=[]\n",
-    "        else:\n",
-    "            cur.append(t)\n",
-    "    if cur:\n",
-    "        groups.append(cur)\n",
+    "    groups.append(resolved)\n",
     "def socket_arg(g):\n",
     "    for j,t in enumerate(g):\n",
     "        if t=='--socket-path' and j+1<len(g):\n",
@@ -348,17 +399,7 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "    return d.endswith('/Contents/Resources/bin')\n",
     "matched=None\n",
     "for g in groups:\n",
-    "    i=0\n",
-    "    while i<len(g):\n",
-    "        b=os.path.basename(g[i])\n",
-    "        if ASSIGN.match(g[i]) or b in WRAP:\n",
-    "            i+=1\n",
-    "            continue\n",
-    "        if b=='timeout' and i+1<len(g):\n",
-    "            i+=2\n",
-    "            continue\n",
-    "        break\n",
-    "    rest=g[i:]\n",
+    "    rest=strip_prefixes(g)\n",
     "    if not rest:\n",
     "        continue\n",
     "    prog=rest[0]\n",
@@ -515,69 +556,6 @@ pub const REVISION_PR_GUARD_COMMAND: &str = python_command_guard!(
     "    _block(msg)\n",
     "_approve()\n",
 );
-
-/// Tokenizer fragment for [`REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND`]: splits
-/// a (possibly multi-line) shell command string into independent argv groups
-/// at shell delimiters, and strips leading env-assignment / launcher-wrapper
-/// / `timeout <n>` tokens to reach the real program.
-///
-/// This guard previously used `shlex.split`, which does not tokenize a shell
-/// operator written without surrounding spaces (e.g. `cd x&&bazel test //y`
-/// reads as the single token `x&&bazel`, defeating group-splitting).
-/// `shlex.shlex(..., punctuation_chars=";&|")` with `whitespace_split = True`
-/// is the lexer this repo already uses correctly for that reason in the
-/// `BOSS_DATA_DIR` path guard (see `boss_engine::worker_setup`'s
-/// `PATH_GUARD_SCRIPT`); this fragment reuses the same approach.
-///
-/// [`crate::codex::tool_surface_guard::CODEX_TOOL_SURFACE_GUARD_SCRIPT`]
-/// independently reimplements a near-identical tokenizer (same delimiter and
-/// wrapper sets) with the same `shlex.split` gap, unfixed here: unifying it
-/// with this fragment would touch a file this revision otherwise leaves
-/// alone, and is left as a follow-up rather than folded into this pass.
-///
-/// A plain string-literal macro (not a `const`) for the same reason
-/// [`python_command_guard!`] is one: it is spliced into other `concat!`
-/// invocations, which require every argument to be a literal.
-macro_rules! shell_command_tokenizer_fragment {
-    () => {
-        "DELIMS={'&&','||',';','|','&'}\n\
-         WRAPPERS={'env','command','exec','nohup','stdbuf','setsid','caffeinate','sudo','time','xargs'}\n\
-         ASSIGNMENT_RE=re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')\n\
-         def command_groups(command):\n\
-         \x20   groups=[]\n\
-         \x20   for line in command.split(chr(10)):\n\
-         \x20       try:\n\
-         \x20           _lex=shlex.shlex(line,posix=True,punctuation_chars=';&|')\n\
-         \x20           _lex.whitespace_split=True\n\
-         \x20           toks=list(_lex)\n\
-         \x20       except Exception:\n\
-         \x20           toks=line.split()\n\
-         \x20       cur=[]\n\
-         \x20       for tok in toks:\n\
-         \x20           if tok in DELIMS:\n\
-         \x20               if cur:\n\
-         \x20                   groups.append(cur)\n\
-         \x20               cur=[]\n\
-         \x20           else:\n\
-         \x20               cur.append(tok)\n\
-         \x20       if cur:\n\
-         \x20           groups.append(cur)\n\
-         \x20   return groups\n\
-         def strip_prefixes(group):\n\
-         \x20   i=0\n\
-         \x20   while i<len(group):\n\
-         \x20       tok=group[i]\n\
-         \x20       base=os.path.basename(tok)\n\
-         \x20       if ASSIGNMENT_RE.match(tok) or base in WRAPPERS:\n\
-         \x20           i+=1\n\
-         \x20           continue\n\
-         \x20       if base=='timeout' and i+1<len(group):\n\
-         \x20           i+=2\n\
-         \x20           continue\n\
-         \x20       break\n\
-         \x20   return group[i:]\n"
-    };
-}
 
 /// Inline Python decision hook for static-analysis-only reviewer sessions.
 ///
@@ -1674,13 +1652,13 @@ mod tests {
             "python3 scripts/check.py",
             "./bazel-bin/tools/boss/engine/core/engine",
             "checkleft fix",
-            // Chained commands, spaced and unspaced. shlex.split (unlike
-            // shlex.shlex with punctuation_chars) does not tokenize a shell
-            // operator glued to the preceding word, so `cd tools/boss&&bazel
-            // test //x` used to read as a single `cd`-headed group and slip
-            // past the guard entirely.
+            // Operators glued to the preceding word must still split the
+            // group, so the blocked program after `&&` is seen.
             "cd tools/boss && bazel test //x",
             "cd tools/boss&&bazel test //x",
+            // `#` inside a word or after a delimiter must not truncate the
+            // command: the blocked program following it must still be seen.
+            "echo a#b && bazel test //x",
         ] {
             assert_eq!(
                 reviewer_static_guard_decision(command)["decision"],
