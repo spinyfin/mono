@@ -46,14 +46,19 @@ impl WorkerCompletionHandler {
         // still readable on the next sweep.
         let pr_created_proposals_first = self.feature_flags.is_enabled("worker_proposals")
             && self.feature_flags.is_enabled("pr_created_proposals_seam");
-        if pr_created_proposals_first && let (Some(proposed_pr_url), _) = self.pr_created_from_proposal(execution_id) {
+        let (proposed_pr_url, pr_created_proposal_row_existed) = if pr_created_proposals_first {
+            self.pr_created_from_proposal(&execution).await
+        } else {
+            (None, false)
+        };
+        if let Some(proposed_pr_url) = proposed_pr_url {
             tracing::info!(
                 execution_id,
                 pr_url = %proposed_pr_url,
                 "pr-recheck: using PR URL from pr_created worker-proposal row; skipping the staging \
                  cache / cold-reconstruction ladder",
             );
-            return self
+            let staged_outcome = self
                 .finalize_pr_transition(
                     execution_id,
                     proposed_pr_url,
@@ -61,6 +66,7 @@ impl WorkerCompletionHandler {
                     PR_CREATED_PROPOSAL_RECHECK_SOURCE,
                 )
                 .await;
+            return staged_outcome;
         }
 
         // A remote worker writes this artifact on its own host; collect it
@@ -130,7 +136,7 @@ impl WorkerCompletionHandler {
                 "pr-recheck: using PR URL captured from worker hook stream (primary path); skipping detector",
             );
             PR_URL_CAPTURE_PRIMARY_HIT.inc(&self.metrics);
-            return self
+            let staged_outcome = self
                 .finalize_pr_transition(
                     execution_id,
                     staged_url,
@@ -138,6 +144,13 @@ impl WorkerCompletionHandler {
                     "pr_recheck_staged",
                 )
                 .await;
+            self.record_pr_created_fallback_after_success(
+                &execution,
+                "pr_recheck_staged",
+                pr_created_proposal_row_existed,
+                &staged_outcome,
+            );
+            return staged_outcome;
         }
         if !staged_armed {
             tracing::debug!(
@@ -207,7 +220,7 @@ impl WorkerCompletionHandler {
                         "pr-recheck: revision_stop_contributed_head matches current head — \
                          finalising (transient on_stop_inner failure recovery)",
                     );
-                    return self
+                    let sha_outcome = self
                         .finalize_pr_transition(
                             execution_id,
                             pr_url,
@@ -215,6 +228,13 @@ impl WorkerCompletionHandler {
                             "pr_recheck_sha_delta",
                         )
                         .await;
+                    self.record_pr_created_fallback_after_success(
+                        &execution,
+                        "pr_recheck_sha_delta",
+                        pr_created_proposal_row_existed,
+                        &sha_outcome,
+                    );
+                    return sha_outcome;
                 }
                 // Head moved but revision_stop_contributed_head doesn't
                 // match (or was never set). This could be a genuine
@@ -256,7 +276,7 @@ impl WorkerCompletionHandler {
                     "pr-recheck: SHA-delta gate: bound PR head moved since last Stop — \
                      finalising without cold-path detector",
                 );
-                return self
+                let sha_outcome = self
                     .finalize_pr_transition(
                         execution_id,
                         pr_url,
@@ -264,6 +284,13 @@ impl WorkerCompletionHandler {
                         "pr_recheck_sha_delta",
                     )
                     .await;
+                self.record_pr_created_fallback_after_success(
+                    &execution,
+                    "pr_recheck_sha_delta",
+                    pr_created_proposal_row_existed,
+                    &sha_outcome,
+                );
+                return sha_outcome;
             }
             ShaDeltaGateOutcome::NoContribution { pr_url, head_now: _ } => {
                 // Bound PR did not advance during this run. For most resumes
@@ -366,8 +393,16 @@ impl WorkerCompletionHandler {
             PrStatus::Fresh { url } => (url, WorkerPrCompletionTarget::InReview),
             PrStatus::Merged { url } => (url, WorkerPrCompletionTarget::Done),
         };
-        self.finalize_pr_transition(execution_id, pr_url, target, "pr_recheck")
-            .await
+        let outcome = self
+            .finalize_pr_transition(execution_id, pr_url, target, "pr_recheck")
+            .await;
+        self.record_pr_created_fallback_after_success(
+            &execution,
+            "pr_recheck",
+            pr_created_proposal_row_existed,
+            &outcome,
+        );
+        outcome
     }
 
     /// True when the staged-URL recheck must not finalize yet: a revision

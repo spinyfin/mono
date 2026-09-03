@@ -139,26 +139,6 @@ impl WorkerCompletionHandler {
         // teardown still runs per this function's contract, but the failure
         // must be loud rather than silently collapsed into `None`.
         let execution_result = self.work_db.get_execution(execution_id);
-        // Worker-proposal seam (design implementation task 12 — the last of
-        // the per-seam migrations): every PR finalization funnels through
-        // this one function regardless of which layer of the staging-cache
-        // / driver-prose / cold-reconstruction ladder produced the URL, so
-        // this is the single choke point that can count "the pr_created
-        // proposal did NOT cover this finalization" without instrumenting
-        // every individual call site in `on_stop_inner`/`recheck_for_pr`.
-        // `source` names the two call sites that already resolved the URL
-        // from a durable `pr_created` proposal row
-        // (`WorkerCompletionHandler::pr_created_from_proposal`) — every
-        // OTHER source reaching here is definitionally a fallback for this
-        // seam while it's on.
-        if source != PR_CREATED_PROPOSAL_STOP_SOURCE
-            && source != PR_CREATED_PROPOSAL_RECHECK_SOURCE
-            && self.feature_flags.is_enabled("worker_proposals")
-            && self.feature_flags.is_enabled("pr_created_proposals_seam")
-            && let Ok(ref execution) = execution_result
-        {
-            self.record_pr_created_fallback_hit(execution, source);
-        }
         let workspace_path = match &execution_result {
             Ok(execution) => execution.workspace_path.clone(),
             Err(err) => {
@@ -1218,17 +1198,15 @@ impl WorkerCompletionHandler {
     /// path reads.
     ///
     /// Task 6's applier (`crate::work::proposal_apply::apply_pr_created`)
-    /// already verified the URL/repo-slug and any worker-supplied branch
-    /// synchronously at submission time and opportunistically bound
-    /// `task.pr_url`, so this read never re-derives or re-verifies
-    /// anything — it just resolves the same fact from the durable row.
+    /// verified the URL/repo-slug synchronously at submission time. This
+    /// read independently verifies the URL still belongs to the execution's
+    /// expected branch (or the resolved chain-root PR for a revision) before
+    /// returning it, matching the legacy staged-URL path's safety boundary.
     ///
     /// Returns `(None, row_existed)` when no operative `pr_created`
-    /// proposal is available — the caller then runs the legacy ladder,
-    /// counted via [`Self::record_pr_created_fallback_hit`] (invoked from
-    /// the shared [`Self::finalize_pr_transition`] funnel for every source
-    /// other than the proposal path, so a single call site covers every
-    /// layer of the ladder). `row_existed` mirrors
+    /// proposal is available — the caller then runs the legacy ladder and,
+    /// if that ladder actually finalizes, records its fallback hit.
+    /// `row_existed` mirrors
     /// [`super::finalize_passes::WorkerCompletionHandler::automation_outcome_from_proposal`]'s
     /// discipline: `false` when no `pr_created` proposal row exists at all
     /// (or the lookup itself errored — fail open to the legacy ladder
@@ -1243,7 +1221,11 @@ impl WorkerCompletionHandler {
     /// [`crate::work::WorkDb::list_worker_proposals_for_execution`] orders
     /// by `created_at DESC`, so the newest row is always the operative one
     /// — mirrors every other proposal-first read in this module.
-    pub(super) fn pr_created_from_proposal(&self, execution_id: &str) -> (Option<String>, bool) {
+    pub(super) async fn pr_created_from_proposal(
+        &self,
+        execution: &crate::work::WorkExecution,
+    ) -> (Option<String>, bool) {
+        let execution_id = &execution.id;
         let proposals = match self
             .work_db
             .list_worker_proposals_for_execution(execution_id, ProposalKind::PrCreated)
@@ -1265,7 +1247,14 @@ impl WorkerCompletionHandler {
 
         match latest.state {
             ProposalState::Applied => match serde_json::from_str::<PrCreatedProposalPayload>(&latest.payload_json) {
-                Ok(payload) => (Some(payload.pr_url), true),
+                Ok(payload) => {
+                    let pr_url = payload.pr_url;
+                    if self.pr_created_url_matches_execution(execution, &pr_url).await {
+                        (Some(pr_url), true)
+                    } else {
+                        (None, true)
+                    }
+                }
                 Err(err) => {
                     tracing::warn!(
                         execution_id,
@@ -1296,6 +1285,71 @@ impl WorkerCompletionHandler {
                      Applied/Rejected; falling back to the legacy ladder",
                 );
                 (None, true)
+            }
+        }
+    }
+
+    /// Apply the same execution-to-PR association rule used by the staged
+    /// URL path before trusting a durable worker declaration. A proposal is
+    /// not authority to rebind a task: it must name this execution's branch,
+    /// or, for a revision, the chain root's already-bound PR.
+    async fn pr_created_url_matches_execution(&self, execution: &crate::work::WorkExecution, pr_url: &str) -> bool {
+        if execution.kind == ExecutionKind::RevisionImplementation {
+            return match self.resolve_bound_pr_url(execution) {
+                Some(bound_url) if bound_url == pr_url => true,
+                Some(bound_url) => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        proposed_pr_url = %pr_url,
+                        bound_pr_url = %bound_url,
+                        "pr_created_proposals_seam: proposal URL does not match the revision's bound chain-root PR; falling back to the legacy ladder",
+                    );
+                    false
+                }
+                None => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        proposed_pr_url = %pr_url,
+                        "pr_created_proposals_seam: revision has no resolved bound PR; cannot verify proposal URL and will fall back to the legacy ladder",
+                    );
+                    false
+                }
+            };
+        }
+
+        let expected_branch = expected_branch_name(
+            &execution.id,
+            &execution.branch_naming,
+            execution.worker_branch_prefix.as_deref(),
+        );
+        let Ok(repo_slug) = parse_repo_slug(&execution.repo_remote_url) else {
+            tracing::warn!(execution_id = %execution.id, "pr_created_proposals_seam: cannot parse repo slug; falling back to the legacy ladder");
+            return false;
+        };
+        let Some(pr_number) = pr_number_from_url(pr_url) else {
+            tracing::warn!(execution_id = %execution.id, proposed_pr_url = %pr_url, "pr_created_proposals_seam: cannot parse PR number; falling back to the legacy ladder");
+            return false;
+        };
+        match self.branch_verifier.fetch_pr_head_ref(&repo_slug, pr_number).await {
+            Ok(head_ref) if branches_identify_same_work_item(&head_ref, &expected_branch) => true,
+            Ok(head_ref) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    proposed_pr_url = %pr_url,
+                    proposed_pr_branch = %head_ref,
+                    %expected_branch,
+                    "pr_created_proposals_seam: proposal URL's PR branch does not identify this execution; falling back to the legacy ladder",
+                );
+                false
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    proposed_pr_url = %pr_url,
+                    ?err,
+                    "pr_created_proposals_seam: branch verification failed; falling back to the legacy ladder",
+                );
+                false
             }
         }
     }

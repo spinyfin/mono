@@ -934,21 +934,19 @@ fn apply_pr_created(tx: &Transaction<'_>, execution_id: &str, payload_json: &str
     if let Some(existing) = task.pr_url.as_deref().filter(|s| !s.is_empty())
         && existing != payload.pr_url
     {
-        tracing::warn!(
-            execution_id,
-            task_id = %task.id,
-            existing_pr_url = existing,
-            declared_pr_url = %payload.pr_url,
-            "pr_created proposal declared a different PR than the task already has bound; \
-             keeping the existing binding",
-        );
+        return Ok(ApplyDecision::Rejected(format!(
+            "task {} is already bound to {existing}; refusing to replace it with declared PR {}",
+            task.id, payload.pr_url
+        )));
     }
 
-    tx.execute(
-        "UPDATE tasks SET pr_url = ?2, updated_at = ?3 \
-         WHERE id = ?1 AND deleted_at IS NULL AND (pr_url IS NULL OR pr_url = '')",
-        params![task.id, payload.pr_url, now_string()],
-    )?;
+    if task.kind != TaskKind::Revision {
+        tx.execute(
+            "UPDATE tasks SET pr_url = ?2, updated_at = ?3 \
+             WHERE id = ?1 AND deleted_at IS NULL AND (pr_url IS NULL OR pr_url = '')",
+            params![task.id, payload.pr_url, now_string()],
+        )?;
+    }
 
     Ok(ApplyDecision::Applied(ApplyOutcome {
         applied_ref: Some(task.id),

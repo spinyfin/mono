@@ -335,7 +335,11 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
     // just the printed line. The printed line stays regardless — design:
     // "the printed URL line is kept during the soak as human-readable
     // redundancy, then dropped."
-    let declare_pr_directive = if input.pr_created_proposals_seam_enabled {
+    let execution_can_declare_created_pr = matches!(
+        input.execution_kind.as_str(),
+        "task_implementation" | "chore_implementation" | "project_design" | "investigation_implementation"
+    );
+    let declare_pr_directive = if input.pr_created_proposals_seam_enabled && execution_can_declare_created_pr {
         "- Your terminal action after opening or updating a PR is `boss propose pr-created --url \
          <the PR URL>` (add `--branch <branch-name>` when useful for verification). Submission is\n\
          synchronous and validated immediately — a malformed URL or a URL from the wrong repo fails\n\
