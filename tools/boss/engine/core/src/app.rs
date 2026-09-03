@@ -81,6 +81,7 @@ mod ci_remediation;
 mod comments;
 mod conflict_resolution;
 mod context;
+mod coordinator_handoff;
 mod cost;
 mod decisions;
 mod dependencies;
@@ -2673,6 +2674,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::GetConflictResolution { .. } => {
                 conflict_resolution::handle_get_conflict_resolution(ctx, r).await
             }
+            r @ FrontendRequest::GetCoordinatorHandoff => {
+                coordinator_handoff::handle_get_coordinator_handoff(ctx, r).await
+            }
             r @ FrontendRequest::GetCostWindowReport { .. } => cost::handle_get_cost_window_report(ctx, r).await,
             r @ FrontendRequest::GetDecision { .. } => decisions::handle_get_decision(ctx, r).await,
             r @ FrontendRequest::GetDispatchConcurrency => engine_meta::handle_get_dispatch_concurrency(ctx, r).await,
@@ -2849,6 +2853,9 @@ async fn handle_frontend_connection(
             }
             r @ FrontendRequest::SetProductExternalTracker { .. } => {
                 external_tracker::handle_set_product_external_tracker(ctx, r).await
+            }
+            r @ FrontendRequest::SetCoordinatorHandoff { .. } => {
+                coordinator_handoff::handle_set_coordinator_handoff(ctx, r).await
             }
             r @ FrontendRequest::SetProjectDesignDoc { .. } => projects::handle_set_project_design_doc(ctx, r).await,
             r @ FrontendRequest::SetSetting { .. } => engine_meta::handle_set_setting(ctx, r).await,

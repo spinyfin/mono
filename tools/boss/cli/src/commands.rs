@@ -186,6 +186,18 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: PrCommand,
     },
+    /// The coordinator session handoff: the short brief the outgoing
+    /// coordinator session writes so the next one — after a Claude Code
+    /// update, app restart, crash, or the engine's restart ceiling — does
+    /// not start with zero knowledge of what the operator said. The
+    /// engine hands the stored handoff to every fresh coordinator session
+    /// as its first prompt; it never synthesizes one. Coordinator-only.
+    ///
+    /// See `tools/boss/docs/coordinator-session-handoff.md`.
+    Handoff {
+        #[command(subcommand)]
+        command: crate::handoff::HandoffCommand,
+    },
     Engine {
         #[command(subcommand)]
         command: EngineCommand,

@@ -434,6 +434,7 @@ mod update_available_tests {
             spawn_state: "created".to_owned(),
             model: "opus".to_owned(),
             launched_claude_version: Some(version.to_owned()),
+            spawned_at: None,
         }
     }
 

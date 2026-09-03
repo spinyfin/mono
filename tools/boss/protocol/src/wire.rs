@@ -13,19 +13,19 @@ use crate::types::{
     AddDependencyInput, AnswerAgentRun, Attention, AttentionGroup, AttentionMerge, Automation,
     AutomationDedupSuppression, AutomationPatch, AutomationRun, BackgroundWorkItem, BoardDropTarget, CiBudgetSnapshot,
     CiRemediation, CommentAnchor, CommentThreadEntry, CommentWithThread, CommentsBannerState, ConflictHotspotReport,
-    ConflictResolution, CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput,
-    CreateCommentInput, CreateDecisionInput, CreateExecutionInput, CreateInvestigationInput, CreateManyChoresInput,
-    CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput,
-    Decision, DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState, DispatchAdmission,
-    DriverQuotaSnapshot, DriverTrafficSplit, EditorialAction, EngineAttemptListEntry, FollowupMemberOverride,
-    GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch,
-    ProbeDeliveryExpectation, ProbeDeliveryState, ProbeInterruptOutcome, Product, Project, ProposalKind, ProposalState,
-    ProposalSubmissionError, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
-    ResolvedComment, ReviseDocInput, ReviseDocOutcome, SelectedProductState, SetProductEditorialRulesInput,
-    SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput, Task, TaskRuntime,
-    TranscriptSegment, WorkAttachment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
-    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle, WorkerProposal,
-    WorkerTierDenial,
+    ConflictResolution, CoordinatorHandoffView, CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput,
+    CreateChoreInput, CreateCommentInput, CreateDecisionInput, CreateExecutionInput, CreateInvestigationInput,
+    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
+    CreateRunInput, CreateTaskInput, Decision, DeferredScopeAttention, DependencyFilter, DesignDocContent,
+    DesignDocTreeState, DispatchAdmission, DriverQuotaSnapshot, DriverTrafficSplit, EditorialAction,
+    EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
+    PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation, ProbeDeliveryState, ProbeInterruptOutcome,
+    Product, Project, ProposalKind, ProposalState, ProposalSubmissionError, RemoveDependencyInput,
+    RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput, ReviseDocOutcome,
+    SelectedProductState, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput,
+    SetTaskDocPointerInput, Task, TaskRuntime, TranscriptSegment, WorkAttachment, WorkAttentionItem, WorkComment,
+    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
+    WorkRun, WorkerContextBundle, WorkerProposal, WorkerTierDenial,
 };
 
 /// Outcome of the live `getQueue` smoke check `boss engine trunk status`
@@ -789,6 +789,15 @@ pub enum FrontendRequest {
     GetConflictResolution {
         attempt_id: String,
     },
+
+    /// Read-only: the stored coordinator session handoff (see
+    /// [`CoordinatorHandoffView`]), or `None` when no coordinator session
+    /// has ever written one. Backs `boss handoff show`. Replies with
+    /// [`FrontendEvent::CoordinatorHandoffResult`]; a stored handoff that
+    /// cannot be decoded is a [`FrontendEvent::WorkError`], never an empty
+    /// success — "nothing stored" and "stored but unreadable" are
+    /// different states and the caller must be able to tell them apart.
+    GetCoordinatorHandoff,
 
     /// Cost recorded in `[since_epoch_s, until_epoch_s)`, broken down
     /// by execution kind, model, reasoning mode, and effort level.
@@ -2171,6 +2180,18 @@ pub enum FrontendRequest {
         work_item_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         budget: Option<i64>,
+    },
+
+    /// Replace the coordinator session handoff with `body`. Written by the
+    /// coordinator session itself (`boss handoff write`), never
+    /// synthesized by the engine. The engine stamps the write with the
+    /// current time and the writing session's spawn token, which is what
+    /// lets the next session judge staleness. Rejected with
+    /// [`FrontendEvent::WorkError`] when `body` is blank or exceeds the
+    /// engine's size cap — a handoff is a brief, not a transcript. Replies
+    /// with [`FrontendEvent::CoordinatorHandoffSet`].
+    SetCoordinatorHandoff {
+        body: String,
     },
 
     /// Set the interactive-pool ("Bridge Crew" + "Lower Decks") concurrency

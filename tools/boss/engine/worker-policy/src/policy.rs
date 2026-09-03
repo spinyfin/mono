@@ -427,12 +427,19 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         // Registration verbs *establish* the trust roots this gate is built
         // on. A worker calling one would be repointing the engine's notion
         // of who the app or the Boss session is.
+        //
+        // The session handoff is the coordinator's own note to its
+        // successor; a worker has no business reading the operator's
+        // standing instructions to the coordinator, let alone rewriting
+        // them.
         FrontendRequest::EngineResponse { .. }
+        | FrontendRequest::GetCoordinatorHandoff
         | FrontendRequest::RecreateCoordinator { .. }
         | FrontendRequest::RegisterAppSession
         | FrontendRequest::RegisterCapabilities { .. }
         | FrontendRequest::ReportSelectedProduct { .. }
         | FrontendRequest::ReportWorkerSpawnFailed { .. }
+        | FrontendRequest::SetCoordinatorHandoff { .. }
         | FrontendRequest::Shutdown { .. }
         | FrontendRequest::SpawnCapabilityRestored
         | FrontendRequest::UpdateWorkerShellPid { .. }

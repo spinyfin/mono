@@ -277,6 +277,7 @@ mod app_channel;
 mod attachments;
 mod awaiting_input_status;
 mod context;
+mod coordinator_handoff;
 mod dispatch_pause;
 mod driver_start_signal;
 mod engine_health_report;

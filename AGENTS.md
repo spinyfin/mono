@@ -46,6 +46,10 @@ root-cause rule as the section below.
 - Crash watchdog (why an abort always kills the app, and
   `BOSS_CRASH_WATCHDOG_SECONDS`):
   [`tools/boss/docs/crash-watchdog.md`](tools/boss/docs/crash-watchdog.md)
+- Coordinator session handoff (what the outgoing coordinator session
+  writes, how the incoming one is briefed, and the three states it can
+  report):
+  [`tools/boss/docs/coordinator-session-handoff.md`](tools/boss/docs/coordinator-session-handoff.md)
 - Operator runbooks:
   [`tools/boss/docs/runbooks/`](tools/boss/docs/runbooks/)
 
