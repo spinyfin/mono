@@ -64,3 +64,22 @@ pub trait CommandRunner {
         std::thread::sleep(duration);
     }
 }
+
+/// Production command runner for the release CLI.
+#[derive(Debug, Default)]
+pub struct ProcessCommandRunner;
+
+impl CommandRunner for ProcessCommandRunner {
+    fn run(&self, command: &Command) -> std::result::Result<CommandOutput, RunnerError> {
+        let output = std::process::Command::new(&command.program)
+            .args(&command.args)
+            .output()
+            .map_err(|error| RunnerError::new(format!("failed to run {}: {error}", command.program)))?;
+
+        Ok(CommandOutput {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+}
