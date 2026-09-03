@@ -42,7 +42,9 @@
 //! pane live, `pmset -g assertions` shows `PreventUserIdleSystemSleep` held
 //! by a `caffeinate` child.
 
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
+#[cfg(target_os = "macos")]
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
 #[cfg(target_os = "macos")]
