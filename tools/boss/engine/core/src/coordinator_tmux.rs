@@ -733,6 +733,9 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
         "{}unset ANTHROPIC_API_KEY; exec claude --model {quoted_model} --permission-mode auto {initial_prompt}",
         crate::runner::pane_spawn::path_prepend_clause("BOSS_BIN_DIR")
     );
+    crate::tmux_session_options::prepare_server(tmux)
+        .await
+        .context("preparing Boss tmux server before creating coordinator session")?;
     tmux.new_session(&NewSession {
         name: COORDINATOR_SESSION_NAME.to_owned(),
         environment,
@@ -747,9 +750,6 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
     tmux.set_option(COORDINATOR_SESSION_NAME, SPAWN_TOKEN_OPTION, &spawn_token)
         .await
         .context("mirroring coordinator spawn token in tmux")?;
-    tmux.set_option(COORDINATOR_SESSION_NAME, "remain-on-exit", "on")
-        .await
-        .context("preserving coordinator exit state for engine-side restart")?;
     if !work_db.record_coordinator_tmux_session_created(&spawn_token)? {
         bail!("coordinator session was created but its metadata intent was replaced");
     }
@@ -1187,7 +1187,9 @@ mod tests {
                     None => (false, String::new(), "unknown variable".to_owned()),
                 },
                 Some("display-message") => (true, format!("{}\n", self.pane_dead), String::new()),
-                Some("new-session") | Some("set-option") | Some("kill-session") => (true, String::new(), String::new()),
+                Some("start-server") | Some("new-session") | Some("set-option") | Some("kill-session") => {
+                    (true, String::new(), String::new())
+                }
                 Some("send-keys") if self.send_keys_fails => (
                     false,
                     String::new(),
@@ -1268,6 +1270,13 @@ mod tests {
     fn is_server_option(call: &[String], option: &str, value: &str) -> bool {
         call.get(2).map(String::as_str) == Some("set-option")
             && call.get(3).map(String::as_str) == Some("-s")
+            && call.get(4).map(String::as_str) == Some(option)
+            && call.get(5).map(String::as_str) == Some(value)
+    }
+
+    fn is_global_option(call: &[String], option: &str, value: &str) -> bool {
+        call.get(2).map(String::as_str) == Some("set-option")
+            && call.get(3).map(String::as_str) == Some("-g")
             && call.get(4).map(String::as_str) == Some(option)
             && call.get(5).map(String::as_str) == Some(value)
     }
@@ -1376,26 +1385,30 @@ mod tests {
             .unwrap();
         assert_eq!(record.spawn_state, "created");
         let calls = server.calls();
-        assert_eq!(calls[0][2], "new-session");
+        assert_eq!(calls[0][2], "start-server");
+        assert!(is_global_option(&calls[1], "history-limit", "2000"));
+        assert!(is_global_option(&calls[2], "remain-on-exit", "on"));
+        assert_eq!(calls[3][2], "new-session");
         assert!(
-            calls[0]
+            calls[3]
                 .windows(2)
                 .any(|pair| pair[0] == "-e" && pair[1].starts_with("BOSS_SPAWN_TOKEN="))
         );
-        crate::tmux_session_options::assert_color_environment(&calls[0]);
+        crate::tmux_session_options::assert_color_environment(&calls[3]);
         assert!(
-            calls[0]
+            calls[3]
                 .windows(2)
                 .any(|pair| pair[0] == "-c" && Path::new(&pair[1]) == dir.path())
         );
-        assert!(is_server_option(&calls[1], "terminal-features[100]", "xterm*:extkeys"));
-        assert!(is_server_option(&calls[2], "extended-keys", "on"));
-        assert!(is_server_option(&calls[3], "focus-events", "on"));
-        assert_eq!(calls[4][2], "set-option");
-        assert_eq!(calls[4][5], "status");
-        assert_eq!(calls[4][6], "off");
-        assert_eq!(calls[5][5], "@boss_spawn_token");
-        assert_eq!(calls[6][5], "remain-on-exit");
+        assert!(is_server_option(&calls[4], "terminal-features[100]", "xterm*:extkeys"));
+        assert!(is_server_option(&calls[5], "extended-keys", "on"));
+        assert!(is_server_option(&calls[6], "focus-events", "on"));
+        assert_eq!(calls[7][2], "set-option");
+        assert_eq!(calls[7][5], "status");
+        assert_eq!(calls[7][6], "off");
+        assert_eq!(calls[8][5], "remain-on-exit");
+        assert_eq!(calls[8][6], "on");
+        assert_eq!(calls[9][5], "@boss_spawn_token");
         assert_extended_keys_applied(&calls);
     }
 

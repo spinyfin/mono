@@ -266,6 +266,17 @@ impl Tmux {
         TmuxVersion::parse(&output.stdout)
     }
 
+    /// Starts the private server without creating a window.
+    ///
+    /// Callers that need a global option to affect the first window must use
+    /// this before [`Self::new_session`]. `tmux new-session` otherwise starts
+    /// the server and creates that first window in one operation.
+    pub async fn start_server(&self) -> Result<()> {
+        let mut args = self.server_args();
+        args.push("start-server".into());
+        self.invoke(args).await.map(|_| ())
+    }
+
     /// Creates a detached, single-command session with environment set atomically.
     pub async fn new_session(&self, session: &NewSession) -> Result<()> {
         session.validate()?;
@@ -347,6 +358,17 @@ impl Tmux {
             option.into(),
             value.into(),
         ]);
+        self.invoke(args).await.map(|_| ())
+    }
+
+    /// Sets a global tmux option inherited by newly-created sessions and
+    /// windows. Unlike [`Self::set_server_option`], this is for ordinary tmux
+    /// options such as `history-limit`, not server-scoped options.
+    pub async fn set_global_option(&self, option: &str, value: &str) -> Result<()> {
+        validate_value("option name", option)?;
+        validate_value("option value", value)?;
+        let mut args = self.server_args();
+        args.extend(["set-option".into(), "-g".into(), option.into(), value.into()]);
         self.invoke(args).await.map(|_| ())
     }
 
