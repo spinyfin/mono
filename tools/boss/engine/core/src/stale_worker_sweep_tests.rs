@@ -9,6 +9,7 @@ use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::RecordingDispatchEventSink;
 use crate::driver::ProgressFidelity;
 use crate::live_worker_state::LiveWorkerStateRegistry;
+use crate::semantic_progress::SemanticProgressCheckpoint;
 use crate::sweep_loop::SweepOutcome;
 use crate::test_support::*;
 use crate::work::ExecutionStatus;
@@ -408,7 +409,10 @@ async fn stuck_tmux_worker_raises_attention_without_reaping() {
             hold_registry: &hold_registry,
             cube_client: &NoopCube,
         },
-        ALWAYS_STALE,
+        StaleWorkerThresholds {
+            stale_threshold_secs: ALWAYS_STALE,
+            auto_reap_threshold_secs: NEVER_STALE,
+        },
     )
     .await;
 
@@ -460,7 +464,10 @@ async fn live_tmux_coarse_fidelity_raises_degraded_evidence_without_reaping() {
             hold_registry: &hold_registry,
             cube_client: &NoopCube,
         },
-        ALWAYS_STALE,
+        StaleWorkerThresholds {
+            stale_threshold_secs: ALWAYS_STALE,
+            auto_reap_threshold_secs: NEVER_STALE,
+        },
     )
     .await;
 
@@ -513,7 +520,10 @@ async fn live_tmux_unknown_tool_condition_raises_degraded_evidence_without_reapi
             hold_registry: &hold_registry,
             cube_client: &NoopCube,
         },
-        ALWAYS_STALE,
+        StaleWorkerThresholds {
+            stale_threshold_secs: ALWAYS_STALE,
+            auto_reap_threshold_secs: NEVER_STALE,
+        },
     )
     .await;
 
@@ -564,7 +574,10 @@ async fn fresh_window_activity_does_not_rescue_a_semantically_stale_worker() {
             hold_registry: &hold_registry,
             cube_client: &NoopCube,
         },
-        ALWAYS_STALE,
+        StaleWorkerThresholds {
+            stale_threshold_secs: ALWAYS_STALE,
+            auto_reap_threshold_secs: NEVER_STALE,
+        },
     )
     .await;
 
@@ -628,7 +641,10 @@ async fn dead_tmux_pane_is_reaped_and_resolves_open_attention() {
             hold_registry: &hold_registry,
             cube_client: &AlwaysSucceedsCube,
         },
-        ALWAYS_STALE,
+        StaleWorkerThresholds {
+            stale_threshold_secs: ALWAYS_STALE,
+            auto_reap_threshold_secs: NEVER_STALE,
+        },
     )
     .await;
 
@@ -695,7 +711,10 @@ async fn terminal_probe_failure_raises_probe_unavailable_attention_without_reapi
             hold_registry: &hold_registry,
             cube_client: &NoopCube,
         },
-        ALWAYS_STALE,
+        StaleWorkerThresholds {
+            stale_threshold_secs: ALWAYS_STALE,
+            auto_reap_threshold_secs: NEVER_STALE,
+        },
     )
     .await;
 
@@ -771,7 +790,10 @@ async fn alive_and_working_resolves_previously_open_attention() {
             hold_registry: &hold_registry,
             cube_client: &NoopCube,
         },
-        ALWAYS_STALE,
+        StaleWorkerThresholds {
+            stale_threshold_secs: ALWAYS_STALE,
+            auto_reap_threshold_secs: NEVER_STALE,
+        },
     )
     .await;
 
@@ -835,7 +857,10 @@ async fn terminal_execution_is_skipped_and_resolves_open_attention() {
             hold_registry: &hold_registry,
             cube_client: &NoopCube,
         },
-        ALWAYS_STALE,
+        StaleWorkerThresholds {
+            stale_threshold_secs: ALWAYS_STALE,
+            auto_reap_threshold_secs: NEVER_STALE,
+        },
     )
     .await;
 
@@ -1336,7 +1361,10 @@ async fn inferred_dead_skips_reap_when_durable_pid_is_alive() {
             hold_registry: &hold_registry,
             cube_client: &NoopCube,
         },
-        ALWAYS_STALE,
+        StaleWorkerThresholds {
+            stale_threshold_secs: ALWAYS_STALE,
+            auto_reap_threshold_secs: NEVER_STALE,
+        },
     )
     .await;
 
@@ -1346,6 +1374,563 @@ async fn inferred_dead_skips_reap_when_durable_pid_is_alive() {
     assert_eq!(
         db.get_execution(&execution_id).unwrap().status,
         ExecutionStatus::Running
+    );
+    assert!(reaper.reaped().is_empty());
+}
+
+// ─── the two-hour token-verified auto-reap ──────────────────────────────
+
+/// Once a `Rich`, tmux-confirmed-live, `Working` slot's idle checkpoint
+/// clears the LONGER two-hour auto-reap bar too, and a fresh recheck
+/// (identity + semantic evidence) immediately before acting reconfirms
+/// it, the sweep does not stop at an attention — it destructively reaps:
+/// recovery backup, orphan + audit, driver teardown, the token-verified
+/// tmux reap, cube-lease + slot release, and a coordinator kick.
+#[tokio::test]
+async fn two_hour_idle_tmux_worker_is_auto_reaped() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let db = Arc::new(db);
+    let execution_id = create_old_execution(&db, &work_item_id);
+    db.start_execution_run(&execution_id, "worker-1", "repo-1", "lease-1", "ws-1", "/tmp/ws")
+        .unwrap();
+    let live_states = Arc::new(LiveWorkerStateRegistry::new());
+    register_slot(&live_states, 1, &execution_id, &work_item_id);
+    drive_to_working_idle(&live_states, 1);
+
+    let coordinator = make_coordinator(db.clone(), 1);
+    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+    let claimed_before = coordinator.worker_pool().claimed_execution_ids().await;
+    assert!(claimed_before.contains(&execution_id));
+
+    let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let inspector = StaticTerminalInspector(live_terminal(0));
+    let hold_registry = HoldRegistry::new();
+    let outcome = run_one_pass_with_terminal(
+        db.as_ref(),
+        &live_states,
+        Some(&inspector),
+        coordinator.clone(),
+        sink.as_ref(),
+        StaleWorkerSweepControls {
+            reaper: reaper.as_ref(),
+            hold_registry: &hold_registry,
+            cube_client: &AlwaysSucceedsCube,
+        },
+        StaleWorkerThresholds {
+            stale_threshold_secs: ALWAYS_STALE,
+            auto_reap_threshold_secs: ALWAYS_STALE,
+        },
+    )
+    .await;
+
+    assert_eq!(
+        outcome.reaped, 1,
+        "a worker past both thresholds, reconfirmed on recheck, must be auto-reaped"
+    );
+    assert_eq!(
+        outcome.genuinely_stuck, 0,
+        "a successful auto-reap must not also count as a stuck attention"
+    );
+    assert_eq!(outcome.auto_reap_aborted, 0);
+
+    let exec = db.get_execution(&execution_id).unwrap();
+    assert_eq!(exec.status, ExecutionStatus::Orphaned);
+
+    let claimed_after = coordinator.worker_pool().claimed_execution_ids().await;
+    assert!(
+        !claimed_after.contains(&execution_id),
+        "pool slot must be released after the auto-reap",
+    );
+
+    // The reap must run BEFORE the slot/lease is released — the recording
+    // reaper snapshots the slot as still-claimed at reap time.
+    assert_eq!(
+        reaper.reaped(),
+        vec![(execution_id.clone(), true)],
+        "auto-reap must reap the process tree before releasing the slot/lease",
+    );
+
+    let events = sink.events().await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].stage, "stale_worker_reconcile");
+    assert_eq!(events[0].outcome, "ok");
+    assert_eq!(events[0].work_item_id.as_deref(), Some(work_item_id.as_str()));
+    assert_eq!(events[0].details["auto_reap"], true);
+
+    let item = db.get_work_item(&work_item_id).unwrap();
+    let desc = match &item {
+        boss_protocol::WorkItem::Chore(t) | boss_protocol::WorkItem::Task(t) => t.description.clone(),
+        _ => panic!("expected chore"),
+    };
+    assert!(desc.contains("[engine-reconcile]"), "got: {desc:?}");
+    assert!(desc.contains("auto-reaped"), "got: {desc:?}");
+
+    let open_items: Vec<_> = db
+        .list_attention_items_for_work_item(&work_item_id)
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.kind == STALE_WORKER_ATTENTION_KIND && item.status == "open")
+        .collect();
+    assert!(
+        open_items.is_empty(),
+        "an auto-reap must resolve any open stale_worker attention: {open_items:?}",
+    );
+}
+
+/// Terminal inspector whose first call reports the pane alive and whose
+/// SECOND call — the auto-reap token-verified recheck run immediately
+/// before the destructive kill — reports the tmux identity as dead.
+/// Models the session dying, or its spawn token no longer matching,
+/// between this pass's initial classification and the recheck.
+struct DiesOnRecheckInspector {
+    calls: StdMutex<u32>,
+}
+
+#[async_trait]
+impl WorkerTerminalInspector for DiesOnRecheckInspector {
+    async fn inspect(&self, _execution_id: &str) -> Result<Option<TerminalLiveness>> {
+        let mut calls = self.calls.lock().unwrap();
+        *calls += 1;
+        if *calls == 1 {
+            Ok(Some(live_terminal(0)))
+        } else {
+            Ok(Some(TerminalLiveness::Dead {
+                session_name: "boss-worker-test".to_owned(),
+                evidence: DeadPaneEvidence::SpawnTokenMismatch,
+            }))
+        }
+    }
+}
+
+/// Terminal inspector whose first call reports the pane alive and whose
+/// SECOND call — the recheck — fails outright, modeling a tmux command
+/// erroring (e.g. the server becoming unreachable) at the worst possible
+/// moment.
+struct FailsOnRecheckInspector {
+    calls: StdMutex<u32>,
+}
+
+#[async_trait]
+impl WorkerTerminalInspector for FailsOnRecheckInspector {
+    async fn inspect(&self, _execution_id: &str) -> Result<Option<TerminalLiveness>> {
+        let mut calls = self.calls.lock().unwrap();
+        *calls += 1;
+        if *calls == 1 {
+            Ok(Some(live_terminal(0)))
+        } else {
+            Err(anyhow::anyhow!("tmux probe failed on recheck"))
+        }
+    }
+}
+
+/// Terminal inspector that always reports the pane alive, but whose
+/// SECOND call — the recheck — first injects a fresh driver event (a
+/// tool going in flight) into `live_states` as a side effect, modeling a
+/// worker that resumed real work between this pass's initial
+/// classification and the just-in-time recheck.
+struct InjectsActivityOnRecheckInspector<'a> {
+    live_states: &'a LiveWorkerStateRegistry,
+    slot_id: u8,
+    calls: StdMutex<u32>,
+}
+
+#[async_trait]
+impl<'a> WorkerTerminalInspector for InjectsActivityOnRecheckInspector<'a> {
+    async fn inspect(&self, _execution_id: &str) -> Result<Option<TerminalLiveness>> {
+        let mut calls = self.calls.lock().unwrap();
+        *calls += 1;
+        if *calls == 2 {
+            drive_to_working_tool_in_flight(self.live_states, self.slot_id);
+        }
+        Ok(Some(live_terminal(0)))
+    }
+}
+
+/// If the tmux identity re-verified immediately before the kill no
+/// longer matches (session dead / spawn-token mismatch), the auto-reap
+/// aborts — it does not trust the identity established earlier in the
+/// same pass. The candidate falls back to the ordinary non-destructive
+/// attention.
+#[tokio::test]
+async fn auto_reap_recheck_identity_change_blocks_the_reap() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let db = Arc::new(db);
+    let execution_id = create_old_execution(&db, &work_item_id);
+    let live_states = Arc::new(LiveWorkerStateRegistry::new());
+    register_slot(&live_states, 1, &execution_id, &work_item_id);
+    drive_to_working_idle(&live_states, 1);
+
+    let coordinator = make_coordinator(db.clone(), 1);
+    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+    let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let inspector = DiesOnRecheckInspector {
+        calls: StdMutex::new(0),
+    };
+    let hold_registry = HoldRegistry::new();
+    let outcome = run_one_pass_with_terminal(
+        db.as_ref(),
+        &live_states,
+        Some(&inspector),
+        coordinator.clone(),
+        sink.as_ref(),
+        StaleWorkerSweepControls {
+            reaper: reaper.as_ref(),
+            hold_registry: &hold_registry,
+            cube_client: &NoopCube,
+        },
+        StaleWorkerThresholds {
+            stale_threshold_secs: ALWAYS_STALE,
+            auto_reap_threshold_secs: ALWAYS_STALE,
+        },
+    )
+    .await;
+
+    assert_eq!(outcome.reaped, 0, "an identity change on recheck must block the reap");
+    assert_eq!(outcome.auto_reap_aborted, 1);
+    assert_eq!(
+        outcome.genuinely_stuck, 1,
+        "the aborted attempt falls back to the ordinary stuck attention"
+    );
+    assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
+    assert!(reaper.reaped().is_empty());
+}
+
+/// A failed tmux probe on the recheck must never be treated as
+/// confirmation to proceed — it blocks the reap.
+#[tokio::test]
+async fn auto_reap_recheck_probe_error_blocks_the_reap() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let db = Arc::new(db);
+    let execution_id = create_old_execution(&db, &work_item_id);
+    let live_states = Arc::new(LiveWorkerStateRegistry::new());
+    register_slot(&live_states, 1, &execution_id, &work_item_id);
+    drive_to_working_idle(&live_states, 1);
+
+    let coordinator = make_coordinator(db.clone(), 1);
+    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+    let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let inspector = FailsOnRecheckInspector {
+        calls: StdMutex::new(0),
+    };
+    let hold_registry = HoldRegistry::new();
+    let outcome = run_one_pass_with_terminal(
+        db.as_ref(),
+        &live_states,
+        Some(&inspector),
+        coordinator.clone(),
+        sink.as_ref(),
+        StaleWorkerSweepControls {
+            reaper: reaper.as_ref(),
+            hold_registry: &hold_registry,
+            cube_client: &NoopCube,
+        },
+        StaleWorkerThresholds {
+            stale_threshold_secs: ALWAYS_STALE,
+            auto_reap_threshold_secs: ALWAYS_STALE,
+        },
+    )
+    .await;
+
+    assert_eq!(outcome.reaped, 0, "a probe failure on recheck must block the reap");
+    assert_eq!(outcome.auto_reap_aborted, 1);
+    assert_eq!(outcome.genuinely_stuck, 1);
+    assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
+    assert!(reaper.reaped().is_empty());
+}
+
+/// A tool going in flight between this pass's initial classification and
+/// the just-in-time recheck must block the reap — the recheck re-reads
+/// semantic evidence fresh rather than trusting the earlier snapshot.
+#[tokio::test]
+async fn auto_reap_recheck_in_flight_tool_blocks_the_reap() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let db = Arc::new(db);
+    let execution_id = create_old_execution(&db, &work_item_id);
+    let live_states = Arc::new(LiveWorkerStateRegistry::new());
+    register_slot(&live_states, 1, &execution_id, &work_item_id);
+    drive_to_working_idle(&live_states, 1);
+
+    let coordinator = make_coordinator(db.clone(), 1);
+    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+    let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let inspector = InjectsActivityOnRecheckInspector {
+        live_states: &live_states,
+        slot_id: 1,
+        calls: StdMutex::new(0),
+    };
+    let hold_registry = HoldRegistry::new();
+    let outcome = run_one_pass_with_terminal(
+        db.as_ref(),
+        &live_states,
+        Some(&inspector),
+        coordinator.clone(),
+        sink.as_ref(),
+        StaleWorkerSweepControls {
+            reaper: reaper.as_ref(),
+            hold_registry: &hold_registry,
+            cube_client: &NoopCube,
+        },
+        StaleWorkerThresholds {
+            stale_threshold_secs: ALWAYS_STALE,
+            auto_reap_threshold_secs: ALWAYS_STALE,
+        },
+    )
+    .await;
+
+    assert_eq!(
+        outcome.reaped, 0,
+        "new activity discovered on recheck must block the reap"
+    );
+    assert_eq!(outcome.auto_reap_aborted, 1);
+    assert_eq!(outcome.genuinely_stuck, 1);
+    assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
+    assert!(reaper.reaped().is_empty());
+}
+
+/// Terminal inspector that always reports the pane alive, but whose
+/// SECOND call — the recheck — first refreshes the checkpoint's
+/// `progress_at` to "now" while leaving the tool condition `Idle`,
+/// modeling a fresh driver event (a `PostToolUse` that doesn't put a
+/// tool in flight) landing between this pass's initial classification
+/// and the just-in-time recheck.
+struct RefreshesProgressOnRecheckInspector<'a> {
+    live_states: &'a LiveWorkerStateRegistry,
+    slot_id: u8,
+    calls: StdMutex<u32>,
+}
+
+#[async_trait]
+impl<'a> WorkerTerminalInspector for RefreshesProgressOnRecheckInspector<'a> {
+    async fn inspect(&self, _execution_id: &str) -> Result<Option<TerminalLiveness>> {
+        let mut calls = self.calls.lock().unwrap();
+        *calls += 1;
+        if *calls == 2 {
+            self.live_states.seed_semantic_progress(
+                self.slot_id,
+                &SemanticProgressCheckpoint {
+                    tool_condition: SemanticToolCondition::Idle,
+                    progress_at: iso8601_utc(boss_engine_utils::epoch_time::now_epoch_secs()),
+                },
+            );
+        }
+        Ok(Some(live_terminal(0)))
+    }
+}
+
+/// A fresh driver event that refreshes the checkpoint (still `Idle`, not
+/// in flight) between this pass's initial classification and the
+/// just-in-time recheck must block the reap — the recheck re-reads the
+/// checkpoint fresh rather than trusting the (by-then-stale) evidence
+/// the initial classification saw. Uses real, positive thresholds
+/// (rather than this file's `ALWAYS_STALE`/`NEVER_STALE` sign-flip
+/// convention) because this case turns on actual checkpoint age:
+/// [`LiveWorkerStateRegistry::seed_semantic_progress`] is used instead
+/// of the `apply_event`-driven helpers so the initial checkpoint can be
+/// stamped genuinely old.
+#[tokio::test]
+async fn auto_reap_recheck_new_driver_event_blocks_the_reap() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let db = Arc::new(db);
+    let execution_id = create_old_execution(&db, &work_item_id);
+    let live_states = Arc::new(LiveWorkerStateRegistry::new());
+    register_slot(&live_states, 1, &execution_id, &work_item_id);
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    live_states.seed_semantic_progress(
+        1,
+        &SemanticProgressCheckpoint {
+            tool_condition: SemanticToolCondition::Idle,
+            progress_at: iso8601_utc(now - 10_000),
+        },
+    );
+    live_states.set_activity_for_test(1, WorkerActivity::Working);
+
+    let coordinator = make_coordinator(db.clone(), 1);
+    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+    let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let inspector = RefreshesProgressOnRecheckInspector {
+        live_states: &live_states,
+        slot_id: 1,
+        calls: StdMutex::new(0),
+    };
+    let hold_registry = HoldRegistry::new();
+    let outcome = run_one_pass_with_terminal(
+        db.as_ref(),
+        &live_states,
+        Some(&inspector),
+        coordinator.clone(),
+        sink.as_ref(),
+        StaleWorkerSweepControls {
+            reaper: reaper.as_ref(),
+            hold_registry: &hold_registry,
+            cube_client: &NoopCube,
+        },
+        StaleWorkerThresholds {
+            stale_threshold_secs: 200,
+            auto_reap_threshold_secs: 500,
+        },
+    )
+    .await;
+
+    assert_eq!(
+        outcome.reaped, 0,
+        "a fresh driver event discovered on recheck must block the reap"
+    );
+    assert_eq!(outcome.auto_reap_aborted, 1);
+    assert_eq!(outcome.genuinely_stuck, 1);
+    assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
+    assert!(reaper.reaped().is_empty());
+}
+
+/// Terminal inspector that always reports the pane alive, but whose
+/// SECOND call — the recheck — resets the checkpoint's tool condition to
+/// durably `Unknown`, modeling a driver state reset landing between this
+/// pass's initial classification and the just-in-time recheck.
+struct ResetsToUnknownOnRecheckInspector<'a> {
+    live_states: &'a LiveWorkerStateRegistry,
+    slot_id: u8,
+    calls: StdMutex<u32>,
+}
+
+#[async_trait]
+impl<'a> WorkerTerminalInspector for ResetsToUnknownOnRecheckInspector<'a> {
+    async fn inspect(&self, _execution_id: &str) -> Result<Option<TerminalLiveness>> {
+        let mut calls = self.calls.lock().unwrap();
+        *calls += 1;
+        if *calls == 2 {
+            self.live_states
+                .set_semantic_tool_condition_for_test(self.slot_id, SemanticToolCondition::Unknown);
+        }
+        Ok(Some(live_terminal(0)))
+    }
+}
+
+/// A tool condition that reverts to durably `Unknown` between this pass's
+/// initial classification and the just-in-time recheck must block the
+/// reap — there is no evidence a tool is *not* in flight, so the
+/// recheck's reclassification reads degraded evidence, never `Stale`.
+#[tokio::test]
+async fn auto_reap_recheck_unknown_tool_condition_blocks_the_reap() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let db = Arc::new(db);
+    let execution_id = create_old_execution(&db, &work_item_id);
+    let live_states = Arc::new(LiveWorkerStateRegistry::new());
+    register_slot(&live_states, 1, &execution_id, &work_item_id);
+    drive_to_working_idle(&live_states, 1);
+
+    let coordinator = make_coordinator(db.clone(), 1);
+    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+    let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let inspector = ResetsToUnknownOnRecheckInspector {
+        live_states: &live_states,
+        slot_id: 1,
+        calls: StdMutex::new(0),
+    };
+    let hold_registry = HoldRegistry::new();
+    let outcome = run_one_pass_with_terminal(
+        db.as_ref(),
+        &live_states,
+        Some(&inspector),
+        coordinator.clone(),
+        sink.as_ref(),
+        StaleWorkerSweepControls {
+            reaper: reaper.as_ref(),
+            hold_registry: &hold_registry,
+            cube_client: &NoopCube,
+        },
+        StaleWorkerThresholds {
+            stale_threshold_secs: ALWAYS_STALE,
+            auto_reap_threshold_secs: ALWAYS_STALE,
+        },
+    )
+    .await;
+
+    assert_eq!(
+        outcome.reaped, 0,
+        "a tool condition reverting to Unknown on recheck must block the reap"
+    );
+    assert_eq!(outcome.auto_reap_aborted, 1);
+    assert_eq!(outcome.genuinely_stuck, 1);
+    assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
+    assert!(reaper.reaped().is_empty());
+}
+
+/// A hold placed on the execution blocks the two-hour auto-reap exactly
+/// like it blocks the ordinary 30-minute non-destructive path — the hold
+/// check runs before any classification at all, so the candidate never
+/// even reaches the auto-reap attempt.
+#[tokio::test]
+async fn held_worker_past_the_auto_reap_threshold_is_not_reaped() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let db = Arc::new(db);
+    let execution_id = create_old_execution(&db, &work_item_id);
+    let live_states = Arc::new(LiveWorkerStateRegistry::new());
+    register_slot(&live_states, 1, &execution_id, &work_item_id);
+    drive_to_working_idle(&live_states, 1);
+
+    let coordinator = make_coordinator(db.clone(), 1);
+    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+    let hold_registry = HoldRegistry::new();
+    hold_registry.hold(&execution_id, Some("debugging by hand".to_owned()), 0);
+
+    let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let inspector = StaticTerminalInspector(live_terminal(0));
+    let outcome = run_one_pass_with_terminal(
+        db.as_ref(),
+        &live_states,
+        Some(&inspector),
+        coordinator.clone(),
+        sink.as_ref(),
+        StaleWorkerSweepControls {
+            reaper: reaper.as_ref(),
+            hold_registry: &hold_registry,
+            cube_client: &NoopCube,
+        },
+        StaleWorkerThresholds {
+            stale_threshold_secs: ALWAYS_STALE,
+            auto_reap_threshold_secs: ALWAYS_STALE,
+        },
+    )
+    .await;
+
+    assert_eq!(
+        outcome.reaped, 0,
+        "a held worker must never be auto-reaped, however stale it looks"
+    );
+    assert_eq!(outcome.held_skipped, 1);
+    assert_eq!(
+        outcome.auto_reap_aborted, 0,
+        "a hold short-circuits before classification (and so the auto-reap attempt) is even reached"
+    );
+    assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
+    assert!(
+        coordinator
+            .worker_pool()
+            .claimed_execution_ids()
+            .await
+            .contains(&execution_id),
+        "a held worker's slot must remain claimed",
     );
     assert!(reaper.reaped().is_empty());
 }

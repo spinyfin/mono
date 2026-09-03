@@ -79,11 +79,44 @@
 //!   degraded evidence. Local dispatch refuses those drivers, so a
 //!   below-`Rich` live slot cannot support cadence-based judgement and is
 //!   surfaced rather than silently skipped.
-//! - Tool condition `idle` and the checkpoint predates the threshold, on a
-//!   `Rich` driver ⇒ genuinely stale. Raises (or updates) the `stale_worker`
-//!   attention with the session's attach command. This module never reaps
-//!   this case — the two-hour token-verified auto-reap is a later,
-//!   dependent change; today's classifier only detects and surfaces it.
+//! - Tool condition `idle` and the checkpoint predates `stale_threshold_secs`,
+//!   on a `Rich` driver ⇒ genuinely stale. Raises (or updates) the
+//!   `stale_worker` attention with the session's attach command. If the same
+//!   checkpoint ALSO predates the longer [`DEFAULT_AUTO_REAP_THRESHOLD_SECS`]
+//!   (two hours), the sweep does not stop at the attention — see the next
+//!   section.
+//!
+//! ## The two-hour token-verified auto-reap
+//!
+//! A `Working`, unheld, `Rich`, tmux-confirmed-live slot that reads
+//! `SemanticStaleness::Stale` against `stale_threshold_secs` is re-classified
+//! against the longer [`DEFAULT_AUTO_REAP_THRESHOLD_SECS`]. If it clears that
+//! bar too, [`attempt_auto_reap`] re-verifies the candidate ONE more time,
+//! right before acting, rather than trusting the classification this pass
+//! already made — possibly several `.await`s earlier:
+//!
+//! 1. A fresh [`WorkerTerminalInspector::inspect`] call. tmux's own
+//!    dead/alive classification embeds the spawn-token check
+//!    ([`DeadPaneEvidence::SpawnTokenMismatch`]), so requiring a fresh
+//!    `Alive` result here is what makes the reap "token-verified" — it does
+//!    not trust the identity this pass established earlier.
+//! 2. A fresh [`crate::live_worker_state::LiveWorkerStateRegistry::semantic_progress_for_slot`]
+//!    / [`crate::live_worker_state::LiveWorkerStateRegistry::progress_fidelity_for_slot`]
+//!    read, reclassified with [`classify_semantic_staleness`] against
+//!    `DEFAULT_AUTO_REAP_THRESHOLD_SECS`.
+//!
+//! A hold (checked earlier, at the top of the per-slot loop), a new driver
+//! event, a tool going in flight, a durably-unknown tool condition, a
+//! failed probe, or a changed/dead tmux identity all block the reap — the
+//! candidate falls back to the ordinary non-destructive `genuinely_stuck`
+//! attention and is reconsidered next pass. Only once the recheck itself
+//! reconfirms `Stale` does [`execute_auto_reap`] run, in this order: a
+//! recovery backup of uncommitted workspace work, marking the execution
+//! orphaned and appending the `[engine-reconcile]` audit line, tearing down
+//! driver-owned state, the token-verified tmux reap
+//! ([`StaleWorkerReaper::reap_worker`] — the exact teardown `bossctl agents
+//! stop` performs), cube-lease and worker-slot release, and a coordinator
+//! kick so the chore is redispatched.
 //!
 //! ## Cadence
 //!
@@ -444,6 +477,18 @@ pub const DEFAULT_STALE_THRESHOLD_SECS: i64 = 1_800;
 /// spinning up and has not yet emitted its first hook.
 pub const STALE_GRACE_SECS: i64 = 60;
 
+/// Second, longer threshold. A confirmed-live (tmux-verified), `Rich`,
+/// `Working` slot whose tool condition is durably idle and whose
+/// semantic-progress checkpoint ALSO predates this — not just
+/// `stale_threshold_secs` — is not only flagged, it is destructively
+/// reaped, after one more just-in-time recheck (see the module doc's
+/// "two-hour token-verified auto-reap" section and [`attempt_auto_reap`]).
+/// Two hours is deliberately far past [`DEFAULT_STALE_THRESHOLD_SECS`]: the
+/// shorter threshold exists so a human notices; this one exists for the
+/// case nobody does, so a wedge does not hold a workspace, cube lease, and
+/// worker slot hostage indefinitely.
+pub const DEFAULT_AUTO_REAP_THRESHOLD_SECS: i64 = 7_200;
+
 /// Reaps a confirmed-stale worker's OS process tree and tears down its
 /// pane/slot — the exact teardown `bossctl agents stop` performs (the
 /// `release_worker_pane` path: app pane release → `reap_worker_process_tree`
@@ -519,6 +564,14 @@ pub struct StaleWorkerSweepOutcome {
     /// [`crate::durable_liveness`] still reports an alive pid, so the sweep
     /// refused to reap.
     pub dead_uncorroborated: usize,
+    /// A `Rich`, `Working`, tmux-confirmed-live slot cleared the two-hour
+    /// [`DEFAULT_AUTO_REAP_THRESHOLD_SECS`] bar on this pass's initial
+    /// classification, but [`attempt_auto_reap`]'s just-in-time recheck —
+    /// a fresh tmux identity probe and a fresh semantic-progress read,
+    /// immediately before the destructive sequence — no longer confirmed
+    /// it. The reap was aborted; the slot falls back to (and is also
+    /// counted in) the ordinary [`Self::genuinely_stuck`] attention.
+    pub auto_reap_aborted: usize,
 }
 
 impl crate::sweep_loop::SweepOutcome for StaleWorkerSweepOutcome {
@@ -550,6 +603,7 @@ impl crate::sweep_loop::SweepOutcome for StaleWorkerSweepOutcome {
             tool_condition_unknown = self.tool_condition_unknown,
             fidelity_below_rich = self.fidelity_below_rich,
             dead_uncorroborated = self.dead_uncorroborated,
+            auto_reap_aborted = self.auto_reap_aborted,
             "stale-worker sweep: pass complete",
         );
     }
@@ -585,6 +639,19 @@ pub struct StaleWorkerSweepControls<'a> {
     pub cube_client: &'a dyn CubeClient,
 }
 
+/// The two staleness thresholds one pass classifies against. Bundled to
+/// keep [`run_one_pass_with_terminal`] under clippy's argument-count lint
+/// once [`DEFAULT_AUTO_REAP_THRESHOLD_SECS`] joined `stale_threshold_secs`
+/// as a second, independently-configurable bar.
+#[derive(Debug, Clone, Copy)]
+pub struct StaleWorkerThresholds {
+    /// Non-destructive attention bar — see [`DEFAULT_STALE_THRESHOLD_SECS`].
+    pub stale_threshold_secs: i64,
+    /// Destructive auto-reap bar — see [`DEFAULT_AUTO_REAP_THRESHOLD_SECS`]
+    /// and the module doc's "two-hour token-verified auto-reap" section.
+    pub auto_reap_threshold_secs: i64,
+}
+
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`.
 /// Fires immediately on spawn so a worker that wedged before the engine
 /// restarted is recovered at boot without waiting for the first interval.
@@ -592,6 +659,7 @@ pub fn spawn_loop(
     deps: StaleWorkerSweepDeps,
     interval: Duration,
     stale_threshold_secs: i64,
+    auto_reap_threshold_secs: i64,
 ) -> tokio::task::JoinHandle<()> {
     let StaleWorkerSweepDeps {
         work_db,
@@ -624,7 +692,10 @@ pub fn spawn_loop(
                     hold_registry: hold_registry.as_ref(),
                     cube_client: cube_client.as_ref(),
                 },
-                stale_threshold_secs,
+                StaleWorkerThresholds {
+                    stale_threshold_secs,
+                    auto_reap_threshold_secs,
+                },
             )
             .await
         }
@@ -655,7 +726,13 @@ pub async fn run_one_pass(
             // force-releases a cube lease.
             cube_client: &crate::test_support::NoopCube,
         },
-        stale_threshold_secs,
+        StaleWorkerThresholds {
+            stale_threshold_secs,
+            // No terminal inspector on this path, so the tmux-identified
+            // auto-reap branch is unreachable — this value is never
+            // consulted.
+            auto_reap_threshold_secs: DEFAULT_AUTO_REAP_THRESHOLD_SECS,
+        },
     )
     .await
 }
@@ -673,13 +750,17 @@ pub async fn run_one_pass_with_terminal(
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: &dyn DispatchEventSink,
     controls: StaleWorkerSweepControls<'_>,
-    stale_threshold_secs: i64,
+    thresholds: StaleWorkerThresholds,
 ) -> StaleWorkerSweepOutcome {
     let StaleWorkerSweepControls {
         reaper,
         hold_registry,
         cube_client,
     } = controls;
+    let StaleWorkerThresholds {
+        stale_threshold_secs,
+        auto_reap_threshold_secs,
+    } = thresholds;
     let mut outcome = StaleWorkerSweepOutcome::default();
     let snapshot = live_states.snapshot();
 
@@ -897,6 +978,47 @@ pub async fn run_one_pass_with_terminal(
                 .await;
             }
             (SemanticStaleness::Stale { progress_at }, TmuxIdentity::Live { session_name }) => {
+                // The same checkpoint also cleared the longer auto-reap
+                // bar on this pass's initial read — attempt the
+                // token-verified recheck-and-reap before falling back to
+                // the ordinary (non-destructive) stuck attention.
+                let cleared_auto_reap_bar = matches!(
+                    classify_semantic_staleness(
+                        tool_condition,
+                        Some(progress_at.as_str()),
+                        &started_at,
+                        fidelity,
+                        now_epoch_secs,
+                        auto_reap_threshold_secs,
+                    ),
+                    SemanticStaleness::Stale { .. }
+                );
+                if cleared_auto_reap_bar {
+                    let decision = attempt_auto_reap(
+                        AutoReapContext::builder()
+                            .work_db(work_db)
+                            .live_states(live_states)
+                            .coordinator(coordinator.clone())
+                            .dispatch_events(dispatch_events)
+                            .reaper(reaper)
+                            .cube_client(cube_client)
+                            .terminal_inspector(
+                                terminal_inspector.expect("Live identity implies an inspector produced it"),
+                            )
+                            .build(),
+                        &state,
+                        &execution,
+                        &started_at,
+                        auto_reap_threshold_secs,
+                        now_epoch_secs,
+                    )
+                    .await;
+                    if matches!(decision, AutoReapDecision::Reaped) {
+                        outcome.reaped += 1;
+                        continue;
+                    }
+                    outcome.auto_reap_aborted += 1;
+                }
                 outcome.genuinely_stuck += 1;
                 raise_stuck_attention(
                     AttentionContext {
@@ -1121,6 +1243,244 @@ async fn raise_probe_unavailable_attention(ctx: AttentionContext<'_>, verdict: &
         Some(semantic_verdict),
     )
     .await;
+}
+
+/// Outcome of [`attempt_auto_reap`]'s just-in-time recheck.
+enum AutoReapDecision {
+    /// The recheck reconfirmed live identity and `Stale` evidence;
+    /// [`execute_auto_reap`] ran to completion.
+    Reaped,
+    /// The recheck did not reconfirm eligibility — see the `tracing::warn!`
+    /// immediately before the specific return site for why. The caller
+    /// falls back to the ordinary non-destructive attention.
+    Aborted,
+}
+
+/// Collaborators for [`attempt_auto_reap`] / [`execute_auto_reap`], bundled
+/// (with a builder, matching [`StaleWorkerSweepDeps`]/`ReapOptions`'s
+/// convention for a collaborator struct past 5 fields) so the call site
+/// stays under clippy's argument-count lint.
+#[derive(bon::Builder)]
+struct AutoReapContext<'a> {
+    work_db: &'a WorkDb,
+    live_states: &'a LiveWorkerStateRegistry,
+    coordinator: Arc<ExecutionCoordinator>,
+    dispatch_events: &'a dyn DispatchEventSink,
+    reaper: &'a dyn StaleWorkerReaper,
+    cube_client: &'a dyn CubeClient,
+    terminal_inspector: &'a dyn WorkerTerminalInspector,
+}
+
+/// Just-in-time recheck for the two-hour auto-reap, run immediately before
+/// any destructive action: a fresh tmux identity probe (which re-validates
+/// the spawn token as part of its own dead/alive classification — see
+/// [`TmuxWorkerTerminalInspector::inspect`]) and a fresh semantic-progress
+/// read, reclassified against `auto_reap_threshold_secs`. The
+/// classification that got the caller here can be several `.await`s old by
+/// the time it would otherwise act; this function is what makes the reap
+/// "token-verified" rather than trusting that earlier snapshot. Returns
+/// [`AutoReapDecision::Reaped`] only if the recheck itself still reads a
+/// confirmed-live, `Stale` candidate — in which case [`execute_auto_reap`]
+/// has already run.
+async fn attempt_auto_reap(
+    ctx: AutoReapContext<'_>,
+    state: &boss_protocol::LiveWorkerState,
+    execution: &boss_protocol::WorkExecution,
+    started_at: &str,
+    auto_reap_threshold_secs: i64,
+    now_epoch_secs: i64,
+) -> AutoReapDecision {
+    let execution_id = &state.run_id;
+
+    let session_name = match ctx.terminal_inspector.inspect(execution_id).await {
+        Ok(Some(TerminalLiveness::Alive { session_name, .. })) => session_name,
+        Ok(Some(TerminalLiveness::Dead { session_name, evidence })) => {
+            tracing::warn!(
+                execution_id,
+                session_name,
+                ?evidence,
+                "stale-worker sweep: auto-reap recheck found the tmux identity no longer live; \
+                 aborting the reap (falling back to the non-destructive attention)",
+            );
+            return AutoReapDecision::Aborted;
+        }
+        Ok(None) => {
+            tracing::warn!(
+                execution_id,
+                "stale-worker sweep: auto-reap recheck lost tmux identity for this run; aborting the reap",
+            );
+            return AutoReapDecision::Aborted;
+        }
+        Err(err) => {
+            tracing::warn!(
+                execution_id,
+                ?err,
+                "stale-worker sweep: auto-reap recheck's tmux identity probe failed; aborting the reap",
+            );
+            return AutoReapDecision::Aborted;
+        }
+    };
+
+    let checkpoint = ctx.live_states.semantic_progress_for_slot(state.slot_id);
+    let (tool_condition, progress_at) = match &checkpoint {
+        Some(checkpoint) => (checkpoint.tool_condition, Some(checkpoint.progress_at.as_str())),
+        None => (SemanticToolCondition::Unknown, None),
+    };
+    let fidelity = ctx.live_states.progress_fidelity_for_slot(state.slot_id);
+    let verdict = classify_semantic_staleness(
+        tool_condition,
+        progress_at,
+        started_at,
+        fidelity,
+        now_epoch_secs,
+        auto_reap_threshold_secs,
+    );
+    let SemanticStaleness::Stale { progress_at } = verdict else {
+        tracing::warn!(
+            execution_id,
+            session_name,
+            verdict = semantic_verdict_label(&verdict),
+            "stale-worker sweep: auto-reap recheck's semantic evidence no longer reads stale; \
+             aborting the reap (falling back to the non-destructive attention)",
+        );
+        return AutoReapDecision::Aborted;
+    };
+
+    execute_auto_reap(
+        ctx,
+        state,
+        execution,
+        &session_name,
+        &progress_at,
+        auto_reap_threshold_secs,
+        now_epoch_secs,
+    )
+    .await;
+    AutoReapDecision::Reaped
+}
+
+/// Run once [`attempt_auto_reap`]'s recheck has reconfirmed a live,
+/// `Stale` candidate: recovery backup, orphan the execution and append the
+/// `[engine-reconcile]` audit line, tear down driver-owned state, the
+/// token-verified tmux reap ([`StaleWorkerReaper::reap_worker`] — the
+/// exact teardown `bossctl agents stop` performs), release the cube lease
+/// and worker slot, and kick the coordinator so the chore is redispatched
+/// — in that order.
+async fn execute_auto_reap(
+    ctx: AutoReapContext<'_>,
+    state: &boss_protocol::LiveWorkerState,
+    execution: &boss_protocol::WorkExecution,
+    session_name: &str,
+    progress_at: &str,
+    auto_reap_threshold_secs: i64,
+    now_epoch_secs: i64,
+) {
+    let AutoReapContext {
+        work_db,
+        live_states,
+        coordinator,
+        dispatch_events,
+        reaper,
+        cube_client,
+        terminal_inspector: _,
+    } = ctx;
+    let execution_id = &state.run_id;
+
+    tracing::warn!(
+        execution_id,
+        work_item_id = %execution.work_item_id,
+        slot_id = state.slot_id,
+        session_name,
+        progress_at,
+        auto_reap_threshold_secs,
+        "stale-worker sweep: two-hour token-verified auto-reap firing",
+    );
+
+    // 1. Recovery backup — capture uncommitted workspace work before any
+    //    teardown makes the workspace eligible for re-lease/reset.
+    let recovery_patch = boss_engine_recovery::recovery_backup::backup_dead_execution(execution);
+
+    // 2. Orphan + audit.
+    let reason = format!(
+        "stale-worker-auto-reap: tmux session {session_name} confirmed live and idle for more than \
+         {auto_reap_threshold_secs}s (last driver event: {progress_at}); worker force-reaped after a \
+         token-verified recheck"
+    );
+    if let Err(err) = work_db.mark_execution_orphaned(execution_id, &reason) {
+        tracing::warn!(
+            execution_id,
+            ?err,
+            "stale-worker sweep: auto-reap failed to mark execution orphaned; aborting the reap",
+        );
+        return;
+    }
+    resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
+    if let Some(work_item_id) = &state.work_item_id
+        && let Err(err) = crate::reconcile_audit::append_reconcile_audit(
+            work_db,
+            work_item_id,
+            now_epoch_secs,
+            &format!(
+                "stale worker (exec {execution_id}) auto-reaped — tmux session {session_name} was confirmed \
+                 live but idle for more than {auto_reap_threshold_secs}s (last driver event: {progress_at}); \
+                 chore reset to todo for redispatch"
+            ),
+            recovery_patch.as_deref(),
+        )
+    {
+        tracing::warn!(
+            work_item_id,
+            ?err,
+            "stale-worker sweep: auto-reap failed to append audit line to description (non-fatal)",
+        );
+    }
+
+    // 3. Driver teardown.
+    crate::driver_teardown::teardown_driver_workspace(
+        work_db,
+        execution_id,
+        execution.workspace_path.as_deref().map(std::path::Path::new),
+        crate::driver_teardown::TeardownReason::StaleWorkerReconcile,
+    )
+    .await;
+
+    // 4. Token-verified tmux reap. `attempt_auto_reap` already re-verified
+    //    live identity — including the spawn token, checked as part of the
+    //    tmux probe's own dead/alive classification — immediately before
+    //    this call.
+    reaper.reap_worker(execution_id).await;
+
+    // 5. Slot and lease release.
+    if let Some(lease_id) = execution.cube_lease_id.as_deref() {
+        crate::execution_liveness::force_release_lease_best_effort(
+            execution_id,
+            lease_id,
+            cube_client.force_release_lease(lease_id, Some("stale-worker auto-reap: two-hour idle tmux worker")),
+        )
+        .await;
+    }
+    live_states.release_slot(state.slot_id);
+
+    // 6. Coordinator kick.
+    let worker_id = worker_id_for_slot(state.slot_id);
+    coordinator.release_worker_and_kick(&worker_id, None).await;
+
+    dispatch_events
+        .emit(
+            DispatchEvent::new(Stage::StaleWorkerReconcile, Outcome::Ok, execution_id)
+                .with_work_item(&execution.work_item_id)
+                .with_details(serde_json::json!({
+                    "slot_id": state.slot_id,
+                    "auto_reap": true,
+                    "session_name": session_name,
+                    "progress_at": progress_at,
+                    "auto_reap_threshold_secs": auto_reap_threshold_secs,
+                    "recovery_patch": recovery_patch
+                        .as_deref()
+                        .map(|p| p.display().to_string()),
+                })),
+        )
+        .await;
 }
 
 /// The conservative cadence-only fallback for a run with no tmux identity.
