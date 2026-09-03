@@ -133,7 +133,14 @@ fn is_boss_propose_submit_segment(segment: &str) -> bool {
             break;
         }
     }
-    let Some(after) = rest.strip_prefix("boss propose") else {
+    let Some((prog, after_prog)) = rest.split_once(char::is_whitespace) else {
+        return false;
+    };
+    if !boss_engine_worker_bin::is_boss_cli_token(prog) {
+        return false;
+    }
+    let after = after_prog.trim_start();
+    let Some(after) = after.strip_prefix("propose") else {
         return false;
     };
     let after = after.trim_start();
@@ -174,6 +181,21 @@ mod tests {
     fn detects_boss_propose_submit_command() {
         let input = json!({"command": "boss propose blocked --reason \"bazel wedged\""});
         assert!(is_boss_propose_submit_command(&input));
+    }
+
+    #[test]
+    fn detects_named_boss_bin_propose_submit_command() {
+        for command in [
+            r#""$BOSS_BIN" propose blocked --reason "bazel wedged""#,
+            r#"$BOSS_BIN propose blocked --reason x"#,
+            r#"/Applications/Boss.app/Contents/Resources/bin/boss propose blocked --reason x"#,
+        ] {
+            let input = json!({"command": command});
+            assert!(
+                is_boss_propose_submit_command(&input),
+                "must detect named-binary propose: {command}"
+            );
+        }
     }
 
     #[test]

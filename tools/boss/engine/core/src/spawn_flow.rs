@@ -753,10 +753,26 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         .iter()
         .find(|e| e.key == boss_engine_worker_bin::WORKER_BIN_DIR_ENV)
         .map(|e| e.value.clone());
-    if let Some(worker_bin_dir) = worker_bin_dir.filter(|dir| !dir.is_empty())
-        && let Some(path_entry) = env.iter_mut().find(|e| e.key == "PATH")
-    {
-        path_entry.value = format!("{worker_bin_dir}:{}", path_entry.value);
+    if let Some(worker_bin_dir) = worker_bin_dir.filter(|dir| !dir.is_empty()) {
+        if let Some(path_entry) = env.iter_mut().find(|e| e.key == "PATH") {
+            path_entry.value = format!("{worker_bin_dir}:{}", path_entry.value);
+        }
+        // Name the binaries, not a PATH entry. A driver shell snapshot can
+        // demote the launcher dir (Codex does this today); `"$BOSS_BIN"` /
+        // `"$CUBE_BIN"` still exec the launchers. Pushed after the bundle
+        // `BOSS_BIN` so a BTreeMap collect last-wins on duplicate keys.
+        env.push(EnvVar {
+            key: boss_engine_worker_bin::BOSS_BIN_ENV.into(),
+            value: boss_engine_worker_bin::boss_bin_in(Path::new(&worker_bin_dir))
+                .display()
+                .to_string(),
+        });
+        env.push(EnvVar {
+            key: boss_engine_worker_bin::CUBE_BIN_ENV.into(),
+            value: boss_engine_worker_bin::cube_bin_in(Path::new(&worker_bin_dir))
+                .display()
+                .to_string(),
+        });
     }
 
     let claimed_slot = input.slot_id;
@@ -2158,6 +2174,20 @@ mod tests {
                 .map(|(_, v)| v.as_str()),
             Some("/tmp/boss-worker-settings/bin"),
             "the dir must also be exported so the pane's first shell line can re-prepend it",
+        );
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == boss_engine_worker_bin::BOSS_BIN_ENV)
+                .map(|(_, v)| v.as_str()),
+            Some("/tmp/boss-worker-settings/bin/boss"),
+            "BOSS_BIN must name the launcher, not a PATH entry",
+        );
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == boss_engine_worker_bin::CUBE_BIN_ENV)
+                .map(|(_, v)| v.as_str()),
+            Some("/tmp/boss-worker-settings/bin/cube"),
+            "CUBE_BIN must name the launcher, not a PATH entry",
         );
     }
 

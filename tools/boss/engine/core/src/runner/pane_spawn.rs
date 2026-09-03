@@ -539,7 +539,6 @@ fn ensure_worker_bin_dir(settings_dir: &Path, workspace_path: &Path) -> Option<P
                 target = %resolved.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "<unresolved>".to_owned()),
                 "worker `boss` launcher written",
             );
-            Some(dir)
         }
         Err(err) => {
             tracing::warn!(
@@ -548,9 +547,38 @@ fn ensure_worker_bin_dir(settings_dir: &Path, workspace_path: &Path) -> Option<P
                 "could not write the worker `boss` launcher; the worker's PATH is unchanged and \
                  a bare `boss` may resolve to a build-from-source shim",
             );
-            None
+            return None;
         }
     }
+
+    let cube_override = std::env::var_os(boss_engine_worker_bin::CUBE_CLI_BIN_ENV).map(PathBuf::from);
+    let cube_resolved = boss_engine_worker_bin::resolve_cube_cli(
+        &engine_path,
+        workspace_dir.as_deref(),
+        cube_override.as_deref(),
+        boss_bin_dir.as_deref(),
+    );
+    match boss_engine_worker_bin::write_cube_launcher(&dir, cube_resolved.as_deref()) {
+        Ok(launcher) => {
+            tracing::debug!(
+                launcher = %launcher.display(),
+                target = %cube_resolved
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<unresolved>".to_owned()),
+                "worker `cube` launcher written",
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                dir = %dir.display(),
+                "could not write the worker `cube` launcher; a bare `cube` may resolve to a \
+                 build-from-source shim. The `boss` launcher is still in place.",
+            );
+        }
+    }
+    Some(dir)
 }
 
 /// Copy the boss-event shim binary to a stable location in the Boss
@@ -1444,7 +1472,10 @@ mod pane_spawn_tests {
             "implementation prompt must tell the worker to print the URL on its own line: {prompt}",
         );
         assert!(
-            prompt.contains("gh pr create") || prompt.contains("gh pr view") || prompt.contains("cube pr create"),
+            prompt.contains("gh pr create")
+                || prompt.contains("gh pr view")
+                || prompt.contains("cube pr create")
+                || prompt.contains("$CUBE_BIN"),
             "implementation prompt must mention gh pr commands or cube pr create: {prompt}",
         );
         assert!(
@@ -2831,13 +2862,13 @@ mod pane_spawn_tests {
         assert_eq!(String::from_utf8_lossy(&out.stdout), "/usr/bin");
     }
 
-    /// `ensure_worker_bin_dir` always leaves a usable `boss` behind, even
-    /// when nothing resolves — an unresolved launcher that fails loudly
-    /// beats letting the worker PATH-resolve a build-from-source shim.
-    /// And it writes `boss` only: `bossctl` stays Boss-tier. The dir is
-    /// keyed by workspace name so concurrent spawns do not share a path.
+    /// `ensure_worker_bin_dir` always leaves a usable `boss` (and `cube`)
+    /// behind, even when nothing resolves — an unresolved launcher that
+    /// fails loudly beats letting the worker PATH-resolve a build-from-source
+    /// shim. `bossctl` stays Boss-tier. The dir is keyed by workspace name
+    /// so concurrent spawns do not share a path.
     #[test]
-    fn ensure_worker_bin_dir_writes_only_boss() {
+    fn ensure_worker_bin_dir_writes_boss_and_cube_never_bossctl() {
         let dir = TempDir::new().unwrap();
         let workspace = dir.path().join("workspaces/mono-agent-007");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -2851,8 +2882,8 @@ mod pane_spawn_tests {
         entries.sort();
         assert_eq!(
             entries,
-            vec!["boss".to_owned()],
-            "only `boss` may be handed to a worker; `bossctl` is Boss-tier",
+            vec!["boss".to_owned(), "cube".to_owned()],
+            "workers get `boss` and `cube` launchers; `bossctl` is Boss-tier",
         );
     }
 

@@ -282,7 +282,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
     let draft_directive = if input.draft_pr_mode {
         "\n## PR creation mode\n\
          \n\
-         Default PR creation mode: pass `--draft` to `cube pr create`\n\
+         Default PR creation mode: pass `--draft` to `{cube} pr create`\n\
          unless the chore description explicitly says to create a non-draft PR.\n"
     } else {
         ""
@@ -292,6 +292,8 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
     // real bazel target label the way the pre-crate-split
     // `//tools/boss/engine:engine` string did.
     let engine_bazel_run_command = env!("BOSS_ENGINE_BAZEL_RUN_COMMAND");
+    let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
+    let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     format!(
         "# Boss worker rules\n\
          \n\
@@ -301,20 +303,20 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          \n\
          **A task is not complete until a PR exists.** Local commits are NOT enough.\n\
          \n\
-         - Open a PR with `cube pr create` once commits exist and tests pass.\n\
+         - Open a PR with `{cube} pr create` once commits exist and tests pass.\n\
          - **If a PR already exists** (resuming or addressing review),\n\
-           push new commits to it with `cube pr update`; do NOT open a\n\
-           duplicate. `cube pr create` is safe to retry: if a prior call\n\
+           push new commits to it with `{cube} pr update`; do NOT open a\n\
+           duplicate. `{cube} pr create` is safe to retry: if a prior call\n\
            already created the PR (e.g. your tool killed an earlier\n\
            invocation on a timeout but the push had actually landed), it\n\
-           returns that PR's URL instead of erroring. Use `cube pr update`\n\
+           returns that PR's URL instead of erroring. Use `{cube} pr update`\n\
            only when you have new commits to push onto an already-open PR;\n\
-           it errors if none does. Check first with `boss pr status` — one\n\
+           it errors if none does. Check first with `{boss} pr status` — one\n\
            local round trip against the engine, not GitHub. Do NOT rely on\n\
-           `boss context`'s `task.pr_url` field for this: it is NULL for a\n\
+           `{boss} context`'s `task.pr_url` field for this: it is NULL for a\n\
            revision task by design (a revision never owns its own PR — the\n\
            chain root does), so an empty `task.pr_url` does NOT mean \"no\n\
-           PR exists\" when you're a revision worker. `boss pr status`\n\
+           PR exists\" when you're a revision worker. `{boss} pr status`\n\
            resolves your actually-bound PR correctly either way.\n\
          - Do not hard-wrap PR bodies.\n\
          - **NEVER pass the PR body as `--body \"<inline text>\"`** — the shell\n\
@@ -331,26 +333,26 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          These read your own PR only — never another run's — and cost one\n\
          local round trip against the engine, not a GitHub API call:\n\
          \n\
-         - `boss pr status` — includes your resolved `pr_url`, the\n\
+         - `{boss} pr status` — includes your resolved `pr_url`, the\n\
            cheapest way to answer \"do I already have a PR?\" before\n\
-           deciding between `cube pr create` and `cube pr update`. Prefer\n\
-           this over `boss context`'s `task.pr_url` field: that field is\n\
+           deciding between `{cube} pr create` and `{cube} pr update`. Prefer\n\
+           this over `{boss} context`'s `task.pr_url` field: that field is\n\
            NULL for a revision task by design (the chain root owns the PR,\n\
            not the revision), so it reads as \"no PR\" even when one exists.\n\
-           `boss pr status` also returns `mergeable`, `merge_state_status`,\n\
+           `{boss} pr status` also returns `mergeable`, `merge_state_status`,\n\
            `head_sha`, and `observed_at` for your own PR, e.g.:\n\
            ```sh\n\
-           boss pr status --json\n\
+           {boss} pr status --json\n\
            ```\n\
            This is Boss's **last stored observation from the merge poller,\n\
            not live GitHub truth** — `observed_at` (Unix epoch seconds) is\n\
            the timestamp of that observation, not of your call. Right after\n\
            a push, the stored snapshot usually still reflects the *pre-push*\n\
-           state. If you need current state (e.g. right after `cube pr\n\
+           state. If you need current state (e.g. right after `{cube} pr\n\
            update` to see whether the push cleared a conflict), pass\n\
            `--refresh` for one bounded, rate-limited live check:\n\
            ```sh\n\
-           boss pr status --refresh --json\n\
+           {boss} pr status --refresh --json\n\
            ```\n\
            A refresh can be silently throttled (`refresh_throttled: true`\n\
            in the response) if the engine-wide budget is exhausted — in\n\
@@ -359,24 +361,24 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
            change: the engine's own merge poller is what watches your PR to\n\
            green after you push, not you — the same \"do not babysit CI\"\n\
            principle your task prompt states applies here too.\n\
-         - `boss pr body` — the PR title and body/description Boss\n\
+         - `{boss} pr body` — the PR title and body/description Boss\n\
            snapshotted when this run started, for a read-modify-write of\n\
            the description without a `gh pr view` round trip. If the\n\
            response's `body` is null (`--json`) or says \"(none stored)\"\n\
            (text), it means this run began a brand-new PR flow — there is\n\
            nothing to diff against yet, you are about to write the first\n\
-           description via `cube pr\n\
+           description via `{cube} pr\n\
            create --body-file`. It does NOT mean the PR has an empty\n\
            description; an intentionally empty one is stored as `\"\"`, not\n\
            null. Only fall back to `gh pr view --json body` if you must\n\
            confirm the null case is not a fetch failure rather than a\n\
            new-PR flow.\n\
          \n\
-         If a `boss` command fails to run at all — not found, or it exits\n\
+         If a `{boss}` command fails to run at all — not found, or it exits\n\
          non-zero without answering — that is a finding, not noise. Say so\n\
          explicitly in your final response and name the command. Do NOT\n\
          quietly drop the step and carry on: a create-vs-update decision\n\
-         made without `boss pr status` is a decision made blind, and\n\
+         made without `{boss} pr status` is a decision made blind, and\n\
          nobody downstream can tell that from a clean transcript.\n\
          \n\
          ## Your workspace\n\
@@ -399,8 +401,8 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
            `jj bookmark create <name> -r @` to name a commit.\n\
          - **NEVER push branches or open PRs with bare VCS commands** (`jj git push`,\n\
            `git push`, `gh pr create`). A PreToolUse hook blocks these. Use:\n\
-           - `cube pr create --branch <name>` — new PR (pushes branch + opens PR, jj-aware, no GIT_DIR needed)\n\
-           - `cube pr update --branch <name>` — existing PR (pushes new commits to it)\n\
+           - `{cube} pr create --branch <name>` — new PR (pushes branch + opens PR, jj-aware, no GIT_DIR needed)\n\
+           - `{cube} pr update --branch <name>` — existing PR (pushes new commits to it)\n\
          - Never `jj git push --deleted` or `git push --delete`\n\
            without explicit user approval.\n\
          - `{config_dir}/` is gitignored by the engine. Do not force-track\n\
@@ -419,7 +421,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          \n\
          Cube workspaces are secondary jj workspaces. There is no `.git/`\n\
          at the workspace root, so bare `gh` calls fail with\n\
-         `fatal: not a git repository`. Use `cube pr create` instead —\n\
+         `fatal: not a git repository`. Use `{cube} pr create` instead —\n\
          it resolves the remote `owner/repo` from `jj git remote` and\n\
          passes `-R <owner/repo>` to `gh`, so no `GIT_DIR` guess is needed.\n\
          \n\
@@ -436,19 +438,19 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          ## Summary\n\
          Your description here. Inline code like `crate-name` and `$(cmd)` is safe.\n\
          PRBODY\n\
-         cube pr create --branch my-feature --title \"Your PR title\" --body-file \"$body\"\n\
+         {cube} pr create --branch my-feature --title \"Your PR title\" --body-file \"$body\"\n\
          ```\n\
          \n\
-         `cube pr create` is safe to retry: if an open PR already exists for\n\
+         `{cube} pr create` is safe to retry: if an open PR already exists for\n\
          the branch, it returns that PR's URL instead of erroring, without\n\
-         pushing again. Use `cube pr update` only when you have new commits\n\
-         to push onto an already-open PR (see below). `cube pr create` handles\n\
+         pushing again. Use `{cube} pr update` only when you have new commits\n\
+         to push onto an already-open PR (see below). `{cube} pr create` handles\n\
          the push and `--allow-new` automatically; never call `jj git push` directly.\n\
          \n\
          To update an existing PR (push new commits to it):\n\
          \n\
          ```sh\n\
-         cube pr update --branch my-feature   # pushes to the PR; errors if none exists\n\
+         {cube} pr update --branch my-feature   # pushes to the PR; errors if none exists\n\
          ```\n\
          \n\
          ### `origin` is the real GitHub upstream (shared object store)\n\
@@ -457,7 +459,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          object store with its siblings — there is no per-workspace clone. That\n\
          store has a single `origin` remote pointing at the real GitHub upstream.\n\
          \n\
-         - **Only use `cube pr create` / `cube pr update` for pushes and PR operations**:\n\
+         - **Only use `{cube} pr create` / `{cube} pr update` for pushes and PR operations**:\n\
            they push to GitHub by URL and resolve `-R <owner/repo>` for `gh`\n\
            automatically, so PR creation Just Works without `.git/` at the root.\n\
            Direct `jj git push`, `git push`, or `gh pr create` calls are blocked\n\
@@ -480,13 +482,13 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          \n\
          ## Merge-conflict telemetry\n\
          \n\
-         If you ever run `cube workspace rebase` mid-task (e.g. to sync with\n\
+         If you ever run `{cube} workspace rebase` mid-task (e.g. to sync with\n\
          `main` before pushing, or because a push was rejected) and it reports\n\
          `REBASED_WITH_CONFLICTS`, resolve the conflicts as normal, then\n\
          AFTER resolving run:\n\
          \n\
          ```sh\n\
-         boss engine conflicts record-producer --execution-id <your execution id> \\\n\
+         {boss} engine conflicts record-producer --execution-id <your execution id> \\\n\
            --head-branch <branch> --base-branch <main_branch> --files <comma-separated conflicted paths>\n\
          ```\n\
          \n\
@@ -563,12 +565,12 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          Attach them:\n\
          \n\
          ```sh\n\
-         boss attach /tmp/shot.png --caption \"wide table, after the fix\"\n\
+         {boss} attach /tmp/shot.png --caption \"wide table, after the fix\"\n\
          ```\n\
          \n\
          The engine stores the image outside this workspace (which is\n\
          recycled after your run), for your own verification and for an\n\
-         operator looking at this run locally. `boss attach --list` shows\n\
+         operator looking at this run locally. `{boss} attach --list` shows\n\
          what this work item already has, across runs.\n\
          \n\
          Validation is immediate and typed: a path outside this workspace or\n\
@@ -594,6 +596,8 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          as questions from a human reviewer — short, specific answers.\n\
          {draft_directive}",
         absolute_paths = crate::prompt_fragments::absolute_paths_fragment(),
+        boss = boss,
+        cube = cube,
     )
 }
 
@@ -1017,13 +1021,23 @@ fn deny_rules(input: &WorkerSetupInput, fence: DataDirFence) -> Vec<String> {
     // the worker. The rest of the `boss` surface (list/show/etc.)
     // talks to the engine over its IPC socket which is fine, but
     // start/stop reach into engine process state. As with `bossctl`
-    // above, these rules only match the literal PATH-invocation text;
-    // the absolute-path shape (a bundled `boss` binary) is closed by
-    // the `boss engine start|stop` check in `BOSS_LAUNCH_GUARD_COMMAND`.
+    // above, the bare-name rules only match the literal PATH-invocation
+    // text; workers are taught `"$BOSS_BIN"` so those forms need their
+    // own rules. The absolute-path shape (a bundled `boss` binary) is
+    // closed by the `boss engine start|stop` check in
+    // `BOSS_LAUNCH_GUARD_COMMAND`.
     rules.push("Bash(boss engine start)".to_owned());
     rules.push("Bash(boss engine start:*)".to_owned());
     rules.push("Bash(boss engine stop)".to_owned());
     rules.push("Bash(boss engine stop:*)".to_owned());
+    rules.push(r#"Bash("$BOSS_BIN" engine start)"#.to_owned());
+    rules.push(r#"Bash("$BOSS_BIN" engine start:*)"#.to_owned());
+    rules.push(r#"Bash("$BOSS_BIN" engine stop)"#.to_owned());
+    rules.push(r#"Bash("$BOSS_BIN" engine stop:*)"#.to_owned());
+    rules.push("Bash($BOSS_BIN engine start)".to_owned());
+    rules.push("Bash($BOSS_BIN engine start:*)".to_owned());
+    rules.push("Bash($BOSS_BIN engine stop)".to_owned());
+    rules.push("Bash($BOSS_BIN engine stop:*)".to_owned());
 
     // Per-kind extension: reviewer and triage workers both get the read-only /
     // no-publish denylist on top of the static rules above. Standard
@@ -1185,6 +1199,10 @@ pub fn answer_agent_deny_rules() -> Vec<String> {
     // (workspace lease/release, config, …) so the agent cannot touch cube state.
     rules.push("Bash(cube)".to_owned());
     rules.push("Bash(cube:*)".to_owned());
+    rules.push(r#"Bash("$CUBE_BIN")"#.to_owned());
+    rules.push(r#"Bash("$CUBE_BIN":*)"#.to_owned());
+    rules.push("Bash($CUBE_BIN)".to_owned());
+    rules.push("Bash($CUBE_BIN:*)".to_owned());
     rules
 }
 
@@ -1231,9 +1249,14 @@ fn publish_deny_rules() -> Vec<String> {
         "Bash(gh issue close:*)".to_owned(),
         "Bash(gh issue edit)".to_owned(),
         "Bash(gh issue edit:*)".to_owned(),
-        // cube pr operations — Boss's PR management helper.
+        // cube pr operations — Boss's PR management helper. Workers are
+        // taught `"$CUBE_BIN"` so the named-binary form must be denied too.
         "Bash(cube pr)".to_owned(),
         "Bash(cube pr:*)".to_owned(),
+        r#"Bash("$CUBE_BIN" pr)"#.to_owned(),
+        r#"Bash("$CUBE_BIN" pr:*)"#.to_owned(),
+        "Bash($CUBE_BIN pr)".to_owned(),
+        "Bash($CUBE_BIN pr:*)".to_owned(),
     ]
 }
 

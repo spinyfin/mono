@@ -321,7 +321,7 @@ fn acceptance_criterion_uses_fresh_branch_when_no_pr_url() {
         "acceptance criterion should guide fresh branch creation:\n{prompt}",
     );
     assert!(
-        prompt.contains("gh pr create") || prompt.contains("cube pr create"),
+        prompt.contains("gh pr create") || prompt.contains("cube pr create") || prompt.contains("$CUBE_BIN"),
         "acceptance criterion should guide opening a new PR:\n{prompt}",
     );
 }
@@ -1073,8 +1073,8 @@ fn bazel_gate_present_for_chore_on_bazel_workspace_seam_on() {
         "gate must require both bazel build and bazel test:\n{prompt}",
     );
     assert!(
-        prompt.contains("boss propose blocked"),
-        "with the seam flag on, the gate must direct failures to the boss propose blocked \
+        prompt.contains("\"$BOSS_BIN\" propose blocked"),
+        "with the seam flag on, the gate must direct failures to the $BOSS_BIN propose blocked \
              verb:\n{prompt}",
     );
     assert!(
@@ -1092,7 +1092,7 @@ fn bazel_gate_present_for_chore_on_bazel_workspace_seam_on() {
 fn bazel_gate_present_for_chore_on_bazel_workspace_seam_off() {
     // Flag off (the builder default, matching the registry default):
     // the gate must point failures at the legacy `[blocked]` marker, not
-    // `boss propose` — a worker on the flag-off path must never be
+    // `"$BOSS_BIN" propose` — a worker on the flag-off path must never be
     // taught a verb the engine's read path won't yet honor.
     let ws = bazel_workspace();
     let prompt = compose_execution_prompt(
@@ -1108,8 +1108,8 @@ fn bazel_gate_present_for_chore_on_bazel_workspace_seam_off() {
         "bazel pre-push gate must fire for code chores on a Bazel workspace:\n{prompt}",
     );
     assert!(
-        !prompt.contains("boss propose"),
-        "with the seam flag off, the gate must not mention boss propose at all:\n{prompt}",
+        !prompt.contains("\"$BOSS_BIN\" propose"),
+        "with the seam flag off, the gate must not mention $BOSS_BIN propose at all:\n{prompt}",
     );
     assert!(
         prompt.contains("[blocked] reason=\"...\""),
@@ -1131,11 +1131,11 @@ fn worker_escalation_directive_teaches_boss_propose_verbs_when_seam_is_on() {
             .build(),
     );
     assert!(
-        prompt.contains("boss propose effort-escalation --level"),
+        prompt.contains("\"$BOSS_BIN\" propose effort-escalation --level"),
         "seam on: the prompt must teach the effort-escalation verb with a worked example:\n{prompt}",
     );
     assert!(
-        prompt.contains("boss propose blocked --reason"),
+        prompt.contains("\"$BOSS_BIN\" propose blocked --reason"),
         "seam on: the prompt must teach the blocked verb with a worked example:\n{prompt}",
     );
     assert!(
@@ -1154,7 +1154,7 @@ fn worker_escalation_directive_teaches_boss_propose_verbs_when_seam_is_on() {
 fn worker_escalation_directive_teaches_legacy_markers_when_seam_is_off() {
     // Flag off (builder default = registry default): the directive must
     // reproduce the pre-migration marker-only text byte-for-byte in
-    // spirit — no `boss propose` verb anywhere, both markers taught.
+    // spirit — no `"$BOSS_BIN" propose` verb anywhere, both markers taught.
     let ws = tempfile::TempDir::new().unwrap();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
@@ -1165,8 +1165,8 @@ fn worker_escalation_directive_teaches_legacy_markers_when_seam_is_off() {
             .build(),
     );
     assert!(
-        !prompt.contains("boss propose"),
-        "seam off: the directive must not mention boss propose at all:\n{prompt}",
+        !prompt.contains("\"$BOSS_BIN\" propose"),
+        "seam off: the directive must not mention $BOSS_BIN propose at all:\n{prompt}",
     );
     assert!(
         prompt.contains("[effort-escalation] requested_level=<level> reason=\"<why>\""),
@@ -1392,7 +1392,7 @@ fn revision_directive_with_conflict_provenance_injects_conflict_fragment() {
     );
     // Must include the stop conditions.
     assert!(
-        prompt.contains("boss engine conflicts mark-failed"),
+        prompt.contains("engine conflicts mark-failed"),
         "conflict fragment must include the mark-failed stop condition:\n{prompt}",
     );
     // Must contain the jj first-class conflict / stacked-branch recipe.
@@ -1582,7 +1582,7 @@ fn conflict_revision_gate_points_at_boss_propose_blocked_when_seam_is_on() {
     );
     assert!(
         prompt.contains(
-            "Do NOT idle waiting on a wedged build; call `boss propose blocked --reason \"...\"` naming the failure and stop."
+            "Do NOT idle waiting on a wedged build; call `\"$BOSS_BIN\" propose blocked --reason \"...\"` naming the failure and stop."
         ),
         "seam on: conflict-resolution gate's own sentence must direct a wedged build to boss \
              propose blocked (not merely any occurrence of that phrase elsewhere in the prompt):\n{prompt}",
@@ -1615,8 +1615,8 @@ fn conflict_revision_gate_points_at_legacy_marker_when_seam_is_off() {
              sentence must direct a wedged build to the legacy [blocked] marker:\n{prompt}",
     );
     assert!(
-        !prompt.contains("boss propose"),
-        "seam off: conflict-resolution gate must not mention boss propose at all:\n{prompt}",
+        !prompt.contains("\"$BOSS_BIN\" propose"),
+        "seam off: conflict-resolution gate must not mention $BOSS_BIN propose at all:\n{prompt}",
     );
 }
 
@@ -1635,8 +1635,8 @@ fn no_op_directive_points_at_boss_propose_blocked_when_seam_is_on() {
             .build(),
     );
     assert!(
-        prompt.contains("call `boss propose blocked --reason \"...\"` instead"),
-        "seam on: no-op directive's blocked-pointer must name boss propose blocked:\n{prompt}",
+        prompt.contains("call `\"$BOSS_BIN\" propose blocked --reason \"...\"` instead"),
+        "seam on: no-op directive's blocked-pointer must name $BOSS_BIN propose blocked:\n{prompt}",
     );
     assert!(
         !prompt.contains("emit a `[blocked] reason=\"...\"` marker instead"),
@@ -1660,8 +1660,8 @@ fn no_op_directive_points_at_legacy_marker_when_seam_is_off() {
              must name the legacy [blocked] marker:\n{prompt}",
     );
     assert!(
-        !prompt.contains("call `boss propose blocked --reason \"...\"` instead"),
-        "seam off: no-op directive must not point at boss propose:\n{prompt}",
+        !prompt.contains("call `\"$BOSS_BIN\" propose blocked --reason \"...\"` instead"),
+        "seam off: no-op directive must not point at $BOSS_BIN propose:\n{prompt}",
     );
 }
 
@@ -1872,7 +1872,7 @@ fn ci_remediation_prompt_offers_mark_noop_for_non_rebounce() {
         "non-rebounce ci_remediation prompt must offer the validated mark-noop escape:\n{prompt}",
     );
     assert!(
-        prompt.contains("boss engine ci mark-noop --attempt-id"),
+        prompt.contains("\"$BOSS_BIN\" engine ci mark-noop --attempt-id"),
         "non-rebounce ci_remediation prompt must include the mark-noop verb:\n{prompt}",
     );
 }
@@ -1910,7 +1910,7 @@ fn trunk_eviction_prompt_offers_a_terminal_when_no_failing_build_was_captured() 
         "an eviction with no evidence must offer a bail-out:\n{prompt}",
     );
     assert!(
-        prompt.contains("boss engine ci mark-failed --attempt-id"),
+        prompt.contains("\"$BOSS_BIN\" engine ci mark-failed --attempt-id"),
         "the bail-out must name the terminal the engine actually accepts:\n{prompt}",
     );
     assert!(
@@ -2176,7 +2176,7 @@ fn deferred_scope_directive_teaches_boss_propose_verb_when_seam_is_on() {
             .build(),
     );
     assert!(
-        prompt.contains("boss propose deferred-scope --summary"),
+        prompt.contains("\"$BOSS_BIN\" propose deferred-scope --summary"),
         "seam on: the prompt must teach the deferred-scope verb with a worked example:\n{prompt}",
     );
     assert!(
@@ -2221,7 +2221,7 @@ fn deferred_scope_directive_teaches_boss_propose_verb_when_seam_is_on_for_revisi
             .build(),
     );
     assert!(
-        prompt.contains("boss propose deferred-scope --summary"),
+        prompt.contains("\"$BOSS_BIN\" propose deferred-scope --summary"),
         "revision prompt, seam on: must teach the deferred-scope verb with a worked example:\n{prompt}",
     );
     assert!(
@@ -2266,7 +2266,7 @@ fn escalation_protocol_directive_present_for_revision_implementation_seam_off() 
     // ChoreImplementation / ProjectDesign / InvestigationImplementation did
     // (see the `matches!` guard above `deferred_scope_directive`'s call
     // site). But `compose_revision_directive` injects a Bazel pre-push gate
-    // whose flag-on failure sentence points at "boss propose blocked" and,
+    // whose flag-on failure sentence points at "\"$BOSS_BIN\" propose blocked" and,
     // for the non-conflict-resolution variant, at "see \"If you are blocked
     // or the work is bigger than estimated\" below for the exact syntax" —
     // a section that was never rendered for revisions, leaving the
@@ -2291,8 +2291,8 @@ fn escalation_protocol_directive_present_for_revision_implementation_seam_off() 
         "revision prompt, seam off: escalation section must teach the legacy [blocked] marker:\n{prompt}",
     );
     assert!(
-        !prompt.contains("boss propose"),
-        "revision prompt, seam off: escalation section must not mention boss propose at all:\n{prompt}",
+        !prompt.contains("\"$BOSS_BIN\" propose"),
+        "revision prompt, seam off: escalation section must not mention $BOSS_BIN propose at all:\n{prompt}",
     );
 }
 
@@ -2314,8 +2314,8 @@ fn escalation_protocol_directive_teaches_boss_propose_verb_when_seam_is_on_for_r
              section:\n{prompt}",
     );
     assert!(
-        prompt.contains("boss propose blocked --reason \"<why>\""),
-        "revision prompt, seam on: escalation section must teach the boss propose blocked verb:\n{prompt}",
+        prompt.contains("\"$BOSS_BIN\" propose blocked --reason \"<why>\""),
+        "revision prompt, seam on: escalation section must teach the $BOSS_BIN propose blocked verb:\n{prompt}",
     );
     assert!(
         !prompt.contains("Two sanctioned markers, each on its own line in your final response"),
@@ -2355,7 +2355,7 @@ fn deferred_scope_directive_absent_for_answer_agent() {
 // -----------------------------------------------------------
 // Worker-proposal seam (worker-proposal-api-replace-fragile-worker-to-engine-seams.md,
 // implementation task 10): `followup_proposals_seam` teaches
-// `boss propose followup-task` instead of the legacy structured-output
+// `"$BOSS_BIN" propose followup-task` instead of the legacy structured-output
 // artifact / `FOLLOWUPS:` sentinel. Mirrors the `deferred_scope_proposals_seam`
 // tests above.
 // -----------------------------------------------------------
@@ -2379,7 +2379,7 @@ fn followups_block_teaches_legacy_artifact_and_sentinel_when_seam_is_off() {
         "seam off: the prompt must keep the FOLLOWUPS: sentinel fallback:\n{prompt}",
     );
     assert!(
-        !prompt.contains("boss propose followup-task"),
+        !prompt.contains("\"$BOSS_BIN\" propose followup-task"),
         "seam off: the prompt must not teach a verb the engine won't yet read proposals-first for:\n{prompt}",
     );
 }
@@ -2396,7 +2396,7 @@ fn followups_block_teaches_boss_propose_verb_when_seam_is_on() {
             .build(),
     );
     assert!(
-        prompt.contains("boss propose followup-task --name"),
+        prompt.contains("\"$BOSS_BIN\" propose followup-task --name"),
         "seam on: the prompt must teach the followup-task verb with a worked example:\n{prompt}",
     );
     assert!(

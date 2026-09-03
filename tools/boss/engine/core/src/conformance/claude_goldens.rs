@@ -159,6 +159,14 @@ fn golden_deny_rules_standard_worker() {
         "Bash(boss engine start:*)".to_owned(),
         "Bash(boss engine stop)".to_owned(),
         "Bash(boss engine stop:*)".to_owned(),
+        r#"Bash("$BOSS_BIN" engine start)"#.to_owned(),
+        r#"Bash("$BOSS_BIN" engine start:*)"#.to_owned(),
+        r#"Bash("$BOSS_BIN" engine stop)"#.to_owned(),
+        r#"Bash("$BOSS_BIN" engine stop:*)"#.to_owned(),
+        "Bash($BOSS_BIN engine start)".to_owned(),
+        "Bash($BOSS_BIN engine start:*)".to_owned(),
+        "Bash($BOSS_BIN engine stop)".to_owned(),
+        "Bash($BOSS_BIN engine stop:*)".to_owned(),
     ];
     assert_eq!(
         deny, expected,

@@ -400,6 +400,13 @@ async fn provision_workspace_creates_owned_home_and_snapshots_auth_body(
         "must pin the memory-import feature off: {config}"
     );
     assert!(
+        config.contains("shell_snapshot = false")
+            && config.contains("allow_login_shell = false")
+            && config.contains("[shell_environment_policy]")
+            && config.contains("experimental_use_profile = false"),
+        "must pin Codex snapshot/login-shell off so PATH is not rebuilt on top of the pane: {config}"
+    );
+    assert!(
         config.contains("trust_level = \"trusted\""),
         "must stamp project trust: {config}"
     );

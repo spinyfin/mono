@@ -191,8 +191,8 @@ fn guard_block_message_suggests_cube_pr_update_with_branch() {
     // forensics required.
     let reason = run_revision_guard_reason("cube pr create --branch boss/exec_abc123_01 --title 'x'");
     assert!(
-        reason.contains("cube pr update --branch boss/exec_abc123_01"),
-        "block reason must suggest `cube pr update --branch <bookmark>`, got: {reason}",
+        reason.contains("CUBE_BIN") && reason.contains("pr update --branch boss/exec_abc123_01"),
+        "block reason must suggest `$CUBE_BIN` pr update --branch <bookmark>, got: {reason}",
     );
 }
 
@@ -202,7 +202,7 @@ fn guard_block_message_reuses_head_branch_from_gh_pr_create() {
     // in the `cube pr update` suggestion.
     let reason = run_revision_guard_reason("gh pr create --head boss/exec_abc123_01 --title 'x'");
     assert!(
-        reason.contains("cube pr update --branch boss/exec_abc123_01"),
+        reason.contains("CUBE_BIN") && reason.contains("pr update --branch boss/exec_abc123_01"),
         "block reason must reuse the --head branch in the update suggestion, got: {reason}",
     );
 }

@@ -11,20 +11,20 @@ strong stated justification.
 
 **A task is not complete until a PR exists.** Local commits are NOT enough.
 
-- Open a PR with `cube pr create` once commits exist and tests pass.
+- Open a PR with `"$CUBE_BIN" pr create` once commits exist and tests pass.
 - **If a PR already exists** (resuming or addressing review),
-push new commits to it with `cube pr update`; do NOT open a
-duplicate. `cube pr create` is safe to retry: if a prior call
+push new commits to it with `"$CUBE_BIN" pr update`; do NOT open a
+duplicate. `"$CUBE_BIN" pr create` is safe to retry: if a prior call
 already created the PR (e.g. your tool killed an earlier
 invocation on a timeout but the push had actually landed), it
-returns that PR's URL instead of erroring. Use `cube pr update`
+returns that PR's URL instead of erroring. Use `"$CUBE_BIN" pr update`
 only when you have new commits to push onto an already-open PR;
-it errors if none does. Check first with `boss pr status` — one
+it errors if none does. Check first with `"$BOSS_BIN" pr status` — one
 local round trip against the engine, not GitHub. Do NOT rely on
-`boss context`'s `task.pr_url` field for this: it is NULL for a
+`"$BOSS_BIN" context`'s `task.pr_url` field for this: it is NULL for a
 revision task by design (a revision never owns its own PR — the
 chain root does), so an empty `task.pr_url` does NOT mean "no
-PR exists" when you're a revision worker. `boss pr status`
+PR exists" when you're a revision worker. `"$BOSS_BIN" pr status`
 resolves your actually-bound PR correctly either way.
 - Do not hard-wrap PR bodies.
 - **NEVER pass the PR body as `--body "<inline text>"`** — the shell
@@ -41,26 +41,26 @@ Boss already stores most of what you'd otherwise ask GitHub for.
 These read your own PR only — never another run's — and cost one
 local round trip against the engine, not a GitHub API call:
 
-- `boss pr status` — includes your resolved `pr_url`, the
+- `"$BOSS_BIN" pr status` — includes your resolved `pr_url`, the
 cheapest way to answer "do I already have a PR?" before
-deciding between `cube pr create` and `cube pr update`. Prefer
-this over `boss context`'s `task.pr_url` field: that field is
+deciding between `"$CUBE_BIN" pr create` and `"$CUBE_BIN" pr update`. Prefer
+this over `"$BOSS_BIN" context`'s `task.pr_url` field: that field is
 NULL for a revision task by design (the chain root owns the PR,
 not the revision), so it reads as "no PR" even when one exists.
-`boss pr status` also returns `mergeable`, `merge_state_status`,
+`"$BOSS_BIN" pr status` also returns `mergeable`, `merge_state_status`,
 `head_sha`, and `observed_at` for your own PR, e.g.:
 ```sh
-boss pr status --json
+"$BOSS_BIN" pr status --json
 ```
 This is Boss's **last stored observation from the merge poller,
 not live GitHub truth** — `observed_at` (Unix epoch seconds) is
 the timestamp of that observation, not of your call. Right after
 a push, the stored snapshot usually still reflects the *pre-push*
-state. If you need current state (e.g. right after `cube pr
+state. If you need current state (e.g. right after `"$CUBE_BIN" pr
 update` to see whether the push cleared a conflict), pass
 `--refresh` for one bounded, rate-limited live check:
 ```sh
-boss pr status --refresh --json
+"$BOSS_BIN" pr status --refresh --json
 ```
 A refresh can be silently throttled (`refresh_throttled: true`
 in the response) if the engine-wide budget is exhausted — in
@@ -69,24 +69,24 @@ or a hang. Never loop calling `--refresh` waiting for a state
 change: the engine's own merge poller is what watches your PR to
 green after you push, not you — the same "do not babysit CI"
 principle your task prompt states applies here too.
-- `boss pr body` — the PR title and body/description Boss
+- `"$BOSS_BIN" pr body` — the PR title and body/description Boss
 snapshotted when this run started, for a read-modify-write of
 the description without a `gh pr view` round trip. If the
 response's `body` is null (`--json`) or says "(none stored)"
 (text), it means this run began a brand-new PR flow — there is
 nothing to diff against yet, you are about to write the first
-description via `cube pr
+description via `"$CUBE_BIN" pr
 create --body-file`. It does NOT mean the PR has an empty
 description; an intentionally empty one is stored as `""`, not
 null. Only fall back to `gh pr view --json body` if you must
 confirm the null case is not a fetch failure rather than a
 new-PR flow.
 
-If a `boss` command fails to run at all — not found, or it exits
+If a `"$BOSS_BIN"` command fails to run at all — not found, or it exits
 non-zero without answering — that is a finding, not noise. Say so
 explicitly in your final response and name the command. Do NOT
 quietly drop the step and carry on: a create-vs-update decision
-made without `boss pr status` is a decision made blind, and
+made without `"$BOSS_BIN" pr status` is a decision made blind, and
 nobody downstream can tell that from a clean transcript.
 
 ## Your workspace
@@ -127,8 +127,8 @@ Use `jj` for all VCS. Do not invoke `git` directly except via `gh`.
 `jj bookmark create <name> -r @` to name a commit.
 - **NEVER push branches or open PRs with bare VCS commands** (`jj git push`,
 `git push`, `gh pr create`). A PreToolUse hook blocks these. Use:
-- `cube pr create --branch <name>` — new PR (pushes branch + opens PR, jj-aware, no GIT_DIR needed)
-- `cube pr update --branch <name>` — existing PR (pushes new commits to it)
+- `"$CUBE_BIN" pr create --branch <name>` — new PR (pushes branch + opens PR, jj-aware, no GIT_DIR needed)
+- `"$CUBE_BIN" pr update --branch <name>` — existing PR (pushes new commits to it)
 - Never `jj git push --deleted` or `git push --delete`
 without explicit user approval.
 - `.claude/` is gitignored by the engine. Do not force-track
@@ -147,7 +147,7 @@ re-running with `-m`.
 
 Cube workspaces are secondary jj workspaces. There is no `.git/`
 at the workspace root, so bare `gh` calls fail with
-`fatal: not a git repository`. Use `cube pr create` instead —
+`fatal: not a git repository`. Use `"$CUBE_BIN" pr create` instead —
 it resolves the remote `owner/repo` from `jj git remote` and
 passes `-R <owner/repo>` to `gh`, so no `GIT_DIR` guess is needed.
 
@@ -164,19 +164,19 @@ cat > "$body" << 'PRBODY'
 ## Summary
 Your description here. Inline code like `crate-name` and `$(cmd)` is safe.
 PRBODY
-cube pr create --branch my-feature --title "Your PR title" --body-file "$body"
+"$CUBE_BIN" pr create --branch my-feature --title "Your PR title" --body-file "$body"
 ```
 
-`cube pr create` is safe to retry: if an open PR already exists for
+`"$CUBE_BIN" pr create` is safe to retry: if an open PR already exists for
 the branch, it returns that PR's URL instead of erroring, without
-pushing again. Use `cube pr update` only when you have new commits
-to push onto an already-open PR (see below). `cube pr create` handles
+pushing again. Use `"$CUBE_BIN" pr update` only when you have new commits
+to push onto an already-open PR (see below). `"$CUBE_BIN" pr create` handles
 the push and `--allow-new` automatically; never call `jj git push` directly.
 
 To update an existing PR (push new commits to it):
 
 ```sh
-cube pr update --branch my-feature   # pushes to the PR; errors if none exists
+"$CUBE_BIN" pr update --branch my-feature   # pushes to the PR; errors if none exists
 ```
 
 ### `origin` is the real GitHub upstream (shared object store)
@@ -185,7 +185,7 @@ Every cube workspace is a **secondary jj workspace** that SHARES one
 object store with its siblings — there is no per-workspace clone. That
 store has a single `origin` remote pointing at the real GitHub upstream.
 
-- **Only use `cube pr create` / `cube pr update` for pushes and PR operations**:
+- **Only use `"$CUBE_BIN" pr create` / `"$CUBE_BIN" pr update` for pushes and PR operations**:
 they push to GitHub by URL and resolve `-R <owner/repo>` for `gh`
 automatically, so PR creation Just Works without `.git/` at the root.
 Direct `jj git push`, `git push`, or `gh pr create` calls are blocked
@@ -208,13 +208,13 @@ gh api repos/<owner>/<repo>/pulls/<n> --jq .head.sha
 
 ## Merge-conflict telemetry
 
-If you ever run `cube workspace rebase` mid-task (e.g. to sync with
+If you ever run `"$CUBE_BIN" workspace rebase` mid-task (e.g. to sync with
 `main` before pushing, or because a push was rejected) and it reports
 `REBASED_WITH_CONFLICTS`, resolve the conflicts as normal, then
 AFTER resolving run:
 
 ```sh
-boss engine conflicts record-producer --execution-id <your execution id> \
+"$BOSS_BIN" engine conflicts record-producer --execution-id <your execution id> \
 --head-branch <branch> --base-branch <main_branch> --files <comma-separated conflicted paths>
 ```
 
@@ -291,12 +291,12 @@ what you verified and what you could not.
 Attach them:
 
 ```sh
-boss attach /tmp/shot.png --caption "wide table, after the fix"
+"$BOSS_BIN" attach /tmp/shot.png --caption "wide table, after the fix"
 ```
 
 The engine stores the image outside this workspace (which is
 recycled after your run), for your own verification and for an
-operator looking at this run locally. `boss attach --list` shows
+operator looking at this run locally. `"$BOSS_BIN" attach --list` shows
 what this work item already has, across runs.
 
 Validation is immediate and typed: a path outside this workspace or

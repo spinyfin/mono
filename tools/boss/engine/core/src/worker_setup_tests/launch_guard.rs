@@ -14,15 +14,22 @@ use super::super::*;
 /// Run the Boss-launch guard against a simulated Bash `tool_input`
 /// payload and return its decision plus reason.
 fn run_launch_guard(bash_command: &str) -> (String, String) {
+    run_launch_guard_with_env(bash_command, &[])
+}
+
+fn run_launch_guard_with_env(bash_command: &str, extra_env: &[(&str, &str)]) -> (String, String) {
     use std::io::Write as _;
     let stdin_payload = serde_json::json!({
         "tool_input": {"command": bash_command}
     })
     .to_string();
 
-    let mut child = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(BOSS_LAUNCH_GUARD_COMMAND)
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c").arg(BOSS_LAUNCH_GUARD_COMMAND);
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    let mut child = cmd
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -335,6 +342,76 @@ fn launch_guard_blocks_unspaced_and_commented_chains() {
         launch_decision("git log --grep=x#123"),
         "approve",
         "a `#` inside an ordinary argument must not be treated as a comment or otherwise misparsed"
+    );
+}
+
+/// Bare `boss` / `cube` is an untrusted PATH lookup: Codex's shell snapshot
+/// demotes the launcher directory, and a hit on repobin silently bazel-builds
+/// the CLI. The named `"$BOSS_BIN"` / `"$CUBE_BIN"` form is the contract.
+#[test]
+fn launch_guard_blocks_bare_boss_and_cube_path_lookups() {
+    for command in [
+        "boss pr status --json",
+        "cube pr create --branch x",
+        "boss propose blocked --reason x",
+    ] {
+        let (decision, reason) = run_launch_guard(command);
+        assert_eq!(decision, "block", "must block bare PATH lookup: {command}");
+        assert!(
+            reason.contains("PATH lookup") || reason.contains("repobin"),
+            "reason must name the PATH/repobin failure: {reason}"
+        );
+        assert!(
+            reason.contains("BOSS_BIN") && reason.contains("CUBE_BIN"),
+            "reason must tell the worker to name the env var: {reason}"
+        );
+    }
+}
+
+/// `"$BOSS_BIN"` / `"$CUBE_BIN"` pointing at a real non-shim binary is the
+/// sanctioned form and must still be approved.
+#[test]
+fn launch_guard_allows_named_boss_bin_and_cube_bin() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let boss = tmp.path().join("boss");
+    let cube = tmp.path().join("cube");
+    std::fs::write(&boss, b"#!/bin/sh\n").unwrap();
+    std::fs::write(&cube, b"#!/bin/sh\n").unwrap();
+    let env = [
+        ("BOSS_BIN", boss.to_str().unwrap()),
+        ("CUBE_BIN", cube.to_str().unwrap()),
+    ];
+    for command in ["\"$BOSS_BIN\" pr status --json", "\"$CUBE_BIN\" pr create --branch x"] {
+        let (decision, reason) = run_launch_guard_with_env(command, &env);
+        assert_eq!(
+            decision, "approve",
+            "named binary must be allowed: {command} reason={reason}"
+        );
+    }
+}
+
+/// A `"$BOSS_BIN"` that itself resolves to repobin is still a shim and
+/// must fail closed — never rewritten, never passed.
+#[test]
+fn launch_guard_blocks_named_bin_that_is_a_repobin_shim() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let repobin = bin.join("repobin");
+    std::fs::write(&repobin, b"#!/bin/sh\n").unwrap();
+    let boss = bin.join("boss");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&repobin, &boss).unwrap();
+    #[cfg(not(unix))]
+    std::fs::copy(&repobin, &boss).unwrap();
+    let (decision, reason) = run_launch_guard_with_env(
+        "\"$BOSS_BIN\" pr status --json",
+        &[("BOSS_BIN", boss.to_str().unwrap())],
+    );
+    assert_eq!(decision, "block", "shim via BOSS_BIN must be blocked: {reason}");
+    assert!(
+        reason.contains("repobin") || reason.contains("shim"),
+        "reason must name the shim: {reason}"
     );
 }
 

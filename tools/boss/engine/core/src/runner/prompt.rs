@@ -45,7 +45,7 @@ pub(super) struct ExecutionPromptParams<'a> {
     /// [`worker_escalation_protocol_directive`], the two Bazel pre-push gate
     /// blurbs, and [`no_op_completion_directive`]'s pointer. `false` (the
     /// flag's registry default) reproduces the exact marker-only
-    /// text; `true` teaches the `boss propose` verbs instead — see those
+    /// text; `true` teaches the `\"$BOSS_BIN\" propose` verbs instead — see those
     /// functions' docs. This is the OTHER half of the flag: the engine's
     /// read path (`crate::completion::WorkerCompletionHandler::detect_and_file_worker_signals`)
     /// is gated by the same flag name read directly from
@@ -58,7 +58,7 @@ pub(super) struct ExecutionPromptParams<'a> {
     /// prompt half of the deferred-scope seam migration (design
     /// implementation task 9): [`deferred_scope_directive`]. `false` (the
     /// flag's registry default) reproduces the exact marker-only text;
-    /// `true` teaches `boss propose deferred-scope` instead. This is the
+    /// `true` teaches `\"$BOSS_BIN\" propose deferred-scope` instead. This is the
     /// OTHER half of the flag: the engine's read path
     /// (`crate::completion::WorkerCompletionHandler::detect_and_record_deferred_scope`)
     /// is gated by the same flag name read directly from
@@ -70,7 +70,7 @@ pub(super) struct ExecutionPromptParams<'a> {
     /// prompt half of the follow-ups seam migration (design implementation
     /// task 10): [`followups_emission_block`]. `false` (the flag's registry
     /// default) reproduces the exact structured-output-artifact-primary /
-    /// `FOLLOWUPS:`-sentinel-fallback text; `true` teaches `boss propose
+    /// `FOLLOWUPS:`-sentinel-fallback text; `true` teaches `\"$BOSS_BIN\" propose
     /// followup-task` instead. This is the OTHER half of the flag:
     /// `crate::completion::pr_transition`'s followups block, which counts a
     /// fallback hit whenever its legacy chain lands a follow-up not already
@@ -805,12 +805,12 @@ fn bazel_prepush_gate_block(workspace_path: &Path, seam_enabled: bool) -> Option
 ///
 /// `seam_enabled` mirrors `worker_signal_proposals_seam` (see
 /// [`worker_escalation_protocol_directive`]): `true` points a build-gate
-/// failure at `boss propose blocked`; `false` reproduces the pre-migration
+/// failure at `\"$BOSS_BIN\" propose blocked`; `false` reproduces the pre-migration
 /// `[blocked]` marker sentence, so a worker on the flag-off path is never
 /// told to call a verb the engine won't yet honor proposals-first.
 pub(crate) fn bazel_prepush_gate_text(seam_enabled: bool) -> String {
     let failure_sentence = if seam_enabled {
-        "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT push red code and do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout, and is never a reason to stop short of a clean result. A command still producing output is slow, not wedged — wait for it. A command producing no output and no progress is wedged: re-run it wrapped in an explicit `timeout` so it returns a real result you can act on, rather than waiting on it or guessing. Call `boss propose blocked --reason \"...\"` naming the failing/timed-out command and its output, and stop (see \"If you are blocked or the work is bigger than estimated\" below for the exact syntax). Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
+        "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT push red code and do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout, and is never a reason to stop short of a clean result. A command still producing output is slow, not wedged — wait for it. A command producing no output and no progress is wedged: re-run it wrapped in an explicit `timeout` so it returns a real result you can act on, rather than waiting on it or guessing. Call `\"$BOSS_BIN\" propose blocked --reason \"...\"` naming the failing/timed-out command and its output, and stop (see \"If you are blocked or the work is bigger than estimated\" below for the exact syntax). Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
     } else {
         "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT push red code and do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout, and is never a reason to stop short of a clean result. A command still producing output is slow, not wedged — wait for it. A command producing no output and no progress is wedged: re-run it wrapped in an explicit `timeout` so it returns a real result you can act on, rather than waiting on it or guessing. Emit a `[blocked] reason=\"...\"` marker in your final response naming the failing/timed-out command and its output, and stop (see \"If you are blocked or the work is bigger than estimated\" below for the exact syntax). Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
     };
@@ -860,7 +860,7 @@ fn bazel_conflict_resolution_gate_block(workspace_path: &Path, seam_enabled: boo
 /// and [`bazel_prepush_gate_text`] for what `seam_enabled` selects.
 pub(crate) fn bazel_conflict_resolution_gate_text(seam_enabled: bool) -> String {
     let failure_sentence = if seam_enabled {
-        "If `bazel build` fails (the merge does not compile) and you cannot make it compile, do NOT push. Deciding on your own that the run has gone on long enough is not a build failure, and is never a reason to stop short of a clean build. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; call `boss propose blocked --reason \"...\"` naming the failure and stop.\n"
+        "If `bazel build` fails (the merge does not compile) and you cannot make it compile, do NOT push. Deciding on your own that the run has gone on long enough is not a build failure, and is never a reason to stop short of a clean build. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; call `\"$BOSS_BIN\" propose blocked --reason \"...\"` naming the failure and stop.\n"
     } else {
         "If `bazel build` fails (the merge does not compile) and you cannot make it compile, do NOT push. Deciding on your own that the run has gone on long enough is not a build failure, and is never a reason to stop short of a clean build. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; emit a `[blocked] reason=\"...\"` marker naming the failure and stop.\n"
     };
@@ -1043,11 +1043,11 @@ fn pr_terminal_directive(seam_enabled: bool) -> String {
 /// restore the marker-only vocabulary on the prompt side, not just the
 /// engine's read side.
 ///
-/// `seam_enabled = true` documents the two sanctioned `boss propose` verbs a
+/// `seam_enabled = true` documents the two sanctioned `\"$BOSS_BIN\" propose` verbs a
 /// worker calls when it cannot proceed unassisted: `effort-escalation` (the
 /// work is bigger than estimated) and `blocked` (a human/coordinator
 /// decision is needed), plus the `[blocked]` marker retained as a bootstrap
-/// fallback of last resort. `boss propose` validates synchronously, so a
+/// fallback of last resort. `\"$BOSS_BIN\" propose` validates synchronously, so a
 /// malformed call fails with a typed error the worker can fix and retry
 /// in-run, instead of a marker whose fields are only checked long after the
 /// worker could do anything about it. The `[blocked]` marker itself is not
@@ -1063,7 +1063,7 @@ fn pr_terminal_directive(seam_enabled: bool) -> String {
 ///
 /// `seam_enabled = false` renders the marker-grammar variant of this
 /// directive: both `[effort-escalation]` and `[blocked]` as markers, no
-/// `boss propose` mention anywhere. Shared guidance that names no verb
+/// `\"$BOSS_BIN\" propose` mention anywhere. Shared guidance that names no verb
 /// (e.g. what makes a reason valid) is carried by both branches. Incident
 /// 2026-07-02 (`exec_18b5243e65ff188_2d`) is why the marker syntax is
 /// spelled out explicitly rather than left implicit — a worker hit a
@@ -1115,17 +1115,17 @@ pub(crate) fn worker_escalation_protocol_directive(seam_enabled: bool) -> String
      right move over pushing broken/unvalidated work or idling silently. Submission is synchronous \
      and validated immediately, so a malformed call fails right away with a typed error you can fix \
      and retry — unlike a marker line, which the engine only reads long after you've moved on:\n\n\
-     - **`boss propose effort-escalation --level <level> --reason \"<why>\"`** — the assigned work \
+     - **`\"$BOSS_BIN\" propose effort-escalation --level <level> --reason \"<why>\"`** — the assigned work \
      needs more effort than it was classified at. `<level>` is one of \
      `trivial|small|medium|large|max`. Example:\n\n\
      ```\n\
-     boss propose effort-escalation --level large --reason \"ran into a multi-subsystem race; description didn't mention the engine/app boundary\"\n\
+     \"$BOSS_BIN\" propose effort-escalation --level large --reason \"ran into a multi-subsystem race; description didn't mention the engine/app boundary\"\n\
      ```\n\n\
-     - **`boss propose blocked --reason \"<why>\"`** — you cannot proceed without a \
+     - **`\"$BOSS_BIN\" propose blocked --reason \"<why>\"`** — you cannot proceed without a \
      human/coordinator decision: a build failure you can't resolve, an ambiguous requirement, \
      conflicting instructions, a missing credential. Example:\n\n\
      ```\n\
-     boss propose blocked --reason \"bazel build fails with E0583 for a newly added file, survives clean --expunge; need guidance or explicit direction before proceeding\"\n\
+     \"$BOSS_BIN\" propose blocked --reason \"bazel build fails with E0583 for a newly added file, survives clean --expunge; need guidance or explicit direction before proceeding\"\n\
      ```\n\n\
      `--reason` must name an external fact — a command that ran and failed (with its output), a \
      missing credential, an instruction that genuinely conflicts with another. Citing the run's \
@@ -1135,16 +1135,16 @@ pub(crate) fn worker_escalation_protocol_directive(seam_enabled: bool) -> String
      Either call files a coordinator-visible attention item immediately and pauses the \"produce a \
      PR\" auto-nudge loop for this run until a coordinator acks it, so you will not be re-prompted \
      to \"produce a PR\" while one is pending. Do NOT stop silently or push code you know is broken \
-     to work around a blocker: call `boss propose` instead.\n\n\
-     **Bootstrap fallback only:** if `boss propose` itself is unreachable (the mechanism is down, \
+     to work around a blocker: call `\"$BOSS_BIN\" propose` instead.\n\n\
+     **Bootstrap fallback only:** if `\"$BOSS_BIN\" propose` itself is unreachable (the mechanism is down, \
      the socket is gone, or you are a remote worker with no local peer to attribute the call to), \
      fall back to a bare `[blocked] reason=\"<why>\"` line on its own line in your final response — \
      the one marker kept specifically because it must still work when the mechanism itself is \
      broken. If the underlying problem is an effort escalation rather than a blocker, state the \
-     requested level in the reason (e.g. `[blocked] reason=\"boss propose unreachable; requesting \
+     requested level in the reason (e.g. `[blocked] reason=\"\"$BOSS_BIN\" propose unreachable; requesting \
      effort escalation to large — <why>\"`) — this bootstrap channel is the only one guaranteed to \
-     work when `boss propose` itself is down, so it carries both signal kinds rather than teaching \
-     a second marker grammar back. Do not use it once `boss propose` has already succeeded for this \
+     work when `\"$BOSS_BIN\" propose` itself is down, so it carries both signal kinds rather than teaching \
+     a second marker grammar back. Do not use it once `\"$BOSS_BIN\" propose` has already succeeded for this \
      signal; it is a last resort, not a second channel.\n"
         .to_string()
 }
@@ -1230,12 +1230,12 @@ pub(crate) fn run_done_directive(seam_enabled: bool) -> String {
 /// reads for the engine's read path, threaded here so the two halves of the
 /// migration move together (design implementation task 9, following the
 /// recipe [`worker_escalation_protocol_directive`] established): a worker
-/// must never be taught the `boss propose deferred-scope` verb when the
+/// must never be taught the `\"$BOSS_BIN\" propose deferred-scope` verb when the
 /// engine won't yet read proposals-first for it, and flipping the flag off
 /// must restore today's marker-only directive exactly.
 ///
 /// `seam_enabled = false` reproduces the pre-migration directive verbatim.
-/// `seam_enabled = true` instructs `boss propose deferred-scope` instead —
+/// `seam_enabled = true` instructs `\"$BOSS_BIN\" propose deferred-scope` instead —
 /// unlike `[blocked]`, the `[deferred-scope]` marker has no bootstrap-
 /// fallback carve-out (design §"Failure semantics": only `[blocked]` is
 /// retained indefinitely), so the seam-enabled directive teaches the verb
@@ -1277,30 +1277,30 @@ pub(crate) fn deferred_scope_directive(seam_enabled: bool) -> String {
     "\n## If you deliver less than the brief asks: declare the gap\n\n\
      If you consciously decide to narrow scope — implement part of what was asked and \
      deliberately leave a piece undone (it needs plumbing/data/access this run doesn't have, \
-     it's a genuinely separate concern, etc.) rather than doing it — call `boss propose \
+     it's a genuinely separate concern, etc.) rather than doing it — call `\"$BOSS_BIN\" propose \
      deferred-scope` once per deferred item, during the run:\n\n\
      ```\n\
-     boss propose deferred-scope --summary \"<what you did not deliver>\" --reason \"<why you deferred it>\"\n\
+     \"$BOSS_BIN\" propose deferred-scope --summary \"<what you did not deliver>\" --reason \"<why you deferred it>\"\n\
      ```\n\n\
      Both flags are required. Example:\n\n\
      ```\n\
-     boss propose deferred-scope --summary \"wiring for the third data source\" --reason \"needs a new ingestion pipeline; out of scope for this wiring-only chore\"\n\
+     \"$BOSS_BIN\" propose deferred-scope --summary \"wiring for the third data source\" --reason \"needs a new ingestion pipeline; out of scope for this wiring-only chore\"\n\
      ```\n\n\
      Submission is synchronous and validated immediately — a malformed call fails right away with \
      a typed error you can fix and retry, unlike a marker line the engine only reads long after \
      you've moved on. Do NOT write \"filed as a followup\", \"tracked separately\", or similar in \
      your PR body or summary as a substitute for calling this — you have no other way to file or \
-     track anything, that sentence would simply be false. `boss propose deferred-scope` is the \
+     track anything, that sentence would simply be false. `\"$BOSS_BIN\" propose deferred-scope` is the \
      channel that actually creates a durable record: it is recorded against this task and \
      surfaced to a human, who decides whether to spin up a followup or accept the gap. This is \
      distinct from the followups mechanism above, which proposes brand-new out-of-scope work you \
-     noticed — use `boss propose deferred-scope` specifically for work the brief asked for that \
+     noticed — use `\"$BOSS_BIN\" propose deferred-scope` specifically for work the brief asked for that \
      you did not deliver.\n\n\
      **The verb is the only sanctioned channel for declaring deferred scope — prose is not \
      enough.** If your PR body, a summary section, or your final response says anything that \
      states or implies narrowed scope — \"deferred\", \"not included in this PR\", \"left for a \
      future task\", \"out of scope for now\", a \"## Deferred\" heading, or similar — every item \
-     it names MUST also have a matching `boss propose deferred-scope` call. A prose deferral \
+     it names MUST also have a matching `\"$BOSS_BIN\" propose deferred-scope` call. A prose deferral \
      section with no matching proposal is a protocol violation: reviewers are instructed to flag \
      it, and it will be flagged. A \"## Deferred\" section in the PR body is fine as human-\
      readable prose, but only in addition to the proposal calls, never instead of them.\n"
@@ -1329,7 +1329,7 @@ pub(crate) fn deferred_scope_directive(seam_enabled: bool) -> String {
 fn no_op_completion_directive(seam_enabled: bool) -> String {
     let marker = crate::no_op_signal::NO_CHANGES_NEEDED_MARKER;
     let blocked_pointer = if seam_enabled {
-        "call `boss propose blocked --reason \"...\"` instead"
+        "call `\"$BOSS_BIN\" propose blocked --reason \"...\"` instead"
     } else {
         "emit a `[blocked] reason=\"...\"` marker instead"
     };
@@ -1382,7 +1382,7 @@ fn no_op_completion_directive(seam_enabled: bool) -> String {
 fn revision_no_op_completion_directive(seam_enabled: bool) -> String {
     let marker = crate::no_op_signal::NO_CHANGES_NEEDED_MARKER;
     let blocked_pointer = if seam_enabled {
-        "call `boss propose blocked --reason \"...\"` instead"
+        "call `\"$BOSS_BIN\" propose blocked --reason \"...\"` instead"
     } else {
         "emit a `[blocked] reason=\"...\"` marker instead"
     };
@@ -1513,7 +1513,7 @@ fn postmortem_followups_emission_block(output_path: &str) -> String {
 /// transitional fallback (and to keep remote workers working until the
 /// artifact is fetched cross-host).
 ///
-/// `seam_enabled = true` instructs `boss propose followup-task` instead: one
+/// `seam_enabled = true` instructs `\"$BOSS_BIN\" propose followup-task` instead: one
 /// call per follow-up, during the run, not batched into an end-of-run
 /// artifact. Submission is synchronous — a malformed call fails right away
 /// with a typed error the worker can fix and retry, unlike an artifact/
@@ -1552,9 +1552,9 @@ fn followups_emission_block(output_path: &str, seam_enabled: bool) -> String {
         "If, while completing this task, you noticed concrete follow-on work worth filing — a separate bug, a needed refactor, a missing test, a docs gap — that is OUT OF SCOPE for this PR, you may surface it for the human. This is OPTIONAL: only include genuine, actionable proposals, never invent work to fill it, and never list the change you just made.\n\n",
     );
     out.push_str(
-        "If (and only if) you have followups, call `boss propose followup-task` once per follow-up, during the run:\n\n\
+        "If (and only if) you have followups, call `\"$BOSS_BIN\" propose followup-task` once per follow-up, during the run:\n\n\
          ```\n\
-         boss propose followup-task --name \"<short task title>\" --description \"<one paragraph of scope>\" --rationale \"<why it is worth doing>\"\n\
+         \"$BOSS_BIN\" propose followup-task --name \"<short task title>\" --description \"<one paragraph of scope>\" --rationale \"<why it is worth doing>\"\n\
          ```\n\n",
     );
     out.push_str("- `--name` (required): a short task title.\n");
@@ -1562,12 +1562,12 @@ fn followups_emission_block(output_path: &str, seam_enabled: bool) -> String {
     out.push_str("- `--rationale` (required): why it is worth doing.\n");
     out.push_str("- `--effort` (optional): one of `trivial` | `small` | `medium` | `large` | `max`.\n");
     out.push_str("- `--work-kind` (optional): one of `task` | `chore` | `project` (defaults to `chore`).\n\n");
-    out.push_str("Example:\n\n```\nboss propose followup-task --name \"Add retry/backoff to the X client\" --description \"The X client fails hard on transient 5xx; add bounded retry with jitter.\" --effort small --work-kind task --rationale \"Observed flakes during this task.\"\n```\n\n");
+    out.push_str("Example:\n\n```\n\"$BOSS_BIN\" propose followup-task --name \"Add retry/backoff to the X client\" --description \"The X client fails hard on transient 5xx; add bounded retry with jitter.\" --effort small --work-kind task --rationale \"Observed flakes during this task.\"\n```\n\n");
     out.push_str(
         "Do NOT call this at all if you have no followups — never calling it means \"no followups\", which is the normal case. Calling it does not block this PR — it upserts into the originating task's followup group for the human to review; task creation still requires the human's own batch-accept gesture.\n\n",
     );
     out.push_str(&format!(
-        "As a fallback only (e.g. if `boss propose` is unreachable), you may instead **write** a JSON array to this exact file (also exported as `$BOSS_STRUCTURED_OUTPUT`): `{output_path}`. Each array element is an object with `proposed_name` (required), `proposed_description` (required), `proposed_effort` (optional), `proposed_work_kind` (optional), and `rationale` (optional) — or append a `FOLLOWUPS:` sentinel plus fenced ```json array to your final message. Prefer `boss propose followup-task` — it validates synchronously and is visible to the human immediately, instead of waiting until this run completes.\n\n",
+        "As a fallback only (e.g. if `\"$BOSS_BIN\" propose` is unreachable), you may instead **write** a JSON array to this exact file (also exported as `$BOSS_STRUCTURED_OUTPUT`): `{output_path}`. Each array element is an object with `proposed_name` (required), `proposed_description` (required), `proposed_effort` (optional), `proposed_work_kind` (optional), and `rationale` (optional) — or append a `FOLLOWUPS:` sentinel plus fenced ```json array to your final message. Prefer `\"$BOSS_BIN\" propose followup-task` — it validates synchronously and is visible to the human immediately, instead of waiting until this run completes.\n\n",
     ));
     out.push_str(
         "**Phrasing matters:** a `followup-task` proposal is submitted, not filed — task creation still needs a human's batch-accept gesture. If your PR body or summary references one, say \"proposed follow-up `prp_…`\" (the id the command prints on success), never \"filed as a followup\" or \"tracked separately\" — you have no ability to file or track anything directly, and that phrasing would be false.\n",
@@ -1949,7 +1949,7 @@ fn compose_revision_directive(
     out.push_str(check_bypass_prohibition_text());
     out.push('\n');
     // The Bazel pre-push gate above (both variants) points a build-failure
-    // sentence at "boss propose blocked" and, on the non-conflict-resolution
+    // sentence at "\"$BOSS_BIN\" propose blocked" and, on the non-conflict-resolution
     // variant, at the "If you are blocked or the work is bigger than
     // estimated" section for the exact syntax. Revisions never received that
     // section, leaving the cross-reference dangling and the worker with no
@@ -2076,7 +2076,7 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
          never the default resolution.\n\
          - **If you believe one side is genuinely superseded, STOP.** Do not delete it and \
          rationalize the removal. Deletion of code a merged parent added is an operator \
-         decision, not a resolution choice: run `boss engine conflicts mark-failed <attempt-id> \
+         decision, not a resolution choice: run `\"$BOSS_BIN\" engine conflicts mark-failed <attempt-id> \
          --reason product_decision_required`, comment on the PR explaining the situation, and \
          do NOT push a resolution that drops the feature.\n\
          - **Any removal of code a merged parent added must be called out explicitly** in your \
@@ -2173,7 +2173,7 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
     out.push_str("\n### Stop conditions\n\n");
     out.push_str(
         "If any of the following applies, comment on the PR explaining the situation,\n\
-         do NOT push, and run `boss engine conflicts mark-failed <attempt-id> --reason <r>`\n\
+         do NOT push, and run `\"$BOSS_BIN\" engine conflicts mark-failed <attempt-id> --reason <r>`\n\
          with the appropriate reason — the engine will mark the attempt `failed`:\n\n\
             1. **Semantic obsolescence** — the upstream change accomplished what this PR\n   \
             was trying to do. Reason: `obsolescence_suspected`.\n\
@@ -2357,7 +2357,7 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
              >   addresses it — the engine refuses every \"nothing to push\" terminal for a \
              >   queue-side failure because the PR's head CI is green already and so proves nothing \
              >   about that build. If no failing build is listed, do **not** invent one: follow the \
-             >   STOP section and `boss engine ci mark-failed` rather than force-pushing.\n\n",
+             >   STOP section and `\"$BOSS_BIN\" engine ci mark-failed` rather than force-pushing.\n\n",
         );
     } else {
         out.push_str(&format!(
@@ -2449,8 +2449,8 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
              Search once, using the Buildkite recipe above. If no failing `trunk-merge/pr-{pr_num}/*` \
              build exists, that is your answer — Trunk never got as far as testing. Record it and stop:\n\n\
              ```\n\
-             boss engine ci classify --attempt-id {attempt} --class unfixable\n\
-             boss engine ci mark-failed --attempt-id {attempt} --reason no-failing-build-found\n\
+             \"$BOSS_BIN\" engine ci classify --attempt-id {attempt} --class unfixable\n\
+             \"$BOSS_BIN\" engine ci mark-failed --attempt-id {attempt} --reason no-failing-build-found\n\
              ```\n\n\
              **Do NOT** rebase, reset, force-push, or \"resolve\" anything to make this attempt look \
              addressed. There is no conflict on the head branch to resolve, and a revision whose head \
@@ -2470,7 +2470,7 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
              re-detected) — you do NOT have to invent a fix. Declare it; the engine VALIDATES your \
              claim against live CI before retiring the attempt:\n\n\
              ```\n\
-             boss engine ci mark-noop --attempt-id {attempt} --observed-sha <current-head-sha> --reason already-green\n\
+             \"$BOSS_BIN\" engine ci mark-noop --attempt-id {attempt} --observed-sha <current-head-sha> --reason already-green\n\
              ```\n\n\
              The engine independently re-probes live CI for the PR's current head SHA. If every \
              required check is verified green, the attempt is retired and the parent unblocks — you are \
@@ -2491,7 +2491,7 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
             "1. Re-run the failing build via the per-provider CLI (`bk build retry <build-id>` \
              for Buildkite or `gh run rerun <run-id> --failed` for GitHub Actions). The failing \
              check's `target_url` above carries the right id.\n\
-             2. Call `boss engine ci mark-retriggered --attempt-id <attempt-id> --new-id <new-build-or-run-id>` \
+             2. Call `\"$BOSS_BIN\" engine ci mark-retriggered --attempt-id <attempt-id> --new-id <new-build-or-run-id>` \
              so the engine records the new run id and stays out of the budget path. Do NOT call \
              `mark-failed` or push code.\n\
              3. Stop. The merge-poller will observe the re-run's outcome on the next sweep.\n\n",
@@ -2583,7 +2583,7 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
             out.push_str(
                 "Wait for the re-run's required checks to settle (`gh pr checks --watch`). Then:\n\n\
                  - **If post-rebase CI is green**, call \
-                 `boss engine ci mark-succeeded-via-rebase --attempt-id <attempt-id>`. The engine \
+                 `\"$BOSS_BIN\" engine ci mark-succeeded-via-rebase --attempt-id <attempt-id>`. The engine \
                  independently re-probes live CI for the PR's current head SHA before honoring this — \
                  calling it early or on a red head gets a rejection (non-zero exit), not a recorded \
                  success, so actually wait for `--watch` to finish. On a verified-green response, stop; \
@@ -2667,7 +2667,7 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
             }
         }
         out.push_str(
-            "1. Classify the failure with `boss engine ci classify --attempt-id <attempt-id> --class <tractable|flaky_or_infra|unfixable>`.\n   \
+            "1. Classify the failure with `\"$BOSS_BIN\" engine ci classify --attempt-id <attempt-id> --class <tractable|flaky_or_infra|unfixable>`.\n   \
                 - `tractable` → there's a clear code change that resolves it. Make it. Push.\n   ",
         );
         // `flaky_or_infra` on a queue-side failure must NOT steer the worker
@@ -2686,7 +2686,7 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
                 does, and a resubmit needs a new head sha — so push something that re-triggers it \
                 (a rebase onto the current target branch is the usual minimum), or, if the infra \
                 failure is genuinely not addressable from this PR, call \
-                `boss engine ci mark-failed --attempt-id <attempt-id> --reason <reason>` and stop.\n   ",
+                `\"$BOSS_BIN\" engine ci mark-failed --attempt-id <attempt-id> --reason <reason>` and stop.\n   ",
             );
         } else {
             out.push_str(
@@ -2696,7 +2696,7 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
         }
         out.push_str(
             "- `unfixable` → the failure is real and out of scope. Call \
-                `boss engine ci mark-failed --attempt-id <attempt-id> --reason <reason>` \
+                `\"$BOSS_BIN\" engine ci mark-failed --attempt-id <attempt-id> --reason <reason>` \
                 and stop. Do NOT push.\n",
         );
         out.push_str("2. No `test_command` context is available here; rely on CI to verify the push.\n");
@@ -2731,7 +2731,7 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
                  `/trunk merge` yourself, and do NOT run `gh pr merge`; any of those would race the \
                  automatic resubmit. **Do not exit without pushing**: with no new commit there is no \
                  new head sha, nothing for the poller to observe, and the PR stays out of the queue. \
-                 If you truly cannot fix it here, call `boss engine ci mark-failed` so a human is \
+                 If you truly cannot fix it here, call `\"$BOSS_BIN\" engine ci mark-failed` so a human is \
                  told, rather than stopping silently.\n\n",
             );
         }
@@ -2820,7 +2820,7 @@ fn compose_ci_remediation_prompt(
              passing, declare it instead of retriggering — the engine validates the claim against live \
              CI before retiring the attempt:\n\n\
              ```\n\
-             boss engine ci mark-noop --attempt-id {attempt} --observed-sha <current-head-sha> --reason already-green\n\
+             \"$BOSS_BIN\" engine ci mark-noop --attempt-id {attempt} --observed-sha <current-head-sha> --reason already-green\n\
              ```\n\n\
              Verified green → attempt retired, parent unblocked, you are done. Still red/pending → the \
              command fails (non-zero) and the attempt stays open; fall through to the retrigger playbook.\n\n",
@@ -2840,7 +2840,7 @@ fn compose_ci_remediation_prompt(
         "1. Re-run the failing build via the per-provider CLI (`bk build retry <build-id>` \
          for Buildkite or `gh run rerun <run-id> --failed` for GitHub Actions). The failing \
          check's `target_url` above carries the right id.\n\
-         2. Call `boss engine ci mark-retriggered --attempt-id <attempt-id> --new-id <new-build-or-run-id>` \
+         2. Call `\"$BOSS_BIN\" engine ci mark-retriggered --attempt-id <attempt-id> --new-id <new-build-or-run-id>` \
          so the engine records the new run id and stays out of the budget path. Do NOT call \
          `mark-failed` or push code.\n\
          3. Stop. The merge-poller will observe the re-run's outcome on the next sweep.\n\n",

@@ -67,6 +67,14 @@ fn settings_json_denies_bossctl_and_engine_lifecycle_verbs() {
         "Bash(boss engine start:*)",
         "Bash(boss engine stop)",
         "Bash(boss engine stop:*)",
+        r#"Bash("$BOSS_BIN" engine start)"#,
+        r#"Bash("$BOSS_BIN" engine start:*)"#,
+        r#"Bash("$BOSS_BIN" engine stop)"#,
+        r#"Bash("$BOSS_BIN" engine stop:*)"#,
+        "Bash($BOSS_BIN engine start)",
+        "Bash($BOSS_BIN engine start:*)",
+        "Bash($BOSS_BIN engine stop)",
+        "Bash($BOSS_BIN engine stop:*)",
     ] {
         assert!(deny.contains(&rule), "expected deny rule {rule} in {deny:?}",);
     }

@@ -37,8 +37,8 @@ fn revision_implementation_adds_gh_pr_create_guard_to_pre_tool_use() {
         "revision guard must also block the deprecated cube pr ensure: {guard_cmd}",
     );
     assert!(
-        guard_cmd.contains("cube pr update"),
-        "revision guard block message must point workers at `cube pr update`: {guard_cmd}",
+        guard_cmd.contains("CUBE_BIN") && guard_cmd.contains("pr update"),
+        "revision guard block message must point workers at `$CUBE_BIN` pr update: {guard_cmd}",
     );
     assert!(
         guard_cmd.contains("block"),
@@ -49,13 +49,16 @@ fn revision_implementation_adds_gh_pr_create_guard_to_pre_tool_use() {
         .iter()
         .find(|e| {
             let cmd = e["hooks"][0]["command"].as_str().unwrap_or("");
-            cmd.contains("jj git push") && cmd.contains("cube pr create") && !cmd.contains("ensure")
+            cmd.contains("jj git push")
+                && cmd.contains("CUBE_BIN")
+                && cmd.contains("pr create")
+                && !cmd.contains("ensure")
         })
         .expect("revision PreToolUse must include the PR redirect guard (all standard workers)");
     let redirect_cmd = pr_redirect_guard["hooks"][0]["command"].as_str().unwrap_or("");
     assert!(
-        redirect_cmd.contains("cube pr update"),
-        "PR redirect guard block message must mention cube pr update: {redirect_cmd}",
+        redirect_cmd.contains("CUBE_BIN") && redirect_cmd.contains("pr update"),
+        "PR redirect guard block message must mention $CUBE_BIN pr update: {redirect_cmd}",
     );
 }
 
@@ -87,7 +90,7 @@ fn chore_implementation_has_pr_redirect_guard_but_no_revision_guard() {
     // The PR redirect guard must be present for chore workers.
     let has_pr_redirect_guard = pre.iter().any(|e| {
         let cmd = e["hooks"][0]["command"].as_str().unwrap_or("");
-        cmd.contains("jj git push") && cmd.contains("cube pr create")
+        cmd.contains("jj git push") && cmd.contains("CUBE_BIN") && cmd.contains("pr create")
     });
     assert!(has_pr_redirect_guard, "chore must carry the PR redirect guard: {pre:?}",);
     // No revision-specific guard: nothing inspects `cube ... ensure`.
@@ -118,7 +121,10 @@ fn design_and_investigation_workers_carry_pr_redirect_guard() {
         // `ensure`, which is the revision-only guard).
         let has_pr_redirect_guard = pre.iter().any(|e| {
             let cmd = e["hooks"][0]["command"].as_str().unwrap_or("");
-            cmd.contains("jj git push") && cmd.contains("cube pr create") && !cmd.contains("ensure")
+            cmd.contains("jj git push")
+                && cmd.contains("CUBE_BIN")
+                && cmd.contains("pr create")
+                && !cmd.contains("ensure")
         });
         assert!(
             has_pr_redirect_guard,

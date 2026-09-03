@@ -203,10 +203,20 @@ impl StagedRevisionPushCache {
 ///   older worker prompts that still push directly. Plain `git push` is
 ///   intentionally excluded — the worker fleet uses `jj` exclusively.
 pub fn is_revision_push_command_str(command: &str) -> bool {
-    if command.contains("cube pr update") || command.contains("cube pr ensure") {
+    if names_cube_pr(command, "update") || names_cube_pr(command, "ensure") {
         return true;
     }
     command.contains("jj git push") && !command.contains("--dry-run")
+}
+
+/// Whether `command` invokes `cube pr <verb>`, including the `"$CUBE_BIN"`
+/// form workers are taught (a PATH lookup of `cube` is not trustworthy).
+fn names_cube_pr(command: &str, verb: &str) -> bool {
+    let bare = format!("cube pr {verb}");
+    let named = format!("$CUBE_BIN\" pr {verb}");
+    let unquoted = format!("$CUBE_BIN pr {verb}");
+    let braced = format!("${{CUBE_BIN}} pr {verb}");
+    command.contains(&bare) || command.contains(&named) || command.contains(&unquoted) || command.contains(&braced)
 }
 
 /// Claude-shaped wrapper: read `tool_input.command` and delegate to
@@ -320,7 +330,7 @@ pub fn is_pr_url_binding_command_str(command: &str) -> bool {
     // purposes. They are not `gh` invocations, so the shared classifier
     // doesn't see them; check them directly. `.contains` also covers the
     // Codex `/bin/zsh -lc 'cube pr …'` envelope without peeling.
-    if command.contains("cube pr create") || command.contains("cube pr update") || command.contains("cube pr ensure") {
+    if names_cube_pr(command, "create") || names_cube_pr(command, "update") || names_cube_pr(command, "ensure") {
         return true;
     }
     // Peel shell `-c`/`-lc` wrappers before classify: quote-stripping inside
@@ -367,7 +377,7 @@ pub fn is_pr_url_finalization_command_str(command: &str) -> bool {
     }
     // `cube pr create` is publish evidence but is not a revision push
     // (revisions push to an existing parent PR via update/ensure / jj).
-    if command.contains("cube pr create") {
+    if names_cube_pr(command, "create") {
         return true;
     }
     let command = peel_shell_c_payload(command).unwrap_or(command);
