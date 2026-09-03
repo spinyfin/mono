@@ -165,6 +165,12 @@ diziet-1:     queue=bazel-any, os=linux, arch=amd64, host=diziet
 
 This is a real, live inconsistency in the agent bootstrap configuration on `empiricist`, not a typo in this document — it is recorded here deliberately rather than silently normalized, per the host-config-must-be-identical consequence above. It does not currently break scheduling (nothing in `.buildkite/pipeline.yml` selects on `arch=`), but it means `empiricist`'s two agents cannot be targeted by an `arch=amd64` tag selector the way `zoologist`/`diziet` can, and it is exactly the kind of drift that turns into a confusing failure later. Fixing the bootstrap config that sets this tag is host configuration change, out of scope for this doc-only runbook; whoever owns that config should correct `empiricist`'s tag to `arch=amd64` to match the other two hosts.
 
+## Known inconsistency: BIOS version drift (diziet vs. zoologist)
+
+`diziet` and `zoologist` are the same board (Intel NUC11PABi5) but are not on the same firmware: `diziet` is on BIOS `PATGL357.0051.2023.0420.1005` (dated 2023-04-20), while `zoologist` is on `PATGL357.0058.2025.1223.1053` (dated 2025-12-23) — nearly three years newer. See the [hardware inventory](#hardware-inventory) in "Power loss and unattended recovery" below for the full per-host BIOS table, including `empiricist`'s unrelated Beelink/AMI firmware.
+
+This is the same trap as the `arch=` tag typo above, on firmware instead of agent metadata: a BIOS-version-dependent difference in behavior (power/ACPI settings, microcode, any firmware-level workaround) between two boards that are supposed to be identical would show up as a `diziet`-vs-`zoologist` flake, not as an obvious configuration bug. Updating `diziet`'s firmware to match `zoologist` is a host-configuration change requiring physical access to the BIOS setup menu (see below) and is out of scope for this doc-only runbook.
+
 ## Disk layout
 
 All three hosts have the same two-disk shape:
@@ -197,6 +203,102 @@ Per `.buildkite/README.md` ("Pushing from CI"), pushes from Linux Buildkite agen
 - **Stale build directories**: `zoologist` has a leftover `/var/lib/buildkite-agent/builds/zoologist-2/` (a `mono` checkout, last touched 2026-06-05) and `diziet` has a leftover `/var/lib/buildkite-agent/builds/diziet-2/` (a `flunge-ci` checkout, last touched 2026-06-14). Neither corresponds to a currently-registered agent in `bk agent list` — these are checkouts left behind by a previously-registered second agent slot on each host that no longer exists. They are not part of the current live agent inventory; do not treat their presence as evidence of a second active agent on those hosts.
 - **Bazel version**: all three hosts run bazelisk via `/usr/bin/bazel`. Outside a workspace this resolves to `9.2.0` (bazelisk's default, verified on `empiricist`; `zoologist`/`diziet` re-downloaded the release on invocation, `empiricist` had it cached) — but that fallback is not what CI runs. Inside the actual agent checkout (e.g. `/var/lib/buildkite-agent/builds/empiricist-1/flunge/mono`), `bazel --version` reports `9.1.0`, because the repo pins `.bazelversion` to that value as of 2026-07-27. Debugging a version-specific sandbox/strategy issue should reason about `9.1.0`, not `9.2.0`.
 - **OS**: Ubuntu 26.04 LTS ("resolute") on all three hosts, kernel `7.0.0-22-generic` (`empiricist`/`zoologist`) or `7.0.0-28-generic` (`diziet`).
+- **Open question — `diziet`'s unexplained 2026-08-21 outage**: `diziet`'s previous boot ended uncleanly at 2026-08-21 12:33:28, two days before the 2026-08-23 power-loss incident described below, and it was the only one of the five `bazel-any` hosts (three Linux, two macOS) to go down that day — neither macOS agent rebooted on 2026-08-21, so this was not a house-wide power event. This has not been diagnosed. Candidate causes, none confirmed: a separate outlet or power strip for `diziet` that lost power independently, a hard hang unrelated to power, or a PSU/barrel-jack fault. Do not attribute it to any of these without further evidence.
+
+## Power loss and unattended recovery
+
+This section exists for the same reason the rest of this runbook does (see the incident preamble at the top): the fleet's firmware AC-restore behavior is a real, currently-undocumented source of divergence between hosts, and it directly caused a multi-day outage that could only be resolved by physically walking up to three machines. Host facts below were gathered by read-only inspection over SSH on 2026-09-02/2026-09-03, the same way as the rest of this document; the ones that genuinely require physical BIOS access are called out as such rather than guessed.
+
+### Incident: the 2026-08-23 outage and its 10-day tail
+
+AC power to the office returned at approximately **Sun 2026-08-23 04:35 PDT**. The two macOS `bazel-any` agents (`anaplian`, `skaffen`) powered on unattended within about a minute of that. The three Linux `bazel-any` hosts did not: they stayed off until someone physically pressed their power buttons on **Wed 2026-09-02, 19:09–19:11 PDT** — a 3-second gap between the first two presses and a 36-second gap before the third, consistent with sequential hand presses rather than a second AC-restore event.
+
+`journalctl --list-boots` on each host (note: `last` is **not installed** on any of the three, which is why `--list-boots` is the tool — see the recovery checklist below):
+
+| Host         | Previous boot ended | Current boot began  | Off for   |
+| ------------ | ------------------- | ------------------- | --------- |
+| `diziet`     | 2026-08-21 12:33:28 | 2026-09-02 19:09:52 | 12.3 days |
+| `empiricist` | 2026-08-23 01:15:22 | 2026-09-02 19:10:31 | 10.7 days |
+| `zoologist`  | 2026-08-23 01:11:31 | 2026-09-02 19:09:55 | 10.7 days |
+
+All three previous boots ended uncleanly — the journal simply stops mid-activity, with no shutdown sequence recorded — and no boot occurred on any of the three hosts between the outage and the 2026-09-02 physical recovery.
+
+### Hardware inventory
+
+Not previously recorded anywhere in this runbook — the "OS layout" and "other configuration" sections above describe disks, OS and kernel, but never what the machines physically are. This matters operationally because it determines the BIOS menu path below, and it rules out any remote fix: whatever the box is, there is no way to power it on except by being in front of it (see "No BMC" below).
+
+| Host         | Model                     | Board      | BIOS version                                     | BIOS date  |
+| ------------ | ------------------------- | ---------- | ------------------------------------------------ | ---------- |
+| `diziet`     | Intel NUC11PAHi5          | NUC11PABi5 | `PATGL357.0051.2023.0420.1005`                   | 2023-04-20 |
+| `zoologist`  | Intel NUC11PAHi5          | NUC11PABi5 | `PATGL357.0058.2025.1223.1053`                   | 2025-12-23 |
+| `empiricist` | Beelink SER mini-PC (AMD) | —          | AMI BIOS `HPT.2xx.SERMP.V035.P8C0M0C15.07.BLink` | 2025-12-16 |
+
+See "Known inconsistency: BIOS version drift" above for why `diziet` and `zoologist` sharing a board but not a firmware version matters.
+
+### The firmware AC-restore policy is a fleet invariant — and it is not readable or settable from the OS
+
+Every modern x86 BIOS/UEFI has a setting that decides what the machine does when AC power returns after a loss: stay off, power on, or resume whatever state it was last in. **This setting could not be read from any of the three Linux hosts over SSH — there is no supported OS-level read path for it (see "No BMC" below) — so its current value is not stated here as a fact.** What can be stated as fact is the observed behavior: AC returned at a known time, all three Linux hosts were healthy immediately beforehand, and none of them powered on. That is consistent with the AC-restore policy being set to something other than "power on" (or with a firmware bug that produces the same symptom), but it is an inference from behavior, not a read value.
+
+Because this is a per-host firmware setting with no OS-level visibility and no remote path, it must be checked and corrected **physically, per host**, and it is exactly the kind of setting the "host configuration must be identical" consequence at the top of this doc is warning about — a fleet where three otherwise-identical Linux builders can silently diverge on outage behavior, discoverable only by an actual outage.
+
+Menu paths (differ by vendor — do not assume the NUC path applies to the Beelink):
+
+- **NUC (`diziet`, `zoologist`)**: press `F2` at power-on to enter setup → **Power → Secondary Power Settings → "After Power Failure"** → set to **Power On** → `F10` to save and exit.
+- **Beelink SER (`empiricist`)**: press `Del` or `F7` at power-on → the option is named **"Restore AC Power Loss"** or **"State After G3"**, and depending on SER generation lives under either _Chipset → PCH/SoC Power Management_ or _Advanced → ACPI Settings_ → set to **Power On** / **S0 State**. This menu path is genuinely different from the NUC's and must not be assumed identical when someone is next in front of these machines.
+
+**Why "Power On" and not "Last State":** "Last State" resumes whatever power state the machine was in immediately before the outage. That is wrong for an unattended CI builder specifically because it means any _deliberate_ shutdown (a manual power-off for maintenance, a firmware update, moving the box) leaves the machine off after the next outage too — the two failure modes compound instead of the AC-restore policy being a clean, single fallback. "Power On" always brings the machine back regardless of why it was off.
+
+### No BMC exists on any host
+
+None of these three hosts has a baseboard management controller, and none of the product lines involved (Intel NUC11, Beelink SER) ships one. This is recorded here so it is not re-derived during the next incident:
+
+- `ipmitool` is not installed on any of the three hosts.
+- `/dev/ipmi*` does not exist on any of the three.
+- `/sys/class/ipmi` does not exist on any of the three.
+
+There is consequently no remote console and no remote power-on path for any of these machines — physical presence is the only way to power one on or to read/change the AC-restore setting.
+
+Two things that look like they might substitute for a BMC read, and don't:
+
+- **`dmidecode` cannot answer this, even with root.** SMBIOS type 3 (System Enclosure) exposes `Boot-up State` and `Power Supply State` fields, but neither of those is the AC-restore policy — they describe enclosure/PSU status fields, not what the firmware does after an AC loss.
+- **The UEFI setup variables under `/sys/firmware/efi/efivars`** (`Setup-80e1202e-…`, `PchSetup-…`, `SaSetup-…`, `AmiWrapperSetup-…`, `AMD_PBS_SETUP-…`) are vendor-private opaque binary blobs. There is no supported, documented way to decode the AC-restore bit out of them.
+
+### Why the macOS agents recovered and the Linux agents did not
+
+`.buildkite/README.md` already documents `bazel-any` as one heterogeneous queue spanning Mac and Linux agents (see the top of this doc); this is the specific mechanism behind the outage-recovery gap between the two halves of that queue.
+
+**macOS (`anaplian`, `skaffen` — both `Mac16,10` Mac mini M4):**
+
+- `pmset autorestart = 1`, `pmset sleep = 0` — the firmware/OS auto-restarts on AC restore and never sleeps.
+- FileVault is **off** — no disk-unlock prompt blocks boot.
+- Auto-login is enabled (`autoLoginUser = brianduff`, `/etc/kcpassword` present) — the console reaches a logged-in GUI session with no human input.
+- The Buildkite agents are **user LaunchAgents** — `~/Library/LaunchAgents/homebrew.mxcl.buildkite-agent@3.plist` and `…@3-bazel-any.plist`, both `RunAtLoad=true` with `KeepAlive{SuccessfulExit=false}` — loaded in the GUI launchd domain of that logged-in user session. There are **no** buildkite LaunchDaemons on these hosts.
+
+The macOS recovery chain is therefore login-dependent end to end: `autorestart` → boot → no FileVault prompt → auto-login → GUI-domain LaunchAgents load once a user session exists.
+
+**Linux (`diziet`, `zoologist`, `empiricist`):** firmware AC-restore policy → boot → `buildkite-agent.service`, a **system** unit that needs no login session at all (see "Verified-good Linux boot chain" below).
+
+**This is a deliberate difference, not a gap to close.** The Linux side does not require auto-login today and should not grow one — a system unit with no session dependency is a strictly simpler and more robust recovery path than the macOS LaunchAgent-in-a-GUI-session chain, and the fix for the Linux hosts not recovering is the firmware AC-restore setting above, not mimicking the macOS auto-login mechanism.
+
+### Verified-good Linux boot chain
+
+Confirmed identically on all three hosts as of the 2026-09-02 recovery, so it does not need to be re-derived during the next incident:
+
+- `buildkite-agent.service` is `enabled` (`WantedBy=multi-user.target`) and `active (running)`. It is the plain unit described earlier in this doc, not the `@.service` template, and runs as `User=buildkite-agent`.
+- No login session is required to start it: there are no user-scoped systemd units for the `buildkite-agent` account (`/var/lib/buildkite-agent/.config/systemd/user` does not exist), and uid 997 (`buildkite-agent`) is correctly **not** set to linger.
+- It starts fast and unattended: on `diziet`, boot began at 19:09:52 and `Started buildkite-agent.service` was logged at 19:10:00 — 8 seconds later, with nobody logged in.
+- `/mnt/ssd` (the Bazel-cache disk described in "Disk layout" above) carries `nofail` in `/etc/fstab` on all three hosts (`… /mnt/ssd ext4 defaults,nofail 0 2`). This is the specific thing that prevents a missing or slow-to-appear cache disk from dropping the boot into an emergency shell that would otherwise wait forever for interactive input that never comes on an unattended builder.
+- No failed units at boot, no full-disk encryption, no boot passphrase, and Ubuntu is first in `BootOrder` on all three. Secure Boot is enabled on `diziet` and `zoologist`, disabled on `empiricist`.
+- `systemd-analyze` for that boot: `diziet` — `25.835s (firmware) + 2.263s (loader) + 1.208s (kernel) + 1.580s (initrd) + 16.937s (userspace) = 47.825s`; `zoologist` — `41.561s` total.
+
+### Recovery checklist
+
+How to tell "the host did not power back on" apart from "it powered on but the agent failed to start," without physical access to the host:
+
+1. `tailscale status` — a host that's up and networked shows as online; a host that's still powered off does not.
+2. If it's not online, `ssh` in (if reachable another way) or wait for the next physical check, then run `journalctl --list-boots` and compare the most recent boot's start time against when you expect it to have come back (e.g. against a known AC-restore time). **`last` is not installed on any of the three hosts — do not reach for it.** `journalctl --list-boots` is the tool that actually works here.
+3. If the host is up but the agent isn't registered in `bk agent list`, check `systemctl status buildkite-agent.service` and the unit's journal (`journalctl -u buildkite-agent.service`) for why it failed to start, rather than assuming a power problem.
+4. Anything requiring `sudo` needs a human physically or interactively present: all three hosts prompt for a password for the `bduff` account, and there is **no passwordless sudo** on any of them (consistent with the note at the top of this doc).
 
 ## Needs operator input
 
