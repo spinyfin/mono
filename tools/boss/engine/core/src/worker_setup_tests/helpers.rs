@@ -90,5 +90,6 @@ pub(crate) fn sample_input() -> WorkerSetupInput {
         automation_outcome_proposals_seam_enabled: false,
         is_review_supervisor: false,
         is_post_merge_reviewer: false,
+        pr_created_proposals_seam_enabled: false,
     }
 }
