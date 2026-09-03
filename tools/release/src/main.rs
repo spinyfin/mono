@@ -50,11 +50,16 @@ struct ConfigArgs {
     config: PathBuf,
 }
 
+fn config_path(path: &std::path::Path) -> PathBuf {
+    let workspace = env::var_os("BUILD_WORKSPACE_DIRECTORY").map(PathBuf::from);
+    commands::resolve_config_path(path, workspace.as_deref())
+}
+
 fn run(cli: Cli) -> Result<()> {
     let runner = ProcessCommandRunner;
     match cli.command {
         ReleaseCommand::Prepare(args) => {
-            let config = commands::load_config(&args.config)?;
+            let config = commands::load_config(&config_path(&args.config))?;
             let trigger_source = env::var("BUILDKITE_SOURCE").unwrap_or_default();
             let buildkite_job_id = env::var("BUILDKITE_JOB_ID").ok();
             // Prefer the product-neutral name; keep the checkleft-era spelling
@@ -89,7 +94,7 @@ fn run(cli: Cli) -> Result<()> {
             tag,
             assets,
         } => {
-            let config = commands::load_config(&args.config)?;
+            let config = commands::load_config(&config_path(&args.config))?;
             let assets = assets
                 .iter()
                 .map(|asset| commands::Asset::parse(asset))
@@ -97,7 +102,7 @@ fn run(cli: Cli) -> Result<()> {
             commands::upload(&runner, &config, &tag, &assets)?;
         }
         ReleaseCommand::Publish { config: args, tag } => {
-            let config = commands::load_config(&args.config)?;
+            let config = commands::load_config(&config_path(&args.config))?;
             commands::publish(&runner, &config, &tag)?;
         }
     }

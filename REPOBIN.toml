@@ -26,3 +26,6 @@ target = "//tools/cube:cube"
 
 [tools.hood]
 target = "//tools/hood:hood"
+
+[tools.release]
+target = "//tools/release:release"

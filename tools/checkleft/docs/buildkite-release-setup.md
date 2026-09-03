@@ -1,48 +1,52 @@
 # Buildkite: checkleft release setup
 
-This document is the operator checklist for the **checkleft release pipeline** — the Buildkite pipeline that builds prebuilt `checkleft` binaries for Linux and macOS and publishes them as assets on a GitHub Release of `spinyfin/mono`. External repos consume these prebuilts instead of building checkleft from source.
+This is the operator guide for `mono-checkleft-release`, the Buildkite pipeline
+that produces checkleft's Linux and macOS prebuilt binaries. External
+repositories consume the GitHub Release assets and their `.sha256` sidecars
+instead of building checkleft from a mono checkout.
 
-It is modeled on the Boss release pipeline; for that reference see [`../../boss/docs/buildkite-release-setup.md`](../../boss/docs/buildkite-release-setup.md). The two differ in one important way: Boss releases run as a _step inside the existing `mono` pipeline_, while checkleft releases run as a **separate pipeline** with its own cron schedule and its own manual trigger. **Creating the in-repo pipeline file is not enough — the pipeline must be registered in Buildkite using the steps below.**
+The product-specific shell script builds binaries; the shared
+[`//tools/release`](../../release/BUILD.bazel) tool owns the release record:
+version resolution, change detection, tags, draft creation, release notes,
+asset staging, checksums, retries, verification, and publication. Its
+configuration for checkleft is [`../release.toml`](../release.toml).
 
 - Pipeline definition: [`../../../.buildkite/pipeline-checkleft-release.yml`](../../../.buildkite/pipeline-checkleft-release.yml)
-- Release script: [`../../../.buildkite/steps/checkleft-release.sh`](../../../.buildkite/steps/checkleft-release.sh)
-- Version source of truth: [`../Cargo.toml`](../Cargo.toml) (`version = "0.1.0-alpha.N"`)
+- Dynamically uploaded build fragment: [`../../../.buildkite/pipeline-checkleft-release-builds.yml`](../../../.buildkite/pipeline-checkleft-release-builds.yml)
+- Product build step: [`../../../.buildkite/steps/checkleft-release.sh`](../../../.buildkite/steps/checkleft-release.sh)
+- Shared release CLI: [`../../release/BUILD.bazel`](../../release/BUILD.bazel)
 
----
+The checkleft pipeline remains separate from the main `mono` pipeline. Register
+it in Buildkite; adding the files to the repository alone does not register a
+pipeline.
 
-## How releases are triggered
+## Triggering releases
 
-| Trigger                                                            | When       | Change-detection                                                           |
-| ------------------------------------------------------------------ | ---------- | -------------------------------------------------------------------------- |
-| Buildkite cron schedule                                            | e.g. daily | Skips if nothing under checkleft changed since the last `checkleft-v*` tag |
-| Manual build (`bk build create`, BK UI **New Build**, or REST API) | On demand  | Always releases (skips change-detection)                                   |
+| Trigger                  | When               | Behavior                                                                                              |
+| ------------------------ | ------------------ | ----------------------------------------------------------------------------------------------------- |
+| Buildkite schedule       | For example, daily | Skips unless a configured checkleft release path changed since the latest published tag.              |
+| Manual build (UI or API) | On demand          | Cuts a release unless the current commit is already published; re-adopts a draft for the same commit. |
 
-The pipeline should **not** be wired to build on push. It pushes only a tag, never a commit to `main` (the version bump is patched into the release checkout, never committed), and an idempotency guard no-ops any run whose `HEAD` is already the latest release commit — but the cleanest configuration is push-builds disabled, schedule + manual only.
+Do not configure push or pull-request builds. A release pushes a tag, never a
+commit to `main`; schedule and manual triggers make that intent explicit.
 
-The org slug is `flunge`; the GitHub repo is `spinyfin/mono`. (Boss's release build URLs look like `https://buildkite.com/flunge/mono/builds/N`.)
-
----
+`tools/checkleft/release.toml` is the single source for release policy:
+`checkleft-v` tags, the alpha-counter version scheme, release-note paths, and
+the required versus optional asset set. The shell step only maps product build
+outputs to those declared asset names.
 
 ## One-time registration
 
-All `bk` commands below assume the Buildkite CLI is authenticated. Verify with:
+All commands below assume the Buildkite CLI is authenticated.
 
 ```sh
 bk whoami
-bk use flunge          # select the org these pipelines live in
-```
-
-### 1. Find the cluster the mono pipelines use
-
-New pipelines must be created in the same cluster as the existing `mono` pipeline so they schedule onto the same agent fleet (the `bazel-any` and `macos-arm64` queues).
-
-```sh
+bk use flunge
 bk cluster list
 ```
 
-Note the cluster name (or ID). It is passed as `-c` when creating the pipeline below.
-
-### 2. Create the pipeline
+Create the pipeline in the same cluster as `mono` so it can use the existing
+`bazel-any` agents:
 
 ```sh
 bk pipeline create "mono-checkleft-release" \
@@ -51,11 +55,8 @@ bk pipeline create "mono-checkleft-release" \
   --cluster-id "<cluster-name-or-id>"
 ```
 
-This creates the pipeline and connects it to the GitHub repo (which provisions the webhook). Confirm with `bk pipeline view mono-checkleft-release`.
-
-### 3. Point the pipeline at the release YAML
-
-`bk pipeline create` does not upload the steps; like every pipeline in this repo, the registered pipeline must run a single bootstrap step that uploads the in-repo definition. The bootstrap step **must target a queue** (`bazel-any`) — the Default cluster has no default queue, so an untargeted step fails with "no queue has been targeted". Set the pipeline's **Steps** (Buildkite UI → Pipeline → **Settings** → **Steps**, or via the REST API) to exactly:
+Set the pipeline's **Steps** configuration to this bootstrap step. The explicit
+queue is required because the Default cluster has no default queue.
 
 ```yaml
 steps:
@@ -65,49 +66,71 @@ steps:
       queue: bazel-any
 ```
 
-(The default pipeline-upload command reads `.buildkite/pipeline.yml`; the explicit path is what makes this pipeline use the checkleft definition.)
+Then disable push and pull-request triggers in the pipeline's GitHub settings
+and add the desired schedule, for example:
 
-To do it via the API instead of the UI:
+- Description: `checkleft release check`
+- Cron: `0 7 * * *`
+- Branch: `main`
+- Commit: `HEAD`
+
+No new credential is required. `release prepare` pushes the tag and uses `gh`
+through the agents' existing ambient credentials. The pipeline never pushes a
+commit to `main`, so it does not need a branch-protection bypass.
+
+## Release flow
+
+The static Linux `prepare` step invokes:
 
 ```sh
-bk api --method PATCH /pipelines/mono-checkleft-release --data '{"configuration":"steps:\n  - label: \":pipeline:\"\n    command: buildkite-agent pipeline upload .buildkite/pipeline-checkleft-release.yml\n    agents:\n      queue: bazel-any\n"}'
+bin/release prepare --config tools/checkleft/release.toml
 ```
 
-### 4. Disable push-triggered builds
+On a release, this creates (or manually resumes) a draft and records its tag in
+Buildkite metadata. It then uploads the existing build fragment. A scheduled
+no-op leaves no tag and uploads no build steps, so no Bazel builds run.
 
-In Pipeline **Settings** → **GitHub**, turn **off** "Trigger builds when branches are pushed" (and any PR triggers). Releases come only from the cron schedule and manual builds. The release pushes only a tag (never a commit to `main`), so there is no self-trigger to guard against — push-builds-off simply keeps the pipeline schedule/manual-only.
+The `linux`, `musl`, and `darwin` steps each read the tag with `bin/release tag`,
+build their local artifact, and pass it to `bin/release upload`. `publish` runs
+after all three build steps and calls `bin/release publish`. It verifies the
+required assets—and any optional asset that was uploaded—by downloading their
+sidecars and hashing the downloaded files before publishing the draft.
 
-### 5. Create the cron schedule
+Expected release assets are declared in `release.toml`:
 
-In Pipeline **Settings** → **Schedules** → **New Schedule**:
+- `checkleft-x86_64-unknown-linux-gnu` — required
+- `checkleft-x86_64-unknown-linux-musl` — required
+- `checkleft-aarch64-apple-darwin` — required
+- `checkleft-x86_64-apple-darwin` — optional
 
-- **Description:** `checkleft release check`
-- **Cron interval:** `0 7 * * *` (daily 07:00 UTC — adjust to taste)
-- **Branch:** `main`
-- **Message:** `Scheduled checkleft release check`
-- **Commit:** `HEAD`
+Every listed binary has a `<name>.sha256` sidecar. A missing or corrupt required
+asset fails publication and leaves the GitHub Release as a draft for recovery.
 
-If a scheduled run finds no checkleft-affecting changes since the last `checkleft-v*` tag, the build logs `release skipped: ...` and exits 0 without cutting a release.
+## Build behavior and the musl guarantee
 
-### 6. GitHub authentication — nothing to provision
+All three build phases derive their version from the recorded `checkleft-v…`
+tag. Before compiling, each phase stamps that version into its isolated CI
+checkout's `tools/checkleft/Cargo.toml` and `Cargo.lock`; this is never
+committed. checkleft's Bazel rules and Cargo builds read `CARGO_PKG_VERSION`
+from that manifest, so the release binary reports the release version rather
+than a generic development version.
 
-No release token or secret is needed. The release pushes the tag with `git push origin` and creates the GitHub Release with `gh`, both authenticating via the CI agents' **ambient credentials** — exactly like the boss release step in the `mono` pipeline. Every CI worker already has push-capable git auth and `gh` access to `spinyfin/mono`, so the pipeline works without any pipeline-specific token.
+The native Linux and Apple Silicon macOS artifacts are built through Bazel. The
+static `x86_64-unknown-linux-musl` artifact is also built hermetically by Bazel
+with `//tools/checkleft:checkleft_musl`; it is not a Cargo cross-build. After
+building, the `musl` phase executes the binary and requires its reported version
+to match the tag-derived version. Any Bazel, execution, or version-check failure
+fails the phase and blocks publication.
 
-No branch-protection bypass is involved either: the release only pushes a **tag** (which protected branches permit) and never a commit to `main`.
+The Darwin x86_64 artifact is the one exception: it remains a best-effort
+`cargo build --target x86_64-apple-darwin` from the Apple Silicon agent. If
+that Cargo cross-build fails, the phase logs a warning and uploads the required
+Apple Silicon artifact alone. If present, its checksum is still verified before
+publication.
 
-### 7. musl: hermetic Bazel build, release-blocking
+## Verifying a release
 
-The static `x86_64-unknown-linux-musl` asset is built **hermetically with Bazel**, not `cargo`, and a failure to build it **blocks the release**:
-
-- The `musl` release phase (`phase_musl` in `.buildkite/steps/checkleft-release.sh`) builds `//tools/checkleft:checkleft_musl` (`tools/checkleft/BUILD.bazel:116-120`) via `bazel build -c opt //tools/checkleft:checkleft_musl`, after `apply_version_edits` has already patched Cargo.toml's `version` field so the build's `CARGO_PKG_VERSION` (sourced via `:cargo_toml_env_vars`) reflects the release version; the script's `set -euo pipefail` plus the explicit `die` calls around that build and the subsequent version guard mean a musl build failure aborts the phase — there is no warn-and-continue path for musl.
-- The toolchains are fully hermetic, requiring no host-provisioned `rustup target` or `musl-gcc`: `hermetic_cc_toolchain` (Zig-based CC, `MODULE.bazel:42-45`) supplies the C toolchain for musl's C deps (tree-sitter, wasmtime), a `musl_rust_toolchain` module extension (`MODULE.bazel:92-103`, implemented in `tools/checkleft/musl/ext.bzl`) supplies the Rust musl toolchains, and `platforms/BUILD.bazel:12-32` defines the `linux_x86_64_musl` / `linux_aarch64_musl` platforms whose `@zig_sdk//libc:musl` constraint selects them. `tools/checkleft/BUILD.bazel:3` and `tools/checkleft/musl/transition.bzl`'s `musl_binary` rule wire the target's platform transition.
-- Cargo is not eliminated from the release entirely: the **darwin phase's x86_64 asset** (`x86_64-apple-darwin`, cross-built from the arm64 macOS agent, in `phase_darwin`) still goes through `cargo build --target` (the `build_cross_cargo` function) and _is_ best-effort — a failure there logs a warning and ships the arm64 asset alone, unlike musl. The native Linux-gnu asset and the darwin arm64 asset are both built the same hermetic-Bazel way as musl.
-
-If you do not need the static musl binary, there is nothing to leave unprovisioned — the toolchains are pulled hermetically by Bazel on any Linux release agent.
-
----
-
-## Triggering a release manually
+Trigger a manual build:
 
 ```sh
 bk build create \
@@ -116,72 +139,62 @@ bk build create \
   --message "Manual checkleft release"
 ```
 
-Because `BUILDKITE_SOURCE` is `api`/`ui`, change-detection is skipped and a release is always cut. The BK UI **New Build** button does the same.
-
----
-
-## Verifying the setup
-
-1. Trigger a manual build (above) and open the build URL.
-2. The **prepare** step should compute the next version, push the tag, and create the GitHub Release as a **draft** (not yet visible to normal `gh release view` / `gh release list` consumers as a published release).
-3. The **linux**, **musl**, and **darwin** steps then run in parallel, each building its binaries and uploading them to that draft release. The **publish** step runs last (`depends_on` all three): it re-downloads and re-verifies every required asset's checksum, then flips the release from draft to published.
-4. Confirm the release and its assets:
+The prepare step should create a draft, the three build phases should run in
+parallel, and publish should make the release visible only after verification.
+For example:
 
 ```sh
 gh release view checkleft-v0.1.0-alpha.9 --repo spinyfin/mono
 ```
 
-Expected assets (named by Rust target triple, each with a `.sha256` sidecar):
+## Recovering from a draft
 
-- `checkleft-x86_64-unknown-linux-gnu` — **required**
-- `checkleft-x86_64-unknown-linux-musl` — **required**
-- `checkleft-aarch64-apple-darwin` — **required**
-- `checkleft-x86_64-apple-darwin` — **optional**: verified if present, but does not block publish if the darwin x86_64 cross-build fails (see `phase_darwin`'s warning-only fallback)
+When a build or verification fails, the tag, draft, and any uploaded assets are
+preserved deliberately.
 
-A missing or checksum-mismatched **required** asset fails the `publish` step and leaves the release as an unpublished draft; the required/optional split is declared explicitly as `REQUIRED_ASSETS`/`OPTIONAL_ASSETS` in `checkleft-release.sh`.
-
----
-
-## Recovering from a partial release
-
-`prepare` creates the tag and the GitHub Release as a **draft** before any build runs, then the `linux`, `musl`, and `darwin` build steps attach their assets in parallel, and `publish` verifies + publishes at the end. If a build step fails, or `publish` finds a missing/mismatched asset, the release is left as a draft — never published — with whatever assets did upload still attached. To recover:
-
-- **Re-run the failed build job** (`bk job retry <job-id>`) — it reads the tag from build meta-data and re-uploads (assets use `--clobber`), so it picks up where it left off. Re-run `publish` afterwards (or it re-runs automatically as part of a full pipeline retry) to verify and publish.
-- **Or upload manually** from an agent of the right OS, checked out at the tag:
+- Retry the failed Buildkite job. `bin/release tag` reads the tag recorded by
+  prepare, and `release upload` uses `--clobber`, so the job can replace its
+  assets safely. Retry `publish` after the build jobs complete.
+- Re-run the whole pipeline manually on the same commit. A manual prepare run
+  re-adopts that commit's draft and fans out the build steps again. Scheduled
+  runs refuse to resume drafts automatically; set `RELEASE_RESUME_DRAFT=1` only
+  when intentionally resuming one from a schedule.
+- To repair an asset outside Buildkite, build it from the tagged checkout and
+  invoke the shared tool directly, for example:
 
   ```sh
-  CHECKLEFT_RELEASE_TAG=checkleft-v0.1.0-alpha.9 \
-    .buildkite/steps/checkleft-release.sh darwin   # or: linux / musl
+  bin/release upload --config tools/checkleft/release.toml \
+    --tag checkleft-v0.1.0-alpha.9 \
+    --asset checkleft-x86_64-unknown-linux-gnu=<path-to-binary>
   ```
 
-- **Or re-trigger the whole pipeline manually** (`bk build create` / BK UI **New Build**) on the same commit. Because the trigger is manual (`BUILDKITE_SOURCE` is `ui`/`api`), `prepare`'s resume-existing-draft check re-adopts the existing draft/tag instead of computing a new version, and re-uploads the build fragment (skipping the upload if the fragment is already present in this build, e.g. a retried `prepare` job) — so the leftover draft is not orphaned and the fan-out build phases attach the remaining assets. A **scheduled (cron)** trigger will refuse to auto-resume a stranded draft — see "Abandoning a draft release" below — to avoid silently retrying a stuck release forever.
+  The command writes and uploads the checksum sidecar with the asset.
 
-(If `prepare` itself fails before the Release is created, its cleanup trap deletes any tag it pushed, so a fresh run starts clean.)
+- To abandon a persistently broken draft, delete both the release and its tag
+  before starting a fresh release:
 
-## Abandoning a draft release
+  ```sh
+  gh release delete checkleft-v0.1.0-alpha.9 --repo spinyfin/mono --yes
+  git push origin :refs/tags/checkleft-v0.1.0-alpha.9
+  ```
 
-If a draft release is stuck (e.g. a persistent agent-pool problem keeps failing the same build/publish phase) and you do not want to keep resuming it, delete the draft and its tag so the next run — scheduled or manual — computes a fresh version instead of finding the stranded draft:
+## The shared tool's own release
 
-```sh
-gh release delete checkleft-v0.1.0-alpha.9 --repo spinyfin/mono --yes
-git push origin :refs/tags/checkleft-v0.1.0-alpha.9
-```
+`//tools/release` is released by its own separate `mono-release` pipeline. It
+uses the same prepare → parallel native builds → verify → publish structure,
+but builds `bin/release` from the mono source checkout and first runs
+`//tools/release:release_lib_test`. It publishes
+`release-<target-triple>` assets and `.sha256` sidecars under `release-v*` tags.
 
-A scheduled build that finds a draft for the current `HEAD` refuses to resume it on its own (see above) and names this exact recovery in its failure message, so a cron tick never gets stuck retrying indefinitely. To force a scheduled build to resume a draft instead of abandoning it, set `CHECKLEFT_RESUME_DRAFT=1` on that build.
-
----
-
-## How it works (summary)
-
-- **Version:** only the `-alpha.N` counter is revved (the base `X.Y.Z` is carried through). The next N is `max(Cargo.toml alpha, highest published checkleft-v* alpha) + 1`, so a stale Cargo.toml can never reuse a published alpha — which is exactly why the bump never has to be committed back to `main`. The new version is patched into `tools/checkleft/Cargo.toml` + `Cargo.lock` in the release checkout (never committed) and the release **commit** (`BUILDKITE_COMMIT`) is tagged `checkleft-vX.Y.Z-alpha.N`. `main`'s `Cargo.toml` stays at whatever version it last held, so developer builds carry a non-meaningful version — intentional and harmless (see Build tool).
-- **Build tool:** native binaries are built with `bazel build -c opt //tools/checkleft:checkleft` (matches how mono builds checkleft and reuses the CI disk cache); the cross targets (`x86_64-apple-darwin`, `x86_64-unknown-linux-musl`) are built with `cargo --target`, since those triples are not registered in mono's bazel toolchains. checkleft's CLI does not embed `CARGO_PKG_VERSION`, so all binaries are byte-identical regardless of the version string — the patched-in version is for tree-consistency, not the artifact bytes; all phases build at `BUILDKITE_COMMIT`.
-- **Structure:** a `prepare` step (skip-logic + version + tag + GitHub Release, created as a **draft**) fans out to the `linux`, `musl`, and `darwin` build steps, which depend only on `prepare` and run in **parallel** on separate agents. A `publish` step depends on all three build steps, verifies every required asset's checksum, and flips the release from draft to published — wall-clock is `prepare + max(linux, musl, darwin) + publish`. The `concurrency_group` lives on `prepare` so two release runs can't create tags at once.
-- **Loop prevention:** no commit is pushed to `main` (only a tag), so there is no self-trigger; push-triggered builds are disabled; and the idempotency guard no-ops any run whose `HEAD` is already the latest release commit.
-
----
+That source-built path is the bootstrap answer: mono never needs a published
+`release` binary in order to release a corrected one. External repositories
+pin the published assets and their checksums. If such a pin is bad, the
+consumer recovers by restoring its previous known-good pin; mono and the
+checkleft pipeline remain able to cut a replacement from source.
 
 ## Related
 
-- [`../../../.buildkite/pipeline-checkleft-release.yml`](../../../.buildkite/pipeline-checkleft-release.yml) — pipeline definition
-- [`../../../.buildkite/steps/checkleft-release.sh`](../../../.buildkite/steps/checkleft-release.sh) — release script
-- [`../../boss/docs/buildkite-release-setup.md`](../../boss/docs/buildkite-release-setup.md) — the Boss release pipeline this is modeled on
+- [`../../../.buildkite/pipeline-checkleft-release.yml`](../../../.buildkite/pipeline-checkleft-release.yml)
+- [`../../../.buildkite/steps/checkleft-release.sh`](../../../.buildkite/steps/checkleft-release.sh)
+- [`../release.toml`](../release.toml)
+- [`../../release/BUILD.bazel`](../../release/BUILD.bazel)
