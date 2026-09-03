@@ -196,15 +196,23 @@ pub fn spawn_event_subscriber(
     work_db: Arc<WorkDb>,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: Arc<dyn DispatchEventSink>,
+    convergence: Arc<dyn LiveWorkerConvergence>,
     event_bus: Arc<EventBus>,
 ) -> tokio::task::JoinHandle<()> {
     boss_event_bus::spawn_supervised("orphan_sweep_event", move || {
         let work_db = Arc::clone(&work_db);
         let coordinator = Arc::clone(&coordinator);
         let dispatch_events = Arc::clone(&dispatch_events);
+        let convergence = Arc::clone(&convergence);
         let event_bus = Arc::clone(&event_bus);
         async move {
-            run_one_pass(work_db.as_ref(), Arc::clone(&coordinator), dispatch_events.as_ref()).await;
+            run_one_pass(
+                work_db.as_ref(),
+                Arc::clone(&coordinator),
+                dispatch_events.as_ref(),
+                convergence.as_ref(),
+            )
+            .await;
 
             let mut subscription = event_bus.subscribe(TopicFilter::kind(EventKind::ExecutionTerminal));
             while let Some(event) = subscription.recv().await {
@@ -215,6 +223,7 @@ pub fn spawn_event_subscriber(
                     work_db.as_ref(),
                     Arc::clone(&coordinator),
                     dispatch_events.as_ref(),
+                    convergence.as_ref(),
                     &task_id,
                 )
                 .await;
@@ -235,7 +244,7 @@ pub async fn run_one_pass(
     dispatch_events: &dyn DispatchEventSink,
     convergence: &dyn LiveWorkerConvergence,
 ) -> OrphanSweepOutcome {
-    run_one_pass_filtered(work_db, coordinator, dispatch_events, None).await
+    run_one_pass_filtered(work_db, coordinator, dispatch_events, convergence, None).await
 }
 
 /// Event-driven counterpart of [`run_one_pass`]: re-evaluates only
@@ -257,9 +266,10 @@ pub async fn run_one_pass_for_item(
     work_db: &WorkDb,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: &dyn DispatchEventSink,
+    convergence: &dyn LiveWorkerConvergence,
     work_item_id: &str,
 ) -> OrphanSweepOutcome {
-    run_one_pass_filtered(work_db, coordinator, dispatch_events, Some(work_item_id)).await
+    run_one_pass_filtered(work_db, coordinator, dispatch_events, convergence, Some(work_item_id)).await
 }
 
 /// Shared implementation behind [`run_one_pass`] and
@@ -270,6 +280,7 @@ async fn run_one_pass_filtered(
     work_db: &WorkDb,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: &dyn DispatchEventSink,
+    convergence: &dyn LiveWorkerConvergence,
     only_work_item_id: Option<&str>,
 ) -> OrphanSweepOutcome {
     let mut outcome = OrphanSweepOutcome::default();
@@ -1653,7 +1664,14 @@ mod tests {
         let coordinator = make_coordinator(db.clone(), 1);
         let sink = Arc::new(RecordingDispatchEventSink::new());
 
-        let outcome = run_one_pass_for_item(db.as_ref(), coordinator.clone(), sink.as_ref(), &work_item_id).await;
+        let outcome = run_one_pass_for_item(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+            &work_item_id,
+        )
+        .await;
 
         assert_eq!(outcome.redispatched, 1);
         let executions = db.list_executions(Some(&work_item_id)).unwrap();
@@ -1677,7 +1695,14 @@ mod tests {
         let coordinator = make_coordinator(db.clone(), 1);
         let sink = Arc::new(RecordingDispatchEventSink::new());
 
-        let outcome = run_one_pass_for_item(db.as_ref(), coordinator.clone(), sink.as_ref(), "task_unrelated").await;
+        let outcome = run_one_pass_for_item(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+            "task_unrelated",
+        )
+        .await;
 
         assert_eq!(outcome.redispatched, 0);
         let executions = db.list_executions(Some(&work_item_id)).unwrap();
@@ -1703,13 +1728,26 @@ mod tests {
         let coordinator = make_coordinator(db.clone(), 1);
         let sink = Arc::new(RecordingDispatchEventSink::new());
 
-        let first = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref()).await;
+        let first = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+        )
+        .await;
         assert_eq!(
             first.redispatched, 1,
             "periodic sweep should redispatch the orphan once"
         );
 
-        let second = run_one_pass_for_item(db.as_ref(), coordinator.clone(), sink.as_ref(), &work_item_id).await;
+        let second = run_one_pass_for_item(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+            &work_item_id,
+        )
+        .await;
         assert_eq!(
             second.redispatched, 0,
             "event-driven pass for the same work item must be a no-op once already redispatched"
@@ -1749,7 +1787,13 @@ mod tests {
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let bus = Arc::new(EventBus::new());
 
-        let _handle = spawn_event_subscriber(db.clone(), coordinator.clone(), sink.clone(), bus.clone());
+        let _handle = spawn_event_subscriber(
+            db.clone(),
+            coordinator.clone(),
+            sink.clone(),
+            Arc::new(NoopLiveWorkerConvergence),
+            bus.clone(),
+        );
 
         // Let the subscriber's initial full-reconcile pass run and observe
         // no idle worker before we free the slot below.

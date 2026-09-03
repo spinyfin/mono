@@ -1829,6 +1829,7 @@ pub async fn serve_with_merge_probe(
         server_state.work_db.clone(),
         server_state.execution_coordinator.clone(),
         server_state.dispatch_events.clone(),
+        server_state.clone(),
         server_state.event_bus.clone(),
     );
 
