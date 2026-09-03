@@ -142,21 +142,108 @@ pub fn local_fallback(name: &str) -> Option<String> {
     Some(words.join(" "))
 }
 
+/// Words that make a poor endpoint for a truncated name fragment:
+/// articles, prepositions, conjunctions, and copulas. When a fragment
+/// must be cut, we walk the cut point back off any of these so the
+/// result doesn't stop mid-clause (e.g. on "the", "for", "is").
+const DANGLING_STOPWORDS: &[&str] = &[
+    "a", "an", "the", "of", "for", "to", "with", "by", "into", "onto", "on", "in", "and", "or", "but", "from", "as",
+    "at", "is", "are", "was", "were", "be",
+];
+
+/// Clause punctuation that should not sit immediately before an ellipsis,
+/// and that should not mask a dangling stopword (`"for,"`).
+const TRAILING_CLAUSE_PUNCT: [char; 4] = [',', ';', ':', '-'];
+
+fn strip_trailing_clause_punct(word: &str) -> &str {
+    word.trim_end_matches(TRAILING_CLAUSE_PUNCT)
+}
+
+/// A trailing possessive (`"engine's"`) is just as bad a stopping point
+/// as a bare preposition — it reads as a dangling clause fragment.
+fn ends_in_possessive(word: &str) -> bool {
+    word.ends_with("'s") || word.ends_with("\u{2019}s")
+}
+
+fn is_dangling(word: &str) -> bool {
+    let word = strip_trailing_clause_punct(word);
+    word.is_empty() || ends_in_possessive(word) || DANGLING_STOPWORDS.contains(&word.to_lowercase().as_str())
+}
+
+/// Take up to `max_words` words from `task_name` for embedding in a
+/// derived pane-title phrase, preserving the name's original casing —
+/// the borrowed name is a proper noun / identifier fragment, not the
+/// fixed verb phrase it's spliced into, so it must not be lowercased.
+///
+/// A name that already fits within `max_words` is returned whole and
+/// unmarked. A name that must be shortened has its cut point walked
+/// back off any trailing article, preposition, conjunction, copula, or
+/// possessive (see [`is_dangling`]) so it doesn't stop mid-clause, and
+/// gets a trailing "…" so the shortening reads as a deliberate
+/// abbreviation rather than data cut off by accident. Trailing `,`,
+/// `;`, `:`, and `-` on the last kept word are stripped before the
+/// ellipsis, and the same marks are ignored when classifying a word as
+/// dangling.
+///
+/// Returns `None` when the name is empty or reduces to nothing but
+/// dangling words, so the caller can fall back to its fixed short
+/// phrase instead of an empty or unreadable fragment.
+fn name_fragment(task_name: &str, max_words: usize) -> Option<String> {
+    let trimmed = task_name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    if words.len() <= max_words {
+        return Some(words.join(" "));
+    }
+    let mut candidate = &words[..max_words];
+    while let Some(last) = candidate.last() {
+        if is_dangling(last) {
+            candidate = &candidate[..candidate.len() - 1];
+        } else {
+            break;
+        }
+    }
+    if candidate.is_empty() {
+        return None;
+    }
+    let mut fragment = candidate.join(" ");
+    fragment.truncate(fragment.trim_end_matches(TRAILING_CLAUSE_PUNCT).len());
+    if fragment.is_empty() {
+        return None;
+    }
+    Some(format!("{fragment}…"))
+}
+
+/// Splice a fixed verb phrase together with a shortened, case-preserved
+/// fragment of `task_name` (see [`name_fragment`]), falling back to the
+/// shorter fixed `fallback` phrase when the name is empty or has no
+/// legible fragment to offer. Shared by [`conflict_resolution_summary`],
+/// [`ci_remediation_summary`], and [`pr_review_summary`], which differ
+/// only in their verb phrase, fallback text, and word budget.
+fn derived_task_phrase(verb_phrase: &str, fallback: &str, task_name: &str, max_words: usize) -> String {
+    match name_fragment(task_name, max_words) {
+        Some(fragment) => format!("{verb_phrase} {fragment}"),
+        None => fallback.to_owned(),
+    }
+}
+
 /// Returns a fixed gerund phrase for conflict-resolution workers, overriding
 /// the original task's pane summary so the pane titlebar reads
 /// `"<Name> is resolving merge conflicts for <task-name>"` rather than
 /// `"<Name> is implementing …"` (the original task's gerund).
 ///
-/// The task name is truncated to 3 words so the combined phrase stays within
+/// The task name is capped to 3 words so the combined phrase stays within
 /// the 7-word UI guidance. If the task name is empty the shorter
 /// `"resolving merge conflicts"` is returned instead.
 pub fn conflict_resolution_summary(task_name: &str) -> Option<String> {
-    let short: Vec<String> = task_name.split_whitespace().take(3).map(|w| w.to_lowercase()).collect();
-    if short.is_empty() {
-        Some("resolving merge conflicts".to_owned())
-    } else {
-        Some(format!("resolving merge conflicts for {}", short.join(" ")))
-    }
+    Some(derived_task_phrase(
+        "resolving merge conflicts for",
+        "resolving merge conflicts",
+        task_name,
+        3,
+    ))
 }
 
 /// Pane summary for `ci_remediation` workers — same rationale as
@@ -164,12 +251,7 @@ pub fn conflict_resolution_summary(task_name: &str) -> Option<String> {
 /// <task-name>"` (or the shorter `"fixing CI"` when the task name is
 /// empty / unavailable).
 pub fn ci_remediation_summary(task_name: &str) -> Option<String> {
-    let short: Vec<String> = task_name.split_whitespace().take(3).map(|w| w.to_lowercase()).collect();
-    if short.is_empty() {
-        Some("fixing CI".to_owned())
-    } else {
-        Some(format!("fixing CI for {}", short.join(" ")))
-    }
+    Some(derived_task_phrase("fixing CI for", "fixing CI", task_name, 3))
 }
 
 /// Pane summary for `pr_review` workers. A reviewer's `work_item_id` is
@@ -179,13 +261,17 @@ pub fn ci_remediation_summary(task_name: &str) -> Option<String> {
 /// derived phrase instead, mirroring [`ci_remediation_summary`], so the
 /// pane reads `"<Name> is reviewing the PR for <task-name>"` rather than
 /// the implementer's own "addressing …" gerund.
+///
+/// The task name is capped to 3 words (not 4: `"reviewing the PR for"`
+/// is itself 4 words, so a 4-word fragment would blow the 7-word budget)
+/// so the combined phrase stays within the 7-word UI guidance.
 pub fn pr_review_summary(task_name: &str) -> Option<String> {
-    let short: Vec<String> = task_name.split_whitespace().take(4).map(|w| w.to_lowercase()).collect();
-    if short.is_empty() {
-        Some("reviewing a pull request".to_owned())
-    } else {
-        Some(format!("reviewing the PR for {}", short.join(" ")))
-    }
+    Some(derived_task_phrase(
+        "reviewing the PR for",
+        "reviewing a pull request",
+        task_name,
+        3,
+    ))
 }
 
 /// Pane summary for `answer_agent` workers. The synthetic work item's
@@ -495,26 +581,26 @@ mod tests {
     }
 
     #[test]
-    fn conflict_resolution_summary_uses_first_three_words_of_task_name() {
+    fn conflict_resolution_summary_walks_back_off_a_dangling_word_and_marks_the_cut() {
         assert_eq!(
-            conflict_resolution_summary("Implementing app + engine resolution path").as_deref(),
-            Some("resolving merge conflicts for implementing app +"),
+            conflict_resolution_summary("Implementing app and engine resolution path").as_deref(),
+            Some("resolving merge conflicts for Implementing app…"),
         );
     }
 
     #[test]
-    fn conflict_resolution_summary_lowercases_task_name_fragment() {
+    fn conflict_resolution_summary_preserves_task_name_casing() {
         assert_eq!(
             conflict_resolution_summary("Fix The Fencer Scraper").as_deref(),
-            Some("resolving merge conflicts for fix the fencer"),
+            Some("resolving merge conflicts for Fix The Fencer…"),
         );
     }
 
     #[test]
-    fn conflict_resolution_summary_handles_short_task_name() {
+    fn conflict_resolution_summary_passes_short_task_name_through_unmarked() {
         assert_eq!(
             conflict_resolution_summary("Fix it").as_deref(),
-            Some("resolving merge conflicts for fix it"),
+            Some("resolving merge conflicts for Fix it"),
         );
     }
 
@@ -531,10 +617,10 @@ mod tests {
     }
 
     #[test]
-    fn ci_remediation_summary_uses_first_three_words_of_task_name() {
+    fn ci_remediation_summary_caps_at_three_words_preserving_case_and_marking_the_cut() {
         assert_eq!(
             ci_remediation_summary("Fix flaky fencer scraper test").as_deref(),
-            Some("fixing CI for fix flaky fencer"),
+            Some("fixing CI for Fix flaky fencer…"),
         );
     }
 
@@ -545,10 +631,10 @@ mod tests {
     }
 
     #[test]
-    fn pr_review_summary_uses_first_four_words_of_task_name() {
+    fn pr_review_summary_caps_at_three_words_to_stay_within_the_seven_word_budget() {
         assert_eq!(
             pr_review_summary("Address automated PR review findings").as_deref(),
-            Some("reviewing the PR for address automated pr review"),
+            Some("reviewing the PR for Address automated PR…"),
         );
     }
 
@@ -556,6 +642,41 @@ mod tests {
     fn pr_review_summary_handles_empty_task_name() {
         assert_eq!(pr_review_summary("").as_deref(), Some("reviewing a pull request"));
         assert_eq!(pr_review_summary("   ").as_deref(), Some("reviewing a pull request"));
+    }
+
+    /// A long sentence-shaped name whose first three words end on a
+    /// possessive: the cut point walks back past `the` and `from` so the
+    /// fragment stops on the identifier rather than mid-clause, and the
+    /// identifier's casing survives.
+    #[test]
+    fn pr_review_summary_walks_back_off_a_trailing_possessive() {
+        assert_eq!(
+            pr_review_summary(
+                "SessionEnd from the engine's own reap resurrects abandoned executions into unreapable phantoms"
+            )
+            .as_deref(),
+            Some("reviewing the PR for SessionEnd…"),
+        );
+    }
+
+    #[test]
+    fn pr_review_summary_trims_trailing_punctuation_before_the_ellipsis() {
+        assert_eq!(
+            pr_review_summary("Fix the flake, then rerun CI").as_deref(),
+            Some("reviewing the PR for Fix the flake…"),
+        );
+        assert_eq!(
+            pr_review_summary("Read wire path: movement on the extra words").as_deref(),
+            Some("reviewing the PR for Read wire path…"),
+        );
+    }
+
+    #[test]
+    fn pr_review_summary_treats_punctuated_stopwords_as_dangling() {
+        assert_eq!(
+            pr_review_summary("Ship feature for, extra words remaining").as_deref(),
+            Some("reviewing the PR for Ship feature…"),
+        );
     }
 
     #[test]
@@ -569,19 +690,19 @@ mod tests {
             derived_title_summary(&ExecutionKind::CiRemediation, "Fix flaky test")
                 .unwrap()
                 .as_deref(),
-            Some("fixing CI for fix flaky test"),
+            Some("fixing CI for Fix flaky test"),
         );
         assert_eq!(
             derived_title_summary(&ExecutionKind::ConflictResolution, "Fix flaky test")
                 .unwrap()
                 .as_deref(),
-            Some("resolving merge conflicts for fix flaky test"),
+            Some("resolving merge conflicts for Fix flaky test"),
         );
         assert_eq!(
             derived_title_summary(&ExecutionKind::PrReview, "Fix flaky test")
                 .unwrap()
                 .as_deref(),
-            Some("reviewing the PR for fix flaky test"),
+            Some("reviewing the PR for Fix flaky test"),
         );
         assert_eq!(
             derived_title_summary(&ExecutionKind::AnswerAgent, "Answer comment: anything")
