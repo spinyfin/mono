@@ -456,6 +456,13 @@ fn record_worker_idle_abandonment_finalizes_execution_leaves_task_status_untouch
                 "idle abandonment must clear autostart so the rescan doesn't immediately \
                  re-dispatch the same task",
             );
+            assert!(
+                t.dispatch_failed_reason.is_none(),
+                "idle abandonment must not stamp dispatch_failed_reason — those columns are the \
+                 sole source of the kanban card's 'Failed to start' banner, and this worker did \
+                 start; leave the row to a human's explicit re-arm instead of the loose \
+                 dispatch-failure recovery sweep",
+            );
         }
         other => panic!("expected chore, got {other:?}"),
     }

@@ -26,7 +26,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
-use boss_protocol::{ProbeInterruptOutcome, WorkerEvent};
+use boss_protocol::{ProbeDeliveryState, ProbeInterruptOutcome, WorkerEvent};
 use boss_tmux::{CommandOutput, CommandRunner, Tmux};
 
 use crate::app::executions;
@@ -1177,4 +1177,41 @@ async fn interrupting_path_reports_queued_not_failed_when_a_different_probe_hold
         }
         other => panic!("expected ProbeDelivered, got {other:?}"),
     }
+}
+
+/// Interrupt uses the in-memory session name and can succeed even when
+/// durable tmux identity was never persisted. The write cannot. Cutting the
+/// turn and then failing the write is how a healthy worker loses its turn
+/// and receives nothing — confirm the transport first, and send no Escape.
+#[tokio::test]
+async fn interrupting_probe_does_not_cut_the_turn_when_tmux_identity_is_missing() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 22, Some("grok"));
+    let session_name = "boss-probe-no-identity";
+    let runner = Arc::new(RecordingTmux::alive(session_name, "unused-token"));
+    server_state
+        .worker_registry
+        .register_tmux_run_slot(&run_id, 22, session_name);
+    *server_state.pane_delivery_tmux_override.write().unwrap() =
+        Some(Tmux::with_runner_and_socket("/usr/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap());
+
+    let probe_id = server_state.queue_probe(run_id.clone(), "should never land".into(), false);
+    let delivered = crate::app::probe_interrupt::deliver_probe_interrupting(&server_state, &run_id, &probe_id).await;
+
+    assert_eq!(delivered.state, ProbeDeliveryState::InterruptFailed);
+    assert_eq!(
+        runner.escape_presses(),
+        0,
+        "must not interrupt a turn the write cannot land in; calls were {:?}",
+        runner.calls(),
+    );
+    assert!(!runner.wrote_text(), "must not type into the pane");
+    assert!(
+        delivered
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("no durable tmux identity")),
+        "detail must name the transport failure, got {:?}",
+        delivered.detail,
+    );
 }

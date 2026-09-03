@@ -6,6 +6,14 @@
 use super::*;
 
 impl WorkerCompletionHandler {
+    /// Undo a nudge that was counted against the circuit breaker but never
+    /// reached the pane. Probe dispatch calls this when delivery is
+    /// undeliverable so three failed injections cannot park a worker for
+    /// ignoring messages it never received.
+    pub(crate) fn revert_undelivered_nudge(&self, execution_id: &str) {
+        self.nudge_breaker.revert_undelivered(execution_id);
+    }
+
     /// Generic auto-nudge gate. Records the intent to nudge `execution`
     /// against the circuit breaker (keyed by `fingerprint`, which must
     /// encode the work state so an unchanged state counts as

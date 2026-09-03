@@ -608,6 +608,25 @@ pub(super) async fn dispatch_live_worker_state(
                     // demonstrably alive (its worker is still emitting
                     // hooks). If so, make it LOUD and countable instead
                     // of swallowing it silently.
+                    //
+                    // SessionEnd is the exception: it is the worker
+                    // announcing its exit, including the echo of a reap
+                    // the engine just started. The idle-park path marks
+                    // teardown before it terminalizes, so a SessionEnd
+                    // that arrives while that mark is live is our own
+                    // teardown, not external proof of life.
+                    if event_kind == crate::worker_readoption::SESSION_END_TRIGGER
+                        && matches!(
+                            server_state.teardown_registry.state(run_id, std::time::Instant::now()),
+                            crate::teardown_registry::TeardownState::InFlight { .. }
+                        )
+                    {
+                        tracing::debug!(
+                            run_id,
+                            "session_end during engine-owned teardown is a process boundary, not liveness evidence",
+                        );
+                        return;
+                    }
                     if !converge_terminal_execution_contradiction(server_state, run_id, event_kind).await {
                         tracing::warn!(
                             run_id,
@@ -943,9 +962,12 @@ async fn register_remote_worker_slot(server_state: &Arc<ServerState>, run_id: &s
 /// A terminal execution that is *still emitting worker hook events* is a
 /// contradiction: the engine believed the run dead — because an ack-timeout
 /// was mis-handled as a spawn failure, or a sweep reaped it — yet its worker
-/// is demonstrably alive. A hook is the strongest liveness evidence the engine
-/// ever gets: it is produced by the worker's own process, in-band, and cannot
-/// be forged by stale bookkeeping the way a pool claim or a registry entry can.
+/// is demonstrably alive. A mid-turn hook (`Stop` / `PreToolUse` /
+/// `Notification`) is the strongest liveness evidence the engine ever gets:
+/// it is produced by the worker's own process, in-band, and cannot be forged
+/// by stale bookkeeping the way a pool claim or a registry entry can.
+/// `session_end` is the opposite: the worker announcing its exit, including
+/// the echo of a reap the engine just provoked. It is never liveness.
 ///
 /// Convergence happens here rather than being left to the sweeps. Every
 /// sweep's only verb is reap, and each correctly refuses to reap a live
@@ -1424,6 +1446,17 @@ pub(super) async fn dispatch_post_hoc_interception_on_post_tool_use(
 /// returned [`ProbeDispatchOutcome`] names the branch taken so tests can
 /// assert on it without scraping log output.
 pub(super) async fn dispatch_probe_on_stop(
+    server_state: &Arc<ServerState>,
+    incoming: &crate::events_socket::IncomingHookEvent,
+) -> ProbeDispatchOutcome {
+    let outcome = dispatch_probe_on_stop_inner(server_state, incoming).await;
+    if let Some(run_id) = incoming.run_id.as_deref() {
+        revert_undelivered_nudge_if_needed(server_state, run_id, outcome);
+    }
+    outcome
+}
+
+async fn dispatch_probe_on_stop_inner(
     server_state: &Arc<ServerState>,
     incoming: &crate::events_socket::IncomingHookEvent,
 ) -> ProbeDispatchOutcome {
@@ -2139,6 +2172,18 @@ async fn inject_probe_mid_turn(
 /// `tokio::spawn` from the `ProbeRun` handler, so a caller that never sees a
 /// probe arrive has no other way to find out what it decided.
 pub(super) async fn dispatch_probe_now(server_state: &Arc<ServerState>, run_id: &str) -> ProbeDispatchOutcome {
+    let outcome = dispatch_probe_now_inner(server_state, run_id).await;
+    revert_undelivered_nudge_if_needed(server_state, run_id, outcome);
+    outcome
+}
+
+fn revert_undelivered_nudge_if_needed(server_state: &ServerState, run_id: &str, outcome: ProbeDispatchOutcome) {
+    if outcome.should_revert_undelivered_nudge() {
+        server_state.completion_handler.revert_undelivered_nudge(run_id);
+    }
+}
+
+async fn dispatch_probe_now_inner(server_state: &Arc<ServerState>, run_id: &str) -> ProbeDispatchOutcome {
     let queued = server_state.pending_probe_count(run_id);
     if queued == 0 {
         tracing::debug!(run_id, "probe-now: nothing queued for this run");

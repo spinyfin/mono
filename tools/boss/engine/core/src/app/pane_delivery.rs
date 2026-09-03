@@ -581,6 +581,27 @@ impl ServerState {
         Ok(None)
     }
 
+    /// Whether a subsequent pane write can actually land for `run_id`.
+    ///
+    /// Interrupt delivery uses the in-memory session name and can succeed
+    /// even when durable tmux identity was never persisted. The write path
+    /// cannot: it requires a spawn token on `work_runs`. Call this *before*
+    /// interrupting so a healthy worker does not lose its turn and then
+    /// receive nothing.
+    pub(super) fn pane_write_transport_ready(&self, run_id: &str) -> Result<(), String> {
+        let pane = self.worker_registry.pane_for_run(run_id);
+        match pane {
+            Some(pane) if pane.tmux_session_name.is_some() || pane.tmux_hosted => {
+                match self.work_db.tmux_identity_for_execution(run_id) {
+                    Ok(Some(_)) => Ok(()),
+                    Ok(None) => Err("no durable tmux identity recorded for run".to_owned()),
+                    Err(err) => Err(format!("tmux identity lookup failed: {err:#}")),
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The only shared text-write primitive. Every caller first resolves a
     /// posture, then reaches this method immediately before it would invoke
     /// `tmux send-keys` or app `SendToPane`. Both transports must prove that
@@ -604,16 +625,16 @@ impl ServerState {
                 let tmux = self.tmux_for_pane_delivery(run_id).map_err(PaneSendFailure::Tmux)?;
                 let expected_spawn_token = self
                     .work_db
-                    .tmux_run_for_execution(run_id)
+                    .tmux_identity_for_execution(run_id)
                     .map_err(|err| {
-                        PaneSendFailure::DriverLivenessUnavailable(format!("tmux run lookup failed: {err:#}"))
+                        PaneSendFailure::DriverLivenessUnavailable(format!("tmux identity lookup failed: {err:#}"))
                     })?
                     .ok_or_else(|| {
                         PaneSendFailure::DriverLivenessUnavailable(
                             "no durable tmux identity recorded for run".to_owned(),
                         )
                     })?
-                    .tmux_spawn_token;
+                    .spawn_token;
                 match Self::tmux_pane_confirmed_dead(&tmux, &session_name, &expected_spawn_token).await {
                     Ok(Some(pane_dead_status)) => {
                         self.reconcile_driver_exit(

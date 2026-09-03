@@ -196,6 +196,27 @@ impl ProbeDispatchOutcome {
             Self::RequeuedAfterFailure => "requeued_after_failure",
         }
     }
+
+    /// True when this outcome means a nudge was issued (queued against the
+    /// circuit breaker) but never reached the pane. The breaker must not
+    /// count these as unproductive nudges.
+    ///
+    /// Deliberately narrower than "every outcome that didn't deliver right
+    /// now": `NoSlotMapping`, `PostureRefused`, and `RequeuedAfterFailure`
+    /// all leave the probe queued for a later boundary rather than removing
+    /// it — reverting on them un-counts a nudge that then lands on the very
+    /// next boundary (recorded at N, refused, reverted, then delivered at
+    /// N+1 alongside a freshly recorded nudge), which pins the count and
+    /// makes `max_unproductive_nudges` unreachable for exactly the wedged
+    /// workers the breaker exists to park. Only `Dispatched` describes a
+    /// probe that actually left the queue through this call; among those,
+    /// only an undeliverable terminal state (e.g. `Abandoned`) never reached
+    /// the pane and must be reverted. The two interrupting-path call sites
+    /// (`probe_interrupt.rs`) already invoke the revert directly for their
+    /// own terminal failures, so this predicate does not need to cover them.
+    pub(super) fn should_revert_undelivered_nudge(self) -> bool {
+        matches!(self, Self::Dispatched(state) if state.is_undeliverable())
+    }
 }
 
 /// One queued probe that has not yet been dispatched into the worker.

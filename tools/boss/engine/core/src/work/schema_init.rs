@@ -227,6 +227,7 @@ impl WorkDb {
                 artifacts_path TEXT,
                 created_at TEXT NOT NULL,
                 started_at TEXT,
+                liveness_anchor_at TEXT,
                 finished_at TEXT,
                 host_id TEXT NOT NULL DEFAULT 'local',
                 cube_workspace_id TEXT,
@@ -735,6 +736,10 @@ impl WorkDb {
         // The spawn path does not use these columns until the tmux-hosting
         // rollout lands.
         migrate_work_runs_tmux_columns(conn)?;
+        // `work_runs.liveness_anchor_at`: mutable liveness-age for durable
+        // reconcilers, so readoption can reset the pane-attach clock without
+        // stomping the immutable pane-spawn `started_at`.
+        migrate_work_runs_liveness_anchor_at(conn)?;
         // `execution_driver_decisions`: one row per execution recording the
         // driver traffic allocation decision (driver + reason + the split it
         // was decided under). New table plus one additive column, independent
@@ -1054,6 +1059,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tmux_columns, 5, "expected all per-run tmux columns");
+
+        let liveness_anchor: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('work_runs')
+                 WHERE name = 'liveness_anchor_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(liveness_anchor, 1, "expected work_runs.liveness_anchor_at");
 
         let semantic_progress_columns: i64 = conn
             .query_row(

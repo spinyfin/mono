@@ -600,11 +600,47 @@ impl WorkDb {
     /// hosting path. The liveness reconcilers read `shell_pid`, while
     /// `tmux_pane_pid` retains the most recent tmux observation for comparison
     /// and token-verified teardown diagnostics.
+    ///
+    /// Test-only convenience wrapper over
+    /// [`Self::persist_tmux_identity_after_observation`] that omits
+    /// `session_name` / `server_label` (the `None, None` shape). Every
+    /// production caller now knows both values by the time it confirms
+    /// session creation (`spawn_flow::start_tmux_worker` already recorded
+    /// them in the preceding intent write) and passes them straight through
+    /// `persist_tmux_identity_after_observation` instead — see
+    /// [`crate::spawn_flow::TmuxSpawnStore::record_tmux_session_created`].
+    /// Kept `#[cfg(test)]` rather than deleted because a broad set of tests
+    /// across this crate legitimately don't care about the session name/
+    /// label and would otherwise have to invent placeholder values just to
+    /// call the five-argument form.
+    #[cfg(test)]
     pub fn record_tmux_session_created_for_execution(
         &self,
         execution_id: &str,
         spawn_token: &str,
         pane_pid: i64,
+    ) -> Result<bool> {
+        self.persist_tmux_identity_after_observation(execution_id, spawn_token, pane_pid, None, None)
+    }
+
+    /// Persist the live tmux session as durable identity for this execution.
+    ///
+    /// Adoption used to write only `shell_pid` (via the spawn-token row's
+    /// created-state update) and leave `tmux_session_name` / `tmux_spawn_state`
+    /// / `tmux_pane_pid` / `host_id` untouched. Probe delivery then failed
+    /// for every tmux-hosted worker with `DriverLivenessUnavailable("no
+    /// durable tmux identity recorded for run")`, because
+    /// [`Self::tmux_run_for_execution`] and [`Self::tmux_identity_for_execution`]
+    /// both require those columns. This write is the load-bearing repair:
+    /// session name, server label, spawn-state, pane pid, shell pid, and
+    /// `host_id = 'local'` land together so the next probe can find the row.
+    pub fn persist_tmux_identity_after_observation(
+        &self,
+        execution_id: &str,
+        spawn_token: &str,
+        pane_pid: i64,
+        session_name: Option<&str>,
+        server_label: Option<&str>,
     ) -> Result<bool> {
         if pane_pid <= 0 {
             bail!("refusing to record tmux session {spawn_token} with non-positive pane pid {pane_pid}");
@@ -614,9 +650,12 @@ impl WorkDb {
             "UPDATE work_runs
              SET tmux_spawn_state = 'created',
                  tmux_pane_pid = ?3,
-                 shell_pid = ?3
+                 shell_pid = ?3,
+                 tmux_session_name = COALESCE(?4, tmux_session_name),
+                 tmux_server_label = COALESCE(?5, tmux_server_label),
+                 host_id = 'local'
              WHERE execution_id = ?1 AND tmux_spawn_token = ?2",
-            params![execution_id, spawn_token, pane_pid],
+            params![execution_id, spawn_token, pane_pid, session_name, server_label],
         )?;
         Ok(updated > 0)
     }
@@ -716,6 +755,17 @@ impl WorkDb {
             .map(|(shell_pid, _tmux_pane_pid)| shell_pid)
     }
 
+    /// The durably-observed tmux pane pid of the **latest** `work_runs` row
+    /// for `execution_id` — the number `persist_tmux_identity_after_observation`
+    /// stamps into `tmux_pane_pid`, which is a stored observation, not a live
+    /// handle: callers that need to know whether the process behind it is
+    /// still alive must still probe it (`durable_liveness::probe_recorded_pid`),
+    /// never trust the stored value on its own.
+    pub fn latest_local_tmux_pane_pid_for_execution(&self, execution_id: &str) -> Result<Option<i64>> {
+        self.latest_local_pane_pid_snapshot_for_execution(execution_id)
+            .map(|(_shell_pid, tmux_pane_pid)| tmux_pane_pid)
+    }
+
     /// `COALESCE(started_at, created_at)` of the **latest** `work_runs` row
     /// for `execution_id`, parsed as Unix epoch seconds. `None` when no run
     /// exists or the column is unparseable.
@@ -728,15 +778,15 @@ impl WorkDb {
     /// needs, so a fresh run's not-yet-attached pane is never judged
     /// against an ancient first-run timestamp.
     ///
-    /// `started_at` takes priority over `created_at` deliberately:
-    /// [`WorkDb::readopt_inferred_terminal_execution`] resets a readopted
-    /// run's `started_at` to the readoption moment (and deliberately leaves
-    /// `created_at` alone, since [`crate::work::cost_report_db`] keys its
-    /// reporting window off `created_at`), so this is the field that
-    /// actually carries the reset liveness age. A run row inserted by
-    /// `start_execution_run` always has both set together at insert time, so
-    /// the two agree for every row this function has not itself been the
-    /// target of a readoption on.
+    /// `liveness_anchor_at` takes priority over `started_at` / `created_at`
+    /// deliberately: [`WorkDb::readopt_inferred_terminal_execution`] resets
+    /// a readopted run's `liveness_anchor_at` to the readoption moment and
+    /// leaves `started_at` as the immutable pane-spawn time (and
+    /// `created_at` as the reporting window
+    /// [`crate::work::cost_report_db`] keys off). A run row inserted by
+    /// `start_execution_run` has `liveness_anchor_at` NULL until a
+    /// readoption writes it, so the COALESCE falls through to `started_at`
+    /// for every row that has not been the target of a readoption.
     pub fn latest_run_started_epoch_for_execution(&self, execution_id: &str) -> Result<Option<i64>> {
         let conn = self.connect()?;
         let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
@@ -744,7 +794,7 @@ impl WorkDb {
         };
         let anchor: Option<String> = conn
             .query_row(
-                "SELECT COALESCE(started_at, created_at) FROM work_runs WHERE id = ?1",
+                "SELECT COALESCE(liveness_anchor_at, started_at, created_at) FROM work_runs WHERE id = ?1",
                 params![run_id],
                 |row| row.get(0),
             )
@@ -1074,7 +1124,7 @@ impl WorkDb {
     /// read [`crate::app::ServerState::reap_tmux_worker`] starts every tmux
     /// teardown from. Targets the same row
     /// [`Self::record_tmux_spawn_intent_for_execution`] /
-    /// [`Self::record_tmux_session_created_for_execution`] wrote.
+    /// [`Self::persist_tmux_identity_after_observation`] wrote.
     ///
     /// Deliberately does NOT go through [`resolve_run_id_for_execution_hooks`]:
     /// that resolver's tie-breaks (prefer unfinished, deprioritize `failed`,
@@ -1125,7 +1175,7 @@ impl WorkDb {
 
     /// Clear the tmux identity columns once teardown has verified and
     /// destroyed the session — the durable counterpart of
-    /// [`Self::record_tmux_session_created_for_execution`]'s write. Scoped
+    /// [`Self::persist_tmux_identity_after_observation`]'s write. Scoped
     /// to `(execution_id, spawn_token)`, matching that write's own scoping:
     /// an execution that resumed onto a new run (and therefore a new
     /// token) between a teardown starting and finishing must not have the

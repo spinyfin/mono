@@ -576,6 +576,21 @@ pub(crate) fn migrate_work_runs_tmux_hosted(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Mutable liveness-age anchor for a spawned run, distinct from `started_at`.
+///
+/// `started_at` is the immutable pane-spawn time. Readoption used to stomp it
+/// so durable liveness reconcilers would not immediately re-enter an overdue
+/// state, which inverted spawn-finished vs spawn-started for `bossctl agents
+/// status` and shifted [`crate::work::cost_report_db`] / WorkResumed evidence
+/// off the original spawn. Nullable so legacy rows fall through to
+/// `started_at` via COALESCE until a readoption writes this column.
+pub(crate) fn migrate_work_runs_liveness_anchor_at(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "work_runs", "liveness_anchor_at")? {
+        conn.execute("ALTER TABLE work_runs ADD COLUMN liveness_anchor_at TEXT", [])?;
+    }
+    Ok(())
+}
+
 /// Raw per-run agent usage captured incrementally from transcript records.
 ///
 /// Cache-write tokens keep both the provider's total and its 5-minute /

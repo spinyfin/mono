@@ -266,33 +266,31 @@ impl WorkDb {
     ///   `waiting_human` additionally makes the row invisible to
     ///   [`Self::list_orphan_active_candidates`], which is what stops the
     ///   re-dispatch storm at its source.
-    /// - `finished_at` is cleared: the run did not finish.
-    /// - The latest run's `started_at` is refreshed to the readoption moment,
-    ///   resetting the pane-attach age used by durable liveness reconcilers —
-    ///   [`Self::latest_run_started_epoch_for_execution`] anchors on
-    ///   `COALESCE(started_at, created_at)` precisely so this write is what
-    ///   it reads. Without the reset, a false reap followed by readoption
-    ///   immediately re-enters the same overdue state and oscillates on
-    ///   every sweep. This write is unconditional — not gated on the run's
-    ///   own `status` — because the highest-value case for it is exactly the
-    ///   one where the run row is *not* `orphaned`: a spawn-ack-timeout reap
-    ///   stamps the run `completed` at spawn-return, before the worker ever
-    ///   produces a shell (see the comment on the `error_text` write below),
-    ///   and that is the run row a readoption of this kind needs to convince
-    ///   `lost_workspace_sweep` is fresh again. `started_at` is also read by
+    /// - `finished_at` is cleared on the *execution*: the execution did not
+    ///   finish. The latest run row's `finished_at` is left alone unless that
+    ///   row itself was stamped `orphaned` by the reap (see below) — a
+    ///   spawn-ack-timeout leaves the run `completed`, and that status is
+    ///   the run's own history, not an inference to withdraw.
+    /// - The latest run's `liveness_anchor_at` is refreshed to the readoption
+    ///   moment, resetting the pane-attach age used by durable liveness
+    ///   reconcilers — [`Self::latest_run_started_epoch_for_execution`]
+    ///   anchors on `COALESCE(liveness_anchor_at, started_at, created_at)`
+    ///   precisely so this write is what it reads. Without the reset, a
+    ///   false reap followed by readoption immediately re-enters the same
+    ///   overdue state and oscillates on every sweep. `started_at` is
+    ///   immutable: it is the moment the pane-spawn ran, and is also read by
     ///   [`crate::work::cost_report_db`] and
-    ///   [`crate::work::attention_reconcile::work_resumed_evidence`], so a
-    ///   readoption shifts their visible resume time too; that is accurate,
-    ///   because the worker genuinely resumed. `created_at` remains untouched
-    ///   to preserve the original creation-time reporting window.
+    ///   [`crate::work::attention_reconcile::work_resumed_evidence`].
+    ///   Stomping it made `bossctl agents status` print spawn-finished
+    ///   before spawn-started. `created_at` remains untouched too.
     /// - A positively observed `shell_pid`, when supplied, is stored on that
     ///   same latest run in the transaction. Non-positive values are rejected;
     ///   readoption never persists the historical `0` sentinel as liveness.
     /// - The latest `work_runs` row is un-orphaned **only if the reap was what
     ///   stamped it**. A row this execution finished legitimately is
     ///   `completed`/`failed` and its `status`/`finished_at`/`result_summary`
-    ///   are left exactly as they are — only `started_at`/`shell_pid` (the
-    ///   liveness-facing fields above) are refreshed regardless of status.
+    ///   are left exactly as they are — only `liveness_anchor_at`/`shell_pid`
+    ///   (the liveness-facing fields above) are refreshed regardless of status.
     /// - A work item demoted to `todo` by the reap is put back to `active`,
     ///   but only when this execution is still its latest — the same
     ///   latest-execution guard [`demote_active_if_latest_execution`] applies
@@ -301,12 +299,13 @@ impl WorkDb {
     ///
     /// ## Refusals
     ///
-    /// Errors when the execution is unknown, when its status is not an
-    /// inferred terminal, or when the work item already has a DIFFERENT live
-    /// execution. That last check is the anti-duplication invariant restated
-    /// at the storage layer: re-adopting into a row that already has a live
-    /// worker would create precisely the double-worker state this whole change
-    /// exists to prevent, so it is refused here even if a caller asks for it.
+    /// Errors when the execution is unknown, when its status is not
+    /// `orphaned` (the only inferred terminal), or when the work item already
+    /// has a DIFFERENT live execution. `abandoned` is a deliberate idle-park
+    /// decision and is refused here even if a caller asks. The last check is
+    /// the anti-duplication invariant restated at the storage layer:
+    /// re-adopting into a row that already has a live worker would create
+    /// precisely the double-worker state this whole change exists to prevent.
     pub fn readopt_inferred_terminal_execution(
         &self,
         execution_id: &str,
@@ -319,10 +318,10 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        if !matches!(existing.status, ExecutionStatus::Orphaned | ExecutionStatus::Abandoned) {
+        if !matches!(existing.status, ExecutionStatus::Orphaned) {
             bail!(
                 "execution {execution_id} is `{}`, which is a deliberate outcome rather than an \
-                 inferred death; only `orphaned` / `abandoned` may be re-adopted",
+                 inferred death; only `orphaned` may be re-adopted",
                 existing.status
             );
         }
@@ -366,7 +365,7 @@ impl WorkDb {
         // this exists to fix leaves the run row `completed`, not `orphaned`.
         let liveness_age_reset = tx.execute(
             "UPDATE work_runs
-             SET started_at = ?2,
+             SET liveness_anchor_at = ?2,
                  shell_pid = COALESCE(?3, shell_pid)
              WHERE id = (
                  SELECT id FROM work_runs
@@ -829,6 +828,45 @@ impl WorkDb {
              WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND workspace_path IS NOT NULL
                AND workspace_path != ''
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([], map_execution)?;
+        collect_rows(rows)
+    }
+
+    /// Return every non-terminal `work_executions` row whose latest local
+    /// `work_runs` row recorded a positive `shell_pid` — the candidate set
+    /// for the pane-death reconciler ([`crate::dead_pane_sweep`]).
+    ///
+    /// Distinct from [`Self::list_non_terminal_executions_with_workspace`]:
+    /// that query stats `workspace_path`, which the idle-park path NULLs in
+    /// the same transaction that terminalizes, so a later `session_end`
+    /// readopt that restores `status=running` without restoring the path
+    /// would vanish from both death sweeps at once. This query keys on the
+    /// durable pid the pane-death probe actually uses, so a non-terminal
+    /// execution with a dead pid is reachable even when teardown cleared
+    /// its workspace columns.
+    pub fn list_non_terminal_executions_with_local_shell_pid(&self) -> Result<Vec<WorkExecution>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                    cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                    created_at, started_at, finished_at,
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after
+             FROM work_executions
+             WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+               AND EXISTS (
+                   SELECT 1 FROM work_runs r
+                   WHERE r.id = (
+                       SELECT latest.id FROM work_runs latest
+                       WHERE latest.execution_id = work_executions.id
+                       ORDER BY latest.created_at DESC, latest.id DESC
+                       LIMIT 1
+                   )
+                     AND r.host_id = 'local'
+                     AND r.shell_pid IS NOT NULL
+                     AND r.shell_pid > 0
+               )
              ORDER BY created_at ASC, id ASC",
         )?;
         let rows = stmt.query_map([], map_execution)?;

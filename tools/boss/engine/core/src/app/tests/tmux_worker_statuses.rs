@@ -163,6 +163,7 @@ async fn adopted_live_pane_reads_activity_and_returns_attach_command() {
         ok("0"),
         ok("1776528000"),
         ok("claude"),
+        ok("5"),
     ]);
     *server_state.pane_delivery_tmux_override.write().unwrap() = Some(tmux);
 
@@ -223,6 +224,15 @@ async fn adopted_live_pane_reads_activity_and_returns_attach_command() {
                 "-t",
                 "boss-1-example",
                 "#{pane_current_command}"
+            ],
+            vec![
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
+                "display-message",
+                "-p",
+                "-t",
+                "boss-1-example",
+                "#{history_size}"
             ],
         ],
     );

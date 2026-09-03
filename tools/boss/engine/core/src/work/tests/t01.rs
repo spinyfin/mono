@@ -2879,3 +2879,66 @@ fn tmux_identity_for_execution_prefers_the_newest_run_over_the_hook_resolver() {
     assert_eq!(identity.session_name, "boss-newer");
     assert_eq!(identity.spawn_token, "token-newer");
 }
+
+/// Adoption used to refresh `shell_pid` and leave session name / spawn-state
+/// / host_id untouched, so `tmux_run_for_execution` and
+/// `tmux_identity_for_execution` both returned None and every probe failed
+/// with "no durable tmux identity recorded for run".
+#[test]
+fn persist_tmux_identity_after_observation_fills_session_name_and_local_host() {
+    let db = WorkDb::open(temp_db_path("tmux-identity-repair")).unwrap();
+    let execution_id = start_run_on_host_for_test(&db, "local");
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(&execution_id, "boss", "boss-worker-1", "tok-repair")
+            .unwrap()
+    );
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs
+             SET tmux_session_name = NULL,
+                 tmux_spawn_state = NULL,
+                 tmux_pane_pid = NULL,
+                 host_id = ''
+             WHERE execution_id = ?1",
+            rusqlite::params![&execution_id],
+        )
+        .unwrap();
+    assert!(
+        db.tmux_identity_for_execution(&execution_id).unwrap().is_none(),
+        "precondition: incomplete identity is invisible to pane delivery",
+    );
+    assert!(
+        db.tmux_run_for_execution(&execution_id).unwrap().is_none(),
+        "precondition: incomplete identity is invisible to the adoptable lookup",
+    );
+
+    assert!(
+        db.persist_tmux_identity_after_observation(
+            &execution_id,
+            "tok-repair",
+            4321,
+            Some("boss-worker-1"),
+            Some("boss"),
+        )
+        .unwrap()
+    );
+
+    let identity = db
+        .tmux_identity_for_execution(&execution_id)
+        .unwrap()
+        .expect("pane delivery must see the repaired identity");
+    assert_eq!(identity.session_name, "boss-worker-1");
+    assert_eq!(identity.spawn_token, "tok-repair");
+    assert_eq!(identity.pane_pid, Some(4321));
+    let handle = db
+        .tmux_run_for_execution(&execution_id)
+        .unwrap()
+        .expect("adoptable lookup must see host_id=local after repair");
+    assert_eq!(handle.tmux_spawn_state, "created");
+    assert_eq!(handle.tmux_session_name, "boss-worker-1");
+    assert_eq!(
+        db.latest_local_pane_pid_snapshot_for_execution(&execution_id).unwrap(),
+        (Some(4321), Some(4321)),
+    );
+}

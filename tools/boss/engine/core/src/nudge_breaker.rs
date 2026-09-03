@@ -195,6 +195,30 @@ impl NudgeBreaker {
             .expect("NudgeBreaker mutex poisoned")
             .remove(execution_id);
     }
+
+    /// Undo a nudge that was recorded against the breaker but never
+    /// delivered. `record` counts issued probes; a probe that failed to
+    /// reach the pane (no durable tmux identity, send failed, posture
+    /// refused) must not burn the unproductive-nudge budget — that is how
+    /// three undeliverable probes killed a worker for ignoring messages it
+    /// never received.
+    ///
+    /// Decrements `count` and `total_count` when either is positive, and
+    /// leaves `last_nudge_at` in place so a rapid retry is still debounced
+    /// rather than hammering a delivery path that just failed. Idempotent
+    /// against an execution with no tracked state.
+    pub fn revert_undelivered(&self, execution_id: &str) {
+        let mut guard = self.inner.lock().expect("NudgeBreaker mutex poisoned");
+        let Some(entry) = guard.get_mut(execution_id) else {
+            return;
+        };
+        if entry.count > 0 {
+            entry.count -= 1;
+        }
+        if entry.total_count > 0 {
+            entry.total_count -= 1;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -435,6 +459,36 @@ mod tests {
             breaker.record("exec_r", "stale:https://github.com/x/y/pull/1", 3, t1),
             NudgeDecision::Proceed { count: 1 },
             "a fingerprint change must proceed immediately, not debounce",
+        );
+    }
+
+    #[test]
+    fn revert_undelivered_does_not_trip_the_breaker() {
+        // Three undeliverable probes must not park the worker: each Proceed
+        // is undone, so the cap is never exhausted.
+        let breaker = NudgeBreaker::new();
+        let fp = "no_pr";
+        for i in 0..5 {
+            assert_eq!(
+                breaker.record("exec_undelivered", fp, 3, tick(i)),
+                NudgeDecision::Proceed { count: 1 },
+                "after revert the next issued nudge is still the first of a fresh cycle",
+            );
+            breaker.revert_undelivered("exec_undelivered");
+        }
+        assert_eq!(
+            breaker.record("exec_undelivered", fp, 3, tick(5)),
+            NudgeDecision::Proceed { count: 1 },
+        );
+    }
+
+    #[test]
+    fn revert_undelivered_is_a_no_op_for_unknown_executions() {
+        let breaker = NudgeBreaker::new();
+        breaker.revert_undelivered("never-tracked");
+        assert_eq!(
+            breaker.record("never-tracked", "no_pr", 3, tick(0)),
+            NudgeDecision::Proceed { count: 1 },
         );
     }
 

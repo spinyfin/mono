@@ -110,6 +110,12 @@ pub enum DisplayField {
     PaneDeadStatus,
     PaneCurrentCommand,
     WindowActivity,
+    /// `#{history_size}` — the pane's scrollback line count. Unlike
+    /// `#{window_activity}`, this advances only when the pane actually
+    /// writes new output, so it distinguishes genuine progress from an
+    /// attached TUI repainting the same spinner frame in place (which bumps
+    /// `window_activity` without adding a line).
+    HistorySize,
 }
 
 impl DisplayField {
@@ -120,6 +126,7 @@ impl DisplayField {
             Self::PaneDeadStatus => "#{pane_dead_status}",
             Self::PaneCurrentCommand => "#{pane_current_command}",
             Self::WindowActivity => "#{window_activity}",
+            Self::HistorySize => "#{history_size}",
         }
     }
 }

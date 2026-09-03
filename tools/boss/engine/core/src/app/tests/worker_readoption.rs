@@ -300,6 +300,39 @@ async fn a_hook_for_a_cancelled_execution_reaps_instead_of_readopting() {
     );
 }
 
+/// Idle-park writes `abandoned` as a decision, then tears the pane down.
+/// The dying process's `session_end` must not resurrect the row into a
+/// `running` phantom with no workspace, lease, or registry entry.
+#[tokio::test]
+async fn session_end_for_an_abandoned_execution_does_not_readopt() {
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+    let execution_id = create_spawned_execution(db, &work_item_id, dead_pid());
+    db.record_worker_idle_abandonment(&execution_id, "breaker tripped")
+        .unwrap()
+        .expect("live execution is idle-abandoned");
+
+    crate::app::worker_events::converge_terminal_execution_contradiction(
+        &server_state,
+        &execution_id,
+        crate::worker_readoption::SESSION_END_TRIGGER,
+    )
+    .await;
+
+    let after = server_state.work_db.get_execution(&execution_id).unwrap();
+    assert_eq!(
+        after.status,
+        ExecutionStatus::Abandoned,
+        "session_end is the worker announcing exit, not proof of life",
+    );
+    assert!(
+        after.workspace_path.is_none() || after.workspace_path.as_deref() == Some(""),
+        "idle-park cleared the workspace; readopt must not restore a running row on top of that",
+    );
+}
+
 /// The anti-duplication invariant at the convergence layer: once a replacement
 /// worker is live on the row, the survivor is reaped even though its own
 /// terminal status was only an inference. Re-adopting here is exactly how two

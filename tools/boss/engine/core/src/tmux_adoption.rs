@@ -106,6 +106,9 @@ use crate::spawn_flow::{TMUX_SESSION_SCHEMA, WorkerSpawner};
 use crate::work::{TmuxRunHandle, WorkDb};
 use crate::worker_readoption::LiveWorkerConvergence;
 
+mod persist;
+use persist::{PaneObservation, PersistedPanePid, adoption_pid_snapshot, persist_observed_pane_pid};
+
 /// The tmux session environment variable carrying [`TMUX_SESSION_SCHEMA`].
 /// Names what a different process generation wrote into its live session, so
 /// it stays local to this compatibility boundary rather than being imported
@@ -186,181 +189,23 @@ async fn session_pane_pid(tmux: &Tmux, session_name: &str, execution_id: &str) -
     }
 }
 
-/// Outcome of [`persist_observed_pane_pid`]. The durable write and the
-/// in-memory adoption are deliberately allowed to disagree on one axis: a
-/// pid that was *positively observed* on the live tmux pane is real evidence
-/// of liveness regardless of whether the database happened to accept the
-/// write at that instant, so a transient DB failure alone must not throw that
-/// evidence away. Only `NoMatchingRun` — the identity itself being wrong —
-/// is a hard refusal.
-enum PersistedPanePid {
-    /// The durable write landed. Carries the pre-write snapshot for event
-    /// diagnostics.
-    Written(Option<i64>, Option<i64>),
-    /// The write did not land, but the pid was positively observed on the
-    /// pane, so in-memory adoption should still proceed; the next sweep pass
-    /// retries the durable write. `None` means the pre-write snapshot could
-    /// not be read, rather than claiming it contained no pids.
-    WriteFailed(Option<(Option<i64>, Option<i64>)>),
-    /// `spawn_token` matched no durable run row at all — the identity is
-    /// wrong, not just unwritable. Adoption must refuse.
-    NoMatchingRun,
-}
-
-/// Convert a durable-pid outcome into the diagnostic snapshot carried by an
-/// in-memory adoption. `None` is the identity-mismatch refusal; the boolean
-/// distinguishes an unreadable snapshot from a known pair of absent pids.
-fn adoption_pid_snapshot(outcome: PersistedPanePid) -> Option<(Option<i64>, Option<i64>, bool)> {
-    match outcome {
-        PersistedPanePid::Written(stored, previous) => Some((stored, previous, true)),
-        PersistedPanePid::WriteFailed(Some((stored, previous))) => Some((stored, previous, true)),
-        PersistedPanePid::WriteFailed(None) => Some((None, None, false)),
-        PersistedPanePid::NoMatchingRun => None,
-    }
-}
-
-/// Reconcile one positive tmux pane observation into the durable liveness
-/// fields before any in-memory adoption or terminal readoption proceeds.
-async fn persist_observed_pane_pid(
-    work_db: &WorkDb,
-    dispatch_events: &dyn DispatchEventSink,
-    execution_id: &str,
-    spawn_token: &str,
-    session_name: &str,
-    observed_shell_pid: i32,
-    write_reason: &str,
-) -> PersistedPanePid {
-    let before = match work_db.latest_local_pane_pid_snapshot_for_execution(execution_id) {
-        Ok(snapshot) => snapshot,
-        Err(err) => {
-            tracing::warn!(
-                execution_id,
-                session = session_name,
-                observed_shell_pid,
-                write_reason,
-                error = %format!("{err:#}"),
-                "tmux adoption: could not read the durable pid snapshot; the pid was still positively \
-                 observed, so adoption proceeds and the durable write is retried on the next sweep",
-            );
-            return PersistedPanePid::WriteFailed(None);
-        }
-    };
-    let (stored_shell_pid, previous_tmux_pane_pid) = before;
-    tracing::info!(
-        execution_id,
-        session = session_name,
-        stored_shell_pid = ?stored_shell_pid,
-        previous_tmux_pane_pid = ?previous_tmux_pane_pid,
-        observed_shell_pid,
-        write_reason,
-        "tmux adoption: persisting observed pane pid as durable shell liveness",
-    );
-
-    let persisted =
-        work_db.record_tmux_session_created_for_execution(execution_id, spawn_token, i64::from(observed_shell_pid));
-    match persisted {
-        Ok(true) => {
-            // The write targets the row identified by `spawn_token`, but
-            // every liveness reader instead selects the newest LOCAL run row
-            // by `created_at`. When an execution has acquired a sibling run
-            // row between the two writes, that row is not the same one, and
-            // the write above would silently land somewhere the liveness
-            // readers never look. Read back through the same path the
-            // readers use and surface the mismatch instead of leaving it to
-            // resurface later as an unexplained `NeverAttached` verdict.
-            match work_db.latest_local_pane_pid_snapshot_for_execution(execution_id) {
-                Ok((Some(visible_shell_pid), _)) if visible_shell_pid == i64::from(observed_shell_pid) => {}
-                Ok((visible_shell_pid, _)) => {
-                    tracing::error!(
-                        execution_id,
-                        session = session_name,
-                        observed_shell_pid,
-                        write_reason,
-                        visible_shell_pid = ?visible_shell_pid,
-                        "tmux adoption: pid write landed on the spawn-token run row, but the newest local \
-                         run row every liveness reader selects does not reflect it — the execution likely \
-                         acquired a sibling run row between the two writes",
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        execution_id,
-                        session = session_name,
-                        observed_shell_pid,
-                        write_reason,
-                        error = %format!("{err:#}"),
-                        "tmux adoption: could not verify the pid write became visible to liveness readers",
-                    );
-                }
-            }
-            PersistedPanePid::Written(before.0, before.1)
-        }
-        Ok(false) => {
-            tracing::error!(
-                execution_id,
-                session = session_name,
-                observed_shell_pid,
-                write_reason,
-                "tmux adoption: observed pane pid matched no durable tmux run; refusing to adopt the session",
-            );
-            dispatch_events
-                .emit(
-                    DispatchEvent::new(Stage::TmuxAdopt, Outcome::Error, execution_id).with_details(
-                        serde_json::json!({
-                            "tmux_session_name": session_name,
-                            "stored_shell_pid": stored_shell_pid,
-                            "previous_tmux_pane_pid": previous_tmux_pane_pid,
-                            "observed_shell_pid": observed_shell_pid,
-                            "shell_pid_write_reason": write_reason,
-                            "error": "tmux_run_not_found",
-                        }),
-                    ),
-                )
-                .await;
-            PersistedPanePid::NoMatchingRun
-        }
-        Err(err) => {
-            tracing::warn!(
-                execution_id,
-                session = session_name,
-                observed_shell_pid,
-                write_reason,
-                error = %format!("{err:#}"),
-                "tmux adoption: failed to persist the observed pane pid (likely transient); the pid was \
-                 still positively observed, so adoption proceeds and the durable write is retried on the \
-                 next sweep",
-            );
-            dispatch_events
-                .emit(
-                    DispatchEvent::new(Stage::TmuxAdopt, Outcome::Error, execution_id).with_details(
-                        serde_json::json!({
-                            "tmux_session_name": session_name,
-                            "stored_shell_pid": stored_shell_pid,
-                            "previous_tmux_pane_pid": previous_tmux_pane_pid,
-                            "observed_shell_pid": observed_shell_pid,
-                            "shell_pid_write_reason": write_reason,
-                            "error": format!("{err:#}"),
-                            "adoption_proceeded_without_write": true,
-                        }),
-                    ),
-                )
-                .await;
-            PersistedPanePid::WriteFailed(Some(before))
-        }
-    }
-}
-
 /// Fine-grained classification of one durable tmux identity against the live
 /// server. Shared by `ServerState::tmux_worker_statuses` and
 /// [`crate::stale_worker_sweep::TmuxWorkerTerminalInspector`] so the two
 /// cannot drift on the interrogation sequence.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct TmuxIdentityObservation {
     pub adoption_state: boss_protocol::TmuxAdoptionState,
     pub pane_dead: Option<bool>,
     pub pane_dead_status: Option<String>,
     pub window_activity_epoch_secs: Option<i64>,
     pub current_command: Option<String>,
+    /// `#{history_size}` on a live pane — the scrollback line count.
+    /// Advances only on genuine new output, unlike `window_activity_epoch_secs`
+    /// which an attached TUI repainting the same frame also bumps. See
+    /// [`crate::stale_worker_sweep`]'s use as a cross-pass delta.
+    pub history_size: Option<i64>,
 }
 
 fn probe_unavailable_observation() -> TmuxIdentityObservation {
@@ -370,6 +215,7 @@ fn probe_unavailable_observation() -> TmuxIdentityObservation {
         pane_dead_status: None,
         window_activity_epoch_secs: None,
         current_command: None,
+        history_size: None,
     }
 }
 
@@ -399,6 +245,7 @@ pub async fn observe_tmux_identity(
             pane_dead_status: None,
             window_activity_epoch_secs: None,
             current_command: None,
+            history_size: None,
         };
     }
     let token = match session_spawn_token(tmux, session_name).await {
@@ -419,6 +266,7 @@ pub async fn observe_tmux_identity(
             pane_dead_status: None,
             window_activity_epoch_secs: None,
             current_command: None,
+            history_size: None,
         };
     }
     let pane_dead = match tmux.display_message(session_name, DisplayField::PaneDead).await {
@@ -488,12 +336,38 @@ pub async fn observe_tmux_identity(
             }
         }
     };
+    let history_size = if pane_dead {
+        None
+    } else {
+        match tmux.display_message(session_name, DisplayField::HistorySize).await {
+            Ok(value) => match value.parse::<i64>() {
+                Ok(size) => Some(size),
+                Err(err) => {
+                    tracing::debug!(
+                        session = %session_name,
+                        error = %err,
+                        "tmux identity probe: history_size unparseable"
+                    );
+                    None
+                }
+            },
+            Err(err) => {
+                tracing::debug!(
+                    session = %session_name,
+                    error = %format!("{err:#}"),
+                    "tmux identity probe: history_size unreadable"
+                );
+                None
+            }
+        }
+    };
     TmuxIdentityObservation {
         adoption_state: boss_protocol::TmuxAdoptionState::Adopted,
         pane_dead: Some(pane_dead),
         pane_dead_status,
         window_activity_epoch_secs,
         current_command,
+        history_size,
     }
 }
 
@@ -948,15 +822,19 @@ async fn adopt_one<S>(
     } else {
         "refresh_created_tmux_session"
     };
+    let server_label = tmux.server_identity();
     let Some((stored_shell_pid, previous_tmux_pane_pid, stored_pid_snapshot_known)) = adoption_pid_snapshot(
         persist_observed_pane_pid(
             work_db,
             dispatch_events,
-            execution_id,
-            &handle.tmux_spawn_token,
-            session_name,
-            shell_pid,
-            shell_pid_write_reason,
+            &PaneObservation {
+                execution_id,
+                spawn_token: &handle.tmux_spawn_token,
+                session_name,
+                server_label: &server_label,
+                observed_shell_pid: shell_pid,
+                write_reason: shell_pid_write_reason,
+            },
         )
         .await,
     ) else {
@@ -1133,15 +1011,19 @@ async fn classify_untracked_session<S>(
         let Some(shell_pid) = session_pane_pid(tmux, &session.session_name, &execution_id).await else {
             return;
         };
+        let server_label = tmux.server_identity();
         if matches!(
             persist_observed_pane_pid(
                 work_db,
                 dispatch_events,
-                &execution_id,
-                &session.spawn_token,
-                &session.session_name,
-                shell_pid,
-                "terminal_tmux_readoption",
+                &PaneObservation {
+                    execution_id: &execution_id,
+                    spawn_token: &session.spawn_token,
+                    session_name: &session.session_name,
+                    server_label: &server_label,
+                    observed_shell_pid: shell_pid,
+                    write_reason: "terminal_tmux_readoption",
+                },
             )
             .await,
             PersistedPanePid::NoMatchingRun
@@ -1174,11 +1056,67 @@ async fn classify_untracked_session<S>(
             )
             .await;
         }
-        Ok(None) => tracing::warn!(
-            execution_id,
-            session = %session.session_name,
-            "tmux session sweep: non-terminal execution has no complete tmux run handle; skipping",
-        ),
+        Ok(None) => {
+            // Token exists (we resolved execution_id from it) but the
+            // identity columns the adopted-predicate requires are incomplete.
+            // Persist the live session as durable identity and retry; skipping
+            // here is how probe delivery stayed dead for the whole run.
+            tracing::warn!(
+                execution_id,
+                session = %session.session_name,
+                "tmux session sweep: non-terminal execution has no complete tmux run handle; \
+                 persisting live identity and retrying adoption",
+            );
+            let Some(shell_pid) = session_pane_pid(tmux, &session.session_name, &execution_id).await else {
+                return;
+            };
+            let server_label = tmux.server_identity();
+            if matches!(
+                persist_observed_pane_pid(
+                    work_db,
+                    dispatch_events,
+                    &PaneObservation {
+                        execution_id: &execution_id,
+                        spawn_token: &session.spawn_token,
+                        session_name: &session.session_name,
+                        server_label: &server_label,
+                        observed_shell_pid: shell_pid,
+                        write_reason: "repair_incomplete_tmux_identity",
+                    },
+                )
+                .await,
+                PersistedPanePid::NoMatchingRun
+            ) {
+                return;
+            }
+            match work_db.tmux_run_handle_for_spawn_token(&session.spawn_token) {
+                Ok(Some(handle)) => {
+                    adopt_one(
+                        work_db,
+                        tmux,
+                        coordinator,
+                        spawner,
+                        dispatch_events,
+                        &handle,
+                        &session.session_name,
+                        outcome,
+                    )
+                    .await;
+                }
+                Ok(None) => tracing::warn!(
+                    execution_id,
+                    session = %session.session_name,
+                    "tmux session sweep: identity write landed but the run handle is still incomplete; \
+                     leaving the session for a later pass",
+                ),
+                Err(err) => tracing::warn!(
+                    execution_id,
+                    session = %session.session_name,
+                    error = %format!("{err:#}"),
+                    "tmux session sweep: failed to reload tmux run handle after identity repair",
+                ),
+            }
+        }
         Err(err) => tracing::warn!(
             execution_id,
             session = %session.session_name,

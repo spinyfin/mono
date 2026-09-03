@@ -186,7 +186,7 @@ pub async fn run_one_pass(
     let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
     let live_states = coordinator.live_worker_states();
 
-    let candidates = match work_db.list_non_terminal_executions_with_workspace() {
+    let candidates = match work_db.list_non_terminal_executions_with_local_shell_pid() {
         Ok(rows) => rows,
         Err(err) => {
             tracing::warn!(
@@ -1097,5 +1097,47 @@ mod tests {
             cube.force_release_calls().is_empty(),
             "a live registry entry must keep the potentially active workspace leased",
         );
+    }
+
+    /// Idle-park NULLs `workspace_path` in the same transaction that
+    /// terminalizes; a later `session_end` readopt that restores `running`
+    /// without restoring the path used to vanish from both DB-driven death
+    /// sweeps. The pid-keyed candidate set must still see that row.
+    #[tokio::test]
+    async fn empty_workspace_path_with_dead_pid_is_still_a_candidate_and_is_reaped() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let exec = parked_triage_execution(&db, &automation, "/tmp/ws-phantom", "local", Some(dead_pid()));
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET workspace_path = '', cube_lease_id = NULL WHERE id = ?1",
+                rusqlite::params![&exec.id],
+            )
+            .unwrap();
+        let exec = db.get_execution(&exec.id).unwrap();
+        assert_eq!(exec.workspace_path.as_deref(), Some(""));
+        assert!(
+            db.list_non_terminal_executions_with_workspace()
+                .unwrap()
+                .iter()
+                .all(|row| row.id != exec.id),
+            "the workspace-keyed query must not see a cleared path — that is the blinding defect",
+        );
+        assert!(
+            db.list_non_terminal_executions_with_local_shell_pid()
+                .unwrap()
+                .iter()
+                .any(|row| row.id == exec.id),
+            "the pid-keyed query must still reach a non-terminal row with a durable dead pid",
+        );
+
+        let sink = NoopDispatchEventSink;
+        assert!(
+            reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs(), None, None).await,
+            "a phantom running/waiting_human row with a dead durable pid must still be reaped",
+        );
+        assert_eq!(db.get_execution(&exec.id).unwrap().status, ExecutionStatus::Orphaned);
     }
 }
