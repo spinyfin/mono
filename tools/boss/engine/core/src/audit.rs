@@ -582,6 +582,13 @@ mod tests {
     #[test]
     fn public_start_and_shutdown_path_emits_two_records() {
         let _globals = lock_globals();
+        // record_shutdown drops every call after the first
+        // (SHUTDOWN_EMITTED.swap below), and other shutdown paths in this
+        // binary (app/server.rs's signal/rpc/orphan handlers) can call it
+        // before this test runs. Re-arm at entry so this test's own
+        // record_shutdown("signal:SIGTERM") below is never a silent no-op
+        // because some sibling already flipped the flag.
+        SHUTDOWN_EMITTED.store(false, Ordering::SeqCst);
 
         record_start(StartContext {
             argv: vec!["engine".into()],

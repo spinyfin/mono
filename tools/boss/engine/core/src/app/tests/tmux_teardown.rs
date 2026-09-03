@@ -212,25 +212,20 @@ async fn absent_session_clears_identity_without_signalling() {
 /// [`ServerState::tmux_for_run`] routing: a run recorded with the literal
 /// legacy server label must resolve to a `-L boss` handle built from the
 /// same executable, not the durable socket — the routing
-/// [`ServerState::reap_tmux_worker`] relies on so a legacy-adopted run's
-/// teardown is torn down against the server that actually hosts it, rather
-/// than silently treated as "already gone" against an unrelated socket.
+/// A test process must refuse a legacy label handle backed by the real
+/// runner, because that label addresses tmux's shared default socket.
 #[tokio::test]
 async fn tmux_for_run_routes_legacy_label_to_the_label_server() {
     let (server_state, _dir) = test_server_state();
     let (socket_tmux, _runner) = fake_tmux(Vec::<boss_tmux::CommandOutput>::new());
 
-    let legacy = server_state
+    let error = server_state
         .tmux_for_run(&socket_tmux, boss_tmux::SERVER_LABEL)
-        .unwrap();
-    assert_eq!(
-        legacy.operator_prefix(),
-        format!("tmux -L {}", boss_tmux::quote_for_shell(boss_tmux::SERVER_LABEL))
-    );
-    assert_eq!(
-        legacy.program(),
-        socket_tmux.program(),
-        "must reuse the resolved executable"
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("refusing to construct a legacy `-L boss` tmux handle")
     );
 
     let socket = server_state

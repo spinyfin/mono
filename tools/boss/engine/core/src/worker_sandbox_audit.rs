@@ -342,16 +342,18 @@ mod tests {
 
         let path = audit::default_audit_log_path().expect("a test process always resolves its isolated audit path");
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            raw.contains("worker_sandbox_attempt"),
-            "expected audit line, got: {raw}",
-        );
-        assert!(raw.contains("\"tool\":\"Read\""), "missing tool field: {raw}");
-        assert!(
-            raw.contains("\"reason\":\"boss_state_path\""),
-            "missing reason field: {raw}",
-        );
-        assert!(raw.contains("\"run_id\":\"run-abc\""), "missing run_id: {raw}");
+        // The audit file is shared across every audit-writing test in this
+        // binary and never truncated, so locate this test's own record by
+        // its unique `run_id` rather than substring-matching the whole file
+        // — a substring match could be satisfied by an unrelated record.
+        let record = raw
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("valid jsonl"))
+            .find(|v| v["event"] == "worker_sandbox_attempt" && v["run_id"] == "run-abc")
+            .unwrap_or_else(|| panic!("expected a worker_sandbox_attempt record for run-abc, got: {raw}"));
+        assert_eq!(record["tool"], "Read");
+        assert_eq!(record["reason"], "boss_state_path");
     }
 
     #[test]
