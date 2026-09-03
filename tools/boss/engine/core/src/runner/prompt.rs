@@ -342,7 +342,7 @@ fn merge_cancelled_review_recovery_block(
 /// gets its own path and env var (see [`structured_output_env_vars`]).
 /// Returns `None` for kinds with no designated payload (answer agent, CI
 /// remediation, plain design tasks).
-pub(super) fn designated_output_kind(execution: &WorkExecution, work_item: &WorkItem) -> Option<StructuredOutputKind> {
+pub(crate) fn designated_output_kind(execution: &WorkExecution, work_item: &WorkItem) -> Option<StructuredOutputKind> {
     match execution.kind {
         ExecutionKind::PrReview => Some(StructuredOutputKind::ReviewResult),
         ExecutionKind::AutomationTriage => Some(StructuredOutputKind::TriageDecision),

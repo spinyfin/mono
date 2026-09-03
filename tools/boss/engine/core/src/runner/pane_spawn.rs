@@ -714,6 +714,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         let ComposedWorkerSpawn {
             prompt_text,
             spawn_config,
+            embedded_output_path: _,
         } = compose_worker_spawn(
             &self.work_db,
             worker_id,

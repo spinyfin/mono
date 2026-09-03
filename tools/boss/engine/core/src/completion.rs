@@ -1556,6 +1556,9 @@ pub struct WorkerCompletionHandler {
     /// [`Self::with_structured_output_dir`] so they can seed/inspect the
     /// artifact without touching the shared system temp dir.
     structured_output_dir: std::path::PathBuf,
+    /// Resolves remote adapters for structured-output collection at the read
+    /// site. Kept optional for local-only tests and installations.
+    host_adapter_provider: Arc<std::sync::RwLock<Option<Arc<dyn crate::host_adapter::HostAdapterProvider>>>>,
     /// Clock the auto-nudge debounce guard reads from
     /// ([`crate::nudge_breaker::MIN_RENUDGE_INTERVAL`]). Defaults to the
     /// real wall clock (`Instant::now`) — correct for production, where
@@ -1864,6 +1867,16 @@ pub const REVISION_NO_OP_ATTENTION_KIND: &str = "revision_no_changes_needed";
 /// tools/boss/docs/postmortems/incident-004-live-revision-workers-reaped-mid-turn.md.
 pub const MID_TURN_REAP_ATTENTION_KIND: &str = "mid_turn_reap";
 
+/// Attention-item kind filed when the engine could not pull a completed
+/// remote worker's structured-output artifact off its host (positive proof
+/// per [`crate::host_adapter::CollectOutcome::Failed`] — an invalid
+/// descriptor, or an artifact whose copy into place failed). Distinct from
+/// [`DRIVER_TERMINAL_ERROR_ATTENTION_KIND`]: the worker's own driver
+/// reported nothing wrong here — the remote host has the result, the engine
+/// simply could not retrieve it — so this tells the true story instead of
+/// implying a provider-side failure that never happened.
+pub const REMOTE_COLLECTION_FAILED_ATTENTION_KIND: &str = "remote_collection_failed";
+
 /// Probe text dispatched when a worker stops without producing any PR
 /// for its branch. Phrased so a worker that already finished the work
 /// will simply push and open one, but a worker that's blocked has an
@@ -2024,6 +2037,9 @@ edits and push them, or close the PR and explain what went wrong.";
 /// only logs this; tests assert on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopOutcome {
+    /// The engine could not retrieve a required structured-output artifact
+    /// from the remote host after the worker reached its terminal boundary.
+    RemoteCollectionFailed { detail: String },
     /// Stop arrived for a run id that doesn't map to a known execution
     /// (e.g., test infra, agent runs).
     UnknownExecution,

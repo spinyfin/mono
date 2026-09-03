@@ -21,6 +21,12 @@
 #                            silently run as another.
 #   BOSS_DRIVER_COMMAND    — full shell command from that driver's SpawnPlan.
 #   BOSS_DRIVER_ENV        — shell environment directives from that SpawnPlan.
+#   BOSS_STRUCTURED_OUTPUT_KIND — optional designated payload kind (for
+#                            example `review-result`). When present, this
+#                            wrapper resolves a writable result path on the
+#                            remote host and exports it to the worker.
+#   BOSS_PR_URL_OUTPUT     — when set, resolve and export a separate PR-URL
+#                            artifact path on this host.
 #   BOSS_REPO_REMOTE_URL   — repo origin URL (used by the worker for
 #                            informational logging only; cube already
 #                            cloned the repo before lease was issued).
@@ -127,6 +133,47 @@ export BOSS_LEASE_ID
 export BOSS_WORKSPACE
 export BOSS_DRIVER
 export BOSS_REPO_REMOTE_URL="${BOSS_REPO_REMOTE_URL:-}"
+
+# Structured output must be resolved where the worker writes it. In
+# particular, macOS assigns per-host/per-user TMPDIR roots, so an engine-side
+# path is not meaningful here. Publish the resolved path through a small
+# remote descriptor that the engine reads back over SSH at completion; the
+# descriptor is written atomically so the collector never observes a partial
+# pathname.
+prepare_structured_output() {
+    output_kind="$1"
+    remote_output_dir="${TMPDIR:-/tmp}/boss-worker-output"
+    remote_output_path="$remote_output_dir/$BOSS_RUN_ID.$output_kind.json"
+    remote_descriptor_dir="$HOME/.boss-remote/runs"
+    remote_descriptor="$remote_descriptor_dir/$BOSS_RUN_ID.$output_kind.structured-output-path"
+    if ! mkdir -p "$remote_output_dir" "$remote_descriptor_dir" \
+        || ! test -w "$remote_output_dir" \
+        || ! test -w "$remote_descriptor_dir"; then
+        printf 'boss-remote-run: cannot prepare remote structured-output path under TMPDIR=%s\n' \
+            "${TMPDIR:-/tmp}" 1>&2
+        exit 78
+    fi
+    descriptor_tmp="$remote_descriptor.$$.tmp"
+    if ! printf '%s\n' "$remote_output_path" > "$descriptor_tmp" \
+        || ! mv "$descriptor_tmp" "$remote_descriptor"; then
+        rm -f "$descriptor_tmp"
+        printf 'boss-remote-run: cannot publish remote structured-output descriptor: %s\n' \
+            "$remote_descriptor" 1>&2
+        exit 78
+    fi
+    prepared_output_path="$remote_output_path"
+}
+
+if [ -n "${BOSS_STRUCTURED_OUTPUT_KIND:-}" ]; then
+    prepare_structured_output "$BOSS_STRUCTURED_OUTPUT_KIND"
+    BOSS_STRUCTURED_OUTPUT="$prepared_output_path"
+    export BOSS_STRUCTURED_OUTPUT
+fi
+if [ -n "${BOSS_PR_URL_OUTPUT:-}" ]; then
+    prepare_structured_output pr-url
+    BOSS_PR_URL_OUTPUT="$prepared_output_path"
+    export BOSS_PR_URL_OUTPUT
+fi
 
 # Per-run scratch + log dir under the cube workspace. The engine pulls
 # tails of worker.log over the SSH multiplex on demand so remote runs

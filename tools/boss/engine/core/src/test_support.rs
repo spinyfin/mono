@@ -843,9 +843,17 @@ macro_rules! stub_host_adapter {
 
     // ── read_worker_log_tail (trait default unless overridden) ───────────────
     (@munch $ty:ty [$($acc:tt)*] @read_worker_log_tail async fn read_worker_log_tail $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn read_worker_log_tail $a -> $r $b] @done $($rest)*);
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn read_worker_log_tail $a -> $r $b] @collect_structured_output $($rest)*);
     };
     (@munch $ty:ty [$($acc:tt)*] @read_worker_log_tail $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*] @collect_structured_output $($rest)*);
+    };
+
+    // ── collect_structured_output (trait default unless overridden) ──────────
+    (@munch $ty:ty [$($acc:tt)*] @collect_structured_output async fn collect_structured_output $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn collect_structured_output $a -> $r $b] @done $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @collect_structured_output $($rest:tt)*) => {
         $crate::stub_host_adapter!(@munch $ty [$($acc)*] @done $($rest)*);
     };
 

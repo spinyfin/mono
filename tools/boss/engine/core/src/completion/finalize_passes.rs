@@ -61,7 +61,9 @@ impl WorkerCompletionHandler {
     /// 3. record the terminal outcome (`produced_task` / `skipped`, or keep
     ///    `failed_will_retry` for a missing / ambiguous / unverifiable
     ///    decision);
-    /// 4. finalise the execution (`completed`) and release pane + workspace.
+    /// 4. finalise the execution (`completed`) and release pane + workspace;
+    ///    if remote artifact collection positively fails, record the terminal
+    ///    run outcome, reap artifacts, and fail the execution instead.
     ///
     /// Design implementation task 11
     /// (`worker-proposal-api-replace-fragile-worker-to-engine-seams.md` —
@@ -83,6 +85,57 @@ impl WorkerCompletionHandler {
     /// WARN-logged — this seam's explicit exit criterion. Flag off
     /// reproduces the legacy-only behavior exactly.
     pub(super) async fn finalize_automation_triage(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
+        // Same collection contract as the review pass: only positive proof
+        // the artifact is untrustworthy terminalizes; a remote triage
+        // worker whose decision artifact could not be pulled otherwise
+        // falls through to `resolve_triage_decision`'s driver-fallback /
+        // no-decision recovery below exactly as a genuinely absent artifact
+        // already does.
+        if let RemoteCollectionResult::Failed { host_id, reason } = self
+            .collect_remote_structured_output(
+                execution,
+                crate::structured_output::StructuredOutputKind::TriageDecision,
+            )
+            .await
+        {
+            tracing::error!(execution_id = %execution.id, host_id = %host_id, error = %reason, "automation triage finalize: cannot safely continue after collection failure");
+            let automation_id = execution.work_item_id.clone();
+            let (outcome, produced_task_id, detail) = match self
+                .work_db
+                .find_most_recent_open_task_for_automation(&automation_id, execution.created_epoch())
+            {
+                Ok(Some(task)) => (
+                    AUTOMATION_OUTCOME_PRODUCED_TASK,
+                    Some(task.id),
+                    format!("produced a task before remote collection failed on host {host_id}: {reason}"),
+                ),
+                Ok(None) => (
+                    boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
+                    None,
+                    format!("no task was produced; remote collection failed on host {host_id}: {reason}"),
+                ),
+                Err(err) => {
+                    tracing::warn!(execution_id = %execution.id, automation_id = %automation_id, ?err, "automation triage finalize: open-task lookup failed after remote collection failure");
+                    (
+                        boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
+                        None,
+                        format!("no task was produced; remote collection failed on host {host_id}: {reason}"),
+                    )
+                }
+            };
+            if let Err(err) = self.work_db.finalize_automation_triage_run(
+                &execution.id,
+                outcome,
+                produced_task_id.as_deref(),
+                Some(&detail),
+            ) {
+                tracing::error!(execution_id = %execution.id, ?err, "failed to finalise automation_runs row after remote collection failure");
+            }
+            crate::structured_output::clear_all(&self.structured_output_dir, &execution.id);
+            return self
+                .finalize_remote_collection_failure(execution, &host_id, &reason)
+                .await;
+        }
         let automation_id = execution.work_item_id.clone();
 
         let automation_outcome_proposals_first = self.feature_flags.is_enabled("worker_proposals")
@@ -732,6 +785,22 @@ impl WorkerCompletionHandler {
         // instruction.
         let mut parse_error: Option<String> = None;
 
+        // A remote wrapper writes its artifact on the remote host. Collection
+        // lives at the read site, not the Stop dispatcher, so rechecks and
+        // recovery finalization paths observe the same artifact. Only a
+        // `Failed` outcome — positive proof the artifact is untrustworthy —
+        // terminalizes; every other outcome falls through to the ordinary
+        // artifact/transcript read below.
+        if let RemoteCollectionResult::Failed { host_id, reason } = self
+            .collect_remote_structured_output(execution, crate::structured_output::StructuredOutputKind::ReviewResult)
+            .await
+        {
+            tracing::error!(execution_id = %execution.id, host_id = %host_id, error = %reason, "pr_review finalize: cannot safely continue after collection failure");
+            return self
+                .finalize_remote_collection_failure(execution, &host_id, &reason)
+                .await;
+        }
+
         let from_artifact = match crate::structured_output::read(
             &self.structured_output_dir,
             &execution.id,
@@ -809,11 +878,24 @@ impl WorkerCompletionHandler {
                     return StopOutcome::ReviewPassAwaitingResult;
                 }
                 NudgeDecision::Proceed { count } => {
+                    let is_remote = match self.work_db.execution_host_id(&execution.id) {
+                        Ok(Some(host_id)) => host_id != "local",
+                        Ok(None) => false,
+                        Err(err) => {
+                            tracing::warn!(execution_id = %execution.id, ?err, "pr_review finalize: could not resolve execution host for re-prompt; using local path");
+                            false
+                        }
+                    };
                     let output_path = crate::structured_output::path_for(
                         &self.structured_output_dir,
                         &execution.id,
                         crate::structured_output::StructuredOutputKind::ReviewResult,
                     );
+                    let output_destination = if is_remote {
+                        "$BOSS_STRUCTURED_OUTPUT".to_owned()
+                    } else {
+                        output_path.display().to_string()
+                    };
                     // Include the specific serde error in the probe when we have one so
                     // the reviewer can correct the exact malformation rather than blindly
                     // rewriting the entire JSON.
@@ -831,7 +913,7 @@ impl WorkerCompletionHandler {
                              If your sandbox does not allow writing that path, instead end \
                              your reply with the corrected JSON in a fenced ```json block as \
                              the last content in the message. Do NOT change the PR.",
-                            output_path.display(),
+                            output_destination,
                         )
                     } else {
                         format!(
@@ -841,7 +923,7 @@ impl WorkerCompletionHandler {
                              If your sandbox does not allow writing that path, instead end \
                              your reply with the JSON in a fenced ```json block as the last \
                              content in the message. Do NOT change the PR.",
-                            output_path.display(),
+                            output_destination,
                         )
                     };
                     tracing::warn!(
@@ -1297,6 +1379,34 @@ impl WorkerCompletionHandler {
             }
             boss_protocol::ReviewBatchMemberStatus::Failed => "review batch member already failed",
         };
+
+        // A batch member never reads the ReviewResult artifact — delivery is
+        // exclusively via the `boss propose review-report` proposal above —
+        // so it never reaches `collect_remote_structured_output`'s call
+        // sites, and for a remote reviewer that means its
+        // `~/.boss-remote/runs/<id>.structured-output-path` descriptor and
+        // `$TMPDIR` artifact are never reaped: reaping is otherwise a side
+        // effect of a successful pull. Trigger that same pull-and-reap here,
+        // purely for its reap side effect (the pulled copy is immediately
+        // discarded by `clear_all` below); best-effort, since this member is
+        // already finalized via the proposal channel regardless of outcome.
+        match self
+            .collect_remote_structured_output(execution, crate::structured_output::StructuredOutputKind::ReviewResult)
+            .await
+        {
+            RemoteCollectionResult::Failed { host_id, reason } => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    host_id = %host_id,
+                    error = %reason,
+                    "pr_review batch member: remote structured-output reap failed; \
+                     descriptor/artifact may be left behind on the host",
+                );
+            }
+            RemoteCollectionResult::NotRemote
+            | RemoteCollectionResult::Collected
+            | RemoteCollectionResult::NotAvailable => {}
+        }
 
         // The report body is only a shell-safe input file for `boss propose`.
         // Once the proposal is accepted (or the member is failed), retaining a
@@ -1914,5 +2024,98 @@ impl WorkerCompletionHandler {
         }
 
         None
+    }
+}
+
+/// Outcome of [`WorkerCompletionHandler::collect_remote_structured_output`],
+/// carrying the host id alongside the adapter's
+/// [`crate::host_adapter::CollectOutcome`] so a terminal failure can name
+/// which host it came from.
+pub(super) enum RemoteCollectionResult {
+    /// Not a remote execution, no host to collect from — the ordinary
+    /// local-artifact / transcript read path applies unchanged.
+    NotRemote,
+    Collected,
+    /// Not available yet, or a transient condition (DB error, missing
+    /// provider, transport failure) prevented the attempt — not proof the
+    /// artifact is bad. Callers must fall through to transcript/nudge
+    /// recovery, not terminalize.
+    NotAvailable,
+    /// Positive proof the artifact on `host_id` cannot be trusted.
+    Failed {
+        host_id: String,
+        reason: String,
+    },
+}
+
+impl WorkerCompletionHandler {
+    /// Collect a remote worker's structured-output artifact, fully fail-open
+    /// except for [`RemoteCollectionResult::Failed`]: only that variant is
+    /// positive proof (an invalid descriptor, or a copy that ran and failed)
+    /// that the result cannot be trusted. Every other obstacle — the host
+    /// lookup failing, the host row vanishing, the adapter provider being
+    /// unavailable, a transport error resolving the adapter — is a
+    /// transient/engine-side condition, not evidence about the artifact
+    /// itself, so it degrades to `NotAvailable` and lets the caller fall
+    /// back to transcript/nudge recovery instead of terminalizing a
+    /// completed review over (for example) a momentary ControlMaster hiccup.
+    pub(super) async fn collect_remote_structured_output(
+        &self,
+        execution: &crate::work::WorkExecution,
+        kind: crate::structured_output::StructuredOutputKind,
+    ) -> RemoteCollectionResult {
+        let host_id = match self.work_db.execution_host_id(&execution.id) {
+            Ok(Some(host_id)) if host_id != "local" => host_id,
+            Ok(_) => return RemoteCollectionResult::NotRemote,
+            Err(err) => {
+                tracing::warn!(execution_id = %execution.id, ?err, "structured-output collection: host lookup failed; falling back to normal completion");
+                return RemoteCollectionResult::NotAvailable;
+            }
+        };
+        let host = match self.work_db.get_host(&host_id) {
+            Ok(Some(host)) => host,
+            Ok(None) => {
+                tracing::warn!(execution_id = %execution.id, host_id, "structured-output collection: remote host is no longer registered; falling back to normal completion");
+                return RemoteCollectionResult::NotAvailable;
+            }
+            Err(err) => {
+                tracing::warn!(execution_id = %execution.id, host_id, ?err, "structured-output collection: host lookup failed; falling back to normal completion");
+                return RemoteCollectionResult::NotAvailable;
+            }
+        };
+        let provider = match self
+            .host_adapter_provider
+            .read()
+            .expect("host adapter provider lock poisoned")
+            .clone()
+        {
+            Some(provider) => provider,
+            None => {
+                tracing::warn!(execution_id = %execution.id, host_id, "structured-output collection: remote host adapter provider is unavailable; falling back to normal completion");
+                return RemoteCollectionResult::NotAvailable;
+            }
+        };
+        let adapter = match provider.adapter_for(&host).await {
+            Ok(adapter) => adapter,
+            Err(err) => {
+                tracing::warn!(execution_id = %execution.id, host_id, ?err, "structured-output collection: could not resolve host adapter; falling back to normal completion");
+                return RemoteCollectionResult::NotAvailable;
+            }
+        };
+        let destination = crate::structured_output::path_for(&self.structured_output_dir, &execution.id, kind);
+        match adapter
+            .collect_structured_output(&execution.id, kind, &destination)
+            .await
+        {
+            Ok(crate::host_adapter::CollectOutcome::Collected) => RemoteCollectionResult::Collected,
+            Ok(crate::host_adapter::CollectOutcome::NotAvailable) => RemoteCollectionResult::NotAvailable,
+            Ok(crate::host_adapter::CollectOutcome::Failed(reason)) => {
+                RemoteCollectionResult::Failed { host_id, reason }
+            }
+            Err(err) => {
+                tracing::warn!(execution_id = %execution.id, host_id, ?err, "structured-output collection: adapter call failed; falling back to normal completion");
+                RemoteCollectionResult::NotAvailable
+            }
+        }
     }
 }

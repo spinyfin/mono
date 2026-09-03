@@ -5,6 +5,18 @@
 
 use super::*;
 
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+struct PaneParkedFailure<'a> {
+    teardown_reason: &'static str,
+    attention_kind: &'a str,
+    attention_title: &'a str,
+    attention_body: String,
+    publish_event: &'static str,
+    log_label: &'a str,
+    outcome: StopOutcome,
+}
+
 impl WorkerCompletionHandler {
     /// Finalize a sanctioned no-op completion: the worker verified its work
     /// is already done (empty diff, no PR produced and none bound), so the
@@ -144,6 +156,82 @@ impl WorkerCompletionHandler {
         execution: &crate::work::WorkExecution,
         detail: &str,
     ) -> StopOutcome {
+        let body = format!(
+            "The worker's own driver reported its terminal turn boundary as an unrecoverable \
+             error, so the engine failed this execution instead of treating a dead process as a \
+             clean completion or nudging it for a result it can never produce.\n\n\
+             **Driver-reported error:**\n\n{detail}\n\n\
+             The execution's cube lease and worker slot have been released."
+        );
+        self.finalize_pane_parked_failure(
+            execution,
+            detail,
+            PaneParkedFailure::builder()
+                .teardown_reason("driver_terminal_error")
+                .attention_kind(DRIVER_TERMINAL_ERROR_ATTENTION_KIND)
+                .attention_title("Worker failed: driver reported an unrecoverable error")
+                .attention_body(body)
+                .publish_event("worker_driver_terminal_error")
+                .log_label("driver terminal error")
+                .outcome(StopOutcome::DriverTerminalError {
+                    detail: detail.to_owned(),
+                })
+                .build(),
+        )
+        .await
+    }
+
+    /// Finalize a completed remote worker whose structured-output artifact
+    /// the engine could not pull off its host — [`crate::host_adapter::CollectOutcome::Failed`]:
+    /// positive proof (an invalid descriptor, or a copy that ran and failed)
+    /// that the result sitting on the remote host cannot be trusted here.
+    /// The worker itself may have finished cleanly; this is an engine-side
+    /// retrieval failure, not a driver-reported error, so it gets its own
+    /// attention kind/title/body rather than borrowing
+    /// [`Self::finalize_driver_terminal_error`]'s language, which would tell
+    /// the UI a false causal story ("the driver failed") for a cause that
+    /// was actually "the engine couldn't copy the file".
+    pub(super) async fn finalize_remote_collection_failure(
+        &self,
+        execution: &crate::work::WorkExecution,
+        host_id: &str,
+        reason: &str,
+    ) -> StopOutcome {
+        let detail = format!("remote structured-output collection failed on host {host_id}: {reason}");
+        let body = format!(
+            "The worker on remote host `{host_id}` reached its terminal turn boundary, but the \
+             engine could not retrieve its structured-output result from that host — the driver \
+             itself reported nothing wrong.\n\n\
+             **Collection failure:**\n\n{reason}\n\n\
+             The execution's cube lease and worker slot have been released."
+        );
+        self.finalize_pane_parked_failure(
+            execution,
+            &detail,
+            PaneParkedFailure::builder()
+                .teardown_reason("remote_collection_failed")
+                .attention_kind(REMOTE_COLLECTION_FAILED_ATTENTION_KIND)
+                .attention_title("Worker failed: remote result could not be collected")
+                .attention_body(body)
+                .publish_event("worker_remote_collection_failed")
+                .log_label("remote collection failure")
+                .outcome(StopOutcome::RemoteCollectionFailed { detail: detail.clone() })
+                .build(),
+        )
+        .await
+    }
+
+    /// Shared teardown + fail-and-file-attention body for an execution the
+    /// engine must terminalize for a reason that is not the worker's own
+    /// driver reporting an error — parameterized by attention kind/title/body
+    /// (and the teardown/publish event labels) so each failure class tells
+    /// its own true story instead of all borrowing driver-terminal-error's.
+    async fn finalize_pane_parked_failure(
+        &self,
+        execution: &crate::work::WorkExecution,
+        detail: &str,
+        failure: PaneParkedFailure<'_>,
+    ) -> StopOutcome {
         // Marked before the terminalizing write — see `super::teardown`.
         let teardown = self.begin_teardown(&execution.id);
         let completion = match self.work_db.fail_pane_parked_execution(&execution.id, detail) {
@@ -153,7 +241,7 @@ impl WorkerCompletionHandler {
                 tracing::error!(
                     execution_id = %execution.id,
                     ?err,
-                    "driver terminal error: failed to record execution failure",
+                    "{}: failed to record execution failure", failure.log_label,
                 );
                 return StopOutcome::DbError;
             }
@@ -178,31 +266,24 @@ impl WorkerCompletionHandler {
             &execution.id,
             execution.cube_lease_id.as_deref(),
             execution.workspace_path.as_deref().map(std::path::Path::new),
-            "driver_terminal_error",
+            failure.teardown_reason,
             teardown,
         )
         .await;
 
-        let body = format!(
-            "The worker's own driver reported its terminal turn boundary as an unrecoverable \
-             error, so the engine failed this execution instead of treating a dead process as a \
-             clean completion or nudging it for a result it can never produce.\n\n\
-             **Driver-reported error:**\n\n{detail}\n\n\
-             The execution's cube lease and worker slot have been released."
-        );
         if let Err(err) = self
             .file_execution_attention(
                 execution,
-                DRIVER_TERMINAL_ERROR_ATTENTION_KIND,
-                "Worker failed: driver reported an unrecoverable error",
-                body,
+                failure.attention_kind,
+                failure.attention_title,
+                failure.attention_body,
             )
             .await
         {
             tracing::warn!(
                 execution_id = %execution.id,
                 ?err,
-                "driver terminal error: failed to file attention item",
+                "{}: failed to file attention item", failure.log_label,
             );
         }
 
@@ -211,7 +292,7 @@ impl WorkerCompletionHandler {
                 &completion.id,
                 &execution.work_item_id,
                 completion.status.as_str(),
-                "worker_driver_terminal_error",
+                failure.publish_event,
             )
             .await;
         tracing::error!(
@@ -219,11 +300,9 @@ impl WorkerCompletionHandler {
             work_item_id = %execution.work_item_id,
             kind = %execution.kind,
             detail,
-            "driver terminal error: execution failed (driver reported an unrecoverable error)",
+            "{}: execution failed", failure.log_label,
         );
-        StopOutcome::DriverTerminalError {
-            detail: detail.to_owned(),
-        }
+        failure.outcome
     }
 
     /// File a human-visible attention item recording that a reviewer worker

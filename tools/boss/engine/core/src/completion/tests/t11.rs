@@ -4,9 +4,201 @@
 //!
 //! Theme: automation-outcome worker-proposal seam
 //! (`automation_outcome_proposals_seam`). Extracted from `t01.rs` so that
-//! file stays under the repo file-size check.
+//! file stays under the repo file-size check. Also covers recovery
+//! ownership for completed reviewer give-ups, and the remote
+//! structured-output collection fail-open/terminalize contract
+//! (`WorkerCompletionHandler::collect_remote_structured_output`).
 
 use super::*;
+
+/// Build a `pr_review` execution attributed to `host_id` (via
+/// `start_execution_run_on_host`) instead of `pr_review_exec_fixture`'s
+/// local run, so `finalize_pr_review_pass` takes the remote-collection
+/// branch. Returns `(db_dir, db, chore_id, pr_review_exec_id, pr_url)`.
+fn remote_pr_review_exec_fixture(
+    workspace_path: &Path,
+    host_id: &str,
+) -> (TempDir, Arc<WorkDb>, String, String, String) {
+    const PR_URL: &str = "https://github.com/spinyfin/mono/pull/188";
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    db.add_host(host_id, "user@remote-host", 2, &[]).unwrap();
+
+    let product = create_test_product(&db);
+    let chore = db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Implement feature X")
+                .description("Feature X adds Y functionality to the pipeline.")
+                .build(),
+        )
+        .unwrap();
+    db.update_work_item(
+        &chore.id,
+        crate::work::WorkItemPatch {
+            pr_url: Some(PR_URL.into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let pr_review_exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .build(),
+        )
+        .unwrap();
+    let (pr_review_exec, run) = db
+        .start_execution_run_on_host(
+            &pr_review_exec.id,
+            "review-worker-1",
+            "mono",
+            "lease-review-1",
+            "mono-agent-review-001",
+            workspace_path.to_str().unwrap(),
+            host_id,
+        )
+        .unwrap();
+    let _ = db
+        .finish_execution_run(
+            FinishExecutionRunInput::builder()
+                .execution_id(&pr_review_exec.id)
+                .run_id(&run.id)
+                .execution_status(ExecutionStatus::Running)
+                .run_status("completed")
+                .result_summary("reviewer spawned")
+                .build(),
+        )
+        .unwrap();
+
+    (dir, db, chore.id, pr_review_exec.id, PR_URL.to_owned())
+}
+
+/// Host adapter whose `collect_structured_output` always returns a fixed
+/// outcome — either a deliberately induced `Failed` (models an invalid
+/// descriptor / failed copy) or `NotAvailable` (models a transient
+/// condition that must fail open). Every other `HostAdapter` method panics
+/// if hit — `finalize_pr_review_pass`'s collection call is the only one
+/// these tests exercise.
+struct FixedCollectAdapter {
+    host_id: &'static str,
+    fail_reason: Option<&'static str>,
+}
+
+crate::stub_host_adapter! { FixedCollectAdapter {
+    fn host_id(&self) -> &str {
+        self.host_id
+    }
+    async fn collect_structured_output(
+        &self,
+        _execution_id: &str,
+        _kind: crate::structured_output::StructuredOutputKind,
+        _destination: &std::path::Path,
+    ) -> anyhow::Result<crate::host_adapter::CollectOutcome> {
+        Ok(match self.fail_reason {
+            Some(reason) => crate::host_adapter::CollectOutcome::Failed(reason.to_owned()),
+            None => crate::host_adapter::CollectOutcome::NotAvailable,
+        })
+    }
+} }
+
+struct FixedAdapterProvider(Arc<FixedCollectAdapter>);
+
+#[async_trait]
+impl crate::host_adapter::HostAdapterProvider for FixedAdapterProvider {
+    async fn adapter_for(
+        &self,
+        _host: &crate::host_registry::Host,
+    ) -> Result<Arc<dyn crate::host_adapter::HostAdapter>> {
+        Ok(self.0.clone() as Arc<dyn crate::host_adapter::HostAdapter>)
+    }
+}
+
+/// A deliberately induced remote collection failure (`CollectOutcome::Failed`)
+/// must terminalize the reviewer execution as `failed`, name the cause in
+/// both the recorded detail and a dedicated `remote_collection_failed`
+/// attention item, and must NOT advance the producing task to `in_review` —
+/// the review never actually happened, so it must not read as one that did.
+#[tokio::test]
+async fn remote_review_collection_failure_terminalizes_with_named_cause() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, chore_id, pr_review_exec_id, _pr_url) = remote_pr_review_exec_fixture(workspace.path(), "zakalwe");
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None)).handler;
+    handler.set_host_adapter_provider(Arc::new(FixedAdapterProvider(Arc::new(FixedCollectAdapter {
+        host_id: "zakalwe",
+        fail_reason: Some("boom"),
+    }))));
+
+    let outcome = handler.on_stop(&pr_review_exec_id).await;
+    let detail = match &outcome {
+        StopOutcome::RemoteCollectionFailed { detail } => detail.clone(),
+        other => panic!("expected a terminalizing outcome from an induced collection failure, got {other:?}"),
+    };
+    assert!(
+        detail.contains("boom"),
+        "recorded detail must name the collection failure cause; got: {detail}",
+    );
+
+    let execution = db.get_execution(&pr_review_exec_id).unwrap();
+    assert_eq!(
+        execution.status,
+        ExecutionStatus::Failed,
+        "an induced collection failure must fail the execution, not leave it running",
+    );
+
+    let attentions = db.list_attention_items(&pr_review_exec_id).unwrap();
+    assert!(
+        attentions
+            .iter()
+            .any(|item| item.kind == REMOTE_COLLECTION_FAILED_ATTENTION_KIND && item.body_markdown.contains("boom")),
+        "an attention item naming the remote collection failure must be filed; got {attentions:?}",
+    );
+
+    let task = match db.get_work_item(&chore_id).unwrap() {
+        WorkItem::Chore(task) | WorkItem::Task(task) => task,
+        other => panic!("expected chore, got {other:?}"),
+    };
+    assert_ne!(
+        task.status,
+        TaskStatus::InReview,
+        "a collection failure must never be mistaken for a completed review",
+    );
+}
+
+/// The companion fail-open proof: a `NotAvailable` collection outcome (a
+/// transient condition — DB error, missing provider, transport failure)
+/// must fall through to the ordinary transcript/probe recovery path
+/// instead of terminalizing, exactly as a genuinely absent artifact does.
+#[tokio::test]
+async fn remote_review_collection_not_available_falls_through_to_recovery() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _chore_id, pr_review_exec_id, _pr_url) = remote_pr_review_exec_fixture(workspace.path(), "zakalwe");
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None)).handler;
+    handler.set_host_adapter_provider(Arc::new(FixedAdapterProvider(Arc::new(FixedCollectAdapter {
+        host_id: "zakalwe",
+        fail_reason: None,
+    }))));
+
+    let outcome = handler.on_stop(&pr_review_exec_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::ReviewPassAwaitingResult),
+        "a NotAvailable collection outcome must fall through to transcript/probe recovery, \
+         not terminalize; got {outcome:?}",
+    );
+    let execution = db.get_execution(&pr_review_exec_id).unwrap();
+    assert_ne!(
+        execution.status,
+        ExecutionStatus::Failed,
+        "a NotAvailable collection outcome must never terminalize the execution",
+    );
+}
 
 /// After the auto-nudge breaker trips, a completed give-up stays in Doing but
 /// is reserved for review recovery rather than orphan-active implementation

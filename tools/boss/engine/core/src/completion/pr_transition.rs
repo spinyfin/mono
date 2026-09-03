@@ -3,6 +3,7 @@
 //! change; see [`super`] for the handler struct, shared types, traits,
 //! and free helpers this module reaches via `use super::*`.
 
+use super::finalize_passes::RemoteCollectionResult;
 use super::*;
 
 #[derive(serde::Deserialize)]
@@ -658,6 +659,31 @@ impl WorkerCompletionHandler {
                 // best-effort `FOLLOWUPS:` mechanism below (which is
                 // skipped entirely for this kind, see that block).
                 if task.kind == TaskKind::DesignPostmortem {
+                    // Collect the remote worker's postmortem-followups artifact
+                    // before reading it, mirroring the review pass —
+                    // a remote postmortem worker's artifact otherwise sits
+                    // uncollected and unreaped on the host. Best-effort: a
+                    // collection failure here does not block the PR
+                    // transition — `reconcile_postmortem_followups` already
+                    // treats a missing/malformed artifact as an
+                    // operator-visible error on the postmortem task itself,
+                    // which still fires correctly when the read below simply
+                    // finds nothing.
+                    if let RemoteCollectionResult::Failed { host_id, reason } = self
+                        .collect_remote_structured_output(
+                            &completion.execution,
+                            crate::structured_output::StructuredOutputKind::PostmortemFollowups,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            execution_id,
+                            host_id = %host_id,
+                            error = %reason,
+                            "postmortem followups: remote structured-output collection failed; \
+                             continuing without the artifact",
+                        );
+                    }
                     crate::postmortem_followups::reconcile_postmortem_followups(
                         &self.work_db,
                         &task.id,
@@ -750,6 +776,27 @@ impl WorkerCompletionHandler {
             let followup_proposals_first = self.feature_flags.is_enabled("worker_proposals")
                 && self.feature_flags.is_enabled("followup_proposals_seam");
             let transcript_path = self.work_db.transcript_path_for_execution(execution_id).ok().flatten();
+            // Same generalisation as the postmortem branch above: collect a
+            // remote worker's Followups artifact before reading it. Best
+            // effort — followups are optional by design (module doc on
+            // `reconcile_task_followups`), so a collection failure here must
+            // never block the PR transition; it just falls through to the
+            // transcript-sentinel / backstop channels below exactly as an
+            // absent artifact already does.
+            if let RemoteCollectionResult::Failed { host_id, reason } = self
+                .collect_remote_structured_output(
+                    &completion.execution,
+                    crate::structured_output::StructuredOutputKind::Followups,
+                )
+                .await
+            {
+                tracing::warn!(
+                    execution_id,
+                    host_id = %host_id,
+                    error = %reason,
+                    "followups: remote structured-output collection failed; continuing without the artifact",
+                );
+            }
             let followups_result = attentions_detector::reconcile_task_followups(
                 &self.work_db,
                 &work_item_id,
