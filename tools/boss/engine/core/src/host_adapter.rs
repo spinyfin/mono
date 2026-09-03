@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use boss_protocol::ExecutionKind;
 use tokio::sync::Mutex;
 
 use crate::config::RuntimeConfig;
@@ -949,6 +950,13 @@ impl HostAdapter for SshHostAdapter {
                     .collect::<String>(),
             )
             .maybe_structured_output_kind(structured_output_kind.map(|kind| kind.slug().to_owned()))
+            .pr_url_output(matches!(
+                execution.kind,
+                ExecutionKind::TaskImplementation
+                    | ExecutionKind::ChoreImplementation
+                    | ExecutionKind::ProjectDesign
+                    | ExecutionKind::InvestigationImplementation
+            ))
             .build();
 
         let engine_socket = self.events_socket_path.display().to_string();
@@ -1080,7 +1088,10 @@ impl HostAdapter for SshHostAdapter {
         kind: crate::structured_output::StructuredOutputKind,
         destination: &Path,
     ) -> Result<CollectOutcome> {
-        let descriptor = format!("~/.boss-remote/runs/{execution_id}.structured-output-path");
+        let descriptor = format!(
+            "~/.boss-remote/runs/{execution_id}.{}.structured-output-path",
+            kind.slug()
+        );
         let descriptor_exists = match self.transport.run_with_remote_paths(&["test", "-f", &descriptor]).await {
             Ok(out) => out,
             Err(err) => {

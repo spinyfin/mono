@@ -1277,6 +1277,41 @@ mod compose_worker_spawn_tests {
             "fallback generic prompt must contain the execution id:\n{}",
             composed.prompt_text,
         );
+        assert_eq!(composed.embedded_output_path, None);
+    }
+
+    /// A missing automation row degrades an automation-triage execution to
+    /// the generic prompt, which must not advertise the triage artifact path.
+    #[tokio::test]
+    async fn automation_triage_without_automation_row_omits_embedded_output_path() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let execution = WorkExecution::builder()
+            .id("exec_triage123_01")
+            .work_item_id("automation-missing")
+            .kind(ExecutionKind::AutomationTriage)
+            .status(ExecutionStatus::Running)
+            .repo_remote_url("git@github.com:org/repo.git")
+            .workspace_path("/tmp/workspace")
+            .created_at("2026-05-15T00:00:00Z")
+            .build();
+
+        let composed = compose_worker_spawn(
+            &db,
+            "worker-1",
+            &execution,
+            &task_without_pr("task-triage-1"),
+            workspace.path(),
+            None,
+            WorkerSpawnOpts::default(),
+        )
+        .await
+        .unwrap();
+
+        let triage_path =
+            crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::TriageDecision);
+        assert_eq!(composed.embedded_output_path, None);
+        assert!(!composed.prompt_text.contains(&triage_path));
     }
 
     /// When a `pr_review` execution has a `pr_url`, `compose_worker_spawn`
@@ -1318,6 +1353,10 @@ mod compose_worker_spawn_tests {
             "reviewer prompt must include the PR URL:\n{}",
             composed.prompt_text,
         );
+        let path = composed
+            .embedded_output_path
+            .expect("reviewer prompt must embed its output path");
+        assert!(composed.prompt_text.contains(&path));
     }
 
     /// A non-`pr_review` execution kind (e.g. `ChoreImplementation`) must not

@@ -596,6 +596,11 @@ impl WorkerCompletionHandler {
             return StopOutcome::DeferredForProbeTurn;
         }
 
+        // A remote worker writes this artifact on its own host; collect it
+        // before reading so the primary channel remains usable off-host.
+        let _ = self
+            .collect_remote_structured_output(&execution, crate::structured_output::StructuredOutputKind::PrUrl)
+            .await;
         // Primary channel: the structured-output PR-URL artifact the worker
         // wrote (file contract — no transcript or hook-stream knowledge
         // needed, so every driver can satisfy it). It fills the same staging

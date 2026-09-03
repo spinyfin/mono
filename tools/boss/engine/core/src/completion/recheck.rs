@@ -37,6 +37,11 @@ impl WorkerCompletionHandler {
         if execution.kind == ExecutionKind::PrReview {
             return StopOutcome::AlreadyTerminal;
         }
+        // A remote worker writes this artifact on its own host; collect it
+        // before reading so the primary channel remains usable after restart.
+        let _ = self
+            .collect_remote_structured_output(&execution, crate::structured_output::StructuredOutputKind::PrUrl)
+            .await;
         // Primary channel mirror: the structured-output PR-URL artifact. It
         // matters even more here than on Stop — the staging cache is
         // in-memory, so an engine restart between the worker's push and its

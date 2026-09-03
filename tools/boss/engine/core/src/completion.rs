@@ -1951,6 +1951,9 @@ edits and push them, or close the PR and explain what went wrong.";
 /// only logs this; tests assert on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopOutcome {
+    /// The engine could not retrieve a required structured-output artifact
+    /// from the remote host after the worker reached its terminal boundary.
+    RemoteCollectionFailed { detail: String },
     /// Stop arrived for a run id that doesn't map to a known execution
     /// (e.g., test infra, agent runs).
     UnknownExecution,

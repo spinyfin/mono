@@ -137,7 +137,7 @@ async fn remote_review_collection_failure_terminalizes_with_named_cause() {
 
     let outcome = handler.on_stop(&pr_review_exec_id).await;
     let detail = match &outcome {
-        StopOutcome::DriverTerminalError { detail } => detail.clone(),
+        StopOutcome::RemoteCollectionFailed { detail } => detail.clone(),
         other => panic!("expected a terminalizing outcome from an induced collection failure, got {other:?}"),
     };
     assert!(

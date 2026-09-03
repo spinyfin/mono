@@ -659,9 +659,8 @@ impl WorkerCompletionHandler {
                 // best-effort `FOLLOWUPS:` mechanism below (which is
                 // skipped entirely for this kind, see that block).
                 if task.kind == TaskKind::DesignPostmortem {
-                    // Generalises the same remote-artifact collection the
-                    // review pass uses (finding: export was generalised to
-                    // every structured-output kind but collection was not) —
+                    // Collect the remote worker's postmortem-followups artifact
+                    // before reading it, mirroring the review pass —
                     // a remote postmortem worker's artifact otherwise sits
                     // uncollected and unreaped on the host. Best-effort: a
                     // collection failure here does not block the PR

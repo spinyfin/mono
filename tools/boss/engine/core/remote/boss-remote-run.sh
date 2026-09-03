@@ -25,6 +25,8 @@
 #                            example `review-result`). When present, this
 #                            wrapper resolves a writable result path on the
 #                            remote host and exports it to the worker.
+#   BOSS_PR_URL_OUTPUT     — when set, resolve and export a separate PR-URL
+#                            artifact path on this host.
 #   BOSS_REPO_REMOTE_URL   — repo origin URL (used by the worker for
 #                            informational logging only; cube already
 #                            cloned the repo before lease was issued).
@@ -138,11 +140,12 @@ export BOSS_REPO_REMOTE_URL="${BOSS_REPO_REMOTE_URL:-}"
 # remote descriptor that the engine reads back over SSH at completion; the
 # descriptor is written atomically so the collector never observes a partial
 # pathname.
-if [ -n "${BOSS_STRUCTURED_OUTPUT_KIND:-}" ]; then
+prepare_structured_output() {
+    output_kind="$1"
     remote_output_dir="${TMPDIR:-/tmp}/boss-worker-output"
-    remote_output_path="$remote_output_dir/$BOSS_RUN_ID.$BOSS_STRUCTURED_OUTPUT_KIND.json"
+    remote_output_path="$remote_output_dir/$BOSS_RUN_ID.$output_kind.json"
     remote_descriptor_dir="$HOME/.boss-remote/runs"
-    remote_descriptor="$remote_descriptor_dir/$BOSS_RUN_ID.structured-output-path"
+    remote_descriptor="$remote_descriptor_dir/$BOSS_RUN_ID.$output_kind.structured-output-path"
     if ! mkdir -p "$remote_output_dir" "$remote_descriptor_dir" \
         || ! test -w "$remote_output_dir" \
         || ! test -w "$remote_descriptor_dir"; then
@@ -158,7 +161,18 @@ if [ -n "${BOSS_STRUCTURED_OUTPUT_KIND:-}" ]; then
             "$remote_descriptor" 1>&2
         exit 78
     fi
-    export BOSS_STRUCTURED_OUTPUT="$remote_output_path"
+    prepared_output_path="$remote_output_path"
+}
+
+if [ -n "${BOSS_STRUCTURED_OUTPUT_KIND:-}" ]; then
+    prepare_structured_output "$BOSS_STRUCTURED_OUTPUT_KIND"
+    BOSS_STRUCTURED_OUTPUT="$prepared_output_path"
+    export BOSS_STRUCTURED_OUTPUT
+fi
+if [ -n "${BOSS_PR_URL_OUTPUT:-}" ]; then
+    prepare_structured_output pr-url
+    BOSS_PR_URL_OUTPUT="$prepared_output_path"
+    export BOSS_PR_URL_OUTPUT
 fi
 
 # Per-run scratch + log dir under the cube workspace. The engine pulls

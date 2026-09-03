@@ -61,7 +61,9 @@ impl WorkerCompletionHandler {
     /// 3. record the terminal outcome (`produced_task` / `skipped`, or keep
     ///    `failed_will_retry` for a missing / ambiguous / unverifiable
     ///    decision);
-    /// 4. finalise the execution (`completed`) and release pane + workspace.
+    /// 4. finalise the execution (`completed`) and release pane + workspace;
+    ///    if remote artifact collection positively fails, record the terminal
+    ///    run outcome, reap artifacts, and fail the execution instead.
     ///
     /// Design implementation task 11
     /// (`worker-proposal-api-replace-fragile-worker-to-engine-seams.md` —
@@ -97,6 +99,39 @@ impl WorkerCompletionHandler {
             .await
         {
             tracing::error!(execution_id = %execution.id, host_id = %host_id, error = %reason, "automation triage finalize: cannot safely continue after collection failure");
+            let automation_id = execution.work_item_id.clone();
+            let (outcome, produced_task_id, detail) = match self
+                .work_db
+                .find_most_recent_open_task_for_automation(&automation_id, execution.created_epoch())
+            {
+                Ok(Some(task)) => (
+                    AUTOMATION_OUTCOME_PRODUCED_TASK,
+                    Some(task.id),
+                    format!("produced a task before remote collection failed on host {host_id}: {reason}"),
+                ),
+                Ok(None) => (
+                    boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
+                    None,
+                    format!("no task was produced; remote collection failed on host {host_id}: {reason}"),
+                ),
+                Err(err) => {
+                    tracing::warn!(execution_id = %execution.id, automation_id = %automation_id, ?err, "automation triage finalize: open-task lookup failed after remote collection failure");
+                    (
+                        boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
+                        None,
+                        format!("no task was produced; remote collection failed on host {host_id}: {reason}"),
+                    )
+                }
+            };
+            if let Err(err) = self.work_db.finalize_automation_triage_run(
+                &execution.id,
+                outcome,
+                produced_task_id.as_deref(),
+                Some(&detail),
+            ) {
+                tracing::error!(execution_id = %execution.id, ?err, "failed to finalise automation_runs row after remote collection failure");
+            }
+            crate::structured_output::clear_all(&self.structured_output_dir, &execution.id);
             return self
                 .finalize_remote_collection_failure(execution, &host_id, &reason)
                 .await;

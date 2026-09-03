@@ -258,7 +258,7 @@ mod tests {
         for (name, body) in [
             (
                 "claude",
-                "#!/bin/sh\nprintf '%s\\n' \"$BOSS_STRUCTURED_OUTPUT\" > \"$OUTPUT_CAPTURE\"\n",
+                "#!/bin/sh\nprintf '%s|%s\\n' \"$BOSS_STRUCTURED_OUTPUT\" \"$BOSS_PR_URL_OUTPUT\" > \"$OUTPUT_CAPTURE\"\n",
             ),
             ("cube", "#!/bin/sh\nexit 0\n"),
             ("gh", "#!/bin/sh\nexit 0\n"),
@@ -284,6 +284,7 @@ mod tests {
             .env("BOSS_DRIVER_COMMAND", "claude")
             .env("BOSS_DRIVER_ENV", ":")
             .env("BOSS_STRUCTURED_OUTPUT_KIND", "review-result")
+            .env("BOSS_PR_URL_OUTPUT", "1")
             .output()
             .unwrap();
         assert!(
@@ -292,7 +293,11 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         for _ in 0..1_000 {
-            if output_capture.exists() {
+            if output_capture
+                .metadata()
+                .map(|metadata| metadata.len() > 0)
+                .unwrap_or(false)
+            {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -300,13 +305,26 @@ mod tests {
         let expected = remote_tmp.join("boss-worker-output/run-test.review-result.json");
         assert_eq!(
             std::fs::read_to_string(&output_capture).unwrap().trim(),
-            expected.to_str().unwrap()
+            format!(
+                "{}|{}",
+                expected.display(),
+                remote_tmp.join("boss-worker-output/run-test.pr-url.json").display()
+            )
         );
         assert_eq!(
-            std::fs::read_to_string(remote_home.join(".boss-remote/runs/run-test.structured-output-path"))
+            std::fs::read_to_string(
+                remote_home.join(".boss-remote/runs/run-test.review-result.structured-output-path")
+            )
+            .unwrap()
+            .trim(),
+            expected.to_str().unwrap(),
+        );
+        let pr_url_expected = remote_tmp.join("boss-worker-output/run-test.pr-url.json");
+        assert_eq!(
+            std::fs::read_to_string(remote_home.join(".boss-remote/runs/run-test.pr-url.structured-output-path"))
                 .unwrap()
                 .trim(),
-            expected.to_str().unwrap(),
+            pr_url_expected.to_str().unwrap(),
         );
     }
 

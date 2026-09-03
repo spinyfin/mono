@@ -276,12 +276,12 @@ impl WorkerCompletionHandler {
             | StopOutcome::DetectorFailed
             | StopOutcome::NoWorkspace
             | StopOutcome::DbError => true,
-            // The driver reported this worker's own terminal turn boundary
-            // as an unrecoverable error — the execution has already been
-            // failed by `on_stop_inner`'s early gate. Mark the CI attempt
+            // The driver reported an unrecoverable error, or the engine could
+            // not collect a required remote artifact — the execution has already
+            // been failed. Mark the CI attempt
             // failed too rather than leaving it `running` forever; there is
             // no live worker left to retrigger or push anything.
-            StopOutcome::DriverTerminalError { .. } => true,
+            StopOutcome::DriverTerminalError { .. } | StopOutcome::RemoteCollectionFailed { .. } => true,
             // The terminal PR-detection/nudge/park decision was withheld for
             // this boundary because a probe was just delivered — the
             // worker's turn loop is still live and will produce another
