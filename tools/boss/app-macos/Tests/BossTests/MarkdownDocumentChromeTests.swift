@@ -597,6 +597,15 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         XCTAssertEqual(highlightedChunks, 2)
     }
 
+    func testCommentAnchorStraddlingAHeadingDropsWhitespaceOnlyFragment() {
+        let headingBoundaryNewline = CommentAnchor(
+            exact: "\n",
+            prefix: "ends here",
+            suffix: "starts there"
+        )
+        XCTAssertFalse(MarkdownCommentAnchorMap.isAnchorable(headingBoundaryNewline))
+    }
+
     private static func containsHighlight(in result: AttributedString) -> Bool {
         result.runs.contains { $0.swiftUI.backgroundColor != nil }
     }
@@ -644,14 +653,17 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         )
         window.contentView = hosting
         hosting.layoutSubtreeIfNeeded()
-        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+        let deadline = Date(timeIntervalSinceNow: 2)
+        while probe.appeared.isEmpty, Date() < deadline {
+            RunLoop.current.run(until: min(Date(timeIntervalSinceNow: 0.01), deadline))
+        }
         XCTAssertGreaterThan(probe.appeared.count, 0, "at least the on-screen chunks must appear")
-        XCTAssertLessThan(
+        XCTAssertLessThanOrEqual(
             probe.appeared.count,
-            total,
+            total / 2,
             "LazyVStack must not instantiate every heading chunk; appeared=\(probe.appeared.count) total=\(total)"
         )
-        _ = window
+        withExtendedLifetime(window) {}
     }
 
     private static func largeHeadedDocument(sections: Int) -> String {

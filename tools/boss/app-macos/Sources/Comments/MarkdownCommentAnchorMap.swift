@@ -12,6 +12,12 @@ import Foundation
 /// pre-chunking "one span in the document" rule; a range that crosses a
 /// heading is clipped so each overlapping chunk highlights its piece.
 enum MarkdownCommentAnchorMap {
+    private struct Projection {
+        var plains: [String]
+        var starts: [Int]
+        var concat: String
+    }
+
     struct ChunkAnchors: Equatable {
         var highlighted: [CommentAnchor]
         var flashing: CommentAnchor?
@@ -28,6 +34,7 @@ enum MarkdownCommentAnchorMap {
         private var highlighted: [CommentAnchor]?
         private var flashing: CommentAnchor?
         private var baseURL: URL?
+        private var projection: Projection?
         private var value: [ChunkAnchors] = []
 
         func partition(
@@ -38,12 +45,13 @@ enum MarkdownCommentAnchorMap {
             flashing: CommentAnchor?,
             baseURL: URL?
         ) -> [ChunkAnchors] {
-            if self.source == source,
-               self.headings == headings,
+            let projectionIsCurrent = self.source == source
+                && self.headings == headings
+                && self.baseURL == baseURL
+                && projection?.plains.count == chunks.count
+            if projectionIsCurrent,
                self.highlighted == highlighted,
-               self.flashing == flashing,
-               self.baseURL == baseURL,
-               value.count == chunks.count {
+               self.flashing == flashing {
                 return value
             }
             self.source = source
@@ -51,11 +59,13 @@ enum MarkdownCommentAnchorMap {
             self.highlighted = highlighted
             self.flashing = flashing
             self.baseURL = baseURL
-            value = MarkdownCommentAnchorMap.partition(
-                chunks: chunks,
+            if !projectionIsCurrent {
+                projection = MarkdownCommentAnchorMap.projection(for: chunks, baseURL: baseURL)
+            }
+            value = MarkdownCommentAnchorMap.assign(
                 highlighted: highlighted,
                 flashing: flashing,
-                baseURL: baseURL
+                projection: projection!,
             )
             return value
         }
@@ -72,10 +82,15 @@ enum MarkdownCommentAnchorMap {
         baseURL: URL?
     ) -> [ChunkAnchors] {
         guard !chunks.isEmpty else { return [] }
-        guard !highlighted.isEmpty || flashing != nil else {
-            return Array(repeating: .empty, count: chunks.count)
-        }
+        return assign(
+            highlighted: highlighted,
+            flashing: flashing,
+            projection: projection(for: chunks, baseURL: baseURL)
+        )
+    }
 
+    @MainActor
+    private static func projection(for chunks: [MarkdownDocumentChunk], baseURL: URL?) -> Projection {
         let plains = chunks.map { CommentProjection.plainText(for: $0.renderedText, baseURL: baseURL) }
         var starts: [Int] = []
         var cursor = 0
@@ -83,14 +98,25 @@ enum MarkdownCommentAnchorMap {
             starts.append(cursor)
             cursor += plain.count
         }
-        let concat = plains.joined()
+        return Projection(plains: plains, starts: starts, concat: plains.joined())
+    }
 
-        var result = Array(repeating: ChunkAnchors.empty, count: chunks.count)
+    @MainActor
+    private static func assign(
+        highlighted: [CommentAnchor],
+        flashing: CommentAnchor?,
+        projection: Projection
+    ) -> [ChunkAnchors] {
+        guard !highlighted.isEmpty || flashing != nil else {
+            return Array(repeating: .empty, count: projection.plains.count)
+        }
+
+        var result = Array(repeating: ChunkAnchors.empty, count: projection.plains.count)
         for anchor in highlighted {
-            assign(anchor, in: concat, plains: plains, starts: starts, to: &result, flashing: false)
+            assign(anchor, in: projection.concat, plains: projection.plains, starts: projection.starts, to: &result, flashing: false)
         }
         if let flashing {
-            assign(flashing, in: concat, plains: plains, starts: starts, to: &result, flashing: true)
+            assign(flashing, in: projection.concat, plains: projection.plains, starts: projection.starts, to: &result, flashing: true)
         }
         return result
     }
@@ -114,6 +140,7 @@ enum MarkdownCommentAnchorMap {
             guard overlapStart < overlapEnd else { continue }
             let local = (overlapStart - chunkStart)..<(overlapEnd - chunkStart)
             let clipped = clip(plains[index], to: local)
+            guard isAnchorable(clipped) else { continue }
             if flashing {
                 result[index].flashing = clipped
             } else {
@@ -132,6 +159,10 @@ enum MarkdownCommentAnchorMap {
         let prefix = substring(plain, prefixStart..<local.lowerBound)
         let suffix = substring(plain, local.upperBound..<suffixEnd)
         return CommentAnchor(exact: exact, prefix: prefix, suffix: suffix)
+    }
+
+    static func isAnchorable(_ anchor: CommentAnchor) -> Bool {
+        !anchor.exact.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private static func characterOffsets(of range: Range<String.Index>, in string: String) -> Range<Int> {

@@ -8,7 +8,7 @@ import SwiftUI
 ///
 /// ## Focus rule (find-bar-open + text-selected)
 ///
-/// T548's type-to-comment trigger (`CommentLayer.shouldConsumeKeyEvent`)
+/// The type-to-comment trigger (`CommentLayer.shouldConsumeKeyEvent`)
 /// opens the comment popover on any plain-letter keystroke while the
 /// document has a text selection. That check inspects whatever the *current*
 /// AppKit first responder validates as copyable — normally correct, but if
