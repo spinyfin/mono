@@ -757,8 +757,10 @@ impl HostAdapter for SshHostAdapter {
             // Editorial controls and every worker-proposal-seam prompt gate
             // default OFF on the remote path: SshHostAdapter does not hold a
             // FeatureFlagsStore (its `cfg` is "not yet read"; see struct
-            // docs), so these all hardcode `false` regardless of the
-            // engine's own (local) read of `worker_signal_proposals_seam` /
+            // docs), so every seam flag and `review_batch_fanout_enabled` is
+            // left unset here, and the builder's `#[builder(default)]`
+            // `false` applies — regardless of the engine's own (local) read
+            // of `worker_signal_proposals_seam` /
             // `deferred_scope_proposals_seam` / `followup_proposals_seam` /
             // `automation_outcome_proposals_seam` — the remote worker always
             // gets the legacy marker/artifact text, even when the engine's
@@ -768,14 +770,16 @@ impl HostAdapter for SshHostAdapter {
             // counters' declaration in `completion.rs` before using them as
             // an exit criterion. Wire feature flags into the remote path
             // alongside the cross-host config work (PR3/PR4).
-            WorkerSpawnOpts {
-                editorial_enabled: false,
-                max_embed_diff_lines: self.cfg.work.max_review_embed_diff_lines,
-                worker_signal_proposals_seam_enabled: false,
-                deferred_scope_proposals_seam_enabled: false,
-                followup_proposals_seam_enabled: false,
-                automation_outcome_proposals_seam_enabled: false,
-            },
+            //
+            // `review_batch_fanout_enabled` defaults `false` for the same
+            // reason: the remote path cannot read the flag, so a
+            // remote-spawned `pr_review` execution never gets the
+            // fail-closed check — it keeps today's legacy-pool-fallback
+            // behavior rather than gaining it, matching every other flag on
+            // this path.
+            WorkerSpawnOpts::builder()
+                .max_embed_diff_lines(self.cfg.work.max_review_embed_diff_lines)
+                .build(),
         )
         .await?;
         // `compose_execution_prompt` decides the Bazel pre-push gate by
@@ -803,10 +807,10 @@ impl HostAdapter for SshHostAdapter {
             // so a reviewer/triage/answer-agent dispatched remotely still gets
             // its reduced surface instead of silently becoming Standard.
             worker_kind: crate::worker_setup::worker_kind_for_execution(&execution.kind),
-            // Mirrors the `WorkerSpawnOpts` hardcoding above: a remotely
-            // dispatched triage worker always gets the legacy marker-only
-            // CLAUDE.md, since SshHostAdapter has no FeatureFlagsStore to
-            // read `automation_outcome_proposals_seam` from.
+            // Mirrors `WorkerSpawnOpts` above: a remotely dispatched triage
+            // worker always gets the legacy marker-only CLAUDE.md, since
+            // SshHostAdapter has no FeatureFlagsStore to read
+            // `automation_outcome_proposals_seam` from.
             automation_outcome_proposals_seam_enabled: false,
         };
         // Resolve the same driver `compose_worker_spawn` already validated

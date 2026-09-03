@@ -265,20 +265,28 @@ impl ExecutionCoordinator {
         // the driver spawn will actually launch; otherwise use the same
         // row/product/allocation resolution the events socket and spawn
         // path use.
-        let required_driver = crate::coordinator::pool_dispatch_policy_for_worker_id(worker_id)
-            .map(|policy| policy.driver.to_owned())
-            .or_else(|| {
-                self.work_db
-                    .get_execution_driver_slug(&execution.id)
-                    .unwrap_or_else(|err| {
-                        tracing::warn!(
-                            execution_id = %execution.id,
-                            error = %format!("{err:#}"),
-                            "host-selection: failed to resolve driver slug; treating as none",
-                        );
-                        None
-                    })
-            });
+        let required_driver = if execution.kind == ExecutionKind::PrReview {
+            self.work_db
+                .review_batch_member_for_execution(&execution.id)?
+                .map(|member| member.requested_driver)
+        } else {
+            None
+        }
+        .or_else(|| {
+            crate::coordinator::pool_dispatch_policy_for_worker_id(worker_id).map(|policy| policy.driver.to_owned())
+        })
+        .or_else(|| {
+            self.work_db
+                .get_execution_driver_slug(&execution.id)
+                .unwrap_or_else(|err| {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        error = %format!("{err:#}"),
+                        "host-selection: failed to resolve driver slug; treating as none",
+                    );
+                    None
+                })
+        });
         self.pick_host(work_item, pinned, requested, required_driver)
     }
 
@@ -374,130 +382,142 @@ impl ExecutionCoordinator {
             .get_live_execution_for_work_item(&execution.work_item_id, &execution.id)
         {
             Ok(Some(live)) => {
-                // Liveness gate (waiting_human-zombie fix, 2026-06-14 incident):
-                // `get_live_execution_for_work_item` returns any row in
-                // `status IN ('running','waiting_human')`, but that is a *paper*
-                // liveness signal. A row can sit `waiting_human` forever after
-                // its worker died without a `Stop` hook — e.g. the cube
-                // workspace-root migration relocated the pool out from under
-                // three running triage panes, so their rows stayed `waiting_human`
-                // and every subsequent fire died right here with `redundant_spawn`.
-                // Before treating this execution as a redundant duplicate, verify
-                // the blocker is *actually* live: a local execution whose worker
-                // pane is provably gone (workspace dir vanished, recorded pane pid
-                // dead, or a pane that never attached) is a zombie — reconcile it
-                // to a terminal status and proceed with this spawn instead of
-                // blocking. This is the restart-robust check that keeps the guard
-                // from deferring forever to a corpse (the recurring 2026-07-03
-                // redundant_spawn spam).
-                let reconciled_lost_workspace = crate::lost_workspace_sweep::reconcile_if_execution_dead(
-                    self.work_db.as_ref(),
-                    self.dispatch_events.as_ref(),
-                    &live,
-                    None, // lease release follows via host_adapter below
-                )
-                .await;
-                let reconciled_dead_pane = !reconciled_lost_workspace
-                    && crate::dead_pane_sweep::reconcile_if_pane_dead(
-                        self.work_db.as_ref(),
-                        self.dispatch_events.as_ref(),
-                        &live,
-                        boss_engine_utils::epoch_time::now_epoch_secs(),
-                        self.live_worker_states.as_deref(),
-                        None, // lease release follows via host_adapter below
-                    )
-                    .await;
-                if reconciled_lost_workspace || reconciled_dead_pane {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        reconciled_execution_id = %live.id,
-                        work_item_id = %execution.work_item_id,
-                        reason = if reconciled_dead_pane { "pane_dead" } else { "workspace_lost" },
-                        "spawn_attempt: prior 'live' execution's worker pane was gone; \
-                         reconciled it and proceeding with this spawn",
-                    );
-                    self.release_lease_after_reconcile(&live, reconciled_dead_pane).await;
-                    // Not redundant after all — fall through to the rest of dispatch.
-                } else {
-                    // The blocker survived every death check the reconciler
-                    // applies, so it is genuinely live: this fire is redundant
-                    // *normal* scheduler behaviour (the work is already running),
-                    // NOT a failure. Annotate the blocker's liveness verdict +
-                    // age-in-status so the next recurrence is attributable in one
-                    // read.
-                    let live_age_secs = live
-                        .started_at
-                        .as_deref()
-                        .and_then(|s| s.parse::<i64>().ok())
-                        .map(|s| boss_engine_utils::epoch_time::now_epoch_secs().saturating_sub(s));
+                if self.work_db.are_same_review_batch_leaves(&execution.id, &live.id)? {
                     tracing::info!(
                         execution_id = %execution.id,
                         live_execution_id = %live.id,
                         work_item_id = %execution.work_item_id,
-                        live_execution_age_secs = ?live_age_secs,
-                        "spawn_attempt: work already running in a live execution; skipping this fire (not an error)",
+                        "spawn_attempt: permitting concurrent read-only leaf reviewers from one batch",
                     );
-                    if let Err(err) = self.work_db.mark_execution_redundant(&execution.id) {
-                        tracing::error!(
-                            execution_id = %execution.id,
-                            ?err,
-                            "spawn_attempt: failed to mark redundant execution abandoned",
-                        );
-                    }
-                    // Neutral automation bookkeeping: an `automation_triage` fire
-                    // superseded by a genuinely-live execution records
-                    // `triage_running` — the automation IS being triaged, just by
-                    // the live execution, not this one. This overwrites the
-                    // pessimistic "dispatched; awaiting triage worker decision"
-                    // placeholder with a *neutral* outcome so the automation UI
-                    // renders "Running" (blue), NOT "Failed (retrying)" (which is
-                    // reserved for dispatch failures that will not self-heal — a
-                    // redundant fire self-heals when the live execution finishes).
-                    if execution.kind == ExecutionKind::AutomationTriage
-                        && let Err(err) = self.work_db.finalize_automation_triage_run(
-                            &execution.id,
-                            boss_protocol::AUTOMATION_OUTCOME_TRIAGE_RUNNING,
-                            None,
-                            Some(&format!(
-                                "skipped: work already running in live execution {} (this fire was redundant, \
-                                 not a failure)",
-                                live.id
-                            )),
-                        )
-                    {
-                        tracing::warn!(
-                            execution_id = %execution.id,
-                            ?err,
-                            "spawn_attempt: failed to record already-running outcome on automation_runs row",
-                        );
-                    }
-                    // Emit a terminal event so the dispatch timeline doesn't
-                    // silently stall at `worker_claimed/ok` for 30s until the
-                    // watchdog fires. The execution is already marked redundant
-                    // (terminal DB state); `host_selected:error` remains the
-                    // timeline closer (`is_terminal_event` keys off `error`), but
-                    // its details carry `live_execution_liveness: "alive"` +
-                    // `live_execution_age_secs` so the diagnostic stream shows the
-                    // block was against a genuinely-live execution, not a corpse.
-                    self.dispatch_events
-                        .emit(
-                            DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, &execution.id)
-                                .with_work_item(&execution.work_item_id)
-                                .with_worker(worker_id)
-                                .with_details(serde_json::json!({
-                                    "reason": "redundant_spawn",
-                                    "live_execution_id": live.id,
-                                    "live_execution_liveness": "alive",
-                                    "live_execution_age_secs": live_age_secs,
-                                })),
+                    // Same-batch leaf reviewers have no workspace-writing role;
+                    // their report proposals are independently scoped to their
+                    // persisted member rows. Continue to ordinary host selection.
+                } else {
+                    // Liveness gate (waiting_human-zombie fix, 2026-06-14 incident):
+                    // `get_live_execution_for_work_item` returns any row in
+                    // `status IN ('running','waiting_human')`, but that is a *paper*
+                    // liveness signal. A row can sit `waiting_human` forever after
+                    // its worker died without a `Stop` hook — e.g. the cube
+                    // workspace-root migration relocated the pool out from under
+                    // three running triage panes, so their rows stayed `waiting_human`
+                    // and every subsequent fire died right here with `redundant_spawn`.
+                    // Before treating this execution as a redundant duplicate, verify
+                    // the blocker is *actually* live: a local execution whose worker
+                    // pane is provably gone (workspace dir vanished, recorded pane pid
+                    // dead, or a pane that never attached) is a zombie — reconcile it
+                    // to a terminal status and proceed with this spawn instead of
+                    // blocking. This is the restart-robust check that keeps the guard
+                    // from deferring forever to a corpse (the recurring 2026-07-03
+                    // redundant_spawn spam).
+                    let reconciled_lost_workspace = crate::lost_workspace_sweep::reconcile_if_execution_dead(
+                        self.work_db.as_ref(),
+                        self.dispatch_events.as_ref(),
+                        &live,
+                        None, // lease release follows via host_adapter below
+                    )
+                    .await;
+                    let reconciled_dead_pane = !reconciled_lost_workspace
+                        && crate::dead_pane_sweep::reconcile_if_pane_dead(
+                            self.work_db.as_ref(),
+                            self.dispatch_events.as_ref(),
+                            &live,
+                            boss_engine_utils::epoch_time::now_epoch_secs(),
+                            self.live_worker_states.as_deref(),
+                            None, // lease release follows via host_adapter below
                         )
                         .await;
-                    return Err(anyhow::anyhow!(
-                        "redundant spawn: execution {} for work_item {} superseded by live execution {}",
-                        execution.id,
-                        execution.work_item_id,
-                        live.id,
-                    ));
+                    if reconciled_lost_workspace || reconciled_dead_pane {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            reconciled_execution_id = %live.id,
+                            work_item_id = %execution.work_item_id,
+                            reason = if reconciled_dead_pane { "pane_dead" } else { "workspace_lost" },
+                            "spawn_attempt: prior 'live' execution's worker pane was gone; \
+                             reconciled it and proceeding with this spawn",
+                        );
+                        self.release_lease_after_reconcile(&live, reconciled_dead_pane).await;
+                        // Not redundant after all — fall through to the rest of dispatch.
+                    } else {
+                        // The blocker survived every death check the reconciler
+                        // applies, so it is genuinely live: this fire is redundant
+                        // *normal* scheduler behaviour (the work is already running),
+                        // NOT a failure. Annotate the blocker's liveness verdict +
+                        // age-in-status so the next recurrence is attributable in one
+                        // read.
+                        let live_age_secs = live
+                            .started_at
+                            .as_deref()
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .map(|s| boss_engine_utils::epoch_time::now_epoch_secs().saturating_sub(s));
+                        tracing::info!(
+                            execution_id = %execution.id,
+                            live_execution_id = %live.id,
+                            work_item_id = %execution.work_item_id,
+                            live_execution_age_secs = ?live_age_secs,
+                            "spawn_attempt: work already running in a live execution; skipping this fire (not an error)",
+                        );
+                        if let Err(err) = self.work_db.mark_execution_redundant(&execution.id) {
+                            tracing::error!(
+                                execution_id = %execution.id,
+                                ?err,
+                                "spawn_attempt: failed to mark redundant execution abandoned",
+                            );
+                        }
+                        // Neutral automation bookkeeping: an `automation_triage` fire
+                        // superseded by a genuinely-live execution records
+                        // `triage_running` — the automation IS being triaged, just by
+                        // the live execution, not this one. This overwrites the
+                        // pessimistic "dispatched; awaiting triage worker decision"
+                        // placeholder with a *neutral* outcome so the automation UI
+                        // renders "Running" (blue), NOT "Failed (retrying)" (which is
+                        // reserved for dispatch failures that will not self-heal — a
+                        // redundant fire self-heals when the live execution finishes).
+                        if execution.kind == ExecutionKind::AutomationTriage
+                            && let Err(err) = self.work_db.finalize_automation_triage_run(
+                                &execution.id,
+                                boss_protocol::AUTOMATION_OUTCOME_TRIAGE_RUNNING,
+                                None,
+                                Some(&format!(
+                                    "skipped: work already running in live execution {} (this fire was redundant, \
+                                 not a failure)",
+                                    live.id
+                                )),
+                            )
+                        {
+                            tracing::warn!(
+                                execution_id = %execution.id,
+                                ?err,
+                                "spawn_attempt: failed to record already-running outcome on automation_runs row",
+                            );
+                        }
+                        // Emit a terminal event so the dispatch timeline doesn't
+                        // silently stall at `worker_claimed/ok` for 30s until the
+                        // watchdog fires. The execution is already marked redundant
+                        // (terminal DB state); `host_selected:error` remains the
+                        // timeline closer (`is_terminal_event` keys off `error`), but
+                        // its details carry `live_execution_liveness: "alive"` +
+                        // `live_execution_age_secs` so the diagnostic stream shows the
+                        // block was against a genuinely-live execution, not a corpse.
+                        self.dispatch_events
+                            .emit(
+                                DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, &execution.id)
+                                    .with_work_item(&execution.work_item_id)
+                                    .with_worker(worker_id)
+                                    .with_details(serde_json::json!({
+                                        "reason": "redundant_spawn",
+                                        "live_execution_id": live.id,
+                                        "live_execution_liveness": "alive",
+                                        "live_execution_age_secs": live_age_secs,
+                                    })),
+                            )
+                            .await;
+                        return Err(anyhow::anyhow!(
+                            "redundant spawn: execution {} for work_item {} superseded by live execution {}",
+                            execution.id,
+                            execution.work_item_id,
+                            live.id,
+                        ));
+                    }
                 }
             }
             Ok(None) => {}

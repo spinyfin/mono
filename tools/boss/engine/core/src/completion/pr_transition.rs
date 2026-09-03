@@ -5,6 +5,53 @@
 
 use super::*;
 
+#[derive(serde::Deserialize)]
+struct BatchReviewPrView {
+    #[serde(rename = "baseRefOid")]
+    base_sha: String,
+    #[serde(rename = "headRefOid")]
+    target_sha: String,
+    #[serde(default)]
+    additions: Option<i64>,
+    #[serde(default)]
+    deletions: Option<i64>,
+}
+
+/// Fetch and freeze the target metadata before handing it to the atomic DB
+/// creation path. Callers can retain the legacy path if this cannot establish
+/// an immutable target SHA.
+async fn enqueue_review_batch(
+    work_db: &crate::work::WorkDb,
+    producing: &crate::work::WorkExecution,
+    pr_url: &str,
+) -> anyhow::Result<crate::work::ReviewBatchDispatch> {
+    let root =
+        boss_github::pr_files::fetch_pr_view_json(pr_url, "baseRefOid,headRefOid,files,additions,deletions").await?;
+    let view: BatchReviewPrView = serde_json::from_value(root.clone())?;
+    if view.base_sha.is_empty() || view.target_sha.is_empty() {
+        anyhow::bail!("GitHub PR metadata omitted immutable base or head SHA");
+    }
+    let pr_number = boss_github::pr_url::pr_number_from_url(pr_url)
+        .ok_or_else(|| anyhow::anyhow!("could not parse pull request number from {pr_url:?}"))?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("pull request number does not fit the review-batch schema"))?;
+    let classification = crate::pr_review::classify_pr_review_metadata(&crate::pr_review::PrReviewMetadata {
+        additions: view.additions,
+        changed_files: Some(boss_github::pr_files::parse_changed_file_paths(&root)),
+        deletions: view.deletions,
+    });
+    let input = crate::work::ReviewBatchCreateInput::builder()
+        .cycle_root_id(work_db.review_cycle_root_id(&producing.work_item_id))
+        .base_sha(view.base_sha)
+        .classification(classification)
+        .phase(boss_protocol::ReviewBatchPhase::PreMerge)
+        .pr_number(pr_number)
+        .pr_url(pr_url)
+        .target_sha(view.target_sha)
+        .build();
+    work_db.create_pre_merge_review_batch(input, &producing.repo_remote_url)
+}
+
 impl WorkerCompletionHandler {
     /// Stop hook path, `"pr_recheck"` for the merge-poller's
     /// fallback sweep — so operators can see which path closed a
@@ -258,43 +305,161 @@ impl WorkerCompletionHandler {
                             // the producing execution as not-yet-terminal around the
                             // same moment and would otherwise both enqueue a `pr_review`
                             // execution for the same unchanged head sha.
-                            match self
-                                .work_db
-                                .create_pr_review_execution_dedup(&producing.work_item_id, &producing.repo_remote_url)
-                            {
-                                Ok((review_exec, true)) => {
-                                    tracing::info!(
-                                        execution_id,
-                                        review_execution_id = %review_exec.id,
-                                        pr_url = %pr_url,
-                                        producing_kind = %producing.kind,
-                                        trigger,
-                                        "pr_review execution enqueued; \
-                                         holding producing task for reviewer pass",
-                                    );
-                                    self.publisher.kick_scheduler();
-                                    true
+                            if self.feature_flags.is_enabled("review_batch_fanout") {
+                                match enqueue_review_batch(&self.work_db, producing, &pr_url).await {
+                                    Ok(crate::work::ReviewBatchDispatch::Created { batch, executions }) => {
+                                        tracing::info!(
+                                            execution_id,
+                                            batch_id = %batch.id,
+                                            leaf_executions = executions.len(),
+                                            pr_url = %pr_url,
+                                            producing_kind = %producing.kind,
+                                            trigger,
+                                            "review batch leaf executions enqueued; holding producing task for reviewer pass",
+                                        );
+                                        self.publisher.kick_scheduler();
+                                        true
+                                    }
+                                    Ok(crate::work::ReviewBatchDispatch::ExistingBatch { batch, executions }) => {
+                                        tracing::info!(
+                                            execution_id,
+                                            batch_id = %batch.id,
+                                            leaf_executions = executions.len(),
+                                            pr_url = %pr_url,
+                                            "review batch already enqueued for immutable target",
+                                        );
+                                        true
+                                    }
+                                    Ok(crate::work::ReviewBatchDispatch::LegacyExecution(review_exec)) => {
+                                        tracing::info!(
+                                            execution_id,
+                                            review_execution_id = %review_exec.id,
+                                            pr_url = %pr_url,
+                                            "legacy reviewer already owns this target; preserving mode separation",
+                                        );
+                                        true
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            execution_id,
+                                            ?error,
+                                            "failed to create immutable review batch; using legacy reviewer path",
+                                        );
+                                        // The failed `enqueue_review_batch` call could not resolve the
+                                        // current target SHA, so we cannot probe `review_batch_for_target`
+                                        // directly. Instead check for any non-terminal pre_merge batch
+                                        // already open for this cycle root: if one exists, a legacy
+                                        // execution here would let old-mode and batch-mode finalizers act
+                                        // on the same target, which must never happen.
+                                        match self.work_db.review_batches_for_cycle_root(&producing.work_item_id) {
+                                            Err(error) => {
+                                                // Fail safe, not fail open: a query error must never be
+                                                // read as "no live batch exists", or this fallback would
+                                                // mint a legacy reviewer on top of a batch it simply
+                                                // failed to see, recreating the double-ownership this
+                                                // guard exists to prevent. Leaving the target alone this
+                                                // pass is recoverable — the next `pr_recheck` sweep
+                                                // retries the same check.
+                                                tracing::warn!(
+                                                    execution_id,
+                                                    ?error,
+                                                    pr_url = %pr_url,
+                                                    "failed to query existing review batches for cycle root; \
+                                                     skipping legacy reviewer this pass to avoid double ownership",
+                                                );
+                                                true
+                                            }
+                                            Ok(batches) => {
+                                                let existing_batch = batches.into_iter().find(|batch| {
+                                                    batch.phase == boss_protocol::ReviewBatchPhase::PreMerge
+                                                        && !matches!(
+                                                            batch.status,
+                                                            boss_protocol::ReviewBatchStatus::Completed
+                                                                | boss_protocol::ReviewBatchStatus::Failed
+                                                        )
+                                                });
+                                                if let Some(batch) = existing_batch {
+                                                    tracing::info!(
+                                                        execution_id,
+                                                        batch_id = %batch.id,
+                                                        batch_target_sha = %batch.target_sha,
+                                                        pr_url = %pr_url,
+                                                        "a live pre_merge batch is open for this cycle root (target \
+                                                         SHA unknown after the failed fetch); skipping the legacy \
+                                                         reviewer to preserve mode separation — the next \
+                                                         pr_recheck pass will create a batch for the current head \
+                                                         if needed",
+                                                    );
+                                                    true
+                                                } else {
+                                                    match self.work_db.create_pr_review_execution_dedup(
+                                                        &producing.work_item_id,
+                                                        &producing.repo_remote_url,
+                                                    ) {
+                                                        Ok((review_exec, _)) => {
+                                                            self.publisher.kick_scheduler();
+                                                            tracing::info!(
+                                                                execution_id,
+                                                                review_execution_id = %review_exec.id,
+                                                                "legacy reviewer enqueued after batch metadata \
+                                                                 failure",
+                                                            );
+                                                            true
+                                                        }
+                                                        Err(legacy_error) => {
+                                                            tracing::warn!(
+                                                                execution_id,
+                                                                ?legacy_error,
+                                                                "failed to create legacy reviewer after batch \
+                                                                 metadata failure",
+                                                            );
+                                                            false
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
-                                Ok((review_exec, false)) => {
-                                    tracing::info!(
-                                        execution_id,
-                                        review_execution_id = %review_exec.id,
-                                        pr_url = %pr_url,
-                                        producing_kind = %producing.kind,
-                                        trigger,
-                                        "pr_review execution already enqueued/in-flight for this \
-                                         item; reusing instead of dispatching a duplicate review",
-                                    );
-                                    true
-                                }
-                                Err(err) => {
-                                    tracing::warn!(
-                                        execution_id,
-                                        ?err,
-                                        "failed to create pr_review execution; \
+                            } else {
+                                match self.work_db.create_pr_review_execution_dedup(
+                                    &producing.work_item_id,
+                                    &producing.repo_remote_url,
+                                ) {
+                                    Ok((review_exec, true)) => {
+                                        tracing::info!(
+                                            execution_id,
+                                            review_execution_id = %review_exec.id,
+                                            pr_url = %pr_url,
+                                            producing_kind = %producing.kind,
+                                            trigger,
+                                            "pr_review execution enqueued; \
+                                             holding producing task for reviewer pass",
+                                        );
+                                        self.publisher.kick_scheduler();
+                                        true
+                                    }
+                                    Ok((review_exec, false)) => {
+                                        tracing::info!(
+                                            execution_id,
+                                            review_execution_id = %review_exec.id,
+                                            pr_url = %pr_url,
+                                            producing_kind = %producing.kind,
+                                            trigger,
+                                            "pr_review execution already enqueued/in-flight for this \
+                                             item; reusing instead of dispatching a duplicate review",
+                                        );
+                                        true
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            execution_id,
+                                            ?err,
+                                            "failed to create pr_review execution; \
                                      falling back to immediate in_review",
-                                    );
-                                    false
+                                        );
+                                        false
+                                    }
                                 }
                             }
                         }

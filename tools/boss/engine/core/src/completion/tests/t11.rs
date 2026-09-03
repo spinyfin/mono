@@ -121,6 +121,21 @@ async fn batch_reviewer_without_report_fails_member_without_transcript_recovery(
         task_status_after, task_status_before,
         "batch leaf must not advance the task itself"
     );
+
+    // Regression: a leaf that ran but submitted no report is the designed
+    // main path the batch recovery sweep exists to retry by role (see
+    // `finalize_review_batch_member`'s doc comment). Driving the member to
+    // `failed` through the real finalizer — not by stamping
+    // `work_executions.status = 'orphaned'` directly — must make it a
+    // recovery candidate; excluding `failed` from the candidate query's
+    // member-status filter would silently strand it here.
+    assert!(
+        db.list_dead_review_batch_member_candidates()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.work_item_id == chore_id && candidate.execution_id == execution_id),
+        "a member failed by finalize_review_batch_member (no submitted report) must be listed for retry",
+    );
 }
 
 /// Writes a no-marker final message so `finalize_automation_triage` lands on

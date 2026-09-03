@@ -83,6 +83,13 @@ pub struct FeatureFlagSpec {
 /// there is no other path to introduce a new flag name.
 pub const REGISTRY: &[FeatureFlagSpec] = &[
     FeatureFlagSpec {
+        name: "review_batch_fanout",
+        description: "Dispatch each eligible pull request to three independent Claude, Codex, and Grok leaf reviewers, with durable per-role retry state. DEFAULT OFF — retain the established single-reviewer pipeline until the new fan-out path is explicitly enabled.",
+        category: "review",
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
         name: "detect_pr_cold_fallback",
         description: "Run the `detect_pr` cold-path fallback (gh pr list --head) when the worker-hook \
              staging cache is empty on Stop. Disable to make empty-staging fall straight to \

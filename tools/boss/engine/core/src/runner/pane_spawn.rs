@@ -655,6 +655,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // disagree about which decision-declaration mechanism is live.
         let automation_outcome_proposals_seam_enabled = self.feature_flags.is_enabled("worker_proposals")
             && self.feature_flags.is_enabled("automation_outcome_proposals_seam");
+        let review_batch_fanout_enabled = self.feature_flags.is_enabled("review_batch_fanout");
         let ComposedWorkerSpawn {
             prompt_text,
             spawn_config,
@@ -665,14 +666,15 @@ impl ExecutionRunner for PaneSpawnRunner {
             work_item,
             workspace_path,
             cube_change_id,
-            WorkerSpawnOpts {
-                editorial_enabled,
-                max_embed_diff_lines: self.cfg.work.max_review_embed_diff_lines,
-                worker_signal_proposals_seam_enabled,
-                deferred_scope_proposals_seam_enabled,
-                followup_proposals_seam_enabled,
-                automation_outcome_proposals_seam_enabled,
-            },
+            WorkerSpawnOpts::builder()
+                .editorial_enabled(editorial_enabled)
+                .max_embed_diff_lines(self.cfg.work.max_review_embed_diff_lines)
+                .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
+                .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
+                .followup_proposals_seam_enabled(followup_proposals_seam_enabled)
+                .automation_outcome_proposals_seam_enabled(automation_outcome_proposals_seam_enabled)
+                .review_batch_fanout_enabled(review_batch_fanout_enabled)
+                .build(),
         )
         .await
         // Every other fallible step below already names itself in its error

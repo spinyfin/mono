@@ -14,7 +14,7 @@ use crate::structured_output::StructuredOutputKind;
 use crate::work::{
     REASON_ALLOCATION, REASON_LEGACY_PERCENTAGE, WorkDb, WorkExecution, WorkItem, driver_clears_dispatch_gate,
 };
-use boss_protocol::{ExecutionKind, TaskKind};
+use boss_protocol::{EffortLevel, ExecutionKind, ReviewBatchMember, ReviewBatchPhase, ReviewBatchStatus, TaskKind};
 
 use super::prompt::{
     ExecutionPromptParams, compose_answer_agent_prompt, compose_execution_prompt, render_merge_order_preservation_lines,
@@ -60,6 +60,13 @@ pub(crate) struct WorkerSpawnOpts {
     pub(crate) followup_proposals_seam_enabled: bool,
     #[builder(default)]
     pub(crate) automation_outcome_proposals_seam_enabled: bool,
+    /// Mirrors `pr_transition.rs`'s own `review_batch_fanout` read. When on,
+    /// a `pr_review` execution with no persisted batch-member row must fail
+    /// closed rather than silently falling back to the legacy Claude pool —
+    /// see `docs/designs/multi-agent-code-review.md`, "Dispatch three
+    /// executions, not one execution with subagents".
+    #[builder(default)]
+    pub(crate) review_batch_fanout_enabled: bool,
 }
 
 /// Fetch authoritative PR metadata for a reviewer worker's initial prompt.
@@ -297,6 +304,30 @@ fn check_model_driver_compatibility(
     }
 }
 
+/// Batch members carry the exact policy chosen when the immutable target was
+/// created. This intentionally bypasses review-pool Claude/strong defaults so
+/// a leaf remains on its assigned provider even if task settings change later.
+fn resolve_batch_reviewer_spawn(
+    registry: &crate::driver::DriverRegistry,
+    member: &ReviewBatchMember,
+    work_item_kind: Option<&TaskKind>,
+) -> anyhow::Result<SpawnConfig> {
+    let effort = member.provider_effort.parse::<EffortLevel>().map_err(|error| {
+        anyhow::anyhow!(
+            "invalid persisted review batch effort {:?}: {error}",
+            member.provider_effort
+        )
+    })?;
+    let input = SpawnResolutionInput::builder()
+        .effort_level(effort)
+        .model_override(member.resolved_model.as_str())
+        .task_driver(member.requested_driver.as_str())
+        .maybe_kind(work_item_kind)
+        .build();
+    resolve_spawn_config_in(registry, &input)
+        .map_err(|error| anyhow::anyhow!("review batch effort/model resolution: {error}"))
+}
+
 /// Per-execution prompt + spawn-config composition shared by every
 /// worker transport.
 ///
@@ -320,7 +351,7 @@ pub(crate) async fn compose_worker_spawn(
     work_item: &WorkItem,
     workspace_path: &Path,
     cube_change_id: Option<&str>,
-    // Bundled (rather than five positional bools) to keep the parameter
+    // Bundled (rather than a run of positional bools) to keep the parameter
     // count under clippy::too_many_arguments AND so call sites name what
     // they set instead of relying on positional order — a transposed pair
     // of seam flags here would compile silently and mis-gate a prompt.
@@ -333,6 +364,7 @@ pub(crate) async fn compose_worker_spawn(
         deferred_scope_proposals_seam_enabled,
         followup_proposals_seam_enabled,
         automation_outcome_proposals_seam_enabled,
+        review_batch_fanout_enabled,
     } = editorial_opts;
     // For any project-scoped task (the synthetic `kind = 'design'`
     // task and ordinary `project_task` rows alike), the richer
@@ -749,7 +781,7 @@ pub(crate) async fn compose_worker_spawn(
             }
         }
     } else if execution.kind == ExecutionKind::AnswerAgent {
-        // P3b: an `answer_agent` execution renders the answer-agent prompt
+        // An `answer_agent` execution renders the answer-agent prompt
         // (doc content, comment, thread history, reply instructions) instead
         // of the ordinary implementer prompt. Its `work_item_id` is the
         // comment id (see `WorkDb::create_answer_agent_execution`).
@@ -777,10 +809,55 @@ pub(crate) async fn compose_worker_spawn(
     };
     let work_item_kind = work_item_task_kind_enum(work_item);
     let registry = crate::driver::DriverRegistry::default();
+    let batch_member = if execution.kind == ExecutionKind::PrReview {
+        work_db
+            .review_batch_member_for_execution(&execution.id)
+            .map_err(|error| anyhow::anyhow!("loading review batch member for spawn: {error}"))?
+    } else {
+        None
+    };
+    // Fail closed rather than falling back to the legacy Claude pool, but
+    // ONLY when this execution should have had a member row: a live
+    // (non-terminal) pre_merge batch already exists for the work item, so a
+    // memberless `pr_review` execution here is a genuine race (a leaf whose
+    // member-row write raced this read) rather than one of the other
+    // legacy-dispatch paths. `pr_transition.rs` gates only its own dispatch
+    // on `review_batch_fanout` — `WorkDb::request_pr_review`
+    // (`bossctl review start`), the merge poller's reviewer-fallback re-fire,
+    // pr_review_recovery's legacy loop, and pr_transition's own
+    // batch-metadata-failure fallback all still mint memberless legacy
+    // `pr_review` executions with the flag on, matching
+    // docs/designs/multi-agent-code-review.md's rollout clause that "the old
+    // single-reviewer path remains available behind the batch feature
+    // flag". Keying the gate on "no live batch exists for this work item"
+    // instead of "flag is on" lets those genuine legacy executions keep
+    // resolving `pool_dispatch_policy_for_worker_id` below.
+    if review_batch_fanout_enabled && execution.kind == ExecutionKind::PrReview && batch_member.is_none() {
+        let live_batch_exists = work_db
+            .review_batches_for_cycle_root(&execution.work_item_id)
+            .map_err(|error| anyhow::anyhow!("checking for a live review batch before spawn: {error}"))?
+            .into_iter()
+            .any(|batch| {
+                batch.phase == ReviewBatchPhase::PreMerge
+                    && !matches!(batch.status, ReviewBatchStatus::Completed | ReviewBatchStatus::Failed)
+            });
+        if live_batch_exists {
+            anyhow::bail!(
+                "review_batch_fanout is enabled and a live pre_merge batch already exists for work item {} \
+                 but execution {} (pr_review) has no review batch member row; refusing to spawn rather than \
+                 silently falling back to the legacy Claude pool",
+                execution.work_item_id,
+                execution.id
+            );
+        }
+    }
     // Single resolution point for review/automation dispatch policy — see
     // `pool_dispatch_policy_for_worker_id`'s doc comment. `None` for
     // main-pool workers, which dispatch on the row's own `driver` column.
-    let pool_policy = pool_dispatch_policy_for_worker_id(worker_id);
+    let pool_policy = batch_member
+        .is_none()
+        .then(|| pool_dispatch_policy_for_worker_id(worker_id))
+        .flatten();
     // Main-pool only: a live pin that the capability gate will refuse for
     // this execution kind yields to allocation / the engine default rather
     // than hard-failing `compose_worker_spawn`. Pool workers already ignore
@@ -796,31 +873,36 @@ pub(crate) async fn compose_worker_spawn(
             product_default_driver.as_deref(),
         )
     };
-    let spawn_input = SpawnResolutionInput::builder()
-        // Effort always comes from the owning row, for pool and main-pool workers alike.
-        // For review/automation pools this is deliberate: capability comes from the pool's
-        // strong model tier below, while effort stays proportional to the likely material to
-        // inspect instead of raising every small review's spend. The automated-reviewer
-        // design §5 defines that override; §10 keeps production effort/model selection unchanged.
-        // `resolve_spawn_config` documents their independent precedence, and
-        // `pool_override_does_not_change_effort_or_addendum` pins the separation.
-        // For PR reviews this is only a size proxy, not a claim that small
-        // diffs are low risk: the rubric applies the same correctness bar at
-        // every level.
-        .maybe_effort_level(row_effort)
-        .maybe_model_override(row_model_override.as_deref())
-        .maybe_pool_model_override(pool_policy.map(|p| p.model_tier))
-        .maybe_product_default_model(product_default_model.as_deref())
-        .maybe_task_driver(effective_task_driver)
-        .maybe_product_default_driver(effective_product_default_driver)
-        .maybe_pool_policy_driver(pool_policy.map(|policy| policy.driver))
-        .maybe_allocated_driver(allocated_driver.as_deref())
-        .maybe_kind(work_item_kind)
-        .maybe_reasoning(row_reasoning)
-        .design_reasoning_effort_xhigh(row_design_reasoning_effort_xhigh)
-        .build();
-    let spawn_config = resolve_spawn_config_in(&registry, &spawn_input)
-        .map_err(|e| anyhow::anyhow!("effort/model resolution: {e}"))?;
+    let spawn_config = match batch_member.as_ref() {
+        Some(member) => resolve_batch_reviewer_spawn(&registry, member, work_item_kind)?,
+        None => {
+            let spawn_input = SpawnResolutionInput::builder()
+                // Effort always comes from the owning row, for pool and main-pool workers alike.
+                // For review/automation pools this is deliberate: capability comes from the pool's
+                // strong model tier below, while effort stays proportional to the likely material to
+                // inspect instead of raising every small review's spend. The automated-reviewer
+                // design §5 defines that override; §10 keeps production effort/model selection unchanged.
+                // `resolve_spawn_config` documents their independent precedence, and
+                // `pool_override_does_not_change_effort_or_addendum` pins the separation.
+                // For PR reviews this is only a size proxy, not a claim that small
+                // diffs are low risk: the rubric applies the same correctness bar at
+                // every level.
+                .maybe_effort_level(row_effort)
+                .maybe_model_override(row_model_override.as_deref())
+                .maybe_pool_model_override(pool_policy.map(|p| p.model_tier))
+                .maybe_product_default_model(product_default_model.as_deref())
+                .maybe_task_driver(effective_task_driver)
+                .maybe_product_default_driver(effective_product_default_driver)
+                .maybe_pool_policy_driver(pool_policy.map(|policy| policy.driver))
+                .maybe_allocated_driver(allocated_driver.as_deref())
+                .maybe_kind(work_item_kind)
+                .maybe_reasoning(row_reasoning)
+                .design_reasoning_effort_xhigh(row_design_reasoning_effort_xhigh)
+                .build();
+            resolve_spawn_config_in(&registry, &spawn_input)
+                .map_err(|error| anyhow::anyhow!("effort/model resolution: {error}"))?
+        }
+    };
 
     tracing::info!(
         execution_id = %execution.id,
@@ -984,6 +1066,29 @@ mod reviewer_pool_policy_tests {
             crate::effort::ModelResolutionSource::PoolStrongTier
         );
         assert_eq!(investigation.effort_value, Some("xhigh"));
+    }
+
+    #[test]
+    fn persisted_batch_member_overrides_the_legacy_claude_review_pool() {
+        let registry = crate::driver::DriverRegistry::default();
+        let member = boss_protocol::ReviewBatchMember::builder()
+            .id("member")
+            .batch_id("batch")
+            .attempt(1)
+            .created_at("1")
+            .provider_effort("medium")
+            .requested_driver("codex")
+            .resolved_model("gpt-5.6-terra")
+            .role(boss_protocol::ReviewBatchMemberRole::CodexReviewer)
+            .status(boss_protocol::ReviewBatchMemberStatus::Pending)
+            .updated_at("1")
+            .execution_id("execution")
+            .build();
+
+        let config = super::resolve_batch_reviewer_spawn(&registry, &member, None).unwrap();
+        assert_eq!(config.driver, "codex");
+        assert_eq!(config.model, "gpt-5.6-terra");
+        assert_eq!(config.effort_level, Some(boss_protocol::EffortLevel::Medium));
     }
 }
 
