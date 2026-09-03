@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
-use boss_tmux::Tmux;
+use boss_tmux::{OptionScope, OptionSetting, Tmux};
 
 const BOSS_SESSION_OPTIONS: &[(&str, &str)] = &[("status", "off"), ("remain-on-exit", "on")];
 
@@ -81,21 +81,33 @@ pub(crate) fn assert_color_environment(new_session: &[String]) {
     );
 }
 
-/// Apply Boss-owned tmux options after tmux has loaded user config.
+/// Converge Boss-owned tmux options after tmux has loaded user config.
 ///
 /// Server options are set first so `terminal-features` is in place before
 /// the caller returns an identity used to attach a client.
 pub(crate) async fn apply(tmux: &Tmux, session_name: &str) -> Result<()> {
+    let mut settings = Vec::new();
     for &(option, value) in BOSS_SERVER_OPTIONS {
-        tmux.set_server_option(option, value)
-            .await
-            .with_context(|| format!("setting Boss tmux server option {option}={value}"))?;
+        if tmux.show_server_option(option).await? != Some(value.to_owned()) {
+            settings.push(OptionSetting {
+                scope: OptionScope::Server,
+                option,
+                value,
+            });
+        }
     }
     for &(option, value) in BOSS_SESSION_OPTIONS {
-        tmux.set_option(session_name, option, value)
-            .await
-            .with_context(|| format!("setting Boss tmux session option {option}={value} for {session_name}"))?;
+        if tmux.show_option(session_name, option).await? != Some(value.to_owned()) {
+            settings.push(OptionSetting {
+                scope: OptionScope::Session(session_name),
+                option,
+                value,
+            });
+        }
     }
+    tmux.set_options(&settings)
+        .await
+        .context("setting Boss tmux options that do not already match")?;
     Ok(())
 }
 

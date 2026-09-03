@@ -1198,6 +1198,7 @@ mod tests {
                 Some("start-server") => ("server-bootstrap", ""),
                 Some("-V") => ("version", self.tmux_version_stdout.as_str()),
                 Some("new-session") => ("new-session", ""),
+                Some("show-options") => ("presentation", ""),
                 Some("set-option") if args.get(3).map(String::as_str) == Some("-g") => {
                     match args.get(4).map(String::as_str) {
                         Some("history-limit") | Some("remain-on-exit") => ("server-bootstrap", ""),
@@ -1308,6 +1309,7 @@ mod tests {
                 "presentation",
                 "presentation",
                 "presentation",
+                "presentation",
                 "label",
                 "pane-pid",
                 "created"
@@ -1361,64 +1363,40 @@ mod tests {
             "tmux must launch through WorkerPaneLaunch's interactive login shell: {create:?}"
         );
         assert_eq!(
-            calls[4],
-            vec![
+            calls[9],
+            [
                 "-S",
                 boss_tmux::TEST_SOCKET_PATH,
                 "set-option",
                 "-s",
                 "terminal-features[100]",
-                "xterm*:extkeys"
-            ]
-        );
-        assert_eq!(
-            calls[5],
-            vec![
-                "-S",
-                boss_tmux::TEST_SOCKET_PATH,
+                "xterm*:extkeys",
+                ";",
                 "set-option",
                 "-s",
                 "extended-keys",
-                "on"
-            ]
-        );
-        assert_eq!(
-            calls[6],
-            vec![
-                "-S",
-                boss_tmux::TEST_SOCKET_PATH,
+                "on",
+                ";",
                 "set-option",
                 "-s",
                 "focus-events",
+                "on",
+                ";",
+                "set-option",
+                "-t",
+                "boss-3-run-test",
+                "status",
+                "off",
+                ";",
+                "set-option",
+                "-t",
+                "boss-3-run-test",
+                "remain-on-exit",
                 "on"
             ]
         );
         assert_eq!(
-            &calls[7][..6],
-            [
-                "-S",
-                boss_tmux::TEST_SOCKET_PATH,
-                "set-option",
-                "-t",
-                "boss-3-run-test",
-                "status"
-            ]
-        );
-        assert_eq!(calls[7][6], "off");
-        assert_eq!(
-            &calls[8][..6],
-            [
-                "-S",
-                boss_tmux::TEST_SOCKET_PATH,
-                "set-option",
-                "-t",
-                "boss-3-run-test",
-                "remain-on-exit"
-            ]
-        );
-        assert_eq!(calls[8][6], "on");
-        assert_eq!(
-            &calls[9][..6],
+            &calls[10][..6],
             [
                 "-S",
                 boss_tmux::TEST_SOCKET_PATH,
@@ -1434,22 +1412,22 @@ mod tests {
             .expect("expected pane-pid read after options");
         let features = calls
             .iter()
-            .position(|call| call.get(4).map(String::as_str) == Some("terminal-features[100]"))
+            .position(|call| call.iter().any(|argument| argument == "terminal-features[100]"))
             .expect("expected terminal-features write");
         let extended = calls
             .iter()
-            .position(|call| call.get(4).map(String::as_str) == Some("extended-keys"))
+            .position(|call| call.iter().any(|argument| argument == "extended-keys"))
             .expect("expected extended-keys write");
         let focus = calls
             .iter()
-            .position(|call| call.get(4).map(String::as_str) == Some("focus-events"))
+            .position(|call| call.iter().any(|argument| argument == "focus-events"))
             .expect("expected focus-events write");
         assert!(
             features < pane_pid && extended < pane_pid && focus < pane_pid,
             "server options must be set before the attach identity is returned"
         );
         assert_eq!(
-            calls[10],
+            calls[11],
             vec![
                 "-S",
                 boss_tmux::TEST_SOCKET_PATH,

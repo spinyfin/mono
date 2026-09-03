@@ -43,6 +43,25 @@ pub enum KillSessionOutcome {
     Absent,
 }
 
+/// Scope for an option set by [`Tmux::set_options`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionScope<'a> {
+    /// An option owned by the private tmux server.
+    Server,
+    /// An option owned by one tmux session.
+    Session(&'a str),
+    /// A global default inherited by future sessions and windows.
+    Global,
+}
+
+/// One option assignment in a batched [`Tmux::set_options`] invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptionSetting<'a> {
+    pub scope: OptionScope<'a>,
+    pub option: &'a str,
+    pub value: &'a str,
+}
+
 /// Failure returned by [`Tmux::kill_session_verified`].
 #[derive(Debug)]
 pub enum KillSessionError {
@@ -388,6 +407,35 @@ impl Tmux {
             option.into(),
             value.into(),
         ]);
+        self.invoke(args).await.map(|_| ())
+    }
+
+    /// Applies several option assignments in one tmux command sequence.
+    ///
+    /// The individual `set-option` commands retain tmux's normal scopes, but
+    /// using its `\;` separator avoids a process launch for every assignment.
+    pub async fn set_options(&self, settings: &[OptionSetting<'_>]) -> Result<()> {
+        if settings.is_empty() {
+            return Ok(());
+        }
+        let mut args = self.server_args();
+        for (index, setting) in settings.iter().enumerate() {
+            validate_value("option name", setting.option)?;
+            validate_value("option value", setting.value)?;
+            if index != 0 {
+                args.push(";".into());
+            }
+            args.push("set-option".into());
+            match setting.scope {
+                OptionScope::Server => args.push("-s".into()),
+                OptionScope::Session(session) => {
+                    validate_value("session name", session)?;
+                    args.extend(["-t".into(), session.into()]);
+                }
+                OptionScope::Global => args.push("-g".into()),
+            }
+            args.extend([setting.option.into(), setting.value.into()]);
+        }
         self.invoke(args).await.map(|_| ())
     }
 
