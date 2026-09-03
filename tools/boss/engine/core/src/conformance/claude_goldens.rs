@@ -51,9 +51,41 @@ fn normalize_host_paths(rendered: &str) -> String {
     };
     let tmp = tmp.display().to_string();
     let tmp = tmp.trim_end_matches('/').to_owned();
-    rendered
+    let with_tmp = rendered
         .replace(&tmp, "$TMPDIR")
-        .replace(&tmp.replace(' ', "\\ "), "$TMPDIR")
+        .replace(&tmp.replace(' ', "\\ "), "$TMPDIR");
+    // Guard scripts live in a content-addressed subdirectory keyed on the
+    // script sha256 (`path-guard-<hex>/boss-path-guard.py`). That hash
+    // changes whenever the script bytes change; the golden pins the
+    // settings.json *shape*, not a particular hash, so strip the
+    // directory component before comparing.
+    strip_content_addressed_guard_dirs(&with_tmp)
+}
+
+/// Remove `<kind>-<64 hex>/` path components so a content-addressed
+/// guard path compares equal to the pre-hashing golden
+/// (`…/boss-worker-settings/boss-path-guard.py`).
+fn strip_content_addressed_guard_dirs(s: &str) -> String {
+    strip_kind_hash_dir(&strip_kind_hash_dir(s, "path-guard-"), "checkleft-push-guard-")
+}
+
+fn strip_kind_hash_dir(s: &str, prefix: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(idx) = rest.find(prefix) {
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + prefix.len()..];
+        let hash = after.get(..64);
+        let slash = after.as_bytes().get(64);
+        if hash.is_some_and(|h| h.bytes().all(|b| b.is_ascii_hexdigit())) && slash == Some(&b'/') {
+            rest = &after[65..];
+        } else {
+            out.push_str(prefix);
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 // ── Spawn line ──────────────────────────────────────────────────────────────
@@ -175,6 +207,20 @@ fn golden_deny_rules_standard_worker() {
 }
 
 // ── settings.json ───────────────────────────────────────────────────────────
+
+#[test]
+fn strip_content_addressed_guard_dirs_removes_kind_hash_component() {
+    let hashed = "$TMPDIR/boss-worker-settings/path-guard-a8a5bfd127fda4353a55ebdcae8b58e154e46d4fbdf0b9df5cd0bc963e33fd16/boss-path-guard.py";
+    assert_eq!(
+        strip_content_addressed_guard_dirs(hashed),
+        "$TMPDIR/boss-worker-settings/boss-path-guard.py"
+    );
+    let checkleft = "$TMPDIR/boss-worker-settings/checkleft-push-guard-df95ca546c6b89098a3afd957409744c52c2334079f3f435cbcbe81bbb4e4e8d/boss-checkleft-push-guard.py";
+    assert_eq!(
+        strip_content_addressed_guard_dirs(checkleft),
+        "$TMPDIR/boss-worker-settings/boss-checkleft-push-guard.py"
+    );
+}
 
 #[test]
 fn golden_settings_json_standard_worker() {

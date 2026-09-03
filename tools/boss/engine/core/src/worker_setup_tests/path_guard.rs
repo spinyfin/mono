@@ -123,9 +123,13 @@ fn heal_worker_settings_json_refreshes_path_guard_script() {
 
     heal_worker_settings_json(settings_dir.path(), &PathBuf::from("/stable/boss-event"));
 
-    let script = settings_dir.path().join(PATH_GUARD_SCRIPT_NAME);
+    let script = path_guard_script_path_in(settings_dir.path());
     assert!(script.exists(), "heal must refresh the gate script");
     assert_eq!(std::fs::read_to_string(&script).unwrap(), PATH_GUARD_SCRIPT);
+    assert!(
+        !settings_dir.path().join(PATH_GUARD_SCRIPT_NAME).exists(),
+        "heal must not write the unversioned shared path that Codex attests"
+    );
 }
 
 // ── PATH_GUARD_SCRIPT execution tests ─────────────────────────────────

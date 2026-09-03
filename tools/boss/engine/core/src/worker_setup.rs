@@ -30,8 +30,10 @@
 //!   tool call that resolves inside the Boss data dir, regardless of which
 //!   tool dresses up the access, whether the path is relative, or whether
 //!   the session model spots the path string. The script is written next to
-//!   the settings file by [`write_workspace_files`] / refreshed by
-//!   [`heal_worker_settings_json`]. The data-dir `deny` globs are a cheap
+//!   the settings file in a content-addressed directory keyed on the
+//!   script's sha256 ([`write_workspace_files`] / [`heal_worker_settings_json`])
+//!   so one engine build cannot overwrite the bytes another build's
+//!   workers have attested. The data-dir `deny` globs are a cheap
 //!   literal-path belt layered on top of that gate, never a substitute for
 //!   it — [`deny_rules`] emits them only when the gate is actually wired
 //!   into the same file (see [`DataDirFence`]).
@@ -60,8 +62,10 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use serde_json;
+use sha2::{Digest, Sha256};
 
 use boss_protocol::ExecutionKind;
 
@@ -1268,14 +1272,35 @@ fn publish_deny_rules() -> Vec<String> {
 const WORKER_SETTINGS_SUBDIR: &str = "boss-worker-settings";
 
 /// Filename of the deterministic Boss-data-dir access gate script.
-/// Written next to the worker settings file (same dir, shared fate) and
-/// invoked by the `PreToolUse` hook with its absolute path.
+/// Written under a content-addressed directory next to the worker
+/// settings file and invoked by the `PreToolUse` hook with its absolute
+/// path. The filename itself is stable so hook-command matching can key
+/// on it; the containing directory is what isolates one engine build's
+/// bytes from another's (see [`ensure_content_addressed_script`]).
 const PATH_GUARD_SCRIPT_NAME: &str = "boss-path-guard.py";
 
+/// Directory-name prefix for a content-addressed path-guard materialisation
+/// (`path-guard-<sha256>/boss-path-guard.py`). Distinct from the checkleft
+/// prefix so the two scripts can change independently.
+const PATH_GUARD_KIND: &str = "path-guard";
+
 /// Filename of the deterministic pre-push checkleft gate script. Written
-/// next to the worker settings file (same dir, shared fate) and invoked
-/// by the `PreToolUse` hook with its absolute path.
+/// under a content-addressed directory next to the worker settings file
+/// and invoked by the `PreToolUse` hook with its absolute path.
 const CHECKLEFT_PUSH_GUARD_SCRIPT_NAME: &str = "boss-checkleft-push-guard.py";
+
+/// Directory-name prefix for a content-addressed checkleft-guard
+/// materialisation (`checkleft-push-guard-<sha256>/boss-checkleft-push-guard.py`).
+const CHECKLEFT_PUSH_GUARD_KIND: &str = "checkleft-push-guard";
+
+/// Unreferenced content-addressed guard directories older than this are
+/// pruned on the next materialise. Live workers are protected by this
+/// window (and by settings-JSON references in the same directory): a
+/// hashed file is never deleted while it is still young enough that a
+/// worker armed against it may still be running. Seven days is well
+/// beyond a healthy worker's lifetime; hung-worker recovery is out of
+/// scope for this materialisation.
+const GUARD_SCRIPT_PRUNE_GRACE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// The deterministic Boss-data-dir access gate, run as a `PreToolUse`
 /// hook for every tool call.
@@ -2175,10 +2200,10 @@ if __name__ == "__main__":
 /// Under Bazel tests, prefers `$TEST_TMPDIR` when set. That directory is
 /// unique per test action (including each shard of a `shard_count > 1`
 /// `rust_test` and each `runs_per_test` copy), so concurrent processes
-/// do not race on the shared gate-script paths
-/// (`boss-path-guard.py`, `boss-checkleft-push-guard.py`) that live
-/// here. Production never sets `TEST_TMPDIR`, so the stable per-user
-/// location that heal relies on is unchanged.
+/// do not race on per-workspace settings JSON files that live here.
+/// Gate scripts are content-addressed (one directory per bytes-hash)
+/// and never overwrite one another. Production never sets `TEST_TMPDIR`,
+/// so the stable per-user location that heal relies on is unchanged.
 pub fn worker_settings_dir() -> PathBuf {
     worker_settings_root().join(WORKER_SETTINGS_SUBDIR)
 }
@@ -2207,42 +2232,301 @@ pub fn worker_settings_path(workspace_path: &Path) -> PathBuf {
     worker_settings_dir().join(format!("{key}.json"))
 }
 
-/// Absolute path to the deterministic Boss-data-dir gate script. Shared
-/// across every session (the script is data-dir-agnostic; the dir is
-/// passed at invocation via `BOSS_DATA_DIR`), so it lives once in the
-/// [`worker_settings_dir`] alongside the per-workspace settings files.
+/// Absolute path to this engine build's Boss-data-dir gate script.
+///
+/// Content-addressed: the containing directory is keyed on the sha256 of
+/// [`PATH_GUARD_SCRIPT`], so two engine builds with different guard bytes
+/// materialise distinct paths and cannot overwrite one another. The
+/// script is data-dir-agnostic; the dir is passed at invocation via
+/// `BOSS_DATA_DIR`.
 pub fn path_guard_script_path() -> PathBuf {
-    worker_settings_dir().join(PATH_GUARD_SCRIPT_NAME)
+    path_guard_script_path_in(&worker_settings_dir())
 }
 
-/// Write the [`PATH_GUARD_SCRIPT`] into `dir`, creating it if needed.
-/// Idempotent: overwrites any existing copy with the current source so a
-/// stale script from an older engine build is refreshed. Returns the
-/// path written.
+/// [`path_guard_script_path`] resolved under `dir` instead of
+/// [`worker_settings_dir`]. Used by tests that materialise into a temp
+/// directory, and by [`ensure_path_guard_script_in`].
+fn path_guard_script_path_in(dir: &Path) -> PathBuf {
+    content_addressed_guard_path(
+        dir,
+        PATH_GUARD_KIND,
+        PATH_GUARD_SCRIPT_NAME,
+        PATH_GUARD_SCRIPT.as_bytes(),
+    )
+}
+
+/// Write the [`PATH_GUARD_SCRIPT`] into a content-addressed directory
+/// under `dir`.
+///
+/// Never overwrites a file whose bytes differ from this build's script:
+/// an armed Codex worker content-binds the path at spawn and re-checks
+/// it on every tool call, so mutating those bytes bricks the worker for
+/// the rest of its lifetime. Same bytes are a no-op (mtime is refreshed
+/// so the prune grace stays relative to last use). Returns the path
+/// written (or already present).
 pub fn ensure_path_guard_script_in(dir: &Path) -> io::Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
-    let path = dir.join(PATH_GUARD_SCRIPT_NAME);
-    std::fs::write(&path, PATH_GUARD_SCRIPT)?;
-    Ok(path)
+    ensure_content_addressed_script(
+        dir,
+        PATH_GUARD_KIND,
+        PATH_GUARD_SCRIPT_NAME,
+        PATH_GUARD_SCRIPT.as_bytes(),
+    )
 }
 
-/// Absolute path to the deterministic pre-push checkleft gate script.
-/// Shared across every session (the script resolves the repo + checkleft
-/// binary at invocation time), so it lives once in the
-/// [`worker_settings_dir`] alongside the per-workspace settings files.
+/// Absolute path to this engine build's pre-push checkleft gate script.
+/// Content-addressed the same way as [`path_guard_script_path`]: Codex
+/// attests this file too, so a shared mutable path would brick already-
+/// armed workers the same way.
 pub fn checkleft_push_guard_script_path() -> PathBuf {
-    worker_settings_dir().join(CHECKLEFT_PUSH_GUARD_SCRIPT_NAME)
+    checkleft_push_guard_script_path_in(&worker_settings_dir())
 }
 
-/// Write the [`CHECKLEFT_PUSH_GUARD_SCRIPT`] into `dir`, creating it if
-/// needed. Idempotent: overwrites any existing copy with the current
-/// source so a stale script from an older engine build is refreshed.
-/// Returns the path written.
+fn checkleft_push_guard_script_path_in(dir: &Path) -> PathBuf {
+    content_addressed_guard_path(
+        dir,
+        CHECKLEFT_PUSH_GUARD_KIND,
+        CHECKLEFT_PUSH_GUARD_SCRIPT_NAME,
+        CHECKLEFT_PUSH_GUARD_SCRIPT.as_bytes(),
+    )
+}
+
+/// Write the [`CHECKLEFT_PUSH_GUARD_SCRIPT`] into a content-addressed
+/// directory under `dir`. Same write-once contract as
+/// [`ensure_path_guard_script_in`].
 pub fn ensure_checkleft_push_guard_script_in(dir: &Path) -> io::Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
-    let path = dir.join(CHECKLEFT_PUSH_GUARD_SCRIPT_NAME);
-    std::fs::write(&path, CHECKLEFT_PUSH_GUARD_SCRIPT)?;
+    ensure_content_addressed_script(
+        dir,
+        CHECKLEFT_PUSH_GUARD_KIND,
+        CHECKLEFT_PUSH_GUARD_SCRIPT_NAME,
+        CHECKLEFT_PUSH_GUARD_SCRIPT.as_bytes(),
+    )
+}
+
+fn content_addressed_guard_dir(parent: &Path, kind: &str, bytes: &[u8]) -> PathBuf {
+    parent.join(format!("{kind}-{}", sha256_hex(bytes)))
+}
+
+fn content_addressed_guard_path(parent: &Path, kind: &str, filename: &str, bytes: &[u8]) -> PathBuf {
+    content_addressed_guard_dir(parent, kind, bytes).join(filename)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Materialise `bytes` at `dir/<kind>-<sha256(bytes)>/<filename>`.
+///
+/// Write-once: a file whose contents already match is left in place; a
+/// file whose contents differ is **not** overwritten (the filename
+/// claims these bytes, and an armed worker may have attested whatever
+/// is already there). Different `bytes` resolve to a different
+/// directory, which is what stops engine-build divergence from
+/// clobbering an already-armed worker's guard.
+fn ensure_content_addressed_script(dir: &Path, kind: &str, filename: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    let hash = sha256_hex(bytes);
+    let guard_dir = content_addressed_guard_dir(dir, kind, bytes);
+    let path = guard_dir.join(filename);
+    std::fs::create_dir_all(&guard_dir)?;
+
+    match std::fs::read(&path) {
+        Ok(existing) if existing == bytes => {
+            // Same bytes: not a write. Refresh mtime so prune grace is
+            // measured from last use by this build, not from first create.
+            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
+                let _ = file.set_modified(SystemTime::now());
+            }
+        }
+        Ok(existing) => {
+            // Same content-addressed path, different bytes: corruption or
+            // a sha256 collision. Never overwrite — that is the outage
+            // this function exists to make impossible.
+            log_guard_script_write(
+                kind,
+                &path,
+                &hash,
+                Some(&sha256_hex(&existing)),
+                /*replaced_different_bytes=*/ false,
+                /*existing_bytes_differ=*/ true,
+            );
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            let tmp = guard_dir.join(format!(".{filename}.{}.tmp", std::process::id()));
+            std::fs::write(&tmp, bytes)?;
+            match std::fs::rename(&tmp, &path) {
+                Ok(()) => {
+                    log_guard_script_write(
+                        kind, &path, &hash, None, /*replaced_different_bytes=*/ false,
+                        /*existing_bytes_differ=*/ false,
+                    );
+                }
+                Err(rename_err) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    // A concurrent writer of the same hash may have won
+                    // the rename. If the winner's bytes match, we are
+                    // done; if they differ, leave them (never overwrite).
+                    match std::fs::read(&path) {
+                        Ok(existing) if existing == bytes => {}
+                        Ok(existing) => {
+                            log_guard_script_write(
+                                kind,
+                                &path,
+                                &hash,
+                                Some(&sha256_hex(&existing)),
+                                /*replaced_different_bytes=*/ false,
+                                /*existing_bytes_differ=*/ true,
+                            );
+                        }
+                        Err(_) => return Err(rename_err),
+                    }
+                }
+            }
+        }
+        Err(err) => return Err(err),
+    }
+
+    prune_unreferenced_guard_dirs(dir, kind, filename, &guard_dir);
     Ok(path)
+}
+
+fn log_guard_script_write(
+    kind: &str,
+    path: &Path,
+    content_sha256: &str,
+    existing_sha256: Option<&str>,
+    replaced_different_bytes: bool,
+    existing_bytes_differ: bool,
+) {
+    let pid = std::process::id();
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unknown".to_owned());
+    let version = crate::build_info::version_string("boss-engine");
+    let git_sha = crate::build_info::git_sha();
+    let binary_fingerprint = crate::build_info::binary_fingerprint();
+    if existing_bytes_differ {
+        tracing::error!(
+            pid,
+            exe = %exe,
+            version = %version,
+            git_sha,
+            binary_fingerprint,
+            kind,
+            path = %path.display(),
+            content_sha256,
+            existing_sha256 = existing_sha256.unwrap_or("unknown"),
+            replaced_different_bytes,
+            existing_bytes_differ,
+            "worker guard script already exists with different bytes; leaving attested file unchanged"
+        );
+    } else {
+        tracing::info!(
+            pid,
+            exe = %exe,
+            version = %version,
+            git_sha,
+            binary_fingerprint,
+            kind,
+            path = %path.display(),
+            content_sha256,
+            replaced_different_bytes,
+            existing_bytes_differ,
+            "wrote worker guard script"
+        );
+    }
+}
+
+/// Drop content-addressed `<kind>-<sha256>/` directories under `dir` that
+/// are not `keep_dir`, not referenced by any `*.json` in `dir`, and older
+/// than [`GUARD_SCRIPT_PRUNE_GRACE`].
+///
+/// Bounded: each unique guard-bytes version leaves one directory, and
+/// versions that no running engine has rewritten and no live settings
+/// file still points at fall off after the grace window. Never walks
+/// outside `dir` (Codex/Grok homes live elsewhere; scanning them from a
+/// test would touch the host temp tree).
+fn prune_unreferenced_guard_dirs(dir: &Path, kind: &str, filename: &str, keep_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let referenced = referenced_guard_dir_names(dir);
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep_dir {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !is_content_addressed_guard_dir_name(name, kind) {
+            continue;
+        }
+        if referenced.iter().any(|r| r == name) {
+            continue;
+        }
+        let script = path.join(filename);
+        let mtime = std::fs::metadata(&script)
+            .and_then(|m| m.modified())
+            .or_else(|_| std::fs::metadata(&path).and_then(|m| m.modified()));
+        if let Ok(mtime) = mtime
+            && now.duration_since(mtime).unwrap_or(Duration::ZERO) < GUARD_SCRIPT_PRUNE_GRACE
+        {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                tracing::info!(
+                    kind,
+                    path = %path.display(),
+                    "pruned unreferenced worker guard script directory"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    kind,
+                    path = %path.display(),
+                    ?err,
+                    "failed to prune unreferenced worker guard script directory"
+                );
+            }
+        }
+    }
+}
+
+fn is_content_addressed_guard_dir_name(name: &str, kind: &str) -> bool {
+    let prefix = format!("{kind}-");
+    let Some(hash) = name.strip_prefix(&prefix) else {
+        return false;
+    };
+    hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Directory names (`path-guard-<sha256>`, …) mentioned by any `*.json`
+/// file in `dir`. Claude settings bake the absolute guard path into the
+/// PreToolUse hook command; as long as that file remains, the hashed
+/// directory is still live.
+fn referenced_guard_dir_names(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for token in text.split(|c: char| !c.is_ascii_alphanumeric() && c != '-') {
+            if is_content_addressed_guard_dir_name(token, PATH_GUARD_KIND)
+                || is_content_addressed_guard_dir_name(token, CHECKLEFT_PUSH_GUARD_KIND)
+            {
+                names.push(token.to_owned());
+            }
+        }
+    }
+    names
 }
 
 /// Substring that marks a hook command as engine-injected. Every
@@ -2442,9 +2726,10 @@ pub fn write_workspace_files(
     let settings_path = worker_settings_path(&input.workspace_path);
     if let Some(parent) = settings_path.parent() {
         std::fs::create_dir_all(parent)?;
-        // The PreToolUse gate scripts live next to the settings file
-        // (same dir, shared fate) and the hooks invoke them by absolute
-        // path; write them whenever we materialise the settings file.
+        // The PreToolUse gate scripts live next to the settings file in
+        // content-addressed subdirectories (same parent, per-bytes-hash
+        // isolation) and the hooks invoke them by absolute path; write
+        // them whenever we materialise the settings file.
         ensure_path_guard_script_in(parent)?;
         ensure_checkleft_push_guard_script_in(parent)?;
     }
@@ -2517,9 +2802,11 @@ pub fn heal_worker_settings_json(settings_dir: &Path, new_boss_event_path: &Path
     };
 
     // The settings dir exists, so live workers may have PreToolUse hooks
-    // pointing at the gate scripts in it. Refresh them (TMPDIR churn or an
-    // older engine build may have removed/staled them) so the gates
-    // survive an engine restart, not just a fresh spawn.
+    // pointing at the gate scripts in it. Materialise *this* build's
+    // content-addressed copies (TMPDIR churn may have removed them)
+    // without touching any other build's hashed directory — overwriting
+    // those would brick Codex workers already armed against the previous
+    // bytes.
     if let Err(err) = ensure_path_guard_script_in(settings_dir) {
         tracing::warn!(
             dir = %settings_dir.display(),
