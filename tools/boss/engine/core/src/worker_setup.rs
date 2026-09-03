@@ -513,10 +513,11 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
            --socket-path /tmp/boss-test-$(uuidgen).sock\n\
          ```\n\
          \n\
-         A `--socket-path` outside the Boss state root and distinct from the\n\
-         legacy `/tmp/boss-engine.sock` puts the engine in test-fixture mode,\n\
-         where the db, events socket, pid file and control token are all\n\
-         derived from that socket's path. Unset\n\
+         Any `--socket-path` other than the production socket puts the engine\n\
+         in test-fixture mode, where the db, events socket, pid file and\n\
+         control token are all derived from that socket's path — this\n\
+         includes the legacy `/tmp/boss-engine.sock`, which is a test\n\
+         fixture, not a safe alternative. Unset\n\
          `BOSS_EVENTS_SOCKET` because your pane inherits one pointing at\n\
          production. Point a client at the same `--socket-path` to drive it.\n\
          \n\

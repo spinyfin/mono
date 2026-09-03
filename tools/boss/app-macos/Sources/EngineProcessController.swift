@@ -86,6 +86,17 @@ final class EngineProcessController: @unchecked Sendable {
     var onOutputLine: (@MainActor @Sendable (String) -> Void)?
     var onSupervisionStateChange: (@MainActor @Sendable (EngineSupervisionState) -> Void)?
 
+    /// Liveness signal for the per-`pollInterval` supervision tick. When set
+    /// (normally to `EngineClient.isReachable`, which reflects the app's
+    /// existing long-lived connection), the tick reuses that connection's
+    /// state instead of opening and closing a fresh socket to the engine's
+    /// frontend listener every tick — each such probe drives a full
+    /// `handle_frontend_connection` session setup/teardown on the engine
+    /// side. Falls back to a raw socket probe (`discoverRunningEngine`) when
+    /// unset, e.g. in tests that exercise supervision without an
+    /// `EngineClient`.
+    var livenessProbe: (@Sendable () -> Bool)?
+
     init(
         paths: BossEnginePaths,
         launchDirectory: String = ProcessInfo.processInfo.environment["BUILD_WORKSPACE_DIRECTORY"]
@@ -95,7 +106,8 @@ final class EngineProcessController: @unchecked Sendable {
         restartPolicy: EngineRestartPolicy = .fromEnvironment(),
         socketControl: any EngineSocketControlling = EngineSocketControl(),
         bundledEnginePathOverride: String? = nil,
-        launchHandler: (@Sendable (String, String?, String) throws -> pid_t)? = nil
+        launchHandler: (@Sendable (String, String?, String) throws -> pid_t)? = nil,
+        livenessProbe: (@Sendable () -> Bool)? = nil
     ) {
         self.paths = paths
         self.lockFilePath = "\(paths.pidPath).lock"
@@ -107,6 +119,7 @@ final class EngineProcessController: @unchecked Sendable {
         self.socketControl = socketControl
         self.bundledEnginePathOverride = bundledEnginePathOverride
         self.launchHandler = launchHandler
+        self.livenessProbe = livenessProbe
     }
 
     deinit {
@@ -142,30 +155,49 @@ final class EngineProcessController: @unchecked Sendable {
                 //   [engine version-check skipped: <reason>] — check didn't run
                 //   [engine version-check ok] — ran, fingerprints matched
                 //   [engine upgrade] — ran, fingerprints differed, restarting
-                guard bundledEnginePath() != nil else {
+                //
+                // BOSS_ENGINE_CMD wins unconditionally (see
+                // resolveEngineCommand): a dev running against a custom
+                // engine binary has nothing bundled to compare it to, and
+                // fingerprinting the *bundled* binary against it would
+                // always mismatch and tear down the dev's own engine.
+                if ProcessInfo.processInfo.environment["BOSS_ENGINE_CMD"] != nil {
+                    emit("[engine version-check skipped: BOSS_ENGINE_CMD is set (developer custom engine)] attaching to \(describe(running))")
+                    return
+                }
+                guard let bundledPath = bundledEnginePath() else {
                     emit("[engine version-check skipped: no bundled engine in app resources (dev/bazel-run mode)] attaching to \(describe(running))")
                     return
                 }
-
-                // We know bundledEnginePath() is non-nil from the guard above.
-                guard let bundledPath = bundledEnginePath(),
-                      let bundledFP = computeBinaryFingerprint(path: bundledPath)
-                else {
-                    throw controllerError("could not fingerprint bundled engine at \(bundledEnginePath() ?? "unknown path")")
+                guard let bundledFP = computeBinaryFingerprint(path: bundledPath) else {
+                    throw controllerError("could not fingerprint bundled engine at \(bundledPath)")
                 }
 
-                let runningFP = socketControl.fingerprint(
-                    socketPath: running.socketPath,
-                    timeoutSeconds: 3.0
-                )
+                // A single missed 3s deadline can mean "the engine is busy",
+                // not "the engine is stale" — retry a couple of times before
+                // treating non-response as a mismatch, so a slow-but-healthy
+                // engine isn't torn down and replaced (and doesn't then hit
+                // the SIGTERM/SIGKILL fallback if the follow-on shutdown RPC
+                // also times out).
+                var runningFP: String?
+                var fingerprintAttempts = 0
+                let maxFingerprintAttempts = 3
+                while fingerprintAttempts < maxFingerprintAttempts {
+                    fingerprintAttempts += 1
+                    runningFP = socketControl.fingerprint(socketPath: running.socketPath, timeoutSeconds: 3.0)
+                    if runningFP != nil { break }
+                }
 
                 if let runningFP, bundledFP == runningFP {
                     emit("[engine version-check ok] running=\(runningFP) matches bundled — attaching to \(describe(running))")
                     return
                 }
 
-                let runningDescription = runningFP ?? "unavailable"
-                emit("[engine upgrade] running=\(runningDescription) bundled=\(bundledFP) — replacing \(describe(running))")
+                if runningFP == nil {
+                    emit("[engine upgrade] running fingerprint unavailable after \(fingerprintAttempts) attempts bundled=\(bundledFP) — replacing \(describe(running))")
+                } else {
+                    emit("[engine upgrade] running=\(runningFP ?? "unavailable") bundled=\(bundledFP) — replacing \(describe(running))")
+                }
                 try stopRunningEngine(running)
                 emit("[engine upgrade] old engine stopped — launching new engine from bundle")
             }
@@ -357,7 +389,8 @@ final class EngineProcessController: @unchecked Sendable {
 
     private func checkEngineLiveness() {
         guard !isSupervisionStopped, pendingRestart == nil else { return }
-        let action = supervisor.tick(isAlive: discoverRunningEngine() != nil, now: Date())
+        let isAlive = livenessProbe?() ?? (discoverRunningEngine() != nil)
+        let action = supervisor.tick(isAlive: isAlive, now: Date())
         switch action {
         case .running:
             lastLaunchError = nil
@@ -506,7 +539,18 @@ final class EngineProcessController: @unchecked Sendable {
             throw controllerError("detached engine launcher did not report the child pid")
         }
 
-        let deadline = Date().addingTimeInterval(8)
+        // The frontend socket binds late in engine startup — after
+        // `WorkDb::open`, the tmux preflight probe (which shells out to
+        // tmux), and planner-run recovery — so a slow-but-healthy start can
+        // legitimately outlast this window, especially the `bazel run`
+        // command shape used in dev mode, where a cold build alone can
+        // exceed it. Only the child actually exiting (checked every
+        // iteration above) is treated as a launch failure; a still-running
+        // child that simply hasn't bound its socket yet is not killed —
+        // supervision (`checkEngineLiveness`) observes the outcome once the
+        // socket comes up, or once the process actually exits.
+        let readinessWindow: TimeInterval = command.contains(BossEngineBinary.bazelRunCommand) ? 120 : 30
+        let deadline = Date().addingTimeInterval(readinessWindow)
         while Date() < deadline {
             if socketControl.isReachable(socketPath: socketPath, timeoutSeconds: 0.5) {
                 return childPID
@@ -523,14 +567,10 @@ final class EngineProcessController: @unchecked Sendable {
             Thread.sleep(forTimeInterval: 0.1)
         }
 
-        _ = kill(childPID, SIGTERM)
-        throw controllerError(
-            launchFailureMessage(
-                prefix: "engine process pid=\(childPID) did not make socket \(socketPath) reachable within 8 seconds",
-                launchErrorPath: launchErrorPath,
-                fallback: nil
-            )
+        emit(
+            "[engine launch] pid=\(childPID) socket \(socketPath) not yet reachable after \(Int(readinessWindow))s; still running, leaving it to supervision rather than killing it"
         )
+        return childPID
     }
 
     private func launchFailureMessage(prefix: String, launchErrorPath: String, fallback: String?) -> String {
@@ -579,8 +619,13 @@ final class EngineProcessController: @unchecked Sendable {
             guard socketControl.isReachable(socketPath: endpoint.socketPath) else {
                 continue
             }
-            let pid = currentEnginePID(pidPath: endpoint.pidPath)
-                ?? socketControl.peerPID(socketPath: endpoint.socketPath, timeoutSeconds: 1)
+            // Peer credentials are direct, unforgeable proof of which
+            // process owns the socket we just connected to; the pid file is
+            // the deletable, potentially stale artefact this discovery step
+            // otherwise leans on. Prefer the peer pid and only fall back to
+            // the file when peer credentials aren't available.
+            let pid = socketControl.peerPID(socketPath: endpoint.socketPath, timeoutSeconds: 1)
+                ?? currentEnginePID(pidPath: endpoint.pidPath)
             return RunningEngine(
                 socketPath: endpoint.socketPath,
                 pidPath: endpoint.pidPath,

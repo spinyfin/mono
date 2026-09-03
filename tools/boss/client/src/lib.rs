@@ -246,7 +246,12 @@ pub async fn discover_running_engine(discovery: &Discovery) -> Option<RunningEng
             .ok()
             .and_then(|credentials| credentials.pid())
             .and_then(|pid| u32::try_from(pid).ok());
-        let pid = running_engine_pid(pid_file_path).or(peer_pid);
+        // Peer credentials are direct, unforgeable proof of which process
+        // owns the socket we just connected to; the pid file is the
+        // deletable, potentially stale artefact this discovery step
+        // otherwise leans on. Prefer the peer pid and only fall back to
+        // the file when peer credentials aren't available.
+        let pid = peer_pid.or_else(|| running_engine_pid(pid_file_path));
         return Some(RunningEngine {
             socket_path: socket_path.to_owned(),
             pid_file_path: pid_file_path.to_owned(),
@@ -294,10 +299,19 @@ pub async fn ensure_engine_running(discovery: &Discovery) -> Result<()> {
         return Ok(());
     }
 
+    // A pid file naming a live, recognizably-engine process is worth
+    // waiting on rather than starting a competitor. But `running_engine_pid`
+    // only checks `kill -0`, so a stale pid file whose number has been
+    // reused by any unrelated live process must not veto autostart forever
+    // — gate on `is_likely_engine_process` too, and fall through to
+    // starting a fresh engine when that check fails. The events-socket
+    // guard in `serve_with_merge_probe` still fails closed if a real engine
+    // turns out to be alive after all.
     if let Some((pid, _)) = discovery
         .endpoint_candidates()
         .into_iter()
         .find_map(|(_, pid_path)| running_engine_pid(pid_path).map(|pid| (pid, pid_path)))
+        .filter(|(pid, _)| is_likely_engine_process(*pid))
     {
         if wait_for_discovered_engine(discovery, discovery.start_timeout).await {
             return Ok(());

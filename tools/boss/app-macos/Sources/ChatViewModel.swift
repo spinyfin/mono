@@ -1220,6 +1220,10 @@ final class ChatViewModel: ObservableObject {
         showSystemMessages = showSystem == "1" || showSystem.lowercased() == "true"
         engine = EngineClient(socketPaths: paths.socketPaths)
         commentBridge = CommentEngineBridge(engine: engine)
+        // Reuse the app's existing long-lived connection as the supervision
+        // liveness signal instead of opening a fresh probe socket to the
+        // engine every poll tick (see EngineProcessController.livenessProbe).
+        processController.livenessProbe = { [weak engine] in engine?.isReachable ?? false }
 
         commonInit()
     }
