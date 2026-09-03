@@ -936,6 +936,7 @@ pub(crate) fn coordinator_working_directory() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -1143,6 +1144,7 @@ mod tests {
         token: Option<String>,
         pane_dead: String,
         send_keys_fails: bool,
+        options: Mutex<BTreeMap<String, String>>,
         calls: Mutex<Vec<Vec<String>>>,
     }
 
@@ -1162,6 +1164,7 @@ mod tests {
                 token: token.map(str::to_owned),
                 pane_dead: pane_dead.to_owned(),
                 send_keys_fails,
+                options: Mutex::new(BTreeMap::new()),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -1187,7 +1190,38 @@ mod tests {
                     None => (false, String::new(), "unknown variable".to_owned()),
                 },
                 Some("display-message") => (true, format!("{}\n", self.pane_dead), String::new()),
-                Some("start-server") | Some("new-session") | Some("set-option") | Some("kill-session") => {
+                Some("show-options") => {
+                    let key = match args.get(3).map(String::as_str) {
+                        Some("-s") => format!("server:{}", args[5]),
+                        Some("-v") => format!("session:{}:{}", args[5], args[6]),
+                        other => panic!("unexpected show-options scope: {other:?}, args={args:?}"),
+                    };
+                    match self.options.lock().unwrap().get(&key) {
+                        Some(value) => (true, format!("{value}\n"), String::new()),
+                        None => (false, String::new(), "invalid option".to_owned()),
+                    }
+                }
+                Some("set-option") => {
+                    let mut index = 2;
+                    let mut options = self.options.lock().unwrap();
+                    while index < args.len() {
+                        assert_eq!(args[index], "set-option", "expected command sequence, args={args:?}");
+                        let (key, value_index) = match args.get(index + 1).map(String::as_str) {
+                            Some("-s") => (format!("server:{}", args[index + 2]), index + 3),
+                            Some("-t") => (format!("session:{}:{}", args[index + 2], args[index + 3]), index + 4),
+                            Some("-g") => (format!("global:{}", args[index + 2]), index + 3),
+                            other => panic!("unexpected set-option scope: {other:?}, args={args:?}"),
+                        };
+                        options.insert(key, args[value_index].clone());
+                        index = value_index + 1;
+                        if index < args.len() {
+                            assert_eq!(args[index], ";", "expected command separator, args={args:?}");
+                            index += 1;
+                        }
+                    }
+                    (true, String::new(), String::new())
+                }
+                Some("start-server") | Some("new-session") | Some("kill-session") => {
                     (true, String::new(), String::new())
                 }
                 Some("send-keys") if self.send_keys_fails => (
@@ -1268,17 +1302,17 @@ mod tests {
     }
 
     fn is_server_option(call: &[String], option: &str, value: &str) -> bool {
-        call.get(2).map(String::as_str) == Some("set-option")
-            && call.get(3).map(String::as_str) == Some("-s")
-            && call.get(4).map(String::as_str) == Some(option)
-            && call.get(5).map(String::as_str) == Some(value)
+        option_assignments(call).any(|assignment| assignment == ["-s", option, value])
     }
 
     fn is_global_option(call: &[String], option: &str, value: &str) -> bool {
-        call.get(2).map(String::as_str) == Some("set-option")
-            && call.get(3).map(String::as_str) == Some("-g")
-            && call.get(4).map(String::as_str) == Some(option)
-            && call.get(5).map(String::as_str) == Some(value)
+        option_assignments(call).any(|assignment| assignment == ["-g", option, value])
+    }
+
+    fn option_assignments(call: &[String]) -> impl Iterator<Item = &[String]> {
+        call[2..]
+            .split(|argument| argument == ";")
+            .filter_map(|command| command.strip_prefix(&["set-option".to_owned()]))
     }
 
     /// Boss-owned server options must be present in the recorded argv
@@ -1400,15 +1434,23 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair[0] == "-c" && Path::new(&pair[1]) == dir.path())
         );
-        assert!(is_server_option(&calls[4], "terminal-features[100]", "xterm*:extkeys"));
-        assert!(is_server_option(&calls[5], "extended-keys", "on"));
-        assert!(is_server_option(&calls[6], "focus-events", "on"));
-        assert_eq!(calls[7][2], "set-option");
-        assert_eq!(calls[7][5], "status");
-        assert_eq!(calls[7][6], "off");
-        assert_eq!(calls[8][5], "remain-on-exit");
-        assert_eq!(calls[8][6], "on");
-        assert_eq!(calls[9][5], "@boss_spawn_token");
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.get(2).map(String::as_str) == Some("set-option"))
+                .count(),
+            4
+        );
+        assert!(calls.iter().any(|call| {
+            option_assignments(call).any(|assignment| assignment == ["-t", COORDINATOR_SESSION_NAME, "status", "off"])
+        }));
+        assert!(calls.iter().any(|call| {
+            option_assignments(call)
+                .any(|assignment| assignment == ["-t", COORDINATOR_SESSION_NAME, "remain-on-exit", "on"])
+        }));
+        assert!(calls.iter().any(|call| {
+            option_assignments(call).any(|assignment| assignment.get(2).map(String::as_str) == Some(SPAWN_TOKEN_OPTION))
+        }));
         assert_extended_keys_applied(&calls);
     }
 
@@ -1533,23 +1575,16 @@ mod tests {
             .unwrap();
         assert_eq!(record.spawn_state, "created");
         let calls = server.calls();
-        assert!(
-            calls
-                .iter()
-                .any(|call| call.get(5).map(String::as_str) == Some("status")
-                    && call.get(6).map(String::as_str) == Some("off"))
-        );
-        assert!(
-            calls
-                .iter()
-                .any(|call| call.get(2).map(String::as_str) == Some("set-option")
-                    && call.get(5).map(String::as_str) == Some("@boss_spawn_token"))
-        );
-        assert!(
-            calls
-                .iter()
-                .any(|call| call.get(5).map(String::as_str) == Some("remain-on-exit"))
-        );
+        assert!(calls.iter().any(|call| {
+            option_assignments(call).any(|assignment| assignment == ["-t", COORDINATOR_SESSION_NAME, "status", "off"])
+        }));
+        assert!(calls.iter().any(|call| {
+            option_assignments(call)
+                .any(|assignment| assignment.get(2).map(String::as_str) == Some("@boss_spawn_token"))
+        }));
+        assert!(calls.iter().any(|call| {
+            option_assignments(call).any(|assignment| assignment.get(2).map(String::as_str) == Some("remain-on-exit"))
+        }));
     }
 
     #[tokio::test]
@@ -1565,15 +1600,13 @@ mod tests {
 
         let calls = server.calls();
         assert!(calls.iter().any(|call| {
-            call.get(2).map(String::as_str) == Some("set-option")
-                && call.get(5).map(String::as_str) == Some("status")
-                && call.get(6).map(String::as_str) == Some("off")
+            option_assignments(call).any(|assignment| assignment == ["-t", COORDINATOR_SESSION_NAME, "status", "off"])
         }));
         assert_extended_keys_applied(&calls);
     }
 
     #[tokio::test]
-    async fn restart_if_dead_on_a_live_session_reapplies_extended_keys() {
+    async fn restart_if_dead_on_a_live_session_converges_tmux_options() {
         let (db, tmux, server, dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
         db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus", None)
             .unwrap();
@@ -1584,6 +1617,18 @@ mod tests {
             .unwrap();
         assert!(replacement.is_none(), "a live session must not force reattach");
         assert_extended_keys_applied(&server.calls());
+
+        let calls_before_second_pass = server.calls().len();
+        let replacement = restart_if_dead(&spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe))
+            .await
+            .unwrap();
+        assert!(replacement.is_none(), "a live session must not force reattach");
+        assert!(
+            server.calls()[calls_before_second_pass..]
+                .iter()
+                .all(|call| call.get(2).map(String::as_str) != Some("set-option")),
+            "a second pass over converged options must not set any options"
+        );
     }
 
     #[tokio::test]

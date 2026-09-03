@@ -565,6 +565,42 @@ async fn standard_tmux_options_are_supported() {
 }
 
 #[tokio::test]
+async fn option_assignments_are_batched_into_one_tmux_invocation() {
+    let (tmux, runner) = tmux([success("")]);
+    tmux.set_options(&[
+        OptionSetting {
+            scope: OptionScope::Server,
+            option: "extended-keys",
+            value: "on",
+        },
+        OptionSetting {
+            scope: OptionScope::Session("boss-1"),
+            option: "status",
+            value: "off",
+        },
+    ])
+    .await
+    .unwrap();
+    assert_eq!(
+        runner.calls(),
+        vec![vec![
+            "-S",
+            TEST_SOCKET_PATH,
+            "set-option",
+            "-s",
+            "extended-keys",
+            "on",
+            ";",
+            "set-option",
+            "-t",
+            "boss-1",
+            "status",
+            "off"
+        ]]
+    );
+}
+
+#[tokio::test]
 async fn server_option_set_and_read_carry_no_session_target() {
     let (tmux, runner) = tmux([success(""), success("4242\n")]);
     tmux.set_server_option("@boss_engine_owner", "4242").await.unwrap();
