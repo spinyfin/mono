@@ -127,6 +127,10 @@ pub struct Tmux {
     program: PathBuf,
     runner: Arc<dyn CommandRunner>,
     server: ServerAddress,
+    /// Memoized result of [`Self::version`]. The resolved executable's
+    /// version cannot change under a running server, so callers that probe
+    /// it per-spawn (e.g. gating `source-file -t`) don't each fork `tmux -V`.
+    version: tokio::sync::OnceCell<TmuxVersion>,
 }
 
 impl std::fmt::Debug for Tmux {
@@ -195,6 +199,7 @@ impl Tmux {
             program,
             runner,
             server,
+            version: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -259,11 +264,19 @@ impl Tmux {
     }
 
     /// Probes the resolved executable's version before the engine accepts work.
+    ///
+    /// Memoized: the version of a resolved executable cannot change while
+    /// this handle is in use, so only the first call forks `tmux -V`.
     pub async fn version(&self) -> Result<TmuxVersion> {
-        let mut args = self.server_args();
-        args.push("-V".into());
-        let output = self.invoke(args).await?;
-        TmuxVersion::parse(&output.stdout)
+        self.version
+            .get_or_try_init(|| async {
+                let mut args = self.server_args();
+                args.push("-V".into());
+                let output = self.invoke(args).await?;
+                TmuxVersion::parse(&output.stdout)
+            })
+            .await
+            .copied()
     }
 
     /// Starts the private server without creating a window.
