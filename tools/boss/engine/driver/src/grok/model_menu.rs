@@ -98,11 +98,7 @@ pub(super) fn prompt_addendum_for_level(level: EffortLevel) -> Option<&'static s
     match level {
         EffortLevel::Trivial | EffortLevel::Small => None,
         EffortLevel::Medium => Some("Sketch a brief plan before you start editing."),
-        EffortLevel::Large | EffortLevel::Max => Some(
-            "Begin with a written plan. Identify the files you expect to touch and the \
-             order you'll touch them in. Confirm the approach against the work item's \
-             description before writing code.",
-        ),
+        EffortLevel::Large | EffortLevel::Max => Some(crate::LARGE_EFFORT_PROMPT_ADDENDUM),
     }
 }
 

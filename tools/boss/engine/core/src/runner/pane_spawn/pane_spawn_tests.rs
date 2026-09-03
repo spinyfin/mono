@@ -500,7 +500,7 @@ async fn untagged_row_spawn_matches_engine_default() {
             "/usr/bin/taskpolicy -b -p $$ >/dev/null 2>&1; \
                  [ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; \
                  [ -n \"$BOSS_WORKER_BIN_DIR\" ] && export PATH=\"$BOSS_WORKER_BIN_DIR:$PATH\"; \
-                 unset ANTHROPIC_API_KEY; claude --model {} --permission-mode auto --settings '{}' \"$(cat .claude/initial-prompt.txt)\"\n",
+                 unset ANTHROPIC_API_KEY; claude --model {} --disallowedTools=AskUserQuestion --permission-mode auto --settings '{}' \"$(cat .claude/initial-prompt.txt)\"\n",
             crate::driver::ClaudeDriver.descriptor().model_menu.engine_default,
             settings_path.display(),
         ),

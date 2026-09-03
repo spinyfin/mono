@@ -2,6 +2,31 @@
 
 use super::*;
 
+/// Each driver's `prompt_addendum_for_level` table must return the shared
+/// `LARGE_EFFORT_PROMPT_ADDENDUM` constant for `large`/`max`, not a forked
+/// copy of the same sentence. The wording-property test lives in
+/// `claude.rs`; this one is what would catch a driver re-forking its own
+/// literal.
+#[test]
+fn large_effort_addendum_is_shared_across_drivers() {
+    let codex = CodexDriver::default();
+    let grok = GrokDriver::default();
+    let drivers: [(&DriverDescriptor, &str); 3] = [
+        (ClaudeDriver.descriptor(), "claude"),
+        (codex.descriptor(), "codex"),
+        (grok.descriptor(), "grok"),
+    ];
+    for (descriptor, slug) in drivers {
+        for level in [EffortLevel::Large, EffortLevel::Max] {
+            assert_eq!(
+                (descriptor.model_menu.prompt_addendum_for_level)(level),
+                Some(LARGE_EFFORT_PROMPT_ADDENDUM),
+                "{slug} {level:?} addendum must be the shared constant, not a forked literal",
+            );
+        }
+    }
+}
+
 /// The trait default must be the *safe* answer. A new driver that says
 /// nothing about mid-turn stdin gets `Rejects`, so the engine never writes
 /// into a pane whose foreground process might leave the bytes in the tty
