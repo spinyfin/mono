@@ -533,8 +533,11 @@ pub fn render_triage_claude_md(lease_id: &str) -> String {
          Lease held for the lifetime of this run. Do not lease, release,\n\
          or mutate cube state.\n\
          \n\
+         {absolute_paths}\
+         \n\
          {boundaries_and_coordinator}",
         lease = lease_id,
+        absolute_paths = crate::prompt_fragments::absolute_paths_fragment(),
         boundaries_and_coordinator = crate::prompt_fragments::boundaries_and_coordinator_fragment(),
     )
 }

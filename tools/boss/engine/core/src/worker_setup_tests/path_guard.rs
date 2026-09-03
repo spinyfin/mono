@@ -175,6 +175,90 @@ fn run_path_guard_raw(data_dir: &std::path::Path, stdin: &str) -> (String, Strin
 }
 
 #[test]
+fn path_guard_blocks_a_relative_read_whose_cwd_is_the_data_dir() {
+    // This is the case the data-dir fence now leans on the hook for.
+    //
+    // The `Read(<data dir>/**)` deny globs were removed from the worker
+    // settings (any `Read()` deny rule arms Claude Code's "compound command
+    // contains `cd` with a relative file read" permission prompt and stalls
+    // an unattended worker). Those globs never covered this shape anyway: a
+    // literal-path glob cannot match `state.db` — only the hook can, because
+    // it canonicalises the candidate path against the call's own `cwd`.
+    let data = TempDir::new().unwrap();
+    std::fs::write(data.path().join("state.db"), b"x").unwrap();
+
+    let (decision, reason) = run_path_guard(
+        data.path(),
+        serde_json::json!({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "state.db"},
+            "cwd": data.path().display().to_string(),
+        }),
+    );
+    assert_eq!(
+        decision, "block",
+        "a Read of a relative path resolving into the data dir must be blocked: {reason}",
+    );
+    assert!(reason.contains("engine-owned"), "{reason}");
+
+    // Same shape one level deeper, and via `..` — canonicalisation, not
+    // string matching, is what makes the boundary hold.
+    let nested = data.path().join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let (decision, reason) = run_path_guard(
+        data.path(),
+        serde_json::json!({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "../state.db"},
+            "cwd": nested.display().to_string(),
+        }),
+    );
+    assert_eq!(
+        decision, "block",
+        "a `..` escape back into the data dir must be blocked"
+    );
+    assert!(reason.contains("engine-owned"), "{reason}");
+}
+
+#[test]
+fn path_guard_approves_a_relative_read_outside_the_data_dir() {
+    // The belt above must not become a blanket refusal of relative reads:
+    // an ordinary relative `Read` inside the workspace still approves.
+    let data = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let (decision, reason) = run_path_guard(
+        data.path(),
+        serde_json::json!({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "src/main.rs"},
+            "cwd": workspace.path().display().to_string(),
+        }),
+    );
+    assert_eq!(
+        decision, "approve",
+        "ordinary relative reads must not be disturbed: {reason}"
+    );
+}
+
+#[test]
+fn path_guard_blocks_a_bash_cd_then_relative_read_of_the_data_dir() {
+    // The compound shape Claude Code's own classifier reacts to: `cd <data
+    // dir> && cat state.db`. The literal-path deny globs could never see the
+    // relative `state.db`; the hook resolves the `cd` target and blocks.
+    let data = TempDir::new().unwrap();
+    let command = format!("cd {} && cat state.db", data.path().display());
+    let (decision, reason) = run_path_guard(
+        data.path(),
+        serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}}),
+    );
+    assert_eq!(
+        decision, "block",
+        "cd-into-data-dir then read must be blocked: {reason}"
+    );
+    assert!(reason.contains("engine-owned"), "{reason}");
+}
+
+#[test]
 fn path_guard_blocks_apply_patch_writing_into_the_data_dir() {
     let data = TempDir::new().unwrap();
     let target = data.path().join("state.db");

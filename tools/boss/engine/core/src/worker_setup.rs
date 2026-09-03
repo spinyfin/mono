@@ -24,14 +24,17 @@
 //!   runtime state. The engine points the spawned session at it with
 //!   `claude --settings <abs-path>`.
 //!
-//!   On top of the `deny` globs, the `PreToolUse` hooks include a
-//!   *deterministic* Boss-data-dir gate (see [`PATH_GUARD_SCRIPT`]): a
-//!   small script that canonicalises the working dir and every candidate
-//!   path and blocks any tool call that resolves inside the Boss data
-//!   dir, regardless of which tool dresses up the access or whether the
-//!   session model spots the path string. The script is written next to
+//!   The Boss-data-dir boundary itself is enforced by a *deterministic*
+//!   `PreToolUse` gate (see [`PATH_GUARD_SCRIPT`]): a small script that
+//!   canonicalises the working dir and every candidate path and blocks any
+//!   tool call that resolves inside the Boss data dir, regardless of which
+//!   tool dresses up the access, whether the path is relative, or whether
+//!   the session model spots the path string. The script is written next to
 //!   the settings file by [`write_workspace_files`] / refreshed by
-//!   [`heal_worker_settings_json`].
+//!   [`heal_worker_settings_json`]. The data-dir `deny` globs are a cheap
+//!   literal-path belt layered on top of that gate, never a substitute for
+//!   it — [`deny_rules`] emits them only when the gate is actually wired
+//!   into the same file (see [`DataDirFence`]).
 //!
 //!   This file is deliberately **never** written into the workspace
 //!   tree — not as `.claude/settings.json`, not as
@@ -246,6 +249,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
         return crate::pr_review::render_reviewer_claude_md(
             &input.lease_id,
             &input.workspace_path.display().to_string(),
+            crate::prompt_fragments::absolute_paths_fragment(),
             crate::prompt_fragments::boundaries_and_coordinator_fragment(),
         );
     }
@@ -367,6 +371,8 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          \n\
          Lease held for the lifetime of this run. Do not lease, release,\n\
          or mutate cube state.\n\
+         \n\
+         {absolute_paths}\
          \n\
          ## VCS\n\
          \n\
@@ -569,7 +575,8 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          \n\
          The coordinator may probe this session between turns. Treat probes\n\
          as questions from a human reviewer — short, specific answers.\n\
-         {draft_directive}"
+         {draft_directive}",
+        absolute_paths = crate::prompt_fragments::absolute_paths_fragment(),
     )
 }
 
@@ -590,6 +597,92 @@ enum EngineDataDirSandbox {
     Enabled,
     /// Omit them (remote SSH workers).
     Disabled,
+}
+
+/// How the Boss-data-dir boundary is enforced for the settings file being
+/// rendered.
+///
+/// The boundary itself is [`PATH_GUARD_SCRIPT`], installed as a matcher-`*`
+/// `PreToolUse` hook: it is tool-agnostic and canonicalises every candidate
+/// path against the call's `cwd`, so it covers `Read` (and a relative path
+/// after a `cd`) in a way a literal deny glob cannot. The `Edit(...)` deny
+/// globs in [`deny_rules`] are a cheap literal-path belt *on top of* that
+/// hook, never a substitute for it.
+///
+/// This type exists so the belt cannot outlive the thing it is a belt for.
+/// Before the deny list is built, [`data_dir_fence`] checks the hook is
+/// actually in the file it is about to describe; a spawn path that
+/// suppresses hooks therefore cannot leave behind a settings file whose deny
+/// list still claims to fence the data dir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataDirFence {
+    /// Enforced, by the deterministic path-guard hook in this same settings
+    /// file. The `Edit(...)` deny globs ride along as a literal-path belt.
+    PathGuardHook,
+    /// Not enforced through this file — and so the deny list must not
+    /// pretend otherwise. Two cases, neither a gap:
+    ///
+    /// - a remote SSH worker ([`EngineDataDirSandbox::Disabled`]): there is
+    ///   no engine data dir on that host to fence;
+    /// - a driver whose interception guards do not live in this file at all
+    ///   (a `DriverOwned` hook wiring, or a byte-stream ingress such as
+    ///   Codex's). Those drivers never receive this file — only Claude's
+    ///   spawn plan passes `--settings` — and they arm the same boundary in
+    ///   their own `write_permission_config`.
+    NotThroughThisFile,
+}
+
+/// Resolve the [`DataDirFence`] for a settings file, from what was actually
+/// wired into it.
+///
+/// `guards_land_in_this_file` is the same decision
+/// [`merges_hooks_into_worker_settings`] makes: whether the driver declared
+/// this settings file as the destination for its hook wiring (and therefore
+/// for the `PreToolUse` interception guards layered onto it).
+/// `path_guard_hook_installed` is read back off the hooks that were actually
+/// produced, not assumed from the driver's identity.
+///
+/// Panics when the engine-data-dir sandbox is requested and this file *is*
+/// the guard destination, yet no path-guard hook made it in. That
+/// combination means the boundary is unenforced, and a boundary that cannot
+/// be enforced must fail loudly rather than ship a settings file whose deny
+/// list implies a fence that is not there. It is unreachable today (Claude
+/// is the only `WorkerSettingsFile`-destination driver, and it emits the
+/// hook whenever `data_dir` and `path_guard_script` are both set, which is
+/// exactly when the sandbox is enabled) — it exists to catch the next spawn
+/// path that changes one of those without the other.
+fn data_dir_fence(
+    sandbox: EngineDataDirSandbox,
+    guards_land_in_this_file: bool,
+    path_guard_hook_installed: bool,
+) -> DataDirFence {
+    if sandbox == EngineDataDirSandbox::Disabled || !guards_land_in_this_file {
+        return DataDirFence::NotThroughThisFile;
+    }
+    assert!(
+        path_guard_hook_installed,
+        "engine-data-dir sandbox is enabled and this settings file is the interception-guard \
+         destination, but no {PATH_GUARD_SCRIPT_NAME} PreToolUse hook was wired into it. The \
+         Boss data-dir boundary is enforced by that hook (the deny globs are only a literal-path \
+         belt), so rendering these settings would leave the worker unfenced. Fix the spawn path \
+         that dropped the hook; do not make the fence advisory.",
+    );
+    DataDirFence::PathGuardHook
+}
+
+/// True when `entry` is a `PreToolUse` hook entry that runs the
+/// deterministic Boss-data-dir gate script.
+///
+/// Matches on the gate script's filename inside the hook command, which is
+/// how the command is built (`… python3 <abs path>/boss-path-guard.py`) and
+/// how the existing hook tests recognise it.
+fn hook_entry_runs_path_guard(entry: &serde_json::Value) -> bool {
+    entry["hooks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|hook| hook["command"].as_str())
+        .any(|command| command.contains(PATH_GUARD_SCRIPT_NAME))
 }
 
 /// Render the worker settings file. Wires every claude hook event to
@@ -675,6 +768,10 @@ fn settings_value(
     // guardrail loss.
     let layer_into_settings = merges_hooks_into_worker_settings(&ingress);
     let mut hooks = hooks_map_for_ingress(ingress);
+    // Read back off the wiring that was actually produced, never assumed
+    // from the driver's identity — this is what `data_dir_fence` checks the
+    // deny globs against.
+    let mut path_guard_hook_installed = false;
 
     if layer_into_settings {
         // ToolUseInterception (design §1.5): delegate guard wiring to the driver.
@@ -710,11 +807,20 @@ fn settings_value(
             run_id: Some(input.run_id.clone()),
             workspace_path: Some(input.workspace_path.clone()),
         });
+        path_guard_hook_installed = interception_wiring
+            .pre_tool_use_hooks
+            .iter()
+            .any(hook_entry_runs_path_guard);
         pre_tool_use_hooks.extend(interception_wiring.pre_tool_use_hooks);
     }
 
+    // The Boss-data-dir deny globs describe a boundary the path-guard hook
+    // enforces; resolving the fence here ties the two together explicitly
+    // instead of leaving them to agree by coincidence.
+    let fence = data_dir_fence(sandbox, layer_into_settings, path_guard_hook_installed);
+
     let mut value = serde_json::json!({
-        "permissions": permissions_value(input, sandbox),
+        "permissions": permissions_value(input, fence),
     });
     // `hooks` is the driver-produced map (all seven lifecycle events wired to
     // the forwarder), with the interception guards layered onto `PreToolUse`
@@ -798,17 +904,17 @@ fn pre_tool_use_array(hooks: &mut serde_json::Map<String, serde_json::Value>) ->
 ///   [`crate::driver::ClaudeDriver::spawn_invocation`]) so the mode cannot be
 ///   downgraded to `auto`/`--dangerously-skip-permissions`, which would defeat
 ///   the allowlist.
-fn permissions_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> serde_json::Value {
+fn permissions_value(input: &WorkerSetupInput, fence: DataDirFence) -> serde_json::Value {
     if input.worker_kind == WorkerKind::AnswerAgent {
         serde_json::json!({
             "defaultMode": "dontAsk",
             "allow": answer_agent_allow_rules(),
-            "deny": deny_rules(input, sandbox),
+            "deny": deny_rules(input, fence),
         })
     } else {
         serde_json::json!({
             "defaultMode": "auto",
-            "deny": deny_rules(input, sandbox),
+            "deny": deny_rules(input, fence),
         })
     }
 }
@@ -820,33 +926,59 @@ fn permissions_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) ->
 /// parent — both live under `~/Library/Application Support/Boss/` in
 /// production, but tests / future relocations get the same treatment
 /// without a hardcoded path.
-fn deny_rules(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> Vec<String> {
+///
+/// `fence` says whether the Boss-data-dir boundary is enforced for the
+/// settings file being rendered, and by what — see [`DataDirFence`]. The
+/// data-dir globs below are emitted only for
+/// [`DataDirFence::PathGuardHook`], i.e. only when the deterministic gate
+/// that actually enforces the boundary is in the same file.
+fn deny_rules(input: &WorkerSetupInput, fence: DataDirFence) -> Vec<String> {
     let mut rules = Vec::new();
 
-    // The engine-data-dir globs only make sense for a local worker (the
-    // events socket's parent is the Boss support dir). A remote worker's
+    // The engine-data-dir globs only make sense for a local worker whose
+    // path-guard hook is installed in this very settings file (the events
+    // socket's parent is then the Boss support dir). A remote worker's
     // `events_socket_path` is the forwarded `/tmp` socket, so these would
     // wrongly fence the worker off all of `/tmp`; skip them there. The
     // static `bossctl` / `boss engine` guards below still apply to both.
-    if sandbox == EngineDataDirSandbox::Enabled
+    if fence == DataDirFence::PathGuardHook
         && let Some(state_dir) = input.events_socket_path.parent()
     {
         let dir = state_dir.display().to_string();
         // Both the bare directory and the `**` subtree are listed
         // explicitly: glob `**` doesn't match the directory itself in
-        // every harness, and we want a `Read("…/Boss")` ls attempt to
-        // be denied just like a `Read("…/Boss/state.db")`.
+        // every harness, and we want an `Edit("…/Boss")` attempt to
+        // be denied just like an `Edit("…/Boss/state.db")`.
         //
-        // Only `Read` and `Edit` are listed — `Write(path)` is inert in
-        // Claude Code's permission engine: file-editing tool calls (Edit AND
-        // Write) are matched only against `Edit(path)` rules, so a
-        // `Write(path)` deny rule matches nothing and was silently dead
-        // weight (surfaced as a startup warning). `Edit(path)` alone covers
-        // both tools.
-        for prefix in ["Read", "Edit"] {
-            rules.push(format!("{prefix}({dir})"));
-            rules.push(format!("{prefix}({dir}/**)"));
-        }
+        // Only `Edit` is listed.
+        //
+        // `Write(path)` is inert in Claude Code's permission engine:
+        // file-editing tool calls (Edit AND Write) are matched only against
+        // `Edit(path)` rules, so a `Write(path)` deny rule matches nothing
+        // and was silently dead weight (surfaced as a startup warning).
+        // `Edit(path)` alone covers both tools.
+        //
+        // `Read(path)` is deliberately NOT emitted. Claude Code 2.1.257
+        // added a permission-classifier branch that refuses to auto-approve
+        // any compound Bash command pairing a `cd` with a relative file read
+        // whenever the session carries *any* `Read()` deny rule — the
+        // predicate is existence-only over `alwaysDenyRules`, so no
+        // narrowing of the glob and no compensating `permissions.allow`
+        // entry can suppress it, and 2.1.259 widened the same predicate to a
+        // non-classifier-approvable circuit breaker over `grep`/`rg`/`diff`/
+        // `git`/`cp`/`mv`. Every `--permission-mode auto` worker stalled on a
+        // permission dialog with no human to answer it. The read side of the
+        // fence is not weakened by dropping the glob: it is carried by
+        // [`PATH_GUARD_SCRIPT`], which is tool-agnostic (it reads
+        // `file_path` / `notebook_path` / `path` from every tool, `Read`
+        // included) and canonicalises `~`, `$VAR`, `..` and symlinks against
+        // the call's `cwd` — so it also catches the relative-path-after-`cd`
+        // shape the literal glob never could. That dependency is not a
+        // coincidence to be rediscovered later: [`data_dir_fence`] refuses
+        // to hand back [`DataDirFence::PathGuardHook`] unless the hook is
+        // actually in the rendered file.
+        rules.push(format!("Edit({dir})"));
+        rules.push(format!("Edit({dir}/**)"));
     }
 
     // `bossctl` is the coordinator's CLI surface (probes, agents
