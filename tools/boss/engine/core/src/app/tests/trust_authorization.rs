@@ -1,5 +1,5 @@
 #[cfg(target_os = "macos")]
-use super::super::server::pid_is_alive;
+use super::super::process_signals::pid_is_alive;
 use super::*;
 
 #[test]
