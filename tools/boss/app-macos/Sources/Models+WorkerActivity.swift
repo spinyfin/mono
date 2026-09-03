@@ -66,6 +66,10 @@ enum WorkerActivity: String, Hashable {
 enum AgentActivityState: Equatable {
     case active
     case waiting(reason: String)
+    /// The worker occupies a slot but has not supplied a hook-derived state.
+    /// This is distinct from both working and waiting: after re-adoption the
+    /// engine knows the process exists, but not what it is currently doing.
+    case unknown(reason: String)
     case errored(reason: String)
     case none
     /// The row is `status=todo, autostart=true` and no worker slot is
@@ -134,7 +138,7 @@ enum AgentActivityState: Equatable {
                     self = .waiting(reason: "Worker idle between turns")
                 }
             case .spawning:
-                self = .waiting(reason: "Worker spawning")
+                self = .unknown(reason: "Worker state not yet reported")
             case .errored:
                 self = .errored(reason: "Worker reported an error")
             case .terminated:
@@ -161,10 +165,14 @@ enum AgentActivityState: Equatable {
     ///    is watching for. This must precede the bound-slot shortcut
     ///    below; it clears on its own once the worker resumes and the
     ///    activity flips back to `.working`.
-    /// 3. A bound live worker otherwise reads as active.
-    /// 4. Conflict / CI-remediation runs without a bound live worker
+    /// 3. A slot-bound worker which has not reported a hook-derived state
+    ///    reads as unknown rather than being guessed as active: after
+    ///    re-adoption, `.spawning` means the engine knows the process exists
+    ///    but not what it is doing.
+    /// 4. A bound live worker otherwise reads as active.
+    /// 5. Conflict / CI-remediation runs without a bound live worker
     ///    read as their respective "resolving" waits.
-    /// 5. Fall back to the runtime+liveState mapping.
+    /// 6. Fall back to the runtime+liveState mapping.
     static func forDoingCard(
         runtime: WorkTaskRuntime?,
         liveState: WorkerLiveState?,
@@ -178,6 +186,9 @@ enum AgentActivityState: Equatable {
         }
         if liveState?.activity == .waitingForInput {
             return .waiting(reason: "Waiting on user input")
+        }
+        if liveState?.activity == .spawning {
+            return .unknown(reason: "Worker state not yet reported")
         }
         if liveState?.slotId != nil {
             return .active
@@ -199,6 +210,8 @@ enum AgentActivityState: Equatable {
         case .active:
             return "Agent is actively working"
         case .waiting(let reason):
+            return reason
+        case .unknown(let reason):
             return reason
         case .errored(let reason):
             return reason

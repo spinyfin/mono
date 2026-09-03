@@ -102,7 +102,6 @@ use boss_tmux::{DisplayField, TMUX_SPAWN_TOKEN_ENV, Tmux};
 use crate::coordinator::{ExecutionCoordinator, slot_id_from_worker_id};
 use crate::dead_pid_sweep::{PidStatus, probe_pid};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, ENGINE_BOOT_EXECUTION_ID, Outcome, Stage};
-use crate::live_worker_state::{LiveSpawnRouting, ReadoptionEvidence, attributed_pool_label};
 use crate::spawn_flow::{TMUX_SESSION_SCHEMA, WorkerSpawner};
 use crate::work::{TmuxRunHandle, WorkDb};
 use crate::worker_readoption::LiveWorkerConvergence;
@@ -1008,45 +1007,16 @@ async fn adopt_one<S>(
             .require(crate::effort::ENGINE_DEFAULT_DRIVER)
             .ok()
     });
-
-    if let Some(live_states) = spawner.live_worker_state_registry() {
-        let binding = work_db
-            .get_work_item(&execution.work_item_id)
-            .ok()
-            .map(|item| boss_protocol::WorkItemBinding {
-                work_item_id: execution.work_item_id.clone(),
-                work_item_name: crate::runner::work_item_name(&item).to_owned(),
-                execution_id: execution_id.to_owned(),
-            });
-        let has_source_automation = matches!(
-            work_db.source_automation_id_for_work_item(&execution.work_item_id),
-            Ok(Some(_))
-        );
-        let pool = attributed_pool_label(execution.kind.clone(), has_source_automation);
-        let model_label = driver
-            .as_ref()
-            .map(|driver| driver.descriptor().label.to_owned())
-            .unwrap_or_else(|| crate::effort::ENGINE_DEFAULT_DRIVER.to_owned());
-        let awaiting_input_capable = driver.as_ref().is_some_and(|driver| {
-            driver
-                .capabilities()
-                .provides(crate::driver::Capability::AwaitingInputSignal)
-        });
-        live_states.register_readoption(
-            slot_id,
-            execution_id.to_owned(),
-            model_label,
-            shell_pid,
-            binding,
-            awaiting_input_capable,
-            LiveSpawnRouting::new(pool, execution.kind.as_str()),
-            ReadoptionEvidence::LiveShellPid,
-        );
-        spawner.publish_live_worker_states().await;
-        if let Some(driver) = driver {
-            spawner.start_live_status_slot(slot_id, execution_id, driver);
-        }
-    }
+    crate::tmux_adoption_live_state::register_adopted_live_state(
+        work_db,
+        spawner,
+        &execution,
+        execution_id,
+        slot_id,
+        shell_pid,
+        driver,
+    )
+    .await;
 
     outcome.adopted_execution_ids.insert(execution_id.to_owned());
 
@@ -1933,6 +1903,9 @@ mod tests {
     /// Kept in its own file to stay under this file's line-count budget.
     #[path = "tmux_adoption_pid_write_failure_tests.rs"]
     mod pid_write_failure_tests;
+
+    #[path = "tmux_adoption_semantic_progress_tests.rs"]
+    mod semantic_progress_tests;
 
     /// The cardinal case: engine restarts, the worker's tmux session (and its
     /// non-terminal execution row) survived. The pass must rebuild the slot

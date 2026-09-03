@@ -152,6 +152,7 @@ pub mod resolution_signal_capture;
 pub mod rotating_file;
 pub mod run_reconcile;
 pub mod runner;
+pub mod semantic_progress;
 pub mod settings;
 pub mod sleep_assertion;
 pub mod spawn_ack_sweep;
@@ -174,6 +175,7 @@ pub mod terminal_work_sweep;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tmux_adoption;
+pub(crate) mod tmux_adoption_live_state;
 pub(crate) mod tmux_session_options;
 pub use boss_transcript_tail as transcript_tail;
 pub mod trace_rotation;

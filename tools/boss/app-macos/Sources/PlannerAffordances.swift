@@ -788,6 +788,11 @@ struct AgentActivityDot: View {
                     .font(.system(size: 9, weight: .medium))
                     .foregroundStyle(Color(nsColor: .tertiaryLabelColor))
                     .frame(width: 7, height: 7)
+            } else if case .unknown = state {
+                Image(systemName: "questionmark.circle")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(Color(nsColor: .tertiaryLabelColor))
+                    .frame(width: 7, height: 7)
             } else {
                 Circle()
                     .fill(fillColor)
@@ -804,6 +809,8 @@ struct AgentActivityDot: View {
             return .green
         case .waiting:
             return .yellow
+        case .unknown:
+            return Color(nsColor: .tertiaryLabelColor)
         case .errored:
             return .red
         case .none:
