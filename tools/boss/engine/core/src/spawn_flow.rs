@@ -155,11 +155,34 @@ const WORKER_EXTRA_ENV_ALLOWLIST: &[&str] = &[
 /// forgotten `-m` into a fast, recoverable error.
 const WORKER_EDITOR_NOOP: &str = "false";
 
+/// Set `env[key] = value`, overwriting an existing entry rather than
+/// pushing a duplicate. A later duplicate wins for the shell env prefix a
+/// worker pane actually runs under, but any consumer that does
+/// `.find(|e| e.key == ..)` (e.g. the `worker_bin_dir_is_prepended_ahead_of_the_sanitized_path`
+/// test, and any future one) sees the FIRST match — so a duplicate key is
+/// never safe to leave behind even when shell semantics happen to paper
+/// over it.
+fn set_env_var(env: &mut Vec<EnvVar>, key: &str, value: String) {
+    if let Some(existing) = env.iter_mut().find(|e| e.key == key) {
+        existing.value = value;
+    } else {
+        env.push(EnvVar {
+            key: key.to_owned(),
+            value,
+        });
+    }
+}
+
 /// Propagate the running app's bundled CLI directory into a worker env.
 ///
 /// When `boss_bin_dir` is non-empty (installed mode: set by the macOS app
 /// to `…/Boss.app/Contents/Resources/bin`):
-/// - export `BOSS_BIN_DIR` and `BOSS_BIN` (`$BOSS_BIN_DIR/boss`)
+/// - export `BOSS_BIN_DIR`, `BOSS_BIN` (`$BOSS_BIN_DIR/boss`), and `CUBE_BIN`
+///   (`$BOSS_BIN_DIR/cube`) — the bundle ships both CLIs side by side, so a
+///   worker whose per-workspace launcher dir write later fails (see
+///   `start_worker`'s `worker_bin_dir` handling below) still has a
+///   bundle-derived `CUBE_BIN` to name, rather than a prompt that names an
+///   unset variable.
 /// - prepend the directory to `PATH` so bare `boss` hits the
 ///   version-matched copy ahead of any sanitized-PATH fallback. `bossctl`
 ///   also ships in this directory, but stays coordinator-only: it is never
@@ -173,14 +196,9 @@ fn apply_boss_bin_dir_to_worker_env(env: &mut Vec<EnvVar>, boss_bin_dir: Option<
     let Some(boss_bin_dir) = boss_bin_dir.filter(|d| !d.is_empty()) else {
         return;
     };
-    env.push(EnvVar {
-        key: "BOSS_BIN_DIR".into(),
-        value: boss_bin_dir.to_owned(),
-    });
-    env.push(EnvVar {
-        key: "BOSS_BIN".into(),
-        value: format!("{boss_bin_dir}/boss"),
-    });
+    set_env_var(env, "BOSS_BIN_DIR", boss_bin_dir.to_owned());
+    set_env_var(env, "BOSS_BIN", format!("{boss_bin_dir}/boss"));
+    set_env_var(env, "CUBE_BIN", format!("{boss_bin_dir}/cube"));
     if let Some(path_entry) = env.iter_mut().find(|e| e.key == "PATH") {
         path_entry.value = format!("{boss_bin_dir}:{}", path_entry.value);
     }
@@ -759,20 +777,26 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         }
         // Name the binaries, not a PATH entry. A driver shell snapshot can
         // demote the launcher dir (Codex does this today); `"$BOSS_BIN"` /
-        // `"$CUBE_BIN"` still exec the launchers. Pushed after the bundle
-        // `BOSS_BIN` so a BTreeMap collect last-wins on duplicate keys.
-        env.push(EnvVar {
-            key: boss_engine_worker_bin::BOSS_BIN_ENV.into(),
-            value: boss_engine_worker_bin::boss_bin_in(Path::new(&worker_bin_dir))
+        // `"$CUBE_BIN"` still exec the launchers. Overwrites the bundle
+        // `BOSS_BIN`/`CUBE_BIN` set above (if any) rather than pushing a
+        // duplicate key: a duplicate is last-wins for the shell env prefix a
+        // worker pane runs under, but any `.find(|e| e.key == ..)` consumer
+        // — including this crate's own tests — sees the FIRST match, which
+        // would silently be the bundle path instead of the launcher.
+        set_env_var(
+            &mut env,
+            boss_engine_worker_bin::BOSS_BIN_ENV,
+            boss_engine_worker_bin::boss_bin_in(Path::new(&worker_bin_dir))
                 .display()
                 .to_string(),
-        });
-        env.push(EnvVar {
-            key: boss_engine_worker_bin::CUBE_BIN_ENV.into(),
-            value: boss_engine_worker_bin::cube_bin_in(Path::new(&worker_bin_dir))
+        );
+        set_env_var(
+            &mut env,
+            boss_engine_worker_bin::CUBE_BIN_ENV,
+            boss_engine_worker_bin::cube_bin_in(Path::new(&worker_bin_dir))
                 .display()
                 .to_string(),
-        });
+        );
     }
 
     let claimed_slot = input.slot_id;
@@ -2245,6 +2269,12 @@ mod tests {
             env.iter().find(|e| e.key == "BOSS_BIN").map(|e| e.value.as_str()),
             Some("/tmp/fake-boss-app/Contents/Resources/bin/boss"),
         );
+        assert_eq!(
+            env.iter().find(|e| e.key == "CUBE_BIN").map(|e| e.value.as_str()),
+            Some("/tmp/fake-boss-app/Contents/Resources/bin/cube"),
+            "a bundle-derived CUBE_BIN must exist even if the per-workspace launcher dir write \
+             later fails, so a rendered prompt never names an unset variable",
+        );
         let path = env.iter().find(|e| e.key == "PATH").expect("PATH").value.as_str();
         assert_eq!(
             path,
@@ -2262,6 +2292,45 @@ mod tests {
         assert_eq!(untouched.len(), 1);
         assert_eq!(untouched[0].value, WORKER_SANITIZED_PATH);
         assert!(!untouched.iter().any(|e| e.key == "BOSS_BIN" || e.key == "BOSS_BIN_DIR"));
+    }
+
+    /// `set_env_var` must overwrite an existing entry in place rather than
+    /// pushing a duplicate: a `.find(|e| e.key == ..)` consumer sees the
+    /// FIRST match, so a stale duplicate would silently win over a later,
+    /// more-specific value (the per-workspace launcher overwriting the
+    /// bundle path from `apply_boss_bin_dir_to_worker_env`).
+    #[test]
+    fn set_env_var_overwrites_rather_than_duplicates() {
+        let mut env = vec![EnvVar {
+            key: "PATH".into(),
+            value: WORKER_SANITIZED_PATH.into(),
+        }];
+        apply_boss_bin_dir_to_worker_env(&mut env, Some("/tmp/fake-boss-app/Contents/Resources/bin"));
+        assert_eq!(env.iter().filter(|e| e.key == "BOSS_BIN").count(), 1);
+        assert_eq!(env.iter().filter(|e| e.key == "CUBE_BIN").count(), 1);
+
+        set_env_var(&mut env, "BOSS_BIN", "/tmp/boss-worker-settings/bin/boss".into());
+        set_env_var(&mut env, "CUBE_BIN", "/tmp/boss-worker-settings/bin/cube".into());
+
+        assert_eq!(
+            env.iter().filter(|e| e.key == "BOSS_BIN").count(),
+            1,
+            "must overwrite, not duplicate, BOSS_BIN"
+        );
+        assert_eq!(
+            env.iter().filter(|e| e.key == "CUBE_BIN").count(),
+            1,
+            "must overwrite, not duplicate, CUBE_BIN"
+        );
+        assert_eq!(
+            env.iter().find(|e| e.key == "BOSS_BIN").map(|e| e.value.as_str()),
+            Some("/tmp/boss-worker-settings/bin/boss"),
+            "the per-workspace launcher must win over the bundle path"
+        );
+        assert_eq!(
+            env.iter().find(|e| e.key == "CUBE_BIN").map(|e| e.value.as_str()),
+            Some("/tmp/boss-worker-settings/bin/cube"),
+        );
     }
 
     #[tokio::test]

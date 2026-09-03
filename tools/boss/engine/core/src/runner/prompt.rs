@@ -45,7 +45,7 @@ pub(super) struct ExecutionPromptParams<'a> {
     /// [`worker_escalation_protocol_directive`], the two Bazel pre-push gate
     /// blurbs, and [`no_op_completion_directive`]'s pointer. `false` (the
     /// flag's registry default) reproduces the exact marker-only
-    /// text; `true` teaches the `\"$BOSS_BIN\" propose` verbs instead — see those
+    /// text; `true` teaches the `"$BOSS_BIN" propose` verbs instead — see those
     /// functions' docs. This is the OTHER half of the flag: the engine's
     /// read path (`crate::completion::WorkerCompletionHandler::detect_and_file_worker_signals`)
     /// is gated by the same flag name read directly from
@@ -58,7 +58,7 @@ pub(super) struct ExecutionPromptParams<'a> {
     /// prompt half of the deferred-scope seam migration (design
     /// implementation task 9): [`deferred_scope_directive`]. `false` (the
     /// flag's registry default) reproduces the exact marker-only text;
-    /// `true` teaches `\"$BOSS_BIN\" propose deferred-scope` instead. This is the
+    /// `true` teaches `"$BOSS_BIN" propose deferred-scope` instead. This is the
     /// OTHER half of the flag: the engine's read path
     /// (`crate::completion::WorkerCompletionHandler::detect_and_record_deferred_scope`)
     /// is gated by the same flag name read directly from
@@ -70,7 +70,7 @@ pub(super) struct ExecutionPromptParams<'a> {
     /// prompt half of the follow-ups seam migration (design implementation
     /// task 10): [`followups_emission_block`]. `false` (the flag's registry
     /// default) reproduces the exact structured-output-artifact-primary /
-    /// `FOLLOWUPS:`-sentinel-fallback text; `true` teaches `\"$BOSS_BIN\" propose
+    /// `FOLLOWUPS:`-sentinel-fallback text; `true` teaches `"$BOSS_BIN" propose
     /// followup-task` instead. This is the OTHER half of the flag:
     /// `crate::completion::pr_transition`'s followups block, which counts a
     /// fallback hit whenever its legacy chain lands a follow-up not already
@@ -442,6 +442,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
             /* test_command */ None,
         );
     }
+    let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     let mut prompt = String::new();
     prompt.push_str("You are a reusable Boss worker running one execution inside a dedicated repo workspace.\n");
     prompt.push_str("The current session cwd is already set to that workspace.\n");
@@ -467,11 +468,11 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
              After leasing your workspace:\n\
              ```\n\
              jj git fetch\n\
-             cube workspace goto --pr {pr_number}   # lands you on the PR branch\n\
+             {cube} workspace goto --pr {pr_number}   # lands you on the PR branch\n\
              ```\n\
              Then make your changes on that branch and push:\n\
              ```\n\
-             cube pr update --branch <branch-name>\n\
+             {cube} pr update --branch <branch-name>\n\
              ```\n\
              \n\
              If the branch cannot be resumed (deleted upstream, conflict you cannot resolve, etc.),\n\
@@ -681,7 +682,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
                 .unwrap_or_else(|| "?".into());
             prompt.push_str(&format!(
                 "\nAcceptance criterion: when you believe the work is done, the deliverable is a PR URL.\n\
-                 - Push your commits to the existing PR branch with `cube pr update --branch <branch-name>` (see the ## RESUME EXISTING PR block above). Do NOT open a new PR.\n\
+                 - Push your commits to the existing PR branch with `{cube} pr update --branch <branch-name>` (see the ## RESUME EXISTING PR block above). Do NOT open a new PR.\n\
                  - Confirm the PR is updated with `gh pr view {pr_number}` (pass `-R owner/repo` since bare gh calls need it in a jj workspace — use `jj git remote` to find the slug, or check the PR URL above).\n\
                  - As soon as cube prints the PR URL, record it by writing the file `{pr_url_artifact}` with the contents `{{\"pr_url\": \"<the url>\"}}` (path also exported as `$BOSS_PR_URL_OUTPUT`). That path is outside the repo/workspace, so it never pollutes your PR, and it is the channel the engine reads first.\n\
                  - Print the PR URL on its own line as the final thing in your final response as well, so the engine can still pick it up if that file write fails.\n\
@@ -691,8 +692,8 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
             prompt.push_str(&format!(
                 "\nAcceptance criterion: when you believe the work is done, the deliverable is a PR URL.\n\
                  - Use the engine-supplied branch name from the `expected branch name` line above (`{expected_branch}`) when creating your bookmark — do NOT invent a different name.\n\
-                 - Push your branch (`jj bookmark create {expected_branch} -r @`) and open a PR with `cube pr create --branch {expected_branch}` which pushes the branch and opens the PR in one step (jj-aware, no GIT_DIR needed). It is safe to retry: if a prior call already created the PR (e.g. your tool killed an earlier invocation on a timeout but the push had actually landed), it returns that PR's URL instead of erroring. Use `cube pr update --branch {expected_branch}` only when you have new commits to push onto an already-open PR.\n\
-                 - **Never use `jj git push`, `git push`, or `gh pr create` directly** — always use `cube pr create` or `cube pr update`. A PreToolUse hook blocks direct push/PR-create attempts and redirects you to cube.\n\
+                 - Push your branch (`jj bookmark create {expected_branch} -r @`) and open a PR with `{cube} pr create --branch {expected_branch}` which pushes the branch and opens the PR in one step (jj-aware, no GIT_DIR needed). It is safe to retry: if a prior call already created the PR (e.g. your tool killed an earlier invocation on a timeout but the push had actually landed), it returns that PR's URL instead of erroring. Use `{cube} pr update --branch {expected_branch}` only when you have new commits to push onto an already-open PR.\n\
+                 - **Never use `jj git push`, `git push`, or `gh pr create` directly** — always use `{cube} pr create` or `{cube} pr update`. A PreToolUse hook blocks direct push/PR-create attempts and redirects you to cube.\n\
                  - If a PR already exists for this branch (e.g. you are resuming work or addressing review comments), push your new commits to update it instead of opening a duplicate. Check with `gh pr view` from inside the workspace.\n\
                  - As soon as cube prints the PR URL, record it by writing the file `{pr_url_artifact}` with the contents `{{\"pr_url\": \"<the url>\"}}` (path also exported as `$BOSS_PR_URL_OUTPUT`). That path is outside the repo/workspace, so it never pollutes your PR, and it is the channel the engine reads first.\n\
                  - Print the PR URL on its own line as the final thing in your final response as well, so the engine can still pick it up if that file write fails.\n\
@@ -805,7 +806,7 @@ fn bazel_prepush_gate_block(workspace_path: &Path, seam_enabled: bool) -> Option
 ///
 /// `seam_enabled` mirrors `worker_signal_proposals_seam` (see
 /// [`worker_escalation_protocol_directive`]): `true` points a build-gate
-/// failure at `\"$BOSS_BIN\" propose blocked`; `false` reproduces the pre-migration
+/// failure at `"$BOSS_BIN" propose blocked`; `false` reproduces the pre-migration
 /// `[blocked]` marker sentence, so a worker on the flag-off path is never
 /// told to call a verb the engine won't yet honor proposals-first.
 pub(crate) fn bazel_prepush_gate_text(seam_enabled: bool) -> String {
@@ -1016,6 +1017,7 @@ fn render_editorial_rules_block(
 /// the push is what may reap the worker — but a worker left to reconcile
 /// them itself will reasonably conclude it cannot do both, and drop one.
 fn pr_terminal_directive(seam_enabled: bool) -> String {
+    let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     let mut out = String::new();
     out.push_str("\n## Important: PR creation is your terminal act\n\n");
     out.push_str(
@@ -1029,7 +1031,7 @@ fn pr_terminal_directive(seam_enabled: bool) -> String {
              planned to make afterwards may never happen.\n\n",
         );
     }
-    out.push_str("You will NOT get another turn after `gh pr create` / `cube pr create` (or `cube pr update` for an existing PR). Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR while background work (parallel/sub-agent runs, backgrounded builds, code reviews) is still in flight expecting to consume its results.\n\n");
+    out.push_str(&format!("You will NOT get another turn after `gh pr create` / `{cube} pr create` (or `{cube} pr update` for an existing PR). Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR while background work (parallel/sub-agent runs, backgrounded builds, code reviews) is still in flight expecting to consume its results.\n\n"));
     out.push_str("Therefore: finish everything — including consuming any review/self-review findings you started — BEFORE you open the PR. If a background review is still running and you care about its results, wait for it and address all findings FIRST, then open the PR. If you don't intend to wait, don't start the review.\n");
     out
 }
@@ -1043,11 +1045,11 @@ fn pr_terminal_directive(seam_enabled: bool) -> String {
 /// restore the marker-only vocabulary on the prompt side, not just the
 /// engine's read side.
 ///
-/// `seam_enabled = true` documents the two sanctioned `\"$BOSS_BIN\" propose` verbs a
+/// `seam_enabled = true` documents the two sanctioned `"$BOSS_BIN" propose` verbs a
 /// worker calls when it cannot proceed unassisted: `effort-escalation` (the
 /// work is bigger than estimated) and `blocked` (a human/coordinator
 /// decision is needed), plus the `[blocked]` marker retained as a bootstrap
-/// fallback of last resort. `\"$BOSS_BIN\" propose` validates synchronously, so a
+/// fallback of last resort. `"$BOSS_BIN" propose` validates synchronously, so a
 /// malformed call fails with a typed error the worker can fix and retry
 /// in-run, instead of a marker whose fields are only checked long after the
 /// worker could do anything about it. The `[blocked]` marker itself is not
@@ -1063,7 +1065,7 @@ fn pr_terminal_directive(seam_enabled: bool) -> String {
 ///
 /// `seam_enabled = false` renders the marker-grammar variant of this
 /// directive: both `[effort-escalation]` and `[blocked]` as markers, no
-/// `\"$BOSS_BIN\" propose` mention anywhere. Shared guidance that names no verb
+/// `"$BOSS_BIN" propose` mention anywhere. Shared guidance that names no verb
 /// (e.g. what makes a reason valid) is carried by both branches. Incident
 /// 2026-07-02 (`exec_18b5243e65ff188_2d`) is why the marker syntax is
 /// spelled out explicitly rather than left implicit — a worker hit a
@@ -1141,7 +1143,7 @@ pub(crate) fn worker_escalation_protocol_directive(seam_enabled: bool) -> String
      fall back to a bare `[blocked] reason=\"<why>\"` line on its own line in your final response — \
      the one marker kept specifically because it must still work when the mechanism itself is \
      broken. If the underlying problem is an effort escalation rather than a blocker, state the \
-     requested level in the reason (e.g. `[blocked] reason=\"\"$BOSS_BIN\" propose unreachable; requesting \
+     requested level in the reason (e.g. `[blocked] reason=\"boss propose unreachable; requesting \
      effort escalation to large — <why>\"`) — this bootstrap channel is the only one guaranteed to \
      work when `\"$BOSS_BIN\" propose` itself is down, so it carries both signal kinds rather than teaching \
      a second marker grammar back. Do not use it once `\"$BOSS_BIN\" propose` has already succeeded for this \
@@ -1230,12 +1232,12 @@ pub(crate) fn run_done_directive(seam_enabled: bool) -> String {
 /// reads for the engine's read path, threaded here so the two halves of the
 /// migration move together (design implementation task 9, following the
 /// recipe [`worker_escalation_protocol_directive`] established): a worker
-/// must never be taught the `\"$BOSS_BIN\" propose deferred-scope` verb when the
+/// must never be taught the `"$BOSS_BIN" propose deferred-scope` verb when the
 /// engine won't yet read proposals-first for it, and flipping the flag off
 /// must restore today's marker-only directive exactly.
 ///
 /// `seam_enabled = false` reproduces the pre-migration directive verbatim.
-/// `seam_enabled = true` instructs `\"$BOSS_BIN\" propose deferred-scope` instead —
+/// `seam_enabled = true` instructs `"$BOSS_BIN" propose deferred-scope` instead —
 /// unlike `[blocked]`, the `[deferred-scope]` marker has no bootstrap-
 /// fallback carve-out (design §"Failure semantics": only `[blocked]` is
 /// retained indefinitely), so the seam-enabled directive teaches the verb
@@ -1513,7 +1515,7 @@ fn postmortem_followups_emission_block(output_path: &str) -> String {
 /// transitional fallback (and to keep remote workers working until the
 /// artifact is fetched cross-host).
 ///
-/// `seam_enabled = true` instructs `\"$BOSS_BIN\" propose followup-task` instead: one
+/// `seam_enabled = true` instructs `"$BOSS_BIN" propose followup-task` instead: one
 /// call per follow-up, during the run, not batched into an end-of-run
 /// artifact. Submission is synchronous — a malformed call fails right away
 /// with a typed error the worker can fix and retry, unlike an artifact/
@@ -1772,6 +1774,7 @@ fn compose_revision_directive(
     proposals_seam_flags: (bool, bool),
 ) -> String {
     let (worker_signal_proposals_seam_enabled, deferred_scope_proposals_seam_enabled) = proposals_seam_flags;
+    let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     let description = match work_item {
         WorkItem::Task(task) | WorkItem::Chore(task) => task.description.trim().to_owned(),
         _ => String::new(),
@@ -1830,7 +1833,7 @@ fn compose_revision_directive(
             "**Fallback** (only if the workspace is NOT already positioned on an editable change atop the PR head):\n",
         );
         out.push_str("```\n");
-        out.push_str(&format!("cube workspace goto --pr {pr_number}\n"));
+        out.push_str(&format!("{cube} workspace goto --pr {pr_number}\n"));
         out.push_str("```\n");
     } else {
         out.push_str(
@@ -1839,7 +1842,7 @@ fn compose_revision_directive(
              (replace `<n>` with the actual PR number):**\n",
         );
         out.push_str("```\n");
-        out.push_str("cube workspace goto --pr <n>\n");
+        out.push_str(&format!("{cube} workspace goto --pr <n>\n"));
         out.push_str("```\n");
     }
     out.push_str("IMPORTANT: NEVER run `jj edit`, `gh pr checkout`, or `git checkout` in this workspace — fetched remote commits are immutable and those tools do not work correctly in a jj workspace.\n");
@@ -1854,9 +1857,9 @@ fn compose_revision_directive(
     out.push_str("   # Advance the local bookmark:\n");
     out.push_str("   jj bookmark set <parent-branch-name> -r @\n");
     out.push_str("   ```\n");
-    out.push_str(
-        "4. `cube pr update --branch <parent-branch-name>`   # pushes to the existing PR; no GIT_DIR or --allow-new needed.\n",
-    );
+    out.push_str(&format!(
+        "4. `{cube} pr update --branch <parent-branch-name>`   # pushes to the existing PR; no GIT_DIR or --allow-new needed.\n",
+    ));
     out.push_str("5. **Update the PR title AND description** — this is a required step, not optional:\n");
     out.push_str(&format!(
         "   a. Read the current title and description: `gh pr view {pr_number} -R {repo_slug} --json title,body -q '\"title: \" + .title + \"\\n\\n\" + .body'`\n"
@@ -1949,7 +1952,7 @@ fn compose_revision_directive(
     out.push_str(check_bypass_prohibition_text());
     out.push('\n');
     // The Bazel pre-push gate above (both variants) points a build-failure
-    // sentence at "\"$BOSS_BIN\" propose blocked" and, on the non-conflict-resolution
+    // sentence at `"$BOSS_BIN" propose blocked` and, on the non-conflict-resolution
     // variant, at the "If you are blocked or the work is bigger than
     // estimated" section for the exact syntax. Revisions never received that
     // section, leaving the cross-reference dangling and the worker with no
@@ -2042,6 +2045,7 @@ fn compose_merge_order_preservation_fragment(merged_siblings: &[String]) -> Stri
 /// covers only the signal-specific parts: the diagnosis block, rebase
 /// instructions, stop conditions, and post-resolution PR comment template.
 fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String {
+    let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     let mut out = String::new();
     out.push_str("\n---\n\n");
     out.push_str(&format!(
@@ -2088,11 +2092,11 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
          replaces the other, both surfaces must survive.\n\n",
     );
     out.push_str("### Rebase steps (replaces step 3)\n\n");
-    out.push_str(
+    out.push_str(&format!(
         "Run the cube rebase command — it encodes the correct jj recipe automatically \
          and avoids the `@origin` / immutable-heads pitfalls agents commonly hit:\n\n\
          ```\n\
-         cube workspace rebase\n\
+         {cube} workspace rebase\n\
          ```\n\n\
          This command: fetches the latest integration branch from GitHub, resolves this \
          workspace's boss branch automatically (no branch name argument needed), rebases \
@@ -2104,8 +2108,8 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
          was touched on the upstream side, resolve each file, then continue to step 4.\n\n\
          Do NOT hand-roll `jj rebase` manually — the correct flags differ from the bare \
          form and agents reliably get them wrong.\n\n",
-    );
-    out.push_str(
+    ));
+    out.push_str(&format!(
         "### How to resolve jj conflicts (first-class conflicts — stacked branches)\n\n\
          **jj records conflicts IN each commit independently.** `jj git push` refuses to push \
          ANY commit that still contains a conflict, including ancestors. Resolving only the \
@@ -2128,7 +2132,7 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
          ```\n\
          jj log -r '::<branch>' -T 'conflict ++ \"\\n\"'\n\
          ```\n\
-         Output must contain no `true`. Only then run `cube pr update --branch <branch>`.\n\n\
+         Output must contain no `true`. Only then run `{cube} pr update --branch <branch>`.\n\n\
          **Do NOT** squash or resolve only at the working-copy tip — it cannot clear an \
          ancestor's conflict.\n\n\
          **Non-interactive env:** ALWAYS pass `-m \"…\"` to `jj describe`, `jj squash`, \
@@ -2148,7 +2152,7 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
          ranges, and concatenate them to rebuild the file. That approach silently drops hunks \
          (off-by-one, missed sections) and makes the resolution look like a from-scratch \
          rewrite. Edit the marker regions directly instead.\n\n",
-    );
+    ));
     out.push_str("### Conflict diagnosis (from the engine's pre-spawn pass)\n\n");
     match attempt
         .conflict_diagnosis
@@ -2254,6 +2258,7 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
 /// ([`crate::conflict_stop_gate`]) — this fragment is the cooperative
 /// half, not the guarantee.
 fn compose_conflict_ground_truth_fragment(attempt: &ConflictResolution) -> String {
+    let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     format!(
         "### Ground truth: run these FIRST, in this order (HARD GATE)\n\n\
          Before `jj log`, before `jj st`, before forming any opinion about whether this \
@@ -2269,7 +2274,7 @@ fn compose_conflict_ground_truth_fragment(attempt: &ConflictResolution) -> Strin
          already resolved.\n\n\
          **2. Rebase — this is step 3 of your brief and it is not optional:**\n\n\
          ```\n\
-         cube workspace rebase\n\
+         {cube} workspace rebase\n\
          ```\n\n\
          Its output (`REBASED_CLEAN` / `REBASED_WITH_CONFLICTS`) is the local ground truth. \
          Quote it in your final response.\n\n\
@@ -2278,7 +2283,7 @@ fn compose_conflict_ground_truth_fragment(attempt: &ConflictResolution) -> Strin
          and `jj git fetch` reporting \"Nothing changed\" are **not** evidence the conflict \
          is gone — a branch can satisfy all three while GitHub still reports `CONFLICTING`. \
          If you believe there is nothing to do, you must show the `gh pr view` output saying \
-         `MERGEABLE` and the `cube workspace rebase` output saying `REBASED_CLEAN`. Without \
+         `MERGEABLE` and the `{cube} workspace rebase` output saying `REBASED_CLEAN`. Without \
          both, keep working.\n\n\
          **4. Divergent change ids make local revsets lie.** Cube workspaces share one `jj` \
          object store, so the same change id can name several commits. If any `jj` output \

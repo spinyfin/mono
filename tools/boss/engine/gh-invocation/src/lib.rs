@@ -191,7 +191,13 @@ pub fn is_cube_pr_create(command: &str) -> bool {
 /// look for `cube pr create` still see the named-binary form workers are
 /// taught. Must run *before* [`strip_quoted_string_contents`]: that helper
 /// would otherwise turn `"$CUBE_BIN" pr create` into `"" pr create`.
-fn with_named_binaries_as_bare_names(cmd: &str) -> String {
+///
+/// The one normaliser for "does this text name the boss/cube CLI by its
+/// `$BOSS_BIN`/`$CUBE_BIN` contract" — [`crate::pr_url_capture::names_cube_pr`]
+/// (in `boss_engine_core`) calls this rather than duplicating its own
+/// substring set, so the two editorial-vs-PR-URL-capture surfaces can never
+/// disagree on which quoting shapes count. `pub` for that cross-crate call.
+pub fn with_named_binaries_as_bare_names(cmd: &str) -> String {
     let mut s = cmd.to_owned();
     // Longer / quoted forms first so `"$CUBE_BIN"` is not left as `""` after
     // replacing the inner `$CUBE_BIN`.

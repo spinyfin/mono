@@ -279,21 +279,23 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
     }
     let workspace = input.workspace_path.display();
     let lease = &input.lease_id;
+    let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
+    let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     let draft_directive = if input.draft_pr_mode {
-        "\n## PR creation mode\n\
-         \n\
-         Default PR creation mode: pass `--draft` to `{cube} pr create`\n\
-         unless the chore description explicitly says to create a non-draft PR.\n"
+        format!(
+            "\n## PR creation mode\n\
+             \n\
+             Default PR creation mode: pass `--draft` to `{cube} pr create`\n\
+             unless the chore description explicitly says to create a non-draft PR.\n"
+        )
     } else {
-        ""
+        String::new()
     };
     // Sourced from //tools/boss/engine/core:engine_binary.bzl at build time
     // (via the engine_lib rustc_env) so this advice can't drift from the
     // real bazel target label the way the pre-crate-split
     // `//tools/boss/engine:engine` string did.
     let engine_bazel_run_command = env!("BOSS_ENGINE_BAZEL_RUN_COMMAND");
-    let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
-    let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     format!(
         "# Boss worker rules\n\
          \n\

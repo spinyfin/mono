@@ -266,9 +266,44 @@ macro_rules! shell_command_tokenizer_fragment {
         "DELIMS={'&&','||',';','|','&'}\n\
          WRAPPERS={'env','command','exec','nohup','stdbuf','setsid','caffeinate','sudo','time','xargs'}\n\
          ASSIGNMENT_RE=re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')\n\
+         def heredoc_delim(line):\n\
+         \x20   idx=line.find('<<')\n\
+         \x20   if idx<0:\n\
+         \x20       return None\n\
+         \x20   rest=line[idx+2:]\n\
+         \x20   if rest.startswith('-'):\n\
+         \x20       rest=rest[1:]\n\
+         \x20   rest=rest.lstrip()\n\
+         \x20   if not rest:\n\
+         \x20       return None\n\
+         \x20   q1=chr(39)\n\
+         \x20   q2=chr(34)\n\
+         \x20   quote=None\n\
+         \x20   if rest[0] in (q1,q2):\n\
+         \x20       quote=rest[0]\n\
+         \x20       rest=rest[1:]\n\
+         \x20   end=0\n\
+         \x20   while end<len(rest) and (rest[end].isalnum() or rest[end]=='_'):\n\
+         \x20       end+=1\n\
+         \x20   word=rest[:end]\n\
+         \x20   if not word:\n\
+         \x20       return None\n\
+         \x20   if quote:\n\
+         \x20       if end<len(rest) and rest[end]==quote:\n\
+         \x20           return word\n\
+         \x20       return None\n\
+         \x20   return word\n\
          def command_groups(command):\n\
          \x20   groups=[]\n\
+         \x20   heredoc_end=None\n\
          \x20   for line in command.split(chr(10)):\n\
+         \x20       if heredoc_end is not None:\n\
+         \x20           if line==heredoc_end:\n\
+         \x20               heredoc_end=None\n\
+         \x20           continue\n\
+         \x20       d=heredoc_delim(line)\n\
+         \x20       if d:\n\
+         \x20           heredoc_end=d\n\
          \x20       try:\n\
          \x20           _lex=shlex.shlex(line,posix=True,punctuation_chars=';&|')\n\
          \x20           _lex.whitespace_split=True\n\
@@ -489,8 +524,31 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "shim=None\n",
     "bare=None\n",
     "named_unset=None\n",
+    // Peel a `sh -c` / `bash -lc` / `zsh -lc` shell envelope before the WATCH
+    // check below: the Codex driver wraps every tool call as `/bin/zsh -lc
+    // '<payload>'`, so without this the guard's own program token is the
+    // shell binary, never the bare `cube`/`boss` it exists to catch.
+    "def peel_shell_c(rest):\n",
+    "    if not rest: return rest\n",
+    "    base=os.path.basename(rest[0])\n",
+    "    if base not in ('sh','bash','zsh'): return rest\n",
+    "    j=1\n",
+    "    payload=None\n",
+    "    while j<len(rest):\n",
+    "        t=rest[j]\n",
+    "        if t.startswith('-') and 'c' in t[1:]:\n",
+    "            if j+1<len(rest):\n",
+    "                payload=rest[j+1]\n",
+    "            break\n",
+    "        j+=1\n",
+    "    if payload is None: return rest\n",
+    "    try:\n",
+    "        toks=shlex.split(payload,posix=True)\n",
+    "    except Exception:\n",
+    "        toks=payload.split()\n",
+    "    return strip_prefixes(toks) if toks else rest\n",
     "for g in groups:\n",
-    "    rest=strip_prefixes(g)\n",
+    "    rest=peel_shell_c(strip_prefixes(g))\n",
     "    if not rest: continue\n",
     "    orig=rest[0]\n",
     "    if orig in (DOL+'BOSS_BIN', DOL+'{BOSS_BIN}', DOL+'CUBE_BIN', DOL+'{CUBE_BIN}'):\n",

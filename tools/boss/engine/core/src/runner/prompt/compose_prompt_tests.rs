@@ -1392,7 +1392,7 @@ fn revision_directive_with_conflict_provenance_injects_conflict_fragment() {
     );
     // Must include the stop conditions.
     assert!(
-        prompt.contains("engine conflicts mark-failed"),
+        prompt.contains("\"$BOSS_BIN\" engine conflicts mark-failed"),
         "conflict fragment must include the mark-failed stop condition:\n{prompt}",
     );
     // Must contain the jj first-class conflict / stacked-branch recipe.
@@ -1473,7 +1473,7 @@ fn conflict_fragment_hard_gates_the_ground_truth_commands_before_local_jj_reason
         .find("--json mergeable,mergeStateStatus")
         .unwrap_or_else(|| panic!("brief must mandate the mergeable query:\n{prompt}"));
     let rebase = prompt
-        .find("cube workspace rebase")
+        .find("\"$CUBE_BIN\" workspace rebase")
         .unwrap_or_else(|| panic!("brief must mandate the rebase:\n{prompt}"));
     assert!(
         gh_query < rebase,
@@ -2266,7 +2266,7 @@ fn escalation_protocol_directive_present_for_revision_implementation_seam_off() 
     // ChoreImplementation / ProjectDesign / InvestigationImplementation did
     // (see the `matches!` guard above `deferred_scope_directive`'s call
     // site). But `compose_revision_directive` injects a Bazel pre-push gate
-    // whose flag-on failure sentence points at "\"$BOSS_BIN\" propose blocked" and,
+    // whose flag-on failure sentence points at `"$BOSS_BIN" propose blocked` and,
     // for the non-conflict-resolution variant, at "see \"If you are blocked
     // or the work is bigger than estimated\" below for the exact syntax" —
     // a section that was never rendered for revisions, leaving the

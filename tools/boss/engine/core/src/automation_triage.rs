@@ -175,11 +175,13 @@ file(s), same symbol, or clearly the same fix), do NOT create a new task. Instea
 ",
     );
     block.push_str(&if seam_enabled {
-        "declare the outcome as a skip:\n\n\
-```\nboss propose automation-outcome --skip --reason \"duplicate of <ref>\"\n```\n\n\
-citing the referenced id, e.g. `boss propose automation-outcome --skip --reason \
-\"duplicate of the sibling's short label\"`.\n\n"
-            .to_owned()
+        format!(
+            "declare the outcome as a skip:\n\n\
+```\n{boss} propose automation-outcome --skip --reason \"duplicate of <ref>\"\n```\n\n\
+citing the referenced id, e.g. `{boss} propose automation-outcome --skip --reason \
+\"duplicate of the sibling's short label\"`.\n\n",
+            boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION,
+        )
     } else {
         "end your final message with:\n\n\
 ```\nautomation: skip — duplicate of <ref>\n```\n\n\
@@ -305,9 +307,10 @@ pub fn render_triage_preamble(
         .map(|n| format!("A{n}"))
         .unwrap_or_else(|| automation.id.clone());
     let create_cmd = format!(
-        "boss task create --automation {} --name \"<concise title>\" --description \"<what to do>\" \\\n    \
+        "{boss} task create --automation {} --name \"<concise title>\" --description \"<what to do>\" \\\n    \
          --target-file <path/to/file> [--target-file <path/to/other/file> ...]",
-        automation.id
+        automation.id,
+        boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION,
     );
     let context_block = render_context_block(context, automation_outcome_proposals_seam_enabled);
     let already_tracked = render_already_tracked_section(siblings, automation_outcome_proposals_seam_enabled);
@@ -350,6 +353,7 @@ exists — that is a normal, expected outcome on most runs.\n\n\
 /// skip` marker-only text (plus the file-artifact contract); `true` teaches
 /// `boss propose automation-outcome` instead.
 fn render_decision_section(create_cmd: &str, decision_artifact_path: &str, seam_enabled: bool) -> String {
+    let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
     if !seam_enabled {
         return format!(
             "## You MUST report exactly one decision\n\n\
@@ -394,7 +398,7 @@ immediately in that same turn — do not stop before you do.\n\
 happen inline using read-only actions (shell commands like `grep`/`find`/`cat`, \
 file reads, web searches). Finish the investigation before you make your \
 decision.\n\
-- **If you create a task** with `boss task create --automation`, emit the \
+- **If you create a task** with `{boss} task create --automation`, emit the \
 `automation: task <id>` marker **in the same response**, immediately after the \
 tool call returns with the task id. Do not stop between the tool call and the \
 marker.\n\n\
@@ -418,9 +422,9 @@ marker is the only real failure here.\n\n\
 ## Hard guardrails\n\n\
 - **Do NOT do the work yourself.** Do not edit files, do not commit, do not open a \
 PR. A separate worker executes the task you create. Your only deliverable is the \
-decision marker (and, if applicable, the one `boss task create --automation` call).\n\
+decision marker (and, if applicable, the one `{boss} task create --automation` call).\n\
 - **Create at most one task.** The automation enforces an open-task cap; a second \
-`boss task create --automation` call in this run will be rejected.\n\
+`{boss} task create --automation` call in this run will be rejected.\n\
 - **Emit exactly one marker line**, as the very last line of your final message. \
 Zero markers (or more than one) is treated as an inconclusive run and retried — it \
 is NOT a skip.\n"
@@ -434,7 +438,7 @@ object, either `{{\"decision\": \"task\", \"task_id\": \"T42\"}}` or \
 `{{\"decision\": \"skip\", \"reason\": \"<one line>\"}}`. That path is outside \
 the repo, so it never pollutes anything, and it is the channel the engine reads \
 first.\n\
-2. **Also declare the outcome with `boss propose automation-outcome`** (below), \
+2. **Also declare the outcome with `{boss} propose automation-outcome`** (below), \
 as your terminal act. Submission is synchronous and validated immediately: a \
 malformed or provenance-mismatched call fails/rejects right away with a typed \
 reason you can act on, unlike the file the engine only reads after you've moved \
@@ -449,14 +453,14 @@ Omitting a file you know you'll touch weakens that gate for every automation on 
 product, not just this run. Add `--target-symbol <name>` (repeatable, optional) if \
 you can also name the specific function/type you're targeting.\n\n\
   The command prints the new task id (e.g. `T42`). Then declare the outcome:\n\n\
-  ```\n  boss propose automation-outcome --produced-task T42\n  ```\n\n\
+  ```\n  {boss} propose automation-outcome --produced-task T42\n  ```\n\n\
   **If the create command fails with a `duplicate-suspect of Txxxx` error**, do NOT \
 retry with a different name or description — the engine has already determined your \
 candidate is a near-certain duplicate of open task `Txxxx` and filed an attention item \
 for an operator to review. Declare the outcome as a skip instead:\n\n\
-  ```\n  boss propose automation-outcome --skip --reason \"duplicate of Txxxx\"\n  ```\n\n\
+  ```\n  {boss} propose automation-outcome --skip --reason \"duplicate of Txxxx\"\n  ```\n\n\
 - **If there is nothing appropriate to do right now**, declare it as a skip:\n\n\
-  ```\n  boss propose automation-outcome --skip --reason \"<one-line reason>\"\n  ```\n\n\
+  ```\n  {boss} propose automation-outcome --skip --reason \"<one-line reason>\"\n  ```\n\n\
 ## Single-shot mandate — no sub-agents, no deferral\n\n\
 This run is **single-shot**: the investigation AND the outcome declaration must both \
 happen within this session. The session ends the moment you stop responding.\n\n\
@@ -469,8 +473,8 @@ immediately in that same turn — do not stop before you do.\n\
 - **Do NOT wait for any external process or event.** All investigation must \
 happen inline using read-only tool calls (`grep`/`find`/`cat`, `Bash`, `Read`, \
 `WebSearch`). Finish the investigation before you make your decision.\n\
-- **If you create a task** with `boss task create --automation`, declare it with \
-`boss propose automation-outcome --produced-task <id>` **in the same response**, \
+- **If you create a task** with `{boss} task create --automation`, declare it with \
+`{boss} propose automation-outcome --produced-task <id>` **in the same response**, \
 immediately after the tool call returns with the task id. Do not stop between the \
 tool call and the declaration.\n\n\
 ## Keep it lightweight — decide, then stop\n\n\
@@ -493,13 +497,13 @@ declaration is the only real failure here.\n\n\
 ## Hard guardrails\n\n\
 - **Do NOT do the work yourself.** Do not edit files, do not commit, do not open a \
 PR. A separate worker executes the task you create. Your only deliverable is the \
-outcome declaration (and, if applicable, the one `boss task create --automation` \
+outcome declaration (and, if applicable, the one `{boss} task create --automation` \
 call).\n\
 - **Create at most one task.** The automation enforces an open-task cap; a second \
-`boss task create --automation` call in this run will be rejected.\n\
+`{boss} task create --automation` call in this run will be rejected.\n\
 - **Declare exactly one outcome**, as your terminal act. A run that ends with zero \
 declarations is treated as inconclusive and retried — it is NOT a skip. If you call \
-`boss propose automation-outcome` more than once (you revised your decision), only \
+`{boss} propose automation-outcome` more than once (you revised your decision), only \
 the latest call's outcome is used.\n"
     )
 }
@@ -546,9 +550,11 @@ it dispatches a second worker onto work already in progress, produces a competin
 PR, and leaves a human to untangle which one to keep. ",
     );
     section.push_str(&if seam_enabled {
-        "Declare it as a skip:\n\n\
-        ```\n  boss propose automation-outcome --skip --reason \"already tracked as T<n>\"\n  ```\n\n"
-            .to_owned()
+        format!(
+            "Declare it as a skip:\n\n\
+        ```\n  {boss} propose automation-outcome --skip --reason \"already tracked as T<n>\"\n  ```\n\n",
+            boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION,
+        )
     } else {
         "End the run with:\n\n\
         ```\n  automation: skip — already tracked as T<n>\n  ```\n\n"
@@ -629,8 +635,11 @@ pub fn render_triage_claude_md(lease_id: &str, automation_outcome_proposals_seam
 /// [`render_decision_section`]'s two-branch shape; see
 /// [`render_triage_preamble`]'s doc for what `seam_enabled` gates.
 fn claude_md_decision_contract(seam_enabled: bool) -> String {
+    let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
+    let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     if !seam_enabled {
-        return "## Triage mandate (HARD CONSTRAINT)\n\
+        return format!(
+            "## Triage mandate (HARD CONSTRAINT)\n\
          \n\
          **There is NO pull-request deliverable for a triage run.** Your only\n\
          deliverable is a single decision marker.\n\
@@ -639,7 +648,7 @@ fn claude_md_decision_contract(seam_enabled: bool) -> String {
          and nothing after it:\n\
          \n\
          - `automation: task <id>` — after creating **exactly one** task with\n\
-           `boss task create --automation <automation-id> --name \"…\" --description \"…\" \\`\n\
+           `{boss} task create --automation <automation-id> --name \"…\" --description \"…\" \\`\n\
            `  --target-file <path> [--target-file <path> ...]` (repeat `--target-file`\n\
            once per file you expect to touch — declaring targets is required, not\n\
            optional; the command prints the new task id, e.g. `T42`). If this fails\n\
@@ -663,7 +672,7 @@ fn claude_md_decision_contract(seam_enabled: bool) -> String {
          - **Do NOT defer to a later turn.** If you say \"I'll create the task\n\
            next\" or \"Let me wait for the agent\", you must complete that action\n\
            immediately in the same turn — the session will NOT give you another.\n\
-         - **If you run `boss task create --automation`**, emit the\n\
+         - **If you run `{boss} task create --automation`**, emit the\n\
            `automation: task <id>` marker in the **same response**, right after\n\
            the tool call returns the task id. Do not stop between the two.\n\
          \n\
@@ -696,34 +705,37 @@ fn claude_md_decision_contract(seam_enabled: bool) -> String {
          - Committing or pushing (`jj git push`, `git push`).\n\
          - Opening, merging, closing, editing, or commenting on a PR\n\
            (`gh pr create/merge/close/edit/comment/review`) or running\n\
-           `cube pr create`/`cube pr update`.\n\
+           `{cube} pr create`/`{cube} pr update`.\n\
          - Filing or updating GitHub issues.\n\
          \n\
          Do NOT create a PR, do NOT push a branch, and do NOT print a PR URL —\n\
          none of that applies to a triage run. Investigate read-only (`grep`,\n\
          `find`, `cat`, `jj log`/`show`/`diff`, etc.), then create at most one\n\
          task and emit your marker.\n\
-         \n"
-        .to_owned();
+         \n",
+            boss = boss,
+            cube = cube
+        );
     }
-    "## Triage mandate (HARD CONSTRAINT)\n\
+    format!(
+        "## Triage mandate (HARD CONSTRAINT)\n\
          \n\
          **There is NO pull-request deliverable for a triage run.** Your only\n\
-         deliverable is a single outcome declaration, submitted with `boss\n\
-         propose automation-outcome`.\n\
+         deliverable is a single outcome declaration, submitted with\n\
+         `{boss} propose automation-outcome`.\n\
          \n\
          Your terminal act MUST be exactly one of these two declarations:\n\
          \n\
-         - `boss propose automation-outcome --produced-task <id>` — after\n\
+         - `{boss} propose automation-outcome --produced-task <id>` — after\n\
            creating **exactly one** task with\n\
-           `boss task create --automation <automation-id> --name \"…\" --description \"…\" \\`\n\
+           `{boss} task create --automation <automation-id> --name \"…\" --description \"…\" \\`\n\
            `  --target-file <path> [--target-file <path> ...]` (repeat `--target-file`\n\
            once per file you expect to touch — declaring targets is required, not\n\
            optional; the command prints the new task id, e.g. `T42`). If this fails\n\
            with `duplicate-suspect of Txxxx`, do not retry — declare\n\
-           `boss propose automation-outcome --skip --reason \"duplicate of Txxxx\"`\n\
+           `{boss} propose automation-outcome --skip --reason \"duplicate of Txxxx\"`\n\
            instead.\n\
-         - `boss propose automation-outcome --skip --reason \"<one-line reason>\"` —\n\
+         - `{boss} propose automation-outcome --skip --reason \"<one-line reason>\"` —\n\
            when nothing appropriate exists right now (a normal, expected outcome on\n\
            most runs).\n\
          \n\
@@ -744,8 +756,8 @@ fn claude_md_decision_contract(seam_enabled: bool) -> String {
          - **Do NOT defer to a later turn.** If you say \"I'll create the task\n\
            next\" or \"Let me wait for the agent\", you must complete that action\n\
            immediately in the same turn — the session will NOT give you another.\n\
-         - **If you run `boss task create --automation`**, declare it with\n\
-           `boss propose automation-outcome --produced-task <id>` in the **same\n\
+         - **If you run `{boss} task create --automation`**, declare it with\n\
+           `{boss} propose automation-outcome --produced-task <id>` in the **same\n\
            response**, right after the tool call returns the task id. Do not stop\n\
            between the two.\n\
          \n\
@@ -778,15 +790,17 @@ fn claude_md_decision_contract(seam_enabled: bool) -> String {
          - Committing or pushing (`jj git push`, `git push`).\n\
          - Opening, merging, closing, editing, or commenting on a PR\n\
            (`gh pr create/merge/close/edit/comment/review`) or running\n\
-           `cube pr create`/`cube pr update`.\n\
+           `{cube} pr create`/`{cube} pr update`.\n\
          - Filing or updating GitHub issues.\n\
          \n\
          Do NOT create a PR, do NOT push a branch, and do NOT print a PR URL —\n\
          none of that applies to a triage run. Investigate read-only (`grep`,\n\
          `find`, `cat`, `jj log`/`show`/`diff`, etc.), then create at most one\n\
          task and declare the outcome.\n\
-         \n"
-    .to_owned()
+         \n",
+        boss = boss,
+        cube = cube
+    )
 }
 
 /// Resolve the decision a triage agent reached, file first.
@@ -1150,11 +1164,11 @@ mod tests {
     fn triage_claude_md_teaches_boss_propose_verb_when_seam_is_on() {
         let md = render_triage_claude_md("lease_seam_on", true);
         assert!(
-            md.contains("boss propose automation-outcome --produced-task <id>"),
+            md.contains("\"$BOSS_BIN\" propose automation-outcome --produced-task <id>"),
             "seam on: must teach the produced-task verb form:\n{md}",
         );
         assert!(
-            md.contains("boss propose automation-outcome --skip --reason \"<one-line reason>\""),
+            md.contains("\"$BOSS_BIN\" propose automation-outcome --skip --reason \"<one-line reason>\""),
             "seam on: must teach the skip verb form with a worked example:\n{md}",
         );
         assert!(
@@ -1360,15 +1374,15 @@ mod tests {
             true,
         );
         assert!(
-            preamble.contains("boss propose automation-outcome --produced-task T42"),
+            preamble.contains("\"$BOSS_BIN\" propose automation-outcome --produced-task T42"),
             "seam on: preamble must teach the produced-task verb with a worked example:\n{preamble}",
         );
         assert!(
-            preamble.contains("boss propose automation-outcome --skip --reason \"duplicate of Txxxx\""),
+            preamble.contains("\"$BOSS_BIN\" propose automation-outcome --skip --reason \"duplicate of Txxxx\""),
             "seam on: preamble must teach the duplicate-skip verb form:\n{preamble}",
         );
         assert!(
-            preamble.contains("boss propose automation-outcome --skip --reason \"<one-line reason>\""),
+            preamble.contains("\"$BOSS_BIN\" propose automation-outcome --skip --reason \"<one-line reason>\""),
             "seam on: preamble must teach the generic-skip verb form:\n{preamble}",
         );
         assert!(
@@ -1607,7 +1621,7 @@ mod tests {
             true,
         );
         assert!(
-            preamble.contains("boss propose automation-outcome --skip --reason \"already tracked as T<n>\""),
+            preamble.contains("\"$BOSS_BIN\" propose automation-outcome --skip --reason \"already tracked as T<n>\""),
             "seam on: must show the boss propose form of the already-tracked skip:\n{preamble}",
         );
         assert!(

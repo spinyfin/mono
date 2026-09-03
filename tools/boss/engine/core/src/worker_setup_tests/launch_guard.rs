@@ -415,6 +415,34 @@ fn launch_guard_blocks_named_bin_that_is_a_repobin_shim() {
     );
 }
 
+/// The Codex driver wraps every tool call as `/bin/zsh -lc '<payload>'`, so
+/// the guard's WATCH check must peel that envelope rather than approving
+/// because the program token is `/bin/zsh`, not the bare `cube`/`boss`
+/// inside the payload.
+#[test]
+fn launch_guard_blocks_bare_cube_inside_a_zsh_lc_envelope() {
+    let (decision, reason) = run_launch_guard("/bin/zsh -lc 'cube pr create --branch x'");
+    assert_eq!(decision, "block", "must peel the zsh -lc envelope: reason={reason}");
+    assert!(
+        reason.contains("BOSS_BIN") && reason.contains("CUBE_BIN"),
+        "reason must tell the worker to name the env var: {reason}"
+    );
+}
+
+/// A heredoc PR body that mentions `cube pr create` in prose (as the
+/// worker's own CLAUDE.md instructs it to write) must not be treated as an
+/// invocation of that command — only the actual command lines (the
+/// `cat > ... << 'PRBODY'` opener) are real commands here.
+#[test]
+fn launch_guard_allows_heredoc_body_mentioning_cube_pr_create() {
+    let command = "body=$(mktemp)\ncat > \"$body\" << 'PRBODY'\n## Summary\nUse `cube pr create --branch x` to open a PR.\nPRBODY\n";
+    let (decision, reason) = run_launch_guard(command);
+    assert_eq!(
+        decision, "approve",
+        "heredoc body must not be scanned as commands: {reason}"
+    );
+}
+
 /// The reason has to hand the worker the supported commands; a refusal
 /// with no alternative produces a worker that finds its own.
 #[test]
