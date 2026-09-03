@@ -84,7 +84,7 @@ boss handoff write - <<'HANDOFF'
 - Do not file chores about greyarea disk exhaustion.
 HANDOFF
 
-# Anyone on the machine: read it back (age, writer, body).
+# Coordinator: read it back (age, writer, body).
 boss handoff show
 boss handoff show --json
 ```

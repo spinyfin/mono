@@ -296,6 +296,12 @@ pub(crate) fn compose_start_brief(inputs: StartBriefInputs<'_>) -> String {
                     "HANDOFF PRESENT: written by {previous_phrase}, {written}. Facts in it are current as of that \
                      time, not now.\n"
                 ));
+            } else if handoff.writer_spawn_token.is_empty() {
+                out.push_str(&format!(
+                    "HANDOFF PRESENT (writer unknown): a handoff was written {written}, but the engine has no record \
+                     of the session that wrote it. Treat it as possibly stale and confirm its facts with the \
+                     operator.\n"
+                ));
             } else if previous.is_some() {
                 out.push_str(&format!(
                     "HANDOFF STALE: {previous_phrase} never wrote a handoff. The newest handoff, below, was written \

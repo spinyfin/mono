@@ -102,38 +102,16 @@ async fn run_show(ctx: &RunContext) -> Result<(), CliError> {
                     handoff.writer_spawn_token
                 )
             };
-            println!(
-                "Written: {} ({}) by {writer}",
-                handoff.written_at_iso8601,
-                describe_age(handoff.age_secs)
-            );
+            let age = boss_engine_utils::iso8601::format_elapsed_ago(
+                handoff.written_at,
+                handoff.written_at + handoff.age_secs,
+            )
+            .unwrap_or_else(|| handoff.written_at_iso8601.clone());
+            let written =
+                crate::time_fmt::format_epoch(handoff.written_at, &crate::time_fmt::resolve_display_tz(false));
+            println!("Written: {written} ({age}) by {writer}");
             println!("---");
             println!("{}", handoff.body);
         }
     })
-}
-
-fn describe_age(age_secs: i64) -> String {
-    if age_secs < 60 {
-        "just now".to_owned()
-    } else if age_secs < 3600 {
-        format!("{} min ago", age_secs / 60)
-    } else if age_secs < 86_400 {
-        format!("{} h ago", age_secs / 3600)
-    } else {
-        format!("{} d ago", age_secs / 86_400)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::describe_age;
-
-    #[test]
-    fn age_is_rendered_in_the_coarsest_useful_unit() {
-        assert_eq!(describe_age(5), "just now");
-        assert_eq!(describe_age(240), "4 min ago");
-        assert_eq!(describe_age(7_200), "2 h ago");
-        assert_eq!(describe_age(3 * 86_400), "3 d ago");
-    }
 }
