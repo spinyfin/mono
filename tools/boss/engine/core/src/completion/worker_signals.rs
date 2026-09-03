@@ -618,29 +618,59 @@ impl WorkerCompletionHandler {
         );
     }
 
-    /// Count one legacy-ladder hit for the PR-created-declaration seam
-    /// (design implementation task 12 — the last of the per-seam
-    /// migrations) and log a WARN. Called from the shared
-    /// [`super::pr_transition::WorkerCompletionHandler::finalize_pr_transition`]
-    /// funnel — not from `on_stop_inner`/`recheck_for_pr` directly — so
-    /// every PR finalization that reaches that funnel via a source other
-    /// than the `pr_created` proposal read (`"stop_proposal"` /
-    /// `"pr_recheck_proposal"`) is counted exactly once, regardless of
-    /// which layer of the staging-cache / driver-prose / cold-
-    /// reconstruction ladder actually produced the URL. `source` is the
-    /// same finalize-source string already threaded through that funnel
-    /// (`"stop_staged"`, `"stop_driver_fallback"`, `"stop_sha_delta"`,
-    /// `"stop"`, `"pr_recheck_staged"`, `"pr_recheck_sha_delta"`,
-    /// `"pr_recheck"`, …), carried into the WARN as `detail` so the log is
-    /// diagnosable without a second lookup.
-    pub(super) fn record_pr_created_fallback_hit(&self, execution: &crate::work::WorkExecution, source: &str) {
-        self.record_proposal_fallback_hit_no_row(
+    /// Count one legacy-ladder hit for the PR-created-declaration seam only
+    /// after a proposal-first read failed to cover a successful ladder
+    /// finalization. Sources that only act on a pre-existing binding never
+    /// reach this recorder.
+    pub(super) fn record_pr_created_fallback_hit(
+        &self,
+        execution: &crate::work::WorkExecution,
+        source: &str,
+        row_existed: bool,
+    ) {
+        let reason = if row_existed {
+            "a pr_created worker_proposals row existed but could not be used (see the preceding WARN for specifics); falling back to the legacy PR-detection ladder"
+        } else {
+            "no worker_proposals row found for this execution/kind"
+        };
+        self.record_proposal_fallback_hit(
             execution,
             &PR_CREATED_FALLBACK_HIT,
             "pr_created_proposals_seam",
             "pr_created",
             source,
+            reason,
         );
+    }
+
+    pub(super) fn record_pr_created_fallback_after_success(
+        &self,
+        execution: &crate::work::WorkExecution,
+        source: &'static str,
+        row_existed: bool,
+        outcome: &StopOutcome,
+    ) {
+        let ladder_source = matches!(
+            source,
+            "stop_staged"
+                | "stop_driver_fallback"
+                | "stop"
+                | "stop_sha_delta"
+                | "pr_recheck_staged"
+                | "pr_recheck_sha_delta"
+                | "pr_recheck"
+        );
+        let finalized = matches!(
+            outcome,
+            StopOutcome::PrDetected { .. } | StopOutcome::PrMerged { .. } | StopOutcome::ReviewerEnqueued { .. }
+        );
+        if self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("pr_created_proposals_seam")
+            && ladder_source
+            && finalized
+        {
+            self.record_pr_created_fallback_hit(execution, source, row_existed);
+        }
     }
 
     /// Consume this execution's staged `proposal_channel_error` (if any —
