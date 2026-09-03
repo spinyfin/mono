@@ -27,6 +27,7 @@ use crate::{
 pub const BUILDKITE_TAG_KEY: &str = "release-tag";
 
 const UPLOAD_ATTEMPTS: usize = 3;
+const VERSION_PLACEHOLDER: &str = "{version}";
 
 /// The visible result of a prepare invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,9 +181,10 @@ pub fn upload(runner: &impl CommandRunner, config: &ReleaseConfig, tag: &str, as
     if assets.is_empty() {
         bail!("at least one --asset is required");
     }
-    validate_upload_assets(config, assets)?;
+    let assets = expand_upload_assets(config, tag, assets)?;
+    validate_upload_assets(config, tag, &assets)?;
 
-    let stage = stage_assets(assets)?;
+    let stage = stage_assets(&assets)?;
     let mut args = vec!["release".to_owned(), "upload".to_owned(), tag.to_owned()];
     for asset in assets {
         args.push(stage.path().join(&asset.name).display().to_string());
@@ -230,9 +232,11 @@ pub fn publish(runner: &impl CommandRunner, config: &ReleaseConfig, tag: &str) -
         .filter(|name| !name.is_empty())
         .collect::<HashSet<_>>();
 
+    let required_assets = expand_asset_list(&config.required_assets, tag, &config.tag_prefix)?;
+    let optional_assets = expand_asset_list(&config.optional_assets, tag, &config.tag_prefix)?;
+
     let mut missing = Vec::new();
-    for asset in &config.required_assets {
-        validate_asset_name(asset)?;
+    for asset in &required_assets {
         for required_name in [asset.as_str(), &format!("{asset}.sha256")] {
             if !remote_assets.contains(required_name) {
                 missing.push(required_name.to_owned());
@@ -246,9 +250,8 @@ pub fn publish(runner: &impl CommandRunner, config: &ReleaseConfig, tag: &str) -
         );
     }
 
-    let mut to_verify = config.required_assets.clone();
-    for asset in &config.optional_assets {
-        validate_asset_name(asset)?;
+    let mut to_verify = required_assets;
+    for asset in &optional_assets {
         if remote_assets.contains(asset.as_str()) {
             let checksum = format!("{asset}.sha256");
             if !remote_assets.contains(checksum.as_str()) {
@@ -522,16 +525,55 @@ fn cleanup_tag(runner: &impl CommandRunner, tag: &str, local_tag_created: bool, 
     }
 }
 
-fn validate_upload_assets(config: &ReleaseConfig, assets: &[Asset]) -> Result<()> {
-    let known_assets = config
-        .required_assets
+fn expand_upload_assets(config: &ReleaseConfig, tag: &str, assets: &[Asset]) -> Result<Vec<Asset>> {
+    assets
         .iter()
-        .chain(&config.optional_assets)
-        .map(String::as_str)
+        .map(|asset| {
+            Ok(Asset {
+                name: expand_asset_name(&asset.name, tag, &config.tag_prefix)?,
+                source: asset.source.clone(),
+            })
+        })
+        .collect()
+}
+
+fn expand_asset_list(names: &[String], tag: &str, tag_prefix: &str) -> Result<Vec<String>> {
+    names
+        .iter()
+        .map(|name| expand_asset_name(name, tag, tag_prefix))
+        .collect()
+}
+
+/// Substitutes `{version}` with the version encoded in `tag` (the tag with
+/// `tag_prefix` stripped). Names without the placeholder are unchanged.
+fn expand_asset_name(name: &str, tag: &str, tag_prefix: &str) -> Result<String> {
+    let expanded = if name.contains(VERSION_PLACEHOLDER) {
+        let version = version_from_tag(tag, tag_prefix)?;
+        name.replace(VERSION_PLACEHOLDER, version)
+    } else {
+        name.to_owned()
+    };
+    validate_asset_name(&expanded)?;
+    Ok(expanded)
+}
+
+fn version_from_tag<'a>(tag: &'a str, tag_prefix: &str) -> Result<&'a str> {
+    let version = tag
+        .strip_prefix(tag_prefix)
+        .ok_or_else(|| anyhow!("release tag {tag} does not start with configured tag_prefix {tag_prefix}"))?;
+    if version.is_empty() {
+        bail!("release tag {tag} has an empty version after stripping prefix {tag_prefix}");
+    }
+    Ok(version)
+}
+
+fn validate_upload_assets(config: &ReleaseConfig, tag: &str, assets: &[Asset]) -> Result<()> {
+    let known_assets = expand_asset_list(&config.required_assets, tag, &config.tag_prefix)?
+        .into_iter()
+        .chain(expand_asset_list(&config.optional_assets, tag, &config.tag_prefix)?)
         .collect::<HashSet<_>>();
     let mut seen = HashSet::new();
     for asset in assets {
-        validate_asset_name(&asset.name)?;
         if !known_assets.contains(asset.name.as_str()) {
             bail!("asset {} is not declared in the release config", asset.name);
         }
@@ -908,6 +950,103 @@ source = "github-generated"
         assert_eq!(
             *runner.sleeps.borrow(),
             vec![Duration::from_secs(15), Duration::from_secs(30)]
+        );
+    }
+
+    const BOSS_CONFIG: &str = r#"
+repo = "example/project"
+tag_prefix = "boss-v"
+title_prefix = "Boss"
+change_paths = ["tools/boss/"]
+required_assets = ["Boss-{version}.zip"]
+optional_assets = []
+
+[version]
+scheme = "patch-counter"
+major_minor = "1.0"
+
+[notes]
+source = "github-generated"
+"#;
+
+    #[test]
+    fn expands_version_placeholder_from_the_release_tag() {
+        assert_eq!(
+            expand_asset_name("Boss-{version}.zip", "boss-v1.0.10", "boss-v").expect("expand"),
+            "Boss-1.0.10.zip"
+        );
+        assert_eq!(
+            expand_asset_name("demo-linux", "demo-v1.0.0", "demo-v").expect("unchanged"),
+            "demo-linux"
+        );
+        let error =
+            expand_asset_name("Boss-{version}.zip", "checkleft-v1.0.0", "boss-v").expect_err("tag must match prefix");
+        assert!(error.to_string().contains("does not start with"), "{error:#}");
+    }
+
+    #[test]
+    fn upload_expands_versioned_asset_names_from_config_and_cli() {
+        let source_dir = tempdir().expect("source dir");
+        let source = source_dir.path().join("binary");
+        fs::write(&source, b"release bytes").expect("write source");
+        let config = ReleaseConfig::parse(BOSS_CONFIG).expect("config");
+        let runner = FixtureRunner::new([success("")]);
+
+        upload(
+            &runner,
+            &config,
+            "boss-v1.0.10",
+            &[Asset {
+                name: "Boss-{version}.zip".to_owned(),
+                source: source.clone(),
+            }],
+        )
+        .expect("placeholder on the CLI");
+
+        let calls = runner.calls.into_inner();
+        assert!(
+            calls[0].args.iter().any(|arg| arg.ends_with("Boss-1.0.10.zip")),
+            "{:?}",
+            calls[0].args
+        );
+        assert!(
+            calls[0].args.iter().any(|arg| arg.ends_with("Boss-1.0.10.zip.sha256")),
+            "{:?}",
+            calls[0].args
+        );
+
+        let runner = FixtureRunner::new([success("")]);
+        upload(
+            &runner,
+            &config,
+            "boss-v1.0.10",
+            &[Asset {
+                name: "Boss-1.0.10.zip".to_owned(),
+                source,
+            }],
+        )
+        .expect("already-expanded CLI name");
+        let calls = runner.calls.into_inner();
+        assert!(calls[0].args.iter().any(|arg| arg.ends_with("Boss-1.0.10.zip")));
+    }
+
+    #[test]
+    fn publish_verifies_the_expanded_versioned_asset_name() {
+        let config = ReleaseConfig::parse(BOSS_CONFIG).expect("config");
+        let runner = FixtureRunner::new([success("Boss-1.0.10.zip\nBoss-1.0.10.zip.sha256\n"), success("")])
+            .with_matching_download();
+
+        publish(&runner, &config, "boss-v1.0.10").expect("publish versioned zip");
+
+        let calls = runner.calls.into_inner();
+        assert_eq!(calls[1].args[0..2], ["release", "download"]);
+        assert!(
+            calls[1]
+                .args
+                .windows(2)
+                .any(|window| window == ["--pattern", "Boss-1.0.10.zip"]),
+            "{:?}",
+            calls[1].args
         );
     }
 
