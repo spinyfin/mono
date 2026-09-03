@@ -329,7 +329,7 @@ pub async fn github_pull_request_description(
     repository: &str,
     change_id: &str,
     github_token: Option<&str>,
-) -> Result<Option<String>> {
+) -> Result<GithubPrDescription> {
     let url = format!(
         "{}/repos/{repository}/pulls/{change_id}",
         github.base_url.trim_end_matches('/')
@@ -353,12 +353,17 @@ pub async fn github_pull_request_description(
         Err(error) if error.is_timeout() => return Err(github_timeout("fetching PR description")),
         Err(error) => {
             warn!(repository, error = %error, "checkleft: GitHub PR description lookup skipped — transport error");
-            return Ok(None);
+            return Ok(GithubPrDescription::LookupFailed {
+                reason: format!("GitHub API PR description lookup transport error: {error}"),
+            });
         }
     };
     if !response.status().is_success() {
-        warn!(repository, status = %response.status(), "checkleft: GitHub PR description lookup skipped — non-success status");
-        return Ok(None);
+        let status = response.status();
+        warn!(repository, %status, "checkleft: GitHub PR description lookup skipped — non-success status");
+        return Ok(GithubPrDescription::LookupFailed {
+            reason: format!("GitHub API PR description lookup returned HTTP {status}"),
+        });
     }
 
     let response_bytes = match response.bytes().await {
@@ -366,34 +371,54 @@ pub async fn github_pull_request_description(
         Err(error) if error.is_timeout() => return Err(github_timeout("fetching PR description")),
         Err(error) => {
             warn!(repository, error = %error, "checkleft: GitHub PR description lookup skipped — response body error");
-            return Ok(None);
+            return Ok(GithubPrDescription::LookupFailed {
+                reason: format!("GitHub API PR description lookup response body error: {error}"),
+            });
         }
     };
     let payload: GithubPullRequestResponse = match serde_json::from_slice(&response_bytes) {
         Ok(payload) => payload,
         Err(error) => {
             warn!(repository, error = %error, "checkleft: GitHub PR description lookup skipped — invalid JSON response");
-            return Ok(None);
+            return Ok(GithubPrDescription::LookupFailed {
+                reason: format!("GitHub API PR description lookup returned invalid JSON: {error}"),
+            });
         }
     };
     // A successful response with an empty body is still a resolved PR
     // description. Callers need that distinction to avoid reporting that the
     // PR description was unreachable.
-    Ok(Some(payload.body.unwrap_or_default()))
+    Ok(GithubPrDescription::Found(payload.body.unwrap_or_default()))
+}
+
+/// Outcome of fetching a known pull request's description via the GitHub API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GithubPrDescription {
+    Found(String),
+    LookupFailed { reason: String },
+}
+
+/// Outcome of looking up an open PR for a branch via the GitHub API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchPrLookup {
+    Found(String),
+    NoOpenPr,
+    LookupFailed { reason: String },
 }
 
 /// Look up the open PR number for a branch via the GitHub API.
-/// Returns the PR number as a string (e.g. "42"), or None if no open PR is
-/// found, auth fails, or a non-timeout error occurs. Timeouts are returned as
-/// errors so the caller cannot proceed with incomplete GitHub inputs.
+///
+/// Only a successful, parsed empty response is [`BranchPrLookup::NoOpenPr`].
+/// Non-timeout API and decoding failures are reported separately so callers do
+/// not mistake an unscanned PR description for a local no-PR invocation.
 pub async fn github_pr_number_for_branch(
     github: GithubApiContext<'_>,
     repository: &str,
     branch: &str,
     github_token: Option<&str>,
-) -> Result<Option<String>> {
+) -> Result<BranchPrLookup> {
     let Some(owner) = repository.split('/').next() else {
-        return Ok(None);
+        return Ok(BranchPrLookup::NoOpenPr);
     };
     let url = format!(
         "{}/repos/{repository}/pulls?head={owner}:{branch}&state=open&per_page=1",
@@ -418,12 +443,17 @@ pub async fn github_pr_number_for_branch(
         Err(error) if error.is_timeout() => return Err(github_timeout("looking up the open PR for a branch")),
         Err(error) => {
             warn!(repository, error = %error, "checkleft: GitHub branch PR lookup skipped — transport error");
-            return Ok(None);
+            return Ok(BranchPrLookup::LookupFailed {
+                reason: format!("GitHub API branch lookup transport error: {error}"),
+            });
         }
     };
     if !response.status().is_success() {
-        warn!(repository, status = %response.status(), "checkleft: GitHub branch PR lookup skipped — non-success status");
-        return Ok(None);
+        let status = response.status();
+        warn!(repository, %status, "checkleft: GitHub branch PR lookup skipped — non-success status");
+        return Ok(BranchPrLookup::LookupFailed {
+            reason: format!("GitHub API branch lookup returned HTTP {status}"),
+        });
     }
 
     let bytes = match response.bytes().await {
@@ -431,17 +461,25 @@ pub async fn github_pr_number_for_branch(
         Err(error) if error.is_timeout() => return Err(github_timeout("looking up the open PR for a branch")),
         Err(error) => {
             warn!(repository, error = %error, "checkleft: GitHub branch PR lookup skipped — response body error");
-            return Ok(None);
+            return Ok(BranchPrLookup::LookupFailed {
+                reason: format!("GitHub API branch lookup response body error: {error}"),
+            });
         }
     };
     let prs: Vec<GithubPullRequestListItem> = match serde_json::from_slice(&bytes) {
         Ok(prs) => prs,
         Err(error) => {
             warn!(repository, error = %error, "checkleft: GitHub branch PR lookup skipped — invalid JSON response");
-            return Ok(None);
+            return Ok(BranchPrLookup::LookupFailed {
+                reason: format!("GitHub API branch lookup returned invalid JSON: {error}"),
+            });
         }
     };
-    Ok(prs.into_iter().next().map(|pr| pr.number.to_string()))
+    Ok(prs
+        .into_iter()
+        .next()
+        .map(|pr| BranchPrLookup::Found(pr.number.to_string()))
+        .unwrap_or(BranchPrLookup::NoOpenPr))
 }
 
 fn run_command(root: &Path, binary: &str, args: &[&str]) -> Result<String> {
@@ -824,10 +862,10 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{
-        GithubApiContext, GithubApiTimeout, github_pull_request_description, parse_git_name_status,
-        parse_git_status_porcelain_paths, parse_jj_diff_summary, parse_jj_remote_list_url, parse_repo_root_output,
-        parse_repo_slug_from_remote_url, parse_tracked_file_list, resolve_jj_repo_slug_from_remote_list,
-        try_expand_brace_notation,
+        GithubApiContext, GithubApiTimeout, GithubPrDescription, github_pull_request_description,
+        parse_git_name_status, parse_git_status_porcelain_paths, parse_jj_diff_summary, parse_jj_remote_list_url,
+        parse_repo_root_output, parse_repo_slug_from_remote_url, parse_tracked_file_list,
+        resolve_jj_repo_slug_from_remote_list, try_expand_brace_notation,
     };
 
     #[tokio::test]
@@ -868,9 +906,9 @@ mod tests {
             None,
         )
         .await
-        .expect("non-timeout GitHub failures are best effort");
+        .expect("non-timeout GitHub failures return a typed result");
 
-        assert_eq!(description, None);
+        assert!(matches!(description, GithubPrDescription::LookupFailed { ref reason } if reason.contains("HTTP 500")));
     }
 
     #[test]

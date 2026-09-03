@@ -6,17 +6,20 @@ use checkleft::output::{CheckResult, FileEdit, Finding, Location, Severity, Sugg
 
 use checkleft::change_detection::environment::{CiEnvironment, resolve_head_sha};
 use checkleft::change_detection::merge_queue::{pr_number_from_branch, pr_numbers_from_branch};
+use checkleft::vcs::{GithubApiContext, Vcs};
 
 use checkleft::external::FixInvocationOutcome;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::{
-    ColorLevel, ExternalProviderMode, FixCheckPlan, FixPlan, OutputStyle, TRUNCATE_HEAD_LINES, TRUNCATE_MAX_LINE_LEN,
-    TRUNCATE_TAIL_LINES, branch_from_ci_env, ci_from_env, compute_fix_plan, distinct_applied_files,
-    github_auth_unavailable_warning, invocation_root_from, normalize_optional_description,
-    parse_external_provider_mode, parse_github_ref_pr_number, pr_numbers_for_description, render_fix_results,
-    render_human_footer, render_human_results, render_no_checks_ran, resolve_github_token_from_sources,
-    resolve_ref_for_upload, should_show_progress, sort_results_for_output, still_failing_from_verify,
-    truncate_tool_output,
+    ColorLevel, ExternalProviderMode, FixCheckPlan, FixPlan, OutputStyle, PrDescriptionResolution, TRUNCATE_HEAD_LINES,
+    TRUNCATE_MAX_LINE_LEN, TRUNCATE_TAIL_LINES, branch_from_ci_env, ci_from_env, compute_fix_plan,
+    distinct_applied_files, github_auth_unavailable_warning, invocation_root_from, json_run_output,
+    normalize_optional_description, parse_external_provider_mode, parse_github_ref_pr_number,
+    pr_numbers_for_description, render_fix_results, render_human_footer, render_human_results, render_no_checks_ran,
+    resolve_github_token_from_sources, resolve_pr_description_with_github, resolve_ref_for_upload,
+    should_show_progress, sort_results_for_output, still_failing_from_verify, truncate_tool_output,
 };
 
 #[test]
@@ -984,6 +987,229 @@ fn github_auth_unavailable_warning_lists_checkleft_gh_token_first() {
         checkleft_pos < checks_pos,
         "CHECKLEFT_GH_TOKEN must appear before CHECKS_GITHUB_TOKEN in the warning"
     );
+}
+
+// --- PrDescriptionResolution (PR description three-state contract) ---
+
+#[test]
+fn pr_description_resolution_status_lines_are_distinguishable() {
+    let resolved = PrDescriptionResolution::Resolved("hello".to_owned());
+    let not_applicable = PrDescriptionResolution::NotApplicable;
+    let unavailable = PrDescriptionResolution::Unavailable {
+        reason: "boom".to_owned(),
+    };
+
+    let resolved_line = resolved.status_line();
+    let n_a_line = not_applicable.status_line();
+    let unavail_line = unavailable.status_line();
+
+    assert!(resolved_line.contains("scanned"), "{resolved_line}");
+    assert!(resolved_line.contains("5 bytes"), "{resolved_line}");
+    assert!(n_a_line.contains("not applicable"), "{n_a_line}");
+    assert!(n_a_line.contains("no open PR"), "{n_a_line}");
+    assert!(unavail_line.contains("UNAVAILABLE"), "{unavail_line}");
+    assert!(unavail_line.contains("boom"), "{unavail_line}");
+
+    // The three lines must not collapse to the same text — that was the core harm.
+    assert_ne!(resolved_line, n_a_line);
+    assert_ne!(resolved_line, unavail_line);
+    assert_ne!(n_a_line, unavail_line);
+}
+
+#[test]
+fn pr_description_resolution_into_changeset_fields_three_states() {
+    assert_eq!(
+        PrDescriptionResolution::Resolved("body".to_owned()).into_changeset_fields(),
+        (Some("body".to_owned()), None)
+    );
+    assert_eq!(
+        PrDescriptionResolution::NotApplicable.into_changeset_fields(),
+        (None, None)
+    );
+    assert_eq!(
+        PrDescriptionResolution::Unavailable {
+            reason: "no token".to_owned()
+        }
+        .into_changeset_fields(),
+        (None, Some("no token".to_owned()))
+    );
+}
+
+fn vcs_for_pr_description_resolution_test() -> (tempfile::TempDir, Vcs) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    checkleft::test_git::init_repo_with_branch(temp.path(), "main");
+    let vcs = Vcs::detect(temp.path()).expect("detect vcs");
+    (temp, vcs)
+}
+
+#[tokio::test]
+async fn resolve_pr_description_marks_known_pr_body_failure_unavailable() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/o/r/pulls/42"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let (_temp, vcs) = vcs_for_pr_description_resolution_test();
+
+    let resolution = resolve_pr_description_with_github(
+        "o/r",
+        Some("42"),
+        &CiEnvironment::default(),
+        &vcs,
+        GithubApiContext::new(&server.uri(), Duration::from_secs(1)),
+        Some("token"),
+    )
+    .await
+    .expect("non-timeout failure becomes unavailable");
+
+    assert!(matches!(resolution, PrDescriptionResolution::Unavailable { ref reason } if reason.contains("HTTP 500")));
+}
+
+#[tokio::test]
+async fn resolve_pr_description_without_github_token_is_not_applicable() {
+    let (_temp, vcs) = vcs_for_pr_description_resolution_test();
+
+    let resolution = resolve_pr_description_with_github(
+        "o/r",
+        Some("42"),
+        &CiEnvironment::default(),
+        &vcs,
+        GithubApiContext::new("http://127.0.0.1:9", Duration::from_secs(1)),
+        None,
+    )
+    .await
+    .expect("missing credentials must not attempt a GitHub API call");
+
+    assert_eq!(resolution, PrDescriptionResolution::NotApplicable);
+}
+
+#[tokio::test]
+async fn resolve_pr_description_marks_empty_branch_lookup_not_applicable() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/o/r/pulls"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .mount(&server)
+        .await;
+    let (_temp, vcs) = vcs_for_pr_description_resolution_test();
+    let env = CiEnvironment {
+        buildkite_branch: Some("feature".to_owned()),
+        ..Default::default()
+    };
+
+    let resolution = resolve_pr_description_with_github(
+        "o/r",
+        None,
+        &env,
+        &vcs,
+        GithubApiContext::new(&server.uri(), Duration::from_secs(1)),
+        Some("token"),
+    )
+    .await
+    .expect("empty lookup is a valid no-PR response");
+
+    assert_eq!(resolution, PrDescriptionResolution::NotApplicable);
+}
+
+#[tokio::test]
+async fn resolve_pr_description_marks_failed_branch_lookup_unavailable() {
+    for status in [401, 403] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
+        let (_temp, vcs) = vcs_for_pr_description_resolution_test();
+        let env = CiEnvironment {
+            buildkite_branch: Some("feature".to_owned()),
+            ..Default::default()
+        };
+
+        let resolution = resolve_pr_description_with_github(
+            "o/r",
+            None,
+            &env,
+            &vcs,
+            GithubApiContext::new(&server.uri(), Duration::from_secs(1)),
+            Some("token"),
+        )
+        .await
+        .expect("non-timeout lookup failure becomes unavailable");
+
+        assert!(
+            matches!(resolution, PrDescriptionResolution::Unavailable { ref reason } if reason.contains(&status.to_string())),
+            "HTTP {status} must not silently become not-applicable: {resolution:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn resolve_pr_description_marks_partial_merge_queue_fetch_unavailable() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/o/r/pulls/123"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"body":"first"}"#))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/o/r/pulls/124"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let (_temp, vcs) = vcs_for_pr_description_resolution_test();
+    let env = CiEnvironment {
+        buildkite_branch: Some("gh-readonly-queue/main/pr-123-pr-124-abc".to_owned()),
+        ..Default::default()
+    };
+
+    let resolution = resolve_pr_description_with_github(
+        "o/r",
+        None,
+        &env,
+        &vcs,
+        GithubApiContext::new(&server.uri(), Duration::from_secs(1)),
+        Some("token"),
+    )
+    .await
+    .expect("partial merge-queue failure becomes unavailable");
+
+    assert!(
+        matches!(resolution, PrDescriptionResolution::Unavailable { ref reason } if reason.contains("HTTP 500")),
+        "unavailable result must preserve the GitHub failure reason: {resolution:?}"
+    );
+}
+
+#[tokio::test]
+async fn resolve_pr_description_treats_empty_pr_body_as_resolved() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/o/r/pulls/42"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"body":null}"#))
+        .mount(&server)
+        .await;
+    let (_temp, vcs) = vcs_for_pr_description_resolution_test();
+
+    let resolution = resolve_pr_description_with_github(
+        "o/r",
+        Some("42"),
+        &CiEnvironment::default(),
+        &vcs,
+        GithubApiContext::new(&server.uri(), Duration::from_secs(1)),
+        Some("token"),
+    )
+    .await
+    .expect("empty body is still a resolved response");
+
+    assert_eq!(resolution, PrDescriptionResolution::Resolved(String::new()));
+}
+
+#[test]
+fn json_run_output_includes_pr_description_surface() {
+    let output = json_run_output(&[], "not_applicable");
+    assert_eq!(output["pr_description_surface"], "not_applicable");
+    assert_eq!(output["results"], serde_json::json!([]));
 }
 
 // --- truncate_tool_output ---

@@ -415,8 +415,8 @@ The detection method that actually works, and should be a required step in the p
 checkleft run --all --format json > before.json      # at the base commit
 checkleft run --all --format json > after.json       # with the migration applied
 # The set of (check_id, location.path) pairs must be identical.
-diff <(jq -r '.[]|.check_id as $c|.findings[]|select(.location)|"\($c)\t\(.location.path)"' before.json | sort -u) \
-     <(jq -r '.[]|.check_id as $c|.findings[]|select(.location)|"\($c)\t\(.location.path)"' after.json | sort -u)
+diff <(jq -r '.results[]|.check_id as $c|.findings[]|select(.location)|"\($c)\t\(.location.path)"' before.json | sort -u) \
+     <(jq -r '.results[]|.check_id as $c|.findings[]|select(.location)|"\($c)\t\(.location.path)"' after.json | sort -u)
 ```
 
 `--all` is essential here: a diff-based run only exercises the files that happen to have changed, so it cannot distinguish "scope preserved" from "scope silently narrowed to zero". This is one of the few legitimate uses of `--all` outside CI's integrity pipeline, and it should be stated as such in the PR.

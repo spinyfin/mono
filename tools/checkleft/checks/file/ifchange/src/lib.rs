@@ -900,6 +900,7 @@ mod tests {
                 .collect(),
             commit_description: None,
             pr_description: None,
+            pr_description_unavailable_reason: None,
             change_id: None,
             repository: None,
             base_files: base_files

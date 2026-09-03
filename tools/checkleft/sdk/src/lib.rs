@@ -98,6 +98,13 @@ pub struct ChangeSet {
     pub file_diffs: Vec<FileDiff>,
     pub commit_description: Option<String>,
     pub pr_description: Option<String>,
+    /// When set, the host identified a PR whose description was required but
+    /// could not be fetched. Mutually exclusive with a present
+    /// [`Self::pr_description`]. Checks that scan the PR description must
+    /// treat this as a hard failure (not a clean pass). A missing
+    /// `pr_description` with this also absent means the PR surface does not
+    /// apply for this run (no open PR).
+    pub pr_description_unavailable_reason: Option<String>,
     pub change_id: Option<String>,
     pub repository: Option<String>,
     /// Base-revision content for deleted and modified files.
@@ -440,6 +447,7 @@ mod tests {
                 file_diffs: vec![],
                 commit_description: None,
                 pr_description: None,
+                pr_description_unavailable_reason: None,
                 change_id: None,
                 repository: None,
                 base_files: vec![],

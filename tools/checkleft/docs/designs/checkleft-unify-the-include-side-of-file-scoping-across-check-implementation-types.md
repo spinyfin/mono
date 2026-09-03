@@ -211,8 +211,8 @@ Every migration PR must run all four steps and paste the output of steps 2 and 3
    ```sh
    base/checkleft run --all --format json > before.json
    head/checkleft run --all --format json > after.json
-   diff <(jq -r '.[] | .check_id as $c | .findings[] | select(.location) | "\($c)\t\(.location.path)"' before.json | sort -u) \
-        <(jq -r '.[] | .check_id as $c | .findings[] | select(.location) | "\($c)\t\(.location.path)"' after.json | sort -u)
+   diff <(jq -r '.results[] | .check_id as $c | .findings[] | select(.location) | "\($c)\t\(.location.path)"' before.json | sort -u) \
+        <(jq -r '.results[] | .check_id as $c | .findings[] | select(.location) | "\($c)\t\(.location.path)"' after.json | sort -u)
    ```
 
    This must also be empty. It catches what step 2 cannot: a change in _check-internal_ behaviour on an unchanged selection — for example, hoisting `md/doc-structure`'s `include_globs` to the framework widens what the framework selects while the check's own `.md` gate (read — `src/checks/doc_structure.rs:101-103`) still applies, so the selection legitimately changes while findings must not.
