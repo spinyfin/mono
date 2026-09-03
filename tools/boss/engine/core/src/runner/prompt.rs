@@ -15,7 +15,9 @@ use boss_protocol::{EditorialRules, ExecutionKind, TaskKind, TemplatePolicy};
 
 use super::work_item::{project_details, work_item_details, work_item_name, work_item_pr_url};
 
+mod ci_monitoring;
 mod design;
+use ci_monitoring::ci_monitoring_directive;
 use design::{compose_design_directive, compose_design_postmortem_directive};
 
 #[derive(bon::Builder)]
@@ -1410,51 +1412,6 @@ fn revision_no_op_completion_directive(seam_enabled: bool) -> String {
          is bigger than estimated\" above). This marker is specifically for a finding you have \
          determined, after investigation, requires no code change.\n",
     ));
-    out
-}
-
-/// Post-PR CI-monitoring directive (issue #899). A worker that opens a
-/// PR and then sits in a `gh pr checks` poll-loop "until every check is
-/// green" never completes under CI models where some required checks are
-/// gated on a human action and never auto-resolve — LinkedIn's
-/// `Owner Approval` is the canonical case. The engine's merge poller
-/// already classifies CI correctly for these orgs: it partitions the
-/// human-gated checks out of the CI rollup
-/// (`merge_poller::review_signal_checks_for_owner`) before deciding the
-/// PR is "effectively green", and auto-transitions the task to Review.
-/// The worker had no share of that knowledge and so polled forever.
-///
-/// This block hands the worker the *same* CI-completion definition the
-/// engine uses, sourced from the *same* table — when the PR's org ships
-/// human-gated checks, they are named verbatim from
-/// `review_signal_checks_for_owner` so the worker's "don't wait on these"
-/// list and the engine's "these don't block CI-clean" set cannot drift.
-fn ci_monitoring_directive(execution: &WorkExecution) -> String {
-    let mut out = String::new();
-    out.push_str("\n## After the PR is open: do not babysit CI\n\n");
-    out.push_str(
-        "Once your branch is pushed and the PR exists, your deliverable is done — print the PR URL and stop. Do NOT sit in a loop polling `gh pr checks` / `gh pr view` waiting for every check to turn green. That loop can run forever and strands your slot.\n\n",
-    );
-    out.push_str(
-        "Why this is safe: the engine polls this PR's CI on its own cadence and auto-transitions the task to Review the moment CI is *effectively green*. \"Effectively green\" matches the engine's own definition — every required CI check has reached a passing terminal state (`SUCCESS`, `NEUTRAL`, or `SKIPPED`). It deliberately does NOT require checks that are gated on a human action and never resolve from CI alone; waiting on those is waiting forever.\n\n",
-    );
-    // Name the human-gated checks for this PR's org from the *same* table
-    // the engine's CI classifier reclassifies on, so the two lists are
-    // sourced once. Empty for orgs without review-signal rules — then the
-    // general guidance above stands on its own.
-    if let Ok(slug) = crate::completion::parse_repo_slug(&execution.repo_remote_url) {
-        let owner = slug.split('/').next().unwrap_or("");
-        let names = crate::merge_poller::review_signal_checks_for_owner(owner);
-        if !names.is_empty() {
-            let rendered = names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ");
-            out.push_str(&format!(
-                "This PR's org (`{owner}`) ships required check(s) that are human-gated and never auto-resolve from CI: {rendered}. The engine's CI-completion check treats them as NOT blocking — they stay pending until a human approves. You must do the same: their pending/running state is not a reason to keep this run alive.\n\n",
-            ));
-        }
-    }
-    out.push_str(
-        "A required CI check that has genuinely *failed* (not merely pending) is different — fix it and push, or escalate per the build-gate rules above. But a still-running or human-gated check never blocks your completion.\n",
-    );
     out
 }
 
