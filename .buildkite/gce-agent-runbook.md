@@ -23,7 +23,7 @@ Tailnet membership and passwordless SSH are optional — get green first.
 
 ## Architecture: x86_64, not negotiable
 
-`tools/checkleft/release.toml` (and `tools/release/release.toml`) declare the required asset names, including `checkleft-x86_64-unknown-linux-gnu` and its musl equivalent. `steps/checkleft-release.sh:84-87` then _executes_ the built musl binary on the agent to verify its version, dying with "musl version check could not execute the binary" (or a version mismatch) if the agent architecture is wrong.
+`tools/checkleft/release.toml` (and `tools/release/release.toml`) declare the required asset names, including `checkleft-x86_64-unknown-linux-gnu` and its musl equivalent. `steps/checkleft-release.sh`'s `phase_musl` then _executes_ the built musl binary on the agent to verify its version, dying with "musl version check could not execute the binary" (or a version mismatch) if the agent architecture is wrong. `steps/changelog-release.sh:522` does the same for `${ASSET_PREFIX}-x86_64-unknown-linux-gnu`.
 
 `MODULE.bazel` does register `wasm_tools_aarch64_linux`, so arm64 is not technically impossible for `bazel-build-test` — it would still break the release pipelines.
 

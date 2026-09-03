@@ -34,7 +34,8 @@ phase_prepare() {
 phase_linux() {
   [[ "$(uname -s)" == "Linux" ]] || die "linux phase must run on Linux (got $(uname -s))"
   local tag path
-  if ! tag="$(release_tag)"; then return; fi
+  release_tag || return
+  tag="${RELEASE_TAG}"
   bazel build -c opt "${TARGET}"
   path="$(binary_path "${TARGET}")"
   bin/release upload --config "${CONFIG}" --tag "${tag}" \
@@ -44,7 +45,8 @@ phase_linux() {
 phase_darwin() {
   [[ "$(uname -s)" == "Darwin" ]] || die "darwin phase must run on macOS (got $(uname -s))"
   local tag path
-  if ! tag="$(release_tag)"; then return; fi
+  release_tag || return
+  tag="${RELEASE_TAG}"
   bazel build -c opt "${TARGET}"
   path="$(binary_path "${TARGET}")"
   bin/release upload --config "${CONFIG}" --tag "${tag}" \
@@ -53,7 +55,8 @@ phase_darwin() {
 
 phase_publish() {
   local tag
-  if ! tag="$(release_tag)"; then return; fi
+  release_tag || return
+  tag="${RELEASE_TAG}"
   bin/release publish --config "${CONFIG}" --tag "${tag}"
 }
 

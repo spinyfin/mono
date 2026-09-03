@@ -96,16 +96,20 @@ bazel() {
 # RELEASE_LOG_PREFIX to its own name before sourcing this file.
 die() { echo "error: $*" >&2; exit 1; }
 
+# Sets the RELEASE_TAG global rather than printing to stdout via a command
+# substitution: `die` calls `exit 1`, and a `$(...)` substitution runs in a
+# subshell, so a die inside one only exits that subshell — the caller's `if
+# ! tag="$(release_tag)"` would see a merely-nonzero assignment and take the
+# same branch as the documented "no tag" skip, turning a hard failure into a
+# silent no-op. Setting a global keeps die's exit reaching the caller's shell.
 release_tag() {
-  local tag
-  if ! tag="$(bin/release tag)"; then
+  if ! RELEASE_TAG="$(bin/release tag)"; then
     die "bin/release tag failed"
   fi
-  if [[ -z "${tag}" ]]; then
+  if [[ -z "${RELEASE_TAG}" ]]; then
     echo "[${RELEASE_LOG_PREFIX}] no tag from prepare — nothing to build" >&2
     return 1
   fi
-  printf '%s\n' "${tag}"
 }
 
 binary_path() {

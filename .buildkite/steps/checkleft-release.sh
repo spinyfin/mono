@@ -50,7 +50,8 @@ phase_prepare() {
 phase_linux() {
   [[ "$(uname -s)" == "Linux" ]] || die "linux phase must run on Linux (got $(uname -s))"
   local tag version path
-  if ! tag="$(release_tag)"; then return; fi
+  release_tag || return
+  tag="${RELEASE_TAG}"
   version="${tag#checkleft-v}"
   stamp_build_version "${version}"
   bazel build -c opt "${NATIVE_TARGET}"
@@ -61,14 +62,16 @@ phase_linux() {
 
 phase_musl() {
   [[ "$(uname -s)" == "Linux" ]] || die "musl phase must run on Linux (got $(uname -s))"
-  local tag version path reported
-  if ! tag="$(release_tag)"; then return; fi
+  local tag version path raw reported
+  release_tag || return
+  tag="${RELEASE_TAG}"
   version="${tag#checkleft-v}"
   stamp_build_version "${version}"
   bazel build -c opt "${MUSL_TARGET}"
   path="$(binary_path "${MUSL_TARGET}")"
-  reported="$("${path}" --version 2>&1 | awk '{print $2}')" \
+  raw="$("${path}" --version 2>&1)" \
     || die "musl version check could not execute the binary"
+  reported="$(awk '{print $2}' <<<"${raw}")"
   [[ "${reported}" == "${version}" ]] \
     || die "musl version guard failed: binary reports ${reported}, expected ${version}"
   bin/release upload --config "${CONFIG}" --tag "${tag}" \
@@ -78,7 +81,8 @@ phase_musl() {
 phase_darwin() {
   [[ "$(uname -s)" == "Darwin" ]] || die "darwin phase must run on macOS (got $(uname -s))"
   local tag version arm_path x86_path
-  if ! tag="$(release_tag)"; then return; fi
+  release_tag || return
+  tag="${RELEASE_TAG}"
   version="${tag#checkleft-v}"
   stamp_build_version "${version}"
   bazel build -c opt "${NATIVE_TARGET}"
@@ -99,7 +103,8 @@ phase_darwin() {
 
 phase_publish() {
   local tag
-  if ! tag="$(release_tag)"; then return; fi
+  release_tag || return
+  tag="${RELEASE_TAG}"
   bin/release publish --config "${CONFIG}" --tag "${tag}"
 }
 
