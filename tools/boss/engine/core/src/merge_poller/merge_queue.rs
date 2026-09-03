@@ -227,7 +227,7 @@ pub(crate) async fn clear_github_merge_intent_on_observed_dequeue(
             .created_at
             .as_deref()
             .and_then(|created_at| chrono::DateTime::parse_from_rfc3339(created_at).ok())
-            .map(|created_at| created_at.timestamp().to_string())
+            .map(|created_at| created_at.timestamp())
         else {
             tracing::debug!(
                 work_item_id = %candidate.work_item_id,
@@ -241,7 +241,7 @@ pub(crate) async fn clear_github_merge_intent_on_observed_dequeue(
             &candidate.work_item_id,
             &candidate.pr_url,
             head_sha,
-            &event_created_at,
+            event_created_at,
         ) {
             Ok(Some(prior)) => prior,
             Ok(None) => continue,

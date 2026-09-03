@@ -2156,23 +2156,40 @@ pub(crate) async fn update_pr_poll_state(
     // materializes its derived state. Preserve only that empty observation;
     // a positive observation remains the fresh detailed projection, and an
     // observed dequeue timeline event retires the intent separately.
+    //
+    // An absent `headRefOid` is not evidence the submitted head departed —
+    // every other `head_ref_oid` consumer in this crate fails closed on it.
+    // Only an observed, differing head retires the intent as `head_advanced`.
+    //
+    // Do not drop preserve on red CI: writing NULL is destructive, and a
+    // later green empty probe would then preserve that hole. The demotion
+    // above owns display for `auto_merge_enabled` only; a queued row (this
+    // intent's projection) must stay queued through a transient required-
+    // check failure, matching `renumber_merge_queue`'s membership invariant.
     let preserve_github_merge_queue_state = raw_merge_queue_state.is_none()
         && match work_db.get_active_github_merge_intent(&candidate.work_item_id, &candidate.pr_url) {
-            Ok(Some(intent)) if probe.head_ref_oid.as_deref() == Some(intent.head_sha.as_str()) => ci_state != "fail",
-            Ok(Some(_intent)) => {
-                match work_db.retire_github_merge_intent(&candidate.work_item_id, &candidate.pr_url, "head_advanced") {
-                    Ok(_) => false,
-                    Err(err) => {
-                        tracing::warn!(
-                            work_item_id = %candidate.work_item_id,
-                            pr_url = %candidate.pr_url,
-                            ?err,
-                            "merge poller: failed to retire GitHub merge intent after head advanced",
-                        );
-                        true
+            Ok(Some(intent)) => match probe.head_ref_oid.as_deref() {
+                None => true,
+                Some(sha) if sha == intent.head_sha => true,
+                Some(_) => {
+                    match work_db.retire_github_merge_intent(
+                        &candidate.work_item_id,
+                        &candidate.pr_url,
+                        "head_advanced",
+                    ) {
+                        Ok(_) => false,
+                        Err(err) => {
+                            tracing::warn!(
+                                work_item_id = %candidate.work_item_id,
+                                pr_url = %candidate.pr_url,
+                                ?err,
+                                "merge poller: failed to retire GitHub merge intent after head advanced",
+                            );
+                            true
+                        }
                     }
                 }
-            }
+            },
             Ok(None) => false,
             Err(err) => {
                 tracing::warn!(
@@ -2184,6 +2201,27 @@ pub(crate) async fn update_pr_poll_state(
                 false
             }
         };
+    if preserve_github_merge_queue_state {
+        // A prior poll may already have written NULL (the old CI-fail gate).
+        // Re-assert `'queued'` so recovery does not depend on GitHub's
+        // projection having materialized; preserve then keeps the restored
+        // row (or the original queued detail) untouched.
+        let detail = serde_json::json!({
+            "position": null,
+            "state": null,
+            "enqueued_at": null,
+            "section_order": QUEUED_NO_POSITION_SECTION_ORDER,
+        })
+        .to_string();
+        if let Err(err) = work_db.reassert_github_merge_queue_if_cleared(&candidate.work_item_id, &detail) {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                ?err,
+                "merge poller: failed to re-assert GitHub merge-queue lane for a live intent",
+            );
+        }
+    }
     let preserve_merge_queue_state = preserve_trunk_merge_queue_state || preserve_github_merge_queue_state;
 
     let outcome = match work_db.update_task_pr_poll_state(

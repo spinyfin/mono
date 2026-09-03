@@ -356,7 +356,7 @@ impl MergeProbe for CommandMergeProbe {
 /// query. Mirrors the field set `CommandMergeProbe::probe`'s `gh pr view
 /// --json` call requests, plus `mergeQueueEntry` folded in directly (that
 /// probe fetches it via a *second* `gh api graphql` round trip —
-/// `pr_in_merge_queue` — because `mergeQueueEntry` isn't a `--json` field in
+/// `pr_merge_queue_entry` — because `mergeQueueEntry` isn't a `--json` field in
 /// all `gh` versions; here we just ask GraphQL for it inline, since we're
 /// already hand-building the query).
 ///

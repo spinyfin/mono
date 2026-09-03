@@ -1211,7 +1211,9 @@ async fn update_pr_poll_state_preserves_github_intent_through_empty_first_probe(
         serde_json::json!(QUEUED_NO_POSITION_SECTION_ORDER)
     );
     assert!(
-        db.has_active_github_merge_intent(&task, &candidate.pr_url).unwrap(),
+        db.get_active_github_merge_intent(&task, &candidate.pr_url)
+            .unwrap()
+            .is_some(),
         "an empty observation is not a dequeue"
     );
 }
@@ -1253,7 +1255,11 @@ async fn observed_github_dequeue_retires_intent_and_clears_merging() {
     let (state, detail) = merge_queue_columns(&db, &task);
     assert!(state.is_none());
     assert_eq!(detail, serde_json::Value::Null);
-    assert!(!db.has_active_github_merge_intent(&task, &candidate.pr_url).unwrap());
+    assert!(
+        db.get_active_github_merge_intent(&task, &candidate.pr_url)
+            .unwrap()
+            .is_none()
+    );
     assert!(
         publisher
             .events
@@ -1299,7 +1305,11 @@ async fn historical_github_dequeue_does_not_retire_newer_intent() {
     let publisher = RecordingPublisher::default();
     clear_github_merge_intent_on_observed_dequeue(&db, &publisher, &candidate, &events).await;
 
-    assert!(db.has_active_github_merge_intent(&task, &candidate.pr_url).unwrap());
+    assert!(
+        db.get_active_github_merge_intent(&task, &candidate.pr_url)
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(merge_queue_columns(&db, &task).0.as_deref(), Some("queued"));
 }
 
@@ -1329,8 +1339,113 @@ async fn update_pr_poll_state_retires_github_intent_when_head_advances() {
     let publisher = RecordingPublisher::default();
     update_pr_poll_state(&db, &publisher, &candidate, &probe, None).await;
 
-    assert!(!db.has_active_github_merge_intent(&task, &candidate.pr_url).unwrap());
+    assert!(
+        db.get_active_github_merge_intent(&task, &candidate.pr_url)
+            .unwrap()
+            .is_none()
+    );
     assert!(merge_queue_columns(&db, &task).0.is_none());
+}
+
+/// An empty probe that omits `headRefOid` is unevaluable, not a head
+/// advance. Retiring on that absence would bounce Merging permanently.
+#[tokio::test]
+async fn update_pr_poll_state_preserves_github_intent_when_probe_head_is_missing() {
+    let (_dir, db) = open_db();
+    let product = create_test_product_with_repo(&db, "GitHubIntentMissingHead", Some("git@github.com:foo/bar.git"));
+    let task = chore_in_review_for_product(&db, &product.id, "T", "https://github.com/foo/bar/pull/6");
+    let detail = serde_json::json!({
+        "position": null,
+        "state": null,
+        "enqueued_at": null,
+        "section_order": QUEUED_NO_POSITION_SECTION_ORDER,
+    })
+    .to_string();
+    db.record_github_merge_intent(
+        crate::work::GithubMergeIntentInsertInput::builder()
+            .work_item_id(task.clone())
+            .pr_url("https://github.com/foo/bar/pull/6")
+            .head_sha("head-6")
+            .build(),
+        &detail,
+    )
+    .unwrap();
+    let candidate = PendingMergeCheck {
+        work_item_id: task.clone(),
+        product_id: product.id.clone(),
+        pr_url: "https://github.com/foo/bar/pull/6".to_owned(),
+    };
+    let probe = probe_with_queue_fields(false, None, None, None, false, None);
+    assert!(probe.head_ref_oid.is_none());
+    let publisher = RecordingPublisher::default();
+    update_pr_poll_state(&db, &publisher, &candidate, &probe, None).await;
+
+    assert!(
+        db.get_active_github_merge_intent(&task, &candidate.pr_url)
+            .unwrap()
+            .is_some(),
+        "a missing head is not evidence the submitted head departed"
+    );
+    assert_eq!(merge_queue_columns(&db, &task).0.as_deref(), Some("queued"));
+}
+
+/// Red CI on an empty probe must not clear a live intent's queued lane, and
+/// a later green empty probe must restore `'queued'` if a prior write
+/// already punched a hole.
+#[tokio::test]
+async fn update_pr_poll_state_keeps_github_intent_queued_through_ci_fail_and_recovers() {
+    let (_dir, db) = open_db();
+    let product = create_test_product_with_repo(&db, "GitHubIntentCiFail", Some("git@github.com:foo/bar.git"));
+    let task = chore_in_review_for_product(&db, &product.id, "T", "https://github.com/foo/bar/pull/7");
+    let detail = serde_json::json!({
+        "position": null,
+        "state": null,
+        "enqueued_at": null,
+        "section_order": QUEUED_NO_POSITION_SECTION_ORDER,
+    })
+    .to_string();
+    db.record_github_merge_intent(
+        crate::work::GithubMergeIntentInsertInput::builder()
+            .work_item_id(task.clone())
+            .pr_url("https://github.com/foo/bar/pull/7")
+            .head_sha("head-7")
+            .build(),
+        &detail,
+    )
+    .unwrap();
+    let candidate = PendingMergeCheck {
+        work_item_id: task.clone(),
+        product_id: product.id.clone(),
+        pr_url: "https://github.com/foo/bar/pull/7".to_owned(),
+    };
+    let publisher = RecordingPublisher::default();
+
+    let mut failing_probe = probe_with_queue_fields(false, None, None, None, false, None);
+    failing_probe.head_ref_oid = Some("head-7".to_owned());
+    failing_probe.state = PrLifecycleState::Open(OpenPrStatus::ci_failing(vec![failure("ci/test", "FAILURE")]));
+    update_pr_poll_state(&db, &publisher, &candidate, &failing_probe, None).await;
+    assert_eq!(
+        merge_queue_columns(&db, &task).0.as_deref(),
+        Some("queued"),
+        "a live intent's queued projection must survive red CI on an empty probe"
+    );
+    assert!(
+        db.get_active_github_merge_intent(&task, &candidate.pr_url)
+            .unwrap()
+            .is_some()
+    );
+
+    db.set_task_merge_queue_state(&task, None, None).unwrap();
+    assert!(merge_queue_columns(&db, &task).0.is_none());
+
+    let mut recovered_probe = probe_with_queue_fields(false, None, None, None, false, None);
+    recovered_probe.head_ref_oid = Some("head-7".to_owned());
+    update_pr_poll_state(&db, &publisher, &candidate, &recovered_probe, None).await;
+    assert_eq!(
+        merge_queue_columns(&db, &task).0.as_deref(),
+        Some("queued"),
+        "a still-live intent must re-assert queued after a prior destructive clear"
+    );
 }
 
 /// Terminal PR observations for human-driven rows clear a stale Merging lane

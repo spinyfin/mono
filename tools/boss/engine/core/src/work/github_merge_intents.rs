@@ -16,7 +16,8 @@ pub struct GithubMergeIntent {
     pub pr_url: String,
     pub head_sha: String,
     /// `active` while GitHub has not supplied terminal/dequeue evidence;
-    /// `merged`, `closed`, or `dequeued` after that evidence arrives.
+    /// `merged`, `closed`, `dequeued`, or `head_advanced` after that
+    /// evidence arrives.
     pub status: String,
     pub created_at: String,
 }
@@ -116,14 +117,6 @@ impl WorkDb {
         query_active_github_merge_intent_for_pr(&conn, work_item_id, pr_url)
     }
 
-    /// Whether an empty GitHub queue/auto-merge observation must preserve the
-    /// prior Merging projection. The caller deliberately checks this only for
-    /// an empty observation: a positive observation remains the newer,
-    /// detailed projection.
-    pub fn has_active_github_merge_intent(&self, work_item_id: &str, pr_url: &str) -> Result<bool> {
-        Ok(self.get_active_github_merge_intent(work_item_id, pr_url)?.is_some())
-    }
-
     /// Retire an active intent when the PR itself reaches a terminal state.
     /// The task terminal transition owns its queue-column clear; this records
     /// the corresponding durable fact so a future reopen/candidate cannot
@@ -148,7 +141,7 @@ impl WorkDb {
         work_item_id: &str,
         pr_url: &str,
         head_sha: &str,
-        event_created_at: &str,
+        event_created_at: i64,
     ) -> Result<Option<Option<String>>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -159,7 +152,7 @@ impl WorkDb {
                AND pr_url = ?2
                AND head_sha = ?3
                AND status = 'active'
-               AND created_at < ?4",
+               AND CAST(created_at AS INTEGER) < ?4",
             params![work_item_id, pr_url, head_sha, event_created_at],
         )?;
         if retired == 0 {
@@ -182,6 +175,23 @@ impl WorkDb {
         )?;
         tx.commit()?;
         Ok(Some(prior_merge_queue_state))
+    }
+
+    /// Restore `'queued'` when a live GitHub-native intent's card was
+    /// already cleared. No-op when the lane is already set, so a richer
+    /// stored detail blob is left alone.
+    pub fn reassert_github_merge_queue_if_cleared(&self, work_item_id: &str, merge_queue_detail: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let rows = conn.execute(
+            "UPDATE tasks
+             SET merge_queue_state = 'queued',
+                 merge_queue_detail = COALESCE(merge_queue_detail, ?2)
+             WHERE id = ?1
+               AND deleted_at IS NULL
+               AND merge_queue_state IS NULL",
+            params![work_item_id, merge_queue_detail],
+        )?;
+        Ok(rows > 0)
     }
 }
 
@@ -244,8 +254,9 @@ mod tests {
         assert!(first.inserted);
         assert!(first.merge_queue_state_changed);
         assert!(
-            db.has_active_github_merge_intent(&task, "https://github.com/acme/widgets/pull/1")
+            db.get_active_github_merge_intent(&task, "https://github.com/acme/widgets/pull/1")
                 .unwrap()
+                .is_some()
         );
 
         let duplicate = db
@@ -281,14 +292,15 @@ mod tests {
                 &task,
                 "https://github.com/acme/widgets/pull/1",
                 "other-head",
-                "9999999999",
+                9_999_999_999,
             )
             .unwrap()
             .is_none()
         );
         assert!(
-            db.has_active_github_merge_intent(&task, "https://github.com/acme/widgets/pull/1")
+            db.get_active_github_merge_intent(&task, "https://github.com/acme/widgets/pull/1")
                 .unwrap()
+                .is_some()
         );
 
         assert_eq!(
@@ -296,14 +308,93 @@ mod tests {
                 &task,
                 "https://github.com/acme/widgets/pull/1",
                 "head-1",
-                "9999999999",
+                9_999_999_999,
             )
             .unwrap(),
             Some(Some("queued".to_owned()))
         );
         assert!(
-            !db.has_active_github_merge_intent(&task, "https://github.com/acme/widgets/pull/1")
+            db.get_active_github_merge_intent(&task, "https://github.com/acme/widgets/pull/1")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn dequeue_compares_created_at_as_integer_not_text() {
+        let db = test_db();
+        let task = seed_task(&db);
+        db.record_github_merge_intent(
+            GithubMergeIntentInsertInput::builder()
+                .work_item_id(task.clone())
+                .pr_url("https://github.com/acme/widgets/pull/1")
+                .head_sha("head-1")
+                .build(),
+            "{}",
+        )
+        .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE github_merge_intents SET created_at = '9' WHERE work_item_id = ?1",
+                params![task],
+            )
+            .unwrap();
+
+        // TEXT: `'9' < '10'` is false (`'9' > '1'`). INTEGER: 9 < 10.
+        assert_eq!(
+            db.retire_github_merge_intent_on_dequeue(&task, "https://github.com/acme/widgets/pull/1", "head-1", 10,)
+                .unwrap(),
+            Some(Some("queued".to_owned()))
+        );
+    }
+
+    #[test]
+    fn reassert_queued_fills_a_cleared_lane_and_is_idempotent() {
+        let db = test_db();
+        let task = seed_task(&db);
+        db.record_github_merge_intent(
+            GithubMergeIntentInsertInput::builder()
+                .work_item_id(task.clone())
+                .pr_url("https://github.com/acme/widgets/pull/1")
+                .head_sha("head-1")
+                .build(),
+            r#"{"section_order":1}"#,
+        )
+        .unwrap();
+        assert!(
+            !db.reassert_github_merge_queue_if_cleared(&task, r#"{"section_order":500000}"#)
                 .unwrap()
         );
+        let conn = db.connect().unwrap();
+        let detail: String = conn
+            .query_row(
+                "SELECT merge_queue_detail FROM tasks WHERE id = ?1",
+                params![task],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(detail, r#"{"section_order":1}"#);
+
+        conn.execute(
+            "UPDATE tasks SET merge_queue_state = NULL, merge_queue_detail = NULL WHERE id = ?1",
+            params![task],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            db.reassert_github_merge_queue_if_cleared(&task, r#"{"section_order":500000}"#)
+                .unwrap()
+        );
+        let conn = db.connect().unwrap();
+        let (state, detail): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT merge_queue_state, merge_queue_detail FROM tasks WHERE id = ?1",
+                params![task],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state.as_deref(), Some("queued"));
+        assert_eq!(detail.as_deref(), Some(r#"{"section_order":500000}"#));
     }
 }
