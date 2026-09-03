@@ -165,10 +165,14 @@ enum AgentActivityState: Equatable {
     ///    is watching for. This must precede the bound-slot shortcut
     ///    below; it clears on its own once the worker resumes and the
     ///    activity flips back to `.working`.
-    /// 3. A bound live worker otherwise reads as active.
-    /// 4. Conflict / CI-remediation runs without a bound live worker
+    /// 3. A slot-bound worker which has not reported a hook-derived state
+    ///    reads as unknown rather than being guessed as active: after
+    ///    re-adoption, `.spawning` means the engine knows the process exists
+    ///    but not what it is doing.
+    /// 4. A bound live worker otherwise reads as active.
+    /// 5. Conflict / CI-remediation runs without a bound live worker
     ///    read as their respective "resolving" waits.
-    /// 5. Fall back to the runtime+liveState mapping.
+    /// 6. Fall back to the runtime+liveState mapping.
     static func forDoingCard(
         runtime: WorkTaskRuntime?,
         liveState: WorkerLiveState?,

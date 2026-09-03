@@ -491,7 +491,7 @@ impl LiveWorkerStateRegistry {
     /// the engine re-established tracking for it.
     ///
     /// Same registration as [`Self::register_spawn_with_capabilities`],
-    /// plus the two things re-adoption must not get wrong:
+    /// plus the three things re-adoption must not get wrong:
     ///
     /// 1. The entry is marked [`DriverStartExpectation::Readopted`], so
     ///    [`Self::unverified_driver_starts`] leaves it alone. Registration
@@ -510,6 +510,13 @@ impl LiveWorkerStateRegistry {
     ///    discarding real evidence is never the safe default. A pid-only
     ///    trigger ([`ReadoptionEvidence::LiveShellPid`]) records nothing:
     ///    a live shell says nothing about the driver.
+    /// 3. Re-adopting the slot's current run is a reconciliation observation,
+    ///    not registration: it retains every [`LiveWorkerState`] field and
+    ///    `spawned_at`, while (re)asserting the readopted driver-start
+    ///    expectation. Full registration below applies only when the slot's
+    ///    occupant genuinely changes. A positive observed shell pid repairs a
+    ///    provisional or stale stored pid; a zero observation never clobbers a
+    ///    known pid.
     ///
     /// Exists as its own method rather than a flag on the spawn
     /// registration so the marking cannot be forgotten by a caller that
@@ -529,7 +536,7 @@ impl LiveWorkerStateRegistry {
         evidence: ReadoptionEvidence,
     ) {
         let run_id = run_id.into();
-        let retained_existing_state = {
+        let (retained_existing_state, repaired_shell_pid) = {
             let mut guard = self.inner.lock().expect("registry mutex poisoned");
             match guard.get_mut(&slot_id) {
                 Some(entry) if entry.state.run_id == run_id => {
@@ -538,14 +545,28 @@ impl LiveWorkerStateRegistry {
                     // every live-state field (including an operator hold) rather
                     // than replacing it with the freshly-spawned fiction.
                     entry.meta.driver_start_expectation = DriverStartExpectation::Readopted;
-                    true
+                    let repaired_shell_pid = (shell_pid > 0 && shell_pid != entry.state.shell_pid).then(|| {
+                        let previous_shell_pid = entry.state.shell_pid;
+                        entry.state.shell_pid = shell_pid;
+                        previous_shell_pid
+                    });
+                    (true, repaired_shell_pid)
                 }
-                _ => false,
+                _ => (false, None),
             }
         };
         if retained_existing_state {
             if evidence == ReadoptionEvidence::DriverHook {
                 self.record_driver_signal(&run_id, DriverSignalKind::HookEvent);
+            }
+            if let Some(previous_shell_pid) = repaired_shell_pid {
+                tracing::info!(
+                    slot_id,
+                    run_id = %run_id,
+                    previous_shell_pid,
+                    shell_pid,
+                    "live-state registry: re-adoption repaired the retained shell pid",
+                );
             }
             tracing::info!(
                 slot_id,
@@ -2649,7 +2670,7 @@ mod tests {
     #[test]
     fn readopting_the_same_run_preserves_its_live_state_and_hold() {
         let reg = LiveWorkerStateRegistry::new();
-        reg.register_spawn(1, "run-a", "claude-opus-4-7", 123, None);
+        reg.register_spawn(1, "run-a", "claude-opus-4-7", 0, None);
         reg.apply_event(1, &pre_tool("Bash"));
         reg.set_live_status(1, Some("editing the worker registry".into()));
         assert_eq!(reg.set_held("run-a", true), Some(1));
@@ -2666,11 +2687,57 @@ mod tests {
             ReadoptionEvidence::LiveShellPid,
         );
 
+        let repaired = reg.get(1).unwrap();
+        assert_eq!(
+            repaired.shell_pid, 456,
+            "a positive observation repairs a provisional pid"
+        );
+        assert_eq!(repaired.run_id, before.run_id);
+        assert_eq!(repaired.activity, before.activity);
+        assert_eq!(repaired.held, before.held);
+        assert_eq!(repaired.last_event_at, before.last_event_at);
+        assert_eq!(reg.driver_start_expectation(1), Some(DriverStartExpectation::Readopted));
+
+        reg.register_readoption(
+            1,
+            "run-a",
+            "opus",
+            0,
+            None,
+            false,
+            LiveSpawnRouting::none(),
+            ReadoptionEvidence::LiveShellPid,
+        );
         assert_eq!(
             reg.get(1).unwrap(),
-            before,
-            "re-adopting the current occupant must retain all live state, including the operator hold",
+            repaired,
+            "a pid-less re-adoption must not clobber the repaired shell pid or retained live state",
         );
+    }
+
+    #[test]
+    fn readopting_a_new_run_replaces_the_previous_occupants_live_state() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-a", "claude-opus-4-7", 123, None);
+        reg.apply_event(1, &pre_tool("Bash"));
+        assert_eq!(reg.set_held("run-a", true), Some(1));
+
+        reg.register_readoption(
+            1,
+            "run-b",
+            "opus",
+            456,
+            None,
+            false,
+            LiveSpawnRouting::none(),
+            ReadoptionEvidence::LiveShellPid,
+        );
+
+        let state = reg.get(1).unwrap();
+        assert_eq!(state.run_id, "run-b");
+        assert_eq!(state.activity, WorkerActivity::Spawning);
+        assert!(!state.held);
+        assert!(state.last_event_at.is_none());
         assert_eq!(reg.driver_start_expectation(1), Some(DriverStartExpectation::Readopted));
     }
 

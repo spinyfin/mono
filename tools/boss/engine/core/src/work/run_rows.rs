@@ -1012,12 +1012,16 @@ impl WorkDb {
         .map_err(Into::into)
     }
 
-    /// Return the newest local tmux run for one live execution.
+    /// Return the unfinished local tmux run, then the newest, for one live execution.
     pub fn tmux_run_for_execution(&self, execution_id: &str) -> Result<Option<TmuxRunHandle>> {
         let conn = self.connect()?;
         let sql = format!(
             "{TMUX_RUN_SELECT} WHERE r.execution_id = ?1 AND {TMUX_RUN_ADOPTABLE_PREDICATE} \
-             ORDER BY r.created_at DESC, r.id DESC LIMIT 1"
+             ORDER BY
+               CASE WHEN r.finished_at IS NULL THEN 0 ELSE 1 END,
+               r.created_at DESC,
+               r.id DESC
+             LIMIT 1"
         );
         conn.query_row(&sql, params![execution_id], map_tmux_run_handle)
             .optional()
