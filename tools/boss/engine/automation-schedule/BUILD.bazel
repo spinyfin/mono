@@ -1,5 +1,6 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//tools/boss/test-isolation:boss_rust_test.bzl", "boss_rust_test")
 
 exports_files(["Cargo.toml"])
 
@@ -18,7 +19,7 @@ rust_library(
     ],
 )
 
-rust_test(
+boss_rust_test(
     name = "automation-schedule_test",
     size = "small",
     crate = ":automation-schedule",

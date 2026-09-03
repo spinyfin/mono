@@ -1,5 +1,6 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//tools/boss/test-isolation:boss_rust_test.bzl", "boss_rust_test")
 
 exports_files(["Cargo.toml"])
 
@@ -13,11 +14,12 @@ rust_library(
     visibility = ["//tools/boss/engine:__subpackages__"],
     deps = [
         "//tools/boss/command-runner",
+        "//tools/boss/log-files",
         "//tools/boss/shell-quote",
     ] + all_crate_deps(normal = True),
 )
 
-rust_test(
+boss_rust_test(
     name = "tmux_test",
     size = "small",
     crate = ":tmux",
@@ -28,6 +30,7 @@ rust_test(
     ),
     deps = [
         "//tools/boss/command-runner",
+        "//tools/boss/log-files",
         "//tools/boss/shell-quote",
     ] + all_crate_deps(
         normal = True,

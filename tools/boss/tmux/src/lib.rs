@@ -178,6 +178,16 @@ impl Tmux {
 
     /// Creates a controller with an explicit socket, for production and
     /// command-construction tests that need to exercise `-S`.
+    ///
+    /// Refuses in a test process when `socket_path` has production's *shape*
+    /// (parent ends `Library/Application Support/Boss`, filename `tmux.sock`)
+    /// — computed structurally via [`boss_log_files::is_production_shaped`],
+    /// not by comparing `$HOME` (see that function's doc for why: it also
+    /// catches a path inherited from a production engine running under a
+    /// *different* `$HOME`, or with `HOME` unset here entirely). Unconditional
+    /// on the runner, unlike [`Self::for_legacy_label_server_with_runner`]:
+    /// no legitimate test ever needs to name this literal path, so there is
+    /// no fake-runner-based coverage to preserve by narrowing the check.
     pub fn with_runner_and_socket(
         program: impl Into<PathBuf>,
         runner: Arc<dyn CommandRunner>,
@@ -186,6 +196,15 @@ impl Tmux {
         let socket_path = socket_path.into();
         if !socket_path.is_absolute() {
             bail!("tmux socket path must be absolute: {socket_path:?}");
+        }
+        if boss_log_files::is_test_process()
+            && boss_log_files::is_production_shaped(&socket_path, boss_log_files::TMUX_SOCKET_FILENAME)
+        {
+            bail!(
+                "refusing to address the production tmux socket ({}) from a test process — a test must \
+                 use a private socket path (e.g. TEST_SOCKET_PATH), never production's",
+                socket_path.display()
+            );
         }
         Self::with_runner_for_server(program, runner, ServerAddress::Socket(socket_path))
     }
@@ -199,10 +218,26 @@ impl Tmux {
 
     /// Test/drain variant of [`Self::for_legacy_label_server`] with an
     /// injectable process runner.
+    ///
+    /// `-L boss` addresses tmux's default socket directory — unlike
+    /// [`Self::with_runner_and_socket`] there is no path parameter to check
+    /// the shape of, so a test process cannot be isolated from it by
+    /// construction. Refuses whenever `runner.is_real()` — the runner that
+    /// could actually reach the live server — leaving every existing test
+    /// that injects a fake/stub/scripted runner to exercise legacy-vs-socket
+    /// server *selection* logic exactly as before: a fake runner can never
+    /// reach a real server no matter what it is pointed at.
     pub fn for_legacy_label_server_with_runner(
         program: impl Into<PathBuf>,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Self> {
+        if boss_log_files::is_test_process() && runner.is_real() {
+            bail!(
+                "refusing to construct a legacy `-L boss` tmux handle with the real command runner from a \
+                 test process — `-L boss` addresses tmux's shared default socket directory and cannot be \
+                 scoped to a private path; inject a fake CommandRunner instead"
+            );
+        }
         Self::with_runner_for_server(program, runner, ServerAddress::Label)
     }
 

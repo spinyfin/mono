@@ -89,6 +89,11 @@ impl TestEngine {
         let work_config = WorkConfig::builder()
             .cwd(temp.path().to_path_buf())
             .db_path(db_path.clone())
+            // `db_path` is `:memory:` by default (no parent directory), so
+            // `resolved_tmux_socket_path`'s beside-the-db fallback can't
+            // derive one — give this test engine its own private socket
+            // explicitly, in the same tempdir as everything else here.
+            .tmux_socket_path(temp.path().join("tmux.sock"))
             .build();
         let cfg = Arc::new(RuntimeConfig::from_parts(work_config, None));
 

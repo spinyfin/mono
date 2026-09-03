@@ -319,20 +319,18 @@ mod tests {
     #[test]
     fn record_if_sandbox_attempt_writes_to_audit_log_on_match() {
         // End-to-end: a PreToolUse that names state.db produces a
-        // `worker_sandbox_attempt` line in the engine audit log,
-        // tagged with the run_id so triage can pivot back to the
-        // worker. Uses the BOSS_ENGINE_AUDIT_PATH env override to
-        // redirect writes to a tempfile rather than the global path.
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("audit-from-test.log");
-        // SAFETY: tests run single-threaded with serial when sharing
-        // process-global env; this test is benign even if interleaved
-        // (the audit module's `OnceLock` may have been set already,
-        // in which case our write goes elsewhere and the assertions
-        // below skip cleanly — see the `if path.exists()` guard).
-        unsafe {
-            std::env::set_var(audit::AUDIT_PATH_ENV, &path);
-        }
+        // `worker_sandbox_attempt` line in the engine audit log, tagged with
+        // the run_id so triage can pivot back to the worker.
+        //
+        // `resolve_path` always resolves to this test process's isolated
+        // root (see `boss_log_files::is_test_process`), deterministically on
+        // every call, so there is nothing to redirect and nothing to race:
+        // `lock_audit_globals_for_tests` alone keeps this test's write
+        // contiguous against the other tests in this binary that share the
+        // same resolved audit file (`audit`'s own
+        // `public_start_and_shutdown_path_emits_two_records`,
+        // `coordinator_tmux`'s `operator_reset_kills_old_session_and_creates_a_fresh_one`).
+        let _audit_globals = audit::lock_audit_globals_for_tests();
 
         let event = pre_tool(
             "Read",
@@ -342,16 +340,7 @@ mod tests {
         );
         record_if_sandbox_attempt(&boss_dir(), Some("run-abc"), &event);
 
-        unsafe {
-            std::env::remove_var(audit::AUDIT_PATH_ENV);
-        }
-
-        if !path.exists() {
-            // Another test set AUDIT_PATH first via OnceLock; can't
-            // assert on the tempfile in that case. Detection itself
-            // is verified by the classify_* tests.
-            return;
-        }
+        let path = audit::default_audit_log_path().expect("a test process always resolves its isolated audit path");
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(
             raw.contains("worker_sandbox_attempt"),

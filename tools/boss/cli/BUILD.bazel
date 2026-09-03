@@ -1,5 +1,6 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library")
+load("//tools/boss/test-isolation:boss_rust_test.bzl", "boss_rust_test")
 
 exports_files(["Cargo.toml"])
 
@@ -72,7 +73,7 @@ rust_binary(
     ] + all_crate_deps(normal = True),
 )
 
-rust_test(
+boss_rust_test(
     name = "boss_test",
     size = "small",
     crate = ":boss",
@@ -96,7 +97,7 @@ rust_test(
 
 # End-to-end coverage for `boss decision` create/list/show/revoke/supersede
 # plus the create-time overlap warning (stderr-only, non-blocking).
-rust_test(
+boss_rust_test(
     name = "decision_test",
     size = "small",
     timeout = "moderate",
@@ -126,7 +127,7 @@ rust_test(
 # Spawns an in-process engine and drives the `boss` binary as a real
 # subprocess; the data dep stages it into the test's runfiles tree at
 # `$RUNFILES_DIR/_main/tools/boss/cli/boss`.
-rust_test(
+boss_rust_test(
     name = "infer_product_test",
     size = "small",
     timeout = "moderate",
@@ -154,7 +155,7 @@ rust_test(
 
 # Shared work-item id resolver: short ids without --product, not-found
 # vs product-required, and ambiguity listing every candidate.
-rust_test(
+boss_rust_test(
     name = "short_id_resolution_test",
     size = "small",
     timeout = "moderate",
@@ -185,7 +186,7 @@ rust_test(
 # — drives the `boss` binary against an in-process engine to confirm
 # `--effort` / `--model` round-trip through create/edit/show and
 # `set-default-model` lifecycles.
-rust_test(
+boss_rust_test(
     name = "effort_and_model_test",
     size = "small",
     timeout = "moderate",
@@ -216,7 +217,7 @@ rust_test(
 # tests — drives the `boss` binary against an in-process engine to
 # confirm the inference chain (explicit → prompt parser → recent →
 # default → no-input refuse) behaves as designed.
-rust_test(
+boss_rust_test(
     name = "repo_resolution_test",
     size = "small",
     timeout = "moderate",
@@ -245,7 +246,7 @@ rust_test(
 # End-to-end coverage for the blocked_reason grapheme-length limit and the
 # blocked_detail sibling field, driven against a real engine over its RPC
 # socket (not just in-process WorkDb calls).
-rust_test(
+boss_rust_test(
     name = "blocked_reason_length_limit_test",
     size = "small",
     timeout = "moderate",
@@ -273,7 +274,7 @@ rust_test(
 
 # Regression test: boss uninstall with BOSS_INSTALL_ROOT set must not kill
 # the host engine. Drives the boss binary as a subprocess; no engine needed.
-rust_test(
+boss_rust_test(
     name = "uninstall_test",
     size = "small",
     srcs = [
@@ -294,7 +295,7 @@ rust_test(
 
 # End-to-end coverage for `boss shake` (the "file a bug against Boss"
 # verb). Uses --dry-run so no `gh` call is made and no real issue is filed.
-rust_test(
+boss_rust_test(
     name = "shake_test",
     size = "small",
     srcs = [
@@ -317,7 +318,7 @@ rust_test(
 # (chore 3 of 5 — "Friendly numeric IDs"). Verifies that 42, #42,
 # boss/42, boss/#42, and primary-id forms all resolve correctly and
 # that wrong-kind errors name the corrective verb.
-rust_test(
+boss_rust_test(
     name = "friendly_id_test",
     size = "small",
     timeout = "moderate",
@@ -348,7 +349,7 @@ rust_test(
 # full case list (mixed short/primary id resolution, the unknown-id error,
 # composition with --priority/--dep/--parent/--deleted, the all-empty
 # footgun, and resolution-failure vs. not-found error propagation).
-rust_test(
+boss_rust_test(
     name = "ids_filter_test",
     size = "small",
     timeout = "moderate",
@@ -379,7 +380,7 @@ rust_test(
 # audit-effort` against an in-process engine with synthetic
 # escalation events filed via the wire surface the sibling
 # escalation-handler task will use.
-rust_test(
+boss_rust_test(
     name = "audit_effort_test",
     size = "small",
     timeout = "moderate",
@@ -409,7 +410,7 @@ rust_test(
 # external-tracker block in `boss product show` (chores 11 + 14 of the
 # external-issue-tracker-sync design). Drives the `boss` binary against
 # an in-process engine and verifies bind → show → unbind → show lifecycle.
-rust_test(
+boss_rust_test(
     name = "external_tracker_test",
     size = "small",
     timeout = "moderate",
@@ -439,7 +440,7 @@ rust_test(
 # `boss product show` (editorial-rules block), and `boss editorial test`.
 # Verifies the set → show → unset round-trip and that editorial::evaluate
 # produces the correct decision without touching GitHub.
-rust_test(
+boss_rust_test(
     name = "editorial_test",
     size = "small",
     timeout = "moderate",
@@ -470,7 +471,7 @@ rust_test(
 # merge-conflict-handling-in-review.md). Drives the `boss` binary
 # against an in-process engine with `ci_remediations` rows seeded via
 # the engine's WorkDb.
-rust_test(
+boss_rust_test(
     name = "engine_ci_verbs_test",
     size = "small",
     timeout = "moderate",

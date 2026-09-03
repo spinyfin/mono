@@ -29,7 +29,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     if let Some(ref iso_tmux) = isolation.derived.tmux_socket {
         work.tmux_socket_path = Some(iso_tmux.clone());
     } else {
-        work.tmux_socket_path = Some(crate::config::tmux_socket_path_beside_db(&work.db_path));
+        work.tmux_socket_path = Some(crate::config::tmux_socket_path_beside_db(&work.db_path)?);
     }
     let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(work, None));
 

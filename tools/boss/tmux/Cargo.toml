@@ -7,6 +7,7 @@ workspace = "../../.."
 [dependencies]
 anyhow = { workspace = true }
 boss-command-runner = { path = "../command-runner" }
+boss-log-files = { path = "../log-files" }
 boss-shell-quote = { path = "../shell-quote" }
 tokio = { workspace = true, features = ["process", "time"] }
 which = { workspace = true }

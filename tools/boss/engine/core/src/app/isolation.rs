@@ -53,12 +53,6 @@ pub fn default_pid_path() -> Option<PathBuf> {
     boss_log_files::default_engine_pid_path()
 }
 
-/// Directory production's state-root files (db, events socket, control
-/// token) live under, relative to `$HOME` — shared by [`is_production_shaped`]
-/// so it can recognize production's shape without depending on *this*
-/// process's `$HOME`.
-const STATE_ROOT_SUFFIX: &str = "Library/Application Support/Boss";
-
 /// The five pieces of engine-owned state a test fixture could collide with.
 ///
 /// One shape serves three roles: where production keeps each file
@@ -437,11 +431,12 @@ fn same_path(a: &Path, b: Option<&Path>) -> bool {
 /// rather than risk a collision — but it means such a path is never treated
 /// as an intentional override; name the file or the containing directory
 /// differently to opt out.
+///
+/// Thin re-export of [`boss_log_files::is_production_shaped`], which moved
+/// there so `boss-tmux`'s test-process guard (`Tmux::for_legacy_label_server*`
+/// et al.) can share this exact check instead of re-deriving it.
 fn is_production_shaped(path: &Path, filename: &str) -> bool {
-    if path.file_name().and_then(|n| n.to_str()) != Some(filename) {
-        return false;
-    }
-    path.parent().is_some_and(|parent| parent.ends_with(STATE_ROOT_SUFFIX))
+    boss_log_files::is_production_shaped(path, filename)
 }
 
 fn resolve_for_compare(path: &Path) -> PathBuf {

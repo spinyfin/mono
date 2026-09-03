@@ -246,7 +246,7 @@ impl WorkConfig {
             Some(path) => Some(PathBuf::from(path)),
             None => boss_log_files::default_events_socket_path(),
         };
-        let tmux_socket_path = Some(tmux_socket_path_beside_db(&db_path));
+        let tmux_socket_path = Some(tmux_socket_path_beside_db(&db_path)?);
         // Default to the hard cap so the engine pool tracks the macOS
         // app's slot count (`WorkersWorkspaceModel.workerSlotCount = 8`).
         // A smaller default left slots 5–8 idle while the dispatcher
@@ -296,20 +296,40 @@ impl WorkConfig {
             .build())
     }
 
-    /// Socket this engine's tmux handle must target. Falls back to the
-    /// file beside `db_path` when the field was left unset (test builders).
+    /// Socket this engine's tmux handle must target. Falls back to the file
+    /// beside `db_path` when the field was left unset (test builders that
+    /// build a `WorkConfig` directly rather than through
+    /// [`WorkConfig::load_from`]).
+    ///
+    /// Panics if `db_path` has no usable parent directory (e.g. `:memory:`)
+    /// — see [`tmux_socket_path_beside_db`]. A production `db_path` always
+    /// has one; this can only fire for a test-only `WorkConfig` that both
+    /// left `tmux_socket_path` unset AND used a parentless `db_path`, and a
+    /// loud panic is exactly what such a test needs instead of silently
+    /// resolving production's tmux socket.
     pub fn resolved_tmux_socket_path(&self) -> PathBuf {
-        self.tmux_socket_path
-            .clone()
-            .unwrap_or_else(|| tmux_socket_path_beside_db(&self.db_path))
+        self.tmux_socket_path.clone().unwrap_or_else(|| {
+            tmux_socket_path_beside_db(&self.db_path)
+                .unwrap_or_else(|err| panic!("cannot resolve a tmux socket path for this WorkConfig: {err:#}"))
+        })
     }
 }
 
 /// `<db_path's parent>/tmux.sock` — the production layout next to `state.db`.
-pub fn tmux_socket_path_beside_db(db_path: &Path) -> PathBuf {
+///
+/// Errors — never silently falls back to
+/// [`boss_log_files::default_tmux_socket_path`] — when `db_path` has no
+/// usable parent directory (e.g. `":memory:"`, used by ~150 test call sites
+/// as a `db_path`). A path that cannot be scoped beside `db_path` must fail
+/// loudly instead of quietly becoming the shared production tmux socket.
+pub fn tmux_socket_path_beside_db(db_path: &Path) -> Result<PathBuf> {
     match db_path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        Some(root) => root.join(boss_log_files::TMUX_SOCKET_FILENAME),
-        None => boss_log_files::default_tmux_socket_path().unwrap_or_else(|| PathBuf::from("/state/boss/tmux.sock")),
+        Some(root) => Ok(root.join(boss_log_files::TMUX_SOCKET_FILENAME)),
+        None => bail!(
+            "cannot derive a tmux socket path beside db_path {db_path:?}: it has no usable parent directory \
+             (e.g. \":memory:\" or a bare filename). Set WorkConfig::tmux_socket_path explicitly instead of \
+             relying on this fallback."
+        ),
     }
 }
 

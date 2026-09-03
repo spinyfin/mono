@@ -122,3 +122,46 @@ checks:
           message: "FileHandle(forWritingAtPath:) opens without O_APPEND, so a following seekToEnd()+write() is two separate syscalls — concurrent appenders (e.g. the app and the engine on the same log) can compute the same offset and splice each other's records. Use DiagnosticWrite.openForAppending(atPath:) instead, which opens with O_APPEND so the offset lookup and the write are atomic (see tools/boss/app-macos/Sources/Diagnostics/DiagnosticWrite.swift). This warning only applies to append paths — a test constructing a handle to exercise a non-append write/close failure is fine and can be left as-is."
           severity: warning
 
+  # Structural guard for the test-process state-isolation fix (see
+  # tools/boss/log-files/src/paths.rs's `is_test_process`/
+  # `install_test_state_root`, tools/boss/test-isolation/src/lib.rs, and the
+  # 2026-09-03 incident that motivated it): a `rust_test` that skips the
+  # `boss_rust_test` Bazel macro (tools/boss/test-isolation/boss_rust_test.bzl)
+  # never links the `boss-test-isolation` guard crate, so its process never
+  # installs an isolated state root and — if invoked directly rather than
+  # through `bazel test` — silently resolves production's paths instead.
+  # Word-boundary anchored (`\b`) so it does not also flag calls to the
+  # macro itself, `boss_rust_test(...)`.
+  - id: boss/raw-rust-test-forbidden
+    check: text/forbidden-pattern
+    include:
+      - "**/BUILD.bazel"
+    exclude:
+      # This crate's own `rust_test` recompiles `boss_log_files` itself with
+      # `--cfg test`. `boss-test-isolation` depends on `boss_log_files`, so
+      # linking it here would pull in a *second*, separately-compiled copy of
+      # this very crate with its own independent isolation statics — the
+      # ctor would install onto that second copy, invisible to the first
+      # copy this target's own tests exercise. See the target's own comment
+      # in log-files/BUILD.bazel.
+      - "log-files/BUILD.bazel"
+      # `boss-test-isolation`'s own `rust_test` recompiles this crate itself
+      # with `--cfg test` (`crate = ":test-isolation"`), so the ctor under
+      # test is already linked into the resulting binary; adding
+      # `//tools/boss/test-isolation` to its own `deps` (what `boss_rust_test`
+      # would do) would pull in a second, un-`--cfg test` copy of the same
+      # crate name and fail to compile. See the target's own comment in
+      # test-isolation/BUILD.bazel.
+      - "test-isolation/BUILD.bazel"
+    policy:
+      severity: error
+      changed_lines_only: true
+    config:
+      surfaces:
+        - files
+      patterns:
+        - name: raw-rust-test-rule
+          pattern: '\brust_test\s*\('
+          message: "Use the boss_rust_test macro instead of raw rust_test: load(\"//tools/boss/test-isolation:boss_rust_test.bzl\", \"boss_rust_test\"). Every test under tools/boss/** must link the boss-test-isolation guard crate so it cannot silently resolve production state paths when run outside bazel test — see tools/boss/log-files/src/paths.rs."
+          severity: error
+

@@ -1,6 +1,7 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//tools/boss/test-isolation:boss_rust_test.bzl", "boss_rust_test")
 load(":engine_binary.bzl", "ENGINE_BINARY_BAZEL_RUN_COMMAND", "ENGINE_BINARY_NAME", "ENGINE_BINARY_TARGET")
 
 rust_library(
@@ -189,7 +190,7 @@ rust_binary(
 #   bazel run --test_sharding_strategy=disabled \
 #       //tools/boss/engine/core:engine_lib_test -- --exact path::to::test_name
 
-rust_test(
+boss_rust_test(
     name = "engine_lib_test",
     size = "small",
     timeout = "moderate",
@@ -213,7 +214,7 @@ rust_test(
     ),
 )
 
-rust_test(
+boss_rust_test(
     name = "work_crud_test",
     size = "small",
     timeout = "moderate",
@@ -243,7 +244,7 @@ rust_test(
 # Populator -> validate -> Materializer pipeline over real design-doc breakdowns
 # checked in under tests/fixtures/planner/ (embedded via include_str!, hence the
 # compile_data glob).
-rust_test(
+boss_rust_test(
     name = "planner_e2e_fixtures_test",
     size = "small",
     timeout = "moderate",
@@ -266,7 +267,7 @@ rust_test(
     ),
 )
 
-rust_test(
+boss_rust_test(
     name = "editorial_pretooluse_test",
     size = "small",
     timeout = "moderate",
@@ -286,7 +287,7 @@ rust_test(
     ),
 )
 
-rust_test(
+boss_rust_test(
     name = "comments_crud_test",
     size = "small",
     timeout = "moderate",
@@ -311,7 +312,7 @@ rust_test(
     ),
 )
 
-rust_test(
+boss_rust_test(
     name = "control_verbs_test",
     size = "small",
     # linux-amd64 CI runners run ~6-7x slower than macOS dev boxes; the 60s default
@@ -340,7 +341,7 @@ rust_test(
     ),
 )
 
-rust_test(
+boss_rust_test(
     name = "pause_bypass_e2e_test",
     size = "small",
     timeout = "moderate",
@@ -364,7 +365,7 @@ rust_test(
     ),
 )
 
-rust_test(
+boss_rust_test(
     name = "shutdown_rpc_test",
     size = "small",
     timeout = "moderate",
@@ -388,7 +389,7 @@ rust_test(
     ),
 )
 
-rust_test(
+boss_rust_test(
     name = "stop_engine_runtime_test",
     size = "small",
     timeout = "moderate",
@@ -407,7 +408,7 @@ rust_test(
     ),
 )
 
-rust_test(
+boss_rust_test(
     name = "isolation_guard_test",
     size = "small",
     timeout = "moderate",
@@ -428,7 +429,7 @@ rust_test(
     ),
 )
 
-rust_test(
+boss_rust_test(
     name = "orphan_reaping_test",
     size = "small",
     # The orphan-reap watcher polls every 1s; ORPHAN_TIMEOUT is 8s.
@@ -451,7 +452,7 @@ rust_test(
     ),
 )
 
-rust_test(
+boss_rust_test(
     name = "startup_recovery_test",
     size = "small",
     timeout = "moderate",
@@ -476,7 +477,7 @@ rust_test(
 # server. The fixture redraws continuously with a non-driver process title,
 # then exercises restart adoption, token-verified stale reaping, lease/slot
 # release, and orphan redispatch with short test-only timing windows.
-rust_test(
+boss_rust_test(
     name = "tmux_recovery_integration_test",
     size = "medium",
     timeout = "moderate",
@@ -513,7 +514,7 @@ rust_test(
     ),
 )
 
-rust_test(
+boss_rust_test(
     name = "background_work_rpc_test",
     size = "small",
     timeout = "moderate",

@@ -2,6 +2,7 @@
 //! override and the default Boss state root.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Environment variable that overrides the audit-log path. Honoured by both
 /// the engine (writer) and `bossctl` (reader) so they always agree on which
@@ -110,11 +111,98 @@ impl LogSource {
     }
 }
 
-/// The default Boss state root: `$HOME/Library/Application Support/Boss`.
-/// Returns `None` when `HOME` is unset.
+/// Directory production's state-root files (db, events socket, control
+/// token, tmux socket, audit/trace logs — everything under the state root)
+/// live under, relative to `$HOME`.
+///
+/// Exposed so callers that need to recognize production's *shape* without
+/// depending on this process's own `$HOME` can share one definition —
+/// see [`is_production_shaped`].
+pub const STATE_ROOT_SUFFIX: &str = "Library/Application Support/Boss";
+
+/// Isolated state root installed by `boss-test-isolation`'s process
+/// constructor for any binary that links it (via the `boss_rust_test` Bazel
+/// macro). `None` in a production binary, which never links that crate.
+///
+/// This is the chokepoint every `default_*_path` function in this module
+/// ultimately derives from ([`default_state_root`]), so a test process gets
+/// exactly one place to install isolation and every derived path (db,
+/// sockets, pid, control token, audit/trace/dispatch logs) follows.
+static TEST_STATE_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Install the isolated state root for this process. Idempotent — only the
+/// first call wins. Called exactly once, by `boss-test-isolation`'s ctor,
+/// before any application code (including `main`) runs.
+pub fn install_test_state_root(root: PathBuf) {
+    let _ = TEST_STATE_ROOT.set(root);
+}
+
+/// True when this process has installed an isolated test state root — i.e.
+/// it links `boss-test-isolation`, which every `rust_test` target under
+/// `tools/boss/**` does via the `boss_rust_test` Bazel macro. `false` in a
+/// production binary (`engine`, `bossctl`, the `boss` CLI), none of which
+/// link that crate.
+pub fn is_test_process() -> bool {
+    TEST_STATE_ROOT.get().is_some()
+}
+
+/// The default Boss state root. In a production process this is
+/// `$HOME/Library/Application Support/Boss` (`None` when `HOME` is unset).
+/// In a test process (see [`is_test_process`]) this is the isolated root
+/// [`install_test_state_root`] installed — **never** `$HOME`, so a test
+/// binary invoked directly (bypassing `bazel test`'s `HOME` redirect and
+/// seatbelt) still cannot resolve production's state root.
+///
+/// Panics if this is a test process and no isolated root was installed: a
+/// `rust_test` target that reaches this point without having linked
+/// `boss-test-isolation` has escaped the `boss_rust_test` macro (which the
+/// `tools/boss/**` build-time check should have caught) — refusing loudly
+/// here is the last line of defense against writing into production state.
 pub fn default_state_root() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/Boss"))
+    resolve_state_root(
+        is_test_process(),
+        TEST_STATE_ROOT.get().map(PathBuf::as_path),
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+    )
+}
+
+/// Pure decision logic behind [`default_state_root`], split out so tests can
+/// exercise every branch — including the refusal — without depending on the
+/// real process-global installed-root state (which, once `boss-test-isolation`
+/// is linked, is populated before any test body runs, making the "no root
+/// installed" branch otherwise unreachable from an ordinary test).
+fn resolve_state_root(is_test_process: bool, installed_root: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+    if is_test_process {
+        let root = installed_root.unwrap_or_else(|| {
+            panic!(
+                "boss-log-files: refusing to resolve Boss's production state root (~/{STATE_ROOT_SUFFIX}) \
+                 from a test process — no isolated test root has been installed. This binary must run \
+                 under `bazel test` (which links the `boss-test-isolation` guard crate via the \
+                 `boss_rust_test` Bazel macro), not be invoked directly as a bazel-bin binary."
+            )
+        });
+        return Some(root.to_path_buf());
+    }
+    Some(home?.join(STATE_ROOT_SUFFIX))
+}
+
+/// Does `path` have production's *shape* for `filename` — i.e. is it named
+/// exactly `filename` and does its parent end with production's state-root
+/// suffix ([`STATE_ROOT_SUFFIX`])?
+///
+/// A structural check independent of *whose* `$HOME` produced `path`, so it
+/// catches an override or ambient path inherited from a production engine
+/// running under a different `$HOME` than this process (or with `HOME`
+/// unset here entirely) — cases plain path-equality against this process's
+/// own production model cannot see. See callers for the safe-direction
+/// tradeoff this implies: a deliberately-chosen private path that happens to
+/// reproduce this shape under a different root is still treated as
+/// production-shaped, not honored as an intentional override.
+pub fn is_production_shaped(path: &Path, filename: &str) -> bool {
+    if path.file_name().and_then(|n| n.to_str()) != Some(filename) {
+        return false;
+    }
+    path.parent().is_some_and(|parent| parent.ends_with(STATE_ROOT_SUFFIX))
 }
 
 /// Production location of the SQLite state database:
@@ -323,7 +411,12 @@ mod tests {
 
     #[test]
     fn engine_runtime_files_resolve_under_state_root() {
-        let root = default_state_root().expect("bazel test supplies HOME");
+        // Under `bazel test` this crate's own tests link `boss-test-isolation`
+        // (via `boss_rust_test`), so `default_state_root` returns the
+        // installed isolated root, not a `$HOME`-derived path — either way,
+        // it must be internally consistent with the other `default_*_path`
+        // functions, which is all this test asserts.
+        let root = default_state_root().expect("a test or production process always resolves a root");
         assert_eq!(default_frontend_socket_path(), Some(root.join("engine.sock")));
         assert_eq!(default_engine_pid_path(), Some(root.join("engine.pid")));
         assert_eq!(default_engine_text_log_path(), Some(root.join("engine.log")));
@@ -441,5 +534,104 @@ mod tests {
                 "population-timing-2026-07-26.jsonl",
             ]
         );
+    }
+
+    // -- resolve_state_root: the test-isolation refusal gate ---------------
+    //
+    // Exercised directly against the pure function rather than through
+    // `default_state_root()` / `is_test_process()`: this crate's own test
+    // binary links `boss-test-isolation`, so the real process-global
+    // `TEST_STATE_ROOT` is always populated by the time any test body runs —
+    // the "test process with no installed root" branch is otherwise
+    // unreachable from an ordinary test. See that function's doc comment.
+
+    #[test]
+    fn production_process_resolves_under_home() {
+        let home = Path::new("/Users/tester");
+        assert_eq!(
+            resolve_state_root(false, None, Some(home)),
+            Some(home.join(STATE_ROOT_SUFFIX))
+        );
+    }
+
+    #[test]
+    fn production_process_with_no_home_resolves_to_none() {
+        assert_eq!(resolve_state_root(false, None, None), None);
+    }
+
+    #[test]
+    fn test_process_uses_the_installed_root_never_home() {
+        let installed = Path::new("/tmp/boss-test-isolation-abc123");
+        let home = Path::new("/Users/tester");
+        assert_eq!(
+            resolve_state_root(true, Some(installed), Some(home)),
+            Some(installed.to_path_buf()),
+            "a test process must resolve its own installed root even when a real $HOME is present"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "refusing to resolve Boss's production state root")]
+    fn test_process_with_no_installed_root_refuses() {
+        resolve_state_root(true, None, Some(Path::new("/Users/tester")));
+    }
+
+    #[test]
+    fn install_test_state_root_is_idempotent() {
+        // This crate's own `rust_test` target is deliberately plain
+        // `rust_test`, not `boss_rust_test` — see log-files/BUILD.bazel's
+        // comment on why linking `boss-test-isolation` here would install
+        // onto a second, separately-compiled copy of this very crate rather
+        // than the one under test. So `TEST_STATE_ROOT` starts unset here,
+        // and this test drives `install_test_state_root` directly rather
+        // than relying on a ctor — confirming the OnceLock's first-writer-
+        // wins semantics is exactly what `boss-test-isolation`'s own
+        // end-to-end test (`tools/boss/test-isolation/src/lib.rs`) then
+        // relies on when it calls the real thing through the real ctor.
+        let first = PathBuf::from("/tmp/boss-test-isolation-first");
+        install_test_state_root(first.clone());
+        assert!(is_test_process());
+        assert_eq!(TEST_STATE_ROOT.get(), Some(&first));
+
+        install_test_state_root(PathBuf::from("/tmp/boss-test-isolation-second"));
+        assert_eq!(
+            TEST_STATE_ROOT.get(),
+            Some(&first),
+            "the first installed root always wins"
+        );
+    }
+
+    // -- is_production_shaped -----------------------------------------------
+
+    #[test]
+    fn production_shaped_path_matches_filename_and_suffix() {
+        assert!(is_production_shaped(
+            Path::new("/Users/tester/Library/Application Support/Boss/tmux.sock"),
+            TMUX_SOCKET_FILENAME
+        ));
+    }
+
+    #[test]
+    fn production_shaped_check_is_independent_of_whose_home() {
+        assert!(is_production_shaped(
+            Path::new("/Users/someone-else/Library/Application Support/Boss/tmux.sock"),
+            TMUX_SOCKET_FILENAME
+        ));
+    }
+
+    #[test]
+    fn wrong_filename_is_not_production_shaped() {
+        assert!(!is_production_shaped(
+            Path::new("/Users/tester/Library/Application Support/Boss/other.sock"),
+            TMUX_SOCKET_FILENAME
+        ));
+    }
+
+    #[test]
+    fn right_filename_wrong_parent_is_not_production_shaped() {
+        assert!(!is_production_shaped(
+            Path::new("/tmp/boss-test-abc123.tmux.sock"),
+            TMUX_SOCKET_FILENAME
+        ));
     }
 }
