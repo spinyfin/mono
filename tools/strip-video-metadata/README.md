@@ -118,6 +118,10 @@ behaves the same regardless of the order you clicked.
   the first keyframe are present in the container but not meant to be shown.
   Remuxing drops them, which is a real content change, so the tool declines.
   Camera-original files don't have this.
+- **"note: could not preserve file mode".** Harmless. The strip itself was
+  verified and applied; only the permission bits or timestamp couldn't be
+  copied across. This can happen when the sandbox a Quick Action runs under
+  declines a metadata change.
 - **Quick Action doesn't appear in the menu.** Restart Finder
   (`killall Finder`), or check System Settings → Privacy & Security →
   Extensions → Finder / Quick Actions and make sure _Strip Video Metadata_ is
