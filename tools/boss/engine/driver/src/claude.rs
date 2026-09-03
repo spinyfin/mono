@@ -116,11 +116,7 @@ fn claude_prompt_addendum_for_level(level: EffortLevel) -> Option<&'static str> 
     match level {
         EffortLevel::Trivial | EffortLevel::Small => None,
         EffortLevel::Medium => Some("Sketch a brief plan before you start editing."),
-        EffortLevel::Large | EffortLevel::Max => Some(
-            "Begin with a written plan. Identify the files you expect to touch and the \
-             order you'll touch them in. Confirm the approach against the work item's \
-             description before writing code.",
-        ),
+        EffortLevel::Large | EffortLevel::Max => Some(crate::LARGE_EFFORT_PROMPT_ADDENDUM),
     }
 }
 
@@ -803,6 +799,16 @@ impl AgentDriver for ClaudeDriver {
             cmd.push_str(" --effort ");
             cmd.push_str(e);
         }
+        // `AskUserQuestion` opens a mid-turn interactive prompt: the turn
+        // never ends, so none of Boss's Stop-boundary machinery (the
+        // `WaitingForInput` transition, `bossctl probe`) ever runs, and the
+        // worker just sits holding its slot until a human happens to be
+        // watching. It is not a permission-gated tool, so neither
+        // `--permission-mode` nor the settings-file `deny` rules touch it —
+        // this flag is the only lever that actually removes it from the
+        // worker's tool surface. A worker that is genuinely blocked already
+        // has the right channel: stop and summarize (a real Stop boundary).
+        cmd.push_str(" --disallowedTools AskUserQuestion");
         if let Some(mode) = permission_mode_override {
             // Forced mode (e.g. `dontAsk` for the capability-restricted answer
             // agent). Suppresses BOTH the `auto` and `--dangerously-skip-permissions`
@@ -2073,6 +2079,68 @@ mod tests {
             vec![EnvDirective::Unset("ANTHROPIC_API_KEY".to_owned())],
             "spawn plan must unset ANTHROPIC_API_KEY; got: {:?}",
             plan.env,
+        );
+    }
+
+    #[test]
+    fn spawn_invocation_disallows_ask_user_question() {
+        // `AskUserQuestion` opens a mid-turn interactive prompt with no Stop
+        // boundary, so it is not gated by --permission-mode or the
+        // settings-file deny rules (see the comment at the call site in
+        // spawn_invocation). --disallowedTools is the only lever that
+        // removes it from the worker's tool surface — verified present
+        // regardless of which --permission-mode branch this spawn takes.
+        for model in ["sonnet", "opus"] {
+            let cmd = ClaudeDriver.spawn_invocation(spawn_request(model)).command;
+            assert!(
+                cmd.contains("--disallowedTools AskUserQuestion"),
+                "worker spawn for model {model:?} must disallow AskUserQuestion; got: {cmd}",
+            );
+        }
+    }
+
+    #[test]
+    fn large_effort_addendum_has_no_human_confirmation_reading() {
+        // Regression for the incident this addendum was reworded over: a
+        // worker read "Confirm the approach against the work item's
+        // description before writing code" as an instruction to ask a
+        // human, and called AskUserQuestion to get an operator to bless a
+        // pure code-organisation choice — holding its slot for ten minutes
+        // to decide something that could not change the deliverable.
+        let addendum = claude_prompt_addendum_for_level(EffortLevel::Large).expect("large effort carries an addendum");
+        assert_eq!(
+            claude_prompt_addendum_for_level(EffortLevel::Max),
+            Some(addendum),
+            "large and max must share the same addendum wording",
+        );
+
+        assert!(
+            !addendum.contains("Confirm the approach"),
+            "addendum must not use the ambiguous 'Confirm the approach' phrasing \
+             that read as a request for human confirmation; got: {addendum}",
+        );
+        for banned in ["ask the human", "seek confirmation", "get approval"] {
+            assert!(
+                !addendum.to_ascii_lowercase().contains(banned),
+                "addendum must not invite human confirmation via {banned:?}; got: {addendum}",
+            );
+        }
+        // The self-check survives: the worker still checks its own plan
+        // against the work item before writing code.
+        assert!(
+            addendum.contains("Check that plan against the work item's description yourself"),
+            "addendum must keep the self-check; got: {addendum}",
+        );
+        // The correction is explicit, not merely an omission.
+        assert!(
+            addendum.contains("do not ask the operator to confirm scope"),
+            "addendum must explicitly redirect the confirmation to the worker itself; got: {addendum}",
+        );
+        // Genuinely underspecified work still has an instruction: pick, say
+        // why, and continue — this must not turn into silent guessing.
+        assert!(
+            addendum.contains("state which you picked and why") && addendum.contains("continue"),
+            "addendum must tell the worker what to do when a decision is genuinely open; got: {addendum}",
         );
     }
 

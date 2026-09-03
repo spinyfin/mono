@@ -22,6 +22,28 @@ use boss_protocol::{
 
 pub mod transcript_store;
 
+/// `large`/`max`-effort worker-prompt addendum, shared verbatim across every
+/// driver's `*_prompt_addendum_for_level` table so the wording — and its
+/// regression test in each driver module — cannot drift between drivers.
+///
+/// Prior wording ("Confirm the approach against the work item's description
+/// before writing code") reads naturally as "ask a human to confirm", and a
+/// worker took it that way: it called `AskUserQuestion` to get an operator to
+/// bless a pure code-organisation choice, holding its slot for ten minutes to
+/// decide something that could not change the deliverable. The self-check is
+/// the useful half of that sentence; only the human-confirmation reading was
+/// the defect. This wording keeps the self-check, makes explicit that the
+/// worker — not the operator — resolves it, and tells the worker what to do
+/// when the work item genuinely leaves a decision open: pick, say why, and
+/// keep going. It deliberately does NOT tell the worker to stay silent when
+/// truly blocked — that escalation path (stop and summarize; see the worker
+/// prompt's "Avoid asking the human for permission" framing) is untouched.
+pub const LARGE_EFFORT_PROMPT_ADDENDUM: &str = "Begin with a written plan. Identify the files you expect to touch \
+     and the order you'll touch them in. Check that plan against the work item's description yourself before \
+     writing code — do not ask the operator to confirm scope. If the description genuinely leaves a decision \
+     open, pick the option consistent with the project's design and conventions, state which you picked and why \
+     in your summary, and continue.";
+
 /// Worker posture for the [`Capability::PermissionPolicy`] capability's
 /// deny-rule selection (reviewer read-only, triage no-work, answer-agent
 /// allowlist).

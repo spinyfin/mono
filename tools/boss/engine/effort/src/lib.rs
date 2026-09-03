@@ -1252,7 +1252,7 @@ mod tests {
         let cfg = resolve_spawn_config(&SpawnResolutionInput::builder().build()).unwrap();
         assert_eq!(
             cfg.claude_invocation(false, None),
-            "claude --model opus --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
+            "claude --model opus --disallowedTools AskUserQuestion --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
         );
     }
 
@@ -1289,7 +1289,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             cfg.claude_invocation(false, None),
-            "claude --model sonnet --effort low --dangerously-skip-permissions \"$(cat .claude/initial-prompt.txt)\"\n",
+            "claude --model sonnet --effort low --disallowedTools AskUserQuestion --dangerously-skip-permissions \"$(cat .claude/initial-prompt.txt)\"\n",
         );
     }
 
@@ -1305,7 +1305,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             cfg.claude_invocation(false, None),
-            "claude --model opus --effort high --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
+            "claude --model opus --effort high --disallowedTools AskUserQuestion --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
         );
     }
 
