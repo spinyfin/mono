@@ -1693,23 +1693,13 @@ pub trait TrunkEvictionEvidence: Send + Sync {
     async fn newest_trunk_bot_comment(&self, repo: &str, pr_number: i64) -> Option<String>;
 
     /// GitHub's own *live* mergeability for `pr_url` — never a cached
-    /// snapshot — retried past a transient `UNKNOWN` and, when
-    /// `expected_base_tip` is given, past a definitive-looking answer
-    /// computed against a base ref that has not yet caught up to it. See
+    /// snapshot — retried past a transient `UNKNOWN`. See
     /// [`crate::conflict_stop_gate::verify_mergeability_live`], which this
     /// wraps: the same "never treat UNKNOWN as mergeable" discipline
     /// `conflict_stop_gate` already enforces for the Stop-verification path
     /// (mono#1531 / mono#1398 / mono#1764), reused here rather than
     /// reimplemented so the two call sites can't diverge again.
-    async fn live_mergeability(&self, pr_url: &str, expected_base_tip: Option<&str>) -> ConflictClearance;
-
-    /// The current tip commit sha of `branch` on `repo`, read live. Used as
-    /// the `expected_base_tip` for [`Self::live_mergeability`] when a base
-    /// move is what triggered the check, so a `mergeable` computed against
-    /// the *previous* base is not mistaken for a fresh answer. `None` when
-    /// unavailable — callers fall back to skipping the staleness check
-    /// rather than blocking on it.
-    async fn base_branch_tip(&self, repo: &str, branch: &str) -> Option<String>;
+    async fn live_mergeability(&self, pr_url: &str) -> ConflictClearance;
 }
 
 /// Production evidence: shells out to `bk` and `gh`.
@@ -1771,32 +1761,15 @@ impl TrunkEvictionEvidence for CliEvictionEvidence {
         newest_trunk_bot_comment(&output.stdout)
     }
 
-    async fn live_mergeability(&self, pr_url: &str, expected_base_tip: Option<&str>) -> ConflictClearance {
+    async fn live_mergeability(&self, pr_url: &str) -> ConflictClearance {
         let prober = CommandMergeProbe::new();
         conflict_stop_gate::verify_mergeability_live(
             &prober,
             pr_url,
             conflict_stop_gate::DEFAULT_UNKNOWN_RETRY_BACKOFF,
             None,
-            expected_base_tip,
         )
         .await
-    }
-
-    async fn base_branch_tip(&self, repo: &str, branch: &str) -> Option<String> {
-        let path = format!("repos/{repo}/branches/{branch}");
-        let output = boss_github::gh_runner::gh_output(&["api", &path]).await.ok()?;
-        if !output.status.success() {
-            tracing::debug!(
-                repo,
-                branch,
-                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-                "trunk queue poller: gh api for the base branch tip failed",
-            );
-            return None;
-        }
-        let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-        parsed["commit"]["sha"].as_str().map(str::to_owned)
     }
 }
 
@@ -1925,13 +1898,7 @@ async fn handle_trunk_queue_eviction(
                 // live_mergeability` factors the same discipline
                 // `conflict_stop_gate` already enforces elsewhere).
                 Some(BotCommentClass::Ambiguous) => {
-                    let base_tip = evidence
-                        .base_branch_tip(&member.intent.repo, &member.intent.target_branch)
-                        .await;
-                    match evidence
-                        .live_mergeability(&member.intent.pr_url, base_tip.as_deref())
-                        .await
-                    {
+                    match evidence.live_mergeability(&member.intent.pr_url).await {
                         ConflictClearance::StillConflicting {
                             raw_mergeable,
                             raw_merge_state_status,
@@ -1999,12 +1966,14 @@ async fn handle_trunk_queue_eviction(
             // read, immediately before minting — if GitHub now says
             // CONFLICTING, hand this off to the conflict lane instead of a
             // "Investigate merge-queue rejection" revision that would repeat
-            // the incident this classifier exists to prevent.
+            // the incident this classifier exists to prevent. An
+            // indeterminate or unavailable read deliberately falls through
+            // to minting rather than stranding the eviction.
             if failures.is_empty()
                 && let ConflictClearance::StillConflicting {
                     raw_mergeable,
                     raw_merge_state_status,
-                } = evidence.live_mergeability(&member.intent.pr_url, None).await
+                } = evidence.live_mergeability(&member.intent.pr_url).await
             {
                 tracing::info!(
                     work_item_id = %member.intent.work_item_id,

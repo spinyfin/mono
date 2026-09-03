@@ -39,6 +39,7 @@ impl StubError {
 }
 
 #[derive(Default, bon::Builder)]
+#[builder(on(String, into))]
 struct StubTrunkApi {
     /// Replies for successive `getQueue` calls. The last entry is sticky,
     /// so a test that only cares about one shape can enqueue it once and
@@ -212,85 +213,97 @@ impl TrunkQueueApi for StubTrunkApi {
 /// subprocess or touches the network — with a real authenticated `gh` on a
 /// developer's PATH the production impl would otherwise issue live API calls
 /// against whatever repo/PR number the fixture happens to name.
-#[derive(Default, bon::Builder)]
+#[derive(Default)]
 struct StubEvictionEvidence {
+    answers: StubEvictionEvidenceAnswers,
+    calls: StubEvictionEvidenceCalls,
+}
+
+#[derive(Default)]
+struct StubEvictionEvidenceAnswers {
     /// Returned verbatim from `failing_construction_build`. Empty by default
     /// — the common case, since Trunk usually leaves no build behind.
     failing_jobs: Vec<RequiredCheckFailure>,
     /// Returned from `newest_trunk_bot_comment`. `None` by default.
     bot_comment: Option<String>,
-    /// Calls to `newest_trunk_bot_comment`, so a test can assert the
-    /// classifier short-circuits on the structured signal instead of
-    /// reaching for the comment.
-    bot_comment_calls: Mutex<usize>,
     /// Returned verbatim from every `live_mergeability` call.
     /// [`ConflictClearance::Cleared`] when unset (see `live_mergeability`
     /// below) — the inert default, since most tests never exercise the
     /// live-read path (the `VsBaseConflict` and `SiblingInQueue` bot-comment
     /// classes never consult it for their own routing decision).
     live_mergeability_reply: Option<ConflictClearance>,
-    /// `(pr_url, expected_base_tip)` for every `live_mergeability` call, in
-    /// order — lets a test assert both that the ambiguous-comment path
+}
+
+#[derive(Default)]
+struct StubEvictionEvidenceCalls {
+    /// Calls to `newest_trunk_bot_comment`, so a test can assert the
+    /// classifier short-circuits on the structured signal instead of
+    /// reaching for the comment.
+    bot_comment_calls: Mutex<usize>,
+    /// PR URLs for every `live_mergeability` call, in order — lets a test
+    /// assert both that the ambiguous-comment path
     /// consulted GitHub live (not a cache) and that the mint-time recheck
     /// fired a second, independent call.
-    live_mergeability_calls: Mutex<Vec<(String, Option<String>)>>,
-    /// Returned from `base_branch_tip`. `None` by default.
-    base_branch_tip_reply: Option<String>,
+    live_mergeability_calls: Mutex<Vec<String>>,
 }
 
 impl StubEvictionEvidence {
     fn with_failing_job() -> Self {
         Self {
-            failing_jobs: vec![RequiredCheckFailure {
-                name: "Trunk merge queue: flunge-ci".to_owned(),
-                conclusion: "failure".to_owned(),
-                target_url: "https://buildkite.com/flunge/flunge-ci/builds/2364#job-uuid".to_owned(),
-                provider: crate::merge_poller::CiProvider::Buildkite,
-                provider_job_id: Some("job-uuid".to_owned()),
-            }],
+            answers: StubEvictionEvidenceAnswers {
+                failing_jobs: vec![RequiredCheckFailure {
+                    name: "Trunk merge queue: flunge-ci".to_owned(),
+                    conclusion: "failure".to_owned(),
+                    target_url: "https://buildkite.com/flunge/flunge-ci/builds/2364#job-uuid".to_owned(),
+                    provider: crate::merge_poller::CiProvider::Buildkite,
+                    provider_job_id: Some("job-uuid".to_owned()),
+                }],
+                ..StubEvictionEvidenceAnswers::default()
+            },
             ..Self::default()
         }
     }
 
     fn with_bot_comment(body: &str) -> Self {
         Self {
-            bot_comment: Some(body.to_owned()),
+            answers: StubEvictionEvidenceAnswers {
+                bot_comment: Some(body.to_owned()),
+                ..StubEvictionEvidenceAnswers::default()
+            },
             ..Self::default()
         }
     }
 
     fn bot_comment_call_count(&self) -> usize {
-        *self.bot_comment_calls.lock().unwrap()
+        *self.calls.bot_comment_calls.lock().unwrap()
     }
 
     fn live_mergeability_call_count(&self) -> usize {
-        self.live_mergeability_calls.lock().unwrap().len()
+        self.calls.live_mergeability_calls.lock().unwrap().len()
     }
 }
 
 #[async_trait]
 impl TrunkEvictionEvidence for StubEvictionEvidence {
     async fn failing_construction_build(&self, _pr_number: u64) -> Vec<RequiredCheckFailure> {
-        self.failing_jobs.clone()
+        self.answers.failing_jobs.clone()
     }
 
     async fn newest_trunk_bot_comment(&self, _repo: &str, _pr_number: i64) -> Option<String> {
-        *self.bot_comment_calls.lock().unwrap() += 1;
-        self.bot_comment.clone()
+        *self.calls.bot_comment_calls.lock().unwrap() += 1;
+        self.answers.bot_comment.clone()
     }
 
-    async fn live_mergeability(&self, pr_url: &str, expected_base_tip: Option<&str>) -> ConflictClearance {
-        self.live_mergeability_calls
+    async fn live_mergeability(&self, pr_url: &str) -> ConflictClearance {
+        self.calls
+            .live_mergeability_calls
             .lock()
             .unwrap()
-            .push((pr_url.to_owned(), expected_base_tip.map(str::to_owned)));
-        self.live_mergeability_reply
+            .push(pr_url.to_owned());
+        self.answers
+            .live_mergeability_reply
             .clone()
             .unwrap_or(ConflictClearance::Cleared)
-    }
-
-    async fn base_branch_tip(&self, _repo: &str, _branch: &str) -> Option<String> {
-        self.base_branch_tip_reply.clone()
     }
 }
 
@@ -965,14 +978,17 @@ async fn an_eviction_boss_did_not_initiate_is_adopted_and_remediated() {
     );
     // What `bk` returns for `trunk-merge/pr-1156/*`: build 2837, one failed job.
     let evidence = Arc::new(StubEvictionEvidence {
-        failing_jobs: vec![RequiredCheckFailure {
-            name: "Trunk merge queue: flunge-ci".to_owned(),
-            conclusion: "failure".to_owned(),
-            target_url: "https://buildkite.com/flunge/flunge-ci/builds/2837#019fb6c1-0457-482f-9181-3f18f31701e7"
-                .to_owned(),
-            provider: crate::merge_poller::CiProvider::Buildkite,
-            provider_job_id: Some("019fb6c1-0457-482f-9181-3f18f31701e7".to_owned()),
-        }],
+        answers: StubEvictionEvidenceAnswers {
+            failing_jobs: vec![RequiredCheckFailure {
+                name: "Trunk merge queue: flunge-ci".to_owned(),
+                conclusion: "failure".to_owned(),
+                target_url: "https://buildkite.com/flunge/flunge-ci/builds/2837#019fb6c1-0457-482f-9181-3f18f31701e7"
+                    .to_owned(),
+                provider: crate::merge_poller::CiProvider::Buildkite,
+                provider_job_id: Some("019fb6c1-0457-482f-9181-3f18f31701e7".to_owned()),
+            }],
+            ..StubEvictionEvidenceAnswers::default()
+        },
         ..StubEvictionEvidence::default()
     });
     let publisher = RecordingPublisher::default();
@@ -1223,11 +1239,14 @@ async fn an_ambiguous_comment_with_live_conflicting_mergeability_routes_to_the_c
     let (_tmp, db) = crate::test_support::open_db();
     let (_, _task_id) = seed_intent(&db, "evicted-ambiguous-conflicting", 1600);
     let evidence = Arc::new(StubEvictionEvidence {
-        bot_comment: Some("Blocked: this PR has a Merge Conflict with main.".to_owned()),
-        live_mergeability_reply: Some(ConflictClearance::StillConflicting {
-            raw_mergeable: "CONFLICTING".to_owned(),
-            raw_merge_state_status: "DIRTY".to_owned(),
-        }),
+        answers: StubEvictionEvidenceAnswers {
+            bot_comment: Some("Blocked: this PR has a Merge Conflict with main.".to_owned()),
+            live_mergeability_reply: Some(ConflictClearance::StillConflicting {
+                raw_mergeable: "CONFLICTING".to_owned(),
+                raw_merge_state_status: "DIRTY".to_owned(),
+            }),
+            ..StubEvictionEvidenceAnswers::default()
+        },
         ..StubEvictionEvidence::default()
     });
     let entry = entry_of_with_state_changed_at(1600, TrunkPrState::Failed, "2026-07-25T03:54:36.000Z");
@@ -1247,8 +1266,11 @@ async fn an_ambiguous_comment_with_live_clean_mergeability_mints_a_revision() {
     let (_tmp, db) = crate::test_support::open_db();
     let (_, task_id) = seed_intent(&db, "evicted-ambiguous-clean", 1601);
     let evidence = Arc::new(StubEvictionEvidence {
-        bot_comment: Some("Blocked: this PR has a Merge Conflict with main.".to_owned()),
-        live_mergeability_reply: Some(ConflictClearance::Cleared),
+        answers: StubEvictionEvidenceAnswers {
+            bot_comment: Some("Blocked: this PR has a Merge Conflict with main.".to_owned()),
+            live_mergeability_reply: Some(ConflictClearance::Cleared),
+            ..StubEvictionEvidenceAnswers::default()
+        },
         ..StubEvictionEvidence::default()
     });
     let entry = entry_of_with_state_changed_at(1601, TrunkPrState::Failed, "2026-07-25T03:54:36.000Z");
@@ -1271,8 +1293,11 @@ async fn an_ambiguous_comment_with_indeterminate_mergeability_defers_without_min
     let (_tmp, db) = crate::test_support::open_db();
     let (_, task_id) = seed_intent(&db, "evicted-ambiguous-indeterminate", 1602);
     let evidence = Arc::new(StubEvictionEvidence {
-        bot_comment: Some("Blocked: this PR has a Merge Conflict with main.".to_owned()),
-        live_mergeability_reply: Some(ConflictClearance::Indeterminate),
+        answers: StubEvictionEvidenceAnswers {
+            bot_comment: Some("Blocked: this PR has a Merge Conflict with main.".to_owned()),
+            live_mergeability_reply: Some(ConflictClearance::Indeterminate),
+            ..StubEvictionEvidenceAnswers::default()
+        },
         ..StubEvictionEvidence::default()
     });
     let entry = entry_of_with_state_changed_at(1602, TrunkPrState::Failed, "2026-07-25T03:54:36.000Z");
@@ -1310,10 +1335,13 @@ async fn the_mint_time_recheck_catches_a_freshly_conflicting_pr() {
     let (_tmp, db) = crate::test_support::open_db();
     let (_, task_id) = seed_intent(&db, "evicted-mint-time-conflicting", 1700);
     let evidence = Arc::new(StubEvictionEvidence {
-        live_mergeability_reply: Some(ConflictClearance::StillConflicting {
-            raw_mergeable: "CONFLICTING".to_owned(),
-            raw_merge_state_status: "DIRTY".to_owned(),
-        }),
+        answers: StubEvictionEvidenceAnswers {
+            live_mergeability_reply: Some(ConflictClearance::StillConflicting {
+                raw_mergeable: "CONFLICTING".to_owned(),
+                raw_merge_state_status: "DIRTY".to_owned(),
+            }),
+            ..StubEvictionEvidenceAnswers::default()
+        },
         ..StubEvictionEvidence::default()
     });
     let entry = evicted_entry_with_readiness(1700, healthy_readiness());

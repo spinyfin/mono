@@ -115,6 +115,44 @@ async fn spawned_revision_pins_standard_reasoning_regardless_of_chain_root() {
 }
 
 #[tokio::test]
+async fn evidence_free_trunk_eviction_spawns_an_investigation_revision() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/104";
+    let (product, chore) = make_in_review(&db, "C-trunk-reasoning", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    let flipped = on_trunk_queue_eviction_detected(
+        &db,
+        pub_.as_ref(),
+        &candidate(&product, &chore, pr),
+        Some("feature-branch"),
+        "entry-reasoning",
+        "2026-09-03T00:00:00.000Z",
+        &[],
+    )
+    .await;
+    assert!(flipped);
+
+    let attempt = db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap()
+        .expect("a pending attempt row must exist");
+    let revision = match db
+        .get_work_item(attempt.revision_task_id.as_deref().expect("revision must be created"))
+        .unwrap()
+    {
+        WorkItem::Task(t) => t,
+        other => panic!("expected revision task, got {other:?}"),
+    };
+    assert_eq!(
+        revision.reasoning,
+        Some(boss_protocol::ReasoningMode::Investigation),
+        "an evidence-free queue eviction requires diagnosis rather than a pre-solved fix",
+    );
+}
+
+#[tokio::test]
 async fn detection_idempotent_does_not_double_spawn_revision() {
     // Re-firing on the same head sha reuses the existing attempt (whose
     // revision_task_id is already set) and spawns no second revision.

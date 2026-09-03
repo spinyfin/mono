@@ -106,7 +106,7 @@ pub async fn verify_conflict_cleared_from(
     unknown_backoff: Duration,
     initial: Option<PrLifecycleProbe>,
 ) -> ConflictClearance {
-    verify_mergeability_live(probe, pr_url, unknown_backoff, initial, None).await
+    verify_mergeability_live(probe, pr_url, unknown_backoff, initial).await
 }
 
 /// Shared primitive behind [`verify_conflict_cleared_from`] and other
@@ -116,24 +116,19 @@ pub async fn verify_conflict_cleared_from(
 /// exists to enforce (see the module doc) — so it is retried with backoff
 /// like every other caller of this loop.
 ///
-/// `expected_base_tip`, when given, adds a second "GitHub hasn't caught up
-/// yet" condition alongside `UNKNOWN`: a probe whose `baseRefOid` does not
-/// match it is treated as not-yet-converged and retried too, rather than
-/// accepted at face value. This matters specifically when the base branch
-/// moving is what triggered the check — the same event that can create a
-/// real conflict can also leave a stale `mergeable` computed against the
-/// *previous* base, and a stale `Clean` read that way is not evidence of
-/// anything. Pass `None` to skip this check (the original
-/// [`verify_conflict_cleared_from`] contract, unchanged).
+/// GitHub's `baseRefOid` is fixed when a PR opens and does not follow its
+/// target branch as that branch advances, so it cannot establish whether a
+/// mergeability answer reflects the current base. A raw `UNKNOWN` is the
+/// only convergence signal this gate uses: it is retried, while definitive
+/// `Clean` and `Conflict` answers are accepted immediately.
 ///
-/// Exhausting the retries without a definitive, non-stale answer returns
+/// Exhausting the retries without a definitive answer returns
 /// [`ConflictClearance::Indeterminate`] — never a guess.
 pub async fn verify_mergeability_live(
     probe: &dyn MergeProbe,
     pr_url: &str,
     unknown_backoff: Duration,
     initial: Option<PrLifecycleProbe>,
-    expected_base_tip: Option<&str>,
 ) -> ConflictClearance {
     let mut initial = initial;
     let mut delay = unknown_backoff;
@@ -159,25 +154,20 @@ pub async fn verify_mergeability_live(
             // caller's own merged/closed handling is the right one.
             _ => return ConflictClearance::Unavailable,
         };
-        let base_is_stale = expected_base_tip.is_some_and(|tip| result.base_ref_oid.as_deref() != Some(tip));
         match open.mergeability {
-            OpenPrMergeability::Clean if !base_is_stale => return ConflictClearance::Cleared,
-            OpenPrMergeability::Conflict if !base_is_stale => {
+            OpenPrMergeability::Clean => return ConflictClearance::Cleared,
+            OpenPrMergeability::Conflict => {
                 return ConflictClearance::StillConflicting {
                     raw_mergeable: non_empty_or(&result.raw_mergeable, "CONFLICTING"),
                     raw_merge_state_status: non_empty_or(&result.raw_merge_state_status, "DIRTY"),
                 };
             }
-            OpenPrMergeability::Unknown | OpenPrMergeability::Clean | OpenPrMergeability::Conflict => {
-                // Either genuinely UNKNOWN, or a definitive-looking result
-                // computed against a base ref that lags what the caller
-                // already knows landed — neither is a trustworthy answer yet.
+            OpenPrMergeability::Unknown => {
                 if attempt == UNKNOWN_RETRY_ATTEMPTS {
                     tracing::info!(
                         pr_url,
                         probes = attempt + 1,
-                        base_is_stale,
-                        "conflict stop gate: no definitive, non-stale mergeability after retries; \
+                        "conflict stop gate: no definitive mergeability after retries; \
                          refusing to guess",
                     );
                     return ConflictClearance::Indeterminate;
@@ -185,9 +175,8 @@ pub async fn verify_mergeability_live(
                 tracing::debug!(
                     pr_url,
                     attempt,
-                    base_is_stale,
                     backoff_ms = delay.as_millis(),
-                    "conflict stop gate: mergeability not yet trustworthy (UNKNOWN or stale base); re-probing",
+                    "conflict stop gate: mergeability is UNKNOWN; re-probing",
                 );
                 tokio::time::sleep(delay).await;
                 delay = delay.saturating_mul(2);
@@ -264,6 +253,7 @@ mod tests {
         states: Mutex<Vec<PrLifecycleState>>,
         calls: Mutex<u32>,
         raw: (String, String),
+        base_ref_oid: Option<String>,
     }
 
     impl ScriptedProbe {
@@ -272,11 +262,17 @@ mod tests {
                 states: Mutex::new(states),
                 calls: Mutex::new(0),
                 raw: (String::new(), String::new()),
+                base_ref_oid: None,
             }
         }
 
         fn with_raw(mut self, mergeable: &str, merge_state_status: &str) -> Self {
             self.raw = (mergeable.to_owned(), merge_state_status.to_owned());
+            self
+        }
+
+        fn with_base_ref_oid(mut self, base_ref_oid: &str) -> Self {
+            self.base_ref_oid = Some(base_ref_oid.to_owned());
             self
         }
 
@@ -304,6 +300,7 @@ mod tests {
                 .review(PrReviewState::Unknown)
                 .raw_mergeable(self.raw.0.clone())
                 .raw_merge_state_status(self.raw.1.clone())
+                .maybe_base_ref_oid(self.base_ref_oid.clone())
                 .build())
         }
     }
@@ -339,6 +336,40 @@ mod tests {
                 raw_mergeable: "CONFLICTING".into(),
                 raw_merge_state_status: "DIRTY".into(),
             },
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pinned_base_ref_oid_does_not_make_a_clean_answer_stale() {
+        let probe = ScriptedProbe::new(vec![PrLifecycleState::Open(OpenPrStatus::clean())])
+            .with_base_ref_oid("base-at-pr-open");
+        assert_eq!(
+            verify_mergeability_live(&probe, PR, Duration::ZERO, None).await,
+            ConflictClearance::Cleared,
+        );
+        assert_eq!(
+            probe.calls(),
+            1,
+            "a definitive answer must not be retried for a pinned base oid"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pinned_base_ref_oid_does_not_make_a_conflict_answer_stale() {
+        let probe = ScriptedProbe::new(vec![PrLifecycleState::Open(OpenPrStatus::conflict_only())])
+            .with_base_ref_oid("base-at-pr-open")
+            .with_raw("CONFLICTING", "DIRTY");
+        assert_eq!(
+            verify_mergeability_live(&probe, PR, Duration::ZERO, None).await,
+            ConflictClearance::StillConflicting {
+                raw_mergeable: "CONFLICTING".into(),
+                raw_merge_state_status: "DIRTY".into(),
+            },
+        );
+        assert_eq!(
+            probe.calls(),
+            1,
+            "a definitive conflict must not be retried for a pinned base oid"
         );
     }
 
