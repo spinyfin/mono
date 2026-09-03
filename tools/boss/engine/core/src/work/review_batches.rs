@@ -295,6 +295,29 @@ fn create_review_batch_in_tx(
     ))
 }
 
+/// Look up the only batch allowed for an immutable target, against any
+/// open connection or transaction. Shared by the public
+/// [`WorkDb::review_batch_for_target`] and the in-transaction lookup in
+/// [`WorkDb::create_pre_merge_review_batch`] so the fourteen-column SELECT
+/// and `map_review_batch` stay in one place.
+fn review_batch_for_target_in(
+    conn: &rusqlite::Connection,
+    cycle_root_id: &str,
+    phase: ReviewBatchPhase,
+    target_sha: &str,
+) -> Result<Option<ReviewBatch>> {
+    conn.query_row(
+        "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
+                phase, pr_number, pr_url, status, target_sha, updated_at,
+                completed_at, final_verdict_proposal_id, merge_sha
+         FROM pr_review_batches WHERE cycle_root_id = ?1 AND phase = ?2 AND target_sha = ?3",
+        params![cycle_root_id, phase.as_str(), target_sha],
+        map_review_batch,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 fn batch_executions_in_tx(tx: &rusqlite::Transaction<'_>, batch_id: &str) -> Result<Vec<WorkExecution>> {
     let mut statement = tx.prepare(
         "SELECT execution_id FROM pr_review_batch_members WHERE batch_id = ?1 ORDER BY role ASC, attempt ASC, id ASC",
@@ -345,24 +368,30 @@ impl WorkDb {
         }
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(batch) = tx
-            .query_row(
-                "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
-                        phase, pr_number, pr_url, status, target_sha, updated_at,
-                        completed_at, final_verdict_proposal_id, merge_sha
-                 FROM pr_review_batches WHERE cycle_root_id = ?1 AND phase = ?2 AND target_sha = ?3",
-                params![input.cycle_root_id, input.phase.as_str(), input.target_sha],
-                map_review_batch,
-            )
-            .optional()?
-        {
+        if let Some(batch) = review_batch_for_target_in(&tx, &input.cycle_root_id, input.phase, &input.target_sha)? {
             let executions = batch_executions_in_tx(&tx, &batch.id)?;
             tx.commit()?;
             return Ok(ReviewBatchDispatch::ExistingBatch { batch, executions });
         }
         if let Some(execution) = existing_nonterminal_pr_review_execution(&tx, &input.cycle_root_id)? {
-            tx.commit()?;
-            return Ok(ReviewBatchDispatch::LegacyExecution(execution));
+            // `existing_nonterminal_pr_review_execution` cannot itself tell a
+            // batch leaf apart from a genuine legacy single reviewer — both
+            // are non-terminal `pr_review` executions on the same work item.
+            // A leaf from a different (now-stale) target, or a fresh retry
+            // execution inserted by `retry_dead_review_batch_member`, must
+            // never be misread as "legacy reviewer owns this target": that
+            // would silently suppress batch creation for the new target.
+            let is_batch_leaf: Option<()> = tx
+                .query_row(
+                    "SELECT 1 FROM pr_review_batch_members WHERE execution_id = ?1",
+                    params![execution.id],
+                    |_| Ok(()),
+                )
+                .optional()?;
+            if is_batch_leaf.is_none() {
+                tx.commit()?;
+                return Ok(ReviewBatchDispatch::LegacyExecution(execution));
+            }
         }
         let executions = (0..3)
             .map(|_| {
@@ -410,17 +439,7 @@ impl WorkDb {
         target_sha: &str,
     ) -> Result<Option<ReviewBatch>> {
         let conn = self.connect()?;
-        conn.query_row(
-            "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
-                    phase, pr_number, pr_url, status, target_sha, updated_at,
-                    completed_at, final_verdict_proposal_id, merge_sha
-             FROM pr_review_batches
-             WHERE cycle_root_id = ?1 AND phase = ?2 AND target_sha = ?3",
-            params![cycle_root_id, phase.as_str(), target_sha],
-            map_review_batch,
-        )
-        .optional()
-        .map_err(Into::into)
+        review_batch_for_target_in(&conn, cycle_root_id, phase, target_sha)
     }
 
     /// Return all persisted batches for a review cycle root, newest first.
@@ -516,22 +535,32 @@ impl WorkDb {
     /// List each failed-in-place leaf independently. Unlike the legacy
     /// candidate query, this is not collapsed to one row per work item: three
     /// roles may validly fail or recover in parallel.
+    ///
+    /// `member.status` includes `'failed'` alongside `'pending'`/`'running'`
+    /// because `finalize_review_batch_member` already stamps a member
+    /// `'failed'` (and completes its execution) when its worker stops
+    /// without submitting a review-report proposal — that is the designed
+    /// main path this recovery sweep exists to retry by role. Excluding
+    /// `'failed'` here would leave only the narrower host-death case (a
+    /// member still `'pending'`/`'running'` whose execution died without a
+    /// Stop hook) ever recovered. `retry_dead_review_batch_member` already
+    /// bounds this to one retry per role via `member.attempt >= 2` and the
+    /// existing-retry check.
     pub fn list_dead_review_batch_member_candidates(&self) -> Result<Vec<DeadPrReviewCandidate>> {
         let conn = self.connect()?;
-        let unproductive_completed =
-            super::review_verdicts::unproductive_completed_pr_review_sql().replace("we.", "execution.");
+        let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
         let sql = format!(
-            "SELECT execution.work_item_id, execution.id, execution.status
+            "SELECT we.work_item_id, we.id, we.status
              FROM pr_review_batch_members member
              JOIN pr_review_batches batch ON batch.id = member.batch_id
-             JOIN work_executions execution ON execution.id = member.execution_id
-             JOIN tasks task ON task.id = execution.work_item_id
+             JOIN work_executions we ON we.id = member.execution_id
+             JOIN tasks task ON task.id = we.work_item_id
              WHERE batch.phase = 'pre_merge'
                AND member.role IN ('claude_reviewer', 'codex_reviewer', 'grok_reviewer')
-               AND member.status IN ('pending', 'running')
+               AND member.status IN ('pending', 'running', 'failed')
                AND task.deleted_at IS NULL AND task.status NOT IN ('done', 'archived')
-               AND (execution.status IN ('orphaned', 'abandoned', 'failed', 'cancelled') OR {unproductive_completed})
-             ORDER BY task.updated_at ASC, execution.id ASC"
+               AND (we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled') OR {unproductive_completed})
+             ORDER BY task.updated_at ASC, we.id ASC"
         );
         let mut statement = conn.prepare(&sql)?;
         let rows = statement.query_map([], |row| {

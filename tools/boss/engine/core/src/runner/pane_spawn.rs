@@ -655,6 +655,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // disagree about which decision-declaration mechanism is live.
         let automation_outcome_proposals_seam_enabled = self.feature_flags.is_enabled("worker_proposals")
             && self.feature_flags.is_enabled("automation_outcome_proposals_seam");
+        let review_batch_fanout_enabled = self.feature_flags.is_enabled("review_batch_fanout");
         let ComposedWorkerSpawn {
             prompt_text,
             spawn_config,
@@ -672,6 +673,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 deferred_scope_proposals_seam_enabled,
                 followup_proposals_seam_enabled,
                 automation_outcome_proposals_seam_enabled,
+                review_batch_fanout_enabled,
             },
         )
         .await

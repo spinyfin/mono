@@ -60,6 +60,13 @@ pub(crate) struct WorkerSpawnOpts {
     pub(crate) followup_proposals_seam_enabled: bool,
     #[builder(default)]
     pub(crate) automation_outcome_proposals_seam_enabled: bool,
+    /// Mirrors `pr_transition.rs`'s own `review_batch_fanout` read. When on,
+    /// a `pr_review` execution with no persisted batch-member row must fail
+    /// closed rather than silently falling back to the legacy Claude pool —
+    /// see `docs/designs/multi-agent-code-review.md`, "Dispatch three
+    /// executions, not one execution with subagents".
+    #[builder(default)]
+    pub(crate) review_batch_fanout_enabled: bool,
 }
 
 /// Fetch authoritative PR metadata for a reviewer worker's initial prompt.
@@ -357,6 +364,7 @@ pub(crate) async fn compose_worker_spawn(
         deferred_scope_proposals_seam_enabled,
         followup_proposals_seam_enabled,
         automation_outcome_proposals_seam_enabled,
+        review_batch_fanout_enabled,
     } = editorial_opts;
     // For any project-scoped task (the synthetic `kind = 'design'`
     // task and ordinary `project_task` rows alike), the richer
@@ -808,6 +816,20 @@ pub(crate) async fn compose_worker_spawn(
     } else {
         None
     };
+    // Fail closed rather than falling back to the legacy Claude pool: with
+    // the flag on, a `pr_review` execution missing its member row (a leaf
+    // whose row write raced this read, or a legacy execution minted by the
+    // `pr_transition` error fallback) must not silently collapse the
+    // three-way reviewer diversity the batch exists to measure. Gated on
+    // the flag so legacy (flag-off) mode — where every `pr_review`
+    // execution has no member row by design — is unaffected.
+    if review_batch_fanout_enabled && execution.kind == ExecutionKind::PrReview && batch_member.is_none() {
+        anyhow::bail!(
+            "review_batch_fanout is enabled but execution {} (pr_review) has no review batch member row; \
+             refusing to spawn rather than silently falling back to the legacy Claude pool",
+            execution.id
+        );
+    }
     // Single resolution point for review/automation dispatch policy — see
     // `pool_dispatch_policy_for_worker_id`'s doc comment. `None` for
     // main-pool workers, which dispatch on the row's own `driver` column.

@@ -601,6 +601,99 @@ fn leaf_dispatch_creates_three_atomic_role_pinned_executions() {
     }
 }
 
+/// `are_same_review_batch_leaves` relaxes the ordinary single-writer chain
+/// guard for exactly one case: two leaf executions of the SAME persisted
+/// batch. Its false cases are the safety-critical ones — a too-permissive
+/// predicate would let genuinely unrelated executions run concurrently on
+/// one work item, which is precisely what the guard exists to stop.
+#[test]
+fn are_same_review_batch_leaves_rejects_cross_batch_and_memberless_pairs() {
+    let db = WorkDb::open(temp_db_path("review-batch-leaves-negative")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+
+    let (_batch_a, executions_a) = match db
+        .create_pre_merge_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha-a", ReviewBatchPhase::PreMerge),
+            "https://github.com/example/repo",
+        )
+        .unwrap()
+    {
+        ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+        other => panic!("expected a newly-created review batch, got {other:?}"),
+    };
+
+    // (a) Two leaves belonging to DIFFERENT batches under the same cycle
+    // root (a second batch at another target SHA) must not read as "same
+    // batch leaves".
+    let (_batch_b, executions_b) = match db
+        .create_pre_merge_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha-b", ReviewBatchPhase::PreMerge),
+            "https://github.com/example/repo",
+        )
+        .unwrap()
+    {
+        ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+        other => panic!("expected a newly-created review batch, got {other:?}"),
+    };
+    assert!(
+        !db.are_same_review_batch_leaves(&executions_a[0].id, &executions_b[0].id)
+            .unwrap(),
+        "leaves from different batches must not be treated as the same batch's leaves"
+    );
+
+    // (b) A leaf paired with an execution that has no member row at all
+    // must not read as "same batch leaves" either.
+    let bare_execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    assert!(
+        !db.are_same_review_batch_leaves(&executions_a[0].id, &bare_execution.id)
+            .unwrap(),
+        "an execution with no batch member row must not be treated as a batch leaf"
+    );
+}
+
+/// The flag-off / non-batch path: `create_pre_merge_review_batch` must
+/// treat a genuine legacy (non-batch) non-terminal `pr_review` execution as
+/// owning the target and refuse to create a batch alongside it — the
+/// mode-separation invariant the work item requires.
+#[test]
+fn create_pre_merge_review_batch_defers_to_a_genuine_legacy_execution() {
+    let db = WorkDb::open(temp_db_path("review-batch-legacy-execution")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+
+    let legacy_execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+
+    match db
+        .create_pre_merge_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            "https://github.com/example/repo",
+        )
+        .unwrap()
+    {
+        ReviewBatchDispatch::LegacyExecution(execution) => {
+            assert_eq!(execution.id, legacy_execution.id);
+        }
+        other => panic!("expected LegacyExecution for a genuine legacy reviewer, got {other:?}"),
+    }
+}
+
 #[test]
 fn dead_leaf_retries_only_its_own_role_once() {
     let db = WorkDb::open(temp_db_path("review-batch-role-retry")).unwrap();

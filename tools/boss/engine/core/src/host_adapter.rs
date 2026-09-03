@@ -768,6 +768,12 @@ impl HostAdapter for SshHostAdapter {
             // counters' declaration in `completion.rs` before using them as
             // an exit criterion. Wire feature flags into the remote path
             // alongside the cross-host config work (PR3/PR4).
+            //
+            // `review_batch_fanout_enabled: false` for the same reason: the
+            // remote path cannot read the flag, so a remote-spawned
+            // `pr_review` execution never gets the fail-closed check —
+            // it keeps today's legacy-pool-fallback behavior rather than
+            // gaining it, matching every other flag on this path.
             WorkerSpawnOpts {
                 editorial_enabled: false,
                 max_embed_diff_lines: self.cfg.work.max_review_embed_diff_lines,
@@ -775,6 +781,7 @@ impl HostAdapter for SshHostAdapter {
                 deferred_scope_proposals_seam_enabled: false,
                 followup_proposals_seam_enabled: false,
                 automation_outcome_proposals_seam_enabled: false,
+                review_batch_fanout_enabled: false,
             },
         )
         .await?;
