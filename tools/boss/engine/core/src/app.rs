@@ -1597,6 +1597,7 @@ impl ServerState {
                 ));
             }
             let execution_coordinator = Arc::new(execution_coordinator_inner);
+            completion_handler.set_host_adapter_provider(execution_coordinator.host_adapter_provider());
 
             ServerState::builder()
                 .work_db(work_db)

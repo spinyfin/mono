@@ -2510,25 +2510,6 @@ pub(super) async fn dispatch_completion_on_stop(
     let Some(run_id) = incoming.run_id.as_deref() else {
         return;
     };
-    // A remote wrapper resolves its structured-output path under the remote
-    // host's own temp root. Pull a completed review result over the existing
-    // SSH transport before the normal finalizer reads its engine-local path.
-    // An absent artifact is still the normal re-prompt case; a descriptor or
-    // copy failure is terminal and explicitly recorded rather than falling
-    // through as a review with no findings.
-    if let Err(err) = collect_remote_review_result(server_state, run_id).await {
-        let reason = format!("remote structured-output collection failed: {err:#}");
-        tracing::error!(run_id, error = %reason, "completion: refusing to finalize remote review without its structured result");
-        match server_state.work_db.mark_execution_orphaned(run_id, &reason) {
-            Ok(_) => {}
-            Err(mark_err) => tracing::error!(
-                run_id,
-                ?mark_err,
-                "completion: could not record remote structured-output collection failure",
-            ),
-        }
-        return;
-    }
     let outcome = server_state
         .completion_handler
         .on_stop_with_turn_end_deferrable(run_id, incoming.turn_boundary(), defer_finalization)
@@ -2539,38 +2520,6 @@ pub(super) async fn dispatch_completion_on_stop(
     // zero log evidence because this was at debug — operators saw
     // `activity=idle` workers but no record of what `on_stop` returned.
     tracing::info!(run_id, ?outcome, "completion handler stop result");
-}
-
-async fn collect_remote_review_result(server_state: &Arc<ServerState>, execution_id: &str) -> anyhow::Result<()> {
-    let execution = server_state.work_db.get_execution(execution_id)?;
-    if execution.kind != boss_protocol::ExecutionKind::PrReview {
-        return Ok(());
-    }
-    let host_id = server_state
-        .work_db
-        .execution_host_id(execution_id)?
-        .unwrap_or_else(|| "local".to_owned());
-    if host_id == "local" {
-        return Ok(());
-    }
-    let host = server_state
-        .work_db
-        .get_host(&host_id)?
-        .ok_or_else(|| anyhow::anyhow!("remote host {host_id:?} is no longer registered"))?;
-    let adapter = server_state.execution_coordinator.adapter_for_host(&host).await?;
-    let destination = crate::structured_output::path_for(
-        &crate::structured_output::default_dir(),
-        execution_id,
-        crate::structured_output::StructuredOutputKind::ReviewResult,
-    );
-    let _ = adapter
-        .collect_structured_output(
-            execution_id,
-            crate::structured_output::StructuredOutputKind::ReviewResult,
-            &destination,
-        )
-        .await?;
-    Ok(())
 }
 
 #[cfg(test)]

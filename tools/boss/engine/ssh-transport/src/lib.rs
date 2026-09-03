@@ -404,8 +404,8 @@ impl SshTransport {
 
     /// Fetch a remote file over the existing ControlMaster. The caller owns
     /// validation of `remote`; unlike [`Self::scp_push`], it commonly comes
-    /// from a remote-side descriptor and must be treated as data, not a shell
-    /// fragment.
+    /// from a remote-side descriptor and is shell-quoted before `scp` hands
+    /// its remote half to the SSH server.
     pub async fn scp_pull(&self, remote: &str, local: &Path) -> Result<SshOutput> {
         let mut cmd = Command::new("scp");
         cmd.args([
@@ -413,7 +413,7 @@ impl SshTransport {
             "BatchMode=yes",
             "-o",
             &format!("ControlPath={}", self.control_socket.display()),
-            &format!("{}:{remote}", self.ssh_target),
+            &format!("{}:{}", self.ssh_target, shell_quote(remote)),
             local.to_string_lossy().as_ref(),
         ]);
         cmd.stdout(Stdio::piped());

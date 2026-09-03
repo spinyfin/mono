@@ -732,6 +732,18 @@ impl WorkerCompletionHandler {
         // instruction.
         let mut parse_error: Option<String> = None;
 
+        // A remote wrapper writes its artifact on the remote host. Collection
+        // lives at the read site, not the Stop dispatcher, so rechecks and
+        // recovery finalization paths observe the same artifact.
+        if let Err(err) = self
+            .collect_remote_structured_output(execution, crate::structured_output::StructuredOutputKind::ReviewResult)
+            .await
+        {
+            let detail = format!("remote structured-output collection failed: {err:#}");
+            tracing::error!(execution_id = %execution.id, error = %detail, "pr_review finalize: cannot safely continue after collection failure");
+            return self.finalize_driver_terminal_error(execution, &detail).await;
+        }
+
         let from_artifact = match crate::structured_output::read(
             &self.structured_output_dir,
             &execution.id,
@@ -809,11 +821,24 @@ impl WorkerCompletionHandler {
                     return StopOutcome::ReviewPassAwaitingResult;
                 }
                 NudgeDecision::Proceed { count } => {
+                    let is_remote = match self.work_db.execution_host_id(&execution.id) {
+                        Ok(Some(host_id)) => host_id != "local",
+                        Ok(None) => false,
+                        Err(err) => {
+                            tracing::warn!(execution_id = %execution.id, ?err, "pr_review finalize: could not resolve execution host for re-prompt; using local path");
+                            false
+                        }
+                    };
                     let output_path = crate::structured_output::path_for(
                         &self.structured_output_dir,
                         &execution.id,
                         crate::structured_output::StructuredOutputKind::ReviewResult,
                     );
+                    let output_destination = if is_remote {
+                        "$BOSS_STRUCTURED_OUTPUT".to_owned()
+                    } else {
+                        output_path.display().to_string()
+                    };
                     // Include the specific serde error in the probe when we have one so
                     // the reviewer can correct the exact malformation rather than blindly
                     // rewriting the entire JSON.
@@ -831,7 +856,7 @@ impl WorkerCompletionHandler {
                              If your sandbox does not allow writing that path, instead end \
                              your reply with the corrected JSON in a fenced ```json block as \
                              the last content in the message. Do NOT change the PR.",
-                            output_path.display(),
+                            output_destination,
                         )
                     } else {
                         format!(
@@ -841,7 +866,7 @@ impl WorkerCompletionHandler {
                              If your sandbox does not allow writing that path, instead end \
                              your reply with the JSON in a fenced ```json block as the last \
                              content in the message. Do NOT change the PR.",
-                            output_path.display(),
+                            output_destination,
                         )
                     };
                     tracing::warn!(
@@ -1914,5 +1939,37 @@ impl WorkerCompletionHandler {
         }
 
         None
+    }
+}
+
+impl WorkerCompletionHandler {
+    async fn collect_remote_structured_output(
+        &self,
+        execution: &crate::work::WorkExecution,
+        kind: crate::structured_output::StructuredOutputKind,
+    ) -> anyhow::Result<bool> {
+        let host_id = match self.work_db.execution_host_id(&execution.id) {
+            Ok(Some(host_id)) if host_id != "local" => host_id,
+            Ok(_) => return Ok(false),
+            Err(err) => {
+                tracing::warn!(execution_id = %execution.id, ?err, "structured-output collection: host lookup failed; falling back to normal completion");
+                return Ok(false);
+            }
+        };
+        let host = self
+            .work_db
+            .get_host(&host_id)?
+            .ok_or_else(|| anyhow::anyhow!("remote host {host_id:?} is no longer registered"))?;
+        let provider = self
+            .host_adapter_provider
+            .read()
+            .expect("host adapter provider lock poisoned")
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("remote host adapter provider is unavailable"))?;
+        let adapter = provider.adapter_for(&host).await?;
+        let destination = crate::structured_output::path_for(&self.structured_output_dir, &execution.id, kind);
+        adapter
+            .collect_structured_output(&execution.id, kind, &destination)
+            .await
     }
 }

@@ -800,11 +800,12 @@ impl HostAdapter for SshHostAdapter {
         // the wrapper resolves a path under *its* temp root and exports it.
         // Keep the prompt and environment in one contract by referring to the
         // exported value instead of shipping a coordinator-local pathname.
-        let structured_output_kind = (execution.kind == boss_protocol::ExecutionKind::PrReview)
-            .then(|| crate::runner::designated_output_kind(execution, work_item))
-            .flatten();
+        let structured_output_kind = crate::runner::designated_output_kind(execution, work_item);
         if let Some(kind) = structured_output_kind {
             let local_path = crate::structured_output::default_path_string(&run_id, kind);
+            if !prompt_text.contains(&local_path) {
+                bail!("remote spawn prompt omitted structured-output path {local_path:?} for execution {run_id}");
+            }
             prompt_text = prompt_text.replace(&local_path, "$BOSS_STRUCTURED_OUTPUT");
         }
         // `compose_execution_prompt` decides the Bazel pre-push gate by
@@ -1049,6 +1050,18 @@ impl HostAdapter for SshHostAdapter {
         destination: &Path,
     ) -> Result<bool> {
         let descriptor = format!("~/.boss-remote/runs/{execution_id}.structured-output-path");
+        let descriptor_exists = self
+            .transport
+            .run_with_remote_paths(&["test", "-f", &descriptor])
+            .await?;
+        if !descriptor_exists.success() {
+            tracing::warn!(
+                execution_id,
+                host_id = %self.transport.host_id,
+                "remote structured-output descriptor is absent; falling back to transcript/probe recovery",
+            );
+            return Ok(false);
+        }
         let descriptor_out = self
             .transport
             .run_with_remote_paths(&["cat", &descriptor])
@@ -1066,21 +1079,12 @@ impl HostAdapter for SshHostAdapter {
                 non_empty(&descriptor_out.stderr, descriptor_out.status)
             );
         }
-        let remote_path = descriptor_out.stdout.trim();
-        if !remote_path.starts_with('/') || remote_path.contains('\n') || remote_path.contains('\r') {
-            bail!(
-                "remote structured-output descriptor for execution {execution_id} on host {} contained an invalid path {:?}",
-                self.transport.host_id,
-                remote_path
-            );
-        }
-        if !remote_path.ends_with(&format!(".{}.json", kind.slug())) {
-            bail!(
-                "remote structured-output descriptor for execution {execution_id} on host {} named {remote_path:?}, not a {} artifact",
-                self.transport.host_id,
-                kind.slug(),
-            );
-        }
+        let remote_path = validate_remote_output_path(&descriptor_out.stdout, kind).with_context(|| {
+            format!(
+                "remote structured-output descriptor for execution {execution_id} on host {}",
+                self.transport.host_id
+            )
+        })?;
         let exists = self.transport.run(&["test", "-f", remote_path]).await?;
         if !exists.success() {
             return Ok(false);
@@ -1107,8 +1111,30 @@ impl HostAdapter for SshHostAdapter {
                 destination.display()
             )
         })?;
+        let reap = self
+            .transport
+            .run_with_remote_paths(&["rm", "-f", &descriptor, remote_path])
+            .await?;
+        if !reap.success() {
+            tracing::warn!(execution_id, host_id = %self.transport.host_id, stderr = %reap.stderr, "collected remote structured output but could not reap remote files");
+        }
         Ok(true)
     }
+}
+
+/// Validate an output descriptor before passing its path to `scp`.
+pub(crate) fn validate_remote_output_path(
+    raw: &str,
+    kind: crate::structured_output::StructuredOutputKind,
+) -> Result<&str> {
+    let path = raw.strip_suffix('\n').unwrap_or(raw);
+    if !path.starts_with('/') || path.contains('\n') || path.contains('\r') {
+        bail!("contained an invalid absolute path {path:?}");
+    }
+    if !path.ends_with(&format!(".{}.json", kind.slug())) {
+        bail!("named {path:?}, not a {} artifact", kind.slug());
+    }
+    Ok(path)
 }
 
 // ── HostAdapterCubeClient ─────────────────────────────────────────────────────
@@ -1685,5 +1711,17 @@ mod tests {
             Arc::new(crate::test_support::NoopRunner),
         );
         assert_eq!(adapter.command_repr(&["anything"]), None);
+    }
+
+    #[test]
+    fn remote_output_descriptor_requires_a_safe_absolute_kind_path() {
+        use crate::structured_output::StructuredOutputKind::ReviewResult;
+        assert!(validate_remote_output_path("relative.review-result.json", ReviewResult).is_err());
+        assert!(validate_remote_output_path("/tmp/a\nb.review-result.json", ReviewResult).is_err());
+        assert!(validate_remote_output_path("/tmp/a.followups.json", ReviewResult).is_err());
+        assert_eq!(
+            validate_remote_output_path("/tmp/a.review-result.json\n", ReviewResult).unwrap(),
+            "/tmp/a.review-result.json"
+        );
     }
 }

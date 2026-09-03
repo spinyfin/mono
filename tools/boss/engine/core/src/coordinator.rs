@@ -2212,14 +2212,6 @@ pub struct ExecutionCoordinator {
     pause_state_changed: tokio::sync::watch::Sender<u64>,
 }
 
-impl ExecutionCoordinator {
-    /// Resolve the host-specific adapter for non-dispatch lifecycle work such
-    /// as collecting a remote worker's structured result at its Stop boundary.
-    pub(crate) async fn adapter_for_host(&self, host: &crate::host_registry::Host) -> Result<Arc<dyn HostAdapter>> {
-        self.host_adapter_provider.adapter_for(host).await
-    }
-}
-
 mod config;
 mod dispatch_admission;
 mod execution;

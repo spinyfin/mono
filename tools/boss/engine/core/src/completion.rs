@@ -1495,6 +1495,9 @@ pub struct WorkerCompletionHandler {
     /// [`Self::with_structured_output_dir`] so they can seed/inspect the
     /// artifact without touching the shared system temp dir.
     structured_output_dir: std::path::PathBuf,
+    /// Resolves remote adapters for structured-output collection at the read
+    /// site. Kept optional for local-only tests and installations.
+    host_adapter_provider: Arc<std::sync::RwLock<Option<Arc<dyn crate::host_adapter::HostAdapterProvider>>>>,
     /// Clock the auto-nudge debounce guard reads from
     /// ([`crate::nudge_breaker::MIN_RENUDGE_INTERVAL`]). Defaults to the
     /// real wall clock (`Instant::now`) — correct for production, where

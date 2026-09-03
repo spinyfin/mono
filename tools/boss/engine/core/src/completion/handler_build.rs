@@ -53,6 +53,7 @@ impl WorkerCompletionHandler {
             enable_revision_triggered_reviews: false,
             pr_state_checker: Arc::new(crate::work::GhPrStateChecker),
             structured_output_dir: crate::structured_output::default_dir(),
+            host_adapter_provider: Arc::new(std::sync::RwLock::new(None)),
             now_fn: Arc::new(std::time::Instant::now),
         }
     }
@@ -93,6 +94,15 @@ impl WorkerCompletionHandler {
     pub fn with_structured_output_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.structured_output_dir = dir;
         self
+    }
+
+    /// Install the same provider the coordinator uses so every completion
+    /// route can collect remote artifacts immediately before reading them.
+    pub fn set_host_adapter_provider(&self, provider: Arc<dyn crate::host_adapter::HostAdapterProvider>) {
+        *self
+            .host_adapter_provider
+            .write()
+            .expect("host adapter provider lock poisoned") = Some(provider);
     }
 
     /// Wire an externally-owned [`StagedRevisionPushCache`] into this handler.
