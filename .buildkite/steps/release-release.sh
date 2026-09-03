@@ -4,29 +4,15 @@
 # bin/release; this script owns only Buildkite fan-out and product builds.
 set -euo pipefail
 
+RELEASE_LOG_PREFIX="release-release"
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 CONFIG="tools/release/release.toml"
 TARGET="//tools/release:release"
 
-die() { echo "error: $*" >&2; exit 1; }
-
-release_tag() {
-  local tag
-  tag="$(bin/release tag)"
-  if [[ -z "${tag}" ]]; then
-    echo "[release-release] no tag from prepare — nothing to build" >&2
-    return 1
-  fi
-  printf '%s\n' "${tag}"
-}
-
-binary_path() {
-  local target="$1" path
-  path="$(bazel cquery -c opt --output=files "${target}" 2>/dev/null | grep '^bazel-out/' | head -1 || true)"
-  [[ -n "${path}" && -f "${path}" ]] || die "could not locate Bazel output for ${target}"
-  printf '%s\n' "${path}"
-}
+# die(), release_tag(), and binary_path() are shared with checkleft-release.sh
+# and live in ci-env.sh (parameterised by RELEASE_LOG_PREFIX above) so the two
+# release step scripts don't carry byte-identical copies.
 
 phase_prepare() {
   echo "[release-release] agent: $(uname -a)"

@@ -12,6 +12,6 @@ steps:
       queue: bazel-any
       os: linux
     concurrency: 1
-    concurrency_group: "release"
+    concurrency_group: "mono-release"
     retry:
       automatic: false

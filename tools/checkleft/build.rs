@@ -2,7 +2,7 @@ fn main() {
     // CARGO_PKG_VERSION is set automatically by Cargo from Cargo.toml — no manual
     // wiring needed here. The release pipeline patches Cargo.toml's `version`
     // field in the release checkout before building (see
-    // .buildkite/steps/checkleft-release.sh apply_version_edits), so Cargo builds
+    // .buildkite/steps/checkleft-release.sh stamp_build_version), so Cargo builds
     // during a release pick up the bumped version through the same mechanism.
 
     // Emit the wasmtime version so runtime.rs can include it in the .cwasm

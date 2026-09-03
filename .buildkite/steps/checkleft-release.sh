@@ -4,6 +4,7 @@
 # script keeps only the product-specific build work that must run on each OS.
 set -euo pipefail
 
+RELEASE_LOG_PREFIX="checkleft-release"
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 CONFIG="tools/checkleft/release.toml"
@@ -12,17 +13,9 @@ CARGO_LOCK="Cargo.lock"
 NATIVE_TARGET="//tools/checkleft:checkleft"
 MUSL_TARGET="//tools/checkleft:checkleft_musl"
 
-die() { echo "error: $*" >&2; exit 1; }
-
-release_tag() {
-  local tag
-  tag="$(bin/release tag)"
-  if [[ -z "${tag}" ]]; then
-    echo "[checkleft-release] no tag from prepare — nothing to build" >&2
-    return 1
-  fi
-  printf '%s\n' "${tag}"
-}
+# die(), release_tag(), and binary_path() are shared with release-release.sh
+# and live in ci-env.sh (parameterised by RELEASE_LOG_PREFIX above) so the two
+# release step scripts don't carry byte-identical copies.
 
 # The shared release tool records the computed version but never transforms a
 # product's source. checkleft's Bazel and Cargo builds read CARGO_PKG_VERSION
@@ -36,13 +29,6 @@ stamp_build_version() {
   rm -f "${CARGO_LOCK}.bak"
   grep -qF "version = \"${version}\"" "${CARGO_TOML}" \
     || die "could not stamp ${CARGO_TOML} with ${version}"
-}
-
-binary_path() {
-  local target="$1" path
-  path="$(bazel cquery -c opt --output=files "${target}" 2>/dev/null | grep '^bazel-out/' | head -1 || true)"
-  [[ -n "${path}" && -f "${path}" ]] || die "could not locate Bazel output for ${target}"
-  printf '%s\n' "${path}"
 }
 
 phase_prepare() {
@@ -97,10 +83,10 @@ phase_darwin() {
   stamp_build_version "${version}"
   bazel build -c opt "${NATIVE_TARGET}"
   arm_path="$(binary_path "${NATIVE_TARGET}")"
+  x86_path="target/x86_64-apple-darwin/release/checkleft"
   if rustup target add x86_64-apple-darwin \
-      && cargo build --release --locked -p checkleft --target x86_64-apple-darwin; then
-    x86_path="target/x86_64-apple-darwin/release/checkleft"
-    [[ -f "${x86_path}" ]] || die "cargo reported success but did not produce ${x86_path}"
+      && cargo build --release --locked -p checkleft --target x86_64-apple-darwin \
+      && [[ -f "${x86_path}" ]]; then
     bin/release upload --config "${CONFIG}" --tag "${tag}" \
       --asset "checkleft-aarch64-apple-darwin=${arm_path}" \
       --asset "checkleft-x86_64-apple-darwin=${x86_path}"

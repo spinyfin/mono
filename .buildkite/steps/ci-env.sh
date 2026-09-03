@@ -10,7 +10,7 @@ export REPOBIN_BAZEL_FLAGS="--config=ci-${OS_TYPE}"
 # invocation instead of lingering for bazel's multi-hour default. The hot `mono`
 # PR pipeline keeps a long TTL so back-to-back PR builds stay warm.
 case "${BUILDKITE_PIPELINE_SLUG:-}" in
-  mono-checkleft-release | mono-changelog-release | mono-integrity)
+  mono-checkleft-release | mono-changelog-release | mono-integrity | mono-release)
     BAZEL_MAX_IDLE_SECS=900
     ;;
   *)
@@ -89,6 +89,34 @@ bazel() {
 
   rm -f "$tmplog"
   return 1
+}
+
+# Shared by the release step scripts (checkleft-release.sh, release-release.sh)
+# so they don't each carry byte-identical copies. Each script sets
+# RELEASE_LOG_PREFIX to its own name before sourcing this file.
+die() { echo "error: $*" >&2; exit 1; }
+
+release_tag() {
+  local tag
+  if ! tag="$(bin/release tag)"; then
+    die "bin/release tag failed"
+  fi
+  if [[ -z "${tag}" ]]; then
+    echo "[${RELEASE_LOG_PREFIX}] no tag from prepare — nothing to build" >&2
+    return 1
+  fi
+  printf '%s\n' "${tag}"
+}
+
+binary_path() {
+  local target="$1" path
+  # The bazel() wrapper above does `2>&1 | tee`, so the `2>/dev/null` here does
+  # NOT suppress bazel's INFO/Loading/Analyzing lines — on a cold analysis
+  # cache those lines can arrive on stdout before the queried path, so the
+  # output must be filtered to bazel-out/ lines before taking the first one.
+  path="$(bazel cquery -c opt --output=files "${target}" 2>/dev/null | grep '^bazel-out/' | head -1 || true)"
+  [[ -n "${path}" && -f "${path}" ]] || die "could not locate Bazel output for ${target}"
+  printf '%s\n' "${path}"
 }
 
 echo "+++ installing repobin tools into bin/"
