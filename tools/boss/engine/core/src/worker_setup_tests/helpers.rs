@@ -23,10 +23,11 @@ pub(crate) fn claude_md_for(input: &WorkerSetupInput) -> String {
 }
 
 /// Serializes tests that touch the worker-settings dir within one
-/// process. `write_workspace_files` truncate-writes the shared gate
-/// scripts (`boss-path-guard.py`, `boss-checkleft-push-guard.py`) under
-/// [`worker_settings_dir`]; a concurrent reader of that same file
-/// otherwise observes a half-written (empty) script.
+/// process. `write_workspace_files` materialises per-workspace settings
+/// JSON under [`worker_settings_dir`]; a concurrent writer of the same
+/// workspace's file otherwise races. Gate scripts are content-addressed
+/// and write-once, so they no longer share a mutable path, but the
+/// settings JSON still does.
 ///
 /// Cross-process isolation (Bazel shards / `runs_per_test` copies) is
 /// handled by [`worker_settings_dir`] preferring `$TEST_TMPDIR` when

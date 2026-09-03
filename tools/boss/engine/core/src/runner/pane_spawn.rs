@@ -884,11 +884,21 @@ impl ExecutionRunner for PaneSpawnRunner {
             || matches!(worker_kind, crate::worker_setup::WorkerKind::Triage)
             || matches!(worker_kind, crate::worker_setup::WorkerKind::AnswerAgent)
         {
-            crate::worker_setup::ensure_path_guard_script_in(&settings_dir).ok()
+            Some(
+                crate::worker_setup::ensure_path_guard_script_in(&settings_dir)
+                    .with_context(|| format!("materialising path guard script for execution {}", execution.id))?,
+            )
         } else {
             None
         };
-        let checkleft_guard_script = crate::worker_setup::ensure_checkleft_push_guard_script_in(&settings_dir).ok();
+        let checkleft_guard_script = Some(
+            crate::worker_setup::ensure_checkleft_push_guard_script_in(&settings_dir).with_context(|| {
+                format!(
+                    "materialising checkleft push-guard script for execution {}",
+                    execution.id
+                )
+            })?,
+        );
 
         // Permission artifacts (Codex: hooks + trust attest into CODEX_HOME;
         // Claude: empty — settings still come from worker_setup).

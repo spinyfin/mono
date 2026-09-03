@@ -153,9 +153,13 @@ fn heal_worker_settings_json_refreshes_checkleft_push_guard_script() {
 
     heal_worker_settings_json(settings_dir.path(), &PathBuf::from("/stable/boss-event"));
 
-    let script = settings_dir.path().join(CHECKLEFT_PUSH_GUARD_SCRIPT_NAME);
+    let script = checkleft_push_guard_script_path_in(settings_dir.path());
     assert!(script.exists(), "heal must refresh the push-guard script");
     assert_eq!(std::fs::read_to_string(&script).unwrap(), CHECKLEFT_PUSH_GUARD_SCRIPT);
+    assert!(
+        !settings_dir.path().join(CHECKLEFT_PUSH_GUARD_SCRIPT_NAME).exists(),
+        "heal must not write the unversioned shared path that Codex attests"
+    );
 }
 
 // ── checkleft pre-push guard execution tests ──────────────────────────

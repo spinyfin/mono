@@ -105,7 +105,13 @@ pub fn guard_trace_path(codex_home: &Path) -> PathBuf {
 /// The trace shim, materialised verbatim as an executable `.py`. Invoked as
 /// `python3 <shim> <guard-executable>`; reads the hook payload on stdin and
 /// writes the guard's decision to stdout.
-pub(super) const GUARD_TRACE_SHIM_SCRIPT: &str = r#"#!/usr/bin/env python3
+///
+/// Public (not `pub(super)`) only so `engine/core`'s cross-build
+/// guard-isolation conformance test (`worker_setup_tests/guard_script_isolation.rs`)
+/// can run the real production shim against both builds' guard bytes —
+/// `driver` cannot depend back on `core`, so the test lives in `core` and
+/// needs this constant from here. Not intended as a general-purpose export.
+pub const GUARD_TRACE_SHIM_SCRIPT: &str = r#"#!/usr/bin/env python3
 """Boss guard-trace shim for Codex PreToolUse hooks.
 
 Runs one Boss guard, records what it decided, and re-emits that decision *in
