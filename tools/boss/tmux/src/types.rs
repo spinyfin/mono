@@ -105,6 +105,7 @@ pub struct Session {
 /// Fields that can be read without parsing a pane capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayField {
+    PaneId,
     PanePid,
     PaneDead,
     PaneDeadStatus,
@@ -115,6 +116,7 @@ pub enum DisplayField {
 impl DisplayField {
     pub(crate) const fn format(self) -> &'static str {
         match self {
+            Self::PaneId => "#{pane_id}",
             Self::PanePid => "#{pane_pid}",
             Self::PaneDead => "#{pane_dead}",
             Self::PaneDeadStatus => "#{pane_dead_status}",
