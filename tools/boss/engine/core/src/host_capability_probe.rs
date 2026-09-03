@@ -517,6 +517,18 @@ mod tests {
         // (or wait on a TTY) and blow the probe's two-second timeout.
         // A script rather than zsh-specific setup keeps the regression
         // portable to the Linux Bazel test environment too.
+        //
+        // The final `command -v` check runs under `env -i`, wiping every
+        // inherited variable except the `PATH` this test builds by hand.
+        // Without that, the check runs in whatever environment the test
+        // process happened to inherit from the CI host — e.g. a
+        // `BASH_FUNC_*%%` export from a dev-tool shell hook (rbenv, nvm,
+        // direnv, ...) can shadow a POSIX builtin like `test` or `command`
+        // for the duration of that one process, which is exactly the kind
+        // of unowned host state this regression exists to keep out. Pinning
+        // the environment here means a failure can only mean the probe
+        // itself regressed, never that some agent happened to have a
+        // different shell setup that run.
         let login_shell = temp.path().join("profile-login-shell");
         fs::write(
             &login_shell,
@@ -525,10 +537,8 @@ mod tests {
                  test \"$1\" = -l || exit 41\n\
                  test \"$2\" = -i || exit 42\n\
                  test \"$PATH\" = \"{}\" || exit 43\n\
-                 PATH=\"{}:$PATH\"\n\
-                 export PATH\n\
                  shift 2\n\
-                 exec /bin/sh \"$@\"\n",
+                 exec env -i PATH=\"{}:$PATH\" /bin/sh \"$@\"\n",
                 crate::spawn_flow::WORKER_SANITIZED_PATH,
                 profile_bin.display(),
             ),
