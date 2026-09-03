@@ -9,7 +9,11 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use boss_tmux::Tmux;
 
-const BOSS_SESSION_OPTIONS: &[(&str, &str)] = &[("status", "off")];
+const BOSS_SESSION_OPTIONS: &[(&str, &str)] = &[("status", "off"), ("remain-on-exit", "on")];
+
+/// The bounded diagnostic history retained in each Boss window. Driver
+/// transcripts, not tmux history, are the durable record.
+const HISTORY_LIMIT: &str = "2000";
 
 /// Server-scoped options required for modified keys (e.g. Ctrl+Enter) to
 /// reach the pane, plus `focus-events` so attached clients receive
@@ -37,6 +41,25 @@ const BOSS_SERVER_OPTIONS: &[(&str, &str)] = &[
 pub(crate) fn insert_color_environment(environment: &mut BTreeMap<String, String>) {
     environment.insert("CLAUDE_CODE_TMUX_TRUECOLOR".to_owned(), "1".to_owned());
     environment.insert("COLORTERM".to_owned(), "truecolor".to_owned());
+}
+
+/// Start Boss's private server and establish defaults before its first window.
+///
+/// `history-limit` only affects windows created after it is set. Starting the
+/// server separately prevents `new-session` from racing ahead and creating an
+/// unbounded first window. The global `remain-on-exit` default closes the same
+/// first-window race; [`apply`] repeats it per session after user config has
+/// loaded.
+pub(crate) async fn prepare_server(tmux: &Tmux) -> Result<()> {
+    tmux.start_server()
+        .await
+        .context("starting Boss private tmux server before its first window")?;
+    for &(option, value) in &[("history-limit", HISTORY_LIMIT), ("remain-on-exit", "on")] {
+        tmux.set_global_option(option, value)
+            .await
+            .with_context(|| format!("setting Boss tmux global option {option}={value} before its first window"))?;
+    }
+    Ok(())
 }
 
 /// Assert a `new-session` argv carries the color `-e` pair and omits `FORCE_COLOR`.

@@ -249,8 +249,8 @@ The app stops owning worker ptys and becomes an attacher.
 **What improves as a side effect:**
 
 - `work_runs.shell_pid` becomes `#{pane_pid}` read synchronously at creation, replacing the async `onSurfaceAttached` → `foregroundPid` round trip that can legitimately return 0 (`WorkersWorkspaceModel.swift:196-225`, `spawn_flow.rs:543-551`).
-- Scrollback moves into tmux (`history-limit`), so quitting the app no longer discards it.
-- With `remain-on-exit on`, a pane whose agent exited stays inspectable with `#{pane_dead}=1` and `#{pane_dead_status}=<exit code>` (validated). Today an exited agent's pane simply vanishes, and the exit status is lost.
+- Scrollback moves into tmux with an explicit `history-limit=2000`, established before Boss creates its first window. Quitting the app no longer discards that bounded diagnostic history; the driver's JSONL remains the complete transcript.
+- With `remain-on-exit on`, a pane whose agent exited stays inspectable with `#{pane_dead}=1` and `#{pane_dead_status}=<exit code>` (validated). The worker reconciliation records that status, then removes the retained session only through token-verified teardown.
 
 **What is explicitly unaffected** — worth stating because reviewers will ask:
 
@@ -272,7 +272,7 @@ What genuinely carries across an app restart, an app crash, or an engine restart
 
 - the `claude` process itself, with its full in-memory conversation state,
 - any turn that was in flight,
-- the terminal scrollback.
+- the bounded 2,000-line terminal scrollback.
 
 Reattaching after an app relaunch drops you back into the same live conversation. That is a real improvement over today, where an app restart kills the coordinator outright.
 

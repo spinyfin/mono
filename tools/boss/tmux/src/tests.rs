@@ -185,6 +185,23 @@ async fn new_session_is_detached_private_and_carries_environment_atomically() {
     );
 }
 
+#[tokio::test]
+async fn server_bootstrap_can_set_global_options_before_the_first_window() {
+    let (tmux, runner) = tmux([success(""), success(""), success("")]);
+    tmux.start_server().await.unwrap();
+    tmux.set_global_option("history-limit", "2000").await.unwrap();
+    tmux.set_global_option("remain-on-exit", "on").await.unwrap();
+
+    assert_eq!(
+        runner.calls(),
+        vec![
+            vec!["-S", TEST_SOCKET_PATH, "start-server"],
+            vec!["-S", TEST_SOCKET_PATH, "set-option", "-g", "history-limit", "2000"],
+            vec!["-S", TEST_SOCKET_PATH, "set-option", "-g", "remain-on-exit", "on"],
+        ]
+    );
+}
+
 #[test]
 fn attach_session_command_uses_resolved_program_and_omits_exec() {
     let (tmux, _runner) = tmux([]);

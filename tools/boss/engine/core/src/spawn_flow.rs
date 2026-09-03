@@ -342,6 +342,10 @@ async fn start_tmux_worker(
     environment.insert("BOSS_RUN_ID".to_owned(), execution_id.to_owned());
     crate::tmux_session_options::insert_color_environment(&mut environment);
 
+    crate::tmux_session_options::prepare_server(&host.tmux)
+        .await
+        .context("preparing Boss tmux server before creating worker session")
+        .map_err(StartWorkerError::Tmux)?;
     host.tmux
         .new_session(&NewSession {
             name: host.session_name.clone(),
@@ -1088,7 +1092,14 @@ mod tests {
                 .map(|argument| argument.to_string_lossy().into_owned())
                 .collect::<Vec<_>>();
             let (step, stdout) = match args.get(2).map(String::as_str) {
+                Some("start-server") => ("server-bootstrap", ""),
                 Some("new-session") => ("new-session", ""),
+                Some("set-option") if args.get(3).map(String::as_str) == Some("-g") => {
+                    match args.get(4).map(String::as_str) {
+                        Some("history-limit") | Some("remain-on-exit") => ("server-bootstrap", ""),
+                        other => panic!("unexpected tmux global set-option: {other:?}, args={args:?}"),
+                    }
+                }
                 Some("set-option") if args.get(3).map(String::as_str) == Some("-s") => {
                     match args.get(4).map(String::as_str) {
                         Some("terminal-features[100]") | Some("extended-keys") | Some("focus-events") => {
@@ -1098,7 +1109,7 @@ mod tests {
                     }
                 }
                 Some("set-option") => match args.get(5).map(|option| option.as_str()) {
-                    Some("status") => ("presentation", ""),
+                    Some("status") | Some("remain-on-exit") => ("presentation", ""),
                     Some("@boss_spawn_token") => ("label", ""),
                     other => panic!("unexpected tmux set-option: {other:?}, args={args:?}"),
                 },
@@ -1156,7 +1167,11 @@ mod tests {
             store.steps(),
             vec![
                 "intent",
+                "server-bootstrap",
+                "server-bootstrap",
+                "server-bootstrap",
                 "new-session",
+                "presentation",
                 "presentation",
                 "presentation",
                 "presentation",
@@ -1168,7 +1183,30 @@ mod tests {
         );
 
         let calls = runner.calls();
-        let create = &calls[0];
+        assert_eq!(calls[0], vec!["-S", boss_tmux::TEST_SOCKET_PATH, "start-server"]);
+        assert_eq!(
+            calls[1],
+            vec![
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
+                "set-option",
+                "-g",
+                "history-limit",
+                "2000"
+            ]
+        );
+        assert_eq!(
+            calls[2],
+            vec![
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
+                "set-option",
+                "-g",
+                "remain-on-exit",
+                "on"
+            ]
+        );
+        let create = &calls[3];
         assert_eq!(
             &create[..5],
             ["-S", boss_tmux::TEST_SOCKET_PATH, "new-session", "-d", "-s"]
@@ -1191,7 +1229,7 @@ mod tests {
             "tmux must launch through WorkerPaneLaunch's interactive login shell: {create:?}"
         );
         assert_eq!(
-            calls[1],
+            calls[4],
             vec![
                 "-S",
                 boss_tmux::TEST_SOCKET_PATH,
@@ -1202,7 +1240,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            calls[2],
+            calls[5],
             vec![
                 "-S",
                 boss_tmux::TEST_SOCKET_PATH,
@@ -1213,7 +1251,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            calls[3],
+            calls[6],
             vec![
                 "-S",
                 boss_tmux::TEST_SOCKET_PATH,
@@ -1224,7 +1262,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            &calls[4][..6],
+            &calls[7][..6],
             [
                 "-S",
                 boss_tmux::TEST_SOCKET_PATH,
@@ -1234,9 +1272,21 @@ mod tests {
                 "status"
             ]
         );
-        assert_eq!(calls[4][6], "off");
+        assert_eq!(calls[7][6], "off");
         assert_eq!(
-            &calls[5][..6],
+            &calls[8][..6],
+            [
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
+                "set-option",
+                "-t",
+                "boss-3-run-test",
+                "remain-on-exit"
+            ]
+        );
+        assert_eq!(calls[8][6], "on");
+        assert_eq!(
+            &calls[9][..6],
             [
                 "-S",
                 boss_tmux::TEST_SOCKET_PATH,
@@ -1267,7 +1317,7 @@ mod tests {
             "server options must be set before the attach identity is returned"
         );
         assert_eq!(
-            calls[6],
+            calls[10],
             vec![
                 "-S",
                 boss_tmux::TEST_SOCKET_PATH,

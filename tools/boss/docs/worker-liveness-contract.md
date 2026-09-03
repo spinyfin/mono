@@ -105,6 +105,17 @@ as above, via the trigger `tmux_session_sweep`, and emits
 resolves to no row at all is left for `engine/core/src/husk_pane_sweep.rs`'s
 periodic two-pass reap instead of being handled here.
 
+### Retained worker exits
+
+Before Boss creates its first private-server window, it starts the server and
+sets the global `history-limit=2000` and `remain-on-exit=on` defaults. The
+former makes scrollback a bounded diagnostic convenience; driver JSONL remains
+the durable transcript. The latter keeps an exited worker pane available long
+enough for the real tmux wrapper to read `#{pane_dead}` and
+`#{pane_dead_status}`. The stale-worker reconciler records that observed exit
+status, and the ordinary release path removes the retained session only after
+its live `BOSS_SPAWN_TOKEN` exactly matches the durable run identity.
+
 ## Rules of thumb for future work here
 
 - **Never make a liveness decision from derived bookkeeping alone** when the decision is irreversible (killing a worker) or duplicating (spawning a second one). Corroborate with `work_runs.shell_pid` via `engine/core/src/durable_liveness.rs`.
