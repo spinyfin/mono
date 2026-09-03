@@ -19,7 +19,7 @@ use tempfile::{NamedTempFile, TempDir, tempdir};
 
 use crate::{
     Command, CommandOutput, CommandRunner, GitHubRelease, NotesSource, ReleaseConfig, SkipDecision, Trigger,
-    assert_allowed_trigger, compute_next_version, query_release_state, should_skip,
+    assert_allowed_trigger, compute_next_version, previous_notes_tag, query_release_state, should_skip,
 };
 
 /// Buildkite's per-build key that passes a release tag from `prepare` to the
@@ -140,7 +140,7 @@ pub fn prepare(
         DraftRequest {
             config,
             repo_root: &repo_root,
-            last_published: state.last.published.as_ref(),
+            notes_start_tag: previous_notes_tag(&state.releases, &config.tag_prefix),
             head_sha: &head_sha,
             tag: &next.tag,
             version: &next.version,
@@ -389,7 +389,7 @@ fn changed_paths(runner: &impl CommandRunner, from: &str, head: &str) -> Result<
 struct DraftRequest<'a> {
     config: &'a ReleaseConfig,
     repo_root: &'a Path,
-    last_published: Option<&'a GitHubRelease>,
+    notes_start_tag: Option<&'a str>,
     head_sha: &'a str,
     tag: &'a str,
     version: &'a str,
@@ -426,7 +426,7 @@ fn create_draft(runner: &impl CommandRunner, request: DraftRequest<'_>) -> Resul
             runner,
             request.config,
             request.repo_root,
-            request.last_published,
+            request.notes_start_tag,
             request.tag,
             request.version,
         )?;
@@ -444,7 +444,7 @@ fn create_release(
     runner: &impl CommandRunner,
     config: &ReleaseConfig,
     repo_root: &Path,
-    last_published: Option<&GitHubRelease>,
+    notes_start_tag: Option<&str>,
     tag: &str,
     version: &str,
 ) -> Result<()> {
@@ -461,14 +461,16 @@ fn create_release(
     let mut notes_file = None;
     match config.notes.source {
         NotesSource::Changelog => {
-            let notes = changelog_notes(runner, config, repo_root, last_published, tag)?;
+            let notes = changelog_notes(runner, config, repo_root, notes_start_tag, tag)?;
             let mut file = NamedTempFile::new().context("could not create release-notes file")?;
             file.write_all(notes.as_bytes())
                 .context("could not write release notes")?;
             args.extend(["--notes-file".to_owned(), file.path().display().to_string()]);
             notes_file = Some(file);
         }
-        NotesSource::GithubGenerated => args.push("--generate-notes".to_owned()),
+        NotesSource::GithubGenerated => {
+            args.extend(github_generated_notes_args(&config.title_prefix, notes_start_tag));
+        }
     }
     let result = run_checked(runner, Command::new("gh", args));
     drop(notes_file);
@@ -476,15 +478,35 @@ fn create_release(
     Ok(())
 }
 
+/// CLI args that bound GitHub-generated notes to this tool's own previous tag.
+///
+/// `--generate-notes` without `--notes-start-tag` lets GitHub pick the newest
+/// release in the repository. A first release for the prefix cannot use that
+/// API without inventing a cross-tool range, so it gets a short initial note.
+fn github_generated_notes_args(title_prefix: &str, start_tag: Option<&str>) -> Vec<String> {
+    match start_tag {
+        Some(tag) => vec![
+            "--generate-notes".to_owned(),
+            "--notes-start-tag".to_owned(),
+            tag.to_owned(),
+        ],
+        None => vec!["--notes".to_owned(), initial_release_notes(title_prefix)],
+    }
+}
+
+fn initial_release_notes(title_prefix: &str) -> String {
+    format!("Initial {title_prefix} release.\n")
+}
+
 fn changelog_notes(
     runner: &impl CommandRunner,
     config: &ReleaseConfig,
     repo_root: &Path,
-    last_published: Option<&GitHubRelease>,
+    notes_start_tag: Option<&str>,
     tag: &str,
 ) -> Result<String> {
-    let Some(last_published) = last_published else {
-        return Ok(format!("Initial {} release.\n", config.title_prefix));
+    let Some(from_tag) = notes_start_tag else {
+        return Ok(initial_release_notes(&config.title_prefix));
     };
     let shallow = run_checked(runner, Command::new("git", ["rev-parse", "--is-shallow-repository"]))?;
     if shallow.stdout.trim() == "true" {
@@ -497,7 +519,7 @@ fn changelog_notes(
         .with_context(|| format!("could not derive changelog paths from {}", project.display()))?;
     let range = extract_changelog(&ExtractionConfig {
         repo_path: repo_root.to_owned(),
-        from_tag: last_published.tag_name.clone(),
+        from_tag: from_tag.to_owned(),
         to_tag: tag.to_owned(),
         path_globs: paths,
         repo_slug: config.repo.clone(),
@@ -944,7 +966,7 @@ source = "github-generated"
         let runner = FixtureRunner::new([
             success(""),
             repo_root_response(root.path()),
-            success("[]"),
+            success(r#"[{"tag_name":"boss-v1.0.608","draft":false}]"#),
             success(""),
             success("head\n"),
             success(""),
@@ -964,10 +986,20 @@ source = "github-generated"
             }
         );
         let calls = runner.calls.into_inner();
+        let create = release_create_args(&calls);
         assert!(
-            calls
+            create.contains(&"--notes".to_owned()),
+            "first release must not let GitHub infer a previous tag: {create:?}"
+        );
+        assert_eq!(
+            create[create.iter().position(|arg| arg == "--notes").expect("notes flag") + 1],
+            "Initial Demo release.\n"
+        );
+        assert!(
+            !create
                 .iter()
-                .any(|call| call.program == "gh" && call.args.starts_with(&["release".to_owned(), "create".to_owned()]))
+                .any(|arg| arg == "--generate-notes" || arg == "--notes-start-tag"),
+            "first release must not generate a changelog range: {create:?}"
         );
         assert!(calls.iter().any(|call| {
             call.program == "buildkite-agent"
@@ -977,6 +1009,61 @@ source = "github-generated"
             calls.iter().any(|call| {
                 call.program == "git" && call.args == ["rev-parse", "--show-toplevel"].map(str::to_owned)
             })
+        );
+    }
+
+    #[test]
+    fn github_generated_notes_use_an_explicit_prefix_start_tag() {
+        assert_eq!(
+            github_generated_notes_args("checkleft", Some("checkleft-v0.1.0-alpha.122")),
+            ["--generate-notes", "--notes-start-tag", "checkleft-v0.1.0-alpha.122"].map(str::to_owned)
+        );
+        assert_eq!(
+            github_generated_notes_args("release", None),
+            ["--notes", "Initial release release.\n"].map(str::to_owned)
+        );
+    }
+
+    #[test]
+    fn prepare_bounds_generated_notes_to_the_previous_prefix_tag() {
+        let root = tempdir().expect("repo root");
+        let config = ReleaseConfig::parse(CONFIG).expect("config");
+        let runner = FixtureRunner::new([
+            success(""),
+            repo_root_response(root.path()),
+            success(
+                r#"[{"tag_name":"boss-v1.0.608","draft":false},{"tag_name":"demo-v1.0.5","draft":false},{"tag_name":"demo-v1.0.4","draft":false}]"#,
+            ),
+            success("sha\trefs/tags/demo-v1.0.5\nsha\trefs/tags/demo-v1.0.4\n"),
+            success("head\n"),
+            success("oldsha\n"),
+            success(""),
+            failure("not found"),
+            success(""),
+            success(""),
+            success(""),
+            success(""),
+        ]);
+
+        let outcome = prepare(&runner, &config, "ui", Some("job-1"), false).expect("prepare");
+
+        assert_eq!(
+            outcome,
+            PrepareOutcome::Created {
+                tag: "demo-v1.0.6".to_owned()
+            }
+        );
+        let calls = runner.calls.into_inner();
+        let create = release_create_args(&calls);
+        assert!(
+            create
+                .windows(2)
+                .any(|window| window == ["--notes-start-tag", "demo-v1.0.5"]),
+            "notes must start at the previous demo-v tag, not boss-v1.0.608: {create:?}"
+        );
+        assert!(
+            create.contains(&"--generate-notes".to_owned()),
+            "subsequent github-generated notes still use GitHub's generator: {create:?}"
         );
     }
 
@@ -1158,5 +1245,13 @@ source = "github-generated"
                 && call.args.windows(2).any(|window| window == ["edit", "demo-v1.0.0"])
                 && call.args.iter().any(|arg| arg == "--draft=false")
         })
+    }
+
+    fn release_create_args(calls: &[Command]) -> &[String] {
+        calls
+            .iter()
+            .find(|call| call.program == "gh" && call.args.starts_with(&["release".to_owned(), "create".to_owned()]))
+            .map(|call| call.args.as_slice())
+            .expect("gh release create")
     }
 }
