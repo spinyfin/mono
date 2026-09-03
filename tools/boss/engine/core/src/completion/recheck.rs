@@ -52,6 +52,19 @@ impl WorkerCompletionHandler {
             (None, false)
         };
         if let Some(proposed_pr_url) = proposed_pr_url {
+            // As with the staged-URL arm below, a merge-poller sweep must
+            // not turn a revision's mid-turn push into implicit completion.
+            if execution.kind == ExecutionKind::RevisionImplementation
+                && self.should_defer_staged_pr_recheck(execution_id)
+            {
+                tracing::info!(
+                    execution_id,
+                    pr_url = %proposed_pr_url,
+                    "pr-recheck: proposal PR URL present for a mid-turn revision; retaining it \
+                     for the worker's own Stop boundary before finalization",
+                );
+                return StopOutcome::AwaitingInput;
+            }
             tracing::info!(
                 execution_id,
                 pr_url = %proposed_pr_url,

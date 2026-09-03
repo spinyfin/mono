@@ -396,17 +396,18 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              after automation_outcome_proposals_seam). When on, an execution that already carries an \
              Applied pr_created proposal (submitted via `boss propose pr-created --url ...`, run after \
              the worker's `cube pr create`/`cube pr update` terminal action) finalizes straight from that \
-             proposal's already-verified URL — task 6's applier (apply_pr_created) already validated the \
-             URL/repo-slug and any worker-supplied branch synchronously at submission time, so this read \
-             never re-derives anything; it just resolves the fact from a durable row instead of the \
-             in-memory StagedPrUrlCache, which is what lets finalization survive an engine restart \
+             proposal's URL after independently re-verifying that the PR head ref matches the execution's \
+             expected branch (or, for a revision, that it matches the chain-root binding). If that check \
+             fails, it falls back to the legacy ladder; otherwise the durable row replaces the in-memory \
+             StagedPrUrlCache, which lets finalization survive an engine restart \
              between the worker's push and this Stop. When no such proposal exists, the legacy ladder \
              still runs exactly as before, and every time it finalizes via that ladder instead of the \
              proposal the worker_proposals.fallback_hit.pr_created counter increments and a WARN logs — \
              the counter is this seam's explicit exit criterion for eventually deleting the staging-cache \
              / cold-reconstruction fallback. The PROBE_NO_PR re-prompt is unaffected either way — it \
              handles \"no PR exists at all\", which no declaration can fix. DEFAULT OFF: enable per \
-             operator once the proposal path is validated in staging. Kill switch: set false to restore \
+             operator once the proposal path is validated in staging. Revision executions are excluded from \
+             fallback-hit counting because their prompts do not teach this declaration. Kill switch: set false to restore \
              the pre-migration staging-cache/cold-reconstruction-only behavior exactly, prompt included.",
         category: "completion",
         default_enabled: false,
