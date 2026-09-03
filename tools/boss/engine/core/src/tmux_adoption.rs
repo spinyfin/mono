@@ -193,19 +193,13 @@ async fn session_pane_pid(tmux: &Tmux, session_name: &str, execution_id: &str) -
 /// server. Shared by `ServerState::tmux_worker_statuses` and
 /// [`crate::stale_worker_sweep::TmuxWorkerTerminalInspector`] so the two
 /// cannot drift on the interrogation sequence.
-#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
-#[builder(on(String, into))]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxIdentityObservation {
     pub adoption_state: boss_protocol::TmuxAdoptionState,
     pub pane_dead: Option<bool>,
     pub pane_dead_status: Option<String>,
     pub window_activity_epoch_secs: Option<i64>,
     pub current_command: Option<String>,
-    /// `#{history_size}` on a live pane — the scrollback line count.
-    /// Advances only on genuine new output, unlike `window_activity_epoch_secs`
-    /// which an attached TUI repainting the same frame also bumps. See
-    /// [`crate::stale_worker_sweep`]'s use as a cross-pass delta.
-    pub history_size: Option<i64>,
 }
 
 fn probe_unavailable_observation() -> TmuxIdentityObservation {
@@ -215,7 +209,6 @@ fn probe_unavailable_observation() -> TmuxIdentityObservation {
         pane_dead_status: None,
         window_activity_epoch_secs: None,
         current_command: None,
-        history_size: None,
     }
 }
 
@@ -245,7 +238,6 @@ pub async fn observe_tmux_identity(
             pane_dead_status: None,
             window_activity_epoch_secs: None,
             current_command: None,
-            history_size: None,
         };
     }
     let token = match session_spawn_token(tmux, session_name).await {
@@ -266,7 +258,6 @@ pub async fn observe_tmux_identity(
             pane_dead_status: None,
             window_activity_epoch_secs: None,
             current_command: None,
-            history_size: None,
         };
     }
     let pane_dead = match tmux.display_message(session_name, DisplayField::PaneDead).await {
@@ -336,38 +327,12 @@ pub async fn observe_tmux_identity(
             }
         }
     };
-    let history_size = if pane_dead {
-        None
-    } else {
-        match tmux.display_message(session_name, DisplayField::HistorySize).await {
-            Ok(value) => match value.parse::<i64>() {
-                Ok(size) => Some(size),
-                Err(err) => {
-                    tracing::debug!(
-                        session = %session_name,
-                        error = %err,
-                        "tmux identity probe: history_size unparseable"
-                    );
-                    None
-                }
-            },
-            Err(err) => {
-                tracing::debug!(
-                    session = %session_name,
-                    error = %format!("{err:#}"),
-                    "tmux identity probe: history_size unreadable"
-                );
-                None
-            }
-        }
-    };
     TmuxIdentityObservation {
         adoption_state: boss_protocol::TmuxAdoptionState::Adopted,
         pane_dead: Some(pane_dead),
         pane_dead_status,
         window_activity_epoch_secs,
         current_command,
-        history_size,
     }
 }
 
