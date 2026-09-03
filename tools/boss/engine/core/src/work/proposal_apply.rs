@@ -444,11 +444,11 @@ fn apply_review_verdict(
 }
 
 /// Mark a prior `review_verdict` proposal superseded by the corrected one
-/// that just replaced it. Restores the supersession precedent
-/// `supersede_prior_review_verdicts` established for the design where
-/// verdict application was asynchronous — here it is scoped to the single
-/// corrected-resubmission case in [`apply_review_verdict`] rather than
-/// running unconditionally before every submission.
+/// that just replaced it. Scoped deliberately to the single
+/// corrected-resubmission case in [`apply_review_verdict`] — keyed on the
+/// exact prior proposal id this same supervisor member was recorded
+/// against — so it can never fire for a different member or an unrelated
+/// completed batch.
 fn supersede_verdict_proposal(
     tx: &Transaction<'_>,
     prior_proposal_id: &str,
