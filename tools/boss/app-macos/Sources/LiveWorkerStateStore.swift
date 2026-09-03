@@ -14,10 +14,12 @@ final class LiveWorkerStateStore: ObservableObject {
 
     /// Count of workers in a non-terminal "alive" state: `spawning`,
     /// `working`, or `waitingForInput`. Used by the quit-confirmation
-    /// guard — from the user's perspective a worker idle at a Claude
-    /// prompt is still kill-worthy (live conversation history,
-    /// possibly in-progress edits in its leased workspace). Excludes
-    /// `idle`, `errored`, and `terminated`.
+    /// guard — a worker idle at a prompt still has live conversation
+    /// history and possibly in-progress edits in its leased workspace,
+    /// so the operator should see the confirmation either way. What
+    /// quitting then *does* depends on hosting mode (see
+    /// [[QuitConfirmation]]). Excludes `idle`, `errored`, and
+    /// `terminated`.
     var activeAgentCount: Int {
         let live: Set<WorkerActivity> = [.spawning, .working, .waitingForInput]
         return bySlot.values.filter { live.contains($0.activity) }.count

@@ -528,28 +528,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Builds the Cmd-Q confirmation for the current live-worker snapshot
+    /// and hosting mode. `nil` when no agents are working, so the caller
+    /// can terminate immediately. Isolated from `runModal` so tests can
+    /// exercise both hosting modes against a real `NSAlert` without
+    /// blocking on a dialog.
+    func makeQuitConfirmationAlert() -> NSAlert? {
+        let count = liveWorkerStates?.activeAgentCount ?? 0
+        guard count > 0 else { return nil }
+
+        // Hosting mode is read from the live settings snapshot (same
+        // boolean the Workers grid and Settings toggle use). Unloaded
+        // settings default off, which keeps the legacy termination
+        // warning — the conservative answer when we cannot positively
+        // confirm tmux hosting.
+        return QuitConfirmation.makeAlert(
+            activeAgentCount: count,
+            tmuxHostingEnabled: chatModel?.tmuxHostingEnabled ?? false
+        )
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         // Capture runs always exit cleanly — no agent-running prompt.
         if BossCaptureArgs.shared.isCaptureMode {
             return .terminateNow
         }
-        let count = liveWorkerStates?.activeAgentCount ?? 0
-        guard count > 0 else { return .terminateNow }
-
-        let alert = NSAlert()
-        alert.messageText = "Quit Boss?"
-        let agentWord = count == 1 ? "agent is" : "agents are"
-        alert.informativeText =
-            "\(count) \(agentWord) currently working. Quitting will terminate them and discard any unsaved progress."
-        alert.addButton(withTitle: "Cancel")
-        alert.addButton(withTitle: "Quit Anyway")
-        alert.alertStyle = .warning
-
-        // Make Cancel (index 0) the default so a stray Cmd-Q doesn't
-        // accidentally confirm through the dialog.
-        alert.buttons[0].keyEquivalent = "\r"
-        alert.buttons[1].keyEquivalent = ""
-        alert.buttons[1].hasDestructiveAction = true
+        guard let alert = makeQuitConfirmationAlert() else {
+            return .terminateNow
+        }
 
         let response = alert.runModal()
         if response == .alertFirstButtonReturn {
