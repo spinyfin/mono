@@ -6,6 +6,7 @@ import Foundation
 struct EngineSupervisor: Sendable {
     enum Action: Equatable, Sendable {
         case running
+        case unreachable(consecutiveFailures: Int, requiredFailures: Int)
         case restart(attempt: Int, delay: TimeInterval)
         case gaveUp(attempts: Int)
         case wait
@@ -13,6 +14,7 @@ struct EngineSupervisor: Sendable {
 
     private let policy: EngineRestartPolicy
     private var restartAttempts = 0
+    private var consecutiveFailures = 0
     private var engineBecameHealthyAt: Date?
     private var restartBudgetExhausted = false
 
@@ -22,12 +24,14 @@ struct EngineSupervisor: Sendable {
 
     mutating func reset() {
         restartAttempts = 0
+        consecutiveFailures = 0
         engineBecameHealthyAt = nil
         restartBudgetExhausted = false
     }
 
     mutating func tick(isAlive: Bool, now: Date) -> Action {
         if isAlive {
+            consecutiveFailures = 0
             if engineBecameHealthyAt == nil {
                 engineBecameHealthyAt = now
             }
@@ -41,9 +45,17 @@ struct EngineSupervisor: Sendable {
         }
 
         engineBecameHealthyAt = nil
+        consecutiveFailures += 1
         guard !restartBudgetExhausted else {
             return .wait
         }
+        guard consecutiveFailures >= policy.consecutiveFailureThreshold else {
+            return .unreachable(
+                consecutiveFailures: consecutiveFailures,
+                requiredFailures: policy.consecutiveFailureThreshold
+            )
+        }
+        consecutiveFailures = 0
         let attempt = restartAttempts + 1
         guard attempt <= policy.maximumAttempts else {
             restartBudgetExhausted = true

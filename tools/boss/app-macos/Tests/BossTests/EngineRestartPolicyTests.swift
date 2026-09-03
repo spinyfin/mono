@@ -31,7 +31,8 @@ final class EngineRestartPolicyTests: XCTestCase {
 
     func testExhaustsBudgetAcrossDeadTicks() {
         var supervisor = EngineSupervisor(policy: .init(
-            backoffSchedule: [1, 2], maximumAttempts: 2, pollInterval: 1, healthyResetInterval: 60
+            backoffSchedule: [1, 2], maximumAttempts: 2, pollInterval: 1, healthyResetInterval: 60,
+            consecutiveFailureThreshold: 1
         ))
         let now = Date()
 
@@ -43,7 +44,8 @@ final class EngineRestartPolicyTests: XCTestCase {
 
     func testHealthyIntervalReplenishesExhaustedBudget() {
         var supervisor = EngineSupervisor(policy: .init(
-            backoffSchedule: [1], maximumAttempts: 1, pollInterval: 1, healthyResetInterval: 60
+            backoffSchedule: [1], maximumAttempts: 1, pollInterval: 1, healthyResetInterval: 60,
+            consecutiveFailureThreshold: 1
         ))
         let now = Date()
 
@@ -59,13 +61,31 @@ final class EngineRestartPolicyTests: XCTestCase {
 
     func testResetRestoresRestartBudgetImmediately() {
         var supervisor = EngineSupervisor(policy: .init(
-            backoffSchedule: [1], maximumAttempts: 1, pollInterval: 1, healthyResetInterval: 60
+            backoffSchedule: [1], maximumAttempts: 1, pollInterval: 1, healthyResetInterval: 60,
+            consecutiveFailureThreshold: 1
         ))
         let now = Date()
 
         _ = supervisor.tick(isAlive: false, now: now)
         XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .gaveUp(attempts: 1))
         supervisor.reset()
+        XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .restart(attempt: 1, delay: 1))
+    }
+
+    func testDebouncesSingleUnreachableTickBeforeSchedulingRestart() {
+        var supervisor = EngineSupervisor(policy: .init(
+            backoffSchedule: [1], maximumAttempts: 1, consecutiveFailureThreshold: 3
+        ))
+        let now = Date()
+
+        XCTAssertEqual(
+            supervisor.tick(isAlive: false, now: now),
+            .unreachable(consecutiveFailures: 1, requiredFailures: 3)
+        )
+        XCTAssertEqual(
+            supervisor.tick(isAlive: false, now: now),
+            .unreachable(consecutiveFailures: 2, requiredFailures: 3)
+        )
         XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .restart(attempt: 1, delay: 1))
     }
 }

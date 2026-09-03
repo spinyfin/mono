@@ -221,6 +221,22 @@ final class EngineProcessControllerTests: XCTestCase {
         XCTAssertEqual(launchRecorder.socketPaths, [fixture.paths.socketPath])
     }
 
+    func testUnresponsiveReachableEngineIsKeptWithoutReplacement() throws {
+        let fixture = try Fixture(reachableSocket: .primary, fingerprintAvailable: false)
+        let launchRecorder = LaunchRecorder()
+        let controller = fixture.makeController { _, _, socketPath in
+            launchRecorder.record(socketPath)
+            return 4242
+        }
+        defer { controller.stop() }
+
+        try controller.start()
+
+        XCTAssertEqual(fixture.socketControl.fingerprintRequests, Array(repeating: fixture.paths.socketPath, count: 3))
+        XCTAssertTrue(fixture.socketControl.shutdownRequests.isEmpty)
+        XCTAssertTrue(launchRecorder.socketPaths.isEmpty)
+    }
+
     func testFailedEngineStartPropagatesTheLaunchErrorToTheBannerState() throws {
         let fixture = try Fixture(reachableSocket: .none)
         let controller = fixture.makeController { _, _, _ in
@@ -275,11 +291,11 @@ private extension EngineProcessControllerTests {
     final class FakeSocketControl: EngineSocketControlling, @unchecked Sendable {
         private let lock = NSLock()
         private let reachableSocket: String
-        private let expectedFingerprint: String
+        private let expectedFingerprint: String?
         private var requests: [String] = []
         private var shutdowns: [String] = []
 
-        init(reachableSocket: String, expectedFingerprint: String) {
+        init(reachableSocket: String, expectedFingerprint: String?) {
             self.reachableSocket = reachableSocket
             self.expectedFingerprint = expectedFingerprint
         }
@@ -334,7 +350,11 @@ private extension EngineProcessControllerTests {
         let bundledEnginePath: String
         let socketControl: FakeSocketControl
 
-        init(reachableSocket: ReachableSocket, runningFingerprint: String? = nil) throws {
+        init(
+            reachableSocket: ReachableSocket,
+            runningFingerprint: String? = nil,
+            fingerprintAvailable: Bool = true
+        ) throws {
             let testRoot = ProcessInfo.processInfo.environment["TEST_TMPDIR"]
                 .map { URL(fileURLWithPath: $0, isDirectory: true) }
                 ?? FileManager.default.temporaryDirectory
@@ -364,7 +384,7 @@ private extension EngineProcessControllerTests {
             }
             socketControl = FakeSocketControl(
                 reachableSocket: reachablePath,
-                expectedFingerprint: runningFingerprint ?? fingerprint
+                expectedFingerprint: fingerprintAvailable ? (runningFingerprint ?? fingerprint) : nil
             )
         }
 
