@@ -1,0 +1,17 @@
+# mono-release Buildkite pipeline.
+#
+# Releases the shared //tools/release binary as checksum-verified prebuilt
+# assets. The static prepare step only uploads the build fragment when a release
+# is needed, so scheduled no-op runs do not build either platform.
+
+steps:
+  - label: ":package: release (prepare)"
+    key: "release-prepare"
+    command: ".buildkite/steps/release-release.sh prepare"
+    agents:
+      queue: bazel-any
+      os: linux
+    concurrency: 1
+    concurrency_group: "mono-release"
+    retry:
+      automatic: false

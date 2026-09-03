@@ -1,0 +1,34 @@
+# Build fragment uploaded by mono-release's prepare step after it creates or
+# resumes a draft release. The two native builds run in parallel; publish waits
+# for both uploads and verifies their checksum sidecars before publishing.
+
+steps:
+  - label: ":rust: release (linux)"
+    key: "release-linux"
+    command: ".buildkite/steps/release-release.sh linux"
+    agents:
+      queue: bazel-any
+      os: linux
+    retry:
+      automatic: false
+
+  - label: ":apple: release (darwin)"
+    key: "release-darwin"
+    command: ".buildkite/steps/release-release.sh darwin"
+    agents:
+      queue: bazel-any
+      os: darwin
+    retry:
+      automatic: false
+
+  - label: ":white_check_mark: release (publish)"
+    key: "release-publish"
+    command: ".buildkite/steps/release-release.sh publish"
+    depends_on:
+      - "release-linux"
+      - "release-darwin"
+    agents:
+      queue: bazel-any
+      os: linux
+    retry:
+      automatic: false

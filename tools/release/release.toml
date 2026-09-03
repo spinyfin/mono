@@ -1,0 +1,19 @@
+repo = "spinyfin/mono"
+tag_prefix = "release-v"
+title_prefix = "release"
+change_paths = [
+  "tools/release/",
+  "REPOBIN.toml",
+  ".buildkite/steps/release-release.sh",
+  ".buildkite/pipeline-release.yml",
+  ".buildkite/pipeline-release-builds.yml",
+]
+required_assets = ["release-x86_64-unknown-linux-gnu", "release-aarch64-apple-darwin"]
+optional_assets = []
+
+[version]
+scheme = "patch-counter"
+manifest = "tools/release/Cargo.toml"
+
+[notes]
+source = "github-generated"

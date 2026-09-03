@@ -67,6 +67,16 @@ pub fn load_config(path: &Path) -> Result<ReleaseConfig> {
     ReleaseConfig::parse(&contents).with_context(|| format!("invalid release config {}", path.display()))
 }
 
+/// Resolves a relative config from Bazel's workspace when the CLI is launched
+/// through `bazel run`; direct `bin/release` invocations retain their current
+/// working-directory behavior.
+pub fn resolve_config_path(path: &Path, bazel_workspace: Option<&Path>) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    bazel_workspace.map_or_else(|| path.to_path_buf(), |workspace| workspace.join(path))
+}
+
 /// Performs the prepare phase: resolve state, optionally create the tag and
 /// draft, then hand the tag to later Buildkite phases.
 pub fn prepare(
@@ -850,6 +860,22 @@ source = "github-generated"
         );
         assert!(Asset::parse("demo-linux").is_err());
         assert!(Asset::parse("../demo=/tmp/demo").is_err());
+    }
+
+    #[test]
+    fn resolves_relative_config_from_a_bazel_workspace() {
+        assert_eq!(
+            resolve_config_path(Path::new("release.toml"), Some(Path::new("/repo"))),
+            PathBuf::from("/repo/release.toml")
+        );
+        assert_eq!(
+            resolve_config_path(Path::new("release.toml"), None),
+            PathBuf::from("release.toml")
+        );
+        assert_eq!(
+            resolve_config_path(Path::new("/tmp/release.toml"), Some(Path::new("/repo"))),
+            PathBuf::from("/tmp/release.toml")
+        );
     }
 
     #[test]

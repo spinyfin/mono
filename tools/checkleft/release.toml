@@ -1,0 +1,23 @@
+repo = "spinyfin/mono"
+tag_prefix = "checkleft-v"
+title_prefix = "checkleft"
+change_paths = [
+  "tools/checkleft/",
+  ".buildkite/steps/checkleft-release.sh",
+  ".buildkite/pipeline-checkleft-release.yml",
+  ".buildkite/pipeline-checkleft-release-builds.yml",
+]
+required_assets = [
+  "checkleft-x86_64-unknown-linux-gnu",
+  "checkleft-x86_64-unknown-linux-musl",
+  "checkleft-aarch64-apple-darwin",
+]
+optional_assets = ["checkleft-x86_64-apple-darwin"]
+
+[version]
+scheme = "alpha-counter"
+manifest = "tools/checkleft/Cargo.toml"
+
+[notes]
+source = "changelog"
+project = "tools/checkleft/PROJECT.yaml"

@@ -12,6 +12,8 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
   pipeline-integrity.yml              # mono-integrity: periodic full-repo build/test health check
   pipeline-checkleft-release.yml      # checkleft prebuilt-binary release: prepare step, fans out to builds
   pipeline-checkleft-release-builds.yml # checkleft-release build fragment, uploaded dynamically by prepare
+  pipeline-release.yml                # shared release tool: prepare step, fans out to native builds
+  pipeline-release-builds.yml         # shared release-tool build fragment, uploaded dynamically by prepare
   REQUIRED_CHECKS.md                  # branch-protection contract for buildkite/mono/<step-key> checks
   steps/
     bazel-build-test.sh    # bazel build //... then bazel test //... (one agent, reuses build outputs)
@@ -20,6 +22,7 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
     ensure-node.sh         # sourced by checkleft steps: pin Node >= 22 when host npx is missing
     boss-release.sh        # boss release (main only, macos-arm64)
     checkleft-release.sh   # checkleft prebuilt-binary release (prepare/linux/musl/darwin phases)
+    release-release.sh     # shared release tool prebuilt-binary release
     ci-env.sh              # shared env/toolchain setup sourced by other steps
     integrity-commit-delta.sh # mono-integrity: commit-delta check
     integrity-bazel.sh        # mono-integrity: full bazel build + test
