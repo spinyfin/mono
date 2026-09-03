@@ -276,6 +276,7 @@ pub struct StubDriver {
     pub caps: CapabilitySet,
     pub post_hoc_interception_fn: Option<PostHocInterceptionFn>,
     pub worker_process_lifetime: WorkerProcessLifetime,
+    pub progress_fidelity: ProgressFidelity,
 }
 
 impl StubDriver {
@@ -285,6 +286,9 @@ impl StubDriver {
             caps,
             post_hoc_interception_fn: None,
             worker_process_lifetime: WorkerProcessLifetime::Persistent,
+            // Minimal: call-site cutover tests that seed live state from a
+            // stub don't need a Claude-shaped cadence.
+            progress_fidelity: ProgressFidelity::Minimal,
         }
     }
 
@@ -300,6 +304,14 @@ impl StubDriver {
     /// a driver that declares `OneTurnPerProcess`.
     pub fn with_worker_process_lifetime(mut self, lifetime: WorkerProcessLifetime) -> Self {
         self.worker_process_lifetime = lifetime;
+        self
+    }
+
+    /// Chainable: override the fixture's declared [`ProgressFidelity`]
+    /// (defaults to `Minimal`). Local spawn tests that need to pass the
+    /// Rich-progress dispatch gate use `ProgressFidelity::Rich`.
+    pub fn with_progress_fidelity(mut self, fidelity: ProgressFidelity) -> Self {
+        self.progress_fidelity = fidelity;
         self
     }
 }
@@ -340,9 +352,7 @@ impl AgentDriver for StubDriver {
         unimplemented!()
     }
     fn progress_fidelity(&self) -> ProgressFidelity {
-        // Minimal tier: call-site cutover tests that seed live state
-        // from a stub don't need a Claude-shaped cadence.
-        ProgressFidelity::Minimal
+        self.progress_fidelity
     }
     fn progress_observation_wiring(&self, _: &ProgressObservationConfig) -> ProgressIngress {
         // No hooks: a StdoutJsonl-shaped ingress. `write_workspace_files`

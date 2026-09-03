@@ -2,13 +2,14 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
 use async_trait::async_trait;
-use boss_protocol::{WorkItemBinding, WorkerEvent};
+use boss_protocol::{WorkItemBinding, WorkerActivity, WorkerEvent};
 
 use super::*;
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::RecordingDispatchEventSink;
 use crate::driver::ProgressFidelity;
 use crate::live_worker_state::LiveWorkerStateRegistry;
+use crate::sweep_loop::SweepOutcome;
 use crate::test_support::*;
 use crate::work::ExecutionStatus;
 
@@ -63,13 +64,12 @@ fn fresh_checkpoint_is_healthy_regardless_of_tool_condition() {
     }
 }
 
-// The core regression this rewrite exists for: a `Rich` driver whose
-// tool condition is durably idle and whose checkpoint predates the
-// threshold is stale — and this holds regardless of what tmux terminal
-// signals would have said (`classify_semantic_staleness` never takes
-// `window_activity`/`pane_current_command` as parameters at all, so an
-// attached, continuously repainting TUI cannot mask this verdict the
-// way it masked the old `classify_worker_liveness`).
+// A `Rich` driver whose tool condition is durably idle and whose
+// checkpoint predates the threshold is stale — and this holds
+// regardless of what tmux terminal signals would have said.
+// `classify_semantic_staleness` never takes `window_activity` /
+// `pane_current_command` as parameters, so an attached, continuously
+// repainting TUI cannot mask this verdict.
 #[test]
 fn idle_stale_checkpoint_on_a_rich_driver_is_stale() {
     let now = 10_000;
@@ -159,6 +159,30 @@ fn fidelity_below_rich_is_degraded_evidence_even_when_idle_and_stale() {
             "fidelity={fidelity:?}",
         );
     }
+}
+
+#[test]
+fn has_activity_is_true_for_each_degraded_counter_alone_without_a_reap() {
+    let setters: [fn(&mut StaleWorkerSweepOutcome); 5] = [
+        |o| o.genuinely_stuck = 1,
+        |o| o.terminal_probe_failed = 1,
+        |o| o.tool_condition_unknown = 1,
+        |o| o.fidelity_below_rich = 1,
+        |o| o.dead_uncorroborated = 1,
+    ];
+    for set in setters {
+        let mut outcome = StaleWorkerSweepOutcome::default();
+        set(&mut outcome);
+        assert_eq!(outcome.reaped, 0);
+        assert!(
+            outcome.has_activity(),
+            "degraded counter alone must be activity: {outcome:?}"
+        );
+    }
+    assert!(
+        !StaleWorkerSweepOutcome::default().has_activity(),
+        "an empty pass must not look like activity"
+    );
 }
 
 /// Records every `reap_worker` call and, at reap time, snapshots
@@ -281,7 +305,7 @@ fn drive_to_working_tool_in_flight(live_states: &LiveWorkerStateRegistry, slot_i
 fn live_terminal(window_activity_epoch_secs: i64) -> TerminalLiveness {
     TerminalLiveness::Alive {
         session_name: "boss-worker-test".to_owned(),
-        window_activity_epoch_secs,
+        window_activity_epoch_secs: Some(window_activity_epoch_secs),
         pane_current_command: None,
     }
 }
@@ -405,13 +429,111 @@ async fn stuck_tmux_worker_raises_attention_without_reaping() {
     );
 }
 
-// The core end-to-end regression this rewrite exists for: an attached,
-// continuously repainting TUI (huge/fresh `#{window_activity}`) must
-// NOT rescue a semantically stale worker — window_activity is a
-// diagnostic only and is never consulted for the health verdict. Before
-// this rewrite, `output_is_recent` in `classify_worker_liveness` made
-// this exact scenario `AliveAndWorking`, which is the inertness the
-// design doc's investigation identified.
+/// A live tmux pane whose driver is below `Rich` fidelity raises the
+/// degraded-evidence attention and never reaps.
+#[tokio::test]
+async fn live_tmux_coarse_fidelity_raises_degraded_evidence_without_reaping() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let db = Arc::new(db);
+    let execution_id = create_old_execution(&db, &work_item_id);
+    let live_states = Arc::new(LiveWorkerStateRegistry::new());
+    register_slot(&live_states, 1, &execution_id, &work_item_id);
+    live_states.set_progress_fidelity(1, ProgressFidelity::Coarse);
+    drive_to_working_idle(&live_states, 1);
+
+    let coordinator = make_coordinator(db.clone(), 1);
+    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+    let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let inspector = StaticTerminalInspector(live_terminal(0));
+    let hold_registry = HoldRegistry::new();
+    let outcome = run_one_pass_with_terminal(
+        db.as_ref(),
+        &live_states,
+        Some(&inspector),
+        coordinator.clone(),
+        sink.as_ref(),
+        StaleWorkerSweepControls {
+            reaper: reaper.as_ref(),
+            hold_registry: &hold_registry,
+            cube_client: &NoopCube,
+        },
+        ALWAYS_STALE,
+    )
+    .await;
+
+    assert_eq!(outcome.fidelity_below_rich, 1);
+    assert_eq!(outcome.reaped, 0);
+    assert_eq!(outcome.genuinely_stuck, 0);
+    assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
+    assert!(reaper.reaped().is_empty());
+    let attention = db
+        .list_attention_items_for_work_item(&work_item_id)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.kind == STALE_WORKER_ATTENTION_KIND && item.status == "open")
+        .expect("below-Rich live tmux worker must raise a degraded-evidence attention");
+    assert!(
+        attention.body_markdown.contains("Worker evidence degraded") || attention.title.contains("degraded"),
+        "got title={:?} body={}",
+        attention.title,
+        attention.body_markdown,
+    );
+}
+
+/// A live tmux pane whose tool condition has never left `Unknown` raises
+/// the degraded-evidence attention and never reaps.
+#[tokio::test]
+async fn live_tmux_unknown_tool_condition_raises_degraded_evidence_without_reaping() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let db = Arc::new(db);
+    let execution_id = create_old_execution(&db, &work_item_id);
+    let live_states = Arc::new(LiveWorkerStateRegistry::new());
+    register_slot(&live_states, 1, &execution_id, &work_item_id);
+    live_states.set_activity_for_test(1, WorkerActivity::Working);
+
+    let coordinator = make_coordinator(db.clone(), 1);
+    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+    let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let inspector = StaticTerminalInspector(live_terminal(0));
+    let hold_registry = HoldRegistry::new();
+    let outcome = run_one_pass_with_terminal(
+        db.as_ref(),
+        &live_states,
+        Some(&inspector),
+        coordinator.clone(),
+        sink.as_ref(),
+        StaleWorkerSweepControls {
+            reaper: reaper.as_ref(),
+            hold_registry: &hold_registry,
+            cube_client: &NoopCube,
+        },
+        ALWAYS_STALE,
+    )
+    .await;
+
+    assert_eq!(outcome.tool_condition_unknown, 1);
+    assert_eq!(outcome.reaped, 0);
+    assert_eq!(outcome.genuinely_stuck, 0);
+    assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
+    assert!(reaper.reaped().is_empty());
+    let open = db
+        .list_attention_items_for_work_item(&work_item_id)
+        .unwrap()
+        .into_iter()
+        .any(|item| item.kind == STALE_WORKER_ATTENTION_KIND && item.status == "open");
+    assert!(open, "unknown tool condition must raise an open stale_worker attention");
+}
+
+// An attached, continuously repainting TUI (huge/fresh
+// `#{window_activity}`) must NOT rescue a semantically stale worker —
+// window_activity is a diagnostic only and is never consulted for the
+// health verdict.
 #[tokio::test]
 async fn fresh_window_activity_does_not_rescue_a_semantically_stale_worker() {
     let (_dir, db) = open_db();
@@ -592,6 +714,11 @@ async fn terminal_probe_failure_raises_probe_unavailable_attention_without_reapi
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].stage, "stale_worker_reconcile");
     assert_eq!(events[0].outcome, "skipped");
+    assert_eq!(events[0].details["verdict"], "probe_unavailable");
+    assert_eq!(
+        events[0].details["semantic_verdict"], "genuinely_stuck",
+        "probe-unavailable telemetry must record the underlying cadence result"
+    );
 
     let attention = db
         .list_attention_items_for_work_item(&work_item_id)
@@ -695,8 +822,8 @@ async fn terminal_execution_is_skipped_and_resolves_open_attention() {
     let sink = Arc::new(RecordingDispatchEventSink::new());
     let hold_registry = HoldRegistry::new();
     // No inspector: the production `tmux_run_for_execution` predicate
-    // returns `None` for a terminal execution, so the sweep used to fall
-    // through to cadence and `continue` without resolving attention.
+    // returns `None` for a terminal execution, so this pass skips the
+    // inspector and still resolves any open stale_worker attention.
     let outcome = run_one_pass_with_terminal(
         db.as_ref(),
         &live_states,
@@ -1238,6 +1365,7 @@ struct ScriptedTmux {
     sessions: Vec<String>,
     tokens: std::collections::HashMap<String, String>,
     fields: std::collections::HashMap<(String, String), String>,
+    failing_fields: std::collections::HashSet<(String, String)>,
     calls: StdMutex<Vec<Vec<String>>>,
 }
 
@@ -1247,6 +1375,7 @@ impl ScriptedTmux {
             sessions: Vec::new(),
             tokens: std::collections::HashMap::new(),
             fields: std::collections::HashMap::new(),
+            failing_fields: std::collections::HashSet::new(),
             calls: StdMutex::new(Vec::new()),
         }
     }
@@ -1260,6 +1389,11 @@ impl ScriptedTmux {
     fn with_field(mut self, session: &str, format: &str, value: &str) -> Self {
         self.fields
             .insert((session.to_owned(), format.to_owned()), value.to_owned());
+        self
+    }
+
+    fn with_failing_field(mut self, session: &str, format: &str) -> Self {
+        self.failing_fields.insert((session.to_owned(), format.to_owned()));
         self
     }
 
@@ -1312,6 +1446,14 @@ impl boss_tmux::CommandRunner for ScriptedTmux {
             Some("display-message") => {
                 let session = &args[5];
                 let format = &args[6];
+                if self.failing_fields.contains(&(session.clone(), format.clone())) {
+                    return Ok(boss_tmux::CommandOutput {
+                        success: false,
+                        code: Some(1),
+                        stdout: String::new(),
+                        stderr: format!("can't find pane: {format}"),
+                    });
+                }
                 match self.fields.get(&(session.clone(), format.clone())) {
                     Some(value) => Ok(ok_tmux(format!("{value}\n"))),
                     None => Ok(ok_tmux("\n")),
@@ -1373,13 +1515,12 @@ async fn inspector_live_pane_reports_diagnostics_only() {
 
     // `window_activity_epoch_secs`/`pane_current_command` are carried
     // through as diagnostics only — the inspector never resolves the
-    // run's driver or compares against it (that comparison used to gate
-    // `agent_is_foreground`/`foreground_command_mismatch`, both removed).
+    // run's driver or compares against it.
     assert_eq!(
         verdict.unwrap(),
         Some(TerminalLiveness::Alive {
             session_name: "boss-worker-1".to_owned(),
-            window_activity_epoch_secs: 9000,
+            window_activity_epoch_secs: Some(9000),
             pane_current_command: Some(CLASSIFIER_DRIVER_BINARY.to_owned()),
         })
     );
@@ -1579,70 +1720,67 @@ async fn inspector_pane_dead_carries_status() {
 }
 
 #[tokio::test]
-async fn inspector_unparseable_window_activity_is_an_error() {
+async fn inspector_unparseable_window_activity_is_still_alive() {
     let (_dir, db) = open_db();
     let product_id = create_product(&db);
     let work_item_id = create_active_chore(&db, &product_id, "test chore");
     let execution_id = create_old_execution(&db, &work_item_id);
     stamp_tmux_run(&db, &execution_id, "boss-worker-1", "tok-1");
 
-    let (verdict, calls) = inspect_with(
+    let (verdict, _) = inspect_with(
         db,
         &execution_id,
         ScriptedTmux::new()
             .with_session("boss-worker-1", "tok-1")
             .with_field("boss-worker-1", "#{pane_dead}", "0")
-            .with_field("boss-worker-1", "#{window_activity}", "not-a-number"),
+            .with_field("boss-worker-1", "#{window_activity}", "not-a-number")
+            .with_field("boss-worker-1", "#{pane_current_command}", "claude"),
     )
     .await;
-    assert!(
-        verdict.is_err(),
-        "unparseable window_activity must be Err, got {verdict:?}"
-    );
     assert_eq!(
-        calls,
-        vec![
-            vec![
-                "-S".to_owned(),
-                boss_tmux::TEST_SOCKET_PATH.to_owned(),
-                "list-sessions".to_owned(),
-                "-F".to_owned(),
-                "#{session_name}\t#{@boss_spawn_token}".to_owned(),
-            ],
-            vec![
-                "-S".to_owned(),
-                boss_tmux::TEST_SOCKET_PATH.to_owned(),
-                "show-environment".to_owned(),
-                "-t".to_owned(),
-                "boss-worker-1".to_owned(),
-                "BOSS_SPAWN_TOKEN".to_owned(),
-            ],
-            vec![
-                "-S".to_owned(),
-                boss_tmux::TEST_SOCKET_PATH.to_owned(),
-                "display-message".to_owned(),
-                "-p".to_owned(),
-                "-t".to_owned(),
-                "boss-worker-1".to_owned(),
-                "#{pane_dead}".to_owned(),
-            ],
-            vec![
-                "-S".to_owned(),
-                boss_tmux::TEST_SOCKET_PATH.to_owned(),
-                "display-message".to_owned(),
-                "-p".to_owned(),
-                "-t".to_owned(),
-                "boss-worker-1".to_owned(),
-                "#{window_activity}".to_owned(),
-            ],
-        ]
+        verdict.unwrap(),
+        Some(TerminalLiveness::Alive {
+            session_name: "boss-worker-1".to_owned(),
+            window_activity_epoch_secs: None,
+            pane_current_command: Some("claude".to_owned()),
+        }),
+        "unparseable window_activity is a missing diagnostic, not a probe failure"
+    );
+}
+
+#[tokio::test]
+async fn inspector_unreadable_pane_current_command_is_still_alive() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let execution_id = create_old_execution(&db, &work_item_id);
+    stamp_tmux_run(&db, &execution_id, "boss-worker-1", "tok-1");
+
+    let (verdict, _) = inspect_with(
+        db,
+        &execution_id,
+        ScriptedTmux::new()
+            .with_session("boss-worker-1", "tok-1")
+            .with_field("boss-worker-1", "#{pane_dead}", "0")
+            .with_field("boss-worker-1", "#{window_activity}", "9000")
+            .with_failing_field("boss-worker-1", "#{pane_current_command}"),
+    )
+    .await;
+    assert_eq!(
+        verdict.unwrap(),
+        Some(TerminalLiveness::Alive {
+            session_name: "boss-worker-1".to_owned(),
+            window_activity_epoch_secs: Some(9000),
+            pane_current_command: None,
+        }),
+        "unreadable pane_current_command is a missing diagnostic, not a probe failure"
     );
 }
 
 // A `#{pane_current_command}` that differs from the driver binary (e.g.
 // Claude sourced through a login shell that hasn't exec'd it yet) is
 // carried through as a plain diagnostic, not compared against anything
-// or flagged — the removed veto this rewrite deletes.
+// or treated as a health signal.
 #[tokio::test]
 async fn inspector_reports_pane_current_command_as_diagnostic_only() {
     let (_dir, db) = open_db();
@@ -1665,7 +1803,7 @@ async fn inspector_reports_pane_current_command_as_diagnostic_only() {
         verdict.unwrap(),
         Some(TerminalLiveness::Alive {
             session_name: "boss-worker-1".to_owned(),
-            window_activity_epoch_secs: 9000,
+            window_activity_epoch_secs: Some(9000),
             pane_current_command: Some("node".to_owned()),
         })
     );
@@ -1720,7 +1858,7 @@ async fn inspector_routes_legacy_labeled_run_to_the_label_server() {
         verdict,
         Some(TerminalLiveness::Alive {
             session_name: "boss-worker-1".to_owned(),
-            window_activity_epoch_secs: 9000,
+            window_activity_epoch_secs: Some(9000),
             pane_current_command: Some(CLASSIFIER_DRIVER_BINARY.to_owned()),
         }),
         "the run must be inspected against the legacy server, not the socket",

@@ -46,7 +46,7 @@
 //! 3. Consult tmux when the run has durable tmux identity:
 //!    - Session absent, token mismatched, or pane confirmed dead → existing
 //!      corroborated death handling, reaped through the pane-death
-//!      reconciliation path (unchanged by this module).
+//!      reconciliation path.
 //!    - Pane live, or the identity probe itself failed → evaluate semantic
 //!      staleness (below). A probe failure is never proof of health or
 //!      death; it degrades the evidence and is itself counted and, once
@@ -58,9 +58,8 @@
 //!    reaping, require a stale hook timestamp and an execution beyond its
 //!    grace period, then mark the execution `orphaned`, append an audit
 //!    line, release the pool slot, emit a dispatch event, and kick the
-//!    coordinator so stranded work is redispatched. This path is untouched
-//!    scope-wise: it already self-heals correctly for populations without
-//!    tmux identity, and this module only replaces the tmux-evidence path.
+//!    coordinator so stranded work is redispatched. This path already
+//!    self-heals correctly for populations without tmux identity.
 //!
 //! ## Semantic staleness ([`classify_semantic_staleness`])
 //!
@@ -77,10 +76,9 @@
 //!   Never destructive; raises a degraded-evidence attention once past the
 //!   threshold.
 //! - The driver's [`crate::driver::ProgressFidelity`] tier below `Rich` ⇒
-//!   degraded evidence for the same reason `Coarse`/`Minimal` were
-//!   previously exempted from cadence judgement entirely — but now that
-//!   local (tmux-hosted) dispatch requires `Rich` per the tmux-only design,
-//!   this case is surfaced rather than silently skipped.
+//!   degraded evidence. Local dispatch refuses those drivers, so a
+//!   below-`Rich` live slot cannot support cadence-based judgement and is
+//!   surfaced rather than silently skipped.
 //! - Tool condition `idle` and the checkpoint predates the threshold, on a
 //!   `Rich` driver ⇒ genuinely stale. Raises (or updates) the `stale_worker`
 //!   attention with the session's attach command. This module never reaps
@@ -102,7 +100,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use boss_protocol::WorkerActivity;
 use boss_tmux::Tmux;
 
@@ -167,7 +165,9 @@ pub enum TerminalLiveness {
     Alive {
         session_name: String,
         /// Diagnostic only. tmux's epoch-second `#{window_activity}` value.
-        window_activity_epoch_secs: i64,
+        /// `None` when the field was unreadable or unparseable — missing
+        /// diagnostics never fail the identity probe.
+        window_activity_epoch_secs: Option<i64>,
         /// Diagnostic only. tmux's `#{pane_current_command}`.
         pane_current_command: Option<String>,
     },
@@ -231,10 +231,9 @@ pub enum SemanticStaleness {
 ///
 /// `in_flight` is unconditionally healthy however old the checkpoint is: a
 /// long foreground tool call (a multi-minute `bazel build`) can run with no
-/// intervening event, and reaping that would break real work — the same
-/// guard the pre-rewrite cadence fallback's `current_tool.is_some()` check
-/// provided, now keyed to the durable checkpoint instead of the transient
-/// hook-derived field.
+/// intervening event, and reaping that would break real work. The guard is
+/// the durable checkpoint's tool condition, not a transient hook-derived
+/// `current_tool` field.
 pub fn classify_semantic_staleness(
     tool_condition: SemanticToolCondition,
     progress_at: Option<&str>,
@@ -387,21 +386,15 @@ impl WorkerTerminalInspector for TmuxWorkerTerminalInspector {
                 }))
             }
             boss_protocol::TmuxAdoptionState::Adopted => {
-                // `window_activity_epoch_secs`/`current_command` are carried
-                // for operator diagnostics only (see `TerminalLiveness`);
-                // this arm no longer resolves the driver binary or compares
-                // it against `#{pane_current_command}` — that comparison
-                // used to gate `AliveAndGenuinelyStuck` and made the
-                // classifier inert for an attached, continuously repainting
-                // TUI (Claude publishes a version string as its process
-                // title, and `window_activity` follows display repaint, not
-                // semantic work).
-                let window_activity_epoch_secs = observation
-                    .window_activity_epoch_secs
-                    .context("tmux window_activity missing on a live pane")?;
+                // Carried for operator diagnostics only: `#{pane_current_command}`
+                // is a presentation field (Claude publishes a version string as
+                // its process title), so it must never be compared against the
+                // driver binary to infer health. `#{window_activity}` follows
+                // display repaint, not semantic work, and a missing reading
+                // is `None` rather than a probe failure.
                 Ok(Some(TerminalLiveness::Alive {
                     session_name: run.tmux_session_name,
-                    window_activity_epoch_secs,
+                    window_activity_epoch_secs: observation.window_activity_epoch_secs,
                     pane_current_command: observation.current_command,
                 }))
             }
@@ -463,9 +456,8 @@ pub const STALE_GRACE_SECS: i64 = 60;
 /// live workers would interleave edits in one working copy. Freeing the
 /// slot while the process lives converts a false-positive cancel into a
 /// workspace-sharing catastrophe; reaping first closes that gap (same
-/// requirement as the `bossctl agents stop` leak in #1006 and the
-/// PR-merge retire path in T1561 — this is yet another retire path that
-/// skipped teardown).
+/// requirement as the `bossctl agents stop` leak in #1006; this is
+/// another retire path that skipped teardown).
 #[async_trait::async_trait]
 pub trait StaleWorkerReaper: Send + Sync {
     /// Kill the worker process tree for `execution_id` and release its
@@ -530,11 +522,9 @@ pub struct StaleWorkerSweepOutcome {
 }
 
 impl crate::sweep_loop::SweepOutcome for StaleWorkerSweepOutcome {
-    /// Independent of `reaped`: a pass that only raised a stuck, degraded,
-    /// probe-unavailable, or uncorroborated-death attention is still worth
-    /// logging. Before this, `terminal_probe_failed` and the tmux-path
-    /// degraded counters were only ever logged in the same pass as a reap,
-    /// making the sweep's own degradation invisible without debug logging.
+    /// Independent of `reaped`: any degraded counter alone makes the pass
+    /// worth logging, so the sweep's own degradation is visible without a
+    /// reap.
     fn has_activity(&self) -> bool {
         self.reaped > 0
             || self.genuinely_stuck > 0
@@ -738,9 +728,8 @@ pub async fn run_one_pass_with_terminal(
         let identity = match terminal_inspector {
             Some(inspector) => match inspector.inspect(&state.run_id).await {
                 Ok(Some(TerminalLiveness::Dead { session_name, evidence })) => {
-                    // Existing corroborated death handling — unchanged by
-                    // this rewrite. Tmux's death signal is authoritative on
-                    // its own terms; it needs no cadence/semantic evidence.
+                    // Tmux's death signal is authoritative on its own terms;
+                    // it needs no cadence/semantic evidence.
                     if evidence.requires_pid_corroboration() {
                         let process = crate::durable_liveness::probe_execution_worker_within(
                             work_db,
@@ -790,10 +779,9 @@ pub async fn run_one_pass_with_terminal(
                     // A failed probe is never proof of health or death — it
                     // degrades the evidence available for this pass. Fall
                     // through to the same semantic-staleness evaluation a
-                    // live pane gets, rather than skipping the slot: the
-                    // pre-rewrite behaviour here silently dropped the pass
-                    // entirely, which is what made `terminal_probe_failed`
-                    // invisible outside a reap.
+                    // live pane gets, rather than skipping the slot, so
+                    // `terminal_probe_failed` is visible even when nothing
+                    // is reaped.
                     tracing::warn!(
                         execution_id = %state.run_id,
                         ?err,
@@ -809,19 +797,23 @@ pub async fn run_one_pass_with_terminal(
         let Some(identity) = identity else {
             // No tmux identity for this run at all (no terminal inspector
             // configured, or the run predates tmux columns) — the
-            // conservative cadence-only fallback below, unchanged by this
-            // rewrite, remains this population's liveness backstop.
+            // conservative cadence-only fallback below remains this
+            // population's liveness backstop.
             run_cadence_fallback(
-                work_db,
-                live_states,
-                coordinator.clone(),
-                dispatch_events,
-                reaper,
+                CadenceFallbackContext {
+                    work_db,
+                    live_states,
+                    coordinator: coordinator.clone(),
+                    dispatch_events,
+                    reaper,
+                },
+                SweepClocks {
+                    grace_cutoff,
+                    now_epoch_secs,
+                    stale_threshold_secs,
+                },
                 &state,
                 &execution,
-                grace_cutoff,
-                now_epoch_secs,
-                stale_threshold_secs,
                 &mut outcome,
             )
             .await;
@@ -873,12 +865,14 @@ pub async fn run_one_pass_with_terminal(
             }
             (verdict, TmuxIdentity::ProbeUnavailable) => {
                 raise_probe_unavailable_attention(
-                    work_db,
-                    dispatch_events,
-                    &state,
-                    &execution,
+                    AttentionContext {
+                        work_db,
+                        dispatch_events,
+                        state: &state,
+                        execution: &execution,
+                        stale_threshold_secs,
+                    },
                     &verdict,
-                    stale_threshold_secs,
                 )
                 .await;
             }
@@ -888,29 +882,33 @@ pub async fn run_one_pass_with_terminal(
                     DegradedEvidenceReason::FidelityBelowRich => outcome.fidelity_below_rich += 1,
                 }
                 raise_degraded_evidence_attention(
-                    work_db,
-                    dispatch_events,
+                    AttentionContext {
+                        work_db,
+                        dispatch_events,
+                        state: &state,
+                        execution: &execution,
+                        stale_threshold_secs,
+                    },
                     terminal_inspector,
-                    &state,
-                    &execution,
                     session_name,
                     reason,
                     fidelity,
-                    stale_threshold_secs,
                 )
                 .await;
             }
             (SemanticStaleness::Stale { progress_at }, TmuxIdentity::Live { session_name }) => {
                 outcome.genuinely_stuck += 1;
                 raise_stuck_attention(
-                    work_db,
-                    dispatch_events,
+                    AttentionContext {
+                        work_db,
+                        dispatch_events,
+                        state: &state,
+                        execution: &execution,
+                        stale_threshold_secs,
+                    },
                     terminal_inspector,
-                    &state,
-                    &execution,
                     session_name,
                     &progress_at,
-                    stale_threshold_secs,
                 )
                 .await;
             }
@@ -929,38 +927,80 @@ enum TmuxIdentity {
     ProbeUnavailable,
 }
 
+/// Shared collaborators for the non-destructive tmux-path attentions.
+struct AttentionContext<'a> {
+    work_db: &'a WorkDb,
+    dispatch_events: &'a dyn DispatchEventSink,
+    state: &'a boss_protocol::LiveWorkerState,
+    execution: &'a boss_protocol::WorkExecution,
+    stale_threshold_secs: i64,
+}
+
+/// Pass-level clocks for the cadence fallback.
+struct SweepClocks {
+    grace_cutoff: i64,
+    now_epoch_secs: i64,
+    stale_threshold_secs: i64,
+}
+
+/// Collaborators for [`run_cadence_fallback`], bundled so the function
+/// stays under clippy's argument-count lint (same convention as
+/// [`StaleWorkerSweepDeps`]). Pass-level clocks stay positional via
+/// [`SweepClocks`].
+struct CadenceFallbackContext<'a> {
+    work_db: &'a WorkDb,
+    live_states: &'a LiveWorkerStateRegistry,
+    coordinator: Arc<ExecutionCoordinator>,
+    dispatch_events: &'a dyn DispatchEventSink,
+    reaper: &'a dyn StaleWorkerReaper,
+}
+
+fn semantic_verdict_label(verdict: &SemanticStaleness) -> &'static str {
+    match verdict {
+        SemanticStaleness::Healthy => "healthy",
+        SemanticStaleness::DegradedEvidence(DegradedEvidenceReason::ToolConditionUnknown) => "tool_condition_unknown",
+        SemanticStaleness::DegradedEvidence(DegradedEvidenceReason::FidelityBelowRich) => "fidelity_below_rich",
+        SemanticStaleness::Stale { .. } => "genuinely_stuck",
+    }
+}
+
 /// Shared tail for the two non-destructive tmux-path attentions: upsert the
 /// `stale_worker` attention and emit a matching `Outcome::Skipped` dispatch
 /// event, so a pass that only raised attention (no reap) is still
 /// observable via structured telemetry (`details.verdict` names the case).
-#[allow(clippy::too_many_arguments)]
+/// `semantic_verdict` is the underlying cadence result when `verdict` is
+/// `probe_unavailable`; omitted for the other cases.
 async fn upsert_attention_and_emit(
-    work_db: &WorkDb,
-    dispatch_events: &dyn DispatchEventSink,
-    execution: &boss_protocol::WorkExecution,
-    run_id: &str,
-    slot_id: u8,
+    ctx: AttentionContext<'_>,
     title: &str,
     body: &str,
     verdict: &str,
+    semantic_verdict: Option<&str>,
 ) {
-    if let Err(err) =
-        work_db.upsert_external_tracker_attention(&execution.work_item_id, STALE_WORKER_ATTENTION_KIND, title, body)
-    {
+    if let Err(err) = ctx.work_db.upsert_external_tracker_attention(
+        &ctx.execution.work_item_id,
+        STALE_WORKER_ATTENTION_KIND,
+        title,
+        body,
+    ) {
         tracing::warn!(
-            execution_id = run_id,
+            execution_id = %ctx.state.run_id,
             ?err,
             "stale-worker sweep: failed to raise attention",
         );
     }
-    dispatch_events
+    let mut details = serde_json::json!({
+        "slot_id": ctx.state.slot_id,
+        "verdict": verdict,
+    });
+    if let Some(semantic_verdict) = semantic_verdict {
+        details["semantic_verdict"] = serde_json::Value::String(semantic_verdict.to_owned());
+    }
+    ctx.dispatch_events
         .emit(
-            DispatchEvent::new(Stage::StaleWorkerReconcile, Outcome::Skipped, run_id)
-                .with_work_item(&execution.work_item_id)
-                .with_details(serde_json::json!({
-                    "slot_id": slot_id,
-                    "verdict": verdict,
-                })),
+            DispatchEvent::new(Stage::StaleWorkerReconcile, Outcome::Skipped, &ctx.state.run_id)
+                .with_work_item(&ctx.execution.work_item_id)
+                .with_details(details),
         )
         .await;
 }
@@ -970,35 +1010,27 @@ async fn upsert_attention_and_emit(
 /// semantic-progress checkpoint predates `stale_threshold_secs`, with a
 /// confirmed-live tmux identity. Never reaps — the two-hour token-verified
 /// auto-reap is a later, dependent change.
-#[allow(clippy::too_many_arguments)]
 async fn raise_stuck_attention(
-    work_db: &WorkDb,
-    dispatch_events: &dyn DispatchEventSink,
+    ctx: AttentionContext<'_>,
     terminal_inspector: Option<&dyn WorkerTerminalInspector>,
-    state: &boss_protocol::LiveWorkerState,
-    execution: &boss_protocol::WorkExecution,
     session_name: &str,
     progress_at: &str,
-    stale_threshold_secs: i64,
 ) {
     let attach_cmd = terminal_inspector
         .expect("Live identity implies an inspector produced it")
-        .attach_session_command_for_run(&state.run_id, session_name);
+        .attach_session_command_for_run(&ctx.state.run_id, session_name);
     let body = format!(
-        "Worker execution `{}` has had no driver-originated progress for more than {stale_threshold_secs} seconds \
+        "Worker execution `{}` has had no driver-originated progress for more than {} seconds \
          while `Working` with its tool condition durably idle. The tmux session is still live, so Boss did not \
          reap it.\n\nLast driver event: {progress_at}\n\nSession: `{session_name}`\n\nInspect it with:\n\n```sh\n{attach_cmd}\n```",
-        state.run_id,
+        ctx.state.run_id, ctx.stale_threshold_secs,
     );
     upsert_attention_and_emit(
-        work_db,
-        dispatch_events,
-        execution,
-        &state.run_id,
-        state.slot_id,
+        ctx,
         "Worker appears stuck; inspection required",
         &body,
         "genuinely_stuck",
+        None,
     )
     .await;
 }
@@ -1007,17 +1039,12 @@ async fn raise_stuck_attention(
 /// (confirmed-live) `Working` slot whose staleness cannot be judged from
 /// driver evidence — durably unknown tool condition, or below-`Rich`
 /// fidelity. Never destructive.
-#[allow(clippy::too_many_arguments)]
 async fn raise_degraded_evidence_attention(
-    work_db: &WorkDb,
-    dispatch_events: &dyn DispatchEventSink,
+    ctx: AttentionContext<'_>,
     terminal_inspector: Option<&dyn WorkerTerminalInspector>,
-    state: &boss_protocol::LiveWorkerState,
-    execution: &boss_protocol::WorkExecution,
     session_name: &str,
     reason: DegradedEvidenceReason,
     fidelity: ProgressFidelity,
-    stale_threshold_secs: i64,
 ) {
     let (verdict, evidence_line) = match reason {
         DegradedEvidenceReason::ToolConditionUnknown => (
@@ -1036,22 +1063,19 @@ async fn raise_degraded_evidence_attention(
     };
     let attach_cmd = terminal_inspector
         .expect("Live identity implies an inspector produced it")
-        .attach_session_command_for_run(&state.run_id, session_name);
+        .attach_session_command_for_run(&ctx.state.run_id, session_name);
     let body = format!(
         "Worker execution `{}` is `Working`, but Boss cannot judge staleness for it: {evidence_line} Boss is \
-         neither reaping nor assuming health while this evidence gap persists (more than {stale_threshold_secs} \
+         neither reaping nor assuming health while this evidence gap persists (more than {} \
          seconds).\n\nSession: `{session_name}`\n\nInspect it with:\n\n```sh\n{attach_cmd}\n```",
-        state.run_id,
+        ctx.state.run_id, ctx.stale_threshold_secs,
     );
     upsert_attention_and_emit(
-        work_db,
-        dispatch_events,
-        execution,
-        &state.run_id,
-        state.slot_id,
+        ctx,
         "Worker evidence degraded; staleness cannot be judged",
         &body,
         verdict,
+        None,
     )
     .await;
 }
@@ -1063,15 +1087,10 @@ async fn raise_degraded_evidence_attention(
 /// identity to act on, so this attention always fires once a
 /// non-`Healthy` semantic verdict persists past `stale_threshold_secs`,
 /// regardless of what that verdict specifically was — it records the
-/// cadence result rather than acting on it.
-async fn raise_probe_unavailable_attention(
-    work_db: &WorkDb,
-    dispatch_events: &dyn DispatchEventSink,
-    state: &boss_protocol::LiveWorkerState,
-    execution: &boss_protocol::WorkExecution,
-    verdict: &SemanticStaleness,
-    stale_threshold_secs: i64,
-) {
+/// cadence result rather than acting on it. Structured telemetry keeps
+/// `"verdict": "probe_unavailable"` and adds `"semantic_verdict"` for the
+/// underlying cadence result.
+async fn raise_probe_unavailable_attention(ctx: AttentionContext<'_>, verdict: &SemanticStaleness) {
     let cadence_note = match verdict {
         SemanticStaleness::Healthy => unreachable!("Healthy is handled before this attention is raised"),
         SemanticStaleness::DegradedEvidence(DegradedEvidenceReason::ToolConditionUnknown) => {
@@ -1089,41 +1108,44 @@ async fn raise_probe_unavailable_attention(
     let body = format!(
         "Worker execution `{}` is `Working`, but the tmux identity probe failed this pass, so Boss could not \
          confirm the session's exact process identity — {cadence_note}. This is not treated as death; automatic \
-         action stays blocked until a later pass re-establishes exact identity (more than {stale_threshold_secs} \
+         action stays blocked until a later pass re-establishes exact identity (more than {} \
          seconds).",
-        state.run_id,
+        ctx.state.run_id, ctx.stale_threshold_secs,
     );
+    let semantic_verdict = semantic_verdict_label(verdict);
     upsert_attention_and_emit(
-        work_db,
-        dispatch_events,
-        execution,
-        &state.run_id,
-        state.slot_id,
+        ctx,
         "Worker identity probe unavailable",
         &body,
         "probe_unavailable",
+        Some(semantic_verdict),
     )
     .await;
 }
 
-/// The conservative cadence-only fallback for a run with no tmux identity —
-/// unchanged by this rewrite. This population (no terminal inspector
-/// configured, or a run predating tmux columns) already self-heals
-/// correctly; this module's rewrite scope is the tmux-evidence path above.
-#[allow(clippy::too_many_arguments)]
+/// The conservative cadence-only fallback for a run with no tmux identity.
+/// This population (no terminal inspector configured, or a run predating
+/// tmux columns) already self-heals correctly; the tmux-evidence path
+/// above is this module's classifier.
 async fn run_cadence_fallback(
-    work_db: &WorkDb,
-    live_states: &LiveWorkerStateRegistry,
-    coordinator: Arc<ExecutionCoordinator>,
-    dispatch_events: &dyn DispatchEventSink,
-    reaper: &dyn StaleWorkerReaper,
+    ctx: CadenceFallbackContext<'_>,
+    clocks: SweepClocks,
     state: &boss_protocol::LiveWorkerState,
     execution: &boss_protocol::WorkExecution,
-    grace_cutoff: i64,
-    now_epoch_secs: i64,
-    stale_threshold_secs: i64,
     outcome: &mut StaleWorkerSweepOutcome,
 ) {
+    let CadenceFallbackContext {
+        work_db,
+        live_states,
+        coordinator,
+        dispatch_events,
+        reaper,
+    } = ctx;
+    let SweepClocks {
+        grace_cutoff,
+        now_epoch_secs,
+        stale_threshold_secs,
+    } = clocks;
     let Some(effective_threshold_secs) = live_states
         .progress_fidelity_for_slot(state.slot_id)
         .stale_threshold_secs(stale_threshold_secs)
