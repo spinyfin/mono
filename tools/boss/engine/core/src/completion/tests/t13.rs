@@ -215,6 +215,66 @@ async fn pr_created_proposals_first_via_recheck_for_pr_uses_proposal_and_skips_d
     );
 }
 
+/// The durable proposal path has the same mid-turn safety boundary as the
+/// staged-URL path: a merge-poller sweep must leave a working revision for
+/// its own Stop boundary to finish PR reconciliation and review reporting.
+#[tokio::test]
+async fn pr_created_proposal_recheck_defers_a_mid_turn_revision() {
+    let workspace = tempdir().unwrap();
+    let parent_pr_url = "https://github.com/spinyfin/mono/pull/500";
+    let (_dir, db, _product_id, revision_id, execution_id) = revision_fixture(
+        workspace.path(),
+        parent_pr_url,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+        execution_id: &execution_id,
+        work_item_id: &revision_id,
+        kind: ProposalKind::PrCreated,
+        payload_json: r#"{"pr_url":"https://github.com/spinyfin/mono/pull/500"}"#,
+        idempotency_key: "key-1",
+    })
+    .unwrap()
+    .unwrap();
+
+    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+    live_states.register_spawn(
+        2,
+        &execution_id,
+        "claude-opus-5",
+        std::process::id() as i32,
+        Some(boss_protocol::WorkItemBinding {
+            work_item_id: revision_id.clone(),
+            work_item_name: "proposal mid-turn revision".to_owned(),
+            execution_id: execution_id.clone(),
+        }),
+    );
+    live_states.apply_event(
+        2,
+        &boss_protocol::WorkerEvent::PreToolUse {
+            session_id: "s".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+        },
+    );
+
+    let (flags, _flags_dir) = enable_pr_created_seam();
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let outcome = handler
+        .with_feature_flags(flags)
+        .with_live_worker_states(live_states)
+        .with_staged_pr_mid_turn_defer_secs(60)
+        .recheck_for_pr(&execution_id)
+        .await;
+
+    assert_eq!(outcome, StopOutcome::AwaitingInput);
+    match db.get_work_item(&revision_id).unwrap() {
+        WorkItem::Task(task) => assert_eq!(task.status, TaskStatus::Active),
+        other => panic!("expected revision task, got {other:?}"),
+    }
+    assert!(cube.release_calls.lock().await.is_empty());
+}
+
 /// A `pr_created` proposal rejected at submission (wrong repo/URL shape)
 /// carries no usable URL — the legacy ladder runs as the counted fallback,
 /// exactly like the "no proposal at all" case.

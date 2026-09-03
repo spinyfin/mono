@@ -622,12 +622,7 @@ impl WorkerCompletionHandler {
     /// after a proposal-first read failed to cover a successful ladder
     /// finalization. Sources that only act on a pre-existing binding never
     /// reach this recorder.
-    pub(super) fn record_pr_created_fallback_hit(
-        &self,
-        execution: &crate::work::WorkExecution,
-        source: &str,
-        row_existed: bool,
-    ) {
+    fn record_pr_created_fallback_hit(&self, execution: &crate::work::WorkExecution, source: &str, row_existed: bool) {
         let reason = if row_existed {
             "a pr_created worker_proposals row existed but could not be used (see the preceding WARN for specifics); falling back to the legacy PR-detection ladder"
         } else {
@@ -650,23 +645,15 @@ impl WorkerCompletionHandler {
         row_existed: bool,
         outcome: &StopOutcome,
     ) {
-        let ladder_source = matches!(
-            source,
-            "stop_staged"
-                | "stop_driver_fallback"
-                | "stop"
-                | "stop_sha_delta"
-                | "pr_recheck_staged"
-                | "pr_recheck_sha_delta"
-                | "pr_recheck"
-        );
         let finalized = matches!(
             outcome,
             StopOutcome::PrDetected { .. } | StopOutcome::PrMerged { .. } | StopOutcome::ReviewerEnqueued { .. }
         );
         if self.feature_flags.is_enabled("worker_proposals")
             && self.feature_flags.is_enabled("pr_created_proposals_seam")
-            && ladder_source
+            // Revision workers are intentionally not taught the declaration,
+            // so their legacy finalizations cannot measure declaration uptake.
+            && execution.kind != crate::work::ExecutionKind::RevisionImplementation
             && finalized
         {
             self.record_pr_created_fallback_hit(execution, source, row_existed);
