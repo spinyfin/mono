@@ -160,6 +160,7 @@ pub mod spawn_health;
 pub mod speculative_conflict;
 pub mod ssh_spawn;
 pub use boss_ssh_transport as ssh_transport;
+pub mod semantic_progress;
 pub mod stacked_pr_structuring;
 pub mod stale_worker_sweep;
 pub mod startup_pane_reconcile;
@@ -174,6 +175,7 @@ pub mod terminal_work_sweep;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tmux_adoption;
+pub(crate) mod tmux_adoption_live_state;
 pub(crate) mod tmux_session_options;
 pub use boss_transcript_tail as transcript_tail;
 pub mod trace_rotation;

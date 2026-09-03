@@ -291,6 +291,7 @@ mod probe_delivery;
 mod probe_interrupt;
 mod proposals;
 mod selected_product;
+mod semantic_progress_ingress;
 mod session_sink_queue;
 mod t02;
 mod t03;

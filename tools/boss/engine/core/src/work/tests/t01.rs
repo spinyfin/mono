@@ -2631,7 +2631,7 @@ fn tmux_run_accessors_record_and_list_only_adoptable_local_runs() {
 }
 
 #[test]
-fn list_adoptable_tmux_runs_excludes_finished_run_of_live_execution() {
+fn list_adoptable_tmux_runs_includes_finished_run_of_live_execution() {
     let db = WorkDb::open(temp_db_path("tmux-finished-run")).unwrap();
     let execution_id = start_run_on_host_for_test(&db, "local");
     let run = db.list_runs(&execution_id).unwrap().pop().unwrap();
@@ -2651,14 +2651,15 @@ fn list_adoptable_tmux_runs_excludes_finished_run_of_live_execution() {
     )
     .unwrap();
 
+    let adoptable = db.list_adoptable_tmux_runs().unwrap();
     assert!(
-        db.list_adoptable_tmux_runs().unwrap().is_empty(),
-        "a finished run must not be offered while its execution remains non-terminal",
+        adoptable.iter().any(|candidate| candidate.execution_id == execution_id),
+        "a completed dispatch run must remain adoptable while its execution is live",
     );
 }
 
 #[test]
-fn tmux_run_for_execution_prefers_the_newest_active_run() {
+fn tmux_run_for_execution_prefers_the_newest_unfinished_run() {
     let db = WorkDb::open(temp_db_path("tmux-run-for-exec-newest")).unwrap();
     let execution_id = start_run_on_host_for_test(&db, "local");
 
@@ -2697,7 +2698,79 @@ fn tmux_run_for_execution_prefers_the_newest_active_run() {
         .expect("expected a tmux run for the execution");
     assert_eq!(
         run.tmux_session_name, "boss-worker-new",
-        "the newest active run must win the tie-break",
+        "the newest unfinished run must win the tie-break",
+    );
+}
+
+#[test]
+fn tmux_run_for_execution_prefers_an_unfinished_run_over_a_newer_finished_sibling() {
+    let db = WorkDb::open(temp_db_path("tmux-run-for-exec-unfinished-first")).unwrap();
+    let execution_id = start_run_on_host_for_test(&db, "local");
+
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(&execution_id, "boss", "boss-worker-live", "token-live")
+            .unwrap()
+    );
+    assert!(
+        db.record_tmux_session_created_for_execution(&execution_id, "token-live", 111)
+            .unwrap()
+    );
+
+    let finished_run = db
+        .create_run(
+            CreateRunInput::builder()
+                .agent_id("worker-1")
+                .execution_id(execution_id.clone())
+                .status("active")
+                .build(),
+        )
+        .unwrap();
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(&execution_id, "boss", "boss-worker-finished", "token-finished")
+            .unwrap()
+    );
+    db.finish_execution_run(
+        FinishExecutionRunInput::builder()
+            .execution_id(execution_id.clone())
+            .run_id(finished_run.id)
+            .execution_status(ExecutionStatus::WaitingHuman)
+            .run_status("completed")
+            .clear_workspace_lease(false)
+            .build(),
+    )
+    .unwrap();
+
+    let run = db
+        .tmux_run_for_execution(&execution_id)
+        .unwrap()
+        .expect("expected a tmux run for the execution");
+    assert_eq!(run.tmux_session_name, "boss-worker-live");
+}
+
+#[test]
+fn tmux_run_for_execution_includes_finished_run_of_live_execution() {
+    let db = WorkDb::open(temp_db_path("tmux-run-for-live-finished-run")).unwrap();
+    let execution_id = start_run_on_host_for_test(&db, "local");
+    let run = db.list_runs(&execution_id).unwrap().pop().unwrap();
+
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(&execution_id, "boss", "boss-worker", "token-finished")
+            .unwrap()
+    );
+    db.finish_execution_run(
+        FinishExecutionRunInput::builder()
+            .execution_id(execution_id.clone())
+            .run_id(run.id)
+            .execution_status(ExecutionStatus::WaitingHuman)
+            .run_status("completed")
+            .clear_workspace_lease(false)
+            .build(),
+    )
+    .unwrap();
+
+    assert!(
+        db.tmux_run_for_execution(&execution_id).unwrap().is_some(),
+        "a completed dispatch run must remain visible while its execution is live",
     );
 }
 

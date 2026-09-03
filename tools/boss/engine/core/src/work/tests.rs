@@ -657,6 +657,7 @@ mod resolve_repo_tests;
 mod review_batches_tests;
 mod review_verdicts_tests;
 mod schema_migration_tests;
+mod semantic_progress_tests;
 mod short_id_alloc_tests;
 mod t06;
 mod t07;

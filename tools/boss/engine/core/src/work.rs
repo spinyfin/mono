@@ -519,6 +519,7 @@ mod revise_doc;
 mod revision_helpers;
 mod run_rows;
 mod schema_init;
+mod semantic_progress;
 mod task_targets;
 #[cfg(test)]
 mod tests;

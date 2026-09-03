@@ -63,6 +63,21 @@ final class AwaitingInputKanbanTests: XCTestCase {
         }
     }
 
+    func testSpawningBoundWorkerSurfacesAsUnknownNotActive() {
+        let live = makeLiveState(activity: .spawning)
+        let state = AgentActivityState.forDoingCard(
+            runtime: makeRuntime(),
+            liveState: live,
+            isDispatchPending: false,
+            isResolvingConflicts: false,
+            isRemediatingCI: false
+        )
+        guard case let .unknown(reason) = state else {
+            return XCTFail("expected .unknown for a spawning worker; got \(state)")
+        }
+        XCTAssertTrue(reason.lowercased().contains("not yet"), "unknown reason should explain the missing state")
+    }
+
     func testDispatchPendingStillWins() {
         // Dispatch-pending is the highest-precedence rule and must hold
         // even if a stale live state reports waiting-for-input.

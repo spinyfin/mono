@@ -718,6 +718,12 @@ impl WorkDb {
         // long-lived agent session's rollout at the right byte rather than
         // replaying it from zero or skipping to its end.
         migrate_work_runs_progress_ingress_checkpoint(conn)?;
+        // `work_runs.semantic_progress_at` / `semantic_tool_condition`: last
+        // driver-originated event time and tri-state tool condition, so tmux
+        // re-adoption and later stale recovery can judge semantic health
+        // after an engine restart without treating engine-synthesized
+        // display timestamps as progress. Nullable; legacy NULL is unknown.
+        migrate_work_runs_semantic_progress(conn)?;
         // Tmux session identity is durable per spawned run so startup
         // adoption can match a surviving session by its opaque token.
         // The spawn path does not use these columns until the tmux-hosting
@@ -1035,6 +1041,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tmux_columns, 5, "expected all per-run tmux columns");
+
+        let semantic_progress_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('work_runs')
+                 WHERE name IN ('semantic_progress_at', 'semantic_tool_condition')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            semantic_progress_columns, 2,
+            "expected per-run semantic progress columns",
+        );
 
         let tmux_token_index_exists: bool = conn
             .query_row(

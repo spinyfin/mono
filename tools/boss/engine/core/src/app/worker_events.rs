@@ -91,6 +91,15 @@ pub(super) async fn dispatch_worker_event_fanout(
         &incoming.event,
     );
     crate::events_socket::publish_hook_derived_events(&server_state.event_bus, incoming).await;
+    if let Some(run_id) = incoming.run_id.as_deref()
+        && let Err(err) = server_state.work_db.record_semantic_progress(run_id, &incoming.event)
+    {
+        tracing::warn!(
+            run_id,
+            error = %format!("{err:#}"),
+            "failed to persist semantic worker-progress checkpoint",
+        );
+    }
     dispatch_live_worker_state(server_state, incoming).await;
     // Codex unobserved-command detection: stage any abandoned-command
     // Notification the progress session emitted ahead of its Stop, so

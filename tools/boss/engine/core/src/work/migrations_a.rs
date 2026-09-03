@@ -489,6 +489,23 @@ pub(crate) fn migrate_work_runs_progress_ingress_checkpoint(conn: &Connection) -
     Ok(())
 }
 
+/// Last driver-originated progress time and tri-state tool condition for one
+/// spawned run.
+///
+/// Additive and nullable so legacy rows stay non-destructive until a real
+/// driver event establishes their state. Distinct from the live-state
+/// `last_event_at` display field, which is also written by engine inference:
+/// persisting that container would let a synthesized timestamp masquerade as
+/// agent progress after restart.
+pub(crate) fn migrate_work_runs_semantic_progress(conn: &Connection) -> Result<()> {
+    for column in ["semantic_progress_at", "semantic_tool_condition"] {
+        if !table_has_column(conn, "work_runs", column)? {
+            conn.execute(&format!("ALTER TABLE work_runs ADD COLUMN {column} TEXT"), [])?;
+        }
+    }
+    Ok(())
+}
+
 /// Tmux session identity for a single spawned worker run.
 ///
 /// All fields stay nullable so legacy and in-flight app-hosted workers retain

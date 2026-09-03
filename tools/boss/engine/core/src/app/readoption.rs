@@ -400,6 +400,18 @@ impl ServerState {
                 crate::live_worker_state::LiveSpawnRouting::new(pool, restored.kind.as_str()),
                 evidence,
             );
+            match self.work_db.get_run_semantic_progress_checkpoint(run_id) {
+                Ok(Some(checkpoint)) => self.live_worker_states.seed_semantic_progress(slot_id, &checkpoint),
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        run_id,
+                        error = %format!("{err:#}"),
+                        "readopt: could not load the semantic-progress checkpoint; leaving live state \
+                         unknown until a driver event arrives",
+                    );
+                }
+            }
             self.broadcast_live_worker_states().await;
         } else {
             tracing::warn!(
