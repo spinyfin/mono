@@ -1,4 +1,4 @@
-use super::super::server::process_group_signal_target;
+use super::super::process_signals::process_group_signal_target;
 use super::tmux_stub::{fake_tmux, ok};
 use super::*;
 use crate::test_support::spawn_group_leader_sleeper;

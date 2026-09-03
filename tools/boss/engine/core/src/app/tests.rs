@@ -1,4 +1,3 @@
-use super::server::current_parent_pid;
 use super::*;
 use crate::protocol::TopicEventPayload;
 

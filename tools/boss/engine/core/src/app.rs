@@ -114,6 +114,7 @@ mod pr_status;
 // Individual items stay `pub(super)`; only the module path is widened.
 mod probe_interrupt;
 pub(crate) mod probes;
+mod process_signals;
 mod products;
 mod projects;
 pub(crate) mod proposals;
@@ -139,10 +140,10 @@ pub use server::{process_is_alive, run, serve, serve_with_merge_probe};
 
 use isolation::IsolationPaths;
 
-// Re-import server-internal helpers so child modules can access them via `use super::*`.
-use server::{
-    constant_time_eq, is_descendant_of_any, reap_worker_process_tree, register_app_session_trust_ok,
-    resolve_status_actor, signal_shell_pids,
+// Re-import process-signal helpers so child modules can access them via `use super::*`.
+use process_signals::{
+    constant_time_eq, current_parent_pid, is_descendant_of_any, reap_worker_process_tree,
+    register_app_session_trust_ok, resolve_status_actor, signal_shell_pids,
 };
 
 // Re-import pane-op error types so child modules can match on them via
