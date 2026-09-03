@@ -1003,7 +1003,7 @@ fn reviewer_sandbox_extra_args_are_output_only_workspace_write() {
         workspace.display().to_string(),
         "the --cd output root must differ from the checkout the rules file names"
     );
-    let rules = boss_pr_review::render_reviewer_claude_md("lease-1", &workspace.display().to_string(), "");
+    let rules = boss_pr_review::render_reviewer_claude_md("lease-1", &workspace.display().to_string(), "", "");
     assert!(
         rules.contains(&format!("jj log -R {}", workspace.display())),
         "rules file must instruct jj against the checkout, not the --cd root: {rules}"

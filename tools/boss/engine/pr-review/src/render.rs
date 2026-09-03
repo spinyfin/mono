@@ -1006,7 +1006,7 @@ mod tests {
         // `reviewer_output_sandbox_extra_args` in the codex driver), so a
         // bare `jj log` would resolve against the wrong workspace. The rules
         // file must tell the reviewer to name the checkout explicitly.
-        let rendered = render_reviewer_claude_md("lease-1", "/tmp/ws-for-jj", "");
+        let rendered = render_reviewer_claude_md("lease-1", "/tmp/ws-for-jj", "", "");
         assert!(
             rendered.contains("jj log -R /tmp/ws-for-jj"),
             "reviewer CLAUDE.md must instruct `jj log -R <workspace>`: {rendered}"
