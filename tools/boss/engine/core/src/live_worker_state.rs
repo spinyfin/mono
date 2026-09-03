@@ -1527,6 +1527,17 @@ impl LiveWorkerStateRegistry {
             entry.state.last_event_at = Some(last_event_at.into());
         }
     }
+
+    /// Override `activity` for `slot_id`. Test seam for a `Working` slot
+    /// whose tool condition is still [`SemanticToolCondition::Unknown`]
+    /// (no Pre/PostToolUse has ever established idle/in-flight).
+    #[cfg(test)]
+    pub fn set_activity_for_test(&self, slot_id: u8, activity: WorkerActivity) {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        if let Some(entry) = guard.get_mut(&slot_id) {
+            entry.state.activity = activity;
+        }
+    }
 }
 
 fn current_iso8601() -> String {

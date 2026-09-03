@@ -269,8 +269,9 @@ final class WorkersWorkspaceModelPaneInputTests: XCTestCase {
     /// tool call shelled out to) is alive, not exited — the pane's
     /// foreground command differing from the driver binary is the normal
     /// shape of that, and must not refuse the write. This is the app-path
-    /// analogue of `TmuxWorkerTerminalInspector`/`classify_worker_liveness`
-    /// treating the identical tmux signal as `AliveAndWorking`.
+    /// analogue of `TmuxWorkerTerminalInspector` carrying
+    /// `#{pane_current_command}` as a diagnostic only (not evidence of
+    /// death, and not consulted by `classify_semantic_staleness` for health).
     func testDriverInputAllowsALiveForegroundChildOfTheDriver() {
         XCTAssertNil(
             WorkersWorkspaceModel.driverInputError(

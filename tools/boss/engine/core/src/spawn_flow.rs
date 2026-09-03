@@ -32,7 +32,7 @@ use tokio::time::Duration;
 
 use std::sync::Arc;
 
-use crate::driver::{AgentDriver, Capability, ProgressIngress, ProgressObservationConfig};
+use crate::driver::{AgentDriver, Capability, ProgressFidelity, ProgressIngress, ProgressObservationConfig};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::protocol::{
     AttachWorkerPaneInput, EngineToAppError, EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput,
@@ -551,6 +551,8 @@ pub enum StartWorkerError {
     ProgressIngress(String),
     #[error("tmux-hosted worker spawn: {0:#}")]
     Tmux(#[source] anyhow::Error),
+    #[error("local dispatch requires Rich progress fidelity so wedge recovery can judge cadence; driver reports {0:?}")]
+    ProgressFidelity(ProgressFidelity),
 }
 
 /// Public API for callers that want to wire pane-spawning into the
@@ -650,6 +652,15 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     input: StartWorkerInput,
     spawn_timeout: StdDuration,
 ) -> Result<StartedWorker, StartWorkerError> {
+    // Local dispatch is only recoverable when the driver supplies Rich
+    // per-tool progress boundaries. A Coarse/Minimal driver would silently
+    // lose automatic wedge recovery, so refuse before writing files or
+    // creating a pane.
+    let fidelity = input.driver.progress_fidelity();
+    if fidelity != ProgressFidelity::Rich {
+        return Err(StartWorkerError::ProgressFidelity(fidelity));
+    }
+
     let progress_ingress = input.driver.progress_observation_wiring(&ProgressObservationConfig {
         events_socket_path: input.events_socket_path.clone(),
         lease_id: input.lease_id.clone(),
@@ -1639,7 +1650,10 @@ mod tests {
         descriptor.config_dir = ".stub";
         descriptor.agent_rules_filename = "AGENTS.md";
         let mut input = sample_input(&workspace);
-        input.driver = Arc::new(StubDriver::new(descriptor, CapabilitySet::new([Capability::Spawn])));
+        input.driver = Arc::new(
+            StubDriver::new(descriptor, CapabilitySet::new([Capability::Spawn]))
+                .with_progress_fidelity(ProgressFidelity::Rich),
+        );
 
         let started = start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
 
@@ -1653,6 +1667,51 @@ mod tests {
             "start_worker must render the resolved driver's preamble, got: {rules:?}",
         );
         assert!(!workspace.path().join(".claude").join("CLAUDE.md").exists());
+    }
+
+    /// Local dispatch refuses a driver below `Rich` progress fidelity
+    /// before writing workspace files or asking the app to host a pane.
+    #[tokio::test]
+    async fn local_dispatch_refuses_below_rich_progress_fidelity() {
+        use crate::driver::test_support::{StubDriver, stub_descriptor};
+        use crate::driver::{Capability, CapabilitySet};
+
+        let workspace = TempDir::new().unwrap();
+        let registry = WorkerRegistry::new();
+        let spawner = StubSpawner {
+            registry: registry.clone(),
+            spawn_calls: Arc::new(AtomicUsize::new(0)),
+            last_request: std::sync::Mutex::new(None),
+            canned_response: Err(SendToAppError::NotRegistered),
+        };
+
+        let mut input = sample_input(&workspace);
+        input.driver = Arc::new(StubDriver::new(
+            stub_descriptor(),
+            CapabilitySet::new([Capability::Spawn]),
+        ));
+
+        let result = start_worker(&spawner, input, StdDuration::from_secs(1)).await;
+        assert!(
+            matches!(
+                result,
+                Err(StartWorkerError::ProgressFidelity(ProgressFidelity::Minimal))
+            ),
+            "below-Rich local dispatch must be refused; got {result:?}",
+        );
+        assert_eq!(
+            spawner.spawn_calls.load(Ordering::SeqCst),
+            0,
+            "a refused spawn must not contact the app",
+        );
+        assert!(
+            registry.slot_for_run("run-test").is_none(),
+            "a refused spawn must not register a run→slot mapping",
+        );
+        assert!(
+            !workspace.path().join(".claude").join("CLAUDE.md").exists(),
+            "a refused spawn must not write worker config",
+        );
     }
 
     #[tokio::test]

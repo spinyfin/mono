@@ -379,7 +379,12 @@ fn probe_unavailable_observation() -> TmuxIdentityObservation {
 /// `list_sessions` once. When the session is missing, no further tmux
 /// calls are issued. A live session is classified by spawn-token match,
 /// then `#{pane_dead}` / `#{pane_dead_status}` / `#{window_activity}` /
-/// `#{pane_current_command}` — `#{window_activity}` is read even on a
+/// `#{pane_current_command}`. Spawn-token and `#{pane_dead}` (and
+/// `#{pane_dead_status}` on a dead pane) establish identity; a failure to
+/// read them is [`boss_protocol::TmuxAdoptionState::ProbeUnavailable`].
+/// `#{window_activity}` and `#{pane_current_command}` are diagnostics
+/// only — unreadable or unparseable values become `None` and never
+/// degrade the identity verdict. `#{window_activity}` is still read on a
 /// dead pane because `remain-on-exit` keeps it readable.
 pub async fn observe_tmux_identity(
     tmux: &Tmux,
@@ -445,38 +450,24 @@ pub async fn observe_tmux_identity(
     let window_activity_epoch_secs = match tmux.display_message(session_name, DisplayField::WindowActivity).await {
         Ok(value) => match value.parse::<i64>() {
             Ok(epoch) => Some(epoch),
-            Err(err) if pane_dead => {
-                tracing::debug!(
-                    session = %session_name,
-                    error = %err,
-                    "tmux identity probe: window_activity unparseable on a dead pane"
-                );
-                None
-            }
             Err(err) => {
                 tracing::debug!(
                     session = %session_name,
                     error = %err,
+                    pane_dead,
                     "tmux identity probe: window_activity unparseable"
                 );
-                return probe_unavailable_observation();
+                None
             }
         },
-        Err(err) if pane_dead => {
-            tracing::debug!(
-                session = %session_name,
-                error = %format!("{err:#}"),
-                "tmux identity probe: window_activity unreadable on a dead pane"
-            );
-            None
-        }
         Err(err) => {
             tracing::debug!(
                 session = %session_name,
                 error = %format!("{err:#}"),
+                pane_dead,
                 "tmux identity probe: window_activity unreadable"
             );
-            return probe_unavailable_observation();
+            None
         }
     };
     let current_command = if pane_dead {
@@ -493,7 +484,7 @@ pub async fn observe_tmux_identity(
                     error = %format!("{err:#}"),
                     "tmux identity probe: pane_current_command unreadable"
                 );
-                return probe_unavailable_observation();
+                None
             }
         }
     };

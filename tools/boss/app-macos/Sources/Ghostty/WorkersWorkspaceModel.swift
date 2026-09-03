@@ -499,9 +499,11 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// (see `foregroundPid`'s docstring) legitimately returns something
     /// other than the driver's own pid while the driver is alive and
     /// running a foreground child (e.g. a `bazel build` a tool call
-    /// shelled out to) — the same signal `TmuxWorkerTerminalInspector` /
-    /// `classify_worker_liveness` treats as `AliveAndWorking` on the tmux
-    /// path, not as exited. `proc_name`'s kernel accounting name is also
+    /// shelled out to) — the same signal `TmuxWorkerTerminalInspector`
+    /// carries as a diagnostic only on the tmux path (a differing
+    /// foreground command is not evidence of death, and
+    /// `classify_semantic_staleness` does not consult it for health).
+    /// `proc_name`'s kernel accounting name is also
     /// unreliable for this comparison: it names whatever was exec'd (an
     /// interpreter or shim for a wrapped CLI), not necessarily
     /// `DriverDescriptor.binary`. The only signal trustworthy enough to

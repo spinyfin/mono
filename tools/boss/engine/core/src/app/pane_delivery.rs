@@ -547,10 +547,11 @@ impl ServerState {
     /// itself reports the pane dead (`#{pane_dead}`). A pane whose
     /// foreground command merely differs from the driver binary is
     /// deliberately NOT evidence of death here — that is the normal shape of
-    /// the agent running a foreground child, which `classify_worker_liveness`
-    /// (stale_worker_sweep.rs:144) classifies as `AliveAndWorking`. Only
-    /// session absence, a spawn-token mismatch, or `#{pane_dead}` may
-    /// terminalize a run here.
+    /// the agent running a foreground child. `TmuxWorkerTerminalInspector`
+    /// treats the same signal as diagnostic only: a differing foreground
+    /// command is not evidence of death, and [`crate::stale_worker_sweep::classify_semantic_staleness`]
+    /// does not consult it for health either. Only session absence, a
+    /// spawn-token mismatch, or `#{pane_dead}` may terminalize a run here.
     ///
     /// `Ok(None)` means the pane is alive and a write may proceed; `Ok(Some(evidence))`
     /// means the pane is confirmed dead, with `evidence` carrying a
@@ -634,10 +635,10 @@ impl ServerState {
                         // foreground command may differ from the driver
                         // binary (e.g. the agent is running a foreground
                         // `bazel build`) is expected and is NOT evidence the
-                        // driver exited — see
-                        // `TmuxWorkerTerminalInspector`/`classify_worker_liveness`
-                        // in `stale_worker_sweep`, which assigns the same
-                        // signal the identical meaning. Only actual proof of
+                        // driver exited — `TmuxWorkerTerminalInspector`
+                        // carries `#{pane_current_command}` as a diagnostic
+                        // only, and `classify_semantic_staleness` never
+                        // consults it for health. Only actual proof of
                         // death (session absent or `#{pane_dead}`) may
                         // terminalize the run.
                     }
