@@ -150,6 +150,13 @@ fn version_parser_accepts_letter_suffixes_and_enforces_floor() {
     assert!(TmuxVersion::parse("3.6a").is_err());
 }
 
+#[test]
+fn source_file_target_requires_3_4() {
+    assert!(!TmuxVersion::parse("tmux 3.3a\n").unwrap().supports_source_file_target());
+    assert!(TmuxVersion::parse("tmux 3.4\n").unwrap().supports_source_file_target());
+    assert!(TmuxVersion::parse("tmux 3.6a\n").unwrap().supports_source_file_target());
+}
+
 #[tokio::test]
 async fn version_uses_resolved_program() {
     let (tmux, runner) = tmux([success("tmux 3.6a\n")]);

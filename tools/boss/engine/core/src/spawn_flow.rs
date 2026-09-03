@@ -364,13 +364,37 @@ async fn start_tmux_worker(
     // Driver-specific tmux session config (e.g. codex's `mouse on` for
     // wheel scrollback — see `crate::driver::tmux_session_config_for`).
     // Sourced with `-t` so it is scoped to this one session, never the
-    // whole server; see `boss_tmux::Tmux::source_file`.
+    // whole server; see `boss_tmux::Tmux::source_file`. `-t` on
+    // `source-file` needs tmux 3.4+ (Boss's floor is 3.2), so probe before
+    // sending it — an older server rejects the flag outright, which would
+    // otherwise fail the whole spawn over a cosmetic scrollback fix.
     if let Some(config) = crate::driver::tmux_session_config_for(driver_name) {
-        host.tmux
-            .source_file(&host.session_name, config)
-            .await
-            .with_context(|| format!("sourcing {driver_name} tmux session config"))
-            .map_err(StartWorkerError::Tmux)?;
+        match host.tmux.version().await {
+            Ok(version) if version.supports_source_file_target() => {
+                host.tmux
+                    .source_file(&host.session_name, config)
+                    .await
+                    .with_context(|| format!("sourcing {driver_name} tmux session config"))
+                    .map_err(StartWorkerError::Tmux)?;
+            }
+            Ok(version) => {
+                tracing::warn!(
+                    execution_id = %execution_id,
+                    driver_name = %driver_name,
+                    tmux_major = version.major,
+                    tmux_minor = version.minor,
+                    "tmux predates 3.4's `source-file -t`; skipping session-scoped tmux config for this driver",
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    execution_id = %execution_id,
+                    driver_name = %driver_name,
+                    %error,
+                    "could not probe tmux version; skipping session-scoped tmux config for this driver",
+                );
+            }
+        }
     }
     host.tmux
         .set_option(&host.session_name, TMUX_SPAWN_TOKEN_OPTION, &spawn_token)
@@ -1082,6 +1106,7 @@ mod tests {
         calls: std::sync::Mutex<Vec<Vec<String>>>,
         stdin: std::sync::Mutex<Vec<Vec<u8>>>,
         steps: Arc<RecordingTmuxStore>,
+        tmux_version_stdout: String,
     }
 
     impl RecordingTmuxRunner {
@@ -1090,7 +1115,15 @@ mod tests {
                 calls: std::sync::Mutex::new(Vec::new()),
                 stdin: std::sync::Mutex::new(Vec::new()),
                 steps,
+                tmux_version_stdout: "tmux 3.6a\n".to_owned(),
             }
+        }
+
+        /// Overrides the probed `tmux -V` output, for tests exercising the
+        /// pre-3.4 `source-file -t` fallback.
+        fn with_tmux_version(mut self, version_line: &str) -> Self {
+            self.tmux_version_stdout = version_line.to_owned();
+            self
         }
 
         fn calls(&self) -> Vec<Vec<String>> {
@@ -1112,6 +1145,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let (step, stdout) = match args.get(2).map(String::as_str) {
                 Some("start-server") => ("server-bootstrap", ""),
+                Some("-V") => ("version", self.tmux_version_stdout.as_str()),
                 Some("new-session") => ("new-session", ""),
                 Some("set-option") if args.get(3).map(String::as_str) == Some("-g") => {
                     match args.get(4).map(String::as_str) {
@@ -1456,6 +1490,58 @@ mod tests {
                 "boss-1-run-codex-tmux",
                 "-"
             ]
+        );
+    }
+
+    /// `source-file -t` was only added in tmux 3.4; Boss's floor is 3.2, so
+    /// a codex spawn against an older-but-supported server must skip the
+    /// session config instead of sending the unknown flag and failing the
+    /// whole spawn over a cosmetic scrollback fix.
+    #[test]
+    fn tmux_hosted_codex_spawn_skips_session_config_on_pre_3_4_tmux() {
+        let homes = TempDir::new().unwrap();
+        let _homes_env = codex_homes_override(homes.path());
+        let transcripts = TempDir::new().unwrap();
+        let _transcripts_env = transcript_store_override(transcripts.path());
+
+        let workspace = TempDir::new().unwrap();
+        let spawner = StubSpawner {
+            registry: WorkerRegistry::new(),
+            spawn_calls: Arc::new(AtomicUsize::new(0)),
+            last_request: std::sync::Mutex::new(None),
+            canned_response: Err(SendToAppError::NotRegistered),
+        };
+        let store = Arc::new(RecordingTmuxStore::default());
+        let runner = Arc::new(RecordingTmuxRunner::new(store.clone()).with_tmux_version("tmux 3.3a\n"));
+        let tmux = Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH)
+            .unwrap();
+        let mut input = codex_input(&workspace, "run-codex-tmux-old", 1);
+        input.tmux_host = Some(TmuxWorkerHost::new(
+            tmux,
+            store.clone(),
+            "boss-1-run-codex-tmux-old".to_owned(),
+        ));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        runtime.block_on(async {
+            start_worker(&spawner, input, StdDuration::from_secs(1))
+                .await
+                .expect("codex tmux-hosted spawn should still succeed on pre-3.4 tmux");
+            spawner.stop_progress_ingress("run-codex-tmux-old");
+        });
+
+        assert!(
+            !store.steps().contains(&"source-file"),
+            "pre-3.4 tmux must not receive `source-file -t`: {:?}",
+            store.steps()
+        );
+        assert!(
+            store.steps().contains(&"version"),
+            "expected a version probe before deciding whether to source: {:?}",
+            store.steps()
         );
     }
 
