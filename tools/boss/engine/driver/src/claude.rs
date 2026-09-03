@@ -516,6 +516,69 @@ pub const REVISION_PR_GUARD_COMMAND: &str = python_command_guard!(
     "_approve()\n",
 );
 
+/// Tokenizer fragment for [`REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND`]: splits
+/// a (possibly multi-line) shell command string into independent argv groups
+/// at shell delimiters, and strips leading env-assignment / launcher-wrapper
+/// / `timeout <n>` tokens to reach the real program.
+///
+/// This guard previously used `shlex.split`, which does not tokenize a shell
+/// operator written without surrounding spaces (e.g. `cd x&&bazel test //y`
+/// reads as the single token `x&&bazel`, defeating group-splitting).
+/// `shlex.shlex(..., punctuation_chars=";&|")` with `whitespace_split = True`
+/// is the lexer this repo already uses correctly for that reason in the
+/// `BOSS_DATA_DIR` path guard (see `boss_engine::worker_setup`'s
+/// `PATH_GUARD_SCRIPT`); this fragment reuses the same approach.
+///
+/// [`crate::codex::tool_surface_guard::CODEX_TOOL_SURFACE_GUARD_SCRIPT`]
+/// independently reimplements a near-identical tokenizer (same delimiter and
+/// wrapper sets) with the same `shlex.split` gap, unfixed here: unifying it
+/// with this fragment would touch a file this revision otherwise leaves
+/// alone, and is left as a follow-up rather than folded into this pass.
+///
+/// A plain string-literal macro (not a `const`) for the same reason
+/// [`python_command_guard!`] is one: it is spliced into other `concat!`
+/// invocations, which require every argument to be a literal.
+macro_rules! shell_command_tokenizer_fragment {
+    () => {
+        "DELIMS={'&&','||',';','|','&'}\n\
+         WRAPPERS={'env','command','exec','nohup','stdbuf','setsid','caffeinate','sudo','time','xargs'}\n\
+         ASSIGNMENT_RE=re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')\n\
+         def command_groups(command):\n\
+         \x20   groups=[]\n\
+         \x20   for line in command.split(chr(10)):\n\
+         \x20       try:\n\
+         \x20           _lex=shlex.shlex(line,posix=True,punctuation_chars=';&|')\n\
+         \x20           _lex.whitespace_split=True\n\
+         \x20           toks=list(_lex)\n\
+         \x20       except Exception:\n\
+         \x20           toks=line.split()\n\
+         \x20       cur=[]\n\
+         \x20       for tok in toks:\n\
+         \x20           if tok in DELIMS:\n\
+         \x20               if cur:\n\
+         \x20                   groups.append(cur)\n\
+         \x20               cur=[]\n\
+         \x20           else:\n\
+         \x20               cur.append(tok)\n\
+         \x20       if cur:\n\
+         \x20           groups.append(cur)\n\
+         \x20   return groups\n\
+         def strip_prefixes(group):\n\
+         \x20   i=0\n\
+         \x20   while i<len(group):\n\
+         \x20       tok=group[i]\n\
+         \x20       base=os.path.basename(tok)\n\
+         \x20       if ASSIGNMENT_RE.match(tok) or base in WRAPPERS:\n\
+         \x20           i+=1\n\
+         \x20           continue\n\
+         \x20       if base=='timeout' and i+1<len(group):\n\
+         \x20           i+=2\n\
+         \x20           continue\n\
+         \x20       break\n\
+         \x20   return group[i:]\n"
+    };
+}
+
 /// Inline Python decision hook for static-analysis-only reviewer sessions.
 ///
 /// Mutation and publication remain fenced by the existing reviewer deny rules
@@ -524,62 +587,28 @@ pub const REVISION_PR_GUARD_COMMAND: &str = python_command_guard!(
 /// generators, language runners, shell interpreters, and direct execution of
 /// checked-out artifacts. It is shared unchanged by Claude, Codex, and Grok.
 pub const REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND: &str = python_command_guard!(
-    "DELIMS={'&&','||',';','|','&'}\n",
-    "WRAPPERS={'env','command','exec','nohup','stdbuf','setsid','caffeinate','sudo','time','xargs'}\n",
-    "BLOCKED={'make','just','cmake','ninja','meson','buck','xcodebuild','gradle','gradlew','mvn','mvnw','sbt','dotnet','pytest','tox','nox','rustfmt','gofmt','prettier','black','ruff','protoc','buf','codegen','npx','npm','pnpm','yarn','bun','deno','node','python','python3','ruby','perl','php','lua','java','kotlinc','swift','uv','poetry','pipenv','maturin'}\n",
-    "def groups_for(line):\n",
-    "    try:\n",
-    "        toks=shlex.split(line,posix=True)\n",
-    "    except Exception:\n",
-    "        toks=line.split()\n",
-    "    groups=[]\n",
-    "    cur=[]\n",
-    "    for tok in toks:\n",
-    "        if tok in DELIMS:\n",
-    "            if cur:\n",
-    "                groups.append(cur)\n",
-    "            cur=[]\n",
-    "        else:\n",
-    "            cur.append(tok)\n",
-    "    if cur:\n",
-    "        groups.append(cur)\n",
-    "    return groups\n",
-    "def command_start(group):\n",
-    "    i=0\n",
-    "    while i<len(group):\n",
-    "        tok=group[i]\n",
-    "        base=os.path.basename(tok)\n",
-    "        if re.match(r'^[A-Za-z_][A-Za-z0-9_]*=',tok) or base in WRAPPERS:\n",
-    "            i+=1\n",
-    "            continue\n",
-    "        if base=='timeout' and i+1<len(group):\n",
-    "            i+=2\n",
-    "            continue\n",
-    "        return group[i:]\n",
-    "    return []\n",
+    shell_command_tokenizer_fragment!(),
+    "BLOCKED={'make','just','cmake','ninja','meson','buck','xcodebuild','gradle','gradlew','mvn','mvnw','sbt','dotnet','pytest','tox','nox','rustfmt','gofmt','prettier','black','ruff','protoc','buf','codegen','npx','npm','pnpm','yarn','bun','deno','node','python','python3','ruby','perl','php','lua','java','kotlinc','swift','uv','poetry','pipenv','maturin','checkleft'}\n",
     "matched=None\n",
-    "for line in cmd.split(chr(10)):\n",
-    "    for group in groups_for(line):\n",
-    "        rest=command_start(group)\n",
-    "        if not rest:\n",
-    "            continue\n",
-    "        prog=rest[0]\n",
-    "        base=os.path.basename(prog)\n",
-    "        subcommands=set(rest[1:])\n",
-    "        if base in ('bash','sh','zsh','fish') or base in ('source','.'):\n",
-    "            matched=base\n",
-    "        elif base in ('bazel','bazelisk') and subcommands.intersection({'build','test','run','coverage'}):\n",
-    "            matched=base+' execution subcommand'\n",
-    "        elif base=='cargo' and subcommands.intersection({'build','test','run','bench','fmt','clippy','install'}):\n",
-    "            matched='cargo execution subcommand'\n",
-    "        elif base=='go' and subcommands.intersection({'build','test','run','generate','install'}):\n",
-    "            matched='go execution subcommand'\n",
-    "        elif base in BLOCKED:\n",
-    "            matched=base\n",
-    "        elif prog.startswith('./') or prog.startswith('../') or '/bazel-bin/' in prog or '/target/' in prog:\n",
-    "            matched=prog\n",
-    "        if matched:\n",
-    "            break\n",
+    "for group in command_groups(cmd):\n",
+    "    rest=strip_prefixes(group)\n",
+    "    if not rest:\n",
+    "        continue\n",
+    "    prog=rest[0]\n",
+    "    base=os.path.basename(prog)\n",
+    "    subcommands=set(rest[1:])\n",
+    "    if base in ('bash','sh','zsh','fish') or base in ('source','.'):\n",
+    "        matched=base\n",
+    "    elif base in ('bazel','bazelisk') and subcommands.intersection({'build','test','run','coverage'}):\n",
+    "        matched=base+' execution subcommand'\n",
+    "    elif base=='cargo' and subcommands.intersection({'build','test','run','bench','fmt','clippy','install'}):\n",
+    "        matched='cargo execution subcommand'\n",
+    "    elif base=='go' and subcommands.intersection({'build','test','run','generate','install'}):\n",
+    "        matched='go execution subcommand'\n",
+    "    elif base in BLOCKED:\n",
+    "        matched=base\n",
+    "    elif prog.startswith('./') or prog.startswith('../') or '/bazel-bin/' in prog or '/target/' in prog:\n",
+    "        matched=prog\n",
     "    if matched:\n",
     "        break\n",
     "if matched:\n",
@@ -1644,6 +1673,14 @@ mod tests {
             "cargo fmt",
             "python3 scripts/check.py",
             "./bazel-bin/tools/boss/engine/core/engine",
+            "checkleft fix",
+            // Chained commands, spaced and unspaced. shlex.split (unlike
+            // shlex.shlex with punctuation_chars) does not tokenize a shell
+            // operator glued to the preceding word, so `cd tools/boss&&bazel
+            // test //x` used to read as a single `cd`-headed group and slip
+            // past the guard entirely.
+            "cd tools/boss && bazel test //x",
+            "cd tools/boss&&bazel test //x",
         ] {
             assert_eq!(
                 reviewer_static_guard_decision(command)["decision"],

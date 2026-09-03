@@ -1012,7 +1012,12 @@ fn reviewer_config_keeps_checkout_out_of_writable_roots() {
     let workspace = Path::new("/tmp/reviewer-workspace");
     let output_dir = boss_engine_structured_output::default_dir();
     let config = render_reviewer_base_config_toml(workspace, &output_dir);
-    assert!(config.contains("network_access = false"), "{config}");
+    // network_access = true is required for the boss propose Unix-socket
+    // report channel; exclude_tmpdir_env_var/exclude_slash_tmp keep the
+    // filesystem grant narrowed to the --cd output root despite that.
+    assert!(config.contains("network_access = true"), "{config}");
+    assert!(config.contains("exclude_tmpdir_env_var = true"), "{config}");
+    assert!(config.contains("exclude_slash_tmp = true"), "{config}");
     assert!(!config.contains("writable_roots"), "{config}");
     assert!(
         config.contains(&toml_basic_string(&workspace.display().to_string())),

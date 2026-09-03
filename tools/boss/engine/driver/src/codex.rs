@@ -790,11 +790,29 @@ fn render_sandbox_workspace_write_toml(workspace: &Path) -> String {
     out
 }
 
-/// Reviewer sandbox configuration deliberately has no additional writable
-/// roots and no network access. Its `--cd` output directory is the only
-/// writable location granted by Codex's workspace-write profile.
+/// Reviewer sandbox configuration deliberately has no additional
+/// `writable_roots`. `network_access = true` is required despite the
+/// reviewer's read-only intent: the reviewer's only report-delivery channel
+/// is `boss propose review-report`, a Unix-domain-socket connect to the
+/// engine control socket (`BossClient::connect_socket`), and Codex's seatbelt
+/// classifies an `AF_UNIX connect()` as a `network-outbound` operation that
+/// `network_access = false` denies — the same class of local-socket denial
+/// this repo already documented for Bazel's TCP handshake (see
+/// [`render_sandbox_workspace_write_toml`]'s doc comment). Granting it here
+/// widens outbound network reachability, not filesystem writes: it does not
+/// add to `writable_roots`, so the checkout stays outside every writable
+/// root. `exclude_tmpdir_env_var` and `exclude_slash_tmp` narrow the
+/// filesystem grant instead — without them Codex's workspace-write profile
+/// additionally grants all of `$TMPDIR` and `/tmp`, which (since
+/// `boss_engine_structured_output::default_dir()` is a `boss-worker-output`
+/// subdirectory of `std::env::temp_dir()`, keyed by filename) would let the
+/// reviewer overwrite concurrent executions' artifacts and reach the engine
+/// control socket at `/tmp/boss-engine.sock` by filesystem write, not just
+/// the sanctioned `boss propose` connect. With both flags set, the `--cd`
+/// output directory remains the only writable location.
 fn render_reviewer_sandbox_workspace_write_toml() -> String {
-    "[sandbox_workspace_write]\nnetwork_access = false\n\n".to_owned()
+    "[sandbox_workspace_write]\nnetwork_access = true\nexclude_tmpdir_env_var = true\nexclude_slash_tmp = true\n\n"
+        .to_owned()
 }
 
 /// Resolve the writable roots Bazel needs outside the workspace.

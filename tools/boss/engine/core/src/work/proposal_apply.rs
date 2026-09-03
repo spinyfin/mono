@@ -183,7 +183,7 @@ fn apply_review_report(
     let report: boss_pr_review::ReviewerReport = serde_json::from_value(payload.report.clone())?;
     let member = tx
         .query_row(
-            "SELECT members.id, members.batch_id, members.status, members.report_proposal_id,
+            "SELECT members.id, members.status, members.report_proposal_id,
                     batches.pr_url, batches.target_sha, batches.phase
              FROM pr_review_batch_members AS members
              JOIN pr_review_batches AS batches ON batches.id = members.batch_id
@@ -193,27 +193,24 @@ fn apply_review_report(
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
                 ))
             },
         )
         .optional()?;
-    let Some((member_id, member_batch_id, status, existing_report, pr_url, target_sha, phase)) = member else {
+    // The WHERE clause already filters on `members.batch_id = ?2`
+    // (`payload.batch_id`), so a returned row's batch membership is
+    // guaranteed to match by construction — no separate mismatch check is
+    // needed or possible here.
+    let Some((member_id, status, existing_report, pr_url, target_sha, phase)) = member else {
         return Ok(ApplyDecision::Rejected(format!(
             "this execution is not a member of review batch `{}`",
             payload.batch_id
         )));
     };
-    if member_batch_id != payload.batch_id {
-        return Ok(ApplyDecision::Rejected(format!(
-            "review batch membership does not match submitted batch `{}`",
-            payload.batch_id
-        )));
-    }
     if payload.target_sha != target_sha {
         return Ok(ApplyDecision::Rejected(
             "submitted target SHA does not match batch target".to_owned(),

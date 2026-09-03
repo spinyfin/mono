@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use anyhow::Context as _;
 use boss_engine_gh_invocation::gh_output;
 use boss_gh_telemetry::{callers, scope as gh_scope};
 
@@ -658,6 +659,17 @@ pub(crate) async fn compose_worker_spawn(
             };
             let reviewer_repo_slug = crate::completion::parse_repo_slug(&execution.repo_remote_url)
                 .unwrap_or_else(|_| "<owner/repo>".to_owned());
+            // A member row existing is the same signal `finalize_pr_review_pass`
+            // uses to take the batch branch unconditionally (it never falls
+            // back to reading the legacy artifact once a member row exists).
+            // So once we observe a member row here, the batch destination is
+            // the ONLY delivery channel the finalizer will ever read for this
+            // execution: falling back to the legacy prompt in that case would
+            // render a prompt whose artifact/transcript delivery instructions
+            // the finalizer is guaranteed to ignore, silently discarding a
+            // review the worker actually completed. Fail the dispatch instead
+            // so the execution surfaces as a real failure rather than a
+            // reviewer that appears to succeed but whose report vanishes.
             let report_destination = match work_db.review_batch_member_for_execution(&execution.id) {
                 Ok(Some(member)) => match work_db.review_batch(&member.batch_id) {
                     Ok(Some(batch)) => Some(
@@ -673,31 +685,28 @@ pub(crate) async fn compose_worker_spawn(
                             .build(),
                     ),
                     Ok(None) => {
-                        tracing::error!(
-                            execution_id = %execution.id,
-                            batch_id = %member.batch_id,
-                            "pr_review execution has a member without its persisted batch; using legacy prompt",
+                        anyhow::bail!(
+                            "pr_review execution {} has review-batch member for batch {} but the batch row is \
+                             missing; refusing to dispatch with the legacy prompt, which finalize_pr_review_pass \
+                             would never read",
+                            execution.id,
+                            member.batch_id,
                         );
-                        None
                     }
                     Err(err) => {
-                        tracing::error!(
-                            execution_id = %execution.id,
-                            batch_id = %member.batch_id,
-                            ?err,
-                            "could not load batch report destination; using legacy prompt",
-                        );
-                        None
+                        return Err(err).context(format!(
+                            "loading review batch {} for execution {} member row; refusing to dispatch with the \
+                             legacy prompt, which finalize_pr_review_pass would never read",
+                            member.batch_id, execution.id,
+                        ));
                     }
                 },
                 Ok(None) => None,
                 Err(err) => {
-                    tracing::error!(
-                        execution_id = %execution.id,
-                        ?err,
-                        "could not determine whether reviewer belongs to a batch; using legacy prompt",
-                    );
-                    None
+                    return Err(err).context(format!(
+                        "determining whether reviewer execution {} belongs to a review batch",
+                        execution.id,
+                    ));
                 }
             };
             match report_destination.as_ref() {
