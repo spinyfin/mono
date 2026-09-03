@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -83,59 +82,6 @@ pub fn resolve_last_release(
         published: published.map(|(_, release)| release),
         draft: draft.map(|(_, release)| release),
     })
-}
-
-/// Previous published tag that should bound generated notes for this tool.
-///
-/// GitHub's `--generate-notes` otherwise picks the newest release in the
-/// repository, which in a monorepo is almost never the previous release of the
-/// same tool. Drafts and tags that do not start with `tag_prefix` are ignored.
-/// `None` means this prefix has no prior published tag.
-pub fn previous_notes_tag<'a>(releases: &'a [GitHubRelease], tag_prefix: &str) -> Option<&'a str> {
-    releases
-        .iter()
-        .filter(|release| !release.draft)
-        .map(|release| release.tag_name.as_str())
-        .filter(|tag| tag.starts_with(tag_prefix) && tag.len() > tag_prefix.len())
-        .max_by(|left, right| cmp_prefixed_tags(tag_prefix, left, right))
-}
-
-fn cmp_prefixed_tags(tag_prefix: &str, left: &str, right: &str) -> Ordering {
-    cmp_version_like(
-        left.strip_prefix(tag_prefix).unwrap_or(left),
-        right.strip_prefix(tag_prefix).unwrap_or(right),
-    )
-}
-
-/// Compares version-like suffixes so `0.4.10` ranks above `0.4.9` and
-/// `0.4.1-alpha.9` above `0.4.1-alpha.8`. Lexicographic tag order is not used.
-fn cmp_version_like(left: &str, right: &str) -> Ordering {
-    version_chunks(left).cmp(&version_chunks(right))
-}
-
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum VersionChunk<'a> {
-    Number(u64),
-    Text(&'a str),
-}
-
-fn version_chunks(value: &str) -> Vec<VersionChunk<'_>> {
-    let mut chunks = Vec::new();
-    let mut rest = value;
-    while !rest.is_empty() {
-        if rest.as_bytes()[0].is_ascii_digit() {
-            let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-            let (digits, next) = rest.split_at(end);
-            chunks.push(VersionChunk::Number(digits.parse().unwrap_or(u64::MAX)));
-            rest = next;
-        } else {
-            let end = rest.find(|c: char| c.is_ascii_digit()).unwrap_or(rest.len());
-            let (text, next) = rest.split_at(end);
-            chunks.push(VersionChunk::Text(text));
-            rest = next;
-        }
-    }
-    chunks
 }
 
 fn list_releases(runner: &impl CommandRunner, repo: &str) -> Result<Vec<GitHubRelease>> {
@@ -298,67 +244,6 @@ mod tests {
             stdout: stdout.to_owned(),
             stderr: String::new(),
         })
-    }
-
-    fn release(tag: &str, draft: bool) -> GitHubRelease {
-        GitHubRelease {
-            tag_name: tag.to_owned(),
-            draft,
-        }
-    }
-
-    #[test]
-    fn first_release_for_a_prefix_has_no_notes_start_tag() {
-        let releases = vec![
-            release("boss-v1.0.608", false),
-            release("checkleft-v0.1.0-alpha.122", false),
-            release("changelog-v0.1.3", false),
-        ];
-
-        assert_eq!(previous_notes_tag(&releases, "release-v"), None);
-    }
-
-    #[test]
-    fn subsequent_release_picks_the_highest_tag_with_the_same_prefix() {
-        let releases = vec![
-            release("checkleft-v0.1.0-alpha.122", false),
-            release("checkleft-v0.1.0-alpha.121", false),
-            release("boss-v1.0.608", false),
-        ];
-
-        assert_eq!(
-            previous_notes_tag(&releases, "checkleft-v"),
-            Some("checkleft-v0.1.0-alpha.122")
-        );
-    }
-
-    #[test]
-    fn notes_start_tag_ignores_a_newer_release_from_another_tool() {
-        let releases = vec![
-            release("boss-v1.0.608", false),
-            release("checkleft-v0.1.0-alpha.122", false),
-            release("changelog-v0.1.3", false),
-            release("release-v0.1.1", false),
-        ];
-
-        assert_eq!(
-            previous_notes_tag(&releases, "checkleft-v"),
-            Some("checkleft-v0.1.0-alpha.122")
-        );
-        assert_eq!(previous_notes_tag(&releases, "changelog-v"), Some("changelog-v0.1.3"));
-        assert_eq!(previous_notes_tag(&releases, "boss-v"), Some("boss-v1.0.608"));
-    }
-
-    #[test]
-    fn notes_start_tag_ignores_drafts_and_orders_numeric_suffixes() {
-        let releases = vec![
-            release("demo-v1.0.10", false),
-            release("demo-v1.0.9", false),
-            release("demo-v1.0.11", true),
-            release("other-v9.9.9", false),
-        ];
-
-        assert_eq!(previous_notes_tag(&releases, "demo-v"), Some("demo-v1.0.10"));
     }
 
     #[test]
