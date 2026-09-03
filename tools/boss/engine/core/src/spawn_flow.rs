@@ -516,6 +516,9 @@ pub struct StartWorkerInput {
     /// Forwarded to `WorkerSetupInput` — see that field's doc. Ignored
     /// unless `worker_kind` is [`WorkerKind::Triage`].
     pub automation_outcome_proposals_seam_enabled: bool,
+    /// Forwarded to `WorkerSetupInput` — see that field's doc. Ignored
+    /// unless `worker_kind` is [`WorkerKind::Reviewer`].
+    pub is_review_supervisor: bool,
 }
 
 #[derive(Debug)]
@@ -671,6 +674,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         task_kind: input.task_kind.clone(),
         worker_kind: input.worker_kind.clone(),
         automation_outcome_proposals_seam_enabled: input.automation_outcome_proposals_seam_enabled,
+        is_review_supervisor: input.is_review_supervisor,
     };
     let written = write_workspace_files(&setup, input.driver.as_ref()).map_err(StartWorkerError::WriteFiles)?;
     spawner
@@ -1104,6 +1108,7 @@ mod tests {
                 .expect("engine default driver is always registered"),
             tmux_host: None,
             automation_outcome_proposals_seam_enabled: false,
+            is_review_supervisor: false,
         }
     }
 

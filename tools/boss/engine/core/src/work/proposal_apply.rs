@@ -61,8 +61,9 @@ use crate::worker_escalation::{WORKER_BLOCKED_ATTENTION_KIND, WORKER_ESCALATION_
 use boss_protocol::{
     Attention, AttentionGroup, AttentionProposalPayload, AutomationOutcomeProposalPayload, BlockedProposalPayload,
     CreateAttentionInput, CreateAttentionItemInput, DeferredScopeProposalPayload, EffortEscalationProposalPayload,
-    FollowupTaskProposalPayload, PrCreatedProposalPayload, ProposalKind, ReviewBatchMemberStatus,
-    ReviewReportProposalPayload, ReviewVerdictProposalPayload, RunDoneProposalPayload,
+    FollowupTaskProposalPayload, PrCreatedProposalPayload, ProposalKind, ReviewBatchMemberRole,
+    ReviewBatchMemberStatus, ReviewBatchStatus, ReviewReportProposalPayload, ReviewVerdictProposalPayload,
+    RunDoneProposalPayload,
 };
 
 /// `work_attention_items.kind` for an `attention` proposal that did not
@@ -91,17 +92,14 @@ pub fn apply_policy(kind: ProposalKind) -> ProposalApplyPolicy {
         | ProposalKind::AutomationOutcome
         | ProposalKind::PrCreated
         | ProposalKind::ReviewReport
-        | ProposalKind::RunDone => ProposalApplyPolicy::AutoApply,
+        | ProposalKind::RunDone
+        | ProposalKind::ReviewVerdict => ProposalApplyPolicy::AutoApply,
         // Gated by design: task creation from a followup proposal always
         // requires the human batch-accept gesture
         // (`WorkDb::action_attention_group`). See
         // `stage_followup_task_in_transaction` for what *does* still happen
         // synchronously at submission for this kind despite being gated.
         ProposalKind::FollowupTask => ProposalApplyPolicy::Gated,
-        // Gated because verdict application is asynchronous and lands outside
-        // the submission transaction. The row stays `proposed` until that
-        // applier consumes it; nothing is staged at submission.
-        ProposalKind::ReviewVerdict => ProposalApplyPolicy::Gated,
     }
 }
 
@@ -160,12 +158,10 @@ pub fn apply_in_transaction(
         ProposalKind::PrCreated => apply_pr_created(tx, execution_id, payload_json),
         ProposalKind::ReviewReport => apply_review_report(tx, execution_id, payload_json, proposal_id),
         ProposalKind::RunDone => apply_run_done(tx, execution_id, payload_json, proposal_id),
+        ProposalKind::ReviewVerdict => apply_review_verdict(tx, execution_id, payload_json, proposal_id),
         ProposalKind::FollowupTask => anyhow::bail!(
             "no applier for `followup_task`; it stages via \
              stage_followup_task_in_transaction and remains Gated for human acceptance"
-        ),
-        ProposalKind::ReviewVerdict => anyhow::bail!(
-            "no applier for `review_verdict`; it remains Gated because its asynchronous applier has not landed"
         ),
     }
 }
@@ -249,27 +245,126 @@ fn apply_review_report(
          WHERE id = ?4",
         rusqlite::params![ReviewBatchMemberStatus::Reported.as_str(), proposal_id, now, member_id],
     )?;
+    advance_review_batch_quorum_best_effort(tx, execution_id, &payload.batch_id);
     Ok(ApplyDecision::Applied(ApplyOutcome {
         applied_ref: Some(member_id),
         post_commit_audit_line: None,
     }))
 }
 
-/// Supersede prior undecided verdicts for the submitted batch. A later
-/// asynchronous applier can therefore consume exactly one proposed verdict:
-/// the newest submission for that batch.
-pub fn supersede_prior_review_verdicts(tx: &Transaction<'_>, payload_json: &str, proposal_id: &str) -> Result<()> {
+/// Check whether accepting a leaf report or a supervisor verdict just settled
+/// this batch's quorum, inside the same transaction the acceptance itself
+/// committed in. Best-effort: a failure here must never roll back (or even
+/// fail) the report/verdict acceptance that already succeeded — it is logged
+/// loudly instead, since nothing else is guaranteed to retry this exact
+/// transition (unlike a leaf's exhausted retry, which the recovery sweep
+/// revisits on its own schedule).
+fn advance_review_batch_quorum_best_effort(tx: &Transaction<'_>, execution_id: &str, batch_id: &str) {
+    let registry = crate::driver::DriverRegistry::default();
+    if let Err(error) = super::review_batches::try_advance_review_batch_quorum_in_tx(tx, batch_id, &registry) {
+        tracing::error!(
+            execution_id,
+            batch_id,
+            ?error,
+            "accepted a review-batch report/verdict, but the quorum advance that should follow it failed; \
+             the batch may now be stuck until a human intervenes",
+        );
+    }
+}
+
+/// Accept the supervisor's consolidated verdict for a batch. Verifies the
+/// submitting execution owns the batch's supervisor member, that the
+/// verdict's identity matches the persisted batch, then marks that member
+/// reported and hands off to [`try_advance_review_batch_quorum_in_tx`] to
+/// complete the batch (application of the verdict's *content* — deciding
+/// what happens to the reviewed work item — is separate, later work; this
+/// only records that the batch's consolidated outcome now exists).
+fn apply_review_verdict(
+    tx: &Transaction<'_>,
+    execution_id: &str,
+    payload_json: &str,
+    proposal_id: &str,
+) -> Result<ApplyDecision> {
     let payload: ReviewVerdictProposalPayload = serde_json::from_str(payload_json)?;
+    let verdict: boss_pr_review::SupervisorVerdict = serde_json::from_value(payload.verdict.clone())?;
+    let member = tx
+        .query_row(
+            "SELECT members.id, members.role, members.status, members.report_proposal_id,
+                    batches.status, batches.pr_url, batches.target_sha, batches.phase
+             FROM pr_review_batch_members AS members
+             JOIN pr_review_batches AS batches ON batches.id = members.batch_id
+             WHERE members.execution_id = ?1 AND members.batch_id = ?2",
+            rusqlite::params![execution_id, payload.batch_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((member_id, role, status, existing_verdict, batch_status, pr_url, target_sha, phase)) = member else {
+        return Ok(ApplyDecision::Rejected(format!(
+            "this execution is not a member of review batch `{}`",
+            payload.batch_id
+        )));
+    };
+    let role: ReviewBatchMemberRole = role.parse().map_err(anyhow::Error::msg)?;
+    if role != ReviewBatchMemberRole::Supervisor {
+        return Ok(ApplyDecision::Rejected(format!(
+            "review batch member `{member_id}` is a `{role}`, not the batch's supervisor; only the \
+             supervisor member may submit a review-verdict",
+        )));
+    }
+    if batch_status != ReviewBatchStatus::Supervising.as_str() {
+        return Ok(ApplyDecision::Rejected(format!(
+            "review batch `{}` is `{batch_status}`, not `supervising`; a verdict can only be accepted \
+             while the batch is awaiting one",
+            payload.batch_id
+        )));
+    }
+    if verdict.batch_id != payload.batch_id
+        || verdict.target_sha != target_sha
+        || verdict.pr_url != pr_url
+        || verdict.phase.as_str() != phase
+    {
+        return Ok(ApplyDecision::Rejected(
+            "verdict identity does not match its persisted batch target".to_owned(),
+        ));
+    }
+    if let Some(existing_verdict) = existing_verdict {
+        return Ok(ApplyDecision::Rejected(format!(
+            "review batch member `{member_id}` already accepted verdict proposal `{existing_verdict}`",
+        )));
+    }
+    let status: ReviewBatchMemberStatus = status.parse().map_err(anyhow::Error::msg)?;
+    if !matches!(
+        status,
+        ReviewBatchMemberStatus::Pending | ReviewBatchMemberStatus::Running
+    ) {
+        return Ok(ApplyDecision::Rejected(format!(
+            "review batch member `{member_id}` cannot accept a verdict while status is `{status}`",
+        )));
+    }
+
     let now = now_string();
     tx.execute(
-        "UPDATE worker_proposals
-         SET state = 'superseded', decided_by = 'policy', decided_at = ?2,
-             decision_reason = 'superseded by newer review_verdict proposal (' || ?3 || ') for the same batch'
-         WHERE kind = 'review_verdict' AND state = 'proposed' AND id <> ?3
-           AND json_extract(payload_json, '$.batch_id') = ?1",
-        rusqlite::params![payload.batch_id, now, proposal_id],
+        "UPDATE pr_review_batch_members
+         SET status = ?1, report_proposal_id = ?2, terminal_at = ?3, updated_at = ?3
+         WHERE id = ?4",
+        rusqlite::params![ReviewBatchMemberStatus::Reported.as_str(), proposal_id, now, member_id],
     )?;
-    Ok(())
+    advance_review_batch_quorum_best_effort(tx, execution_id, &payload.batch_id);
+    Ok(ApplyDecision::Applied(ApplyOutcome {
+        applied_ref: Some(payload.batch_id),
+        post_commit_audit_line: None,
+    }))
 }
 
 fn create_attention_item_row(

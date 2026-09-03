@@ -1279,9 +1279,28 @@ impl WorkerCompletionHandler {
                             execution_id = %execution.id,
                             member_id = %member.id,
                             batch_id = %member.batch_id,
-                            "reviewer stopped without submitting review-report proposal; member marked failed",
+                            "reviewer stopped without submitting review-report/review-verdict proposal; \
+                             member marked failed",
                         );
-                        "review report proposal missing; member failed"
+                        // This member just permanently settled failed (a
+                        // leaf gets one retry via the recovery sweep, but
+                        // the supervisor gets none), so the batch's quorum
+                        // decision may have just become decidable — check
+                        // now rather than waiting on some other hook.
+                        match self.work_db.try_advance_review_batch_quorum(&member.batch_id) {
+                            Ok(crate::work::ReviewBatchQuorumOutcome::SupervisorDispatched) => {
+                                self.publisher.kick_scheduler();
+                            }
+                            Ok(_) => {}
+                            Err(err) => tracing::error!(
+                                execution_id = %execution.id,
+                                batch_id = %member.batch_id,
+                                ?err,
+                                "pr_review finalize: quorum advance after member failure failed; the batch \
+                                 may now be stuck until a human intervenes",
+                            ),
+                        }
+                        "review report/verdict proposal missing; member failed"
                     }
                     Ok(false) => "review batch member was already terminal",
                     Err(err) => {

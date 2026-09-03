@@ -571,7 +571,9 @@ pub(crate) use products_design::{
 pub(crate) use products_design::resolve_task_doc_pointer;
 pub(crate) use proposal_apply::*;
 pub(crate) use query_ensure::*;
-pub use review_batches::{ReviewBatchCreateInput, ReviewBatchDispatch, ReviewBatchMemberCreateInput};
+pub use review_batches::{
+    ReviewBatchCreateInput, ReviewBatchDispatch, ReviewBatchMemberCreateInput, ReviewBatchQuorumOutcome,
+};
 pub(crate) use review_verdicts::query_latest_informative_review_verdicts;
 pub(crate) use revision_helpers::*;
 pub(crate) use task_targets::*;

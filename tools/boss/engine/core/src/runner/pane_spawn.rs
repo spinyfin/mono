@@ -14,7 +14,7 @@ use crate::coordinator::slot_id_from_worker_id;
 use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, TmuxWorkerHost, start_worker};
 use crate::work::{WorkDb, WorkExecution, WorkItem};
-use boss_protocol::{ExecutionStatus, WorkItemBinding};
+use boss_protocol::{ExecutionKind, ExecutionStatus, ReviewBatchMemberRole, WorkItemBinding};
 
 use super::prompt::structured_output_env_vars;
 use super::work_item::{followup_pr_body_prefix_for_work_item, work_item_id, work_item_name, work_item_task_kind};
@@ -869,6 +869,15 @@ impl ExecutionRunner for PaneSpawnRunner {
         // force a new restricted kind to decide both.
         let worker_kind = crate::worker_setup::worker_kind_for_execution(&execution.kind);
         let permission_mode_override = worker_kind.forced_permission_mode();
+        // Only a review-batch's Supervisor-role member gets the supervisor
+        // CLAUDE.md instead of the leaf reviewer's; every other `pr_review`
+        // execution (leaf members, and legacy memberless reviewers) keeps
+        // the existing reviewer posture unchanged.
+        let is_review_supervisor = execution.kind == ExecutionKind::PrReview
+            && matches!(
+                self.work_db.review_batch_member_for_execution(&execution.id),
+                Ok(Some(member)) if member.role == ReviewBatchMemberRole::Supervisor
+            );
         // Any environment scrubbing/exporting a driver's spawn needs (e.g.
         // Claude unsetting ANTHROPIC_API_KEY so it authenticates via OAuth
         // credentials instead of a stray shell-profile key) is the driver's
@@ -1078,6 +1087,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 driver: driver.clone(),
                 tmux_host,
                 automation_outcome_proposals_seam_enabled,
+                is_review_supervisor,
             },
             StdDuration::from_secs(30),
         )

@@ -3,7 +3,7 @@
 
 use boss_protocol::{
     ProposalDecider, ProposalKind, ProposalState, ReviewBatchMemberRole, ReviewBatchMemberStatus, ReviewBatchPhase,
-    ReviewClassification, ReviewLanguageBucket, ReviewProfile,
+    ReviewBatchStatus, ReviewClassification, ReviewLanguageBucket, ReviewProfile,
 };
 
 use super::*;
@@ -76,6 +76,27 @@ fn submit_review_report(
 fn assert_member_unchanged(member: &ReviewBatchMember, status: ReviewBatchMemberStatus) {
     assert_eq!(member.status, status);
     assert_eq!(member.report_proposal_id, None);
+}
+
+/// A verdict submission is only accepted while its batch is `supervising`
+/// (see `apply_review_verdict`). Tests that only exercise the proposal
+/// ledger's own submission/supersession mechanics — not the full quorum flow
+/// that would normally get a batch there — force the status directly rather
+/// than standing up three leaf reports first.
+fn force_batch_supervising(db: &WorkDb, batch_id: &str) {
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_batches SET status = 'supervising' WHERE id = ?1",
+            rusqlite::params![batch_id],
+        )
+        .unwrap();
+}
+
+fn verdict_payload(batch_id: &str, target_sha: &str) -> String {
+    format!(
+        r#"{{"batch_id":"{batch_id}","verdict":{{"batch_id":"{batch_id}","pr_url":"https://github.com/example/repo/pull/42","target_sha":"{target_sha}","phase":"pre_merge","summary":"Clean.","revision_warranted":false,"findings":[],"contradictions":[]}}}}"#
+    )
 }
 
 /// Batch persistence preserves the raw classifier result and the resolved
@@ -460,7 +481,7 @@ fn missing_review_report_marks_only_its_member_failed() {
 }
 
 #[test]
-fn review_verdict_remains_proposed_for_the_asynchronous_applier() {
+fn review_verdict_auto_applies_and_completes_the_batch() {
     let db = WorkDb::open(temp_db_path("review-verdict-proposal")).unwrap();
     let product = create_test_product(&db);
     let cycle_root = create_test_chore_manual(&db, product.id, "review target");
@@ -479,29 +500,49 @@ fn review_verdict_remains_proposed_for_the_asynchronous_applier() {
             &[member(ReviewBatchMemberRole::Supervisor, Some(execution.id.clone()))],
         )
         .unwrap();
+    force_batch_supervising(&db, &batch.id);
 
     let outcome = db
         .submit_worker_proposal(SubmitWorkerProposalInput {
             execution_id: &execution.id,
             work_item_id: &cycle_root.id,
             kind: ProposalKind::ReviewVerdict,
-            payload_json: &format!(r#"{{"batch_id":"{}","verdict":{{"outcome":"approved"}}}}"#, batch.id),
+            payload_json: &verdict_payload(&batch.id, "head-sha"),
             idempotency_key: "verdict-1",
         })
         .unwrap()
         .unwrap();
 
-    assert_eq!(outcome.proposal.state, ProposalState::Proposed);
-    assert_eq!(outcome.proposal.applied_ref, None);
+    assert_eq!(outcome.proposal.state, ProposalState::Applied);
+    assert_eq!(outcome.proposal.applied_ref.as_deref(), Some(batch.id.as_str()));
+    let completed = db.review_batch(&batch.id).unwrap().unwrap();
+    assert_eq!(completed.status, ReviewBatchStatus::Completed);
     assert_eq!(
-        db.review_batch(&batch.id).unwrap().unwrap().final_verdict_proposal_id,
-        None
+        completed.final_verdict_proposal_id.as_deref(),
+        Some(outcome.proposal.id.as_str())
     );
+    assert!(completed.completed_at.is_some());
+
+    let member = db
+        .review_batch_members(&batch.id)
+        .unwrap()
+        .into_iter()
+        .find(|member| member.role == ReviewBatchMemberRole::Supervisor)
+        .unwrap();
+    assert_eq!(member.status, ReviewBatchMemberStatus::Reported);
+    assert_eq!(member.report_proposal_id.as_deref(), Some(outcome.proposal.id.as_str()));
 }
 
+/// A second verdict submission for an already-decided (via the first
+/// submission's auto-apply, which also completes the batch) supervisor
+/// member must be rejected rather than silently accepted. The batch has
+/// already moved past `supervising` by the time the second submission
+/// arrives, so it is rejected on that broader check rather than reaching the
+/// narrower "member already reported" one — both are correct, but the batch
+/// check fires first.
 #[test]
-fn newer_review_verdict_supersedes_the_prior_batch_verdict() {
-    let db = WorkDb::open(temp_db_path("review-verdict-supersede")).unwrap();
+fn a_second_review_verdict_for_an_already_reported_supervisor_is_rejected() {
+    let db = WorkDb::open(temp_db_path("review-verdict-duplicate")).unwrap();
     let product = create_test_product(&db);
     let cycle_root = create_test_chore_manual(&db, product.id, "review target");
     let execution = db
@@ -519,28 +560,92 @@ fn newer_review_verdict_supersedes_the_prior_batch_verdict() {
             &[member(ReviewBatchMemberRole::Supervisor, Some(execution.id.clone()))],
         )
         .unwrap();
-    let submit = |idempotency_key| {
-        db.submit_worker_proposal(SubmitWorkerProposalInput {
+    force_batch_supervising(&db, &batch.id);
+
+    let first = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
             execution_id: &execution.id,
             work_item_id: &cycle_root.id,
             kind: ProposalKind::ReviewVerdict,
-            payload_json: &format!(r#"{{"batch_id":"{}","verdict":{{"outcome":"approved"}}}}"#, batch.id),
-            idempotency_key,
+            payload_json: &verdict_payload(&batch.id, "head-sha"),
+            idempotency_key: "verdict-1",
         })
         .unwrap()
+        .unwrap();
+    assert_eq!(first.proposal.state, ProposalState::Applied);
+
+    let second = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &execution.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &verdict_payload(&batch.id, "head-sha"),
+            idempotency_key: "verdict-2",
+        })
         .unwrap()
-    };
-    let first = submit("verdict-1");
-    let second = submit("verdict-2");
-    let proposals = db
-        .list_worker_proposals_for_work_item(&cycle_root.id, Some(ProposalKind::ReviewVerdict), None)
         .unwrap();
-    let first = proposals
-        .iter()
-        .find(|proposal| proposal.id == first.proposal.id)
+    assert_eq!(second.proposal.state, ProposalState::Rejected);
+    assert!(
+        second
+            .proposal
+            .decision_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not `supervising`")
+    );
+}
+
+/// A verdict submitted before the batch has actually reached `supervising`
+/// (e.g. still `collecting` — the quorum hasn't dispatched a supervisor yet)
+/// must be rejected, not silently accepted for a batch that isn't ready for
+/// one.
+#[test]
+fn review_verdict_is_rejected_while_batch_is_not_supervising() {
+    let db = WorkDb::open(temp_db_path("review-verdict-wrong-status")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
         .unwrap();
-    assert_eq!(first.state, ProposalState::Superseded);
-    assert_eq!(second.proposal.state, ProposalState::Proposed);
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member(ReviewBatchMemberRole::Supervisor, Some(execution.id.clone()))],
+        )
+        .unwrap();
+    // Deliberately NOT calling `force_batch_supervising` — the batch is
+    // still `collecting`, matching `create_review_batch`'s default status.
+
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &execution.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &verdict_payload(&batch.id, "head-sha"),
+            idempotency_key: "verdict-1",
+        })
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(outcome.proposal.state, ProposalState::Rejected);
+    assert!(
+        outcome
+            .proposal
+            .decision_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not `supervising`")
+    );
+    assert_eq!(
+        db.review_batch(&batch.id).unwrap().unwrap().final_verdict_proposal_id,
+        None
+    );
 }
 
 #[test]

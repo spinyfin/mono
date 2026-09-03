@@ -215,6 +215,37 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
         ProposalKind::ReviewVerdict => {
             let batch_id = reader.required_text("batch_id", MAX_SHORT_FIELD_CHARS);
             let verdict = reader.required_json_object("verdict", MAX_LONG_FIELD_CHARS);
+            if let Some(verdict) = verdict.as_ref() {
+                match serde_json::from_value::<boss_pr_review::SupervisorVerdict>(verdict.clone()) {
+                    Ok(parsed) => {
+                        if let Some(batch_id) = batch_id.as_deref()
+                            && parsed.batch_id != batch_id
+                        {
+                            reader.error("verdict.batch_id", "must match `batch_id`");
+                        }
+                        for (index, finding) in parsed.findings.iter().enumerate() {
+                            if finding.sources.is_empty() {
+                                reader.error(
+                                    &format!("verdict.findings[{index}].sources"),
+                                    "must name at least one source reviewer; a finding cannot be unattributed",
+                                );
+                            }
+                        }
+                        for (index, contradiction) in parsed.contradictions.iter().enumerate() {
+                            if contradiction.positions.len() < 2 {
+                                reader.error(
+                                    &format!("verdict.contradictions[{index}].positions"),
+                                    "must name at least two positions; a contradiction requires more than one side",
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => reader.error(
+                        "verdict",
+                        format!("does not match the supervisor verdict schema: {err}"),
+                    ),
+                }
+            }
             reader.finish()?;
             to_json(&ReviewVerdictProposalPayload {
                 batch_id: batch_id.unwrap_or_default(),

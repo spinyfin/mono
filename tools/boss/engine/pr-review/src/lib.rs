@@ -37,6 +37,8 @@
 mod blocks;
 mod parsing;
 mod render;
+mod supervisor_render;
+mod supervisor_types;
 mod types;
 
 pub use blocks::{render_boss_construct_sweep_block, render_supersession_flag_block};
@@ -47,6 +49,10 @@ pub use parsing::{
 pub use render::{
     ReviewOrigin, ReviewerReportDestination, render_batch_reviewer_initial_prompt, render_reviewer_claude_md,
     render_reviewer_initial_prompt, render_revision_instructions, render_revision_title,
+};
+pub use supervisor_render::{SupervisorReportInput, render_supervisor_claude_md, render_supervisor_initial_prompt};
+pub use supervisor_types::{
+    ConsolidatedFinding, ReviewerPosition, SupervisorContradiction, SupervisorSourceRole, SupervisorVerdict,
 };
 pub use types::{
     PrReviewContext, RegressionCheck, ReviewCoverage, ReviewFinding, ReviewFindingCategory, ReviewFindingConfidence,

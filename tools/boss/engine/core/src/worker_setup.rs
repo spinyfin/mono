@@ -242,6 +242,13 @@ pub struct WorkerSetupInput {
     /// decision-declaration mechanism is live.
     #[builder(default = false)]
     pub automation_outcome_proposals_seam_enabled: bool,
+    /// `true` when this [`WorkerKind::Reviewer`] execution is the batch's
+    /// consolidating supervisor rather than a leaf reviewer — selects
+    /// [`crate::pr_review::render_supervisor_claude_md`] over
+    /// [`crate::pr_review::render_reviewer_claude_md`]. Ignored for every
+    /// other worker kind.
+    #[builder(default = false)]
+    pub is_review_supervisor: bool,
 }
 
 /// Render the worker-facing agent-rules file (CLAUDE.md or equivalent).
@@ -257,6 +264,14 @@ pub struct WorkerSetupInput {
 /// that prominently states the read-only mandate and omits PR-creation
 /// instructions (reviewers never open or update PRs).
 pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &str) -> String {
+    if input.worker_kind == WorkerKind::Reviewer && input.is_review_supervisor {
+        return crate::pr_review::render_supervisor_claude_md(
+            &input.lease_id,
+            &input.workspace_path.display().to_string(),
+            crate::prompt_fragments::absolute_paths_fragment(),
+            crate::prompt_fragments::boundaries_and_coordinator_fragment(),
+        );
+    }
     if input.worker_kind == WorkerKind::Reviewer {
         return crate::pr_review::render_reviewer_claude_md(
             &input.lease_id,

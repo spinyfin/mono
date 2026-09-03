@@ -70,7 +70,16 @@ fn valid_payload_for(kind: ProposalKind) -> Value {
         }),
         ProposalKind::ReviewVerdict => json!({
             "batch_id": "rvb_123",
-            "verdict": {"outcome": "approved"},
+            "verdict": {
+                "batch_id": "rvb_123",
+                "pr_url": "https://github.com/o/r/pull/123",
+                "target_sha": "head_123",
+                "phase": "pre_merge",
+                "summary": "Clean.",
+                "revision_warranted": false,
+                "findings": [],
+                "contradictions": [],
+            },
         }),
         ProposalKind::RunDone => json!({"outcome": "delivered", "summary": "opened the PR"}),
     }
@@ -134,7 +143,8 @@ fn canonical_payloads_deserialize_as_their_payload_struct() {
     );
     let parsed: ReviewVerdictProposalPayload = serde_json::from_str(&canonical).unwrap();
     assert_eq!(parsed.batch_id, "rvb_123");
-    assert_eq!(parsed.verdict, json!({"outcome": "approved"}));
+    assert_eq!(parsed.verdict["batch_id"], "rvb_123");
+    assert_eq!(parsed.verdict["revision_warranted"], false);
 }
 
 #[test]

@@ -87,5 +87,6 @@ pub(crate) fn sample_input() -> WorkerSetupInput {
         task_kind: Some("chore".into()),
         worker_kind: WorkerKind::Standard,
         automation_outcome_proposals_seam_enabled: false,
+        is_review_supervisor: false,
     }
 }
