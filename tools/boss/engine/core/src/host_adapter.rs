@@ -82,6 +82,13 @@ pub trait HostAdapter: Send + Sync {
     /// Stable host identifier (e.g. `"local"`, `"zakalwe"`).
     fn host_id(&self) -> &str;
 
+    /// Whether a local worker in `pool` is intended to run in tmux. Remote
+    /// adapters keep the default because their workers do not use the local
+    /// tmux server.
+    fn tmux_hosting_enabled_for(&self, _pool: &str) -> bool {
+        false
+    }
+
     // ── Workspace lifecycle ─────────────────────────────────────────────────
 
     async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle>;
@@ -254,6 +261,10 @@ impl LocalHostAdapter {
 impl HostAdapter for LocalHostAdapter {
     fn host_id(&self) -> &str {
         "local"
+    }
+
+    fn tmux_hosting_enabled_for(&self, pool: &str) -> bool {
+        self.execution_runner.tmux_hosting_enabled_for(pool)
     }
 
     async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle> {

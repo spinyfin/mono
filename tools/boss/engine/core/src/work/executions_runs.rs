@@ -1089,6 +1089,32 @@ impl WorkDb {
         workspace_path: &str,
         host_id: &str,
     ) -> Result<(WorkExecution, WorkRun)> {
+        self.start_execution_run_on_host_with_tmux_hosting(
+            execution_id,
+            agent_id,
+            cube_repo_id,
+            cube_lease_id,
+            cube_workspace_id,
+            workspace_path,
+            host_id,
+            false,
+        )
+    }
+
+    /// Host-aware run start with the hosting mode snapshot written atomically
+    /// with the run row, before any pane spawn is attempted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_execution_run_on_host_with_tmux_hosting(
+        &self,
+        execution_id: &str,
+        agent_id: &str,
+        cube_repo_id: &str,
+        cube_lease_id: &str,
+        cube_workspace_id: &str,
+        workspace_path: &str,
+        host_id: &str,
+        tmux_hosted: bool,
+    ) -> Result<(WorkExecution, WorkRun)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
@@ -1241,9 +1267,9 @@ impl WorkDb {
         tx.execute(
             "INSERT INTO work_runs (
                 id, execution_id, agent_id, status, error_text, result_summary, transcript_path,
-                artifacts_path, created_at, started_at, finished_at, host_id
-             ) VALUES (?1, ?2, ?3, 'active', NULL, NULL, NULL, NULL, ?4, ?4, NULL, ?5)",
-            params![run_id, execution_id, agent_id, now, host_id],
+                artifacts_path, created_at, started_at, finished_at, host_id, tmux_hosted
+             ) VALUES (?1, ?2, ?3, 'active', NULL, NULL, NULL, NULL, ?4, ?4, NULL, ?5, ?6)",
+            params![run_id, execution_id, agent_id, now, host_id, tmux_hosted],
         )?;
 
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;

@@ -81,14 +81,17 @@ pub struct StartupPaneReconcileOutcome {
 ///
 /// `hosted_run_ids` is the result of one `ListHostedPanes` round-trip:
 /// `Ok` even when empty (the app answered), `Err` when the app could not
-/// be asked. Executions whose pool uses tmux hosting do not need the app
-/// oracle — boot-time tmux adoption plus the live-state registry are
-/// sufficient.
+/// be asked. Whether a run was tmux-hosted is read from the newest run's
+/// durable hosting-mode snapshot ([`WorkDb::latest_run_tmux_hosting_for_execution`]),
+/// never from the current pool setting — that setting only decides how the
+/// *next* spawn is issued. A tmux-intended run does not need the app oracle:
+/// boot-time tmux adoption plus the live-state registry are sufficient,
+/// including before its spawn identity has been written.
 pub struct EnginePaneOracle {
+    pub work_db: WorkDb,
     pub live_states: Option<Arc<LiveWorkerStateRegistry>>,
     pub tmux_adopted: HashSet<String>,
     pub hosted_run_ids: Result<HashSet<String>, String>,
-    pub tmux_hosted_ids: HashSet<String>,
 }
 
 #[async_trait]
@@ -104,10 +107,18 @@ impl PanePresenceOracle for EnginePaneOracle {
         {
             return PanePresence::Present;
         }
-        if self.tmux_hosted_ids.contains(execution_id) {
-            // Tmux inventory already ran; not adopted and not in live-state
-            // means the session was never created.
-            return PanePresence::Absent;
+        match self.work_db.latest_run_tmux_hosting_for_execution(execution_id) {
+            Ok(Some(true)) => {
+                // Boot-time tmux inventory already ran. Not adopted and not
+                // in live-state means the intended session was never created.
+                return PanePresence::Absent;
+            }
+            Ok(Some(false) | None) => {}
+            Err(err) => {
+                return PanePresence::Undetermined {
+                    reason: format!("durable tmux hosting mode unreadable: {err:#}"),
+                };
+            }
         }
         match &self.hosted_run_ids {
             Ok(ids) if ids.contains(execution_id) => PanePresence::Present,
@@ -401,6 +412,10 @@ mod tests {
     }
 
     fn seed_running_leased(db: &WorkDb) -> WorkExecution {
+        seed_running_leased_with_tmux_hosting(db, false)
+    }
+
+    fn seed_running_leased_with_tmux_hosting(db: &WorkDb, tmux_hosted: bool) -> WorkExecution {
         let product = create_test_product(db);
         let chore = create_test_chore_manual(db, product.id.clone(), "stranded spawn");
         db.reconcile_product_executions(&product.id).unwrap();
@@ -408,7 +423,16 @@ mod tests {
             .unwrap();
         let exec = db.list_executions(Some(&chore.id)).unwrap().into_iter().next().unwrap();
         let (exec, _run) = db
-            .start_execution_run(&exec.id, "worker-1", "mono", "lease-1", "ws-1", "/tmp/ws-1")
+            .start_execution_run_on_host_with_tmux_hosting(
+                &exec.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "ws-1",
+                "/tmp/ws-1",
+                "local",
+                tmux_hosted,
+            )
             .unwrap();
         assert_eq!(exec.status, ExecutionStatus::Running);
         assert!(exec.cube_lease_id.is_some());
@@ -419,6 +443,36 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert(id.to_owned(), RunReconcileVerdict::Live);
         map
+    }
+
+    fn record_tmux_intent(db: &WorkDb, execution_id: &str) {
+        assert!(
+            db.record_tmux_spawn_intent_for_execution(
+                execution_id,
+                "boss",
+                &format!("boss-worker-{execution_id}"),
+                &format!("tok-{execution_id}"),
+            )
+            .unwrap(),
+            "durable tmux identity must land on the latest local run"
+        );
+        assert!(
+            db.tmux_run_for_execution(execution_id).unwrap().is_some(),
+            "precondition: tmux_run_for_execution must see the recorded identity"
+        );
+    }
+
+    fn engine_oracle(
+        db: &WorkDb,
+        tmux_adopted: HashSet<String>,
+        hosted_run_ids: Result<HashSet<String>, String>,
+    ) -> EnginePaneOracle {
+        EnginePaneOracle {
+            work_db: db.clone(),
+            live_states: None,
+            tmux_adopted,
+            hosted_run_ids,
+        }
     }
 
     /// The gap this module exists to close: `running`, lease re-adopted at
@@ -567,16 +621,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn engine_oracle_treats_tmux_hosted_absence_as_absent_without_the_app() {
-        let oracle = EnginePaneOracle {
-            live_states: None,
-            tmux_adopted: HashSet::new(),
-            hosted_run_ids: Err("no app session is registered".into()),
-            tmux_hosted_ids: ["exec-tmux".to_owned()].into_iter().collect(),
-        };
-        assert_eq!(oracle.pane_presence("exec-tmux").await, PanePresence::Absent);
+    async fn engine_oracle_treats_durable_tmux_identity_absence_as_absent_without_the_app() {
+        let (_dir, db) = open_db();
+        let tmux_exec = seed_running_leased_with_tmux_hosting(&db, true);
+        record_tmux_intent(&db, &tmux_exec.id);
+        let app_exec = seed_running_leased(&db);
+        let oracle = engine_oracle(&db, HashSet::new(), Err("no app session is registered".into()));
+        assert_eq!(oracle.pane_presence(&tmux_exec.id).await, PanePresence::Absent);
         assert_eq!(
-            oracle.pane_presence("exec-app").await,
+            oracle.pane_presence(&app_exec.id).await,
             PanePresence::Undetermined {
                 reason: "no app session is registered".into()
             }
@@ -585,29 +638,186 @@ mod tests {
 
     #[tokio::test]
     async fn engine_oracle_uses_list_hosted_panes_when_the_app_answered() {
-        let oracle = EnginePaneOracle {
-            live_states: None,
-            tmux_adopted: HashSet::new(),
-            hosted_run_ids: Ok(["exec-hosted".to_owned()].into_iter().collect()),
-            tmux_hosted_ids: HashSet::new(),
-        };
+        let (_dir, db) = open_db();
+        let oracle = engine_oracle(
+            &db,
+            HashSet::new(),
+            Ok(["exec-hosted".to_owned()].into_iter().collect()),
+        );
         assert_eq!(oracle.pane_presence("exec-hosted").await, PanePresence::Present);
         assert_eq!(oracle.pane_presence("exec-missing").await, PanePresence::Absent);
     }
 
     #[tokio::test]
     async fn engine_oracle_keeps_a_tmux_run_present_from_live_state_after_retry_loses_adoption_set() {
+        let (_dir, db) = open_db();
+        let exec = seed_running_leased_with_tmux_hosting(&db, true);
+        record_tmux_intent(&db, &exec.id);
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
-        live_states.register_spawn(1, "exec-tmux", "claude-opus-4-7", 0, None);
+        live_states.register_spawn(1, exec.id.clone(), "claude-opus-4-7", 0, None);
         let oracle = EnginePaneOracle {
+            work_db: db.clone(),
             live_states: Some(live_states),
             // App-registration retry deliberately has no boot adoption set.
             tmux_adopted: HashSet::new(),
             hosted_run_ids: Err("no app session is registered".into()),
-            tmux_hosted_ids: ["exec-tmux".to_owned()].into_iter().collect(),
         };
 
-        assert_eq!(oracle.pane_presence("exec-tmux").await, PanePresence::Present);
+        assert_eq!(oracle.pane_presence(&exec.id).await, PanePresence::Present);
+    }
+
+    /// The mixed-mode startup bug: after an app-hosted→tmux pool flip,
+    /// a surviving app-hosted run has no durable tmux identity. Missing
+    /// tmux adoption must not be treated as "no pane" — if the app cannot
+    /// be asked, presence is undetermined and we must not spawn a duplicate.
+    #[tokio::test]
+    async fn restart_after_app_hosted_to_tmux_flip_does_not_treat_missing_tmux_as_absent() {
+        let (_dir, db) = open_db();
+        let exec = seed_running_leased(&db);
+        assert!(
+            db.tmux_run_for_execution(&exec.id).unwrap().is_none(),
+            "precondition: the surviving pane was app-hosted, so it has no durable tmux identity"
+        );
+        let resumer = RecordingResumer::new();
+        let sink = RecordingDispatchEventSink::new();
+        let oracle = engine_oracle(&db, HashSet::new(), Err("no app session is registered".into()));
+        let outcome = reconcile_unspawned_running(
+            &db,
+            std::slice::from_ref(&exec),
+            &live_verdicts(&exec.id),
+            &oracle,
+            &resumer,
+            &sink,
+        )
+        .await;
+        assert_eq!(
+            outcome.respawned, 0,
+            "must not respawn while an app-hosted pane may still exist"
+        );
+        assert_eq!(outcome.undetermined, 1);
+        assert!(resumer.calls.lock().unwrap().is_empty());
+    }
+
+    /// Mixed-mode restart: a run spawned app-hosted (no durable tmux
+    /// identity) is still hosted by the app after the pool setting flipped to
+    /// tmux. Current pool policy is not an input here — missing
+    /// tmux adoption must not be treated as proof the pane is gone.
+    #[tokio::test]
+    async fn restart_after_app_hosted_to_tmux_flip_does_not_duplicate_existing_app_pane() {
+        let (_dir, db) = open_db();
+        let exec = seed_running_leased(&db);
+        assert!(
+            db.tmux_run_for_execution(&exec.id).unwrap().is_none(),
+            "precondition: the surviving pane was app-hosted, so it has no durable tmux identity"
+        );
+        let resumer = RecordingResumer::new();
+        let sink = RecordingDispatchEventSink::new();
+        let oracle = engine_oracle(&db, HashSet::new(), Ok([exec.id.clone()].into_iter().collect()));
+        let outcome = reconcile_unspawned_running(
+            &db,
+            std::slice::from_ref(&exec),
+            &live_verdicts(&exec.id),
+            &oracle,
+            &resumer,
+            &sink,
+        )
+        .await;
+        assert_eq!(
+            outcome.respawned, 0,
+            "must not spawn a second pane over the live app-hosted worker"
+        );
+        assert_eq!(outcome.skipped_present, 1);
+        assert!(resumer.calls.lock().unwrap().is_empty());
+    }
+
+    /// Mixed-mode restart (rollback): a run spawned in tmux keeps its
+    /// durable identity after the pool setting flipped back to
+    /// app-hosted. Boot adoption found the session, so startup must neither
+    /// spawn an app-hosted duplicate nor drop the tmux pane as untracked.
+    #[tokio::test]
+    async fn restart_after_tmux_to_app_hosted_flip_does_not_duplicate_or_strand_existing_tmux_pane() {
+        let (_dir, db) = open_db();
+        let exec = seed_running_leased_with_tmux_hosting(&db, true);
+        record_tmux_intent(&db, &exec.id);
+        let resumer = RecordingResumer::new();
+        let sink = RecordingDispatchEventSink::new();
+        // App inventory is empty: the worker process lives in tmux, not in
+        // an app-owned pty. Keying presence on current pool policy (now
+        // app-hosted) would have consulted this empty inventory and
+        // respawned — duplicating the live session and stranding the
+        // original pane from engine tracking.
+        let oracle = engine_oracle(&db, [exec.id.clone()].into_iter().collect(), Ok(HashSet::new()));
+        let outcome = reconcile_unspawned_running(
+            &db,
+            std::slice::from_ref(&exec),
+            &live_verdicts(&exec.id),
+            &oracle,
+            &resumer,
+            &sink,
+        )
+        .await;
+        assert_eq!(
+            outcome.respawned, 0,
+            "must not spawn an app-hosted duplicate over the live tmux session"
+        );
+        assert_eq!(outcome.skipped_present, 1, "the adopted tmux pane must stay tracked");
+        assert!(resumer.calls.lock().unwrap().is_empty());
+    }
+
+    /// Rollback must not strand the original recovery: a tmux-intent run
+    /// whose session was never created still respawns immediately, even
+    /// though current pool policy is now app-hosted and the app inventory
+    /// is empty.
+    #[tokio::test]
+    async fn restart_after_tmux_to_app_hosted_flip_still_respawns_never_issued_pane() {
+        let (_dir, db) = open_db();
+        let exec = seed_running_leased_with_tmux_hosting(&db, true);
+        record_tmux_intent(&db, &exec.id);
+        let resumer = RecordingResumer::new();
+        let sink = RecordingDispatchEventSink::new();
+        let oracle = engine_oracle(&db, HashSet::new(), Ok(HashSet::new()));
+        let outcome = reconcile_unspawned_running(
+            &db,
+            std::slice::from_ref(&exec),
+            &live_verdicts(&exec.id),
+            &oracle,
+            &resumer,
+            &sink,
+        )
+        .await;
+        assert_eq!(
+            outcome.respawned, 1,
+            "a never-issued tmux pane must still be re-driven after a hosting-mode rollback"
+        );
+        assert_eq!(*resumer.calls.lock().unwrap(), vec![exec.id.clone()]);
+    }
+
+    /// A tmux-intended run can die after its row is committed but before the
+    /// spawn flow writes a tmux identity. Boot-time tmux inventory has already
+    /// ruled out a session, so an unavailable app cannot delay recovery.
+    #[tokio::test]
+    async fn tmux_intended_run_without_spawn_identity_respawns_when_app_is_unavailable() {
+        let (_dir, db) = open_db();
+        let exec = seed_running_leased_with_tmux_hosting(&db, true);
+        assert!(
+            db.tmux_run_for_execution(&exec.id).unwrap().is_none(),
+            "precondition: the spawn flow has not yet written tmux identity"
+        );
+        let resumer = RecordingResumer::new();
+        let sink = RecordingDispatchEventSink::new();
+        let oracle = engine_oracle(&db, HashSet::new(), Err("no app session is registered".into()));
+        let outcome = reconcile_unspawned_running(
+            &db,
+            std::slice::from_ref(&exec),
+            &live_verdicts(&exec.id),
+            &oracle,
+            &resumer,
+            &sink,
+        )
+        .await;
+        assert_eq!(outcome.respawned, 1);
+        assert_eq!(outcome.undetermined, 0);
+        assert_eq!(*resumer.calls.lock().unwrap(), vec![exec.id.clone()]);
     }
 
     #[tokio::test]

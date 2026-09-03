@@ -150,6 +150,13 @@ pub struct RunOutcome {
 
 #[async_trait]
 pub trait ExecutionRunner: Send + Sync {
+    /// Whether a worker in `pool` will be hosted in tmux. The coordinator
+    /// snapshots this before it creates the durable run row, so recovery can
+    /// decide a pre-spawn crash without consulting the current pool setting.
+    fn tmux_hosting_enabled_for(&self, _pool: &str) -> bool {
+        false
+    }
+
     async fn run_execution(
         &self,
         worker_id: &str,

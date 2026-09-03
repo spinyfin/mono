@@ -623,6 +623,13 @@ pub(crate) fn install_boss_event_to_stable_bin(source_shim: &Path, stable_bin_di
 
 #[async_trait]
 impl ExecutionRunner for PaneSpawnRunner {
+    fn tmux_hosting_enabled_for(&self, pool: &str) -> bool {
+        self.server_state
+            .get()
+            .and_then(Weak::upgrade)
+            .is_some_and(|state| state.tmux_hosting_enabled_for(pool))
+    }
+
     async fn run_execution(
         &self,
         worker_id: &str,

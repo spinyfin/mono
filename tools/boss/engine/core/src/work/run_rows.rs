@@ -1028,6 +1028,25 @@ impl WorkDb {
             .map_err(Into::into)
     }
 
+    /// Whether the newest run for `execution_id` was intended for tmux.
+    ///
+    /// This deliberately selects the newest row before reading the mode: a
+    /// resumed app-hosted run must not inherit a prior run's tmux identity.
+    /// `None` means no run row exists.
+    pub fn latest_run_tmux_hosting_for_execution(&self, execution_id: &str) -> Result<Option<bool>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT tmux_hosted FROM work_runs
+             WHERE execution_id = ?1
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+            params![execution_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// Resolve the execution id behind a tmux spawn token, independent of the
     /// execution's terminal status — unlike [`Self::list_adoptable_tmux_runs`],
     /// which only ever returns non-terminal candidates.

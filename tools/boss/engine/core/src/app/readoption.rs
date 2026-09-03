@@ -689,19 +689,15 @@ impl ServerState {
         if in_flight.is_empty() {
             return;
         }
-        let tmux_hosted_ids = in_flight
-            .iter()
-            .filter(|execution| {
-                let pool = self.execution_coordinator.attributed_pool_label(execution);
-                self.settings.tmux_hosting_enabled_for(pool)
-            })
-            .map(|execution| execution.id.clone())
-            .collect();
+        // Pane-hosting history is the newest run's durable hosting-mode
+        // snapshot, not the current pool setting. The setting only decides
+        // how the *next* spawn is issued; using it here as history is the
+        // mixed-mode duplicate-worker startup bug.
         let oracle = crate::startup_pane_reconcile::EnginePaneOracle {
+            work_db: (*self.work_db).clone(),
             live_states: Some(self.live_worker_states.clone()),
             tmux_adopted: tmux_adopted.clone(),
             hosted_run_ids: self.hosted_pane_run_ids().await,
-            tmux_hosted_ids,
         };
         let outcome = crate::startup_pane_reconcile::reconcile_unspawned_running(
             self.work_db.as_ref(),
