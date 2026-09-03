@@ -217,17 +217,41 @@ pub trait HostAdapter: Send + Sync {
     }
 
     /// Collect a structured-output artifact produced on this host into the
-    /// engine-local destination. `Ok(false)` means the worker has not written
-    /// the artifact yet; transport, descriptor, or copy failures are errors
-    /// so a completed remote review cannot be mistaken for an empty one.
+    /// engine-local destination.
+    ///
+    /// [`CollectOutcome::NotAvailable`] covers both "the worker has not
+    /// written the artifact yet" and any transient condition (a DB error
+    /// resolving the host, a missing adapter provider, an SSH transport
+    /// failure probing or reading the descriptor) that is not itself proof
+    /// the artifact is bad — callers should fall through to the
+    /// transcript/nudge recovery path for these, not terminalize.
+    /// [`CollectOutcome::Failed`] is reserved for positive evidence the
+    /// artifact cannot be trusted: a descriptor that exists but names an
+    /// invalid path, or an artifact that exists but whose copy into place
+    /// failed. Only `Failed` should terminalize a completed remote review.
     async fn collect_structured_output(
         &self,
         _execution_id: &str,
         _kind: crate::structured_output::StructuredOutputKind,
         _destination: &Path,
-    ) -> Result<bool> {
-        Ok(false)
+    ) -> Result<CollectOutcome> {
+        Ok(CollectOutcome::NotAvailable)
     }
+}
+
+/// Outcome of [`HostAdapter::collect_structured_output`]. See that method's
+/// doc for the terminalize/fail-open contract each variant carries.
+#[derive(Debug)]
+pub enum CollectOutcome {
+    /// The artifact was pulled and installed at the destination.
+    Collected,
+    /// Not available yet, or collection could not be attempted for a
+    /// reason that is not proof the artifact itself is unusable. Not
+    /// terminal — callers should fall back to transcript/nudge recovery.
+    NotAvailable,
+    /// Positive proof the artifact cannot be trusted. Terminal — callers
+    /// should fail the execution, naming `reason`.
+    Failed(String),
 }
 
 /// How much of a dead remote worker's `worker.log` to pull. The interesting
@@ -760,6 +784,7 @@ impl HostAdapter for SshHostAdapter {
         let ComposedWorkerSpawn {
             mut prompt_text,
             spawn_config,
+            embedded_output_path,
         } = compose_worker_spawn(
             &self.work_db,
             _worker_id,
@@ -801,12 +826,18 @@ impl HostAdapter for SshHostAdapter {
         // Keep the prompt and environment in one contract by referring to the
         // exported value instead of shipping a coordinator-local pathname.
         let structured_output_kind = crate::runner::designated_output_kind(execution, work_item);
-        if let Some(kind) = structured_output_kind {
-            let local_path = crate::structured_output::default_path_string(&run_id, kind);
-            if !prompt_text.contains(&local_path) {
+        // Assert against the path the composer actually rendered, not the
+        // path `designated_output_kind` alone would predict: a degraded
+        // fallback (e.g. an automation-triage spawn whose automation row
+        // failed to resolve) legitimately renders the generic prompt with
+        // no structured-output path at all, and that must not fail the
+        // spawn — only a designated kind that WAS supposed to be embedded
+        // but is missing from the prompt is a real bug worth bailing on.
+        if let Some(local_path) = embedded_output_path.as_deref() {
+            if !prompt_text.contains(local_path) {
                 bail!("remote spawn prompt omitted structured-output path {local_path:?} for execution {run_id}");
             }
-            prompt_text = prompt_text.replace(&local_path, "$BOSS_STRUCTURED_OUTPUT");
+            prompt_text = prompt_text.replace(local_path, "$BOSS_STRUCTURED_OUTPUT");
         }
         // `compose_execution_prompt` decides the Bazel pre-push gate by
         // probing the LOCAL filesystem, which never matches a remote
@@ -1048,46 +1079,79 @@ impl HostAdapter for SshHostAdapter {
         execution_id: &str,
         kind: crate::structured_output::StructuredOutputKind,
         destination: &Path,
-    ) -> Result<bool> {
+    ) -> Result<CollectOutcome> {
         let descriptor = format!("~/.boss-remote/runs/{execution_id}.structured-output-path");
-        let descriptor_exists = self
-            .transport
-            .run_with_remote_paths(&["test", "-f", &descriptor])
-            .await?;
+        let descriptor_exists = match self.transport.run_with_remote_paths(&["test", "-f", &descriptor]).await {
+            Ok(out) => out,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    host_id = %self.transport.host_id,
+                    ?err,
+                    "remote structured-output descriptor probe failed; falling back to transcript/probe recovery",
+                );
+                return Ok(CollectOutcome::NotAvailable);
+            }
+        };
         if !descriptor_exists.success() {
             tracing::warn!(
                 execution_id,
                 host_id = %self.transport.host_id,
                 "remote structured-output descriptor is absent; falling back to transcript/probe recovery",
             );
-            return Ok(false);
+            return Ok(CollectOutcome::NotAvailable);
         }
-        let descriptor_out = self
-            .transport
-            .run_with_remote_paths(&["cat", &descriptor])
-            .await
-            .with_context(|| {
-                format!(
-                    "reading structured-output descriptor for execution {execution_id} on host {}",
-                    self.transport.host_id
-                )
-            })?;
+        let descriptor_out = match self.transport.run_with_remote_paths(&["cat", &descriptor]).await {
+            Ok(out) => out,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    host_id = %self.transport.host_id,
+                    ?err,
+                    "remote structured-output descriptor read failed; falling back to transcript/probe recovery",
+                );
+                return Ok(CollectOutcome::NotAvailable);
+            }
+        };
         if !descriptor_out.success() {
-            bail!(
-                "remote structured-output descriptor unavailable for execution {execution_id} on host {}: {}",
-                self.transport.host_id,
-                non_empty(&descriptor_out.stderr, descriptor_out.status)
+            // The descriptor existed a moment ago (`test -f` above) but
+            // `cat` failed to read it — a transient race or permission
+            // blip, not proof the artifact is bad. Fail open.
+            tracing::warn!(
+                execution_id,
+                host_id = %self.transport.host_id,
+                stderr = %non_empty(&descriptor_out.stderr, descriptor_out.status),
+                "remote structured-output descriptor became unreadable after existence check; \
+                 falling back to transcript/probe recovery",
             );
+            return Ok(CollectOutcome::NotAvailable);
         }
-        let remote_path = validate_remote_output_path(&descriptor_out.stdout, kind).with_context(|| {
-            format!(
-                "remote structured-output descriptor for execution {execution_id} on host {}",
-                self.transport.host_id
-            )
-        })?;
-        let exists = self.transport.run(&["test", "-f", remote_path]).await?;
+        let remote_path = match validate_remote_output_path(&descriptor_out.stdout, kind) {
+            Ok(path) => path,
+            Err(err) => {
+                // The descriptor exists and was read successfully, but its
+                // content is not a safe path for this kind — positive proof
+                // the artifact cannot be trusted.
+                return Ok(CollectOutcome::Failed(format!(
+                    "remote structured-output descriptor for execution {execution_id} on host {} is invalid: {err:#}",
+                    self.transport.host_id
+                )));
+            }
+        };
+        let exists = match self.transport.run(&["test", "-f", remote_path]).await {
+            Ok(out) => out,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    host_id = %self.transport.host_id,
+                    ?err,
+                    "remote structured-output artifact existence probe failed; falling back to transcript/probe recovery",
+                );
+                return Ok(CollectOutcome::NotAvailable);
+            }
+        };
         if !exists.success() {
-            return Ok(false);
+            return Ok(CollectOutcome::NotAvailable);
         }
         let parent = destination
             .parent()
@@ -1096,29 +1160,50 @@ impl HostAdapter for SshHostAdapter {
             .with_context(|| format!("creating local structured-output dir {}", parent.display()))?;
         let temporary = destination.with_extension(format!("{}.pulling", kind.slug()));
         let _ = std::fs::remove_file(&temporary);
-        let pull = self.transport.scp_pull(remote_path, &temporary).await?;
+        let pull = match self.transport.scp_pull(remote_path, &temporary).await {
+            Ok(out) => out,
+            Err(err) => {
+                let _ = std::fs::remove_file(&temporary);
+                tracing::warn!(
+                    execution_id,
+                    host_id = %self.transport.host_id,
+                    ?err,
+                    "remote structured-output scp transport failed; falling back to transcript/probe recovery",
+                );
+                return Ok(CollectOutcome::NotAvailable);
+            }
+        };
         if !pull.success() {
             let _ = std::fs::remove_file(&temporary);
-            bail!(
+            // The artifact exists on the remote host but the copy itself
+            // failed (ran and returned nonzero) — positive proof this
+            // attempt did not produce a usable local copy.
+            return Ok(CollectOutcome::Failed(format!(
                 "remote structured-output collection failed for execution {execution_id} on host {} from {remote_path}: {}",
                 self.transport.host_id,
                 non_empty(&pull.stderr, pull.status)
-            );
+            )));
         }
-        std::fs::rename(&temporary, destination).with_context(|| {
-            format!(
-                "installing collected remote structured-output for execution {execution_id} at {}",
+        if let Err(err) = std::fs::rename(&temporary, destination) {
+            return Ok(CollectOutcome::Failed(format!(
+                "installing collected remote structured-output for execution {execution_id} at {}: {err}",
                 destination.display()
-            )
-        })?;
-        let reap = self
+            )));
+        }
+        match self
             .transport
             .run_with_remote_paths(&["rm", "-f", &descriptor, remote_path])
-            .await?;
-        if !reap.success() {
-            tracing::warn!(execution_id, host_id = %self.transport.host_id, stderr = %reap.stderr, "collected remote structured output but could not reap remote files");
+            .await
+        {
+            Ok(reap) if !reap.success() => {
+                tracing::warn!(execution_id, host_id = %self.transport.host_id, stderr = %reap.stderr, "collected remote structured output but could not reap remote files");
+            }
+            Err(err) => {
+                tracing::warn!(execution_id, host_id = %self.transport.host_id, ?err, "collected remote structured output but reap request failed");
+            }
+            Ok(_) => {}
         }
-        Ok(true)
+        Ok(CollectOutcome::Collected)
     }
 }
 

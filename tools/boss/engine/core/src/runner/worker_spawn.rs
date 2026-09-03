@@ -17,7 +17,8 @@ use crate::work::{
 use boss_protocol::{EffortLevel, ExecutionKind, ReviewBatchMember, ReviewBatchPhase, ReviewBatchStatus, TaskKind};
 
 use super::prompt::{
-    ExecutionPromptParams, compose_answer_agent_prompt, compose_execution_prompt, render_merge_order_preservation_lines,
+    ExecutionPromptParams, compose_answer_agent_prompt, compose_execution_prompt, designated_output_kind,
+    render_merge_order_preservation_lines,
 };
 use super::work_item::{work_item_created_via, work_item_name, work_item_pr_url, work_item_task_kind_enum};
 
@@ -26,6 +27,19 @@ use super::work_item::{work_item_created_via, work_item_name, work_item_pr_url, 
 pub(crate) struct ComposedWorkerSpawn {
     pub prompt_text: String,
     pub spawn_config: SpawnConfig,
+    /// The designated structured-output path actually rendered into
+    /// `prompt_text`, when this execution has one. `None` either because the
+    /// execution kind has no designated payload ([`designated_output_kind`]
+    /// returns `None`), or because a fallback branch degraded to the generic
+    /// prompt without rendering it (e.g. an `automation_triage` execution
+    /// whose automation row failed to resolve, or a `pr_review` execution
+    /// whose producing task has no `pr_url` yet). Callers that need to
+    /// assert the prompt actually carries a structured-output path (the
+    /// remote spawn path swaps it for `$BOSS_STRUCTURED_OUTPUT`) must check
+    /// this field rather than re-deriving the expected path from
+    /// `designated_output_kind` alone — that alone can't tell a rendered
+    /// path from a degraded fallback that never rendered one.
+    pub embedded_output_path: Option<String>,
 }
 
 /// Editorial + worker-proposal-seam knobs [`compose_worker_spawn`] threads
@@ -514,6 +528,15 @@ pub(crate) async fn compose_worker_spawn(
     // If the task or its pr_url cannot be resolved, fall back to the
     // generic prompt (reviewer still gets workspace context but a weaker
     // framing — better than no spawn at all).
+    // Baseline: the path `designated_output_kind` says this execution kind
+    // should carry. Overridden to `None` below in the specific fallback
+    // branches that degrade to the generic prompt without rendering it —
+    // `compose_execution_prompt`'s own designated-kind branches (Followups /
+    // PostmortemFollowups) always render unconditionally, so the baseline
+    // holds for those; only the AutomationTriage/PrReview degraded paths
+    // need an override.
+    let mut embedded_output_path = designated_output_kind(execution, work_item)
+        .map(|kind| crate::structured_output::default_path_string(&execution.id, kind));
     let prompt_text = if execution.kind == ExecutionKind::AutomationTriage {
         match work_db.get_automation(&execution.work_item_id) {
             Ok(Some(automation)) => {
@@ -571,6 +594,7 @@ pub(crate) async fn compose_worker_spawn(
                     "automation_triage execution could not resolve its automation; \
                      falling back to generic prompt",
                 );
+                embedded_output_path = None;
                 compose_execution_prompt(
                     ExecutionPromptParams::builder()
                         .execution(execution)
@@ -605,6 +629,7 @@ pub(crate) async fn compose_worker_spawn(
                 "pr_review execution: producing task has no pr_url; \
                  falling back to generic prompt — review will lack PR context",
             );
+            embedded_output_path = None;
             compose_execution_prompt(
                 ExecutionPromptParams::builder()
                     .execution(execution)
@@ -968,6 +993,7 @@ pub(crate) async fn compose_worker_spawn(
     Ok(ComposedWorkerSpawn {
         prompt_text,
         spawn_config,
+        embedded_output_path,
     })
 }
 
