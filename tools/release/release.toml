@@ -16,4 +16,5 @@ scheme = "patch-counter"
 manifest = "tools/release/Cargo.toml"
 
 [notes]
-source = "github-generated"
+source = "changelog"
+project = "tools/release/PROJECT.yaml"
