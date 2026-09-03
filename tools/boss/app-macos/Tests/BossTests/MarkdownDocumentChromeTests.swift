@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import XCTest
 
@@ -60,7 +61,7 @@ final class MarkdownDocumentChromeTests: XCTestCase {
     /// The editorial treatment is opt-in. The environment default must stay
     /// false so transcript bubbles, comment cards, release notes, and the
     /// find bar keep compact system-font markdown unless a caller sets the
-    /// key (only `MarkdownDocumentChrome.documentBody` does).
+    /// key (only the document-column chunk ForEach does).
     func testEditorialStyleDefaultsOff() {
         XCTAssertFalse(EnvironmentValues().markdownEditorialStyle)
     }
@@ -285,28 +286,38 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         )
     }
 
-    /// The default (empty) heading set must leave every document — every
-    /// caller except a revision task's description — split as a single
-    /// unmodified `.plain` chunk, so today's single-`StructuredText`
-    /// rendering path is unaffected.
-    func testHeadingSectionsWithNoCollapsibleHeadingsIsSinglePlainChunk() {
+    /// An empty collapsible set still splits on every heading so each
+    /// section is its own `StructuredText`. Concatenating the `.plain`
+    /// chunks must reconstruct the source exactly.
+    func testHeadingSectionsSplitsOnHeadingsEvenWithoutCollapsibleSet() {
         let chunks = MarkdownHeadingSections.chunks(in: Self.revisionBrief, collapsibleHeadings: [])
-        XCTAssertEqual(chunks.count, 1)
-        guard case .plain(let text) = chunks[0] else {
-            return XCTFail("expected a single .plain chunk")
+        XCTAssertEqual(chunks.count, 3, "prefix + HARD RULE heading + finding heading: \(chunks)")
+        XCTAssertTrue(chunks.allSatisfy { if case .plain = $0 { return true }; return false })
+        XCTAssertEqual(chunks.map(\.renderedText).joined(), Self.revisionBrief)
+        guard case .plain(let hardRule) = chunks[1] else {
+            return XCTFail("expected the HARD RULE heading as a .plain chunk")
         }
-        XCTAssertEqual(text, Self.revisionBrief)
+        XCTAssertTrue(hardRule.hasPrefix("## HARD RULE"))
+        guard case .plain(let finding) = chunks[2] else {
+            return XCTFail("expected the finding heading as a .plain chunk")
+        }
+        XCTAssertTrue(finding.contains("### [high]"))
     }
 
     /// A heading set that names no heading actually present in the source
-    /// must also fall back to a single `.plain` chunk (e.g. a design doc
-    /// that happens to be checked against a heading text it doesn't have).
-    func testHeadingSectionsWithNonMatchingHeadingIsSinglePlainChunk() {
+    /// still splits on real headings; it just never produces a `.collapsible`
+    /// chunk.
+    func testHeadingSectionsWithNonMatchingHeadingStillSplitsOnRealHeadings() {
         let chunks = MarkdownHeadingSections.chunks(in: Self.revisionBrief, collapsibleHeadings: ["Not present anywhere"])
-        XCTAssertEqual(chunks.count, 1)
-        guard case .plain = chunks[0] else {
-            return XCTFail("expected a single .plain chunk")
-        }
+        XCTAssertEqual(chunks.count, 3)
+        XCTAssertTrue(chunks.allSatisfy { if case .plain = $0 { return true }; return false })
+    }
+
+    /// A document with no ATX headings stays a single `.plain` chunk.
+    func testHeadingSectionsWithNoHeadingsIsSinglePlainChunk() {
+        let source = "Just a paragraph.\n\nAnd another.\n"
+        let chunks = MarkdownHeadingSections.chunks(in: source, collapsibleHeadings: [])
+        XCTAssertEqual(chunks, [.plain(source)])
     }
 
     /// The core invariant: the `## HARD RULE ...` section folds, but the
@@ -390,9 +401,15 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         body
         """
         let chunks = MarkdownHeadingSections.chunks(in: doc, collapsibleHeadings: ["not a heading"])
-        XCTAssertEqual(chunks.count, 1, "a '#' line inside a fence must not be treated as a heading/section boundary")
-        guard case .plain(let text) = chunks[0] else { return XCTFail("expected a single .plain chunk") }
-        XCTAssertEqual(text, doc)
+        XCTAssertFalse(
+            chunks.contains(where: {
+                if case .collapsible(let heading, _) = $0 { return heading == "not a heading" }
+                return false
+            }),
+            "a '#' line inside a fence must not be treated as a heading/section boundary"
+        )
+        XCTAssertEqual(chunks.map(\.renderedText).joined(), doc)
+        XCTAssertEqual(chunks.count, 2, "expected Title + Real heading chunks, not a split on the fenced '#': \(chunks)")
     }
 
     /// CommonMark permits up to three leading spaces before an ATX heading's
@@ -479,5 +496,195 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         state.query = "Null pointer"
         XCTAssertEqual(state.matches.count, 1)
         XCTAssertNil(state.currentCollapsibleHeadingToExpand)
+    }
+
+    // MARK: - Highlight refresh (no .id() remount)
+
+    func testHighlightRefreshTagIsStrippedBeforeParse() {
+        let source = "# Title\n\nHello."
+        XCTAssertEqual(MarkdownHighlightRefreshParser.stripNonce(from: source), source)
+        let tagged = MarkdownHighlightRefreshParser.tagged(source, generation: 7)
+        XCTAssertNotEqual(tagged, source)
+        XCTAssertEqual(MarkdownHighlightRefreshParser.stripNonce(from: tagged), source)
+        XCTAssertEqual(MarkdownHighlightRefreshParser.tagged(source, generation: 0), source)
+    }
+
+    // MARK: - Comment anchors across heading chunks
+
+    /// An `exact` that recurs in two heading sections must paint once in the
+    /// whole document — the occurrence disambiguated by prefix/suffix —
+    /// not once per chunk that happens to contain the same words.
+    func testCommentAnchorRecurringExactHighlightsOnceAcrossHeadingChunks() throws {
+        let source = """
+        # Alpha
+
+        run checkleft run here please
+
+        # Beta
+
+        run checkleft run there instead
+        """
+        let chunks = MarkdownHeadingSections.chunks(in: source, collapsibleHeadings: [])
+        XCTAssertEqual(chunks.count, 2)
+        let anchor = CommentAnchor(exact: "checkleft run", prefix: "run ", suffix: " here")
+        let partitioned = MarkdownCommentAnchorMap.partition(
+            chunks: chunks,
+            highlighted: [anchor],
+            flashing: nil,
+            baseURL: nil
+        )
+        let nonempty = partitioned.enumerated().filter { !$0.element.highlighted.isEmpty }
+        XCTAssertEqual(nonempty.count, 1, "exactly one chunk should receive the recurring exact")
+        XCTAssertEqual(nonempty.first?.offset, 0, "prefix/suffix must pick the Alpha occurrence")
+
+        var highlightedChunks = 0
+        for (index, chunk) in chunks.enumerated() {
+            let parser = HighlightingMarkdownParser(
+                highlightedAnchors: partitioned[index].highlighted
+            )
+            let result = try parser.attributedString(for: chunk.renderedText)
+            if Self.containsHighlight(in: result) { highlightedChunks += 1 }
+        }
+        XCTAssertEqual(highlightedChunks, 1)
+    }
+
+    /// A selection whose `exact` straddles a heading boundary must still
+    /// paint — clipped onto each overlapping chunk — rather than vanishing
+    /// because no single chunk contains the whole quote.
+    func testCommentAnchorStraddlingAHeadingHighlightsOverlappingChunks() throws {
+        let source = """
+        # Alpha
+
+        starts here
+        # Beta
+        and continues
+        """
+        let chunks = MarkdownHeadingSections.chunks(in: source, collapsibleHeadings: [])
+        XCTAssertEqual(chunks.count, 2)
+        let plains = chunks.map { CommentProjection.plainText(for: $0.renderedText) }
+        let concat = plains.joined()
+        let boundary = plains[0].count
+        XCTAssertGreaterThan(boundary, 4)
+        XCTAssertLessThan(boundary, concat.count - 4)
+        let start = concat.index(concat.startIndex, offsetBy: boundary - 4)
+        let end = concat.index(concat.startIndex, offsetBy: boundary + 4)
+        let needle = String(concat[start..<end])
+        let range = concat.range(of: needle)!
+        let prefixStart = concat.index(range.lowerBound, offsetBy: -6, limitedBy: concat.startIndex) ?? concat.startIndex
+        let suffixEnd = concat.index(range.upperBound, offsetBy: 4, limitedBy: concat.endIndex) ?? concat.endIndex
+        let anchor = CommentAnchor(
+            exact: needle,
+            prefix: String(concat[prefixStart..<range.lowerBound]),
+            suffix: String(concat[range.upperBound..<suffixEnd])
+        )
+        let partitioned = MarkdownCommentAnchorMap.partition(
+            chunks: chunks,
+            highlighted: [anchor],
+            flashing: nil,
+            baseURL: nil
+        )
+        let nonempty = partitioned.enumerated().filter { !$0.element.highlighted.isEmpty }
+        XCTAssertEqual(nonempty.count, 2, "a heading-straddling exact must clip onto both chunks")
+
+        var highlightedChunks = 0
+        for (index, chunk) in chunks.enumerated() {
+            let parser = HighlightingMarkdownParser(
+                highlightedAnchors: partitioned[index].highlighted
+            )
+            let result = try parser.attributedString(for: chunk.renderedText)
+            if Self.containsHighlight(in: result) { highlightedChunks += 1 }
+        }
+        XCTAssertEqual(highlightedChunks, 2)
+    }
+
+    func testCommentAnchorStraddlingAHeadingDropsWhitespaceOnlyFragment() {
+        let headingBoundaryNewline = CommentAnchor(
+            exact: "\n",
+            prefix: "ends here",
+            suffix: "starts there"
+        )
+        XCTAssertFalse(MarkdownCommentAnchorMap.isAnchorable(headingBoundaryNewline))
+    }
+
+    private static func containsHighlight(in result: AttributedString) -> Bool {
+        result.runs.contains { $0.swiftUI.backgroundColor != nil }
+    }
+
+    // MARK: - Layout cost
+
+    /// Pins that a multi-heading document still hosts. Chunking cost is
+    /// recorded in the PR description, not asserted here.
+    func testLargeDocumentChunksAndHosts() {
+        let source = Self.largeHeadedDocument(sections: 24)
+        let chunks = MarkdownHeadingSections.chunks(in: source, collapsibleHeadings: [])
+        XCTAssertEqual(chunks.count, 25, "title + 24 sections: \(chunks.count)")
+
+        let view = MarkdownDocumentChrome(
+            title: "Large doc",
+            source: source,
+            commentsEnabled: false
+        )
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: 760, height: 640)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+    }
+
+    /// The 24-section fixture in a short viewport must not instantiate every
+    /// `DocumentStructuredText` — that is the signal that `ForEach` flattened
+    /// into `LazyVStack` rather than wrapping as one non-lazy child.
+    func testLargeDocumentLazyStackInstantiatesOnlyOnscreenChunks() {
+        let source = Self.largeHeadedDocument(sections: 24)
+        let total = MarkdownHeadingSections.chunks(in: source, collapsibleHeadings: []).count
+        let probe = MarkdownChunkAppearProbe()
+        let view = MarkdownDocumentChrome(
+            title: "Large doc",
+            source: source,
+            commentsEnabled: false
+        )
+        .environment(\.markdownChunkAppearProbe, probe)
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: 760, height: 400)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 400),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hosting
+        hosting.layoutSubtreeIfNeeded()
+        let deadline = Date(timeIntervalSinceNow: 2)
+        while probe.appeared.isEmpty, Date() < deadline {
+            RunLoop.current.run(until: min(Date(timeIntervalSinceNow: 0.01), deadline))
+        }
+        XCTAssertGreaterThan(probe.appeared.count, 0, "at least the on-screen chunks must appear")
+        XCTAssertLessThanOrEqual(
+            probe.appeared.count,
+            total / 2,
+            "LazyVStack must not instantiate every heading chunk; appeared=\(probe.appeared.count) total=\(total)"
+        )
+        withExtendedLifetime(window) {}
+    }
+
+    private static func largeHeadedDocument(sections: Int) -> String {
+        var parts: [String] = ["# Large document\n\nIntro paragraph with **bold** and a [link](https://example.com).\n"]
+        for i in 1...sections {
+            parts.append("""
+
+            ## Section \(i)
+
+            Paragraph \(i) with nested structure:
+
+            - top
+              - nested
+                - deeper still, item \(i)
+
+            ```swift
+            let value = \(i)
+            ```
+
+            """)
+        }
+        return parts.joined()
     }
 }

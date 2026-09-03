@@ -8,7 +8,7 @@ import SwiftUI
 ///
 /// ## Focus rule (find-bar-open + text-selected)
 ///
-/// T548's type-to-comment trigger (`CommentLayer.shouldConsumeKeyEvent`)
+/// The type-to-comment trigger (`CommentLayer.shouldConsumeKeyEvent`)
 /// opens the comment popover on any plain-letter keystroke while the
 /// document has a text selection. That check inspects whatever the *current*
 /// AppKit first responder validates as copyable — normally correct, but if
@@ -96,25 +96,6 @@ struct MarkdownFindBar: View {
 @MainActor
 final class MarkdownScrollController {
     weak var scrollView: NSScrollView?
-
-    /// Current scroll offset, in the clip view's own (flipped) coordinate
-    /// space. Used to snapshot the viewport position before a forced
-    /// `StructuredText` remount (see `parseVersion` in
-    /// `MarkdownDocumentColumn`) so it
-    /// can be restored once the remount lands, instead of leaving AppKit's
-    /// default post-remount scroll offset (top-of-document) in place.
-    func currentOffset() -> CGPoint? {
-        scrollView?.contentView.bounds.origin
-    }
-
-    /// Restores a previously captured offset without animation — this runs
-    /// right after a remount, so an animated scroll would visibly fight the
-    /// content that's still settling into place.
-    func restoreOffset(_ origin: CGPoint) {
-        guard let scrollView else { return }
-        scrollView.contentView.bounds.origin = origin
-        scrollView.reflectScrolledClipView(scrollView.contentView)
-    }
 
     func scrollToFraction(_ fraction: Double) {
         guard let scrollView, let documentView = scrollView.documentView else { return }
