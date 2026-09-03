@@ -114,6 +114,69 @@ pub async fn run_one_pass(
 ) -> PrReviewRecoveryOutcome {
     let mut outcome = PrReviewRecoveryOutcome::default();
 
+    // Batch leaves are independent read-only roles, so they must not pass
+    // through the legacy one-row-per-work-item candidate query below. Recover
+    // each role exactly once from its durable member policy; this preserves
+    // the assigned driver/model and never turns one failed leaf into a second
+    // single-reviewer pass.
+    let batch_candidates = match work_db.list_dead_review_batch_member_candidates() {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                "pr_review recovery: failed to list dead batch members; skipping batch recovery"
+            );
+            Vec::new()
+        }
+    };
+    for candidate in batch_candidates {
+        let DeadPrReviewCandidate {
+            work_item_id,
+            execution_id: dead_execution_id,
+            execution_status: dead_status,
+        } = candidate;
+        match work_db.retry_dead_review_batch_member(&dead_execution_id) {
+            Ok(Some(retry)) => {
+                file_dead_review_attention(work_db, &work_item_id, &dead_execution_id, dead_status.as_str());
+                dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::PrReviewDeadRecovery, Outcome::Ok, &retry.id)
+                            .with_work_item(&work_item_id)
+                            .with_details(serde_json::json!({
+                                "dead_execution_id": dead_execution_id,
+                                "dead_execution_status": dead_status.as_str(),
+                                "recovery_mode": "review_batch_member",
+                            })),
+                    )
+                    .await;
+                tracing::warn!(
+                    work_item_id = %work_item_id,
+                    dead_execution_id = %dead_execution_id,
+                    retry_execution_id = %retry.id,
+                    "pr_review recovery: refired one role-scoped batch leaf",
+                );
+                coordinator.kick();
+                outcome.refired += 1;
+            }
+            Ok(None) => {
+                tracing::info!(
+                    work_item_id = %work_item_id,
+                    dead_execution_id = %dead_execution_id,
+                    "pr_review recovery: batch leaf already exhausted its one retry",
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    work_item_id = %work_item_id,
+                    dead_execution_id = %dead_execution_id,
+                    ?error,
+                    "pr_review recovery: failed to recover batch leaf",
+                );
+                outcome.error_skipped += 1;
+            }
+        }
+    }
+
     let candidates = match work_db.list_dead_pr_review_candidates() {
         Ok(c) => c,
         Err(err) => {
@@ -131,6 +194,21 @@ pub async fn run_one_pass(
             execution_id: dead_execution_id,
             execution_status: dead_status,
         } = candidate;
+
+        match work_db.review_batch_member_for_execution(&dead_execution_id) {
+            Ok(Some(_)) => continue,
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    work_item_id = %work_item_id,
+                    dead_execution_id = %dead_execution_id,
+                    ?error,
+                    "pr_review recovery: failed to identify batch membership; skipping legacy recovery",
+                );
+                outcome.error_skipped += 1;
+                continue;
+            }
+        }
 
         // Churn guard: a work item whose *reviews* keep failing to produce
         // an informative result is almost certainly hitting something
