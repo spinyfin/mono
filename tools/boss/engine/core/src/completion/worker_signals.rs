@@ -873,7 +873,7 @@ impl WorkerCompletionHandler {
                 "run_done_proposals_seam",
                 "run_done",
                 crate::no_op_signal::NO_CHANGES_NEEDED_MARKER,
-                "no run_done proposal declared no_changes_needed; falling back to the legacy marker scan",
+                "no run_done proposal declared no_changes_needed; falling back to the legacy transcript marker",
             );
         }
         signalled
