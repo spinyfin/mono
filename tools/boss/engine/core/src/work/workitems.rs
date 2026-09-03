@@ -1036,6 +1036,8 @@ impl WorkDb {
         );
         trace.record_nplus1(segment::DB_DOC_POINTERS, elapsed_ms(t), resolved, doc_pointer_queries);
 
+        let ideas = list_ideas_in_tx(&conn, product_id, None)?;
+
         Ok(WorkTree {
             product,
             projects,
@@ -1043,6 +1045,7 @@ impl WorkDb {
             chores,
             task_runtimes,
             dependencies,
+            ideas,
         })
     }
 

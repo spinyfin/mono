@@ -2,6 +2,7 @@
 //! external-ref types, and worktree metadata.
 
 use super::dependency::WorkItemDependency;
+use super::idea::Idea;
 use super::product::Product;
 use super::project::Project;
 use super::task::{Task, TaskRuntime};
@@ -327,4 +328,11 @@ pub struct WorkTree {
     pub task_runtimes: Vec<TaskRuntime>,
 
     pub tasks: Vec<Task>,
+    /// Ideas for this product (D7: zero new subscription machinery — the
+    /// worktree fetch and its `work.product.<id>` invalidation topic are
+    /// the same ones every other product-scoped entity uses). Optional
+    /// for backward compatibility with a payload captured before this
+    /// field existed.
+    #[serde(default)]
+    pub ideas: Vec<Idea>,
 }

@@ -421,6 +421,12 @@ pub const CREATED_VIA_DOC_COMMENT_PREFIX: &str = "doc-comment:";
 /// row Boothby touched in that pass is recoverable from `boothby_actions`,
 /// which carries the pre/post images needed to undo it.
 pub const CREATED_VIA_BOOTHBY_PREFIX: &str = "boothby:";
+/// Prefix for the chore produced by graduating an idea to a chore
+/// (`FrontendRequest::GraduateIdea`): `idea-graduation:<ideas.id>`. The
+/// idea id is the back-pointer; graduating to a project has no equivalent
+/// stamp (`CreateProjectInput` carries no `created_via`) — that direction
+/// is recoverable from the idea's own `graduated_to_id` instead.
+pub const CREATED_VIA_IDEA_GRADUATION_PREFIX: &str = "idea-graduation:";
 
 /// Documented `created_via` values. The engine canonicalises caller-
 /// supplied strings against this set; values outside it are stored
@@ -446,6 +452,7 @@ pub fn is_known_created_via(value: &str) -> bool {
         || value.starts_with(CREATED_VIA_PR_REVIEW_PREFIX)
         || value.starts_with(CREATED_VIA_DOC_COMMENT_PREFIX)
         || value.starts_with(CREATED_VIA_BOOTHBY_PREFIX)
+        || value.starts_with(CREATED_VIA_IDEA_GRADUATION_PREFIX)
         || value.starts_with("pr-comment:")
 }
 

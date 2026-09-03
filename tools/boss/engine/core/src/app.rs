@@ -98,6 +98,7 @@ mod github_auth;
 // `pub(super)`; only the module path is widened.
 pub(crate) mod handler_helpers;
 mod hosts;
+mod ideas;
 /// Public so `tests/isolation_guard.rs` can drive `IsolationPaths::derive*`
 /// directly.
 pub mod isolation;
@@ -2660,6 +2661,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::CreateChore { .. } => work_items::handle_create_chore(ctx, r).await,
             r @ FrontendRequest::CreateDecision { .. } => decisions::handle_create_decision(ctx, r).await,
             r @ FrontendRequest::CreateExecution { .. } => executions::handle_create_execution(ctx, r).await,
+            r @ FrontendRequest::CreateIdea { .. } => ideas::handle_create_idea(ctx, r).await,
             r @ FrontendRequest::CreateInvestigation { .. } => work_items::handle_create_investigation(ctx, r).await,
             r @ FrontendRequest::CreateManyChores { .. } => work_items::handle_create_many_chores(ctx, r).await,
             r @ FrontendRequest::CreateManyTasks { .. } => work_items::handle_create_many_tasks(ctx, r).await,
@@ -2675,6 +2677,7 @@ async fn handle_frontend_connection(
                 live_status::handle_debug_live_status_pipeline(ctx, r).await
             }
             r @ FrontendRequest::DeleteAutomation { .. } => automations::handle_delete_automation(ctx, r).await,
+            r @ FrontendRequest::DeleteIdea { .. } => ideas::handle_delete_idea(ctx, r).await,
             r @ FrontendRequest::DeleteWorkItem { .. } => work_items::handle_delete_work_item(ctx, r).await,
             r @ FrontendRequest::DisableAutomation { .. } => automations::handle_disable_automation(ctx, r).await,
             r @ FrontendRequest::DismissAttention { .. } => attentions::handle_dismiss_attention(ctx, r).await,
@@ -2711,6 +2714,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::GetEngineVersion => engine_meta::handle_get_engine_version(ctx, r).await,
             r @ FrontendRequest::GetExecution { .. } => executions::handle_get_execution(ctx, r).await,
             r @ FrontendRequest::GetHost { .. } => hosts::handle_get_host(ctx, r).await,
+            r @ FrontendRequest::GetIdea { .. } => ideas::handle_get_idea(ctx, r).await,
             r @ FrontendRequest::GetPrBody { .. } => pr_status::handle_get_pr_body(ctx, r).await,
             r @ FrontendRequest::GetProductDesignDoc { .. } => design_docs::handle_get_product_design_doc(ctx, r).await,
             r @ FrontendRequest::GetPrStatus { .. } => pr_status::handle_get_pr_status(ctx, r).await,
@@ -2730,6 +2734,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::GitHubAuthDisconnect => github_auth::handle_git_hub_auth_disconnect(ctx, r).await,
             r @ FrontendRequest::GitHubAuthStart => github_auth::handle_git_hub_auth_start(ctx, r).await,
             r @ FrontendRequest::GitHubAuthStatus => github_auth::handle_git_hub_auth_status(ctx, r).await,
+            r @ FrontendRequest::GraduateIdea { .. } => ideas::handle_graduate_idea(ctx, r).await,
             r @ FrontendRequest::HoldRun { .. } => executions::handle_hold_run(ctx, r).await,
             r @ FrontendRequest::InterruptWorkerPane { .. } => panes::handle_interrupt_worker_pane(ctx, r).await,
             r @ FrontendRequest::KickPrReconcilers => engine_meta::handle_kick_pr_reconcilers(ctx, r).await,
@@ -2770,6 +2775,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::ListFeatureFlags => engine_meta::handle_list_feature_flags(ctx, r).await,
             r @ FrontendRequest::ListHosts => hosts::handle_list_hosts(ctx, r).await,
             r @ FrontendRequest::ListHostedPaneStatuses => panes::handle_list_hosted_pane_statuses(ctx, r).await,
+            r @ FrontendRequest::ListIdeas { .. } => ideas::handle_list_ideas(ctx, r).await,
             r @ FrontendRequest::ListLiveStatusDisabledSlots => {
                 live_status::handle_list_live_status_disabled_slots(ctx, r).await
             }
@@ -2906,6 +2912,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::UnpopulateProject { .. } => planner_ops::handle_unpopulate_project(ctx, r).await,
             r @ FrontendRequest::Unsubscribe { .. } => subscriptions::handle_unsubscribe(ctx, r).await,
             r @ FrontendRequest::UpdateAutomation { .. } => automations::handle_update_automation(ctx, r).await,
+            r @ FrontendRequest::UpdateIdea { .. } => ideas::handle_update_idea(ctx, r).await,
             r @ FrontendRequest::MoveWorkItemOnBoard { .. } => work_items::handle_move_work_item_on_board(ctx, r).await,
             r @ FrontendRequest::UpdateWorkItem { .. } => work_items::handle_update_work_item(ctx, r).await,
             r @ FrontendRequest::ReportSelectedProduct { .. } => {

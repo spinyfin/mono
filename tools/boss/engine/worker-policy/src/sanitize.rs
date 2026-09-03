@@ -301,6 +301,12 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::DecisionResult { .. }
         | FrontendEvent::DecisionsList { .. }
         | FrontendEvent::DecisionUpdated { .. }
+        | FrontendEvent::IdeaCreated { .. }
+        | FrontendEvent::IdeaResult { .. }
+        | FrontendEvent::IdeasList { .. }
+        | FrontendEvent::IdeaUpdated { .. }
+        | FrontendEvent::IdeaDeleted { .. }
+        | FrontendEvent::IdeaGraduated { .. }
         | FrontendEvent::DispatchAdmissionEvaluated { .. }) => passthrough,
     }
 }

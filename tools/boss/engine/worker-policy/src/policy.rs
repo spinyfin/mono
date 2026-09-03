@@ -480,6 +480,17 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::GetAutomationOpenTaskCount { .. }
         | FrontendRequest::ListAutomationTasks { .. }
         | FrontendRequest::GetAutomationState
+        // Ideas are a human/coordinator authoring surface (a markdown draft
+        // composed over time, later graduated into a chore or project) —
+        // deliberately not a work item and not in the design's exposed
+        // read set. A worker never needs to read or write another draft;
+        // nothing about its own task depends on idea state.
+        | FrontendRequest::CreateIdea { .. }
+        | FrontendRequest::DeleteIdea { .. }
+        | FrontendRequest::GetIdea { .. }
+        | FrontendRequest::GraduateIdea { .. }
+        | FrontendRequest::ListIdeas { .. }
+        | FrontendRequest::UpdateIdea { .. }
         | FrontendRequest::GetCiBudget { .. }
         | FrontendRequest::GetCiRemediation { .. }
         | FrontendRequest::GetConflictHotspots { .. }

@@ -90,6 +90,10 @@ fn is_non_work_item_surface(surface: &str) -> bool {
     if surface.starts_with("automation ") && (surface.ends_with(" selector") || surface.ends_with(" id")) {
         return true;
     }
+    // Idea namespace: I<n> / idea_…. Ideas are deliberately not work items.
+    if surface.starts_with("idea ") && surface.ends_with(" selector") {
+        return true;
+    }
     // Attention groups / members (A<n>, atg_…, atn_…) — not T/P short ids.
     // Exception: attention list|create --task|--project ARE work items
     // (marked WORK_ITEM_ID); those paths end with " task" / " project".

@@ -107,6 +107,14 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: DecisionCommand,
     },
+    /// Manage ideas: markdown drafts authored over time and later graduated
+    /// into a chore or project. Live in a per-product `I<n>` namespace.
+    /// Deliberately not a work item: not dispatchable, no PR, not on the
+    /// kanban. Lifecycle: `draft` → `graduated` (kept forever) or `archived`.
+    Idea {
+        #[command(subcommand)]
+        command: IdeaCommand,
+    },
     /// Manage automations: standing, scheduled maintenance instructions that
     /// periodically triage and spawn work outside the normal backlog.
     ///
