@@ -52,7 +52,14 @@ async fn pr_created_proposals_first_uses_proposal_url_surviving_an_empty_staging
     let metrics = Arc::new(Registry::new());
     register_metrics(&metrics);
     let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
-    let handler = handler.with_feature_flags(flags).with_metrics(metrics.clone());
+    let handler = handler
+        .with_feature_flags(flags)
+        .with_metrics(metrics.clone())
+        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(
+            &execution_id,
+            &BranchNaming::BossExecPrefix,
+            None,
+        )));
 
     let outcome = handler.on_stop(&execution_id).await;
     assert!(
@@ -89,7 +96,14 @@ async fn pr_created_proposals_first_falls_back_to_the_ladder_and_counts_the_hit(
     let metrics = Arc::new(Registry::new());
     register_metrics(&metrics);
     let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
-    let handler = handler.with_feature_flags(flags).with_metrics(metrics.clone());
+    let handler = handler
+        .with_feature_flags(flags)
+        .with_metrics(metrics.clone())
+        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(
+            &execution_id,
+            &BranchNaming::BossExecPrefix,
+            None,
+        )));
 
     let outcome = handler.on_stop(&execution_id).await;
     assert!(
@@ -175,7 +189,14 @@ async fn pr_created_proposals_first_via_recheck_for_pr_uses_proposal_and_skips_d
     let metrics = Arc::new(Registry::new());
     register_metrics(&metrics);
     let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
-    let handler = handler.with_feature_flags(flags).with_metrics(metrics.clone());
+    let handler = handler
+        .with_feature_flags(flags)
+        .with_metrics(metrics.clone())
+        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(
+            &execution_id,
+            &BranchNaming::BossExecPrefix,
+            None,
+        )));
 
     let outcome = handler.recheck_for_pr(&execution_id).await;
     assert!(
@@ -234,4 +255,69 @@ async fn pr_created_proposals_first_rejected_proposal_falls_back_to_the_ladder()
         Some(1),
         "a rejected proposal still counts as 'the proposal did not cover this finalization'",
     );
+}
+
+/// Completion paths that act on an already-bound PR are outside the
+/// PR-creation ladder. They must not affect this seam's deletion criterion.
+#[tokio::test]
+async fn pr_created_fallback_counter_ignores_non_ladder_finalization_sources() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    let (flags, _flags_dir) = enable_pr_created_seam();
+    let metrics = Arc::new(Registry::new());
+    register_metrics(&metrics);
+    let TestHarness { handler, .. } = TestHarness::new(db, StubPrDetector::ok(None));
+    let handler = handler.with_feature_flags(flags).with_metrics(metrics.clone());
+
+    let outcome = handler
+        .finalize_pr_transition(
+            &execution_id,
+            "https://github.com/spinyfin/mono/pull/500".to_owned(),
+            WorkerPrCompletionTarget::InReview,
+            "metadata_only_fix",
+        )
+        .await;
+    assert!(matches!(outcome, StopOutcome::ReviewerEnqueued { .. }));
+    assert_eq!(
+        metrics.counter_value("worker_proposals.fallback_hit.pr_created"),
+        Some(0),
+        "an already-bound-PR completion source is not a missing pr_created declaration",
+    );
+}
+
+/// Revision declarations are accepted durably without mutating the revision
+/// task row, but only the chain root's bound PR may be used at completion.
+#[tokio::test]
+async fn pr_created_proposal_for_revision_rejects_a_url_other_than_the_bound_chain_root_pr() {
+    let workspace = tempdir().unwrap();
+    let bound_pr_url = "https://github.com/spinyfin/mono/pull/500";
+    let (_dir, db, _product_id, revision_id, execution_id) = revision_fixture(
+        workspace.path(),
+        bound_pr_url,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    let submitted = db
+        .submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+            execution_id: &execution_id,
+            work_item_id: &revision_id,
+            kind: ProposalKind::PrCreated,
+            payload_json: r#"{"pr_url":"https://github.com/spinyfin/mono/pull/999"}"#,
+            idempotency_key: "key-1",
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(submitted.proposal.state, ProposalState::Applied);
+
+    let (flags, _flags_dir) = enable_pr_created_seam();
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let outcome = handler.with_feature_flags(flags).on_stop(&execution_id).await;
+    assert!(
+        !matches!(outcome, StopOutcome::ReviewerEnqueued { pr_url } if pr_url == "https://github.com/spinyfin/mono/pull/999"),
+        "a revision may not finalize against a declaration other than its bound chain-root PR",
+    );
+    let revision = match db.get_work_item(&revision_id).unwrap() {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task,
+        other => panic!("expected revision task, got {other:?}"),
+    };
+    assert!(revision.pr_url.is_none(), "revision tasks never own a PR URL");
 }
