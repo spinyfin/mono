@@ -14,7 +14,11 @@ pub struct ReleaseConfig {
     pub version: VersionConfig,
     pub notes: NotesConfig,
     pub change_paths: Vec<String>,
+    /// Required release assets. `{version}` expands to the version encoded in
+    /// the release tag (the tag with `tag_prefix` stripped).
     pub required_assets: Vec<String>,
+    /// Optional release assets. Uses the same `{version}` expansion as
+    /// `required_assets`.
     pub optional_assets: Vec<String>,
 }
 

@@ -112,7 +112,7 @@ confirm:
 gh release view boss-v1.0.0 --repo spinyfin/mono
 ```
 
-3. `Boss-1.0.0.zip` is attached to the release.
+3. `Boss-1.0.0.zip` and `Boss-1.0.0.zip.sha256` are attached to the release.
 
 If the step fails with `Missing Buildkite secrets: …`, one or more secrets were
 not found — recheck the names (they are case-sensitive) and the pipeline scope.

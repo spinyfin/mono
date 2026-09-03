@@ -1,0 +1,21 @@
+# Product record for the Boss.app GitHub Release.
+#
+# Version arithmetic, skip/idempotency, notes, draft creation, checksum
+# sidecars, and publish live in //tools/release. This file is the only
+# per-product input that file consumes. `{version}` in asset names expands
+# to the version encoded in the tag (tag minus tag_prefix), so the published
+# zip stays `Boss-1.0.N.zip` — the exact name UpdateChecker resolves.
+repo = "spinyfin/mono"
+tag_prefix = "boss-v"
+title_prefix = "Boss"
+change_paths = ["tools/boss/", ".buildkite/steps/boss-release.sh", ".buildkite/pipeline.yml"]
+required_assets = ["Boss-{version}.zip"]
+optional_assets = []
+
+[version]
+scheme = "patch-counter"
+major_minor = "1.0"
+
+[notes]
+source = "changelog"
+project = "tools/boss/PROJECT.yaml"
