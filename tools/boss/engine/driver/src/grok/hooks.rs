@@ -727,7 +727,10 @@ mod tests {
         assert_eq!(code, 0);
         let decision: serde_json::Value = serde_json::from_str(&stdout).expect(&stdout);
         assert_eq!(decision["decision"], "deny", "gh pr create must be refused: {stdout}");
-        assert!(decision["reason"].as_str().unwrap().contains("cube pr"));
+        assert!(
+            decision["reason"].as_str().unwrap().contains("CUBE_BIN"),
+            "reason must redirect to $CUBE_BIN: {stdout}"
+        );
     }
 
     /// Same guard, `jj git push` — the other bare-VCS-push phrasing the

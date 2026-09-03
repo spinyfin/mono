@@ -87,13 +87,38 @@ pub const WORKER_BIN_SUBDIR: &str = "bin";
 /// `$BOSS_BIN_DIR` prepend, so the launcher wins over the bundle.
 pub const WORKER_BIN_DIR_ENV: &str = "BOSS_WORKER_BIN_DIR";
 
+/// Env var carrying the absolute path of this workspace's `boss` launcher.
+/// Workers are taught to invoke [`WORKER_BOSS_INVOCATION`] rather than the
+/// bare word `boss`: a driver shell snapshot can demote the launcher
+/// directory on `PATH`, and a PATH entry is not a binary.
+pub const BOSS_BIN_ENV: &str = "BOSS_BIN";
+
+/// Env var carrying the absolute path of this workspace's `cube` launcher.
+/// Same contract as [`BOSS_BIN_ENV`]: name the binary, not a PATH entry.
+pub const CUBE_BIN_ENV: &str = "CUBE_BIN";
+
+/// Shell token workers are taught to run instead of a PATH-resolved `boss`.
+pub const WORKER_BOSS_INVOCATION: &str = r#""$BOSS_BIN""#;
+
+/// Shell token workers are taught to run instead of a PATH-resolved `cube`.
+pub const WORKER_CUBE_INVOCATION: &str = r#""$CUBE_BIN""#;
+
 /// Env var that overrides `boss` CLI resolution outright. Tests and
 /// operators use it; it is honoured before every filesystem candidate.
 pub const BOSS_CLI_BIN_ENV: &str = "BOSS_CLI_BIN";
 
+/// Env var that overrides `cube` CLI resolution outright. Same contract
+/// as [`BOSS_CLI_BIN_ENV`].
+pub const CUBE_CLI_BIN_ENV: &str = "CUBE_CLI_BIN";
+
+/// Workspace-relative path of the `cube` CLI under runfiles / bazel-bin.
+const CUBE_CLI_RUNFILES_REL: &str = "tools/cube/cube";
+
 /// Every executable name the engine may write into the launcher directory.
-/// The optional `cube` wrapper preserves engine-owned PR provenance; neither
-/// entry exposes the Boss-tier `bossctl` control surface.
+/// `boss` is always present; `cube` is always present too (a thin exec of
+/// the bundled CLI, overwritten by the derived-PR compose wrapper when
+/// that worker needs it). Neither entry exposes the Boss-tier `bossctl`
+/// control surface.
 ///
 /// The engine deliberately keeps `bossctl` off the worker `PATH`: it is
 /// the Boss-tier control surface (host registry, agent fleet, engine
@@ -230,6 +255,34 @@ pub fn resolve_boss_cli(
     )
 }
 
+/// Resolve the absolute path of the `cube` CLI that belongs to the
+/// running engine. Same candidate order and shim rejection as
+/// [`resolve_boss_cli`], with the `cube` basename and runfiles path.
+///
+/// Ordinary workers previously had no `cube` launcher at all, so a
+/// Codex shell snapshot that demoted the bundle dir on `PATH` sent
+/// every `cube` invocation through repobin. The launcher written next
+/// to `boss` closes that, and [`CUBE_BIN_ENV`] names it explicitly.
+pub fn resolve_cube_cli(
+    engine_path: &Path,
+    workspace_dir: Option<&Path>,
+    env_override: Option<&Path>,
+    boss_bin_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    resolve_engine_binary(
+        CUBE_LAUNCHER_NAME,
+        CUBE_CLI_RUNFILES_REL,
+        ResolvePaths {
+            engine_path,
+            workspace_dir,
+            env_override,
+            boss_bin_dir,
+            stable_bin_dir: None,
+        },
+        true,
+    )
+}
+
 /// Resolve the absolute path of the `boss-event` shim that belongs to
 /// the running engine.
 ///
@@ -297,6 +350,61 @@ pub fn is_build_from_source_shim(path: &Path) -> bool {
         .ok()
         .and_then(|target| target.file_name().map(|name| name == REPOBIN_NAME))
         .unwrap_or(false)
+}
+
+/// First executable named `name` on a `PATH`-shaped string, or `None`.
+///
+/// Does not consult the process `PATH`; the caller passes the environment
+/// the command will actually see. Absolute `name` values are returned as-is
+/// when they exist.
+pub fn resolve_on_path(name: &str, path: &str) -> Option<PathBuf> {
+    let candidate = Path::new(name);
+    if candidate.is_absolute() {
+        return candidate.exists().then(|| candidate.to_path_buf());
+    }
+    for dir in path.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = Path::new(dir).join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// If `program` (a first-token argv, possibly an absolute path) would
+/// resolve on `path` to a build-from-source shim, return that resolved
+/// path. Used by tests and by the PreToolUse guard's documented contract;
+/// the runtime guard is the Python in `BOSS_LAUNCH_GUARD_COMMAND`.
+pub fn resolves_to_build_from_source_shim(program: &str, path: &str) -> Option<PathBuf> {
+    let resolved = resolve_on_path(program, path)?;
+    is_build_from_source_shim(&resolved).then_some(resolved)
+}
+
+/// Whether `token` names the engine-owned `boss` CLI, including the
+/// `"$BOSS_BIN"` / `$BOSS_BIN` form workers are taught and an absolute
+/// path whose basename is `boss`.
+pub fn is_boss_cli_token(token: &str) -> bool {
+    is_named_cli_token(token, BOSS_LAUNCHER_NAME, BOSS_BIN_ENV)
+}
+
+/// Whether `token` names the engine-owned `cube` CLI. Same shapes as
+/// [`is_boss_cli_token`].
+pub fn is_cube_cli_token(token: &str) -> bool {
+    is_named_cli_token(token, CUBE_LAUNCHER_NAME, CUBE_BIN_ENV)
+}
+
+fn is_named_cli_token(token: &str, basename: &str, env_var: &str) -> bool {
+    let token = token.trim_matches(|c| c == '"' || c == '\'');
+    if token == basename {
+        return true;
+    }
+    if token == format!("${env_var}") || token == format!("${{{env_var}}}") {
+        return true;
+    }
+    Path::new(token).file_name().is_some_and(|name| name == basename)
 }
 
 /// Render the `/bin/sh` launcher written to `<dir>/boss`.
@@ -370,14 +478,34 @@ sibling directory, and found none of them. Build it
 /// launcher pointing at a previous engine's binary. The write is atomic
 /// (temp sibling + `rename`) so a concurrent reader/`exec` of `boss`
 /// never observes a truncated file.
+///
+/// Does not touch a co-located `cube` launcher: [`write_cube_launcher`]
+/// (or the derived-PR compose wrapper) owns that file. A non-derived
+/// spawn must still call [`write_cube_launcher`] so a stale compose
+/// wrapper from a previous worker in this workspace cannot linger.
 pub fn write_boss_launcher(dir: &Path, resolved: Option<&Path>) -> io::Result<PathBuf> {
-    let path = write_launcher(dir, BOSS_LAUNCHER_NAME, &launcher_script(resolved))?;
-    let prefix_launcher = dir.join(CUBE_LAUNCHER_NAME);
-    match std::fs::remove_file(&prefix_launcher) {
-        Ok(()) => Ok(path),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(path),
-        Err(err) => Err(err),
-    }
+    write_launcher(dir, BOSS_LAUNCHER_NAME, &launcher_script(resolved))
+}
+
+/// Write the per-workspace `cube` launcher, atomically replacing an older
+/// launcher (including a stale derived-PR compose wrapper) with mode 0755.
+///
+/// `resolved` is the output of [`resolve_cube_cli`]. `Some` produces a
+/// one-line `exec` of that absolute path; `None` produces a loudly-failing
+/// launcher, same contract as [`write_boss_launcher`]. A derived-PR spawn
+/// overwrites this afterwards with [`write_cube_pr_body_compose_launcher`].
+pub fn write_cube_launcher(dir: &Path, resolved: Option<&Path>) -> io::Result<PathBuf> {
+    write_launcher(dir, CUBE_LAUNCHER_NAME, &launcher_script(resolved))
+}
+
+/// Absolute path of the `boss` launcher inside `dir`.
+pub fn boss_bin_in(dir: &Path) -> PathBuf {
+    dir.join(BOSS_LAUNCHER_NAME)
+}
+
+/// Absolute path of the `cube` launcher inside `dir`.
+pub fn cube_bin_in(dir: &Path) -> PathBuf {
+    dir.join(CUBE_LAUNCHER_NAME)
 }
 
 /// Write the optional per-worker `cube` wrapper that composes `body_header`
@@ -1015,17 +1143,72 @@ mod tests {
     }
 
     #[test]
-    fn refreshing_boss_launcher_removes_a_stale_cube_body_compose_wrapper() {
+    fn writing_the_cube_launcher_replaces_a_stale_body_compose_wrapper() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("bin");
         write_cube_pr_body_compose_launcher(&dir, "## Stale").expect("write compose wrapper");
         write_boss_launcher(&dir, Some(Path::new("/opt/boss/bin/boss"))).expect("refresh boss launcher");
+        // A non-derived spawn must still replace the compose wrapper; writing
+        // only `boss` would leave the previous worker's header in place.
+        write_cube_launcher(&dir, Some(Path::new("/opt/boss/bin/cube"))).expect("refresh cube launcher");
 
         assert!(dir.join(BOSS_LAUNCHER_NAME).exists());
+        let cube = std::fs::read_to_string(dir.join(CUBE_LAUNCHER_NAME)).expect("read cube launcher");
         assert!(
-            !dir.join(CUBE_LAUNCHER_NAME).exists(),
+            cube.contains("exec '/opt/boss/bin/cube'"),
+            "stale compose wrapper must be replaced with a thin exec: {cube}"
+        );
+        assert!(
+            !cube.contains("## Stale"),
             "a non-derived worker must not inherit a prior worker's body-compose wrapper"
         );
+    }
+
+    #[test]
+    fn a_repobin_symlink_on_path_is_detected_as_a_shim_invocation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let repobin = bin.join("repobin");
+        std::fs::write(&repobin, b"#!/bin/sh\n").unwrap();
+        let boss = bin.join("boss");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&repobin, &boss).unwrap();
+        #[cfg(not(unix))]
+        std::fs::copy(&repobin, &boss).unwrap();
+
+        let path = format!("{}:/usr/bin", bin.display());
+        let hit = resolves_to_build_from_source_shim("boss", &path);
+        assert_eq!(hit.as_deref(), Some(boss.as_path()));
+        assert!(is_build_from_source_shim(&boss));
+    }
+
+    #[test]
+    fn a_real_binary_on_path_is_not_a_shim_invocation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let boss = bin.join("boss");
+        std::fs::write(&boss, b"#!/bin/sh\n").unwrap();
+        let path = format!("{}:/usr/bin", bin.display());
+        assert_eq!(resolves_to_build_from_source_shim("boss", &path), None);
+    }
+
+    #[test]
+    fn named_cli_tokens_cover_env_var_and_absolute_forms() {
+        assert!(is_boss_cli_token("boss"));
+        assert!(is_boss_cli_token("\"$BOSS_BIN\""));
+        assert!(is_boss_cli_token("$BOSS_BIN"));
+        assert!(is_boss_cli_token("${BOSS_BIN}"));
+        assert!(is_boss_cli_token("/Applications/Boss.app/Contents/Resources/bin/boss"));
+        assert!(!is_boss_cli_token("bossctl"));
+        assert!(!is_boss_cli_token("notboss"));
+
+        assert!(is_cube_cli_token("cube"));
+        assert!(is_cube_cli_token("\"$CUBE_BIN\""));
+        assert!(is_cube_cli_token("$CUBE_BIN"));
+        assert!(is_cube_cli_token("/opt/bin/cube"));
+        assert!(!is_cube_cli_token("notcube"));
     }
 
     #[cfg(unix)]

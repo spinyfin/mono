@@ -181,8 +181,43 @@ static GH_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// Quoted argument values are stripped before matching so that a commit
 /// message mentioning `cube pr create` does not produce a false positive.
 pub fn is_cube_pr_create(command: &str) -> bool {
-    let stripped = strip_quoted_string_contents(command);
+    let normalized = with_named_binaries_as_bare_names(command);
+    let stripped = strip_quoted_string_contents(&normalized);
     CUBE_PR_CREATE_RE.is_match(&stripped)
+}
+
+/// Rewrite `"$CUBE_BIN"` / `$CUBE_BIN` / `"$BOSS_BIN"` / `$BOSS_BIN` (quoted
+/// or braced) to the bare `cube` / `boss` token so command matchers that
+/// look for `cube pr create` still see the named-binary form workers are
+/// taught. Must run *before* [`strip_quoted_string_contents`]: that helper
+/// would otherwise turn `"$CUBE_BIN" pr create` into `"" pr create`.
+///
+/// The one normaliser for "does this text name the boss/cube CLI by its
+/// `$BOSS_BIN`/`$CUBE_BIN` contract" — [`crate::pr_url_capture::names_cube_pr`]
+/// (in `boss_engine_core`) calls this rather than duplicating its own
+/// substring set, so the two editorial-vs-PR-URL-capture surfaces can never
+/// disagree on which quoting shapes count. `pub` for that cross-crate call.
+pub fn with_named_binaries_as_bare_names(cmd: &str) -> String {
+    let mut s = cmd.to_owned();
+    // Longer / quoted forms first so `"$CUBE_BIN"` is not left as `""` after
+    // replacing the inner `$CUBE_BIN`.
+    for (needle, name) in [
+        ("\"${CUBE_BIN}\"", "cube"),
+        ("'${CUBE_BIN}'", "cube"),
+        ("\"$CUBE_BIN\"", "cube"),
+        ("'$CUBE_BIN'", "cube"),
+        ("${CUBE_BIN}", "cube"),
+        ("$CUBE_BIN", "cube"),
+        ("\"${BOSS_BIN}\"", "boss"),
+        ("'${BOSS_BIN}'", "boss"),
+        ("\"$BOSS_BIN\"", "boss"),
+        ("'$BOSS_BIN'", "boss"),
+        ("${BOSS_BIN}", "boss"),
+        ("$BOSS_BIN", "boss"),
+    ] {
+        s = s.replace(needle, name);
+    }
+    s
 }
 
 /// Fast pre-filter for the editorial PreToolUse audit path. Returns `true`
@@ -349,6 +384,17 @@ mod tests {
     #[test]
     fn detects_cube_pr_create() {
         assert!(is_cube_pr_create("cube pr create --branch feat/foo --title 'My PR'"));
+    }
+
+    #[test]
+    fn detects_named_cube_bin_pr_create() {
+        for command in [
+            r#""$CUBE_BIN" pr create --branch feat/foo --title 'My PR'"#,
+            r#"$CUBE_BIN pr create --branch feat/foo"#,
+            r#""${CUBE_BIN}" pr create --branch feat/foo"#,
+        ] {
+            assert!(is_cube_pr_create(command), "must detect named-binary create: {command}");
+        }
     }
 
     #[test]

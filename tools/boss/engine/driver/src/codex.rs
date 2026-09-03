@@ -698,8 +698,30 @@ fn render_config_toml(workspace: &Path, sandbox_root: Option<&Path>, sandbox_wor
          [notice.external_config_migration_prompts.projects]\n\
          {workspace_key} = true\n\
          \n\
+         # Force non-login shells for tool commands and reject explicit\n\
+         # login-shell requests. The pane already ran a login shell before\n\
+         # exec'ing Codex; a second login at tool-run time is what rebuilds\n\
+         # PATH from zprofile and is what the snapshot then freezes. This is a\n\
+         # top-level ConfigToml key, not a features-table flag, so it MUST be\n\
+         # emitted before the first table header below — a blank line does\n\
+         # not close a TOML table, so placing it after the features table\n\
+         # would silently make it features.allow_login_shell, which Codex\n\
+         # never reads.\n\
+         allow_login_shell = false\n\
+         \n\
          [features]\n\
          external_agent_memory_import = false\n\
+         # Codex snapshots PATH after a login shell re-applies the user's\n\
+         # zprofile prepends on top of the already-correct pane PATH, which\n\
+         # demotes the worker launcher directory and sends bare `boss`/`cube`\n\
+         # through repobin. Naming `$BOSS_BIN` is the invocation contract;\n\
+         # pinning snapshot/profile off is the driver-env half of the same\n\
+         # hole. Verified to load under --strict-config on 0.145.0 and 0.150.0.\n\
+         shell_snapshot = false\n\
+         \n\
+         [shell_environment_policy]\n\
+         inherit = \"all\"\n\
+         experimental_use_profile = false\n\
          \n\
          {sandbox_workspace_write}\
          [projects.{workspace_key}]\n\

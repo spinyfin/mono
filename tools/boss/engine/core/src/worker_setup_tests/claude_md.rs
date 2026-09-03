@@ -199,7 +199,10 @@ fn claude_md_pr_section_is_front_and_centre() {
     // via `boss pr status` (Boss already tracks the PR, and resolves it
     // correctly even for revision tasks where `task.pr_url` is NULL), not
     // a `gh` hunt.
-    assert!(rendered.contains("Check first with `boss pr status`"));
+    assert!(
+        rendered.contains("Check first with `\"$BOSS_BIN\" pr status`"),
+        "resuming-work guidance must name $BOSS_BIN pr status, got a snippet around PR section"
+    );
     assert!(
         !rendered.contains("gh pr list --head"),
         "worker CLAUDE.md must not send workers to GitHub to find their own PR"
@@ -223,12 +226,12 @@ fn claude_md_has_cube_pr_create_section() {
         "expected a 'Creating a PR from a jj workspace' section",
     );
     assert!(
-        rendered.contains("cube pr create"),
-        "expected cube pr create to be the canonical PR creation command",
+        rendered.contains("`\"$CUBE_BIN\" pr create --branch <name>` — new PR"),
+        "expected $CUBE_BIN pr create to be the canonical PR creation command",
     );
     assert!(
-        rendered.contains("cube pr update"),
-        "expected cube pr update to be the canonical PR-advancing command",
+        rendered.contains("`\"$CUBE_BIN\" pr update --branch <name>` — existing PR"),
+        "expected $CUBE_BIN pr update to be the canonical PR-advancing command",
     );
     assert!(
         !rendered.contains("cube pr ensure"),
@@ -246,20 +249,20 @@ fn claude_md_documents_pr_status_and_body_verbs() {
     let input = sample_input();
     let rendered = claude_md_for(&input);
     assert!(
-        rendered.contains("boss pr status"),
-        "expected `boss pr status` to be introduced with a concrete invocation",
+        rendered.contains("\"$BOSS_BIN\" pr status --json"),
+        "expected `$BOSS_BIN` pr status to be introduced with a concrete invocation",
     );
     assert!(
-        rendered.contains("boss pr status --refresh"),
+        rendered.contains("\"$BOSS_BIN\" pr status --refresh --json"),
         "expected the --refresh flag to be documented as a concrete invocation",
     );
     assert!(
-        rendered.contains("boss pr body"),
-        "expected `boss pr body` to be introduced",
+        rendered.contains("`\"$BOSS_BIN\" pr body`"),
+        "expected `$BOSS_BIN` pr body to be introduced",
     );
     assert!(
-        rendered.contains("boss pr status") && rendered.contains("NULL for a revision task"),
-        "expected `boss pr status` to be pointed at as the cheapest PR-discovery check, and \
+        rendered.contains("NULL for a revision task by design"),
+        "expected `$BOSS_BIN` pr status to be pointed at as the cheapest PR-discovery check, and \
          `boss context`'s `task.pr_url` field to be called out as unreliable for revision \
          workers (it is NULL by design — the chain root owns the PR, not the revision)",
     );
@@ -301,8 +304,8 @@ fn claude_md_draft_directive_present_when_enabled() {
         "CLAUDE.md must include --draft directive when draft_pr_mode is true",
     );
     assert!(
-        rendered.contains("cube pr create"),
-        "draft directive must reference cube pr create",
+        rendered.contains("Default PR creation mode: pass `--draft` to `\"$CUBE_BIN\" pr create`"),
+        "draft directive must reference $CUBE_BIN pr create",
     );
 }
 
@@ -368,7 +371,7 @@ fn standard_claude_md_is_unchanged_by_reviewer_branch() {
     let input = sample_input(); // WorkerKind::Standard
     let rendered = claude_md_for(&input);
     assert!(rendered.contains("Pull requests are the deliverable"));
-    assert!(rendered.contains("cube pr create"));
+    assert!(rendered.contains("`\"$CUBE_BIN\" pr create --branch <name>` — new PR"));
     assert!(rendered.contains("real GitHub upstream"));
 }
 

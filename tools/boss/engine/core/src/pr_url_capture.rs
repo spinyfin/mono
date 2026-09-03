@@ -203,10 +203,21 @@ impl StagedRevisionPushCache {
 ///   older worker prompts that still push directly. Plain `git push` is
 ///   intentionally excluded — the worker fleet uses `jj` exclusively.
 pub fn is_revision_push_command_str(command: &str) -> bool {
-    if command.contains("cube pr update") || command.contains("cube pr ensure") {
+    if names_cube_pr(command, "update") || names_cube_pr(command, "ensure") {
         return true;
     }
     command.contains("jj git push") && !command.contains("--dry-run")
+}
+
+/// Whether `command` invokes `cube pr <verb>`, including every `$CUBE_BIN`
+/// quoting shape workers are taught (a PATH lookup of `cube` is not
+/// trustworthy). Delegates the named-binary normalisation to
+/// [`boss_engine_gh_invocation::with_named_binaries_as_bare_names`] — the
+/// same normaliser [`boss_engine_gh_invocation::is_cube_pr_create`] uses —
+/// rather than keeping a second, independently-drifting substring set here.
+fn names_cube_pr(command: &str, verb: &str) -> bool {
+    let normalized = boss_engine_gh_invocation::with_named_binaries_as_bare_names(command);
+    normalized.contains(&format!("cube pr {verb}"))
 }
 
 /// Claude-shaped wrapper: read `tool_input.command` and delegate to
@@ -320,7 +331,7 @@ pub fn is_pr_url_binding_command_str(command: &str) -> bool {
     // purposes. They are not `gh` invocations, so the shared classifier
     // doesn't see them; check them directly. `.contains` also covers the
     // Codex `/bin/zsh -lc 'cube pr …'` envelope without peeling.
-    if command.contains("cube pr create") || command.contains("cube pr update") || command.contains("cube pr ensure") {
+    if names_cube_pr(command, "create") || names_cube_pr(command, "update") || names_cube_pr(command, "ensure") {
         return true;
     }
     // Peel shell `-c`/`-lc` wrappers before classify: quote-stripping inside
@@ -367,7 +378,7 @@ pub fn is_pr_url_finalization_command_str(command: &str) -> bool {
     }
     // `cube pr create` is publish evidence but is not a revision push
     // (revisions push to an existing parent PR via update/ensure / jj).
-    if command.contains("cube pr create") {
+    if names_cube_pr(command, "create") {
         return true;
     }
     let command = peel_shell_c_payload(command).unwrap_or(command);
@@ -593,6 +604,25 @@ mod tests {
         let url = extract_pr_url_from_text(&feed.output_text).expect("url");
         assert_eq!(url, "https://github.com/spinyfin/mono/pull/99");
         assert!(is_pr_url_binding_command_str(&feed.command));
+    }
+
+    #[test]
+    fn names_cube_pr_agrees_with_is_cube_pr_create_on_single_quoted_named_binary() {
+        // `names_cube_pr` and `boss_engine_gh_invocation::is_cube_pr_create`
+        // both classify `$CUBE_BIN` invocations, and used to do so via two
+        // independently-maintained substring sets that disagreed on this
+        // exact shape (single-quoted `'$CUBE_BIN'`). Both must now agree,
+        // since `names_cube_pr` delegates to the same normaliser
+        // `is_cube_pr_create` uses.
+        let single_quoted = "'$CUBE_BIN' pr create --branch b";
+        assert!(
+            is_pr_url_binding_command_str(single_quoted),
+            "names_cube_pr must recognise a single-quoted $CUBE_BIN invocation: {single_quoted}"
+        );
+        assert!(
+            boss_engine_gh_invocation::is_cube_pr_create(single_quoted),
+            "is_cube_pr_create must recognise the same command: {single_quoted}"
+        );
     }
 
     #[test]

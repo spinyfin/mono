@@ -266,9 +266,44 @@ macro_rules! shell_command_tokenizer_fragment {
         "DELIMS={'&&','||',';','|','&'}\n\
          WRAPPERS={'env','command','exec','nohup','stdbuf','setsid','caffeinate','sudo','time','xargs'}\n\
          ASSIGNMENT_RE=re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')\n\
+         def heredoc_delim(line):\n\
+         \x20   idx=line.find('<<')\n\
+         \x20   if idx<0:\n\
+         \x20       return None\n\
+         \x20   rest=line[idx+2:]\n\
+         \x20   if rest.startswith('-'):\n\
+         \x20       rest=rest[1:]\n\
+         \x20   rest=rest.lstrip()\n\
+         \x20   if not rest:\n\
+         \x20       return None\n\
+         \x20   q1=chr(39)\n\
+         \x20   q2=chr(34)\n\
+         \x20   quote=None\n\
+         \x20   if rest[0] in (q1,q2):\n\
+         \x20       quote=rest[0]\n\
+         \x20       rest=rest[1:]\n\
+         \x20   end=0\n\
+         \x20   while end<len(rest) and (rest[end].isalnum() or rest[end]=='_'):\n\
+         \x20       end+=1\n\
+         \x20   word=rest[:end]\n\
+         \x20   if not word:\n\
+         \x20       return None\n\
+         \x20   if quote:\n\
+         \x20       if end<len(rest) and rest[end]==quote:\n\
+         \x20           return word\n\
+         \x20       return None\n\
+         \x20   return word\n\
          def command_groups(command):\n\
          \x20   groups=[]\n\
+         \x20   heredoc_end=None\n\
          \x20   for line in command.split(chr(10)):\n\
+         \x20       if heredoc_end is not None:\n\
+         \x20           if line==heredoc_end:\n\
+         \x20               heredoc_end=None\n\
+         \x20           continue\n\
+         \x20       d=heredoc_delim(line)\n\
+         \x20       if d:\n\
+         \x20           heredoc_end=d\n\
          \x20       try:\n\
          \x20           _lex=shlex.shlex(line,posix=True,punctuation_chars=';&|')\n\
          \x20           _lex.whitespace_split=True\n\
@@ -367,9 +402,14 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     // whether a group came from before or after a delimiter, and whether it
     // spans one line or several -- `vars` carries across both.
     "vars={}\n",
+    "for k in ('BOSS_BIN','CUBE_BIN','BOSS_BIN_DIR','BOSS_WORKER_BIN_DIR'):\n",
+    "    v=os.environ.get(k)\n",
+    "    if v:\n",
+    "        vars[k]=v\n",
     "def expand(t):\n",
-    "    for k,v in vars.items():\n",
-    "        t=t.replace('$'+'{'+k+'}',v).replace('$'+k,v)\n",
+    "    keys=sorted(vars, key=len, reverse=True)\n",
+    "    for k in keys:\n",
+    "        t=t.replace('$'+'{'+k+'}',vars[k]).replace('$'+k,vars[k])\n",
     "    return t\n",
     "groups=[]\n",
     "for g in command_groups(cmd):\n",
@@ -457,6 +497,90 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "screen-recording permission. Read the PNG back and state in the PR what you verified. ",
     "Building and testing are unaffected (bazel build, bazel test).')\n",
     "    _block(msg)\n",
+    // Fail closed on a PATH lookup of `boss`/`cube`, and on any invocation
+    // that resolves to a repobin multiplexer. Naming `"$BOSS_BIN"` is the
+    // worker-facing contract; a Codex shell snapshot demotes the launcher
+    // dir, so a bare name is not a trustworthy resolution even when this
+    // hook's own PATH still has the launcher first.
+    "WATCH={'boss','cube'}\n",
+    "REPOBIN='repobin'\n",
+    "DOL=chr(36)\n",
+    "def which(name):\n",
+    "    if os.sep in name:\n",
+    "        return name if os.path.isfile(name) else None\n",
+    "    for d in os.environ.get('PATH','').split(':'):\n",
+    "        if not d: continue\n",
+    "        p=os.path.join(d,name)\n",
+    "        if os.path.isfile(p) and os.access(p,os.X_OK):\n",
+    "            return p\n",
+    "    return None\n",
+    "def is_shim(p):\n",
+    "    if not p: return False\n",
+    "    if os.path.basename(p)==REPOBIN: return True\n",
+    "    try:\n",
+    "        return os.path.basename(os.path.realpath(p))==REPOBIN\n",
+    "    except Exception:\n",
+    "        return False\n",
+    "shim=None\n",
+    "bare=None\n",
+    "named_unset=None\n",
+    // Peel a `sh -c` / `bash -lc` / `zsh -lc` shell envelope before the WATCH
+    // check below: the Codex driver wraps every tool call as `/bin/zsh -lc
+    // '<payload>'`, so without this the guard's own program token is the
+    // shell binary, never the bare `cube`/`boss` it exists to catch.
+    "def peel_shell_c(rest):\n",
+    "    if not rest: return rest\n",
+    "    base=os.path.basename(rest[0])\n",
+    "    if base not in ('sh','bash','zsh'): return rest\n",
+    "    j=1\n",
+    "    payload=None\n",
+    "    while j<len(rest):\n",
+    "        t=rest[j]\n",
+    "        if t.startswith('-') and 'c' in t[1:]:\n",
+    "            if j+1<len(rest):\n",
+    "                payload=rest[j+1]\n",
+    "            break\n",
+    "        j+=1\n",
+    "    if payload is None: return rest\n",
+    "    try:\n",
+    "        toks=shlex.split(payload,posix=True)\n",
+    "    except Exception:\n",
+    "        toks=payload.split()\n",
+    "    return strip_prefixes(toks) if toks else rest\n",
+    "for g in groups:\n",
+    "    rest=peel_shell_c(strip_prefixes(g))\n",
+    "    if not rest: continue\n",
+    "    orig=rest[0]\n",
+    "    if orig in (DOL+'BOSS_BIN', DOL+'{BOSS_BIN}', DOL+'CUBE_BIN', DOL+'{CUBE_BIN}'):\n",
+    "        key=orig.strip(DOL+'{}')\n",
+    "        target=vars.get(key) or os.environ.get(key) or ''\n",
+    "        if not target:\n",
+    "            named_unset=key\n",
+    "            break\n",
+    "        if is_shim(target):\n",
+    "            shim=target\n",
+    "            break\n",
+    "        continue\n",
+    "    base=os.path.basename(orig)\n",
+    "    if orig in WATCH:\n",
+    "        resolved=which(orig)\n",
+    "        if resolved and is_shim(resolved):\n",
+    "            shim=resolved\n",
+    "        else:\n",
+    "            bare=orig\n",
+    "        break\n",
+    "    if base in WATCH:\n",
+    "        candidate=orig if os.path.isfile(orig) else (which(orig) or orig)\n",
+    "        if is_shim(candidate):\n",
+    "            shim=candidate\n",
+    "            break\n",
+    "if named_unset:\n",
+    "    _block('Blocked: '+named_unset+' is unset in this worker session, so the named-binary invocation cannot run. Report this as a finding: the engine should have exported '+named_unset+' to the launcher under BOSS_WORKER_BIN_DIR.')\n",
+    "if shim or bare:\n",
+    "    name=bare or os.path.basename(shim or '')\n",
+    "    where=('repobin shim at '+shim) if shim else ('bare PATH lookup of '+name)\n",
+    "    q=chr(34)\n",
+    "    _block('Blocked: this command would run '+name+' via '+where+'. That is a build-from-source multiplexer (repobin) or an untrusted PATH lookup: a driver shell snapshot can demote the launcher directory and silently bazel-build the CLI from a checkout for ~30s. Workers must name the engine-owned binary, not a PATH entry: '+q+DOL+'BOSS_BIN'+q+' / '+q+DOL+'CUBE_BIN'+q+'. Re-issue quoting the env var, e.g. '+q+DOL+'BOSS_BIN'+q+' pr status --json. Do not work around this gate and do not suppress bazel output.')\n",
     "_approve()\n",
 );
 
@@ -502,7 +626,9 @@ pub const PR_REDIRECT_GUARD_COMMAND: &str = python_command_guard!(
     "        matched='git push'\n",
     "        break\n",
     "if matched:\n",
-    "    msg='Workers must not push branches or open PRs with bare VCS commands (blocked: '+matched+'). Use cube instead: cube pr create --branch <branch> (new PR: pushes the branch and opens the PR in one step, jj-aware, no GIT_DIR) or cube pr update --branch <branch> (existing PR: pushes new commits to it). Never use jj git push, git push, or gh pr create directly.'\n",
+    "    q=chr(34)\n",
+    "    cub=q+chr(36)+'CUBE_BIN'+q\n",
+    "    msg='Workers must not push branches or open PRs with bare VCS commands (blocked: '+matched+'). Use cube instead: '+cub+' pr create --branch <branch> (new PR: pushes the branch and opens the PR in one step, jj-aware, no GIT_DIR) or '+cub+' pr update --branch <branch> (existing PR: pushes new commits to it). Never use jj git push, git push, or gh pr create directly.'\n",
     "    _block(msg)\n",
     "_approve()\n",
 );
@@ -542,16 +668,20 @@ pub const REVISION_PR_GUARD_COMMAND: &str = python_command_guard!(
     "    while i<len(g) and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=',g[i]):\n",
     "        i+=1\n",
     "    rest=g[i:]\n",
+    "    prog=os.path.basename(rest[0]) if rest else ''\n",
+    "    dol=chr(36)\n",
+    "    is_cube=prog=='cube' or (rest and rest[0] in (dol+'CUBE_BIN', dol+'{CUBE_BIN}'))\n",
     "    if len(rest)>=3 and rest[0]=='gh' and rest[1]=='pr' and rest[2]=='create':\n",
     "        matched='gh pr create'\n",
     "        br=branch_of(rest)\n",
     "        break\n",
-    "    if len(rest)>=3 and rest[0]=='cube' and rest[1]=='pr' and rest[2] in ('create','ensure'):\n",
+    "    if len(rest)>=3 and is_cube and rest[1]=='pr' and rest[2] in ('create','ensure'):\n",
     "        matched='cube pr '+rest[2]\n",
     "        br=branch_of(rest)\n",
     "        break\n",
     "if matched:\n",
-    "    sug='cube pr update --branch '+br if br else 'cube pr update --branch <your-pr-bookmark>'\n",
+    "    cub=chr(34)+chr(36)+'CUBE_BIN'+chr(34)\n",
+    "    sug=cub+' pr update --branch '+br if br else cub+' pr update --branch <your-pr-bookmark>'\n",
     "    msg='Revision tasks push commits to the existing parent PR; they must not open a new PR (matched command: '+matched+'). Push your commits to the existing PR with: '+sug\n",
     "    _block(msg)\n",
     "_approve()\n",
