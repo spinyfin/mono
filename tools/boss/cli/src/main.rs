@@ -102,6 +102,7 @@ mod data;
 mod decision_commands;
 mod dependency_filter_args;
 mod engine_cmds;
+mod handoff;
 mod output;
 mod project_create_args;
 mod status_args;
@@ -300,6 +301,10 @@ pub(crate) async fn run_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Pr { command } => {
             let ctx = RunContext::from_flags(&cli.global)?;
             pr::run_pr_command(command, &ctx).await
+        }
+        Commands::Handoff { command } => {
+            let ctx = RunContext::from_flags(&cli.global)?;
+            handoff::run_handoff_command(command, &ctx).await
         }
         Commands::Engine { command } => {
             let ctx = RunContext::from_flags(&cli.global)?;

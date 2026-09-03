@@ -40,6 +40,17 @@ struct TagCase {
 // the wire test needs — a real id string, a real enum discriminant — never a
 // full realistic row.
 
+fn coordinator_handoff() -> CoordinatorHandoffView {
+    CoordinatorHandoffView::builder()
+        .age_secs(240)
+        .body("- greyarea is shut down")
+        .writer_spawn_token("token-a")
+        .written_at(1747000000)
+        .written_at_iso8601("2025-05-11T22:26:40Z")
+        .written_by_current_session(true)
+        .build()
+}
+
 fn product() -> Product {
     Product::builder()
         .id("prod_1")
@@ -1442,6 +1453,20 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "pr_body_result",
         },
         TagCase {
+            label: "CoordinatorHandoffResult",
+            event: FrontendEvent::CoordinatorHandoffResult {
+                handoff: Some(coordinator_handoff()),
+            },
+            expected_tag: "coordinator_handoff_result",
+        },
+        TagCase {
+            label: "CoordinatorHandoffSet",
+            event: FrontendEvent::CoordinatorHandoffSet {
+                handoff: coordinator_handoff(),
+            },
+            expected_tag: "coordinator_handoff_set",
+        },
+        TagCase {
             label: "WorkerTierDenied",
             event: FrontendEvent::WorkerTierDenied {
                 denial: WorkerTierDenial::redirect(
@@ -2045,6 +2070,8 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::WorkerContextResult { .. }
         | FrontendEvent::PrStatusResult { .. }
         | FrontendEvent::PrBodyResult { .. }
+        | FrontendEvent::CoordinatorHandoffResult { .. }
+        | FrontendEvent::CoordinatorHandoffSet { .. }
         | FrontendEvent::WorkerTierDenied { .. }
         | FrontendEvent::UnpopulateProjectResult { .. }
         | FrontendEvent::FeatureFlagsList { .. }

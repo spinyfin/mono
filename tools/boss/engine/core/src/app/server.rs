@@ -581,14 +581,14 @@ pub async fn serve_with_merge_probe(
                     .clone();
                 let restart = match working_directory {
                     Some(working_directory) => Some(
-                        crate::coordinator_tmux::restart_if_dead(
-                            coordinator_supervisor_state.work_db.as_ref(),
-                            &active_tmux,
-                            &tmux,
-                            &coordinator_supervisor_state.coordinator_model,
-                            &working_directory,
-                            &crate::coordinator_tmux::RealClaudeVersionProbe,
-                        )
+                        crate::coordinator_tmux::restart_if_dead(&crate::coordinator_tmux::CoordinatorSpawn {
+                            work_db: coordinator_supervisor_state.work_db.as_ref(),
+                            tmux: &active_tmux,
+                            create_tmux: &tmux,
+                            model: &coordinator_supervisor_state.coordinator_model,
+                            working_directory: &working_directory,
+                            version_probe: &crate::coordinator_tmux::RealClaudeVersionProbe,
+                        })
                         .await,
                     ),
                     None => None,

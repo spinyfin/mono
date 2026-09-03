@@ -219,14 +219,14 @@ async fn attach_coordinator_to_registered_app(server_state: Arc<ServerState>) {
         let active_tmux = crate::coordinator_tmux::resolve_active_handle(&tmux, legacy_tmux.as_ref())
             .await
             .clone();
-        let record = match crate::coordinator_tmux::ensure_for_attach(
-            server_state.work_db.as_ref(),
-            &active_tmux,
-            &tmux,
-            &server_state.coordinator_model,
-            &working_directory,
-            &crate::coordinator_tmux::RealClaudeVersionProbe,
-        )
+        let record = match crate::coordinator_tmux::ensure_for_attach(&crate::coordinator_tmux::CoordinatorSpawn {
+            work_db: server_state.work_db.as_ref(),
+            tmux: &active_tmux,
+            create_tmux: &tmux,
+            model: &server_state.coordinator_model,
+            working_directory: &working_directory,
+            version_probe: &crate::coordinator_tmux::RealClaudeVersionProbe,
+        })
         .await
         {
             Ok(state) => state,
@@ -434,6 +434,7 @@ mod update_available_tests {
             spawn_state: "created".to_owned(),
             model: "opus".to_owned(),
             launched_claude_version: Some(version.to_owned()),
+            spawned_at: None,
         }
     }
 
@@ -617,14 +618,16 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
         let _guard = server_state.coordinator_tmux_lock.lock().await;
         let active_tmux = crate::coordinator_tmux::resolve_active_handle(&tmux, legacy_tmux.as_ref()).await;
         crate::coordinator_tmux::recreate_after_confirmation(
-            server_state.work_db.as_ref(),
-            active_tmux,
-            &tmux,
-            &server_state.coordinator_model,
+            &crate::coordinator_tmux::CoordinatorSpawn {
+                work_db: server_state.work_db.as_ref(),
+                tmux: active_tmux,
+                create_tmux: &tmux,
+                model: &server_state.coordinator_model,
+                working_directory: &working_directory,
+                version_probe: &crate::coordinator_tmux::RealClaudeVersionProbe,
+            },
             &expected_spawn_token,
-            &working_directory,
             reason,
-            &crate::coordinator_tmux::RealClaudeVersionProbe,
         )
         .await
     };

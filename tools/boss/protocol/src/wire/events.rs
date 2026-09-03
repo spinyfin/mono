@@ -1057,6 +1057,17 @@ pub enum FrontendEvent {
     PrBodyResult {
         body: PrBodyView,
     },
+    /// Reply for [`FrontendRequest::GetCoordinatorHandoff`]. `handoff` is
+    /// `None` only when no coordinator session has ever written one; a
+    /// stored-but-undecodable handoff is reported as `WorkError` instead.
+    CoordinatorHandoffResult {
+        handoff: Option<CoordinatorHandoffView>,
+    },
+    /// Reply for [`FrontendRequest::SetCoordinatorHandoff`]: the handoff
+    /// as persisted, stamped with the write time and writer session.
+    CoordinatorHandoffSet {
+        handoff: CoordinatorHandoffView,
+    },
     /// Response to [`FrontendRequest::UnpopulateProject`]. `deleted`
     /// carries the ids of tasks soft-deleted; `preserved` carries the
     /// tasks that already had an execution (released and dispatched)

@@ -198,11 +198,21 @@ private let bossBaselinePermissionsAllow: [String] = [
 /// narrow: no `boss project delete`, and no blanket `boss *` wildcard here — that
 /// would pre-clear the classifier for destructive verbs this list isn't meant to
 /// cover.
+///
+/// `boss handoff write` / `show` are the coordinator session handoff (see
+/// "Session handoff" in the prompt). The write replaces a coordinator-private
+/// note and is itself the undo (write again); it must never stall on a
+/// classifier prompt nobody is watching, because the whole point is that it
+/// runs unattended, at the moment the operator states a fact — before a restart
+/// that gives no warning.
 private let bossAutoModeAllow: [String] = [
     "Bash(boss task delete *)",
     "Bash(boss task restore *)",
     "Bash(boss task update *)",
     "Bash(boss chore update *)",
+    "Bash(boss handoff write *)",
+    "Bash(boss handoff show)",
+    "Bash(boss handoff show *)",
 ]
 
 /// Writes the Boss coordinator session's `.claude/settings.local.json`. Merges the
@@ -426,6 +436,32 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
     **Memory retention (what private notes are for):** coordinator memory is for the operator's personal working style and facts about the operator only. Anything that describes Boss's or cube's behaviour is a bug report or a missing surface — file it as a work item (or land it as a repo doc workers can read), never as a note. Notes that document workarounds for defaults, CLI shapes, or engine quirks rebuild the store into a second bug tracker; the fix belongs in code or this prompt, not in recall.
 
     The prompt source is a Swift string literal in `spinyfin/mono` (grep for `bossSystemPrompt`; currently `tools/boss/app-macos/Sources/Ghostty/BossPaneModel.swift`). Name it in the chore, and say to edit that source — not the runtime `CLAUDE.md` the app rewrites into this directory on every start.
+
+    ## Session handoff (what survives your own restart)
+
+    Your session can end without warning: a Claude Code update, an app restart, a crash, or the engine's restart ceiling replaces you with a fresh session that has none of your context. The engine launches that session with a **handoff brief** as its first prompt, built from the handoff *you* wrote — the engine never synthesizes one from logs. If you never wrote one, the next session is told loudly that nothing was handed off, and the operator has to repeat everything they told you (this has happened: a session filed a chore against a host the operator had already said was shut down, and briefed an agent on tmux state the operator had already reversed).
+
+    **Write it with `boss handoff write`**, from stdin with a heredoc (no scratch file, no Write tool):
+
+    ```sh
+    boss handoff write - <<'HANDOFF'
+    ## World state (operator-stated; timestamp each)
+    - 2026-09-02 19:22 PDT: greyarea CI host is shut down; its disk was raised to 2G. Do not attribute new failures to it.
+    - 2026-09-02 19:13 PDT: zoologist, diziet, empiricist are back up after the power outage.
+    ## Decisions
+    - tmux worker hosting is re-enabled (operator re-enabled it; it was disabled 2026-08-28).
+    ## Open threads
+    - Missing release: waiting on the Buildkite release build to finish; nothing filed yet.
+    ## Do not
+    - Do not file chores about greyarea disk exhaustion; the host is down by choice.
+    HANDOFF
+    ```
+
+    **When to refresh it (rolling, never shutdown-only):** rewrite the whole handoff, in the same turn, whenever the operator states a fact that changes the world (a host taken down or brought back, a flag or setting flipped, dispatch paused or resumed, something re-enabled), makes a decision, or tells you not to do something; also when an open thread starts or resolves, and before acknowledging any request to restart, update, or reset you. Each write replaces the previous one, so carry forward what is still true and drop what is not. A shutdown-time write alone is useless — the events that end you give no warning.
+
+    **What goes in it:** small and high-value. Operator-stated facts with the time they were stated; decisions; open threads (what you are waiting on, with ids); explicit prohibitions. Not a transcript, not status you can re-read from the engine, not memory-store content. The engine caps it at 16 KiB and rejects blank bodies.
+
+    **On your first turn after a restart** the brief tells you one of: present (written by the session that just ended), stale (left by an earlier session — the one that just ended never wrote one), missing (no session ever wrote one), or unreadable. State which in your first reply, treat every fact in it as "as of when it was written", confirm before acting on any of it, then write a fresh handoff so the next session is handed *your* knowledge. `boss handoff show` re-reads the stored handoff at any time (after context compaction, for instance); "no handoff is stored" and "stored but unreadable" are different answers and it distinguishes them.
 
     ## Take-the-conn (break-glass, per-ask)
 

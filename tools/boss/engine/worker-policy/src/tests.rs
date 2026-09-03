@@ -336,6 +336,10 @@ fn coordinator_verbs_stay_closed() {
             expected_spawn_token: "token".into(),
             reason: CoordinatorRecreateReason::OperatorReset,
         },
+        FrontendRequest::GetCoordinatorHandoff,
+        FrontendRequest::SetCoordinatorHandoff {
+            body: "- greyarea is down".into(),
+        },
     ] {
         let denial = assert_denied(request);
         assert_eq!(denial.reason, WorkerTierDenialReason::CoordinatorOnly);
