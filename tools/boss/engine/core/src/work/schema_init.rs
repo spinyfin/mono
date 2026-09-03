@@ -236,7 +236,8 @@ impl WorkDb {
                 tmux_session_name TEXT,
                 tmux_spawn_token TEXT,
                 tmux_spawn_state TEXT,
-                tmux_pane_pid INTEGER
+                tmux_pane_pid INTEGER,
+                tmux_hosted INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS work_runs_execution_idx
@@ -405,6 +406,7 @@ impl WorkDb {
         // a run executed on.
         crate::host_registry::migrate_work_runs_host_columns(conn)?;
         crate::host_registry::migrate_work_runs_shell_pid(conn)?;
+        migrate_work_runs_tmux_hosted(conn)?;
         // Dispatch-time host health circuit breaker (starves-on-broken-host
         // fix): consecutive-failure counter used by
         // `record_host_dispatch_failure` / `_success` to auto-disable a

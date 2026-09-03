@@ -1465,7 +1465,9 @@ impl ExecutionCoordinator {
             }
         };
 
-        match self.work_db.start_execution_run_on_host(
+        let attributed_pool = self.attributed_pool_label(execution);
+        let tmux_hosted = selected_host.id == "local" && adapter.tmux_hosting_enabled_for(attributed_pool);
+        match self.work_db.start_execution_run_on_host_with_tmux_hosting(
             &execution.id,
             worker_id,
             &repo.repo_id,
@@ -1473,6 +1475,7 @@ impl ExecutionCoordinator {
             &lease.workspace_id,
             &lease.workspace_path.display().to_string(),
             &selected_host.id,
+            tmux_hosted,
         ) {
             Ok((execution, run)) => {
                 // Dispatch succeeded: the request-scoped `--host` constraint

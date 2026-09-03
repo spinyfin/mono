@@ -533,6 +533,19 @@ pub(crate) fn migrate_work_runs_tmux_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Durable hosting-mode snapshot for the run, written before any tmux spawn
+/// attempt. Existing rows predate the snapshot and retain the legacy
+/// app-hosted reconciliation path.
+pub(crate) fn migrate_work_runs_tmux_hosted(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "work_runs", "tmux_hosted")? {
+        conn.execute(
+            "ALTER TABLE work_runs ADD COLUMN tmux_hosted INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// Raw per-run agent usage captured incrementally from transcript records.
 ///
 /// Cache-write tokens keep both the provider's total and its 5-minute /
