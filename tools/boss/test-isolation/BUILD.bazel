@@ -22,6 +22,10 @@ rust_library(
     deps = [
         "//tools/boss/log-files",
     ] + all_crate_deps(normal = True),
+    # The macro-injected dependency has no Rust symbol references. Make the
+    # Rust toolchain retain it (and order its transitive Rust dependencies)
+    # so the `#[ctor]` is linked into every consuming test binary.
+    alwayslink = True,
 )
 
 # Deliberately a plain `rust_test`, not `boss_rust_test`: this target

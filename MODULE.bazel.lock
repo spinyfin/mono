@@ -981,7 +981,7 @@
           "REPO_MAPPING:rules_rust+,rules_cc rules_cc+",
           "REPO_MAPPING:rules_rust+,rules_rust rules_rust+",
           "FILE:@@//Cargo.lock 848bd4cfa919febf6f76168077cca6995fffaa4b477b539d1974dbc9982a2df5",
-          "FILE:@@//Cargo.toml 277cfacb1e94f890f53d876ec36e71138004ea606b50de1c00763d7be7555fc7",
+          "FILE:@@//Cargo.toml 023f8e502ffa0caaa1e04bc22cc76580ecee9e2d9b09df868fb0d07b1e41bd5e",
           "FILE:@@//lib/rust/broker-robinhood/Cargo.toml 283446ff4724eb01b6f89291264a15a3904596fb9df32f157c50f8f691c3ed23",
           "FILE:@@//lib/rust/git_utils/Cargo.toml be3e4d5fc347d5d3652d576bd80903dc4067b500bbb6ba3a4dda143317b6a63f",
           "FILE:@@//tools/boss/bossctl/Cargo.toml fa47b996710d9201cf7630ec892bcf10df5692205ec3738b9f47d863f5cd9320",

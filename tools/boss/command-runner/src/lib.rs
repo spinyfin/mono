@@ -207,6 +207,29 @@ mod tests {
     use std::ffi::OsString;
     use std::path::Path;
 
+    /// A runner that implements no methods beyond the trait's defaults, to
+    /// pin `CommandRunner::is_real`'s default value independently of any
+    /// fake used elsewhere in the codebase.
+    struct DefaultOnlyRunner;
+
+    #[async_trait]
+    impl CommandRunner for DefaultOnlyRunner {
+        async fn run(
+            &self,
+            _program: &Path,
+            _args: &[OsString],
+            _cwd: Option<&Path>,
+        ) -> std::io::Result<CommandOutput> {
+            unimplemented!("not exercised by this test")
+        }
+    }
+
+    #[test]
+    fn is_real_defaults_to_false_and_is_true_only_for_the_real_runner() {
+        assert!(!DefaultOnlyRunner.is_real());
+        assert!(RealCommandRunner.is_real());
+    }
+
     #[tokio::test]
     async fn run_with_stdin_captures_stdout_and_stderr() {
         let runner = RealCommandRunner;

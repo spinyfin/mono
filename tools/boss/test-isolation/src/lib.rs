@@ -21,6 +21,14 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Linker anchor used by `boss_rust_test` to retain this crate's constructor.
+///
+/// The test macro passes the platform's undefined-symbol flag for this exact
+/// name, making the linker pull this crate through the ordinary Rust
+/// dependency graph before `main` runs.
+#[unsafe(no_mangle)]
+pub extern "C" fn boss_test_isolation_force_link() {}
+
 /// Runs before any other code in a binary that links this crate — including
 /// `main`, and including every `#[test]` function, since libtest's harness
 /// itself only starts running after the process's constructors have. Aborts

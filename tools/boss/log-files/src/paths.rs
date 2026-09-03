@@ -143,7 +143,28 @@ pub fn install_test_state_root(root: PathBuf) {
 /// production binary (`engine`, `bossctl`, the `boss` CLI), none of which
 /// link that crate.
 pub fn is_test_process() -> bool {
-    TEST_STATE_ROOT.get().is_some()
+    TEST_STATE_ROOT.get().is_some() || running_from_bazel_output()
+}
+
+fn running_from_bazel_output() -> bool {
+    std::env::current_exe()
+        .ok()
+        .is_some_and(|path| path.components().any(|component| component.as_os_str() == "bazel-out"))
+}
+
+fn install_bazel_test_root_if_needed() {
+    if TEST_STATE_ROOT.get().is_some() || !running_from_bazel_output() {
+        return;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let root = std::env::temp_dir().join(format!("boss-test-isolation-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap_or_else(|error| {
+        panic!("boss-log-files: refusing to run Bazel test without an isolated state root: {error}")
+    });
+    install_test_state_root(root);
 }
 
 /// The default Boss state root. In a production process this is
@@ -159,6 +180,7 @@ pub fn is_test_process() -> bool {
 /// `tools/boss/**` build-time check should have caught) — refusing loudly
 /// here is the last line of defense against writing into production state.
 pub fn default_state_root() -> Option<PathBuf> {
+    install_bazel_test_root_if_needed();
     resolve_state_root(
         is_test_process(),
         TEST_STATE_ROOT.get().map(PathBuf::as_path),
@@ -265,6 +287,29 @@ pub fn audit_path_override() -> Option<PathBuf> {
     }
 }
 
+/// Refuse `path` when this is a test process (see [`is_test_process`]) and
+/// `path` is production-shaped for `filename` (see [`is_production_shaped`]).
+///
+/// Guards the [`AUDIT_PATH_ENV`] override path specifically: an override is a
+/// deliberate operator choice in production, but a test process can inherit
+/// one from its environment (an exported shell var, or a value carried over
+/// from a production engine's environment) pointing straight at production's
+/// `engine-audit.log` — the exact file the incident this guard exists for
+/// corrupted. Unlike [`resolve_state_root`], the override is honoured for any
+/// path that is *not* production-shaped, since a test's own private override
+/// path is exactly the escape hatch tests are expected to use.
+fn refuse_if_test_process_inherited_production_override(path: &Path, filename: &str) {
+    if is_test_process() && is_production_shaped(path, filename) {
+        panic!(
+            "boss-log-files: refusing to write Boss's production audit log ({}) from a test process — \
+             {AUDIT_PATH_ENV} was inherited pointing at a production-shaped path. This binary must run \
+             under `bazel test` with its own isolated override, not inherit one from the ambient \
+             environment.",
+            path.display()
+        );
+    }
+}
+
 /// Resolve a [`LogSource`] to its primary live on-disk path under `state_root`.
 ///
 /// - Trace: `<state_root>/engine-trace.jsonl`
@@ -276,7 +321,13 @@ pub fn audit_path_override() -> Option<PathBuf> {
 /// that participates in the logical stream (rotated + day-dated).
 pub fn resolve_log_source_path(source: LogSource, state_root: &Path) -> PathBuf {
     match source {
-        LogSource::Audit => audit_path_override().unwrap_or_else(|| state_root.join(ENGINE_AUDIT_FILENAME)),
+        LogSource::Audit => match audit_path_override() {
+            Some(path) => {
+                refuse_if_test_process_inherited_production_override(&path, ENGINE_AUDIT_FILENAME);
+                path
+            }
+            None => state_root.join(ENGINE_AUDIT_FILENAME),
+        },
         LogSource::EngineTrace => state_root.join(ENGINE_TRACE_FILENAME),
         LogSource::Dispatch => state_root.join(DISPATCH_EVENTS_DIR).join(DISPATCH_EVENTS_LIVE_FILENAME),
         LogSource::Spawn | LogSource::PopulationTiming => state_root.join(DIAGNOSTICS_DIR),
@@ -374,6 +425,7 @@ fn day_file_date_key(path: &Path) -> Option<&str> {
 /// the override nor `HOME` is available.
 pub fn default_audit_log_path() -> Option<PathBuf> {
     if let Some(path) = audit_path_override() {
+        refuse_if_test_process_inherited_production_override(&path, ENGINE_AUDIT_FILENAME);
         return Some(path);
     }
     Some(default_state_root()?.join(ENGINE_AUDIT_FILENAME))
@@ -382,13 +434,32 @@ pub fn default_audit_log_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, Once};
 
     /// Serializes tests that mutate the process-global `AUDIT_PATH_ENV`.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn lock_env() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Installs one deterministic isolated test root before any test in this
+    /// binary observes the process-global `TEST_STATE_ROOT`, so
+    /// `engine_runtime_files_resolve_under_state_root` and
+    /// `install_test_state_root_is_idempotent` — which run concurrently under
+    /// libtest and both touch that same global — cannot race for who wins as
+    /// first writer. Every caller gets back the one root that actually won,
+    /// regardless of call order.
+    static INIT_TEST_ROOT: Once = Once::new();
+
+    fn ensure_test_root_installed() -> PathBuf {
+        INIT_TEST_ROOT.call_once(|| {
+            install_test_state_root(PathBuf::from("/tmp/boss-log-files-test-state-root"));
+        });
+        TEST_STATE_ROOT
+            .get()
+            .cloned()
+            .expect("installed by the call_once above")
     }
 
     #[test]
@@ -411,12 +482,17 @@ mod tests {
 
     #[test]
     fn engine_runtime_files_resolve_under_state_root() {
-        // Under `bazel test` this crate's own tests link `boss-test-isolation`
-        // (via `boss_rust_test`), so `default_state_root` returns the
-        // installed isolated root, not a `$HOME`-derived path — either way,
-        // it must be internally consistent with the other `default_*_path`
-        // functions, which is all this test asserts.
-        let root = default_state_root().expect("a test or production process always resolves a root");
+        // This crate's own test target deliberately does not link
+        // `boss-test-isolation` (see log-files/BUILD.bazel), so
+        // `default_state_root` here resolves from `$HOME` unless a sibling
+        // test has installed a root. `ensure_test_root_installed` pins that
+        // down deterministically so this test doesn't race
+        // `install_test_state_root_is_idempotent` for which one installs
+        // first — either way, the result must stay internally consistent
+        // with the other `default_*_path` functions, which is all this
+        // asserts.
+        let root = ensure_test_root_installed();
+        assert_eq!(default_state_root(), Some(root.clone()));
         assert_eq!(default_frontend_socket_path(), Some(root.join("engine.sock")));
         assert_eq!(default_engine_pid_path(), Some(root.join("engine.pid")));
         assert_eq!(default_engine_text_log_path(), Some(root.join("engine.log")));
@@ -467,6 +543,55 @@ mod tests {
         unsafe {
             std::env::remove_var(AUDIT_PATH_ENV);
         }
+    }
+
+    #[test]
+    fn audit_override_pointing_at_production_shape_is_refused_in_test_process() {
+        let _guard = lock_env();
+        ensure_test_root_installed();
+        unsafe {
+            std::env::set_var(
+                AUDIT_PATH_ENV,
+                "/Users/tester/Library/Application Support/Boss/engine-audit.log",
+            );
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(default_audit_log_path));
+        unsafe {
+            std::env::remove_var(AUDIT_PATH_ENV);
+        }
+        let err = result.expect_err("expected a panic refusing the production-shaped override");
+        let message = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            message.contains("refusing to write Boss's production audit log"),
+            "unexpected panic message: {message}"
+        );
+    }
+
+    #[test]
+    fn audit_override_pointing_at_production_shape_is_refused_via_resolve_log_source_path() {
+        let _guard = lock_env();
+        ensure_test_root_installed();
+        unsafe {
+            std::env::set_var(
+                AUDIT_PATH_ENV,
+                "/Users/tester/Library/Application Support/Boss/engine-audit.log",
+            );
+        }
+        let root = Path::new("/tmp/boss-state");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            resolve_log_source_path(LogSource::Audit, root)
+        }));
+        unsafe {
+            std::env::remove_var(AUDIT_PATH_ENV);
+        }
+        assert!(
+            result.is_err(),
+            "expected a panic refusing the production-shaped override"
+        );
     }
 
     #[test]
@@ -539,11 +664,10 @@ mod tests {
     // -- resolve_state_root: the test-isolation refusal gate ---------------
     //
     // Exercised directly against the pure function rather than through
-    // `default_state_root()` / `is_test_process()`: this crate's own test
-    // binary links `boss-test-isolation`, so the real process-global
-    // `TEST_STATE_ROOT` is always populated by the time any test body runs —
-    // the "test process with no installed root" branch is otherwise
-    // unreachable from an ordinary test. See that function's doc comment.
+    // `default_state_root()` / `is_test_process()`: those read a
+    // process-global `OnceLock` that sibling tests in this binary install
+    // into, so driving the pure function is the only way to pin each branch
+    // — including "test process with no installed root" — deterministically.
 
     #[test]
     fn production_process_resolves_under_home() {
@@ -588,16 +712,20 @@ mod tests {
         // wins semantics is exactly what `boss-test-isolation`'s own
         // end-to-end test (`tools/boss/test-isolation/src/lib.rs`) then
         // relies on when it calls the real thing through the real ctor.
-        let first = PathBuf::from("/tmp/boss-test-isolation-first");
-        install_test_state_root(first.clone());
+        //
+        // `ensure_test_root_installed` may already have raced this test to
+        // be the first writer (libtest runs tests concurrently by default),
+        // so this asserts first-writer-wins against whatever already won,
+        // rather than assuming this test itself is the first writer.
+        let already_installed = ensure_test_root_installed();
         assert!(is_test_process());
-        assert_eq!(TEST_STATE_ROOT.get(), Some(&first));
+        assert_eq!(TEST_STATE_ROOT.get(), Some(&already_installed));
 
-        install_test_state_root(PathBuf::from("/tmp/boss-test-isolation-second"));
+        install_test_state_root(PathBuf::from("/tmp/boss-test-isolation-late-writer"));
         assert_eq!(
             TEST_STATE_ROOT.get(),
-            Some(&first),
-            "the first installed root always wins"
+            Some(&already_installed),
+            "an already-installed root always wins over a later install_test_state_root call"
         );
     }
 

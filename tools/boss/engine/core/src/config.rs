@@ -599,8 +599,10 @@ mod tests {
         DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER, DEFAULT_MAX_EMBED_DIFF_LINES, DEFAULT_MAX_REVIEW_CYCLES,
         DEFAULT_MERGE_ORDER_STAGGER_SECS, DEFAULT_MIN_REVIEW_CHANGED_LINES, DEFAULT_REVIEW_POOL_SIZE,
         MAX_AUTOMATION_POOL_SIZE, MAX_MERGE_ORDER_STAGGER_SECS, MAX_WORKER_POOL_SIZE, WorkConfig,
+        tmux_socket_path_beside_db,
     };
     use std::ffi::OsString;
+    use std::path::Path;
 
     #[test]
     fn prefers_bazel_workspace_directory_when_present() {
@@ -955,5 +957,20 @@ mod tests {
                 "blank env value {blank:?} must fall back to the default"
             );
         }
+    }
+
+    #[test]
+    fn tmux_socket_path_beside_db_errors_for_a_parentless_db_path() {
+        let error = tmux_socket_path_beside_db(Path::new(":memory:")).unwrap_err();
+        assert!(
+            error.to_string().contains("no usable parent directory"),
+            "error was: {error:#}"
+        );
+    }
+
+    #[test]
+    fn tmux_socket_path_beside_db_resolves_next_to_the_db_file() {
+        let socket = tmux_socket_path_beside_db(Path::new("/tmp/x/state.db")).unwrap();
+        assert_eq!(socket, Path::new("/tmp/x/tmux.sock"));
     }
 }
