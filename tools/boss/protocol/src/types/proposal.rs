@@ -460,7 +460,6 @@ pub struct RunDoneProposalPayload {
     pub summary: String,
 }
 
-
 // ---------------------------------------------------------------------------
 // Submission errors and rate caps (the `SubmitProposal` / `ListProposals` RPCs)
 // ---------------------------------------------------------------------------

@@ -378,7 +378,7 @@ async fn stop_satisfied_clean_does_not_terminalize_a_mid_turn_worker() {
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1346";
         let head = "cccccccccccccccccccccccccccccccccccccccc";
-        let (_dir, db, _product_id, _revision_id, execution_id) =
+        let (_dir, db, _product_id, revision_id, execution_id) =
             revision_fixture(workspace.path(), parent_pr_url, head);
 
         let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
@@ -398,24 +398,55 @@ async fn stop_satisfied_clean_does_not_terminalize_a_mid_turn_worker() {
         verifier.set_head_oid(Ok(head.to_owned())).await;
         verifier.set_fresh_head_oid(Ok(fresh_head.to_owned())).await;
         let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
+        let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            workspace.path().join("feature-flags.toml"),
+        ));
+        flags.load().unwrap();
+        flags.set("worker_proposals", true).unwrap();
+        flags.set("run_done_proposals_seam", true).unwrap();
         let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
         let handler = handler
             .with_branch_verifier(verifier)
             .with_live_worker_states(live_states)
-            .with_merge_probe(probe);
+            .with_merge_probe(probe)
+            .with_feature_flags(flags);
 
         let execution_before = db.get_execution(&execution_id).unwrap();
         assert_eq!(execution_before.pr_head_before.as_deref(), Some(head));
-        assert_eq!(
+        assert!(matches!(
             handler
-                .try_finalize_satisfied_deliverable_on_stop(
+                .evaluate_satisfied_deliverable_on_stop(
                     &execution_id,
                     &execution_before,
                     parent_pr_url,
                     ContributionEvidence::Indeterminate,
                 )
                 .await,
-            Some(StopOutcome::AwaitingInput),
+            SatisfiedDeliverableOutcome::AwaitingDeclaration,
+        ));
+
+        db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+            execution_id: &execution_id,
+            work_item_id: &revision_id,
+            kind: boss_protocol::ProposalKind::RunDone,
+            payload_json: r#"{"outcome":"delivered","summary":"updated the PR"}"#,
+            idempotency_key: &format!("done-{label}"),
+        })
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            matches!(
+                handler
+                    .evaluate_satisfied_deliverable_on_stop(
+                        &execution_id,
+                        &execution_before,
+                        parent_pr_url,
+                        ContributionEvidence::Indeterminate,
+                    )
+                    .await,
+                SatisfiedDeliverableOutcome::Finalized(StopOutcome::AwaitingInput),
+            ),
             "mid-turn satisfied-deliverable must defer regardless of head ({label})",
         );
         let execution = db.get_execution(&execution_id).unwrap();

@@ -151,7 +151,6 @@ pub(crate) enum ProposeCommand {
     /// the PR with the md5 crate swap"` / `boss propose done --outcome
     /// no-changes-needed --summary "already on main; empty diff"`
     Done(RunDoneArgs),
-
 }
 
 /// Shared `--idempotency-key` override, flattened into every kind's args.
@@ -378,7 +377,6 @@ impl From<RunDoneOutcomeArg> for RunDoneOutcome {
     }
 }
 
-
 /// CLI-local mirror of [`ProposalKind`] so `--kind` gets enumerated
 /// `--help` output and shell completion (clap's `ValueEnum` can't be
 /// implemented directly on the protocol type — neither it nor `ValueEnum`
@@ -530,8 +528,7 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
     use boss_protocol::{
         AttentionProposalPayload, AutomationOutcomeProposalPayload, BlockedProposalPayload,
         DeferredScopeProposalPayload, EffortEscalationProposalPayload, EffortLevel, FollowupTaskProposalPayload,
-        PrCreatedProposalPayload, ReviewReportProposalPayload, ReviewVerdictProposalPayload,
-        RunDoneProposalPayload,
+        PrCreatedProposalPayload, ReviewReportProposalPayload, ReviewVerdictProposalPayload, RunDoneProposalPayload,
     };
 
     Ok(match command {
@@ -642,7 +639,6 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
             .map_err(CliError::internal)?,
             args.common.idempotency_key,
         ),
-
     })
 }
 
