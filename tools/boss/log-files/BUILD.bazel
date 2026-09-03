@@ -18,10 +18,24 @@ rust_library(
         "//tools/boss/engine/dispatch-reader:__pkg__",
         "//tools/boss/engine/driver:__pkg__",
         "//tools/boss/engine/recovery:__pkg__",
+        "//tools/boss/test-isolation:__pkg__",
+        "//tools/boss/tmux:__pkg__",
     ],
     deps = all_crate_deps(normal = True),
 )
 
+# Deliberately a plain `rust_test`, not `boss_rust_test`: this target
+# recompiles `boss_log_files` itself with `--cfg test` (`crate = ":log-files"`).
+# `boss-test-isolation` depends on `boss_log_files` too, so linking it here
+# would pull in a *second*, separately-compiled copy of this very crate with
+# its own independent `TEST_STATE_ROOT`/`is_test_process` statics — the
+# ctor would install the isolated root onto that second copy, invisible to
+# the first copy this target's own tests actually exercise. The
+# `boss/raw-rust-test-forbidden` checkleft check (tools/boss/CHECKS.yaml)
+# excludes this one file for exactly this reason. (`boss-test-isolation`'s
+# own self-test, in tools/boss/test-isolation/BUILD.bazel, has the same
+# exception for the same structural reason, and is what actually verifies
+# the ctor mechanism end-to-end.)
 rust_test(
     name = "log-files_test",
     size = "small",

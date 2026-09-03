@@ -34,6 +34,23 @@ pub trait CommandRunner: Send + Sync {
             "command runner does not support stdin",
         ))
     }
+
+    /// True only for [`RealCommandRunner`] — the runner that actually execs a
+    /// subprocess. `false` by default, so every fake/stub/scripted runner
+    /// used in tests (there is no other kind in this codebase) reports itself
+    /// as harmless without needing to implement this.
+    ///
+    /// Safety guards that must refuse a real subprocess exec from a test
+    /// process (e.g. `boss-tmux`'s legacy-label-server constructor) key off
+    /// this instead of `boss_log_files::is_test_process()` alone: a fake
+    /// runner can never reach a live server no matter what path or label it
+    /// is pointed at, so gating on the runner's own realness — rather than
+    /// refusing unconditionally — closes the actual hazard without breaking
+    /// the many existing tests that exercise real server-selection logic
+    /// through an injected fake.
+    fn is_real(&self) -> bool {
+        false
+    }
 }
 
 /// Locale environment variables, in the precedence order POSIX gives them.
@@ -123,6 +140,10 @@ pub struct RealCommandRunner;
 
 #[async_trait]
 impl CommandRunner for RealCommandRunner {
+    fn is_real(&self) -> bool {
+        true
+    }
+
     async fn run(&self, program: &Path, args: &[OsString], cwd: Option<&Path>) -> std::io::Result<CommandOutput> {
         let mut command = tokio::process::Command::new(program);
         command.args(args);

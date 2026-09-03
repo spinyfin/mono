@@ -61,6 +61,7 @@ members = [
   "tools/boss/engine/stdout-progress",
   "tools/boss/engine/structured-output",
   "tools/boss/engine/test-git",
+  "tools/boss/test-isolation",
   "tools/boss/engine/timer-wheel",
   "tools/boss/engine/transcript-tail",
   "tools/boss/engine/transient-error",
@@ -108,6 +109,7 @@ bon = "3.9.1"
 chrono = { version = "0.4.39", default-features = false, features = ["std"] }
 chrono-tz = "0.10.1"
 clap = "4.5.39"
+ctor = "0.2"
 directories = "5.0"
 flate2 = "1.1.5"
 fs4 = "0.13"
