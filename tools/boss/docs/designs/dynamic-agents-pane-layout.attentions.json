@@ -1,0 +1,24 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Hard cap on panes per page, applied after the window-size formula? The doc proposes 16 (a four-by-four grid) and expects large displays to hit the cap rather than the formula.",
+    "choices": ["16", "12", "no cap (formula only)"],
+    "anchor": "capacity-computation"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Persona name when all 32 roster names are held by live workers (only reachable with remote workers live)? The doc proposes `Ensign N`.",
+    "choices": ["Ensign N", "Crewman N", "grow the roster instead"],
+    "anchor": "persona-allocation"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Reset the project and type filters to All on every app launch (the doc's choice), rather than persisting them across restarts?",
+    "anchor": "filtering-semantics"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Keep a finished-but-unreaped worker's pane visible with an Exited pill until the engine releases its slot, so the view never disagrees with `bossctl agents list`?",
+    "anchor": "what-only-running-agents-means"
+  }
+]
