@@ -427,7 +427,9 @@ final class GhosttyRuntime: @unchecked Sendable {
             resolved.host?.applyColorChange(change)
 
         case .ringBell:
-            NSSound.beep()
+            if Self.shouldRingBell(role: resolved.host?.session.role) {
+                NSSound.beep()
+            }
 
         case .openURL(let raw):
             if let url = URL(string: raw), url.scheme != nil {
@@ -497,6 +499,16 @@ final class GhosttyRuntime: @unchecked Sendable {
             pasteboard.setString(String(cString: item.data), forType: .string)
             break
         }
+    }
+
+    /// The operator's system alert may only ring for their own pane (the
+    /// coordinator/tmux-client surface, `role == .boss`). libghostty forwards
+    /// `GHOSTTY_ACTION_RING_BELL` for every BEL from every mounted surface —
+    /// including hidden worker panes, which stay live because
+    /// `ContentView` keeps both tabs mounted at `opacity(0)` — with no gate
+    /// of its own, so a worker's bell must never reach `NSSound.beep()`.
+    static func shouldRingBell(role: PaneRole?) -> Bool {
+        role == .boss
     }
 
     /// Classify libghostty's close callback using the facts that actually
