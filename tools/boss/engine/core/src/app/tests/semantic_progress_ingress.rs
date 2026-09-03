@@ -67,6 +67,16 @@ fn session_start(execution_id: &str) -> crate::events_socket::IncomingHookEvent 
     )
 }
 
+fn notification(execution_id: &str) -> crate::events_socket::IncomingHookEvent {
+    hook(
+        WorkerEvent::Notification {
+            session_id: "claude-sess-1".into(),
+            message: "guard-trace replay".into(),
+        },
+        execution_id,
+    )
+}
+
 #[tokio::test]
 async fn ingress_persists_driver_originated_progress_and_tool_condition() {
     let (server_state, _dir) = test_server_state();
@@ -109,6 +119,26 @@ async fn session_start_ingress_does_not_coerce_unknown_to_idle() {
         .unwrap()
         .expect("session start is driver-originated progress");
     assert_eq!(checkpoint.tool_condition, SemanticToolCondition::Unknown);
+}
+
+#[tokio::test]
+async fn notification_after_pre_tool_use_leaves_the_checkpoint_in_flight() {
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id)).await;
+    dispatch_worker_event_fanout(&server_state, &notification(&execution_id)).await;
+
+    let checkpoint = server_state
+        .work_db
+        .get_run_semantic_progress_checkpoint(&execution_id)
+        .unwrap()
+        .expect("notification is driver-originated progress time");
+    assert_eq!(
+        checkpoint.tool_condition,
+        SemanticToolCondition::InFlight,
+        "a Notification must not durably clear an in-flight tool for a driver that doesn't trust it",
+    );
 }
 
 #[test]

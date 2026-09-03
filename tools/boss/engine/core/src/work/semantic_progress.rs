@@ -7,7 +7,7 @@
 use super::run_rows::resolve_run_id_for_execution_hooks;
 use super::*;
 
-use crate::semantic_progress::{SemanticProgressCheckpoint, SemanticToolCondition, next_tool_condition};
+use crate::semantic_progress::{SemanticProgressCheckpoint, SemanticToolCondition, tool_condition_signal};
 use boss_protocol::WorkerEvent;
 
 impl WorkDb {
@@ -15,37 +15,47 @@ impl WorkDb {
     /// agent-session row.
     ///
     /// Updates the last-progress timestamp on every call. The tri-state tool
-    /// condition advances through [`next_tool_condition`]: session
-    /// start/end leave an unknown row unknown. Redundant writes of the same
-    /// `(timestamp, condition)` pair are skipped.
+    /// condition advances through [`next_tool_condition`], but never by
+    /// reading `previous` back from the row first: `next_tool_condition`
+    /// only consults `previous` to carry it through unchanged (session
+    /// start/end and `Notification` are not tool-state signals), and a
+    /// carry is exactly "don't touch the column" in SQL — so a `PreToolUse`
+    /// or tool-boundary event writes a single keyed UPDATE, and a carry
+    /// event writes the timestamp alone, skipping both the read and the
+    /// tool-condition write this per-event hot path would otherwise repeat
+    /// on every dispatched event.
     ///
-    /// Errors when the execution has no run row: a checkpoint nobody can
-    /// read back is indistinguishable from no progress at all.
-    pub fn record_semantic_progress(&self, execution_id: &str, event: &WorkerEvent) -> Result<()> {
+    /// Returns `true` when a row was updated, `false` when no run row exists
+    /// yet for this execution — benign and routine (this fan-out reaches
+    /// every dispatched event from every source, including ones that beat
+    /// run-row creation), matching
+    /// [`Self::record_run_turn_boundary_for_execution`]'s convention rather
+    /// than erroring: the caller decides how loudly to log the no-row case,
+    /// and a genuine DB failure still surfaces as `Err`.
+    pub fn record_semantic_progress(&self, execution_id: &str, event: &WorkerEvent) -> Result<bool> {
         let conn = self.connect()?;
         let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
-            bail!("no work_runs row for execution {execution_id}");
+            return Ok(false);
         };
-        let previous = SemanticToolCondition::parse(
-            conn.query_row(
-                "SELECT semantic_tool_condition FROM work_runs WHERE id = ?1",
-                params![run_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten()
-            .as_deref(),
-        );
-        let condition = next_tool_condition(event, previous);
         let now = boss_engine_utils::iso8601::format_epoch_iso8601(boss_engine_utils::epoch_time::now_epoch_secs());
-        conn.execute(
-            "UPDATE work_runs
-             SET semantic_progress_at = ?2, semantic_tool_condition = ?3
-             WHERE id = ?1
-               AND (semantic_progress_at IS NOT ?2 OR semantic_tool_condition IS NOT ?3)",
-            params![run_id, now, condition.as_str()],
-        )?;
-        Ok(())
+        match tool_condition_signal(event) {
+            Some(condition) => {
+                conn.execute(
+                    "UPDATE work_runs
+                     SET semantic_progress_at = ?2, semantic_tool_condition = ?3
+                     WHERE id = ?1
+                       AND (semantic_progress_at IS NOT ?2 OR semantic_tool_condition IS NOT ?3)",
+                    params![run_id, now, condition.as_str()],
+                )?;
+            }
+            None => {
+                conn.execute(
+                    "UPDATE work_runs SET semantic_progress_at = ?2 WHERE id = ?1 AND semantic_progress_at IS NOT ?2",
+                    params![run_id, now],
+                )?;
+            }
+        }
+        Ok(true)
     }
 
     /// Read back the run's semantic-progress checkpoint.

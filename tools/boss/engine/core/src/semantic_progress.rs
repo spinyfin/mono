@@ -23,7 +23,7 @@ pub enum SemanticToolCondition {
     /// An unbalanced `PreToolUse` is in flight.
     InFlight,
     /// A driver event established that no tool is in flight (`PostToolUse`,
-    /// `Stop`, `UserPromptSubmit`, or a trusted `Notification`).
+    /// `Stop`, or `UserPromptSubmit`).
     Idle,
     /// No driver event has established tool state. The default for a fresh
     /// run and for every legacy row that predates the checkpoint columns.
@@ -65,18 +65,43 @@ pub struct SemanticProgressCheckpoint {
 
 /// Advance the tri-state tool condition for a driver-originated event.
 ///
-/// `SessionStart` and `SessionEnd` update the progress *time* but are not
-/// tool-state signals, so they leave `previous` untouched — including
-/// [`SemanticToolCondition::Unknown`]. A real tool-boundary event is what
-/// first establishes idle or in-flight on a legacy-null row.
+/// `SessionStart`, `SessionEnd`, and `Notification` update the progress
+/// *time* but are not tool-state signals, so they leave `previous`
+/// untouched — including [`SemanticToolCondition::Unknown`]. A real
+/// tool-boundary event is what first establishes idle or in-flight on a
+/// legacy-null row.
+///
+/// `Notification` is deliberately excluded from the idle arm even though a
+/// *trusted* Notification can mean "awaiting input" for capability-declaring
+/// drivers: `apply_event` in `live_worker_state.rs` only honours that signal
+/// behind the `awaiting_input_capable` gate, and for drivers that don't
+/// declare it (e.g. Codex) a Notification can arrive mid-tool — a
+/// guard-trace replay, a command denial, an unobserved-command marker —
+/// none of which balance an outstanding `PreToolUse`. Coercing every
+/// Notification to idle here would durably assert "no tool in flight" from
+/// a signal the in-memory path refuses to trust, breaking `InFlight`'s
+/// invariant that an unbalanced `PreToolUse` is in flight.
 pub fn next_tool_condition(event: &WorkerEvent, previous: SemanticToolCondition) -> SemanticToolCondition {
+    tool_condition_signal(event).unwrap_or(previous)
+}
+
+/// What tool-state `event` establishes on its own, independent of any prior
+/// condition — `None` for an event that carries no tool-state signal
+/// (`SessionStart`, `SessionEnd`, `Notification`), and the established
+/// condition otherwise.
+///
+/// Split out from [`next_tool_condition`] so a per-event writer can decide
+/// whether it needs to touch the stored condition at all *without* reading
+/// the previous value back first: a `None` here means "leave the column
+/// alone," which a caller can express directly in SQL instead of resolving
+/// `previous` just to hand it back unchanged.
+pub fn tool_condition_signal(event: &WorkerEvent) -> Option<SemanticToolCondition> {
     match event {
-        WorkerEvent::PreToolUse { .. } => SemanticToolCondition::InFlight,
-        WorkerEvent::PostToolUse { .. }
-        | WorkerEvent::UserPromptSubmit { .. }
-        | WorkerEvent::Stop { .. }
-        | WorkerEvent::Notification { .. } => SemanticToolCondition::Idle,
-        WorkerEvent::SessionStart { .. } | WorkerEvent::SessionEnd { .. } => previous,
+        WorkerEvent::PreToolUse { .. } => Some(SemanticToolCondition::InFlight),
+        WorkerEvent::PostToolUse { .. } | WorkerEvent::UserPromptSubmit { .. } | WorkerEvent::Stop { .. } => {
+            Some(SemanticToolCondition::Idle)
+        }
+        WorkerEvent::SessionStart { .. } | WorkerEvent::SessionEnd { .. } | WorkerEvent::Notification { .. } => None,
     }
 }
 
@@ -139,6 +164,23 @@ mod tests {
             next_tool_condition(&session_end(), SemanticToolCondition::InFlight),
             SemanticToolCondition::InFlight,
             "SessionEnd must not clear an in-flight tool, matching apply_event",
+        );
+    }
+
+    #[test]
+    fn notification_does_not_clear_an_in_flight_tool() {
+        let notification = WorkerEvent::Notification {
+            session_id: "s".into(),
+            message: "guard-trace replay".into(),
+        };
+        assert_eq!(
+            next_tool_condition(&notification, SemanticToolCondition::InFlight),
+            SemanticToolCondition::InFlight,
+            "Notification must not be treated as a tool-boundary signal, matching apply_event",
+        );
+        assert_eq!(
+            next_tool_condition(&notification, SemanticToolCondition::Unknown),
+            SemanticToolCondition::Unknown,
         );
     }
 

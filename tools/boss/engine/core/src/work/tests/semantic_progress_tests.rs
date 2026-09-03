@@ -135,11 +135,28 @@ fn session_start_does_not_coerce_legacy_null_to_idle() {
 }
 
 #[test]
-fn record_semantic_progress_errors_when_the_execution_has_no_run_row() {
+fn record_semantic_progress_returns_false_when_the_execution_has_no_run_row() {
     let db = WorkDb::open(temp_db_path("semantic-progress-missing-run")).unwrap();
-    let err = db.record_semantic_progress("exec_missing", &pre_tool()).unwrap_err();
-    assert!(
-        err.to_string().contains("no work_runs row"),
-        "missing run must be an error, got {err:#}",
+    let recorded = db.record_semantic_progress("exec_missing", &pre_tool()).unwrap();
+    assert!(!recorded, "missing run must be a benign no-op, not an error");
+}
+
+#[test]
+fn notification_does_not_touch_a_previously_established_tool_condition() {
+    let db = WorkDb::open(temp_db_path("semantic-progress-notification")).unwrap();
+    let execution_id = started_execution(&db);
+
+    db.record_semantic_progress(&execution_id, &pre_tool()).unwrap();
+    let notification = WorkerEvent::Notification {
+        session_id: "s".into(),
+        message: "guard-trace replay".into(),
+    };
+    db.record_semantic_progress(&execution_id, &notification).unwrap();
+
+    let checkpoint = db.get_run_semantic_progress_checkpoint(&execution_id).unwrap().unwrap();
+    assert_eq!(
+        checkpoint.tool_condition,
+        SemanticToolCondition::InFlight,
+        "a Notification must not durably clear an in-flight tool",
     );
 }
