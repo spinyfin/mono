@@ -229,7 +229,29 @@ struct MarkdownDocumentChrome: View {
 /// `phase=parse` / `phase=interactive` timing logs).
 private struct StructuredTextHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+/// Test-only probe: `DocumentStructuredText` records its chunk index on
+/// appear so a hosting test can observe that `LazyVStack` instantiates
+/// only on-screen sections. Production callers leave this nil.
+@MainActor
+final class MarkdownChunkAppearProbe {
+    private(set) var appeared: Set<Int> = []
+    func record(_ index: Int) { appeared.insert(index) }
+}
+
+private struct MarkdownChunkAppearProbeKey: EnvironmentKey {
+    static var defaultValue: MarkdownChunkAppearProbe? { nil }
+}
+
+extension EnvironmentValues {
+    var markdownChunkAppearProbe: MarkdownChunkAppearProbe? {
+        get { self[MarkdownChunkAppearProbeKey.self] }
+        set { self[MarkdownChunkAppearProbeKey.self] = newValue }
+    }
 }
 
 /// The scrolling document column: find bar, rich header, and the shared markdown
@@ -283,6 +305,8 @@ private struct MarkdownDocumentColumn: View {
     @State private var cachedDocumentMeasure: CGFloat? = nil
     @State private var parseStartTime: Date? = nil
     @State private var parseLogged = false
+    /// Per-chunk comment-anchor partition, memoized across `body` evaluations.
+    @State private var commentAnchorMapCache = MarkdownCommentAnchorMap.Cache()
 
     /// Tokenized document ground, applied to the scrolling column only, so a
     /// sibling comment sidebar / questions panel keeps `windowBackgroundColor`.
@@ -305,36 +329,54 @@ private struct MarkdownDocumentColumn: View {
                 // it inside a regular VStack would ask it for a full ideal
                 // height and instantiate every chunk, which is the stall this
                 // view is trying to avoid.
-                LazyVStack(alignment: .leading, spacing: 12) {
+                LazyVStack(alignment: .leading, spacing: 0) {
                     // Chrome rows stay at the readable measure even when the
                     // document column widens for a table, and are centered
                     // on that same axis, so the title row and rule share the
                     // prose's centered column instead of hugging the wide
-                    // document column's left edge.
+                    // document column's left edge. Stack spacing is 0 so
+                    // `MarkdownChunkTopSpacing` owns the whole inter-chunk
+                    // gap; the 12pt that used to live on the stack is
+                    // explicit padding on these two chrome rows.
                     header
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .frame(maxWidth: MarkdownDocumentMeasure.proseContent)
                         .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.bottom, 12)
                     Divider()
                         .overlay(BossMarkdownPalette.hairline)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .frame(maxWidth: MarkdownDocumentMeasure.proseContent)
                         .frame(maxWidth: .infinity, alignment: .center)
-                    documentBody
+                        .padding(.bottom, 12)
+                    if let loadError {
+                        loadErrorView(loadError)
+                    }
+                    // ForEach is a direct LazyVStack child (not nested inside
+                    // a @ViewBuilder conditional with the error branch) so
+                    // the stack can instantiate only on-screen chunks.
+                    ForEach(loadError == nil ? renderedChunks : []) { entry in
+                        chunkView(entry)
+                            // Applied per chunk so BossMarkdownTheme does not wrap the
+                            // ForEach as a single non-lazy child of LazyVStack.
+                            .bossMarkdown()
+                            .environment(\.markdownProseMeasure, MarkdownDocumentMeasure.proseContent)
+                            .environment(\.markdownEditorialStyle, true)
+                            .background(
+                                GeometryReader { geo in
+                                    Color.clear.preference(
+                                        key: StructuredTextHeightKey.self,
+                                        value: geo.size.height
+                                    )
+                                }
+                            )
+                    }
                 }
                 .padding(.horizontal, MarkdownDocumentLayout.horizontalPadding)
                 .padding(.vertical, MarkdownDocumentLayout.verticalPadding)
                 .frame(maxWidth: cachedDocumentMeasure ?? MarkdownDocumentMeasure.forSource(source))
                 .frame(maxWidth: .infinity)
                 .background(MarkdownScrollViewCapture(controller: scrollController))
-                .background(
-                    GeometryReader { geo in
-                        Color.clear.preference(
-                            key: StructuredTextHeightKey.self,
-                            value: geo.size.height
-                        )
-                    }
-                )
             }
             .textSelection(.enabled)
             .background(viewerBackground)
@@ -453,28 +495,17 @@ private struct MarkdownDocumentColumn: View {
     }
 
     @ViewBuilder
-    private var documentBody: some View {
-        if let loadError {
-            VStack(alignment: .leading, spacing: 8) {
-                Text(loadError)
-                    .foregroundStyle(BossMarkdownPalette.alert)
+    private func loadErrorView(_ loadError: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(loadError)
+                .foregroundStyle(BossMarkdownPalette.alert)
+                .font(.callout)
+            if let url = githubURL {
+                Link("Open on GitHub instead", destination: url)
                     .font(.callout)
-                if let url = githubURL {
-                    Link("Open on GitHub instead", destination: url)
-                        .font(.callout)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        } else {
-            ForEach(renderedChunks) { entry in
-                chunkView(entry)
-                    // Applied per chunk so BossMarkdownTheme does not wrap the
-                    // ForEach as a single non-lazy child of LazyVStack.
-                    .bossMarkdown()
-                    .environment(\.markdownProseMeasure, MarkdownDocumentMeasure.proseContent)
-                    .environment(\.markdownEditorialStyle, true)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
@@ -484,7 +515,8 @@ private struct MarkdownDocumentColumn: View {
             DocumentStructuredText(
                 text: text,
                 parser: entry.parser,
-                highlightGeneration: highlightGeneration
+                highlightGeneration: highlightGeneration,
+                chunkIndex: entry.id
             )
             .modifier(MarkdownChunkTopSpacing(isFirst: entry.id == 0))
         case .collapsible(let heading, let body):
@@ -515,8 +547,24 @@ private struct MarkdownDocumentColumn: View {
     /// each chunk's own parser. The heading split is cached across `body`
     /// evaluations; parsers are cheap to rebuild when highlight state changes.
     private var renderedChunks: [RenderedMarkdownChunk] {
-        documentChunks.enumerated().map { index, chunk in
-            RenderedMarkdownChunk(id: index, chunk: chunk, parser: markdownParser(forChunkAt: index))
+        let chunks = documentChunks
+        let anchorMap = commentAnchorMapCache.partition(
+            source: source,
+            headings: collapsedByDefaultHeadings,
+            chunks: chunks,
+            highlighted: commentedAnchors,
+            flashing: commentFlashAnchor,
+            baseURL: baseURL
+        )
+        return chunks.enumerated().map { index, chunk in
+            RenderedMarkdownChunk(
+                id: index,
+                chunk: chunk,
+                parser: markdownParser(
+                    forChunkAt: index,
+                    anchors: index < anchorMap.count ? anchorMap[index] : .empty
+                )
+            )
         }
     }
 
@@ -536,22 +584,23 @@ private struct MarkdownDocumentColumn: View {
         cachedDocumentMeasure = MarkdownDocumentMeasure.forSource(source)
     }
 
-    /// Builds the parser for one rendered chunk: the same comment-highlighting
-    /// base every chunk shares, plus search-match highlighting for exactly
-    /// that chunk's own matches, read directly from `findState` — which owns
-    /// the chunk split and computes matches per chunk once per source/query
-    /// change (see `MarkdownFindState`), rather than this view re-parsing the
-    /// chunk's plain-text projection on every body evaluation. `baseURL` is
-    /// threaded through the comment-highlighting base so relative
-    /// links/images resolve.
-    private func markdownParser(forChunkAt index: Int) -> any MarkupParser {
+    /// Builds the parser for one rendered chunk: comment highlights already
+    /// resolved against the whole-document projection and clipped to this
+    /// chunk (see `MarkdownCommentAnchorMap`), plus search-match highlighting
+    /// for exactly that chunk's own matches, read directly from `findState`.
+    /// `baseURL` is threaded through the comment-highlighting base so
+    /// relative links/images resolve.
+    private func markdownParser(
+        forChunkAt index: Int,
+        anchors: MarkdownCommentAnchorMap.ChunkAnchors
+    ) -> any MarkupParser {
         let base: any MarkupParser
-        if commentedAnchors.isEmpty && commentFlashAnchor == nil {
+        if anchors.highlighted.isEmpty && anchors.flashing == nil {
             base = AttributedStringMarkdownParser.markdown(baseURL: baseURL)
         } else {
             base = HighlightingMarkdownParser(
-                highlightedAnchors: commentedAnchors,
-                flashingAnchor: commentFlashAnchor,
+                highlightedAnchors: anchors.highlighted,
+                flashingAnchor: anchors.flashing,
                 baseURL: baseURL
             )
         }
@@ -736,6 +785,8 @@ private struct DocumentStructuredText: View {
     let text: String
     let parser: any MarkupParser
     let highlightGeneration: Int
+    var chunkIndex: Int = 0
+    @Environment(\.markdownChunkAppearProbe) private var appearProbe
 
     var body: some View {
         StructuredText(
@@ -744,13 +795,15 @@ private struct DocumentStructuredText: View {
         )
         .textual.textSelection(.enabled)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .onAppear { appearProbe?.record(chunkIndex) }
     }
 }
 
 /// Restores the heading top-spacing that `BlockVStack` would have applied
 /// between the previous section's last block and this chunk's first heading.
-/// Collapsible chunks already pad themselves; this is only for `.plain`
-/// chunks after the first.
+/// The enclosing `LazyVStack` uses spacing 0 so this modifier owns the whole
+/// inter-chunk gap. Collapsible chunks already pad themselves; this is only
+/// for `.plain` chunks after the first.
 private struct MarkdownChunkTopSpacing: ViewModifier {
     let isFirst: Bool
     @Environment(\.markdownEditorialStyle) private var isEditorial
@@ -833,7 +886,8 @@ private struct CollapsibleMarkdownSection: View {
                 DocumentStructuredText(
                     text: sectionBody,
                     parser: parser,
-                    highlightGeneration: highlightGeneration
+                    highlightGeneration: highlightGeneration,
+                    chunkIndex: -1
                 )
             }
         }

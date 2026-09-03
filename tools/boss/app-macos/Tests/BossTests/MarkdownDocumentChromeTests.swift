@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import XCTest
 
@@ -60,7 +61,7 @@ final class MarkdownDocumentChromeTests: XCTestCase {
     /// The editorial treatment is opt-in. The environment default must stay
     /// false so transcript bubbles, comment cards, release notes, and the
     /// find bar keep compact system-font markdown unless a caller sets the
-    /// key (only `MarkdownDocumentChrome.documentBody` does).
+    /// key (only the document-column chunk ForEach does).
     func testEditorialStyleDefaultsOff() {
         XCTAssertFalse(EnvironmentValues().markdownEditorialStyle)
     }
@@ -508,30 +509,106 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         XCTAssertEqual(MarkdownHighlightRefreshParser.tagged(source, generation: 0), source)
     }
 
+    // MARK: - Comment anchors across heading chunks
+
+    /// An `exact` that recurs in two heading sections must paint once in the
+    /// whole document — the occurrence disambiguated by prefix/suffix —
+    /// not once per chunk that happens to contain the same words.
+    func testCommentAnchorRecurringExactHighlightsOnceAcrossHeadingChunks() throws {
+        let source = """
+        # Alpha
+
+        run checkleft run here please
+
+        # Beta
+
+        run checkleft run there instead
+        """
+        let chunks = MarkdownHeadingSections.chunks(in: source, collapsibleHeadings: [])
+        XCTAssertEqual(chunks.count, 2)
+        let anchor = CommentAnchor(exact: "checkleft run", prefix: "run ", suffix: " here")
+        let partitioned = MarkdownCommentAnchorMap.partition(
+            chunks: chunks,
+            highlighted: [anchor],
+            flashing: nil,
+            baseURL: nil
+        )
+        let nonempty = partitioned.enumerated().filter { !$0.element.highlighted.isEmpty }
+        XCTAssertEqual(nonempty.count, 1, "exactly one chunk should receive the recurring exact")
+        XCTAssertEqual(nonempty.first?.offset, 0, "prefix/suffix must pick the Alpha occurrence")
+
+        var highlightedChunks = 0
+        for (index, chunk) in chunks.enumerated() {
+            let parser = HighlightingMarkdownParser(
+                highlightedAnchors: partitioned[index].highlighted
+            )
+            let result = try parser.attributedString(for: chunk.renderedText)
+            if Self.containsHighlight(in: result) { highlightedChunks += 1 }
+        }
+        XCTAssertEqual(highlightedChunks, 1)
+    }
+
+    /// A selection whose `exact` straddles a heading boundary must still
+    /// paint — clipped onto each overlapping chunk — rather than vanishing
+    /// because no single chunk contains the whole quote.
+    func testCommentAnchorStraddlingAHeadingHighlightsOverlappingChunks() throws {
+        let source = """
+        # Alpha
+
+        starts here
+        # Beta
+        and continues
+        """
+        let chunks = MarkdownHeadingSections.chunks(in: source, collapsibleHeadings: [])
+        XCTAssertEqual(chunks.count, 2)
+        let plains = chunks.map { CommentProjection.plainText(for: $0.renderedText) }
+        let concat = plains.joined()
+        let boundary = plains[0].count
+        XCTAssertGreaterThan(boundary, 4)
+        XCTAssertLessThan(boundary, concat.count - 4)
+        let start = concat.index(concat.startIndex, offsetBy: boundary - 4)
+        let end = concat.index(concat.startIndex, offsetBy: boundary + 4)
+        let needle = String(concat[start..<end])
+        let range = concat.range(of: needle)!
+        let prefixStart = concat.index(range.lowerBound, offsetBy: -6, limitedBy: concat.startIndex) ?? concat.startIndex
+        let suffixEnd = concat.index(range.upperBound, offsetBy: 4, limitedBy: concat.endIndex) ?? concat.endIndex
+        let anchor = CommentAnchor(
+            exact: needle,
+            prefix: String(concat[prefixStart..<range.lowerBound]),
+            suffix: String(concat[range.upperBound..<suffixEnd])
+        )
+        let partitioned = MarkdownCommentAnchorMap.partition(
+            chunks: chunks,
+            highlighted: [anchor],
+            flashing: nil,
+            baseURL: nil
+        )
+        let nonempty = partitioned.enumerated().filter { !$0.element.highlighted.isEmpty }
+        XCTAssertEqual(nonempty.count, 2, "a heading-straddling exact must clip onto both chunks")
+
+        var highlightedChunks = 0
+        for (index, chunk) in chunks.enumerated() {
+            let parser = HighlightingMarkdownParser(
+                highlightedAnchors: partitioned[index].highlighted
+            )
+            let result = try parser.attributedString(for: chunk.renderedText)
+            if Self.containsHighlight(in: result) { highlightedChunks += 1 }
+        }
+        XCTAssertEqual(highlightedChunks, 2)
+    }
+
+    private static func containsHighlight(in result: AttributedString) -> Bool {
+        result.runs.contains { $0.swiftUI.backgroundColor != nil }
+    }
+
     // MARK: - Layout cost
 
-    /// Pins that a multi-heading document still hosts, and records scan vs
-    /// one-shot chunking cost. Heavy before/after layout numbers for an
-    /// 80-section fixture were captured locally (see the PR) and are not
-    /// re-run here so this shard stays well inside the small timeout.
+    /// Pins that a multi-heading document still hosts. Chunking cost is
+    /// recorded in the PR description, not asserted here.
     func testLargeDocumentChunksAndHosts() {
         let source = Self.largeHeadedDocument(sections: 24)
         let chunks = MarkdownHeadingSections.chunks(in: source, collapsibleHeadings: [])
         XCTAssertEqual(chunks.count, 25, "title + 24 sections: \(chunks.count)")
-
-        let scanIterations = 50
-        let scanStart = CFAbsoluteTimeGetCurrent()
-        for _ in 0..<scanIterations {
-            _ = MarkdownHeadingSections.chunks(in: source, collapsibleHeadings: []).count
-        }
-        let scanMs = (CFAbsoluteTimeGetCurrent() - scanStart) * 1000
-        let oneStart = CFAbsoluteTimeGetCurrent()
-        _ = MarkdownHeadingSections.chunks(in: source, collapsibleHeadings: [])
-        let oneMs = (CFAbsoluteTimeGetCurrent() - oneStart) * 1000
-        print(String(
-            format: "MARKDOWN_SCAN_MS iterations=%d total=%.2f one=%.3f chunks=%d bytes=%d",
-            scanIterations, scanMs, oneMs, chunks.count, source.utf8.count
-        ))
 
         let view = MarkdownDocumentChrome(
             title: "Large doc",
@@ -542,6 +619,39 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         hosting.frame = NSRect(x: 0, y: 0, width: 760, height: 640)
         hosting.layoutSubtreeIfNeeded()
         XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+    }
+
+    /// The 24-section fixture in a short viewport must not instantiate every
+    /// `DocumentStructuredText` — that is the signal that `ForEach` flattened
+    /// into `LazyVStack` rather than wrapping as one non-lazy child.
+    func testLargeDocumentLazyStackInstantiatesOnlyOnscreenChunks() {
+        let source = Self.largeHeadedDocument(sections: 24)
+        let total = MarkdownHeadingSections.chunks(in: source, collapsibleHeadings: []).count
+        let probe = MarkdownChunkAppearProbe()
+        let view = MarkdownDocumentChrome(
+            title: "Large doc",
+            source: source,
+            commentsEnabled: false
+        )
+        .environment(\.markdownChunkAppearProbe, probe)
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: 760, height: 400)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 400),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hosting
+        hosting.layoutSubtreeIfNeeded()
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+        XCTAssertGreaterThan(probe.appeared.count, 0, "at least the on-screen chunks must appear")
+        XCTAssertLessThan(
+            probe.appeared.count,
+            total,
+            "LazyVStack must not instantiate every heading chunk; appeared=\(probe.appeared.count) total=\(total)"
+        )
+        _ = window
     }
 
     private static func largeHeadedDocument(sections: Int) -> String {
