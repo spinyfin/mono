@@ -2,40 +2,48 @@ use super::super::*;
 use super::helpers::*;
 
 #[test]
-fn settings_json_denies_boss_state_dir_reads_writes_and_edits() {
-    // The acceptance criterion for the worker-sandboxing change:
-    // a worker spawned by the engine cannot, via Read / Edit /
-    // Write, touch any file under the Boss state dir. The deny
-    // list must name the dir and the `**` subtree for each tool
-    // so a `Read("…/Boss")` ls and a `Read("…/Boss/state.db")`
-    // both deny.
+fn settings_json_denies_boss_state_dir_edits_and_emits_no_read_or_write_rule() {
+    // The acceptance criterion for the worker-sandboxing change: a worker
+    // spawned by the engine cannot touch any file under the Boss state dir.
+    // The deny list must name the dir and the `**` subtree so an
+    // `Edit("…/Boss")` and an `Edit("…/Boss/state.db")` both deny.
     //
-    // Only `Read` and `Edit` rules are emitted, not `Write` — Claude Code's
-    // permission engine matches both the Edit and Write *tools* against
-    // `Edit(path)` rules, so a `Write(path)` deny rule matches nothing and is
-    // dead weight (previously surfaced as a startup warning:
-    // "Write(...) is not matched by file permission checks — only Edit(path)
-    // rules are").
+    // Only `Edit` rules are emitted.
+    //
+    // Not `Write` — Claude Code's permission engine matches both the Edit and
+    // Write *tools* against `Edit(path)` rules, so a `Write(path)` deny rule
+    // matches nothing and is dead weight (previously surfaced as a startup
+    // warning: "Write(...) is not matched by file permission checks — only
+    // Edit(path) rules are").
+    //
+    // And not `Read` — Claude Code 2.1.257 refuses to auto-approve a compound
+    // Bash command pairing `cd` with a relative file read whenever the
+    // session carries ANY `Read()` deny rule (an existence-only predicate
+    // over the deny list, so narrowing the glob or adding an allow entry
+    // cannot suppress it), which stalled every `--permission-mode auto`
+    // worker on a dialog no human was watching. The read side of the fence is
+    // carried by the path-guard PreToolUse hook instead — see
+    // `path_guard.rs`, which proves the hook blocks the relative-path-after-
+    // `cd` shape the glob never covered.
     let input = sample_input();
     let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
     let deny = parsed["permissions"]["deny"].as_array().expect("deny array present");
     let deny_set: Vec<&str> = deny.iter().filter_map(|v| v.as_str()).collect();
     let boss_dir = "/Users/brianduff/Library/Application Support/Boss";
-    for tool in ["Read", "Edit"] {
-        let bare = format!("{tool}({boss_dir})");
-        let glob = format!("{tool}({boss_dir}/**)");
+    for rule in [format!("Edit({boss_dir})"), format!("Edit({boss_dir}/**)")] {
         assert!(
-            deny_set.iter().any(|r| *r == bare),
-            "expected deny rule {bare} in {deny_set:?}",
-        );
-        assert!(
-            deny_set.iter().any(|r| *r == glob),
-            "expected deny rule {glob} in {deny_set:?}",
+            deny_set.iter().any(|r| *r == rule),
+            "expected deny rule {rule} in {deny_set:?}",
         );
     }
     assert!(
         !deny_set.iter().any(|r| r.starts_with(&format!("Write({boss_dir}"))),
         "expected no Write(...) deny rule for the Boss state dir (inert in Claude Code's permission engine): {deny_set:?}",
+    );
+    assert!(
+        !deny_set.iter().any(|r| r.starts_with("Read(")),
+        "expected NO Read(...) deny rule at all — any one of them arms Claude Code's \
+         cd-with-relative-read permission prompt and stalls the worker: {deny_set:?}",
     );
 }
 
@@ -242,4 +250,98 @@ fn settings_json_does_not_deny_workspace_paths() {
             "deny rule must not target the workspaces dir: {rule}",
         );
     }
+}
+
+// ── Data-dir fence ↔ path-guard hook tie-in ───────────────────────────────
+//
+// The `Edit(...)` deny globs are a literal-path belt on top of the
+// deterministic path-guard `PreToolUse` hook, which is what actually enforces
+// the Boss-data-dir boundary (it is tool-agnostic and canonicalises relative
+// paths against the call's `cwd`). These tests pin that the belt is derived
+// from the hook actually being wired into the same settings file, rather than
+// the two agreeing by coincidence because both read `EngineDataDirSandbox`.
+
+#[test]
+fn settings_json_carries_the_data_dir_globs_and_the_path_guard_hook_together() {
+    let input = sample_input();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
+
+    let boss_dir = "/Users/brianduff/Library/Application Support/Boss";
+    let deny: Vec<&str> = parsed["permissions"]["deny"]
+        .as_array()
+        .expect("deny array present")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        deny.iter().any(|r| *r == format!("Edit({boss_dir}/**)")),
+        "expected the data-dir Edit glob: {deny:?}",
+    );
+
+    let guarded = parsed["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("PreToolUse array present")
+        .iter()
+        .any(hook_entry_runs_path_guard);
+    assert!(
+        guarded,
+        "the deny globs describe a boundary the path-guard hook enforces; the hook must be in \
+         the same settings file: {}",
+        parsed["hooks"]["PreToolUse"],
+    );
+}
+
+#[test]
+fn data_dir_fence_is_armed_only_when_the_path_guard_hook_is_wired_in() {
+    assert_eq!(
+        data_dir_fence(EngineDataDirSandbox::Enabled, true, true),
+        DataDirFence::PathGuardHook,
+    );
+    // Remote worker: no engine data dir on that host to fence.
+    assert_eq!(
+        data_dir_fence(EngineDataDirSandbox::Disabled, true, true),
+        DataDirFence::NotThroughThisFile,
+    );
+    // A driver whose guards do not live in this settings file (a DriverOwned
+    // hook wiring, or a byte-stream ingress) never receives it — only
+    // Claude's spawn plan passes `--settings` — so the deny list must not
+    // claim a fence this file cannot carry.
+    assert_eq!(
+        data_dir_fence(EngineDataDirSandbox::Enabled, false, false),
+        DataDirFence::NotThroughThisFile,
+    );
+}
+
+#[test]
+#[should_panic(expected = "no boss-path-guard.py PreToolUse hook was wired into it")]
+fn data_dir_fence_fails_loudly_when_the_sandbox_is_on_but_the_hook_is_missing() {
+    // A spawn path that keeps the sandbox flag but drops the hook leaves the
+    // boundary unenforced. That must fail loudly, not quietly render a
+    // settings file whose deny list implies a fence that is not there.
+    let _ = data_dir_fence(EngineDataDirSandbox::Enabled, true, false);
+}
+
+#[test]
+fn deny_rules_omit_the_data_dir_globs_when_the_fence_is_not_carried_here() {
+    let input = sample_input();
+    let rules = deny_rules(&input, DataDirFence::NotThroughThisFile);
+    assert!(
+        !rules.iter().any(|r| r.contains("Application Support/Boss")),
+        "an unfenced settings file must not carry data-dir globs: {rules:?}",
+    );
+    // The static coordinator-surface guards are unconditional and survive.
+    assert!(rules.iter().any(|r| r == "Bash(bossctl)"), "{rules:?}");
+}
+
+#[test]
+fn hook_entry_runs_path_guard_matches_only_the_gate_script_entry() {
+    assert!(hook_entry_runs_path_guard(&serde_json::json!({
+        "matcher": "*",
+        "hooks": [{"type": "command", "command": "BOSS_DATA_DIR='/d' python3 '/t/boss-path-guard.py'"}],
+    })));
+    assert!(!hook_entry_runs_path_guard(&serde_json::json!({
+        "matcher": "Bash",
+        "hooks": [{"type": "command", "command": "python3 '/t/boss-checkleft-push-guard.py'"}],
+    })));
+    assert!(!hook_entry_runs_path_guard(&serde_json::json!({"matcher": "Bash"})));
 }

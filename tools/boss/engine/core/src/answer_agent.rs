@@ -119,6 +119,8 @@ pub fn render_answer_agent_claude_md(lease_id: &str, workspace_path: &str) -> St
          The workspace is a read-only checkout. Lease held for the lifetime of\n\
          this run by the engine. Do not lease, release, or mutate cube state.\n\
          \n\
+         {absolute_paths}\
+         \n\
          ## Boundaries\n\
          \n\
          - Do not modify files inside or outside your workspace. Other\n\
@@ -129,6 +131,7 @@ pub fn render_answer_agent_claude_md(lease_id: &str, workspace_path: &str) -> St
         reply_cmd = THREAD_REPLY_COMMAND,
         workspace_path = workspace_path,
         lease = lease_id,
+        absolute_paths = crate::prompt_fragments::absolute_paths_fragment(),
     )
 }
 

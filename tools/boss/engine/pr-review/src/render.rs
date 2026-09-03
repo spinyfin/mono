@@ -161,12 +161,20 @@ pub fn render_revision_instructions(result: &ReviewResult, origin: ReviewOrigin)
 /// The workspace is already checked out to the PR head SHA, so the reviewer
 /// can read files directly without `gh pr diff` for every lookup.
 ///
-/// `boundaries_and_coordinator` is the shared `## Boundaries` + `## Coordinator`
-/// block, supplied by the engine rather than owned here: the same text is used
+/// `absolute_paths` and `boundaries_and_coordinator` are shared blocks
+/// supplied by the engine rather than owned here: the same text is used
 /// verbatim by other engine-side agent prompts, and duplicating it in this
-/// crate would let the two copies drift. It is interpolated as the final
-/// section, so it should start at the `## Boundaries` heading.
-pub fn render_reviewer_claude_md(lease_id: &str, workspace_path: &str, boundaries_and_coordinator: &str) -> String {
+/// crate would let the copies drift. `absolute_paths` is the
+/// `## Always use absolute paths` block — every worker kind gets it, because
+/// the harness behaviour it steers around is not reviewer-specific — and
+/// `boundaries_and_coordinator` is interpolated as the final section, so it
+/// should start at the `## Boundaries` heading.
+pub fn render_reviewer_claude_md(
+    lease_id: &str,
+    workspace_path: &str,
+    absolute_paths: &str,
+    boundaries_and_coordinator: &str,
+) -> String {
     format!(
         "# Boss reviewer rules\n\
          \n\
@@ -222,6 +230,8 @@ pub fn render_reviewer_claude_md(lease_id: &str, workspace_path: &str, boundarie
          Lease held for the lifetime of this run. Do not lease, release,\n\
          or mutate cube state.\n\
          \n\
+         {absolute_paths}\
+         \n\
          ## VCS (read-only)\n\
          \n\
          Use `jj` for read-only navigation. Do not push or modify history.\n\
@@ -233,6 +243,7 @@ pub fn render_reviewer_claude_md(lease_id: &str, workspace_path: &str, boundarie
          {boundaries_and_coordinator}",
         lease = lease_id,
         workspace_path = workspace_path,
+        absolute_paths = absolute_paths,
         boundaries_and_coordinator = boundaries_and_coordinator,
     )
 }

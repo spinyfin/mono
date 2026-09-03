@@ -143,9 +143,13 @@ fn golden_deny_rules_standard_worker() {
         .collect();
 
     let boss_dir = "/Users/brianduff/Library/Application Support/Boss";
+    // No `Read(...)` entries: any `Read()` deny rule arms Claude Code's
+    // "compound command contains `cd` with a relative file read" permission
+    // prompt (an existence-only predicate over the deny list), which stalls
+    // an unattended worker. The read side of the Boss-data-dir fence is
+    // carried by the path-guard PreToolUse hook, which is stricter — it
+    // canonicalises relative paths against the call's `cwd`.
     let expected = vec![
-        format!("Read({boss_dir})"),
-        format!("Read({boss_dir}/**)"),
         format!("Edit({boss_dir})"),
         format!("Edit({boss_dir}/**)"),
         "Bash(bossctl)".to_owned(),

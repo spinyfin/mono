@@ -13,6 +13,9 @@
 //! and [`crate::worker_setup`] names a concrete sibling-workspace path and
 //! adds a work-taxonomy sentence. Do not fold those onto this fragment
 //! without matching each site's semantics.
+//!
+//! [`absolute_paths_fragment`], by contrast, IS shared by every worker
+//! prompt — the harness behaviour it describes is not worker-kind-specific.
 
 /// The `## Boundaries` + `## Coordinator` block shared verbatim by the
 /// `pr_review` and `automation_triage` agent prompts.
@@ -36,9 +39,62 @@ pub(crate) fn boundaries_and_coordinator_fragment() -> &'static str {
      as questions from a human reviewer — short, specific answers.\n"
 }
 
+/// The `## Always use absolute paths` block shared verbatim by every worker
+/// prompt (standard, reviewer, triage, answer-agent).
+///
+/// Claude Code 2.1.257 added a permission-classifier branch that refuses to
+/// auto-approve a compound Bash command pairing a `cd` with a *relative* file
+/// read; 2.1.259 widened the same idea to a circuit breaker (explicitly not
+/// classifier-approvable) over `grep`, `egrep`, `fgrep`, `rg`, `diff`, `git`,
+/// `cp` and `mv`. An unattended `--permission-mode auto` worker that writes
+/// commands in that shape stalls on a dialog nobody is watching.
+///
+/// Boss no longer arms the first of those branches (the Boss-data-dir fence
+/// emits no `Read()` deny rule — see `worker_setup::deny_rules`), but this
+/// instruction is a complement to that fix, not a substitute for it: the
+/// absolute-path command shape is unaffected by either branch, and by
+/// whatever the next release adds in the same vein. The engine-owned
+/// boundaries are enforced by hooks regardless of how a path is spelled, so
+/// nothing here relaxes a guard — it only steers the worker onto the command
+/// shape that runs clean.
+///
+/// The string starts at the `## Always use absolute paths` heading and ends
+/// with a trailing newline, so a caller embeds it right after the blank line
+/// that precedes it.
+pub(crate) fn absolute_paths_fragment() -> &'static str {
+    "## Always use absolute paths — never `cd`\n\
+     \n\
+     Your shell already starts in your workspace, so a `cd` buys you nothing\n\
+     and costs you the run: the agent harness refuses to auto-approve a\n\
+     compound command that pairs a `cd` with a relative file read (and, for\n\
+     `grep`/`rg`/`diff`/`git`/`cp`/`mv`, refuses outright), so the session\n\
+     stops on a permission dialog with no human watching it.\n\
+     \n\
+     - Do NOT write `cd <dir> && <command>`, and do not `cd` as a separate\n\
+     step either.\n\
+     - Address every file and directory by its absolute path:\n\
+     `cat /abs/path/to/file.rs`, `rg pattern /abs/path/to/dir`,\n\
+     `sed -n '1,40p' /abs/path/to/file.rs`.\n\
+     - For a tool that must run from a directory, use its own flag rather\n\
+     than a `cd` — e.g. `git -C <abs dir> …`, `make -C <abs dir> …`.\n\
+     \n\
+     This is about the command shape, not about what you may access: the\n\
+     engine's guards resolve every path the same way however it is spelled,\n\
+     so writing paths in full is never a way around a boundary.\n"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absolute_paths_fragment_forbids_cd_and_ends_with_a_newline() {
+        let frag = absolute_paths_fragment();
+        assert!(frag.starts_with("## Always use absolute paths"));
+        assert!(frag.contains("never `cd`"));
+        assert!(frag.contains("absolute path"));
+        assert!(frag.ends_with('\n'));
+    }
 
     #[test]
     fn fragment_has_both_headings_and_bossctl_note() {

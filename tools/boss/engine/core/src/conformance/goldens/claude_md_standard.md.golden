@@ -97,6 +97,26 @@ nobody downstream can tell that from a clean transcript.
 Lease held for the lifetime of this run. Do not lease, release,
 or mutate cube state.
 
+## Always use absolute paths — never `cd`
+
+Your shell already starts in your workspace, so a `cd` buys you nothing
+and costs you the run: the agent harness refuses to auto-approve a
+compound command that pairs a `cd` with a relative file read (and, for
+`grep`/`rg`/`diff`/`git`/`cp`/`mv`, refuses outright), so the session
+stops on a permission dialog with no human watching it.
+
+- Do NOT write `cd <dir> && <command>`, and do not `cd` as a separate
+step either.
+- Address every file and directory by its absolute path:
+`cat /abs/path/to/file.rs`, `rg pattern /abs/path/to/dir`,
+`sed -n '1,40p' /abs/path/to/file.rs`.
+- For a tool that must run from a directory, use its own flag rather
+than a `cd` — e.g. `git -C <abs dir> …`, `make -C <abs dir> …`.
+
+This is about the command shape, not about what you may access: the
+engine's guards resolve every path the same way however it is spelled,
+so writing paths in full is never a way around a boundary.
+
 ## VCS
 
 Use `jj` for all VCS. Do not invoke `git` directly except via `gh`.

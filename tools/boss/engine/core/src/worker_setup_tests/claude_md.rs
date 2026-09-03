@@ -168,6 +168,7 @@ fn reviewer_claude_md_omits_reuse_before_you_build_guardrail() {
     let rendered = crate::pr_review::render_reviewer_claude_md(
         "lease-1",
         "/tmp/ws",
+        crate::prompt_fragments::absolute_paths_fragment(),
         crate::prompt_fragments::boundaries_and_coordinator_fragment(),
     );
     assert!(
@@ -369,4 +370,36 @@ fn standard_claude_md_is_unchanged_by_reviewer_branch() {
     assert!(rendered.contains("Pull requests are the deliverable"));
     assert!(rendered.contains("cube pr create"));
     assert!(rendered.contains("real GitHub upstream"));
+}
+
+/// Every worker prompt renderer must carry the absolute-paths instruction.
+///
+/// The harness behaviour it steers around (a compound `cd` + relative file
+/// read is not auto-approved, and for `grep`/`rg`/`diff`/`git`/`cp`/`mv` is
+/// refused outright) is not worker-kind-specific, so a renderer that misses
+/// it leaves that worker kind able to stall on a permission dialog with no
+/// human watching. Rendered through `render_claude_md` for each kind so a new
+/// kind that forgets the fragment fails here.
+#[test]
+fn every_worker_kind_claude_md_carries_the_absolute_paths_instruction() {
+    let heading = "## Always use absolute paths";
+    for kind in [
+        WorkerKind::Standard,
+        WorkerKind::Reviewer,
+        WorkerKind::Triage,
+        WorkerKind::AnswerAgent,
+    ] {
+        let label = format!("{kind:?}");
+        let mut input = sample_input();
+        input.worker_kind = kind;
+        let rendered = claude_md_for(&input);
+        assert!(
+            rendered.contains(heading),
+            "{label} CLAUDE.md must carry the {heading:?} section",
+        );
+        assert!(
+            rendered.contains(crate::prompt_fragments::absolute_paths_fragment()),
+            "{label} CLAUDE.md must embed the shared fragment verbatim, not a paraphrase",
+        );
+    }
 }
