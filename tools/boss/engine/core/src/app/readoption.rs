@@ -140,10 +140,27 @@ impl ServerState {
                 }
             },
         };
-        let latest_tmux_observed_pid = self
-            .work_db
-            .latest_local_tmux_pane_pid_for_execution(&execution.id)
-            .unwrap_or(None);
+        let latest_tmux_observed_pid = match self.work_db.latest_local_tmux_pane_pid_for_execution(&execution.id) {
+            Ok(pid) => pid,
+            Err(err) => {
+                // A transient DB error must not be coerced into "no pid
+                // recorded": that value feeds `process_live` below, and with
+                // no other positive-liveness evidence it tips
+                // `classify_contradiction` toward `Reap { NoPositiveLiveness
+                // }` — the irreversible branch — on nothing more than a
+                // read failure. Readoption is recoverable; reaping destroys
+                // in-flight work and is not, so an unreadable pid must read
+                // as unknown, not as evidence of death. Skip this pass and
+                // let the next sweep decide once the read succeeds.
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    error = %format!("{err:#}"),
+                    "readopt: could not read the latest tmux-observed pane pid; skipping contradiction \
+                     convergence for this pass rather than treating the read failure as no liveness",
+                );
+                return "tmux_pid_lookup_failed";
+            }
+        };
         let observed_shell_pid =
             crate::durable_liveness::probe_execution_worker(&self.work_db, &execution.id).alive_pid();
         let registry_slot = self.worker_registry.slot_for_run(&execution.id);

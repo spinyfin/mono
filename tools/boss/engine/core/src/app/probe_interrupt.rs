@@ -671,6 +671,16 @@ async fn inject_after_interrupt(
 ///
 /// Deliberately **not** `InterruptFailed`: the interrupt did take. Reporting
 /// otherwise would send an operator to fix the wrong thing.
+///
+/// Deliberately does **not** call `revert_undelivered_nudge` on the requeue
+/// branch: this is a requeue path (the probe id is pushed back for a later
+/// boundary), and [`super::probes::ProbeDispatchOutcome::should_revert_undelivered_nudge`]'s
+/// doc explains why requeue-style outcomes must not revert — a probe
+/// recorded at boundary N, reverted, then delivered at N+1 alongside a
+/// freshly recorded nudge pins the count and makes `max_unproductive_nudges`
+/// unreachable for exactly the wedged workers the breaker exists to park.
+/// The revert only belongs on the terminal `Abandoned` branch below, where
+/// the probe truly never reaches the pane.
 async fn requeue_after_write_declined(
     server_state: &Arc<ServerState>,
     run_id: &str,
@@ -680,7 +690,6 @@ async fn requeue_after_write_declined(
     reason: &str,
 ) -> InterruptingDelivery {
     let probe_id = probe.probe_id.clone();
-    server_state.completion_handler.revert_undelivered_nudge(run_id);
     server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Queued);
     if server_state.release_probe_reservation(run_id, probe) {
         tracing::warn!(
@@ -699,6 +708,7 @@ async fn requeue_after_write_declined(
         }
     } else {
         let detail = format!("{reason}, and the run had already been released, so there was nothing to retry against");
+        server_state.completion_handler.revert_undelivered_nudge(run_id);
         server_state
             .surface_undelivered_probe(run_id, &probe_id, ProbeDeliveryState::Abandoned, &detail)
             .await;

@@ -792,14 +792,14 @@ async fn adopt_one<S>(
         persist_observed_pane_pid(
             work_db,
             dispatch_events,
-            &PaneObservation {
-                execution_id,
-                spawn_token: &handle.tmux_spawn_token,
-                session_name,
-                server_label: &server_label,
-                observed_shell_pid: shell_pid,
-                write_reason: shell_pid_write_reason,
-            },
+            &PaneObservation::builder()
+                .execution_id(execution_id)
+                .spawn_token(&handle.tmux_spawn_token)
+                .session_name(session_name)
+                .server_label(&server_label)
+                .observed_shell_pid(shell_pid)
+                .write_reason(shell_pid_write_reason)
+                .build(),
         )
         .await,
     ) else {
@@ -981,14 +981,14 @@ async fn classify_untracked_session<S>(
             persist_observed_pane_pid(
                 work_db,
                 dispatch_events,
-                &PaneObservation {
-                    execution_id: &execution_id,
-                    spawn_token: &session.spawn_token,
-                    session_name: &session.session_name,
-                    server_label: &server_label,
-                    observed_shell_pid: shell_pid,
-                    write_reason: "terminal_tmux_readoption",
-                },
+                &PaneObservation::builder()
+                    .execution_id(&execution_id)
+                    .spawn_token(&session.spawn_token)
+                    .session_name(&session.session_name)
+                    .server_label(&server_label)
+                    .observed_shell_pid(shell_pid)
+                    .write_reason("terminal_tmux_readoption")
+                    .build(),
             )
             .await,
             PersistedPanePid::NoMatchingRun
@@ -1040,14 +1040,14 @@ async fn classify_untracked_session<S>(
                 persist_observed_pane_pid(
                     work_db,
                     dispatch_events,
-                    &PaneObservation {
-                        execution_id: &execution_id,
-                        spawn_token: &session.spawn_token,
-                        session_name: &session.session_name,
-                        server_label: &server_label,
-                        observed_shell_pid: shell_pid,
-                        write_reason: "repair_incomplete_tmux_identity",
-                    },
+                    &PaneObservation::builder()
+                        .execution_id(&execution_id)
+                        .spawn_token(&session.spawn_token)
+                        .session_name(&session.session_name)
+                        .server_label(&server_label)
+                        .observed_shell_pid(shell_pid)
+                        .write_reason("repair_incomplete_tmux_identity")
+                        .build(),
                 )
                 .await,
                 PersistedPanePid::NoMatchingRun
