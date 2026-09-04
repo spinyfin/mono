@@ -199,6 +199,53 @@ pub(super) async fn handle_create_task_from_deferred_scope_attention(ctx: Dispat
     }
 }
 
+/// The human decision that lifts a `worker_recovery_permanent_error` /
+/// `worker_recovery_exhausted` dispatch gate. See
+/// [`crate::work::WorkDb::resolve_worker_recovery_attention`] for the
+/// validation rules (must be one of the two gate kinds, must be open).
+pub(super) async fn handle_resolve_worker_recovery_attention(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::ResolveWorkerRecoveryAttention { id } = req else {
+        unreachable!()
+    };
+    match work_db.resolve_worker_recovery_attention(&id) {
+        Ok(item) => {
+            if let Some(product_id) = worker_recovery_item_product_id(&work_db, &item) {
+                server_state
+                    .publisher
+                    .publish_frontend_event_on_product(
+                        &product_id,
+                        FrontendEvent::AttentionItemUpdated { item: item.clone() },
+                    )
+                    .await;
+            }
+            send_response(&sink, &request_id, FrontendEvent::AttentionItemUpdated { item });
+        }
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+        }
+    }
+}
+
+/// Resolve the owning product id for a `worker_recovery_*` attention item —
+/// these are always work-item-scoped (filed via
+/// `upsert_external_tracker_attention`, never against an execution) — so
+/// [`handle_resolve_worker_recovery_attention`] can publish its live-update
+/// on the right product topic. `None` if the work item has since vanished;
+/// the RPC still replies to the direct caller either way, it just skips the
+/// broadcast.
+fn worker_recovery_item_product_id(work_db: &WorkDb, item: &WorkAttentionItem) -> Option<String> {
+    let work_item_id = item.work_item_id.as_deref()?;
+    let work_item = work_db.get_work_item(work_item_id).ok()?;
+    Some(work_item.product_id().to_owned())
+}
+
 /// List every open `deferred_scope` attention item across a product, each
 /// paired with the id of the work item whose execution recorded it. Backs
 /// the kanban review-lane card affordance (badge + popup).

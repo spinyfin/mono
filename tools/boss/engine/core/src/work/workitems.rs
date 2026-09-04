@@ -249,6 +249,48 @@ impl WorkDb {
         Ok(())
     }
 
+    /// The human decision that lifts a `worker_recovery_permanent_error` /
+    /// `worker_recovery_exhausted` dispatch gate: mark the open item
+    /// resolved so [`Self::list_orphan_active_candidates`] stops excluding
+    /// its work item — the item's own body already tells the operator that
+    /// resolving it re-enables redispatch (see the `ClearedBy::HumanDecision`
+    /// entries for both kinds in [`crate::attention_lifecycle`]).
+    ///
+    /// Rejects any other kind (this is not a generic "resolve any attention
+    /// item" verb — those 26 other `HumanDecision` kinds are reports, not
+    /// gates, and have no actuator here) and any non-`open` item (no
+    /// double-resolving). Mirrors [`Self::resolve_deferred_scope_attention`]'s
+    /// shape.
+    pub fn resolve_worker_recovery_attention(&self, id: &str) -> Result<WorkAttentionItem> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let attention = query_attention_item(&tx, id)?.with_context(|| format!("unknown attention item: {id}"))?;
+        if !matches!(
+            attention.kind.as_str(),
+            crate::work::ATTENTION_KIND_RECOVERY_PERMANENT | crate::work::ATTENTION_KIND_RECOVERY_EXHAUSTED
+        ) {
+            bail!(
+                "attention item {id} is not a dispatch-gate item (kind = {}); only \
+                 {permanent} and {exhausted} can be resolved this way",
+                attention.kind,
+                permanent = crate::work::ATTENTION_KIND_RECOVERY_PERMANENT,
+                exhausted = crate::work::ATTENTION_KIND_RECOVERY_EXHAUSTED,
+            );
+        }
+        if attention.status != "open" {
+            bail!("attention item {id} is not open (status = {})", attention.status);
+        }
+        let now = now_string();
+        tx.execute(
+            "UPDATE work_attention_items SET status = 'resolved', resolved_at = ?2 WHERE id = ?1",
+            params![id, now],
+        )?;
+        let updated =
+            query_attention_item(&tx, id)?.with_context(|| format!("missing attention item after update: {id}"))?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
     /// File (idempotently) the operator-visible attention item raised when
     /// [`crate::orphan_sweep`] or [`crate::pr_review_recovery`] trips the
     /// shared churn guard and parks a work item instead of auto-redispatching
@@ -1981,5 +2023,81 @@ impl WorkDb {
             prerequisites,
             dependents,
         })
+    }
+}
+
+#[cfg(test)]
+mod resolve_worker_recovery_attention_tests {
+    use super::*;
+    use crate::test_support::{create_active_chore, create_product, open_db};
+
+    /// Insert an `open` `work_attention_items` row directly against
+    /// `work_item_id`, bypassing the production filers so a test can pick
+    /// any `kind` it needs (including a non-gate kind, for the negative
+    /// case).
+    fn open_attention_row(db: &WorkDb, work_item_id: &str, kind: &str) -> String {
+        let id = next_id("attn");
+        let now = now_string();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "INSERT INTO work_attention_items
+                 (id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at)
+             VALUES (?1, NULL, ?2, ?3, 'open', 'test', 'test', ?4, NULL)",
+            params![id, work_item_id, kind, now],
+        )
+        .unwrap();
+        id
+    }
+
+    #[test]
+    fn resolves_an_open_permanent_error_gate_item() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "gated chore");
+        let attn_id = open_attention_row(&db, &work_item_id, crate::work::ATTENTION_KIND_RECOVERY_PERMANENT);
+
+        let resolved = db.resolve_worker_recovery_attention(&attn_id).unwrap();
+
+        assert_eq!(resolved.status, "resolved");
+        assert!(resolved.resolved_at.is_some());
+    }
+
+    #[test]
+    fn resolves_an_open_exhausted_gate_item() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "gated chore");
+        let attn_id = open_attention_row(&db, &work_item_id, crate::work::ATTENTION_KIND_RECOVERY_EXHAUSTED);
+
+        let resolved = db.resolve_worker_recovery_attention(&attn_id).unwrap();
+
+        assert_eq!(resolved.status, "resolved");
+    }
+
+    #[test]
+    fn refuses_a_non_gate_kind() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "unrelated chore");
+        // `deferred_scope` is a real `HumanDecision` kind, but not a dispatch
+        // gate — this verb must not become a general-purpose resolver.
+        let attn_id = open_attention_row(&db, &work_item_id, crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND);
+
+        let err = db.resolve_worker_recovery_attention(&attn_id).unwrap_err();
+
+        assert!(err.to_string().contains("not a dispatch-gate item"), "{err}");
+    }
+
+    #[test]
+    fn refuses_an_already_resolved_item() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "gated chore");
+        let attn_id = open_attention_row(&db, &work_item_id, crate::work::ATTENTION_KIND_RECOVERY_PERMANENT);
+        db.resolve_worker_recovery_attention(&attn_id).unwrap();
+
+        let err = db.resolve_worker_recovery_attention(&attn_id).unwrap_err();
+
+        assert!(err.to_string().contains("not open"), "{err}");
     }
 }
