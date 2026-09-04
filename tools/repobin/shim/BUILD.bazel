@@ -8,7 +8,9 @@ package(default_visibility = ["//visibility:private"])
 # package exists to test them hermetically (fake bazel, decoy PATH copies).
 sh_test(
     name = "repobin_shim_test",
-    size = "small",
+    # This test creates isolated workspaces and launches nested shell tools;
+    # under CI contention that can exceed Bazel's 60-second `small` timeout.
+    size = "medium",
     srcs = ["repobin_shim_test.sh"],
     args = [
         "$(location repobin-shim.sh)",
