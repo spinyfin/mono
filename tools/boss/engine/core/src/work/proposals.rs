@@ -238,7 +238,7 @@ impl WorkDb {
             // land in the same `INSERT`, so a reader can never observe one
             // without the other.
             let apply_decision = match apply_policy(input.kind) {
-                ProposalApplyPolicy::AutoApply => Some(apply_in_transaction(
+                ProposalApplyPolicy::AutoApply | ProposalApplyPolicy::Async => Some(apply_in_transaction(
                     &tx,
                     input.execution_id,
                     input.payload_json,
@@ -273,6 +273,15 @@ impl WorkDb {
                     Some(now.clone()),
                     None,
                     None,
+                ),
+                Some(ApplyDecision::Staged(outcome)) => (
+                    ProposalState::Proposed,
+                    None,
+                    None,
+                    None,
+                    None,
+                    outcome.post_commit_audit_line,
+                    outcome.review_batch_quorum_outcome,
                 ),
                 None => (ProposalState::Proposed, None, None, None, None, None, None),
             };

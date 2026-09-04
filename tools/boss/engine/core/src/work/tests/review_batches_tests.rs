@@ -896,7 +896,7 @@ fn missing_review_report_marks_only_its_member_failed() {
 }
 
 #[test]
-fn review_verdict_auto_applies_and_completes_the_batch() {
+fn review_verdict_stages_proposed_and_moves_the_batch_to_applying() {
     let db = WorkDb::open(temp_db_path("review-verdict-proposal")).unwrap();
     let product = create_test_product(&db);
     let cycle_root = create_test_chore_manual(&db, product.id, "review target");
@@ -928,15 +928,15 @@ fn review_verdict_auto_applies_and_completes_the_batch() {
         .unwrap()
         .unwrap();
 
-    assert_eq!(outcome.proposal.state, ProposalState::Applied);
-    assert_eq!(outcome.proposal.applied_ref.as_deref(), Some(batch.id.as_str()));
-    let completed = db.review_batch(&batch.id).unwrap().unwrap();
-    assert_eq!(completed.status, ReviewBatchStatus::Completed);
+    assert_eq!(outcome.proposal.state, ProposalState::Proposed);
+    assert_eq!(outcome.proposal.applied_ref, None);
+    let applying = db.review_batch(&batch.id).unwrap().unwrap();
+    assert_eq!(applying.status, ReviewBatchStatus::Applying);
     assert_eq!(
-        completed.final_verdict_proposal_id.as_deref(),
+        applying.final_verdict_proposal_id.as_deref(),
         Some(outcome.proposal.id.as_str())
     );
-    assert!(completed.completed_at.is_some());
+    assert!(applying.completed_at.is_none());
 
     let member = db
         .review_batch_members(&batch.id)
@@ -949,11 +949,10 @@ fn review_verdict_auto_applies_and_completes_the_batch() {
 }
 
 /// A second, corrected verdict submission from the SAME supervisor member
-/// that already completed this exact batch is accepted, not rejected: it
-/// supersedes the first (schema-valid but potentially wrong) verdict and
-/// re-points the batch at the corrected one. This is the supervisor's only
-/// correction path, since the batch synchronously completes on the first
-/// schema-valid submission and nothing else re-opens it.
+/// that already staged this exact batch is accepted, not rejected: it
+/// supersedes the first (still-undecided) verdict and re-points the batch
+/// at the corrected one. Once the reconciler has applied the verdict the
+/// batch is `completed` and this path is closed.
 #[test]
 fn a_corrected_review_verdict_from_the_same_supervisor_supersedes_the_prior_one() {
     let db = WorkDb::open(temp_db_path("review-verdict-correction")).unwrap();
@@ -986,7 +985,7 @@ fn a_corrected_review_verdict_from_the_same_supervisor_supersedes_the_prior_one(
         })
         .unwrap()
         .unwrap();
-    assert_eq!(first.proposal.state, ProposalState::Applied);
+    assert_eq!(first.proposal.state, ProposalState::Proposed);
 
     let second = db
         .submit_worker_proposal(SubmitWorkerProposalInput {
@@ -998,13 +997,13 @@ fn a_corrected_review_verdict_from_the_same_supervisor_supersedes_the_prior_one(
         })
         .unwrap()
         .unwrap();
-    assert_eq!(second.proposal.state, ProposalState::Applied);
-    assert_eq!(second.proposal.applied_ref.as_deref(), Some(batch.id.as_str()));
+    assert_eq!(second.proposal.state, ProposalState::Proposed);
+    assert_eq!(second.proposal.applied_ref, None);
 
-    let completed = db.review_batch(&batch.id).unwrap().unwrap();
-    assert_eq!(completed.status, ReviewBatchStatus::Completed);
+    let applying = db.review_batch(&batch.id).unwrap().unwrap();
+    assert_eq!(applying.status, ReviewBatchStatus::Applying);
     assert_eq!(
-        completed.final_verdict_proposal_id.as_deref(),
+        applying.final_verdict_proposal_id.as_deref(),
         Some(second.proposal.id.as_str()),
         "the batch must now point at the corrected verdict"
     );
@@ -1071,7 +1070,7 @@ fn a_review_verdict_from_a_different_execution_is_rejected_even_after_completion
         })
         .unwrap()
         .unwrap();
-    assert_eq!(first.proposal.state, ProposalState::Applied);
+    assert_eq!(first.proposal.state, ProposalState::Proposed);
 
     // `other_execution` is not a member of this batch at all, so it hits the
     // "not a member" rejection rather than the batch-status one — either
@@ -1102,7 +1101,7 @@ fn a_review_verdict_from_a_different_execution_is_rejected_even_after_completion
             .final_verdict_proposal_id
             .as_deref(),
         Some(first.proposal.id.as_str()),
-        "the foreign rejection must not disturb the already-completed batch"
+        "the foreign rejection must not disturb the already-staged batch"
     );
 }
 

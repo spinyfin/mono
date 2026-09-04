@@ -5,7 +5,8 @@
 //! that decides when enough leaf reviewers have settled to dispatch the
 //! consolidating supervisor, or to give up on the batch. It deliberately does
 //! not apply a supervisor's verdict; that is
-//! [`crate::work::proposal_apply::apply_review_verdict`]'s job.
+//! [`crate::work::review_verdict_apply`]'s job after
+//! [`crate::work::proposal_apply::apply_review_verdict`] stages it.
 
 use std::str::FromStr;
 
@@ -477,8 +478,9 @@ pub enum ReviewBatchQuorumOutcome {
     /// Two or three leaves reported; the supervisor member and its execution
     /// were just created and the batch moved to `supervising`.
     SupervisorDispatched,
-    /// The supervisor reported; the batch moved to `completed`.
-    Completed,
+    /// The supervisor reported; the batch moved to `applying` so the
+    /// asynchronous verdict reconciler can materialize the outcome.
+    Applying,
     /// Either fewer than two leaves reported (both exhausted their retry), or
     /// the supervisor exhausted its one retry without submitting a verdict.
     /// The batch moved to `failed` and a human-visible attention was filed —
@@ -545,10 +547,10 @@ fn fail_review_batch_with_attention(
 ///   verdict" requirement. Still-in-flight roles are a no-op.
 /// - `supervising`: once the supervisor's latest attempt has settled
 ///   (reported, or failed with its one retry exhausted — the same bound
-///   as a leaf), advance to `completed` or `failed` accordingly. A failed
-///   attempt-1 supervisor is a no-op so the recovery sweep can insert the
-///   retry rather than failing the batch the moment Stop (or a death
-///   stamp) lands.
+///   as a leaf), advance to `applying` (verdict reconciler will complete
+///   the batch) or `failed` accordingly. A failed attempt-1 supervisor is
+///   a no-op so the recovery sweep can insert the retry rather than
+///   failing the batch the moment Stop (or a death stamp) lands.
 /// - Any other status (`applying`, `completed`, `failed`): no-op. This is
 ///   what makes redundant calls safe.
 ///
@@ -629,11 +631,11 @@ pub(crate) fn try_advance_review_batch_quorum_in_tx(
                     .ok_or_else(|| anyhow::anyhow!("reported supervisor member is missing its report_proposal_id"))?;
                 tx.execute(
                     "UPDATE pr_review_batches
-                         SET status = 'completed', completed_at = ?2, updated_at = ?2, final_verdict_proposal_id = ?3
+                         SET status = 'applying', updated_at = ?2, final_verdict_proposal_id = ?3
                          WHERE id = ?1",
                     params![batch_id, now, proposal_id],
                 )?;
-                Ok(ReviewBatchQuorumOutcome::Completed)
+                Ok(ReviewBatchQuorumOutcome::Applying)
             }
             Some(member) if member_attempt_is_settled(member) => {
                 fail_review_batch_with_attention(

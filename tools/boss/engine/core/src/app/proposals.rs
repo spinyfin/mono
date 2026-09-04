@@ -418,6 +418,10 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                     }
                 }
             }
+            let apply_after_submit = !already_submitted
+                && kind == ProposalKind::ReviewVerdict
+                && proposal.state == boss_protocol::ProposalState::Proposed;
+            let apply_proposal_id = apply_after_submit.then(|| proposal.id.clone());
             send_response(
                 &sink,
                 &request_id,
@@ -426,6 +430,30 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                     already_submitted,
                 },
             );
+            // Apply after the worker has the `proposed` ack so GitHub probes
+            // and remediation creation cannot stall the submission socket.
+            // The periodic sweep is the crash-recovery path for the same work.
+            if let Some(proposal_id) = apply_proposal_id {
+                let work_db = Arc::clone(&work_db);
+                let publisher = server_state.publisher.clone();
+                tokio::spawn(async move {
+                    let created = tokio::task::spawn_blocking(move || {
+                        work_db.apply_review_verdict_proposal(&proposal_id, &crate::work::GhPrStateChecker)
+                    })
+                    .await;
+                    match created {
+                        Ok(Ok(Some(_))) => publisher.kick_scheduler(),
+                        Ok(Ok(None)) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(?error, "submit_proposal: review-verdict apply failed; sweep will retry",)
+                        }
+                        Err(error) => tracing::warn!(
+                            ?error,
+                            "submit_proposal: review-verdict apply task joined with error; sweep will retry",
+                        ),
+                    }
+                });
+            }
         }
         Ok(Err(refusal)) => {
             if refusal.code == ProposalErrorCode::RateLimited {

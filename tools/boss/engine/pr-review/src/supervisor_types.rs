@@ -155,6 +155,41 @@ impl SupervisorVerdict {
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }
+
+    /// Project this consolidated verdict into the legacy [`crate::types::ReviewResult`]
+    /// shape so the existing severity gate and revision-instruction renderer
+    /// can run without a parallel implementation.
+    pub fn to_review_result(&self) -> crate::types::ReviewResult {
+        let findings = self
+            .findings
+            .iter()
+            .map(|finding| crate::types::ReviewFinding {
+                severity: finding.severity.clone(),
+                category: finding.category.clone(),
+                file: finding.file.clone(),
+                location: finding.location.clone(),
+                title: finding.title.clone(),
+                detail: finding.detail.clone(),
+                confidence: finding.confidence.clone(),
+            })
+            .collect::<Vec<_>>();
+        let suspected_deletions = findings
+            .iter()
+            .filter(|finding| matches!(finding.category, crate::types::ReviewFindingCategory::Regression))
+            .cloned()
+            .collect();
+        crate::types::ReviewResult {
+            pr_url: self.pr_url.clone(),
+            head_sha: self.target_sha.clone(),
+            summary: self.summary.clone(),
+            revision_warranted: self.revision_warranted,
+            findings,
+            regression_check: crate::types::RegressionCheck {
+                performed: true,
+                suspected_deletions,
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -190,6 +225,17 @@ mod tests {
                 "resolved_in_favor_of": "codex"
             }]
         })
+    }
+
+    #[test]
+    fn supervisor_verdict_projects_into_a_review_result_for_the_severity_gate() {
+        let parsed = SupervisorVerdict::from_json(&sample_verdict_json().to_string()).expect("valid verdict");
+        let result = parsed.to_review_result();
+        assert_eq!(result.pr_url, parsed.pr_url);
+        assert_eq!(result.head_sha, parsed.target_sha);
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(result.findings[0].title, "Unchecked index into changed_files");
+        assert!(crate::passes_severity_gate(&result));
     }
 
     #[test]

@@ -71,12 +71,20 @@ use boss_protocol::{
 pub const ATTENTION_PROPOSAL_DEFAULT_KIND: &str = "worker_attention";
 
 /// Whether [`apply_in_transaction`] runs synchronously at submission
-/// (`AutoApply`) or the proposal stays `proposed` for a later/human
-/// disposition path (`Gated`).
+/// (`AutoApply`), the proposal stays `proposed` for a later/human
+/// disposition path (`Gated`), or staging runs at submission but the
+/// proposal remains `proposed` until a later reconciler applies the
+/// effect (`Async`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProposalApplyPolicy {
     AutoApply,
     Gated,
+    /// Staged at submission (validation + member bookkeeping) but the
+    /// proposal stays `proposed` until a later reconciler applies the
+    /// effect. Used by `review_verdict` because application probes GitHub
+    /// and may create a remediation work item — that must not block the
+    /// submission socket.
+    Async,
 }
 
 /// The policy table. Exhaustive match: adding a `ProposalKind` variant is a
@@ -92,8 +100,11 @@ pub fn apply_policy(kind: ProposalKind) -> ProposalApplyPolicy {
         | ProposalKind::AutomationOutcome
         | ProposalKind::PrCreated
         | ProposalKind::ReviewReport
-        | ProposalKind::RunDone
-        | ProposalKind::ReviewVerdict => ProposalApplyPolicy::AutoApply,
+        | ProposalKind::RunDone => ProposalApplyPolicy::AutoApply,
+        // Staged at submission (member reported, batch → applying) but the
+        // proposal stays `proposed` until the verdict reconciler records
+        // the durable batch verdict and its clean/remediation result.
+        ProposalKind::ReviewVerdict => ProposalApplyPolicy::Async,
         // Gated by design: task creation from a followup proposal always
         // requires the human batch-accept gesture
         // (`WorkDb::action_attention_group`). See
@@ -139,6 +150,10 @@ pub enum ApplyDecision {
     /// Human-readable reason, stored verbatim as the proposal's
     /// `decision_reason`.
     Rejected(String),
+    /// Staging succeeded; the proposal remains `proposed` until a later
+    /// reconciler applies the effect. Only [`ProposalApplyPolicy::Async`]
+    /// kinds return this.
+    Staged(ApplyOutcome),
 }
 
 /// Auto-apply `kind` inside `tx` — the same transaction
@@ -291,25 +306,27 @@ fn advance_review_batch_quorum_best_effort(
     }
 }
 
-/// Accept the supervisor's consolidated verdict for a batch. Verifies the
+/// Stage the supervisor's consolidated verdict for a batch. Verifies the
 /// submitting execution owns the batch's supervisor member, that the
 /// verdict's identity matches the persisted batch, then marks that member
 /// reported and hands off to [`try_advance_review_batch_quorum_in_tx`] to
-/// complete the batch (application of the verdict's *content* — deciding
-/// what happens to the reviewed work item — is separate, later work; this
-/// only records that the batch's consolidated outcome now exists).
+/// move the batch to `applying`. The proposal itself stays `proposed`
+/// until [`super::review_verdict_apply`] records the durable batch verdict
+/// and its clean/remediation result — application probes GitHub and may
+/// create a work item, so it must not run inside the submission
+/// transaction.
 ///
-/// A resubmission from the SAME supervisor member that already completed
+/// A resubmission from the SAME supervisor member that already staged
 /// this exact batch (`existing_verdict == final_verdict_proposal_id`) is
-/// accepted as a correction rather than rejected: [`supersede_verdict_proposal`]
-/// marks the prior proposal superseded and this call re-points the member
-/// and the batch's `final_verdict_proposal_id` at the new one. This is the
-/// only correction path a supervisor has for a schema-valid but semantically
-/// wrong verdict — the batch has already synchronously completed on the
-/// first schema-valid submission, and nothing else re-opens it. A different
-/// member, or a stale/foreign proposal, can never trigger this path: it is
-/// keyed on the exact prior proposal id this member itself was recorded
-/// against, not merely on role or batch id.
+/// accepted as a correction rather than rejected while the batch is still
+/// `supervising` or `applying` (the prior proposal is still undecided):
+/// [`supersede_verdict_proposal`] marks the prior proposal superseded and
+/// this call re-points the member and the batch's
+/// `final_verdict_proposal_id` at the new one. Once the reconciler has
+/// marked the batch `completed`, further verdicts are rejected. A
+/// different member, or a stale/foreign proposal, can never trigger this
+/// path: it is keyed on the exact prior proposal id this member itself
+/// was recorded against, not merely on role or batch id.
 fn apply_review_verdict(
     tx: &Transaction<'_>,
     execution_id: &str,
@@ -366,15 +383,16 @@ fn apply_review_verdict(
              supervisor member may submit a review-verdict",
         )));
     }
-    // A correction: this exact member already completed this exact batch
-    // with its previously accepted verdict proposal. Anything else —
-    // another member, a batch this member didn't complete, or a batch some
-    // other event moved to `completed` — falls through to the ordinary
-    // `supervising`-only rule below.
-    let is_own_completed_verdict = batch_status == ReviewBatchStatus::Completed.as_str()
-        && existing_verdict.is_some()
-        && existing_verdict == final_verdict_proposal_id;
-    if batch_status != ReviewBatchStatus::Supervising.as_str() && !is_own_completed_verdict {
+    // A correction: this exact member already staged this exact batch
+    // with its previously accepted (still-undecided) verdict proposal.
+    // Anything else — another member, a batch this member didn't stage, or
+    // a batch the reconciler has already completed — falls through to the
+    // ordinary `supervising`-only rule below.
+    let batch_awaiting_apply =
+        batch_status == ReviewBatchStatus::Supervising.as_str() || batch_status == ReviewBatchStatus::Applying.as_str();
+    let is_own_undecided_verdict =
+        batch_awaiting_apply && existing_verdict.is_some() && existing_verdict == final_verdict_proposal_id;
+    if batch_status != ReviewBatchStatus::Supervising.as_str() && !is_own_undecided_verdict {
         return Ok(ApplyDecision::Rejected(format!(
             "review batch `{}` is `{batch_status}`, not `supervising`; a verdict can only be accepted \
              while the batch is awaiting one",
@@ -391,14 +409,14 @@ fn apply_review_verdict(
         ));
     }
     if let Some(existing_verdict) = &existing_verdict
-        && !is_own_completed_verdict
+        && !is_own_undecided_verdict
     {
         return Ok(ApplyDecision::Rejected(format!(
             "review batch member `{member_id}` already accepted verdict proposal `{existing_verdict}`",
         )));
     }
     let status: ReviewBatchMemberStatus = status.parse().map_err(anyhow::Error::msg)?;
-    if !is_own_completed_verdict
+    if !is_own_undecided_verdict
         && !matches!(
             status,
             ReviewBatchMemberStatus::Pending | ReviewBatchMemberStatus::Running
@@ -408,10 +426,13 @@ fn apply_review_verdict(
             "review batch member `{member_id}` cannot accept a verdict while status is `{status}`",
         )));
     }
+    if let Some(reason) = review_verdict_unknown_source_reason(tx, &payload.batch_id, &verdict)? {
+        return Ok(ApplyDecision::Rejected(reason));
+    }
 
     let now = now_string();
-    if is_own_completed_verdict {
-        let prior_proposal_id = existing_verdict.expect("is_own_completed_verdict implies existing_verdict is Some");
+    if is_own_undecided_verdict {
+        let prior_proposal_id = existing_verdict.expect("is_own_undecided_verdict implies existing_verdict is Some");
         supersede_verdict_proposal(tx, &prior_proposal_id, proposal_id, &now)?;
         tx.execute(
             "UPDATE pr_review_batch_members
@@ -423,8 +444,9 @@ fn apply_review_verdict(
             "UPDATE pr_review_batches SET final_verdict_proposal_id = ?1, updated_at = ?2 WHERE id = ?3",
             rusqlite::params![proposal_id, now, payload.batch_id],
         )?;
-        return Ok(ApplyDecision::Applied(ApplyOutcome {
-            applied_ref: Some(payload.batch_id),
+        supersede_other_undecided_review_verdicts(tx, &payload.batch_id, proposal_id, &now)?;
+        return Ok(ApplyDecision::Staged(ApplyOutcome {
+            applied_ref: None,
             post_commit_audit_line: None,
             review_batch_quorum_outcome: None,
         }));
@@ -436,8 +458,9 @@ fn apply_review_verdict(
         rusqlite::params![ReviewBatchMemberStatus::Reported.as_str(), proposal_id, now, member_id],
     )?;
     let quorum_outcome = advance_review_batch_quorum_best_effort(tx, execution_id, &payload.batch_id);
-    Ok(ApplyDecision::Applied(ApplyOutcome {
-        applied_ref: Some(payload.batch_id),
+    supersede_other_undecided_review_verdicts(tx, &payload.batch_id, proposal_id, &now)?;
+    Ok(ApplyDecision::Staged(ApplyOutcome {
+        applied_ref: None,
         post_commit_audit_line: None,
         review_batch_quorum_outcome: quorum_outcome,
     }))
@@ -463,6 +486,69 @@ fn supersede_verdict_proposal(
         rusqlite::params![now, new_proposal_id, prior_proposal_id],
     )?;
     Ok(())
+}
+
+/// A newer verdict supersedes any earlier undecided verdict for the same
+/// batch, not only the member's own prior proposal. The newest submission
+/// remains `proposed` until the reconciler lands.
+fn supersede_other_undecided_review_verdicts(
+    tx: &Transaction<'_>,
+    batch_id: &str,
+    new_proposal_id: &str,
+    now: &str,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE worker_proposals
+         SET state = 'superseded', decided_by = 'policy', decided_at = ?1,
+             decision_reason = 'superseded by a newer review_verdict (' || ?2 || ') for the same batch'
+         WHERE kind = 'review_verdict'
+           AND state = 'proposed'
+           AND id <> ?2
+           AND json_extract(payload_json, '$.batch_id') = ?3",
+        rusqlite::params![now, new_proposal_id, batch_id],
+    )?;
+    Ok(())
+}
+
+/// Every source role cited in the verdict must belong to a reported leaf of
+/// this batch. A supervisor may not invent a source the batch never
+/// accepted, including a missing role in a degraded two-of-three quorum.
+fn review_verdict_unknown_source_reason(
+    tx: &Transaction<'_>,
+    batch_id: &str,
+    verdict: &boss_pr_review::SupervisorVerdict,
+) -> Result<Option<String>> {
+    let mut statement = tx.prepare(
+        "SELECT role FROM pr_review_batch_members
+         WHERE batch_id = ?1 AND status = 'reported'
+           AND role IN ('claude_reviewer', 'codex_reviewer', 'grok_reviewer')",
+    )?;
+    let reported: std::collections::HashSet<String> = statement
+        .query_map(rusqlite::params![batch_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let cited = verdict
+        .findings
+        .iter()
+        .flat_map(|finding| finding.sources.iter())
+        .chain(
+            verdict
+                .contradictions
+                .iter()
+                .flat_map(|contradiction| contradiction.positions.iter().map(|position| &position.role)),
+        );
+    for role in cited {
+        let member_role = match role {
+            boss_pr_review::SupervisorSourceRole::Claude => "claude_reviewer",
+            boss_pr_review::SupervisorSourceRole::Codex => "codex_reviewer",
+            boss_pr_review::SupervisorSourceRole::Grok => "grok_reviewer",
+        };
+        if !reported.contains(member_role) {
+            return Ok(Some(format!(
+                "verdict cites source `{role}` which has no accepted report in batch `{batch_id}`"
+            )));
+        }
+    }
+    Ok(None)
 }
 
 fn create_attention_item_row(
@@ -1132,6 +1218,7 @@ mod tests {
         );
         assert_eq!(apply_policy(ProposalKind::PrCreated), ProposalApplyPolicy::AutoApply);
         assert_eq!(apply_policy(ProposalKind::RunDone), ProposalApplyPolicy::AutoApply);
+        assert_eq!(apply_policy(ProposalKind::ReviewVerdict), ProposalApplyPolicy::Async);
     }
 
     /// The whole point of the kind: a declaration stamps the execution row,
@@ -1261,13 +1348,13 @@ mod tests {
         );
     }
 
-    /// `followup_task` is the only kind implementation task 6 keeps gated —
-    /// `automation_outcome` and `pr_created` both flip to `AutoApply` in this
-    /// PR (real appliers above), leaving `followup_task` as the sole
-    /// permanently-gated kind (per design: task creation always needs the
-    /// human batch-accept gesture).
+    /// `followup_task` is the only kind kept gated — `review_verdict` is
+    /// `Async` (staged at submit, applied by the reconciler) rather than
+    /// human-gated. Task creation from a followup proposal always needs the
+    /// human batch-accept gesture.
     #[test]
     fn followup_task_stays_gated() {
         assert_eq!(apply_policy(ProposalKind::FollowupTask), ProposalApplyPolicy::Gated);
+        assert_eq!(apply_policy(ProposalKind::ReviewVerdict), ProposalApplyPolicy::Async);
     }
 }
