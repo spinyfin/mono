@@ -507,7 +507,6 @@ mod migrations_attachments;
 mod migrations_b;
 mod migrations_boothby;
 mod migrations_c;
-mod migrations_ideas;
 mod migrations_review_batches;
 mod output_types;
 mod planner_runs;
@@ -555,6 +554,7 @@ pub(crate) use driver_allocation::*;
 pub(crate) use exec_status_helpers::*;
 pub(crate) use exec_tail::content_checksum;
 use ideas::list_ideas_in_tx;
+pub(crate) use ideas::migrate_ideas_tables;
 pub(crate) use insert_helpers::*;
 // Private on purpose: only the list-read submodules under `work` build
 // these queries, so it stays visible to `work` and its children only.
@@ -565,7 +565,6 @@ pub(crate) use migrations_attachments::*;
 pub(crate) use migrations_b::*;
 pub(crate) use migrations_boothby::*;
 pub(crate) use migrations_c::*;
-pub(crate) use migrations_ideas::*;
 pub(crate) use migrations_review_batches::*;
 pub(crate) use pr_state::stored_pr_number;
 pub(crate) use products_design::{
