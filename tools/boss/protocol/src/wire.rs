@@ -14,18 +14,18 @@ use crate::types::{
     AutomationDedupSuppression, AutomationPatch, AutomationRun, BackgroundWorkItem, BoardDropTarget, CiBudgetSnapshot,
     CiRemediation, CommentAnchor, CommentThreadEntry, CommentWithThread, CommentsBannerState, ConflictHotspotReport,
     ConflictResolution, CoordinatorHandoffView, CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput,
-    CreateChoreInput, CreateCommentInput, CreateDecisionInput, CreateExecutionInput, CreateInvestigationInput,
-    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
-    CreateRunInput, CreateTaskInput, Decision, DeferredScopeAttention, DependencyFilter, DesignDocContent,
-    DesignDocTreeState, DispatchAdmission, DriverQuotaSnapshot, DriverTrafficSplit, EditorialAction,
-    EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
-    PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation, ProbeDeliveryState, ProbeInterruptOutcome,
-    Product, Project, ProposalKind, ProposalState, ProposalSubmissionError, RemoveDependencyInput,
-    RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput, ReviseDocOutcome,
-    SelectedProductState, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput,
-    SetTaskDocPointerInput, Task, TaskRuntime, TranscriptSegment, WorkAttachment, WorkAttentionItem, WorkComment,
-    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
-    WorkRun, WorkerContextBundle, WorkerProposal, WorkerTierDenial,
+    CreateChoreInput, CreateCommentInput, CreateDecisionInput, CreateExecutionInput, CreateIdeaInput,
+    CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
+    CreateRevisionInput, CreateRunInput, CreateTaskInput, Decision, DeferredScopeAttention, DependencyFilter,
+    DesignDocContent, DesignDocTreeState, DispatchAdmission, DriverQuotaSnapshot, DriverTrafficSplit, EditorialAction,
+    EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto, Idea, IdeaGraduationKind, IdeaPatch,
+    LinkExternalRefInput, ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation,
+    ProbeDeliveryState, ProbeInterruptOutcome, Product, Project, ProposalKind, ProposalState, ProposalSubmissionError,
+    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput,
+    ReviseDocOutcome, SelectedProductState, SetProductEditorialRulesInput, SetProductExternalTrackerInput,
+    SetProjectDesignDocInput, SetTaskDocPointerInput, Task, TaskRuntime, TranscriptSegment, WorkAttachment,
+    WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
+    WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle, WorkerProposal, WorkerTierDenial,
 };
 
 /// Outcome of the live `getQueue` smoke check `boss engine trunk status`
@@ -539,6 +539,13 @@ pub enum FrontendRequest {
         input: CreateExecutionInput,
     },
 
+    /// Create a new idea (markdown draft) for a product. Replies with
+    /// [`FrontendEvent::IdeaCreated`] on success.
+    CreateIdea {
+        #[serde(flatten)]
+        input: CreateIdeaInput,
+    },
+
     /// Create a `kind = 'investigation'` task. Parallel to
     /// `CreateChore` but uses `investigation` kind and supports an
     /// optional `project_id`. Workers dispatched against investigation
@@ -612,6 +619,11 @@ pub enum FrontendRequest {
     /// Permanently delete an automation and its run history.
     /// Replies with [`FrontendEvent::AutomationDeleted`].
     DeleteAutomation {
+        id: String,
+    },
+
+    /// Permanently delete an idea. Replies with [`FrontendEvent::IdeaDeleted`].
+    DeleteIdea {
         id: String,
     },
 
@@ -880,6 +892,13 @@ pub enum FrontendRequest {
         id: String,
     },
 
+    /// Fetch a single idea by its canonical `idea_…` id. Replies with
+    /// [`FrontendEvent::IdeaResult`] or [`FrontendEvent::WorkError`] when
+    /// not found.
+    GetIdea {
+        id: String,
+    },
+
     /// Worker → engine, read-only: the caller's own PR's body as Boss
     /// snapshotted it at the start of this execution's run (see
     /// `WorkDb::get_execution_pr_body_before`) — never a live GitHub read.
@@ -1062,6 +1081,29 @@ pub enum FrontendRequest {
     /// immediately with a [`FrontendEvent::GitHubAuthState`] push
     /// reflecting the latest known state.
     GitHubAuthStatus,
+
+    /// Graduate a `draft` idea into a chore or project: a thin,
+    /// deterministic wrapper — not a general promote/convert mechanism —
+    /// that inserts the target row and flips the idea to `graduated` with
+    /// `graduated_to_id` set, in one transaction. Graduating to a project
+    /// puts the idea's markdown into the auto-minted design seed task's
+    /// description, born `autostart = false` so the gesture never silently
+    /// dispatches a design worker. `effort_level` / `reasoning` apply only
+    /// to `target = chore` (a project's design task has no such knobs) —
+    /// supplying either with `target = project` is a `WorkError`. `name`
+    /// overrides the idea's own name as the produced row's title; `None`
+    /// reuses the idea's name. Refuses (`WorkError`) unless the idea is
+    /// currently `draft`. Replies with [`FrontendEvent::IdeaGraduated`].
+    GraduateIdea {
+        id: String,
+        target: IdeaGraduationKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort_level: Option<crate::EffortLevel>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<crate::ReasoningMode>,
+    },
 
     /// Boss-tier RPC: place an explicit operator hold on the live run
     /// `run_id`, exempting it from the idle-park
@@ -1378,6 +1420,16 @@ pub enum FrontendRequest {
     /// Includes the built-in `local` host. Replies with
     /// [`FrontendEvent::HostsList`].
     ListHosts,
+
+    /// List ideas for a product, newest first. `status` filters to one
+    /// lifecycle state (draft / graduated / archived); `None` returns
+    /// every idea regardless of status. Replies with
+    /// [`FrontendEvent::IdeasList`].
+    ListIdeas {
+        product_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<crate::IdeaStatus>,
+    },
 
     /// Snapshot of which slots currently have the live-status
     /// summarizer disabled. The UI uses this to render the toggle
@@ -2646,6 +2698,13 @@ pub enum FrontendRequest {
     UpdateAutomation {
         id: String,
         patch: AutomationPatch,
+    },
+
+    /// Apply an `IdeaPatch` to an idea. `None` fields are left unchanged.
+    /// Replies with [`FrontendEvent::IdeaUpdated`].
+    UpdateIdea {
+        id: String,
+        patch: IdeaPatch,
     },
 
     /// App reports the real shell pid for a worker pane after the

@@ -1,5 +1,57 @@
 use super::*;
 
+/// Insert a project (and, unless `no_design_task`, its auto-minted design
+/// seed task) inside a caller-supplied transaction. Factored out of
+/// [`WorkDb::create_project`] so idea graduation can create the
+/// project in the SAME transaction that flips the source idea to
+/// `graduated` — an all-or-nothing commit, mirroring how
+/// [`insert_chore_in_tx`] / [`insert_task_in_tx`] let attention-group
+/// actioning commit its produced row alongside the group update.
+///
+/// `design_task_description` seeds the auto-minted design task's
+/// `description` column (normally `''`; idea graduation passes the idea's
+/// markdown body there instead).
+pub(crate) fn create_project_in_tx(
+    conn: &Connection,
+    input: CreateProjectInput,
+    design_task_description: &str,
+) -> Result<Project> {
+    ensure_product_exists(conn, &input.product_id)?;
+
+    let id = next_id("proj");
+    let now = now_string();
+    let slug = unique_project_slug(conn, &input.product_id, &slugify(&input.name))?;
+    let description = input.description.unwrap_or_default();
+    let goal = input.goal.unwrap_or_default();
+    let short_id = allocate_short_id(conn, &input.product_id)?;
+
+    conn.execute(
+        "INSERT INTO projects (id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, short_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'planned', 'medium', ?7, ?7, ?8)",
+        params![id, input.product_id, input.name, slug, description, goal, now, short_id],
+    )?;
+
+    // Auto-create the project's design task unless the caller opted out
+    // with `no_design_task`. For design-shaped projects the task sorts
+    // first (ordinal = 0) so the dispatcher picks it up before the
+    // project's own tasks (ordinal ≥ 1). Non-design-shaped projects
+    // (postmortems, checklists, etc.) pass `no_design_task = true` and
+    // land here with zero tasks.
+    if !input.no_design_task {
+        insert_design_task_for_project_in_tx(
+            conn,
+            &input.product_id,
+            &id,
+            &input.name,
+            input.autostart,
+            input.design_reasoning_effort_xhigh,
+            design_task_description,
+        )?;
+    }
+
+    query_project(conn, &id)?.with_context(|| format!("missing project after insert: {id}"))
+}
+
 impl WorkDb {
     pub fn open(path: PathBuf) -> Result<Self> {
         if path == Path::new(":memory:") {
@@ -152,39 +204,7 @@ impl WorkDb {
     pub fn create_project(&self, input: CreateProjectInput) -> Result<Project> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        ensure_product_exists(&tx, &input.product_id)?;
-
-        let id = next_id("proj");
-        let now = now_string();
-        let slug = unique_project_slug(&tx, &input.product_id, &slugify(&input.name))?;
-        let description = input.description.unwrap_or_default();
-        let goal = input.goal.unwrap_or_default();
-        let short_id = allocate_short_id(&tx, &input.product_id)?;
-
-        tx.execute(
-            "INSERT INTO projects (id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, short_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'planned', 'medium', ?7, ?7, ?8)",
-            params![id, input.product_id, input.name, slug, description, goal, now, short_id],
-        )?;
-
-        // Auto-create the project's design task unless the caller
-        // opted out with `no_design_task`. For design-shaped projects
-        // the task sorts first (ordinal = 0) so the dispatcher picks
-        // it up before the project's own tasks (ordinal ≥ 1).
-        // Non-design-shaped projects (postmortems, checklists, etc.)
-        // pass `no_design_task = true` and land here with zero tasks.
-        if !input.no_design_task {
-            insert_design_task_for_project_in_tx(
-                &tx,
-                &input.product_id,
-                &id,
-                &input.name,
-                input.autostart,
-                input.design_reasoning_effort_xhigh,
-            )?;
-        }
-
-        let project = query_project(&tx, &id)?.with_context(|| format!("missing project after insert: {id}"))?;
+        let project = create_project_in_tx(&tx, input, "")?;
         tx.commit()?;
         Ok(project)
     }

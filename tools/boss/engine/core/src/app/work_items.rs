@@ -1282,6 +1282,7 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
                     chores: tree.chores,
                     task_runtimes: tree.task_runtimes,
                     dependencies: tree.dependencies,
+                    ideas: tree.ideas,
                 },
             );
         }

@@ -55,6 +55,8 @@ pub enum FrontendEvent {
         task_runtimes: Vec<TaskRuntime>,
         #[serde(default)]
         dependencies: Vec<WorkItemDependency>,
+        #[serde(default)]
+        ideas: Vec<Idea>,
     },
     WorkItemResult {
         item: WorkItem,
@@ -1560,5 +1562,41 @@ pub enum FrontendEvent {
     /// [`FrontendRequest::SupersedeDecision`].
     DecisionUpdated {
         decision: Decision,
+    },
+
+    // --- Ideas ---
+    /// Response to [`FrontendRequest::CreateIdea`].
+    IdeaCreated {
+        idea: Idea,
+    },
+    /// Response to [`FrontendRequest::GetIdea`].
+    IdeaResult {
+        idea: Idea,
+    },
+    /// Response to [`FrontendRequest::ListIdeas`].
+    IdeasList {
+        product_id: String,
+        ideas: Vec<Idea>,
+    },
+    /// Response to [`FrontendRequest::UpdateIdea`].
+    IdeaUpdated {
+        idea: Idea,
+    },
+    /// Response to [`FrontendRequest::DeleteIdea`].
+    IdeaDeleted {
+        idea_id: String,
+    },
+    /// Response to [`FrontendRequest::GraduateIdea`]. Exactly one of
+    /// `chore` / `project` is `Some`, matching the request's `target`.
+    /// Boxed: an inline `Task` / `Project` here would make this variant far
+    /// larger than its siblings (clippy::large_enum_variant) — serializes
+    /// identically. See [`FrontendEvent::AttentionItemConverted`] for the
+    /// same pattern.
+    IdeaGraduated {
+        idea: Idea,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chore: Option<Box<Task>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<Box<Project>>,
     },
 }

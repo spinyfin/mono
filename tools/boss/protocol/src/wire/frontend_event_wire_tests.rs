@@ -289,6 +289,18 @@ fn decision() -> Decision {
         .build()
 }
 
+fn idea() -> Idea {
+    Idea::builder()
+        .id("idea_1")
+        .product_id("prod_1")
+        .body("# Draft\n\nSome markdown.")
+        .created_at("1747000000")
+        .name("A draft idea")
+        .status(crate::IdeaStatus::Draft)
+        .updated_at("1747000000")
+        .build()
+}
+
 fn automation_run() -> AutomationRun {
     AutomationRun::builder()
         .id("aur_1")
@@ -487,6 +499,7 @@ fn tag_cases() -> Vec<TagCase> {
                 chores: vec![],
                 task_runtimes: vec![],
                 dependencies: vec![],
+                ideas: vec![],
             },
             expected_tag: "work_tree",
         },
@@ -1916,6 +1929,57 @@ fn tag_cases() -> Vec<TagCase> {
             event: FrontendEvent::DecisionUpdated { decision: decision() },
             expected_tag: "decision_updated",
         },
+        // --- Ideas ---
+        TagCase {
+            label: "IdeaCreated",
+            event: FrontendEvent::IdeaCreated { idea: idea() },
+            expected_tag: "idea_created",
+        },
+        TagCase {
+            label: "IdeaResult",
+            event: FrontendEvent::IdeaResult { idea: idea() },
+            expected_tag: "idea_result",
+        },
+        TagCase {
+            label: "IdeasList",
+            event: FrontendEvent::IdeasList {
+                product_id: "prod_1".into(),
+                ideas: vec![],
+            },
+            expected_tag: "ideas_list",
+        },
+        TagCase {
+            label: "IdeaUpdated",
+            event: FrontendEvent::IdeaUpdated { idea: idea() },
+            expected_tag: "idea_updated",
+        },
+        TagCase {
+            label: "IdeaDeleted",
+            event: FrontendEvent::IdeaDeleted {
+                idea_id: "idea_1".into(),
+            },
+            expected_tag: "idea_deleted",
+        },
+        TagCase {
+            label: "IdeaGraduated",
+            event: FrontendEvent::IdeaGraduated {
+                idea: idea(),
+                // None here exercises the tag/round-trip pin cheaply; the
+                // boxed payload is pinned by the IdeaGraduatedWithChore case.
+                chore: None,
+                project: None,
+            },
+            expected_tag: "idea_graduated",
+        },
+        TagCase {
+            label: "IdeaGraduatedWithChore",
+            event: FrontendEvent::IdeaGraduated {
+                idea: idea(),
+                chore: Some(Box::new(task())),
+                project: None,
+            },
+            expected_tag: "idea_graduated",
+        },
         TagCase {
             label: "DispatchConcurrencyResult",
             event: FrontendEvent::DispatchConcurrencyResult {
@@ -2134,6 +2198,12 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::DecisionResult { .. }
         | FrontendEvent::DecisionsList { .. }
         | FrontendEvent::DecisionUpdated { .. }
+        | FrontendEvent::IdeaCreated { .. }
+        | FrontendEvent::IdeaResult { .. }
+        | FrontendEvent::IdeasList { .. }
+        | FrontendEvent::IdeaUpdated { .. }
+        | FrontendEvent::IdeaDeleted { .. }
+        | FrontendEvent::IdeaGraduated { .. }
         | FrontendEvent::ProbeRefused { .. }
         | FrontendEvent::ProbeStatusResult { .. }
         | FrontendEvent::SelectedProductResult { .. }

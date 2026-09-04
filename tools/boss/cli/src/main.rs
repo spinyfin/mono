@@ -12,16 +12,16 @@ pub(crate) use boss_protocol::{
     AutomationPatch, AutomationRun, AutomationTrigger, BackgroundWorkItem, BackgroundWorkKind, CREATED_VIA_CLI,
     CiBudgetSnapshot, CiRemediation, CommentAnchor, ConflictHotspotReport, ConflictResolution, CostBucket,
     CostMeasurement, CreateAttentionInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput,
-    CreateDecisionInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput,
-    CreateProjectInput, CreateRevisionInput, CreateTaskInput, Decision, DependencyDirection, DependencyEdge,
-    DependencyFilter, EditorialAction, EditorialRules, EffortAuditReport, EffortLevel, EngineAttemptListEntry,
-    ExecutionKind, FollowupMemberOverride, FrontendEvent, FrontendRequest, GitHubAuthStateDto, LinkExternalRefInput,
-    ListDependenciesInput, OrgAuthState, PlannerOutput, PlannerRun, PrWorkItemMatch, Product, Project,
-    ProjectDesignDocState, ReasoningMode, RemoveDependencyInput, ResolveProjectDesignDocOutput, ResolvedDesignDocKind,
-    SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput,
-    Task, TaskCostReport, TaskRuntime, TopCostReport, UnpopulatePreservedTask, WindowCostReport, WorkAttentionItem,
-    WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
-    WorkItemPatch,
+    CreateDecisionInput, CreateIdeaInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput,
+    CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateTaskInput, Decision, DependencyDirection,
+    DependencyEdge, DependencyFilter, EditorialAction, EditorialRules, EffortAuditReport, EffortLevel,
+    EngineAttemptListEntry, ExecutionKind, FollowupMemberOverride, FrontendEvent, FrontendRequest, GitHubAuthStateDto,
+    Idea, IdeaPatch, LinkExternalRefInput, ListDependenciesInput, OrgAuthState, PlannerOutput, PlannerRun,
+    PrWorkItemMatch, Product, Project, ProjectDesignDocState, ReasoningMode, RemoveDependencyInput,
+    ResolveProjectDesignDocOutput, ResolvedDesignDocKind, SetProductEditorialRulesInput,
+    SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput, Task, TaskCostReport,
+    TaskRuntime, TopCostReport, UnpopulatePreservedTask, WindowCostReport, WorkAttentionItem, WorkComment,
+    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
 };
 pub(crate) use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 pub(crate) use comfy_table::{Cell, ContentArrangement, Table};
@@ -103,6 +103,8 @@ mod decision_commands;
 mod dependency_filter_args;
 mod engine_cmds;
 mod handoff;
+mod idea_args;
+mod idea_commands;
 mod output;
 mod project_create_args;
 mod status_args;
@@ -117,6 +119,8 @@ pub(crate) use data::*;
 pub(crate) use decision_commands::*;
 pub(crate) use dependency_filter_args::*;
 pub(crate) use engine_cmds::*;
+pub(crate) use idea_args::*;
+pub(crate) use idea_commands::*;
 pub(crate) use output::*;
 pub(crate) use project_create_args::*;
 pub(crate) use status_args::*;
@@ -278,6 +282,10 @@ pub(crate) async fn run_cli(cli: Cli) -> Result<(), CliError> {
             let ctx = RunContext::from_flags(&cli.global)?;
             run_decision_command(command, &ctx).await
         }
+        Commands::Idea { command } => {
+            let ctx = RunContext::from_flags(&cli.global)?;
+            run_idea_command(command, &ctx).await
+        }
         Commands::Automation { command } => {
             let ctx = RunContext::from_flags(&cli.global)?;
             run_automation_command(command, &ctx).await
@@ -367,6 +375,7 @@ pub(crate) fn build_cli_reference() -> Result<CliReferenceDocument, CliError> {
             "Product selectors accept a product id, slug, or 1-based interactive index. For agent use, prefer slug or id, not numeric indexes.",
             "Project selectors accept a project id, slug, short id (#42 or 42), or 1-based interactive index within the selected product. For agent use, prefer slug, short id, or primary id; avoid numeric indexes.",
             "Task and chore selectors accept: (1) primary id (task_…); (2) friendly short id — `T441` / `t441` / `42` / `#42` within the context product, or `boss/42` / `boss/#42` for a specific product. Projects accept `P7` / `p7` in the same position. For agent use, prefer the short id form (T-prefix or #42) when talking to a human, and the primary id when calling other engine RPCs.",
+            "Idea selectors accept `I<n>` (e.g. `I1`, requires --product to identify the namespace) or the canonical `idea_…` id. Ideas are not work items — they have no T/D/A-namespace overlap and are never resolved through `boss task`/`boss chore`.",
             "Kind-agnostic verbs (show, update, move, delete, restore, depend, bind-pr, link-external, unlink-external) accept any leaf work item id under either `boss task` or `boss chore` — a chore is a kind of task. Use whichever noun reads more naturally for the call site; the engine resolves the kind from the id.",
             "Kind-specific verbs (create, create-many, list, reorder) stay split by kind because their inputs and filters genuinely differ (e.g. tasks have a project, chores don't; reorder is project-task-only).",
         ],

@@ -1114,6 +1114,7 @@ pub(crate) fn insert_design_task_for_project_in_tx(
     project_name: &str,
     autostart: bool,
     design_reasoning_effort_xhigh: bool,
+    description: &str,
 ) -> Result<Task> {
     let id = next_id("task");
     let now = now_string();
@@ -1122,7 +1123,7 @@ pub(crate) fn insert_design_task_for_project_in_tx(
     let short_id = allocate_short_id(conn, product_id)?;
     conn.execute(
         "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, short_id, design_reasoning_effort_xhigh)
-         VALUES (?1, ?2, ?3, 'design', ?7, '', 'todo', 0, NULL, NULL, ?4, ?4, ?5, 'medium', ?6, ?8, ?9)",
+         VALUES (?1, ?2, ?3, 'design', ?7, ?10, 'todo', 0, NULL, NULL, ?4, ?4, ?5, 'medium', ?6, ?8, ?9)",
         params![
             id,
             product_id,
@@ -1133,6 +1134,7 @@ pub(crate) fn insert_design_task_for_project_in_tx(
             name,
             short_id,
             design_reasoning_effort_xhigh as i64,
+            description,
         ],
     )?;
     query_task(conn, &id)?.with_context(|| format!("missing design task after insert: {id}"))

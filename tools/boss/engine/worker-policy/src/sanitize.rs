@@ -117,6 +117,27 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
             execution_id,
             runs: runs.into_iter().map(sanitize_run).collect(),
         },
+        // `GetWorkTree` is an allowed taxonomy read, but `ideas` is a
+        // coordinator-only authoring surface (full markdown bodies). A
+        // worker never needs another draft; strip the field so the
+        // worktree cannot leak idea state past the verb gate.
+        FrontendEvent::WorkTree {
+            product,
+            projects,
+            tasks,
+            chores,
+            task_runtimes,
+            dependencies,
+            ideas: _,
+        } => FrontendEvent::WorkTree {
+            product,
+            projects,
+            tasks,
+            chores,
+            task_runtimes,
+            dependencies,
+            ideas: vec![],
+        },
         passthrough @ (FrontendEvent::Hello { .. }
         | FrontendEvent::Subscribed { .. }
         | FrontendEvent::Unsubscribed { .. }
@@ -126,7 +147,6 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::TasksList { .. }
         | FrontendEvent::ChoresList { .. }
         | FrontendEvent::RevisionsList { .. }
-        | FrontendEvent::WorkTree { .. }
         | FrontendEvent::WorkItemResult { .. }
         | FrontendEvent::WorkItemsByPrResult { .. }
         | FrontendEvent::WorkItemCreated { .. }
@@ -301,6 +321,12 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::DecisionResult { .. }
         | FrontendEvent::DecisionsList { .. }
         | FrontendEvent::DecisionUpdated { .. }
+        | FrontendEvent::IdeaCreated { .. }
+        | FrontendEvent::IdeaResult { .. }
+        | FrontendEvent::IdeasList { .. }
+        | FrontendEvent::IdeaUpdated { .. }
+        | FrontendEvent::IdeaDeleted { .. }
+        | FrontendEvent::IdeaGraduated { .. }
         | FrontendEvent::DispatchAdmissionEvaluated { .. }) => passthrough,
     }
 }

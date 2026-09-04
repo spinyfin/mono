@@ -652,6 +652,7 @@ mod decision_tests;
 mod design_doc_audit_tests;
 mod effort_model_tests;
 mod human_driven_tests;
+mod idea_tests;
 mod project_membership_move_tests;
 mod resolve_repo_tests;
 mod review_batches_tests;

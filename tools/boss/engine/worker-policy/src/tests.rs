@@ -11,9 +11,10 @@
 
 use super::*;
 use boss_protocol::{
-    BranchNaming, CoordinatorRecreateReason, ExecutionKind, ExecutionStatus, FrontendEvent, FrontendRequest, Product,
-    ProposalKind, Task, TaskKind, TaskStatus, WorkExecution, WorkItemDependencyDetail, WorkItemPatch, WorkRun,
-    WorkerContextBundle, WorkerTierDenialReason,
+    BranchNaming, CoordinatorRecreateReason, CreateIdeaInput, ExecutionKind, ExecutionStatus, FrontendEvent,
+    FrontendRequest, Idea, IdeaGraduationKind, IdeaPatch, IdeaStatus, Product, ProposalKind, Task, TaskKind,
+    TaskStatus, WorkExecution, WorkItemDependencyDetail, WorkItemPatch, WorkRun, WorkerContextBundle,
+    WorkerTierDenialReason,
 };
 use policy::variant_name;
 use serde_json::json;
@@ -584,4 +585,89 @@ fn unrelated_events_pass_through_untouched() {
     let before = FrontendEvent::ProductsList { products: vec![] };
     let after = sanitize_event_for_worker(before);
     assert!(matches!(after, FrontendEvent::ProductsList { .. }));
+}
+
+fn idea_with_body() -> Idea {
+    Idea::builder()
+        .id("idea_1")
+        .product_id("prod_1")
+        .body("# Secret draft\n\nDo not leak this to a worker.")
+        .created_at("1700000000")
+        .name("Secret")
+        .status(IdeaStatus::Draft)
+        .updated_at("1700000000")
+        .build()
+}
+
+/// Idea verbs are coordinator-only, but `GetWorkTree` is an allowed
+/// taxonomy read whose payload now includes `ideas`. Sanitization must
+/// strip those bodies so the worktree cannot defeat the verb gate.
+#[test]
+fn work_tree_strips_ideas_for_workers() {
+    let product = Product::builder()
+        .id("prod_1")
+        .created_at("1700000000")
+        .description("A product")
+        .name("Widgets")
+        .slug("widgets")
+        .status("active")
+        .updated_at("1700000000")
+        .build();
+    let before = FrontendEvent::WorkTree {
+        product: product.clone(),
+        projects: vec![],
+        tasks: vec![],
+        chores: vec![],
+        task_runtimes: vec![],
+        dependencies: vec![],
+        ideas: vec![idea_with_body()],
+    };
+    let after = sanitize_event_for_worker(before);
+    let FrontendEvent::WorkTree {
+        ideas,
+        product: after_product,
+        tasks,
+        chores,
+        ..
+    } = after
+    else {
+        panic!("sanitizing must not change the variant");
+    };
+    assert!(ideas.is_empty(), "workers must not receive idea bodies via WorkTree");
+    assert_eq!(after_product.id, product.id);
+    assert!(tasks.is_empty());
+    assert!(chores.is_empty());
+}
+
+#[test]
+fn idea_verbs_stay_closed_and_get_work_tree_stays_allowed() {
+    for request in [
+        FrontendRequest::CreateIdea {
+            input: CreateIdeaInput::builder().product_id("prod_1").name("Draft").build(),
+        },
+        FrontendRequest::GetIdea { id: "idea_1".into() },
+        FrontendRequest::ListIdeas {
+            product_id: "prod_1".into(),
+            status: None,
+        },
+        FrontendRequest::UpdateIdea {
+            id: "idea_1".into(),
+            patch: IdeaPatch::default(),
+        },
+        FrontendRequest::DeleteIdea { id: "idea_1".into() },
+        FrontendRequest::GraduateIdea {
+            id: "idea_1".into(),
+            target: IdeaGraduationKind::Chore,
+            name: None,
+            effort_level: None,
+            reasoning: None,
+        },
+    ] {
+        let denial = assert_denied(request);
+        assert_eq!(denial.reason, WorkerTierDenialReason::CoordinatorOnly);
+    }
+    assert_allowed(FrontendRequest::GetWorkTree {
+        product_id: "prod_1".into(),
+        fetch_seq: None,
+    });
 }

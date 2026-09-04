@@ -838,6 +838,11 @@ impl WorkDb {
         // an existing table; independent of every migration above.
         // Design: tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md
         migrate_work_executions_run_done_columns(conn)?;
+        // `ideas` + `idea_short_id_sequences`: markdown drafts authored over
+        // time and later graduated into a chore or project. Own table, own
+        // `I<n>` namespace — deliberately not a `tasks` row. Additive-only
+        // (`CREATE TABLE IF NOT EXISTS`); rides the current schema marker.
+        migrate_ideas_tables(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '32')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
