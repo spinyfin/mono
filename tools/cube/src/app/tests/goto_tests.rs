@@ -80,7 +80,33 @@ fn run_goto(runner: &FakeRunner, bookmark: Option<&str>, pr: Option<u64>) -> Res
         Some(GOTO_CWD.to_string()),
         bookmark.map(str::to_string),
         pr,
+        None,
     )
+}
+
+fn run_goto_revision(runner: &FakeRunner, revision: &str) -> Result<crate::app::errors::RunResult> {
+    workspace_goto(
+        None,
+        runner,
+        Some(GOTO_CWD.to_string()),
+        None,
+        None,
+        Some(revision.to_string()),
+    )
+}
+
+fn goto_revision_positioned_cmd(sha: &str, found_sha: &str) -> ExpectedCommand {
+    let revset = format!("{sha} & ::@");
+    ExpectedCommand::ok(
+        goto_cwd(),
+        "jj",
+        &["log", "-r", &revset, "--no-graph", "-T", "commit_id"],
+        found_sha,
+    )
+}
+
+fn goto_revision_new_cmd(sha: &str) -> ExpectedCommand {
+    ExpectedCommand::ok(goto_cwd(), "jj", &["new", sha], "")
 }
 
 #[test]
@@ -173,4 +199,52 @@ fn goto_requires_bookmark_or_pr() {
     let err = run_goto(&runner, None, None).expect_err("requires arg");
     let msg = format!("{err}");
     assert!(msg.contains("--bookmark") || msg.contains("--pr"), "{msg}");
+}
+
+#[test]
+fn goto_revision_not_yet_positioned_creates_new_commit() {
+    let sha = "merge-sha-1";
+    let cmds = vec![
+        goto_remote_list_cmd(),
+        goto_fetch_cmd(),
+        goto_revision_positioned_cmd(sha, ""), // not yet positioned
+        goto_revision_new_cmd(sha),
+    ];
+    let runner = FakeRunner::new(cmds);
+    let result = run_goto_revision(&runner, sha).expect("revision goto succeeds");
+    runner.assert_exhausted();
+    assert_eq!(result.payload["revision"], sha);
+    assert_eq!(result.payload["already_positioned"], false);
+}
+
+#[test]
+fn goto_revision_already_positioned_skips_new() {
+    let sha = "merge-sha-2";
+    let cmds = vec![
+        goto_remote_list_cmd(),
+        goto_fetch_cmd(),
+        goto_revision_positioned_cmd(sha, sha), // already positioned
+    ];
+    let runner = FakeRunner::new(cmds);
+    let result = run_goto_revision(&runner, sha).expect("idempotent revision goto");
+    runner.assert_exhausted();
+    assert_eq!(result.payload["already_positioned"], true);
+}
+
+#[test]
+fn goto_revision_does_not_touch_pr_state_or_bookmarks() {
+    // A MERGED PR's merge SHA must position cleanly with no `gh pr view`
+    // (state) check and no bookmark writes — the whole point of
+    // `--revision` is to bypass the PR-state guard in the `--pr` path.
+    let sha = "merged-pr-head-sha";
+    let cmds = vec![
+        goto_remote_list_cmd(),
+        goto_fetch_cmd(),
+        goto_revision_positioned_cmd(sha, ""),
+        goto_revision_new_cmd(sha),
+    ];
+    let runner = FakeRunner::new(cmds);
+    let result = run_goto_revision(&runner, sha).expect("revision goto succeeds on a merged PR's sha");
+    runner.assert_exhausted();
+    assert_eq!(result.payload["revision"], sha);
 }

@@ -98,6 +98,8 @@ pub fn render_post_merge_reviewer_initial_prompt(
         .next()
         .filter(|s| !s.is_empty())
         .unwrap_or(destination.pr_url.as_str());
+    let verdict_submission_block =
+        crate::blocks::render_verdict_submission_block(&destination.batch_id, &destination.body_path);
 
     format!(
         "# Post-merge PR review\n\
@@ -160,25 +162,7 @@ pub fn render_post_merge_reviewer_initial_prompt(
          finding is `category: \"regression\"`, `\"duplication\"`, `\"deferred_scope\"`, or \
          `\"agent_isms\"`, regardless of severity.\n\
          \n\
-         ## Required output — CRITICAL\n\
-         \n\
-         You must submit exactly one structured verdict while this session is alive.\n\
-         \n\
-         1. Write the JSON object below to this exact engine-owned body file:\n\
-         \n\
-         `{body_path}`\n\
-         \n\
-         2. Submit it immediately with:\n\
-         \n\
-         ```sh\n\
-         boss propose review-verdict --batch-id {batch_id} --verdict-file \"{body_path}\"\n\
-         ```\n\
-         \n\
-         The command validates the verdict immediately. If it rejects the file, correct the\n\
-         reported field errors and submit again before ending your turn. Do not put the JSON\n\
-         in your final response: transcript recovery is intentionally unavailable for batch\n\
-         reviews. The one body-file write and this local `boss propose` call are permitted;\n\
-         do not edit repository files or publish anything.\n\
+         {verdict_submission_block}\
          \n\
          This is static analysis only. Do not run builds, tests, formatters, generators, or\n\
          executable code.\n\
@@ -219,7 +203,7 @@ pub fn render_post_merge_reviewer_initial_prompt(
         merge_sha = merge_sha,
         pr_ref = pr_ref,
         rubric = rubric,
-        body_path = destination.body_path,
+        verdict_submission_block = verdict_submission_block,
         batch_id = destination.batch_id,
     )
 }

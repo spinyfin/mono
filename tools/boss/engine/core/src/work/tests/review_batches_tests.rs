@@ -2080,6 +2080,35 @@ fn create_post_merge_review_batch_rejects_pre_merge_phase() {
     assert!(error.to_string().contains("post_merge"));
 }
 
+/// A `post_merge` batch is keyed on the merge commit SHA: `target_sha` and
+/// `merge_sha` must match. [`validate_batch_input`] enforces this rather than
+/// merely documenting it — a caller passing different values is rejected,
+/// not silently accepted.
+#[test]
+fn create_post_merge_review_batch_rejects_target_sha_merge_sha_mismatch() {
+    let db = WorkDb::open(temp_db_path("post-merge-batch-sha-mismatch")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let input = ReviewBatchCreateInput::builder()
+        .cycle_root_id(cycle_root.id)
+        .base_sha("base-sha")
+        .classification(classification())
+        .phase(ReviewBatchPhase::PostMerge)
+        .pr_number(42)
+        .pr_url("https://github.com/example/repo/pull/42")
+        .target_sha("target-sha")
+        .merge_sha("different-merge-sha")
+        .build();
+
+    let error = db
+        .create_post_merge_review_batch(input, "https://github.com/example/repo")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("target_sha == merge_sha"),
+        "error must name the violated invariant: {error}"
+    );
+}
+
 /// A post-merge batch has no leaf/supervisor split: its sole
 /// `PostMergeReviewer` member submits the verdict directly while the batch
 /// is still `collecting` (the phase never reaches `supervising`), and that

@@ -102,6 +102,40 @@ fn bind_merged_pr(db: &WorkDb, task_id: &str) {
         .unwrap();
 }
 
+/// Seed `tasks.last_reviewed_sha` directly, modelling the SHA a prior
+/// PreMerge verdict already stamped via `commit_applied_review_verdict`
+/// (`review_verdict_apply.rs::commit_applied_review_verdict` ->
+/// `increment_review_cycle_once_in_tx`). Used to construct the exact
+/// duplicate-head condition a `PostMerge` verdict must be exempt from.
+fn seed_last_reviewed_sha(db: &WorkDb, task_id: &str, sha: &str) {
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET last_reviewed_sha = ?2 WHERE id = ?1",
+            rusqlite::params![task_id, sha],
+        )
+        .unwrap();
+}
+
+fn post_merge_batch_input(cycle_root_id: String, merge_sha: &str) -> ReviewBatchCreateInput {
+    ReviewBatchCreateInput::builder()
+        .cycle_root_id(cycle_root_id)
+        .base_sha("base-sha")
+        .classification(classification())
+        .phase(ReviewBatchPhase::PostMerge)
+        .pr_number(42)
+        .pr_url(PR_URL)
+        .target_sha(merge_sha)
+        .merge_sha(merge_sha)
+        .build()
+}
+
+fn post_merge_findings_verdict_payload(batch_id: &str, target_sha: &str) -> String {
+    format!(
+        r#"{{"batch_id":"{batch_id}","verdict":{{"batch_id":"{batch_id}","pr_url":"{PR_URL}","target_sha":"{target_sha}","phase":"post_merge","summary":"One high-severity defect.","revision_warranted":true,"findings":[{{"severity":"high","category":"correctness","confidence":"high","file":"src/lib.rs","title":"Unchecked index","detail":"Out of bounds read.","sources":["claude"]}}],"contradictions":[]}}}}"#
+    )
+}
+
 fn clean_verdict_payload(batch_id: &str, target_sha: &str) -> String {
     format!(
         r#"{{"batch_id":"{batch_id}","verdict":{{"batch_id":"{batch_id}","pr_url":"{PR_URL}","target_sha":"{target_sha}","phase":"pre_merge","summary":"Clean.","revision_warranted":false,"findings":[],"contradictions":[]}}}}"#
@@ -1314,4 +1348,86 @@ fn sweep_counts_a_proposal_superseded_during_apply() {
         },
         "a proposal still proposed at list time that lands superseded in commit must increment superseded"
     );
+}
+
+/// A `PostMerge` verdict must materialise its follow-up even when
+/// `verdict.target_sha` equals `tasks.last_reviewed_sha` — the duplicate-head
+/// guard exists to suppress a re-review of an unchanged *pre-merge* head, and
+/// has no meaning here: a post-merge verdict's `target_sha` is always either
+/// the merge commit or (the `head_ref_oid` fallback in
+/// `maybe_trigger_post_merge_review`) the PR's own head SHA, which is
+/// precisely the SHA the pre-merge verdict already stamped into
+/// `last_reviewed_sha`. Before the `batch.phase != PostMerge` exemption in
+/// `apply_review_verdict_proposal`, this exact equality tripped
+/// `duplicate_head` and silently dropped every post-merge finding with no
+/// attention item — this test seeds that same equality and asserts the
+/// finding survives instead. One target-sha value stands in for both the
+/// merge-SHA and head-SHA-fallback cases named in the review finding: the
+/// apply-level guard only ever sees the final `target_sha`, so it cannot
+/// distinguish which of the two produced it — the equality-with-prior-head
+/// condition is identical either way.
+#[test]
+fn post_merge_verdict_materialises_a_followup_despite_matching_the_prior_reviewed_head() {
+    let db = WorkDb::open(temp_db_path("verdict-apply-post-merge-duplicate-head")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    bind_merged_pr(&db, &cycle_root.id);
+
+    let shared_sha = "shared-head-and-merge-sha";
+    seed_last_reviewed_sha(&db, &cycle_root.id, shared_sha);
+
+    let post_merge_reviewer = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            post_merge_batch_input(cycle_root.id.clone(), shared_sha),
+            &[member(
+                ReviewBatchMemberRole::PostMergeReviewer,
+                Some(post_merge_reviewer.id.clone()),
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    // A post-merge batch's sole member moves it straight to `applying` on
+    // report — no `force_batch_supervising` needed (unlike the pre-merge
+    // supervisor path above).
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &post_merge_reviewer.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &post_merge_findings_verdict_payload(&batch.id, shared_sha),
+            idempotency_key: "post-merge-verdict-1",
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        db.review_batch(&batch.id).unwrap().unwrap().status,
+        ReviewBatchStatus::Applying
+    );
+
+    let created = db
+        .apply_review_verdict_proposal(&outcome.proposal.id, &FakePrStateChecker::always(PrOpenState::Merged))
+        .unwrap()
+        .expect("a post-merge verdict's findings must materialise a follow-up even at the prior reviewed head");
+    let task = query_task(&db.connect().unwrap(), &created).unwrap().unwrap();
+    assert_eq!(task.kind, TaskKind::Followup);
+
+    let verdict = db
+        .latest_review_verdict(&cycle_root.id)
+        .unwrap()
+        .expect("apply must record the verdict");
+    assert_eq!(
+        verdict.gate_outcome,
+        crate::work::REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS,
+        "gate_outcome must not be dropped_duplicate_head for a PostMerge batch"
+    );
+    assert_eq!(verdict.revision_task_id.as_deref(), Some(created.as_str()));
 }

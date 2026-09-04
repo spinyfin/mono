@@ -394,6 +394,9 @@ fn validate_batch_input(input: &ReviewBatchCreateInput, member_inputs: &[ReviewB
         ReviewBatchPhase::PostMerge if input.merge_sha.is_none() => {
             bail!("post_merge review batches require a merge SHA");
         }
+        ReviewBatchPhase::PostMerge if input.merge_sha.as_deref() != Some(input.target_sha.as_str()) => {
+            bail!("post_merge review batches must key target_sha on the merge SHA (target_sha == merge_sha)");
+        }
         _ => {}
     }
     for member in member_inputs {
@@ -1254,14 +1257,15 @@ impl WorkDb {
 
     /// List each dead `PostMergeReviewer` member — the post-merge analogue
     /// of [`Self::list_dead_review_batch_member_candidates`], with two load-
-    /// bearing differences: no `batch.phase = 'pre_merge'` (its own
-    /// `run_post_merge_recovery_pass` in `pr_review_recovery` retries this
-    /// role instead), and no `task.status NOT IN ('done', 'archived')` guard
-    /// — a post-merge batch's owning task is *expected* to already be
-    /// `done`, since the review only exists because the PR merged. Filtered
-    /// to `attempt < 2` for the same reason as a leaf: an exhausted role is
-    /// listed at most once rather than costing a lookup on every sweep for
-    /// the remaining life of the (already-closed) work item.
+    /// bearing differences: `batch.phase = 'post_merge'` rather than
+    /// `'pre_merge'` (retried by `pr_review_recovery::run_one_pass`'s
+    /// dedicated post-merge loop rather than the pre-merge one), and no
+    /// `task.status NOT IN ('done', 'archived')` guard — a post-merge
+    /// batch's owning task is *expected* to already be `done`, since the
+    /// review only exists because the PR merged. Filtered to `attempt < 2`
+    /// for the same reason as a leaf: an exhausted role is listed at most
+    /// once rather than costing a lookup on every sweep for the remaining
+    /// life of the (already-closed) work item.
     pub fn list_dead_post_merge_review_batch_member_candidates(&self) -> Result<Vec<DeadPrReviewCandidate>> {
         let conn = self.connect()?;
         let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();

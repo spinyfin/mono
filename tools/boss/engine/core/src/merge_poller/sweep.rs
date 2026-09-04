@@ -2653,6 +2653,20 @@ pub(crate) async fn maybe_trigger_post_merge_review(
         return;
     };
 
+    if probe.base_ref_oid.is_none() {
+        // Unlike merge/head SHA, PR number, and repo_remote_url above, a
+        // missing `base_ref_oid` does not abort the trigger — nothing in the
+        // post-merge path reads `base_sha` today. But silently defaulting to
+        // `""` plants an unlabelled sentinel a future reader of the batch row
+        // cannot distinguish from a real (if empty) value, so log the same
+        // warn shape as the sibling guards to keep the gap visible.
+        tracing::warn!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            "merge poller: PR reported merged with no base ref SHA; recording an empty base_sha on the post-merge review batch",
+        );
+    }
+
     let input = crate::work::ReviewBatchCreateInput::builder()
         .cycle_root_id(cycle_root_id)
         .base_sha(probe.base_ref_oid.clone().unwrap_or_default())

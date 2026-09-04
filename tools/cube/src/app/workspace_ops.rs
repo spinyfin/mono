@@ -466,6 +466,7 @@ pub(super) fn workspace_goto(
     workspace: Option<String>,
     bookmark: Option<String>,
     pr: Option<u64>,
+    revision: Option<String>,
 ) -> Result<RunResult> {
     let cwd: PathBuf = match workspace {
         Some(ref p) => PathBuf::from(p),
@@ -479,6 +480,37 @@ pub(super) fn workspace_goto(
         database_path,
         &RealCommandRunner::invocation(&cwd, "jj", &["git", "fetch", "--remote", &github_remote]),
     )?;
+
+    // `--revision` positions on an arbitrary commit (e.g. a merge SHA) rather
+    // than a PR branch head, and deliberately skips the PR-state / bookmark
+    // machinery below: a post-merge review target is by definition a MERGED
+    // PR, which the `--pr` path above refuses outright.
+    if let Some(sha) = revision {
+        let already_positioned = runner
+            .run(&RealCommandRunner::invocation(
+                &cwd,
+                "jj",
+                &["log", "-r", &format!("{sha} & ::@"), "--no-graph", "-T", "commit_id"],
+            ))
+            .map(|out| !out.trim().is_empty())
+            .unwrap_or(false);
+
+        if !already_positioned {
+            run_jj(
+                runner,
+                database_path,
+                &RealCommandRunner::invocation(&cwd, "jj", &["new", &sha]),
+            )?;
+        }
+
+        return RunResult::new(
+            format!("Positioned working copy on {sha}."),
+            json!({
+                "revision": sha,
+                "already_positioned": already_positioned,
+            }),
+        );
+    }
 
     let branch: String = if let Some(b) = bookmark {
         strip_remote_suffix(&b).to_string()

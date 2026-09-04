@@ -117,6 +117,22 @@ pub trait HostAdapter: Send + Sync {
     /// no-op when `@` is already positioned on the PR branch head.
     async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()>;
 
+    /// Position the working copy in `workspace_path` as a fresh editable
+    /// child commit atop an arbitrary commit `sha` (e.g. a post-merge
+    /// review's merge commit). Unlike [`Self::goto_workspace`], this never
+    /// resolves or checks PR state, so it is the only entry point that
+    /// works once a PR has merged or closed. Delegates to `cube workspace
+    /// goto --workspace <path> --revision <sha>`. Idempotent.
+    ///
+    /// Default errors so most test doubles need no change; only the real
+    /// adapters below provide it.
+    async fn goto_workspace_revision(&self, workspace_path: &Path, sha: &str) -> Result<()> {
+        let _ = (workspace_path, sha);
+        Err(anyhow::anyhow!(
+            "goto_workspace_revision is not supported by this adapter"
+        ))
+    }
+
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus>;
 
     async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>>;
@@ -328,6 +344,10 @@ impl HostAdapter for LocalHostAdapter {
 
     async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()> {
         self.cube_client.goto_workspace(workspace_path, pr).await
+    }
+
+    async fn goto_workspace_revision(&self, workspace_path: &Path, sha: &str) -> Result<()> {
+        self.cube_client.goto_workspace_revision(workspace_path, sha).await
     }
 
     async fn release_workspace(&self, lease_id: &str) -> Result<()> {
@@ -711,6 +731,22 @@ impl HostAdapter for SshHostAdapter {
                 workspace_arg.as_str(),
                 "--pr",
                 pr_str.as_str(),
+            ])
+            .await?;
+        Ok(())
+    }
+
+    async fn goto_workspace_revision(&self, workspace_path: &Path, sha: &str) -> Result<()> {
+        let workspace_arg = workspace_path.display().to_string();
+        let _ = self
+            .run_cube_json(&[
+                "--json",
+                "workspace",
+                "goto",
+                "--workspace",
+                workspace_arg.as_str(),
+                "--revision",
+                sha,
             ])
             .await?;
         Ok(())
@@ -1332,6 +1368,10 @@ impl CubeClient for HostAdapterCubeClient {
 
     async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()> {
         self.adapter.goto_workspace(workspace_path, pr).await
+    }
+
+    async fn goto_workspace_revision(&self, workspace_path: &Path, sha: &str) -> Result<()> {
+        self.adapter.goto_workspace_revision(workspace_path, sha).await
     }
 
     async fn release_workspace(&self, lease_id: &str) -> Result<()> {
