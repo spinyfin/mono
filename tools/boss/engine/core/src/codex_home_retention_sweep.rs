@@ -80,6 +80,12 @@ pub async fn run_one_pass_with_policy(
     policy: &retention::CodexHomeRetentionPolicy,
     dry_run: bool,
 ) -> CodexHomeRetentionSweepOutcome {
+    // Same rewrite as the Grok-home sweep: Codex live recording already
+    // watches the durable store, but historical rows can still point at a
+    // reclaimed `$TMPDIR/boss-codex-homes/...` path. `bossctl codex-homes`
+    // must not delete those homes while the DB still names them.
+    work_db.apply_durable_transcript_path_backfill();
+
     let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
 
     let executions = match work_db.list_executions_with_driver_runtime_state() {
@@ -296,6 +302,131 @@ mod tests {
             outcome2.deleted, 1,
             "already-gone path still counts as reclaimed: {outcome2:?}"
         );
+    }
+
+    /// Mirrors
+    /// `grok_home_retention_sweep::backfill_rewrites_a_dead_grok_pointer_before_reclaim`:
+    /// drives the backfill through a real codex home + durable sessions dir
+    /// and a real sweep reclaim, so a layout drift in
+    /// [`boss_engine_driver::codex::codex_homes_root_and_home_for_run`] (the
+    /// `boss-codex-homes/<run>/sessions/...` shape, with no intermediate
+    /// home leaf unlike grok's `grok-home/sessions`) would fail this test
+    /// instead of only the path-helper unit test.
+    #[test]
+    fn backfill_rewrites_a_dead_codex_pointer_before_reclaim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let homes_root = tmp.path().join("boss-codex-homes");
+        let transcripts = tmp.path().join("executions");
+        std::fs::create_dir_all(&homes_root).unwrap();
+        let _homes = boss_engine_driver::test_support::codex_homes_override(&homes_root);
+        let _store = boss_engine_driver::test_support::transcript_store_override(&transcripts);
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(backfill_rewrites_a_dead_codex_pointer_before_reclaim_body());
+    }
+
+    async fn backfill_rewrites_a_dead_codex_pointer_before_reclaim_body() {
+        use boss_engine_driver::codex::codex_home_for_run;
+        use boss_engine_driver::transcript_store::{durable_sessions_dir, provision_durable_sessions};
+
+        let (_dir, db) = open_db();
+        let product_id = create_test_product_with_repo(&db, "p", Some("https://github.com/test/repo")).id;
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product_id)
+                    .name("codex-transcript-backfill".to_owned())
+                    .build(),
+            )
+            .unwrap()
+            .id;
+        let execution = db
+            .request_execution(
+                boss_protocol::RequestExecutionInput::builder()
+                    .work_item_id(chore)
+                    .build(),
+            )
+            .unwrap();
+        let (execution, _run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                "/tmp/mono-agent-001",
+            )
+            .unwrap();
+
+        let codex_home = codex_home_for_run(&execution.id).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        provision_durable_sessions(&codex_home, "codex", &execution.id).unwrap();
+
+        let stamped = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("04")
+            .join("rollout.jsonl");
+        std::fs::create_dir_all(stamped.parent().unwrap()).unwrap();
+        std::fs::write(&stamped, "{\"session\":\"legacy\"}\n").unwrap();
+
+        // Simulate the pre-fix writer: persist the ephemeral stamp.
+        db.set_run_transcript_path_if_unset(&execution.id, stamped.to_str().unwrap())
+            .unwrap();
+
+        let now = now_epoch();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET status = ?2, finished_at = ?3, created_at = ?3 WHERE id = ?1",
+                rusqlite::params![execution.id, "completed", (now - 40 * 24 * 60 * 60).to_string()],
+            )
+            .unwrap();
+        }
+        let state = CodexRuntimeState {
+            codex_home: codex_home.clone(),
+            auth_source_path: PathBuf::from("/tmp/source-auth.json"),
+            auth_fingerprint: "fp".into(),
+            auth_policy: "SnapshotWithRefreshAdoption".into(),
+        }
+        .to_driver_runtime_state();
+        db.set_driver_runtime_state(&execution.id, Some(&state)).unwrap();
+
+        let policy = retention::CodexHomeRetentionPolicy::new(Duration::from_secs(14 * 24 * 60 * 60), u64::MAX);
+        let outcome = run_one_pass_with_policy(&db, &policy, false).await;
+        assert_eq!(outcome.errors, 0, "{outcome:?}");
+        assert_eq!(outcome.deleted, 1, "{outcome:?}");
+        assert!(!stamped.exists(), "ephemeral stamp must be gone after reclaim");
+
+        let stored = db
+            .transcript_path_for_execution(&execution.id)
+            .unwrap()
+            .expect("backfill must have rewritten the ephemeral pointer");
+        assert_ne!(stored, stamped.to_string_lossy());
+        let expected = durable_sessions_dir(
+            &boss_engine_driver::transcript_store::transcript_store_root().unwrap(),
+            "codex",
+            &execution.id,
+        )
+        .unwrap()
+        .join("2026")
+        .join("09")
+        .join("04")
+        .join("rollout.jsonl");
+        assert_eq!(
+            std::fs::canonicalize(&stored).unwrap(),
+            std::fs::canonicalize(&expected).unwrap(),
+            "backfill must land on the durable sessions file (modulo macOS /tmp vs /private/tmp)"
+        );
+        assert!(
+            std::path::Path::new(&stored).is_file(),
+            "backfilled transcript_path must resolve after reclaim: {stored}"
+        );
+        assert_eq!(std::fs::read_to_string(&stored).unwrap(), "{\"session\":\"legacy\"}\n");
     }
 
     #[tokio::test]

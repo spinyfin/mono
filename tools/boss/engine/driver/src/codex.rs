@@ -366,7 +366,7 @@ pub const CODEX_HOMES_ROOT_ENV: &str = "BOSS_CODEX_HOMES_DIR";
 pub static CODEX_HOMES_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Default leaf under the system temp when [`CODEX_HOMES_ROOT_ENV`] is unset.
-const CODEX_HOMES_DIR_NAME: &str = "boss-codex-homes";
+pub(crate) const CODEX_HOMES_DIR_NAME: &str = "boss-codex-homes";
 
 /// Filename of the hook-trust attestation JSON written next to the run home.
 const HOOK_TRUST_ATTESTATION_FILENAME: &str = "hook-trust-attestation.json";

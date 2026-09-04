@@ -2169,6 +2169,13 @@ mod tests {
                     && call.iter().any(|a| a == COORDINATOR_SESSION_NAME)
             })
             .expect("expected a kill-session for the coordinator");
+        let old_pane_read = calls
+            .iter()
+            .position(|call| {
+                call.get(2).map(String::as_str) == Some("display-message")
+                    && call.last().map(String::as_str) == Some("#{pane_id}")
+            })
+            .expect("expected a live pane-id read for the coordinator");
         let new = calls
             .iter()
             .position(|call| call.get(2).map(String::as_str) == Some("new-session"))
@@ -2176,6 +2183,10 @@ mod tests {
         assert!(
             kill < new,
             "the old session must be killed before the replacement is created"
+        );
+        assert!(
+            old_pane_read < kill,
+            "the old pane id must be refreshed from the live session before it is killed"
         );
 
         if !audit_already_resolved {
@@ -2191,7 +2202,9 @@ mod tests {
             assert_eq!(last["trigger"], "operator_confirmation");
             assert_eq!(last["existing_session_disposition"], "engine_killed_session");
             assert_eq!(last["existing_process_disposition"], "live_when_terminated");
-            assert_eq!(last["old_pane_id"], "%old");
+            // The pre-kill display-message assertion above verifies this is
+            // the refreshed live pane identity; FakeTmux reports `%42`.
+            assert_eq!(last["old_pane_id"], "%42");
             assert_eq!(last["new_pane_id"], "%42");
             assert!(last["liveness_evidence"]["last_passed_at_epoch_s"].as_i64().is_some());
             assert!(

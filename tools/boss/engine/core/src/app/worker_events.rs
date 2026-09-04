@@ -458,8 +458,13 @@ pub(super) async fn dispatch_live_worker_state(
     let (resolved_path, from_cache) = match payload_path {
         Some(path) => {
             server_state.dispatcher_stats.inc_with_transcript_path();
-            let _ = server_state.transcript_path_cache.record_if_unset(run_id, path);
-            (Some(path.to_owned()), false)
+            // Codex/Grok stamp a path through a per-run `sessions` symlink
+            // that reclaim deletes. Persist the durable target.
+            let path = crate::driver::transcript_store::persistable_transcript_path(Path::new(path))
+                .to_string_lossy()
+                .into_owned();
+            let _ = server_state.transcript_path_cache.record_if_unset(run_id, &path);
+            (Some(path), false)
         }
         None => {
             server_state.dispatcher_stats.inc_without_transcript_path();

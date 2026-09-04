@@ -8,8 +8,10 @@
 //! `stop`/`reap` overrides), and turn-end recovery for Esc-cancelled turns
 //! (design T-12, see [`turn_end_recovery`]). `TranscriptAccess` (design T-11)
 //! is implemented via [`transcript`]: `transcript_path_for_session` reads
-//! Grok's stamped `transcriptPath`, and [`GrokTranscriptSession`] normalises
-//! the ACP `sessionUpdate` dialect. Full permission-policy artifacts
+//! Grok's stamped `transcriptPath` and rewrites it onto Boss's durable
+//! transcript store (the per-run `$GROK_HOME/sessions` link is reclaimed),
+//! and [`GrokTranscriptSession`] normalises the ACP `sessionUpdate` dialect.
+//! Full permission-policy artifacts
 //! (`--sandbox`/`--allow`/`--deny`, T-17) remain follow-on work — see
 //! `tools/boss/docs/designs/grok-as-a-first-class-interactive-agent-driver.md`.
 //!
@@ -29,7 +31,9 @@ use boss_protocol::{NormalizeError, PaneMonitorSpec, WorkerEvent};
 use boss_ssh_transport::shell_quote;
 use serde_json::Value;
 
-use crate::transcript_store::{durable_sessions_dir, transcript_store_root, verified_durable_sessions_dir};
+use crate::transcript_store::{
+    durable_sessions_dir, persistable_transcript_path, transcript_store_root, verified_durable_sessions_dir,
+};
 
 /// Namespace this driver's durable transcripts are filed under in Boss's
 /// worker transcript store. Every caller that resolves, provisions, or grants
@@ -48,6 +52,7 @@ mod progress;
 mod transcript;
 mod turn_end_recovery;
 
+pub(crate) use home::GROK_HOMES_DIR_NAME;
 pub use home::{
     COMPAT_SURFACES, COMPAT_VENDORS, GROK_AUTH_SOURCE_ENV, GROK_HOMES_ENV_TEST_LOCK, GROK_HOMES_ROOT_ENV,
     GROK_SKIP_POSTURE_ASSERT_ENV, GrokRuntimeState, assert_grok_home_safe_to_delete, assert_inspect_json_posture,
@@ -670,8 +675,16 @@ impl AgentDriver for GrokDriver {
         // rename ClaudeDriver's own field read is, per that section — no
         // glob, no derivation, no directory watch. Empty strings are
         // treated as missing, mirroring ClaudeDriver::transcript_path_for_session.
+        //
+        // `$GROK_HOME/sessions` is a symlink into Boss's durable store.
+        // Record the durable target: the per-run home is reclaimed, and a
+        // pointer through that link dies with it.
         let s = raw.get("transcriptPath")?.as_str()?;
-        if s.is_empty() { None } else { Some(s.to_owned()) }
+        if s.is_empty() {
+            None
+        } else {
+            Some(persistable_transcript_path(Path::new(s)).to_string_lossy().into_owned())
+        }
     }
 
     fn transcript_session(&self) -> Option<Box<dyn TranscriptSessionNormalizer>> {
@@ -1248,6 +1261,10 @@ mod tests {
 
     #[test]
     fn transcript_path_for_session_reads_transcript_path_field() {
+        // A stamped path that is not under a provisioned `sessions` symlink
+        // (and does not match the production `boss-grok-homes` layout) is
+        // returned as-is. The durable rewrite is covered by
+        // `transcript_store::tests::recorded_grok_transcript_path_survives_home_reclaim`.
         let raw = json!({
             "sessionId": "sess-1",
             "hookEventName": "stop",
