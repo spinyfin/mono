@@ -15,11 +15,11 @@
 
 use super::*;
 
-/// Description sentence the revision renderer writes and the follow-up
-/// constructor rewrites. Kept in one place so a wording change cannot
-/// silently desync the two producers.
-pub(crate) const REVIEW_FINDINGS_REVISION_CLOSE_SENTENCE: &str =
-    "Address ALL findings before finalising this revision.";
+/// Re-exported under this module's existing name so call sites need no
+/// change — see `boss_pr_review::REVISION_CLOSE_SENTENCE`'s doc comment for
+/// why this (not a second literal) is the single source of truth for the
+/// sentence `render_revision_instructions` writes.
+pub(crate) use crate::pr_review::REVISION_CLOSE_SENTENCE as REVIEW_FINDINGS_REVISION_CLOSE_SENTENCE;
 pub(crate) const REVIEW_FINDINGS_FOLLOWUP_CLOSE_SENTENCE: &str = "Address ALL findings before closing this follow-up.";
 
 /// Field values the two producers write onto a review-findings follow-up.
@@ -96,14 +96,18 @@ pub(crate) fn existing_review_findings_work_item(conn: &Connection, created_via:
 }
 
 /// Convert a pending review-findings revision in place to a follow-up/chore.
-/// Returns the number of rows changed (0 if the row was already resolved).
+/// Returns the number of rows changed (0 if the row was already resolved)
+/// alongside the plan's `kind` — the caller logs this rather than re-querying
+/// the row afterward, since on the zero-rows-changed path there is no
+/// guarantee the row reflects this plan at all (it may already have been
+/// converted, with a different kind, by a concurrent pass).
 pub(crate) fn convert_revision_to_review_findings_followup(
     conn: &Connection,
     rev: &Task,
     chain_root_id: &str,
     now: &str,
     autostart: bool,
-) -> Result<usize> {
+) -> Result<(usize, TaskKind)> {
     let plan = plan_review_findings_followup(conn, chain_root_id, &rev.description)?;
     let rows_changed = conn.execute(
         "UPDATE tasks
@@ -143,7 +147,7 @@ pub(crate) fn convert_revision_to_review_findings_followup(
             plan.origin_pr_number,
         ],
     )?;
-    Ok(rows_changed)
+    Ok((rows_changed, plan.kind))
 }
 
 /// Inputs for inserting a new review-findings follow-up. Bundled so the

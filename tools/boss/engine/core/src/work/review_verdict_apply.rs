@@ -31,9 +31,25 @@ impl WorkDb {
         for proposal in pending {
             match self.apply_review_verdict_proposal(&proposal.id, pr_checker) {
                 Ok(created) => {
-                    stats.applied += 1;
-                    if created.is_some() {
-                        stats.created_work += 1;
+                    // `apply_review_verdict_proposal` also returns `Ok(None)`
+                    // for a proposal it deliberately left `proposed` for
+                    // retry (e.g. the batch hasn't reached `applying` yet) —
+                    // that is not an application and must not count as one.
+                    // Re-check the row's own state rather than trusting the
+                    // call's `Ok`/`Err` split, so `applied` means what it
+                    // says.
+                    let actually_applied = !matches!(
+                        self.worker_proposal(&proposal.id),
+                        Ok(Some(WorkerProposal {
+                            state: ProposalState::Proposed,
+                            ..
+                        }))
+                    );
+                    if actually_applied {
+                        stats.applied += 1;
+                        if created.is_some() {
+                            stats.created_work += 1;
+                        }
                     }
                 }
                 Err(error) => {
@@ -71,6 +87,28 @@ impl WorkDb {
                 payload.batch_id
             );
         };
+        // The batch's own state machine is the authority on whether this
+        // verdict is ready to apply. `advance_review_batch_quorum_best_effort`
+        // is explicitly best-effort and can leave the batch stranded in
+        // `supervising` (its own doc comment: "the batch may now be stuck
+        // until a human intervenes") while this proposal still reads
+        // `proposed`. Applying anyway would fully materialise/complete a
+        // batch that never reached `applying`, and — because the completion
+        // write below is itself gated on `status = 'applying'` — leave the
+        // batch permanently stuck in `supervising` even though its outcome
+        // already landed. Bail here and leave the proposal `proposed` so a
+        // later pass (after the batch is nudged back to `applying`, or by an
+        // operator) can retry.
+        if batch.status != boss_protocol::ReviewBatchStatus::Applying {
+            tracing::warn!(
+                proposal_id = %proposal.id,
+                batch_id = %batch.id,
+                batch_status = %batch.status,
+                "review-verdict apply: batch is not in `applying`; leaving the proposal \
+                 proposed for retry instead of materialising against a stranded batch",
+            );
+            return Ok(None);
+        }
 
         let review_result = verdict.to_review_result();
         // The engine gate is authoritative: the supervisor's
@@ -208,6 +246,22 @@ impl WorkDb {
                 params![proposal.id],
                 |row| row.get(0),
             )?;
+            // A proposal that moved out of `proposed` to anything other than
+            // `applied` between this call's materialisation (above, in its
+            // own already-committed transaction) and this bookkeeping commit
+            // was decided against — most commonly `superseded` by
+            // `proposal_apply::supersede_other_undecided_review_verdicts`
+            // when a corrected verdict landed in that window. The revision/
+            // follow-up `materialize_review_findings` already created is
+            // therefore an orphan of a decision that didn't stand: tombstone
+            // it so it never autostarts as the (wrong) chain head, rather
+            // than leaving it live alongside whatever the corrected verdict
+            // mints under its own `created_via` key.
+            if current_state != ProposalState::Applied.as_str()
+                && let Some(task_id) = remediating_task_id
+            {
+                tombstone_orphaned_remediation_in_tx(&tx, task_id, &now_string())?;
+            }
             tx.commit()?;
             return Ok(applied_ref);
         }
@@ -243,12 +297,27 @@ impl WorkDb {
 
         let now = now_string();
         let mut pending = PendingEvents::new();
-        tx.execute(
+        let batch_rows_changed = tx.execute(
             "UPDATE pr_review_batches
              SET status = 'completed', completed_at = ?2, updated_at = ?2
              WHERE id = ?1 AND status = 'applying'",
             params![batch.id, now],
         )?;
+        if batch_rows_changed == 0 {
+            // The batch had already moved off `applying` by the time this
+            // apply reached its bookkeeping commit (e.g. a concurrent apply
+            // for the same batch, or the batch was otherwise nudged out from
+            // under us). The verdict/task/proposal writes below still land —
+            // this apply's own outcome is real — but the batch-completion
+            // signal this UPDATE was meant to send did not, so surface it
+            // rather than silently no-opping: nothing else observes that gap.
+            tracing::warn!(
+                proposal_id = %proposal.id,
+                batch_id = %batch.id,
+                "review-verdict apply: batch-completion UPDATE matched no row (batch was \
+                 not `applying`); the batch's status may not reflect this applied verdict",
+            );
+        }
 
         let applied_ref = remediating_task_id.unwrap_or(verdict_id.as_str()).to_owned();
         tx.execute(
@@ -267,59 +336,25 @@ impl WorkDb {
         Ok(Some(applied_ref).filter(|_| remediating_task_id.is_some()))
     }
 
+    /// `list_worker_proposals` orders newest-first (its `bossctl` callers
+    /// want that); this applier processes oldest-first so proposals apply in
+    /// the order the batches were decided, so the result is reversed here
+    /// rather than by adding a second `ORDER BY` variant of the same query.
     fn list_proposed_review_verdicts(&self) -> Result<Vec<WorkerProposal>> {
-        let conn = self.connect()?;
-        let mut statement = conn.prepare(
-            "SELECT id, execution_id, work_item_id, kind, payload_json,
-                    idempotency_key, state, decided_by, decision_reason, applied_ref,
-                    created_at, decided_at
-             FROM worker_proposals
-             WHERE kind = 'review_verdict' AND state = 'proposed'
-             ORDER BY created_at ASC, id ASC",
+        let mut rows = self.list_worker_proposals(
+            None,
+            None,
+            Some(ProposalKind::ReviewVerdict),
+            Some(ProposalState::Proposed),
         )?;
-        let rows = statement
-            .query_map([], map_listed_worker_proposal)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.reverse();
         Ok(rows)
     }
 
     fn worker_proposal(&self, proposal_id: &str) -> Result<Option<WorkerProposal>> {
         let conn = self.connect()?;
-        conn.query_row(
-            "SELECT id, execution_id, work_item_id, kind, payload_json,
-                    idempotency_key, state, decided_by, decision_reason, applied_ref,
-                    created_at, decided_at
-             FROM worker_proposals WHERE id = ?1",
-            params![proposal_id],
-            map_listed_worker_proposal,
-        )
-        .optional()
-        .map_err(Into::into)
+        super::proposals::find_worker_proposal_by_id(&conn, proposal_id)
     }
-}
-
-fn map_listed_worker_proposal(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerProposal> {
-    fn parse_column<T: std::str::FromStr<Err = String>>(raw: &str, index: usize) -> rusqlite::Result<T> {
-        raw.parse::<T>()
-            .map_err(|err| rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, err.into()))
-    }
-    let kind_raw: String = row.get(3)?;
-    let state_raw: String = row.get(6)?;
-    let decided_by_raw: Option<String> = row.get(7)?;
-    Ok(WorkerProposal {
-        id: row.get(0)?,
-        execution_id: row.get(1)?,
-        work_item_id: row.get(2)?,
-        kind: parse_column(&kind_raw, 3)?,
-        payload_json: row.get(4)?,
-        idempotency_key: row.get(5)?,
-        state: parse_column(&state_raw, 6)?,
-        decided_by: decided_by_raw.map(|raw| parse_column(&raw, 7)).transpose()?,
-        decision_reason: row.get(8)?,
-        applied_ref: row.get(9)?,
-        created_at: row.get(10)?,
-        decided_at: row.get(11)?,
-    })
 }
 
 fn parent_no_longer_revisable(error: &anyhow::Error) -> bool {
@@ -329,6 +364,20 @@ fn parent_no_longer_revisable(error: &anyhow::Error) -> bool {
             RevisionGateError::Merged { .. } | RevisionGateError::ClosedUnmerged { .. }
         )
     })
+}
+
+/// Soft-delete a revision/follow-up this call materialised whose owning
+/// proposal turned out not to be the decision that stands (see the
+/// `current_state != Applied` guard in `commit_applied_review_verdict`).
+/// Soft-deleted so it drops out of every `deleted_at IS NULL` dispatch/list
+/// query (including the `autostart` scheduler query) without touching
+/// history.
+fn tombstone_orphaned_remediation_in_tx(tx: &rusqlite::Transaction<'_>, task_id: &str, now: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE tasks SET deleted_at = ?2, updated_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+        params![task_id, now],
+    )?;
+    Ok(())
 }
 
 fn increment_review_cycle_once_in_tx(
@@ -356,20 +405,28 @@ fn advance_cycle_root_to_in_review_in_tx(
     task_id: &str,
     now: &str,
 ) -> Result<()> {
-    let status_before: Option<String> = tx
+    let status_and_block: Option<(String, Option<String>)> = tx
         .query_row(
-            "SELECT status FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+            "SELECT status, blocked_reason FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
             params![task_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let Some(status_before) = status_before else {
+    let Some((status_before, blocked_reason)) = status_and_block else {
         return Ok(());
     };
     if matches!(status_before.as_str(), "done" | "archived" | "in_review") {
         return Ok(());
     }
-    tx.execute(
+    // incident-002 postmortem gate: a cycle root held `blocked:
+    // deletion_signoff` (see `pr_flow::DELETION_SIGNOFF_BLOCKED_REASON` and
+    // `conflict_ladder.rs`) is pending explicit operator sign-off — this
+    // async apply path must not silently release that hold by advancing the
+    // task to `in_review` and clearing `blocked_reason`.
+    if blocked_reason.as_deref() == Some(super::pr_flow::DELETION_SIGNOFF_BLOCKED_REASON) {
+        return Ok(());
+    }
+    let changed = tx.execute(
         "UPDATE tasks
          SET status            = 'in_review',
              updated_at        = ?2,
@@ -378,9 +435,13 @@ fn advance_cycle_root_to_in_review_in_tx(
              blocked_attempt_id = NULL
          WHERE id = ?1
            AND deleted_at IS NULL
-           AND status NOT IN ('done', 'archived', 'in_review')",
-        params![task_id, now],
+           AND status NOT IN ('done', 'archived', 'in_review')
+           AND (blocked_reason IS NULL OR blocked_reason != ?3)",
+        params![task_id, now, super::pr_flow::DELETION_SIGNOFF_BLOCKED_REASON],
     )?;
+    if changed == 0 {
+        return Ok(());
+    }
     cascade_dependents_after_prereq_status_change(pending, tx, task_id, "in_review", now)?;
     Ok(())
 }

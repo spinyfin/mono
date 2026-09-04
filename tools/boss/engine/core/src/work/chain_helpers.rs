@@ -438,14 +438,9 @@ pub(crate) fn resolve_revision_on_parent_close(
         // will use the new kind on its next pass. Construction is shared
         // with the verdict applier's merged-origin insert so both producers
         // write the same kind/provenance/description rewrite.
-        let rows_changed = convert_revision_to_review_findings_followup(conn, rev, chain_root_id, now, is_wip)?;
-        let new_kind = if rows_changed > 0 {
-            query_task(conn, &rev.id)?
-                .map(|task| task.kind.as_str().to_owned())
-                .unwrap_or_else(|| "followup".to_owned())
-        } else {
-            "followup".to_owned()
-        };
+        let (rows_changed, new_kind) =
+            convert_revision_to_review_findings_followup(conn, rev, chain_root_id, now, is_wip)?;
+        let new_kind = new_kind.as_str();
         // Not a duplicate-mint avoidance — this IS the single mint for this
         // review execution, so the ordinary path logs at info. Zero rows
         // changed means the guard didn't match (row already tombstoned, or
