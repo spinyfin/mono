@@ -1,0 +1,27 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "Global decisions as the same table with product_id = NULL and their own G<n> label (keeping per-product D<n> unchanged)? 'No' means a single global D<n> counter with scope as an attribute instead.",
+    "anchor": "scope-model"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Should the engine refuse a colliding create until the caller acknowledges the specific decision by id with a reason (the duplicate-guard shape), rather than raising an attention item and letting the row dispatch?",
+    "anchor": "relevance-and-the-create-gate"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Should a decision_violation review finding force a revision regardless of its assigned severity, the same way regression and duplication findings do today?",
+    "anchor": "enforcement-point-3-the-reviewer-against-the-diff"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "When the planner materializes a design doc's task that collides with an active decision, what should happen to that row?",
+    "choices": [
+      "Fail that row and raise an attention item naming the decision (proposed)",
+      "Create it with an engine-attributed acknowledgement and a ledger row",
+      "Create it without a gate, as today"
+    ],
+    "anchor": "relevance-and-the-create-gate"
+  }
+]
