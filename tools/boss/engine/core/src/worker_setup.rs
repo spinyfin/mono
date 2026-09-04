@@ -1310,12 +1310,13 @@ pub fn write_workspace_files(
     }
     let gitignore_path = config_dir.join(".gitignore");
 
-    let preamble = driver.agent_rules_preamble();
+    let checkleft_pinned = boss_engine_worker_bin::repobin_declares_tool(&input.workspace_path, "checkleft");
+    let preamble = driver.agent_rules_preamble(checkleft_pinned);
     std::fs::write(
         &agent_rules_path,
         render_claude_md_with_invocation(
             input,
-            preamble,
+            &preamble,
             descriptor.config_dir,
             worker_boss_invocation(descriptor.name, &input.worker_kind),
         ),

@@ -2339,7 +2339,14 @@ pub trait AgentDriver: Send + Sync {
 
     /// Driver-specific preamble injected at the top of the agent-rules file,
     /// naming the hook mechanism and the `.claude/`-style gitignore contract.
-    fn agent_rules_preamble(&self) -> &'static str;
+    ///
+    /// `checkleft_pinned` is `true` only when the workspace's `REPOBIN.toml`
+    /// declares `checkleft` (the same condition `spawn_flow` uses to decide
+    /// whether to export `CHECKLEFT_BIN` and the launch guard uses to decide
+    /// whether to watch a bare `checkleft`). The returned text must not
+    /// instruct workers to run `bin/checkleft` unless this is `true` — most
+    /// repos Boss manages have no `bin/` at all.
+    fn agent_rules_preamble(&self, checkleft_pinned: bool) -> String;
 
     /// Absolute path [`crate::worker_setup::write_workspace_files`] (in
     /// `engine/core`) must write the rendered agent-rules body to, so the
@@ -2619,6 +2626,9 @@ pub trait AgentDriver: Send + Sync {
     fn structured_output_fallback(&self, kind: StructuredOutputKind, text: &str) -> Vec<FallbackCandidate>;
 }
 
+/// Shared head of every driver's agent-rules preamble template. `{checkleft}`
+/// is a placeholder each driver's `agent_rules_preamble` fills in from
+/// [`checkleft_preamble_sentence`].
 macro_rules! agent_rules_preamble {
     ($observation:literal, $extra:literal) => {
         concat!(
@@ -2627,9 +2637,7 @@ macro_rules! agent_rules_preamble {
      ",
             $observation,
             "\n\
-     For ordinary pre-push validation, run `bin/checkleft run` with no flags; use\n\
-     `bin/checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
-     strong stated justification.\n\
+     {checkleft}\n\
      Do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run`\n\
      in a shell `timeout`.",
             $extra
@@ -2639,6 +2647,23 @@ macro_rules! agent_rules_preamble {
 
 /// Source of the deterministic pre-push checkleft gate (PreToolUse hook).
 pub const CHECKLEFT_PUSH_GUARD_SCRIPT: &str = include_str!("checkleft_push_guard.py");
+
+/// The checkleft sentence shared by every driver's `agent_rules_preamble`
+/// (see [`AgentDriver::agent_rules_preamble`]). `bin/checkleft` only exists
+/// in a workspace whose `REPOBIN.toml` declares checkleft; a repo that
+/// doesn't must not be told to run a path that isn't there.
+pub fn checkleft_preamble_sentence(checkleft_pinned: bool) -> &'static str {
+    if checkleft_pinned {
+        "For ordinary pre-push validation, run `bin/checkleft run` with no flags; use\n\
+         `bin/checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
+         strong stated justification."
+    } else {
+        "For ordinary pre-push validation, run this repository's sanctioned checkleft\n\
+         entry point with no flags (whatever `checkleft` resolves to on PATH here); use\n\
+         its all-checks mode only in CI, when modifying checkleft itself, or with a\n\
+         strong stated justification."
+    }
+}
 
 pub mod agy;
 pub mod claude;

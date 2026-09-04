@@ -68,7 +68,7 @@ async fn first_prompt_sizes_by_driver_and_kind() {
                 .worker_kind(worker_kind_for_execution(&kind))
                 .run_done_proposals_seam_enabled(true)
                 .build();
-            let rules = render_claude_md(&input, driver.agent_rules_preamble(), driver.descriptor().config_dir);
+            let rules = render_claude_md(&input, &driver.agent_rules_preamble(true), driver.descriptor().config_dir);
             let prompt = composed
                 .prompt_text
                 .replace(workspace.path().to_str().unwrap(), "/tmp/prompt-measure");

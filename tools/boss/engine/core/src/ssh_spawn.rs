@@ -1086,7 +1086,7 @@ mod tests {
                     .unwrap();
                 let calls = exec.calls();
                 let destination = ClaudeDriver.agent_rules_destination(&input.workspace_path, &input.run_id);
-                let expected = render_claude_md(&input, ClaudeDriver.agent_rules_preamble(), ".claude");
+                let expected = render_claude_md(&input, &ClaudeDriver.agent_rules_preamble(false), ".claude");
                 assert!(calls.iter().any(|call| matches!(call, Call::Push(path, body)
                     if path == &destination.to_string_lossy() && body == &expected)));
                 for rule in [

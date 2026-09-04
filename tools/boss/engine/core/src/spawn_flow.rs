@@ -246,13 +246,18 @@ fn apply_checkleft_bin_env(env: &mut Vec<EnvVar>, workspace_path: &Path) {
     let Some(worker_bin_dir) = worker_bin_dir.filter(|dir| !dir.is_empty()) else {
         return;
     };
-    if boss_engine_worker_bin::repobin_declares_tool(workspace_path, "checkleft") {
+    // Gate on the launcher file actually existing, not merely on
+    // REPOBIN.toml declaring checkleft. Exporting CHECKLEFT_BIN for a
+    // launcher that was never written would name a file that is not there
+    // -- and, because the launch guard derives WATCH_CHECKLEFT from
+    // CHECKLEFT_BIN being set, a bare `checkleft` would be blocked at the
+    // same time with nothing that works left.
+    let checkleft_bin = boss_engine_worker_bin::checkleft_bin_in(Path::new(&worker_bin_dir));
+    if boss_engine_worker_bin::repobin_declares_tool(workspace_path, "checkleft") && checkleft_bin.is_file() {
         set_env_var(
             env,
             boss_engine_worker_bin::CHECKLEFT_BIN_ENV,
-            boss_engine_worker_bin::checkleft_bin_in(Path::new(&worker_bin_dir))
-                .display()
-                .to_string(),
+            checkleft_bin.display().to_string(),
         );
     }
 }

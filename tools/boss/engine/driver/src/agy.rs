@@ -113,7 +113,7 @@ static AGY_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     },
 };
 
-const AGY_AGENT_RULES_PREAMBLE: &str =
+const AGY_AGENT_RULES_PREAMBLE_TEMPLATE: &str =
     agent_rules_preamble!("via Antigravity hooks under an engine-owned per-run HOME.", "");
 
 /// Google Antigravity CLI driver.
@@ -551,8 +551,8 @@ impl AgentDriver for AgyDriver {
         }
     }
 
-    fn agent_rules_preamble(&self) -> &'static str {
-        AGY_AGENT_RULES_PREAMBLE
+    fn agent_rules_preamble(&self, checkleft_pinned: bool) -> String {
+        AGY_AGENT_RULES_PREAMBLE_TEMPLATE.replace("{checkleft}", crate::checkleft_preamble_sentence(checkleft_pinned))
     }
 
     /// Route Boss worker rules to `<rules-root>/AGENTS.md` under the per-run

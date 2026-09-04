@@ -1368,11 +1368,17 @@ async fn worker_bin_dir_is_prepended_ahead_of_the_sanitized_path() {
 async fn declared_checkleft_exports_the_worker_bin_launcher() {
     let workspace = TempDir::new().unwrap();
     std::fs::write(workspace.path().join("REPOBIN.toml"), "[tools.checkleft]\n").unwrap();
+    let worker_bin_dir = TempDir::new().unwrap();
+    // CHECKLEFT_BIN must only be exported when the launcher was actually
+    // written -- create it here to model the real `ensure_worker_bin_dir`
+    // success path, distinct from the write-failed case covered by
+    // `declared_checkleft_without_a_written_launcher_is_not_exported`.
+    std::fs::write(worker_bin_dir.path().join("checkleft"), b"#!/bin/sh\n").unwrap();
     let spawner = ok_spawner_capturing();
     let mut input = sample_input(&workspace, spawner.tmux_runner.clone());
     input.extra_env = vec![(
         boss_engine_worker_bin::WORKER_BIN_DIR_ENV.into(),
-        "/tmp/boss-worker-settings/bin".into(),
+        worker_bin_dir.path().display().to_string(),
     )];
 
     start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
@@ -1383,8 +1389,37 @@ async fn declared_checkleft_exports_the_worker_bin_launcher() {
             .iter()
             .find(|(k, _)| k == boss_engine_worker_bin::CHECKLEFT_BIN_ENV)
             .map(|(_, v)| v.as_str()),
-        Some("/tmp/boss-worker-settings/bin/checkleft"),
+        Some(worker_bin_dir.path().join("checkleft").display().to_string().as_str()),
         "declared checkleft must name the worker-bin launcher",
+    );
+}
+
+#[tokio::test]
+async fn declared_checkleft_without_a_written_launcher_is_not_exported() {
+    // REPOBIN.toml declares checkleft, but no launcher file exists at
+    // the worker-bin dir. CHECKLEFT_BIN must not be exported
+    // naming a file that is not there -- that would both fail the
+    // worker's `"$CHECKLEFT_BIN" run` with ENOENT and, because the
+    // launch guard derives WATCH_CHECKLEFT from CHECKLEFT_BIN being
+    // set, block a bare `checkleft` at the same time.
+    let workspace = TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("REPOBIN.toml"), "[tools.checkleft]\n").unwrap();
+    let worker_bin_dir = TempDir::new().unwrap();
+    let spawner = ok_spawner_capturing();
+    let mut input = sample_input(&workspace, spawner.tmux_runner.clone());
+    input.extra_env = vec![(
+        boss_engine_worker_bin::WORKER_BIN_DIR_ENV.into(),
+        worker_bin_dir.path().display().to_string(),
+    )];
+
+    start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
+
+    assert!(
+        !spawner
+            .last_spawn_env()
+            .iter()
+            .any(|(k, _)| k == boss_engine_worker_bin::CHECKLEFT_BIN_ENV),
+        "must not export CHECKLEFT_BIN when the launcher file was never written",
     );
 }
 
