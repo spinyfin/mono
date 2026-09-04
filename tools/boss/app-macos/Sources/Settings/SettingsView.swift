@@ -415,8 +415,9 @@ private struct WorkerSettingsPane: View {
                         Text("Session Hosting")
                     } footer: {
                         Text(
-                            "Applies to worker panes only (review, automation, interactive) — the " +
-                            "coordinator's own session is always tmux-hosted regardless of this setting."
+                            "Deprecated temporary rollback control, enabled by default and scheduled for " +
+                            "removal after this release. Disabling it affects new worker panes only; the " +
+                            "coordinator's own session is always tmux-hosted."
                         )
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -502,7 +503,7 @@ private struct SettingToggleRow: View {
         case "coordinator.direct_developer_mode":
             return "Direct Boss developer mode"
         case "workers.tmux_hosting":
-            return "Host workers in tmux"
+            return "Host workers in tmux (deprecated)"
         default:
             return key
         }

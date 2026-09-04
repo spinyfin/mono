@@ -957,18 +957,18 @@ fn hosting_state_root(name: &str, settings_toml: Option<&str>) -> std::path::Pat
 }
 
 /// No `settings.toml` at all is not an error — every pool reads as the
-/// default legacy (non-tmux) path, matching `SettingsStore::load`'s
-/// missing-file handling.
+/// default tmux-hosted path, matching `SettingsStore::load`'s missing-file
+/// handling.
 #[test]
-fn hosting_report_defaults_to_every_pool_disabled() {
+fn hosting_report_defaults_to_every_pool_enabled() {
     let root = hosting_state_root("missing", None);
     let report = tmux_hosting_pool_report(Some(root.clone())).unwrap().to_json();
     let _ = std::fs::remove_dir_all(&root);
 
-    assert_eq!(report["review"], Value::Bool(false));
-    assert_eq!(report["automation"], Value::Bool(false));
-    assert_eq!(report["interactive"], Value::Bool(false));
-    assert_eq!(report["any_enabled"], Value::Bool(false));
+    assert_eq!(report["review"], Value::Bool(true));
+    assert_eq!(report["automation"], Value::Bool(true));
+    assert_eq!(report["interactive"], Value::Bool(true));
+    assert_eq!(report["any_enabled"], Value::Bool(true));
 }
 
 /// A pool set persisted by the operator toggle (or a hand-edited

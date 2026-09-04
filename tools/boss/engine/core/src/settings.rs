@@ -76,9 +76,10 @@ impl TmuxHostingPool {
 }
 
 /// The configured set of pools whose workers launch in detached tmux
-/// sessions. An empty set is the safe default and preserves the legacy
-/// app-hosted path.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// sessions. Every local pool is enabled by default for this release; an
+/// explicit empty set remains the rollback control for the legacy app-hosted
+/// path until this setting is removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxHostingPools(BTreeSet<TmuxHostingPool>);
 
 impl TmuxHostingPools {
@@ -132,16 +133,26 @@ impl TmuxHostingPools {
             .collect(),
         )
     }
+
+    fn empty() -> Self {
+        Self(BTreeSet::new())
+    }
+}
+
+impl Default for TmuxHostingPools {
+    fn default() -> Self {
+        Self::all()
+    }
 }
 
 /// Description shown in the Boss UI settings toggle for the operator-facing
 /// tmux-hosting switch. Lives here (not in `engine_meta`) since only this
 /// module knows the pool-set representation the boolean is a projection of.
-const TMUX_HOSTING_DESCRIPTION: &str = "Host worker panes (review, automation, interactive) in \
-     detached tmux sessions that survive an app or engine restart, instead of the legacy \
-     app-owned pty path. Takes effect on the next dispatch; already-running workers are \
-     unaffected. The coordinator's tmux session is unconditional and is not controlled by \
-     this setting.";
+const TMUX_HOSTING_DESCRIPTION: &str = "Deprecated temporary rollback control; scheduled for \
+     removal after this release. Enabled by default, it hosts worker panes (review, automation, \
+     interactive) in detached tmux sessions that survive an app or engine restart. Disabling it \
+     affects only new dispatches; already-running tmux workers keep their durable teardown path. \
+     The coordinator's tmux session is unconditional and is not controlled by this setting.";
 
 /// Per-pool tmux-hosting snapshot for the visibility surfaces (the dispatch
 /// event stamp and `bossctl doctor`): whether each pool currently launches
@@ -338,7 +349,7 @@ impl SettingsStore {
         self.set_tmux_hosting_pools(if enabled {
             TmuxHostingPools::all()
         } else {
-            TmuxHostingPools::default()
+            TmuxHostingPools::empty()
         })
     }
 
@@ -363,7 +374,7 @@ impl SettingsStore {
         SettingSnapshot {
             key: TMUX_HOSTING_SETTING.to_owned(),
             description: TMUX_HOSTING_DESCRIPTION.to_owned(),
-            default_enabled: false,
+            default_enabled: true,
             enabled: guard.tmux_hosting == TmuxHostingPools::all(),
         }
     }
@@ -502,14 +513,14 @@ mod tests {
     }
 
     #[test]
-    fn tmux_hosting_defaults_to_no_pools() {
+    fn tmux_hosting_defaults_to_all_local_pools() {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp);
         store.load().unwrap();
 
-        assert!(!store.tmux_hosting_enabled_for("review"));
-        assert!(!store.tmux_hosting_enabled_for("automation"));
-        assert!(!store.tmux_hosting_enabled_for("main"));
+        assert!(store.tmux_hosting_enabled_for("review"));
+        assert!(store.tmux_hosting_enabled_for("automation"));
+        assert!(store.tmux_hosting_enabled_for("main"));
     }
 
     #[test]
@@ -531,14 +542,14 @@ mod tests {
     }
 
     #[test]
-    fn tmux_hosting_snapshot_defaults_to_disabled() {
+    fn tmux_hosting_snapshot_defaults_to_enabled() {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp);
         store.load().unwrap();
         let snap = store.tmux_hosting_snapshot();
         assert_eq!(snap.key, TMUX_HOSTING_SETTING);
-        assert!(!snap.default_enabled);
-        assert!(!snap.enabled);
+        assert!(snap.default_enabled);
+        assert!(snap.enabled);
     }
 
     #[test]
