@@ -155,7 +155,8 @@ final class RevealRevisionRollupTests: XCTestCase {
             tasks: tasks,
             chores: chores,
             taskRuntimes: [],
-            dependencies: []
+            dependencies: [],
+            ideas: []
         )
     }
 

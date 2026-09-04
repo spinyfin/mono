@@ -264,6 +264,56 @@ final class ChatViewModel: ObservableObject {
     }
     @Published var isBossPanelCollapsed: Bool = false
     @Published var bossPanelWidth: CGFloat = 380
+
+    // MARK: - Ideas
+
+    /// Ideas (markdown drafts) keyed by product id, as last synced from the
+    /// engine — via `WorkTree.ideas` (the same invalidation pipeline that
+    /// keeps the kanban live also keeps this in sync across sessions) and
+    /// patched in place by this session's own `create_idea` / `update_idea`
+    /// replies. A missing key means "not fetched yet", not "no ideas".
+    @Published var ideasByProductID: [String: [WorkIdea]] = [:]
+    /// The idea currently open in the Ideas editor, or `nil`. Not persisted
+    /// across launches — mirrors `selectedAutomationID`.
+    @Published var selectedIdeaID: String?
+    /// In-memory draft state for the open idea, bound directly by
+    /// `IdeasView`'s editor. Diverges from the corresponding `WorkIdea` in
+    /// `ideasByProductID` whenever there is an unconfirmed edit in flight —
+    /// see `ChatViewModel+Ideas.swift`.
+    @Published var ideaDraftName: String = ""
+    @Published var ideaDraftBody: String = ""
+    /// Autosave status for the open idea's draft. See `IdeaSaveStatus`.
+    @Published var ideaSaveStatus: IdeaSaveStatus = .idle
+    /// Ids of ideas with an unsynced local draft on disk, mirrored in
+    /// memory so `IdeasView`'s row list is a set lookup rather than a
+    /// per-row filesystem stat on every render. Seeded once from
+    /// `IdeaDraftCache.allIdeaIDsWithPendingDrafts` when the Ideas surface
+    /// first appears, then kept in sync by `writeIdeaDraftToLocalCache`
+    /// (insert) and every `IdeaDraftCache.clear` call site (remove). See
+    /// `ChatViewModel+Ideas.swift`.
+    @Published var ideaIDsWithPendingLocalDraft: Set<String> = []
+    var hasSeededIdeaPendingDrafts = false
+    /// Debounce handles for the two autosave tiers (local crash-floor
+    /// write, engine `update_idea`). Cancelled and replaced on every
+    /// keystroke — mirrors `pendingWorkTreeRefetchTasks`'s Task-based
+    /// debounce. See `ChatViewModel+Ideas.swift`.
+    var ideaLocalCacheTask: Task<Void, Never>?
+    var ideaEngineSaveTask: Task<Void, Never>?
+    /// The values most recently assigned while opening or creating an idea.
+    /// `noteIdeaDraftEdited()` compares against this durable snapshot so a
+    /// later SwiftUI `.onChange` can distinguish that assignment from a
+    /// real keystroke without relying on a synchronous transient flag.
+    var lastLoadedIdeaDraft: (id: String, name: String, body: String)?
+    /// Directory `IdeaDraftCache` reads/writes for this view model. Tests
+    /// override with a scratch directory so state machine coverage never
+    /// touches the real Application Support tree.
+    var ideaDraftCacheDirectory: URL = IdeaDraftCache.defaultDirectory
+    /// Installed by `ContentView` once the coordinator's libghostty pane is
+    /// wired up. Pastes text into the coordinator pane and submits it, as
+    /// if it had been typed there. Returns `false` when no pane is
+    /// attached (e.g. a Bazel build without GhosttyKit) so the caller can
+    /// surface that instead of silently discarding the draft.
+    var sendToCoordinatorHandler: ((String) -> Bool)?
     /// Live runtime state for every active worker, sourced from the
     /// engine's LiveWorkerState snapshot (`worker_live_states_list`
     /// event) and refreshed on each push from the `worker.live_states`
@@ -623,6 +673,7 @@ final class ChatViewModel: ObservableObject {
     let reviewNotifier = ReviewNotificationCenter()
     #if canImport(AppKit)
     private var appActivationObserver: NSObjectProtocol?
+    private var appTerminationObserver: NSObjectProtocol?
     #endif
 
     /// Task IDs currently known to be in `in_review`. Populated from
@@ -744,6 +795,20 @@ final class ChatViewModel: ObservableObject {
             MainActor.assumeIsolated {
                 guard let self, self.isConnected else { return }
                 self.engine.sendKickPrReconcilers()
+            }
+        }
+        // Save-on-window-close for the Ideas draft editor: a graceful quit
+        // (Cmd-Q) fires this before the process exits, so an edit still
+        // sitting inside the autosave debounce window (see
+        // ChatViewModel+Ideas.swift) gets one last synchronous flush
+        // instead of being lost to a debounce that never got to fire.
+        appTerminationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.flushIdeaDraft()
             }
         }
         #endif

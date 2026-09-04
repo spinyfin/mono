@@ -479,7 +479,8 @@ final class WorkCacheInvalidationTests: XCTestCase {
             tasks: tasks,
             chores: [],
             taskRuntimes: [],
-            dependencies: dependencies
+            dependencies: dependencies,
+            ideas: []
         )
     }
 

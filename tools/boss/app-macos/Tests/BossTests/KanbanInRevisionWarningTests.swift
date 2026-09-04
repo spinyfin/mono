@@ -320,7 +320,8 @@ final class KanbanInRevisionWarningTests: XCTestCase {
             tasks: [],
             chores: chores,
             taskRuntimes: [],
-            dependencies: []
+            dependencies: [],
+            ideas: []
         )
     }
 

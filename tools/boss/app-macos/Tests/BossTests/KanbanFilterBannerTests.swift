@@ -117,7 +117,8 @@ final class KanbanFilterBannerTests: XCTestCase {
             tasks: tasks,
             chores: [],
             taskRuntimes: [],
-            dependencies: []
+            dependencies: [],
+            ideas: []
         )
     }
 

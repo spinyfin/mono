@@ -867,6 +867,36 @@ extension EngineClient {
         sendLine(["type": "list_automation_runs", "automation_id": automationId])
     }
 
+    // MARK: - Idea RPCs
+
+    /// Create a new idea (markdown draft) for a product. Engine replies
+    /// with `idea_created`. `body` is `nil` for a brand-new empty draft —
+    /// ideas are typically authored incrementally after creation.
+    func sendCreateIdea(productId: String, name: String, body: String?) {
+        var payload: [String: Any] = [
+            "type": "create_idea",
+            "product_id": productId,
+            "name": name,
+            "created_via": "mac_app",
+        ]
+        if let body {
+            payload["body"] = body
+        }
+        sendLine(payload)
+    }
+
+    /// Apply a name/body patch to an idea. Engine replies with `idea_updated`.
+    func sendUpdateIdea(id: String, name: String, body: String) {
+        sendLine([
+            "type": "update_idea",
+            "id": id,
+            "patch": [
+                "name": name,
+                "body": body,
+            ] as [String: Any],
+        ])
+    }
+
     // MARK: Editorial controls
 
     /// Set a product's editorial rules. Engine replies with `work_item_updated`

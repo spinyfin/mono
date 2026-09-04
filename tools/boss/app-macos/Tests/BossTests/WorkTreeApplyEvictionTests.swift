@@ -164,7 +164,8 @@ final class WorkTreeApplyEvictionTests: XCTestCase {
             tasks: tasks,
             chores: [],
             taskRuntimes: [],
-            dependencies: []
+            dependencies: [],
+            ideas: []
         )
     }
 

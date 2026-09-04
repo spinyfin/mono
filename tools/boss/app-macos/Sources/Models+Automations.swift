@@ -14,6 +14,7 @@ enum NavigationMode: String, CaseIterable, Identifiable {
     case work = "Work"
     case designs = "Designs"
     case automations = "Automations"
+    case ideas = "Ideas"
 
     var id: String { rawValue }
 }

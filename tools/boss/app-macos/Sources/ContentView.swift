@@ -96,6 +96,10 @@ struct ContentView: View {
                 AutomationsView(model: model)
                     .background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea())
             }
+
+            if model.navigationMode == .ideas {
+                IdeasView(chat: model)
+            }
         }
         // Chrome banners live in the window's titlebar-accessory slot: below
         // the toolbar, above the content, with AppKit shrinking
@@ -161,6 +165,16 @@ struct ContentView: View {
             }
             model.coordinatorPaneAttachHandler = { [boss = bossPane] request in
                 boss.attach(request)
+            }
+            // Ideas "Send to Coordinator": paste + submit into the same
+            // libghostty surface the coordinator pane above attaches to.
+            // Three lines because the mechanism already exists
+            // (`GhosttyTerminalHostView.submitText`) — see
+            // `ChatViewModel.sendIdeaDraftToCoordinator`.
+            model.sendToCoordinatorHandler = { [boss = bossPane] text in
+                guard let hostView = boss.session?.hostView else { return false }
+                hostView.submitText(text)
+                return true
             }
             model.paneDetachHandler = { [workspace = workersWorkspace] slotId in
                 workspace.detachWorkerPane(slotId: slotId)
@@ -249,7 +263,7 @@ struct ContentView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(width: 360)
+                .frame(width: 440)
             }
 
             // Agent-capture badge: isolation signal only

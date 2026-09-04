@@ -16,6 +16,18 @@ struct CommentTextEditor: NSViewRepresentable {
     /// While true, re-claim first responder on each update until the claim sticks.
     var wantsFocus: Bool = false
     var onClaimFocus: () -> Void = {}
+    /// When true (the default, matching every existing caller), plain
+    /// Return submits and Shift+Return inserts a newline — the comment-entry
+    /// behavior this type was built for. When false, plain Return inserts a
+    /// newline like an ordinary multi-line text field and `onSubmit` is
+    /// never called from a keystroke — used by the Ideas draft editor,
+    /// where Return is prose, not submission.
+    var submitOnReturn: Bool = true
+    /// Fires when the text view resigns first responder (the user clicks
+    /// elsewhere, tabs away, etc.). Used by the Ideas draft editor to flush
+    /// a pending autosave on blur; the default no-op leaves every other
+    /// caller unaffected.
+    var onBlur: () -> Void = {}
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -43,6 +55,8 @@ struct CommentTextEditor: NSViewRepresentable {
         scrollView.backgroundColor = .clear
         scrollView.borderType = .noBorder
 
+        textView.onResignFirstResponder = onBlur
+
         context.coordinator.textView = textView
         // Apply any seed text before the first layout so the caret lands at end.
         if !text.isEmpty {
@@ -60,6 +74,7 @@ struct CommentTextEditor: NSViewRepresentable {
         context.coordinator.parent = self
 
         guard let textView = scrollView.documentView as? NSTextView else { return }
+        (textView as? SubmitOnReturnTextView)?.onResignFirstResponder = onBlur
 
         if textView.string != text {
             let isFirstResponder = textView.window?.firstResponder === textView
@@ -109,12 +124,23 @@ struct CommentTextEditor: NSViewRepresentable {
     /// Intercept Shift+Return here and route it to `insertNewlineIgnoringFieldEditor:`
     /// (a literal newline) before AppKit's key binding manager collapses it.
     final class SubmitOnReturnTextView: NSTextView {
+        /// See `CommentTextEditor.onBlur`.
+        var onResignFirstResponder: (() -> Void)?
+
         override func keyDown(with event: NSEvent) {
             if event.keyCode == 36, event.modifierFlags.contains(.shift) {
                 insertNewlineIgnoringFieldEditor(nil)
                 return
             }
             super.keyDown(with: event)
+        }
+
+        override func resignFirstResponder() -> Bool {
+            let result = super.resignFirstResponder()
+            if result {
+                onResignFirstResponder?()
+            }
+            return result
         }
     }
 
@@ -136,6 +162,11 @@ struct CommentTextEditor: NSViewRepresentable {
             doCommandBy commandSelector: Selector
         ) -> Bool {
             if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+                guard parent.submitOnReturn else {
+                    // Plain Return is prose, not submission — let AppKit's
+                    // default handling insert the newline.
+                    return false
+                }
                 // Plain Return → submit
                 parent.onSubmit()
                 return true

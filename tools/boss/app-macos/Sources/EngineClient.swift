@@ -315,6 +315,8 @@ final class EngineClient: @unchecked Sendable {
                     .compactMap(parseTaskRuntime)
                 let dependencies = (payload["dependencies"] as? [[String: Any]] ?? [])
                     .compactMap(parseWorkItemDependency)
+                let ideas = (payload["ideas"] as? [[String: Any]] ?? [])
+                    .compactMap { decodeWire(WorkIdea.self, from: $0) }
                 // Population-timing: this decode runs on the EngineClient
                 // serial queue (off main). Record request→reply + decode
                 // duration, payload size, and item cardinalities so timing
@@ -344,7 +346,8 @@ final class EngineClient: @unchecked Sendable {
                     tasks: tasks,
                     chores: chores,
                     taskRuntimes: taskRuntimes,
-                    dependencies: dependencies
+                    dependencies: dependencies,
+                    ideas: ideas
                 ))
             case "work_item_created":
                 guard let itemPayload = payload["item"] as? [String: Any],
@@ -1008,6 +1011,23 @@ final class EngineClient: @unchecked Sendable {
                 if !automationID.isEmpty {
                     emit(.automationRunsList(automationID: automationID, runs: runs))
                 }
+            // MARK: Idea responses
+            case "idea_created":
+                guard let ideaPayload = payload["idea"] as? [String: Any],
+                      let idea = decodeWire(WorkIdea.self, from: ideaPayload)
+                else {
+                    emit(.error(message: "received invalid idea_created payload"))
+                    break
+                }
+                emit(.ideaCreated(idea: idea))
+            case "idea_updated":
+                guard let ideaPayload = payload["idea"] as? [String: Any],
+                      let idea = decodeWire(WorkIdea.self, from: ideaPayload)
+                else {
+                    emit(.error(message: "received invalid idea_updated payload"))
+                    break
+                }
+                emit(.ideaUpdated(idea: idea))
             // MARK: Editorial controls responses
             case "editorial_actions_list":
                 let productID = payload["product_id"] as? String ?? ""
