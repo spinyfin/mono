@@ -2886,6 +2886,9 @@ async fn handle_frontend_connection(
                 r @ FrontendRequest::ResolveProjectDesignDoc { .. } => {
                     projects::handle_resolve_project_design_doc(ctx, r).await
                 }
+                r @ FrontendRequest::ResolveWorkerRecoveryAttention { .. } => {
+                    attentions::handle_resolve_worker_recovery_attention(ctx, r).await
+                }
                 r @ FrontendRequest::RestoreWorkItem { .. } => work_items::handle_restore_work_item(ctx, r).await,
                 r @ FrontendRequest::RetirePane { .. } => panes::handle_retire_pane(ctx, r).await,
                 r @ FrontendRequest::RetryCiRemediation { .. } => {

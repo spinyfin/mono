@@ -1710,3 +1710,124 @@ mod event_bus_tests {
             .expect_err("no second ExecutionTerminal should be published for an already-terminal execution");
     }
 }
+
+#[cfg(test)]
+mod worker_recovery_gate_tests {
+    //! `list_orphan_active_candidates` excludes an `active` work item while
+    //! it has an open `worker_recovery_permanent_error` /
+    //! `worker_recovery_exhausted` attention item — see
+    //! `crate::attention_lifecycle`'s `the_dispatch_gate_kinds_are_never_auto_resolved`
+    //! for why these two are never *auto*-resolved, and
+    //! `WorkDb::resolve_worker_recovery_attention` for the human path that
+    //! lifts the gate this suite pins.
+
+    use super::*;
+    use crate::test_support::{create_active_chore, create_product, open_db};
+
+    /// Stamp `tasks.updated_at` far enough in the past to clear the query's
+    /// min-age guard.
+    fn make_old(db: &WorkDb, work_item_id: &str) {
+        let old_epoch = boss_engine_utils::epoch_time::now_epoch_secs() - 600;
+        db.force_updated_at_for_test(work_item_id, old_epoch).unwrap();
+    }
+
+    fn open_attention_row(db: &WorkDb, work_item_id: &str, kind: &str) -> String {
+        let id = crate::work::next_id("attn");
+        let now = crate::work::now_string();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "INSERT INTO work_attention_items
+                 (id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at)
+             VALUES (?1, NULL, ?2, ?3, 'open', 'test', 'test', ?4, NULL)",
+            rusqlite::params![id, work_item_id, kind, now],
+        )
+        .unwrap();
+        id
+    }
+
+    const MIN_AGE_SECS: i64 = 300;
+
+    #[test]
+    fn open_permanent_error_gate_excludes_the_work_item() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "gated chore");
+        make_old(&db, &work_item_id);
+        assert!(
+            db.list_orphan_active_candidates(MIN_AGE_SECS)
+                .unwrap()
+                .contains(&work_item_id),
+            "an otherwise-eligible active item with no gate must be a candidate"
+        );
+
+        open_attention_row(&db, &work_item_id, ATTENTION_KIND_RECOVERY_PERMANENT);
+
+        assert!(
+            !db.list_orphan_active_candidates(MIN_AGE_SECS)
+                .unwrap()
+                .contains(&work_item_id),
+            "an open worker_recovery_permanent_error item must gate auto-redispatch"
+        );
+    }
+
+    #[test]
+    fn open_exhausted_gate_excludes_the_work_item() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "gated chore");
+        make_old(&db, &work_item_id);
+
+        open_attention_row(&db, &work_item_id, ATTENTION_KIND_RECOVERY_EXHAUSTED);
+
+        assert!(
+            !db.list_orphan_active_candidates(MIN_AGE_SECS)
+                .unwrap()
+                .contains(&work_item_id),
+            "an open worker_recovery_exhausted item must gate auto-redispatch"
+        );
+    }
+
+    #[test]
+    fn resolving_the_gate_readmits_the_work_item() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "gated chore");
+        make_old(&db, &work_item_id);
+        let attn_id = open_attention_row(&db, &work_item_id, ATTENTION_KIND_RECOVERY_PERMANENT);
+        assert!(
+            !db.list_orphan_active_candidates(MIN_AGE_SECS)
+                .unwrap()
+                .contains(&work_item_id),
+            "precondition: the open gate item excludes the work item"
+        );
+
+        db.resolve_worker_recovery_attention(&attn_id)
+            .expect("the human decision that lifts the gate");
+
+        assert!(
+            db.list_orphan_active_candidates(MIN_AGE_SECS)
+                .unwrap()
+                .contains(&work_item_id),
+            "resolving the gate item must re-admit the work item to auto-redispatch"
+        );
+    }
+
+    #[test]
+    fn a_non_gate_kind_attention_does_not_change_dispatch_eligibility() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "unrelated chore");
+        make_old(&db, &work_item_id);
+
+        // A real, open attention item — just not one of the two dispatch
+        // gates — must have no effect on the candidate query.
+        open_attention_row(&db, &work_item_id, crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND);
+
+        assert!(
+            db.list_orphan_active_candidates(MIN_AGE_SECS)
+                .unwrap()
+                .contains(&work_item_id),
+            "an open attention item of a non-gate kind must not exclude the work item"
+        );
+    }
+}

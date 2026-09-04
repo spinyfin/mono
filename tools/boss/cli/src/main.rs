@@ -94,6 +94,7 @@ macro_rules! rpc_call {
     };
 }
 
+mod attention_commands;
 mod automation_cmds;
 mod commands;
 mod comment_commands;
@@ -112,6 +113,7 @@ mod task_update_args;
 mod time_fmt;
 mod work_cmds;
 
+pub(crate) use attention_commands::*;
 pub(crate) use automation_cmds::*;
 pub(crate) use commands::*;
 pub(crate) use comment_commands::*;

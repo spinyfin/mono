@@ -1755,6 +1755,11 @@ pub(crate) async fn list_attention_items_for_work_item(
 /// resolved ones still ride along in the `--json` output but would just be
 /// noise here. Prints nothing when there are none, matching
 /// `print_dependency_section` / `print_executions_section`.
+///
+/// Includes each item's id: for the two `worker_recovery_*` dispatch-gate
+/// kinds it is what an operator passes to `boss attention resolve-gate` to
+/// re-enable auto-redispatch — without it, the gate item would be visible
+/// but not actionable from here.
 pub(crate) fn print_attention_items_section(items: &[WorkAttentionItem]) {
     let open: Vec<&WorkAttentionItem> = items.iter().filter(|item| item.status == "open").collect();
     if open.is_empty() {
@@ -1763,7 +1768,10 @@ pub(crate) fn print_attention_items_section(items: &[WorkAttentionItem]) {
     println!();
     println!("Attention ({}):", open.len());
     for item in &open {
-        println!("  [{}] {} (since {})", item.kind, item.title, item.created_at);
+        println!(
+            "  {} [{}] {} (since {})",
+            item.id, item.kind, item.title, item.created_at
+        );
     }
 }
 
