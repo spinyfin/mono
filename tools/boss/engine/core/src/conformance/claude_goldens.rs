@@ -66,25 +66,6 @@ fn normalize_host_paths(rendered: &str) -> String {
     replace_content_addressed_guard_dirs(&with_tmp)
 }
 
-/// The launch guard's policy is exercised byte-for-byte by the driver tests;
-/// this cross-crate fixture instead pins its hook position and surrounding
-/// settings shape without duplicating its large inline Python payload.
-fn normalize_launch_guard_payload(rendered: &str) -> String {
-    let mut value: serde_json::Value = serde_json::from_str(rendered).expect("settings JSON must parse");
-    let hooks = value["hooks"]["PreToolUse"]
-        .as_array_mut()
-        .expect("PreToolUse hooks must be an array");
-    for entry in hooks {
-        let Some(command) = entry["hooks"][0]["command"].as_str() else {
-            continue;
-        };
-        if command.starts_with("python3 -c ") {
-            entry["hooks"][0]["command"] = serde_json::Value::String("<boss-launch-guard>".into());
-        }
-    }
-    serde_json::to_string_pretty(&value).expect("normalised settings JSON must render") + "\n"
-}
-
 /// Rewrite `<kind>-<64 hex>/` path components to `<kind>-<sha256>/` so a
 /// content-addressed guard path compares equal across builds while still
 /// asserting that the hashed directory component is present.
@@ -250,11 +231,8 @@ fn replace_content_addressed_guard_dirs_pins_the_hashed_shape() {
 #[test]
 fn golden_settings_json_standard_worker() {
     let input = golden_input();
-    let rendered = normalize_launch_guard_payload(&normalize_host_paths(&render_settings_json(
-        &input,
-        &ClaudeDriver as &dyn AgentDriver,
-    )));
-    let expected = normalize_launch_guard_payload(&normalize_host_paths(GOLDEN_SETTINGS_STANDARD));
+    let rendered = normalize_host_paths(&render_settings_json(&input, &ClaudeDriver as &dyn AgentDriver));
+    let expected = normalize_host_paths(GOLDEN_SETTINGS_STANDARD);
     assert_eq!(
         rendered, expected,
         "settings.json must match the golden byte-for-byte (host temp paths normalised to $TMPDIR)",

@@ -498,7 +498,11 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     // worker-facing contract; a Codex shell snapshot demotes the launcher
     // dir, so a bare name is not a trustworthy resolution even when this
     // hook's own PATH still has the launcher first.
-    "WATCH={'boss','cube','checkleft'}\n",
+    "WATCH={'boss','cube'}\n",
+    // Checkleft is pinned only for workspaces whose worker-bin setup wrote a
+    // launcher. Repositories that do not declare it in REPOBIN.toml retain
+    // their existing PATH-based checkleft behaviour.
+    "WATCH_CHECKLEFT=bool(vars.get('CHECKLEFT_BIN') or os.environ.get('CHECKLEFT_BIN'))\n",
     "REPOBIN='repobin'\n",
     "DOL=chr(36)\n",
     "def which(name):\n",
@@ -516,6 +520,17 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "    try:\n",
     "        return os.path.basename(os.path.realpath(p)) in (REPOBIN,'repobin-shim.sh')\n",
     "    except Exception:\n",
+    "        return False\n",
+    // `bin/checkleft` is the repository-owned entry point documented to
+    // workers. It is intentionally a repobin shim, unlike engine-owned
+    // launchers: permit only the current workspace's lexical bin path, not
+    // an arbitrary path that happens to end in bin/checkleft.
+    "def is_workspace_checkleft(p):\n",
+    "    if os.path.basename(p)!='checkleft' or os.sep not in p: return False\n",
+    "    workspace_bin=os.path.join(os.path.abspath(os.getcwd()),'bin')\n",
+    "    try:\n",
+    "        return os.path.commonpath((os.path.abspath(p),workspace_bin))==workspace_bin\n",
+    "    except ValueError:\n",
     "        return False\n",
     "shim=None\n",
     "bare=None\n",
@@ -558,14 +573,16 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "            break\n",
     "        continue\n",
     "    base=os.path.basename(orig)\n",
-    "    if orig in WATCH:\n",
+    "    if orig in WATCH or (orig=='checkleft' and WATCH_CHECKLEFT):\n",
     "        resolved=which(orig)\n",
     "        if resolved and is_shim(resolved):\n",
     "            shim=resolved\n",
     "        else:\n",
     "            bare=orig\n",
     "        break\n",
-    "    if base in WATCH:\n",
+    "    if base=='checkleft' and WATCH_CHECKLEFT and is_workspace_checkleft(orig):\n",
+    "        continue\n",
+    "    if base in WATCH or (base=='checkleft' and WATCH_CHECKLEFT):\n",
     "        candidate=orig if os.path.isfile(orig) else (which(orig) or orig)\n",
     "        if is_shim(candidate):\n",
     "            shim=candidate\n",
@@ -727,7 +744,7 @@ const CLAUDE_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed
      spawned you in a leased cube workspace and observes this session\n\
      via claude hooks.\n\
      For ordinary pre-push validation, run `bin/checkleft run` with no flags; use\n\
-     `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
+     `bin/checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
      strong stated justification.";
 
 /// Reference implementation of [`AgentDriver`] for Claude Code.

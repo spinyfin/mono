@@ -291,7 +291,7 @@ const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed 
      spawned you in a leased cube workspace and observes this session\n\
      via the Codex rollout JSONL file in this run's isolated CODEX_HOME.\n\
      For ordinary pre-push validation, run `bin/checkleft run` with no flags; use\n\
-     `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
+     `bin/checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
      strong stated justification.\n\
      \n\
      Two tool routes are blocked in this session, because Boss's command\n\

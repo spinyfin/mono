@@ -1960,10 +1960,10 @@ If checkleft reports errors the push is blocked and the findings (plus bypass
 guidance) are echoed back so the worker can fix them or add a BYPASS_ directive.
 
 All policy lives in checkleft: this script shells out and trusts the exit code
-(0 = allow, non-zero = block). It is fail-open by construction -- a non-push
-command, a repo with no checkleft binary, or any error resolving/running
-checkleft all approve -- so the gate can never wedge a session; its only
-deterministic action is to block a push that checkleft itself rejected.
+(0 = allow, non-zero = block). It approves non-push commands and pushes from
+repos that neither declare checkleft in REPOBIN.toml nor have bin/checkleft.
+For a repository that declares or installs checkleft, resolution and execution
+failures block with a diagnostic so a required gate cannot be silently skipped.
 
 The PreToolUse payload arrives as JSON on stdin; a decision JSON is written to
 stdout. The checkleft invocation is resolved from (in order) the
@@ -2186,7 +2186,10 @@ def main():
         )
     except Exception as error:
         if repobin_declares_checkleft(root) or os.path.isfile(os.path.join(root, "bin", "checkleft")):
-            emit("block", "Push blocked: the required workspace checkleft did not complete: " + str(error))
+            reason = "Push blocked: the required workspace checkleft did not complete: " + str(error)
+            if isinstance(error, subprocess.TimeoutExpired):
+                reason += ". Run bin/checkleft run once to warm the Bazel build, then retry the push."
+            emit("block", reason)
         # Could not run checkleft in a non-repobin repo -> fail open.
         emit("approve")
 
