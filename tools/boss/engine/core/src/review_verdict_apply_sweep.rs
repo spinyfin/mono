@@ -20,7 +20,7 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(10);
 
 impl crate::sweep_loop::SweepOutcome for ReviewVerdictApplyStats {
     fn has_activity(&self) -> bool {
-        self.applied > 0 || self.failed > 0
+        self.applied > 0 || self.failed > 0 || self.superseded > 0
     }
 
     fn log(&self) {
@@ -28,6 +28,7 @@ impl crate::sweep_loop::SweepOutcome for ReviewVerdictApplyStats {
             applied = self.applied,
             failed = self.failed,
             created_work = self.created_work,
+            superseded = self.superseded,
             "review-verdict apply sweep: applied staged review_verdict proposals",
         );
     }

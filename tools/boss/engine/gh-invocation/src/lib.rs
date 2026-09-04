@@ -45,6 +45,7 @@
 use std::borrow::Cow;
 use std::sync::LazyLock;
 
+use anyhow::Context;
 use regex::Regex;
 
 /// Strip the CONTENT of single- and double-quoted strings from `cmd`,
@@ -286,6 +287,26 @@ pub async fn gh_compare_jq(repo_slug: &str, base: &str, head: &str, jq: &str) ->
     )
     .await?;
     Ok(stdout.trim().to_owned())
+}
+
+/// Blocking counterpart of [`gh_compare_jq`] for call sites that already
+/// run off the tokio runtime (e.g. `spawn_blocking` review-verdict apply).
+pub fn gh_compare_jq_blocking(repo_slug: &str, base: &str, head: &str, jq: &str) -> anyhow::Result<String> {
+    let endpoint = format!("repos/{repo_slug}/compare/{base}...{head}");
+    let display = format!("gh api {endpoint}");
+    let output = boss_github::gh_runner::gh_output_blocking(&[
+        "api",
+        &endpoint,
+        "-H",
+        "Accept: application/vnd.github+json",
+        "--jq",
+        jq,
+    ])
+    .with_context(|| format!("failed to spawn `{display}`"))?;
+    if !output.status.success() {
+        anyhow::bail!("`{display}` failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 #[cfg(test)]

@@ -274,6 +274,13 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          — a direct read of the condition, strictly better than any run-start proxy.",
     ),
     entry(
+        crate::work::REVIEW_VERDICT_BATCH_NOT_APPLYING_ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "The review-verdict applier is both the producer and the only thing that can unstick the \
+         batch: it files this when a staged verdict cannot apply because the batch is not \
+         `applying`, and resolves it itself on the pass that actually lands the verdict.",
+    ),
+    entry(
         EXTERNAL_TRACKER_AUTH_FAILED_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
         "Product-scoped, not work-item-scoped: the reconcile loop resolves it on the next \
@@ -591,6 +598,7 @@ mod tests {
             crate::abandoned_branch_pr_sweep::ATTENTION_KIND_ABANDONED_BRANCH_NO_PR,
             crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND,
             crate::merge_parent_deletion::SIGNOFF_ATTENTION_KIND,
+            crate::work::REVIEW_VERDICT_BATCH_NOT_APPLYING_ATTENTION_KIND,
             crate::merge_mechanism::PUSH_RESTRICTION_ATTENTION_KIND,
             crate::envelope_watch::ENVELOPE_OVERRUN_ATTENTION_KIND,
             crate::codex_unobserved_command::UNOBSERVED_COMMAND_ATTENTION_KIND,

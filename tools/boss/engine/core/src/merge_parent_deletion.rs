@@ -26,8 +26,8 @@
 //! language-aware parser.
 
 use anyhow::Result;
-use boss_engine_gh_invocation::gh_compare_jq;
-use boss_gh_telemetry::{callers, scope as gh_scope};
+use boss_engine_gh_invocation::{gh_compare_jq, gh_compare_jq_blocking};
+use boss_gh_telemetry::{callers, scope as gh_scope, scope_blocking};
 use std::collections::BTreeSet;
 
 /// One entry from GitHub's compare `.files[]` array.
@@ -152,6 +152,55 @@ pub async fn compute_merged_parent_deletions(
     describe_deletions(&merged_parent_deletions(&added, &removed))
 }
 
+/// Blocking counterpart of [`compute_merged_parent_deletions`] for the
+/// review-verdict applier, which already runs inside `spawn_blocking`.
+/// Same fail-open contract: any `gh` error returns an empty set (logged).
+pub fn compute_merged_parent_deletions_blocking(
+    repo_slug: &str,
+    head_before: &str,
+    base_sha: &str,
+    head_after: &str,
+) -> Vec<String> {
+    if head_before.is_empty() || base_sha.is_empty() || head_after.is_empty() {
+        return Vec::new();
+    }
+
+    let added = match fetch_compare_files_blocking(repo_slug, head_before, base_sha) {
+        Ok(files) => added_filenames(&files),
+        Err(err) => {
+            tracing::warn!(
+                repo_slug,
+                head_before,
+                base_sha,
+                error = %format!("{err:#}"),
+                "merge_parent_deletion: compare(head_before...base) failed; \
+                 tripwire fails open (no gate) for this pass",
+            );
+            return Vec::new();
+        }
+    };
+    if added.is_empty() {
+        return Vec::new();
+    }
+
+    let removed = match fetch_compare_files_blocking(repo_slug, base_sha, head_after) {
+        Ok(files) => removed_filenames(&files),
+        Err(err) => {
+            tracing::warn!(
+                repo_slug,
+                base_sha,
+                head_after,
+                error = %format!("{err:#}"),
+                "merge_parent_deletion: compare(base...head_after) failed; \
+                 tripwire fails open (no gate) for this pass",
+            );
+            return Vec::new();
+        }
+    };
+
+    describe_deletions(&merged_parent_deletions(&added, &removed))
+}
+
 /// `work_attention_items.kind` filed when the tripwire halts a task
 /// pending operator sign-off. Shared by the worker-driven `pr_review`
 /// path (`completion.rs`) and the escalation ladder's mechanical-rung
@@ -226,11 +275,21 @@ async fn fetch_compare_files(repo_slug: &str, base: &str, head: &str) -> Result<
         gh_compare_jq(repo_slug, base, head, ".files // []"),
     )
     .await?;
+    parse_compare_files(&trimmed)
+}
+
+fn fetch_compare_files_blocking(repo_slug: &str, base: &str, head: &str) -> Result<Vec<CompareFile>> {
+    let trimmed = scope_blocking(callers::MERGE_PARENT_DELETION, || {
+        gh_compare_jq_blocking(repo_slug, base, head, ".files // []")
+    })?;
+    parse_compare_files(&trimmed)
+}
+
+fn parse_compare_files(trimmed: &str) -> Result<Vec<CompareFile>> {
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
-    let files: Vec<CompareFile> = serde_json::from_str(&trimmed)?;
-    Ok(files)
+    Ok(serde_json::from_str(trimmed)?)
 }
 
 #[cfg(test)]

@@ -12,12 +12,21 @@ use boss_protocol::{
     CreateRevisionInput, ProposalKind, ProposalState, ReasoningMode, ReviewVerdictProposalPayload, WorkerProposal,
 };
 
+/// `work_attention_items.kind` filed when a staged `review_verdict` cannot
+/// apply because its batch is not (and could not be advanced to) `applying`.
+/// The producer (this applier) resolves it on a later pass that actually
+/// lands the verdict.
+pub const REVIEW_VERDICT_BATCH_NOT_APPLYING_ATTENTION_KIND: &str = "pr_review_verdict_batch_not_applying";
+
 /// Count from one apply pass.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ReviewVerdictApplyStats {
     pub applied: usize,
     pub failed: usize,
     pub created_work: usize,
+    /// Proposals this pass observed as `superseded` (a later verdict for
+    /// the same batch won). Distinct from `applied` and from `failed`.
+    pub superseded: usize,
 }
 
 impl WorkDb {
@@ -33,23 +42,28 @@ impl WorkDb {
                 Ok(created) => {
                     // `apply_review_verdict_proposal` also returns `Ok(None)`
                     // for a proposal it deliberately left `proposed` for
-                    // retry (e.g. the batch hasn't reached `applying` yet) —
-                    // that is not an application and must not count as one.
-                    // Re-check the row's own state rather than trusting the
-                    // call's `Ok`/`Err` split, so `applied` means what it
-                    // says.
-                    let actually_applied = !matches!(
-                        self.worker_proposal(&proposal.id),
+                    // retry (e.g. the batch hasn't reached `applying` yet)
+                    // and for a proposal that landed `superseded` in the
+                    // materialise-to-commit window. Re-check the row's own
+                    // state rather than trusting the call's `Ok`/`Err`
+                    // split, so `applied` means `ProposalState::Applied`.
+                    match self.worker_proposal(&proposal.id) {
                         Ok(Some(WorkerProposal {
-                            state: ProposalState::Proposed,
+                            state: ProposalState::Applied,
                             ..
-                        }))
-                    );
-                    if actually_applied {
-                        stats.applied += 1;
-                        if created.is_some() {
-                            stats.created_work += 1;
+                        })) => {
+                            stats.applied += 1;
+                            if created.is_some() {
+                                stats.created_work += 1;
+                            }
                         }
+                        Ok(Some(WorkerProposal {
+                            state: ProposalState::Superseded,
+                            ..
+                        })) => {
+                            stats.superseded += 1;
+                        }
+                        _ => {}
                     }
                 }
                 Err(error) => {
@@ -80,7 +94,7 @@ impl WorkDb {
         }
         let payload: ReviewVerdictProposalPayload = serde_json::from_str(&proposal.payload_json)?;
         let verdict: boss_pr_review::SupervisorVerdict = serde_json::from_value(payload.verdict.clone())?;
-        let Some(batch) = self.review_batch(&payload.batch_id)? else {
+        let Some(mut batch) = self.review_batch(&payload.batch_id)? else {
             anyhow::bail!(
                 "review-verdict {} names missing batch {}",
                 proposal.id,
@@ -90,24 +104,30 @@ impl WorkDb {
         // The batch's own state machine is the authority on whether this
         // verdict is ready to apply. `advance_review_batch_quorum_best_effort`
         // is explicitly best-effort and can leave the batch stranded in
-        // `supervising` (its own doc comment: "the batch may now be stuck
-        // until a human intervenes") while this proposal still reads
-        // `proposed`. Applying anyway would fully materialise/complete a
-        // batch that never reached `applying`, and — because the completion
-        // write below is itself gated on `status = 'applying'` — leave the
-        // batch permanently stuck in `supervising` even though its outcome
-        // already landed. Bail here and leave the proposal `proposed` so a
-        // later pass (after the batch is nudged back to `applying`, or by an
-        // operator) can retry.
+        // `supervising` while this proposal still reads `proposed`. The
+        // recoverable case is exactly that: the supervisor already reported,
+        // so re-running the quorum machine here moves the batch to `applying`
+        // and this pass can continue. Bail only if it still is not `applying`
+        // after that nudge — and file a once-per-batch attention rather than
+        // warning on every 10s sweep.
         if batch.status != boss_protocol::ReviewBatchStatus::Applying {
-            tracing::warn!(
-                proposal_id = %proposal.id,
-                batch_id = %batch.id,
-                batch_status = %batch.status,
-                "review-verdict apply: batch is not in `applying`; leaving the proposal \
-                 proposed for retry instead of materialising against a stranded batch",
-            );
-            return Ok(None);
+            if batch.status == boss_protocol::ReviewBatchStatus::Supervising
+                && let Err(error) = self.try_advance_review_batch_quorum(&batch.id)
+            {
+                tracing::warn!(
+                    proposal_id = %proposal.id,
+                    batch_id = %batch.id,
+                    ?error,
+                    "review-verdict apply: quorum re-advance for a supervising batch failed",
+                );
+            }
+            if let Some(refreshed) = self.review_batch(&batch.id)? {
+                batch = refreshed;
+            }
+            if batch.status != boss_protocol::ReviewBatchStatus::Applying {
+                self.file_stranded_batch_attention_once(&batch, &proposal)?;
+                return Ok(None);
+            }
         }
 
         let review_result = verdict.to_review_result();
@@ -133,6 +153,18 @@ impl WorkDb {
                 )
             })?
         };
+
+        // incident-002 both-parents deletion tripwire, same halt as the
+        // legacy `finalize_pr_review_pass` path: a conflict-resolution PR
+        // that removed a merged parent's surface is held at
+        // `blocked: deletion_signoff` with the shared attention kind, and
+        // no revision is minted.
+        let deletion_signoff =
+            self.compute_batch_merge_parent_deletion_signoff(&origin_task, &verdict.target_sha, pr_checker)?;
+        if !deletion_signoff.is_empty() {
+            self.hold_cycle_root_for_deletion_signoff(&batch.cycle_root_id, &batch.pr_url, &deletion_signoff)?;
+        }
+
         let origin = crate::pr_review::ReviewOrigin {
             task_short_id: origin_task.short_id,
             pr_number: Some(batch.pr_number),
@@ -147,7 +179,9 @@ impl WorkDb {
             let conn = self.connect()?;
             existing_review_findings_work_item(&conn, &created_via)?
         };
-        let remediating_task = if let Some(existing) = existing {
+        let remediating_task = if !deletion_signoff.is_empty() {
+            None
+        } else if let Some(existing) = existing {
             Some(existing)
         } else if revision_warranted {
             Some(self.materialize_review_findings(
@@ -164,7 +198,7 @@ impl WorkDb {
 
         let gate_outcome = if duplicate_head && original_revision_warranted {
             REVIEW_GATE_OUTCOME_DROPPED_DUPLICATE_HEAD
-        } else if remediating_task.is_some() {
+        } else if revision_warranted {
             REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS
         } else {
             REVIEW_GATE_OUTCOME_COMPLETED_CLEAN
@@ -182,6 +216,21 @@ impl WorkDb {
             },
             remediating_task.as_ref().map(|task| task.id.as_str()),
         )?;
+
+        if applied_ref.is_some()
+            || matches!(
+                self.worker_proposal(&proposal.id),
+                Ok(Some(WorkerProposal {
+                    state: ProposalState::Applied,
+                    ..
+                }))
+            )
+        {
+            let _ = self.resolve_external_tracker_attention(
+                &batch.cycle_root_id,
+                REVIEW_VERDICT_BATCH_NOT_APPLYING_ATTENTION_KIND,
+            );
+        }
 
         Ok(applied_ref)
     }
@@ -355,6 +404,162 @@ impl WorkDb {
         let conn = self.connect()?;
         super::proposals::find_worker_proposal_by_id(&conn, proposal_id)
     }
+
+    /// File at most one open attention for a batch that cannot leave
+    /// `supervising`/`collecting`/etc. for `applying`. Subsequent sweep
+    /// passes must not warn again — the 10s interval would otherwise
+    /// flood the log forever.
+    fn file_stranded_batch_attention_once(
+        &self,
+        batch: &boss_protocol::ReviewBatch,
+        proposal: &WorkerProposal,
+    ) -> Result<()> {
+        let already_open = self
+            .list_attention_items_for_work_item(&batch.cycle_root_id)?
+            .iter()
+            .any(|item| item.kind == REVIEW_VERDICT_BATCH_NOT_APPLYING_ATTENTION_KIND && item.status == "open");
+        if already_open {
+            return Ok(());
+        }
+        tracing::warn!(
+            proposal_id = %proposal.id,
+            batch_id = %batch.id,
+            batch_status = %batch.status,
+            "review-verdict apply: batch is not in `applying` after quorum re-advance; \
+             leaving the proposal proposed and filing attention once",
+        );
+        self.upsert_work_item_attention(
+            &batch.cycle_root_id,
+            REVIEW_VERDICT_BATCH_NOT_APPLYING_ATTENTION_KIND,
+            "Automated reviewer: verdict could not apply (batch not applying)",
+            &format!(
+                "A consolidated review-verdict for {} (batch `{}`) is staged but the batch \
+                 is `{status}` rather than `applying`, and re-running the quorum machine did \
+                 not advance it. The proposal is left `proposed` for retry once the batch \
+                 reaches `applying`.",
+                batch.pr_url,
+                batch.id,
+                status = batch.status,
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn compute_batch_merge_parent_deletion_signoff(
+        &self,
+        origin_task: &Task,
+        reviewed_head: &str,
+        pr_checker: &dyn PrStateChecker,
+    ) -> Result<Vec<String>> {
+        let cr = match self.latest_conflict_resolution_for_work_item(&origin_task.id) {
+            Ok(Some(cr)) => cr,
+            Ok(None) => return Ok(Vec::new()),
+            Err(err) => {
+                tracing::warn!(
+                    cycle_root_id = %origin_task.id,
+                    ?err,
+                    "review-verdict apply: conflict_resolution lookup failed; \
+                     skipping merge-parent deletion tripwire",
+                );
+                return Ok(Vec::new());
+            }
+        };
+        if !matches!(cr.status.as_str(), "running" | "succeeded") {
+            return Ok(Vec::new());
+        }
+        let head_after = if !reviewed_head.is_empty() {
+            reviewed_head
+        } else {
+            match cr.head_sha_after.as_deref().filter(|s| !s.is_empty()) {
+                Some(sha) => sha,
+                None => return Ok(Vec::new()),
+            }
+        };
+        let (Some(head_before), Some(base_sha)) = (
+            cr.head_sha_before.as_deref().filter(|s| !s.is_empty()),
+            cr.base_sha_at_trigger.as_deref().filter(|s| !s.is_empty()),
+        ) else {
+            return Ok(Vec::new());
+        };
+        let Some(repo_url) = self.repo_remote_url_for_tripwire(origin_task) else {
+            return Ok(Vec::new());
+        };
+        let repo_slug = match crate::completion::parse_repo_slug(&repo_url) {
+            Ok(slug) => slug,
+            Err(_) => return Ok(Vec::new()),
+        };
+        Ok(pr_checker.merged_parent_deletions(&repo_slug, head_before, base_sha, head_after))
+    }
+
+    /// Per-task `repo_remote_url` is NULL when the product owns the repo
+    /// (`enforce_task_repo_invariant`); fall back to the product, then any
+    /// member execution, matching the completion-path tripwire's need for
+    /// a GitHub slug.
+    fn repo_remote_url_for_tripwire(&self, origin_task: &Task) -> Option<String> {
+        if let Some(url) = origin_task.repo_remote_url.as_deref().filter(|s| !s.is_empty()) {
+            return Some(url.to_owned());
+        }
+        if let Ok(Some(product)) = self.get_product(&origin_task.product_id)
+            && let Some(url) = product.repo_remote_url.filter(|s| !s.is_empty())
+        {
+            return Some(url);
+        }
+        if let Ok(executions) = self.list_executions(Some(&origin_task.id)) {
+            for execution in executions {
+                if !execution.repo_remote_url.is_empty() {
+                    return Some(execution.repo_remote_url);
+                }
+            }
+        }
+        None
+    }
+
+    fn hold_cycle_root_for_deletion_signoff(
+        &self,
+        cycle_root_id: &str,
+        pr_url: &str,
+        deletions: &[String],
+    ) -> Result<()> {
+        let now = now_string();
+        {
+            let conn = self.connect()?;
+            conn.execute(
+                "UPDATE tasks
+                 SET status             = 'blocked',
+                     blocked_reason     = ?3,
+                     blocked_attempt_id = NULL,
+                     last_status_actor  = 'engine',
+                     updated_at         = ?2
+                 WHERE id = ?1
+                   AND deleted_at IS NULL
+                   AND status NOT IN ('done', 'archived')",
+                params![cycle_root_id, now, super::pr_flow::DELETION_SIGNOFF_BLOCKED_REASON],
+            )?;
+        }
+        self.upsert_work_item_attention(
+            cycle_root_id,
+            crate::merge_parent_deletion::SIGNOFF_ATTENTION_KIND,
+            crate::merge_parent_deletion::SIGNOFF_ATTENTION_TITLE,
+            &crate::merge_parent_deletion::render_signoff_attention_body(deletions, pr_url),
+        )?;
+        tracing::warn!(
+            cycle_root_id,
+            pr_url,
+            removed = deletions.len(),
+            "review-verdict apply: merge-parent deletion tripwire fired; cycle root held \
+             in blocked:deletion_signoff pending operator sign-off",
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_tombstone_orphaned_remediation(&self, task_id: &str) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        tombstone_orphaned_remediation_in_tx(&tx, task_id, &now_string())?;
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 fn parent_no_longer_revisable(error: &anyhow::Error) -> bool {
@@ -369,12 +574,25 @@ fn parent_no_longer_revisable(error: &anyhow::Error) -> bool {
 /// Soft-delete a revision/follow-up this call materialised whose owning
 /// proposal turned out not to be the decision that stands (see the
 /// `current_state != Applied` guard in `commit_applied_review_verdict`).
-/// Soft-deleted so it drops out of every `deleted_at IS NULL` dispatch/list
-/// query (including the `autostart` scheduler query) without touching
-/// history.
+/// Soft-delete drops the task from every `tasks.deleted_at IS NULL` list
+/// query (including the `autostart` scheduler query). That is not enough
+/// for dispatch: `list_ready_executions` selects `work_executions` by
+/// `we.status = 'ready'` with no `t.deleted_at IS NULL` predicate, so a
+/// freshly minted autostart revision's `ready` row would otherwise stay
+/// on every drain until the start-time deleted-item guard fails it.
+/// Cancel the task's never-started executions in the same transaction so
+/// the orphan sweep and reconciler will not re-dispatch it.
 fn tombstone_orphaned_remediation_in_tx(tx: &rusqlite::Transaction<'_>, task_id: &str, now: &str) -> Result<()> {
     tx.execute(
         "UPDATE tasks SET deleted_at = ?2, updated_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+        params![task_id, now],
+    )?;
+    tx.execute(
+        "UPDATE work_executions
+         SET status = 'cancelled',
+             finished_at = ?2
+         WHERE work_item_id = ?1
+           AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed')",
         params![task_id, now],
     )?;
     Ok(())
