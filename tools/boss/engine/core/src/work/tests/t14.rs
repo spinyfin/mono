@@ -921,24 +921,68 @@ fn reopen_comments_reopens_task_and_chain_revision_comments() {
 
 // ── deferred pre-merge review admission ──────────────────────────────────
 
-/// A PendingReview hold with no batch and no pr_review execution is a
-/// deferred-admission candidate — the query the recovery sweep is keyed on.
+/// A PendingReview hold with no batch and no pr_review execution, marked by
+/// the open `pr_review_admission_deferred` attention item the deferral path
+/// files, is a deferred-admission candidate — the query the recovery sweep
+/// is keyed on.
 #[test]
 fn deferred_admission_query_surfaces_a_held_task_with_no_review() {
     let db = WorkDb::open(temp_db_path("deferred-admission-none")).unwrap();
     let pr_url = "https://github.com/spinyfin/mono/pull/91";
     let (product_id, chore_id) = active_chore_with_pr(&db, "deferred-none", pr_url);
+    db.upsert_external_tracker_attention(
+        &chore_id,
+        crate::work::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
+        "title",
+        "body",
+    )
+    .unwrap();
 
     let deferred = db.list_tasks_awaiting_pre_merge_review_admission().unwrap();
     assert_eq!(
         deferred.len(),
         1,
-        "a bare PendingReview hold must surface: {deferred:?}"
+        "a bare PendingReview hold marked as deferred must surface: {deferred:?}"
     );
     assert_eq!(deferred[0].task_id, chore_id);
     assert_eq!(deferred[0].product_id, product_id);
     assert_eq!(deferred[0].pr_url, pr_url);
     assert_eq!(deferred[0].cycle_root_id, chore_id);
+}
+
+/// A PendingReview hold with no open deferral marker and a recent
+/// `updated_at` is NOT yet a candidate — it may simply be waiting on a pool
+/// slot or between orphan-sweep passes. It becomes a candidate once it has
+/// been sitting long enough (past the same staleness bound the reaper uses),
+/// even without a marker — covering `AlreadyReviewed` holds, which file none.
+#[test]
+fn deferred_admission_query_withholds_a_fresh_unmarked_hold_until_stale() {
+    let db = WorkDb::open(temp_db_path("deferred-admission-unmarked")).unwrap();
+    let pr_url = "https://github.com/spinyfin/mono/pull/93";
+    let (_product_id, chore_id) = active_chore_with_pr(&db, "deferred-unmarked", pr_url);
+
+    let deferred = db.list_tasks_awaiting_pre_merge_review_admission().unwrap();
+    assert!(
+        deferred.is_empty(),
+        "a fresh unmarked hold must not cost a gh pr view on every sweep pass: {deferred:?}"
+    );
+
+    let stale_secs =
+        (boss_engine_utils::epoch_time::now_epoch_secs() as u64 - crate::work::REVIEW_BATCH_STALE_SECS - 60)
+            .to_string();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET updated_at = ?2 WHERE id = ?1",
+            params![chore_id, stale_secs],
+        )
+        .unwrap();
+    let deferred = db.list_tasks_awaiting_pre_merge_review_admission().unwrap();
+    assert_eq!(
+        deferred.len(),
+        1,
+        "an unmarked hold must still surface once it has been sitting past the staleness bound: {deferred:?}"
+    );
 }
 
 /// A live pre-merge batch for the cycle root removes the task from the

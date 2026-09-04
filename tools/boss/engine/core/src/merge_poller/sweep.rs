@@ -2917,6 +2917,36 @@ pub(crate) async fn sweep_deferred_review_admission(
                     crate::work::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
                 );
             }
+            Ok(crate::work::ReviewBatchDispatch::AlreadyReviewed) => {
+                match work_db.advance_pending_review_task_to_in_review(&candidate.task_id) {
+                    Ok(true) => {
+                        tracing::info!(
+                            task_id = %candidate.task_id,
+                            pr_url = %candidate.pr_url,
+                            "merge poller: deferred-admission hold's current head already has an \
+                             informative review verdict; advancing to in_review instead of re-reviewing"
+                        );
+                        publisher
+                            .publish_work_item_changed(
+                                &candidate.product_id,
+                                &candidate.task_id,
+                                "reviewer_fallback_advanced",
+                            )
+                            .await;
+                        outcome.reviewer_fallback_advanced += 1;
+                    }
+                    Ok(false) => {}
+                    Err(err) => tracing::warn!(
+                        task_id = %candidate.task_id,
+                        ?err,
+                        "merge poller: failed to advance already-reviewed deferred-admission hold"
+                    ),
+                }
+                let _ = work_db.resolve_external_tracker_attention(
+                    &candidate.task_id,
+                    crate::work::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
+                );
+            }
             Ok(crate::work::ReviewBatchDispatch::AdmissionDeferred) => {
                 crate::completion::file_admission_deferred_attention(work_db, &candidate.task_id, &candidate.pr_url);
                 outcome.review_admission_still_deferred += 1;

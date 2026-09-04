@@ -1755,6 +1755,22 @@ fn admission_capacity_follows_the_configured_review_pool_size() {
     );
 }
 
+/// A `BOSS_REVIEW_POOL_SIZE` below the reservation weight of one pre-merge
+/// batch must not deadlock admission: capacity is floored so an empty pool
+/// can still admit its first batch regardless of how small the configured
+/// pool is.
+#[test]
+fn admission_capacity_is_floored_so_a_small_pool_still_admits_on_an_empty_pool() {
+    let db = WorkDb::open(temp_db_path("review-pool-small-configured-size")).unwrap();
+    for pool_size in [1_usize, 2, 3] {
+        assert!(
+            db.can_admit_review_batch_for_pool(ReviewBatchPhase::PreMerge, pool_size)
+                .unwrap(),
+            "pool size {pool_size} must admit the first batch on an empty pool rather than deferring forever"
+        );
+    }
+}
+
 /// A batch whose cycle root is deleted or already terminal does not hold a
 /// reservation, so it cannot block every other product's pre-merge review.
 #[test]
@@ -1821,6 +1837,62 @@ fn reap_inert_review_batches_fails_batches_with_a_deleted_cycle_root() {
     assert!(
         db.can_admit_review_batch(ReviewBatchPhase::PreMerge).unwrap(),
         "reaping a deleted-root batch must release its reservation"
+    );
+}
+
+/// Reaping a batch whose cycle root is gone must terminalize any leaf still
+/// physically running, not just release the reservation — otherwise up to
+/// four review-pool slots stay occupied by a batch admission no longer
+/// counts against, and the leaf later settles silently against a `failed`
+/// batch.
+#[test]
+fn reap_inert_review_batches_terminalizes_running_members_of_a_deleted_cycle_root() {
+    let db = WorkDb::open(temp_db_path("review-pool-reap-deleted-frees-slots")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "gone-but-leaves-running");
+    let running_execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member(
+                ReviewBatchMemberRole::ClaudeReviewer,
+                Some(running_execution.id.clone()),
+            )],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET deleted_at = ?2 WHERE id = ?1",
+            rusqlite::params![cycle_root.id, now_string()],
+        )
+        .unwrap();
+
+    let reaped = db
+        .reap_inert_review_batches(crate::work::REVIEW_BATCH_STALE_SECS)
+        .unwrap();
+    assert_eq!(reaped, vec![batch.id.clone()]);
+
+    let terminalized = db.get_execution(&running_execution.id).unwrap();
+    assert_eq!(
+        terminalized.status,
+        ExecutionStatus::Abandoned,
+        "a leaf still running when its cycle root disappears must be terminalized so its \
+         review-pool slot is actually freed"
+    );
+    let members = db.review_batch_members(&batch.id).unwrap();
+    assert_eq!(
+        members[0].status,
+        ReviewBatchMemberStatus::Failed,
+        "the member row must be marked failed alongside its execution"
     );
 }
 

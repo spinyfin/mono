@@ -647,15 +647,28 @@ impl WorkDb {
     /// live pre-merge batch and no non-terminal `pr_review` execution on
     /// their review-cycle root.
     ///
-    /// This is the durable recovery set for [`super::ReviewBatchDispatch::AdmissionDeferred`]:
-    /// `create_pre_merge_review_batch` writes no batch and no member rows,
-    /// so neither `list_executions_pending_pr_detection` (waiting_human
-    /// producers) nor [`Self::list_tasks_with_stalled_reviewer`] (INNER JOIN
-    /// on a `pr_review` execution) can see them. Includes first-time
-    /// producers with zero reviews and tasks whose previous cycle's
-    /// terminal `pr_review` must not be treated as covering a new head.
+    /// This is the durable recovery set for [`super::ReviewBatchDispatch::AdmissionDeferred`]
+    /// and [`super::ReviewBatchDispatch::AlreadyReviewed`]: both write no
+    /// batch and no member rows, so neither `list_executions_pending_pr_detection`
+    /// (waiting_human producers) nor [`Self::list_tasks_with_stalled_reviewer`]
+    /// (INNER JOIN on a `pr_review` execution) can see them. Includes
+    /// first-time producers with zero reviews and tasks whose previous
+    /// cycle's terminal `pr_review` must not be treated as covering a new
+    /// head.
+    ///
+    /// A task qualifies immediately once an open
+    /// `pr_review_admission_deferred` attention item marks it as an actual
+    /// deferral (the deferral paths file exactly that marker). Absent that
+    /// marker — e.g. an `AlreadyReviewed` hold, which files none — a task
+    /// only qualifies once its `updated_at` is older than
+    /// [`super::REVIEW_BATCH_STALE_SECS`], so a task merely waiting on a pool
+    /// slot or between orphan-sweep passes does not cost a `gh pr view` on
+    /// every full sweep before it has had a chance to resolve on its own.
     pub fn list_tasks_awaiting_pre_merge_review_admission(&self) -> Result<Vec<DeferredReviewAdmissionCandidate>> {
         let conn = self.connect()?;
+        let inertia_cutoff = (boss_engine_utils::epoch_time::now_epoch_secs() as u64)
+            .saturating_sub(super::REVIEW_BATCH_STALE_SECS)
+            .to_string();
         let sql = "WITH RECURSIVE walk(task_id, current_id, kind, parent_task_id, depth) AS (
                SELECT t.id, t.id, t.kind, t.parent_task_id, 0
                FROM tasks t
@@ -712,9 +725,18 @@ impl WorkDb {
                        AND we.status IN ('running', 'waiting_human')
                        AND we.kind != 'pr_review'
                    )
+               AND (
+                     EXISTS (
+                       SELECT 1 FROM work_attention_items ai
+                       WHERE ai.work_item_id = t.id
+                         AND ai.kind = 'pr_review_admission_deferred'
+                         AND ai.status = 'open'
+                     )
+                     OR t.updated_at < ?1
+                   )
              ORDER BY t.updated_at ASC";
         let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map([inertia_cutoff], |row| {
             Ok(DeferredReviewAdmissionCandidate {
                 task_id: row.get(0)?,
                 product_id: row.get(1)?,

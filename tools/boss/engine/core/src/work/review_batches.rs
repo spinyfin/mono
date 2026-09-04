@@ -74,6 +74,14 @@ pub enum ReviewBatchDispatch {
     /// retries `create_pre_merge_review_batch` once an existing batch
     /// completes and releases its reservation.
     AdmissionDeferred,
+    /// The target sha already has a durable, informative `pr_review`
+    /// verdict (from a batch leaf or a legacy single reviewer) recorded
+    /// against the producing task or its cycle root. No batch and no member
+    /// executions were created — the caller must advance the task straight
+    /// to `in_review` instead of dispatching another reviewer pass, or a
+    /// settled review gets silently re-reviewed. See
+    /// `enqueue_review_batch`'s already-reviewed check.
+    AlreadyReviewed,
 }
 
 /// `work_attention_items.kind` filed when a pre-merge batch cannot be
@@ -127,8 +135,16 @@ fn reserved_batch_count_in_tx(tx: &Transaction<'_>, phase: ReviewBatchPhase) -> 
     Ok(count)
 }
 
+/// Floors capacity at [`PRE_MERGE_BATCH_RESERVATION_UNITS`] so a pre-merge
+/// batch can always be admitted on an empty pool: a configured
+/// `BOSS_REVIEW_POOL_SIZE` below the reservation weight of a single batch
+/// would otherwise make `can_admit_review_batch_in_tx`'s pre-merge check
+/// permanently false, deferring every PR's review forever.
 fn reservation_capacity(review_pool_size: usize) -> i64 {
-    review_pool_size.min(crate::coordinator::MAX_REVIEW_POOL_SIZE) as i64
+    review_pool_size.clamp(
+        PRE_MERGE_BATCH_RESERVATION_UNITS as usize,
+        crate::coordinator::MAX_REVIEW_POOL_SIZE,
+    ) as i64
 }
 
 /// Whether one more non-terminal batch of `phase` can be admitted into the
@@ -1337,6 +1353,29 @@ impl WorkDb {
                 tx.commit()?;
                 continue;
             }
+            // The dead-root branch (`deleted_at IS NOT NULL OR status IN
+            // (done, archived)`) bypasses the staleness branch's "no
+            // non-terminal member" guard, so a batch reaped this way can
+            // still have leaf reviewers actually running in review-pool
+            // slots. Terminalize them in the same transaction that frees
+            // the batch's reservation, so the physical slots are freed at
+            // the same moment — otherwise admission would let another batch
+            // in while up to `PRE_MERGE_BATCH_RESERVATION_UNITS` physical
+            // slots are still occupied, and the orphaned leaves would later
+            // settle silently against a batch that is already `failed`.
+            tx.execute(
+                "UPDATE work_executions
+                 SET status = 'abandoned', finished_at = ?2
+                 WHERE id IN (SELECT execution_id FROM pr_review_batch_members WHERE batch_id = ?1)
+                   AND status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')",
+                params![batch_id, now],
+            )?;
+            tx.execute(
+                "UPDATE pr_review_batch_members
+                 SET status = 'failed', terminal_at = ?2, updated_at = ?2
+                 WHERE batch_id = ?1 AND status IN ('pending', 'running')",
+                params![batch_id, now],
+            )?;
             if deleted_at.is_none() {
                 super::workitems::insert_attention_item_row(
                     &tx,

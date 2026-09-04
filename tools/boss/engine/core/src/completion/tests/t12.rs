@@ -239,6 +239,18 @@ async fn deferred_admission_query_includes_a_prior_cycle_terminal_review() {
             .build(),
     )
     .unwrap();
+    // The candidate query only admits an unmarked hold once it has aged past
+    // the staleness bound (see `list_tasks_awaiting_pre_merge_review_admission`'s
+    // doc comment) — mark it as an actual deferral, the way the deferral path
+    // does, so this test still exercises "an open marker surfaces immediately"
+    // rather than the separate staleness arm.
+    db.upsert_external_tracker_attention(
+        &chore.id,
+        crate::work::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
+        "title",
+        "body",
+    )
+    .unwrap();
 
     let deferred = db.list_tasks_awaiting_pre_merge_review_admission().unwrap();
     assert!(
