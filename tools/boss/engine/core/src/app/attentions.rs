@@ -234,12 +234,12 @@ pub(super) async fn handle_resolve_worker_recovery_attention(ctx: Dispatch, req:
 }
 
 /// Resolve the owning product id for a `worker_recovery_*` attention item —
-/// these are always work-item-scoped (filed via
-/// `upsert_external_tracker_attention`, never against an execution) — so
-/// [`handle_resolve_worker_recovery_attention`] can publish its live-update
-/// on the right product topic. `None` if the work item has since vanished;
-/// the RPC still replies to the direct caller either way, it just skips the
-/// broadcast.
+/// these are always work-item-scoped (filed by `crate::transient_recovery`
+/// via [`WorkDb::upsert_work_item_attention`], never against an execution)
+/// — so [`handle_resolve_worker_recovery_attention`] can publish its
+/// live-update on the right product topic. `None` if the work item has
+/// since vanished; the RPC still replies to the direct caller either way,
+/// it just skips the broadcast.
 fn worker_recovery_item_product_id(work_db: &WorkDb, item: &WorkAttentionItem) -> Option<String> {
     let work_item_id = item.work_item_id.as_deref()?;
     let work_item = work_db.get_work_item(work_item_id).ok()?;
