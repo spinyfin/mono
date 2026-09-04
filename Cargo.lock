@@ -994,6 +994,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "boss-command-runner",
+ "boss-log-files",
  "boss-shell-quote",
  "tokio",
  "which",

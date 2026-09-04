@@ -1,5 +1,6 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//tools/boss/test-isolation:boss_rust_test.bzl", "boss_rust_test")
 
 rust_library(
     name = "pr-template",
@@ -14,8 +15,8 @@ rust_library(
     deps = all_crate_deps(normal = True),
 )
 
-rust_test(
-    name = "pr-template-test",
+boss_rust_test(
+    name = "pr-template_test",
     size = "small",
     crate = ":pr-template",
     edition = "2024",

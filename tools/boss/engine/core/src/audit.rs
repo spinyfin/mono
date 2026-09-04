@@ -340,22 +340,17 @@ fn resolve_path() -> Option<PathBuf> {
     Some(resolved)
 }
 
-/// Whether `AUDIT_PATH` has already been resolved in this test binary. The
-/// `OnceLock` is process-global, so any unit test elsewhere in this crate
-/// that wants to assert on `record_event`'s output must skip itself when
-/// another test won the race — mirrors `public_start_and_shutdown_path_emits_two_records`
-/// below, exposed crate-wide so callers outside this module (e.g.
-/// `coordinator_tmux`'s reset tests) can follow the same idiom.
-#[cfg(test)]
-pub(crate) fn path_already_resolved_for_tests() -> bool {
-    AUDIT_PATH.get().is_some()
-}
-
 /// Crate-wide access to the same serializer `tests::lock_globals` uses, for
-/// callers outside this module (e.g. `coordinator_tmux`'s reset tests) that
-/// mutate `AUDIT_PATH_ENV` or otherwise touch these process-global statics.
-/// Must be held for the whole test, not just around the `set_var` call —
-/// see `tests::AUDIT_GLOBALS_LOCK`'s docs for the flake this prevents.
+/// callers outside this module (e.g. `coordinator_tmux`'s reset tests,
+/// `worker_sandbox_audit`'s test) that exercise the public `record_*`/
+/// `record_event` path and then read back the on-disk audit file it
+/// resolved to. Since `default_audit_log_path()` now always resolves to this
+/// process's isolated test root (never production, and the same one file
+/// for every test in the binary — see `boss_log_files::is_test_process`),
+/// this lock is what keeps two such tests from interleaving their writes
+/// into that shared file while one of them is trying to read back exactly
+/// what it just wrote. Must be held for the whole test, not just around one
+/// call — see `tests::AUDIT_GLOBALS_LOCK`'s docs for the flake this prevents.
 #[cfg(test)]
 pub(crate) fn lock_audit_globals_for_tests() -> std::sync::MutexGuard<'static, ()> {
     tests::lock_globals()
@@ -570,27 +565,33 @@ mod tests {
         assert!(path.exists());
     }
 
-    /// End-to-end: `record_start` / `record_shutdown` write through
-    /// the public path (env override → resolve_path → append_to). The
-    /// shutdown record must include `uptime_sec` and a single
-    /// `record_shutdown` per process must override later calls.
+    /// End-to-end: `record_start` / `record_shutdown` write through the
+    /// public path (`resolve_path` → `append_to`). The shutdown record must
+    /// include `uptime_sec` and a single `record_shutdown` per process must
+    /// override later calls.
+    ///
+    /// Does not redirect `AUDIT_PATH_ENV`: `resolve_path` now always
+    /// resolves to this test process's isolated root (installed lazily by
+    /// `boss_log_files::default_state_root()` when the executable is
+    /// recognised as a test process — see `boss_log_files::is_test_process`).
+    /// `TEST_STATE_ROOT` is a first-writer-wins OnceLock that sibling tests
+    /// in this binary may populate, so the path is stable on every call
+    /// regardless of which test in this binary calls it first. Other tests
+    /// elsewhere in this binary (e.g. `coordinator_tmux`'s reset tests)
+    /// append their own, differently-shaped records to that same shared
+    /// file concurrently, so this test locates its own record by the
+    /// `engine_version: "test"` marker below — a value no production code
+    /// path ever sets — rather than by file position.
     #[test]
     fn public_start_and_shutdown_path_emits_two_records() {
         let _globals = lock_globals();
-        // Use a fresh path *and* clear the OnceLock by going through
-        // the env override. This test runs in process; if another test
-        // already populated AUDIT_PATH the env override won't help —
-        // so this test is gated on running in isolation. Skip if a
-        // path was already set.
-        if AUDIT_PATH.get().is_some() {
-            return;
-        }
-
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("public.log");
-        unsafe {
-            std::env::set_var(AUDIT_PATH_ENV, &path);
-        }
+        // record_shutdown drops every call after the first
+        // (SHUTDOWN_EMITTED.swap below), and other shutdown paths in this
+        // binary (app/server.rs's signal/rpc/orphan handlers) can call it
+        // before this test runs. Re-arm at entry so this test's own
+        // record_shutdown("signal:SIGTERM") below is never a silent no-op
+        // because some sibling already flipped the flag.
+        SHUTDOWN_EMITTED.store(false, Ordering::SeqCst);
 
         record_start(StartContext {
             argv: vec!["engine".into()],
@@ -604,27 +605,30 @@ mod tests {
             exe_path: Some(PathBuf::from("/tmp/engine")),
         });
         record_shutdown("signal:SIGTERM");
-        // Second call is a no-op — we still want exactly two lines.
+        // Second call is a no-op — record_shutdown must not have overridden
+        // the SIGTERM reason below.
         record_shutdown("normal");
 
+        let path = default_audit_log_path().expect("a test process always resolves its isolated audit path");
         let parsed = parse_lines(&path);
-        assert_eq!(parsed.len(), 2, "expected start + one shutdown");
-        assert_eq!(parsed[0]["event"], "start");
-        assert_eq!(parsed[0]["argv"][0], "engine");
-        assert_eq!(parsed[0]["engine_version"], "test");
-        assert_eq!(parsed[0]["launched_by"], "app");
-        assert_eq!(parsed[0]["app_pid"], 99);
-        assert_eq!(parsed[0]["exe_path"], "/tmp/engine");
-        assert_eq!(parsed[1]["event"], "shutdown");
-        assert_eq!(parsed[1]["reason"], "signal:SIGTERM");
-        assert!(parsed[1]["uptime_sec"].as_i64().unwrap() >= 0);
+        let start = parsed
+            .iter()
+            .find(|v| v["event"] == "start" && v["engine_version"] == "test")
+            .expect("expected this test's own start record");
+        assert_eq!(start["argv"][0], "engine");
+        assert_eq!(start["launched_by"], "app");
+        assert_eq!(start["app_pid"], 99);
+        assert_eq!(start["exe_path"], "/tmp/engine");
+
+        let shutdown = parsed
+            .iter()
+            .find(|v| v["event"] == "shutdown" && v["reason"] == "signal:SIGTERM")
+            .expect("expected this test's own shutdown record");
+        assert!(shutdown["uptime_sec"].as_i64().unwrap() >= 0);
 
         // Re-arm SHUTDOWN_EMITTED so we don't poison sibling tests if
         // the runner schedules them after this one.
         SHUTDOWN_EMITTED.store(false, Ordering::SeqCst);
-        unsafe {
-            std::env::remove_var(AUDIT_PATH_ENV);
-        }
     }
 
     #[test]

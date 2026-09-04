@@ -1952,39 +1952,30 @@ mod tests {
             .unwrap();
         db.record_coordinator_tmux_session_created_with_pane("token", "%old")
             .unwrap();
-        let audit_dir = tempfile::tempdir().unwrap();
-        let audit_path = audit_dir.path().join("engine-audit.log");
-        let audit_already_resolved = audit::path_already_resolved_for_tests();
-        let _env_guard = if audit_already_resolved {
-            None
-        } else {
-            unsafe { std::env::set_var(audit::AUDIT_PATH_ENV, &audit_path) }
-            Some(AuditPathEnvGuard)
-        };
+        let audit_path =
+            audit::default_audit_log_path().expect("a test process always resolves an isolated audit path");
 
         restart_if_dead(&spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe), 1)
             .await
             .unwrap()
             .expect("dead pane must be recreated");
 
-        if !audit_already_resolved {
-            let last = std::fs::read_to_string(&audit_path)
-                .unwrap()
-                .lines()
-                .last()
-                .and_then(|line| serde_json::from_str::<Value>(line).ok())
-                .expect("expected a coordinator_recreate audit record");
-            assert_eq!(last["event"], "coordinator_recreate");
-            assert_eq!(last["trigger"], "tmux_supervisor");
-            assert_eq!(last["reason"], "pane_dead");
-            assert_eq!(last["liveness_evidence"]["failed_check"], "tmux_pane_dead");
-            assert_eq!(last["liveness_evidence"]["observed"], "1");
-            assert_eq!(last["existing_session_disposition"], "engine_killed_session");
-            assert_eq!(last["existing_process_disposition"], "already_exited_pane_dead");
-            assert_eq!(last["old_pane_id"], "%42");
-            assert_eq!(last["new_pane_id"], "%42");
-            assert_eq!(last["restart_churn"]["count"], 2);
-        }
+        let last = std::fs::read_to_string(&audit_path)
+            .unwrap()
+            .lines()
+            .last()
+            .and_then(|line| serde_json::from_str::<Value>(line).ok())
+            .expect("expected a coordinator_recreate audit record");
+        assert_eq!(last["event"], "coordinator_recreate");
+        assert_eq!(last["trigger"], "tmux_supervisor");
+        assert_eq!(last["reason"], "pane_dead");
+        assert_eq!(last["liveness_evidence"]["failed_check"], "tmux_pane_dead");
+        assert_eq!(last["liveness_evidence"]["observed"], "1");
+        assert_eq!(last["existing_session_disposition"], "engine_killed_session");
+        assert_eq!(last["existing_process_disposition"], "already_exited_pane_dead");
+        assert_eq!(last["old_pane_id"], "%42");
+        assert_eq!(last["new_pane_id"], "%42");
+        assert_eq!(last["restart_churn"]["count"], 2);
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -1996,34 +1987,25 @@ mod tests {
             .unwrap();
         db.record_coordinator_tmux_session_created_with_pane("token", "%old")
             .unwrap();
-        let audit_dir = tempfile::tempdir().unwrap();
-        let audit_path = audit_dir.path().join("engine-audit.log");
-        let audit_already_resolved = audit::path_already_resolved_for_tests();
-        let _env_guard = if audit_already_resolved {
-            None
-        } else {
-            unsafe { std::env::set_var(audit::AUDIT_PATH_ENV, &audit_path) }
-            Some(AuditPathEnvGuard)
-        };
+        let audit_path =
+            audit::default_audit_log_path().expect("a test process always resolves an isolated audit path");
 
         restart_if_dead(&spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe), 0)
             .await
             .unwrap()
             .expect("missing session must be recreated");
 
-        if !audit_already_resolved {
-            let last = std::fs::read_to_string(&audit_path)
-                .unwrap()
-                .lines()
-                .last()
-                .and_then(|line| serde_json::from_str::<Value>(line).ok())
-                .expect("expected a coordinator_recreate audit record");
-            assert_eq!(last["event"], "coordinator_recreate");
-            assert_eq!(last["liveness_evidence"]["failed_check"], "tmux_session_exists");
-            assert_eq!(last["liveness_evidence"]["observed"], "false");
-            assert_eq!(last["existing_session_disposition"], "already_gone");
-            assert_eq!(last["existing_process_disposition"], "session_absent");
-        }
+        let last = std::fs::read_to_string(&audit_path)
+            .unwrap()
+            .lines()
+            .last()
+            .and_then(|line| serde_json::from_str::<Value>(line).ok())
+            .expect("expected a coordinator_recreate audit record");
+        assert_eq!(last["event"], "coordinator_recreate");
+        assert_eq!(last["liveness_evidence"]["failed_check"], "tmux_session_exists");
+        assert_eq!(last["liveness_evidence"]["observed"], "false");
+        assert_eq!(last["existing_session_disposition"], "already_gone");
+        assert_eq!(last["existing_process_disposition"], "session_absent");
     }
 
     #[tokio::test]
@@ -2107,25 +2089,16 @@ mod tests {
 
     // --- operator-confirmed reset (`recreate_after_confirmation`) ---
 
-    /// Drop guard that clears `AUDIT_PATH_ENV` even if the test body panics
-    /// on an assertion, so a failure here can't leak the env override into
-    /// every later test in this binary.
-    struct AuditPathEnvGuard;
-
-    impl Drop for AuditPathEnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                std::env::remove_var(audit::AUDIT_PATH_ENV);
-            }
-        }
-    }
-
     // The default `#[tokio::test]` flavor is single-threaded (`current_thread`),
     // so holding this std `Mutex` across the `recreate_after_confirmation` await
     // below cannot deadlock or block a sibling worker thread here; it is exactly
-    // what serializes this test against the other `AUDIT_PATH_ENV`/`AUDIT_PATH`
-    // mutators in this binary for the whole operation, not just the `set_var`
-    // call, which is the point (see `audit::lock_audit_globals_for_tests`'s docs).
+    // what serializes this test against the other `AUDIT_PATH` mutators in this
+    // binary for the whole operation, not just around one call, which is the
+    // point (see `audit::lock_audit_globals_for_tests`'s docs). `resolve_path`
+    // always resolves to this test process's isolated root (see
+    // `boss_log_files::is_test_process`), deterministically on every call, so
+    // there is nothing to redirect and nothing to race for — this test reads
+    // back the *last* line of that shared file rather than a private one.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn operator_reset_kills_old_session_and_creates_a_fresh_one() {
@@ -2136,18 +2109,6 @@ mod tests {
             .unwrap();
         db.record_coordinator_tmux_session_created_with_pane("token", "%old")
             .unwrap();
-
-        let audit_dir = tempfile::tempdir().unwrap();
-        let audit_path = audit_dir.path().join("engine-audit.log");
-        let audit_already_resolved = audit::path_already_resolved_for_tests();
-        let _env_guard = if audit_already_resolved {
-            None
-        } else {
-            unsafe {
-                std::env::set_var(audit::AUDIT_PATH_ENV, &audit_path);
-            }
-            Some(AuditPathEnvGuard)
-        };
 
         let record = recreate_after_confirmation(
             &spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &FixedProbe("2.1.238")),
@@ -2189,30 +2150,36 @@ mod tests {
             "the old pane id must be refreshed from the live session before it is killed"
         );
 
-        if !audit_already_resolved {
-            let contents = std::fs::read_to_string(&audit_path).unwrap_or_default();
-            let last = contents
-                .lines()
-                .last()
-                .and_then(|line| serde_json::from_str::<Value>(line).ok())
-                .expect("expected a coordinator_recreate audit record");
-            assert_eq!(last["event"], "coordinator_recreate");
-            assert_eq!(last["outcome"], "success");
-            assert_eq!(last["reason"], "recreate_operator_reset");
-            assert_eq!(last["trigger"], "operator_confirmation");
-            assert_eq!(last["existing_session_disposition"], "engine_killed_session");
-            assert_eq!(last["existing_process_disposition"], "live_when_terminated");
-            // The pre-kill display-message assertion above verifies this is
-            // the refreshed live pane identity; FakeTmux reports `%42`.
-            assert_eq!(last["old_pane_id"], "%42");
-            assert_eq!(last["new_pane_id"], "%42");
-            assert!(last["liveness_evidence"]["last_passed_at_epoch_s"].as_i64().is_some());
-            assert!(
-                last["relaunch_command"]
-                    .as_str()
-                    .is_some_and(|command| command.contains("exec claude"))
-            );
-        }
+        let audit_path =
+            audit::default_audit_log_path().expect("a test process always resolves its isolated audit path");
+        let contents = std::fs::read_to_string(&audit_path).unwrap_or_default();
+        // Match on this test's own freshly-minted `new_spawn_token` rather
+        // than file position: several sibling tests in this module also call
+        // `recreate_after_confirmation`, each appending its own
+        // `coordinator_recreate` record to the same shared audit file, so
+        // "the last line" is not reliably this test's own record.
+        let record_line = contents
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|v| v["event"] == "coordinator_recreate" && v["new_spawn_token"] == record.spawn_token)
+            .expect("expected a coordinator_recreate audit record for this test's own fresh spawn token");
+        assert_eq!(record_line["outcome"], "success");
+        assert_eq!(record_line["reason"], "recreate_operator_reset");
+        assert_eq!(record_line["trigger"], "operator_confirmation");
+        assert_eq!(record_line["existing_session_disposition"], "engine_killed_session");
+        assert_eq!(record_line["existing_process_disposition"], "live_when_terminated");
+        assert_eq!(record_line["old_pane_id"], "%42");
+        assert_eq!(record_line["new_pane_id"], "%42");
+        assert!(
+            record_line["liveness_evidence"]["last_passed_at_epoch_s"]
+                .as_i64()
+                .is_some()
+        );
+        assert!(
+            record_line["relaunch_command"]
+                .as_str()
+                .is_some_and(|command| command.contains("exec claude"))
+        );
     }
 
     #[tokio::test]

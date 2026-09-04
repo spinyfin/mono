@@ -1,0 +1,3 @@
+# Package exists so `load("//tools/boss/test-isolation:boss_rust_test.bzl", ...)`
+# resolves. A `.bzl` file does not need `exports_files` to be loaded.
+package(default_visibility = ["//visibility:private"])

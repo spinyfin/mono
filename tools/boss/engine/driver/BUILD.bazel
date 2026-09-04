@@ -1,6 +1,7 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_library")
 load("//tools/boss/engine/core:engine_binary.bzl", "ENGINE_BINARY_BAZEL_RUN_COMMAND")
+load("//tools/boss/test-isolation:boss_rust_test.bzl", "boss_rust_test")
 
 exports_files(["Cargo.toml"])
 
@@ -37,7 +38,7 @@ rust_library(
     ] + all_crate_deps(normal = True),
 )
 
-rust_test(
+boss_rust_test(
     name = "driver_test",
     size = "small",
     compile_data = glob(["src/grok/testdata/**"]) + ["src/codex-tmux.conf"],
