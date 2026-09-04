@@ -208,16 +208,18 @@ fn non_empty_or(value: &str, fallback: &str) -> String {
 /// something left to do. It quotes the live GitHub values and names the one
 /// command whose output can contradict them.
 pub fn probe_conflict_still_present(pr_url: &str, raw_mergeable: &str, raw_merge_state_status: &str) -> String {
+    let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
+    let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
     format!(
         "GitHub still reports `mergeable: {raw_mergeable}` / `mergeStateStatus: \
 {raw_merge_state_status}` on {pr_url}, and this run pushed nothing. The conflict is NOT resolved \
 — whatever your local `jj` state showed, GitHub is the authority here and it disagrees. Do NOT \
-claim \"already resolved\" or \"nothing left to do\": run `cube workspace rebase` and paste its \
+claim \"already resolved\" or \"nothing left to do\": run `{cube} workspace rebase` and paste its \
 output before drawing any conclusion. If it reports `REBASED_WITH_CONFLICTS`, resolve every \
-conflicted commit and push with `cube pr update --branch <bookmark>`. If any `jj` output shows a \
+conflicted commit and push with `{cube} pr update --branch <bookmark>`. If any `jj` output shows a \
 `??` suffix on a change id (e.g. `qtltpmoy??`), that change is DIVERGENT — change-id revsets \
 resolve to an arbitrary copy, so every `conflicts=` / `descendants()` answer you got is unsound; \
-re-check using full commit ids. If you genuinely cannot resolve it, run `boss engine conflicts \
+re-check using full commit ids. If you genuinely cannot resolve it, run `{boss} engine conflicts \
 mark-failed <attempt-id> --reason <reason>` — do not just stop."
     )
 }
@@ -229,12 +231,13 @@ mark-failed <attempt-id> --reason <reason>` — do not just stop."
 /// an unanswered question, and the worker holds the one tool that can
 /// answer it locally.
 pub fn probe_conflict_mergeability_unknown(pr_url: &str) -> String {
+    let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     format!(
         "This run pushed nothing, and GitHub's `mergeable` field for {pr_url} is still `UNKNOWN` \
 (mergeability recompute in flight) — that is NOT evidence the conflict cleared, so \"already \
-resolved\" is not a conclusion you may draw yet. Run `cube workspace rebase` and paste its output: \
+resolved\" is not a conclusion you may draw yet. Run `{cube} workspace rebase` and paste its output: \
 `REBASED_CLEAN` settles it in your favour, `REBASED_WITH_CONFLICTS` means resolve each conflicted \
-commit and push with `cube pr update --branch <bookmark>`. Then re-check with `gh pr view {pr_url} \
+commit and push with `{cube} pr update --branch <bookmark>`. Then re-check with `gh pr view {pr_url} \
 --json mergeable,mergeStateStatus`."
     )
 }
@@ -448,8 +451,9 @@ mod tests {
         );
         assert!(text.contains("DIRTY"), "must quote the live mergeStateStatus: {text}");
         assert!(text.contains(PR), "must name the PR: {text}");
+        let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
         assert!(
-            text.contains("cube workspace rebase"),
+            text.contains(&format!("{cube} workspace rebase")),
             "must name the command that can contradict GitHub: {text}",
         );
         assert!(
@@ -466,8 +470,9 @@ mod tests {
     fn unknown_probe_text_refuses_to_read_unknown_as_resolved() {
         let text = probe_conflict_mergeability_unknown(PR);
         assert!(text.contains("UNKNOWN"), "must name the indeterminate value: {text}");
+        let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
         assert!(
-            text.contains("cube workspace rebase"),
+            text.contains(&format!("{cube} workspace rebase")),
             "must name the settling command: {text}"
         );
         assert!(

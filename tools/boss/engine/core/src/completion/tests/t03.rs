@@ -1478,8 +1478,9 @@ async fn conflict_revision_still_conflicting_gets_targeted_probe_not_the_generic
         text.contains("CONFLICTING") && text.contains("DIRTY"),
         "probe must quote the live GitHub values so the worker cannot argue with local jj state: {text}",
     );
+    let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     assert!(
-        text.contains("cube workspace rebase"),
+        text.contains(&format!("{cube} workspace rebase")),
         "probe must name the mandatory command the worker skipped: {text}",
     );
     assert!(
@@ -1542,8 +1543,9 @@ async fn conflict_revision_unknown_mergeability_is_never_read_as_resolved() {
 
     let queued = probes.snapshot();
     assert_eq!(queued.len(), 1, "exactly one probe must fire; got {queued:?}");
+    let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     assert!(
-        queued[0].1.contains("UNKNOWN") && queued[0].1.contains("cube workspace rebase"),
+        queued[0].1.contains("UNKNOWN") && queued[0].1.contains(&format!("{cube} workspace rebase")),
         "probe must name the indeterminate value and the command that settles it: {}",
         queued[0].1,
     );

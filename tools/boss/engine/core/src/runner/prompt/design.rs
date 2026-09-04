@@ -229,7 +229,8 @@ fn canonical_design_doc_path_line(parent_project: Option<&Project>) -> Option<St
     } else {
         project.slug.trim()
     };
+    let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
     Some(format!(
-        "- the project's `design_doc_path` pointer is not yet set. Place the doc at `docs/designs/{slug}.md`; if the repository already has an established design-doc layout, use that layout instead. After you create the file, set the pointer with `boss project set-design-doc --project <id> --path <path>` so the next run resolves it directly.\n",
+        "- the project's `design_doc_path` pointer is not yet set. Place the doc at `docs/designs/{slug}.md`; if the repository already has an established design-doc layout, use that layout instead. After you create the file, set the pointer with `{boss} project set-design-doc --project <id> --path <path>` so the next run resolves it directly.\n",
     ))
 }

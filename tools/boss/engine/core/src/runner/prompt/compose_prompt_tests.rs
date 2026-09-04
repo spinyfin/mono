@@ -7,6 +7,8 @@ use boss_protocol::{ExecutionStatus, TaskStatus};
 use super::*;
 use crate::work::Task;
 
+mod invocation;
+
 fn base_execution() -> WorkExecution {
     WorkExecution::builder()
         .id("exec_abc123_01")
