@@ -592,6 +592,34 @@ fn ensure_worker_bin_dir(settings_dir: &Path, workspace_path: &Path) -> Option<P
             return None;
         }
     }
+
+    match boss_engine_worker_bin::write_checkleft_launcher(&dir, workspace_path) {
+        Ok(Some(launcher)) => {
+            tracing::debug!(
+                launcher = %launcher.display(),
+                "worker `checkleft` launcher written (the workspace's REPOBIN.toml declares checkleft)",
+            );
+        }
+        Ok(None) => {
+            tracing::debug!(
+                workspace = %workspace_path.display(),
+                "no `checkleft` launcher: the workspace's REPOBIN.toml does not declare checkleft",
+            );
+        }
+        Err(err) => {
+            // Not fail-closed like the two arms above: a stale `checkleft`
+            // launcher left by an earlier worker in this workspace points
+            // at the same `<workspace>/bin/checkleft`, so leaving it is
+            // harmless, and dropping the whole launcher dir would cost the
+            // worker its pinned `boss` / `cube` for nothing.
+            tracing::warn!(
+                ?err,
+                dir = %dir.display(),
+                "could not write the worker `checkleft` launcher; a bare `checkleft` may resolve to a \
+                 PATH copy instead of the workspace's repobin-managed one",
+            );
+        }
+    }
     Some(dir)
 }
 
