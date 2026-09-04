@@ -652,6 +652,16 @@ pub struct StaleWorkerThresholds {
     pub auto_reap_threshold_secs: i64,
 }
 
+/// Every time window consulted by the terminal-aware stale-worker pass.
+///
+/// Keeping the startup grace alongside the two stale thresholds lets real
+/// recovery fixtures shorten all three without widening the pass API.
+#[derive(Debug, Clone, Copy)]
+pub struct StaleWorkerSweepTiming {
+    pub thresholds: StaleWorkerThresholds,
+    pub startup_grace_secs: i64,
+}
+
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`.
 /// Fires immediately on spawn so a worker that wedged before the engine
 /// restarted is recovered at boot without waiting for the first interval.
@@ -752,20 +762,53 @@ pub async fn run_one_pass_with_terminal(
     controls: StaleWorkerSweepControls<'_>,
     thresholds: StaleWorkerThresholds,
 ) -> StaleWorkerSweepOutcome {
+    run_one_pass_with_terminal_and_grace(
+        work_db,
+        live_states,
+        terminal_inspector,
+        coordinator,
+        dispatch_events,
+        controls,
+        StaleWorkerSweepTiming {
+            thresholds,
+            startup_grace_secs: STALE_GRACE_SECS,
+        },
+    )
+    .await
+}
+
+/// Run one terminal-aware stale-worker pass with an explicit startup grace
+/// window. Production callers use [`run_one_pass_with_terminal`], which
+/// supplies [`STALE_GRACE_SECS`]. The explicit form keeps the real recovery
+/// sequence testable with a short-lived fixture instead of teaching a test to
+/// wait through the production minute-long spawn allowance.
+pub async fn run_one_pass_with_terminal_and_grace(
+    work_db: &WorkDb,
+    live_states: &LiveWorkerStateRegistry,
+    terminal_inspector: Option<&dyn WorkerTerminalInspector>,
+    coordinator: Arc<ExecutionCoordinator>,
+    dispatch_events: &dyn DispatchEventSink,
+    controls: StaleWorkerSweepControls<'_>,
+    timing: StaleWorkerSweepTiming,
+) -> StaleWorkerSweepOutcome {
     let StaleWorkerSweepControls {
         reaper,
         hold_registry,
         cube_client,
     } = controls;
-    let StaleWorkerThresholds {
-        stale_threshold_secs,
-        auto_reap_threshold_secs,
-    } = thresholds;
+    let StaleWorkerSweepTiming {
+        thresholds:
+            StaleWorkerThresholds {
+                stale_threshold_secs,
+                auto_reap_threshold_secs,
+            },
+        startup_grace_secs,
+    } = timing;
     let mut outcome = StaleWorkerSweepOutcome::default();
     let snapshot = live_states.snapshot();
 
     let now_epoch_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
-    let grace_cutoff = now_epoch_secs - STALE_GRACE_SECS;
+    let grace_cutoff = now_epoch_secs - startup_grace_secs;
 
     for state in snapshot {
         // Operator hold (`bossctl agents hold`): checked before every

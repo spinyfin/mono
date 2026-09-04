@@ -298,14 +298,31 @@ impl Tmux {
             .copied()
     }
 
-    /// Starts the private server without creating a window.
+    /// Starts the private server and applies settings before any window exists.
     ///
-    /// Callers that need a global option to affect the first window must use
-    /// this before [`Self::new_session`]. `tmux new-session` otherwise starts
-    /// the server and creates that first window in one operation.
-    pub async fn start_server(&self) -> Result<()> {
+    /// tmux shuts down an empty server by default. Sending `start-server` and
+    /// the initial settings in one command sequence lets the caller set
+    /// `exit-empty=off` before the client disconnects, while global defaults
+    /// such as `history-limit` still take effect for the first window.
+    /// Session-scoped settings are rejected because there is no session yet.
+    pub async fn start_server_with_options(&self, settings: &[OptionSetting<'_>]) -> Result<()> {
         let mut args = self.server_args();
         args.push("start-server".into());
+        for setting in settings {
+            validate_value("option name", setting.option)?;
+            validate_value("option value", setting.value)?;
+            if matches!(setting.scope, OptionScope::Session(_)) {
+                bail!("cannot set a session option while starting an empty tmux server");
+            }
+            args.push(";".into());
+            args.push("set-option".into());
+            match setting.scope {
+                OptionScope::Server => args.push("-s".into()),
+                OptionScope::Global => args.push("-g".into()),
+                OptionScope::Session(_) => unreachable!("session options were rejected above"),
+            }
+            args.extend([setting.option.into(), setting.value.into()]);
+        }
         self.invoke(args).await.map(|_| ())
     }
 

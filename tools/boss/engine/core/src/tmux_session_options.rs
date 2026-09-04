@@ -45,20 +45,31 @@ pub(crate) fn insert_color_environment(environment: &mut BTreeMap<String, String
 
 /// Start Boss's private server and establish defaults before its first window.
 ///
-/// `history-limit` only affects windows created after it is set. Starting the
-/// server separately prevents `new-session` from racing ahead and creating an
-/// unbounded first window. The global `remain-on-exit` default closes the same
-/// first-window race; [`apply`] repeats it per session after user config has
-/// loaded.
+/// `history-limit` only affects windows created after it is set. Bootstrap
+/// sends all settings in one tmux command sequence, so `exit-empty=off` keeps
+/// the still-windowless private server alive while the global defaults reach
+/// the first worker window. [`apply`] repeats `remain-on-exit` per session
+/// after user config has loaded.
 pub(crate) async fn prepare_server(tmux: &Tmux) -> Result<()> {
-    tmux.start_server()
-        .await
-        .context("starting Boss private tmux server before its first window")?;
-    for &(option, value) in &[("history-limit", HISTORY_LIMIT), ("remain-on-exit", "on")] {
-        tmux.set_global_option(option, value)
-            .await
-            .with_context(|| format!("setting Boss tmux global option {option}={value} before its first window"))?;
-    }
+    tmux.start_server_with_options(&[
+        OptionSetting {
+            scope: OptionScope::Server,
+            option: "exit-empty",
+            value: "off",
+        },
+        OptionSetting {
+            scope: OptionScope::Global,
+            option: "history-limit",
+            value: HISTORY_LIMIT,
+        },
+        OptionSetting {
+            scope: OptionScope::Global,
+            option: "remain-on-exit",
+            value: "on",
+        },
+    ])
+    .await
+    .context("starting Boss private tmux server before its first window")?;
     Ok(())
 }
 

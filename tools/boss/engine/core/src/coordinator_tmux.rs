@@ -1710,17 +1710,18 @@ mod tests {
         assert_eq!(record.spawn_state, "created");
         let calls = server.calls();
         assert_eq!(calls[0][2], "start-server");
-        assert!(is_global_option(&calls[1], "history-limit", "2000"));
-        assert!(is_global_option(&calls[2], "remain-on-exit", "on"));
-        assert_eq!(calls[3][2], "new-session");
+        assert!(is_server_option(&calls[0], "exit-empty", "off"));
+        assert!(is_global_option(&calls[0], "history-limit", "2000"));
+        assert!(is_global_option(&calls[0], "remain-on-exit", "on"));
+        assert_eq!(calls[1][2], "new-session");
         assert!(
-            calls[3]
+            calls[1]
                 .windows(2)
                 .any(|pair| pair[0] == "-e" && pair[1].starts_with("BOSS_SPAWN_TOKEN="))
         );
-        crate::tmux_session_options::assert_color_environment(&calls[3]);
+        crate::tmux_session_options::assert_color_environment(&calls[1]);
         assert!(
-            calls[3]
+            calls[1]
                 .windows(2)
                 .any(|pair| pair[0] == "-c" && Path::new(&pair[1]) == dir.path())
         );
@@ -1729,7 +1730,7 @@ mod tests {
                 .iter()
                 .filter(|call| call.get(2).map(String::as_str) == Some("set-option"))
                 .count(),
-            4
+            2
         );
         assert!(calls.iter().any(|call| {
             option_assignments(call).any(|assignment| assignment == ["-t", COORDINATOR_SESSION_NAME, "status", "off"])

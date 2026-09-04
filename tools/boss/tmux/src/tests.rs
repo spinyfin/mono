@@ -194,18 +194,49 @@ async fn new_session_is_detached_private_and_carries_environment_atomically() {
 
 #[tokio::test]
 async fn server_bootstrap_can_set_global_options_before_the_first_window() {
-    let (tmux, runner) = tmux([success(""), success(""), success("")]);
-    tmux.start_server().await.unwrap();
-    tmux.set_global_option("history-limit", "2000").await.unwrap();
-    tmux.set_global_option("remain-on-exit", "on").await.unwrap();
+    let (tmux, runner) = tmux([success("")]);
+    tmux.start_server_with_options(&[
+        OptionSetting {
+            scope: OptionScope::Server,
+            option: "exit-empty",
+            value: "off",
+        },
+        OptionSetting {
+            scope: OptionScope::Global,
+            option: "history-limit",
+            value: "2000",
+        },
+        OptionSetting {
+            scope: OptionScope::Global,
+            option: "remain-on-exit",
+            value: "on",
+        },
+    ])
+    .await
+    .unwrap();
 
     assert_eq!(
         runner.calls(),
-        vec![
-            vec!["-S", TEST_SOCKET_PATH, "start-server"],
-            vec!["-S", TEST_SOCKET_PATH, "set-option", "-g", "history-limit", "2000"],
-            vec!["-S", TEST_SOCKET_PATH, "set-option", "-g", "remain-on-exit", "on"],
-        ]
+        vec![vec![
+            "-S",
+            TEST_SOCKET_PATH,
+            "start-server",
+            ";",
+            "set-option",
+            "-s",
+            "exit-empty",
+            "off",
+            ";",
+            "set-option",
+            "-g",
+            "history-limit",
+            "2000",
+            ";",
+            "set-option",
+            "-g",
+            "remain-on-exit",
+            "on",
+        ]]
     );
 }
 

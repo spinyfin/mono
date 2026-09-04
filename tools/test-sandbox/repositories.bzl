@@ -158,3 +158,47 @@ test_runtime_repository = repository_rule(
     environ = ["DEVELOPER_DIR"],
     local = True,
 )
+
+def _host_tmux_repository_impl(repository_ctx):
+    """Exposes the locally installed tmux binary as one declared test input.
+
+    The hermetic test wrapper grants process-exec only to Bazel runfiles and
+    the audited runtime. Keeping tmux in a separate repository prevents it
+    from becoming generally available on every test's PATH: a test must add
+    this target to its own data before it can execute the production binary.
+    """
+    for candidate in [
+        "/opt/homebrew/bin/tmux",
+        "/usr/local/bin/tmux",
+        "/usr/bin/tmux",
+        "/bin/tmux",
+    ]:
+        path = repository_ctx.path(candidate)
+        if path.exists:
+            repository_ctx.symlink(path.realpath, "tmux")
+            repository_ctx.file(
+                "BUILD.bazel",
+                content = """\
+exports_files([\"tmux\"])
+""",
+            )
+            return
+
+    # Keep analysis deterministic on hosts without tmux. The integration
+    # target fails with a direct diagnostic if it is selected there.
+    repository_ctx.file(
+        "tmux",
+        content = "#!/bin/sh\nprintf '%s\\n' 'tmux is not installed on this host' >&2\nexit 127\n",
+        executable = True,
+    )
+    repository_ctx.file(
+        "BUILD.bazel",
+        content = """\
+exports_files([\"tmux\"])
+""",
+    )
+
+host_tmux_repository = repository_rule(
+    implementation = _host_tmux_repository_impl,
+    local = True,
+)
