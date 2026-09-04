@@ -1749,6 +1749,17 @@ pub async fn serve_with_merge_probe(
         crate::proposal_expiry_sweep::DEFAULT_INTERVAL,
     );
 
+    // Asynchronous review-verdict application: a supervisor submission
+    // stays `proposed` so GitHub probes and remediation task creation do
+    // not block the worker socket. This sweep is the crash-recovery path;
+    // `app::proposals` also applies immediately after a fresh submit.
+    let _review_verdict_apply_sweep_handle = crate::review_verdict_apply_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.execution_coordinator.clone(),
+        server_state.dispatch_events.clone(),
+        crate::review_verdict_apply_sweep::DEFAULT_INTERVAL,
+    );
+
     // Periodic attention-reconcile sweep: lowers failure signals whose
     // condition is demonstrably over — open attention items whose declared
     // clearing evidence has arrived, and stale `tasks.dispatch_failed_*`

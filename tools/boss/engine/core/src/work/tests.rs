@@ -655,6 +655,7 @@ mod human_driven_tests;
 mod project_membership_move_tests;
 mod resolve_repo_tests;
 mod review_batches_tests;
+mod review_verdict_apply_tests;
 mod review_verdicts_tests;
 mod schema_migration_tests;
 mod semantic_progress_tests;

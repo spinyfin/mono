@@ -1,5 +1,13 @@
 use super::*;
 
+/// The `blocked_reason` value the incident-002 postmortem tripwire stamps on
+/// a cycle root it halts pending explicit operator sign-off (see
+/// `WorkerPrCompletionTarget::BlockedDeletionSignoff` below and
+/// `conflict_ladder.rs`). Shared with `review_verdict_apply.rs` so the async
+/// verdict-apply path recognises and preserves the same hold instead of
+/// silently clearing it.
+pub(crate) const DELETION_SIGNOFF_BLOCKED_REASON: &str = "deletion_signoff";
+
 impl WorkDb {
     /// Record that a worker produced a PR for `execution_id`. In a single
     /// transaction:
@@ -83,7 +91,7 @@ impl WorkDb {
         // no attempt id (there is no auto-clearing signal — a human moves the
         // task out of `blocked`). Every other target clears the blocked columns.
         let blocked_reason_for_task: Option<&str> = match target {
-            WorkerPrCompletionTarget::BlockedDeletionSignoff => Some("deletion_signoff"),
+            WorkerPrCompletionTarget::BlockedDeletionSignoff => Some(DELETION_SIGNOFF_BLOCKED_REASON),
             _ => None,
         };
         tx.execute(

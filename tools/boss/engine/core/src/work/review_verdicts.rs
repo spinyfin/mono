@@ -215,6 +215,43 @@ impl WorkDb {
         Ok(())
     }
 
+    /// Insert the durable per-batch review verdict row for a supervisor
+    /// proposal. `batch_id` / `proposal_id` uniqueness makes reapply a no-op
+    /// even when the origin PR changed state between attempts.
+    pub(crate) fn insert_batch_review_verdict_in_tx(
+        conn: &Connection,
+        execution_id: &str,
+        work_item_id: &str,
+        batch_id: &str,
+        proposal_id: &str,
+        input: &ReviewVerdictInput,
+        revision_task_id: Option<&str>,
+    ) -> Result<String> {
+        let id = next_id("rvv");
+        let now = now_string();
+        conn.execute(
+            "INSERT INTO pr_review_verdicts (
+                id, execution_id, work_item_id, head_sha, findings_count,
+                revision_warranted, gate_outcome, revision_task_id, created_at,
+                batch_id, proposal_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                id,
+                execution_id,
+                work_item_id,
+                input.head_sha,
+                input.findings_count,
+                input.revision_warranted as i64,
+                input.gate_outcome,
+                revision_task_id,
+                now,
+                batch_id,
+                proposal_id,
+            ],
+        )?;
+        Ok(id)
+    }
+
     /// Record that the revision a verdict predicted (`gate_outcome =
     /// completed_with_findings`) was actually created. Best-effort follow-up
     /// write, outside the completion transaction — `create_revision` cannot

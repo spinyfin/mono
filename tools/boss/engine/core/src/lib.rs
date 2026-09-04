@@ -149,6 +149,7 @@ pub mod remote_transcript;
 pub mod remote_wrapper;
 pub mod repo_slug;
 pub mod resolution_signal_capture;
+pub mod review_verdict_apply_sweep;
 pub mod rotating_file;
 pub mod run_done_backstop;
 pub mod run_reconcile;

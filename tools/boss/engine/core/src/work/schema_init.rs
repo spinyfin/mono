@@ -769,6 +769,9 @@ impl WorkDb {
         // persistence-only at this stage; dispatch still uses legacy review
         // orchestration until the batch reconciler lands.
         migrate_pr_review_batches_tables(conn)?;
+        // Batch-verdict applier: one `pr_review_verdicts` row per batch,
+        // keyed on the review-verdict proposal id so reapply is a no-op.
+        migrate_pr_review_verdicts_batch_columns(conn)?;
         // One-time backfill: auto-resolve `pr_review_died_without_findings`
         // attentions already followed by a later completed review pass —
         // data-only, no schema change; self-idempotent.
@@ -1010,6 +1013,19 @@ mod tests {
         assert_eq!(
             pr_review_batches_exist, 2,
             "expected both review-batch tables from migrate_pr_review_batches_tables"
+        );
+
+        let verdict_batch_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pr_review_verdicts')
+                 WHERE name IN ('batch_id', 'proposal_id')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            verdict_batch_columns, 2,
+            "expected pr_review_verdicts.batch_id and proposal_id from migrate_pr_review_verdicts_batch_columns"
         );
 
         let verdicts_since_exists: bool = conn

@@ -81,7 +81,7 @@ pub struct SubmitWorkerProposalOutcome {
 
 // ---- mapper ----
 
-const SELECT_WORKER_PROPOSAL: &str = "SELECT id, execution_id, work_item_id, kind, payload_json,
+pub(super) const SELECT_WORKER_PROPOSAL: &str = "SELECT id, execution_id, work_item_id, kind, payload_json,
             idempotency_key, state, decided_by, decision_reason, applied_ref,
             created_at, decided_at
      FROM worker_proposals";
@@ -96,7 +96,7 @@ const SELECT_WORKER_PROPOSAL: &str = "SELECT id, execution_id, work_item_id, kin
 /// the read is deliberate: silently coercing an unknown kind to a default
 /// would mean the apply pipeline later acts on a proposal that says
 /// something else.
-fn map_worker_proposal(row: &Row<'_>) -> rusqlite::Result<WorkerProposal> {
+pub(super) fn map_worker_proposal(row: &Row<'_>) -> rusqlite::Result<WorkerProposal> {
     fn parse_column<T: std::str::FromStr<Err = String>>(raw: &str, index: usize) -> rusqlite::Result<T> {
         raw.parse::<T>()
             .map_err(|err| rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, err.into()))
@@ -130,6 +130,16 @@ fn find_by_idempotency_key(
 ) -> Result<Option<WorkerProposal>> {
     let sql = format!("{SELECT_WORKER_PROPOSAL} WHERE execution_id = ?1 AND idempotency_key = ?2");
     conn.query_row(&sql, params![execution_id, idempotency_key], map_worker_proposal)
+        .optional()
+        .map_err(Into::into)
+}
+
+/// Fetch a single `worker_proposals` row by primary key. Shared by any
+/// caller that needs one proposal by id rather than a filtered listing —
+/// e.g. `review_verdict_apply`'s async applier.
+pub(super) fn find_worker_proposal_by_id(conn: &Connection, id: &str) -> Result<Option<WorkerProposal>> {
+    let sql = format!("{SELECT_WORKER_PROPOSAL} WHERE id = ?1");
+    conn.query_row(&sql, params![id], map_worker_proposal)
         .optional()
         .map_err(Into::into)
 }
@@ -238,7 +248,7 @@ impl WorkDb {
             // land in the same `INSERT`, so a reader can never observe one
             // without the other.
             let apply_decision = match apply_policy(input.kind) {
-                ProposalApplyPolicy::AutoApply => Some(apply_in_transaction(
+                ProposalApplyPolicy::AutoApply | ProposalApplyPolicy::Async => Some(apply_in_transaction(
                     &tx,
                     input.execution_id,
                     input.payload_json,
@@ -273,6 +283,15 @@ impl WorkDb {
                     Some(now.clone()),
                     None,
                     None,
+                ),
+                Some(ApplyDecision::Staged(outcome)) => (
+                    ProposalState::Proposed,
+                    None,
+                    None,
+                    None,
+                    None,
+                    outcome.post_commit_audit_line,
+                    outcome.review_batch_quorum_outcome,
                 ),
                 None => (ProposalState::Proposed, None, None, None, None, None, None),
             };

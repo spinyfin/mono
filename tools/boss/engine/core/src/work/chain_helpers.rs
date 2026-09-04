@@ -430,73 +430,17 @@ pub(crate) fn resolve_revision_on_parent_close(
     }
 
     if is_pr_review {
-        // Emit a `followup` with provenance when the chain root still has a
-        // parseable origin PR. Only tag `Followup` when that number is
-        // present — `followup_pr_body_prefix` treats the kind as a hard
-        // origin-PR contract and bails at dispatch otherwise, so minting a
-        // Followup with `origin_pr_number = None` (missing/soft-deleted root
-        // or unparseable `pr_url`) would permanently wedge the task. Fall
-        // back to the historical `chore` in that case, matching the
-        // deferred-scope creation site. Carry the revision's `pr_review:`
-        // `created_via` through onto the followup so `followup_kind_label`
-        // can render "review findings" rather than the degenerate
-        // engine-kind string.
-        let root = query_task(conn, chain_root_id)?;
-        let origin_task_short_id = root.as_ref().and_then(|r| r.short_id);
-        let origin_pr_number = root
-            .as_ref()
-            .and_then(|r| r.pr_url.as_deref().and_then(stored_pr_number));
-        let kind_override = origin_pr_number.is_some().then_some(TaskKind::Followup);
-        let description = rev.description.replace(
-            "Address ALL findings before finalising this revision.",
-            "Address ALL findings before closing this follow-up.",
-        );
-        let new_kind = kind_override.as_ref().map_or("chore", TaskKind::as_str);
-
         // The revision row is already the one work item materialised from
         // this review execution. Re-keying it into a standalone
         // followup/chore keeps that identity and provenance intact;
         // inserting a second row here was the duplicate-mint path that raced
         // a re-review after the first worker had finished. The dispatcher
-        // will use the new kind on its next pass.
-        let rows_changed = conn.execute(
-            "UPDATE tasks
-             SET project_id           = NULL,
-                 kind                 = ?2,
-                 description          = ?3,
-                 status               = 'todo',
-                 ordinal              = NULL,
-                 pr_url               = NULL,
-                 deleted_at           = NULL,
-                 updated_at           = ?4,
-                 autostart             = ?5,
-                 created_via          = ?6,
-                 parent_task_id       = NULL,
-                 origin_task_short_id = ?7,
-                 origin_pr_number     = ?8,
-                 blocked_reason       = NULL,
-                 blocked_attempt_id   = NULL,
-                 archived_by          = NULL,
-                 archived_at          = NULL,
-                 archived_reason      = NULL,
-                 merge_queue_state    = NULL,
-                 merge_queue_detail   = NULL,
-                 completed_at         = NULL,
-                 last_status_actor    = 'engine'
-             WHERE id = ?1
-               AND kind = 'revision'
-               AND deleted_at IS NULL",
-            params![
-                rev.id,
-                new_kind,
-                description,
-                now,
-                i64::from(is_wip),
-                rev.created_via,
-                origin_task_short_id,
-                origin_pr_number,
-            ],
-        )?;
+        // will use the new kind on its next pass. Construction is shared
+        // with the verdict applier's merged-origin insert so both producers
+        // write the same kind/provenance/description rewrite.
+        let (rows_changed, new_kind) =
+            convert_revision_to_review_findings_followup(conn, rev, chain_root_id, now, is_wip)?;
+        let new_kind = new_kind.as_str();
         // Not a duplicate-mint avoidance — this IS the single mint for this
         // review execution, so the ordinary path logs at info. Zero rows
         // changed means the guard didn't match (row already tombstoned, or

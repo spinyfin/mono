@@ -56,3 +56,23 @@ pub(crate) fn migrate_pr_review_batches_tables(conn: &Connection) -> Result<()> 
     )?;
     Ok(())
 }
+
+/// Stamp a batch verdict onto `pr_review_verdicts` with the proposal id as
+/// the materialisation idempotency key. Legacy single-reviewer rows leave
+/// both columns NULL; the unique indexes are partial so they do not
+/// collide.
+pub(crate) fn migrate_pr_review_verdicts_batch_columns(conn: &Connection) -> Result<()> {
+    if !super::table_has_column(conn, "pr_review_verdicts", "batch_id")? {
+        conn.execute("ALTER TABLE pr_review_verdicts ADD COLUMN batch_id TEXT", [])?;
+    }
+    if !super::table_has_column(conn, "pr_review_verdicts", "proposal_id")? {
+        conn.execute("ALTER TABLE pr_review_verdicts ADD COLUMN proposal_id TEXT", [])?;
+    }
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS pr_review_verdicts_batch_id_uidx
+             ON pr_review_verdicts(batch_id) WHERE batch_id IS NOT NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS pr_review_verdicts_proposal_id_uidx
+             ON pr_review_verdicts(proposal_id) WHERE proposal_id IS NOT NULL;",
+    )?;
+    Ok(())
+}

@@ -38,6 +38,21 @@ pub trait PrStateChecker: Send + Sync {
             head_sha: None,
         })
     }
+
+    /// Both-parents deletion tripwire (incident-002): files a merged parent
+    /// added that this resolution removed. Empty means clean or fail-open.
+    /// Default is empty so test doubles that only implement `check` stay
+    /// hermetic; production [`GhPrStateChecker`] runs the blocking GitHub
+    /// compare the review-verdict applier needs inside `spawn_blocking`.
+    fn merged_parent_deletions(
+        &self,
+        _repo_slug: &str,
+        _head_before: &str,
+        _base_sha: &str,
+        _head_after: &str,
+    ) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Snapshot returned by [`PrStateChecker::inspect`].
@@ -106,6 +121,21 @@ pub fn classify_pr_merge_state(state: &str, merged_at: &str) -> PrMergeClass {
 pub struct GhPrStateChecker;
 
 impl PrStateChecker for GhPrStateChecker {
+    fn merged_parent_deletions(
+        &self,
+        repo_slug: &str,
+        head_before: &str,
+        base_sha: &str,
+        head_after: &str,
+    ) -> Vec<String> {
+        crate::merge_parent_deletion::compute_merged_parent_deletions_blocking(
+            repo_slug,
+            head_before,
+            base_sha,
+            head_after,
+        )
+    }
+
     fn check(&self, pr_url: &str) -> Result<PrOpenState> {
         Ok(self.inspect(pr_url)?.open_state)
     }

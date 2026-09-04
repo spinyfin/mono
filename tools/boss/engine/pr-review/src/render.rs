@@ -4,6 +4,17 @@
 
 use crate::types::*;
 
+/// Sentence instructing the worker to address every finding before the
+/// revision it's mining closes out. The single source of truth for this
+/// exact wording — `boss-engine-core`'s `review_findings_followup.rs`
+/// rewrites it (via [`str::replace`]) into
+/// `REVIEW_FINDINGS_FOLLOWUP_CLOSE_SENTENCE` when a merged/closed origin
+/// converts a revision into a standalone follow-up, so a wording change here
+/// cannot silently desync the two call sites. `boss-engine-core` already
+/// depends on `boss-pr-review`, so importing this constant from there keeps
+/// the dependency edge one-directional.
+pub const REVISION_CLOSE_SENTENCE: &str = "Address ALL findings before finalising this revision.";
+
 /// Provenance of the PR + work item that produced a `ReviewResult`. Threaded
 /// into both the rendered revision instructions and the revision/follow-up
 /// card title so a row is never anonymous — including after
@@ -101,7 +112,7 @@ pub fn render_revision_instructions(result: &ReviewResult, origin: ReviewOrigin)
 
     let mut out = format!(
         "Automated PR review of {} found {} finding(s) requiring attention.\n\
-         Address ALL findings before finalising this revision.\n\
+         {REVISION_CLOSE_SENTENCE}\n\
          \n\
          ## HARD RULE: no punting — do the actual work\n\
          \n\

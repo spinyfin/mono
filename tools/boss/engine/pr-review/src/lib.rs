@@ -47,8 +47,8 @@ pub use parsing::{
     extract_review_result_verbose, passes_severity_gate, review_result_from_candidates,
 };
 pub use render::{
-    ReviewOrigin, ReviewerReportDestination, render_batch_reviewer_initial_prompt, render_reviewer_claude_md,
-    render_reviewer_initial_prompt, render_revision_instructions, render_revision_title,
+    REVISION_CLOSE_SENTENCE, ReviewOrigin, ReviewerReportDestination, render_batch_reviewer_initial_prompt,
+    render_reviewer_claude_md, render_reviewer_initial_prompt, render_revision_instructions, render_revision_title,
 };
 pub use supervisor_render::{SupervisorReportInput, render_supervisor_claude_md, render_supervisor_initial_prompt};
 pub use supervisor_types::{
