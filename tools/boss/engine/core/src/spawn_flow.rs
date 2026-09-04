@@ -582,6 +582,43 @@ pub enum StartWorkerError {
     ProgressFidelity(ProgressFidelity),
 }
 
+impl StartWorkerError {
+    /// Stable, machine-readable name for *which spawn step* refused.
+    ///
+    /// Carried on the `spawn_failed` dispatch event so a diagnose
+    /// signature can key on the failing step rather than substring-matching
+    /// a prose error, and so two different causes (an unwritable settings
+    /// dir vs an ingress precondition) never collapse into one generic
+    /// "spawn failed" bucket. The strings are wire values — treat them the
+    /// same as `Stage::as_str()` and do not rename them casually.
+    pub fn class(&self) -> &'static str {
+        match self {
+            Self::WriteFiles(_) => "write_files",
+            Self::Send(_) => "send_spawn_request",
+            Self::AppError(_) => "app_rejected",
+            Self::ResponseKindMismatch => "response_kind_mismatch",
+            Self::ProgressIngress(_) => "progress_ingress",
+            Self::Tmux(_) => "tmux_host",
+        }
+    }
+
+    /// The specific thing this step rejected, with the generic wrapper
+    /// stripped.
+    ///
+    /// For [`Self::ProgressIngress`] that is the precondition text the
+    /// ingress preparer returned verbatim (e.g.
+    /// `/…/sessions is not a real directory`) — the actionable half of the
+    /// message, and the part a recovery hint has to be able to name. Every
+    /// other variant has no inner detail worth separating from its own
+    /// `Display`, so it returns that.
+    pub fn cause_detail(&self) -> String {
+        match self {
+            Self::ProgressIngress(detail) => detail.clone(),
+            other => other.to_string(),
+        }
+    }
+}
+
 /// Public API for callers that want to wire pane-spawning into the
 /// coordinator (or a test). The trait is implemented by
 /// [`crate::app::ServerState`]; users should typically call through

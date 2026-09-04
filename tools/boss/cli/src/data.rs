@@ -1724,12 +1724,15 @@ async fn list_executions_for_item_impl(
     }
 }
 
-/// Fetch the open + resolved operational attention items filed against a
-/// work item directly (`work_attention_items.work_item_id`) — e.g. the
-/// `churn_guard_parked` item an orphan-sweep or pr_review-recovery churn
-/// guard trip files when it stops auto-redispatching an `active` item with
-/// no live execution. Distinct from the `boss attention` noun, which covers
-/// the newer agent-authored question/followup store.
+/// Fetch every open + resolved operational attention item about a work
+/// item, whether scoped to the item itself (`work_attention_items.work_item_id`
+/// — e.g. `churn_guard_parked`, filed when an orphan-sweep or
+/// pr_review-recovery churn guard trip stops auto-redispatching an `active`
+/// item with no live execution) or to one of its executions
+/// (`work_attention_items.execution_id`, resolved through the execution —
+/// e.g. `pane_spawn_failed`, `driver_terminal_error`). Distinct from the
+/// `boss attention` noun, which covers the newer agent-authored
+/// question/followup store.
 pub(crate) async fn list_attention_items_for_work_item(
     client: &mut BossClient,
     work_item_id: &str,
