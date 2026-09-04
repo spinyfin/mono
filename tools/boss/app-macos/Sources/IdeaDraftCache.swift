@@ -4,9 +4,9 @@ import Foundation
 /// Written to disk on every local-cache autosave tick (see
 /// `ChatViewModel+Ideas.swift`) so an app crash or force-quit between that
 /// write and the next successful `update_idea` round trip cannot lose
-/// keystrokes — the acceptance criterion this feature exists for (the
-/// Ideas project description: a coordinator session once died
-/// mid-composition and the unsent buffer was gone for good).
+/// keystrokes. A long unsent draft is unrecoverable once the session
+/// holding it dies, so the on-disk copy — not optimistic in-memory state —
+/// is what makes the buffer survivable.
 struct IdeaDraftCacheEntry: Codable, Equatable {
     let ideaID: String
     let productID: String
@@ -87,9 +87,20 @@ enum IdeaDraftCache {
 
     /// Whether an unsynced local draft exists for `ideaID`. Drives the
     /// sidebar's "unsaved local changes" indicator so a draft that never
-    /// got reconciled (the operator crashed, then opened a different idea)
+    /// got reconciled (the app crashed, then a different idea was opened)
     /// stays visible instead of silently waiting to be rediscovered.
     static func hasPendingDraft(ideaID: String, in directory: URL = defaultDirectory) -> Bool {
         FileManager.default.fileExists(atPath: path(for: ideaID, in: directory).path)
+    }
+
+    /// All idea ids with an unsynced local draft currently on disk. Used to
+    /// seed `ChatViewModel.ideaIDsWithPendingLocalDraft` once, rather than
+    /// stat-ing every row's cache file on every render.
+    static func allIdeaIDsWithPendingDrafts(in directory: URL = defaultDirectory) -> Set<String> {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else {
+            return []
+        }
+        return Set(entries.filter { $0.pathExtension == "json" }.map { $0.deletingPathExtension().lastPathComponent })
     }
 }

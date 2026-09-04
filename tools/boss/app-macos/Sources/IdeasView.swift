@@ -27,6 +27,9 @@ struct IdeasView: View {
                 .background(Color(nsColor: .windowBackgroundColor))
         }
         .navigationTitle("Ideas")
+        .onAppear {
+            chat.seedIdeaPendingDraftsIfNeeded()
+        }
         .onDisappear {
             chat.flushIdeaDraft()
         }

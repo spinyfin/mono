@@ -284,15 +284,39 @@ final class ChatViewModel: ObservableObject {
     @Published var ideaDraftBody: String = ""
     /// Autosave status for the open idea's draft. See `IdeaSaveStatus`.
     @Published var ideaSaveStatus: IdeaSaveStatus = .idle
+    /// Ids of ideas with an unsynced local draft on disk, mirrored in
+    /// memory so `IdeasView`'s row list is a set lookup rather than a
+    /// per-row filesystem stat on every render. Seeded once from
+    /// `IdeaDraftCache.allIdeaIDsWithPendingDrafts` when the Ideas surface
+    /// first appears, then kept in sync by `writeIdeaDraftToLocalCache`
+    /// (insert) and every `IdeaDraftCache.clear` call site (remove). See
+    /// `ChatViewModel+Ideas.swift`.
+    @Published var ideaIDsWithPendingLocalDraft: Set<String> = []
+    var hasSeededIdeaPendingDrafts = false
     /// Debounce handles for the two autosave tiers (local crash-floor
     /// write, engine `update_idea`). Cancelled and replaced on every
     /// keystroke — mirrors `pendingWorkTreeRefetchTasks`'s Task-based
     /// debounce. See `ChatViewModel+Ideas.swift`.
     var ideaLocalCacheTask: Task<Void, Never>?
     var ideaEngineSaveTask: Task<Void, Never>?
+    /// The exact name/body last sent to the engine via `update_idea`, keyed
+    /// by idea id, kept until the matching `idea_updated` echo arrives.
+    /// Lets `handleIdeaUpdated` recognize its own save and clear the
+    /// crash-floor cache for that idea even after the editor has already
+    /// moved on to a different one. See `ChatViewModel+Ideas.swift`.
+    var ideaInFlightSaves: [String: (name: String, body: String)] = [:]
+    /// Set while `loadIdeaDraft`/`handleIdeaCreated` assign the published
+    /// draft fields programmatically, so `noteIdeaDraftEdited()` (driven by
+    /// `IdeasView`'s `.onChange`) can tell that apart from a real keystroke
+    /// and skip marking a freshly-opened idea dirty.
+    var isLoadingIdeaDraft = false
+    /// Directory `IdeaDraftCache` reads/writes for this view model. Tests
+    /// override with a scratch directory so state machine coverage never
+    /// touches the real Application Support tree.
+    var ideaDraftCacheDirectory: URL = IdeaDraftCache.defaultDirectory
     /// Installed by `ContentView` once the coordinator's libghostty pane is
     /// wired up. Pastes text into the coordinator pane and submits it, as
-    /// if the operator had typed it there. Returns `false` when no pane is
+    /// if it had been typed there. Returns `false` when no pane is
     /// attached (e.g. a Bazel build without GhosttyKit) so the caller can
     /// surface that instead of silently discarding the draft.
     var sendToCoordinatorHandler: ((String) -> Bool)?
