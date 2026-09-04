@@ -245,7 +245,13 @@ fn golden_settings_json_standard_worker() {
 fn golden_claude_md_standard_worker() {
     let input = golden_input();
     let driver = ClaudeDriver;
-    let rendered = render_claude_md(&input, driver.agent_rules_preamble(), driver.descriptor().config_dir);
+    // The golden fixture represents mono itself, whose REPOBIN.toml declares
+    // checkleft, so the preamble is rendered in its "pinned" (`bin/checkleft`) form.
+    let rendered = render_claude_md(
+        &input,
+        &driver.agent_rules_preamble(true),
+        driver.descriptor().config_dir,
+    );
     assert_eq!(
         rendered, GOLDEN_CLAUDE_MD_STANDARD,
         "CLAUDE.md must match the golden byte-for-byte through the driver preamble + renderer",
@@ -259,10 +265,10 @@ fn golden_claude_md_starts_with_driver_preamble() {
     // after the title — otherwise PromptComposition extraction regressed.
     let input = golden_input();
     let driver = ClaudeDriver;
-    let rendered = render_claude_md(&input, driver.agent_rules_preamble(), driver.descriptor().config_dir);
-    let preamble = driver.agent_rules_preamble();
+    let preamble = driver.agent_rules_preamble(true);
+    let rendered = render_claude_md(&input, &preamble, driver.descriptor().config_dir);
     assert!(
-        rendered.contains(preamble),
+        rendered.contains(&preamble),
         "rendered CLAUDE.md must embed the driver's agent_rules_preamble verbatim",
     );
     assert!(

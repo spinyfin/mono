@@ -78,7 +78,7 @@ fn codex_descriptor_matches_design() {
 
 #[test]
 fn agent_rules_require_session_polling_until_a_real_exit_status() {
-    let preamble = CodexDriver::default().agent_rules_preamble();
+    let preamble = CodexDriver::default().agent_rules_preamble(true);
     for required in [
         "expected to exceed roughly ten seconds",
         "exec_command` yields after at most 30 seconds;",

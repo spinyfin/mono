@@ -212,8 +212,8 @@ impl AgentDriver for CodexShapedDriver {
         unimplemented!()
     }
 
-    fn agent_rules_preamble(&self) -> &'static str {
-        ""
+    fn agent_rules_preamble(&self, _checkleft_pinned: bool) -> String {
+        String::new()
     }
 
     fn transcript_path_for_session(&self, raw: &serde_json::Value) -> Option<String> {

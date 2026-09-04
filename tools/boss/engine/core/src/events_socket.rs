@@ -1014,8 +1014,8 @@ mod tests {
                 pre_tool_use_hooks: Vec::new(),
             }
         }
-        fn agent_rules_preamble(&self) -> &'static str {
-            "# camelcase test driver preamble\n"
+        fn agent_rules_preamble(&self, _checkleft_pinned: bool) -> String {
+            "# camelcase test driver preamble\n".to_owned()
         }
         fn transcript_path_for_session(&self, _raw: &serde_json::Value) -> Option<String> {
             None

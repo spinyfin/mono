@@ -525,11 +525,21 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     // workers. It is intentionally a repobin shim, unlike engine-owned
     // launchers: permit only the current workspace's lexical bin path, not
     // an arbitrary path that happens to end in bin/checkleft.
+    //
+    // Resolved against the hook payload's own `cwd` field, not this guard
+    // process's os.getcwd(): the Codex driver materialises this same Python
+    // as a standalone script run by its own hook adapter, and Grok runs it
+    // through a Grok-owned adapter, so this process starting in the
+    // workspace root is not guaranteed the way it is for Claude's own hook
+    // runner. Falls back to os.getcwd() only when the payload omits `cwd`.
+    "hook_cwd=inp.get('cwd') or os.getcwd()\n",
     "def is_workspace_checkleft(p):\n",
     "    if os.path.basename(p)!='checkleft' or os.sep not in p: return False\n",
-    "    workspace_bin=os.path.join(os.path.abspath(os.getcwd()),'bin')\n",
+    "    base=os.path.abspath(hook_cwd)\n",
+    "    workspace_bin=os.path.join(base,'bin')\n",
+    "    candidate=p if os.path.isabs(p) else os.path.join(base,p)\n",
     "    try:\n",
-    "        return os.path.commonpath((os.path.abspath(p),workspace_bin))==workspace_bin\n",
+    "        return os.path.commonpath((os.path.normpath(candidate),workspace_bin))==workspace_bin\n",
     "    except ValueError:\n",
     "        return False\n",
     "shim=None\n",
@@ -740,12 +750,15 @@ pub const REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND: &str = python_command_guard!(
 /// The driver-specific preamble for the agent-rules file. Names the hook
 /// mechanism ("claude hooks") and is injected at the top of `CLAUDE.md` by
 /// `boss_engine::worker_setup::render_claude_md`.
-const CLAUDE_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
+///
+/// `{checkleft}` is filled in from [`checkleft_preamble_sentence`]:
+/// `bin/checkleft` only exists in a workspace whose `REPOBIN.toml` declares
+/// checkleft, so a repo that doesn't must not be told to run it (see
+/// [`crate::AgentDriver::agent_rules_preamble`]).
+const CLAUDE_AGENT_RULES_PREAMBLE_TEMPLATE: &str = "You are running inside a Boss-managed worker session. The engine\n\
      spawned you in a leased cube workspace and observes this session\n\
      via claude hooks.\n\
-     For ordinary pre-push validation, run `bin/checkleft run` with no flags; use\n\
-     `bin/checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
-     strong stated justification.";
+     {checkleft}";
 
 /// Reference implementation of [`AgentDriver`] for Claude Code.
 ///
@@ -1105,8 +1118,9 @@ impl AgentDriver for ClaudeDriver {
     /// The Claude-specific preamble injected at the top of `CLAUDE.md`.
     /// Names "claude hooks" as the observability mechanism and is distinct
     /// from the driver-agnostic body that follows it.
-    fn agent_rules_preamble(&self) -> &'static str {
-        CLAUDE_AGENT_RULES_PREAMBLE
+    fn agent_rules_preamble(&self, checkleft_pinned: bool) -> String {
+        CLAUDE_AGENT_RULES_PREAMBLE_TEMPLATE
+            .replace("{checkleft}", crate::checkleft_preamble_sentence(checkleft_pinned))
     }
 
     fn transcript_path_for_session(&self, raw: &serde_json::Value) -> Option<String> {
@@ -1980,7 +1994,7 @@ mod tests {
 
     #[test]
     fn agent_rules_preamble_names_claude_hooks() {
-        let preamble = ClaudeDriver.agent_rules_preamble();
+        let preamble = ClaudeDriver.agent_rules_preamble(true);
         assert!(
             preamble.contains("claude hooks"),
             "preamble must name 'claude hooks': {preamble}"
@@ -1990,8 +2004,18 @@ mod tests {
             "preamble must describe Boss session: {preamble}"
         );
         assert!(
-            preamble.contains("bin/checkleft run") && preamble.contains("checkleft --all"),
+            preamble.contains("bin/checkleft run") && preamble.contains("bin/checkleft --all"),
             "preamble must direct ordinary validation to scoped checkleft: {preamble}"
+        );
+    }
+
+    #[test]
+    fn agent_rules_preamble_unpinned_does_not_say_bin_checkleft() {
+        let preamble = ClaudeDriver.agent_rules_preamble(false);
+        assert!(
+            !preamble.contains("bin/checkleft"),
+            "a repo whose REPOBIN.toml does not declare checkleft has no bin/ dir, \
+             so the preamble must not tell workers to run bin/checkleft: {preamble}"
         );
     }
 
