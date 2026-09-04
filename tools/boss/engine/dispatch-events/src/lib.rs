@@ -181,6 +181,25 @@ pub enum Stage {
     /// occupant). Readers keying off `pane_spawned` — `bossctl doctor`'s
     /// SIG-B/SIG-F/SIG-H signatures — are unaffected.
     SpawnFailed,
+    /// The completion handler finished tearing down an execution it had
+    /// just terminalized — pane released, driver state torn down, cube
+    /// lease released (or its release timed out and was abandoned to cube's
+    /// TTL). Emitted from the one teardown choke point every completion
+    /// route funnels through (`completion::teardown::finish_worker_teardown`),
+    /// so it fires for a PR-producing completion, a declared no-op
+    /// completion, a pr_review / automation / answer-agent finalize, an
+    /// idle park, and a driver-reported terminal error alike; `details.path`
+    /// names which. It is always emitted AFTER the terminalizing DB write.
+    ///
+    /// This is the dispatch timeline's explicit end-of-run marker. Dispatch
+    /// itself ends at `pane_spawned` (or `tmux_adopt` after an engine
+    /// restart), but post-dispatch observations keep being appended to the
+    /// same per-execution timeline for as long as the run lives; without a
+    /// record of the run actually ending, `bossctl dispatch diagnose` can
+    /// only infer completion from the absence of further events. `details`
+    /// carries `path`, `pane_outcome`, `released_lease`, `cube_timed_out`,
+    /// and the per-step teardown timings.
+    ExecutionFinalized,
     /// A non-terminal stage exceeded its per-stage stalled-threshold
     /// without progressing to the next stage. Fires periodically
     /// from the engine's stage-stalled detector; surfaces via
@@ -812,7 +831,99 @@ pub enum Stage {
     StartupPaneRespawn,
 }
 
+/// How a dispatch record participates in an execution timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimelineStageClass {
+    /// A dispatch step which replaces the tracked stage and starts its clock.
+    Pipeline,
+    /// A record made only after dispatch has handed the execution to a pane.
+    PostDispatch,
+    /// Bookkeeping about a timeline that must not replace its tracked stage.
+    Observation,
+}
+
 impl Stage {
+    /// Every stable stage name, for exhaustive schema-contract tests.
+    pub const ALL: [Stage; 62] = [
+        Stage::StatusTransition,
+        Stage::RequestRecorded,
+        Stage::WorkerClaimed,
+        Stage::HostSelected,
+        Stage::CubeRepoEnsureAttempted,
+        Stage::CubeRepoEnsured,
+        Stage::CubeRepoEnsureFailed,
+        Stage::CubeWorkspaceLeaseAttempted,
+        Stage::CubeWorkspaceLeased,
+        Stage::CubeWorkspaceLeaseFailed,
+        Stage::CubeWorkspacePositioned,
+        Stage::CubeWorkspacePositioningFailed,
+        Stage::CubeChangeCreated,
+        Stage::RunStarted,
+        Stage::PaneSpawned,
+        Stage::ExecutionCancelled,
+        Stage::SpawnFailed,
+        Stage::ExecutionFinalized,
+        Stage::StageStalled,
+        Stage::OrphanActiveRedispatch,
+        Stage::PrReviewDeadRecovery,
+        Stage::DeadPidReconcile,
+        Stage::PaneDeathReconcile,
+        Stage::DispatchDecision,
+        Stage::TransientRecovery,
+        Stage::TransientRecoveryExhausted,
+        Stage::TransientRecoveryNudge,
+        Stage::StaleWorkerReconcile,
+        Stage::PoolClaimReconcile,
+        Stage::TerminalWorkReconcile,
+        Stage::CubeLeaseHeartbeat,
+        Stage::LostWorkspaceReconcile,
+        Stage::CubeLeaseAutoReap,
+        Stage::RemoteLeaseReconcile,
+        Stage::HostDrainReconcile,
+        Stage::SpawnAckTimeout,
+        Stage::DriverStartTimeout,
+        Stage::DispatchFailureRecoveryRedispatch,
+        Stage::SpawnNack,
+        Stage::PaneDeathBeforeStart,
+        Stage::SpawnCapabilityUnhealthy,
+        Stage::SpawnCapabilityRecovered,
+        Stage::HuskPaneReconcile,
+        Stage::ExecutionLivenessReconcile,
+        Stage::DispatchPaused,
+        Stage::DispatchResumed,
+        Stage::DispatchPauseOverride,
+        Stage::DispatchPauseOverrideRefused,
+        Stage::DispatchHeldByPause,
+        Stage::BreakerRecoveryProbeAdmitted,
+        Stage::WorkspaceRecovery,
+        Stage::AutomationPreempted,
+        Stage::AbandonedBranchPrRecovery,
+        Stage::LiveWorkerReadopted,
+        Stage::RedispatchBlockedLiveProcess,
+        Stage::RedispatchGuardDeclined,
+        Stage::TmuxAdopt,
+        Stage::TmuxRefuseSkew,
+        Stage::TmuxLeakDetected,
+        Stage::TmuxTokenMismatch,
+        Stage::TmuxAdoptionOwnerConflict,
+        Stage::StartupPaneRespawn,
+    ];
+
+    /// Classify this stage's effect on an execution timeline.
+    pub fn timeline_class(self) -> TimelineStageClass {
+        match self {
+            // These events describe an execution but are not progression in
+            // its dispatch pipeline. In particular, a heartbeat must not
+            // hide a dispatch that is stuck before pane spawn, and the
+            // victim-side preemption record must not reopen a finished run.
+            Stage::DispatchDecision | Stage::AutomationPreempted | Stage::CubeLeaseHeartbeat => {
+                TimelineStageClass::Observation
+            }
+            stage if stage.is_post_dispatch() => TimelineStageClass::PostDispatch,
+            _ => TimelineStageClass::Pipeline,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Stage::StatusTransition => "status_transition",
@@ -832,6 +943,7 @@ impl Stage {
             Stage::PaneSpawned => "pane_spawned",
             Stage::ExecutionCancelled => "execution_cancelled",
             Stage::SpawnFailed => "spawn_failed",
+            Stage::ExecutionFinalized => "execution_finalized",
             Stage::StageStalled => "stage_stalled",
             Stage::OrphanActiveRedispatch => "orphan_active_redispatch",
             Stage::PrReviewDeadRecovery => "pr_review_dead_recovery",
@@ -876,6 +988,125 @@ impl Stage {
             Stage::TmuxTokenMismatch => "tmux_token_mismatch",
             Stage::TmuxAdoptionOwnerConflict => "tmux_adoption_owner_conflict",
             Stage::StartupPaneRespawn => "startup_pane_respawn",
+        }
+    }
+
+    /// Parse a wire stage name (`DispatchEvent::stage`) back into a
+    /// [`Stage`]. `None` for a name this build does not know — a record
+    /// written by a newer engine, or a corrupt line. Readers must treat
+    /// `None` as "not classifiable", never as any particular phase.
+    pub fn from_wire(stage: &str) -> Option<Self> {
+        serde_json::from_value(serde_json::Value::String(stage.to_owned())).ok()
+    }
+
+    /// Whether this stage is a **post-dispatch observation** rather than a
+    /// step of the dispatch pipeline.
+    ///
+    /// The dispatch pipeline is the ordered handoff `request_recorded` →
+    /// `worker_claimed` → … → `pane_spawned`: every stage in it is one the
+    /// run can be *stuck in*, and the stage-stalled detector flags a
+    /// timeline whose last event is such a stage and has not progressed.
+    /// Everything else recorded against an execution id is an observation
+    /// about a run that is already past that handoff — a live pane was
+    /// found or adopted, a sweep reaped or terminalized the execution, the
+    /// completion handler finalized it. Those events are appended to the
+    /// same per-execution timeline, but the run is not "stuck in" them and
+    /// nothing in the pipeline will ever follow them under the same
+    /// execution id, so they must never re-open a timeline that dispatch
+    /// already closed. The 2026-09-04 incident is what happens when one
+    /// does: an engine restart appended `tmux_adopt` to two runs whose
+    /// timelines had ended at `pane_spawned`, the detector treated
+    /// `tmux_adopt` as a pipeline stage that had not progressed, and both
+    /// runs were reported `stage_stalled` at `tmux_adopt` two minutes
+    /// later — a hundred seconds after they had completed cleanly.
+    ///
+    /// The match is deliberately exhaustive: adding a stage forces its
+    /// author to say which side it is on. When in doubt, answer `false` —
+    /// a pipeline stage misfiled here would silence a real stall, whereas
+    /// an observation misfiled as a pipeline stage only produces the false
+    /// stall this classification exists to prevent, which is loud.
+    pub fn is_post_dispatch(self) -> bool {
+        match self {
+            // ---- Dispatch pipeline: a run can be stuck in these. --------
+            Stage::StatusTransition
+            | Stage::RequestRecorded
+            | Stage::WorkerClaimed
+            | Stage::HostSelected
+            | Stage::CubeRepoEnsureAttempted
+            | Stage::CubeRepoEnsured
+            | Stage::CubeRepoEnsureFailed
+            | Stage::CubeWorkspaceLeaseAttempted
+            | Stage::CubeWorkspaceLeased
+            | Stage::CubeWorkspaceLeaseFailed
+            | Stage::CubeWorkspacePositioned
+            | Stage::CubeWorkspacePositioningFailed
+            | Stage::CubeChangeCreated
+            | Stage::RunStarted
+            | Stage::PaneSpawned
+            | Stage::SpawnFailed
+            // Re-entry points: a fresh dispatch starts (or is re-driven)
+            // from these, so what follows is pipeline progress.
+            | Stage::OrphanActiveRedispatch
+            | Stage::PrReviewDeadRecovery
+            | Stage::DispatchFailureRecoveryRedispatch
+            | Stage::BreakerRecoveryProbeAdmitted
+            | Stage::StartupPaneRespawn
+            | Stage::WorkspaceRecovery
+            // Pause / breaker bookkeeping around a dispatch that is being
+            // held; the held run is still waiting on the pipeline.
+            | Stage::DispatchPaused
+            | Stage::DispatchResumed
+            | Stage::DispatchPauseOverride
+            | Stage::DispatchPauseOverrideRefused
+            | Stage::DispatchHeldByPause
+            | Stage::SpawnCapabilityUnhealthy
+            | Stage::SpawnCapabilityRecovered
+            // These are folded as `TimelineStageClass::Observation` before
+            // terminality is considered, so they are neither pipeline nor
+            // post-dispatch events themselves.
+            | Stage::DispatchDecision
+            | Stage::AutomationPreempted
+            | Stage::CubeLeaseHeartbeat
+            // Not a stage at all — the detector's own flag, folded
+            // separately by every reader before terminality is asked.
+            | Stage::StageStalled => false,
+
+            // ---- Post-dispatch: a live pane exists or was adopted. -------
+            Stage::TmuxAdopt
+            | Stage::LiveWorkerReadopted
+            | Stage::TransientRecoveryNudge
+            | Stage::RedispatchBlockedLiveProcess
+            // ---- Post-dispatch: the run ended (completion handler). ------
+            | Stage::ExecutionFinalized
+            | Stage::ExecutionCancelled
+            // ---- Post-dispatch: a sweep reaped / terminalized the run;
+            // any redispatch is a fresh execution id. -------------------
+            | Stage::DeadPidReconcile
+            | Stage::PaneDeathReconcile
+            | Stage::StaleWorkerReconcile
+            | Stage::PoolClaimReconcile
+            | Stage::TerminalWorkReconcile
+            | Stage::LostWorkspaceReconcile
+            | Stage::CubeLeaseAutoReap
+            | Stage::RemoteLeaseReconcile
+            | Stage::HostDrainReconcile
+            | Stage::ExecutionLivenessReconcile
+            | Stage::SpawnAckTimeout
+            | Stage::DriverStartTimeout
+            | Stage::SpawnNack
+            | Stage::PaneDeathBeforeStart
+            | Stage::TransientRecovery
+            | Stage::TransientRecoveryExhausted
+            | Stage::AbandonedBranchPrRecovery
+            | Stage::RedispatchGuardDeclined
+            // ---- Post-dispatch: tmux inventory findings about sessions
+            // that already exist (keyed to a spawn token, the
+            // `engine-boot` sentinel, or a run that had a pane). -------
+            | Stage::HuskPaneReconcile
+            | Stage::TmuxRefuseSkew
+            | Stage::TmuxLeakDetected
+            | Stage::TmuxTokenMismatch
+            | Stage::TmuxAdoptionOwnerConflict => true,
         }
     }
 }
@@ -1655,6 +1886,52 @@ mod tests {
             "tmux_adoption_owner_conflict"
         );
         assert_eq!(Stage::StartupPaneRespawn.as_str(), "startup_pane_respawn");
+        assert_eq!(Stage::ExecutionFinalized.as_str(), "execution_finalized");
+    }
+
+    /// `from_wire` must invert `as_str` — the serde rename and the
+    /// hand-written table are two spellings of the same contract.
+    #[test]
+    fn from_wire_inverts_as_str() {
+        for stage in Stage::ALL {
+            assert_eq!(Stage::from_wire(stage.as_str()), Some(stage), "{}", stage.as_str());
+        }
+        assert_eq!(Stage::from_wire("not_a_stage"), None);
+        assert_eq!(Stage::from_wire(""), None);
+    }
+
+    /// The pipeline stages a run can be stuck in stay on the pipeline
+    /// side; the observations that get appended to an already-dispatched
+    /// run's timeline are post-dispatch. `tmux_adopt` is the one the
+    /// 2026-09-04 false-stall incident turned on.
+    #[test]
+    fn post_dispatch_classification_pins_the_incident_stages() {
+        for stage in Stage::ALL {
+            assert!(matches!(
+                stage.timeline_class(),
+                TimelineStageClass::Pipeline | TimelineStageClass::PostDispatch | TimelineStageClass::Observation
+            ));
+        }
+        for stage in [
+            Stage::DispatchDecision,
+            Stage::AutomationPreempted,
+            Stage::CubeLeaseHeartbeat,
+        ] {
+            assert_eq!(
+                stage.timeline_class(),
+                TimelineStageClass::Observation,
+                "{} is a timeline observation",
+                stage.as_str()
+            );
+        }
+        for stage in [Stage::TmuxAdopt, Stage::ExecutionFinalized, Stage::DeadPidReconcile] {
+            assert_eq!(
+                stage.timeline_class(),
+                TimelineStageClass::PostDispatch,
+                "{} is post-dispatch",
+                stage.as_str()
+            );
+        }
     }
 
     /// `Outcome::as_str` strings are the on-disk outcome identifiers;

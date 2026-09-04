@@ -206,7 +206,11 @@ async fn revision_declaring_no_changes_needed_closes_without_claiming_delivery()
         probes,
         ..
     } = TestHarness::new(db.clone(), detector);
-    let handler = handler.with_branch_verifier(verifier).with_merge_probe(probe);
+    let dispatch_events = crate::dispatch_events::RecordingDispatchEventSink::new();
+    let handler = handler
+        .with_branch_verifier(verifier)
+        .with_merge_probe(probe)
+        .with_dispatch_events(Arc::new(dispatch_events.clone()));
 
     let outcome = handler.on_stop(&execution_id).await;
     assert!(
@@ -214,6 +218,24 @@ async fn revision_declaring_no_changes_needed_closes_without_claiming_delivery()
         "an explicit NO_CHANGES_NEEDED from a revision must close it as a declared no-op; \
          got {outcome:?}",
     );
+    // The dispatch timeline must observe this terminal directly: the
+    // declared-no-op path closes the run with an `execution_finalized`
+    // record, so the stage-stalled detector never has to infer completion
+    // from silence (the 2026-09-04 false `tmux_adopt` stall).
+    let timeline = dispatch_events.events_for(&execution_id).await;
+    let finalized: Vec<_> = timeline
+        .iter()
+        .filter(|e| e.stage == crate::dispatch_events::Stage::ExecutionFinalized.as_str())
+        .collect();
+    assert_eq!(
+        finalized.len(),
+        1,
+        "exactly one execution_finalized record; got {timeline:?}"
+    );
+    assert_eq!(finalized[0].outcome, "ok");
+    assert_eq!(finalized[0].work_item_id.as_deref(), Some(revision_id.as_str()));
+    assert_eq!(finalized[0].details["path"], "no_op");
+    assert_eq!(finalized[0].details["released_lease"], true);
     assert!(
         probes.snapshot().is_empty(),
         "a declared no-op must not be nudged; got {:?}",

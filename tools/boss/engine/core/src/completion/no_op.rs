@@ -60,6 +60,7 @@ impl WorkerCompletionHandler {
         self.hold_registry.release(&execution.id);
         self.finish_worker_teardown(
             &execution.id,
+            &completion.execution.work_item_id,
             completion.released_lease_id.as_deref(),
             workspace_path.as_deref().map(std::path::Path::new),
             "no_op",
@@ -264,6 +265,7 @@ impl WorkerCompletionHandler {
         // adopted back.
         self.finish_worker_teardown(
             &execution.id,
+            &execution.work_item_id,
             execution.cube_lease_id.as_deref(),
             execution.workspace_path.as_deref().map(std::path::Path::new),
             failure.teardown_reason,

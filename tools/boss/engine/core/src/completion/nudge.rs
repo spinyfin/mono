@@ -699,6 +699,7 @@ status is otherwise left unchanged for re-dispatch or manual review."
         self.hold_registry.release(&execution.id);
         self.finish_worker_teardown(
             &execution.id,
+            &completion.execution.work_item_id,
             completion.released_lease_id.as_deref(),
             workspace_path.as_deref().map(std::path::Path::new),
             "idle_park",

@@ -476,7 +476,8 @@ enum DispatchAction {
         signatures_only: bool,
     },
     /// List executions whose dispatch timeline started but never
-    /// reached a terminal stage (`pane_spawned ok` or any error),
+    /// reached a terminal stage (`pane_spawned ok`, any error, or a
+    /// post-dispatch observation such as `tmux_adopt` / `execution_finalized`),
     /// and whose bound work item is not already closed (`done` /
     /// `archived`, or a closed comment). Useful when the engine logs
     /// a successful dispatch but no worker pane ever appeared in the

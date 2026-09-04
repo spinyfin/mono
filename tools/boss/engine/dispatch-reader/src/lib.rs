@@ -156,7 +156,9 @@ fn parse_lines<R: BufRead>(path: &Path, reader: R) -> Result<StreamRead> {
 /// dispatch timeline started but whose last *real* event
 /// ([`TimelineState::live_summary`] — i.e. ignoring `stage_stalled`
 /// observation records) never reached a terminal stage
-/// (`pane_spawned ok`, or any `error` outcome).
+/// (`pane_spawned ok`, any `error` outcome, or a post-dispatch
+/// observation such as `tmux_adopt` / `execution_finalized` — see
+/// [`is_terminal_event`]).
 ///
 /// Surfaced by [`ghost_active`] for inspection through `bossctl
 /// dispatch ghost-active`. Detection here is event-shape only: we
@@ -776,6 +778,7 @@ pub fn spawn_stage_stalled_detector(
 mod tests {
     use super::*;
     use boss_dispatch_events::{DispatchEvent, JsonlFileSink, Outcome, Stage};
+    use serde_json::json;
     use tempfile::TempDir;
 
     async fn write(sink: &JsonlFileSink, ev: DispatchEvent) {
@@ -1214,6 +1217,46 @@ mod tests {
 
         let stalls = pending_stalls(dir.path(), 9_999_999, &flat_thresholds(5_000)).unwrap();
         assert!(stalls.is_empty());
+    }
+
+    /// File-scan path of the 2026-09-04 incident: a run whose dispatch
+    /// ended at `pane_spawned` was re-adopted across an engine restart
+    /// (`tmux_adopt`), then completed via the run-done proposals seam
+    /// (`execution_finalized`). Neither post-dispatch record may re-open
+    /// the timeline, so no stall is ever pending for it — while a run that
+    /// is genuinely stuck in the pipeline alongside it still is.
+    #[tokio::test]
+    async fn pending_stalls_ignores_post_dispatch_observations_but_still_reports_a_real_stall() {
+        let dir = TempDir::new().unwrap();
+        let sink = JsonlFileSink::new(dir.path());
+        let mut spawned = DispatchEvent::new(Stage::PaneSpawned, Outcome::Ok, "exec-adopted");
+        spawned.ts_epoch_ms = 1_000;
+        write(&sink, spawned).await;
+        let mut adopted = DispatchEvent::new(Stage::TmuxAdopt, Outcome::Ok, "exec-adopted");
+        adopted.ts_epoch_ms = 2_000;
+        write(&sink, adopted).await;
+        let stalls = pending_stalls(dir.path(), 9_999_999, &flat_thresholds(5_000)).unwrap();
+        assert!(
+            stalls.is_empty(),
+            "tmux_adopt must not be reported as a stalled stage: {stalls:?}"
+        );
+
+        let mut finalized = DispatchEvent::new(Stage::ExecutionFinalized, Outcome::Ok, "exec-adopted");
+        finalized.ts_epoch_ms = 3_000;
+        finalized.details = serde_json::json!({ "path": "no_op" });
+        write(&sink, finalized).await;
+        let mut stuck = DispatchEvent::new(Stage::CubeChangeCreated, Outcome::Ok, "exec-stuck");
+        stuck.ts_epoch_ms = 3_000;
+        write(&sink, stuck).await;
+
+        let stalls = pending_stalls(dir.path(), 9_999_999, &flat_thresholds(5_000)).unwrap();
+        assert_eq!(
+            stalls.len(),
+            1,
+            "only the genuinely stuck dispatch may be reported: {stalls:?}"
+        );
+        assert_eq!(stalls[0].execution_id, "exec-stuck");
+        assert_eq!(stalls[0].stalled_stage, "cube_change_created");
     }
 
     #[tokio::test]
@@ -1761,6 +1804,152 @@ mod tests {
             0
         );
         assert_eq!(read_execution(dir.path(), "exec-wedged").unwrap().events.len(), 2);
+    }
+
+    /// Replay of the 2026-09-04 false-stall incident through the real
+    /// detector pass, with the engine's production thresholds
+    /// (`app/server.rs`): two runs dispatched to `pane_spawned`, re-adopted
+    /// by an engine restart (`tmux_adopt`), then completed through the
+    /// run-done proposals seam — one as a PR-producing completion, one as a
+    /// declared no-op — while a third run is genuinely wedged in
+    /// `worker_claimed`. The pass must write a `stage_stalled` record for
+    /// the wedged run only; the two finished runs must never be flagged,
+    /// however many passes run after their completion. Before the fix the
+    /// `tmux_adopt` record re-opened both finished timelines and the pass
+    /// flagged them `stalled_stage=tmux_adopt` on its first sweep past the
+    /// 120s default threshold — about a hundred seconds after both had
+    /// closed as `done`.
+    #[tokio::test]
+    async fn run_stage_stalled_pass_never_flags_a_run_that_completed_after_adoption() {
+        let dir = TempDir::new().unwrap();
+        let writer = JsonlFileSink::new(dir.path());
+        // Anchored well in the past so the pass's real `now` is beyond every
+        // threshold for every record below.
+        let t0: u128 = 1_700_000_000_000;
+        let at = |stage: Stage, outcome: Outcome, execution_id: &str, offset_ms: u128, details: serde_json::Value| {
+            let mut event = DispatchEvent::new(stage, outcome, execution_id);
+            event.ts_epoch_ms = t0 + offset_ms;
+            event.work_item_id = Some(format!("task-{execution_id}"));
+            event.details = details;
+            event
+        };
+
+        for (execution_id, completion_path) in [("exec-no-op", "no_op"), ("exec-pr", "stop_staged")] {
+            write(
+                &writer,
+                at(Stage::RequestRecorded, Outcome::Ok, execution_id, 0, json!(null)),
+            )
+            .await;
+            write(
+                &writer,
+                at(Stage::WorkerClaimed, Outcome::Ok, execution_id, 500, json!(null)),
+            )
+            .await;
+            write(
+                &writer,
+                at(
+                    Stage::CubeWorkspaceLeased,
+                    Outcome::Ok,
+                    execution_id,
+                    4_000,
+                    json!(null),
+                ),
+            )
+            .await;
+            write(
+                &writer,
+                at(Stage::RunStarted, Outcome::Ok, execution_id, 5_000, json!(null)),
+            )
+            .await;
+            write(
+                &writer,
+                at(Stage::PaneSpawned, Outcome::Ok, execution_id, 6_000, json!(null)),
+            )
+            .await;
+            // Engine restart: the boot-time adoption pass rebuilds the live
+            // state for the still-running worker and records it.
+            write(
+                &writer,
+                at(
+                    Stage::TmuxAdopt,
+                    Outcome::Ok,
+                    execution_id,
+                    60_000,
+                    json!({ "slot_id": 3, "repaired_intent": false }),
+                ),
+            )
+            .await;
+            // ~18s later the worker's run-done proposal closes the run.
+            write(
+                &writer,
+                at(
+                    Stage::ExecutionFinalized,
+                    Outcome::Ok,
+                    execution_id,
+                    78_000,
+                    json!({ "path": completion_path, "released_lease": true }),
+                ),
+            )
+            .await;
+        }
+        write(
+            &writer,
+            at(Stage::RequestRecorded, Outcome::Ok, "exec-wedged", 0, json!(null)),
+        )
+        .await;
+        write(
+            &writer,
+            at(Stage::WorkerClaimed, Outcome::Ok, "exec-wedged", 500, json!(null)),
+        )
+        .await;
+
+        let index = SharedTimelineIndex::new(dir.path());
+        let sink: Arc<dyn DispatchEventSink> = Arc::new(JsonlFileSink::new(dir.path()));
+        // Mirrors the production `StageThresholds` built in `app/server.rs`.
+        let thresholds = StageThresholds::new(Duration::from_secs(120))
+            .with_override("worker_claimed", Duration::from_secs(30))
+            .with_override("host_selected", Duration::from_secs(30))
+            .with_override("cube_repo_ensure_attempted", Duration::from_secs(60))
+            .with_override("cube_repo_ensured", Duration::from_secs(60))
+            .with_override("cube_workspace_lease_attempted", Duration::from_secs(30));
+
+        // Several sweeps, as the engine would run every 15s: the finished
+        // runs must stay clean on every one of them, not just the first.
+        let mut flagged = 0;
+        for _ in 0..3 {
+            flagged += run_stage_stalled_pass(&index, &thresholds, sink.as_ref())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            flagged, 1,
+            "exactly one stall — the wedged dispatch — across every pass"
+        );
+
+        for execution_id in ["exec-no-op", "exec-pr"] {
+            let mirror = read_execution(dir.path(), execution_id).unwrap().events;
+            let stalls: Vec<_> = mirror.iter().filter(|e| e.stage == "stage_stalled").collect();
+            assert!(
+                stalls.is_empty(),
+                "{execution_id} completed cleanly and must carry no stage_stalled record: {stalls:?}"
+            );
+            assert_eq!(mirror.last().unwrap().stage, "execution_finalized");
+        }
+        let wedged = read_execution(dir.path(), "exec-wedged").unwrap().events;
+        let stall = wedged.last().unwrap();
+        assert_eq!(
+            stall.stage, "stage_stalled",
+            "a genuinely wedged dispatch is still reported"
+        );
+        assert_eq!(stall.details["stalled_stage"], json!("worker_claimed"));
+
+        // And the file-scan surface `bossctl dispatch ghost-active` reads
+        // agrees: only the wedged run is open, and it is stalled.
+        let now = boss_engine_utils::epoch_time::now_epoch_ms();
+        let entries = ghost_active(dir.path(), now, 120_000).unwrap().entries;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].execution_id, "exec-wedged");
+        assert!(entries[0].stalled);
     }
 
     /// A stall that appears *after* the index is already tailing must be

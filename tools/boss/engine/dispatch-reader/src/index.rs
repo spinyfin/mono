@@ -671,6 +671,51 @@ mod tests {
         assert_eq!(index.tracked_timelines(), 0, "terminal timelines must be dropped");
     }
 
+    /// Incremental-index path of the 2026-09-04 incident: the engine
+    /// restarts, tails `tmux_adopt` records for the runs it re-adopted, and
+    /// must not start a stall clock against them — those runs' dispatch
+    /// already ended at `pane_spawned`. The completion handler's
+    /// `execution_finalized` is the same shape. A pipeline stage tailed
+    /// afterwards (startup recovery re-driving a pane) re-opens the
+    /// timeline and is still reported when it does not progress.
+    #[tokio::test]
+    async fn post_dispatch_observations_do_not_start_a_stall_clock() {
+        let dir = TempDir::new().unwrap();
+        emit(dir.path(), Stage::PaneSpawned, Outcome::Ok, "exec-adopted", 1_000).await;
+        emit(dir.path(), Stage::PaneSpawned, Outcome::Ok, "exec-done", 1_000).await;
+        let mut index = TimelineIndex::new(dir.path());
+        index.refresh().unwrap();
+        assert_eq!(index.tracked_timelines(), 0);
+
+        emit(dir.path(), Stage::TmuxAdopt, Outcome::Ok, "exec-adopted", 2_000).await;
+        emit(dir.path(), Stage::ExecutionFinalized, Outcome::Ok, "exec-done", 2_000).await;
+        index.refresh().unwrap();
+        assert_eq!(
+            index.tracked_timelines(),
+            0,
+            "post-dispatch records must not re-open a timeline"
+        );
+        assert!(index.pending_stalls(9_999_999, &flat(5)).is_empty());
+
+        emit(
+            dir.path(),
+            Stage::StartupPaneRespawn,
+            Outcome::Ok,
+            "exec-adopted",
+            3_000,
+        )
+        .await;
+        index.refresh().unwrap();
+        let stalls = index.pending_stalls(10_000, &flat(5));
+        assert_eq!(
+            stalls.len(),
+            1,
+            "a pipeline stage that does not progress is still a stall"
+        );
+        assert_eq!(stalls[0].execution_id, "exec-adopted");
+        assert_eq!(stalls[0].stalled_stage, "startup_pane_respawn");
+    }
+
     /// The detector's own output has to suppress a repeat on the next pass,
     /// whether it arrives via `apply` or via the file tail.
     #[tokio::test]
