@@ -1,18 +1,21 @@
 //! Durable review-batch persistence.
 //!
-//! This module owns only immutable batch/member creation and read APIs. It
-//! deliberately does not schedule reviewers or apply their reports; those
-//! later orchestration phases consume the contract established here.
+//! This module owns immutable batch/member creation and read APIs, plus the
+//! two-of-three quorum state machine ([`try_advance_review_batch_quorum_in_tx`])
+//! that decides when enough leaf reviewers have settled to dispatch the
+//! consolidating supervisor, or to give up on the batch. It deliberately does
+//! not apply a supervisor's verdict; that is
+//! [`crate::work::proposal_apply::apply_review_verdict`]'s job.
 
 use std::str::FromStr;
 
 use anyhow::{Result, bail};
 use boss_protocol::{
-    ExecutionKind, ExecutionStatus, ReviewBatch, ReviewBatchMember, ReviewBatchMemberRole, ReviewBatchMemberStatus,
-    ReviewBatchPhase, ReviewBatchStatus, ReviewClassification,
+    CreateAttentionItemInput, ExecutionKind, ExecutionStatus, ReviewBatch, ReviewBatchMember, ReviewBatchMemberRole,
+    ReviewBatchMemberStatus, ReviewBatchPhase, ReviewBatchStatus, ReviewClassification,
 };
 use rusqlite::types::Type;
-use rusqlite::{OptionalExtension, Row, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
 use super::{
     CreateExecutionInput, DeadPrReviewCandidate, WorkDb, WorkExecution, existing_nonterminal_pr_review_execution,
@@ -153,6 +156,35 @@ fn leaf_reviewer_role(role: ReviewBatchMemberRole) -> bool {
     )
 }
 
+/// Resolve one member's driver/model policy and build its create input.
+/// Shared by [`leaf_member_inputs`] (three leaf members at batch creation)
+/// and [`try_advance_review_batch_quorum_in_tx`] (the single supervisor
+/// member, added later once the leaves have settled) so the
+/// registry-lookup-then-resolve-tier sequence lives in exactly one place.
+fn resolve_member_input(
+    registry: &crate::driver::DriverRegistry,
+    driver: &str,
+    role: ReviewBatchMemberRole,
+    classification: &ReviewClassification,
+    execution_id: String,
+) -> Result<ReviewBatchMemberCreateInput> {
+    let driver_descriptor = registry
+        .get(driver)
+        .ok_or_else(|| anyhow::anyhow!("review batch driver {driver:?} is not registered"))?
+        .descriptor();
+    Ok(ReviewBatchMemberCreateInput::builder()
+        .attempt(1)
+        .provider_effort("medium")
+        .requested_driver(driver)
+        .resolved_model((driver_descriptor.model_menu.review_model_for_tier)(
+            classification.profile.model_tier(),
+        ))
+        .role(role)
+        .status(ReviewBatchMemberStatus::Pending)
+        .execution_id(execution_id)
+        .build())
+}
+
 fn leaf_member_inputs(
     classification: &ReviewClassification,
     execution_ids: &[String],
@@ -170,21 +202,7 @@ fn leaf_member_inputs(
         .into_iter()
         .zip(execution_ids)
         .map(|((role, driver), execution_id)| {
-            let driver_descriptor = registry
-                .get(driver)
-                .ok_or_else(|| anyhow::anyhow!("review batch driver {driver:?} is not registered"))?
-                .descriptor();
-            Ok(ReviewBatchMemberCreateInput::builder()
-                .attempt(1)
-                .provider_effort("medium")
-                .requested_driver(driver)
-                .resolved_model((driver_descriptor.model_menu.review_model_for_tier)(
-                    classification.profile.model_tier(),
-                ))
-                .role(role)
-                .status(ReviewBatchMemberStatus::Pending)
-                .execution_id(execution_id.clone())
-                .build())
+            resolve_member_input(&registry, driver, role, classification, execution_id.clone())
         })
         .collect()
 }
@@ -239,41 +257,7 @@ fn create_review_batch_in_tx(
 
     let mut members = Vec::with_capacity(member_inputs.len());
     for input_member in member_inputs {
-        let id = next_id("rvm");
-        tx.execute(
-            "INSERT INTO pr_review_batch_members (
-                id, batch_id, attempt, created_at, provider_effort,
-                requested_driver, resolved_model, role, status, updated_at,
-                execution_id, report_proposal_id, terminal_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?4, ?10, NULL, NULL)",
-            params![
-                id,
-                batch_id,
-                input_member.attempt,
-                now,
-                input_member.provider_effort,
-                input_member.requested_driver,
-                input_member.resolved_model,
-                input_member.role.as_str(),
-                input_member.status.as_str(),
-                input_member.execution_id,
-            ],
-        )?;
-        members.push(
-            ReviewBatchMember::builder()
-                .id(id)
-                .batch_id(batch_id.clone())
-                .attempt(input_member.attempt)
-                .created_at(now.clone())
-                .provider_effort(input_member.provider_effort.clone())
-                .requested_driver(input_member.requested_driver.clone())
-                .resolved_model(input_member.resolved_model.clone())
-                .role(input_member.role)
-                .status(input_member.status)
-                .updated_at(now.clone())
-                .maybe_execution_id(input_member.execution_id.clone())
-                .build(),
-        );
+        members.push(insert_batch_member_in_tx(tx, &batch_id, input_member, &now)?);
     }
 
     Ok((
@@ -293,6 +277,51 @@ fn create_review_batch_in_tx(
             .build(),
         members,
     ))
+}
+
+/// Insert one member row and return its typed form. Shared by
+/// [`create_review_batch_in_tx`] (three leaf members at batch creation) and
+/// [`try_advance_review_batch_quorum_in_tx`] (the single supervisor member,
+/// added later once the leaves have settled).
+fn insert_batch_member_in_tx(
+    tx: &Transaction<'_>,
+    batch_id: &str,
+    input_member: &ReviewBatchMemberCreateInput,
+    now: &str,
+) -> Result<ReviewBatchMember> {
+    let id = next_id("rvm");
+    tx.execute(
+        "INSERT INTO pr_review_batch_members (
+            id, batch_id, attempt, created_at, provider_effort,
+            requested_driver, resolved_model, role, status, updated_at,
+            execution_id, report_proposal_id, terminal_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?4, ?10, NULL, NULL)",
+        params![
+            id,
+            batch_id,
+            input_member.attempt,
+            now,
+            input_member.provider_effort,
+            input_member.requested_driver,
+            input_member.resolved_model,
+            input_member.role.as_str(),
+            input_member.status.as_str(),
+            input_member.execution_id,
+        ],
+    )?;
+    Ok(ReviewBatchMember::builder()
+        .id(id)
+        .batch_id(batch_id.to_owned())
+        .attempt(input_member.attempt)
+        .created_at(now.to_owned())
+        .provider_effort(input_member.provider_effort.clone())
+        .requested_driver(input_member.requested_driver.clone())
+        .resolved_model(input_member.resolved_model.clone())
+        .role(input_member.role)
+        .status(input_member.status)
+        .updated_at(now.to_owned())
+        .maybe_execution_id(input_member.execution_id.clone())
+        .build())
 }
 
 /// Look up the only batch allowed for an immutable target, against any
@@ -334,6 +363,242 @@ fn batch_executions_in_tx(tx: &rusqlite::Transaction<'_>, batch_id: &str) -> Res
                 .ok_or_else(|| anyhow::anyhow!("review batch {batch_id} references missing execution {execution_id}"))
         })
         .collect()
+}
+
+/// Look up a batch by its durable id, against any open connection or
+/// transaction. Shared by [`WorkDb::review_batch`] and
+/// [`try_advance_review_batch_quorum_in_tx`].
+fn review_batch_by_id_in(conn: &rusqlite::Connection, batch_id: &str) -> Result<Option<ReviewBatch>> {
+    conn.query_row(
+        "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
+                phase, pr_number, pr_url, status, target_sha, updated_at,
+                completed_at, final_verdict_proposal_id, merge_sha
+         FROM pr_review_batches WHERE id = ?1",
+        params![batch_id],
+        map_review_batch,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Return every role-specific attempt for a batch, in deterministic
+/// role/attempt order, against any open connection or transaction. Shared by
+/// [`WorkDb::review_batch_members`] and [`try_advance_review_batch_quorum_in_tx`].
+fn review_batch_members_in(conn: &rusqlite::Connection, batch_id: &str) -> Result<Vec<ReviewBatchMember>> {
+    let mut statement = conn.prepare(
+        "SELECT id, batch_id, attempt, created_at, provider_effort,
+                requested_driver, resolved_model, role, status, updated_at,
+                execution_id, report_proposal_id, terminal_at
+         FROM pr_review_batch_members
+         WHERE batch_id = ?1
+         ORDER BY role ASC, attempt ASC, id ASC",
+    )?;
+    Ok(statement
+        .query_map(params![batch_id], map_review_batch_member)?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The three leaf reviewer roles a batch's quorum decision is computed over.
+/// `ReviewBatchMemberRole::Supervisor` and `PostMergeReviewer` are never part
+/// of the leaf quorum.
+const LEAF_REVIEWER_ROLES: [ReviewBatchMemberRole; 3] = [
+    ReviewBatchMemberRole::ClaudeReviewer,
+    ReviewBatchMemberRole::CodexReviewer,
+    ReviewBatchMemberRole::GrokReviewer,
+];
+
+/// A leaf role is settled once its latest attempt either reported, or failed
+/// with no further retry possible (`retry_dead_review_batch_member` bounds
+/// every role to at most one retry, so `attempt >= 2` while `Failed` is
+/// terminal — mirrors that function's own bound rather than introducing a
+/// second one).
+fn leaf_attempt_is_settled(member: &ReviewBatchMember) -> bool {
+    match member.status {
+        ReviewBatchMemberStatus::Reported => true,
+        ReviewBatchMemberStatus::Failed => member.attempt >= 2,
+        ReviewBatchMemberStatus::Pending | ReviewBatchMemberStatus::Running => false,
+    }
+}
+
+/// The latest (highest-attempt) row for `role` among `members`, or `None` if
+/// the role has no row at all (should not happen for a `collecting` batch,
+/// but a caller must not panic on a data inconsistency).
+fn latest_attempt_for_role(members: &[ReviewBatchMember], role: ReviewBatchMemberRole) -> Option<&ReviewBatchMember> {
+    members.iter().filter(|m| m.role == role).max_by_key(|m| m.attempt)
+}
+
+/// The `repo_remote_url` any settled member's execution was launched with —
+/// needed to spawn the supervisor's own execution, which
+/// [`ReviewBatchCreateInput`] never persists on the batch row itself (only
+/// [`WorkDb::create_pre_merge_review_batch`]'s caller supplies it, out of
+/// band, for the three original leaf executions).
+fn any_member_repo_remote_url(tx: &Transaction<'_>, members: &[ReviewBatchMember]) -> Result<String> {
+    for member in members {
+        let Some(execution_id) = member.execution_id.as_deref() else {
+            continue;
+        };
+        if let Some(execution) = query_execution(tx, execution_id)? {
+            return Ok(execution.repo_remote_url);
+        }
+    }
+    bail!("review batch has no member execution to source repo_remote_url from")
+}
+
+/// What [`try_advance_review_batch_quorum_in_tx`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewBatchQuorumOutcome {
+    /// The batch's members have not all settled yet (still `collecting`
+    /// leaves in flight), or the batch is already past `supervising`. Not an
+    /// error — most calls to this function are speculative "did this
+    /// settle?" checks that resolve to nothing yet.
+    NoOp,
+    /// Two or three leaves reported; the supervisor member and its execution
+    /// were just created and the batch moved to `supervising`.
+    SupervisorDispatched,
+    /// The supervisor reported; the batch moved to `completed`.
+    Completed,
+    /// Either fewer than two leaves reported (both exhausted their retry), or
+    /// the supervisor stopped without submitting a verdict. The batch moved
+    /// to `failed` and a human-visible attention was filed — this is the
+    /// "hold rather than produce a clean verdict" outcome.
+    InsufficientQuorum,
+}
+
+/// The two-of-three quorum state machine for one review batch.
+///
+/// Idempotent and safe to call redundantly from multiple hook points (a leaf
+/// report accepted, a leaf finalized failed, a leaf's retry exhausted, the
+/// supervisor's verdict accepted, the supervisor finalized failed): it reads
+/// the batch's current status and every member's current state fresh each
+/// time, and only acts when that snapshot has just become decidable.
+///
+/// - `collecting`: once every leaf role has settled (reported, or failed with
+///   its one retry exhausted), advance based on how many reported.
+///   `>= 2` dispatches the supervisor (`supervising`); `< 2` fails the batch
+///   — the "fewer than two reports must hold rather than produce a clean
+///   verdict" requirement. Still-in-flight roles are a no-op.
+/// - `supervising`: once the supervisor's own member has settled (reported or
+///   failed — the supervisor gets no retry, unlike a leaf), advance to
+///   `completed` or `failed` accordingly.
+/// - Any other status (`applying`, `completed`, `failed`): no-op. This is
+///   what makes redundant calls safe.
+///
+/// Must be called inside an already-open transaction — see
+/// [`WorkDb::try_advance_review_batch_quorum`] for the standalone wrapper.
+pub(crate) fn try_advance_review_batch_quorum_in_tx(
+    tx: &Transaction<'_>,
+    batch_id: &str,
+    registry: &crate::driver::DriverRegistry,
+) -> Result<ReviewBatchQuorumOutcome> {
+    let Some(batch) = review_batch_by_id_in(tx, batch_id)? else {
+        return Ok(ReviewBatchQuorumOutcome::NoOp);
+    };
+    let members = review_batch_members_in(tx, batch_id)?;
+    let now = now_string();
+
+    match batch.status {
+        ReviewBatchStatus::Collecting => {
+            let mut reported = 0usize;
+            for role in LEAF_REVIEWER_ROLES {
+                match latest_attempt_for_role(&members, role) {
+                    Some(member) if leaf_attempt_is_settled(member) => {
+                        if member.status == ReviewBatchMemberStatus::Reported {
+                            reported += 1;
+                        }
+                    }
+                    _ => return Ok(ReviewBatchQuorumOutcome::NoOp),
+                }
+            }
+
+            if reported >= 2 {
+                let repo_remote_url = any_member_repo_remote_url(tx, &members)?;
+                let execution = insert_execution(
+                    tx,
+                    CreateExecutionInput::builder()
+                        .work_item_id(batch.cycle_root_id.clone())
+                        .kind(ExecutionKind::PrReview)
+                        .status(ExecutionStatus::Ready)
+                        .repo_remote_url(repo_remote_url)
+                        .build(),
+                )?;
+                let member_input = resolve_member_input(
+                    registry,
+                    "claude",
+                    ReviewBatchMemberRole::Supervisor,
+                    &batch.classification,
+                    execution.id.clone(),
+                )?;
+                validate_member_input(batch.phase, &member_input)?;
+                insert_batch_member_in_tx(tx, batch_id, &member_input, &now)?;
+                tx.execute(
+                    "UPDATE pr_review_batches SET status = 'supervising', updated_at = ?2 WHERE id = ?1",
+                    params![batch_id, now],
+                )?;
+                Ok(ReviewBatchQuorumOutcome::SupervisorDispatched)
+            } else {
+                tx.execute(
+                    "UPDATE pr_review_batches SET status = 'failed', completed_at = ?2, updated_at = ?2 WHERE id = ?1",
+                    params![batch_id, now],
+                )?;
+                super::workitems::insert_attention_item_row(
+                    tx,
+                    &CreateAttentionItemInput::builder()
+                        .work_item_id(batch.cycle_root_id.clone())
+                        .kind("pr_review_quorum_failed")
+                        .title("Automated reviewer: insufficient quorum")
+                        .body_markdown(format!(
+                            "Fewer than two of the three independent reviewers reported for {} \
+                             (batch `{batch_id}`) — the remaining role(s) exhausted their retry \
+                             without submitting a report. The review cannot produce a consolidated \
+                             verdict without at least two independent reports.",
+                            batch.pr_url,
+                        ))
+                        .build(),
+                )?;
+                Ok(ReviewBatchQuorumOutcome::InsufficientQuorum)
+            }
+        }
+        ReviewBatchStatus::Supervising => match latest_attempt_for_role(&members, ReviewBatchMemberRole::Supervisor) {
+            Some(member) if member.status == ReviewBatchMemberStatus::Reported => {
+                let proposal_id = member
+                    .report_proposal_id
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("reported supervisor member is missing its report_proposal_id"))?;
+                tx.execute(
+                    "UPDATE pr_review_batches
+                         SET status = 'completed', completed_at = ?2, updated_at = ?2, final_verdict_proposal_id = ?3
+                         WHERE id = ?1",
+                    params![batch_id, now, proposal_id],
+                )?;
+                Ok(ReviewBatchQuorumOutcome::Completed)
+            }
+            Some(member) if member.status == ReviewBatchMemberStatus::Failed => {
+                tx.execute(
+                    "UPDATE pr_review_batches SET status = 'failed', completed_at = ?2, updated_at = ?2 WHERE id = ?1",
+                    params![batch_id, now],
+                )?;
+                super::workitems::insert_attention_item_row(
+                    tx,
+                    &CreateAttentionItemInput::builder()
+                        .work_item_id(batch.cycle_root_id.clone())
+                        .kind("pr_review_quorum_failed")
+                        .title("Automated reviewer: supervisor did not produce a verdict")
+                        .body_markdown(format!(
+                            "The consolidating supervisor for {} (batch `{batch_id}`) stopped \
+                                 without submitting a review-verdict proposal. It is not retried \
+                                 automatically; the review cannot produce a consolidated verdict.",
+                            batch.pr_url,
+                        ))
+                        .build(),
+                )?;
+                Ok(ReviewBatchQuorumOutcome::InsufficientQuorum)
+            }
+            _ => Ok(ReviewBatchQuorumOutcome::NoOp),
+        },
+        ReviewBatchStatus::Applying | ReviewBatchStatus::Completed | ReviewBatchStatus::Failed => {
+            Ok(ReviewBatchQuorumOutcome::NoOp)
+        }
+    }
 }
 
 impl WorkDb {
@@ -419,16 +684,7 @@ impl WorkDb {
     /// Look up a batch by its durable id.
     pub fn review_batch(&self, batch_id: &str) -> Result<Option<ReviewBatch>> {
         let conn = self.connect()?;
-        conn.query_row(
-            "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
-                    phase, pr_number, pr_url, status, target_sha, updated_at,
-                    completed_at, final_verdict_proposal_id, merge_sha
-             FROM pr_review_batches WHERE id = ?1",
-            params![batch_id],
-            map_review_batch,
-        )
-        .optional()
-        .map_err(Into::into)
+        review_batch_by_id_in(&conn, batch_id)
     }
 
     /// Look up the only batch allowed for an immutable target.
@@ -461,17 +717,23 @@ impl WorkDb {
     /// Return every role-specific attempt in deterministic role/attempt order.
     pub fn review_batch_members(&self, batch_id: &str) -> Result<Vec<ReviewBatchMember>> {
         let conn = self.connect()?;
-        let mut statement = conn.prepare(
-            "SELECT id, batch_id, attempt, created_at, provider_effort,
-                    requested_driver, resolved_model, role, status, updated_at,
-                    execution_id, report_proposal_id, terminal_at
-             FROM pr_review_batch_members
-             WHERE batch_id = ?1
-             ORDER BY role ASC, attempt ASC, id ASC",
-        )?;
-        Ok(statement
-            .query_map(params![batch_id], map_review_batch_member)?
-            .collect::<rusqlite::Result<Vec<_>>>()?)
+        review_batch_members_in(&conn, batch_id)
+    }
+
+    /// Advance a batch past `collecting`/`supervising` if its members have
+    /// settled enough to decide the next step. See
+    /// [`try_advance_review_batch_quorum_in_tx`] for the state machine. Opens
+    /// its own transaction — callers that already hold one (e.g.
+    /// `apply_review_report`, `retry_dead_review_batch_member`) must call the
+    /// `_in_tx` function directly instead, since `WorkDb::connect` guards a
+    /// single shared connection and a nested transaction would deadlock.
+    pub fn try_advance_review_batch_quorum(&self, batch_id: &str) -> Result<ReviewBatchQuorumOutcome> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let registry = crate::driver::DriverRegistry::default();
+        let outcome = try_advance_review_batch_quorum_in_tx(&tx, batch_id, &registry)?;
+        tx.commit()?;
+        Ok(outcome)
     }
 
     /// Return the member that owns an execution, when that execution belongs
@@ -620,6 +882,12 @@ impl WorkDb {
             params![now, member.id],
         )?;
         if member.attempt >= 2 {
+            // This role has now permanently settled failed (no more
+            // retries) — the exact moment the quorum decision for this
+            // batch can change, so check it before committing rather than
+            // waiting for some other hook to notice.
+            let registry = crate::driver::DriverRegistry::default();
+            try_advance_review_batch_quorum_in_tx(&tx, &member.batch_id, &registry)?;
             tx.commit()?;
             return Ok(None);
         }
@@ -654,25 +922,7 @@ impl WorkDb {
             .status(ReviewBatchMemberStatus::Pending)
             .execution_id(retry.id.clone())
             .build();
-        let id = next_id("rvm");
-        tx.execute(
-            "INSERT INTO pr_review_batch_members (
-                id, batch_id, attempt, created_at, provider_effort,
-                requested_driver, resolved_model, role, status, updated_at,
-                execution_id, report_proposal_id, terminal_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?4, ?9, NULL, NULL)",
-            params![
-                id,
-                member.batch_id,
-                member_input.attempt,
-                now,
-                member_input.provider_effort,
-                member_input.requested_driver,
-                member_input.resolved_model,
-                member_input.role.as_str(),
-                member_input.execution_id,
-            ],
-        )?;
+        insert_batch_member_in_tx(&tx, &member.batch_id, &member_input, &now)?;
         tx.commit()?;
         Ok(Some(retry))
     }

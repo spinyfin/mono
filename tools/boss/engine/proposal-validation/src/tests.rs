@@ -70,7 +70,16 @@ fn valid_payload_for(kind: ProposalKind) -> Value {
         }),
         ProposalKind::ReviewVerdict => json!({
             "batch_id": "rvb_123",
-            "verdict": {"outcome": "approved"},
+            "verdict": {
+                "batch_id": "rvb_123",
+                "pr_url": "https://github.com/o/r/pull/123",
+                "target_sha": "head_123",
+                "phase": "pre_merge",
+                "summary": "Clean.",
+                "revision_warranted": false,
+                "findings": [],
+                "contradictions": [],
+            },
         }),
         ProposalKind::RunDone => json!({"outcome": "delivered", "summary": "opened the PR"}),
     }
@@ -134,7 +143,8 @@ fn canonical_payloads_deserialize_as_their_payload_struct() {
     );
     let parsed: ReviewVerdictProposalPayload = serde_json::from_str(&canonical).unwrap();
     assert_eq!(parsed.batch_id, "rvb_123");
-    assert_eq!(parsed.verdict, json!({"outcome": "approved"}));
+    assert_eq!(parsed.verdict["batch_id"], "rvb_123");
+    assert_eq!(parsed.verdict["revision_warranted"], false);
 }
 
 #[test]
@@ -547,6 +557,75 @@ fn caller_idempotency_key_rejects_over_length() {
 #[test]
 fn caller_idempotency_key_accepts_a_normal_key() {
     validate_caller_idempotency_key("my-custom-key").unwrap();
+}
+
+// ── review_verdict's deep-validation branches ───────────────────────────────
+
+/// A `verdict` that fails to deserialize as `SupervisorVerdict` (rather than
+/// merely not being a JSON object) must be reported on the `verdict` field
+/// itself, naming the schema it does not match.
+#[test]
+fn review_verdict_rejects_a_verdict_that_does_not_match_the_supervisor_schema() {
+    let errors = errs(
+        ProposalKind::ReviewVerdict,
+        json!({"batch_id": "rvb_123", "verdict": {"batch_id": "rvb_123"}}),
+    );
+    assert!(
+        message_for(&errors, "verdict").contains("supervisor verdict schema"),
+        "{errors:?}"
+    );
+}
+
+/// The verdict's own `batch_id` must match the payload's top-level
+/// `batch_id` — a mismatch is exactly the identity confusion
+/// `apply_review_verdict` also guards against later in the pipeline.
+#[test]
+fn review_verdict_rejects_a_verdict_batch_id_mismatch() {
+    let mut payload = valid_payload_for(ProposalKind::ReviewVerdict);
+    payload["verdict"]["batch_id"] = json!("rvb_other");
+    let errors = errs(ProposalKind::ReviewVerdict, payload);
+    assert_eq!(message_for(&errors, "verdict.batch_id"), "must match `batch_id`");
+}
+
+/// A finding with an empty `sources` list is structurally unattributed —
+/// this must be rejected rather than left to prompt discipline, per the PR's
+/// "semantic dedup is structural, not just a prompt instruction" design.
+#[test]
+fn review_verdict_rejects_a_finding_with_no_sources() {
+    let mut payload = valid_payload_for(ProposalKind::ReviewVerdict);
+    payload["verdict"]["findings"] = json!([{
+        "severity": "high",
+        "category": "correctness",
+        "confidence": "high",
+        "file": "src/lib.rs",
+        "title": "Unattributed finding",
+        "detail": "No leaf named.",
+        "sources": [],
+    }]);
+    let errors = errs(ProposalKind::ReviewVerdict, payload);
+    assert!(
+        message_for(&errors, "verdict.findings[0].sources").contains("at least one source"),
+        "{errors:?}"
+    );
+}
+
+/// A contradiction with fewer than two positions cannot represent a genuine
+/// disagreement — this is the same structural guarantee as `sources`, on the
+/// other new collection.
+#[test]
+fn review_verdict_rejects_a_contradiction_with_fewer_than_two_positions() {
+    let mut payload = valid_payload_for(ProposalKind::ReviewVerdict);
+    payload["verdict"]["contradictions"] = json!([{
+        "file": "src/lib.rs",
+        "description": "Only one side recorded.",
+        "positions": [{"role": "claude", "claim": "It was removed."}],
+        "resolution": "Unresolved.",
+    }]);
+    let errors = errs(ProposalKind::ReviewVerdict, payload);
+    assert!(
+        message_for(&errors, "verdict.contradictions[0].positions").contains("at least two positions"),
+        "{errors:?}"
+    );
 }
 
 // ── run_done ────────────────────────────────────────────────────────────────

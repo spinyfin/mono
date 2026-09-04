@@ -877,6 +877,19 @@ impl HostAdapter for SshHostAdapter {
         //    outside the workspace tree and loaded via `--settings`,
         //    mirroring the local runner.
         let remote_socket = remote_events_socket_path(&run_id);
+        // Mirrors the local pane-spawn path's own lookup: only a review
+        // batch's Supervisor-role member gets the supervisor CLAUDE.md.
+        let is_review_supervisor = execution.kind == boss_protocol::ExecutionKind::PrReview
+            && self
+                .work_db
+                .review_batch_member_for_execution(&execution.id)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "determining whether execution {} is a review supervisor: {error}",
+                        execution.id
+                    )
+                })?
+                .is_some_and(|member| member.role == boss_protocol::ReviewBatchMemberRole::Supervisor);
         let settings_input = WorkerSetupInput {
             run_id: run_id.clone(),
             lease_id: lease_id.clone(),
@@ -890,6 +903,7 @@ impl HostAdapter for SshHostAdapter {
             // so a reviewer/triage/answer-agent dispatched remotely still gets
             // its reduced surface instead of silently becoming Standard.
             worker_kind: crate::worker_setup::worker_kind_for_execution(&execution.kind),
+            is_review_supervisor,
             // Mirrors `WorkerSpawnOpts` above: a remotely dispatched triage
             // worker always gets the legacy marker-only CLAUDE.md, since
             // SshHostAdapter has no FeatureFlagsStore to read
@@ -1554,6 +1568,7 @@ mod tests {
             task_kind: None,
             worker_kind: crate::worker_setup::WorkerKind::Standard,
             automation_outcome_proposals_seam_enabled: false,
+            is_review_supervisor: false,
         }
     }
 

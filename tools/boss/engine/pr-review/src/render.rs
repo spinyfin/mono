@@ -165,16 +165,34 @@ pub fn render_revision_instructions(result: &ReviewResult, origin: ReviewOrigin)
     out
 }
 
-/// Render the CLAUDE.md for a reviewer worker.
+/// Shared CLAUDE.md body for every read-only review worker — the leaf
+/// reviewer ([`render_reviewer_claude_md`]) and the consolidating supervisor
+/// ([`crate::supervisor_render::render_supervisor_claude_md`]). Both roles
+/// share the read-only mandate, the `gh --repo` note, the workspace section,
+/// and the read-only VCS section verbatim; only the opening sentence, the
+/// last forbidden-actions bullet (which permitted write it excepts), the
+/// paragraph(s) describing that one permitted write, and any extra
+/// role-specific sentence in the workspace section actually differ. Keeping
+/// this body in one place means a change to the shared sections (or this
+/// rationale) never has to be made twice.
 ///
-/// Reviewer workers operate **read-only**: they read PR diffs and workspace
-/// files but must not write, push, or post to GitHub. This CLAUDE.md
-/// prominently states that mandate and omits PR-creation / VCS-push
-/// guidance entirely (those actions are also blocked by the reviewer denylist,
-/// so this is the belt that accompanies that suspenders layer).
+/// This file is handed to every reviewer regardless of which delivery
+/// contract its task prompt actually uses — the legacy artifact/transcript
+/// path ([`render_reviewer_initial_prompt`]) or the review-batch
+/// `boss propose review-report` path ([`render_batch_reviewer_initial_prompt`]).
+/// It must therefore authorise both here rather than naming only the
+/// legacy `ReviewResult` write as "the one permitted write": a batch
+/// member that took that literally at its word would read `boss propose`
+/// as forbidden by the line below it (`cube pr create`/`cube pr update` or
+/// any Boss PR helper) and could decline to submit its report at all.
 ///
-/// The workspace is already checked out to the PR head SHA, so the reviewer
-/// can read files directly without `gh pr diff` for every lookup.
+/// Some Codex reviewer sandboxes also relocate the session's cwd to an
+/// engine-owned scratch directory outside the checkout (`--cd`, see
+/// `codex::reviewer_output_sandbox_extra_args`), so a bare `jj log`/`jj
+/// show`/`jj diff` has no `.jj` in its ancestry there. `-R
+/// {workspace_path}` makes every jj invocation resolve against the
+/// checkout regardless of cwd, and is a harmless no-op when cwd is
+/// already the checkout.
 ///
 /// `absolute_paths` and `boundaries_and_coordinator` are shared blocks
 /// supplied by the engine rather than owned here: the same text is used
@@ -184,34 +202,32 @@ pub fn render_revision_instructions(result: &ReviewResult, origin: ReviewOrigin)
 /// the harness behaviour it steers around is not reviewer-specific — and
 /// `boundaries_and_coordinator` is interpolated as the final section, so it
 /// should start at the `## Boundaries` heading.
-pub fn render_reviewer_claude_md(
+pub(crate) struct ReviewWorkerRoleRules<'a> {
+    pub role_heading: &'a str,
+    pub intro: &'a str,
+    pub last_forbidden_bullet: &'a str,
+    pub permitted_write_section: &'a str,
+    pub workspace_extra: &'a str,
+}
+
+pub(crate) fn render_review_worker_claude_md(
+    role: ReviewWorkerRoleRules<'_>,
     lease_id: &str,
     workspace_path: &str,
     absolute_paths: &str,
     boundaries_and_coordinator: &str,
 ) -> String {
-    // This file is handed to every reviewer regardless of which delivery
-    // contract its task prompt actually uses — the legacy artifact/transcript
-    // path ([`render_reviewer_initial_prompt`]) or the review-batch
-    // `boss propose review-report` path ([`render_batch_reviewer_initial_prompt`]).
-    // It must therefore authorise both here rather than naming only the
-    // legacy `ReviewResult` write as "the one permitted write": a batch
-    // member that took that literally at its word would read `boss propose`
-    // as forbidden by the line below it (`cube pr create`/`cube pr update` or
-    // any Boss PR helper) and could decline to submit its report at all.
-    //
-    // Some Codex reviewer sandboxes also relocate the session's cwd to an
-    // engine-owned scratch directory outside the checkout (`--cd`, see
-    // `codex::reviewer_output_sandbox_extra_args`), so a bare `jj log`/`jj
-    // show`/`jj diff` has no `.jj` in its ancestry there. `-R
-    // {workspace_path}` makes every jj invocation resolve against the
-    // checkout regardless of cwd, and is a harmless no-op when cwd is
-    // already the checkout.
+    let ReviewWorkerRoleRules {
+        role_heading,
+        intro,
+        last_forbidden_bullet,
+        permitted_write_section,
+        workspace_extra,
+    } = role;
     format!(
-        "# Boss reviewer rules\n\
+        "# Boss {role_heading} rules\n\
          \n\
-         You are running inside a Boss-managed **reviewer** session. The engine\n\
-         spawned you in a leased cube workspace checked out to the PR head.\n\
+         {intro}\n\
          \n\
          ## Read-only mandate (HARD CONSTRAINT)\n\
          \n\
@@ -225,35 +241,9 @@ pub fn render_reviewer_claude_md(
          - Opening, merging, closing, editing, or commenting on a PR\n\
            (`gh pr create/merge/close/edit/comment/review`).\n\
          - Interacting with GitHub issues in any write capacity.\n\
-         - Running `cube pr create`/`cube pr update` or any Boss PR helper —\n\
-           this does NOT include the `boss propose review-report` call named\n\
-           below, which is not a Boss PR helper: it reports findings, it does\n\
-           not touch the PR.\n\
+         - {last_forbidden_bullet}\n\
          \n\
-         **The one permitted write** is whichever single delivery your task\n\
-         prompt actually names:\n\
-         \n\
-         - If it names an engine-owned `ReviewResult` artifact path\n\
-           (also exported as `$BOSS_STRUCTURED_OUTPUT`): write your\n\
-           `ReviewResult` JSON there.\n\
-         - If it instead names a review-report body-file path and a\n\
-           `boss propose review-report` command: write the report JSON to\n\
-           that body file, then run exactly that one `boss propose` call to\n\
-           submit it. `boss propose` is a local call to the engine control\n\
-           socket, not a write to the PR or repo.\n\
-         \n\
-         Either path is OUTSIDE every worker workspace, so making that one\n\
-         write (or write-then-submit) does not violate the read-only mandate.\n\
-         Do not write anywhere else, and do not use any other Boss PR helper.\n\
-         \n\
-         Anything you would \"fix\", describe as a finding in that output\n\
-         instead. Your feedback stays inside Boss — **it is never posted to\n\
-         GitHub**.\n\
-         \n\
-         Allowed read-only tools: `grep`, `find`, `cat`, `head`, `tail`,\n\
-         `Read`, `jj log`, `jj show`, `jj diff`, `gh pr view`, `gh pr diff`,\n\
-         `gh pr list`, and similar read-only operations.\n\
-         \n\
+         {permitted_write_section}\
          ## `gh` requires `--repo` in this workspace\n\
          \n\
          `gh` cannot auto-detect the repo in a jj workspace (there is no `.git`\n\
@@ -266,15 +256,9 @@ pub fn render_reviewer_claude_md(
          - Workspace path: `{workspace_path}`\n\
          - Cube lease id: `{lease}`\n\
          \n\
-         The workspace is already checked out to the PR head. You can read\n\
-         changed files and surrounding context directly — use `Read`, `cat`,\n\
-         `grep`, etc. on files in `{workspace_path}` (use the absolute path;\n\
-         your session's current working directory is not guaranteed to be\n\
-         inside the checkout — see VCS below). No need to use\n\
-         `git show <sha>:<path>` or fetch files via `gh`.\n\
-         \n\
-         Lease held for the lifetime of this run. Do not lease, release,\n\
-         or mutate cube state.\n\
+         The workspace is already checked out to the PR head. {workspace_extra}Lease held for\n\
+         the lifetime of this run. Do not lease, release, or mutate cube\n\
+         state.\n\
          \n\
          {absolute_paths}\
          \n\
@@ -287,14 +271,89 @@ pub fn render_reviewer_claude_md(
          \n\
          - `jj log -R {workspace_path}`, `jj show -R {workspace_path}`,\n\
            `jj diff -R {workspace_path}` — browse history and diffs.\n\
-         - `gh pr diff <url>` — fetch the PR diff (useful for the annotated diff view).\n\
+         - `gh pr diff <url>` — fetch the PR diff.\n\
          - `gh pr view <url>` — read the PR description.\n\
          \n\
          {boundaries_and_coordinator}",
+        role_heading = role_heading,
+        intro = intro,
+        last_forbidden_bullet = last_forbidden_bullet,
+        permitted_write_section = permitted_write_section,
+        workspace_extra = workspace_extra,
         lease = lease_id,
         workspace_path = workspace_path,
         absolute_paths = absolute_paths,
         boundaries_and_coordinator = boundaries_and_coordinator,
+    )
+}
+
+/// Render the CLAUDE.md for a reviewer worker.
+///
+/// Reviewer workers operate **read-only**: they read PR diffs and workspace
+/// files but must not write, push, or post to GitHub. This CLAUDE.md
+/// prominently states that mandate and omits PR-creation / VCS-push
+/// guidance entirely (those actions are also blocked by the reviewer denylist,
+/// so this is the belt that accompanies that suspenders layer).
+///
+/// The workspace is already checked out to the PR head SHA, so the reviewer
+/// can read files directly without `gh pr diff` for every lookup.
+///
+/// See [`render_review_worker_claude_md`] for the shared body and the
+/// rationale behind its shape.
+pub fn render_reviewer_claude_md(
+    lease_id: &str,
+    workspace_path: &str,
+    absolute_paths: &str,
+    boundaries_and_coordinator: &str,
+) -> String {
+    render_review_worker_claude_md(
+        ReviewWorkerRoleRules {
+            role_heading: "reviewer",
+            intro: "You are running inside a Boss-managed **reviewer** session. The engine\n\
+                    spawned you in a leased cube workspace checked out to the PR head.",
+            last_forbidden_bullet: "Running `cube pr create`/`cube pr update` or any Boss PR helper —\n\
+               this does NOT include the `boss propose review-report` call named\n\
+               below, which is not a Boss PR helper: it reports findings, it does\n\
+               not touch the PR.",
+            permitted_write_section: "**The one permitted write** is whichever single delivery your task\n\
+             prompt actually names:\n\
+             \n\
+             - If it names an engine-owned `ReviewResult` artifact path\n\
+               (also exported as `$BOSS_STRUCTURED_OUTPUT`): write your\n\
+               `ReviewResult` JSON there.\n\
+             - If it instead names a review-report body-file path and a\n\
+               `boss propose review-report` command: write the report JSON to\n\
+               that body file, then run exactly that one `boss propose` call to\n\
+               submit it. `boss propose` is a local call to the engine control\n\
+               socket, not a write to the PR or repo.\n\
+             \n\
+             Either path is OUTSIDE every worker workspace, so making that one\n\
+             write (or write-then-submit) does not violate the read-only mandate.\n\
+             Do not write anywhere else, and do not use any other Boss PR helper.\n\
+             \n\
+             Anything you would \"fix\", describe as a finding in that output\n\
+             instead. Your feedback stays inside Boss — **it is never posted to\n\
+             GitHub**.\n\
+             \n\
+             Allowed read-only tools: `grep`, `find`, `cat`, `head`, `tail`,\n\
+             `Read`, `jj log`, `jj show`, `jj diff`, `gh pr view`, `gh pr diff`,\n\
+             `gh pr list`, and similar read-only operations.\n\
+             \n",
+            workspace_extra: &format!(
+                "You can read\n\
+                 changed files and surrounding context directly — use `Read`, `cat`,\n\
+                 `grep`, etc. on files in `{workspace_path}` (use the absolute path;\n\
+                 your session's current working directory is not guaranteed to be\n\
+                 inside the checkout — see VCS below). No need to use\n\
+                 `git show <sha>:<path>` or fetch files via `gh`.\n\
+                 \n\
+                 "
+            ),
+        },
+        lease_id,
+        workspace_path,
+        absolute_paths,
+        boundaries_and_coordinator,
     )
 }
 

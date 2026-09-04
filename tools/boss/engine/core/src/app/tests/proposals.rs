@@ -422,7 +422,19 @@ async fn every_kind_can_be_submitted() {
                     },
                 })
             }
-            ProposalKind::ReviewVerdict => json!({"batch_id": "rvb_missing", "verdict": {"outcome": "approved"}}),
+            ProposalKind::ReviewVerdict => json!({
+                "batch_id": "rvb_missing",
+                "verdict": {
+                    "batch_id": "rvb_missing",
+                    "pr_url": "https://github.com/o/r/pull/1",
+                    "target_sha": "head_missing",
+                    "phase": "pre_merge",
+                    "summary": "Clean.",
+                    "revision_warranted": false,
+                    "findings": [],
+                    "contradictions": [],
+                },
+            }),
             ProposalKind::RunDone => json!({"outcome": "delivered", "summary": "S"}),
         };
         let (proposal, _) = submitted(submit(&fx, kind, payload).await);

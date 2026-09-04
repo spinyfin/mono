@@ -131,8 +131,8 @@ pub(crate) enum ProposeCommand {
     /// abc123 --body-file review.json`
     ReviewReport(ReviewReportArgs),
     /// Submit the supervisor's consolidated structured verdict for a batch.
-    /// The verdict is persisted for asynchronous application; this command
-    /// does not itself change the reviewed work item's state.
+    /// The verdict is validated and recorded immediately, completing the
+    /// batch; it does not itself change the reviewed work item's state.
     ///
     /// Example: `boss propose review-verdict --batch-id rvb_abc --verdict-file
     /// verdict.json`

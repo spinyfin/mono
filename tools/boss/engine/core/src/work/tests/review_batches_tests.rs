@@ -3,7 +3,7 @@
 
 use boss_protocol::{
     ProposalDecider, ProposalKind, ProposalState, ReviewBatchMemberRole, ReviewBatchMemberStatus, ReviewBatchPhase,
-    ReviewClassification, ReviewLanguageBucket, ReviewProfile,
+    ReviewBatchStatus, ReviewClassification, ReviewLanguageBucket, ReviewProfile,
 };
 
 use super::*;
@@ -76,6 +76,404 @@ fn submit_review_report(
 fn assert_member_unchanged(member: &ReviewBatchMember, status: ReviewBatchMemberStatus) {
     assert_eq!(member.status, status);
     assert_eq!(member.report_proposal_id, None);
+}
+
+/// A verdict submission is only accepted while its batch is `supervising`
+/// (see `apply_review_verdict`). Tests that only exercise the proposal
+/// ledger's own submission/supersession mechanics — not the full quorum flow
+/// that would normally get a batch there — force the status directly rather
+/// than standing up three leaf reports first.
+fn force_batch_supervising(db: &WorkDb, batch_id: &str) {
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_batches SET status = 'supervising' WHERE id = ?1",
+            rusqlite::params![batch_id],
+        )
+        .unwrap();
+}
+
+fn verdict_payload(batch_id: &str, target_sha: &str) -> String {
+    format!(
+        r#"{{"batch_id":"{batch_id}","verdict":{{"batch_id":"{batch_id}","pr_url":"https://github.com/example/repo/pull/42","target_sha":"{target_sha}","phase":"pre_merge","summary":"Clean.","revision_warranted":false,"findings":[],"contradictions":[]}}}}"#
+    )
+}
+
+/// Like [`member`] but with an explicit attempt/status, for driving
+/// [`try_advance_review_batch_quorum_in_tx`]'s branches directly without
+/// standing up the full report-submission flow.
+fn member_with(
+    role: ReviewBatchMemberRole,
+    execution_id: Option<String>,
+    attempt: i64,
+    status: ReviewBatchMemberStatus,
+) -> ReviewBatchMemberCreateInput {
+    ReviewBatchMemberCreateInput::builder()
+        .attempt(attempt)
+        .provider_effort("medium")
+        .requested_driver(match role {
+            ReviewBatchMemberRole::ClaudeReviewer => "claude",
+            ReviewBatchMemberRole::CodexReviewer => "codex",
+            ReviewBatchMemberRole::GrokReviewer => "grok",
+            ReviewBatchMemberRole::Supervisor => "claude",
+            ReviewBatchMemberRole::PostMergeReviewer => "claude",
+        })
+        .resolved_model("test-model")
+        .role(role)
+        .status(status)
+        .maybe_execution_id(execution_id)
+        .build()
+}
+
+fn advance_quorum(db: &WorkDb, batch_id: &str) -> ReviewBatchQuorumOutcome {
+    db.try_advance_review_batch_quorum(batch_id).unwrap()
+}
+
+fn find_quorum_failed_attention(db: &WorkDb, work_item_id: &str) -> Option<boss_protocol::WorkAttentionItem> {
+    db.list_attention_items_for_work_item(work_item_id)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.kind == "pr_review_quorum_failed")
+}
+
+/// (a) All three leaves reported: a `Supervisor` member and a `Ready`
+/// `pr_review` execution are created, and the batch moves to `supervising`.
+#[test]
+fn quorum_dispatches_supervisor_once_all_three_leaves_report() {
+    let db = WorkDb::open(temp_db_path("quorum-all-reported")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let executions: Vec<_> = (0..3)
+        .map(|_| {
+            db.create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(cycle_root.id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[
+                member_with(
+                    ReviewBatchMemberRole::ClaudeReviewer,
+                    Some(executions[0].id.clone()),
+                    1,
+                    ReviewBatchMemberStatus::Reported,
+                ),
+                member_with(
+                    ReviewBatchMemberRole::CodexReviewer,
+                    Some(executions[1].id.clone()),
+                    1,
+                    ReviewBatchMemberStatus::Reported,
+                ),
+                member_with(
+                    ReviewBatchMemberRole::GrokReviewer,
+                    Some(executions[2].id.clone()),
+                    1,
+                    ReviewBatchMemberStatus::Reported,
+                ),
+            ],
+        )
+        .unwrap();
+
+    let outcome = advance_quorum(&db, &batch.id);
+    assert!(matches!(outcome, ReviewBatchQuorumOutcome::SupervisorDispatched));
+
+    let updated = db.review_batch(&batch.id).unwrap().unwrap();
+    assert_eq!(updated.status, ReviewBatchStatus::Supervising);
+
+    let members = db.review_batch_members(&batch.id).unwrap();
+    let supervisor = members
+        .into_iter()
+        .find(|member| member.role == ReviewBatchMemberRole::Supervisor)
+        .expect("a supervisor member must be created");
+    let supervisor_execution_id = supervisor
+        .execution_id
+        .expect("supervisor member must own an execution");
+    let supervisor_execution = db.get_execution(&supervisor_execution_id).unwrap();
+    assert_eq!(supervisor_execution.status, ExecutionStatus::Ready);
+    assert_eq!(supervisor_execution.kind, ExecutionKind::PrReview);
+}
+
+/// (b) Two reported + one failed with its retry exhausted (`attempt >= 2`) is
+/// the named two-of-three case: same dispatch as all three reporting.
+#[test]
+fn quorum_dispatches_supervisor_on_two_of_three_with_one_exhausted() {
+    let db = WorkDb::open(temp_db_path("quorum-two-of-three")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let executions: Vec<_> = (0..3)
+        .map(|_| {
+            db.create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(cycle_root.id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[
+                member_with(
+                    ReviewBatchMemberRole::ClaudeReviewer,
+                    Some(executions[0].id.clone()),
+                    1,
+                    ReviewBatchMemberStatus::Reported,
+                ),
+                member_with(
+                    ReviewBatchMemberRole::CodexReviewer,
+                    Some(executions[1].id.clone()),
+                    1,
+                    ReviewBatchMemberStatus::Reported,
+                ),
+                member_with(
+                    ReviewBatchMemberRole::GrokReviewer,
+                    Some(executions[2].id.clone()),
+                    2,
+                    ReviewBatchMemberStatus::Failed,
+                ),
+            ],
+        )
+        .unwrap();
+
+    let outcome = advance_quorum(&db, &batch.id);
+    assert!(matches!(outcome, ReviewBatchQuorumOutcome::SupervisorDispatched));
+    assert_eq!(
+        db.review_batch(&batch.id).unwrap().unwrap().status,
+        ReviewBatchStatus::Supervising
+    );
+}
+
+/// (c) One reported + two failed-exhausted: the batch fails outright with a
+/// human-visible `pr_review_quorum_failed` attention, rather than producing a
+/// clean verdict from a single source.
+#[test]
+fn quorum_fails_the_batch_when_fewer_than_two_leaves_report() {
+    let db = WorkDb::open(temp_db_path("quorum-insufficient")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let executions: Vec<_> = (0..3)
+        .map(|_| {
+            db.create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(cycle_root.id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[
+                member_with(
+                    ReviewBatchMemberRole::ClaudeReviewer,
+                    Some(executions[0].id.clone()),
+                    1,
+                    ReviewBatchMemberStatus::Reported,
+                ),
+                member_with(
+                    ReviewBatchMemberRole::CodexReviewer,
+                    Some(executions[1].id.clone()),
+                    2,
+                    ReviewBatchMemberStatus::Failed,
+                ),
+                member_with(
+                    ReviewBatchMemberRole::GrokReviewer,
+                    Some(executions[2].id.clone()),
+                    2,
+                    ReviewBatchMemberStatus::Failed,
+                ),
+            ],
+        )
+        .unwrap();
+
+    let outcome = advance_quorum(&db, &batch.id);
+    assert!(matches!(outcome, ReviewBatchQuorumOutcome::InsufficientQuorum));
+
+    let updated = db.review_batch(&batch.id).unwrap().unwrap();
+    assert_eq!(updated.status, ReviewBatchStatus::Failed);
+    assert!(updated.completed_at.is_some());
+
+    let attention =
+        find_quorum_failed_attention(&db, &cycle_root.id).expect("a pr_review_quorum_failed attention must be filed");
+    assert!(attention.title.to_lowercase().contains("insufficient quorum"));
+}
+
+/// (d) One leaf still pending/running: the quorum must not act prematurely —
+/// no-op, no supervisor member created.
+#[test]
+fn quorum_is_a_noop_while_a_leaf_is_still_in_flight() {
+    let db = WorkDb::open(temp_db_path("quorum-in-flight")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let executions: Vec<_> = (0..3)
+        .map(|_| {
+            db.create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(cycle_root.id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[
+                member_with(
+                    ReviewBatchMemberRole::ClaudeReviewer,
+                    Some(executions[0].id.clone()),
+                    1,
+                    ReviewBatchMemberStatus::Reported,
+                ),
+                member_with(
+                    ReviewBatchMemberRole::CodexReviewer,
+                    Some(executions[1].id.clone()),
+                    1,
+                    ReviewBatchMemberStatus::Reported,
+                ),
+                member_with(
+                    ReviewBatchMemberRole::GrokReviewer,
+                    Some(executions[2].id.clone()),
+                    1,
+                    ReviewBatchMemberStatus::Running,
+                ),
+            ],
+        )
+        .unwrap();
+
+    let outcome = advance_quorum(&db, &batch.id);
+    assert!(matches!(outcome, ReviewBatchQuorumOutcome::NoOp));
+    assert_eq!(
+        db.review_batch(&batch.id).unwrap().unwrap().status,
+        ReviewBatchStatus::Collecting
+    );
+    assert!(
+        db.review_batch_members(&batch.id)
+            .unwrap()
+            .iter()
+            .all(|member| member.role != ReviewBatchMemberRole::Supervisor),
+        "no supervisor member may be created before the quorum is decidable"
+    );
+}
+
+/// (e) Calling the quorum advance twice after a dispatch must not create a
+/// second supervisor member — the doc comment's claimed idempotency.
+#[test]
+fn quorum_dispatch_is_idempotent_across_redundant_calls() {
+    let db = WorkDb::open(temp_db_path("quorum-idempotent-dispatch")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let executions: Vec<_> = (0..3)
+        .map(|_| {
+            db.create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(cycle_root.id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[
+                member_with(
+                    ReviewBatchMemberRole::ClaudeReviewer,
+                    Some(executions[0].id.clone()),
+                    1,
+                    ReviewBatchMemberStatus::Reported,
+                ),
+                member_with(
+                    ReviewBatchMemberRole::CodexReviewer,
+                    Some(executions[1].id.clone()),
+                    1,
+                    ReviewBatchMemberStatus::Reported,
+                ),
+                member_with(
+                    ReviewBatchMemberRole::GrokReviewer,
+                    Some(executions[2].id.clone()),
+                    1,
+                    ReviewBatchMemberStatus::Reported,
+                ),
+            ],
+        )
+        .unwrap();
+
+    assert!(matches!(
+        advance_quorum(&db, &batch.id),
+        ReviewBatchQuorumOutcome::SupervisorDispatched
+    ));
+    // The batch is now `supervising`, so a redundant call is a plain no-op
+    // per the "any other status" branch — this is what makes calling the
+    // hook from multiple settle points safe.
+    assert!(matches!(advance_quorum(&db, &batch.id), ReviewBatchQuorumOutcome::NoOp));
+
+    let supervisor_count = db
+        .review_batch_members(&batch.id)
+        .unwrap()
+        .into_iter()
+        .filter(|member| member.role == ReviewBatchMemberRole::Supervisor)
+        .count();
+    assert_eq!(supervisor_count, 1, "exactly one supervisor member must ever exist");
+}
+
+/// (f) A supervisor that settles `Failed` (it gets no retry, unlike a leaf)
+/// fails the batch with the second `pr_review_quorum_failed` attention
+/// variant.
+#[test]
+fn quorum_fails_the_batch_when_the_supervisor_fails() {
+    let db = WorkDb::open(temp_db_path("quorum-supervisor-failed")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member_with(
+                ReviewBatchMemberRole::Supervisor,
+                Some(execution.id.clone()),
+                1,
+                ReviewBatchMemberStatus::Failed,
+            )],
+        )
+        .unwrap();
+    force_batch_supervising(&db, &batch.id);
+
+    let outcome = advance_quorum(&db, &batch.id);
+    assert!(matches!(outcome, ReviewBatchQuorumOutcome::InsufficientQuorum));
+
+    let updated = db.review_batch(&batch.id).unwrap().unwrap();
+    assert_eq!(updated.status, ReviewBatchStatus::Failed);
+    assert!(updated.completed_at.is_some());
+
+    let attention =
+        find_quorum_failed_attention(&db, &cycle_root.id).expect("a pr_review_quorum_failed attention must be filed");
+    assert!(attention.title.to_lowercase().contains("supervisor"));
 }
 
 /// Batch persistence preserves the raw classifier result and the resolved
@@ -460,7 +858,7 @@ fn missing_review_report_marks_only_its_member_failed() {
 }
 
 #[test]
-fn review_verdict_remains_proposed_for_the_asynchronous_applier() {
+fn review_verdict_auto_applies_and_completes_the_batch() {
     let db = WorkDb::open(temp_db_path("review-verdict-proposal")).unwrap();
     let product = create_test_product(&db);
     let cycle_root = create_test_chore_manual(&db, product.id, "review target");
@@ -479,29 +877,48 @@ fn review_verdict_remains_proposed_for_the_asynchronous_applier() {
             &[member(ReviewBatchMemberRole::Supervisor, Some(execution.id.clone()))],
         )
         .unwrap();
+    force_batch_supervising(&db, &batch.id);
 
     let outcome = db
         .submit_worker_proposal(SubmitWorkerProposalInput {
             execution_id: &execution.id,
             work_item_id: &cycle_root.id,
             kind: ProposalKind::ReviewVerdict,
-            payload_json: &format!(r#"{{"batch_id":"{}","verdict":{{"outcome":"approved"}}}}"#, batch.id),
+            payload_json: &verdict_payload(&batch.id, "head-sha"),
             idempotency_key: "verdict-1",
         })
         .unwrap()
         .unwrap();
 
-    assert_eq!(outcome.proposal.state, ProposalState::Proposed);
-    assert_eq!(outcome.proposal.applied_ref, None);
+    assert_eq!(outcome.proposal.state, ProposalState::Applied);
+    assert_eq!(outcome.proposal.applied_ref.as_deref(), Some(batch.id.as_str()));
+    let completed = db.review_batch(&batch.id).unwrap().unwrap();
+    assert_eq!(completed.status, ReviewBatchStatus::Completed);
     assert_eq!(
-        db.review_batch(&batch.id).unwrap().unwrap().final_verdict_proposal_id,
-        None
+        completed.final_verdict_proposal_id.as_deref(),
+        Some(outcome.proposal.id.as_str())
     );
+    assert!(completed.completed_at.is_some());
+
+    let member = db
+        .review_batch_members(&batch.id)
+        .unwrap()
+        .into_iter()
+        .find(|member| member.role == ReviewBatchMemberRole::Supervisor)
+        .unwrap();
+    assert_eq!(member.status, ReviewBatchMemberStatus::Reported);
+    assert_eq!(member.report_proposal_id.as_deref(), Some(outcome.proposal.id.as_str()));
 }
 
+/// A second, corrected verdict submission from the SAME supervisor member
+/// that already completed this exact batch is accepted, not rejected: it
+/// supersedes the first (schema-valid but potentially wrong) verdict and
+/// re-points the batch at the corrected one. This is the supervisor's only
+/// correction path, since the batch synchronously completes on the first
+/// schema-valid submission and nothing else re-opens it.
 #[test]
-fn newer_review_verdict_supersedes_the_prior_batch_verdict() {
-    let db = WorkDb::open(temp_db_path("review-verdict-supersede")).unwrap();
+fn a_corrected_review_verdict_from_the_same_supervisor_supersedes_the_prior_one() {
+    let db = WorkDb::open(temp_db_path("review-verdict-correction")).unwrap();
     let product = create_test_product(&db);
     let cycle_root = create_test_chore_manual(&db, product.id, "review target");
     let execution = db
@@ -519,28 +936,189 @@ fn newer_review_verdict_supersedes_the_prior_batch_verdict() {
             &[member(ReviewBatchMemberRole::Supervisor, Some(execution.id.clone()))],
         )
         .unwrap();
-    let submit = |idempotency_key| {
-        db.submit_worker_proposal(SubmitWorkerProposalInput {
+    force_batch_supervising(&db, &batch.id);
+
+    let first = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
             execution_id: &execution.id,
             work_item_id: &cycle_root.id,
             kind: ProposalKind::ReviewVerdict,
-            payload_json: &format!(r#"{{"batch_id":"{}","verdict":{{"outcome":"approved"}}}}"#, batch.id),
-            idempotency_key,
+            payload_json: &verdict_payload(&batch.id, "head-sha"),
+            idempotency_key: "verdict-1",
         })
         .unwrap()
+        .unwrap();
+    assert_eq!(first.proposal.state, ProposalState::Applied);
+
+    let second = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &execution.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &verdict_payload(&batch.id, "head-sha"),
+            idempotency_key: "verdict-2",
+        })
         .unwrap()
-    };
-    let first = submit("verdict-1");
-    let second = submit("verdict-2");
-    let proposals = db
-        .list_worker_proposals_for_work_item(&cycle_root.id, Some(ProposalKind::ReviewVerdict), None)
         .unwrap();
-    let first = proposals
-        .iter()
+    assert_eq!(second.proposal.state, ProposalState::Applied);
+    assert_eq!(second.proposal.applied_ref.as_deref(), Some(batch.id.as_str()));
+
+    let completed = db.review_batch(&batch.id).unwrap().unwrap();
+    assert_eq!(completed.status, ReviewBatchStatus::Completed);
+    assert_eq!(
+        completed.final_verdict_proposal_id.as_deref(),
+        Some(second.proposal.id.as_str()),
+        "the batch must now point at the corrected verdict"
+    );
+
+    let member = db
+        .review_batch_members(&batch.id)
+        .unwrap()
+        .into_iter()
+        .find(|member| member.role == ReviewBatchMemberRole::Supervisor)
+        .unwrap();
+    assert_eq!(member.report_proposal_id.as_deref(), Some(second.proposal.id.as_str()));
+
+    let prior = db
+        .list_worker_proposals_for_execution(&execution.id, ProposalKind::ReviewVerdict)
+        .unwrap()
+        .into_iter()
         .find(|proposal| proposal.id == first.proposal.id)
+        .expect("the prior verdict proposal must still exist");
+    assert_eq!(prior.state, ProposalState::Superseded);
+}
+
+/// A resubmission from a DIFFERENT member/execution than the one that
+/// completed the batch must still be rejected outright — the correction
+/// path is keyed on the exact member and exact prior proposal, not merely
+/// on the batch being `completed`.
+#[test]
+fn a_review_verdict_from_a_different_execution_is_rejected_even_after_completion() {
+    let db = WorkDb::open(temp_db_path("review-verdict-foreign-after-completion")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
         .unwrap();
-    assert_eq!(first.state, ProposalState::Superseded);
-    assert_eq!(second.proposal.state, ProposalState::Proposed);
+    let other_execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member(ReviewBatchMemberRole::Supervisor, Some(execution.id.clone()))],
+        )
+        .unwrap();
+    force_batch_supervising(&db, &batch.id);
+
+    let first = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &execution.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &verdict_payload(&batch.id, "head-sha"),
+            idempotency_key: "verdict-1",
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.proposal.state, ProposalState::Applied);
+
+    // `other_execution` is not a member of this batch at all, so it hits the
+    // "not a member" rejection rather than the batch-status one — either
+    // way, it must never be accepted as a correction.
+    let foreign = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &other_execution.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &verdict_payload(&batch.id, "head-sha"),
+            idempotency_key: "verdict-foreign",
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(foreign.proposal.state, ProposalState::Rejected);
+    assert!(
+        foreign
+            .proposal
+            .decision_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not a member")
+    );
+    assert_eq!(
+        db.review_batch(&batch.id)
+            .unwrap()
+            .unwrap()
+            .final_verdict_proposal_id
+            .as_deref(),
+        Some(first.proposal.id.as_str()),
+        "the foreign rejection must not disturb the already-completed batch"
+    );
+}
+
+/// A verdict submitted before the batch has actually reached `supervising`
+/// (e.g. still `collecting` — the quorum hasn't dispatched a supervisor yet)
+/// must be rejected, not silently accepted for a batch that isn't ready for
+/// one.
+#[test]
+fn review_verdict_is_rejected_while_batch_is_not_supervising() {
+    let db = WorkDb::open(temp_db_path("review-verdict-wrong-status")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member(ReviewBatchMemberRole::Supervisor, Some(execution.id.clone()))],
+        )
+        .unwrap();
+    // Deliberately NOT calling `force_batch_supervising` — the batch is
+    // still `collecting`, matching `create_review_batch`'s default status.
+
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &execution.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &verdict_payload(&batch.id, "head-sha"),
+            idempotency_key: "verdict-1",
+        })
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(outcome.proposal.state, ProposalState::Rejected);
+    assert!(
+        outcome
+            .proposal
+            .decision_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not `supervising`")
+    );
+    assert_eq!(
+        db.review_batch(&batch.id).unwrap().unwrap().final_verdict_proposal_id,
+        None
+    );
 }
 
 #[test]

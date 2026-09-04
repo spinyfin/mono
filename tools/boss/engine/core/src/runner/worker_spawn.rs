@@ -14,7 +14,10 @@ use crate::structured_output::StructuredOutputKind;
 use crate::work::{
     REASON_ALLOCATION, REASON_LEGACY_PERCENTAGE, WorkDb, WorkExecution, WorkItem, driver_clears_dispatch_gate,
 };
-use boss_protocol::{EffortLevel, ExecutionKind, ReviewBatchMember, ReviewBatchPhase, ReviewBatchStatus, TaskKind};
+use boss_protocol::{
+    EffortLevel, ExecutionKind, ProposalKind, ProposalState, ReviewBatchMember, ReviewBatchMemberRole,
+    ReviewBatchMemberStatus, ReviewBatchPhase, ReviewBatchStatus, ReviewReportProposalPayload, TaskKind,
+};
 
 use super::prompt::{
     ExecutionPromptParams, compose_answer_agent_prompt, compose_execution_prompt, designated_output_kind,
@@ -318,6 +321,86 @@ fn check_model_driver_compatibility(
             driver_descriptor.label,
         ))
     }
+}
+
+/// Load every leaf report the engine has accepted for `batch_id`, paired with
+/// which leaf produced it, for embedding in the supervisor's initial prompt.
+///
+/// Sourced from each leaf member's `report_proposal_id` pointer into its
+/// accepted (`applied`) `review_report` proposal — never re-derived from a
+/// transcript, matching the batch-review contract that transcript recovery is
+/// unavailable for batch members. A member with no `report_proposal_id` (it
+/// exhausted its retry without reporting) is simply omitted; the supervisor
+/// prompt names the gap explicitly instead of silently listing an empty
+/// report for it.
+fn load_batch_leaf_reports(
+    work_db: &WorkDb,
+    cycle_root_id: &str,
+    batch_id: &str,
+) -> anyhow::Result<Vec<crate::pr_review::SupervisorReportInput>> {
+    let members = work_db
+        .review_batch_members(batch_id)
+        .with_context(|| format!("loading members of review batch {batch_id}"))?;
+    let proposals = work_db
+        .list_worker_proposals_for_work_item(
+            cycle_root_id,
+            Some(ProposalKind::ReviewReport),
+            Some(ProposalState::Applied),
+        )
+        .with_context(|| format!("loading accepted review-report proposals for work item {cycle_root_id}"))?;
+
+    let reported_member_count = members
+        .iter()
+        .filter(|member| member.status == ReviewBatchMemberStatus::Reported)
+        .count();
+
+    let mut reports = Vec::new();
+    for member in &members {
+        let role = match member.role {
+            ReviewBatchMemberRole::ClaudeReviewer => crate::pr_review::SupervisorSourceRole::Claude,
+            ReviewBatchMemberRole::CodexReviewer => crate::pr_review::SupervisorSourceRole::Codex,
+            ReviewBatchMemberRole::GrokReviewer => crate::pr_review::SupervisorSourceRole::Grok,
+            ReviewBatchMemberRole::Supervisor | ReviewBatchMemberRole::PostMergeReviewer => continue,
+        };
+        let Some(proposal_id) = member.report_proposal_id.as_deref() else {
+            continue;
+        };
+        let Some(proposal) = proposals.iter().find(|proposal| proposal.id == proposal_id) else {
+            tracing::warn!(
+                member_id = member.id,
+                proposal_id,
+                "review batch member has a report_proposal_id but no matching applied \
+                 review_report proposal was found for its work item; the supervisor prompt \
+                 will not see this leaf's report",
+            );
+            continue;
+        };
+        let payload: ReviewReportProposalPayload = serde_json::from_str(&proposal.payload_json)
+            .with_context(|| format!("parsing accepted review-report proposal {proposal_id} payload"))?;
+        if payload.batch_id != batch_id {
+            tracing::warn!(
+                member_id = member.id,
+                proposal_id,
+                payload_batch_id = payload.batch_id,
+                expected_batch_id = batch_id,
+                "review batch member's report_proposal_id resolved to a proposal for a \
+                 different batch_id; the supervisor prompt will not see this leaf's report",
+            );
+            continue;
+        }
+        let report: crate::pr_review::ReviewerReport = serde_json::from_value(payload.report)
+            .with_context(|| format!("parsing accepted review-report proposal {proposal_id} report body"))?;
+        reports.push(crate::pr_review::SupervisorReportInput { role, report });
+    }
+    if reports.len() < reported_member_count {
+        anyhow::bail!(
+            "review batch {batch_id} has {reported_member_count} member(s) with status `reported`, but only \
+             {} of their accepted review-report proposals could be loaded; refusing to render a supervisor \
+             prompt that would misreport a lookup gap as \"that reviewer did not report\"",
+            reports.len(),
+        );
+    }
+    Ok(reports)
 }
 
 /// Batch members carry the exact policy chosen when the immutable target was
@@ -753,7 +836,8 @@ pub(crate) async fn compose_worker_spawn(
             // reviewer that appears to succeed but whose report vanishes.
             let report_destination = match work_db.review_batch_member_for_execution(&execution.id) {
                 Ok(Some(member)) => match work_db.review_batch(&member.batch_id) {
-                    Ok(Some(batch)) => Some(
+                    Ok(Some(batch)) => Some((
+                        member.role,
                         crate::pr_review::ReviewerReportDestination::builder()
                             .batch_id(batch.id)
                             .pr_url(batch.pr_url)
@@ -764,7 +848,7 @@ pub(crate) async fn compose_worker_spawn(
                                 StructuredOutputKind::ReviewResult,
                             ))
                             .build(),
-                    ),
+                    )),
                     Ok(None) => {
                         anyhow::bail!(
                             "pr_review execution {} has review-batch member for batch {} but the batch row is \
@@ -791,7 +875,19 @@ pub(crate) async fn compose_worker_spawn(
                 }
             };
             match report_destination.as_ref() {
-                Some(destination) => crate::pr_review::render_batch_reviewer_initial_prompt(
+                Some((ReviewBatchMemberRole::Supervisor, destination)) => {
+                    let cycle_root_id = work_db.review_cycle_root_id(&execution.work_item_id);
+                    let reports = load_batch_leaf_reports(work_db, &cycle_root_id, &destination.batch_id)
+                        .context("loading accepted leaf reports for supervisor prompt")?;
+                    crate::pr_review::render_supervisor_initial_prompt(
+                        task_name,
+                        task_description,
+                        destination,
+                        &reports,
+                        &reviewer_repo_slug,
+                    )
+                }
+                Some((_, destination)) => crate::pr_review::render_batch_reviewer_initial_prompt(
                     task_name,
                     task_description,
                     destination,
