@@ -698,6 +698,7 @@ fn sweep_entry_point_applies_every_proposed_verdict_and_skips_already_applied_on
             Some(&applied_root.id),
             Some(ProposalKind::ReviewVerdict),
             Some(ProposalState::Applied),
+            None,
         )
         .unwrap();
     assert_eq!(
@@ -1118,6 +1119,7 @@ fn persistent_not_applying_bail_files_attention_once_and_is_not_counted_applied(
             Some(&cycle_root.id),
             Some(ProposalKind::ReviewVerdict),
             Some(ProposalState::Proposed),
+            None,
         )
         .unwrap();
     assert_eq!(proposal.len(), 1, "stranded apply must leave the proposal proposed");

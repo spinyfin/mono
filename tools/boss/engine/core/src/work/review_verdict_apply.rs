@@ -407,6 +407,7 @@ impl WorkDb {
             None,
             Some(ProposalKind::ReviewVerdict),
             Some(ProposalState::Proposed),
+            None,
         )?;
         rows.reverse();
         Ok(rows)

@@ -570,7 +570,8 @@ const NON_WORK_ITEM_ARG_IDS: &[&str] = &[
     "probe_id",
     "preferred_workspace_id",
     "host_id",
-    "agent", // run id / slot / crew name; work-item form is optional fall-through
+    "agent",       // run id / slot / crew name; work-item form is optional fall-through
+    "proposal_id", // `prp_…` — the `worker_proposals` ledger's own id, not a work item
 ];
 
 /// Surface paths for non-work-item namespaces (hosts, comments cmt_…).

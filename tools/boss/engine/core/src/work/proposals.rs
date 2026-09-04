@@ -457,18 +457,20 @@ impl WorkDb {
 
     /// Coordinator-facing read: every `worker_proposals` row across the
     /// whole ledger, optionally narrowed by any combination of
-    /// `execution_id` / `work_item_id` / `kind` / `state`. Unlike
+    /// `execution_id` / `work_item_id` / `kind` / `state`, newest first and
+    /// bounded by `limit` (`None` → unlimited). Unlike
     /// [`Self::list_worker_proposals_for_work_item`] (worker-tier, scoped to
     /// the caller's own work item) this has no implicit scope — it backs
-    /// `bossctl work proposals list`, which per the design's §"UI
-    /// visibility and provenance" is where the full ledger (including
-    /// `rejected`/`expired` history) is CLI-inspectable.
+    /// `bossctl proposals list`, which per the design's §"UI visibility and
+    /// provenance" is where the full ledger (including `rejected`/`expired`
+    /// history) is CLI-inspectable.
     pub fn list_worker_proposals(
         &self,
         execution_id: Option<&str>,
         work_item_id: Option<&str>,
         kind: Option<ProposalKind>,
         state: Option<ProposalState>,
+        limit: Option<usize>,
     ) -> Result<Vec<WorkerProposal>> {
         let conn = self.connect()?;
         let sql = format!(
@@ -477,19 +479,34 @@ impl WorkDb {
                AND (?2 IS NULL OR work_item_id = ?2)
                AND (?3 IS NULL OR kind = ?3)
                AND (?4 IS NULL OR state = ?4)
-             ORDER BY created_at DESC, id DESC"
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?5"
         );
+        // `LIMIT` needs a concrete bound in every call, so "unlimited" is
+        // spelled as the largest value SQLite's `LIMIT` will accept rather
+        // than making the clause itself conditional.
+        let limit_value = limit.map(|n| n as i64).unwrap_or(i64::MAX);
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(
             params![
                 execution_id,
                 work_item_id,
                 kind.map(|k| k.as_str()),
-                state.map(|s| s.as_str())
+                state.map(|s| s.as_str()),
+                limit_value,
             ],
             map_worker_proposal,
         )?;
         rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Coordinator-facing read: one `worker_proposals` row by id — the full
+    /// stored record (payload, disposition, decision reason) behind
+    /// `bossctl proposals show`. Errs when no such proposal exists, matching
+    /// sibling single-item getters (`get_work_item`, `get_attention_item`).
+    pub fn get_worker_proposal(&self, id: &str) -> Result<WorkerProposal> {
+        let conn = self.connect()?;
+        find_worker_proposal_by_id(&conn, id).require("proposal", id)
     }
 
     /// Expire undecided (`state = 'proposed'`) proposals of an in-flight-only
@@ -1403,27 +1420,29 @@ mod tests {
         .unwrap();
 
         // No filters: every proposal in the ledger.
-        assert_eq!(db.list_worker_proposals(None, None, None, None).unwrap().len(), 3);
+        assert_eq!(db.list_worker_proposals(None, None, None, None, None).unwrap().len(), 3);
 
         // execution_id filter.
-        let by_execution = db.list_worker_proposals(Some(&mine), None, None, None).unwrap();
+        let by_execution = db.list_worker_proposals(Some(&mine), None, None, None, None).unwrap();
         assert_eq!(by_execution.len(), 2);
         assert!(by_execution.iter().all(|p| p.execution_id == mine));
 
         // work_item_id filter.
-        let by_work_item = db.list_worker_proposals(None, Some(&their_chore), None, None).unwrap();
+        let by_work_item = db
+            .list_worker_proposals(None, Some(&their_chore), None, None, None)
+            .unwrap();
         assert_eq!(by_work_item.len(), 1);
         assert_eq!(by_work_item[0].execution_id, theirs);
 
         // kind filter, applied across both work items.
         let by_kind = db
-            .list_worker_proposals(None, None, Some(ProposalKind::Blocked), None)
+            .list_worker_proposals(None, None, Some(ProposalKind::Blocked), None, None)
             .unwrap();
         assert_eq!(by_kind.len(), 2);
 
         // Combined execution_id + kind filter.
         let combined = db
-            .list_worker_proposals(Some(&mine), None, Some(ProposalKind::EffortEscalation), None)
+            .list_worker_proposals(Some(&mine), None, Some(ProposalKind::EffortEscalation), None, None)
             .unwrap();
         assert_eq!(combined.len(), 1);
         assert_eq!(combined[0].idempotency_key, "key-2");
@@ -1432,13 +1451,54 @@ mod tests {
         // EffortEscalation are both AutoApply kinds), so filtering to
         // `Proposed` should find none.
         let none_proposed = db
-            .list_worker_proposals(None, None, None, Some(ProposalState::Proposed))
+            .list_worker_proposals(None, None, None, Some(ProposalState::Proposed), None)
             .unwrap();
         assert!(none_proposed.is_empty());
         let all_applied = db
-            .list_worker_proposals(None, None, None, Some(ProposalState::Applied))
+            .list_worker_proposals(None, None, None, Some(ProposalState::Applied), None)
             .unwrap();
         assert_eq!(all_applied.len(), 3);
+    }
+
+    /// `limit` bounds the result count and keeps the newest-first rows —
+    /// the coordinator-facing surface must not return an unbounded set.
+    #[test]
+    fn list_worker_proposals_limit_bounds_and_keeps_newest_first() {
+        let (_dir, db) = open_db();
+        let (execution_id, chore_id) = execution_for_new_chore(&db, "Cleanup");
+        fill(&db, &execution_id, &chore_id, ProposalKind::Blocked, 3);
+
+        let unlimited = db.list_worker_proposals(None, None, None, None, None).unwrap();
+        assert_eq!(unlimited.len(), 3);
+
+        let limited = db.list_worker_proposals(None, None, None, None, Some(2)).unwrap();
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited, unlimited[..2]);
+    }
+
+    /// [`WorkDb::get_worker_proposal`] is the coordinator-facing single-row
+    /// read behind `bossctl proposals show`: it returns the full record for
+    /// a known id and errs (rather than returning `None`) for an unknown
+    /// one, matching sibling single-item getters.
+    #[test]
+    fn get_worker_proposal_returns_the_full_row_or_errs_on_unknown_id() {
+        let (_dir, db) = open_db();
+        let (execution_id, chore_id) = execution_for_new_chore(&db, "Cleanup");
+        let outcome = submit(
+            &db,
+            &execution_id,
+            &chore_id,
+            ProposalKind::Blocked,
+            r#"{"reason":"stuck"}"#,
+            "key-1",
+        )
+        .unwrap();
+
+        let fetched = db.get_worker_proposal(&outcome.proposal.id).unwrap();
+        assert_eq!(fetched, outcome.proposal);
+
+        let err = db.get_worker_proposal("prp_does_not_exist").unwrap_err();
+        assert!(err.to_string().contains("prp_does_not_exist"), "{err}");
     }
 
     #[test]
