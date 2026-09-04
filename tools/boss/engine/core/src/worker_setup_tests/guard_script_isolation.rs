@@ -266,3 +266,25 @@ fn settings_json_reference_protects_an_old_guard_dir_from_prune() {
         "a settings file still pointing at {hash_dir} must keep that directory"
     );
 }
+
+#[test]
+fn concurrent_same_hash_writers_do_not_fail_closed() {
+    let dir = TempDir::new().unwrap();
+    let bytes = PATH_GUARD_SCRIPT.as_bytes();
+    std::thread::scope(|scope| {
+        let joins: Vec<_> = (0..32)
+            .map(|_| {
+                scope.spawn(|| {
+                    ensure_content_addressed_script(dir.path(), PATH_GUARD_KIND, PATH_GUARD_SCRIPT_NAME, bytes)
+                })
+            })
+            .collect();
+        for join in joins {
+            join.join()
+                .expect("writer thread")
+                .expect("in-process concurrent writers of the same guard bytes must not fail closed");
+        }
+    });
+    let written = path_guard_script_path_in(dir.path());
+    assert_eq!(std::fs::read(&written).unwrap(), bytes);
+}

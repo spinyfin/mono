@@ -62,6 +62,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use serde_json;
@@ -2374,7 +2375,18 @@ fn ensure_content_addressed_script(dir: &Path, kind: &str, filename: &str, bytes
             )));
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            let tmp = guard_dir.join(format!(".{filename}.{}.tmp", std::process::id()));
+            // Pid alone is not unique: one engine process materialises
+            // these scripts on every worker spawn, and Rust's default
+            // test runner runs those paths concurrently. Two writers
+            // sharing `.{filename}.{pid}.tmp` interleave truncate+write
+            // with rename and can land truncated bytes at the hashed
+            // path, which this function then fail-closes on.
+            static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+            let tmp = guard_dir.join(format!(
+                ".{filename}.{}.{}.tmp",
+                std::process::id(),
+                TMP_SEQ.fetch_add(1, Ordering::Relaxed),
+            ));
             std::fs::write(&tmp, bytes)?;
             match std::fs::rename(&tmp, &path) {
                 Ok(()) => {
