@@ -66,7 +66,10 @@ use crate::conflict_stop_gate::{self, ConflictClearance};
 use crate::coordinator::ExecutionPublisher;
 use crate::merge_poller::{CommandMergeProbe, RequiredCheckFailure};
 use crate::metrics::Registry;
-use crate::trunk_merge::{TRUNK_INTENT_AWAITING_RESUBMIT, TRUNK_INTENT_SUPERSEDED_BY_CONFLICT, trunk_repo_ref};
+use crate::trunk_merge::{
+    TRUNK_INTENT_AWAITING_RESUBMIT, TRUNK_INTENT_SUBMIT_FAILED, TRUNK_INTENT_SUPERSEDED_BY_CONFLICT,
+    is_terminal_trunk_state, trunk_repo_ref,
+};
 use crate::work::{ActiveTrunkMergeIntent, PendingMergeCheck, WorkDb};
 
 // ── Metrics ───────────────────────────────────────────────────────────────
@@ -314,15 +317,6 @@ fn is_fast_tier_state(state: &TrunkPrState) -> bool {
     matches!(state, TrunkPrState::Testing | TrunkPrState::TestsPassed)
 }
 
-/// Whether an observed Trunk PR state is one the entry never leaves — the
-/// states that resolve an intent rather than describing a live entry.
-fn is_terminal_trunk_state(state: &TrunkPrState) -> bool {
-    matches!(
-        state,
-        TrunkPrState::Merged | TrunkPrState::Cancelled | TrunkPrState::Failed | TrunkPrState::PendingFailure
-    )
-}
-
 /// Whether a previous pass already resolved this intent's exit from the
 /// queue into a terminal Trunk state. True only for an intent that stayed
 /// `active` afterwards — i.e. an eviction, since `merged`/`cancelled`
@@ -348,6 +342,13 @@ fn is_awaiting_resubmit(member: &ActiveTrunkMergeIntent) -> bool {
 /// out via `cancelPullRequest`.
 fn is_superseded_by_conflict(member: &ActiveTrunkMergeIntent) -> bool {
     member.intent.last_trunk_state.as_deref() == Some(TRUNK_INTENT_SUPERSEDED_BY_CONFLICT)
+}
+
+/// Whether a failed `submitPullRequest` left this intent in place because
+/// the rollback delete also failed. Trunk never accepted the PR, so a
+/// missing-entry probe would only 404.
+fn is_submit_failed(member: &ActiveTrunkMergeIntent) -> bool {
+    member.intent.last_trunk_state.as_deref() == Some(TRUNK_INTENT_SUBMIT_FAILED)
 }
 
 /// Task statuses past which a merge intent is moot — the card has left the
@@ -732,6 +733,7 @@ impl TrunkQueueProbe {
                     maybe_file_stalled_resubmit_attention(ctx, member, outcome).await;
                     None
                 }
+                None if is_submit_failed(member) => None,
                 None => {
                     resolve_missing_entry(ctx, evidence.as_ref(), member, &repo_ref, &key.target_branch, outcome).await
                 }
