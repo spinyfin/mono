@@ -64,17 +64,16 @@ pub(crate) struct ProposeArgs {
 /// One proposal submission per variant, matching `ProposalKind` exactly.
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum ProposeCommand {
-    /// Escalate this run's effort level. Recorded as `proposed`; once the
-    /// apply pipeline lands this files a worker-signal attention and
-    /// pauses the auto-nudge loop until acknowledged.
+    /// Escalate this run's effort level. Applied synchronously at
+    /// submission: files a worker-signal attention and pauses the
+    /// auto-nudge loop until acknowledged.
     ///
     /// Example: `boss propose effort-escalation --level large --reason
     /// "multi-subsystem race; brief didn't mention the engine/app boundary"`
     EffortEscalation(EffortEscalationArgs),
     /// Declare that you cannot proceed without a human/coordinator
-    /// decision. Recorded as `proposed`; once the apply pipeline lands
-    /// this files a worker-signal attention and pauses the auto-nudge
-    /// loop.
+    /// decision. Applied synchronously at submission: files a
+    /// worker-signal attention and pauses the auto-nudge loop.
     ///
     /// Example: `boss propose blocked --reason "bazel E0583 survives
     /// clean --expunge; need direction"`
@@ -91,34 +90,32 @@ pub(crate) enum ProposeCommand {
     /// --rationale "observed transient 5xx during this task"`
     FollowupTask(FollowupTaskArgs),
     /// Record scope you consciously decided not to deliver from this run's
-    /// task. Recorded as `proposed`; once the apply pipeline lands this
-    /// writes a durable audit line on the work item plus an attention.
+    /// task. Applied synchronously at submission: writes a durable audit
+    /// line on the work item plus an attention.
     ///
     /// Example: `boss propose deferred-scope --summary "wiring for the
     /// third data source" --reason "needs a new ingestion pipeline"`
     DeferredScope(DeferredScopeArgs),
     /// File an ad-hoc attention (question or info notice) for the human.
-    /// Recorded as `proposed`; once the apply pipeline lands this writes
-    /// to the same attention rows the engine's own detectors write.
+    /// Applied synchronously at submission: writes to the same attention
+    /// rows the engine's own detectors write.
     ///
     /// Example: `boss propose attention --title "Ambiguous requirement"
     /// --body-file b.md`
     Attention(AttentionProposalArgs),
     /// Declare this automation triage pass's outcome: either the task id
-    /// you created, or that there was nothing to do. Recorded as
-    /// `proposed`; once the apply pipeline lands this applies with a
-    /// provenance check (a `--produced-task` id must actually exist and
-    /// carry this run's `source_automation_id`).
+    /// you created, or that there was nothing to do. Applied synchronously
+    /// at submission with a provenance check (a `--produced-task` id must
+    /// actually exist and carry this run's `source_automation_id`).
     ///
     /// Examples: `boss propose automation-outcome --produced-task
     /// task_abc123` / `boss propose automation-outcome --skip --reason
     /// "repo is clean"`
     AutomationOutcome(AutomationOutcomeArgs),
     /// Declare that you opened a PR — the worker's terminal action after
-    /// `cube pr create`. Recorded as `proposed`; once the apply pipeline
-    /// lands this applies with verification (URL shape, product-repo
-    /// slug, branch match against your execution) and binds the PR to
-    /// the work item.
+    /// `cube pr create`. Applied synchronously at submission, with
+    /// verification (URL shape, product-repo slug, branch match against
+    /// your execution) and binds the PR to the work item.
     ///
     /// Example: `boss propose pr-created --url
     /// https://github.com/o/r/pull/123`
