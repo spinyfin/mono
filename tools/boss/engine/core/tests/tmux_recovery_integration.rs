@@ -345,6 +345,7 @@ async fn production_tmux_recovery_ignores_repaint_and_process_title_then_redispa
             .task_kind("chore")
             .driver(Arc::new(ClaudeDriver))
             .tmux_host(TmuxWorkerHost::new(tmux.clone(), spawn_store, session_name.clone()))
+            .pr_created_proposals_seam_enabled(false)
             .build(),
         SHORT_WINDOW,
     )
