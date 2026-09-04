@@ -121,6 +121,21 @@ fn map_review_batch_member(row: &Row<'_>) -> rusqlite::Result<ReviewBatchMember>
     })
 }
 
+/// Look up the persisted batch member that owns an execution.
+fn member_for_execution_in(conn: &rusqlite::Connection, execution_id: &str) -> Result<Option<ReviewBatchMember>> {
+    conn.query_row(
+        "SELECT id, batch_id, attempt, created_at, provider_effort,
+                requested_driver, resolved_model, role, status, updated_at,
+                execution_id, report_proposal_id, terminal_at
+         FROM pr_review_batch_members
+         WHERE execution_id = ?1",
+        params![execution_id],
+        map_review_batch_member,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 fn member_role_is_valid_for_phase(phase: ReviewBatchPhase, role: ReviewBatchMemberRole) -> bool {
     match phase {
         ReviewBatchPhase::PreMerge => matches!(
@@ -782,17 +797,7 @@ impl WorkDb {
     /// to a persisted batch.
     pub fn review_batch_member_for_execution(&self, execution_id: &str) -> Result<Option<ReviewBatchMember>> {
         let conn = self.connect()?;
-        conn.query_row(
-            "SELECT id, batch_id, attempt, created_at, provider_effort,
-                    requested_driver, resolved_model, role, status, updated_at,
-                    execution_id, report_proposal_id, terminal_at
-             FROM pr_review_batch_members
-             WHERE execution_id = ?1",
-            params![execution_id],
-            map_review_batch_member,
-        )
-        .optional()
-        .map_err(Into::into)
+        member_for_execution_in(&conn, execution_id)
     }
 
     /// Record a batch member that stopped without submitting its required
@@ -909,16 +914,7 @@ impl WorkDb {
     pub fn retry_dead_review_batch_member(&self, execution_id: &str) -> Result<RetryDeadReviewBatchMember> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let member = tx
-            .query_row(
-                "SELECT id, batch_id, attempt, created_at, provider_effort,
-                        requested_driver, resolved_model, role, status, updated_at,
-                        execution_id, report_proposal_id, terminal_at
-                 FROM pr_review_batch_members WHERE execution_id = ?1",
-                params![execution_id],
-                map_review_batch_member,
-            )
-            .optional()?;
+        let member = member_for_execution_in(&tx, execution_id)?;
         let Some(member) = member else {
             tx.commit()?;
             return Ok(RetryDeadReviewBatchMember::NotRetried);
@@ -990,16 +986,7 @@ impl WorkDb {
     pub fn fail_review_batch_for_moved_head(&self, execution_id: &str, live_head_sha: &str) -> Result<bool> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let member = tx
-            .query_row(
-                "SELECT id, batch_id, attempt, created_at, provider_effort,
-                        requested_driver, resolved_model, role, status, updated_at,
-                        execution_id, report_proposal_id, terminal_at
-                 FROM pr_review_batch_members WHERE execution_id = ?1",
-                params![execution_id],
-                map_review_batch_member,
-            )
-            .optional()?;
+        let member = member_for_execution_in(&tx, execution_id)?;
         let Some(member) = member else {
             tx.commit()?;
             return Ok(false);
@@ -1034,6 +1021,51 @@ impl WorkDb {
                  consolidated against a different head. The batch has been failed rather \
                  than retried.",
                 batch.pr_url, batch.id, batch.target_sha,
+            ),
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Fail a supervising batch when its supervisor died and the PR is no
+    /// longer open. A closed PR cannot accept a delayed consolidated verdict,
+    /// so leaving the batch supervising would strand it without a live member
+    /// or an attention item.
+    pub fn fail_review_batch_for_closed_pr(&self, execution_id: &str) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(member) = member_for_execution_in(&tx, execution_id)? else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        if member.role != ReviewBatchMemberRole::Supervisor {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let Some(batch) = review_batch_by_id_in(&tx, &member.batch_id)? else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        if batch.status != ReviewBatchStatus::Supervising {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let now = now_string();
+        tx.execute(
+            "UPDATE pr_review_batch_members SET status = 'failed', terminal_at = ?1, updated_at = ?1
+             WHERE id = ?2 AND status IN ('pending', 'running')",
+            params![now, member.id],
+        )?;
+        fail_review_batch_with_attention(
+            &tx,
+            &batch,
+            &now,
+            "Automated reviewer: PR closed before supervisor could consolidate",
+            format!(
+                "The consolidating supervisor for {} (batch `{}`) died before producing a \
+                 verdict, and the PR is no longer open. The batch has been failed rather \
+                 than retried because a delayed consolidated verdict cannot be applied.",
+                batch.pr_url, batch.id,
             ),
         )?;
         tx.commit()?;

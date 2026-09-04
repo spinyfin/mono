@@ -192,12 +192,33 @@ pub async fn run_one_pass(
         match inspect.open_state {
             PrOpenState::Open => {}
             PrOpenState::Merged | PrOpenState::ClosedUnmerged => {
-                tracing::info!(
-                    work_item_id = %work_item_id,
-                    dead_execution_id = %dead_execution_id,
-                    "pr_review recovery: PR is no longer open; skipping batch member recovery",
-                );
-                outcome.pr_closed_skipped += 1;
+                match work_db.fail_review_batch_for_closed_pr(&dead_execution_id) {
+                    Ok(true) => {
+                        tracing::warn!(
+                            work_item_id = %work_item_id,
+                            dead_execution_id = %dead_execution_id,
+                            "pr_review recovery: PR closed while its dead supervisor awaited recovery; failed the batch",
+                        );
+                        outcome.terminal_failed += 1;
+                    }
+                    Ok(false) => {
+                        tracing::info!(
+                            work_item_id = %work_item_id,
+                            dead_execution_id = %dead_execution_id,
+                            "pr_review recovery: PR is no longer open; skipping batch member recovery",
+                        );
+                        outcome.pr_closed_skipped += 1;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            work_item_id = %work_item_id,
+                            dead_execution_id = %dead_execution_id,
+                            ?error,
+                            "pr_review recovery: failed to settle supervisor batch for closed PR",
+                        );
+                        outcome.error_skipped += 1;
+                    }
+                }
                 continue;
             }
         }
@@ -1181,6 +1202,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refires_dead_supervisor_when_head_sha_is_unknown() {
+        let (_dir, db) = open_db();
+        let (_work_item_id, _dead_execution_id, batch_id) =
+            create_chore_with_dead_supervisor(&db, "https://github.com/test/repo/pull/24", "head-sha");
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+
+        let outcome = run_one_pass(db.as_ref(), coordinator, sink.as_ref(), &checker).await;
+
+        assert_eq!(outcome.refired, 1, "an unknown head SHA must not be treated as a move");
+        assert_eq!(outcome.terminal_failed, 0);
+        assert_eq!(
+            db.review_batch(&batch_id).unwrap().unwrap().status,
+            ReviewBatchStatus::Supervising
+        );
+    }
+
+    #[tokio::test]
     async fn fails_dead_supervisor_batch_when_pr_head_has_moved() {
         let (_dir, db) = open_db();
         let (work_item_id, dead_execution_id, batch_id) =
@@ -1216,7 +1258,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skips_dead_supervisor_when_pr_already_merged() {
+    async fn fails_dead_supervisor_batch_when_pr_already_merged() {
         let (_dir, db) = open_db();
         let (_work_item_id, _dead_execution_id, batch_id) =
             create_chore_with_dead_supervisor(&db, "https://github.com/test/repo/pull/23", "head-sha");
@@ -1229,12 +1271,12 @@ mod tests {
         let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), &checker).await;
 
         assert_eq!(outcome.refired, 0);
-        assert_eq!(outcome.pr_closed_skipped, 1);
-        assert_eq!(outcome.terminal_failed, 0);
+        assert_eq!(outcome.pr_closed_skipped, 0);
+        assert_eq!(outcome.terminal_failed, 1);
         assert_eq!(
             db.review_batch(&batch_id).unwrap().unwrap().status,
-            ReviewBatchStatus::Supervising,
-            "a merged PR skips recovery; it must not silently fail or complete the batch"
+            ReviewBatchStatus::Failed,
+            "a merged PR must settle a dead supervisor batch rather than leaving it supervising"
         );
     }
 }
