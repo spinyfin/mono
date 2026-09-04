@@ -230,6 +230,23 @@ pub(crate) fn apply_worker_tool_env(env: &mut Vec<EnvVar>, boss_bin_dir: Option<
                 .display()
                 .to_string(),
         );
+    }
+}
+
+/// Export `CHECKLEFT_BIN` naming the per-workspace `checkleft` launcher, for
+/// a workspace whose `REPOBIN.toml` declares checkleft. A repository that
+/// does not declare it gets no launcher and keeps its PATH-based checkleft,
+/// so the variable must stay unset there: the launch guard watches a bare
+/// `checkleft` only while `CHECKLEFT_BIN` is set.
+fn apply_checkleft_bin_env(env: &mut Vec<EnvVar>, workspace_path: &Path) {
+    let worker_bin_dir = env
+        .iter()
+        .find(|e| e.key == boss_engine_worker_bin::WORKER_BIN_DIR_ENV)
+        .map(|e| e.value.clone());
+    let Some(worker_bin_dir) = worker_bin_dir.filter(|dir| !dir.is_empty()) else {
+        return;
+    };
+    if boss_engine_worker_bin::repobin_declares_tool(workspace_path, "checkleft") {
         set_env_var(
             env,
             boss_engine_worker_bin::CHECKLEFT_BIN_ENV,
@@ -859,6 +876,7 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
     // `boss` launcher (BOSS_WORKER_BIN_DIR) still pins bare `boss` to the
     // engine's own CLI without searching PATH.
     apply_worker_tool_env(&mut env, std::env::var("BOSS_BIN_DIR").ok().as_deref());
+    apply_checkleft_bin_env(&mut env, &input.workspace_path);
 
     let slot_id = input.slot_id;
     let tmux_host = &input.tmux_host;

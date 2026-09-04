@@ -1358,12 +1358,33 @@ async fn worker_bin_dir_is_prepended_ahead_of_the_sanitized_path() {
         Some("/tmp/boss-worker-settings/bin/cube"),
         "CUBE_BIN must name the launcher, not a PATH entry",
     );
+    assert!(
+        !env.iter().any(|(k, _)| k == boss_engine_worker_bin::CHECKLEFT_BIN_ENV),
+        "a repository without a REPOBIN.toml checkleft declaration must retain PATH behaviour",
+    );
+}
+
+#[tokio::test]
+async fn declared_checkleft_exports_the_worker_bin_launcher() {
+    let workspace = TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("REPOBIN.toml"), "[tools.checkleft]\n").unwrap();
+    let spawner = ok_spawner_capturing();
+    let mut input = sample_input(&workspace, spawner.tmux_runner.clone());
+    input.extra_env = vec![(
+        boss_engine_worker_bin::WORKER_BIN_DIR_ENV.into(),
+        "/tmp/boss-worker-settings/bin".into(),
+    )];
+
+    start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
+
     assert_eq!(
-        env.iter()
+        spawner
+            .last_spawn_env()
+            .iter()
             .find(|(k, _)| k == boss_engine_worker_bin::CHECKLEFT_BIN_ENV)
             .map(|(_, v)| v.as_str()),
         Some("/tmp/boss-worker-settings/bin/checkleft"),
-        "CHECKLEFT_BIN must name the launcher, not a PATH entry",
+        "declared checkleft must name the worker-bin launcher",
     );
 }
 
