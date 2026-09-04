@@ -14,7 +14,7 @@ enum EngineEvent {
     case engineRequest(requestId: String, request: EngineRequestKind)
     case productsList(products: [WorkProduct])
     case projectsList(productId: String, projects: [WorkProject])
-    case workTree(product: WorkProduct, projects: [WorkProject], tasks: [WorkTask], chores: [WorkTask], taskRuntimes: [WorkTaskRuntime], dependencies: [WorkItemDependency])
+    case workTree(product: WorkProduct, projects: [WorkProject], tasks: [WorkTask], chores: [WorkTask], taskRuntimes: [WorkTaskRuntime], dependencies: [WorkItemDependency], ideas: [WorkIdea])
     case workItemCreated(item: WorkItemPayload)
     /// Batch counterpart of `workItemCreated`, pushed on a product's work
     /// topic by background jobs that create many rows at once with no
@@ -281,6 +281,11 @@ enum EngineEvent {
     case automationOpenTaskCount(automationID: String, count: Int)
     /// Response to `list_automation_runs` — the run history for one automation.
     case automationRunsList(automationID: String, runs: [AppAutomationRun])
+    // MARK: Idea events
+    /// Response to `create_idea`.
+    case ideaCreated(idea: WorkIdea)
+    /// Response to `update_idea`.
+    case ideaUpdated(idea: WorkIdea)
     // MARK: Editorial controls events
     /// Response to `list_editorial_actions` — audit rows for a product,
     /// ordered freshest-first.

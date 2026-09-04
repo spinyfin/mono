@@ -97,7 +97,8 @@ final class OptimisticKanbanMoveTests: XCTestCase {
                 tasks: [],
                 chores: [confirmedTask],
                 taskRuntimes: [],
-                dependencies: []
+                dependencies: [],
+                ideas: []
             )
         )
 
@@ -172,7 +173,8 @@ final class OptimisticKanbanMoveTests: XCTestCase {
                 tasks: [],
                 chores: [task, other],  // task_a still "todo"
                 taskRuntimes: [],
-                dependencies: []
+                dependencies: [],
+                ideas: []
             )
         )
 

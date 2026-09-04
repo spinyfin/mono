@@ -17,7 +17,8 @@ extension ChatViewModel {
         tasks: [WorkTask],
         chores: [WorkTask],
         taskRuntimes: [WorkTaskRuntime],
-        dependencies: [WorkItemDependency]
+        dependencies: [WorkItemDependency],
+        ideas: [WorkIdea]
     ) {
         // Fan-out regression counter (design entry 2): full work-tree applies.
         UIUpdateCounters.shared.recordApplyWorkTree()
@@ -79,6 +80,7 @@ extension ChatViewModel {
         let popSortEndNanos = PopulationTiming.now()
         mergeTaskRuntimes(taskRuntimes, for: product.id, tasks: tasks, chores: chores)
         dependenciesByProductID[product.id] = dependencies
+        ideasByProductID[product.id] = ideas
         seedReviewTaskIDs(tasks: tasks, chores: chores, productID: product.id)
         // After tasksByProjectID reflects real engine state, clear optimistic
         // overrides for cards whose true column now matches the target.

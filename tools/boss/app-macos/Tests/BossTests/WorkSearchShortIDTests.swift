@@ -178,7 +178,8 @@ final class WorkSearchShortIDTests: XCTestCase {
             tasks: tasks,
             chores: [],
             taskRuntimes: [],
-            dependencies: []
+            dependencies: [],
+            ideas: []
         )
     }
 

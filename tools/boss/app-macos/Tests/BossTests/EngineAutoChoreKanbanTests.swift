@@ -153,7 +153,8 @@ final class EngineAutoChoreKanbanTests: XCTestCase {
             tasks: [],
             chores: chores,
             taskRuntimes: [],
-            dependencies: []
+            dependencies: [],
+            ideas: []
         )
     }
 

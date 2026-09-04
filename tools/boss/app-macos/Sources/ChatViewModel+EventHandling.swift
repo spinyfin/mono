@@ -158,14 +158,15 @@ extension ChatViewModel {
             refreshWorkSubscriptions()
         case .projectsList(let productId, let projects):
             projectsByProductID[productId] = projects.sorted(by: projectSort)
-        case .workTree(let product, let projects, let tasks, let chores, let taskRuntimes, let dependencies):
+        case .workTree(let product, let projects, let tasks, let chores, let taskRuntimes, let dependencies, let ideas):
             applyWorkTree(
                 product: product,
                 projects: projects,
                 tasks: tasks,
                 chores: chores,
                 taskRuntimes: taskRuntimes,
-                dependencies: dependencies
+                dependencies: dependencies,
+                ideas: ideas
             )
         case .workItemCreated(let item):
             handleCreatedWorkItem(item)
@@ -627,6 +628,11 @@ extension ChatViewModel {
             openTaskCountByAutomationID[automationID] = count
         case .automationRunsList(let automationID, let runs):
             automationRunsByID[automationID] = runs
+        // MARK: Idea events
+        case .ideaCreated(let idea):
+            handleIdeaCreated(idea)
+        case .ideaUpdated(let idea):
+            handleIdeaUpdated(idea)
         // MARK: Editorial controls events
         case .editorialActionsList(let productID, let actions):
             editorialActionsByProductID[productID] = actions

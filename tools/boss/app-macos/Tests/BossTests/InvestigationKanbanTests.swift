@@ -273,7 +273,8 @@ final class InvestigationKanbanTests: XCTestCase {
             tasks: tasks,
             chores: chores,
             taskRuntimes: [],
-            dependencies: []
+            dependencies: [],
+            ideas: []
         )
     }
 
