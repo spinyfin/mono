@@ -230,6 +230,13 @@ pub(crate) fn apply_worker_tool_env(env: &mut Vec<EnvVar>, boss_bin_dir: Option<
                 .display()
                 .to_string(),
         );
+        set_env_var(
+            env,
+            boss_engine_worker_bin::CHECKLEFT_BIN_ENV,
+            boss_engine_worker_bin::checkleft_bin_in(Path::new(&worker_bin_dir))
+                .display()
+                .to_string(),
+        );
     }
 }
 

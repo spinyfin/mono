@@ -2627,7 +2627,7 @@ macro_rules! agent_rules_preamble {
      ",
             $observation,
             "\n\
-     For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
+     For ordinary pre-push validation, run `bin/checkleft run` with no flags; use\n\
      `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
      strong stated justification.\n\
      Do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run`\n\

@@ -1358,6 +1358,13 @@ async fn worker_bin_dir_is_prepended_ahead_of_the_sanitized_path() {
         Some("/tmp/boss-worker-settings/bin/cube"),
         "CUBE_BIN must name the launcher, not a PATH entry",
     );
+    assert_eq!(
+        env.iter()
+            .find(|(k, _)| k == boss_engine_worker_bin::CHECKLEFT_BIN_ENV)
+            .map(|(_, v)| v.as_str()),
+        Some("/tmp/boss-worker-settings/bin/checkleft"),
+        "CHECKLEFT_BIN must name the launcher, not a PATH entry",
+    );
 }
 
 #[tokio::test]
