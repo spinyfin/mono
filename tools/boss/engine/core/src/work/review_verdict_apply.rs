@@ -140,15 +140,15 @@ impl WorkDb {
         // The duplicate-head guard exists to suppress a re-review of an
         // unchanged pre-merge head (e.g. a recovery retry that resubmits a
         // verdict against the same SHA the prior pass already applied). It
-        // has no meaning for a `PostMerge` batch: `verdict.target_sha` there
-        // is the merge commit (or, on the `head_ref_oid` fallback, the PR's
-        // own head SHA) — precisely the SHA the pre-merge verdict already
-        // stamped into `last_reviewed_sha` via `commit_applied_review_verdict`.
-        // Applying the guard unconditionally would make every post-merge
-        // verdict compare equal to that prior SHA and silently discard its
-        // findings with no attention item, which is worse than never
-        // triggering the pass at all. Exempt PostMerge so its findings
-        // always materialise a follow-up when the severity gate warrants one.
+        // has no meaning for a `PostMerge` batch: its `target_sha` is the
+        // frozen merge commit, reviewed exactly once, so there is no earlier
+        // pass to suppress. On a fast-forward or rebase merge that commit can
+        // equal the SHA the pre-merge verdict stamped into `last_reviewed_sha`
+        // via `commit_applied_review_verdict`, which would make the guard
+        // silently discard the post-merge findings with no attention item —
+        // worse than never triggering the pass at all. Exempt PostMerge so
+        // its findings always materialise a follow-up when the severity gate
+        // warrants one.
         let mut duplicate_head = false;
         if batch.phase != boss_protocol::ReviewBatchPhase::PostMerge
             && let Ok((_, prior_sha)) = self.get_task_review_cycle_state(&batch.cycle_root_id)

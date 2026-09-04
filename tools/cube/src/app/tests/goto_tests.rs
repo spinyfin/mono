@@ -203,6 +203,17 @@ fn goto_requires_bookmark_or_pr() {
 
 #[test]
 fn goto_revision_not_yet_positioned_creates_new_commit() {
+    // Regression coverage: the probe must test `parents(@) & {sha}`, not
+    // ancestry (`{sha} & ::@`). A merge SHA on the default branch is an
+    // ancestor of `@` in almost any workspace whose `@` descends from a
+    // `main` that already contains the merge — but `@` is not actually
+    // positioned there. `parents(@) & {sha}` must come back empty in that
+    // case so `jj new` still runs, even though the old ancestor revset
+    // would have reported `already_positioned: true` here. The assertion
+    // below on the probe's revset argument (via `goto_revision_positioned_cmd`
+    // building `parents(@) & {sha}`, which `FakeRunner` requires an exact
+    // match against) is what actually pins this down — the ancestor revset
+    // cannot be reintroduced without this test failing.
     let sha = "merge-sha-1";
     let cmds = vec![
         goto_remote_list_cmd(),
@@ -229,27 +240,4 @@ fn goto_revision_already_positioned_skips_new() {
     let result = run_goto_revision(&runner, sha).expect("idempotent revision goto");
     runner.assert_exhausted();
     assert_eq!(result.payload["already_positioned"], true);
-}
-
-#[test]
-fn goto_revision_ancestor_but_not_parent_still_runs_new() {
-    // Regression test: the probe must test `parents(@) & {sha}`, not
-    // ancestry (`{sha} & ::@`). A merge SHA on the default branch is an
-    // ancestor of `@` in almost any workspace whose `@` descends from a
-    // `main` that already contains the merge — but `@` is not actually
-    // positioned there. `parents(@) & {sha}` must come back empty in that
-    // case so `jj new` still runs, even though the old ancestor revset
-    // would have reported `already_positioned: true` here.
-    let sha = "merged-pr-head-sha";
-    let cmds = vec![
-        goto_remote_list_cmd(),
-        goto_fetch_cmd(),
-        goto_revision_positioned_cmd(sha, ""), // @'s parent is not sha, even though sha is an ancestor of @
-        goto_revision_new_cmd(sha),
-    ];
-    let runner = FakeRunner::new(cmds);
-    let result = run_goto_revision(&runner, sha).expect("revision goto still runs jj new for a descendant @");
-    runner.assert_exhausted();
-    assert_eq!(result.payload["revision"], sha);
-    assert_eq!(result.payload["already_positioned"], false);
 }
