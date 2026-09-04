@@ -2190,7 +2190,9 @@ mod tests {
             assert_eq!(last["trigger"], "operator_confirmation");
             assert_eq!(last["existing_session_disposition"], "engine_killed_session");
             assert_eq!(last["existing_process_disposition"], "live_when_terminated");
-            assert_eq!(last["old_pane_id"], "%old");
+            // `recreate_after_confirmation` refreshes pane identity from the
+            // live session before kill; FakeTmux always reports `%42`.
+            assert_eq!(last["old_pane_id"], "%42");
             assert_eq!(last["new_pane_id"], "%42");
             assert!(last["liveness_evidence"]["last_passed_at_epoch_s"].as_i64().is_some());
             assert!(
