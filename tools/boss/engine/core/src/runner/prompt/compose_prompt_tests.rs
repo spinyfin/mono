@@ -326,6 +326,38 @@ fn acceptance_criterion_uses_fresh_branch_when_no_pr_url() {
     );
 }
 
+#[test]
+fn rendered_prompt_uses_engine_owned_binary_invocations() {
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .run_done_proposals_seam_enabled(true)
+            .build(),
+    );
+
+    assert!(
+        prompt.contains("`\"$BOSS_BIN\" propose done"),
+        "run-done command must use the engine-owned boss binary:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("`\"$BOSS_BIN\" propose blocked"),
+        "blocked command must use the engine-owned boss binary:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("`\"$CUBE_BIN\" pr create` / `\"$CUBE_BIN\" pr update`"),
+        "terminal-push command must use the engine-owned cube binary:\n{prompt}",
+    );
+    for bare_invocation in ["`boss propose", "`cube pr"] {
+        assert!(
+            !prompt.contains(bare_invocation),
+            "prompt must not instruct workers to invoke a bare-path binary ({bare_invocation}):\n{prompt}",
+        );
+    }
+}
+
 /// No `.boss/recovery-report.json` marker in the workspace means the engine
 /// holds no durable pointer for this run: no block at all, and critically no
 /// speculative `jj edit ...@origin` line naming a branch nobody confirmed

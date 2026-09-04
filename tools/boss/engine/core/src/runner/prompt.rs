@@ -1019,6 +1019,7 @@ fn render_editorial_rules_block(
 /// the push is what may reap the worker — but a worker left to reconcile
 /// them itself will reasonably conclude it cannot do both, and drop one.
 fn pr_terminal_directive(seam_enabled: bool) -> String {
+    let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
     let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     let mut out = String::new();
     out.push_str("\n## Important: PR creation is your terminal act\n\n");
@@ -1026,12 +1027,12 @@ fn pr_terminal_directive(seam_enabled: bool) -> String {
         "Opening the PR is the LAST thing you do. The engine reaps you immediately after the PR is created.\n\n",
     );
     if seam_enabled {
-        out.push_str(
+        out.push_str(&format!(
             "The one thing that comes after everything else and BEFORE the push is your run-done \
-             declaration (`boss propose done`, see below) — submit it, then open/update the PR. \
+             declaration (`{boss} propose done`, see below) — submit it, then open/update the PR. \
              Doing it in that order is deliberate: the push can reap you, so a declaration you \
-             planned to make afterwards may never happen.\n\n",
-        );
+             planned to make afterwards may never happen.\n\n"
+        ));
     }
     out.push_str(&format!("You will NOT get another turn after `gh pr create` / `{cube} pr create` (or `{cube} pr update` for an existing PR). Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR while background work (parallel/sub-agent runs, backgrounded builds, code reviews) is still in flight expecting to consume its results.\n\n"));
     out.push_str("Therefore: finish everything — including consuming any review/self-review findings you started — BEFORE you open the PR. If a background review is still running and you care about its results, wait for it and address all findings FIRST, then open the PR. If you don't intend to wait, don't start the review.\n");
@@ -1185,10 +1186,13 @@ pub(crate) fn run_done_directive(seam_enabled: bool) -> String {
     if !seam_enabled {
         return String::new();
     }
-    "\n## Declaring your run finished\n\n\
+    let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
+    let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
+    format!(
+        "\n## Declaring your run finished\n\n\
      When your run is over, say so:\n\n\
      ```\n\
-     boss propose done --outcome <delivered|no-changes-needed|blocked> --summary \"<one line>\"\n\
+     {boss} propose done --outcome <delivered|no-changes-needed|blocked> --summary \"<one line>\"\n\
      ```\n\n\
      This is what ends your run. The engine does not decide it from the state of your PR — for a \
      run dispatched against a PR that is already open and green, that state says nothing about \
@@ -1199,9 +1203,9 @@ pub(crate) fn run_done_directive(seam_enabled: bool) -> String {
      posted the reply).\n\
      - `no-changes-needed` — you verified there was nothing to produce. This replaces the \
      `NO_CHANGES_NEEDED` marker; you do not need both.\n\
-     - `blocked` — you are stopping without delivering. File `boss propose blocked --reason \"...\"` \
+     - `blocked` — you are stopping without delivering. File `{boss} propose blocked --reason \"...\"` \
      alongside it so the blocker itself is recorded, not just the fact that you stopped.\n\n\
-     **Declare immediately BEFORE your terminal push**, not after: `cube pr create` / `cube pr \
+     **Declare immediately BEFORE your terminal push**, not after: `{cube} pr create` / `{cube} pr \
      update` can reap you the moment the PR moves, so a declaration you planned to make afterwards \
      may never happen. Declaring first costs nothing if the push then fails — re-declare with the \
      accurate outcome, the newest declaration wins.\n\n\
@@ -1209,7 +1213,7 @@ pub(crate) fn run_done_directive(seam_enabled: bool) -> String {
      while it can see you working, then asks you once whether you are finished, then parks the run \
      for a human with the outcome recorded as unknown. That is worse for you and for the human than \
      one command.\n"
-        .to_string()
+    )
 }
 
 /// `[deferred-scope]` marker protocol directive (root-caused to PR #765).
