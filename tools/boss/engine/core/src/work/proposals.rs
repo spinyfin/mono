@@ -461,7 +461,7 @@ impl WorkDb {
     /// bounded by `limit` (`None` → unlimited). Unlike
     /// [`Self::list_worker_proposals_for_work_item`] (worker-tier, scoped to
     /// the caller's own work item) this has no implicit scope — it backs
-    /// `bossctl proposals list`, which per the design's §"UI visibility and
+    /// `bossctl work proposals list`, which per the design's §"UI visibility and
     /// provenance" is where the full ledger (including `rejected`/`expired`
     /// history) is CLI-inspectable.
     pub fn list_worker_proposals(
@@ -502,7 +502,7 @@ impl WorkDb {
 
     /// Coordinator-facing read: one `worker_proposals` row by id — the full
     /// stored record (payload, disposition, decision reason) behind
-    /// `bossctl proposals show`. Errs when no such proposal exists, matching
+    /// `bossctl work proposals show`. Errs when no such proposal exists, matching
     /// sibling single-item getters (`get_work_item`, `get_attention_item`).
     pub fn get_worker_proposal(&self, id: &str) -> Result<WorkerProposal> {
         let conn = self.connect()?;

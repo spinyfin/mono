@@ -53,6 +53,10 @@ pub(crate) fn work_proposals_list(
         .list_worker_proposals(execution_id.as_deref(), work_item_id.as_deref(), kind, state, limit)
         .context("listing worker proposals")?;
 
+    if let Some(note) = truncation_note(limit, proposals.len()) {
+        eprintln!("{note}");
+    }
+
     if json {
         println!(
             "{}",
@@ -68,6 +72,12 @@ pub(crate) fn work_proposals_list(
         }
     }
     Ok(())
+}
+
+fn truncation_note(limit: Option<usize>, proposal_count: usize) -> Option<String> {
+    limit
+        .filter(|&n| proposal_count == n)
+        .map(|n| format!("note: showing the newest {n} proposals; pass --limit 0 for the full ledger"))
 }
 
 /// `bossctl work proposals show <prp_id>` — the full stored record for one
@@ -148,7 +158,9 @@ mod tests {
     };
     use boss_protocol::ProposalKind;
 
-    use super::{work_proposals_list, work_proposals_show};
+    use crate::resolve_db_path;
+
+    use super::{truncation_note, work_proposals_list, work_proposals_show};
 
     /// Minimal RAII scratch-directory guard — this crate has no `tempfile`
     /// dev-dependency, so this is the cheapest way to clean up a real,
@@ -173,10 +185,9 @@ mod tests {
     /// product/chore/execution, submits a proposal through the same
     /// `WorkDb::submit_worker_proposal` write path `boss propose` uses, then
     /// calls the exact `work_proposals_list`/`work_proposals_show` functions
-    /// `bossctl`'s CLI dispatches to — the closest exercise of the real code
-    /// path available in-repo (the worker sandbox that wrote this surface
-    /// cannot invoke the compiled `bossctl` binary itself; see the PR
-    /// description).
+    /// `bossctl`'s CLI dispatches to. `bossctl`'s compiled binary is not
+    /// exercised here; this covers the dispatch functions and the real
+    /// `WorkDb` query path they call.
     #[test]
     fn list_and_show_round_trip_against_a_real_db() {
         let scratch = ScratchDir::new("round-trip");
@@ -220,6 +231,20 @@ mod tests {
             .unwrap()
             .unwrap();
 
+        assert_eq!(
+            resolve_db_path(Some(scratch.0.clone())).unwrap(),
+            scratch.0.join("state.db")
+        );
+        let listed = db
+            .list_worker_proposals(Some(&execution.id), None, None, None, Some(50))
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, outcome.proposal.id);
+        assert_eq!(
+            db.get_worker_proposal(&outcome.proposal.id).unwrap().payload_json,
+            r#"{"reason":"smoke test"}"#
+        );
+
         println!(
             "=== bossctl work proposals list --execution-id {} --json ===",
             execution.id
@@ -237,5 +262,15 @@ mod tests {
 
         println!("=== bossctl work proposals show {} --json ===", outcome.proposal.id);
         work_proposals_show(true, Some(scratch.0.clone()), &outcome.proposal.id).unwrap();
+    }
+
+    #[test]
+    fn capped_list_emits_a_truncation_note() {
+        assert_eq!(
+            truncation_note(Some(50), 50).as_deref(),
+            Some("note: showing the newest 50 proposals; pass --limit 0 for the full ledger")
+        );
+        assert_eq!(truncation_note(Some(50), 49), None);
+        assert_eq!(truncation_note(None, 50), None);
     }
 }
