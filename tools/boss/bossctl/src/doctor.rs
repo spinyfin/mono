@@ -33,8 +33,8 @@ enum HostingReport {
 
 /// Reads `workers.tmux_hosting` straight from `settings.toml` under
 /// `state_root` (or the standard per-user location when `None`). A missing
-/// `settings.toml` is not an error — it means every pool is on the default
-/// legacy app-hosted path, same as `SettingsStore::load` treats it. A
+/// `settings.toml` is not an error — it means every local pool uses the
+/// default tmux-hosted path, same as `SettingsStore::load` treats it. A
 /// present-but-unreadable file is reported as [`HostingReport::LoadError`]
 /// rather than propagated, so the rest of the preflight still runs.
 fn tmux_hosting_pool_report(state_root: Option<PathBuf>) -> Result<HostingReport> {

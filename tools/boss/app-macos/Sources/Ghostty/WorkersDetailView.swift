@@ -113,11 +113,11 @@ struct WorkersDetailView: View {
     }
 }
 
-/// Shown on the Workers grid whenever `workers.tmux_hosting` is off, so an
-/// operator-set hosting mode is never silently indistinguishable from the
-/// durability gap it replaces — one of the tmux-hosting migration's three
-/// required visibility surfaces (alongside the dispatch-event stamp and
-/// `bossctl doctor`).
+/// Shown on the Workers grid whenever the deprecated temporary rollback
+/// control `workers.tmux_hosting` is off, so an operator-selected legacy
+/// mode is never silently indistinguishable from the durability gap it
+/// restores — one of the tmux-hosting migration's three required visibility
+/// surfaces (alongside the dispatch-event stamp and `bossctl doctor`).
 private struct LegacyHostingBadge: View {
     var body: some View {
         HStack(spacing: 4) {
@@ -131,8 +131,9 @@ private struct LegacyHostingBadge: View {
         .background(Color.orange.opacity(0.15))
         .clipShape(Capsule())
         .help(
-            "Worker panes are hosted directly by the app instead of tmux, so they will not " +
-            "survive an app or engine restart. Enable \"Host workers in tmux\" in Settings ▸ Workers."
+            "Worker panes are using the temporary legacy-hosting rollback, so they will not " +
+            "survive an app or engine restart. Re-enable \"Host workers in tmux (deprecated)\" " +
+            "in Settings ▸ Workers."
         )
     }
 }

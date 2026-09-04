@@ -129,9 +129,9 @@ mod tests {
         let events = recording.events().await;
         let details = &events[0].details;
         assert_eq!(details["session_name"], "boss-6-abc");
-        assert_eq!(details[DETAILS_KEY]["review"], false);
-        assert_eq!(details[DETAILS_KEY]["automation"], false);
-        assert_eq!(details[DETAILS_KEY]["interactive"], false);
+        assert_eq!(details[DETAILS_KEY]["review"], true);
+        assert_eq!(details[DETAILS_KEY]["automation"], true);
+        assert_eq!(details[DETAILS_KEY]["interactive"], true);
     }
 
     #[tokio::test]
