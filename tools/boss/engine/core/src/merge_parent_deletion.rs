@@ -26,7 +26,7 @@
 //! language-aware parser.
 
 use anyhow::Result;
-use boss_engine_gh_invocation::{gh_compare_jq, gh_compare_jq_blocking};
+use boss_engine_gh_invocation::gh_compare_jq_blocking;
 use boss_gh_telemetry::{callers, scope as gh_scope, scope_blocking};
 use std::collections::BTreeSet;
 
@@ -106,55 +106,30 @@ pub fn describe_deletions(files: &[String]) -> Vec<String> {
 /// GitHub failure must not false-halt a legitimate resolution; the reviewer
 /// rubric is the backstop. This is a deliberate, operator-visible trade-off:
 /// availability over a hard-closed gate on infra flakiness.
+///
+/// The policy body lives in [`compute_merged_parent_deletions_blocking`]; this
+/// wrapper runs it on the blocking pool so async callers do not duplicate it.
 pub async fn compute_merged_parent_deletions(
     repo_slug: &str,
     head_before: &str,
     base_sha: &str,
     head_after: &str,
 ) -> Vec<String> {
-    if head_before.is_empty() || base_sha.is_empty() || head_after.is_empty() {
-        return Vec::new();
-    }
-
-    let added = match fetch_compare_files(repo_slug, head_before, base_sha).await {
-        Ok(files) => added_filenames(&files),
-        Err(err) => {
-            tracing::warn!(
-                repo_slug,
-                head_before,
-                base_sha,
-                error = %format!("{err:#}"),
-                "merge_parent_deletion: compare(head_before...base) failed; \
-                 tripwire fails open (no gate) for this pass",
-            );
-            return Vec::new();
-        }
-    };
-    if added.is_empty() {
-        return Vec::new();
-    }
-
-    let removed = match fetch_compare_files(repo_slug, base_sha, head_after).await {
-        Ok(files) => removed_filenames(&files),
-        Err(err) => {
-            tracing::warn!(
-                repo_slug,
-                base_sha,
-                head_after,
-                error = %format!("{err:#}"),
-                "merge_parent_deletion: compare(base...head_after) failed; \
-                 tripwire fails open (no gate) for this pass",
-            );
-            return Vec::new();
-        }
-    };
-
-    describe_deletions(&merged_parent_deletions(&added, &removed))
+    let repo_slug = repo_slug.to_owned();
+    let head_before = head_before.to_owned();
+    let base_sha = base_sha.to_owned();
+    let head_after = head_after.to_owned();
+    tokio::task::spawn_blocking(move || {
+        compute_merged_parent_deletions_blocking(&repo_slug, &head_before, &base_sha, &head_after)
+    })
+    .await
+    .unwrap_or_default()
 }
 
-/// Blocking counterpart of [`compute_merged_parent_deletions`] for the
-/// review-verdict applier, which already runs inside `spawn_blocking`.
-/// Same fail-open contract: any `gh` error returns an empty set (logged).
+/// Single implementation of the both-parents deletion tripwire. Used directly
+/// by the review-verdict applier (already inside `spawn_blocking`) and by
+/// [`compute_merged_parent_deletions`] via the blocking pool. Same fail-open
+/// contract: any `gh` error returns an empty set (logged).
 pub fn compute_merged_parent_deletions_blocking(
     repo_slug: &str,
     head_before: &str,
@@ -269,15 +244,6 @@ pub async fn fetch_pr_head_sha(repo_slug: &str, pr_number: u64) -> Option<String
 }
 
 /// Fetch and parse the `.files[]` array of a GitHub compare between two refs.
-async fn fetch_compare_files(repo_slug: &str, base: &str, head: &str) -> Result<Vec<CompareFile>> {
-    let trimmed = gh_scope(
-        callers::MERGE_PARENT_DELETION,
-        gh_compare_jq(repo_slug, base, head, ".files // []"),
-    )
-    .await?;
-    parse_compare_files(&trimmed)
-}
-
 fn fetch_compare_files_blocking(repo_slug: &str, base: &str, head: &str) -> Result<Vec<CompareFile>> {
     let trimmed = scope_blocking(callers::MERGE_PARENT_DELETION, || {
         gh_compare_jq_blocking(repo_slug, base, head, ".files // []")
@@ -387,6 +353,13 @@ mod tests {
         assert!(body.contains("- b.tsx"));
         assert!(body.contains("2 surface(s)"));
         assert!(body.contains("PR: https://github.com/org/repo/pull/1"));
+    }
+
+    #[test]
+    fn blocking_compute_short_circuits_on_empty_refs() {
+        assert!(compute_merged_parent_deletions_blocking("org/repo", "", "base", "head").is_empty());
+        assert!(compute_merged_parent_deletions_blocking("org/repo", "before", "", "head").is_empty());
+        assert!(compute_merged_parent_deletions_blocking("org/repo", "before", "base", "").is_empty());
     }
 
     #[test]

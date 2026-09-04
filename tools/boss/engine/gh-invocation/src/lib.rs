@@ -263,6 +263,20 @@ pub fn is_editorial_candidate(command: &str) -> bool {
 // [`gh_compare_jq`].
 pub use boss_github::gh_runner::{gh_output, run_gh};
 
+/// GitHub JSON Accept header shared by every compare call.
+const GH_COMPARE_ACCEPT: &str = "Accept: application/vnd.github+json";
+
+/// `repos/{slug}/compare/{base}...{head}` endpoint used by both the async
+/// and blocking compare helpers.
+fn gh_compare_endpoint(repo_slug: &str, base: &str, head: &str) -> String {
+    format!("repos/{repo_slug}/compare/{base}...{head}")
+}
+
+/// `gh api` argv for a compare: endpoint, Accept header, jq projection.
+fn gh_compare_api_args<'a>(endpoint: &'a str, jq: &'a str) -> [&'a str; 6] {
+    ["api", endpoint, "-H", GH_COMPARE_ACCEPT, "--jq", jq]
+}
+
 /// Shell out to `gh api repos/<repo_slug>/compare/<base>...<head>` with the
 /// GitHub JSON `Accept` header and the caller-supplied `jq` projection,
 /// returning the trimmed stdout.
@@ -273,36 +287,18 @@ pub use boss_github::gh_runner::{gh_output, run_gh};
 /// `Vec<CompareFile>`, or a `u64` line-count parse) and their own fail-open
 /// semantics — this helper only builds the request and returns raw stdout.
 pub async fn gh_compare_jq(repo_slug: &str, base: &str, head: &str, jq: &str) -> anyhow::Result<String> {
-    let endpoint = format!("repos/{repo_slug}/compare/{base}...{head}");
-    let stdout = run_gh(
-        &[
-            "api",
-            &endpoint,
-            "-H",
-            "Accept: application/vnd.github+json",
-            "--jq",
-            jq,
-        ],
-        &format!("gh api {endpoint}"),
-    )
-    .await?;
+    let endpoint = gh_compare_endpoint(repo_slug, base, head);
+    let stdout = run_gh(&gh_compare_api_args(&endpoint, jq), &format!("gh api {endpoint}")).await?;
     Ok(stdout.trim().to_owned())
 }
 
 /// Blocking counterpart of [`gh_compare_jq`] for call sites that already
 /// run off the tokio runtime (e.g. `spawn_blocking` review-verdict apply).
 pub fn gh_compare_jq_blocking(repo_slug: &str, base: &str, head: &str, jq: &str) -> anyhow::Result<String> {
-    let endpoint = format!("repos/{repo_slug}/compare/{base}...{head}");
+    let endpoint = gh_compare_endpoint(repo_slug, base, head);
     let display = format!("gh api {endpoint}");
-    let output = boss_github::gh_runner::gh_output_blocking(&[
-        "api",
-        &endpoint,
-        "-H",
-        "Accept: application/vnd.github+json",
-        "--jq",
-        jq,
-    ])
-    .with_context(|| format!("failed to spawn `{display}`"))?;
+    let output = boss_github::gh_runner::gh_output_blocking(&gh_compare_api_args(&endpoint, jq))
+        .with_context(|| format!("failed to spawn `{display}`"))?;
     if !output.status.success() {
         anyhow::bail!("`{display}` failed: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
@@ -620,5 +616,22 @@ mod tests {
         let s = "plain command arg1 arg2";
         let result = strip_quoted_string_contents(s);
         assert!(matches!(result, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn compare_helpers_share_endpoint_and_args() {
+        let endpoint = gh_compare_endpoint("org/repo", "abc", "def");
+        assert_eq!(endpoint, "repos/org/repo/compare/abc...def");
+        assert_eq!(
+            gh_compare_api_args(&endpoint, ".files // []"),
+            [
+                "api",
+                "repos/org/repo/compare/abc...def",
+                "-H",
+                "Accept: application/vnd.github+json",
+                "--jq",
+                ".files // []",
+            ],
+        );
     }
 }

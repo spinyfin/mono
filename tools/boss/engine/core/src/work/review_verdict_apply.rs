@@ -154,17 +154,6 @@ impl WorkDb {
             })?
         };
 
-        // incident-002 both-parents deletion tripwire, same halt as the
-        // legacy `finalize_pr_review_pass` path: a conflict-resolution PR
-        // that removed a merged parent's surface is held at
-        // `blocked: deletion_signoff` with the shared attention kind, and
-        // no revision is minted.
-        let deletion_signoff =
-            self.compute_batch_merge_parent_deletion_signoff(&origin_task, &verdict.target_sha, pr_checker)?;
-        if !deletion_signoff.is_empty() {
-            self.hold_cycle_root_for_deletion_signoff(&batch.cycle_root_id, &batch.pr_url, &deletion_signoff)?;
-        }
-
         let origin = crate::pr_review::ReviewOrigin {
             task_short_id: origin_task.short_id,
             pr_number: Some(batch.pr_number),
@@ -175,10 +164,33 @@ impl WorkDb {
         // Prefer the existing materialisation keyed on this proposal. A reapply
         // after the cycle increment has landed would otherwise look like a
         // duplicate-head pass and drop the already-created revision/follow-up.
+        // Look this up *before* the tripwire so a retry that now holds the
+        // cycle root can tombstone a revision minted on a prior pass that
+        // failed open (then failed before `commit_applied_review_verdict`).
         let existing = {
             let conn = self.connect()?;
             existing_review_findings_work_item(&conn, &created_via)?
         };
+
+        // incident-002 both-parents deletion tripwire, same halt as the
+        // legacy `finalize_pr_review_pass` path: a conflict-resolution PR
+        // that removed a merged parent's surface is held at
+        // `blocked: deletion_signoff` with the shared attention kind, and
+        // no revision is minted. If a prior apply already materialised one
+        // under this proposal's created_via key, tombstone it so the hold
+        // does not leave an autostart revision running.
+        let deletion_signoff =
+            self.compute_batch_merge_parent_deletion_signoff(&origin_task, &verdict.target_sha, pr_checker)?;
+        if !deletion_signoff.is_empty() {
+            self.hold_cycle_root_for_deletion_signoff(&batch.cycle_root_id, &batch.pr_url, &deletion_signoff)?;
+            if let Some(ref existing_task) = existing {
+                let mut conn = self.connect()?;
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                tombstone_orphaned_remediation_in_tx(&tx, &existing_task.id, &now_string())?;
+                tx.commit()?;
+            }
+        }
+
         let remediating_task = if !deletion_signoff.is_empty() {
             None
         } else if let Some(existing) = existing {
