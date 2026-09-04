@@ -41,13 +41,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use boss_protocol::CreateAttentionItemInput;
+use boss_protocol::{CreateAttentionItemInput, ReviewBatchMemberRole};
 
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::work::{
     DeadPrReviewCandidate, GhPrStateChecker, ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD,
-    ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS, PrOpenState, PrStateChecker, WorkDb, WorkItem,
+    ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS, PrOpenState, PrStateChecker, RetryDeadReviewBatchMember, WorkDb,
+    WorkItem,
 };
 
 /// Attention-item kind filed when a dead review is auto-refired — lets the
@@ -62,11 +63,16 @@ pub struct PrReviewRecoveryOutcome {
     pub churn_skipped: usize,
     pub pr_closed_skipped: usize,
     pub error_skipped: usize,
+    /// Batches this pass terminal-failed (exhausted supervisor retry, or
+    /// supervisor died after the PR head moved). Distinct from `refired`:
+    /// nothing new is spawned, but the batch is no longer wedged in
+    /// `supervising` with nothing raised.
+    pub terminal_failed: usize,
 }
 
 impl crate::sweep_loop::SweepOutcome for PrReviewRecoveryOutcome {
     fn has_activity(&self) -> bool {
-        self.refired > 0 || self.churn_skipped > 0 || self.pr_closed_skipped > 0
+        self.refired > 0 || self.churn_skipped > 0 || self.pr_closed_skipped > 0 || self.terminal_failed > 0
     }
 
     fn log(&self) {
@@ -75,6 +81,7 @@ impl crate::sweep_loop::SweepOutcome for PrReviewRecoveryOutcome {
             churn_skipped = self.churn_skipped,
             pr_closed_skipped = self.pr_closed_skipped,
             error_skipped = self.error_skipped,
+            terminal_failed = self.terminal_failed,
             "pr_review recovery: pass complete",
         );
     }
@@ -169,23 +176,103 @@ pub async fn run_one_pass(
                 continue;
             }
         };
-        match pr_checker.check(&pr_url) {
-            Ok(PrOpenState::Open) => {}
-            Ok(PrOpenState::Merged | PrOpenState::ClosedUnmerged) => {
-                tracing::info!(
-                    work_item_id = %work_item_id,
-                    dead_execution_id = %dead_execution_id,
-                    "pr_review recovery: PR is no longer open; skipping batch leaf recovery",
-                );
-                outcome.pr_closed_skipped += 1;
-                continue;
-            }
+        let inspect = match pr_checker.inspect(&pr_url) {
+            Ok(inspect) => inspect,
             Err(error) => {
                 tracing::warn!(
                     work_item_id = %work_item_id,
                     dead_execution_id = %dead_execution_id,
                     ?error,
-                    "pr_review recovery: failed to check PR state for batch leaf; skipping",
+                    "pr_review recovery: failed to check PR state for batch member; skipping",
+                );
+                outcome.error_skipped += 1;
+                continue;
+            }
+        };
+        match inspect.open_state {
+            PrOpenState::Open => {}
+            PrOpenState::Merged | PrOpenState::ClosedUnmerged => {
+                tracing::info!(
+                    work_item_id = %work_item_id,
+                    dead_execution_id = %dead_execution_id,
+                    "pr_review recovery: PR is no longer open; skipping batch member recovery",
+                );
+                outcome.pr_closed_skipped += 1;
+                continue;
+            }
+        }
+
+        // A retried supervisor collates the existing leaf reports for the
+        // batch's frozen target SHA. If the PR head has moved, those reports
+        // are stale; fail the batch rather than consolidating them.
+        match work_db.review_batch_member_for_execution(&dead_execution_id) {
+            Ok(Some(member)) if member.role == ReviewBatchMemberRole::Supervisor => {
+                match work_db.review_batch(&member.batch_id) {
+                    Ok(Some(batch)) => {
+                        if let Some(live_sha) = inspect.head_sha.as_deref()
+                            && live_sha != batch.target_sha
+                        {
+                            match work_db.fail_review_batch_for_moved_head(&dead_execution_id, live_sha) {
+                                Ok(true) => {
+                                    tracing::warn!(
+                                        work_item_id = %work_item_id,
+                                        dead_execution_id = %dead_execution_id,
+                                        batch_id = %batch.id,
+                                        batch_target_sha = %batch.target_sha,
+                                        live_head_sha = %live_sha,
+                                        "pr_review recovery: supervisor died after PR head moved; failed the batch",
+                                    );
+                                    outcome.terminal_failed += 1;
+                                }
+                                Ok(false) => {
+                                    tracing::info!(
+                                        work_item_id = %work_item_id,
+                                        dead_execution_id = %dead_execution_id,
+                                        "pr_review recovery: supervisor head-move fail was a no-op",
+                                    );
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        work_item_id = %work_item_id,
+                                        dead_execution_id = %dead_execution_id,
+                                        ?error,
+                                        "pr_review recovery: failed to fail batch after PR head moved",
+                                    );
+                                    outcome.error_skipped += 1;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            work_item_id = %work_item_id,
+                            dead_execution_id = %dead_execution_id,
+                            batch_id = %member.batch_id,
+                            "pr_review recovery: supervisor member has no persisted batch; skipping",
+                        );
+                        outcome.error_skipped += 1;
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            work_item_id = %work_item_id,
+                            dead_execution_id = %dead_execution_id,
+                            ?error,
+                            "pr_review recovery: failed to load batch for supervisor SHA check; skipping",
+                        );
+                        outcome.error_skipped += 1;
+                        continue;
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    work_item_id = %work_item_id,
+                    dead_execution_id = %dead_execution_id,
+                    ?error,
+                    "pr_review recovery: failed to identify batch membership; skipping",
                 );
                 outcome.error_skipped += 1;
                 continue;
@@ -193,7 +280,7 @@ pub async fn run_one_pass(
         }
 
         match work_db.retry_dead_review_batch_member(&dead_execution_id) {
-            Ok(Some(retry)) => {
+            Ok(RetryDeadReviewBatchMember::Retried(retry)) => {
                 file_dead_review_attention(work_db, &work_item_id, &dead_execution_id, dead_status.as_str());
                 dispatch_events
                     .emit(
@@ -210,16 +297,24 @@ pub async fn run_one_pass(
                     work_item_id = %work_item_id,
                     dead_execution_id = %dead_execution_id,
                     retry_execution_id = %retry.id,
-                    "pr_review recovery: refired one role-scoped batch leaf",
+                    "pr_review recovery: refired one role-scoped batch member",
                 );
                 coordinator.kick();
                 outcome.refired += 1;
             }
-            Ok(None) => {
+            Ok(RetryDeadReviewBatchMember::BatchFailed) => {
+                tracing::warn!(
+                    work_item_id = %work_item_id,
+                    dead_execution_id = %dead_execution_id,
+                    "pr_review recovery: batch member exhausted its retry; batch failed with attention",
+                );
+                outcome.terminal_failed += 1;
+            }
+            Ok(RetryDeadReviewBatchMember::NotRetried) => {
                 tracing::info!(
                     work_item_id = %work_item_id,
                     dead_execution_id = %dead_execution_id,
-                    "pr_review recovery: batch leaf already exhausted its one retry",
+                    "pr_review recovery: batch member already exhausted its one retry",
                 );
             }
             Err(error) => {
@@ -227,7 +322,7 @@ pub async fn run_one_pass(
                     work_item_id = %work_item_id,
                     dead_execution_id = %dead_execution_id,
                     ?error,
-                    "pr_review recovery: failed to recover batch leaf",
+                    "pr_review recovery: failed to recover batch member",
                 );
                 outcome.error_skipped += 1;
             }
@@ -411,12 +506,18 @@ fn file_dead_review_attention(work_db: &WorkDb, work_item_id: &str, dead_executi
 mod tests {
     use std::sync::Arc;
 
-    use boss_protocol::{ExecutionKind, RequestExecutionInput};
+    use boss_protocol::{
+        ExecutionKind, RequestExecutionInput, ReviewBatchMemberRole, ReviewBatchMemberStatus, ReviewBatchPhase,
+        ReviewBatchStatus, ReviewClassification, ReviewLanguageBucket, ReviewProfile,
+    };
 
     use super::*;
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::test_support::*;
-    use crate::work::{CreateChoreInput, ExecutionStatus, FakePrStateChecker, PrOpenState, WorkDb, WorkItemPatch};
+    use crate::work::{
+        CreateChoreInput, CreateExecutionInput, ExecutionStatus, FakePrStateChecker, PrOpenState,
+        ReviewBatchCreateInput, ReviewBatchMemberCreateInput, WorkDb, WorkItemPatch,
+    };
 
     // `NoopCube` and `NoopRunner` come from `crate::test_support::*`.
 
@@ -981,6 +1082,159 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.work_item_id == work_item_id && candidate.execution_id == execution.id),
             "a completed pr_review created after pr_review_verdicts, with no verdict, is dead"
+        );
+    }
+
+    fn create_chore_with_dead_supervisor(db: &WorkDb, pr_url: &str, target_sha: &str) -> (String, String, String) {
+        let work_item_id = in_review_chore_with_pr(db, pr_url);
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(work_item_id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        let classification = ReviewClassification::builder()
+            .changed_files(vec!["src/lib.rs".to_owned()])
+            .complexity_flags(vec![])
+            .has_production_code(true)
+            .metadata_missing(vec![])
+            .production_languages(vec![ReviewLanguageBucket::Rust])
+            .profile(ReviewProfile::Light)
+            .subsystem_buckets(vec!["src".to_owned()])
+            .build();
+        let (batch, _) = db
+            .create_review_batch(
+                ReviewBatchCreateInput::builder()
+                    .cycle_root_id(work_item_id.clone())
+                    .base_sha("base-sha")
+                    .classification(classification)
+                    .phase(ReviewBatchPhase::PreMerge)
+                    .pr_number(1)
+                    .pr_url(pr_url)
+                    .target_sha(target_sha)
+                    .build(),
+                &[ReviewBatchMemberCreateInput::builder()
+                    .attempt(1)
+                    .provider_effort("medium")
+                    .requested_driver("claude")
+                    .resolved_model("test-model")
+                    .role(ReviewBatchMemberRole::Supervisor)
+                    .status(ReviewBatchMemberStatus::Pending)
+                    .execution_id(execution.id.clone())
+                    .build()],
+            )
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE pr_review_batches SET status = 'supervising' WHERE id = ?1",
+                rusqlite::params![batch.id],
+            )
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET status = 'orphaned' WHERE id = ?1",
+                rusqlite::params![execution.id],
+            )
+            .unwrap();
+        (work_item_id, execution.id, batch.id)
+    }
+
+    #[tokio::test]
+    async fn refires_dead_supervisor_when_head_sha_matches() {
+        let (_dir, db) = open_db();
+        let (work_item_id, dead_execution_id, batch_id) =
+            create_chore_with_dead_supervisor(&db, "https://github.com/test/repo/pull/21", "head-sha");
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let checker = FakePrStateChecker::always(PrOpenState::Open).with_head_sha("head-sha");
+
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), &checker).await;
+
+        assert_eq!(outcome.refired, 1, "dead supervisor should have been retried once");
+        assert_eq!(outcome.terminal_failed, 0);
+        assert_eq!(
+            db.review_batch(&batch_id).unwrap().unwrap().status,
+            ReviewBatchStatus::Supervising
+        );
+        let executions = db.list_executions(Some(&work_item_id)).unwrap();
+        assert!(
+            executions.iter().any(|e| e.kind == ExecutionKind::PrReview
+                && e.status == ExecutionStatus::Ready
+                && e.id != dead_execution_id),
+            "expected a fresh ready supervisor execution distinct from the dead one"
+        );
+        let members = db.review_batch_members(&batch_id).unwrap();
+        assert_eq!(
+            members
+                .iter()
+                .filter(|m| m.role == ReviewBatchMemberRole::Supervisor)
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn fails_dead_supervisor_batch_when_pr_head_has_moved() {
+        let (_dir, db) = open_db();
+        let (work_item_id, dead_execution_id, batch_id) =
+            create_chore_with_dead_supervisor(&db, "https://github.com/test/repo/pull/22", "head-sha");
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let checker = FakePrStateChecker::always(PrOpenState::Open).with_head_sha("new-head");
+
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), &checker).await;
+
+        assert_eq!(outcome.refired, 0, "must not retry a supervisor against a moved head");
+        assert_eq!(outcome.terminal_failed, 1);
+        let failed = db.review_batch(&batch_id).unwrap().unwrap();
+        assert_eq!(failed.status, ReviewBatchStatus::Failed);
+        assert!(
+            !db.list_executions(Some(&work_item_id))
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == ExecutionKind::PrReview
+                    && e.status == ExecutionStatus::Ready
+                    && e.id != dead_execution_id),
+            "moved-head failure must not spawn a retry execution"
+        );
+        let attentions = db.list_attention_items_for_work_item(&work_item_id).unwrap();
+        assert!(
+            attentions
+                .iter()
+                .any(|a| a.kind == "pr_review_quorum_failed" && a.title.to_lowercase().contains("head moved")),
+            "expected a pr_review_quorum_failed attention; got: {attentions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skips_dead_supervisor_when_pr_already_merged() {
+        let (_dir, db) = open_db();
+        let (_work_item_id, _dead_execution_id, batch_id) =
+            create_chore_with_dead_supervisor(&db, "https://github.com/test/repo/pull/23", "head-sha");
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let checker = FakePrStateChecker::always(PrOpenState::Merged).with_head_sha("head-sha");
+
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), &checker).await;
+
+        assert_eq!(outcome.refired, 0);
+        assert_eq!(outcome.pr_closed_skipped, 1);
+        assert_eq!(outcome.terminal_failed, 0);
+        assert_eq!(
+            db.review_batch(&batch_id).unwrap().unwrap().status,
+            ReviewBatchStatus::Supervising,
+            "a merged PR skips recovery; it must not silently fail or complete the batch"
         );
     }
 }

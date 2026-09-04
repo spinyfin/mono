@@ -1364,11 +1364,12 @@ impl WorkerCompletionHandler {
                             "reviewer stopped without submitting review-report/review-verdict proposal; \
                              member marked failed",
                         );
-                        // This member just permanently settled failed (a
-                        // leaf gets one retry via the recovery sweep, but
-                        // the supervisor gets none), so the batch's quorum
-                        // decision may have just become decidable — check
-                        // now rather than waiting on some other hook.
+                        // This member just settled failed. A leaf or
+                        // supervisor at attempt 1 is not yet terminal — the
+                        // recovery sweep inserts the one retry — but an
+                        // exhausted attempt makes the batch's quorum
+                        // decision decidable, so check now rather than
+                        // waiting on some other hook.
                         match self.work_db.try_advance_review_batch_quorum(&member.batch_id) {
                             Ok(crate::work::ReviewBatchQuorumOutcome::SupervisorDispatched) => {
                                 self.publisher.kick_scheduler();
