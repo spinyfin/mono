@@ -70,6 +70,7 @@ impl WorkDb {
             conn: Arc::new(Mutex::new(conn)),
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
+            boothby_event_queue: Arc::default(),
         };
         db.init()?;
         Ok(db)
@@ -90,6 +91,7 @@ impl WorkDb {
             conn: Arc::new(Mutex::new(conn)),
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
+            boothby_event_queue: Arc::default(),
         };
         db.init()?;
         Ok(db)
