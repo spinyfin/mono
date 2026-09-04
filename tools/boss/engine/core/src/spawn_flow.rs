@@ -234,6 +234,13 @@ pub(crate) fn apply_worker_tool_env(env: &mut Vec<EnvVar>, boss_bin_dir: Option<
                 .display()
                 .to_string(),
         );
+        set_env_var(
+            env,
+            boss_engine_worker_bin::CHECKLEFT_BIN_ENV,
+            boss_engine_worker_bin::checkleft_bin_in(Path::new(&worker_bin_dir))
+                .display()
+                .to_string(),
+        );
     }
 }
 
@@ -2345,6 +2352,13 @@ mod tests {
                 .map(|(_, v)| v.as_str()),
             Some("/tmp/boss-worker-settings/bin/cube"),
             "CUBE_BIN must name the launcher, not a PATH entry",
+        );
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == boss_engine_worker_bin::CHECKLEFT_BIN_ENV)
+                .map(|(_, v)| v.as_str()),
+            Some("/tmp/boss-worker-settings/bin/checkleft"),
+            "CHECKLEFT_BIN must name the launcher, not a PATH entry",
         );
     }
 
