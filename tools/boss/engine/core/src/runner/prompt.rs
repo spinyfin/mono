@@ -451,7 +451,21 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
     prompt.push_str("You are a reusable Boss worker running one execution inside a dedicated repo workspace.\n");
     prompt.push_str("The current session cwd is already set to that workspace.\n");
     prompt.push_str("Do the work directly in the repository checkout before ending this run.\n");
-    prompt.push_str(block_boundary_fragment());
+    if matches!(
+        execution.kind,
+        ExecutionKind::TaskImplementation
+            | ExecutionKind::ChoreImplementation
+            | ExecutionKind::InvestigationImplementation
+            | ExecutionKind::RevisionImplementation
+            | ExecutionKind::ConflictResolution
+    ) {
+        prompt.push_str(block_boundary_fragment());
+    } else {
+        prompt.push_str(
+            "Avoid asking the human for permission during this pass; when you need review or \
+             direction, stop and summarize it clearly.\n\n",
+        );
+    }
 
     // If the chore already has a PR, inject a high-prominence resume
     // directive BEFORE the execution context so it outweighs the

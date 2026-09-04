@@ -1,10 +1,11 @@
 //! Opening autonomy / block-boundary for implementation-family worker prompts.
 //!
 //! Split out of `prompt.rs` to keep that file under the repo's `file/size`
-//! check. The one-line "avoid asking; stop and summarize" instruction lived
-//! here and workers were reading it as license to park on merge conflicts or
-//! CI failures they could handle. This fragment keeps the genuine-decision
-//! stop path and names the cases that are not blockers.
+//! check.
+//!
+//! Draws the boundary between a genuine missing-decision stop and work the
+//! worker is expected to do itself — resolving conflicts in its own branch,
+//! and classifying a CI failure by cause.
 
 /// Opening block-boundary text injected at the top of
 /// [`super::compose_execution_prompt`].
@@ -24,6 +25,9 @@ pub(super) fn block_boundary_fragment() -> &'static str {
      unavailable.\n\
      - The brief conflicts with what the code actually does, in a way that \
      means delivering it as written would be wrong.\n\
+     - A build or test failure that you have genuinely tried to fix and \
+     cannot resolve — see the build-gate rules below for the marker to \
+     emit.\n\
      When one of those applies, stop and summarize it clearly.\n\
      \n\
      These are not reasons to block — they are work you are capable of doing:\n\
@@ -273,11 +277,51 @@ mod tests {
                 !prompt.contains("conflict you cannot resolve"),
                 "resume/stop text must not treat a generic unresolvable conflict as a blocker:\n{prompt}",
             );
+            assert!(
+                prompt.find(frag).unwrap() < prompt.find("## RESUME EXISTING PR").unwrap_or(usize::MAX),
+                "block-boundary fragment must precede the RESUME EXISTING PR block so it \
+                 outweighs the workspace-rules default:\n{prompt}",
+            );
         }
         let resumed = compose(&chore_with_pr("https://github.com/org/repo/pull/42"));
         assert!(
             resumed.contains("A merge conflict on that branch is not a resume failure"),
             "resume path must not reintroduce conflicts-as-blockers:\n{resumed}",
         );
+    }
+
+    #[test]
+    fn fragment_is_absent_for_read_only_execution_kinds() {
+        let frag = block_boundary_fragment();
+        for kind in [ExecutionKind::PrReview, ExecutionKind::AnswerAgent] {
+            let execution = WorkExecution::builder()
+                .id("exec_abc123_01")
+                .work_item_id("task-1")
+                .kind(kind.clone())
+                .status(ExecutionStatus::Running)
+                .repo_remote_url("git@github.com:org/repo.git")
+                .workspace_path("/tmp/workspace")
+                .created_at("2026-05-15T00:00:00Z")
+                .build();
+            let work_item = chore_without_pr();
+            let prompt = compose_execution_prompt(
+                ExecutionPromptParams::builder()
+                    .execution(&execution)
+                    .work_item(&work_item)
+                    .workspace_path(std::path::Path::new("/tmp/workspace"))
+                    .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                    .build(),
+            );
+            assert!(
+                !prompt.contains(frag),
+                "read-only execution kind {kind:?} must not receive the implementation-family \
+                 block-boundary fragment:\n{prompt}",
+            );
+            assert!(
+                prompt.contains("Avoid asking the human for permission during this pass"),
+                "read-only execution kind {kind:?} must still keep the short no-permission-ask \
+                 line:\n{prompt}",
+            );
+        }
     }
 }
