@@ -91,6 +91,7 @@ fn write_workspace_files_writes_path_guard_script_outside_workspace() {
         worker_kind: WorkerKind::Standard,
         automation_outcome_proposals_seam_enabled: false,
         is_review_supervisor: false,
+        is_post_merge_reviewer: false,
     };
     write_workspace_files(&input, &ClaudeDriver).unwrap();
 

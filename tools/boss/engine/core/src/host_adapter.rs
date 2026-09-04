@@ -878,10 +878,10 @@ impl HostAdapter for SshHostAdapter {
         //    mirroring the local runner.
         let remote_socket = remote_events_socket_path(&run_id);
         // Mirrors the local pane-spawn path's own lookup: only a review
-        // batch's Supervisor-role member gets the supervisor CLAUDE.md.
-        let is_review_supervisor = execution.kind == boss_protocol::ExecutionKind::PrReview
-            && self
-                .work_db
+        // batch's Supervisor-role member gets the supervisor CLAUDE.md, and
+        // only a PostMergeReviewer-role member gets the post-merge one.
+        let review_batch_member_role = if execution.kind == boss_protocol::ExecutionKind::PrReview {
+            self.work_db
                 .review_batch_member_for_execution(&execution.id)
                 .map_err(|error| {
                     anyhow::anyhow!(
@@ -889,7 +889,13 @@ impl HostAdapter for SshHostAdapter {
                         execution.id
                     )
                 })?
-                .is_some_and(|member| member.role == boss_protocol::ReviewBatchMemberRole::Supervisor);
+                .map(|member| member.role)
+        } else {
+            None
+        };
+        let is_review_supervisor = review_batch_member_role == Some(boss_protocol::ReviewBatchMemberRole::Supervisor);
+        let is_post_merge_reviewer =
+            review_batch_member_role == Some(boss_protocol::ReviewBatchMemberRole::PostMergeReviewer);
         let settings_input = WorkerSetupInput {
             run_id: run_id.clone(),
             lease_id: lease_id.clone(),
@@ -904,6 +910,7 @@ impl HostAdapter for SshHostAdapter {
             // its reduced surface instead of silently becoming Standard.
             worker_kind: crate::worker_setup::worker_kind_for_execution(&execution.kind),
             is_review_supervisor,
+            is_post_merge_reviewer,
             // Mirrors `WorkerSpawnOpts` above: a remotely dispatched triage
             // worker always gets the legacy marker-only CLAUDE.md, since
             // SshHostAdapter has no FeatureFlagsStore to read
@@ -1569,6 +1576,7 @@ mod tests {
             worker_kind: crate::worker_setup::WorkerKind::Standard,
             automation_outcome_proposals_seam_enabled: false,
             is_review_supervisor: false,
+            is_post_merge_reviewer: false,
         }
     }
 

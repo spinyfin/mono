@@ -93,6 +93,14 @@ pub struct PrLifecycleProbe {
     /// not initiate. `None` on every non-Trunk repo, and on a Trunk repo
     /// whose PR has no live or concluded-badly episode.
     pub trunk_queue_check_failure: Option<TrunkQueueCheckFailure>,
+    /// GitHub's `mergeCommit.oid` — the SHA of the actual merge commit
+    /// landed on the base branch, distinct from `head_ref_oid` (the PR
+    /// branch's own tip) for a real merge or squash commit. `None` while
+    /// the PR is open, and also on the rare merged PR for which GitHub
+    /// omitted the field. Used by the merge poller's post-merge review
+    /// trigger to key the immutable review target on the exact landed
+    /// tree rather than the pre-merge head.
+    pub merge_commit_oid: Option<String>,
 }
 
 /// Lifecycle states the poller reacts to. The split between
@@ -299,7 +307,7 @@ impl MergeProbe for CommandMergeProbe {
             // in `fetch_merge_queue_status` below. `autoMergeRequest` (used
             // to detect a "Merge When Ready" PR that hasn't reached the
             // queue) IS a valid `--json` field, so it's requested directly.
-            "state,mergedAt,closedAt,mergeable,mergeStateStatus,baseRefOid,headRefOid,headRefName,baseRefName,labels,statusCheckRollup,reviewDecision,reviews,autoMergeRequest",
+            "state,mergedAt,closedAt,mergeable,mergeStateStatus,baseRefOid,headRefOid,headRefName,baseRefName,labels,statusCheckRollup,reviewDecision,reviews,autoMergeRequest,mergeCommit",
         ])
         .await
         .with_context(|| format!("failed to spawn `gh pr view {pr_url}`"))?;
@@ -399,6 +407,7 @@ pub(crate) const PR_PROBE_FIELDS: &str = concat!(
     "reviewDecision reviews(last: 10) { nodes { author { login } state } } ",
     "mergeQueueEntry { state position enqueuedAt } ",
     "autoMergeRequest { enabledAt } ",
+    "mergeCommit { oid } ",
     "commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 30) { nodes { ",
     // `completedAt` is requested for one reader only: it is the episode
     // discriminator `trunk_queue_adopt` keys adoption on (a head sha is not
@@ -719,6 +728,7 @@ pub(crate) fn flatten_batched_pr_node(node: &serde_json::Value) -> serde_json::V
         "reviews": reviews,
         "mergeQueueEntry": node["mergeQueueEntry"],
         "autoMergeRequest": node["autoMergeRequest"],
+        "mergeCommit": node["mergeCommit"],
     })
 }
 
@@ -1008,6 +1018,16 @@ pub(crate) fn parse_probe_json(url: &str, body: &str, combined_state: Option<&st
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
+    // `mergeCommit` is non-null once the PR has merged (null while open, and
+    // on the rare merged PR where GitHub omitted the field entirely — the
+    // post-merge review trigger falls back to `head_ref_oid` for that case).
+    let merge_commit_oid = root
+        .get("mergeCommit")
+        .filter(|v| !v.is_null())
+        .and_then(|v| v.get("oid"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     Ok(PrLifecycleProbe {
         url: url.to_owned(),
         state,
@@ -1026,5 +1046,6 @@ pub(crate) fn parse_probe_json(url: &str, body: &str, combined_state: Option<&st
         auto_merge_enabled,
         auto_merge_enabled_at,
         trunk_queue_check_failure,
+        merge_commit_oid,
     })
 }

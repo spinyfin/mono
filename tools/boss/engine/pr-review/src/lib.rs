@@ -36,6 +36,7 @@
 
 mod blocks;
 mod parsing;
+mod post_merge_render;
 mod render;
 mod supervisor_render;
 mod supervisor_types;
@@ -46,6 +47,7 @@ pub use parsing::{
     PrReviewMetadata, classify_changed_files, classify_pr_review_metadata, extract_review_result,
     extract_review_result_verbose, passes_severity_gate, review_result_from_candidates,
 };
+pub use post_merge_render::{render_post_merge_reviewer_claude_md, render_post_merge_reviewer_initial_prompt};
 pub use render::{
     REVISION_CLOSE_SENTENCE, ReviewOrigin, ReviewerReportDestination, render_batch_reviewer_initial_prompt,
     render_reviewer_claude_md, render_reviewer_initial_prompt, render_revision_instructions, render_revision_title,

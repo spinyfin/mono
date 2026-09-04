@@ -87,6 +87,7 @@ fn heal_worker_settings_json_updates_all_hook_events() {
         worker_kind: WorkerKind::Standard,
         automation_outcome_proposals_seam_enabled: false,
         is_review_supervisor: false,
+        is_post_merge_reviewer: false,
     };
     let settings_file = settings_dir.path().join("mono-agent-heal.json");
     std::fs::write(&settings_file, render_settings_json(&input, &ClaudeDriver)).unwrap();

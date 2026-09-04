@@ -871,12 +871,12 @@ impl ExecutionRunner for PaneSpawnRunner {
         let worker_kind = crate::worker_setup::worker_kind_for_execution(&execution.kind);
         let permission_mode_override = worker_kind.forced_permission_mode();
         // Only a review-batch's Supervisor-role member gets the supervisor
-        // CLAUDE.md instead of the leaf reviewer's; every other `pr_review`
-        // execution (leaf members, and legacy memberless reviewers) keeps
-        // the existing reviewer posture unchanged.
-        let is_review_supervisor = execution.kind == ExecutionKind::PrReview
-            && self
-                .work_db
+        // CLAUDE.md, and only a PostMergeReviewer-role member gets the
+        // post-merge one, instead of the leaf reviewer's; every other
+        // `pr_review` execution (leaf members, and legacy memberless
+        // reviewers) keeps the existing reviewer posture unchanged.
+        let review_batch_member_role = if execution.kind == ExecutionKind::PrReview {
+            self.work_db
                 .review_batch_member_for_execution(&execution.id)
                 .map_err(|error| {
                     anyhow::anyhow!(
@@ -884,7 +884,12 @@ impl ExecutionRunner for PaneSpawnRunner {
                         execution.id
                     )
                 })?
-                .is_some_and(|member| member.role == ReviewBatchMemberRole::Supervisor);
+                .map(|member| member.role)
+        } else {
+            None
+        };
+        let is_review_supervisor = review_batch_member_role == Some(ReviewBatchMemberRole::Supervisor);
+        let is_post_merge_reviewer = review_batch_member_role == Some(ReviewBatchMemberRole::PostMergeReviewer);
         // Any environment scrubbing/exporting a driver's spawn needs (e.g.
         // Claude unsetting ANTHROPIC_API_KEY so it authenticates via OAuth
         // credentials instead of a stray shell-profile key) is the driver's
@@ -1105,6 +1110,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 tmux_host,
                 automation_outcome_proposals_seam_enabled,
                 is_review_supervisor,
+                is_post_merge_reviewer,
             },
             StdDuration::from_secs(30),
         )

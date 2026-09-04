@@ -2155,6 +2155,7 @@ async fn rebounce_settles_then_conflicting_base_rebuckets_via_sweep() {
             auto_merge_enabled: false,
             auto_merge_enabled_at: None,
             trunk_queue_check_failure: None,
+            merge_commit_oid: None,
         }),
     );
     let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;

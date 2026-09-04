@@ -26,6 +26,7 @@ fn poll_tier_classifies_open_pr_signals() {
         auto_merge_enabled: false,
         auto_merge_enabled_at: None,
         trunk_queue_check_failure: None,
+        merge_commit_oid: None,
     };
 
     assert_eq!(

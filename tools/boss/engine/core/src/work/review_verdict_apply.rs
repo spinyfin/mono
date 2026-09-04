@@ -506,9 +506,11 @@ impl WorkDb {
 
     /// Per-task `repo_remote_url` is NULL when the product owns the repo
     /// (`enforce_task_repo_invariant`); fall back to the product, then any
-    /// member execution, matching the completion-path tripwire's need for
-    /// a GitHub slug.
-    fn repo_remote_url_for_tripwire(&self, origin_task: &Task) -> Option<String> {
+    /// member execution. Originally the completion-path tripwire's own
+    /// helper for resolving a GitHub slug; `pub(crate)` so the merge
+    /// poller's post-merge review trigger (`merge_poller::sweep`) can reuse
+    /// the same fallback chain instead of a second copy.
+    pub(crate) fn repo_remote_url_for_tripwire(&self, origin_task: &Task) -> Option<String> {
         if let Some(url) = origin_task.repo_remote_url.as_deref().filter(|s| !s.is_empty()) {
             return Some(url.to_owned());
         }

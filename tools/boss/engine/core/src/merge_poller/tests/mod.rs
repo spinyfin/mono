@@ -489,6 +489,7 @@ fn probe_with_queue_fields(
         auto_merge_enabled,
         auto_merge_enabled_at: auto_merge_enabled_at.map(str::to_owned),
         trunk_queue_check_failure: None,
+        merge_commit_oid: None,
     }
 }
 
@@ -557,6 +558,7 @@ mod adaptive_tests;
 mod classify_tests;
 mod merge_queue_tests;
 mod metrics_tests;
+mod post_merge_review_trigger_tests;
 mod probe_snapshot_tests;
 mod probe_tests;
 mod remediation_tests;
