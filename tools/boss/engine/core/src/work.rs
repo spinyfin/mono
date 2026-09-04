@@ -507,6 +507,7 @@ mod migrations_attachments;
 mod migrations_b;
 mod migrations_boothby;
 mod migrations_c;
+mod migrations_ideas;
 mod migrations_review_batches;
 mod output_types;
 mod planner_runs;
@@ -564,6 +565,7 @@ pub(crate) use migrations_attachments::*;
 pub(crate) use migrations_b::*;
 pub(crate) use migrations_boothby::*;
 pub(crate) use migrations_c::*;
+pub(crate) use migrations_ideas::*;
 pub(crate) use migrations_review_batches::*;
 pub(crate) use pr_state::stored_pr_number;
 pub(crate) use products_design::{
