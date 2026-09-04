@@ -843,16 +843,7 @@ async fn reap_dead_execution(
     // invariants: `bossctl agents list` stops reporting a dead run as
     // live, and any real app-hosted pane on this slot becomes visible to
     // the husk-pane sweep for automatic retirement.
-    live_states.release_slot(state.slot_id);
-
-    // Release the worker pool slot so the orphan sweep detects
-    // the chore and creates a fresh ready execution for redispatch.
-    // Use worker_id_for_slot (not WorkerPool::worker_id_for_slot) so
-    // automation-pool slots (> MAX_WORKER_POOL_SIZE) produce the
-    // "auto-worker-N" prefix and release_worker_and_kick routes to the
-    // correct pool via pool_for_worker_id.
-    let worker_id = worker_id_for_slot(state.slot_id);
-    coordinator.release_worker_and_kick(&worker_id, None).await;
+    release_reaped_execution(live_states, &coordinator, state).await;
 
     // Structured event for bossctl dispatch tail. Fold in what the
     // liveness probe observed (probe type, result, and the live-state
@@ -885,6 +876,22 @@ async fn reap_dead_execution(
     }
 
     true
+}
+
+/// Remove a reaped run's live-state entry and release its pool claim only
+/// while that claim still belongs to the reaped execution. Reapers that own
+/// pane teardown may already have done both operations; the execution-id
+/// guard makes the second call harmless if dispatch has re-claimed the slot.
+pub(crate) async fn release_reaped_execution(
+    live_states: &LiveWorkerStateRegistry,
+    coordinator: &Arc<ExecutionCoordinator>,
+    state: &LiveWorkerState,
+) {
+    live_states.release_slot(state.slot_id);
+    let worker_id = worker_id_for_slot(state.slot_id);
+    coordinator
+        .release_pool_claim_if_execution(&worker_id, &state.run_id)
+        .await;
 }
 
 /// File (or no-op onto an already-`open` one) a [`PANE_DEATH_ATTENTION_KIND`]

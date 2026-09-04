@@ -1538,6 +1538,20 @@ impl LiveWorkerStateRegistry {
             entry.state.activity = activity;
         }
     }
+
+    /// Override the checkpoint's `tool_condition` for `slot_id` directly,
+    /// bypassing [`Self::seed_semantic_progress`]'s no-op guard (which
+    /// refuses once `last_event_at` is set). Test seam for reproducing a
+    /// driver state reset — the tool condition reverting to
+    /// [`SemanticToolCondition::Unknown`] — landing between two
+    /// classifications of the same live slot within one sweep pass.
+    #[cfg(test)]
+    pub fn set_semantic_tool_condition_for_test(&self, slot_id: u8, tool_condition: SemanticToolCondition) {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        if let Some(entry) = guard.get_mut(&slot_id) {
+            entry.meta.semantic_tool_condition = tool_condition;
+        }
+    }
 }
 
 fn current_iso8601() -> String {

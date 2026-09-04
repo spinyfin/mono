@@ -1571,9 +1571,11 @@ pub async fn serve_with_merge_probe(
     // plus tri-state tool condition) and progress fidelity; tmux itself
     // decides only exact identity and death (`#{window_activity}` and
     // `#{pane_current_command}` are diagnostics, never health vetoes). A
-    // quietly stuck but live pane raises an attention item; confirmed death
-    // remains with the existing death reconcilers. Runs every 60s and fires
-    // on boot.
+    // quietly stuck but live pane raises an attention item; past the
+    // longer DEFAULT_AUTO_REAP_THRESHOLD_SECS it is destructively reaped
+    // (after a token-verified recheck immediately before acting); confirmed
+    // death remains with the existing death reconcilers. Runs every 60s and
+    // fires on boot.
     let stale_worker_terminal_inspector = match server_state.resolve_tmux() {
         Ok(tmux) => {
             let legacy_tmux = boss_tmux::Tmux::for_legacy_label_server(tmux.program().to_path_buf()).ok();
@@ -1608,6 +1610,7 @@ pub async fn serve_with_merge_probe(
         },
         Duration::from_secs(60),
         crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS,
+        crate::stale_worker_sweep::DEFAULT_AUTO_REAP_THRESHOLD_SECS,
     );
 
     // Runtime envelope watchdog: signals (does NOT interrupt) a live
