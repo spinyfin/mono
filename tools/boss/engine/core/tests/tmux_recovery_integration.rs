@@ -352,6 +352,7 @@ async fn production_tmux_recovery_ignores_repaint_and_process_title_then_redispa
             tmux_host: Some(TmuxWorkerHost::new(tmux.clone(), spawn_store, session_name.clone())),
             automation_outcome_proposals_seam_enabled: false,
             is_review_supervisor: false,
+            is_post_merge_reviewer: false,
         },
         SHORT_WINDOW,
     )
