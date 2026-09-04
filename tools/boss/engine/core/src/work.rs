@@ -573,7 +573,8 @@ pub(crate) use products_design::resolve_task_doc_pointer;
 pub(crate) use proposal_apply::*;
 pub(crate) use query_ensure::*;
 pub use review_batches::{
-    ReviewBatchCreateInput, ReviewBatchDispatch, ReviewBatchMemberCreateInput, ReviewBatchQuorumOutcome,
+    RetryDeadReviewBatchMember, ReviewBatchCreateInput, ReviewBatchDispatch, ReviewBatchMemberCreateInput,
+    ReviewBatchQuorumOutcome,
 };
 pub(crate) use review_verdicts::query_latest_informative_review_verdicts;
 pub(crate) use revision_helpers::*;
@@ -630,6 +631,7 @@ pub use pr_flow::QueuedMergeQueueMember;
 #[cfg(test)]
 pub use pr_state::FakePrStateChecker;
 pub use pr_state::GhPrStateChecker;
+pub use pr_state::PrInspect;
 pub use pr_state::PrMergeClass;
 pub use pr_state::PrOpenState;
 pub use pr_state::PrStateChecker;

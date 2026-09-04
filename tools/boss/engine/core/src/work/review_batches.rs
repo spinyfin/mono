@@ -121,6 +121,21 @@ fn map_review_batch_member(row: &Row<'_>) -> rusqlite::Result<ReviewBatchMember>
     })
 }
 
+/// Look up the persisted batch member that owns an execution.
+fn member_for_execution_in(conn: &rusqlite::Connection, execution_id: &str) -> Result<Option<ReviewBatchMember>> {
+    conn.query_row(
+        "SELECT id, batch_id, attempt, created_at, provider_effort,
+                requested_driver, resolved_model, role, status, updated_at,
+                execution_id, report_proposal_id, terminal_at
+         FROM pr_review_batch_members
+         WHERE execution_id = ?1",
+        params![execution_id],
+        map_review_batch_member,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 fn member_role_is_valid_for_phase(phase: ReviewBatchPhase, role: ReviewBatchMemberRole) -> bool {
     match phase {
         ReviewBatchPhase::PreMerge => matches!(
@@ -407,17 +422,24 @@ const LEAF_REVIEWER_ROLES: [ReviewBatchMemberRole; 3] = [
     ReviewBatchMemberRole::GrokReviewer,
 ];
 
-/// A leaf role is settled once its latest attempt either reported, or failed
+/// A role is settled once its latest attempt either reported, or failed
 /// with no further retry possible (`retry_dead_review_batch_member` bounds
-/// every role to at most one retry, so `attempt >= 2` while `Failed` is
-/// terminal — mirrors that function's own bound rather than introducing a
-/// second one).
-fn leaf_attempt_is_settled(member: &ReviewBatchMember) -> bool {
+/// every retryable role — the three leaves and the supervisor — to at most
+/// one retry, so `attempt >= 2` while `Failed` is terminal). Shared by the
+/// leaf-quorum walk and the supervising-state walk so the bound lives in
+/// one place.
+fn member_attempt_is_settled(member: &ReviewBatchMember) -> bool {
     match member.status {
         ReviewBatchMemberStatus::Reported => true,
         ReviewBatchMemberStatus::Failed => member.attempt >= 2,
         ReviewBatchMemberStatus::Pending | ReviewBatchMemberStatus::Running => false,
     }
+}
+
+/// Roles the dead-member recovery sweep may retry once. Post-merge
+/// reviewers are a different topology and are not recovered here.
+fn retryable_batch_member_role(role: ReviewBatchMemberRole) -> bool {
+    leaf_reviewer_role(role) || role == ReviewBatchMemberRole::Supervisor
 }
 
 /// The latest (highest-attempt) row for `role` among `members`, or `None` if
@@ -458,10 +480,54 @@ pub enum ReviewBatchQuorumOutcome {
     /// The supervisor reported; the batch moved to `completed`.
     Completed,
     /// Either fewer than two leaves reported (both exhausted their retry), or
-    /// the supervisor stopped without submitting a verdict. The batch moved
-    /// to `failed` and a human-visible attention was filed — this is the
-    /// "hold rather than produce a clean verdict" outcome.
+    /// the supervisor exhausted its one retry without submitting a verdict.
+    /// The batch moved to `failed` and a human-visible attention was filed —
+    /// this is the "hold rather than produce a clean verdict" outcome.
     InsufficientQuorum,
+}
+
+/// Result of [`WorkDb::retry_dead_review_batch_member`]. Distinguishes a
+/// freshly inserted retry from the two terminal cases so the recovery sweep
+/// can log and count them separately.
+#[derive(Debug)]
+pub enum RetryDeadReviewBatchMember {
+    /// A new pending member and ready execution were inserted for this role.
+    /// Boxed because [`WorkExecution`] is far larger than the unit variants.
+    Retried(Box<WorkExecution>),
+    /// Not a retryable member, a retry already exists, or the role has not
+    /// yet settled the rest of the batch (quorum was a no-op).
+    NotRetried,
+    /// This call itself moved the batch to `failed` and filed attention —
+    /// typically a supervisor whose last attempt died, or a leaf whose
+    /// exhausted retry just made leaf quorum decidable as insufficient.
+    BatchFailed,
+}
+
+/// Stamp a batch `failed` and file the shared `pr_review_quorum_failed`
+/// attention. Used by every terminal-failure destination of the quorum
+/// machine (insufficient leaf reports, exhausted supervisor, moved head)
+/// so they stay on one kind and one write path.
+fn fail_review_batch_with_attention(
+    tx: &Transaction<'_>,
+    batch: &ReviewBatch,
+    now: &str,
+    title: &str,
+    body_markdown: String,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE pr_review_batches SET status = 'failed', completed_at = ?2, updated_at = ?2 WHERE id = ?1",
+        params![batch.id, now],
+    )?;
+    super::workitems::insert_attention_item_row(
+        tx,
+        &CreateAttentionItemInput::builder()
+            .work_item_id(batch.cycle_root_id.clone())
+            .kind("pr_review_quorum_failed")
+            .title(title)
+            .body_markdown(body_markdown)
+            .build(),
+    )?;
+    Ok(())
 }
 
 /// The two-of-three quorum state machine for one review batch.
@@ -477,9 +543,12 @@ pub enum ReviewBatchQuorumOutcome {
 ///   `>= 2` dispatches the supervisor (`supervising`); `< 2` fails the batch
 ///   — the "fewer than two reports must hold rather than produce a clean
 ///   verdict" requirement. Still-in-flight roles are a no-op.
-/// - `supervising`: once the supervisor's own member has settled (reported or
-///   failed — the supervisor gets no retry, unlike a leaf), advance to
-///   `completed` or `failed` accordingly.
+/// - `supervising`: once the supervisor's latest attempt has settled
+///   (reported, or failed with its one retry exhausted — the same bound
+///   as a leaf), advance to `completed` or `failed` accordingly. A failed
+///   attempt-1 supervisor is a no-op so the recovery sweep can insert the
+///   retry rather than failing the batch the moment Stop (or a death
+///   stamp) lands.
 /// - Any other status (`applying`, `completed`, `failed`): no-op. This is
 ///   what makes redundant calls safe.
 ///
@@ -501,7 +570,7 @@ pub(crate) fn try_advance_review_batch_quorum_in_tx(
             let mut reported = 0usize;
             for role in LEAF_REVIEWER_ROLES {
                 match latest_attempt_for_role(&members, role) {
-                    Some(member) if leaf_attempt_is_settled(member) => {
+                    Some(member) if member_attempt_is_settled(member) => {
                         if member.status == ReviewBatchMemberStatus::Reported {
                             reported += 1;
                         }
@@ -536,24 +605,18 @@ pub(crate) fn try_advance_review_batch_quorum_in_tx(
                 )?;
                 Ok(ReviewBatchQuorumOutcome::SupervisorDispatched)
             } else {
-                tx.execute(
-                    "UPDATE pr_review_batches SET status = 'failed', completed_at = ?2, updated_at = ?2 WHERE id = ?1",
-                    params![batch_id, now],
-                )?;
-                super::workitems::insert_attention_item_row(
+                fail_review_batch_with_attention(
                     tx,
-                    &CreateAttentionItemInput::builder()
-                        .work_item_id(batch.cycle_root_id.clone())
-                        .kind("pr_review_quorum_failed")
-                        .title("Automated reviewer: insufficient quorum")
-                        .body_markdown(format!(
-                            "Fewer than two of the three independent reviewers reported for {} \
-                             (batch `{batch_id}`) — the remaining role(s) exhausted their retry \
-                             without submitting a report. The review cannot produce a consolidated \
-                             verdict without at least two independent reports.",
-                            batch.pr_url,
-                        ))
-                        .build(),
+                    &batch,
+                    &now,
+                    "Automated reviewer: insufficient quorum",
+                    format!(
+                        "Fewer than two of the three independent reviewers reported for {} \
+                         (batch `{batch_id}`) — the remaining role(s) exhausted their retry \
+                         without submitting a report. The review cannot produce a consolidated \
+                         verdict without at least two independent reports.",
+                        batch.pr_url,
+                    ),
                 )?;
                 Ok(ReviewBatchQuorumOutcome::InsufficientQuorum)
             }
@@ -572,24 +635,18 @@ pub(crate) fn try_advance_review_batch_quorum_in_tx(
                 )?;
                 Ok(ReviewBatchQuorumOutcome::Completed)
             }
-            Some(member) if member.status == ReviewBatchMemberStatus::Failed => {
-                tx.execute(
-                    "UPDATE pr_review_batches SET status = 'failed', completed_at = ?2, updated_at = ?2 WHERE id = ?1",
-                    params![batch_id, now],
-                )?;
-                super::workitems::insert_attention_item_row(
+            Some(member) if member_attempt_is_settled(member) => {
+                fail_review_batch_with_attention(
                     tx,
-                    &CreateAttentionItemInput::builder()
-                        .work_item_id(batch.cycle_root_id.clone())
-                        .kind("pr_review_quorum_failed")
-                        .title("Automated reviewer: supervisor did not produce a verdict")
-                        .body_markdown(format!(
-                            "The consolidating supervisor for {} (batch `{batch_id}`) stopped \
-                                 without submitting a review-verdict proposal. It is not retried \
-                                 automatically; the review cannot produce a consolidated verdict.",
-                            batch.pr_url,
-                        ))
-                        .build(),
+                    &batch,
+                    &now,
+                    "Automated reviewer: supervisor did not produce a verdict",
+                    format!(
+                        "The consolidating supervisor for {} (batch `{batch_id}`) exhausted its \
+                         one retry without submitting a review-verdict proposal. The review \
+                         cannot produce a consolidated verdict.",
+                        batch.pr_url,
+                    ),
                 )?;
                 Ok(ReviewBatchQuorumOutcome::InsufficientQuorum)
             }
@@ -740,17 +797,7 @@ impl WorkDb {
     /// to a persisted batch.
     pub fn review_batch_member_for_execution(&self, execution_id: &str) -> Result<Option<ReviewBatchMember>> {
         let conn = self.connect()?;
-        conn.query_row(
-            "SELECT id, batch_id, attempt, created_at, provider_effort,
-                    requested_driver, resolved_model, role, status, updated_at,
-                    execution_id, report_proposal_id, terminal_at
-             FROM pr_review_batch_members
-             WHERE execution_id = ?1",
-            params![execution_id],
-            map_review_batch_member,
-        )
-        .optional()
-        .map_err(Into::into)
+        member_for_execution_in(&conn, execution_id)
     }
 
     /// Record a batch member that stopped without submitting its required
@@ -794,25 +841,27 @@ impl WorkDb {
         Ok(found.is_some())
     }
 
-    /// List each failed-in-place leaf independently. Unlike the legacy
-    /// candidate query, this is not collapsed to one row per work item: three
-    /// roles may validly fail or recover in parallel.
+    /// List each failed-in-place leaf or supervisor independently. Unlike the
+    /// legacy candidate query, this is not collapsed to one row per work item:
+    /// three leaf roles (and the supervisor) may validly fail or recover in
+    /// parallel.
     ///
     /// `member.status` includes `'failed'` alongside `'pending'`/`'running'`
     /// because `finalize_review_batch_member` already stamps a member
     /// `'failed'` (and completes its execution) when its worker stops
-    /// without submitting a review-report proposal — that is the designed
-    /// main path this recovery sweep exists to retry by role. Excluding
-    /// `'failed'` here would leave only the narrower host-death case (a
-    /// member still `'pending'`/`'running'` whose execution died without a
-    /// Stop hook) ever recovered. `retry_dead_review_batch_member` already
-    /// bounds this to one retry per role via `member.attempt >= 2` and the
-    /// existing-retry check; this query mirrors both bounds directly (rather
-    /// than relying solely on the caller's post-hoc "already exhausted its
-    /// one retry" skip) so an attempt that can never be retried again is
-    /// listed at most once — otherwise it would keep costing a `gh pr view`
-    /// probe (see `pr_review_recovery`'s `pr_checker.check` call) on every
-    /// sweep for the remaining life of the PR.
+    /// without submitting a review-report/review-verdict proposal — that is
+    /// the designed main path this recovery sweep exists to retry by role.
+    /// Excluding `'failed'` here would leave only the narrower host-death
+    /// case (a member still `'pending'`/`'running'` whose execution died
+    /// without a Stop hook) ever recovered.
+    ///
+    /// Leaves are filtered to `attempt < 2` so an exhausted role is listed
+    /// at most once — otherwise it would keep costing a `gh pr view` probe
+    /// on every sweep for the remaining life of the PR. The supervisor is
+    /// not filtered that way: its last attempt can die without Stop ever
+    /// firing (`pending`/`running` at `attempt >= 2`), and the recovery
+    /// sweep is the only durable hook that will then fail the batch. Once
+    /// the batch is `failed` it drops out via `batch.status NOT IN (...)`.
     pub fn list_dead_review_batch_member_candidates(&self) -> Result<Vec<DeadPrReviewCandidate>> {
         let conn = self.connect()?;
         let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
@@ -823,9 +872,14 @@ impl WorkDb {
              JOIN work_executions we ON we.id = member.execution_id
              JOIN tasks task ON task.id = we.work_item_id
              WHERE batch.phase = 'pre_merge'
-               AND member.role IN ('claude_reviewer', 'codex_reviewer', 'grok_reviewer')
+               AND (
+                   (
+                     member.role IN ('claude_reviewer', 'codex_reviewer', 'grok_reviewer')
+                     AND member.attempt < 2
+                   )
+                   OR member.role = 'supervisor'
+               )
                AND member.status IN ('pending', 'running', 'failed')
-               AND member.attempt < 2
                AND NOT EXISTS (
                    SELECT 1 FROM pr_review_batch_members retry
                    WHERE retry.batch_id = member.batch_id
@@ -851,29 +905,23 @@ impl WorkDb {
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
-    /// Mark a dead leaf attempt failed and create its one role-scoped retry.
-    /// Attempts at two are terminal for this recovery path; no sibling role
-    /// is touched and no legacy single-review execution is ever inserted.
-    pub fn retry_dead_review_batch_member(&self, execution_id: &str) -> Result<Option<WorkExecution>> {
+    /// Mark a dead leaf or supervisor attempt failed and create its one
+    /// role-scoped retry. Attempts at two are terminal for this recovery
+    /// path: the member is stamped failed and quorum is advanced, which for
+    /// a supervisor (or a leaf that just made quorum decidable as
+    /// insufficient) fails the batch with attention. No sibling role is
+    /// touched and no legacy single-review execution is ever inserted.
+    pub fn retry_dead_review_batch_member(&self, execution_id: &str) -> Result<RetryDeadReviewBatchMember> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let member = tx
-            .query_row(
-                "SELECT id, batch_id, attempt, created_at, provider_effort,
-                        requested_driver, resolved_model, role, status, updated_at,
-                        execution_id, report_proposal_id, terminal_at
-                 FROM pr_review_batch_members WHERE execution_id = ?1",
-                params![execution_id],
-                map_review_batch_member,
-            )
-            .optional()?;
+        let member = member_for_execution_in(&tx, execution_id)?;
         let Some(member) = member else {
             tx.commit()?;
-            return Ok(None);
+            return Ok(RetryDeadReviewBatchMember::NotRetried);
         };
-        if !leaf_reviewer_role(member.role) {
+        if !retryable_batch_member_role(member.role) {
             tx.commit()?;
-            return Ok(None);
+            return Ok(RetryDeadReviewBatchMember::NotRetried);
         }
         let now = now_string();
         tx.execute(
@@ -887,9 +935,12 @@ impl WorkDb {
             // batch can change, so check it before committing rather than
             // waiting for some other hook to notice.
             let registry = crate::driver::DriverRegistry::default();
-            try_advance_review_batch_quorum_in_tx(&tx, &member.batch_id, &registry)?;
+            let outcome = try_advance_review_batch_quorum_in_tx(&tx, &member.batch_id, &registry)?;
             tx.commit()?;
-            return Ok(None);
+            return Ok(match outcome {
+                ReviewBatchQuorumOutcome::InsufficientQuorum => RetryDeadReviewBatchMember::BatchFailed,
+                _ => RetryDeadReviewBatchMember::NotRetried,
+            });
         }
         let retry_exists: Option<()> = tx
             .query_row(
@@ -900,7 +951,7 @@ impl WorkDb {
             .optional()?;
         if retry_exists.is_some() {
             tx.commit()?;
-            return Ok(None);
+            return Ok(RetryDeadReviewBatchMember::NotRetried);
         }
         let dead = query_execution(&tx, execution_id)?
             .ok_or_else(|| anyhow::anyhow!("review batch member references missing execution {execution_id}"))?;
@@ -924,6 +975,100 @@ impl WorkDb {
             .build();
         insert_batch_member_in_tx(&tx, &member.batch_id, &member_input, &now)?;
         tx.commit()?;
-        Ok(Some(retry))
+        Ok(RetryDeadReviewBatchMember::Retried(Box::new(retry)))
+    }
+
+    /// Fail a supervising batch whose supervisor died after the PR head
+    /// moved off the frozen `target_sha`. The existing leaf reports are for
+    /// the original SHA and must not be collated against a different head;
+    /// a later review cycle owns the new SHA. Returns `true` when this
+    /// call itself moved the batch to `failed`.
+    pub fn fail_review_batch_for_moved_head(&self, execution_id: &str, live_head_sha: &str) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let member = member_for_execution_in(&tx, execution_id)?;
+        let Some(member) = member else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        if member.role != ReviewBatchMemberRole::Supervisor {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let Some(batch) = review_batch_by_id_in(&tx, &member.batch_id)? else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        if batch.status != ReviewBatchStatus::Supervising || live_head_sha == batch.target_sha {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let now = now_string();
+        tx.execute(
+            "UPDATE pr_review_batch_members SET status = 'failed', terminal_at = ?1, updated_at = ?1
+             WHERE id = ?2 AND status IN ('pending', 'running')",
+            params![now, member.id],
+        )?;
+        fail_review_batch_with_attention(
+            &tx,
+            &batch,
+            &now,
+            "Automated reviewer: PR head moved before supervisor could consolidate",
+            format!(
+                "The consolidating supervisor for {} (batch `{}`) died before producing a \
+                 verdict, but the PR head has moved from `{}` to `{live_head_sha}`. The \
+                 existing leaf reports are for the original target and must not be \
+                 consolidated against a different head. The batch has been failed rather \
+                 than retried.",
+                batch.pr_url, batch.id, batch.target_sha,
+            ),
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Fail a supervising batch when its supervisor died and the PR is no
+    /// longer open. A closed PR cannot accept a delayed consolidated verdict,
+    /// so leaving the batch supervising would strand it without a live member
+    /// or an attention item.
+    pub fn fail_review_batch_for_closed_pr(&self, execution_id: &str) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(member) = member_for_execution_in(&tx, execution_id)? else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        if member.role != ReviewBatchMemberRole::Supervisor {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let Some(batch) = review_batch_by_id_in(&tx, &member.batch_id)? else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        if batch.status != ReviewBatchStatus::Supervising {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let now = now_string();
+        tx.execute(
+            "UPDATE pr_review_batch_members SET status = 'failed', terminal_at = ?1, updated_at = ?1
+             WHERE id = ?2 AND status IN ('pending', 'running')",
+            params![now, member.id],
+        )?;
+        fail_review_batch_with_attention(
+            &tx,
+            &batch,
+            &now,
+            "Automated reviewer: PR closed before supervisor could consolidate",
+            format!(
+                "The consolidating supervisor for {} (batch `{}`) died before producing a \
+                 verdict, and the PR is no longer open. The batch has been failed rather \
+                 than retried because a delayed consolidated verdict cannot be applied.",
+                batch.pr_url, batch.id,
+            ),
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 }

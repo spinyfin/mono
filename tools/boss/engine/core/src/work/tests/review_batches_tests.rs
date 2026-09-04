@@ -2,8 +2,8 @@
 //! classification, membership, and uniqueness contracts.
 
 use boss_protocol::{
-    ProposalDecider, ProposalKind, ProposalState, ReviewBatchMemberRole, ReviewBatchMemberStatus, ReviewBatchPhase,
-    ReviewBatchStatus, ReviewClassification, ReviewLanguageBucket, ReviewProfile,
+    ProposalDecider, ProposalKind, ProposalState, ReviewBatch, ReviewBatchMemberRole, ReviewBatchMemberStatus,
+    ReviewBatchPhase, ReviewBatchStatus, ReviewClassification, ReviewLanguageBucket, ReviewProfile,
 };
 
 use super::*;
@@ -434,12 +434,12 @@ fn quorum_dispatch_is_idempotent_across_redundant_calls() {
     assert_eq!(supervisor_count, 1, "exactly one supervisor member must ever exist");
 }
 
-/// (f) A supervisor that settles `Failed` (it gets no retry, unlike a leaf)
-/// fails the batch with the second `pr_review_quorum_failed` attention
-/// variant.
+/// (f) A supervisor that settles `Failed` on attempt 1 is not yet terminal —
+/// the recovery sweep still has its one retry. Quorum must no-op rather than
+/// fail the batch the moment the first attempt dies.
 #[test]
-fn quorum_fails_the_batch_when_the_supervisor_fails() {
-    let db = WorkDb::open(temp_db_path("quorum-supervisor-failed")).unwrap();
+fn quorum_is_a_noop_when_supervisor_attempt_one_fails() {
+    let db = WorkDb::open(temp_db_path("quorum-supervisor-attempt-1-failed")).unwrap();
     let product = create_test_product(&db);
     let cycle_root = create_test_chore_manual(&db, product.id, "review target");
     let execution = db
@@ -458,6 +458,44 @@ fn quorum_fails_the_batch_when_the_supervisor_fails() {
                 ReviewBatchMemberRole::Supervisor,
                 Some(execution.id.clone()),
                 1,
+                ReviewBatchMemberStatus::Failed,
+            )],
+        )
+        .unwrap();
+    force_batch_supervising(&db, &batch.id);
+
+    let outcome = advance_quorum(&db, &batch.id);
+    assert!(matches!(outcome, ReviewBatchQuorumOutcome::NoOp));
+    assert_eq!(
+        db.review_batch(&batch.id).unwrap().unwrap().status,
+        ReviewBatchStatus::Supervising
+    );
+    assert!(find_quorum_failed_attention(&db, &cycle_root.id).is_none());
+}
+
+/// (g) A supervisor that settles `Failed` on attempt 2 (retry exhausted)
+/// fails the batch with the `pr_review_quorum_failed` attention variant.
+#[test]
+fn quorum_fails_the_batch_when_the_supervisor_retry_is_exhausted() {
+    let db = WorkDb::open(temp_db_path("quorum-supervisor-failed")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member_with(
+                ReviewBatchMemberRole::Supervisor,
+                Some(execution.id.clone()),
+                2,
                 ReviewBatchMemberStatus::Failed,
             )],
         )
@@ -1302,10 +1340,9 @@ fn dead_leaf_retries_only_its_own_role_once() {
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].execution_id, dead.id);
 
-    let retry = db
-        .retry_dead_review_batch_member(&dead.id)
-        .unwrap()
-        .expect("one retry is allowed");
+    let RetryDeadReviewBatchMember::Retried(retry) = db.retry_dead_review_batch_member(&dead.id).unwrap() else {
+        panic!("one retry is allowed");
+    };
     let members = db.review_batch_members(&batch.id).unwrap();
     let dead_member = members
         .iter()
@@ -1333,7 +1370,180 @@ fn dead_leaf_retries_only_its_own_role_once() {
             rusqlite::params![retry.id],
         )
         .unwrap();
-    assert!(db.retry_dead_review_batch_member(&retry.id).unwrap().is_none());
+    assert!(matches!(
+        db.retry_dead_review_batch_member(&retry.id).unwrap(),
+        RetryDeadReviewBatchMember::NotRetried | RetryDeadReviewBatchMember::BatchFailed
+    ));
     let exhausted = db.review_batch_member_for_execution(&retry.id).unwrap().unwrap();
     assert_eq!(exhausted.status, ReviewBatchMemberStatus::Failed);
+}
+
+fn stamp_execution_status(db: &WorkDb, execution_id: &str, status: &str) {
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = ?2 WHERE id = ?1",
+            rusqlite::params![execution_id, status],
+        )
+        .unwrap();
+}
+
+fn create_supervising_batch(
+    db: &WorkDb,
+    attempt: i64,
+    member_status: ReviewBatchMemberStatus,
+) -> (String, ReviewBatch, String) {
+    let product = create_test_product(db);
+    let cycle_root = create_test_chore_manual(db, product.id, "review target");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member_with(
+                ReviewBatchMemberRole::Supervisor,
+                Some(execution.id.clone()),
+                attempt,
+                member_status,
+            )],
+        )
+        .unwrap();
+    force_batch_supervising(db, &batch.id);
+    (cycle_root.id, batch, execution.id)
+}
+
+/// A supervisor whose execution died without Stop is a recovery candidate,
+/// retried once with the same driver/model, and terminal-fails the batch on
+/// the second death — the same one-retry bound as a leaf, applied to the
+/// supervisor role the leaf path previously skipped.
+#[test]
+fn dead_supervisor_retries_once_then_fails_the_batch() {
+    let db = WorkDb::open(temp_db_path("dead-supervisor-retry")).unwrap();
+    let (cycle_root_id, batch, dead_id) = create_supervising_batch(&db, 1, ReviewBatchMemberStatus::Pending);
+    stamp_execution_status(&db, &dead_id, "orphaned");
+
+    let candidates = db.list_dead_review_batch_member_candidates().unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].execution_id, dead_id);
+
+    let RetryDeadReviewBatchMember::Retried(retry) = db.retry_dead_review_batch_member(&dead_id).unwrap() else {
+        panic!("supervisor gets one retry");
+    };
+    let members = db.review_batch_members(&batch.id).unwrap();
+    let dead_member = members
+        .iter()
+        .find(|member| member.execution_id.as_deref() == Some(dead_id.as_str()))
+        .unwrap();
+    assert_eq!(dead_member.status, ReviewBatchMemberStatus::Failed);
+    assert_eq!(dead_member.role, ReviewBatchMemberRole::Supervisor);
+    assert_eq!(dead_member.attempt, 1);
+    let retry_member = members
+        .iter()
+        .find(|member| member.execution_id.as_deref() == Some(retry.id.as_str()))
+        .unwrap();
+    assert_eq!(retry_member.role, ReviewBatchMemberRole::Supervisor);
+    assert_eq!(retry_member.attempt, 2);
+    assert_eq!(retry_member.status, ReviewBatchMemberStatus::Pending);
+    assert_eq!(retry_member.requested_driver, dead_member.requested_driver);
+    assert_eq!(retry_member.resolved_model, dead_member.resolved_model);
+    assert_eq!(
+        db.review_batch(&batch.id).unwrap().unwrap().status,
+        ReviewBatchStatus::Supervising,
+        "a retried supervisor must keep the batch in supervising, not complete it"
+    );
+    assert!(find_quorum_failed_attention(&db, &cycle_root_id).is_none());
+
+    stamp_execution_status(&db, &retry.id, "orphaned");
+    assert!(matches!(
+        db.retry_dead_review_batch_member(&retry.id).unwrap(),
+        RetryDeadReviewBatchMember::BatchFailed
+    ));
+    let failed = db.review_batch(&batch.id).unwrap().unwrap();
+    assert_eq!(failed.status, ReviewBatchStatus::Failed);
+    assert!(failed.completed_at.is_some());
+    let attention = find_quorum_failed_attention(&db, &cycle_root_id)
+        .expect("exhausted supervisor retry must file pr_review_quorum_failed");
+    assert!(attention.title.to_lowercase().contains("supervisor"));
+}
+
+/// The last supervisor attempt can die without Stop ever firing (member
+/// still pending at attempt 2). That row must still be a candidate so the
+/// recovery sweep can fail the batch — otherwise it sits in `supervising`
+/// forever.
+#[test]
+fn pending_supervisor_attempt_two_orphan_is_a_candidate_and_fails_the_batch() {
+    let db = WorkDb::open(temp_db_path("dead-supervisor-attempt-2")).unwrap();
+    let (cycle_root_id, batch, dead_id) = create_supervising_batch(&db, 2, ReviewBatchMemberStatus::Pending);
+    stamp_execution_status(&db, &dead_id, "orphaned");
+
+    let candidates = db.list_dead_review_batch_member_candidates().unwrap();
+    assert_eq!(
+        candidates.len(),
+        1,
+        "attempt-2 pending supervisor must be listed so recovery can fail the batch"
+    );
+    assert_eq!(candidates[0].execution_id, dead_id);
+
+    assert!(matches!(
+        db.retry_dead_review_batch_member(&dead_id).unwrap(),
+        RetryDeadReviewBatchMember::BatchFailed
+    ));
+    assert_eq!(
+        db.review_batch(&batch.id).unwrap().unwrap().status,
+        ReviewBatchStatus::Failed
+    );
+    assert!(find_quorum_failed_attention(&db, &cycle_root_id).is_some());
+}
+
+/// A still-live supervisor is not a dead-member candidate — recovery must
+/// not steal an in-flight collation.
+#[test]
+fn live_supervisor_is_not_a_dead_member_candidate() {
+    let db = WorkDb::open(temp_db_path("live-supervisor-not-candidate")).unwrap();
+    let (_cycle_root_id, _batch, execution_id) = create_supervising_batch(&db, 1, ReviewBatchMemberStatus::Running);
+    let candidates = db.list_dead_review_batch_member_candidates().unwrap();
+    assert!(
+        !candidates.iter().any(|c| c.execution_id == execution_id),
+        "a running supervisor execution must not be listed for retry"
+    );
+}
+
+/// If the PR head has moved since the batch froze its target SHA, refuse to
+/// retry the supervisor: collating the original leaf reports would present
+/// a review of stale code as covering the current PR.
+#[test]
+fn moved_head_fails_the_supervising_batch_instead_of_retrying() {
+    let db = WorkDb::open(temp_db_path("supervisor-moved-head")).unwrap();
+    let (cycle_root_id, batch, dead_id) = create_supervising_batch(&db, 1, ReviewBatchMemberStatus::Pending);
+    stamp_execution_status(&db, &dead_id, "orphaned");
+
+    assert!(
+        !db.fail_review_batch_for_moved_head(&dead_id, "head-sha").unwrap(),
+        "matching SHA must not fail the batch"
+    );
+    assert_eq!(
+        db.review_batch(&batch.id).unwrap().unwrap().status,
+        ReviewBatchStatus::Supervising
+    );
+
+    assert!(db.fail_review_batch_for_moved_head(&dead_id, "other-head").unwrap());
+    let failed = db.review_batch(&batch.id).unwrap().unwrap();
+    assert_eq!(failed.status, ReviewBatchStatus::Failed);
+    let attention = find_quorum_failed_attention(&db, &cycle_root_id)
+        .expect("moved-head failure must file pr_review_quorum_failed");
+    assert!(attention.title.to_lowercase().contains("head moved"));
+    assert!(attention.body_markdown.contains("head-sha"));
+    assert!(attention.body_markdown.contains("other-head"));
+
+    assert!(
+        !db.fail_review_batch_for_moved_head(&dead_id, "other-head").unwrap(),
+        "a second call against an already-failed batch is a no-op"
+    );
 }

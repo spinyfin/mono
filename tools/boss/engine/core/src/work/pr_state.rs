@@ -24,6 +24,27 @@ pub(crate) fn stored_pr_number(pr_url: &str) -> Option<i64> {
 pub trait PrStateChecker: Send + Sync {
     /// Return the live lifecycle state of the given PR URL.
     fn check(&self, pr_url: &str) -> Result<PrOpenState>;
+
+    /// Lifecycle state plus the current head SHA, from one `gh pr view`.
+    ///
+    /// Default implementation has no SHA (existing [`Self::check`]-only
+    /// impls keep working). [`GhPrStateChecker`] fetches `headRefOid` in
+    /// the same call as `state,mergedAt` so supervisor recovery can refuse
+    /// to collate stale leaf reports against a moved head without a second
+    /// GitHub round-trip.
+    fn inspect(&self, pr_url: &str) -> Result<PrInspect> {
+        Ok(PrInspect {
+            open_state: self.check(pr_url)?,
+            head_sha: None,
+        })
+    }
+}
+
+/// Snapshot returned by [`PrStateChecker::inspect`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrInspect {
+    pub open_state: PrOpenState,
+    pub head_sha: Option<String>,
 }
 
 /// Lifecycle state returned by [`PrStateChecker::check`].
@@ -86,6 +107,10 @@ pub struct GhPrStateChecker;
 
 impl PrStateChecker for GhPrStateChecker {
     fn check(&self, pr_url: &str) -> Result<PrOpenState> {
+        Ok(self.inspect(pr_url)?.open_state)
+    }
+
+    fn inspect(&self, pr_url: &str) -> Result<PrInspect> {
         // Via `gh_output_blocking` rather than a bare
         // `Command::new("gh")`: this spends real quota from the shared
         // token, and a raw spawn here would be invisible to the usage
@@ -98,7 +123,13 @@ impl PrStateChecker for GhPrStateChecker {
         // must win rather than being overridden to `pr_state_check`.
         let output =
             boss_gh_telemetry::scope_blocking_if_unattributed(boss_gh_telemetry::callers::PR_STATE_CHECK, || {
-                boss_github::gh_runner::gh_output_blocking(&["pr", "view", pr_url, "--json", "state,mergedAt"])
+                boss_github::gh_runner::gh_output_blocking(&[
+                    "pr",
+                    "view",
+                    pr_url,
+                    "--json",
+                    "state,mergedAt,headRefOid",
+                ])
             })
             .with_context(|| format!("failed to run `gh pr view` for {pr_url}"))?;
         if !output.status.success() {
@@ -108,7 +139,7 @@ impl PrStateChecker for GhPrStateChecker {
         let body = String::from_utf8_lossy(&output.stdout);
         let v: serde_json::Value =
             serde_json::from_str(&body).with_context(|| format!("failed to parse `gh pr view` JSON for {pr_url}"))?;
-        Ok(map_gh_state(&v))
+        Ok(map_gh_inspect(&v))
     }
 }
 
@@ -132,6 +163,21 @@ fn map_gh_state(v: &serde_json::Value) -> PrOpenState {
     }
 }
 
+/// Pure mapping from `gh pr view --json state,mergedAt,headRefOid` JSON.
+/// Empty / missing / non-string `headRefOid` is `None` so a caller that
+/// cannot confirm the live SHA does not treat "unknown" as a move.
+fn map_gh_inspect(v: &serde_json::Value) -> PrInspect {
+    let head_sha = v["headRefOid"]
+        .as_str()
+        .map(str::trim)
+        .filter(|sha| !sha.is_empty())
+        .map(str::to_owned);
+    PrInspect {
+        open_state: map_gh_state(v),
+        head_sha,
+    }
+}
+
 /// A `PrStateChecker` that returns a fixed, already-observed state without
 /// issuing a `gh` call. Used by the merge-conflict producer (Phase 3): the
 /// poller has *just* probed the PR live and is acting on an
@@ -152,6 +198,7 @@ impl PrStateChecker for StaticPrStateChecker {
 pub struct FakePrStateChecker {
     pub states: std::collections::HashMap<String, PrOpenState>,
     pub default: PrOpenState,
+    pub head_sha: Option<String>,
 }
 
 #[cfg(test)]
@@ -160,10 +207,15 @@ impl FakePrStateChecker {
         Self {
             states: Default::default(),
             default: state,
+            head_sha: None,
         }
     }
     pub fn with(mut self, url: &str, state: PrOpenState) -> Self {
         self.states.insert(url.to_owned(), state);
+        self
+    }
+    pub fn with_head_sha(mut self, sha: impl Into<String>) -> Self {
+        self.head_sha = Some(sha.into());
         self
     }
 }
@@ -172,6 +224,13 @@ impl FakePrStateChecker {
 impl PrStateChecker for FakePrStateChecker {
     fn check(&self, pr_url: &str) -> Result<PrOpenState> {
         Ok(self.states.get(pr_url).cloned().unwrap_or(self.default.clone()))
+    }
+
+    fn inspect(&self, pr_url: &str) -> Result<PrInspect> {
+        Ok(PrInspect {
+            open_state: self.check(pr_url)?,
+            head_sha: self.head_sha.clone(),
+        })
     }
 }
 
@@ -243,6 +302,30 @@ mod tests {
         assert_eq!(
             map_gh_state(&json!({"state": "OPEN", "mergedAt": null})),
             PrOpenState::Open
+        );
+    }
+
+    #[test]
+    fn inspect_extracts_head_ref_oid() {
+        assert_eq!(
+            map_gh_inspect(&json!({"state": "OPEN", "mergedAt": null, "headRefOid": "abc123"})),
+            PrInspect {
+                open_state: PrOpenState::Open,
+                head_sha: Some("abc123".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn inspect_missing_or_empty_head_ref_oid_is_none() {
+        assert_eq!(map_gh_inspect(&json!({"state": "OPEN"})).head_sha, None);
+        assert_eq!(
+            map_gh_inspect(&json!({"state": "OPEN", "headRefOid": ""})).head_sha,
+            None
+        );
+        assert_eq!(
+            map_gh_inspect(&json!({"state": "OPEN", "headRefOid": "   "})).head_sha,
+            None
         );
     }
 
