@@ -46,6 +46,8 @@ make_workspace() {
   printf '%s\n' \
     'version = 1' '' \
     '[tools.boss]' 'target = "//tools/boss/cli:boss"' '' \
+    '[tools.bossctl]' 'target = "//tools/boss/cli:bossctl"' '' \
+    '[tools.cube]' 'target = "//tools/cube:cube"' '' \
     '[tools.checkleft]' 'target = "//tools/checkleft:checkleft"' '' \
     '[pins.hood]' 'repo = "https://example.invalid/hood.git"' 'version = "v1.2.3"' \
     > "$ws/REPOBIN.toml"
@@ -130,17 +132,20 @@ run_in() {
 run_in "$ws" bash tools/repobin/shim/install-workspace-shims.sh
 [[ $rc -eq 0 ]] || fail "installer exited $rc: $(cat "$tmp/stderr")"
 shim_in_ws="$ws/tools/repobin/shim/repobin-shim.sh"
-for name in repobin boss checkleft hood; do
+for name in repobin checkleft hood; do
   [[ -L "$ws/bin/$name" ]] || fail "bin/$name is not a symlink after install"
   [[ "$ws/bin/$name" -ef "$shim_in_ws" ]] || fail "bin/$name does not resolve to the workspace's repobin-shim.sh"
   [[ -x "$ws/bin/$name" ]] || fail "bin/$name is not executable"
 done
-grep -q 'bin/ ready (4 installed, 0 already present)' "$tmp/stdout" || fail "unexpected installer report: $(cat "$tmp/stdout")"
-pass "fresh workspace: installer creates bin/{repobin,boss,checkleft,hood} shims"
+for name in boss bossctl cube; do
+  [[ ! -e "$ws/bin/$name" ]] || fail "bin/$name must remain engine-owned, not a repobin shim"
+done
+grep -q 'bin/ ready (3 installed, 0 already present)' "$tmp/stdout" || fail "unexpected installer report: $(cat "$tmp/stdout")"
+pass "fresh workspace: installer creates only non-engine-owned shims"
 
 run_in "$ws" bash tools/repobin/shim/install-workspace-shims.sh
 [[ $rc -eq 0 ]] || fail "second install exited $rc"
-grep -q 'bin/ ready (0 installed, 4 already present)' "$tmp/stdout" || fail "installer is not idempotent: $(cat "$tmp/stdout")"
+grep -q 'bin/ ready (0 installed, 3 already present)' "$tmp/stdout" || fail "installer is not idempotent: $(cat "$tmp/stdout")"
 pass "installer is idempotent"
 
 # 2. bin/checkleft dispatches through repobin built from this checkout.
@@ -239,12 +244,12 @@ pass "real repobin install is left untouched"
 
 # 12. Installer leaves a stray regular file alone (warns) but still
 #     installs the rest, and refuses to report healthy without checkleft.
-rm -f "$ws/bin/boss"
-echo "not a symlink" > "$ws/bin/boss"
+rm -f "$ws/bin/hood"
+echo "not a symlink" > "$ws/bin/hood"
 run_in "$ws" bash tools/repobin/shim/install-workspace-shims.sh
 [[ $rc -eq 0 ]] || fail "installer exited $rc with a stray file: $(cat "$tmp/stderr")"
-grep -q 'bin/boss exists and is not a symlink; leaving it alone' "$tmp/stderr" || fail "stderr: $(cat "$tmp/stderr")"
-[[ "$(cat "$ws/bin/boss")" == "not a symlink" ]] || fail "stray bin/boss was clobbered"
+grep -q 'bin/hood exists and is not a symlink; leaving it alone' "$tmp/stderr" || fail "stderr: $(cat "$tmp/stderr")"
+[[ "$(cat "$ws/bin/hood")" == "not a symlink" ]] || fail "stray bin/hood was clobbered"
 rm -f "$ws/bin/checkleft"
 echo "not executable" > "$ws/bin/checkleft"
 run_in "$ws" bash tools/repobin/shim/install-workspace-shims.sh

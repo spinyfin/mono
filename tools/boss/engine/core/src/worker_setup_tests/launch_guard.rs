@@ -349,10 +349,11 @@ fn launch_guard_blocks_unspaced_and_commented_chains() {
 /// demotes the launcher directory, and a hit on repobin silently bazel-builds
 /// the CLI. The named `"$BOSS_BIN"` / `"$CUBE_BIN"` form is the contract.
 #[test]
-fn launch_guard_blocks_bare_boss_and_cube_path_lookups() {
+fn launch_guard_blocks_bare_engine_owned_path_lookups() {
     for command in [
         "boss pr status --json",
         "cube pr create --branch x",
+        "checkleft run",
         "boss propose blocked --reason x",
     ] {
         let (decision, reason) = run_launch_guard(command);
@@ -362,7 +363,7 @@ fn launch_guard_blocks_bare_boss_and_cube_path_lookups() {
             "reason must name the PATH/repobin failure: {reason}"
         );
         assert!(
-            reason.contains("BOSS_BIN") && reason.contains("CUBE_BIN"),
+            reason.contains("BOSS_BIN") && reason.contains("CUBE_BIN") && reason.contains("CHECKLEFT_BIN"),
             "reason must tell the worker to name the env var: {reason}"
         );
     }
@@ -413,6 +414,25 @@ fn launch_guard_blocks_named_bin_that_is_a_repobin_shim() {
         reason.contains("repobin") || reason.contains("shim"),
         "reason must name the shim: {reason}"
     );
+}
+
+#[test]
+fn launch_guard_blocks_workspace_cube_linked_to_repobin_shim() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let shim_dir = tmp.path().join("tools/repobin/shim");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&shim_dir).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let shim = shim_dir.join("repobin-shim.sh");
+    std::fs::write(&shim, b"#!/bin/sh\n").unwrap();
+    let cube = bin.join("cube");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&shim, &cube).unwrap();
+    #[cfg(not(unix))]
+    std::fs::copy(&shim, &cube).unwrap();
+    let (decision, reason) = run_launch_guard_with_env(&format!("{} pr create --branch x", cube.display()), &[]);
+    assert_eq!(decision, "block", "workspace shim must be blocked: {reason}");
+    assert!(reason.contains("repobin shim"), "reason must name the shim: {reason}");
 }
 
 /// The Codex driver wraps every tool call as `/bin/zsh -lc '<payload>'`, so

@@ -142,7 +142,7 @@ static GROK_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
 const GROK_AGENT_RULES_PREAMBLE: &str = "You are running inside a managed worker session. The engine\n\
      spawned you in a leased cube workspace and observes this session\n\
      via Grok hooks under an engine-owned GROK_HOME.\n\
-     For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
+     For ordinary pre-push validation, run `bin/checkleft run` with no flags; use\n\
      `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
      strong stated justification.\n\
      \n\
