@@ -372,6 +372,7 @@ impl WorkDb {
         let task = query_task(&tx, &work_item_id)?;
 
         let now = now_string();
+        let trimmed = detail.trim();
         tx.execute(
             "UPDATE work_executions
              SET status = 'abandoned',
@@ -386,17 +387,33 @@ impl WorkDb {
         // Stop the automated re-dispatch loop: clear `autostart` so the
         // on-free rescan (`rescan_active_dispatch`) leaves this task parked
         // in `active` instead of immediately spawning a replacement worker
-        // that may just abandon again the same way. Best-effort — if the
-        // task row is gone there's nothing to clear.
+        // that may just abandon again the same way. Deliberately does NOT
+        // stamp `dispatch_failed_reason` / `dispatch_failed_error` /
+        // `dispatch_failed_at`: those three columns are the *only* source of
+        // the kanban card's red "Failed to start" banner
+        // (`WorkDispatchFailureBanner` in the macOS app), whose documented
+        // contract is "the engine gave up starting it" — the opposite of
+        // what happened here, where the worker started, ran, and was torn
+        // down mid-flight. Stamping them also enrolled the row in
+        // `dispatch_failure_recovery_sweep`'s candidate set, which only
+        // guards re-enabling `autostart` with the loose 5-in-24h default —
+        // far looser than the loop this park exists to stop. Leaving them
+        // unset means the item stays parked (`autostart = 0`, no banner)
+        // until a human reviews the attention item filed by this call's
+        // caller and explicitly re-arms `autostart` or dispatches a fresh
+        // execution directly — exactly the surface this method's docs
+        // already promise. Best-effort — if the task row is gone there's
+        // nothing to clear.
         tx.execute(
-            "UPDATE tasks SET autostart = 0 WHERE id = ?1 AND deleted_at IS NULL",
+            "UPDATE tasks
+             SET autostart = 0
+             WHERE id = ?1 AND deleted_at IS NULL",
             params![work_item_id],
         )?;
 
         // Capture the park reason as the run summary if the run hasn't
         // already recorded one — the durable "why was this abandoned" note
         // an operator finds on the row.
-        let trimmed = detail.trim();
         if !trimmed.is_empty() {
             tx.execute(
                 "UPDATE work_runs

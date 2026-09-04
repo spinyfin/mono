@@ -265,8 +265,18 @@ pub trait TmuxSpawnStore: Send + Sync {
     ) -> anyhow::Result<bool>;
 
     /// Mark the pre-recorded session as created after its pane pid is known.
-    fn record_tmux_session_created(&self, execution_id: &str, spawn_token: &str, pane_pid: i64)
-    -> anyhow::Result<bool>;
+    /// `session_name` / `server_label` are already known to the caller at
+    /// this point (the intent write above recorded them), so this passes
+    /// them straight through to [`WorkDb::persist_tmux_identity_after_observation`]
+    /// rather than going through the test-only None/None wrapper.
+    fn record_tmux_session_created(
+        &self,
+        execution_id: &str,
+        spawn_token: &str,
+        pane_pid: i64,
+        session_name: &str,
+        server_label: &str,
+    ) -> anyhow::Result<bool>;
 }
 
 impl TmuxSpawnStore for WorkDb {
@@ -285,8 +295,16 @@ impl TmuxSpawnStore for WorkDb {
         execution_id: &str,
         spawn_token: &str,
         pane_pid: i64,
+        session_name: &str,
+        server_label: &str,
     ) -> anyhow::Result<bool> {
-        self.record_tmux_session_created_for_execution(execution_id, spawn_token, pane_pid)
+        self.persist_tmux_identity_after_observation(
+            execution_id,
+            spawn_token,
+            pane_pid,
+            Some(session_name),
+            Some(server_label),
+        )
     }
 }
 
@@ -431,7 +449,13 @@ async fn start_tmux_worker(
         .ok_or_else(|| StartWorkerError::Tmux(anyhow!("tmux returned an invalid pane pid for {execution_id}")))?;
     let created_recorded = host
         .spawn_store
-        .record_tmux_session_created(execution_id, &spawn_token, i64::from(pane_pid))
+        .record_tmux_session_created(
+            execution_id,
+            &spawn_token,
+            i64::from(pane_pid),
+            &host.session_name,
+            &host.tmux.server_identity(),
+        )
         .context("recording tmux session creation")
         .map_err(StartWorkerError::Tmux)?;
     if !created_recorded {
@@ -1146,6 +1170,8 @@ mod tests {
             _execution_id: &str,
             _spawn_token: &str,
             _pane_pid: i64,
+            _session_name: &str,
+            _server_label: &str,
         ) -> anyhow::Result<bool> {
             self.steps.lock().unwrap().push("created");
             Ok(true)

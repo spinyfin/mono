@@ -140,7 +140,51 @@ impl ServerState {
                 }
             },
         };
-        let verdict = classify_contradiction(&execution.status, work_item_terminal, other_live.as_deref());
+        let latest_tmux_observed_pid = match self.work_db.latest_local_tmux_pane_pid_for_execution(&execution.id) {
+            Ok(pid) => pid,
+            Err(err) => {
+                // A transient DB error must not be coerced into "no pid
+                // recorded": that value feeds `process_live` below, and with
+                // no other positive-liveness evidence it tips
+                // `classify_contradiction` toward `Reap { NoPositiveLiveness
+                // }` — the irreversible branch — on nothing more than a
+                // read failure. Readoption is recoverable; reaping destroys
+                // in-flight work and is not, so an unreadable pid must read
+                // as unknown, not as evidence of death. Skip this pass and
+                // let the next sweep decide once the read succeeds.
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    error = %format!("{err:#}"),
+                    "readopt: could not read the latest tmux-observed pane pid; skipping contradiction \
+                     convergence for this pass rather than treating the read failure as no liveness",
+                );
+                return "tmux_pid_lookup_failed";
+            }
+        };
+        let observed_shell_pid =
+            crate::durable_liveness::probe_execution_worker(&self.work_db, &execution.id).alive_pid();
+        let registry_slot = self.worker_registry.slot_for_run(&execution.id);
+        // A stored-but-dead pid is not liveness: the phantom rows had durable
+        // pids that `kill(pid, 0)` reported ESRCH. `tmux_pane_pid` is written
+        // to the same value as `shell_pid` by
+        // `persist_tmux_identity_after_observation`, so it must be probed
+        // too — trusting the stored number unprobed would make this term
+        // true exactly when the probed `observed_shell_pid` term says dead.
+        // Only a currently-alive process (by either pid), a live slot, or a
+        // mid-turn driver hook (never `session_end`) counts.
+        let process_live = observed_shell_pid.is_some()
+            || crate::durable_liveness::probe_recorded_pid(latest_tmux_observed_pid).is_alive()
+            || registry_slot.is_some();
+        let hook_liveness = trigger != crate::worker_readoption::SESSION_END_TRIGGER
+            && !crate::worker_readoption::NON_HOOK_TRIGGERS.contains(&trigger);
+        let positive_liveness = process_live || hook_liveness;
+        let verdict = classify_contradiction(
+            &execution.status,
+            work_item_terminal,
+            other_live.as_deref(),
+            trigger,
+            positive_liveness,
+        );
         match verdict {
             ContradictionVerdict::NoContradiction => "no_contradiction",
             ContradictionVerdict::Readopt => {
@@ -355,15 +399,11 @@ impl ServerState {
             // *shell* hosting the pane and say nothing about the driver;
             // that conflation is what `driver_signal_at` exists to prevent,
             // so they record nothing. These non-hook triggers are named
-            // explicitly on an allow-list so an unrecognized trigger added
-            // later defaults to withholding driver evidence, not asserting
-            // it.
-            const NON_HOOK_TRIGGERS: [&str; 3] = [
-                "redispatch_guard",
-                "durable_state_scan",
-                crate::tmux_adoption::TERMINAL_HANDOFF_TRIGGER,
-            ];
-            let evidence = if NON_HOOK_TRIGGERS.contains(&trigger) {
+            // explicitly on an allow-list — shared with the positive-liveness
+            // gate above via `worker_readoption::NON_HOOK_TRIGGERS` — so an
+            // unrecognized trigger added later defaults to withholding
+            // driver evidence, not asserting it.
+            let evidence = if crate::worker_readoption::NON_HOOK_TRIGGERS.contains(&trigger) {
                 crate::live_worker_state::ReadoptionEvidence::LiveShellPid
             } else {
                 crate::live_worker_state::ReadoptionEvidence::DriverHook

@@ -386,7 +386,7 @@ pub fn probe_work_item_worker(
     Some((execution_id, probe_recorded_pid(Some(shell_pid))))
 }
 
-fn probe_recorded_pid(shell_pid: Option<i64>) -> WorkerProcess {
+pub(crate) fn probe_recorded_pid(shell_pid: Option<i64>) -> WorkerProcess {
     let Some(pid) = shell_pid.filter(|pid| *pid > 0) else {
         return WorkerProcess::Unknown;
     };

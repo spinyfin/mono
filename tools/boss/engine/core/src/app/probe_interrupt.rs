@@ -213,6 +213,23 @@ struct InterruptFailure {
     worker_gone: bool,
 }
 
+/// Fail before any keystroke if the subsequent pane write cannot land.
+fn refuse_if_write_transport_not_ready(server_state: &ServerState, run_id: &str) -> Result<(), InterruptFailure> {
+    server_state.pane_write_transport_ready(run_id).map_err(|detail| {
+        tracing::warn!(
+            run_id,
+            %detail,
+            "refusing to interrupt: pane write transport is not ready",
+        );
+        InterruptFailure {
+            outcome: ProbeInterruptOutcome::Failed,
+            attempts: 0,
+            detail: format!("the pane write cannot land ({detail}); the worker's turn was not interrupted"),
+            worker_gone: false,
+        }
+    })
+}
+
 /// Bring the worker to a parked posture, interrupting if it is mid-turn.
 ///
 /// `Ok((outcome, attempts))` means the pane will now take a write.
@@ -227,6 +244,7 @@ async fn interrupt_and_confirm(
         // more than nothing — a second Escape at the prompt opens the rewind
         // picker, a modal that would swallow the text we are about to type.
         Some(activity) if activity.accepts_typed_input() => {
+            refuse_if_write_transport_not_ready(server_state, run_id)?;
             return Ok((ProbeInterruptOutcome::NotNeeded, 0));
         }
         Some(WorkerActivity::Working) => {}
@@ -280,6 +298,12 @@ async fn interrupt_and_confirm(
             });
         }
     };
+
+    // Confirm the write can land BEFORE sending Escape. Interrupt uses the
+    // in-memory session name and can succeed while the subsequent write
+    // fails with `no durable tmux identity recorded for run`. That sequence
+    // cuts a healthy worker's turn and delivers nothing.
+    refuse_if_write_transport_not_ready(server_state, run_id)?;
 
     let mut attempts: u8 = 0;
     for attempt in 1..=plan.max_attempts.max(1) {
@@ -647,6 +671,16 @@ async fn inject_after_interrupt(
 ///
 /// Deliberately **not** `InterruptFailed`: the interrupt did take. Reporting
 /// otherwise would send an operator to fix the wrong thing.
+///
+/// Deliberately does **not** call `revert_undelivered_nudge` on the requeue
+/// branch: this is a requeue path (the probe id is pushed back for a later
+/// boundary), and [`super::probes::ProbeDispatchOutcome::should_revert_undelivered_nudge`]'s
+/// doc explains why requeue-style outcomes must not revert — a probe
+/// recorded at boundary N, reverted, then delivered at N+1 alongside a
+/// freshly recorded nudge pins the count and makes `max_unproductive_nudges`
+/// unreachable for exactly the wedged workers the breaker exists to park.
+/// The revert only belongs on the terminal `Abandoned` branch below, where
+/// the probe truly never reaches the pane.
 async fn requeue_after_write_declined(
     server_state: &Arc<ServerState>,
     run_id: &str,
@@ -674,6 +708,7 @@ async fn requeue_after_write_declined(
         }
     } else {
         let detail = format!("{reason}, and the run had already been released, so there was nothing to retry against");
+        server_state.completion_handler.revert_undelivered_nudge(run_id);
         server_state
             .surface_undelivered_probe(run_id, &probe_id, ProbeDeliveryState::Abandoned, &detail)
             .await;
@@ -717,6 +752,7 @@ async fn settle_interrupt_failure(
     server_state
         .surface_undelivered_probe(run_id, &probe_id, state, &failure.detail)
         .await;
+    server_state.completion_handler.revert_undelivered_nudge(run_id);
     InterruptingDelivery::failed(failure.outcome, failure.attempts, failure.detail)
 }
 
