@@ -267,6 +267,9 @@ pub(super) async fn dispatch_request(mut ctx: Dispatch, request: FrontendRequest
         r @ FrontendRequest::ResolveProjectDesignDoc { .. } => {
             Box::pin(projects::handle_resolve_project_design_doc(ctx, r))
         }
+        r @ FrontendRequest::ResolveWorkerRecoveryAttention { .. } => {
+            Box::pin(attentions::handle_resolve_worker_recovery_attention(ctx, r))
+        }
         r @ FrontendRequest::RestoreWorkItem { .. } => Box::pin(work_items::handle_restore_work_item(ctx, r)),
         r @ FrontendRequest::RetirePane { .. } => Box::pin(panes::handle_retire_pane(ctx, r)),
         r @ FrontendRequest::RetryCiRemediation { .. } => Box::pin(ci_remediation::handle_retry_ci_remediation(ctx, r)),
