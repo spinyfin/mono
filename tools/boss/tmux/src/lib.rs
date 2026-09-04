@@ -43,7 +43,8 @@ pub enum KillSessionOutcome {
     Absent,
 }
 
-/// Scope for an option set by [`Tmux::set_options`].
+/// Scope for an option set by [`Tmux::start_server_with_options`] or
+/// [`Tmux::set_options`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OptionScope<'a> {
     /// An option owned by the private tmux server.
@@ -308,21 +309,7 @@ impl Tmux {
     pub async fn start_server_with_options(&self, settings: &[OptionSetting<'_>]) -> Result<()> {
         let mut args = self.server_args();
         args.push("start-server".into());
-        for setting in settings {
-            validate_value("option name", setting.option)?;
-            validate_value("option value", setting.value)?;
-            if matches!(setting.scope, OptionScope::Session(_)) {
-                bail!("cannot set a session option while starting an empty tmux server");
-            }
-            args.push(";".into());
-            args.push("set-option".into());
-            match setting.scope {
-                OptionScope::Server => args.push("-s".into()),
-                OptionScope::Global => args.push("-g".into()),
-                OptionScope::Session(_) => unreachable!("session options were rejected above"),
-            }
-            args.extend([setting.option.into(), setting.value.into()]);
-        }
+        push_option_commands(&mut args, settings, true)?;
         self.invoke(args).await.map(|_| ())
     }
 
@@ -436,34 +423,7 @@ impl Tmux {
             return Ok(());
         }
         let mut args = self.server_args();
-        for (index, setting) in settings.iter().enumerate() {
-            validate_value("option name", setting.option)?;
-            validate_value("option value", setting.value)?;
-            if index != 0 {
-                args.push(";".into());
-            }
-            args.push("set-option".into());
-            match setting.scope {
-                OptionScope::Server => args.push("-s".into()),
-                OptionScope::Session(session) => {
-                    validate_value("session name", session)?;
-                    args.extend(["-t".into(), session.into()]);
-                }
-                OptionScope::Global => args.push("-g".into()),
-            }
-            args.extend([setting.option.into(), setting.value.into()]);
-        }
-        self.invoke(args).await.map(|_| ())
-    }
-
-    /// Sets a global tmux option inherited by newly-created sessions and
-    /// windows. Unlike [`Self::set_server_option`], this is for ordinary tmux
-    /// options such as `history-limit`, not server-scoped options.
-    pub async fn set_global_option(&self, option: &str, value: &str) -> Result<()> {
-        validate_value("option name", option)?;
-        validate_value("option value", value)?;
-        let mut args = self.server_args();
-        args.extend(["set-option".into(), "-g".into(), option.into(), value.into()]);
+        push_option_commands(&mut args, settings, false)?;
         self.invoke(args).await.map(|_| ())
     }
 
@@ -655,6 +615,24 @@ impl Tmux {
         command_failed(&args, &output)
     }
 
+    /// Destroys the entire private tmux server, tearing down every session
+    /// on it. This is for test teardown of a server a fixture started
+    /// itself (e.g. via [`Self::start_server_with_options`]); production
+    /// code destroys only its own session, through
+    /// [`Self::kill_session_verified`], and never the shared server.
+    ///
+    /// A server that is already gone is treated as success, so repeated
+    /// teardown calls stay idempotent.
+    pub async fn kill_server(&self) -> Result<()> {
+        let mut args = self.server_args();
+        args.push("kill-server".into());
+        let output = self.run(&args).await?;
+        if output.success || is_absent_session_stderr(&output.stderr) {
+            return Ok(());
+        }
+        command_failed(&args, &output)
+    }
+
     /// Reads one known pane/window field without parsing a pane capture.
     pub async fn display_message(&self, session: &str, field: DisplayField) -> Result<String> {
         validate_value("session name", session)?;
@@ -718,6 +696,43 @@ impl Tmux {
             .await
             .with_context(|| format!("spawning tmux executable {:?}", self.program))
     }
+}
+
+/// Appends `set-option` commands for `settings` onto an in-progress argv,
+/// shared by [`Tmux::start_server_with_options`] and [`Tmux::set_options`].
+///
+/// `leading_separator` selects the two entry points' differing separator
+/// placement: `start_server_with_options` follows a leading `start-server`
+/// and needs a `;` before every setting, while `set_options` needs one only
+/// between settings. `leading_separator` also marks the "starting an empty
+/// server" context, where a session-scoped option is rejected outright —
+/// there is no session yet for `-t` to address.
+fn push_option_commands(
+    args: &mut Vec<OsString>,
+    settings: &[OptionSetting<'_>],
+    leading_separator: bool,
+) -> Result<()> {
+    for (index, setting) in settings.iter().enumerate() {
+        validate_value("option name", setting.option)?;
+        validate_value("option value", setting.value)?;
+        if leading_separator || index != 0 {
+            args.push(";".into());
+        }
+        args.push("set-option".into());
+        match setting.scope {
+            OptionScope::Server => args.push("-s".into()),
+            OptionScope::Session(session) => {
+                if leading_separator {
+                    bail!("cannot set a session option while starting an empty tmux server");
+                }
+                validate_value("session name", session)?;
+                args.extend(["-t".into(), session.into()]);
+            }
+            OptionScope::Global => args.push("-g".into()),
+        }
+        args.extend([setting.option.into(), setting.value.into()]);
+    }
+    Ok(())
 }
 
 fn parse_session(line: &str) -> Result<Session> {

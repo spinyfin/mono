@@ -492,6 +492,17 @@ rust_test(
         proc_macro = True,
         proc_macro_dev = True,
     ),
+    # `bazel-any` is a heterogeneous queue: the four Linux amd64 agents
+    # (empiricist-1/2, zoologist-1, diziet-1) are not yet confirmed to carry
+    # a host tmux package (see the `tmux` entry in
+    # .buildkite/gce-agent-runbook.md § Packages), and `host_tmux_repository`
+    # silently falls back to an exit-127 stub when it finds none. Without
+    # this tag, `bazel test //...` would put this target on the required
+    # buildkite/mono/bazel-build-test check and it would flap red purely by
+    # host assignment. Remove once every `bazel-any` Linux host is confirmed
+    # to have tmux installed — an operator/fleet-provisioning decision, not
+    # one this target can make for itself.
+    tags = ["manual"],
     deps = [
         ":engine_lib",
         "//tools/boss/protocol",

@@ -200,31 +200,6 @@ impl StaleWorkerReaper for FixtureTmuxReaper {
     }
 }
 
-struct ShellOverride {
-    prior: Option<std::ffi::OsString>,
-}
-
-impl ShellOverride {
-    fn set(shell: &Path) -> Self {
-        let prior = std::env::var_os("SHELL");
-        // SAFETY: this integration target has one test and restores SHELL
-        // before it exits, so no concurrently-running fixture can observe it.
-        unsafe { std::env::set_var("SHELL", shell) };
-        Self { prior }
-    }
-}
-
-impl Drop for ShellOverride {
-    fn drop(&mut self) {
-        // SAFETY: paired with `ShellOverride::set`; this target serializes
-        // the process-global test fixture around the override.
-        match self.prior.as_ref() {
-            Some(value) => unsafe { std::env::set_var("SHELL", value) },
-            None => unsafe { std::env::remove_var("SHELL") },
-        }
-    }
-}
-
 fn write_repainting_shell(root: &Path) -> Result<PathBuf> {
     let shell_path = root.join("repainting-worker.sh");
     std::fs::write(&shell_path, REPAINTING_WORKER)?;
@@ -256,6 +231,30 @@ fn declared_tmux_binary() -> Result<PathBuf> {
         bail!("the declared tmux binary is unavailable at {}", tmux.display());
     }
     Ok(tmux)
+}
+
+/// Kills the private tmux server this fixture started, on drop.
+///
+/// `prepare_server`'s `exit-empty=off` (the fix this target exists to cover)
+/// deliberately stops the server from self-terminating once its last
+/// session is killed, so without this guard every run of this test leaks a
+/// tmux server process and its unlinked socket. Uses a plain synchronous
+/// `Command` rather than [`Tmux::kill_server`] so teardown still runs from a
+/// panicking assertion's unwind, with no dependency on the tokio runtime
+/// still being in a state that can drive an async call.
+struct TmuxServerGuard {
+    program: PathBuf,
+    socket: PathBuf,
+}
+
+impl Drop for TmuxServerGuard {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new(&self.program)
+            .arg("-S")
+            .arg(&self.socket)
+            .arg("kill-server")
+            .output();
+    }
 }
 
 async fn wait_for_repaint(tmux: &Tmux, session_name: &str) -> Result<(i64, String)> {
@@ -290,7 +289,7 @@ async fn production_tmux_recovery_ignores_repaint_and_process_title_then_redispa
     std::fs::create_dir(&home)?;
     let repainting_shell = write_repainting_shell(temp.path())?;
     let _home = boss_engine::driver::test_support::home_override(&home);
-    let _shell = ShellOverride::set(&repainting_shell);
+    let _shell = boss_engine::driver::test_support::shell_override(&repainting_shell);
 
     let work_db = Arc::new(WorkDb::open(temp.path().join("state.db"))?);
     let product = work_db.create_product(
@@ -320,7 +319,12 @@ async fn production_tmux_recovery_ignores_repaint_and_process_title_then_redispa
     )?;
 
     let tmux_socket = temp.path().join("private.tmux.sock");
-    let tmux = Tmux::from_path_with_socket(declared_tmux_binary()?, &tmux_socket)?;
+    let tmux_binary = declared_tmux_binary()?;
+    let tmux = Tmux::from_path_with_socket(tmux_binary.clone(), &tmux_socket)?;
+    let _tmux_server_guard = TmuxServerGuard {
+        program: tmux_binary,
+        socket: tmux_socket,
+    };
     let session_name = "boss-worker-1-recovery-fixture".to_owned();
     let spawn_store: Arc<dyn boss_engine::spawn_flow::TmuxSpawnStore> = work_db.clone();
     let attaching_spawner = AttachingSpawner::default();

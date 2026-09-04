@@ -244,22 +244,15 @@ pub async fn run_one_pass(
     dispatch_events: &dyn DispatchEventSink,
     convergence: &dyn LiveWorkerConvergence,
 ) -> OrphanSweepOutcome {
-    run_one_pass_with_min_age(work_db, coordinator, dispatch_events, convergence, ORPHAN_MIN_AGE_SECS).await
-}
-
-/// Run a full orphan-active pass with an explicit candidate-age threshold.
-/// Production uses [`run_one_pass`] and its conservative
-/// [`ORPHAN_MIN_AGE_SECS`] allowance; recovery integration fixtures can use
-/// a short window while preserving the production candidate, liveness, and
-/// redispatch sequence.
-pub async fn run_one_pass_with_min_age(
-    work_db: &WorkDb,
-    coordinator: Arc<ExecutionCoordinator>,
-    dispatch_events: &dyn DispatchEventSink,
-    convergence: &dyn LiveWorkerConvergence,
-    min_age_secs: i64,
-) -> OrphanSweepOutcome {
-    run_one_pass_filtered(work_db, coordinator, dispatch_events, convergence, None, min_age_secs).await
+    run_one_pass_filtered(
+        work_db,
+        coordinator,
+        dispatch_events,
+        convergence,
+        None,
+        ORPHAN_MIN_AGE_SECS,
+    )
+    .await
 }
 
 /// Event-driven counterpart of [`run_one_pass`]: re-evaluates only
@@ -427,8 +420,9 @@ async fn run_one_pass_filtered(
                         .with_work_item(&work_item_id)
                         .with_details(serde_json::json!({
                             "loop": "orphan_active_sweep",
-                            "predicate": "tasks.status='active' AND no ready execution AND \
-                                          updated_at age >= ORPHAN_MIN_AGE_SECS",
+                            "predicate": format!(
+                                "tasks.status='active' AND no ready execution AND updated_at age >= {min_age_secs}s"
+                            ),
                             "live_execution_id": live.id,
                             "live_execution_status": live.status,
                             "live_execution_claimed": live_claimed,

@@ -240,6 +240,31 @@ async fn server_bootstrap_can_set_global_options_before_the_first_window() {
     );
 }
 
+#[tokio::test]
+async fn start_server_with_options_rejects_session_scope_without_invoking_tmux() {
+    let (tmux, runner) = tmux([success("")]);
+    let err = tmux
+        .start_server_with_options(&[OptionSetting {
+            scope: OptionScope::Session("boss-worker-3"),
+            option: "remain-on-exit",
+            value: "on",
+        }])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "cannot set a session option while starting an empty tmux server"
+    );
+    assert!(runner.calls().is_empty());
+}
+
+#[tokio::test]
+async fn start_server_with_options_emits_bare_start_server_for_no_settings() {
+    let (tmux, runner) = tmux([success("")]);
+    tmux.start_server_with_options(&[]).await.unwrap();
+    assert_eq!(runner.calls(), vec![vec!["-S", TEST_SOCKET_PATH, "start-server"]]);
+}
+
 #[test]
 fn attach_session_command_uses_resolved_program_and_omits_exec() {
     let (tmux, _runner) = tmux([]);
