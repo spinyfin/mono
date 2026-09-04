@@ -2576,10 +2576,12 @@ pub(crate) async fn mark_merged(
 ///   already exists (this call already ran, or is running concurrently) is
 ///   read back rather than re-created.
 ///
-/// Prefers the actual merge-commit SHA (`probe.merge_commit_oid`) as the
-/// batch's target; falls back to the PR's own head SHA only when GitHub
-/// omitted the merge commit (rare) so a Deep PR is never silently skipped
-/// for want of one field.
+/// Uses the actual merge-commit SHA (`probe.merge_commit_oid`) as the
+/// batch's target — the only SHA guaranteed reachable via `jj git fetch`
+/// after a squash merge and head-branch deletion. When GitHub omits it
+/// (rare), the pass is skipped rather than falling back to the PR's own
+/// head SHA, which `cube workspace goto --revision` would then be unable
+/// to fetch or position on.
 pub(crate) async fn maybe_trigger_post_merge_review(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -2609,11 +2611,23 @@ pub(crate) async fn maybe_trigger_post_merge_review(
         return; // only Deep (large/complex) PRs get an automatic post-merge review
     }
 
-    let Some(merge_sha) = probe.merge_commit_oid.clone().or_else(|| probe.head_ref_oid.clone()) else {
+    // Only `merge_commit_oid` is usable as a positioning target: it is the
+    // frozen merge commit reachable from the default branch, so `cube
+    // workspace goto --revision` can always fetch and land on it. A bare
+    // `head_ref_oid` fallback would hand that SHA to `goto` instead, and
+    // after a squash merge (plus GitHub's automatic head-branch deletion)
+    // that commit sits on no remote ref at all — `jj git fetch` cannot
+    // bring it down, so positioning would fail deterministically, burn the
+    // batch's one `pr_review_recovery` retry, and terminal-fail with a
+    // `pr_review_quorum_failed` attention. A PR reported merged with no
+    // `mergeCommit` from GitHub is rare enough that skipping this pass
+    // beats scheduling one that cannot position.
+    let Some(merge_sha) = probe.merge_commit_oid.clone() else {
         tracing::warn!(
             work_item_id = %candidate.work_item_id,
             pr_url = %candidate.pr_url,
-            "merge poller: PR reported merged with no merge or head SHA; cannot trigger post-merge review",
+            "merge poller: PR reported merged with no merge commit SHA (head SHA is not a safe \
+             positioning fallback); skipping post-merge review",
         );
         return;
     };

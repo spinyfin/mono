@@ -160,11 +160,13 @@ async fn deep_pr_gets_a_post_merge_batch_keyed_on_the_merge_commit_and_is_idempo
     );
 }
 
-/// GitHub's `mergeCommit` field can be omitted on rare merged PRs; the
-/// trigger falls back to the PR's own head SHA rather than silently
-/// skipping a Deep PR for want of one field.
+/// GitHub's `mergeCommit` field can be omitted on rare merged PRs. Unlike a
+/// merge commit, a bare PR head SHA is not guaranteed reachable after a
+/// squash merge (GitHub deletes the head branch), so `cube workspace goto
+/// --revision` could never fetch or position on it — the trigger must skip
+/// the pass rather than schedule a review batch doomed to fail positioning.
 #[tokio::test]
-async fn falls_back_to_head_sha_when_merge_commit_oid_is_missing() {
+async fn skips_when_only_head_ref_oid_is_available() {
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
     let pr = "https://github.com/foo/bar/pull/504";
@@ -176,11 +178,15 @@ async fn falls_back_to_head_sha_when_merge_commit_oid_is_missing() {
 
     maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe).await;
 
-    let batch = db
-        .review_batch_for_target(&work_item_id, ReviewBatchPhase::PostMerge, "head-sha-1")
-        .unwrap()
-        .expect("must fall back to head_ref_oid when merge_commit_oid is unavailable");
-    assert_eq!(batch.merge_sha.as_deref(), Some("head-sha-1"));
+    assert_eq!(
+        db.review_batches_for_cycle_root(&work_item_id)
+            .unwrap()
+            .iter()
+            .filter(|batch| batch.phase == ReviewBatchPhase::PostMerge)
+            .count(),
+        0,
+        "must not schedule a post-merge review batch keyed on an unfetchable head SHA",
+    );
 }
 
 /// Neither a merge commit nor a head SHA leaves nothing to key the

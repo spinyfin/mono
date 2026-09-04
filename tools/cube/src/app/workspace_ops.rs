@@ -486,11 +486,23 @@ pub(super) fn workspace_goto(
     // machinery below: a post-merge review target is by definition a MERGED
     // PR, which the `--pr` path above refuses outright.
     if let Some(sha) = revision {
+        // Unlike the `--pr` path below, ancestry (`::@`) is the wrong test here:
+        // a merge SHA lands on the default branch, so it is an ancestor of `@`
+        // in almost any workspace whose `@` was reset via `jj new main` after
+        // the merge — even though `@` is nowhere near that commit. Test that
+        // `@`'s actual parent is the target instead.
         let already_positioned = runner
             .run(&RealCommandRunner::invocation(
                 &cwd,
                 "jj",
-                &["log", "-r", &format!("{sha} & ::@"), "--no-graph", "-T", "commit_id"],
+                &[
+                    "log",
+                    "-r",
+                    &format!("parents(@) & {sha}"),
+                    "--no-graph",
+                    "-T",
+                    "commit_id",
+                ],
             ))
             .map(|out| !out.trim().is_empty())
             .unwrap_or(false);

@@ -1,10 +1,15 @@
-//! Engine-flagged prompt blocks embedded verbatim in the reviewer prompt.
+//! Renderable prompt blocks shared across reviewer roles.
 //!
-//! Both blocks are pure `&[String] -> String` renderers over the *already
-//! scanned* hit lines the engine carries on [`crate::PrReviewContext`]. The
-//! deterministic scans that produce those lines live in the engine
-//! (`supersession_scan`, `boss_construct_scan`); only the reviewer-facing
-//! rendering lives here, next to the prompt it is interpolated into.
+//! [`render_supersession_flag_block`] and [`render_boss_construct_sweep_block`]
+//! are pure `&[String] -> String` renderers over the *already scanned* hit
+//! lines the engine carries on [`crate::PrReviewContext`]. The deterministic
+//! scans that produce those lines live in the engine (`supersession_scan`,
+//! `boss_construct_scan`); only the reviewer-facing rendering lives here,
+//! next to the prompt it is interpolated into.
+//!
+//! [`render_verdict_submission_block`] is unrelated to those scans: it
+//! renders the fixed instructions telling a reviewer/supervisor role how to
+//! submit its verdict for a given review batch.
 
 /// Render an authoritative reviewer-prompt block for a set of deterministic
 /// supersession flag lines (from the engine's `hit_lines` helper). Returns an empty string when
