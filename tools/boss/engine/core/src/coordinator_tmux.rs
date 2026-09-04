@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use boss_protocol::CoordinatorRecreateReason;
-use boss_tmux::{DisplayField, NewSession, Tmux};
+use boss_tmux::{DisplayField, KillSessionOutcome, NewSession, Tmux};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -84,6 +84,150 @@ pub(crate) struct CoordinatorSpawn<'a> {
     pub(crate) version_probe: &'a dyn ClaudeVersionProbe,
 }
 
+/// A completed spawn carries the exact command line that tmux received. It
+/// stays private to this module: callers only need the durable record, while
+/// recreate auditing must preserve the command that actually relaunched the
+/// coordinator rather than reconstructing an approximation later.
+struct StartedCoordinator {
+    record: CoordinatorTmuxRecord,
+    command: String,
+}
+
+/// The code path and stable reason attached to a recreate audit record.
+struct CoordinatorRecreatePath {
+    trigger: &'static str,
+    reason: &'static str,
+}
+
+/// The liveness conclusion that led to a recreate (or explains why a
+/// confirmed operator reset did not consult liveness).
+struct CoordinatorLivenessEvidence {
+    verdict: &'static str,
+    failed_check: &'static str,
+    observed: String,
+    threshold: &'static str,
+}
+
+struct CoordinatorTeardown {
+    kill_existing_session: bool,
+    existing_process_disposition: &'static str,
+}
+
+/// All facts known before a recreate overwrites the old metadata record.
+/// Every automatic and confirmed replacement funnels through this context so
+/// `coordinator_recreate` remains the one durable forensic event.
+struct CoordinatorRecreateContext<'a> {
+    path: CoordinatorRecreatePath,
+    liveness: CoordinatorLivenessEvidence,
+    old_record: &'a CoordinatorTmuxRecord,
+    teardown: CoordinatorTeardown,
+    /// The supervisor's count before this pass. It is incremented only after
+    /// a successful recreate; `None` for non-supervisor recreates.
+    supervisor_restart_churn_before: Option<u32>,
+}
+
+async fn recreate_and_record(
+    spawn: &CoordinatorSpawn<'_>,
+    context: CoordinatorRecreateContext<'_>,
+    reason: CoordinatorStartReason,
+) -> Result<CoordinatorTmuxRecord> {
+    let kill_outcome = if context.teardown.kill_existing_session {
+        spawn
+            .tmux
+            .kill_session_verified(&context.old_record.session_name, &context.old_record.spawn_token)
+            .await
+            .context("removing coordinator tmux session before recreation")?
+    } else {
+        KillSessionOutcome::Absent
+    };
+    let existing_session_disposition = if kill_outcome == KillSessionOutcome::Killed {
+        "engine_killed_session"
+    } else {
+        "already_gone"
+    };
+    let mut teardown_payload = serde_json::Map::new();
+    teardown_payload.insert("outcome".to_owned(), json!("relaunch_started"));
+    teardown_payload.insert("trigger".to_owned(), json!(context.path.trigger));
+    teardown_payload.insert("reason".to_owned(), json!(context.path.reason));
+    teardown_payload.insert("old_spawn_token".to_owned(), json!(context.old_record.spawn_token));
+    teardown_payload.insert(
+        "existing_session_disposition".to_owned(),
+        json!(existing_session_disposition),
+    );
+    teardown_payload.insert(
+        "existing_process_disposition".to_owned(),
+        json!(context.teardown.existing_process_disposition),
+    );
+    audit::record_event("coordinator_recreate", &teardown_payload);
+    let result = start_new(spawn, reason).await;
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "outcome".to_owned(),
+        json!(if result.is_ok() { "success" } else { "failed" }),
+    );
+    payload.insert("trigger".to_owned(), json!(context.path.trigger));
+    payload.insert("reason".to_owned(), json!(context.path.reason));
+    payload.insert("liveness_verdict".to_owned(), json!(context.liveness.verdict));
+    let mut liveness_evidence = serde_json::Map::from_iter([
+        ("failed_check".to_owned(), json!(context.liveness.failed_check)),
+        ("observed".to_owned(), json!(context.liveness.observed)),
+        ("threshold".to_owned(), json!(context.liveness.threshold)),
+    ]);
+    if let Some(last_passed_at) = context.old_record.liveness_passed_at {
+        liveness_evidence.insert("last_passed_at_epoch_s".to_owned(), json!(last_passed_at));
+    }
+    payload.insert(
+        "liveness_evidence".to_owned(),
+        serde_json::Value::Object(liveness_evidence),
+    );
+    payload.insert(
+        "existing_session_disposition".to_owned(),
+        json!(existing_session_disposition),
+    );
+    payload.insert(
+        "existing_process_disposition".to_owned(),
+        json!(context.teardown.existing_process_disposition),
+    );
+    payload.insert(
+        "restart_churn".to_owned(),
+        match context.supervisor_restart_churn_before {
+            Some(count_before) => json!({
+                "count": if result.is_ok() { count_before.saturating_add(1) } else { count_before },
+                "outcome": if result.is_ok() { "incremented_after_successful_recreate" } else { "unchanged_recreate_failed" },
+                "scope": "consecutive_successful_tmux_supervisor_recreates",
+                "window": "no_wall_clock_window",
+                "reset": "resets_to_zero_only_after_a_supervisor_pass_finds_the_current_coordinator_healthy_without_recreating_it",
+                "lifetime": "in_memory_supervisor_state_reset_on_engine_process_restart",
+            }),
+            None => json!({
+                "scope": "not_applicable_outside_tmux_supervisor",
+                "window": "no_wall_clock_window",
+                "reset": "the_tmux_supervisor_counter_is_not_updated_by_this_recreate_path",
+            }),
+        },
+    );
+    payload.insert("old_session_name".to_owned(), json!(context.old_record.session_name));
+    payload.insert("old_spawn_token".to_owned(), json!(context.old_record.spawn_token));
+    if let Some(pane_id) = &context.old_record.pane_id {
+        payload.insert("old_pane_id".to_owned(), json!(pane_id));
+    }
+    match &result {
+        Ok(started) => {
+            payload.insert("new_session_name".to_owned(), json!(started.record.session_name));
+            payload.insert("new_spawn_token".to_owned(), json!(started.record.spawn_token));
+            if let Some(pane_id) = &started.record.pane_id {
+                payload.insert("new_pane_id".to_owned(), json!(pane_id));
+            }
+            payload.insert("relaunch_command".to_owned(), json!(started.command));
+        }
+        Err(error) => {
+            payload.insert("error".to_owned(), json!(format!("{error:#}")));
+        }
+    }
+    audit::record_event("coordinator_recreate", &payload);
+    result.map(|started| started.record)
+}
+
 /// Create or recover the coordinator for an app that has just registered.
 ///
 /// A model mismatch leaves the live conversation intact; the app compares the
@@ -94,7 +238,9 @@ pub(crate) struct CoordinatorSpawn<'a> {
 /// [`start_new`]).
 pub(crate) async fn ensure_for_attach(spawn: &CoordinatorSpawn<'_>) -> Result<CoordinatorTmuxRecord> {
     match spawn.work_db.coordinator_tmux_record()? {
-        None => start_new(spawn, CoordinatorStartReason::FirstCreation).await,
+        None => start_new(spawn, CoordinatorStartReason::FirstCreation)
+            .await
+            .map(|started| started.record),
         Some(record) => reconcile_existing(spawn, record).await,
     }
 }
@@ -106,12 +252,38 @@ pub(crate) async fn ensure_for_attach(spawn: &CoordinatorSpawn<'_>) -> Result<Co
 ///
 /// Returns the replacement record only when the viewer must reattach. A
 /// healthy session and a live model mismatch are deliberately left alone.
-pub(crate) async fn restart_if_dead(spawn: &CoordinatorSpawn<'_>) -> Result<Option<CoordinatorTmuxRecord>> {
-    let Some(record) = spawn.work_db.coordinator_tmux_record()? else {
+pub(crate) async fn restart_if_dead(
+    spawn: &CoordinatorSpawn<'_>,
+    supervisor_restart_churn_before: u32,
+) -> Result<Option<CoordinatorTmuxRecord>> {
+    let Some(mut record) = spawn.work_db.coordinator_tmux_record()? else {
         return Ok(None);
     };
     if !session_exists(spawn.tmux, &record.session_name).await? {
-        return start_new(spawn, CoordinatorStartReason::SessionMissing).await.map(Some);
+        return recreate_and_record(
+            spawn,
+            CoordinatorRecreateContext {
+                path: CoordinatorRecreatePath {
+                    trigger: "tmux_supervisor",
+                    reason: CoordinatorStartReason::SessionMissing.audit_label(),
+                },
+                liveness: CoordinatorLivenessEvidence {
+                    verdict: "failed",
+                    failed_check: "tmux_session_exists",
+                    observed: "false".to_owned(),
+                    threshold: "true",
+                },
+                old_record: &record,
+                teardown: CoordinatorTeardown {
+                    kill_existing_session: false,
+                    existing_process_disposition: "session_absent",
+                },
+                supervisor_restart_churn_before: Some(supervisor_restart_churn_before),
+            },
+            CoordinatorStartReason::SessionMissing,
+        )
+        .await
+        .map(Some);
     }
     let live_token = spawn
         .tmux
@@ -126,24 +298,62 @@ pub(crate) async fn restart_if_dead(spawn: &CoordinatorSpawn<'_>) -> Result<Opti
         Some(_) => bail!("coordinator tmux token does not match the metadata singleton"),
         None => bail!("coordinator tmux session exists without the metadata singleton token"),
     }
-    if spawn
+    let pane_dead = spawn
         .tmux
         .display_message(&record.session_name, DisplayField::PaneDead)
-        .await?
-        .trim()
-        != "1"
-    {
+        .await?;
+    if pane_dead.trim() != "1" {
+        match spawn
+            .tmux
+            .display_message(&record.session_name, DisplayField::PaneId)
+            .await
+        {
+            Ok(pane_id) => {
+                if let Err(error) = spawn
+                    .work_db
+                    .record_coordinator_tmux_liveness_pass(&record.spawn_token, &pane_id)
+                {
+                    tracing::warn!(error = %format!("{error:#}"), "coordinator tmux: failed to persist healthy liveness observation");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "coordinator tmux: failed to read healthy pane identity");
+            }
+        }
         if record.spawn_state == "intended" {
             confirm_existing_intent(spawn.work_db, spawn.tmux, &record).await?;
         }
         return Ok(None);
     }
-    spawn
+    let old_pane_id = spawn
         .tmux
-        .kill_session_verified(&record.session_name, &record.spawn_token)
-        .await
-        .context("removing dead coordinator tmux session before restart")?;
-    start_new(spawn, CoordinatorStartReason::PaneDead).await.map(Some)
+        .display_message(&record.session_name, DisplayField::PaneId)
+        .await?;
+    record.pane_id = Some(old_pane_id);
+    recreate_and_record(
+        spawn,
+        CoordinatorRecreateContext {
+            path: CoordinatorRecreatePath {
+                trigger: "tmux_supervisor",
+                reason: CoordinatorStartReason::PaneDead.audit_label(),
+            },
+            liveness: CoordinatorLivenessEvidence {
+                verdict: "failed",
+                failed_check: "tmux_pane_dead",
+                observed: pane_dead,
+                threshold: "0",
+            },
+            old_record: &record,
+            teardown: CoordinatorTeardown {
+                kill_existing_session: true,
+                existing_process_disposition: "already_exited_pane_dead",
+            },
+            supervisor_restart_churn_before: Some(supervisor_restart_churn_before),
+        },
+        CoordinatorStartReason::PaneDead,
+    )
+    .await
+    .map(Some)
 }
 
 /// Consecutive-failure tracker for the coordinator tmux supervisor.
@@ -266,50 +476,20 @@ impl CoordinatorRestartFailures {
 /// token prevents a delayed confirmation from killing a newer session
 /// created by a concurrent restart recovery. `reason` is recorded to the
 /// audit log so a manual reset is distinguishable there both from the
-/// automatic model-mismatch path and from a crash/session-loss restart
-/// (`restart_if_dead`/`reconcile_existing`), neither of which audits this
-/// event at all.
+/// automatic model-mismatch path and from a crash/session-loss restart.
 pub(crate) async fn recreate_after_confirmation(
     spawn: &CoordinatorSpawn<'_>,
     expected_spawn_token: &str,
     reason: CoordinatorRecreateReason,
 ) -> Result<CoordinatorTmuxRecord> {
-    let result = recreate_after_confirmation_inner(spawn, expected_spawn_token, reason).await;
-    match &result {
-        Ok(record) => audit::record_event(
-            "coordinator_recreate",
-            &json!({
-                "outcome": "success",
-                "reason": reason,
-                "old_spawn_token": expected_spawn_token,
-                "new_spawn_token": record.spawn_token,
-            }),
-        ),
-        Err(error) => audit::record_event(
-            "coordinator_recreate",
-            &json!({
-                "outcome": "failed",
-                "reason": reason,
-                "old_spawn_token": expected_spawn_token,
-                "error": format!("{error:#}"),
-            }),
-        ),
-    }
-    result
-}
-
-async fn recreate_after_confirmation_inner(
-    spawn: &CoordinatorSpawn<'_>,
-    expected_spawn_token: &str,
-    reason: CoordinatorRecreateReason,
-) -> Result<CoordinatorTmuxRecord> {
-    let record = spawn
+    let mut record = spawn
         .work_db
         .coordinator_tmux_record()?
         .ok_or_else(|| anyhow!("no coordinator tmux record exists"))?;
     if record.spawn_token != expected_spawn_token {
         bail!("coordinator changed before confirmation; refresh and confirm the current session instead");
     }
+    let mut kill_existing_session = false;
     if session_exists(spawn.tmux, &record.session_name).await? {
         match spawn
             .tmux
@@ -317,17 +497,45 @@ async fn recreate_after_confirmation_inner(
             .await?
         {
             Some(token) if token == record.spawn_token => {
-                spawn
-                    .tmux
-                    .kill_session_verified(&record.session_name, &record.spawn_token)
-                    .await
-                    .context("destroying the confirmed coordinator session")?;
+                record.pane_id = Some(
+                    spawn
+                        .tmux
+                        .display_message(&record.session_name, DisplayField::PaneId)
+                        .await?,
+                );
+                kill_existing_session = true;
             }
             Some(_) => bail!("coordinator tmux token does not match the metadata singleton"),
             None => bail!("coordinator tmux session exists without the metadata singleton token"),
         }
     }
-    start_new(spawn, CoordinatorStartReason::Recreate(reason)).await
+    recreate_and_record(
+        spawn,
+        CoordinatorRecreateContext {
+            path: CoordinatorRecreatePath {
+                trigger: "operator_confirmation",
+                reason: CoordinatorStartReason::Recreate(reason).audit_label(),
+            },
+            liveness: CoordinatorLivenessEvidence {
+                verdict: "not_evaluated",
+                failed_check: "operator_confirmation",
+                observed: "confirmed".to_owned(),
+                threshold: "explicit_confirmation_required",
+            },
+            old_record: &record,
+            teardown: CoordinatorTeardown {
+                kill_existing_session,
+                existing_process_disposition: if kill_existing_session {
+                    "live_when_terminated"
+                } else {
+                    "session_absent"
+                },
+            },
+            supervisor_restart_churn_before: None,
+        },
+        CoordinatorStartReason::Recreate(reason),
+    )
+    .await
 }
 
 async fn reconcile_existing(
@@ -338,7 +546,29 @@ async fn reconcile_existing(
         // Covers both crash windows in which metadata was committed but
         // `new-session` never happened, and normal session loss. No live
         // conversation remains, so recreation is non-destructive.
-        return start_new(spawn, CoordinatorStartReason::SessionMissing).await;
+        return recreate_and_record(
+            spawn,
+            CoordinatorRecreateContext {
+                path: CoordinatorRecreatePath {
+                    trigger: "attach_reconcile",
+                    reason: CoordinatorStartReason::SessionMissing.audit_label(),
+                },
+                liveness: CoordinatorLivenessEvidence {
+                    verdict: "failed",
+                    failed_check: "tmux_session_exists",
+                    observed: "false".to_owned(),
+                    threshold: "true",
+                },
+                old_record: &record,
+                teardown: CoordinatorTeardown {
+                    kill_existing_session: false,
+                    existing_process_disposition: "session_absent",
+                },
+                supervisor_restart_churn_before: None,
+            },
+            CoordinatorStartReason::SessionMissing,
+        )
+        .await;
     }
     let live_token = spawn
         .tmux
@@ -349,19 +579,39 @@ async fn reconcile_existing(
             crate::tmux_session_options::apply(spawn.tmux, &record.session_name)
                 .await
                 .context("applying Boss coordinator tmux session options")?;
-            if spawn
+            let pane_dead = spawn
                 .tmux
                 .display_message(&record.session_name, DisplayField::PaneDead)
-                .await?
-                .trim()
-                == "1"
-            {
-                spawn
+                .await?;
+            if pane_dead.trim() == "1" {
+                let old_pane_id = spawn
                     .tmux
-                    .kill_session_verified(&record.session_name, &record.spawn_token)
-                    .await
-                    .context("removing dead coordinator tmux session before restart")?;
-                return start_new(spawn, CoordinatorStartReason::PaneDead).await;
+                    .display_message(&record.session_name, DisplayField::PaneId)
+                    .await?;
+                record.pane_id = Some(old_pane_id);
+                return recreate_and_record(
+                    spawn,
+                    CoordinatorRecreateContext {
+                        path: CoordinatorRecreatePath {
+                            trigger: "attach_reconcile",
+                            reason: CoordinatorStartReason::PaneDead.audit_label(),
+                        },
+                        liveness: CoordinatorLivenessEvidence {
+                            verdict: "failed",
+                            failed_check: "tmux_pane_dead",
+                            observed: pane_dead,
+                            threshold: "0",
+                        },
+                        old_record: &record,
+                        teardown: CoordinatorTeardown {
+                            kill_existing_session: true,
+                            existing_process_disposition: "already_exited_pane_dead",
+                        },
+                        supervisor_restart_churn_before: None,
+                    },
+                    CoordinatorStartReason::PaneDead,
+                )
+                .await;
             }
             // Live matching-token sessions are left alone (including
             // model mismatches, which the app surfaces for confirmation).
@@ -369,6 +619,30 @@ async fn reconcile_existing(
             if record.spawn_state == "intended" {
                 confirm_existing_intent(spawn.work_db, spawn.tmux, &record).await?;
                 record.spawn_state = "created".to_owned();
+            }
+            match spawn
+                .tmux
+                .display_message(&record.session_name, DisplayField::PaneId)
+                .await
+            {
+                Ok(pane_id) => {
+                    record.pane_id = Some(pane_id.clone());
+                    match spawn
+                        .work_db
+                        .record_coordinator_tmux_liveness_pass(&record.spawn_token, &pane_id)
+                    {
+                        Ok(true) => record.liveness_passed_at = Some(boss_engine_utils::epoch_time::now_epoch_secs()),
+                        Ok(false) => tracing::warn!(
+                            "coordinator tmux: healthy liveness observation belonged to a replaced session"
+                        ),
+                        Err(error) => {
+                            tracing::warn!(error = %format!("{error:#}"), "coordinator tmux: failed to persist healthy liveness observation")
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "coordinator tmux: failed to read healthy pane identity")
+                }
             }
             seed_claude_version_baseline_if_missing(spawn.work_db, &mut record, spawn.version_probe).await;
             // This branch is reached only when the engine is *adopting* a
@@ -677,7 +951,7 @@ async fn maybe_nudge_prompt_change(
 /// (if any) is being replaced; it is rendered into the session-start
 /// handoff brief the new session receives as its initial prompt (see
 /// [`prepare_session_start_brief`]).
-async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason) -> Result<CoordinatorTmuxRecord> {
+async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason) -> Result<StartedCoordinator> {
     let CoordinatorSpawn {
         work_db,
         create_tmux: tmux,
@@ -740,7 +1014,7 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
         name: COORDINATOR_SESSION_NAME.to_owned(),
         environment,
         working_directory: working_directory.to_path_buf(),
-        command,
+        command: command.clone(),
     })
     .await
     .context("creating detached coordinator tmux session")?;
@@ -750,7 +1024,10 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
     tmux.set_option(COORDINATOR_SESSION_NAME, SPAWN_TOKEN_OPTION, &spawn_token)
         .await
         .context("mirroring coordinator spawn token in tmux")?;
-    if !work_db.record_coordinator_tmux_session_created(&spawn_token)? {
+    let pane_id = tmux
+        .display_message(COORDINATOR_SESSION_NAME, DisplayField::PaneId)
+        .await?;
+    if !work_db.record_coordinator_tmux_session_created_with_pane(&spawn_token, &pane_id)? {
         bail!("coordinator session was created but its metadata intent was replaced");
     }
     seed_prompt_nudge_baseline(work_db, working_directory);
@@ -759,13 +1036,18 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
         .ok()
         .flatten()
         .and_then(|record| record.spawned_at);
-    Ok(CoordinatorTmuxRecord {
-        session_name: COORDINATOR_SESSION_NAME.to_owned(),
-        spawn_token,
-        spawn_state: "created".to_owned(),
-        model: model.to_owned(),
-        launched_claude_version: claude_version,
-        spawned_at,
+    Ok(StartedCoordinator {
+        record: CoordinatorTmuxRecord {
+            session_name: COORDINATOR_SESSION_NAME.to_owned(),
+            spawn_token,
+            spawn_state: "created".to_owned(),
+            model: model.to_owned(),
+            launched_claude_version: claude_version,
+            spawned_at,
+            pane_id: Some(pane_id),
+            liveness_passed_at: Some(boss_engine_utils::epoch_time::now_epoch_secs()),
+        },
+        command,
     })
 }
 
@@ -1093,6 +1375,8 @@ mod tests {
             model: "opus".to_owned(),
             launched_claude_version: launched.map(str::to_owned),
             spawned_at: None,
+            pane_id: None,
+            liveness_passed_at: None,
         }
     }
 
@@ -1189,7 +1473,13 @@ mod tests {
                     Some(token) => (true, format!("BOSS_SPAWN_TOKEN={token}\n"), String::new()),
                     None => (false, String::new(), "unknown variable".to_owned()),
                 },
-                Some("display-message") => (true, format!("{}\n", self.pane_dead), String::new()),
+                Some("display-message") => {
+                    let output = match args.last().map(String::as_str) {
+                        Some("#{pane_id}") => "%42".to_owned(),
+                        _ => self.pane_dead.clone(),
+                    };
+                    (true, format!("{output}\n"), String::new())
+                }
                 Some("show-options") => {
                     let key = match args.get(3).map(String::as_str) {
                         Some("-s") => format!("server:{}", args[5]),
@@ -1612,14 +1902,14 @@ mod tests {
             .unwrap();
         db.record_coordinator_tmux_session_created("token").unwrap();
 
-        let replacement = restart_if_dead(&spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe))
+        let replacement = restart_if_dead(&spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe), 1)
             .await
             .unwrap();
         assert!(replacement.is_none(), "a live session must not force reattach");
         assert_extended_keys_applied(&server.calls());
 
         let calls_before_second_pass = server.calls().len();
-        let replacement = restart_if_dead(&spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe))
+        let replacement = restart_if_dead(&spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe), 1)
             .await
             .unwrap();
         assert!(replacement.is_none(), "a live session must not force reattach");
@@ -1650,6 +1940,89 @@ mod tests {
             .position(|call| call.get(2).map(String::as_str) == Some("new-session"))
             .unwrap();
         assert!(kill < new);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn supervisor_pane_dead_recreate_writes_audit_evidence() {
+        let _audit_globals = audit::lock_audit_globals_for_tests();
+        let (db, tmux, _server, dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "1"));
+        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus", None)
+            .unwrap();
+        db.record_coordinator_tmux_session_created_with_pane("token", "%old")
+            .unwrap();
+        let audit_dir = tempfile::tempdir().unwrap();
+        let audit_path = audit_dir.path().join("engine-audit.log");
+        let audit_already_resolved = audit::path_already_resolved_for_tests();
+        let _env_guard = if audit_already_resolved {
+            None
+        } else {
+            unsafe { std::env::set_var(audit::AUDIT_PATH_ENV, &audit_path) }
+            Some(AuditPathEnvGuard)
+        };
+
+        restart_if_dead(&spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe), 1)
+            .await
+            .unwrap()
+            .expect("dead pane must be recreated");
+
+        if !audit_already_resolved {
+            let last = std::fs::read_to_string(&audit_path)
+                .unwrap()
+                .lines()
+                .last()
+                .and_then(|line| serde_json::from_str::<Value>(line).ok())
+                .expect("expected a coordinator_recreate audit record");
+            assert_eq!(last["event"], "coordinator_recreate");
+            assert_eq!(last["trigger"], "tmux_supervisor");
+            assert_eq!(last["reason"], "pane_dead");
+            assert_eq!(last["liveness_evidence"]["failed_check"], "tmux_pane_dead");
+            assert_eq!(last["liveness_evidence"]["observed"], "1");
+            assert_eq!(last["existing_session_disposition"], "engine_killed_session");
+            assert_eq!(last["existing_process_disposition"], "already_exited_pane_dead");
+            assert_eq!(last["old_pane_id"], "%42");
+            assert_eq!(last["new_pane_id"], "%42");
+            assert_eq!(last["restart_churn"]["count"], 2);
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn supervisor_missing_session_recreate_writes_audit_evidence() {
+        let _audit_globals = audit::lock_audit_globals_for_tests();
+        let (db, tmux, _server, dir) = fixture(FakeTmux::new(vec![], None, "0"));
+        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus", None)
+            .unwrap();
+        db.record_coordinator_tmux_session_created_with_pane("token", "%old")
+            .unwrap();
+        let audit_dir = tempfile::tempdir().unwrap();
+        let audit_path = audit_dir.path().join("engine-audit.log");
+        let audit_already_resolved = audit::path_already_resolved_for_tests();
+        let _env_guard = if audit_already_resolved {
+            None
+        } else {
+            unsafe { std::env::set_var(audit::AUDIT_PATH_ENV, &audit_path) }
+            Some(AuditPathEnvGuard)
+        };
+
+        restart_if_dead(&spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe), 0)
+            .await
+            .unwrap()
+            .expect("missing session must be recreated");
+
+        if !audit_already_resolved {
+            let last = std::fs::read_to_string(&audit_path)
+                .unwrap()
+                .lines()
+                .last()
+                .and_then(|line| serde_json::from_str::<Value>(line).ok())
+                .expect("expected a coordinator_recreate audit record");
+            assert_eq!(last["event"], "coordinator_recreate");
+            assert_eq!(last["liveness_evidence"]["failed_check"], "tmux_session_exists");
+            assert_eq!(last["liveness_evidence"]["observed"], "false");
+            assert_eq!(last["existing_session_disposition"], "already_gone");
+            assert_eq!(last["existing_process_disposition"], "session_absent");
+        }
     }
 
     #[tokio::test]
@@ -1760,7 +2133,8 @@ mod tests {
         let (db, tmux, server, dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
         db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus", None)
             .unwrap();
-        db.record_coordinator_tmux_session_created("token").unwrap();
+        db.record_coordinator_tmux_session_created_with_pane("token", "%old")
+            .unwrap();
 
         let audit_dir = tempfile::tempdir().unwrap();
         let audit_path = audit_dir.path().join("engine-audit.log");
@@ -1812,7 +2186,18 @@ mod tests {
                 .expect("expected a coordinator_recreate audit record");
             assert_eq!(last["event"], "coordinator_recreate");
             assert_eq!(last["outcome"], "success");
-            assert_eq!(last["reason"], "operator_reset");
+            assert_eq!(last["reason"], "recreate_operator_reset");
+            assert_eq!(last["trigger"], "operator_confirmation");
+            assert_eq!(last["existing_session_disposition"], "engine_killed_session");
+            assert_eq!(last["existing_process_disposition"], "live_when_terminated");
+            assert_eq!(last["old_pane_id"], "%old");
+            assert_eq!(last["new_pane_id"], "%42");
+            assert!(last["liveness_evidence"]["last_passed_at_epoch_s"].as_i64().is_some());
+            assert!(
+                last["relaunch_command"]
+                    .as_str()
+                    .is_some_and(|command| command.contains("exec claude"))
+            );
         }
     }
 
