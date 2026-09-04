@@ -1,16 +1,27 @@
 #!/usr/bin/env bash
 # install-workspace-shims.sh — populate <workspace>/bin/ with repobin shims.
 #
-# Run by cube on every lease of a mono workspace (`.cube/setup.yaml`, step
-# `repobin-tool-shims`), and safe to run by hand from anywhere inside the
-# checkout. It makes the gitignored bin/ look like CI's: one entry per eligible
-# tool declared in REPOBIN.toml plus `repobin` itself. The engine owns the
-# `boss`, `boss-event`, `bossctl`, and `cube` launchers, so those names are
-# deliberately skipped even when REPOBIN.toml declares them. CI's entries are real
-# `repobin install` symlinks to a bazel-built repobin binary; here each entry
-# is a symlink to repobin-shim.sh, which builds that same binary on first use
-# and dispatches through it (see the shim's header for why the build is
-# deferred rather than done at lease time).
+# Generic repobin machinery, not mono/Boss-specific: any repobin-using
+# checkout can run this by hand from anywhere inside its tree. It makes the
+# gitignored bin/ look like CI's: one entry per eligible tool declared in
+# REPOBIN.toml plus `repobin` itself. CI's entries are real `repobin install`
+# symlinks to a bazel-built repobin binary; here each entry is a symlink to
+# repobin-shim.sh, which builds that same binary on first use and dispatches
+# through it (see the shim's header for why the build is deferred rather than
+# done at lease time).
+#
+# Two things are repo-specific and are read from the environment rather than
+# hardcoded, so this script has no opinion about who owns which tool names:
+#   * REPOBIN_SHIM_SKIP — space-separated tool names to never shim (e.g. a
+#     repo whose engine owns its own launchers for some names declared in
+#     REPOBIN.toml). Defaults to empty: nothing is skipped.
+#   * REPOBIN_SHIM_REQUIRE — space-separated tool names that must end up
+#     executable in bin/ after install, or the script fails loudly. Defaults
+#     to empty: nothing is required. mono runs this (`.cube/setup.yaml`, step
+#     `repobin-tool-shims`) with REPOBIN_SHIM_SKIP='boss boss-event bossctl
+#     cube' (those four are engine-owned launchers) and
+#     REPOBIN_SHIM_REQUIRE=checkleft (a workspace without a usable checkleft
+#     gate must fail its lease rather than let a worker discover it later).
 #
 # Behaviour:
 #   * Cheap and idempotent: only symlinks are written, so `run_when: always`
@@ -19,9 +30,8 @@
 #     file): that is strictly better than the shim, so bin/ is left alone.
 #   * Never overwrites a regular file or directory at a tool's name; warns
 #     and leaves it.
-#   * Exits non-zero if, after installing, bin/checkleft is not executable —
-#     a workspace without a usable checkleft gate must fail its lease loudly
-#     rather than let a worker discover it (and improvise) later.
+#   * Exits non-zero if, after installing, any REPOBIN_SHIM_REQUIRE name is
+#     not executable in bin/.
 #
 # Tested by //tools/repobin/shim:repobin_shim_test.
 set -euo pipefail
@@ -32,6 +42,8 @@ config="$root/REPOBIN.toml"
 bin="$root/bin"
 shim="$here/repobin-shim.sh"
 shim_rel="../tools/repobin/shim/repobin-shim.sh"
+skip_names="${REPOBIN_SHIM_SKIP:-}"
+require_names="${REPOBIN_SHIM_REQUIRE:-}"
 
 die() {
   printf 'install-workspace-shims: %s\n' "$@" >&2
@@ -53,14 +65,18 @@ mkdir -p "$bin"
 names="$(sed -n -E 's/^[[:space:]]*\[(tools|pins)\.([^]]+)\][[:space:]]*$/\2/p' "$config")"
 [[ -n "$names" ]] || die "REPOBIN.toml at $root declares no [tools.*] or [pins.*] entries"
 
+is_skipped() {
+  local candidate="$1" skip
+  for skip in $skip_names; do
+    [[ "$candidate" == "$skip" ]] && return 0
+  done
+  return 1
+}
+
 installed=0
 kept=0
 for name in repobin $names; do
-  case "$name" in
-    boss|boss-event|bossctl|cube)
-      continue
-      ;;
-  esac
+  is_skipped "$name" && continue
   entry="$bin/$name"
   if [[ -L "$entry" ]]; then
     # Already our shim? (`-ef` compares inodes through the symlink; no
@@ -79,8 +95,11 @@ for name in repobin $names; do
   installed=$((installed + 1))
 done
 
-# The property this whole mechanism exists for. Fail the lease rather than
-# hand out a workspace whose checkleft gate a worker would have to improvise.
-[[ -x "$bin/checkleft" ]] || die "$bin/checkleft is not executable after install; a workspace without a usable checkleft gate is not healthy"
+# The property REPOBIN_SHIM_REQUIRE exists for (mono requires `checkleft`):
+# fail the lease rather than hand out a workspace missing a tool the caller
+# declared load-bearing.
+for name in $require_names; do
+  [[ -x "$bin/$name" ]] || die "$bin/$name is not executable after install; REPOBIN_SHIM_REQUIRE named it as required"
+done
 
 echo "install-workspace-shims: bin/ ready ($installed installed, $kept already present) -> $shim_rel for: repobin $(printf '%s ' $names)"

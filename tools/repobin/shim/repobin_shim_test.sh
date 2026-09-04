@@ -117,6 +117,13 @@ chmod +x "$fake_dir/bazel"
 export PATH="$fake_dir:$decoy_dir:/usr/bin:/bin"
 export FAKE_REPOBIN_LOG="$repobin_log"
 export REPOBIN_SHIM_QUIET=
+# The installer's skip/require lists are generic and read from the
+# environment (see its header); the rest of this suite exercises them set
+# to mono's actual `.cube/setup.yaml` values, and a dedicated section below
+# (see "default: nothing skipped, nothing required") covers the unset
+# default for a repobin-using checkout with no such policy of its own.
+export REPOBIN_SHIM_SKIP='boss boss-event bossctl cube'
+export REPOBIN_SHIM_REQUIRE='checkleft'
 
 run_in() {
   # run_in <dir> <cmd...>: run with cwd=<dir>, capturing rc/stdout/stderr.
@@ -256,5 +263,24 @@ run_in "$ws" bash tools/repobin/shim/install-workspace-shims.sh
 [[ $rc -ne 0 ]] || fail "installer reported healthy with an unusable bin/checkleft"
 grep -q 'bin/checkleft is not executable after install' "$tmp/stderr" || fail "stderr: $(cat "$tmp/stderr")"
 pass "stray regular files are never clobbered; an unusable bin/checkleft fails the install"
+
+# 13. default: nothing skipped, nothing required. A repobin-using checkout
+#     that sets neither REPOBIN_SHIM_SKIP nor REPOBIN_SHIM_REQUIRE gets a
+#     shim for every declared tool -- including names mono happens to skip
+#     -- and a clean exit even though nothing was declared "required".
+default_ws="$tmp/default-ws"
+make_workspace "$default_ws"
+run_in "$default_ws" env -u REPOBIN_SHIM_SKIP -u REPOBIN_SHIM_REQUIRE bash tools/repobin/shim/install-workspace-shims.sh
+[[ $rc -eq 0 ]] || fail "default installer exited $rc: $(cat "$tmp/stderr")"
+for name in repobin checkleft hood boss bossctl cube; do
+  [[ -L "$default_ws/bin/$name" ]] || fail "default install: bin/$name is not a symlink (nothing should be skipped by default)"
+done
+pass "default (unset SKIP/REQUIRE): every declared tool is shimmed, nothing is required"
+
+# Removing bin/checkleft must NOT fail the install when nothing is required.
+rm -f "$default_ws/bin/checkleft"
+run_in "$default_ws" env -u REPOBIN_SHIM_SKIP -u REPOBIN_SHIM_REQUIRE bash tools/repobin/shim/install-workspace-shims.sh
+[[ $rc -eq 0 ]] || fail "default installer with no bin/checkleft exited $rc: $(cat "$tmp/stderr")"
+pass "default (unset REQUIRE): a repo with no checkleft gate installs cleanly"
 
 echo "all repobin shim checks passed"

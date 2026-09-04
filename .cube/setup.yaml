@@ -40,5 +40,10 @@ steps:
   # the lease loudly rather than handing out a workspace whose checkleft
   # gate a worker would have to improvise.
   - id: repobin-tool-shims
-    command: bash tools/repobin/shim/install-workspace-shims.sh
+    # boss/boss-event/bossctl/cube are engine-owned launchers, skipped here
+    # even though REPOBIN.toml declares them; checkleft is the one tool this
+    # repo requires end up executable in bin/ after install (see the
+    # installer's header for the generic REPOBIN_SHIM_SKIP/REPOBIN_SHIM_REQUIRE
+    # contract this script exposes to any repobin-using checkout).
+    command: "REPOBIN_SHIM_SKIP='boss boss-event bossctl cube' REPOBIN_SHIM_REQUIRE='checkleft' bash tools/repobin/shim/install-workspace-shims.sh"
     run_when: always
