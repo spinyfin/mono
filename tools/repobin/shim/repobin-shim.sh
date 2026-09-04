@@ -16,7 +16,8 @@
 #   A lease has a hard time budget (the Boss engine bounds `cube workspace
 #   lease` at ~90s), so cube's setup step cannot afford `bazel build` on a cold
 #   workspace. Instead `.cube/setup.yaml` runs install-workspace-shims.sh,
-#   which symlinks every REPOBIN.toml tool name in bin/ to THIS script. The
+#   which symlinks every eligible REPOBIN.toml tool name in bin/ to THIS script.
+#   The engine-owned boss/cube control names are intentionally excluded. The
 #   shim defers the build to first use and then does exactly what CI's
 #   symlink does:
 #
@@ -38,6 +39,10 @@
 #   * Every invocation prints one provenance line on stderr (suppress with
 #     REPOBIN_SHIM_QUIET=1) so a transcript shows which checkout and target
 #     actually ran.
+#
+# The first invocation can build repobin and its dispatched tool, so callers
+# on a critical gate must allow that work to complete rather than approving a
+# failed or timed-out invocation.
 #
 # Honors the same bazel env knobs repobin does: CI_BAZEL_STARTUP_FLAGS
 # (startup options) and REPOBIN_BAZEL_FLAGS (build/cquery options).
@@ -88,9 +93,14 @@ esac
 
 target=
 if [[ "$tool" != repobin ]]; then
-  if grep -Fqx "[tools.$tool]" "$config"; then
+  if awk -v hdr="[tools.$tool]" '
+      { line = $0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line) }
+      line == hdr { found = 1; exit }
+      END { exit !found }
+    ' "$config"; then
     target="$(awk -v hdr="[tools.$tool]" '
-      $0 == hdr { in_section = 1; next }
+      { line = $0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line) }
+      line == hdr { in_section = 1; next }
       /^\[/ { in_section = 0 }
       in_section && /^target[[:space:]]*=/ {
         sub(/^target[[:space:]]*=[[:space:]]*"/, "")
@@ -99,7 +109,11 @@ if [[ "$tool" != repobin ]]; then
         exit
       }' "$config")"
     [[ -n "$target" ]] || target="(target per REPOBIN.toml)"
-  elif grep -Fqx "[pins.$tool]" "$config"; then
+  elif awk -v hdr="[pins.$tool]" '
+      { line = $0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line) }
+      line == hdr { found = 1; exit }
+      END { exit !found }
+    ' "$config"; then
     target="(pinned upstream tag per REPOBIN.toml)"
   else
     die "\`$tool\` is not declared in $config; refusing to run it" \
