@@ -9,6 +9,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 
+// Default leaf names of the per-run homes roots, reused directly so a rename
+// of either original cannot silently desync this rewrite from where the homes
+// actually live.
+use crate::codex::CODEX_HOMES_DIR_NAME as CODEX_HOMES_DIR_MARKER;
+use crate::grok::GROK_HOMES_DIR_NAME as GROK_HOMES_DIR_MARKER;
+
 /// Test/operator override for the Boss-owned worker transcript-store root.
 pub const WORKER_TRANSCRIPTS_ROOT_ENV: &str = "BOSS_WORKER_TRANSCRIPTS_ROOT";
 
@@ -85,12 +91,6 @@ pub fn durable_sessions_dir(store_root: &Path, driver: &str, run_id: &str) -> an
         .join(driver)
         .join("sessions"))
 }
-
-/// Default leaf names of the per-run homes roots, reused directly so a rename
-/// of either original cannot silently desync this rewrite from where the
-/// homes actually live.
-use crate::codex::CODEX_HOMES_DIR_NAME as CODEX_HOMES_DIR_MARKER;
-use crate::grok::GROK_HOMES_DIR_NAME as GROK_HOMES_DIR_MARKER;
 
 /// Rewrite a driver-stamped transcript path onto Boss's durable store.
 ///
