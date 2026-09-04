@@ -1275,6 +1275,64 @@ fn are_same_review_batch_leaves_rejects_cross_batch_and_memberless_pairs() {
     );
 }
 
+/// A batch still live for the current target — one leaf settled with an
+/// informative verdict, two still outstanding — must keep reporting
+/// `ExistingBatch` for that exact target, never `AlreadyReviewed`. The
+/// already-reviewed check runs after the `ExistingBatch` lookup precisely so
+/// a live batch always wins over a partial verdict: reporting
+/// `AlreadyReviewed` here would tell the caller "this head is settled" while
+/// quorum is still pending.
+#[test]
+fn create_pre_merge_review_batch_prefers_existing_batch_over_a_partial_verdict() {
+    let db = WorkDb::open(temp_db_path("review-batch-existing-over-already-reviewed")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let input = batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge);
+
+    let batch = match db
+        .create_pre_merge_review_batch(input.clone(), "https://github.com/example/repo")
+        .unwrap()
+    {
+        ReviewBatchDispatch::Created { batch, .. } => batch,
+        other => panic!("expected a newly-created review batch, got {other:?}"),
+    };
+
+    // One leaf settles with an informative verdict for this exact target —
+    // recorded against the cycle root, as a real batch leaf's verdict is —
+    // while the batch itself is still non-terminal (two leaves outstanding).
+    let leaf_execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    WorkDb::insert_review_verdict_in_tx(
+        &db.connect().unwrap(),
+        &leaf_execution.id,
+        &cycle_root.id,
+        &ReviewVerdictInput {
+            head_sha: Some("head-sha".to_owned()),
+            findings_count: 0,
+            revision_warranted: false,
+            gate_outcome: REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+        },
+    )
+    .unwrap();
+
+    match db
+        .create_pre_merge_review_batch(input, "https://github.com/example/repo")
+        .unwrap()
+    {
+        ReviewBatchDispatch::ExistingBatch { batch: existing, .. } => {
+            assert_eq!(existing.id, batch.id, "must reuse the still-live batch for this target");
+        }
+        other => panic!("a live batch for this exact target must win over a partial verdict, got {other:?}"),
+    }
+}
+
 /// The flag-off / non-batch path: `create_pre_merge_review_batch` must
 /// treat a genuine legacy (non-batch) non-terminal `pr_review` execution as
 /// owning the target and refuse to create a batch alongside it: a target
@@ -1845,8 +1903,8 @@ fn reap_inert_review_batches_fails_batches_with_a_deleted_cycle_root() {
 /// four review-pool slots stay occupied by a batch admission no longer
 /// counts against, and the leaf later settles silently against a `failed`
 /// batch.
-#[test]
-fn reap_inert_review_batches_terminalizes_running_members_of_a_deleted_cycle_root() {
+#[tokio::test]
+async fn reap_inert_review_batches_terminalizes_running_members_of_a_deleted_cycle_root() {
     let db = WorkDb::open(temp_db_path("review-pool-reap-deleted-frees-slots")).unwrap();
     let product = create_test_product(&db);
     let cycle_root = create_test_chore_manual(&db, product.id, "gone-but-leaves-running");
@@ -1876,10 +1934,31 @@ fn reap_inert_review_batches_terminalizes_running_members_of_a_deleted_cycle_roo
         )
         .unwrap();
 
+    let mut sub = db.event_bus().subscribe(boss_event_bus::TopicFilter::kind(
+        boss_event_bus::EventKind::ExecutionTerminal,
+    ));
+
     let reaped = db
         .reap_inert_review_batches(crate::work::REVIEW_BATCH_STALE_SECS)
         .unwrap();
     assert_eq!(reaped, vec![batch.id.clone()]);
+
+    let event = sub
+        .recv()
+        .await
+        .expect("ExecutionTerminal must be published for the leaf the reaper abandons");
+    assert_eq!(
+        event,
+        boss_event_bus::Event::ExecutionTerminal {
+            execution_id: running_execution.id.clone(),
+            task_id: cycle_root.id.clone(),
+            host_id: "local".to_owned(),
+            pool_claim: None,
+        },
+        "the reaper's raw abandon UPDATE must go through the same execution-terminal publish \
+         path as every other terminalizing writer, so the pane/worker teardown listening for \
+         that event actually runs"
+    );
 
     let terminalized = db.get_execution(&running_execution.id).unwrap();
     assert_eq!(

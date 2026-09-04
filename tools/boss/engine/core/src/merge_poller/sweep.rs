@@ -2918,7 +2918,16 @@ pub(crate) async fn sweep_deferred_review_admission(
                 );
             }
             Ok(crate::work::ReviewBatchDispatch::AlreadyReviewed) => {
-                match work_db.advance_pending_review_task_to_in_review(&candidate.task_id) {
+                // The verdict `already_reviewed_at_head` matched may be keyed
+                // by `candidate.cycle_root_id` rather than the task itself
+                // (a revision task's batch-leaf verdicts live on the cycle
+                // root) — use the source-aware advance so the EXISTS
+                // subquery looks in the right place instead of silently
+                // matching zero rows forever.
+                match work_db.advance_pending_review_task_to_in_review_with_verdict_source(
+                    &candidate.task_id,
+                    &candidate.cycle_root_id,
+                ) {
                     Ok(true) => {
                         tracing::info!(
                             task_id = %candidate.task_id,
@@ -2935,7 +2944,32 @@ pub(crate) async fn sweep_deferred_review_admission(
                             .await;
                         outcome.reviewer_fallback_advanced += 1;
                     }
-                    Ok(false) => {}
+                    Ok(false) => {
+                        // The verdict-EXISTS predicate still didn't match
+                        // (or a live non-review execution blocked the
+                        // advance) even after resolving the cycle root — a
+                        // genuine wedge, not the previously-silent id
+                        // mismatch. File the deferred-admission marker so
+                        // the candidate query's marker arm (rather than the
+                        // 10-minute staleness arm) keeps re-surfacing it,
+                        // and log at warn so it is operator-visible instead
+                        // of an unbounded silent `gh pr view` loop.
+                        tracing::warn!(
+                            task_id = %candidate.task_id,
+                            cycle_root_id = %candidate.cycle_root_id,
+                            pr_url = %candidate.pr_url,
+                            "merge poller: already-reviewed deferred-admission hold did not advance \
+                             (no matching verdict, or a live non-review execution is blocking); \
+                             filing an attention marker so the hold stays visible"
+                        );
+                        crate::completion::file_admission_deferred_attention(
+                            work_db,
+                            &candidate.task_id,
+                            &candidate.pr_url,
+                        );
+                        outcome.review_admission_still_deferred += 1;
+                        continue;
+                    }
                     Err(err) => tracing::warn!(
                         task_id = %candidate.task_id,
                         ?err,

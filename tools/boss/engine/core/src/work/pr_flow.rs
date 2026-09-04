@@ -765,6 +765,24 @@ impl WorkDb {
     /// non-`pr_review` execution exists on the task: the `NOT EXISTS` clause
     /// makes the update a no-op in that case.
     pub fn advance_pending_review_task_to_in_review(&self, work_item_id: &str) -> Result<bool> {
+        self.advance_pending_review_task_to_in_review_with_verdict_source(work_item_id, work_item_id)
+    }
+
+    /// Same as [`Self::advance_pending_review_task_to_in_review`], but looks
+    /// for the informative `pr_review_verdicts` row under `verdict_source_id`
+    /// rather than `work_item_id`. For a revision task, batch leaf executions
+    /// (and their verdicts) are created against the review-cycle root
+    /// (`review_cycle_root_id`), not the task row itself — pass that root as
+    /// `verdict_source_id` so a verdict recorded there still admits the
+    /// advance. `work_item_id` and `verdict_source_id` are identical for a
+    /// legacy single-reviewer verdict (a non-revision task is its own cycle
+    /// root), which is exactly what the single-argument wrapper above
+    /// preserves.
+    pub fn advance_pending_review_task_to_in_review_with_verdict_source(
+        &self,
+        work_item_id: &str,
+        verdict_source_id: &str,
+    ) -> Result<bool> {
         let conn = self.connect()?;
         let now = now_string();
         let review_result_outcomes = super::review_verdicts::review_result_gate_outcomes_sql();
@@ -785,7 +803,7 @@ impl WorkDb {
                  WHERE latest.id = (
                    SELECT newest.id
                    FROM work_executions newest
-                   WHERE newest.work_item_id = ?1
+                   WHERE newest.work_item_id = ?3
                      AND newest.kind = 'pr_review'
                    ORDER BY newest.created_at DESC, newest.id DESC
                    LIMIT 1
@@ -799,7 +817,7 @@ impl WorkDb {
                    AND we.kind != 'pr_review'
                )"
         );
-        let rows_changed = conn.execute(&sql, params![work_item_id, now])?;
+        let rows_changed = conn.execute(&sql, params![work_item_id, now, verdict_source_id])?;
         Ok(rows_changed > 0)
     }
 

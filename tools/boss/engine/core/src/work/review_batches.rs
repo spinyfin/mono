@@ -19,8 +19,9 @@ use rusqlite::types::Type;
 use rusqlite::{OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
 use super::{
-    CreateExecutionInput, DeadPrReviewCandidate, WorkDb, WorkExecution, existing_nonterminal_pr_review_execution,
-    insert_execution, next_id, now_string, query_execution,
+    CreateExecutionInput, DeadPrReviewCandidate, PendingEvents, WorkDb, WorkExecution, commit_and_publish,
+    existing_nonterminal_pr_review_execution, insert_execution, next_id, now_string, query_execution,
+    stage_execution_terminal,
 };
 
 /// Inputs used to freeze an immutable review target before any member starts.
@@ -35,6 +36,13 @@ pub struct ReviewBatchCreateInput {
     pub pr_url: String,
     pub target_sha: String,
     pub merge_sha: Option<String>,
+    /// The originating task id, when it differs from `cycle_root_id` — set
+    /// for a revision task so the already-reviewed check in
+    /// [`WorkDb::create_pre_merge_review_batch_for_pool`] can also see a
+    /// legacy single-reviewer verdict keyed directly by the task (written
+    /// when `review_batch_fanout` was off, or before this task's chain had
+    /// a batch of its own).
+    pub legacy_task_id: Option<String>,
 }
 
 /// Inputs for one role-specific member attempt in a new review batch.
@@ -892,6 +900,24 @@ impl WorkDb {
                 return Ok(ReviewBatchDispatch::LegacyExecution(execution));
             }
         }
+        // Checked here — after ExistingBatch/LegacyExecution, before the
+        // admission gate — rather than by the caller ahead of this whole
+        // call. A batch still live for this exact target (leaves still
+        // running, quorum pending) already has an informative leaf verdict
+        // as soon as its first leaf settles; testing "already reviewed"
+        // ahead of the ExistingBatch check would misreport that live batch
+        // as AlreadyReviewed ("this head is settled") while quorum is still
+        // outstanding. Checked inside this transaction so it sees the same
+        // snapshot the ExistingBatch/LegacyExecution reads above did.
+        let already_reviewed = WorkDb::already_reviewed_at_head_in_tx(&tx, &input.cycle_root_id, &input.target_sha)?
+            || match &input.legacy_task_id {
+                Some(task_id) => WorkDb::already_reviewed_at_head_in_tx(&tx, task_id, &input.target_sha)?,
+                None => false,
+            };
+        if already_reviewed {
+            tx.commit()?;
+            return Ok(ReviewBatchDispatch::AlreadyReviewed);
+        }
         if !can_admit_review_batch_in_tx(&tx, ReviewBatchPhase::PreMerge, reservation_capacity(review_pool_size))? {
             // Read-only so far — nothing to roll back. The caller must hold
             // the producing task pending review rather than treat this as a
@@ -1343,6 +1369,7 @@ impl WorkDb {
         let mut reaped = Vec::new();
         for (batch_id, cycle_root_id, pr_url, deleted_at) in rows {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut pending = PendingEvents::new();
             let changed = tx.execute(
                 "UPDATE pr_review_batches
                  SET status = 'failed', completed_at = ?2, updated_at = ?2
@@ -1363,6 +1390,26 @@ impl WorkDb {
             // in while up to `PRE_MERGE_BATCH_RESERVATION_UNITS` physical
             // slots are still occupied, and the orphaned leaves would later
             // settle silently against a batch that is already `failed`.
+            //
+            // Collect the ids the UPDATE below is about to terminalize
+            // FIRST, then stage an `ExecutionTerminal` event per row — the
+            // same pattern `abandon_stranded_executions_on_closed_work_items`
+            // uses (work/dispatch.rs). A raw UPDATE alone would leave a
+            // still-`running` reviewer (this branch's whole point: a leaf
+            // that was actually live when its cycle root died) with no
+            // terminal event — nothing tears down its pane, cube lease, or
+            // worker process even though the DB now says `abandoned`.
+            let member_execution_ids: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT we.id
+                     FROM work_executions we
+                     JOIN pr_review_batch_members m ON m.execution_id = we.id
+                     WHERE m.batch_id = ?1
+                       AND we.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')",
+                )?;
+                stmt.query_map(params![batch_id], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
             tx.execute(
                 "UPDATE work_executions
                  SET status = 'abandoned', finished_at = ?2
@@ -1370,6 +1417,9 @@ impl WorkDb {
                    AND status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')",
                 params![batch_id, now],
             )?;
+            for execution_id in &member_execution_ids {
+                stage_execution_terminal(&mut pending, &tx, execution_id, &cycle_root_id)?;
+            }
             tx.execute(
                 "UPDATE pr_review_batch_members
                  SET status = 'failed', terminal_at = ?2, updated_at = ?2
@@ -1392,7 +1442,7 @@ impl WorkDb {
                         .build(),
                 )?;
             }
-            tx.commit()?;
+            commit_and_publish(tx, pending, &self.event_bus)?;
             reaped.push(batch_id);
         }
         Ok(reaped)

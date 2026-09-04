@@ -18,26 +18,6 @@ struct BatchReviewPrView {
     deletions: Option<i64>,
 }
 
-/// True when `target_sha` already has a durable, informative `pr_review`
-/// verdict recorded against either `work_item_id` (a legacy single reviewer,
-/// keyed by the task) or `cycle_root_id` (a batch leaf, keyed by the review
-/// cycle root) — the two places [`WorkDb::insert_review_verdict_in_tx`] can
-/// have written one. Dispatching another reviewer pass for a head already
-/// judged would silently discard that verdict and re-review for nothing.
-fn already_reviewed_at_head(
-    work_db: &crate::work::WorkDb,
-    work_item_id: &str,
-    cycle_root_id: &str,
-    target_sha: &str,
-) -> bool {
-    [work_item_id, cycle_root_id].iter().any(|id| {
-        work_db.latest_review_verdict(id).ok().flatten().is_some_and(|verdict| {
-            crate::work::is_informative_gate_outcome(&verdict.gate_outcome)
-                && verdict.head_sha.as_deref() == Some(target_sha)
-        })
-    })
-}
-
 /// Fetch and freeze the target metadata before handing it to the atomic DB
 /// creation path. Callers can retain the legacy path if this cannot establish
 /// an immutable target SHA. Shared by `finalize_pr_transition` and the
@@ -60,14 +40,17 @@ pub(crate) async fn enqueue_review_batch(
         .try_into()
         .map_err(|_| anyhow::anyhow!("pull request number does not fit the review-batch schema"))?;
     let cycle_root_id = work_db.review_cycle_root_id(work_item_id);
-    if already_reviewed_at_head(work_db, work_item_id, &cycle_root_id, &view.target_sha) {
-        return Ok(crate::work::ReviewBatchDispatch::AlreadyReviewed);
-    }
     let classification = crate::pr_review::classify_pr_review_metadata(&crate::pr_review::PrReviewMetadata {
         additions: view.additions,
         changed_files: Some(boss_github::pr_files::parse_changed_file_paths(&root)),
         deletions: view.deletions,
     });
+    // The already-reviewed check runs inside `create_pre_merge_review_batch_for_pool`,
+    // after its ExistingBatch/LegacyExecution checks and before the admission
+    // gate — not here, ahead of them — so a batch still live for this exact
+    // target (a leaf verdict already recorded while the others are still
+    // running) is never misreported as "this head is settled".
+    let legacy_task_id = (work_item_id != cycle_root_id).then(|| work_item_id.to_owned());
     let input = crate::work::ReviewBatchCreateInput::builder()
         .cycle_root_id(cycle_root_id)
         .base_sha(view.base_sha)
@@ -76,6 +59,7 @@ pub(crate) async fn enqueue_review_batch(
         .pr_number(pr_number)
         .pr_url(pr_url)
         .target_sha(view.target_sha)
+        .maybe_legacy_task_id(legacy_task_id)
         .build();
     work_db.create_pre_merge_review_batch_for_pool(input, repo_remote_url, review_pool_size)
 }
@@ -452,6 +436,16 @@ impl WorkerCompletionHandler {
                                             "current head already has an informative review verdict; holding the \
                                              task pending review — the deferred-admission sweep advances it to \
                                              in_review on the next pass without dispatching another reviewer",
+                                        );
+                                        // File the same marker a deferral would, so the
+                                        // candidate query's marker arm surfaces this hold
+                                        // on the very next sweep pass rather than waiting
+                                        // out the 10-minute staleness cutoff — matching
+                                        // what the log line above actually promises.
+                                        file_admission_deferred_attention(
+                                            &self.work_db,
+                                            &producing.work_item_id,
+                                            &pr_url,
                                         );
                                         true
                                     }
@@ -1193,7 +1187,6 @@ impl WorkerCompletionHandler {
 
 #[cfg(test)]
 mod already_reviewed_at_head_tests {
-    use super::already_reviewed_at_head;
     use crate::test_support::{create_test_chore_manual, create_test_product};
     use crate::work::{
         CreateExecutionInput, REVIEW_GATE_OUTCOME_COMPLETED_CLEAN, REVIEW_GATE_OUTCOME_GAVE_UP, ReviewVerdictInput,
@@ -1224,9 +1217,12 @@ mod already_reviewed_at_head_tests {
         .unwrap();
     }
 
+    fn already_reviewed_at_head(db: &WorkDb, work_item_id: &str, target_sha: &str) -> bool {
+        WorkDb::already_reviewed_at_head_in_tx(&db.connect().unwrap(), work_item_id, target_sha).unwrap()
+    }
+
     /// A legacy reviewer's completed, informative verdict — keyed by the
-    /// task itself, not the cycle root — matches when its head sha is the
-    /// current target sha.
+    /// task itself — matches when its head sha is the current target sha.
     #[test]
     fn matches_a_legacy_verdict_keyed_by_the_task() {
         let dir = tempfile::tempdir().unwrap();
@@ -1235,25 +1231,24 @@ mod already_reviewed_at_head_tests {
         let task = create_test_chore_manual(&db, product.id, "already-reviewed-legacy");
         insert_verdict(&db, &task.id, "head-sha", REVIEW_GATE_OUTCOME_COMPLETED_CLEAN);
 
-        assert!(already_reviewed_at_head(&db, &task.id, &task.id, "head-sha"));
+        assert!(already_reviewed_at_head(&db, &task.id, "head-sha"));
         assert!(
-            !already_reviewed_at_head(&db, &task.id, &task.id, "some-other-sha"),
+            !already_reviewed_at_head(&db, &task.id, "some-other-sha"),
             "a verdict for a different head must not match"
         );
     }
 
-    /// A batch leaf's verdict — keyed by the cycle root, which differs from
-    /// the task for a revision chain — also matches.
+    /// A batch leaf's verdict is keyed by the cycle root; passing that id
+    /// (as callers now do — see [`super::enqueue_review_batch`]) matches.
     #[test]
     fn matches_a_batch_leaf_verdict_keyed_by_the_cycle_root() {
         let dir = tempfile::tempdir().unwrap();
         let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let product = create_test_product(&db);
-        let root = create_test_chore_manual(&db, product.id.clone(), "cycle-root");
-        let task = create_test_chore_manual(&db, product.id, "revision-task");
+        let root = create_test_chore_manual(&db, product.id, "cycle-root");
         insert_verdict(&db, &root.id, "head-sha", REVIEW_GATE_OUTCOME_COMPLETED_CLEAN);
 
-        assert!(already_reviewed_at_head(&db, &task.id, &root.id, "head-sha"));
+        assert!(already_reviewed_at_head(&db, &root.id, "head-sha"));
     }
 
     /// A non-informative outcome (e.g. `gave_up`) is not positive evidence
@@ -1266,6 +1261,6 @@ mod already_reviewed_at_head_tests {
         let task = create_test_chore_manual(&db, product.id, "gave-up");
         insert_verdict(&db, &task.id, "head-sha", REVIEW_GATE_OUTCOME_GAVE_UP);
 
-        assert!(!already_reviewed_at_head(&db, &task.id, &task.id, "head-sha"));
+        assert!(!already_reviewed_at_head(&db, &task.id, "head-sha"));
     }
 }
