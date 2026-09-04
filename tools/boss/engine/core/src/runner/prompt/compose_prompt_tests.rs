@@ -124,8 +124,9 @@ fn pr_created_seam_prompt_keeps_declaration_and_printed_url_in_all_pr_paths() {
                 .pr_created_proposals_seam_enabled(true)
                 .build(),
         );
+        let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
         assert!(
-            prompt.contains("boss propose pr-created --url"),
+            prompt.contains(&format!("{boss} propose pr-created --url")),
             "seam-on prompt must teach the declaration in every PR path:\n{prompt}",
         );
         assert!(
