@@ -259,36 +259,28 @@ impl WorkDb {
     /// Rejects any other kind (this is not a generic "resolve any attention
     /// item" verb — those 26 other `HumanDecision` kinds are reports, not
     /// gates, and have no actuator here) and any non-`open` item (no
-    /// double-resolving). Mirrors [`Self::resolve_deferred_scope_attention`]'s
-    /// shape.
+    /// double-resolving). Shares [`Self::close_work_item_attention`] with
+    /// [`Self::resolve_deferred_scope_attention`].
     pub fn resolve_worker_recovery_attention(&self, id: &str) -> Result<WorkAttentionItem> {
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let attention = query_attention_item(&tx, id)?.with_context(|| format!("unknown attention item: {id}"))?;
-        if !matches!(
-            attention.kind.as_str(),
-            crate::work::ATTENTION_KIND_RECOVERY_PERMANENT | crate::work::ATTENTION_KIND_RECOVERY_EXHAUSTED
-        ) {
-            bail!(
-                "attention item {id} is not a dispatch-gate item (kind = {}); only \
-                 {permanent} and {exhausted} can be resolved this way",
-                attention.kind,
-                permanent = crate::work::ATTENTION_KIND_RECOVERY_PERMANENT,
-                exhausted = crate::work::ATTENTION_KIND_RECOVERY_EXHAUSTED,
-            );
-        }
-        if attention.status != "open" {
-            bail!("attention item {id} is not open (status = {})", attention.status);
-        }
-        let now = now_string();
-        tx.execute(
-            "UPDATE work_attention_items SET status = 'resolved', resolved_at = ?2 WHERE id = ?1",
-            params![id, now],
-        )?;
-        let updated =
-            query_attention_item(&tx, id)?.with_context(|| format!("missing attention item after update: {id}"))?;
-        tx.commit()?;
-        Ok(updated)
+        self.close_work_item_attention(
+            id,
+            "resolved",
+            |kind| {
+                matches!(
+                    kind,
+                    crate::work::ATTENTION_KIND_RECOVERY_PERMANENT | crate::work::ATTENTION_KIND_RECOVERY_EXHAUSTED
+                )
+            },
+            |attention| {
+                format!(
+                    "attention item {id} is not a dispatch-gate item (kind = {}); only \
+                     {permanent} and {exhausted} can be resolved this way",
+                    attention.kind,
+                    permanent = crate::work::ATTENTION_KIND_RECOVERY_PERMANENT,
+                    exhausted = crate::work::ATTENTION_KIND_RECOVERY_EXHAUSTED,
+                )
+            },
+        )
     }
 
     /// File (idempotently) the operator-visible attention item raised when
@@ -527,22 +519,44 @@ impl WorkDb {
     /// [`Self::resolve_worker_signal_attentions_for_execution`] doesn't
     /// apply here) and any non-`open` item (no double-closing).
     pub fn resolve_deferred_scope_attention(&self, id: &str) -> Result<WorkAttentionItem> {
+        self.close_work_item_attention(
+            id,
+            "accepted",
+            |kind| kind == crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND,
+            |attention| {
+                format!(
+                    "attention item {id} is not a deferred_scope item (kind = {})",
+                    attention.kind
+                )
+            },
+        )
+    }
+
+    /// Flip a single work-item-scoped attention row from `open` to
+    /// `new_status`. Shared by [`Self::resolve_worker_recovery_attention`]
+    /// (`resolved`) and [`Self::resolve_deferred_scope_attention`]
+    /// (`accepted`); callers supply the kind gate so the two verbs keep
+    /// their distinct validation and terminal status.
+    fn close_work_item_attention(
+        &self,
+        id: &str,
+        new_status: &str,
+        kind_ok: impl Fn(&str) -> bool,
+        kind_err: impl Fn(&WorkAttentionItem) -> String,
+    ) -> Result<WorkAttentionItem> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let attention = query_attention_item(&tx, id)?.with_context(|| format!("unknown attention item: {id}"))?;
-        if attention.kind != crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND {
-            bail!(
-                "attention item {id} is not a deferred_scope item (kind = {})",
-                attention.kind
-            );
+        if !kind_ok(&attention.kind) {
+            bail!("{}", kind_err(&attention));
         }
         if attention.status != "open" {
             bail!("attention item {id} is not open (status = {})", attention.status);
         }
         let now = now_string();
         tx.execute(
-            "UPDATE work_attention_items SET status = 'accepted', resolved_at = ?2 WHERE id = ?1",
-            params![id, now],
+            "UPDATE work_attention_items SET status = ?3, resolved_at = ?2 WHERE id = ?1",
+            params![id, now, new_status],
         )?;
         let updated =
             query_attention_item(&tx, id)?.with_context(|| format!("missing attention item after update: {id}"))?;
