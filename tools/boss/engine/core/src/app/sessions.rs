@@ -376,7 +376,10 @@ pub(super) async fn refresh_coordinator_update_available(
     if decision.should_push {
         tracing::info!(
             spawn_token = %record.spawn_token,
-            installed_version = ?decision.installed_version,
+            previous_advertised = ?existing_entry
+                .as_ref()
+                .and_then(|entry| entry.advertised_update_available_version.as_deref()),
+            advertised = ?decision.update_available_version,
             "coordinator update availability changed; pushing to app",
         );
     }
@@ -412,9 +415,11 @@ fn coordinator_update_probe_due(cache: Option<&CoordinatorInstalledVersionCacheE
 /// cached entry (if any, already filtered to this spawn token), the
 /// coordinator record, and this pass's fresh probe result (`None` when the
 /// probe was not yet due), determines the installed version to carry
-/// forward and whether the advertised banner needs to be pushed again.
+/// forward, the banner value this pass would advertise, and whether that
+/// advertised value needs to be pushed again.
 struct RefreshDecision {
     installed_version: Option<String>,
+    update_available_version: Option<String>,
     should_push: bool,
 }
 
@@ -434,6 +439,7 @@ fn refresh_decision(
     let should_push = advertised_update_available_version != update_available_version;
     RefreshDecision {
         installed_version,
+        update_available_version,
         should_push,
     }
 }
@@ -469,6 +475,7 @@ mod update_available_tests {
         // upgrade must push.
         let decision = refresh_decision(None, &older, Some(Some("2.1.238".to_owned())));
         assert_eq!(decision.installed_version.as_deref(), Some("2.1.238"));
+        assert_eq!(decision.update_available_version.as_deref(), Some("2.1.238"));
         assert!(decision.should_push, "the changed value is pushed to show the banner");
 
         let advertised_shown = CoordinatorInstalledVersionCacheEntry {
@@ -481,6 +488,7 @@ mod update_available_tests {
         // still push, since the advertised value changes from Some to None.
         let clearing = refresh_decision(Some(&advertised_shown), &older, Some(Some("2.1.237".to_owned())));
         assert_eq!(clearing.installed_version.as_deref(), Some("2.1.237"));
+        assert_eq!(clearing.update_available_version, None);
         assert!(clearing.should_push, "the clear is another push-worthy transition");
 
         let advertised_cleared = CoordinatorInstalledVersionCacheEntry {
@@ -516,6 +524,11 @@ mod update_available_tests {
             Some("2.1.238"),
             "the cached installed version is carried forward when no probe ran"
         );
+        assert_eq!(
+            decision.update_available_version.as_deref(),
+            Some("2.1.238"),
+            "the advertised banner value is derived from the cached installed version"
+        );
         assert!(
             decision.should_push,
             "an un-acked push must retry on the next pass instead of waiting a full day"
@@ -524,6 +537,11 @@ mod update_available_tests {
 
     #[test]
     fn attached_update_probe_runs_on_the_configured_interval_not_on_every_supervisor_pass() {
+        assert!(
+            COORDINATOR_UPDATE_CHECK_INTERVAL <= Duration::from_secs(20 * 60),
+            "the probe must fire well within a typical app uptime, or the banner only appears after a UI restart",
+        );
+
         let recent = CoordinatorInstalledVersionCacheEntry {
             spawn_token: "token".to_owned(),
             installed_version: Some("2.1.237".to_owned()),
@@ -536,9 +554,18 @@ mod update_available_tests {
              spawning a subprocess every pass"
         );
 
+        let halfway = CoordinatorInstalledVersionCacheEntry {
+            probed_at: Instant::now() - COORDINATOR_UPDATE_CHECK_INTERVAL / 2,
+            ..recent
+        };
+        assert!(
+            !coordinator_update_probe_due(Some(&halfway), "token"),
+            "the probe is not yet due at half the interval"
+        );
+
         let old = CoordinatorInstalledVersionCacheEntry {
             probed_at: Instant::now() - COORDINATOR_UPDATE_CHECK_INTERVAL,
-            ..recent
+            ..halfway
         };
         assert!(
             coordinator_update_probe_due(Some(&old), "token"),
