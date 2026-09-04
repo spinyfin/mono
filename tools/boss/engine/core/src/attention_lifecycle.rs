@@ -281,6 +281,13 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          `applying`, and resolves it itself on the pass that actually lands the verdict.",
     ),
     entry(
+        crate::work::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "The deferred-admission sweep re-tries create_pre_merge_review_batch every pass and resolves \
+         this item itself when a batch is admitted (or an existing live batch/legacy reviewer covers \
+         the target). A later unrelated run start does not mean a review slot opened.",
+    ),
+    entry(
         EXTERNAL_TRACKER_AUTH_FAILED_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
         "Product-scoped, not work-item-scoped: the reconcile loop resolves it on the next \
@@ -320,6 +327,13 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         ClearedBy::HumanDecision,
         "It is a gate, not a report: the item is held in `blocked:deletion_signoff` until a human \
          signs off. Auto-resolving would release the hold the item exists to hold.",
+    ),
+    entry(
+        crate::work::PR_REVIEW_BATCH_STALE_ATTENTION_KIND,
+        ClearedBy::HumanDecision,
+        "Records that a review batch was reaped because its cycle root vanished or its members went \
+         inert, releasing a global pool reservation. That abandonment already happened; a later \
+         successful review of a different PR does not un-do it.",
     ),
     entry(
         crate::completion::REVIEW_RESULT_GIVEUP_ATTENTION_KIND,
@@ -593,6 +607,8 @@ mod tests {
             crate::coordinator::ANSWER_AGENT_READY_AGE_ATTENTION_KIND,
             crate::stale_worker_sweep::STALE_WORKER_ATTENTION_KIND,
             crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND,
+            crate::work::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
+            crate::work::PR_REVIEW_BATCH_STALE_ATTENTION_KIND,
             crate::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND,
             crate::worker_escalation::WORKER_BLOCKED_ATTENTION_KIND,
             crate::abandoned_branch_pr_sweep::ATTENTION_KIND_ABANDONED_BRANCH_NO_PR,

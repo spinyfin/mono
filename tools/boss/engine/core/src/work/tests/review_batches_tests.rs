@@ -1729,3 +1729,131 @@ fn create_pre_merge_review_batch_defers_when_the_pool_is_at_capacity() {
         "a deferred admission must not create a batch row"
     );
 }
+
+/// Admission capacity tracks the configured review-pool size, not the
+/// compile-time hard cap: a 4-slot pool admits one four-unit pre-merge
+/// batch and denies a second, so leaves cannot starve their supervisor.
+#[test]
+fn admission_capacity_follows_the_configured_review_pool_size() {
+    let db = WorkDb::open(temp_db_path("review-pool-configured-size")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id.clone(), "review target");
+
+    assert!(
+        db.can_admit_review_batch_for_pool(ReviewBatchPhase::PreMerge, 4)
+            .unwrap()
+    );
+    db.create_review_batch(
+        batch_input(cycle_root.id.clone(), "head-sha-0", ReviewBatchPhase::PreMerge),
+        &[member(ReviewBatchMemberRole::ClaudeReviewer, None)],
+    )
+    .unwrap();
+    assert!(
+        !db.can_admit_review_batch_for_pool(ReviewBatchPhase::PreMerge, 4)
+            .unwrap(),
+        "a 4-slot pool is filled by one pre-merge batch"
+    );
+}
+
+/// A batch whose cycle root is deleted or already terminal does not hold a
+/// reservation, so it cannot block every other product's pre-merge review.
+#[test]
+fn reserved_count_excludes_batches_whose_cycle_root_is_gone() {
+    let db = WorkDb::open(temp_db_path("review-pool-dead-root")).unwrap();
+    let product = create_test_product(&db);
+    let mut occupying = Vec::new();
+    for i in 0..4 {
+        let cycle_root = create_test_chore_manual(&db, product.id.clone(), format!("occupant {i}"));
+        let (batch, _) = db
+            .create_review_batch(
+                batch_input(
+                    cycle_root.id.clone(),
+                    &format!("head-sha-{i}"),
+                    ReviewBatchPhase::PreMerge,
+                ),
+                &[member(ReviewBatchMemberRole::ClaudeReviewer, None)],
+            )
+            .unwrap();
+        occupying.push((cycle_root.id, batch.id));
+    }
+    assert!(!db.can_admit_review_batch(ReviewBatchPhase::PreMerge).unwrap());
+
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET deleted_at = ?2 WHERE id = ?1",
+            rusqlite::params![occupying[0].0, now_string()],
+        )
+        .unwrap();
+    assert!(
+        db.can_admit_review_batch(ReviewBatchPhase::PreMerge).unwrap(),
+        "a deleted cycle root must release its reservation without waiting for quorum"
+    );
+}
+
+/// The reaper fails a collecting batch whose cycle root is gone so the row
+/// itself stops occupying the pool, and files an operator-visible item.
+#[test]
+fn reap_inert_review_batches_fails_batches_with_a_deleted_cycle_root() {
+    let db = WorkDb::open(temp_db_path("review-pool-reap-deleted")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id.clone(), "gone");
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member(ReviewBatchMemberRole::ClaudeReviewer, None)],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET deleted_at = ?2 WHERE id = ?1",
+            rusqlite::params![cycle_root.id, now_string()],
+        )
+        .unwrap();
+
+    let reaped = db
+        .reap_inert_review_batches(crate::work::REVIEW_BATCH_STALE_SECS)
+        .unwrap();
+    assert_eq!(reaped, vec![batch.id.clone()]);
+    let stored = db.review_batch(&batch.id).unwrap().unwrap();
+    assert_eq!(stored.status, ReviewBatchStatus::Failed);
+    assert!(
+        db.can_admit_review_batch(ReviewBatchPhase::PreMerge).unwrap(),
+        "reaping a deleted-root batch must release its reservation"
+    );
+}
+
+/// A still-visible terminal cycle root gets an attention item when its
+/// wedged batch is reaped.
+#[test]
+fn reap_inert_review_batches_files_attention_on_a_done_cycle_root() {
+    let db = WorkDb::open(temp_db_path("review-pool-reap-done")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id.clone(), "done");
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member(ReviewBatchMemberRole::ClaudeReviewer, None)],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'done' WHERE id = ?1",
+            rusqlite::params![cycle_root.id],
+        )
+        .unwrap();
+
+    let reaped = db
+        .reap_inert_review_batches(crate::work::REVIEW_BATCH_STALE_SECS)
+        .unwrap();
+    assert_eq!(reaped, vec![batch.id.clone()]);
+    let attentions = db.list_attention_items_for_work_item(&cycle_root.id).unwrap();
+    assert!(
+        attentions
+            .iter()
+            .any(|item| item.kind == crate::work::PR_REVIEW_BATCH_STALE_ATTENTION_KIND),
+        "reaping a still-visible cycle root must file an attention item; got {attentions:?}"
+    );
+}

@@ -20,11 +20,14 @@ struct BatchReviewPrView {
 
 /// Fetch and freeze the target metadata before handing it to the atomic DB
 /// creation path. Callers can retain the legacy path if this cannot establish
-/// an immutable target SHA.
-async fn enqueue_review_batch(
+/// an immutable target SHA. Shared by `finalize_pr_transition` and the
+/// merge poller's deferred-admission sweep.
+pub(crate) async fn enqueue_review_batch(
     work_db: &crate::work::WorkDb,
-    producing: &crate::work::WorkExecution,
+    work_item_id: &str,
+    repo_remote_url: &str,
     pr_url: &str,
+    review_pool_size: usize,
 ) -> anyhow::Result<crate::work::ReviewBatchDispatch> {
     let root =
         boss_github::pr_files::fetch_pr_view_json(pr_url, "baseRefOid,headRefOid,files,additions,deletions").await?;
@@ -42,7 +45,7 @@ async fn enqueue_review_batch(
         deletions: view.deletions,
     });
     let input = crate::work::ReviewBatchCreateInput::builder()
-        .cycle_root_id(work_db.review_cycle_root_id(&producing.work_item_id))
+        .cycle_root_id(work_db.review_cycle_root_id(work_item_id))
         .base_sha(view.base_sha)
         .classification(classification)
         .phase(boss_protocol::ReviewBatchPhase::PreMerge)
@@ -50,7 +53,61 @@ async fn enqueue_review_batch(
         .pr_url(pr_url)
         .target_sha(view.target_sha)
         .build();
-    work_db.create_pre_merge_review_batch(input, &producing.repo_remote_url)
+    work_db.create_pre_merge_review_batch_for_pool(input, repo_remote_url, review_pool_size)
+}
+
+/// Production or test strategy for creating a pre-merge review batch from
+/// a producing execution's PR. Tests inject a stub that skips `gh`.
+#[async_trait]
+pub trait ReviewBatchEnqueuer: Send + Sync {
+    async fn enqueue(
+        &self,
+        work_db: &crate::work::WorkDb,
+        work_item_id: &str,
+        repo_remote_url: &str,
+        pr_url: &str,
+        review_pool_size: usize,
+    ) -> anyhow::Result<crate::work::ReviewBatchDispatch>;
+}
+
+/// Default enqueuer: fetch immutable SHAs from GitHub, then admit a batch.
+pub(crate) struct GhReviewBatchEnqueuer;
+
+#[async_trait]
+impl ReviewBatchEnqueuer for GhReviewBatchEnqueuer {
+    async fn enqueue(
+        &self,
+        work_db: &crate::work::WorkDb,
+        work_item_id: &str,
+        repo_remote_url: &str,
+        pr_url: &str,
+        review_pool_size: usize,
+    ) -> anyhow::Result<crate::work::ReviewBatchDispatch> {
+        enqueue_review_batch(work_db, work_item_id, repo_remote_url, pr_url, review_pool_size).await
+    }
+}
+
+pub(crate) fn file_admission_deferred_attention(work_db: &crate::work::WorkDb, work_item_id: &str, pr_url: &str) {
+    if let Err(err) = work_db.create_attention_item(CreateAttentionItemInput {
+        work_item_id: Some(work_item_id.to_owned()),
+        kind: crate::work::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND.to_owned(),
+        title: "Automated reviewer: waiting for a review-pool slot".to_owned(),
+        body_markdown: format!(
+            "Pre-merge review for {pr_url} was deferred because the review pool has no free \
+             reservation for another pre-merge batch. The task stays in Doing until a batch \
+             completes and the deferred-admission sweep retries. Dismiss this item once that \
+             pass starts."
+        ),
+        execution_id: None,
+        status: None,
+        resolved_at: None,
+    }) {
+        tracing::warn!(
+            work_item_id,
+            ?err,
+            "failed to file review-admission-deferred attention item"
+        );
+    }
 }
 
 impl WorkerCompletionHandler {
@@ -307,7 +364,17 @@ impl WorkerCompletionHandler {
                             // same moment and would otherwise both enqueue a `pr_review`
                             // execution for the same unchanged head sha.
                             if self.feature_flags.is_enabled("review_batch_fanout") {
-                                match enqueue_review_batch(&self.work_db, producing, &pr_url).await {
+                                match self
+                                    .review_batch_enqueuer
+                                    .enqueue(
+                                        &self.work_db,
+                                        &producing.work_item_id,
+                                        &producing.repo_remote_url,
+                                        &pr_url,
+                                        self.review_pool_size,
+                                    )
+                                    .await
+                                {
                                     Ok(crate::work::ReviewBatchDispatch::Created { batch, executions }) => {
                                         tracing::info!(
                                             execution_id,
@@ -345,8 +412,13 @@ impl WorkerCompletionHandler {
                                             execution_id,
                                             pr_url = %pr_url,
                                             "review pool's weighted reservation accounting has no room for a new \
-                                             pre-merge batch; holding the task pending review — the next \
-                                             pr_recheck pass retries once an existing batch completes",
+                                             pre-merge batch; holding the task pending review — the deferred-\
+                                             admission sweep retries once an existing batch completes",
+                                        );
+                                        file_admission_deferred_attention(
+                                            &self.work_db,
+                                            &producing.work_item_id,
+                                            &pr_url,
                                         );
                                         true
                                     }

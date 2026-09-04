@@ -8,6 +8,17 @@ use super::*;
 /// silently clearing it.
 pub(crate) const DELETION_SIGNOFF_BLOCKED_REASON: &str = "deletion_signoff";
 
+/// A task held in PendingReview with no live pre-merge batch, waiting for
+/// weighted admission to retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredReviewAdmissionCandidate {
+    pub task_id: String,
+    pub product_id: String,
+    pub pr_url: String,
+    pub repo_remote_url: String,
+    pub cycle_root_id: String,
+}
+
 impl WorkDb {
     /// Record that a worker produced a PR for `execution_id`. In a single
     /// transaction:
@@ -628,6 +639,89 @@ impl WorkDb {
                 row.get::<_, String>(2)?,
                 row.get::<_, bool>(3)?,
             ))
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Tasks held in `active` (PendingReview) with a bound PR that have no
+    /// live pre-merge batch and no non-terminal `pr_review` execution on
+    /// their review-cycle root.
+    ///
+    /// This is the durable recovery set for [`super::ReviewBatchDispatch::AdmissionDeferred`]:
+    /// `create_pre_merge_review_batch` writes no batch and no member rows,
+    /// so neither `list_executions_pending_pr_detection` (waiting_human
+    /// producers) nor [`Self::list_tasks_with_stalled_reviewer`] (INNER JOIN
+    /// on a `pr_review` execution) can see them. Includes first-time
+    /// producers with zero reviews and tasks whose previous cycle's
+    /// terminal `pr_review` must not be treated as covering a new head.
+    pub fn list_tasks_awaiting_pre_merge_review_admission(&self) -> Result<Vec<DeferredReviewAdmissionCandidate>> {
+        let conn = self.connect()?;
+        let sql = "WITH RECURSIVE walk(task_id, current_id, kind, parent_task_id, depth) AS (
+               SELECT t.id, t.id, t.kind, t.parent_task_id, 0
+               FROM tasks t
+               WHERE t.status = 'active'
+                 AND t.pr_url IS NOT NULL
+                 AND t.pr_url != ''
+                 AND t.deleted_at IS NULL
+               UNION ALL
+               SELECT walk.task_id, parent.id, parent.kind, parent.parent_task_id, walk.depth + 1
+               FROM walk
+               JOIN tasks parent ON parent.id = walk.parent_task_id
+               WHERE walk.kind = 'revision' AND walk.depth < 64
+             ),
+             roots AS (
+               SELECT w.task_id, w.current_id AS cycle_root_id
+               FROM walk w
+               WHERE w.depth = (
+                 SELECT MAX(w2.depth) FROM walk w2 WHERE w2.task_id = w.task_id
+               )
+             )
+             SELECT t.id, t.product_id, t.pr_url,
+                    COALESCE(
+                      NULLIF(p.repo_remote_url, ''),
+                      (
+                        SELECT we.repo_remote_url
+                        FROM work_executions we
+                        WHERE we.work_item_id = t.id
+                          AND we.repo_remote_url IS NOT NULL
+                          AND we.repo_remote_url != ''
+                        ORDER BY we.created_at DESC, we.id DESC
+                        LIMIT 1
+                      ),
+                      ''
+                    ) AS repo_remote_url,
+                    roots.cycle_root_id
+             FROM tasks t
+             JOIN products p ON p.id = t.product_id
+             JOIN roots ON roots.task_id = t.id
+             WHERE NOT EXISTS (
+                     SELECT 1 FROM pr_review_batches b
+                     WHERE b.cycle_root_id = roots.cycle_root_id
+                       AND b.phase = 'pre_merge'
+                       AND b.status NOT IN ('completed', 'failed')
+                   )
+               AND NOT EXISTS (
+                     SELECT 1 FROM work_executions we
+                     WHERE we.work_item_id IN (t.id, roots.cycle_root_id)
+                       AND we.kind = 'pr_review'
+                       AND we.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')
+                   )
+               AND NOT EXISTS (
+                     SELECT 1 FROM work_executions we
+                     WHERE we.work_item_id = t.id
+                       AND we.status IN ('running', 'waiting_human')
+                       AND we.kind != 'pr_review'
+                   )
+             ORDER BY t.updated_at ASC";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DeferredReviewAdmissionCandidate {
+                task_id: row.get(0)?,
+                product_id: row.get(1)?,
+                pr_url: row.get(2)?,
+                repo_remote_url: row.get(3)?,
+                cycle_root_id: row.get(4)?,
+            })
         })?;
         collect_rows(rows)
     }

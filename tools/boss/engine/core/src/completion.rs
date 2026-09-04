@@ -99,6 +99,8 @@ mod worker_signals;
 // submodules (which `use super::*`) can name them — same pattern as the
 // free helpers defined directly in this file.
 use contribution_gate::{RevisionContributionReason, RevisionReviewGate};
+pub use pr_transition::ReviewBatchEnqueuer;
+pub(crate) use pr_transition::{GhReviewBatchEnqueuer, enqueue_review_batch, file_admission_deferred_attention};
 
 // Counter handles for the PR URL capture channels, in the order they are
 // consulted: the worker's structured-output artifact (the driver-agnostic file
@@ -1570,6 +1572,17 @@ pub struct WorkerCompletionHandler {
     /// each call lands past the debounce window without a real sleep;
     /// dedicated debounce tests wire in a clock they control directly.
     now_fn: Arc<dyn Fn() -> std::time::Instant + Send + Sync>,
+    /// How a producing execution's PR is turned into an immutable pre-merge
+    /// review batch. Defaults to [`GhReviewBatchEnqueuer`] (fetches SHAs via
+    /// `gh pr view`); tests inject a stub via
+    /// [`Self::with_review_batch_enqueuer`] so admission deferral can be
+    /// exercised without a live GitHub call.
+    review_batch_enqueuer: Arc<dyn ReviewBatchEnqueuer>,
+    /// Configured review-pool slot count used as weighted-admission
+    /// reservation capacity. Defaults to
+    /// [`crate::coordinator::DEFAULT_REVIEW_POOL_SIZE`]; production wires
+    /// `WorkConfig.review_pool_size` via [`Self::with_review_pool_size`].
+    review_pool_size: usize,
 }
 
 /// Outcome of [`WorkerCompletionHandler::try_retire_cleared_blocking_signal`].

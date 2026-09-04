@@ -139,6 +139,7 @@ async fn stalled_reviewer_fallback_refires_and_restores_reviewing_state() {
             product_id: &product.id,
             pr_url: pr,
             review_result_written: false,
+            skip_unbatched_review_holds: false,
         },
         &checker,
         &mut outcome,
@@ -233,6 +234,7 @@ async fn stalled_running_reviewer_stays_doing_without_double_dispatch() {
             product_id: &product.id,
             pr_url: pr,
             review_result_written: false,
+            skip_unbatched_review_holds: false,
         },
         &checker,
         &mut outcome,
@@ -319,6 +321,7 @@ async fn stalled_reviewer_churn_guard_parks_without_refire() {
             product_id: &product.id,
             pr_url: pr,
             review_result_written: false,
+            skip_unbatched_review_holds: false,
         },
         &checker,
         &mut outcome,
@@ -377,6 +380,7 @@ async fn stalled_reviewer_churn_guard_below_threshold_still_refires() {
             product_id: &product.id,
             pr_url: pr,
             review_result_written: false,
+            skip_unbatched_review_holds: false,
         },
         &checker,
         &mut outcome,
@@ -426,6 +430,7 @@ async fn stale_queued_reviewer_is_not_refired_on_repeated_sweeps() {
                 product_id: &product.id,
                 pr_url: pr,
                 review_result_written: false,
+                skip_unbatched_review_holds: false,
             },
             &checker,
             &mut outcome,
@@ -911,5 +916,120 @@ fn reopen_comments_reopens_task_and_chain_revision_comments() {
         control.revise_task_id.as_deref(),
         Some(root_id.as_str()),
         "a comment that was never in_revision must keep its status and revise_task_id"
+    );
+}
+
+// ── deferred pre-merge review admission ──────────────────────────────────
+
+/// A PendingReview hold with no batch and no pr_review execution is a
+/// deferred-admission candidate — the query the recovery sweep is keyed on.
+#[test]
+fn deferred_admission_query_surfaces_a_held_task_with_no_review() {
+    let db = WorkDb::open(temp_db_path("deferred-admission-none")).unwrap();
+    let pr_url = "https://github.com/spinyfin/mono/pull/91";
+    let (product_id, chore_id) = active_chore_with_pr(&db, "deferred-none", pr_url);
+
+    let deferred = db.list_tasks_awaiting_pre_merge_review_admission().unwrap();
+    assert_eq!(
+        deferred.len(),
+        1,
+        "a bare PendingReview hold must surface: {deferred:?}"
+    );
+    assert_eq!(deferred[0].task_id, chore_id);
+    assert_eq!(deferred[0].product_id, product_id);
+    assert_eq!(deferred[0].pr_url, pr_url);
+    assert_eq!(deferred[0].cycle_root_id, chore_id);
+}
+
+/// A live pre-merge batch for the cycle root removes the task from the
+/// deferred-admission set — recovery must not double-create.
+#[test]
+fn deferred_admission_query_excludes_a_task_with_a_live_batch() {
+    let db = WorkDb::open(temp_db_path("deferred-admission-live-batch")).unwrap();
+    let pr_url = "https://github.com/spinyfin/mono/pull/92";
+    let (_product_id, chore_id) = active_chore_with_pr(&db, "deferred-live", pr_url);
+    db.create_review_batch(
+        crate::work::ReviewBatchCreateInput::builder()
+            .cycle_root_id(chore_id.clone())
+            .base_sha("base-sha")
+            .classification(
+                boss_protocol::ReviewClassification::builder()
+                    .changed_files(vec!["src/lib.rs".to_owned()])
+                    .complexity_flags(vec![])
+                    .has_production_code(true)
+                    .metadata_missing(vec![])
+                    .production_languages(vec![boss_protocol::ReviewLanguageBucket::Rust])
+                    .profile(boss_protocol::ReviewProfile::Light)
+                    .subsystem_buckets(vec!["src".to_owned()])
+                    .build(),
+            )
+            .phase(boss_protocol::ReviewBatchPhase::PreMerge)
+            .pr_number(92)
+            .pr_url(pr_url)
+            .target_sha("head-sha")
+            .build(),
+        &[crate::work::ReviewBatchMemberCreateInput::builder()
+            .attempt(1)
+            .provider_effort("medium")
+            .requested_driver("claude")
+            .resolved_model("test-model")
+            .role(boss_protocol::ReviewBatchMemberRole::ClaudeReviewer)
+            .status(boss_protocol::ReviewBatchMemberStatus::Pending)
+            .build()],
+    )
+    .unwrap();
+
+    let deferred = db.list_tasks_awaiting_pre_merge_review_admission().unwrap();
+    assert!(
+        deferred.is_empty(),
+        "a live pre-merge batch must exclude the hold: {deferred:?}"
+    );
+}
+
+/// With review-batch fan-out, a previous cycle's durable verdict must not
+/// advance the task to in_review while no live batch covers the new head.
+#[tokio::test]
+async fn stalled_reviewer_does_not_skip_a_new_head_when_fanout_owns_the_hold() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/1771";
+    let product = create_test_product_with_repo(&db, "prior-cycle-hold", Some("https://github.com/foo/bar"));
+    let chore = create_test_chore_manual(&db, product.id.clone(), "prior-cycle-hold");
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".into()),
+            pr_url: Some(pr.into()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    let exec_id = pr_review_execution(&db, &chore.id, ExecutionStatus::Completed, &now_string());
+    insert_completed_pr_review_verdict(&db, &exec_id, &chore.id, REVIEW_GATE_OUTCOME_DROPPED_DUPLICATE_HEAD);
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let publisher = crate::coordinator::NoopExecutionPublisher;
+    let mut outcome = crate::merge_poller::SweepOutcome::default();
+    crate::merge_poller::sweep_stalled_reviewer(
+        &db,
+        &publisher,
+        crate::merge_poller::StalledReview {
+            task_id: &chore.id,
+            product_id: &product.id,
+            pr_url: pr,
+            review_result_written: true,
+            skip_unbatched_review_holds: true,
+        },
+        &checker,
+        &mut outcome,
+    )
+    .await;
+
+    assert_eq!(outcome.reviewer_fallback_advanced, 0);
+    let task = query_task(&db.connect().unwrap(), &chore.id).unwrap().unwrap();
+    assert_eq!(
+        task.status,
+        TaskStatus::Active,
+        "a prior-cycle verdict must not skip review of a new PendingReview hold"
     );
 }

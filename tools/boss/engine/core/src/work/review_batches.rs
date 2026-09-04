@@ -68,20 +68,29 @@ pub enum ReviewBatchDispatch {
     /// [`can_admit_review_batch_in_tx`]) has no room for a new batch of this
     /// target's phase right now. No batch and no member executions were
     /// created — the caller must not treat this as a failure to retry with
-    /// backoff; it is expected to happen whenever the pool is at its static
-    /// capacity, and the next reconciliation pass (e.g. the merge poller's
-    /// `pr_recheck` sweep) tries again once an existing batch completes and
-    /// releases its reservation.
+    /// backoff; it is expected whenever the pool is at capacity. The
+    /// producing task is held in PendingReview, and the merge poller's
+    /// deferred-admission sweep (`list_tasks_awaiting_pre_merge_review_admission`)
+    /// retries `create_pre_merge_review_batch` once an existing batch
+    /// completes and releases its reservation.
     AdmissionDeferred,
 }
 
-/// Reservation-unit capacity of the review pool for admission-accounting
-/// purposes. One unit corresponds to one physical review-pool slot
-/// ([`crate::coordinator::MAX_REVIEW_POOL_SIZE`]): the review pool has one
-/// physical slot per reservation unit, so exhausting every unit also fills
-/// every physical slot once every reserved batch is actively dispatching
-/// all of its members at once.
-const REVIEW_POOL_RESERVATION_CAPACITY: i64 = crate::coordinator::MAX_REVIEW_POOL_SIZE as i64;
+/// `work_attention_items.kind` filed when a pre-merge batch cannot be
+/// admitted because the review pool's weighted reservation accounting is
+/// at capacity. The deferred-admission sweep resolves it when a batch is
+/// actually created (or an existing live batch/legacy reviewer covers the
+/// target).
+pub const PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND: &str = "pr_review_admission_deferred";
+
+/// `work_attention_items.kind` filed when a non-terminal review batch is
+/// reaped because its cycle root is gone or its members have been inert
+/// past [`REVIEW_BATCH_STALE_SECS`].
+pub const PR_REVIEW_BATCH_STALE_ATTENTION_KIND: &str = "pr_review_batch_stale";
+
+/// Staleness bound for reaping a wedged non-terminal review batch,
+/// matching the merge poller's stalled-reviewer cutoff.
+pub const REVIEW_BATCH_STALE_SECS: u64 = 10 * 60;
 
 /// Reservation weight of one non-terminal pre-merge batch: three parallel
 /// leaf reviewers plus the supervisor that follows them once they settle,
@@ -95,31 +104,49 @@ const PRE_MERGE_BATCH_RESERVATION_UNITS: i64 = 4;
 /// safety-net reviewer against the already-landed tree.
 const POST_MERGE_BATCH_RESERVATION_UNITS: i64 = 1;
 
-/// Count non-terminal (reservation-holding) batches of `phase`. `completed`
-/// and `failed` are the only statuses that release a batch's reservation —
-/// `collecting`, `supervising`, and `applying` all still hold it, matching
-/// "from creation through supervisor completion".
+/// Count non-terminal (reservation-holding) batches of `phase` whose cycle
+/// root is still a live work item. `completed` and `failed` are the only
+/// statuses that release a batch's reservation — `collecting`,
+/// `supervising`, and `applying` all still hold it, matching "from creation
+/// through supervisor completion". Batches whose cycle root is deleted or
+/// already terminal (`done`/`archived`) do not hold a reservation: nothing
+/// can settle them through the quorum path, so counting them would
+/// permanently deny pre-merge review to every other product.
 fn reserved_batch_count_in_tx(tx: &Transaction<'_>, phase: ReviewBatchPhase) -> Result<i64> {
     let count: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM pr_review_batches WHERE phase = ?1 AND status NOT IN ('completed', 'failed')",
+        "SELECT COUNT(*)
+         FROM pr_review_batches b
+         JOIN tasks t ON t.id = b.cycle_root_id
+         WHERE b.phase = ?1
+           AND b.status NOT IN ('completed', 'failed')
+           AND t.deleted_at IS NULL
+           AND t.status NOT IN ('done', 'archived')",
         params![phase.as_str()],
         |row| row.get(0),
     )?;
     Ok(count)
 }
 
+fn reservation_capacity(review_pool_size: usize) -> i64 {
+    review_pool_size.min(crate::coordinator::MAX_REVIEW_POOL_SIZE) as i64
+}
+
 /// Whether one more non-terminal batch of `phase` can be admitted into the
 /// review pool's weighted reservation accounting right now.
 ///
+/// `reservation_capacity` is the live configured review-pool size (clamped
+/// to [`crate::coordinator::MAX_REVIEW_POOL_SIZE`]), not the compile-time
+/// hard cap: a smaller `BOSS_REVIEW_POOL_SIZE` must not oversubscribe the
+/// physical slots the reservation scheme exists to protect.
+///
 /// Pre-merge admission is checked against pre-merge reservations alone,
 /// which is what gives pre-merge work priority over post-merge safety-net
-/// work: a pre-merge batch is admitted whenever fewer than four pre-merge
-/// batches (`REVIEW_POOL_RESERVATION_CAPACITY /
-/// PRE_MERGE_BATCH_RESERVATION_UNITS`) are already open, regardless of how
-/// many post-merge units are currently reserved. Post-merge admission is
-/// checked against BOTH reservations, so a safety-net batch only starts
-/// when genuinely spare capacity remains after every open pre-merge batch's
-/// block.
+/// work: a pre-merge batch is admitted whenever
+/// `pre_merge_units + PRE_MERGE_BATCH_RESERVATION_UNITS <= reservation_capacity`,
+/// regardless of how many post-merge units are currently reserved.
+/// Post-merge admission is checked against BOTH reservations, so a
+/// safety-net batch only starts when genuinely spare capacity remains after
+/// every open pre-merge batch's block.
 ///
 /// This is static, conservative admission accounting, not a live count of
 /// claimed physical worker-pool slots: a batch keeps its reservation for its
@@ -127,18 +154,19 @@ fn reserved_batch_count_in_tx(tx: &Transaction<'_>, phase: ReviewBatchPhase) -> 
 /// member executions are still queued behind a busy pool. See
 /// docs/designs/multi-agent-code-review.md, "Expand the static review pool
 /// to 16 slots".
-pub(crate) fn can_admit_review_batch_in_tx(tx: &Transaction<'_>, phase: ReviewBatchPhase) -> Result<bool> {
+pub(crate) fn can_admit_review_batch_in_tx(
+    tx: &Transaction<'_>,
+    phase: ReviewBatchPhase,
+    reservation_capacity: i64,
+) -> Result<bool> {
     let pre_merge_units =
         reserved_batch_count_in_tx(tx, ReviewBatchPhase::PreMerge)? * PRE_MERGE_BATCH_RESERVATION_UNITS;
     match phase {
-        ReviewBatchPhase::PreMerge => {
-            Ok(pre_merge_units + PRE_MERGE_BATCH_RESERVATION_UNITS <= REVIEW_POOL_RESERVATION_CAPACITY)
-        }
+        ReviewBatchPhase::PreMerge => Ok(pre_merge_units + PRE_MERGE_BATCH_RESERVATION_UNITS <= reservation_capacity),
         ReviewBatchPhase::PostMerge => {
             let post_merge_units =
                 reserved_batch_count_in_tx(tx, ReviewBatchPhase::PostMerge)? * POST_MERGE_BATCH_RESERVATION_UNITS;
-            Ok(pre_merge_units + post_merge_units + POST_MERGE_BATCH_RESERVATION_UNITS
-                <= REVIEW_POOL_RESERVATION_CAPACITY)
+            Ok(pre_merge_units + post_merge_units + POST_MERGE_BATCH_RESERVATION_UNITS <= reservation_capacity)
         }
     }
 }
@@ -759,13 +787,40 @@ impl WorkDb {
     /// Whether the review pool's weighted reservation accounting has room
     /// for one more non-terminal batch of `phase` right now. See
     /// [`can_admit_review_batch_in_tx`] for the pre-merge-priority rule.
-    /// Read-only — opens its own connection rather than a transaction, since
-    /// callers that need this check inside an existing write use the `_in_tx`
-    /// function directly.
+    ///
+    /// Read-only: runs the same check on its own deferred transaction, which
+    /// is dropped (rolled back) on return; callers already inside a write
+    /// use [`can_admit_review_batch_in_tx`]. Production callers today go
+    /// through [`Self::create_pre_merge_review_batch`]; this method exists
+    /// so tests (and the post-merge wiring, which does not yet create
+    /// batches outside tests) can assert the admission arithmetic without
+    /// inserting a row. The `PostMerge` arm of
+    /// [`can_admit_review_batch_in_tx`] is likewise only reached from tests
+    /// until post-merge batch creation is wired.
     pub fn can_admit_review_batch(&self, phase: ReviewBatchPhase) -> Result<bool> {
+        self.can_admit_review_batch_for_pool(phase, crate::coordinator::DEFAULT_REVIEW_POOL_SIZE)
+    }
+
+    /// Like [`Self::can_admit_review_batch`], but using `review_pool_size` as
+    /// the reservation capacity (clamped to
+    /// [`crate::coordinator::MAX_REVIEW_POOL_SIZE`]). Production passes
+    /// `WorkConfig.review_pool_size` so a smaller `BOSS_REVIEW_POOL_SIZE`
+    /// cannot oversubscribe the physical pool.
+    pub fn can_admit_review_batch_for_pool(&self, phase: ReviewBatchPhase, review_pool_size: usize) -> Result<bool> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        can_admit_review_batch_in_tx(&tx, phase)
+        can_admit_review_batch_in_tx(&tx, phase, reservation_capacity(review_pool_size))
+    }
+
+    /// Currently reserved review-pool units `(pre_merge, post_merge)` for
+    /// live cycle roots. Used by the merge poller to sample the
+    /// `review_pool.reserved_units` gauge.
+    pub fn review_pool_reserved_units(&self) -> Result<(i64, i64)> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let pre = reserved_batch_count_in_tx(&tx, ReviewBatchPhase::PreMerge)? * PRE_MERGE_BATCH_RESERVATION_UNITS;
+        let post = reserved_batch_count_in_tx(&tx, ReviewBatchPhase::PostMerge)? * POST_MERGE_BATCH_RESERVATION_UNITS;
+        Ok((pre, post))
     }
 
     /// Atomically create an immutable pre-merge batch and the three ready leaf
@@ -775,6 +830,21 @@ impl WorkDb {
         &self,
         input: ReviewBatchCreateInput,
         repo_remote_url: &str,
+    ) -> Result<ReviewBatchDispatch> {
+        self.create_pre_merge_review_batch_for_pool(
+            input,
+            repo_remote_url,
+            crate::coordinator::DEFAULT_REVIEW_POOL_SIZE,
+        )
+    }
+
+    /// Like [`Self::create_pre_merge_review_batch`], admitting against
+    /// `review_pool_size` rather than the compile-time default.
+    pub fn create_pre_merge_review_batch_for_pool(
+        &self,
+        input: ReviewBatchCreateInput,
+        repo_remote_url: &str,
+        review_pool_size: usize,
     ) -> Result<ReviewBatchDispatch> {
         if input.phase != ReviewBatchPhase::PreMerge {
             bail!("leaf reviewer dispatch only supports pre_merge batches");
@@ -806,10 +876,10 @@ impl WorkDb {
                 return Ok(ReviewBatchDispatch::LegacyExecution(execution));
             }
         }
-        if !can_admit_review_batch_in_tx(&tx, ReviewBatchPhase::PreMerge)? {
+        if !can_admit_review_batch_in_tx(&tx, ReviewBatchPhase::PreMerge, reservation_capacity(review_pool_size))? {
             // Read-only so far — nothing to roll back. The caller must hold
             // the producing task pending review rather than treat this as a
-            // legacy fallback; the next reconciliation pass retries once an
+            // legacy fallback; the deferred-admission sweep retries once an
             // existing batch completes and frees its reservation.
             tx.commit()?;
             return Ok(ReviewBatchDispatch::AdmissionDeferred);
@@ -852,6 +922,23 @@ impl WorkDb {
     ) -> Result<Option<ReviewBatch>> {
         let conn = self.connect()?;
         review_batch_for_target_in(&conn, cycle_root_id, phase, target_sha)
+    }
+
+    /// Whether `cycle_root_id` currently has a reservation-holding pre-merge
+    /// batch (`collecting` / `supervising` / `applying`).
+    pub fn has_live_pre_merge_review_batch(&self, cycle_root_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let found: Option<()> = conn
+            .query_row(
+                "SELECT 1 FROM pr_review_batches
+                 WHERE cycle_root_id = ?1 AND phase = 'pre_merge'
+                   AND status NOT IN ('completed', 'failed')
+                 LIMIT 1",
+                params![cycle_root_id],
+                |_| Ok(()),
+            )
+            .optional()?;
+        Ok(found.is_some())
     }
 
     /// Return all persisted batches for a review cycle root, newest first.
@@ -1169,5 +1256,106 @@ impl WorkDb {
         )?;
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Fail non-terminal review batches that can never settle, so they stop
+    /// occupying global reservation units.
+    ///
+    /// A batch is reaped when its cycle root is deleted or already terminal,
+    /// or when it has been `collecting`/`supervising`/`applying` past
+    /// `stale_secs` with no non-terminal member execution and no retryable
+    /// dead leaf (the leaf-retry sweep still owns those). Each reaped batch
+    /// is marked `failed` and gets a
+    /// [`PR_REVIEW_BATCH_STALE_ATTENTION_KIND`] item.
+    pub fn reap_inert_review_batches(&self, stale_secs: u64) -> Result<Vec<String>> {
+        let cutoff = (boss_engine_utils::epoch_time::now_epoch_secs() as u64)
+            .saturating_sub(stale_secs)
+            .to_string();
+        let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
+        let sql = format!(
+            "SELECT b.id, b.cycle_root_id, b.pr_url, t.deleted_at
+             FROM pr_review_batches b
+             JOIN tasks t ON t.id = b.cycle_root_id
+             WHERE b.status NOT IN ('completed', 'failed')
+               AND (
+                 t.deleted_at IS NOT NULL
+                 OR t.status IN ('done', 'archived')
+                 OR (
+                   CAST(b.updated_at AS INTEGER) < CAST(?1 AS INTEGER)
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM pr_review_batch_members m
+                     JOIN work_executions we ON we.id = m.execution_id
+                     WHERE m.batch_id = b.id
+                       AND we.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM pr_review_batch_members member
+                     JOIN work_executions we ON we.id = member.execution_id
+                     WHERE member.batch_id = b.id
+                       AND member.role IN ('claude_reviewer', 'codex_reviewer', 'grok_reviewer')
+                       AND member.status IN ('pending', 'running', 'failed')
+                       AND member.attempt < 2
+                       AND NOT EXISTS (
+                         SELECT 1 FROM pr_review_batch_members retry
+                         WHERE retry.batch_id = member.batch_id
+                           AND retry.role = member.role
+                           AND retry.attempt = member.attempt + 1
+                       )
+                       AND (we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
+                            OR {unproductive_completed})
+                   )
+                 )
+               )
+             ORDER BY b.updated_at ASC, b.id ASC"
+        );
+        let mut conn = self.connect()?;
+        let rows: Vec<(String, String, String, Option<String>)> = {
+            let mut statement = conn.prepare(&sql)?;
+            let mapped = statement.query_map(params![cutoff], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let now = now_string();
+        let mut reaped = Vec::new();
+        for (batch_id, cycle_root_id, pr_url, deleted_at) in rows {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
+                "UPDATE pr_review_batches
+                 SET status = 'failed', completed_at = ?2, updated_at = ?2
+                 WHERE id = ?1 AND status NOT IN ('completed', 'failed')",
+                params![batch_id, now],
+            )?;
+            if changed == 0 {
+                tx.commit()?;
+                continue;
+            }
+            if deleted_at.is_none() {
+                super::workitems::insert_attention_item_row(
+                    &tx,
+                    &CreateAttentionItemInput::builder()
+                        .work_item_id(cycle_root_id)
+                        .kind(PR_REVIEW_BATCH_STALE_ATTENTION_KIND)
+                        .title("Automated reviewer: review batch reaped")
+                        .body_markdown(format!(
+                            "The review batch `{batch_id}` for {pr_url} was marked failed because its \
+                             cycle root is gone or its members have not moved within {stale_secs}s \
+                             with nothing left to retry. Its reservation is released so other PRs can \
+                             be reviewed."
+                        ))
+                        .build(),
+                )?;
+            }
+            tx.commit()?;
+            reaped.push(batch_id);
+        }
+        Ok(reaped)
     }
 }

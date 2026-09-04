@@ -154,6 +154,9 @@ mod tests {
             "merge_poller.worker_stopped_on_review",
             "merge_poller.comments_reopened",
             "merge_poller.trunk_episodes_adopted",
+            "review_pool.admission_deferred",
+            "review_pool.admission_recovered",
+            "review_pool.batch_reaped",
         ] {
             assert!(
                 names.contains(&expected.to_owned()),
@@ -298,9 +301,9 @@ mod tests {
         }
         assert_eq!(
             names.len(),
-            108,
+            111,
             "expected 6 answer_agent + 6 pr_url_capture + 6 worker_proposals fallback_hit + 3 cube_workspace_lease + \
-             10 dispatcher + 15 merge_poller + 18 external_tracker + 2 speculative_conflict + \
+             10 dispatcher + 18 merge_poller + 18 external_tracker + 2 speculative_conflict + \
              1 stacked_pr_structuring + 1 dispatch_metrics + 9 trunk_queue_poller + \
              12 worker_proposals submit + 1 worker_proposals channel_error + \
              5 github_api + 2 codex_unobserved_command + 2 codex_guard_trace + \
@@ -322,6 +325,8 @@ mod tests {
                 "github_api.graphql.remaining",
                 "github_api.rest.remaining",
                 "merge_poller.adaptive_tracked",
+                "review_pool.deferred_pre_merge",
+                "review_pool.reserved_units",
             ],
             "init_all must register the dep_unblock gauge, the queue-level dispatch gauges, \
              the GitHub remaining-quota gauges, and the adaptive-schedule size gauge",
