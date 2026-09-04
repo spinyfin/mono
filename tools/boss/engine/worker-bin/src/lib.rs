@@ -112,6 +112,11 @@ pub const BOSS_BIN_ENV: &str = "BOSS_BIN";
 /// Same contract as [`BOSS_BIN_ENV`]: name the binary, not a PATH entry.
 pub const CUBE_BIN_ENV: &str = "CUBE_BIN";
 
+/// Env var carrying the absolute path of this workspace's `checkleft`
+/// launcher. Same contract as [`BOSS_BIN_ENV`]: name the binary, not a PATH
+/// entry that a driver shell may reorder.
+pub const CHECKLEFT_BIN_ENV: &str = "CHECKLEFT_BIN";
+
 /// Shell token workers are taught to run instead of a PATH-resolved `boss`.
 pub const WORKER_BOSS_INVOCATION: &str = r#""$BOSS_BIN""#;
 
@@ -362,12 +367,19 @@ pub fn resolve_boss_event_binary(
 /// excludes it, and guessing would only add a way to reject a
 /// legitimate binary.
 pub fn is_build_from_source_shim(path: &Path) -> bool {
-    if path.file_name().is_some_and(|name| name == REPOBIN_NAME) {
+    if path
+        .file_name()
+        .is_some_and(|name| name == REPOBIN_NAME || name == "repobin-shim.sh")
+    {
         return true;
     }
     std::fs::canonicalize(path)
         .ok()
-        .and_then(|target| target.file_name().map(|name| name == REPOBIN_NAME))
+        .and_then(|target| {
+            target
+                .file_name()
+                .map(|name| name == REPOBIN_NAME || name == "repobin-shim.sh")
+        })
         .unwrap_or(false)
 }
 
@@ -1043,6 +1055,11 @@ mod tests {
     #[test]
     fn a_path_literally_named_repobin_is_a_shim() {
         assert!(is_build_from_source_shim(Path::new("/anywhere/repobin")));
+    }
+
+    #[test]
+    fn a_path_literally_named_repobin_workspace_shim_is_a_shim() {
+        assert!(is_build_from_source_shim(Path::new("/anywhere/repobin-shim.sh")));
     }
 
     #[test]

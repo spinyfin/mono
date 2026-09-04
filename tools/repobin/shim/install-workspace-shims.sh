@@ -3,8 +3,10 @@
 #
 # Run by cube on every lease of a mono workspace (`.cube/setup.yaml`, step
 # `repobin-tool-shims`), and safe to run by hand from anywhere inside the
-# checkout. It makes the gitignored bin/ look like CI's: one entry per tool
-# declared in REPOBIN.toml plus `repobin` itself. CI's entries are real
+# checkout. It makes the gitignored bin/ look like CI's: one entry per eligible
+# tool declared in REPOBIN.toml plus `repobin` itself. The engine owns the
+# `boss`, `boss-event`, `bossctl`, and `cube` launchers, so those names are
+# deliberately skipped even when REPOBIN.toml declares them. CI's entries are real
 # `repobin install` symlinks to a bazel-built repobin binary; here each entry
 # is a symlink to repobin-shim.sh, which builds that same binary on first use
 # and dispatches through it (see the shim's header for why the build is
@@ -46,13 +48,19 @@ fi
 
 mkdir -p "$bin"
 
-# Tool names: every `[tools.<name>]` and `[pins.<name>]` table header.
-names="$(sed -n -E 's/^\[(tools|pins)\.([^]]+)\][[:space:]]*$/\2/p' "$config")"
+# Tool names: every `[tools.<name>]` and `[pins.<name>]` table header, with
+# leading/trailing whitespace ignored just like the shim and worker launcher.
+names="$(sed -n -E 's/^[[:space:]]*\[(tools|pins)\.([^]]+)\][[:space:]]*$/\2/p' "$config")"
 [[ -n "$names" ]] || die "REPOBIN.toml at $root declares no [tools.*] or [pins.*] entries"
 
 installed=0
 kept=0
 for name in repobin $names; do
+  case "$name" in
+    boss|boss-event|bossctl|cube)
+      continue
+      ;;
+  esac
   entry="$bin/$name"
   if [[ -L "$entry" ]]; then
     # Already our shim? (`-ef` compares inodes through the symlink; no

@@ -398,7 +398,7 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     // whether a group came from before or after a delimiter, and whether it
     // spans one line or several -- `vars` carries across both.
     "vars={}\n",
-    "for k in ('BOSS_BIN','CUBE_BIN','BOSS_BIN_DIR','BOSS_WORKER_BIN_DIR'):\n",
+    "for k in ('BOSS_BIN','CUBE_BIN','CHECKLEFT_BIN','BOSS_BIN_DIR','BOSS_WORKER_BIN_DIR'):\n",
     "    v=os.environ.get(k)\n",
     "    if v:\n",
     "        vars[k]=v\n",
@@ -498,7 +498,7 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     // worker-facing contract; a Codex shell snapshot demotes the launcher
     // dir, so a bare name is not a trustworthy resolution even when this
     // hook's own PATH still has the launcher first.
-    "WATCH={'boss','cube'}\n",
+    "WATCH={'boss','cube','checkleft'}\n",
     "REPOBIN='repobin'\n",
     "DOL=chr(36)\n",
     "def which(name):\n",
@@ -512,9 +512,9 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "    return None\n",
     "def is_shim(p):\n",
     "    if not p: return False\n",
-    "    if os.path.basename(p)==REPOBIN: return True\n",
+    "    if os.path.basename(p) in (REPOBIN,'repobin-shim.sh'): return True\n",
     "    try:\n",
-    "        return os.path.basename(os.path.realpath(p))==REPOBIN\n",
+    "        return os.path.basename(os.path.realpath(p)) in (REPOBIN,'repobin-shim.sh')\n",
     "    except Exception:\n",
     "        return False\n",
     "shim=None\n",
@@ -547,7 +547,7 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "    rest=peel_shell_c(strip_prefixes(g))\n",
     "    if not rest: continue\n",
     "    orig=rest[0]\n",
-    "    if orig in (DOL+'BOSS_BIN', DOL+'{BOSS_BIN}', DOL+'CUBE_BIN', DOL+'{CUBE_BIN}'):\n",
+    "    if orig in (DOL+'BOSS_BIN', DOL+'{BOSS_BIN}', DOL+'CUBE_BIN', DOL+'{CUBE_BIN}', DOL+'CHECKLEFT_BIN', DOL+'{CHECKLEFT_BIN}'):\n",
     "        key=orig.strip(DOL+'{}')\n",
     "        target=vars.get(key) or os.environ.get(key) or ''\n",
     "        if not target:\n",
@@ -576,7 +576,7 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "    name=bare or os.path.basename(shim or '')\n",
     "    where=('repobin shim at '+shim) if shim else ('bare PATH lookup of '+name)\n",
     "    q=chr(34)\n",
-    "    _block('Blocked: this command would run '+name+' via '+where+'. That is a build-from-source multiplexer (repobin) or an untrusted PATH lookup: a driver shell snapshot can demote the launcher directory and silently bazel-build the CLI from a checkout for ~30s. Workers must name the engine-owned binary, not a PATH entry: '+q+DOL+'BOSS_BIN'+q+' / '+q+DOL+'CUBE_BIN'+q+'. Re-issue quoting the env var, e.g. '+q+DOL+'BOSS_BIN'+q+' pr status --json. Do not work around this gate and do not suppress bazel output.')\n",
+    "    _block('Blocked: this command would run '+name+' via '+where+'. That is a build-from-source multiplexer (repobin) or an untrusted PATH lookup: a driver shell snapshot can demote the launcher directory and silently bazel-build the CLI from a checkout for ~30s. Workers must name the pinned binary, not a PATH entry: '+q+DOL+'BOSS_BIN'+q+' / '+q+DOL+'CUBE_BIN'+q+' / '+q+DOL+'CHECKLEFT_BIN'+q+'. Re-issue quoting the env var, e.g. '+q+DOL+'CHECKLEFT_BIN'+q+' run. Do not work around this gate and do not suppress bazel output.')\n",
     "_approve()\n",
 );
 
@@ -726,7 +726,7 @@ pub const REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND: &str = python_command_guard!(
 const CLAUDE_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
      spawned you in a leased cube workspace and observes this session\n\
      via claude hooks.\n\
-     For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
+     For ordinary pre-push validation, run `bin/checkleft run` with no flags; use\n\
      `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
      strong stated justification.";
 
@@ -1687,7 +1687,7 @@ mod tests {
             "remote worker must not have the path guard: {cmds:?}",
         );
         assert!(
-            !cmds.iter().any(|c| c.contains("checkleft")),
+            !cmds.iter().any(|c| c.contains("boss-checkleft-push-guard.py")),
             "remote worker must not have the checkleft guard: {cmds:?}",
         );
     }
@@ -1973,7 +1973,7 @@ mod tests {
             "preamble must describe Boss session: {preamble}"
         );
         assert!(
-            preamble.contains("checkleft run") && preamble.contains("checkleft --all"),
+            preamble.contains("bin/checkleft run") && preamble.contains("checkleft --all"),
             "preamble must direct ordinary validation to scoped checkleft: {preamble}"
         );
     }

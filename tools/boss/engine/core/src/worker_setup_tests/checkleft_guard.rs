@@ -465,6 +465,34 @@ fn push_guard_falls_back_to_repo_root_checkleft_when_no_repobin_found() {
 }
 
 #[test]
+fn push_guard_blocks_declared_repobin_checkleft_when_workspace_entry_is_missing() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("REPOBIN.toml"),
+        "  [tools.checkleft]  \ntarget = \"//tools/checkleft:checkleft\"\n",
+    )
+    .unwrap();
+    let path_dir = TempDir::new().unwrap();
+    let decoy = write_fake_checkleft(path_dir.path(), "checkleft", 0, "wrong PATH checkleft ran");
+
+    let decision = run_push_guard_resolving("jj git push -b boss/foo --allow-new", dir.path(), &[path_dir.path()]);
+    assert_eq!(
+        decision["decision"], "block",
+        "a declared repobin checkleft must not fall back to PATH: {decision}"
+    );
+    let reason = decision["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("bin/checkleft"),
+        "must name the missing workspace entry: {reason}"
+    );
+    assert!(
+        reason.contains("install-workspace-shims.sh"),
+        "must name the repair command: {reason}"
+    );
+    assert!(decoy.exists(), "the decoy is present only to prove it was not selected");
+}
+
+#[test]
 fn push_guard_blocks_jj_git_push_when_checkleft_fails() {
     let dir = TempDir::new().unwrap();
     let checkleft = write_fake_checkleft(dir.path(), "checkleft", 1, "error[rustfmt]: needs formatting");
