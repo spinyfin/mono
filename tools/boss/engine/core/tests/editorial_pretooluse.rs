@@ -26,6 +26,8 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 use boss_editorial::CompiledRules;
 use boss_engine::editorial_hook::{DenyTracker, EditorialActionKind, PreToolUseDecision, evaluate_gh_pretooluse};
@@ -64,19 +66,36 @@ echo "https://github.com/foo/bar/pull/1"
 
 /// Run `command` through the stub `gh`, capturing the published body.
 /// Returns the captured body text.
+///
+/// Retries on `ETXTBSY`: the test binary runs many `install_stub_gh` +
+/// exec cycles concurrently across threads, and Linux briefly refuses
+/// `execve` on a freshly-written script while a sibling process (forked
+/// by a parallel test, but not yet past its own `execve`) still holds an
+/// inherited write fd open on it. That window closes as soon as the
+/// sibling reaches its own `execve`/exit, so a short retry clears it.
 fn run_through_stub_gh(command: &str, workspace: &Path, stub_dir: &Path) -> String {
     let capture = workspace.join("gh-capture.txt");
     let existing_path = std::env::var("PATH").unwrap_or_default();
-    let status = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(command)
-        .current_dir(workspace)
-        .env("PATH", format!("{}:{}", stub_dir.display(), existing_path))
-        .env("GH_CAPTURE", &capture)
-        .status()
-        .expect("run stub gh");
-    assert!(status.success(), "stub gh exited non-zero");
-    fs::read_to_string(&capture).unwrap_or_default()
+    let mut last_stderr = String::new();
+    for attempt in 0..10 {
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(workspace)
+            .env("PATH", format!("{}:{}", stub_dir.display(), existing_path))
+            .env("GH_CAPTURE", &capture)
+            .output()
+            .expect("run stub gh");
+        if output.status.success() {
+            return fs::read_to_string(&capture).unwrap_or_default();
+        }
+        last_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if !last_stderr.contains("Text file busy") {
+            panic!("stub gh exited non-zero: {last_stderr}");
+        }
+        thread::sleep(Duration::from_millis(20 * (attempt + 1)));
+    }
+    panic!("stub gh kept hitting ETXTBSY after retries: {last_stderr}");
 }
 
 #[test]
