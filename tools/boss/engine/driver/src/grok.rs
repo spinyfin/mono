@@ -142,7 +142,7 @@ const GROK_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed w
      spawned you in a leased cube workspace and observes this session\n\
      via Grok hooks under a Boss-owned GROK_HOME.\n\
      For ordinary pre-push validation, run `bin/checkleft run` with no flags; use\n\
-     `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
+     `bin/checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
      strong stated justification.\n\
      \n\
      Default to proceeding on a reasonable assumption instead of stopping to\n\
