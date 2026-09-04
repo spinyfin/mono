@@ -21,7 +21,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use boss_dispatch_events::DispatchEvent;
+use boss_dispatch_events::{DispatchEvent, Stage};
 
 /// Wire stage name of the detector's own output. Folding treats these
 /// records as *flags about* a timeline rather than as steps in it — without
@@ -104,10 +104,26 @@ pub struct StalledStage {
 
 /// An event is "terminal" — i.e., the dispatch timeline for that
 /// execution is officially over — when it is either a successful
-/// `pane_spawned` (the slot is up and the worker is now driving),
-/// a successful engine-driven `execution_cancelled`, or any explicit
-/// error (we won't get a follow-up; the `record_start_failure` /
-/// `pane_spawn_failed` paths have run).
+/// `pane_spawned` (the slot is up and the worker is now driving), any
+/// explicit error (we won't get a follow-up; the `record_start_failure` /
+/// `pane_spawn_failed` paths have run), or any **post-dispatch
+/// observation** ([`Stage::is_post_dispatch`]): an event that is only ever
+/// recorded against a run that is already past the dispatch handoff — a
+/// pane adopted after an engine restart (`tmux_adopt`), a sweep that reaped
+/// the execution, the completion handler's own `execution_finalized`,
+/// an engine-driven `execution_cancelled`.
+///
+/// The post-dispatch rule is what keeps a *finished* run from being
+/// reported as stalled. Post-dispatch events are appended to the same
+/// per-execution timeline as the pipeline steps, and the fold is
+/// last-event-wins, so before it existed a `tmux_adopt` landing after a
+/// `pane_spawned` made the timeline look open again at a "stage" no
+/// pipeline step would ever follow — and the detector duly flagged it
+/// once the threshold elapsed, whether or not the run had since completed.
+///
+/// A stage name this build cannot parse is classified as **not** terminal:
+/// an unknown event keeps the timeline open and the detector loud, rather
+/// than quietly treating an unclassifiable run as fine.
 pub fn is_terminal_event(event: &DispatchEvent) -> bool {
     if event.outcome == "error" {
         return true;
@@ -115,10 +131,7 @@ pub fn is_terminal_event(event: &DispatchEvent) -> bool {
     if event.stage == "pane_spawned" && event.outcome == "ok" {
         return true;
     }
-    if event.stage == "execution_cancelled" && event.outcome == "ok" {
-        return true;
-    }
-    false
+    Stage::from_wire(&event.stage).is_some_and(Stage::is_post_dispatch)
 }
 
 /// The last non-`stage_stalled` event of a timeline, reduced to the fields
@@ -315,7 +328,7 @@ fn flagged_ts(event: &DispatchEvent) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boss_dispatch_events::{Outcome, Stage};
+    use boss_dispatch_events::Outcome;
 
     fn ev(stage: Stage, outcome: Outcome, ts: u128) -> DispatchEvent {
         let mut event = DispatchEvent::new(stage, outcome, "exec-1");
@@ -417,6 +430,73 @@ mod tests {
         let mut errored = TimelineState::default();
         errored.apply(&ev(Stage::RunStarted, Outcome::Error, 1_000));
         assert!(!errored.is_live());
+    }
+
+    /// The 2026-09-04 incident: an engine restart appends `tmux_adopt` to
+    /// a run whose dispatch had ended at `pane_spawned`. The adoption is
+    /// the same fact `pane_spawned` recorded — a live pane the worker is
+    /// driving — so it must not re-open the timeline, and no stall may be
+    /// recorded against it however long the run then lives (or after it
+    /// has completed, which is exactly when the false report showed up).
+    #[test]
+    fn post_dispatch_observations_never_reopen_a_terminal_timeline() {
+        let mut state = TimelineState::default();
+        state.apply(&ev(Stage::PaneSpawned, Outcome::Ok, 1_000));
+        state.apply(&ev(Stage::TmuxAdopt, Outcome::Ok, 5_000));
+        assert!(!state.is_live(), "tmux_adopt must not re-open a dispatched timeline");
+        assert!(state.stall_to_emit("exec-1", 9_999_999, &flat(5_000)).is_none());
+        assert!(state.persistent_stall("exec-1", 9_999_999, 5_000).is_none());
+        assert!(state.live_summary().is_none());
+
+        // The completion handler's own end-of-run marker, on either
+        // completion path (PR-producing or declared no-op), is terminal too.
+        for path in ["pr_transition", "no_op"] {
+            let mut done = state.clone();
+            let mut finalized = ev(Stage::ExecutionFinalized, Outcome::Ok, 6_000);
+            finalized.details = serde_json::json!({ "path": path });
+            done.apply(&finalized);
+            assert!(!done.is_live(), "execution_finalized({path}) must close the timeline");
+            assert!(done.stall_to_emit("exec-1", 9_999_999, &flat(5_000)).is_none());
+        }
+
+        // Sweeps that reap a run are the same shape: the execution id is
+        // finished with, and any redispatch is a fresh execution.
+        let mut reaped = TimelineState::default();
+        reaped.apply(&ev(Stage::PaneSpawned, Outcome::Ok, 1_000));
+        reaped.apply(&ev(Stage::DeadPidReconcile, Outcome::Ok, 5_000));
+        assert!(!reaped.is_live());
+        assert!(reaped.stall_to_emit("exec-1", 9_999_999, &flat(5_000)).is_none());
+    }
+
+    /// The converse guard: terminality is a property of the *event*, not
+    /// sticky on the timeline. A pipeline stage recorded after a
+    /// post-dispatch observation (startup recovery re-driving a pane for
+    /// an adopted lease, which then never reaches `pane_spawned`) is a
+    /// genuine dispatch stall and must still be reported.
+    #[test]
+    fn a_pipeline_stage_after_a_post_dispatch_observation_still_stalls() {
+        let mut state = TimelineState::default();
+        state.apply(&ev(Stage::PaneSpawned, Outcome::Ok, 1_000));
+        state.apply(&ev(Stage::TmuxAdopt, Outcome::Ok, 5_000));
+        state.apply(&ev(Stage::StartupPaneRespawn, Outcome::Ok, 6_000));
+        assert!(state.is_live());
+        let stall = state.stall_to_emit("exec-1", 12_000, &flat(5_000)).expect("stall");
+        assert_eq!(stall.stalled_stage, "startup_pane_respawn");
+        assert_eq!(stall.elapsed_in_stage_ms, 6_000);
+    }
+
+    /// A stage this build does not know is not classifiable, so it keeps
+    /// the timeline open — the loud failure mode, never "assume fine".
+    #[test]
+    fn an_unknown_stage_keeps_the_timeline_open() {
+        let mut state = TimelineState::default();
+        state.apply(&ev(Stage::PaneSpawned, Outcome::Ok, 1_000));
+        let mut unknown = ev(Stage::PaneSpawned, Outcome::Ok, 2_000);
+        unknown.stage = "stage_from_a_newer_engine".into();
+        state.apply(&unknown);
+        assert!(state.is_live());
+        let stall = state.stall_to_emit("exec-1", 12_000, &flat(5_000)).expect("stall");
+        assert_eq!(stall.stalled_stage, "stage_from_a_newer_engine");
     }
 
     #[test]

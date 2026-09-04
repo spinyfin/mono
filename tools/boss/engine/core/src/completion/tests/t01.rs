@@ -475,6 +475,8 @@ async fn pr_detected_moves_work_item_to_in_review_and_releases_lease() {
         pane,
         probes,
     } = TestHarness::new(db.clone(), detector);
+    let dispatch_events = crate::dispatch_events::RecordingDispatchEventSink::new();
+    let handler = handler.with_dispatch_events(Arc::new(dispatch_events.clone()));
     let outcome = handler.on_stop(&execution_id).await;
 
     // chore_implementation now enqueues a reviewer and holds
@@ -483,6 +485,24 @@ async fn pr_detected_moves_work_item_to_in_review_and_releases_lease() {
         matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
         "expected ReviewerEnqueued; got {outcome:?}",
     );
+    // The PR-producing completion path closes the dispatch timeline with
+    // an explicit `execution_finalized` record, same as the no-op path.
+    let timeline = dispatch_events.events_for(&execution_id).await;
+    let finalized: Vec<_> = timeline
+        .iter()
+        .filter(|e| e.stage == crate::dispatch_events::Stage::ExecutionFinalized.as_str())
+        .collect();
+    assert_eq!(
+        finalized.len(),
+        1,
+        "exactly one execution_finalized record; got {timeline:?}"
+    );
+    assert_eq!(finalized[0].outcome, "ok");
+    assert_eq!(
+        finalized[0].details["path"], "stop",
+        "the Stop-boundary PR completion names its route"
+    );
+    assert_eq!(finalized[0].details["released_lease"], true);
     let item = db.get_work_item(&chore_id).unwrap();
     match item {
         WorkItem::Chore(t) => {

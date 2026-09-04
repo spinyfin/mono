@@ -155,6 +155,29 @@ impl WorkerCompletionHandler {
             "worker teardown complete",
         );
 
+        // The dispatch timeline's explicit end-of-run marker (see
+        // `Stage::ExecutionFinalized`). Emitted here, from the one choke
+        // point every completion route runs, so the per-execution timeline
+        // records that the run ended on the PR-producing path and the
+        // declared-no-op path alike — the dispatch stage tracker observes
+        // the true terminal state rather than inferring it from silence.
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::ExecutionFinalized, DispatchOutcome::Ok, execution_id).with_details(
+                    serde_json::json!({
+                        "path": path,
+                        "pane_outcome": format!("{pane_outcome:?}"),
+                        "released_lease": lease_id.is_some(),
+                        "cube_timed_out": cube_timed_out,
+                        "release_pane_ms": pane_ms,
+                        "driver_teardown_ms": driver_ms,
+                        "cube_release_ms": cube_ms,
+                        "total_ms": started.elapsed().as_millis(),
+                    }),
+                ),
+            )
+            .await;
+
         // Explicit rather than implicit: the sweep may reclaim this slot
         // again only now that the pane is genuinely gone.
         drop(guard);
