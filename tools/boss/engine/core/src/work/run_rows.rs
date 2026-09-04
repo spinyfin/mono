@@ -178,6 +178,60 @@ impl WorkDb {
         }
     }
 
+    /// Best-effort rewrite of `work_runs.transcript_path` values that still
+    /// point into a per-run Grok or Codex home (`boss-grok-homes` /
+    /// `boss-codex-homes`). Those homes are reclaimed; the transcript bytes
+    /// live under the durable store. Returns the number of rows updated.
+    ///
+    /// Idempotent: a second pass is a no-op. Does not invent a path when the
+    /// stamped location cannot be rewritten — those rows stay as they are so
+    /// a missing transcript remains visible.
+    pub fn backfill_durable_transcript_paths(&self) -> Result<u64> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, transcript_path FROM work_runs
+             WHERE transcript_path IS NOT NULL
+               AND (instr(transcript_path, '/boss-grok-homes/') > 0
+                 OR instr(transcript_path, '/boss-codex-homes/') > 0)",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        let mut updated = 0u64;
+        for (id, path) in rows {
+            let rewritten = crate::driver::transcript_store::persistable_transcript_path(Path::new(&path));
+            let new_path = rewritten.to_string_lossy();
+            if new_path == path {
+                continue;
+            }
+            let n = conn.execute(
+                "UPDATE work_runs SET transcript_path = ?2 WHERE id = ?1 AND transcript_path = ?3",
+                params![id, new_path.as_ref(), path],
+            )?;
+            updated += n as u64;
+        }
+        Ok(updated)
+    }
+
+    /// [`Self::backfill_durable_transcript_paths`] with the log line the
+    /// home-retention sweeps emit. Failures are warned, never fatal: reclaim
+    /// must still run.
+    pub fn apply_durable_transcript_path_backfill(&self) {
+        match self.backfill_durable_transcript_paths() {
+            Ok(0) => {}
+            Ok(updated) => tracing::info!(
+                updated,
+                "rewrote work_runs.transcript_path values onto the durable transcript store"
+            ),
+            Err(err) => tracing::warn!(
+                error = %format!("{err:#}"),
+                "failed to rewrite ephemeral work_runs.transcript_path values; \
+                 grok/codex diagnosis may still see dead pointers"
+            ),
+        }
+    }
+
     /// Persist the cumulative raw-usage snapshot for the latest run of an
     /// execution.
     ///

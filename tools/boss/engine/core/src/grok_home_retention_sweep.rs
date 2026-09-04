@@ -81,6 +81,11 @@ pub async fn run_one_pass_with_policy(
     policy: &retention::GrokHomeRetentionPolicy,
     dry_run: bool,
 ) -> GrokHomeRetentionSweepOutcome {
+    // Rewrite pointers into per-run homes before those homes are deleted.
+    // Covers Grok and Codex rows: this pass also runs from `bossctl grok-homes`,
+    // which is not the engine-start path.
+    work_db.apply_durable_transcript_path_backfill();
+
     let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
 
     let executions = match work_db.list_executions_with_driver_runtime_state() {
@@ -334,6 +339,251 @@ mod tests {
         let (_dir, db) = open_db();
         let outcome = run_one_pass(&db, false).await;
         assert_eq!(outcome, GrokHomeRetentionSweepOutcome::default());
+    }
+
+    /// The path Grok records on `work_runs.transcript_path` must still
+    /// resolve after the retention sweep deletes the per-run home. The
+    /// defect was that the stamped `$GROK_HOME/sessions/...` location died
+    /// with the home while the durable copy under `executions/<id>/transcripts`
+    /// survived.
+    #[test]
+    fn recorded_grok_transcript_path_survives_home_reclaim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let homes_root = tmp.path().join("boss-grok-homes");
+        let transcripts = tmp.path().join("executions");
+        std::fs::create_dir_all(&homes_root).unwrap();
+        let _homes = boss_engine_driver::test_support::grok_homes_override(&homes_root);
+        let _store = boss_engine_driver::test_support::transcript_store_override(&transcripts);
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(recorded_grok_transcript_path_survives_home_reclaim_body());
+    }
+
+    async fn recorded_grok_transcript_path_survives_home_reclaim_body() {
+        use boss_engine_driver::grok::grok_home_for_run;
+        use boss_engine_driver::transcript_store::provision_durable_sessions;
+        use boss_engine_driver::{AgentDriver, GrokDriver};
+        use serde_json::json;
+
+        let (_dir, db) = open_db();
+        let product_id = create_test_product_with_repo(&db, "p", Some("https://github.com/test/repo")).id;
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product_id)
+                    .name("grok-transcript-reclaim".to_owned())
+                    .build(),
+            )
+            .unwrap()
+            .id;
+        let execution = db
+            .request_execution(
+                boss_protocol::RequestExecutionInput::builder()
+                    .work_item_id(chore)
+                    .build(),
+            )
+            .unwrap();
+        let (execution, run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                "/tmp/mono-agent-001",
+            )
+            .unwrap();
+
+        let grok_home = grok_home_for_run(&execution.id).unwrap();
+        std::fs::create_dir_all(&grok_home).unwrap();
+        std::fs::create_dir_all(grok_home.with_file_name("process-home")).unwrap();
+        provision_durable_sessions(&grok_home, "grok", &execution.id).unwrap();
+
+        let stamped = grok_home
+            .join("sessions")
+            .join("%2Ftmp%2Fws")
+            .join("sess-1")
+            .join("updates.jsonl");
+        std::fs::create_dir_all(stamped.parent().unwrap()).unwrap();
+        std::fs::write(&stamped, "{\"session\":\"live\"}\n").unwrap();
+
+        let recorded = GrokDriver::default()
+            .transcript_path_for_session(&json!({
+                "sessionId": "sess-1",
+                "hookEventName": "stop",
+                "transcriptPath": stamped.to_string_lossy(),
+            }))
+            .expect("Grok Stop stamps transcriptPath");
+        db.set_run_transcript_path_if_unset(&execution.id, &recorded).unwrap();
+        assert_eq!(
+            db.get_run(&run.id).unwrap().transcript_path.as_deref(),
+            Some(recorded.as_str()),
+        );
+        assert_ne!(
+            std::path::Path::new(&recorded),
+            stamped.as_path(),
+            "recorded path must not be the ephemeral GROK_HOME stamp"
+        );
+
+        let now = now_epoch();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET status = ?2, finished_at = ?3, created_at = ?3 WHERE id = ?1",
+                rusqlite::params![execution.id, "completed", (now - 40 * 24 * 60 * 60).to_string()],
+            )
+            .unwrap();
+        }
+        let state = GrokRuntimeState::builder()
+            .grok_home(grok_home.clone())
+            .process_home(grok_home.with_file_name("process-home"))
+            .auth_source_path(PathBuf::from("/tmp/source-auth.json"))
+            .session_id("11111111-1111-4111-8111-111111111111")
+            .workspace_path(PathBuf::from("/tmp/ws"))
+            .build()
+            .to_driver_runtime_state();
+        db.set_driver_runtime_state(&execution.id, Some(&state)).unwrap();
+
+        let policy = retention::GrokHomeRetentionPolicy::new(Duration::from_secs(14 * 24 * 60 * 60), u64::MAX);
+        let outcome = run_one_pass_with_policy(&db, &policy, false).await;
+        assert_eq!(outcome.errors, 0, "reclaim errors should be empty: {outcome:?}");
+        assert_eq!(
+            outcome.deleted, 1,
+            "the completed grok home must be reclaimed: {outcome:?}"
+        );
+        assert!(!stamped.exists(), "ephemeral stamp must be gone after reclaim");
+        assert!(!grok_home.exists(), "per-run GROK_HOME must be gone after reclaim");
+
+        let stored = db
+            .transcript_path_for_execution(&execution.id)
+            .unwrap()
+            .expect("transcript_path must remain recorded");
+        assert_eq!(stored, recorded);
+        assert!(
+            std::path::Path::new(&stored).is_file(),
+            "recorded transcript_path must still resolve after reclaim: {stored}"
+        );
+        assert_eq!(std::fs::read_to_string(&stored).unwrap(), "{\"session\":\"live\"}\n");
+    }
+
+    #[test]
+    fn backfill_rewrites_a_dead_grok_pointer_before_reclaim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let homes_root = tmp.path().join("boss-grok-homes");
+        let transcripts = tmp.path().join("executions");
+        std::fs::create_dir_all(&homes_root).unwrap();
+        let _homes = boss_engine_driver::test_support::grok_homes_override(&homes_root);
+        let _store = boss_engine_driver::test_support::transcript_store_override(&transcripts);
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(backfill_rewrites_a_dead_grok_pointer_before_reclaim_body());
+    }
+
+    async fn backfill_rewrites_a_dead_grok_pointer_before_reclaim_body() {
+        use boss_engine_driver::grok::grok_home_for_run;
+        use boss_engine_driver::transcript_store::{durable_sessions_dir, provision_durable_sessions};
+
+        let (_dir, db) = open_db();
+        let product_id = create_test_product_with_repo(&db, "p", Some("https://github.com/test/repo")).id;
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product_id)
+                    .name("grok-transcript-backfill".to_owned())
+                    .build(),
+            )
+            .unwrap()
+            .id;
+        let execution = db
+            .request_execution(
+                boss_protocol::RequestExecutionInput::builder()
+                    .work_item_id(chore)
+                    .build(),
+            )
+            .unwrap();
+        let (execution, _run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                "/tmp/mono-agent-001",
+            )
+            .unwrap();
+
+        let grok_home = grok_home_for_run(&execution.id).unwrap();
+        std::fs::create_dir_all(&grok_home).unwrap();
+        std::fs::create_dir_all(grok_home.with_file_name("process-home")).unwrap();
+        provision_durable_sessions(&grok_home, "grok", &execution.id).unwrap();
+
+        let stamped = grok_home
+            .join("sessions")
+            .join("%2Ftmp%2Fws")
+            .join("sess-1")
+            .join("updates.jsonl");
+        std::fs::create_dir_all(stamped.parent().unwrap()).unwrap();
+        std::fs::write(&stamped, "{\"session\":\"legacy\"}\n").unwrap();
+
+        // Simulate the pre-fix writer: persist the ephemeral stamp.
+        db.set_run_transcript_path_if_unset(&execution.id, stamped.to_str().unwrap())
+            .unwrap();
+
+        let now = now_epoch();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET status = ?2, finished_at = ?3, created_at = ?3 WHERE id = ?1",
+                rusqlite::params![execution.id, "completed", (now - 40 * 24 * 60 * 60).to_string()],
+            )
+            .unwrap();
+        }
+        let state = GrokRuntimeState::builder()
+            .grok_home(grok_home.clone())
+            .process_home(grok_home.with_file_name("process-home"))
+            .auth_source_path(PathBuf::from("/tmp/source-auth.json"))
+            .session_id("11111111-1111-4111-8111-111111111111")
+            .workspace_path(PathBuf::from("/tmp/ws"))
+            .build()
+            .to_driver_runtime_state();
+        db.set_driver_runtime_state(&execution.id, Some(&state)).unwrap();
+
+        let policy = retention::GrokHomeRetentionPolicy::new(Duration::from_secs(14 * 24 * 60 * 60), u64::MAX);
+        let outcome = run_one_pass_with_policy(&db, &policy, false).await;
+        assert_eq!(outcome.errors, 0, "{outcome:?}");
+        assert_eq!(outcome.deleted, 1, "{outcome:?}");
+        assert!(!stamped.exists(), "ephemeral stamp must be gone after reclaim");
+
+        let stored = db
+            .transcript_path_for_execution(&execution.id)
+            .unwrap()
+            .expect("backfill must have rewritten the ephemeral pointer");
+        assert_ne!(stored, stamped.to_string_lossy());
+        let expected = durable_sessions_dir(
+            &boss_engine_driver::transcript_store::transcript_store_root().unwrap(),
+            "grok",
+            &execution.id,
+        )
+        .unwrap()
+        .join("%2Ftmp%2Fws")
+        .join("sess-1")
+        .join("updates.jsonl");
+        assert_eq!(
+            std::fs::canonicalize(&stored).unwrap(),
+            std::fs::canonicalize(&expected).unwrap(),
+            "backfill must land on the durable sessions file (modulo macOS /tmp vs /private/tmp)"
+        );
+        assert!(
+            std::path::Path::new(&stored).is_file(),
+            "backfilled transcript_path must resolve after reclaim: {stored}"
+        );
+        assert_eq!(std::fs::read_to_string(&stored).unwrap(), "{\"session\":\"legacy\"}\n");
     }
 
     #[tokio::test]

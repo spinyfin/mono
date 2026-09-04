@@ -80,6 +80,12 @@ pub async fn run_one_pass_with_policy(
     policy: &retention::CodexHomeRetentionPolicy,
     dry_run: bool,
 ) -> CodexHomeRetentionSweepOutcome {
+    // Same rewrite as the Grok-home sweep: Codex live recording already
+    // watches the durable store, but historical rows can still point at a
+    // reclaimed `$TMPDIR/boss-codex-homes/...` path. `bossctl codex-homes`
+    // must not delete those homes while the DB still names them.
+    work_db.apply_durable_transcript_path_backfill();
+
     let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
 
     let executions = match work_db.list_executions_with_driver_runtime_state() {
