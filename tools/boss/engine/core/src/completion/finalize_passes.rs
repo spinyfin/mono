@@ -223,6 +223,7 @@ impl WorkerCompletionHandler {
         }
         self.finish_worker_teardown(
             &execution.id,
+            &execution.work_item_id,
             lease_id.as_deref(),
             workspace_path.as_deref().map(std::path::Path::new),
             "automation_triage",
@@ -636,6 +637,7 @@ impl WorkerCompletionHandler {
         }
         self.finish_worker_teardown(
             &execution.id,
+            &execution.work_item_id,
             lease_id.as_deref(),
             workspace_path.as_deref().map(std::path::Path::new),
             "answer_agent",
@@ -1159,6 +1161,7 @@ impl WorkerCompletionHandler {
 
         self.finish_worker_teardown(
             &execution.id,
+            &completion.execution.work_item_id,
             completion.released_lease_id.as_deref(),
             workspace_path.as_deref().map(std::path::Path::new),
             "pr_review",
@@ -1453,6 +1456,7 @@ impl WorkerCompletionHandler {
         }
         self.finish_worker_teardown(
             &execution.id,
+            &execution.work_item_id,
             lease_id.as_deref(),
             workspace_path.as_deref().map(std::path::Path::new),
             "pr_review_batch_member",

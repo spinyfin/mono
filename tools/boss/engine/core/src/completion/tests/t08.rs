@@ -233,6 +233,7 @@ async fn revision_declaring_no_changes_needed_closes_without_claiming_delivery()
         "exactly one execution_finalized record; got {timeline:?}"
     );
     assert_eq!(finalized[0].outcome, "ok");
+    assert_eq!(finalized[0].work_item_id.as_deref(), Some(revision_id.as_str()));
     assert_eq!(finalized[0].details["path"], "no_op");
     assert_eq!(finalized[0].details["released_lease"], true);
     assert!(

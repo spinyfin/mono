@@ -831,7 +831,99 @@ pub enum Stage {
     StartupPaneRespawn,
 }
 
+/// How a dispatch record participates in an execution timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimelineStageClass {
+    /// A dispatch step which replaces the tracked stage and starts its clock.
+    Pipeline,
+    /// A record made only after dispatch has handed the execution to a pane.
+    PostDispatch,
+    /// Bookkeeping about a timeline that must not replace its tracked stage.
+    Observation,
+}
+
 impl Stage {
+    /// Every stable stage name, for exhaustive schema-contract tests.
+    pub const ALL: [Stage; 62] = [
+        Stage::StatusTransition,
+        Stage::RequestRecorded,
+        Stage::WorkerClaimed,
+        Stage::HostSelected,
+        Stage::CubeRepoEnsureAttempted,
+        Stage::CubeRepoEnsured,
+        Stage::CubeRepoEnsureFailed,
+        Stage::CubeWorkspaceLeaseAttempted,
+        Stage::CubeWorkspaceLeased,
+        Stage::CubeWorkspaceLeaseFailed,
+        Stage::CubeWorkspacePositioned,
+        Stage::CubeWorkspacePositioningFailed,
+        Stage::CubeChangeCreated,
+        Stage::RunStarted,
+        Stage::PaneSpawned,
+        Stage::ExecutionCancelled,
+        Stage::SpawnFailed,
+        Stage::ExecutionFinalized,
+        Stage::StageStalled,
+        Stage::OrphanActiveRedispatch,
+        Stage::PrReviewDeadRecovery,
+        Stage::DeadPidReconcile,
+        Stage::PaneDeathReconcile,
+        Stage::DispatchDecision,
+        Stage::TransientRecovery,
+        Stage::TransientRecoveryExhausted,
+        Stage::TransientRecoveryNudge,
+        Stage::StaleWorkerReconcile,
+        Stage::PoolClaimReconcile,
+        Stage::TerminalWorkReconcile,
+        Stage::CubeLeaseHeartbeat,
+        Stage::LostWorkspaceReconcile,
+        Stage::CubeLeaseAutoReap,
+        Stage::RemoteLeaseReconcile,
+        Stage::HostDrainReconcile,
+        Stage::SpawnAckTimeout,
+        Stage::DriverStartTimeout,
+        Stage::DispatchFailureRecoveryRedispatch,
+        Stage::SpawnNack,
+        Stage::PaneDeathBeforeStart,
+        Stage::SpawnCapabilityUnhealthy,
+        Stage::SpawnCapabilityRecovered,
+        Stage::HuskPaneReconcile,
+        Stage::ExecutionLivenessReconcile,
+        Stage::DispatchPaused,
+        Stage::DispatchResumed,
+        Stage::DispatchPauseOverride,
+        Stage::DispatchPauseOverrideRefused,
+        Stage::DispatchHeldByPause,
+        Stage::BreakerRecoveryProbeAdmitted,
+        Stage::WorkspaceRecovery,
+        Stage::AutomationPreempted,
+        Stage::AbandonedBranchPrRecovery,
+        Stage::LiveWorkerReadopted,
+        Stage::RedispatchBlockedLiveProcess,
+        Stage::RedispatchGuardDeclined,
+        Stage::TmuxAdopt,
+        Stage::TmuxRefuseSkew,
+        Stage::TmuxLeakDetected,
+        Stage::TmuxTokenMismatch,
+        Stage::TmuxAdoptionOwnerConflict,
+        Stage::StartupPaneRespawn,
+    ];
+
+    /// Classify this stage's effect on an execution timeline.
+    pub fn timeline_class(self) -> TimelineStageClass {
+        match self {
+            // These events describe an execution but are not progression in
+            // its dispatch pipeline. In particular, a heartbeat must not
+            // hide a dispatch that is stuck before pane spawn, and the
+            // victim-side preemption record must not reopen a finished run.
+            Stage::DispatchDecision | Stage::AutomationPreempted | Stage::CubeLeaseHeartbeat => {
+                TimelineStageClass::Observation
+            }
+            stage if stage.is_post_dispatch() => TimelineStageClass::PostDispatch,
+            _ => TimelineStageClass::Pipeline,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Stage::StatusTransition => "status_transition",
@@ -960,11 +1052,6 @@ impl Stage {
             | Stage::BreakerRecoveryProbeAdmitted
             | Stage::StartupPaneRespawn
             | Stage::WorkspaceRecovery
-            // Emitted against both the victim and the preemptor; the
-            // preemptor's dispatch continues from here.
-            | Stage::AutomationPreempted
-            // Keyed to a live execution that may still be mid-dispatch.
-            | Stage::DispatchDecision
             // Pause / breaker bookkeeping around a dispatch that is being
             // held; the held run is still waiting on the pipeline.
             | Stage::DispatchPaused
@@ -974,10 +1061,11 @@ impl Stage {
             | Stage::DispatchHeldByPause
             | Stage::SpawnCapabilityUnhealthy
             | Stage::SpawnCapabilityRecovered
-            // Fires for every in-flight execution that holds a lease,
-            // including one still between `cube_workspace_leased` and
-            // `pane_spawned`; left on the pipeline side so a remote
-            // dispatch wedged there is not masked by its own heartbeat.
+            // These are folded as `TimelineStageClass::Observation` before
+            // terminality is considered, so they are neither pipeline nor
+            // post-dispatch events themselves.
+            | Stage::DispatchDecision
+            | Stage::AutomationPreempted
             | Stage::CubeLeaseHeartbeat
             // Not a stage at all — the detector's own flag, folded
             // separately by every reader before terminality is asked.
@@ -1805,19 +1893,7 @@ mod tests {
     /// hand-written table are two spellings of the same contract.
     #[test]
     fn from_wire_inverts_as_str() {
-        for stage in [
-            Stage::RequestRecorded,
-            Stage::CubeRepoEnsureAttempted,
-            Stage::PaneSpawned,
-            Stage::ExecutionCancelled,
-            Stage::ExecutionFinalized,
-            Stage::PrReviewDeadRecovery,
-            Stage::DeadPidReconcile,
-            Stage::AbandonedBranchPrRecovery,
-            Stage::TmuxAdopt,
-            Stage::TmuxAdoptionOwnerConflict,
-            Stage::StartupPaneRespawn,
-        ] {
+        for stage in Stage::ALL {
             assert_eq!(Stage::from_wire(stage.as_str()), Some(stage), "{}", stage.as_str());
         }
         assert_eq!(Stage::from_wire("not_a_stage"), None);
@@ -1830,34 +1906,29 @@ mod tests {
     /// 2026-09-04 false-stall incident turned on.
     #[test]
     fn post_dispatch_classification_pins_the_incident_stages() {
-        for stage in [
-            Stage::RequestRecorded,
-            Stage::WorkerClaimed,
-            Stage::CubeWorkspaceLeaseAttempted,
-            Stage::CubeChangeCreated,
-            Stage::RunStarted,
-            Stage::PaneSpawned,
-            Stage::StartupPaneRespawn,
-            Stage::WorkspaceRecovery,
-            Stage::DispatchHeldByPause,
-            Stage::StageStalled,
-        ] {
-            assert!(!stage.is_post_dispatch(), "{} is a pipeline stage", stage.as_str());
+        for stage in Stage::ALL {
+            assert!(matches!(
+                stage.timeline_class(),
+                TimelineStageClass::Pipeline | TimelineStageClass::PostDispatch | TimelineStageClass::Observation
+            ));
         }
         for stage in [
-            Stage::TmuxAdopt,
-            Stage::LiveWorkerReadopted,
-            Stage::ExecutionFinalized,
-            Stage::ExecutionCancelled,
-            Stage::DeadPidReconcile,
-            Stage::StaleWorkerReconcile,
-            Stage::TerminalWorkReconcile,
-            Stage::TransientRecovery,
-            Stage::HuskPaneReconcile,
+            Stage::DispatchDecision,
+            Stage::AutomationPreempted,
+            Stage::CubeLeaseHeartbeat,
         ] {
-            assert!(
-                stage.is_post_dispatch(),
-                "{} is a post-dispatch observation",
+            assert_eq!(
+                stage.timeline_class(),
+                TimelineStageClass::Observation,
+                "{} is a timeline observation",
+                stage.as_str()
+            );
+        }
+        for stage in [Stage::TmuxAdopt, Stage::ExecutionFinalized, Stage::DeadPidReconcile] {
+            assert_eq!(
+                stage.timeline_class(),
+                TimelineStageClass::PostDispatch,
+                "{} is post-dispatch",
                 stage.as_str()
             );
         }

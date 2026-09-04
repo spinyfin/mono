@@ -86,6 +86,7 @@ impl WorkerCompletionHandler {
     pub(super) async fn finish_worker_teardown(
         &self,
         execution_id: &str,
+        work_item_id: &str,
         lease_id: Option<&str>,
         workspace_path: Option<&Path>,
         path: &'static str,
@@ -163,8 +164,9 @@ impl WorkerCompletionHandler {
         // the true terminal state rather than inferring it from silence.
         self.dispatch_events
             .emit(
-                DispatchEvent::new(Stage::ExecutionFinalized, DispatchOutcome::Ok, execution_id).with_details(
-                    serde_json::json!({
+                DispatchEvent::new(Stage::ExecutionFinalized, DispatchOutcome::Ok, execution_id)
+                    .with_work_item(work_item_id)
+                    .with_details(serde_json::json!({
                         "path": path,
                         "pane_outcome": format!("{pane_outcome:?}"),
                         "released_lease": lease_id.is_some(),
@@ -173,8 +175,7 @@ impl WorkerCompletionHandler {
                         "driver_teardown_ms": driver_ms,
                         "cube_release_ms": cube_ms,
                         "total_ms": started.elapsed().as_millis(),
-                    }),
-                ),
+                    })),
             )
             .await;
 

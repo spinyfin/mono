@@ -21,7 +21,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use boss_dispatch_events::{DispatchEvent, Stage};
+use boss_dispatch_events::{DispatchEvent, Stage, TimelineStageClass};
 
 /// Wire stage name of the detector's own output. Folding treats these
 /// records as *flags about* a timeline rather than as steps in it — without
@@ -186,6 +186,10 @@ impl TimelineState {
     pub fn apply(&mut self, event: &DispatchEvent) {
         if event.stage == STAGE_STALLED {
             self.last_flag = Some((flagged_stage(event), flagged_ts(event)));
+            return;
+        }
+        if Stage::from_wire(&event.stage).is_some_and(|stage| stage.timeline_class() == TimelineStageClass::Observation)
+        {
             return;
         }
         self.last_real = Some(LastRealEvent {
@@ -466,6 +470,34 @@ mod tests {
         reaped.apply(&ev(Stage::DeadPidReconcile, Outcome::Ok, 5_000));
         assert!(!reaped.is_live());
         assert!(reaped.stall_to_emit("exec-1", 9_999_999, &flat(5_000)).is_none());
+
+        // Timeline observations describe a completed execution without
+        // changing the final pipeline stage or restarting its stall clock.
+        for stage in [
+            Stage::DispatchDecision,
+            Stage::AutomationPreempted,
+            Stage::CubeLeaseHeartbeat,
+        ] {
+            let mut observed = TimelineState::default();
+            observed.apply(&ev(Stage::PaneSpawned, Outcome::Ok, 1_000));
+            observed.apply(&ev(stage, Outcome::Ok, 5_000));
+            assert!(
+                !observed.is_live(),
+                "{} must not re-open a dispatched timeline",
+                stage.as_str()
+            );
+            assert!(observed.stall_to_emit("exec-1", 9_999_999, &flat(5_000)).is_none());
+        }
+    }
+
+    #[test]
+    fn timeline_observations_do_not_mask_an_earlier_pipeline_stall() {
+        let mut state = TimelineState::default();
+        state.apply(&ev(Stage::CubeWorkspaceLeased, Outcome::Ok, 1_000));
+        state.apply(&ev(Stage::CubeLeaseHeartbeat, Outcome::Ok, 9_000));
+        let stall = state.stall_to_emit("exec-1", 12_000, &flat(5_000)).expect("stall");
+        assert_eq!(stall.stalled_stage, "cube_workspace_leased");
+        assert_eq!(stall.elapsed_in_stage_ms, 11_000);
     }
 
     /// The converse guard: terminality is a property of the *event*, not

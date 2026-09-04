@@ -546,6 +546,7 @@ impl WorkerCompletionHandler {
         // while the worker process may still be alive).
         self.finish_worker_teardown(
             execution_id,
+            &completion.execution.work_item_id,
             completion.released_lease_id.as_deref(),
             workspace_path.as_deref().map(std::path::Path::new),
             source,

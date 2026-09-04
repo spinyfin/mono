@@ -498,6 +498,7 @@ async fn pr_detected_moves_work_item_to_in_review_and_releases_lease() {
         "exactly one execution_finalized record; got {timeline:?}"
     );
     assert_eq!(finalized[0].outcome, "ok");
+    assert_eq!(finalized[0].work_item_id.as_deref(), Some(chore_id.as_str()));
     assert_eq!(
         finalized[0].details["path"], "stop",
         "the Stop-boundary PR completion names its route"
