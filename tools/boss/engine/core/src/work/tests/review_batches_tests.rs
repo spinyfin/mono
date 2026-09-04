@@ -1275,6 +1275,64 @@ fn are_same_review_batch_leaves_rejects_cross_batch_and_memberless_pairs() {
     );
 }
 
+/// A batch still live for the current target — one leaf settled with an
+/// informative verdict, two still outstanding — must keep reporting
+/// `ExistingBatch` for that exact target, never `AlreadyReviewed`. The
+/// already-reviewed check runs after the `ExistingBatch` lookup precisely so
+/// a live batch always wins over a partial verdict: reporting
+/// `AlreadyReviewed` here would tell the caller "this head is settled" while
+/// quorum is still pending.
+#[test]
+fn create_pre_merge_review_batch_prefers_existing_batch_over_a_partial_verdict() {
+    let db = WorkDb::open(temp_db_path("review-batch-existing-over-already-reviewed")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let input = batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge);
+
+    let batch = match db
+        .create_pre_merge_review_batch(input.clone(), "https://github.com/example/repo")
+        .unwrap()
+    {
+        ReviewBatchDispatch::Created { batch, .. } => batch,
+        other => panic!("expected a newly-created review batch, got {other:?}"),
+    };
+
+    // One leaf settles with an informative verdict for this exact target —
+    // recorded against the cycle root, as a real batch leaf's verdict is —
+    // while the batch itself is still non-terminal (two leaves outstanding).
+    let leaf_execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    WorkDb::insert_review_verdict_in_tx(
+        &db.connect().unwrap(),
+        &leaf_execution.id,
+        &cycle_root.id,
+        &ReviewVerdictInput {
+            head_sha: Some("head-sha".to_owned()),
+            findings_count: 0,
+            revision_warranted: false,
+            gate_outcome: REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+        },
+    )
+    .unwrap();
+
+    match db
+        .create_pre_merge_review_batch(input, "https://github.com/example/repo")
+        .unwrap()
+    {
+        ReviewBatchDispatch::ExistingBatch { batch: existing, .. } => {
+            assert_eq!(existing.id, batch.id, "must reuse the still-live batch for this target");
+        }
+        other => panic!("a live batch for this exact target must win over a partial verdict, got {other:?}"),
+    }
+}
+
 /// The flag-off / non-batch path: `create_pre_merge_review_batch` must
 /// treat a genuine legacy (non-batch) non-terminal `pr_review` execution as
 /// owning the target and refuse to create a batch alongside it: a target
@@ -1544,5 +1602,409 @@ fn moved_head_fails_the_supervising_batch_instead_of_retrying() {
     assert!(
         !db.fail_review_batch_for_moved_head(&dead_id, "other-head").unwrap(),
         "a second call against an already-failed batch is a no-op"
+    );
+}
+
+fn post_merge_batch_input(cycle_root_id: String, merge_sha: &str) -> ReviewBatchCreateInput {
+    ReviewBatchCreateInput::builder()
+        .cycle_root_id(cycle_root_id)
+        .base_sha("base-sha")
+        .classification(classification())
+        .phase(ReviewBatchPhase::PostMerge)
+        .pr_number(42)
+        .pr_url("https://github.com/example/repo/pull/42")
+        .target_sha(merge_sha)
+        .merge_sha(merge_sha)
+        .build()
+}
+
+/// The review pool's 16-unit reservation capacity divided by the four-unit
+/// pre-merge weight admits exactly four concurrent pre-merge batches and
+/// denies a fifth — the property that stops a fifth wave of leaves from
+/// occupying every slot just as earlier batches become ready to collate.
+#[test]
+fn can_admit_review_batch_allows_four_concurrent_pre_merge_batches_and_denies_a_fifth() {
+    let db = WorkDb::open(temp_db_path("review-pool-admission-pre-merge")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id.clone(), "review target");
+
+    for i in 0..4 {
+        assert!(
+            db.can_admit_review_batch(ReviewBatchPhase::PreMerge).unwrap(),
+            "batch {i} should still be admitted below the four-batch cap"
+        );
+        db.create_review_batch(
+            batch_input(
+                cycle_root.id.clone(),
+                &format!("head-sha-{i}"),
+                ReviewBatchPhase::PreMerge,
+            ),
+            &[member(ReviewBatchMemberRole::ClaudeReviewer, None)],
+        )
+        .unwrap();
+    }
+
+    assert!(
+        !db.can_admit_review_batch(ReviewBatchPhase::PreMerge).unwrap(),
+        "a fifth concurrent pre-merge batch must be denied at the 16-unit cap"
+    );
+}
+
+/// Pre-merge admission is checked against pre-merge reservations alone, so
+/// it never has to wait on post-merge safety-net work — this is the
+/// design's "pre-merge work has priority over post-merge safety-net work".
+#[test]
+fn pre_merge_admission_ignores_post_merge_reservations_giving_it_priority() {
+    let db = WorkDb::open(temp_db_path("review-pool-admission-priority")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id.clone(), "review target");
+
+    // Reserve all 16 of the pool's units with post-merge batches alone.
+    for i in 0..16 {
+        db.create_review_batch(
+            post_merge_batch_input(cycle_root.id.clone(), &format!("merge-sha-{i}")),
+            &[member(ReviewBatchMemberRole::PostMergeReviewer, None)],
+        )
+        .unwrap();
+    }
+
+    // Post-merge itself is now denied: 16 + 1 > 16.
+    assert!(!db.can_admit_review_batch(ReviewBatchPhase::PostMerge).unwrap());
+
+    // But pre-merge is unaffected: its check only looks at pre-merge
+    // reservations (currently zero), so it is still admitted even though
+    // the pool's raw remaining capacity (0 units) is far below the four
+    // units a pre-merge batch reserves.
+    assert!(db.can_admit_review_batch(ReviewBatchPhase::PreMerge).unwrap());
+}
+
+/// Post-merge admission, unlike pre-merge, is checked against BOTH
+/// reservations — it only starts when spare capacity remains after every
+/// open pre-merge batch's block.
+#[test]
+fn post_merge_admission_accounts_for_pre_merge_reservations() {
+    let db = WorkDb::open(temp_db_path("review-pool-admission-post-merge")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id.clone(), "review target");
+
+    for i in 0..4 {
+        db.create_review_batch(
+            batch_input(
+                cycle_root.id.clone(),
+                &format!("head-sha-{i}"),
+                ReviewBatchPhase::PreMerge,
+            ),
+            &[member(ReviewBatchMemberRole::ClaudeReviewer, None)],
+        )
+        .unwrap();
+    }
+
+    assert!(
+        !db.can_admit_review_batch(ReviewBatchPhase::PostMerge).unwrap(),
+        "post-merge must be denied once pre-merge batches alone reserve the full 16 units"
+    );
+}
+
+/// A batch's reservation lasts through its whole non-terminal lifetime and
+/// is released only once it reaches `completed` or `failed` — not merely
+/// once its leaves have reported.
+#[test]
+fn a_completed_batch_releases_its_reservation() {
+    let db = WorkDb::open(temp_db_path("review-pool-admission-release")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id.clone(), "review target");
+
+    let mut batches = Vec::new();
+    for i in 0..4 {
+        let (batch, _) = db
+            .create_review_batch(
+                batch_input(
+                    cycle_root.id.clone(),
+                    &format!("head-sha-{i}"),
+                    ReviewBatchPhase::PreMerge,
+                ),
+                &[member(ReviewBatchMemberRole::ClaudeReviewer, None)],
+            )
+            .unwrap();
+        batches.push(batch);
+    }
+    assert!(!db.can_admit_review_batch(ReviewBatchPhase::PreMerge).unwrap());
+
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_batches SET status = 'completed' WHERE id = ?1",
+            rusqlite::params![batches[0].id],
+        )
+        .unwrap();
+
+    assert!(
+        db.can_admit_review_batch(ReviewBatchPhase::PreMerge).unwrap(),
+        "completing one batch must free its four-unit reservation for a new one"
+    );
+}
+
+/// The production entry point (`create_pre_merge_review_batch`) defers
+/// rather than creating a batch once the pool is at capacity, and leaves no
+/// batch or member execution rows behind.
+#[test]
+fn create_pre_merge_review_batch_defers_when_the_pool_is_at_capacity() {
+    let db = WorkDb::open(temp_db_path("review-pool-admission-deferred-dispatch")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id.clone(), "review target");
+
+    for i in 0..4 {
+        db.create_review_batch(
+            batch_input(
+                cycle_root.id.clone(),
+                &format!("head-sha-{i}"),
+                ReviewBatchPhase::PreMerge,
+            ),
+            &[member(ReviewBatchMemberRole::ClaudeReviewer, None)],
+        )
+        .unwrap();
+    }
+
+    let deferred_cycle_root = create_test_chore_manual(&db, product.id, "another review target");
+    match db
+        .create_pre_merge_review_batch(
+            batch_input(
+                deferred_cycle_root.id.clone(),
+                "new-head-sha",
+                ReviewBatchPhase::PreMerge,
+            ),
+            "https://github.com/example/repo",
+        )
+        .unwrap()
+    {
+        ReviewBatchDispatch::AdmissionDeferred => {}
+        other => panic!("expected AdmissionDeferred once the pool is at capacity, got {other:?}"),
+    }
+    assert!(
+        db.review_batch_for_target(&deferred_cycle_root.id, ReviewBatchPhase::PreMerge, "new-head-sha")
+            .unwrap()
+            .is_none(),
+        "a deferred admission must not create a batch row"
+    );
+}
+
+/// Admission capacity tracks the configured review-pool size, not the
+/// compile-time hard cap: a 4-slot pool admits one four-unit pre-merge
+/// batch and denies a second, so leaves cannot starve their supervisor.
+#[test]
+fn admission_capacity_follows_the_configured_review_pool_size() {
+    let db = WorkDb::open(temp_db_path("review-pool-configured-size")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id.clone(), "review target");
+
+    assert!(
+        db.can_admit_review_batch_for_pool(ReviewBatchPhase::PreMerge, 4)
+            .unwrap()
+    );
+    db.create_review_batch(
+        batch_input(cycle_root.id.clone(), "head-sha-0", ReviewBatchPhase::PreMerge),
+        &[member(ReviewBatchMemberRole::ClaudeReviewer, None)],
+    )
+    .unwrap();
+    assert!(
+        !db.can_admit_review_batch_for_pool(ReviewBatchPhase::PreMerge, 4)
+            .unwrap(),
+        "a 4-slot pool is filled by one pre-merge batch"
+    );
+}
+
+/// A `BOSS_REVIEW_POOL_SIZE` below the reservation weight of one pre-merge
+/// batch must not deadlock admission: capacity is floored so an empty pool
+/// can still admit its first batch regardless of how small the configured
+/// pool is.
+#[test]
+fn admission_capacity_is_floored_so_a_small_pool_still_admits_on_an_empty_pool() {
+    let db = WorkDb::open(temp_db_path("review-pool-small-configured-size")).unwrap();
+    for pool_size in [1_usize, 2, 3] {
+        assert!(
+            db.can_admit_review_batch_for_pool(ReviewBatchPhase::PreMerge, pool_size)
+                .unwrap(),
+            "pool size {pool_size} must admit the first batch on an empty pool rather than deferring forever"
+        );
+    }
+}
+
+/// A batch whose cycle root is deleted or already terminal does not hold a
+/// reservation, so it cannot block every other product's pre-merge review.
+#[test]
+fn reserved_count_excludes_batches_whose_cycle_root_is_gone() {
+    let db = WorkDb::open(temp_db_path("review-pool-dead-root")).unwrap();
+    let product = create_test_product(&db);
+    let mut occupying = Vec::new();
+    for i in 0..4 {
+        let cycle_root = create_test_chore_manual(&db, product.id.clone(), format!("occupant {i}"));
+        let (batch, _) = db
+            .create_review_batch(
+                batch_input(
+                    cycle_root.id.clone(),
+                    &format!("head-sha-{i}"),
+                    ReviewBatchPhase::PreMerge,
+                ),
+                &[member(ReviewBatchMemberRole::ClaudeReviewer, None)],
+            )
+            .unwrap();
+        occupying.push((cycle_root.id, batch.id));
+    }
+    assert!(!db.can_admit_review_batch(ReviewBatchPhase::PreMerge).unwrap());
+
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET deleted_at = ?2 WHERE id = ?1",
+            rusqlite::params![occupying[0].0, now_string()],
+        )
+        .unwrap();
+    assert!(
+        db.can_admit_review_batch(ReviewBatchPhase::PreMerge).unwrap(),
+        "a deleted cycle root must release its reservation without waiting for quorum"
+    );
+}
+
+/// The reaper fails a collecting batch whose cycle root is gone so the row
+/// itself stops occupying the pool, and files an operator-visible item.
+#[test]
+fn reap_inert_review_batches_fails_batches_with_a_deleted_cycle_root() {
+    let db = WorkDb::open(temp_db_path("review-pool-reap-deleted")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id.clone(), "gone");
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member(ReviewBatchMemberRole::ClaudeReviewer, None)],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET deleted_at = ?2 WHERE id = ?1",
+            rusqlite::params![cycle_root.id, now_string()],
+        )
+        .unwrap();
+
+    let reaped = db
+        .reap_inert_review_batches(crate::work::REVIEW_BATCH_STALE_SECS)
+        .unwrap();
+    assert_eq!(reaped, vec![batch.id.clone()]);
+    let stored = db.review_batch(&batch.id).unwrap().unwrap();
+    assert_eq!(stored.status, ReviewBatchStatus::Failed);
+    assert!(
+        db.can_admit_review_batch(ReviewBatchPhase::PreMerge).unwrap(),
+        "reaping a deleted-root batch must release its reservation"
+    );
+}
+
+/// Reaping a batch whose cycle root is gone must terminalize any leaf still
+/// physically running, not just release the reservation — otherwise up to
+/// four review-pool slots stay occupied by a batch admission no longer
+/// counts against, and the leaf later settles silently against a `failed`
+/// batch.
+#[tokio::test]
+async fn reap_inert_review_batches_terminalizes_running_members_of_a_deleted_cycle_root() {
+    let db = WorkDb::open(temp_db_path("review-pool-reap-deleted-frees-slots")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "gone-but-leaves-running");
+    let running_execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member(
+                ReviewBatchMemberRole::ClaudeReviewer,
+                Some(running_execution.id.clone()),
+            )],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET deleted_at = ?2 WHERE id = ?1",
+            rusqlite::params![cycle_root.id, now_string()],
+        )
+        .unwrap();
+
+    let mut sub = db.event_bus().subscribe(boss_event_bus::TopicFilter::kind(
+        boss_event_bus::EventKind::ExecutionTerminal,
+    ));
+
+    let reaped = db
+        .reap_inert_review_batches(crate::work::REVIEW_BATCH_STALE_SECS)
+        .unwrap();
+    assert_eq!(reaped, vec![batch.id.clone()]);
+
+    let event = sub
+        .recv()
+        .await
+        .expect("ExecutionTerminal must be published for the leaf the reaper abandons");
+    assert_eq!(
+        event,
+        boss_event_bus::Event::ExecutionTerminal {
+            execution_id: running_execution.id.clone(),
+            task_id: cycle_root.id.clone(),
+            host_id: "local".to_owned(),
+            pool_claim: None,
+        },
+        "the reaper's raw abandon UPDATE must go through the same execution-terminal publish \
+         path as every other terminalizing writer, so the pane/worker teardown listening for \
+         that event actually runs"
+    );
+
+    let terminalized = db.get_execution(&running_execution.id).unwrap();
+    assert_eq!(
+        terminalized.status,
+        ExecutionStatus::Abandoned,
+        "a leaf still running when its cycle root disappears must be terminalized so its \
+         review-pool slot is actually freed"
+    );
+    let members = db.review_batch_members(&batch.id).unwrap();
+    assert_eq!(
+        members[0].status,
+        ReviewBatchMemberStatus::Failed,
+        "the member row must be marked failed alongside its execution"
+    );
+}
+
+/// A still-visible terminal cycle root gets an attention item when its
+/// wedged batch is reaped.
+#[test]
+fn reap_inert_review_batches_files_attention_on_a_done_cycle_root() {
+    let db = WorkDb::open(temp_db_path("review-pool-reap-done")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id.clone(), "done");
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member(ReviewBatchMemberRole::ClaudeReviewer, None)],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'done' WHERE id = ?1",
+            rusqlite::params![cycle_root.id],
+        )
+        .unwrap();
+
+    let reaped = db
+        .reap_inert_review_batches(crate::work::REVIEW_BATCH_STALE_SECS)
+        .unwrap();
+    assert_eq!(reaped, vec![batch.id.clone()]);
+    let attentions = db.list_attention_items_for_work_item(&cycle_root.id).unwrap();
+    assert!(
+        attentions
+            .iter()
+            .any(|item| item.kind == crate::work::PR_REVIEW_BATCH_STALE_ATTENTION_KIND),
+        "reaping a still-visible cycle root must file an attention item; got {attentions:?}"
     );
 }

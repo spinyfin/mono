@@ -452,6 +452,60 @@ fn advance_refuses_without_pr_or_when_deleted() {
     );
 }
 
+/// A revision task's own id has no `pr_review` execution — a batch leaf's
+/// verdict is keyed by the review-cycle root, not the task — so the plain
+/// `advance_pending_review_task_to_in_review` (verdict source == task id)
+/// never matches and the task is stuck in `active` forever. Passing the
+/// cycle root as the verdict source finds it.
+#[test]
+fn advance_with_verdict_source_finds_a_verdict_keyed_by_the_cycle_root() {
+    let db = WorkDb::open(temp_db_path("advance-verdict-source-cycle-root")).unwrap();
+    let root_id = active_chore_with_pr(&db, "advance-verdict-root", "https://github.com/spinyfin/mono/pull/905");
+    // Simulate a revision task distinct from its cycle root: a second
+    // active row with a pr_url, whose review verdict lives on `root_id`.
+    let revision_id = active_chore_with_pr(
+        &db,
+        "advance-verdict-revision",
+        "https://github.com/spinyfin/mono/pull/905",
+    );
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(root_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    WorkDb::insert_review_verdict_in_tx(
+        &db.connect().unwrap(),
+        &execution.id,
+        &root_id,
+        &ReviewVerdictInput {
+            head_sha: Some("reviewed-head".to_owned()),
+            findings_count: 0,
+            revision_warranted: false,
+            gate_outcome: REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+        },
+    )
+    .unwrap();
+
+    assert!(
+        !db.advance_pending_review_task_to_in_review(&revision_id).unwrap(),
+        "the task-keyed lookup must not find a verdict recorded against a different cycle root"
+    );
+    assert_eq!(task(&db, &revision_id).status, TaskStatus::Active);
+
+    let advanced = db
+        .advance_pending_review_task_to_in_review_with_verdict_source(&revision_id, &root_id)
+        .unwrap();
+    assert!(
+        advanced,
+        "passing the cycle root as the verdict source must find the batch-leaf verdict"
+    );
+    assert_eq!(task(&db, &revision_id).status, TaskStatus::InReview);
+}
+
 // ── get_task_review_cycle_state / increment_task_review_cycle ────────────────
 
 /// A brand-new task starts at cycle 0 with no last-reviewed sha.

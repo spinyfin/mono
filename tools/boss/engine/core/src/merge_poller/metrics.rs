@@ -130,6 +130,31 @@ crate::register_gauge!(
     "merge_poller.adaptive_tracked",
     "PRs currently holding an adaptive poll slot (those whose tier polls faster than the full sweep)."
 );
+crate::register_gauge!(
+    REVIEW_POOL_RESERVED_UNITS,
+    "review_pool.reserved_units",
+    "Weighted reservation units currently held by non-terminal review batches with a live cycle root."
+);
+crate::register_gauge!(
+    REVIEW_POOL_DEFERRED_PRE_MERGE,
+    "review_pool.deferred_pre_merge",
+    "PendingReview tasks waiting for a review-pool reservation (no live pre-merge batch)."
+);
+crate::register_counter!(
+    REVIEW_ADMISSION_DEFERRED,
+    "review_pool.admission_deferred",
+    "Pre-merge review admissions deferred because the pool was at reservation capacity."
+);
+crate::register_counter!(
+    REVIEW_ADMISSION_RECOVERED,
+    "review_pool.admission_recovered",
+    "Previously deferred pre-merge reviews that were admitted on a later sweep."
+);
+crate::register_counter!(
+    REVIEW_BATCH_REAPED,
+    "review_pool.batch_reaped",
+    "Non-terminal review batches failed because their cycle root is gone or members went inert."
+);
 
 /// Record one batched adaptive reconcile of `size` PRs.
 ///
@@ -191,6 +216,11 @@ pub fn init(registry: &Registry) {
     registry.register_counter(&ADAPTIVE_BATCHES);
     registry.register_counter(&ADAPTIVE_PRS_RECONCILED);
     registry.register_gauge(&ADAPTIVE_TRACKED);
+    registry.register_gauge(&REVIEW_POOL_RESERVED_UNITS);
+    registry.register_gauge(&REVIEW_POOL_DEFERRED_PRE_MERGE);
+    registry.register_counter(&REVIEW_ADMISSION_DEFERRED);
+    registry.register_counter(&REVIEW_ADMISSION_RECOVERED);
+    registry.register_counter(&REVIEW_BATCH_REAPED);
 }
 
 // ── GitHub API quota budget ─────────────────────────────────────────────

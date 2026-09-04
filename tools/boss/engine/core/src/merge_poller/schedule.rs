@@ -509,6 +509,11 @@ pub(crate) fn record_sweep_metrics(metrics: &Registry, outcome: &SweepOutcome) {
     WORKER_STOPPED_ON_REVIEW.inc_by(metrics, outcome.worker_stopped_on_review as u64);
     COMMENTS_REOPENED.inc_by(metrics, outcome.comments_reopened as u64);
     TRUNK_EPISODES_ADOPTED.inc_by(metrics, outcome.trunk_episodes_adopted as u64);
+    REVIEW_ADMISSION_RECOVERED.inc_by(metrics, outcome.review_admission_recovered as u64);
+    REVIEW_ADMISSION_DEFERRED.inc_by(metrics, outcome.review_admission_still_deferred as u64);
+    REVIEW_BATCH_REAPED.inc_by(metrics, outcome.review_batches_reaped as u64);
+    REVIEW_POOL_RESERVED_UNITS.set(metrics, outcome.reserved_review_units);
+    REVIEW_POOL_DEFERRED_PRE_MERGE.set(metrics, outcome.deferred_pre_merge_count as i64);
 }
 
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`.

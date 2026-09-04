@@ -56,6 +56,8 @@ impl WorkerCompletionHandler {
             structured_output_dir: crate::structured_output::default_dir(),
             host_adapter_provider: Arc::new(std::sync::RwLock::new(None)),
             now_fn: Arc::new(std::time::Instant::now),
+            review_batch_enqueuer: Arc::new(GhReviewBatchEnqueuer),
+            review_pool_size: crate::coordinator::DEFAULT_REVIEW_POOL_SIZE,
         }
     }
 
@@ -313,12 +315,38 @@ impl WorkerCompletionHandler {
         self
     }
 
+    /// Override the pre-merge review-batch enqueuer. Tests inject a stub
+    /// that skips `gh pr view` so admission deferral can be driven through
+    /// [`Self::finalize_pr_transition`] hermetically.
+    #[cfg(test)]
+    pub(crate) fn with_review_batch_enqueuer(mut self, enqueuer: Arc<dyn ReviewBatchEnqueuer>) -> Self {
+        self.review_batch_enqueuer = enqueuer;
+        self
+    }
+
     /// Whether the rung-1 engine-direct mechanical rebase is enabled on the
     /// conflict-watch path. Read by the merge poller's conflict sweep to
     /// decide whether to hand `on_conflict_detected` a live `CubeClient` for
     /// the escalation ladder. Default OFF (see the flag registry).
     pub fn mechanical_rebase_enabled(&self) -> bool {
         self.feature_flags.is_enabled("conflict_ladder_mechanical_rebase")
+    }
+
+    /// Whether each eligible PR is dispatched as a three-leaf review batch.
+    pub fn review_batch_fanout_enabled(&self) -> bool {
+        self.feature_flags.is_enabled("review_batch_fanout")
+    }
+
+    /// Configured review-pool size used as weighted-admission capacity.
+    pub fn review_pool_size(&self) -> usize {
+        self.review_pool_size
+    }
+
+    /// Wire the live `BOSS_REVIEW_POOL_SIZE` / `WorkConfig.review_pool_size`
+    /// into admission accounting.
+    pub fn with_review_pool_size(mut self, size: usize) -> Self {
+        self.review_pool_size = size.min(crate::coordinator::MAX_REVIEW_POOL_SIZE);
+        self
     }
 
     /// Whether the speculative conflict-prediction sweep is enabled (Layer 4).

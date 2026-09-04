@@ -7,10 +7,10 @@
 //! on.
 //!
 //! Slot ranges are disjoint across pools (interactive 1-16,
-//! automation 17-24, review 25-32), so a name is unique across every
+//! automation 17-24, review 25-40), so a name is unique across every
 //! *concurrently live* worker — regardless of pool — as long as the
 //! roster has at least as many entries as the highest live slot id.
-//! The roster is sized to the full 32-slot space precisely so no two
+//! The roster is sized to the full 40-slot space precisely so no two
 //! live workers can ever be handed the same name; growing the slot
 //! space requires growing the roster to match, not relying on the
 //! modulo wrap (which only exists as a defensive fallback and would
@@ -46,41 +46,49 @@ pub const REMOTE_SLOT_BASE: u8 = 200;
 /// Slot id → crew name. Order is load-bearing: slot 1 maps to
 /// `ROSTER[0]`, slot 2 to `ROSTER[1]`, etc. New names should be
 /// appended, never inserted. Must have at least one entry per live
-/// slot (currently 32: interactive 1-16, automation 17-24, review
-/// 25-32) so every concurrently live worker gets a distinct name.
+/// slot (currently 40: interactive 1-16, automation 17-24, review
+/// 25-40) so every concurrently live worker gets a distinct name.
 pub const ROSTER: &[&str] = &[
-    "Riker",    // TNG
-    "Data",     // TNG
-    "Worf",     // TNG / DS9
-    "La Forge", // TNG
-    "Troi",     // TNG
-    "Crusher",  // TNG
-    "Yar",      // TNG
-    "O'Brien",  // TNG / DS9
-    "Kira",     // DS9
-    "Dax",      // DS9
-    "Bashir",   // DS9
-    "Odo",      // DS9
-    "Quark",    // DS9
-    "Rom",      // DS9
-    "Nog",      // DS9
-    "Garak",    // DS9
-    "Ezri",     // DS9
-    "Chakotay", // VOY
-    "Tuvok",    // VOY
-    "Paris",    // VOY
-    "Kim",      // VOY
-    "Torres",   // VOY
-    "Neelix",   // VOY
-    "Kes",      // VOY
-    "Seven",    // VOY
-    "Doctor",   // VOY
-    "Guinan",   // TNG
-    "Pulaski",  // TNG
-    "Barclay",  // TNG
-    "Tucker",   // ENT
-    "Reed",     // ENT
-    "Sato",     // ENT
+    "Riker",      // TNG
+    "Data",       // TNG
+    "Worf",       // TNG / DS9
+    "La Forge",   // TNG
+    "Troi",       // TNG
+    "Crusher",    // TNG
+    "Yar",        // TNG
+    "O'Brien",    // TNG / DS9
+    "Kira",       // DS9
+    "Dax",        // DS9
+    "Bashir",     // DS9
+    "Odo",        // DS9
+    "Quark",      // DS9
+    "Rom",        // DS9
+    "Nog",        // DS9
+    "Garak",      // DS9
+    "Ezri",       // DS9
+    "Chakotay",   // VOY
+    "Tuvok",      // VOY
+    "Paris",      // VOY
+    "Kim",        // VOY
+    "Torres",     // VOY
+    "Neelix",     // VOY
+    "Kes",        // VOY
+    "Seven",      // VOY
+    "Doctor",     // VOY
+    "Guinan",     // TNG
+    "Pulaski",    // TNG
+    "Barclay",    // TNG
+    "Tucker",     // ENT
+    "Reed",       // ENT
+    "Sato",       // ENT
+    "T'Pol",      // ENT
+    "Phlox",      // ENT
+    "Mayweather", // ENT
+    "Vash",       // TNG
+    "Ro",         // TNG / DS9
+    "Shelby",     // TNG
+    "Brahms",     // TNG
+    "Sela",       // TNG
 ];
 
 /// Display name for a 1-based slot id. Falls back to `"Worker N"` for
@@ -138,12 +146,12 @@ mod tests {
     }
 
     #[test]
-    fn roster_covers_full_32_slot_space_uniquely() {
-        // Interactive 1-16, automation 17-24, review 25-32: every live
+    fn roster_covers_full_40_slot_space_uniquely() {
+        // Interactive 1-16, automation 17-24, review 25-40: every live
         // slot across every pool must resolve to a distinct name.
-        assert!(ROSTER.len() >= 32, "roster must cover all 32 live slots");
-        let names: std::collections::HashSet<_> = (1..=32u8).map(name_for_slot).collect();
-        assert_eq!(names.len(), 32, "slots 1..=32 must map to distinct names");
+        assert!(ROSTER.len() >= 40, "roster must cover all 40 live slots");
+        let names: std::collections::HashSet<_> = (1..=40u8).map(name_for_slot).collect();
+        assert_eq!(names.len(), 40, "slots 1..=40 must map to distinct names");
     }
 
     #[test]
@@ -153,7 +161,7 @@ mod tests {
         // live interactive worker could be handed the same name. The
         // "(Remote)" suffix must keep every remote-range name disjoint
         // from every local-pool name, for the whole remote range.
-        let local_names: std::collections::HashSet<_> = (1..=32u8).map(name_for_slot).collect();
+        let local_names: std::collections::HashSet<_> = (1..=40u8).map(name_for_slot).collect();
         for slot_id in (REMOTE_SLOT_BASE..=u8::MAX).step_by(1) {
             let remote_name = name_for_slot(slot_id);
             assert!(
@@ -171,9 +179,46 @@ mod tests {
         // If this test fails, either that edit forgot to mirror the
         // change here, or this edit forgot to mirror it there.
         const SWIFT_ROSTER: &[&str] = &[
-            "Riker", "Data", "Worf", "La Forge", "Troi", "Crusher", "Yar", "O'Brien", "Kira", "Dax", "Bashir", "Odo",
-            "Quark", "Rom", "Nog", "Garak", "Ezri", "Chakotay", "Tuvok", "Paris", "Kim", "Torres", "Neelix", "Kes",
-            "Seven", "Doctor", "Guinan", "Pulaski", "Barclay", "Tucker", "Reed", "Sato",
+            "Riker",
+            "Data",
+            "Worf",
+            "La Forge",
+            "Troi",
+            "Crusher",
+            "Yar",
+            "O'Brien",
+            "Kira",
+            "Dax",
+            "Bashir",
+            "Odo",
+            "Quark",
+            "Rom",
+            "Nog",
+            "Garak",
+            "Ezri",
+            "Chakotay",
+            "Tuvok",
+            "Paris",
+            "Kim",
+            "Torres",
+            "Neelix",
+            "Kes",
+            "Seven",
+            "Doctor",
+            "Guinan",
+            "Pulaski",
+            "Barclay",
+            "Tucker",
+            "Reed",
+            "Sato",
+            "T'Pol",
+            "Phlox",
+            "Mayweather",
+            "Vash",
+            "Ro",
+            "Shelby",
+            "Brahms",
+            "Sela",
         ];
         assert_eq!(
             ROSTER, SWIFT_ROSTER,

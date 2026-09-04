@@ -1501,7 +1501,8 @@ impl ServerState {
                 ),
             ))
             .with_hold_registry(hold_registry)
-            .with_teardown_registry(teardown_registry),
+            .with_teardown_registry(teardown_registry)
+            .with_review_pool_size(cfg.work.review_pool_size),
         );
 
         // Build PaneSpawnRunner up front, hand its Weak<ServerState>

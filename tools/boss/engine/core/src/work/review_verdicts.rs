@@ -183,6 +183,26 @@ fn map_review_verdict(row: &rusqlite::Row) -> rusqlite::Result<ReviewVerdict> {
     })
 }
 
+/// The most recently recorded review verdict for `work_item_id`, or `None`
+/// if no `pr_review` pass has ever completed for it. Shared by
+/// [`WorkDb::latest_review_verdict`] and
+/// [`WorkDb::already_reviewed_at_head_in_tx`] so both read the same query
+/// against either a fresh connection or an already-open transaction.
+fn latest_review_verdict_in(conn: &rusqlite::Connection, work_item_id: &str) -> Result<Option<ReviewVerdict>> {
+    conn.query_row(
+        "SELECT id, execution_id, work_item_id, head_sha, findings_count,
+                revision_warranted, gate_outcome, revision_task_id, created_at
+         FROM pr_review_verdicts
+         WHERE work_item_id = ?1
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+        params![work_item_id],
+        map_review_verdict,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 impl WorkDb {
     /// Insert the durable per-pass review verdict row for `execution_id`,
     /// against an already-open transaction. Called from
@@ -297,18 +317,22 @@ impl WorkDb {
     /// "unknown" — never infer a clean verdict from its absence.
     pub fn latest_review_verdict(&self, work_item_id: &str) -> Result<Option<ReviewVerdict>> {
         let conn = self.connect()?;
-        conn.query_row(
-            "SELECT id, execution_id, work_item_id, head_sha, findings_count,
-                    revision_warranted, gate_outcome, revision_task_id, created_at
-             FROM pr_review_verdicts
-             WHERE work_item_id = ?1
-             ORDER BY created_at DESC, id DESC
-             LIMIT 1",
-            params![work_item_id],
-            map_review_verdict,
-        )
-        .optional()
-        .map_err(Into::into)
+        latest_review_verdict_in(&conn, work_item_id)
+    }
+
+    /// True when `target_sha` already has a durable, informative `pr_review`
+    /// verdict recorded against `work_item_id` — read inside `tx` so callers
+    /// that must answer this question before deciding whether to admit a new
+    /// batch (e.g. [`Self::create_pre_merge_review_batch_for_pool`]) see a
+    /// consistent snapshot with the rest of that transaction.
+    pub(crate) fn already_reviewed_at_head_in_tx(
+        tx: &rusqlite::Connection,
+        work_item_id: &str,
+        target_sha: &str,
+    ) -> Result<bool> {
+        Ok(latest_review_verdict_in(tx, work_item_id)?.is_some_and(|verdict| {
+            is_informative_gate_outcome(&verdict.gate_outcome) && verdict.head_sha.as_deref() == Some(target_sha)
+        }))
     }
 
     /// The review verdict recorded for a specific execution, if any. Used by

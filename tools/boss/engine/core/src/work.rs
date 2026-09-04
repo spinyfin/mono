@@ -575,11 +575,13 @@ pub(crate) use products_design::{
 };
 // Only the unit-test suite (and the resolver itself) call this directly;
 // production attach sites go through `attach_task_doc_link_state`.
+pub use pr_flow::DeferredReviewAdmissionCandidate;
 #[cfg(test)]
 pub(crate) use products_design::resolve_task_doc_pointer;
 pub(crate) use proposal_apply::*;
 pub(crate) use query_ensure::*;
 pub use review_batches::{
+    PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND, PR_REVIEW_BATCH_STALE_ATTENTION_KIND, REVIEW_BATCH_STALE_SECS,
     RetryDeadReviewBatchMember, ReviewBatchCreateInput, ReviewBatchDispatch, ReviewBatchMemberCreateInput,
     ReviewBatchQuorumOutcome,
 };

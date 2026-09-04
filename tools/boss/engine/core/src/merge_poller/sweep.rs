@@ -88,6 +88,19 @@ pub struct SweepOutcome {
     /// these are evictions that, before adoption existed, were remediated by
     /// nobody.
     pub trunk_episodes_adopted: usize,
+    /// PendingReview tasks that had been admission-deferred and for which
+    /// this pass successfully created (or reused) a pre-merge batch.
+    pub review_admission_recovered: usize,
+    /// PendingReview tasks still waiting on a review-pool reservation
+    /// after this pass retried admission.
+    pub review_admission_still_deferred: usize,
+    /// Non-terminal review batches this pass failed because their cycle
+    /// root is gone or their members have been inert past the stale bound.
+    pub review_batches_reaped: usize,
+    /// Point-in-time reserved review-pool units sampled at the end of the pass.
+    pub reserved_review_units: i64,
+    /// Point-in-time count of PendingReview tasks waiting on admission.
+    pub deferred_pre_merge_count: usize,
 }
 
 impl SweepOutcome {
@@ -107,6 +120,8 @@ impl SweepOutcome {
             + self.comments_reopened
             + self.closed_unmerged
             + self.trunk_episodes_adopted
+            + self.review_admission_recovered
+            + self.review_batches_reaped
     }
 }
 
@@ -535,6 +550,9 @@ pub async fn run_one_pass_observed(
             Vec::new()
         }
     };
+    let skip_unbatched_review_holds = completion_handler
+        .map(|handler| handler.review_batch_fanout_enabled())
+        .unwrap_or(false);
     for (task_id, product_id, pr_url, review_result_written) in &stalled_candidates {
         sweep_stalled_reviewer(
             work_db,
@@ -544,12 +562,35 @@ pub async fn run_one_pass_observed(
                 product_id,
                 pr_url,
                 review_result_written: *review_result_written,
+                skip_unbatched_review_holds,
             },
             &GhPrStateChecker,
             &mut outcome,
         )
         .await;
     }
+
+    if skip_unbatched_review_holds {
+        let pool_size = completion_handler
+            .map(|handler| handler.review_pool_size())
+            .unwrap_or(crate::coordinator::DEFAULT_REVIEW_POOL_SIZE);
+        sweep_deferred_review_admission(work_db, publisher, None, pool_size, &mut outcome).await;
+    }
+    match work_db.reap_inert_review_batches(crate::work::REVIEW_BATCH_STALE_SECS) {
+        Ok(reaped) => {
+            outcome.review_batches_reaped = reaped.len();
+            if !reaped.is_empty() {
+                tracing::info!(
+                    reaped = reaped.len(),
+                    "merge poller: reaped inert review batches to release pool reservations"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(?err, "merge poller: failed to reap inert review batches");
+        }
+    }
+    sample_review_pool_gauges(work_db, &mut outcome);
 
     let observations = poll_observations(&probe_urls, &snapshot.results);
     (outcome, observations)
@@ -724,6 +765,9 @@ pub async fn reconcile_batch(
     run_merge_queue_rebounce_pass(work_db, publisher, &in_review, &blocked_ci, &mut outcome).await;
 
     let reviewer_stale_secs: u64 = 10 * 60;
+    let skip_unbatched_review_holds = completion_handler
+        .map(|handler| handler.review_batch_fanout_enabled())
+        .unwrap_or(false);
     match work_db.list_tasks_with_stalled_reviewer(reviewer_stale_secs) {
         Ok(stalled) => {
             for (task_id, product_id, stalled_pr_url, review_result_written) in
@@ -737,6 +781,7 @@ pub async fn reconcile_batch(
                         product_id,
                         pr_url: stalled_pr_url,
                         review_result_written: *review_result_written,
+                        skip_unbatched_review_holds,
                     },
                     &GhPrStateChecker,
                     &mut outcome,
@@ -745,6 +790,12 @@ pub async fn reconcile_batch(
             }
         }
         Err(err) => tracing::warn!(?err, "merge poller: failed to list stalled reviewer tasks"),
+    }
+    if skip_unbatched_review_holds {
+        let pool_size = completion_handler
+            .map(|handler| handler.review_pool_size())
+            .unwrap_or(crate::coordinator::DEFAULT_REVIEW_POOL_SIZE);
+        sweep_deferred_review_admission(work_db, publisher, Some(&wanted), pool_size, &mut outcome).await;
     }
 
     // Observe every *requested* URL, not just the probed ones, so a URL that
@@ -2554,6 +2605,11 @@ pub(crate) struct StalledReview<'a> {
     pub(crate) product_id: &'a str,
     pub(crate) pr_url: &'a str,
     pub(crate) review_result_written: bool,
+    /// When true (review-batch fan-out), a hold with no live pre-merge batch
+    /// and no non-terminal `pr_review` is owned by
+    /// [`sweep_deferred_review_admission`] so a previous cycle's verdict
+    /// cannot skip review of a new head.
+    pub(crate) skip_unbatched_review_holds: bool,
 }
 
 /// Reviewer-fallback: reconcile a task held in `active` after its latest AI
@@ -2584,7 +2640,15 @@ pub(crate) async fn sweep_stalled_reviewer(
         product_id,
         pr_url,
         review_result_written,
+        skip_unbatched_review_holds,
     } = stalled;
+    if skip_unbatched_review_holds {
+        let cycle_root = work_db.review_cycle_root_id(task_id);
+        let live_batch = work_db.has_live_pre_merge_review_batch(&cycle_root).unwrap_or(false);
+        if !live_batch && !has_nonterminal_pr_review(work_db, task_id, &cycle_root) {
+            return;
+        }
+    }
     if review_result_written {
         match work_db.advance_pending_review_task_to_in_review(task_id) {
             Ok(true) => {
@@ -2723,6 +2787,212 @@ pub(crate) async fn sweep_stalled_reviewer(
                 error = %err,
                 "merge poller: reviewer-fallback could not re-enqueue a review",
             );
+        }
+    }
+}
+
+fn has_nonterminal_pr_review(work_db: &WorkDb, task_id: &str, cycle_root_id: &str) -> bool {
+    let is_live_review = |work_item_id: &str| {
+        work_db
+            .list_executions(Some(work_item_id))
+            .ok()
+            .map(|executions| {
+                executions.iter().any(|execution| {
+                    execution.kind == boss_protocol::ExecutionKind::PrReview && !execution.status.is_terminal()
+                })
+            })
+            .unwrap_or(false)
+    };
+    is_live_review(task_id) || (cycle_root_id != task_id && is_live_review(cycle_root_id))
+}
+
+fn sample_review_pool_gauges(work_db: &WorkDb, outcome: &mut SweepOutcome) {
+    match work_db.review_pool_reserved_units() {
+        Ok((pre, post)) => outcome.reserved_review_units = pre + post,
+        Err(err) => tracing::warn!(?err, "merge poller: failed to sample review-pool reservations"),
+    }
+    match work_db.list_tasks_awaiting_pre_merge_review_admission() {
+        Ok(items) => outcome.deferred_pre_merge_count = items.len(),
+        Err(err) => tracing::warn!(?err, "merge poller: failed to sample deferred pre-merge holds"),
+    }
+}
+
+/// Retry pre-merge review admission for tasks held in PendingReview with no
+/// live batch. Distinguishes a new head (create a batch or stay deferred)
+/// from a completed batch on the current SHA (advance to human Review).
+pub(crate) async fn sweep_deferred_review_admission(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    wanted_pr_urls: Option<&std::collections::HashSet<&str>>,
+    review_pool_size: usize,
+    outcome: &mut SweepOutcome,
+) {
+    let candidates = match work_db.list_tasks_awaiting_pre_merge_review_admission() {
+        Ok(items) => items,
+        Err(err) => {
+            tracing::warn!(?err, "merge poller: failed to list deferred review-admission tasks");
+            return;
+        }
+    };
+    for candidate in candidates {
+        if wanted_pr_urls.is_some_and(|wanted| !wanted.contains(candidate.pr_url.as_str())) {
+            continue;
+        }
+        if candidate.repo_remote_url.is_empty() {
+            tracing::warn!(
+                task_id = %candidate.task_id,
+                pr_url = %candidate.pr_url,
+                "merge poller: deferred review admission has no repo URL; leaving the hold"
+            );
+            crate::completion::file_admission_deferred_attention(work_db, &candidate.task_id, &candidate.pr_url);
+            outcome.review_admission_still_deferred += 1;
+            continue;
+        }
+        match crate::completion::enqueue_review_batch(
+            work_db,
+            &candidate.task_id,
+            &candidate.repo_remote_url,
+            &candidate.pr_url,
+            review_pool_size,
+        )
+        .await
+        {
+            Ok(crate::work::ReviewBatchDispatch::Created { batch, executions }) => {
+                tracing::info!(
+                    task_id = %candidate.task_id,
+                    batch_id = %batch.id,
+                    leaf_executions = executions.len(),
+                    pr_url = %candidate.pr_url,
+                    "merge poller: deferred pre-merge review batch admitted"
+                );
+                publisher.kick_scheduler();
+                publisher
+                    .publish_work_item_changed(&candidate.product_id, &candidate.task_id, "review_admission_recovered")
+                    .await;
+                let _ = work_db.resolve_external_tracker_attention(
+                    &candidate.task_id,
+                    crate::work::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
+                );
+                outcome.review_admission_recovered += 1;
+            }
+            Ok(crate::work::ReviewBatchDispatch::ExistingBatch { batch, .. }) => {
+                if matches!(
+                    batch.status,
+                    boss_protocol::ReviewBatchStatus::Completed | boss_protocol::ReviewBatchStatus::Failed
+                ) {
+                    match work_db.advance_pending_review_task_to_in_review(&candidate.task_id) {
+                        Ok(true) => {
+                            tracing::info!(
+                                task_id = %candidate.task_id,
+                                batch_id = %batch.id,
+                                pr_url = %candidate.pr_url,
+                                "merge poller: deferred-admission hold matched an already-settled \
+                                 batch for this head; advancing to in_review"
+                            );
+                            publisher
+                                .publish_work_item_changed(
+                                    &candidate.product_id,
+                                    &candidate.task_id,
+                                    "reviewer_fallback_advanced",
+                                )
+                                .await;
+                            outcome.reviewer_fallback_advanced += 1;
+                        }
+                        Ok(false) => {}
+                        Err(err) => tracing::warn!(
+                            task_id = %candidate.task_id,
+                            ?err,
+                            "merge poller: failed to advance settled deferred-admission hold"
+                        ),
+                    }
+                }
+                let _ = work_db.resolve_external_tracker_attention(
+                    &candidate.task_id,
+                    crate::work::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
+                );
+            }
+            Ok(crate::work::ReviewBatchDispatch::LegacyExecution(_)) => {
+                let _ = work_db.resolve_external_tracker_attention(
+                    &candidate.task_id,
+                    crate::work::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
+                );
+            }
+            Ok(crate::work::ReviewBatchDispatch::AlreadyReviewed) => {
+                // The verdict `already_reviewed_at_head` matched may be keyed
+                // by `candidate.cycle_root_id` rather than the task itself
+                // (a revision task's batch-leaf verdicts live on the cycle
+                // root) — use the source-aware advance so the EXISTS
+                // subquery looks in the right place instead of silently
+                // matching zero rows forever.
+                match work_db.advance_pending_review_task_to_in_review_with_verdict_source(
+                    &candidate.task_id,
+                    &candidate.cycle_root_id,
+                ) {
+                    Ok(true) => {
+                        tracing::info!(
+                            task_id = %candidate.task_id,
+                            pr_url = %candidate.pr_url,
+                            "merge poller: deferred-admission hold's current head already has an \
+                             informative review verdict; advancing to in_review instead of re-reviewing"
+                        );
+                        publisher
+                            .publish_work_item_changed(
+                                &candidate.product_id,
+                                &candidate.task_id,
+                                "reviewer_fallback_advanced",
+                            )
+                            .await;
+                        outcome.reviewer_fallback_advanced += 1;
+                    }
+                    Ok(false) => {
+                        // The verdict-EXISTS predicate still didn't match
+                        // (or a live non-review execution blocked the
+                        // advance) even after resolving the cycle root — a
+                        // genuine wedge, not the previously-silent id
+                        // mismatch. File the deferred-admission marker so
+                        // the candidate query's marker arm (rather than the
+                        // 10-minute staleness arm) keeps re-surfacing it,
+                        // and log at warn so it is operator-visible instead
+                        // of an unbounded silent `gh pr view` loop.
+                        tracing::warn!(
+                            task_id = %candidate.task_id,
+                            cycle_root_id = %candidate.cycle_root_id,
+                            pr_url = %candidate.pr_url,
+                            "merge poller: already-reviewed deferred-admission hold did not advance \
+                             (no matching verdict, or a live non-review execution is blocking); \
+                             filing an attention marker so the hold stays visible"
+                        );
+                        crate::completion::file_admission_deferred_attention(
+                            work_db,
+                            &candidate.task_id,
+                            &candidate.pr_url,
+                        );
+                        outcome.review_admission_still_deferred += 1;
+                        continue;
+                    }
+                    Err(err) => tracing::warn!(
+                        task_id = %candidate.task_id,
+                        ?err,
+                        "merge poller: failed to advance already-reviewed deferred-admission hold"
+                    ),
+                }
+                let _ = work_db.resolve_external_tracker_attention(
+                    &candidate.task_id,
+                    crate::work::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
+                );
+            }
+            Ok(crate::work::ReviewBatchDispatch::AdmissionDeferred) => {
+                crate::completion::file_admission_deferred_attention(work_db, &candidate.task_id, &candidate.pr_url);
+                outcome.review_admission_still_deferred += 1;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    task_id = %candidate.task_id,
+                    pr_url = %candidate.pr_url,
+                    ?err,
+                    "merge poller: deferred review admission retry failed"
+                );
+            }
         }
     }
 }

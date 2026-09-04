@@ -10,7 +10,7 @@
 //! There are three dispatch pools (see [`crate::coordinator`]): the
 //! interactive/main pool (slots 1..=16, paged into "Bridge Crew" 1..=8 and
 //! "Lower Decks" 9..=16), the automation pool (`auto-worker-N`, slots
-//! 17..=24), and the review pool (`review-N`, slots 25..=32). Automation
+//! 17..=24), and the review pool (`review-N`, slots 25..=40). Automation
 //! work routinely exceeds its 8 slots while interactive slots sit idle.
 //!
 //! This module implements two interlocking rules:

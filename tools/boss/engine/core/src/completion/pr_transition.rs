@@ -20,11 +20,14 @@ struct BatchReviewPrView {
 
 /// Fetch and freeze the target metadata before handing it to the atomic DB
 /// creation path. Callers can retain the legacy path if this cannot establish
-/// an immutable target SHA.
-async fn enqueue_review_batch(
+/// an immutable target SHA. Shared by `finalize_pr_transition` and the
+/// merge poller's deferred-admission sweep.
+pub(crate) async fn enqueue_review_batch(
     work_db: &crate::work::WorkDb,
-    producing: &crate::work::WorkExecution,
+    work_item_id: &str,
+    repo_remote_url: &str,
     pr_url: &str,
+    review_pool_size: usize,
 ) -> anyhow::Result<crate::work::ReviewBatchDispatch> {
     let root =
         boss_github::pr_files::fetch_pr_view_json(pr_url, "baseRefOid,headRefOid,files,additions,deletions").await?;
@@ -36,21 +39,82 @@ async fn enqueue_review_batch(
         .ok_or_else(|| anyhow::anyhow!("could not parse pull request number from {pr_url:?}"))?
         .try_into()
         .map_err(|_| anyhow::anyhow!("pull request number does not fit the review-batch schema"))?;
+    let cycle_root_id = work_db.review_cycle_root_id(work_item_id);
     let classification = crate::pr_review::classify_pr_review_metadata(&crate::pr_review::PrReviewMetadata {
         additions: view.additions,
         changed_files: Some(boss_github::pr_files::parse_changed_file_paths(&root)),
         deletions: view.deletions,
     });
+    // The already-reviewed check runs inside `create_pre_merge_review_batch_for_pool`,
+    // after its ExistingBatch/LegacyExecution checks and before the admission
+    // gate — not here, ahead of them — so a batch still live for this exact
+    // target (a leaf verdict already recorded while the others are still
+    // running) is never misreported as "this head is settled".
+    let legacy_task_id = (work_item_id != cycle_root_id).then(|| work_item_id.to_owned());
     let input = crate::work::ReviewBatchCreateInput::builder()
-        .cycle_root_id(work_db.review_cycle_root_id(&producing.work_item_id))
+        .cycle_root_id(cycle_root_id)
         .base_sha(view.base_sha)
         .classification(classification)
         .phase(boss_protocol::ReviewBatchPhase::PreMerge)
         .pr_number(pr_number)
         .pr_url(pr_url)
         .target_sha(view.target_sha)
+        .maybe_legacy_task_id(legacy_task_id)
         .build();
-    work_db.create_pre_merge_review_batch(input, &producing.repo_remote_url)
+    work_db.create_pre_merge_review_batch_for_pool(input, repo_remote_url, review_pool_size)
+}
+
+/// Production or test strategy for creating a pre-merge review batch from
+/// a producing execution's PR. Tests inject a stub that skips `gh`.
+#[async_trait]
+pub trait ReviewBatchEnqueuer: Send + Sync {
+    async fn enqueue(
+        &self,
+        work_db: &crate::work::WorkDb,
+        work_item_id: &str,
+        repo_remote_url: &str,
+        pr_url: &str,
+        review_pool_size: usize,
+    ) -> anyhow::Result<crate::work::ReviewBatchDispatch>;
+}
+
+/// Default enqueuer: fetch immutable SHAs from GitHub, then admit a batch.
+pub(crate) struct GhReviewBatchEnqueuer;
+
+#[async_trait]
+impl ReviewBatchEnqueuer for GhReviewBatchEnqueuer {
+    async fn enqueue(
+        &self,
+        work_db: &crate::work::WorkDb,
+        work_item_id: &str,
+        repo_remote_url: &str,
+        pr_url: &str,
+        review_pool_size: usize,
+    ) -> anyhow::Result<crate::work::ReviewBatchDispatch> {
+        enqueue_review_batch(work_db, work_item_id, repo_remote_url, pr_url, review_pool_size).await
+    }
+}
+
+pub(crate) fn file_admission_deferred_attention(work_db: &crate::work::WorkDb, work_item_id: &str, pr_url: &str) {
+    let title = "Automated reviewer: waiting for a review-pool slot";
+    let body = format!(
+        "Pre-merge review for {pr_url} was deferred because the review pool has no free \
+         reservation for another pre-merge batch. The task stays in Doing until a batch \
+         completes and the deferred-admission sweep retries. Dismiss this item once that \
+         pass starts."
+    );
+    if let Err(err) = work_db.upsert_external_tracker_attention(
+        work_item_id,
+        crate::work::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
+        title,
+        &body,
+    ) {
+        tracing::warn!(
+            work_item_id,
+            ?err,
+            "failed to file review-admission-deferred attention item"
+        );
+    }
 }
 
 impl WorkerCompletionHandler {
@@ -307,7 +371,17 @@ impl WorkerCompletionHandler {
                             // same moment and would otherwise both enqueue a `pr_review`
                             // execution for the same unchanged head sha.
                             if self.feature_flags.is_enabled("review_batch_fanout") {
-                                match enqueue_review_batch(&self.work_db, producing, &pr_url).await {
+                                match self
+                                    .review_batch_enqueuer
+                                    .enqueue(
+                                        &self.work_db,
+                                        &producing.work_item_id,
+                                        &producing.repo_remote_url,
+                                        &pr_url,
+                                        self.review_pool_size,
+                                    )
+                                    .await
+                                {
                                     Ok(crate::work::ReviewBatchDispatch::Created { batch, executions }) => {
                                         tracing::info!(
                                             execution_id,
@@ -337,6 +411,41 @@ impl WorkerCompletionHandler {
                                             review_execution_id = %review_exec.id,
                                             pr_url = %pr_url,
                                             "legacy reviewer already owns this target; preserving mode separation",
+                                        );
+                                        true
+                                    }
+                                    Ok(crate::work::ReviewBatchDispatch::AdmissionDeferred) => {
+                                        tracing::info!(
+                                            execution_id,
+                                            pr_url = %pr_url,
+                                            "review pool's weighted reservation accounting has no room for a new \
+                                             pre-merge batch; holding the task pending review — the deferred-\
+                                             admission sweep retries once an existing batch completes",
+                                        );
+                                        file_admission_deferred_attention(
+                                            &self.work_db,
+                                            &producing.work_item_id,
+                                            &pr_url,
+                                        );
+                                        true
+                                    }
+                                    Ok(crate::work::ReviewBatchDispatch::AlreadyReviewed) => {
+                                        tracing::info!(
+                                            execution_id,
+                                            pr_url = %pr_url,
+                                            "current head already has an informative review verdict; holding the \
+                                             task pending review — the deferred-admission sweep advances it to \
+                                             in_review on the next pass without dispatching another reviewer",
+                                        );
+                                        // File the same marker a deferral would, so the
+                                        // candidate query's marker arm surfaces this hold
+                                        // on the very next sweep pass rather than waiting
+                                        // out the 10-minute staleness cutoff — matching
+                                        // what the log line above actually promises.
+                                        file_admission_deferred_attention(
+                                            &self.work_db,
+                                            &producing.work_item_id,
+                                            &pr_url,
                                         );
                                         true
                                     }
@@ -1074,5 +1183,85 @@ impl WorkerCompletionHandler {
                 )
                 .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod already_reviewed_at_head_tests {
+    use crate::test_support::{create_test_chore_manual, create_test_product};
+    use crate::work::{
+        CreateExecutionInput, REVIEW_GATE_OUTCOME_COMPLETED_CLEAN, REVIEW_GATE_OUTCOME_GAVE_UP, ReviewVerdictInput,
+        WorkDb,
+    };
+    use boss_protocol::ExecutionKind;
+
+    fn insert_verdict(db: &WorkDb, work_item_id: &str, head_sha: &str, gate_outcome: &'static str) {
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(work_item_id.to_owned())
+                    .kind(ExecutionKind::PrReview)
+                    .build(),
+            )
+            .unwrap();
+        WorkDb::insert_review_verdict_in_tx(
+            &db.connect().unwrap(),
+            &execution.id,
+            work_item_id,
+            &ReviewVerdictInput {
+                head_sha: Some(head_sha.to_owned()),
+                findings_count: 0,
+                revision_warranted: false,
+                gate_outcome,
+            },
+        )
+        .unwrap();
+    }
+
+    fn already_reviewed_at_head(db: &WorkDb, work_item_id: &str, target_sha: &str) -> bool {
+        WorkDb::already_reviewed_at_head_in_tx(&db.connect().unwrap(), work_item_id, target_sha).unwrap()
+    }
+
+    /// A legacy reviewer's completed, informative verdict — keyed by the
+    /// task itself — matches when its head sha is the current target sha.
+    #[test]
+    fn matches_a_legacy_verdict_keyed_by_the_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let product = create_test_product(&db);
+        let task = create_test_chore_manual(&db, product.id, "already-reviewed-legacy");
+        insert_verdict(&db, &task.id, "head-sha", REVIEW_GATE_OUTCOME_COMPLETED_CLEAN);
+
+        assert!(already_reviewed_at_head(&db, &task.id, "head-sha"));
+        assert!(
+            !already_reviewed_at_head(&db, &task.id, "some-other-sha"),
+            "a verdict for a different head must not match"
+        );
+    }
+
+    /// A batch leaf's verdict is keyed by the cycle root; passing that id
+    /// (as callers now do — see [`super::enqueue_review_batch`]) matches.
+    #[test]
+    fn matches_a_batch_leaf_verdict_keyed_by_the_cycle_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let product = create_test_product(&db);
+        let root = create_test_chore_manual(&db, product.id, "cycle-root");
+        insert_verdict(&db, &root.id, "head-sha", REVIEW_GATE_OUTCOME_COMPLETED_CLEAN);
+
+        assert!(already_reviewed_at_head(&db, &root.id, "head-sha"));
+    }
+
+    /// A non-informative outcome (e.g. `gave_up`) is not positive evidence
+    /// of anything and must not suppress a fresh reviewer pass.
+    #[test]
+    fn does_not_match_a_non_informative_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let product = create_test_product(&db);
+        let task = create_test_chore_manual(&db, product.id, "gave-up");
+        insert_verdict(&db, &task.id, "head-sha", REVIEW_GATE_OUTCOME_GAVE_UP);
+
+        assert!(!already_reviewed_at_head(&db, &task.id, "head-sha"));
     }
 }

@@ -30,7 +30,7 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// The count is set dynamically via configureSlots(workerCount:automationCount:reviewCount:)
     /// when the engine pushes EnginePoolConfig on RegisterAppSession, so the
     /// app never independently hardcodes a value that drifts from the engine.
-    /// The initial value of 8 matches DEFAULT_REVIEW_POOL_SIZE in coordinator.rs
+    /// The initial value of 16 matches DEFAULT_REVIEW_POOL_SIZE in coordinator.rs
     /// and ensures the slot grid renders correctly before the first pool-config
     /// push arrives (covering the unlikely race of a SpawnWorkerPane before
     /// EnginePoolConfig, and preventing an empty grid on first launch).
@@ -39,7 +39,7 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// Instance-level review slot count, kept in sync with the engine's live
     /// pool config. Published so the pool-picker header re-renders whenever
     /// the engine reports a pool size change on reconnect.
-    @Published private(set) var reviewSlotCount: Int = 8
+    @Published private(set) var reviewSlotCount: Int = 16
 
     var reviewSlotRange: ClosedRange<Int> {
         WorkersWorkspaceModel.reviewSlotBase...(WorkersWorkspaceModel.reviewSlotBase + reviewSlotCount - 1)
@@ -73,7 +73,7 @@ final class WorkersWorkspaceModel: ObservableObject {
         self.automationSlots = (Self.automationSlotBase...(Self.automationSlotBase + Self.automationSlotCount - 1)).map { slot in
             WorkerSlot(slotId: slot, idleFlavorCycle: Int.random(in: 0...10_000))
         }
-        self.reviewSlots = (Self.reviewSlotBase...(Self.reviewSlotBase + 8 - 1)).map { slot in
+        self.reviewSlots = (Self.reviewSlotBase...(Self.reviewSlotBase + 16 - 1)).map { slot in
             WorkerSlot(slotId: slot, idleFlavorCycle: Int.random(in: 0...10_000))
         }
     }

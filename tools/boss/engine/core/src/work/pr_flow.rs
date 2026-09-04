@@ -8,6 +8,17 @@ use super::*;
 /// silently clearing it.
 pub(crate) const DELETION_SIGNOFF_BLOCKED_REASON: &str = "deletion_signoff";
 
+/// A task held in PendingReview with no live pre-merge batch, waiting for
+/// weighted admission to retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredReviewAdmissionCandidate {
+    pub task_id: String,
+    pub product_id: String,
+    pub pr_url: String,
+    pub repo_remote_url: String,
+    pub cycle_root_id: String,
+}
+
 impl WorkDb {
     /// Record that a worker produced a PR for `execution_id`. In a single
     /// transaction:
@@ -632,6 +643,111 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// Tasks held in `active` (PendingReview) with a bound PR that have no
+    /// live pre-merge batch and no non-terminal `pr_review` execution on
+    /// their review-cycle root.
+    ///
+    /// This is the durable recovery set for [`super::ReviewBatchDispatch::AdmissionDeferred`]
+    /// and [`super::ReviewBatchDispatch::AlreadyReviewed`]: both write no
+    /// batch and no member rows, so neither `list_executions_pending_pr_detection`
+    /// (waiting_human producers) nor [`Self::list_tasks_with_stalled_reviewer`]
+    /// (INNER JOIN on a `pr_review` execution) can see them. Includes
+    /// first-time producers with zero reviews and tasks whose previous
+    /// cycle's terminal `pr_review` must not be treated as covering a new
+    /// head.
+    ///
+    /// A task qualifies immediately once an open
+    /// `pr_review_admission_deferred` attention item marks it as an actual
+    /// deferral (the deferral paths file exactly that marker). Absent that
+    /// marker — e.g. an `AlreadyReviewed` hold, which files none — a task
+    /// only qualifies once its `updated_at` is older than
+    /// [`super::REVIEW_BATCH_STALE_SECS`], so a task merely waiting on a pool
+    /// slot or between orphan-sweep passes does not cost a `gh pr view` on
+    /// every full sweep before it has had a chance to resolve on its own.
+    pub fn list_tasks_awaiting_pre_merge_review_admission(&self) -> Result<Vec<DeferredReviewAdmissionCandidate>> {
+        let conn = self.connect()?;
+        let inertia_cutoff = (boss_engine_utils::epoch_time::now_epoch_secs() as u64)
+            .saturating_sub(super::REVIEW_BATCH_STALE_SECS)
+            .to_string();
+        let sql = "WITH RECURSIVE walk(task_id, current_id, kind, parent_task_id, depth) AS (
+               SELECT t.id, t.id, t.kind, t.parent_task_id, 0
+               FROM tasks t
+               WHERE t.status = 'active'
+                 AND t.pr_url IS NOT NULL
+                 AND t.pr_url != ''
+                 AND t.deleted_at IS NULL
+               UNION ALL
+               SELECT walk.task_id, parent.id, parent.kind, parent.parent_task_id, walk.depth + 1
+               FROM walk
+               JOIN tasks parent ON parent.id = walk.parent_task_id
+               WHERE walk.kind = 'revision' AND walk.depth < 64
+             ),
+             roots AS (
+               SELECT w.task_id, w.current_id AS cycle_root_id
+               FROM walk w
+               WHERE w.depth = (
+                 SELECT MAX(w2.depth) FROM walk w2 WHERE w2.task_id = w.task_id
+               )
+             )
+             SELECT t.id, t.product_id, t.pr_url,
+                    COALESCE(
+                      NULLIF(p.repo_remote_url, ''),
+                      (
+                        SELECT we.repo_remote_url
+                        FROM work_executions we
+                        WHERE we.work_item_id = t.id
+                          AND we.repo_remote_url IS NOT NULL
+                          AND we.repo_remote_url != ''
+                        ORDER BY we.created_at DESC, we.id DESC
+                        LIMIT 1
+                      ),
+                      ''
+                    ) AS repo_remote_url,
+                    roots.cycle_root_id
+             FROM tasks t
+             JOIN products p ON p.id = t.product_id
+             JOIN roots ON roots.task_id = t.id
+             WHERE NOT EXISTS (
+                     SELECT 1 FROM pr_review_batches b
+                     WHERE b.cycle_root_id = roots.cycle_root_id
+                       AND b.phase = 'pre_merge'
+                       AND b.status NOT IN ('completed', 'failed')
+                   )
+               AND NOT EXISTS (
+                     SELECT 1 FROM work_executions we
+                     WHERE we.work_item_id IN (t.id, roots.cycle_root_id)
+                       AND we.kind = 'pr_review'
+                       AND we.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')
+                   )
+               AND NOT EXISTS (
+                     SELECT 1 FROM work_executions we
+                     WHERE we.work_item_id = t.id
+                       AND we.status IN ('running', 'waiting_human')
+                       AND we.kind != 'pr_review'
+                   )
+               AND (
+                     EXISTS (
+                       SELECT 1 FROM work_attention_items ai
+                       WHERE ai.work_item_id = t.id
+                         AND ai.kind = 'pr_review_admission_deferred'
+                         AND ai.status = 'open'
+                     )
+                     OR t.updated_at < ?1
+                   )
+             ORDER BY t.updated_at ASC";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([inertia_cutoff], |row| {
+            Ok(DeferredReviewAdmissionCandidate {
+                task_id: row.get(0)?,
+                product_id: row.get(1)?,
+                pr_url: row.get(2)?,
+                repo_remote_url: row.get(3)?,
+                cycle_root_id: row.get(4)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
     /// Advance a task from `active` to `in_review` as the reviewer-fallback,
     /// but only after its latest reviewer pass durably recorded a real
     /// `ReviewResult`. Idempotent: no-ops if the task is already past
@@ -649,6 +765,24 @@ impl WorkDb {
     /// non-`pr_review` execution exists on the task: the `NOT EXISTS` clause
     /// makes the update a no-op in that case.
     pub fn advance_pending_review_task_to_in_review(&self, work_item_id: &str) -> Result<bool> {
+        self.advance_pending_review_task_to_in_review_with_verdict_source(work_item_id, work_item_id)
+    }
+
+    /// Same as [`Self::advance_pending_review_task_to_in_review`], but looks
+    /// for the informative `pr_review_verdicts` row under `verdict_source_id`
+    /// rather than `work_item_id`. For a revision task, batch leaf executions
+    /// (and their verdicts) are created against the review-cycle root
+    /// (`review_cycle_root_id`), not the task row itself — pass that root as
+    /// `verdict_source_id` so a verdict recorded there still admits the
+    /// advance. `work_item_id` and `verdict_source_id` are identical for a
+    /// legacy single-reviewer verdict (a non-revision task is its own cycle
+    /// root), which is exactly what the single-argument wrapper above
+    /// preserves.
+    pub fn advance_pending_review_task_to_in_review_with_verdict_source(
+        &self,
+        work_item_id: &str,
+        verdict_source_id: &str,
+    ) -> Result<bool> {
         let conn = self.connect()?;
         let now = now_string();
         let review_result_outcomes = super::review_verdicts::review_result_gate_outcomes_sql();
@@ -669,7 +803,7 @@ impl WorkDb {
                  WHERE latest.id = (
                    SELECT newest.id
                    FROM work_executions newest
-                   WHERE newest.work_item_id = ?1
+                   WHERE newest.work_item_id = ?3
                      AND newest.kind = 'pr_review'
                    ORDER BY newest.created_at DESC, newest.id DESC
                    LIMIT 1
@@ -683,7 +817,7 @@ impl WorkDb {
                    AND we.kind != 'pr_review'
                )"
         );
-        let rows_changed = conn.execute(&sql, params![work_item_id, now])?;
+        let rows_changed = conn.execute(&sql, params![work_item_id, now, verdict_source_id])?;
         Ok(rows_changed > 0)
     }
 
