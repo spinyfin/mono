@@ -211,22 +211,23 @@ async fn absent_session_clears_identity_without_signalling() {
 
 /// [`ServerState::tmux_for_run`] routing: a run recorded with the literal
 /// legacy server label must resolve to a `-L boss` handle built from the
-/// same executable, not the durable socket — the routing
-/// A test process must refuse a legacy label handle backed by the real
-/// runner, because that label addresses tmux's shared default socket.
+/// same executable and runner as the durable-socket handle, not the
+/// durable socket itself. Reusing `socket_tmux`'s runner keeps a stubbed
+/// handle stubbed; a real runner is still refused (see
+/// [`tmux_for_run_refuses_legacy_label_with_the_real_runner`]).
 #[tokio::test]
 async fn tmux_for_run_routes_legacy_label_to_the_label_server() {
     let (server_state, _dir) = test_server_state();
     let (socket_tmux, _runner) = fake_tmux(Vec::<boss_tmux::CommandOutput>::new());
 
-    let error = server_state
+    let legacy = server_state
         .tmux_for_run(&socket_tmux, boss_tmux::SERVER_LABEL)
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("refusing to construct a legacy `-L boss` tmux handle")
+        .unwrap();
+    assert_eq!(
+        legacy.operator_prefix(),
+        format!("tmux -L {}", boss_tmux::quote_for_shell(boss_tmux::SERVER_LABEL))
     );
+    assert_eq!(legacy.program(), socket_tmux.program());
 
     let socket = server_state
         .tmux_for_run(&socket_tmux, boss_tmux::TEST_SOCKET_PATH)
@@ -234,6 +235,22 @@ async fn tmux_for_run_routes_legacy_label_to_the_label_server() {
     assert_eq!(
         socket.operator_prefix(),
         format!("tmux -S {}", boss_tmux::quote_for_shell(boss_tmux::TEST_SOCKET_PATH))
+    );
+}
+
+/// A test process must refuse a legacy-label handle backed by the real
+/// runner: `-L boss` addresses tmux's shared default socket and cannot
+/// be scoped to a private path.
+#[tokio::test]
+async fn tmux_for_run_refuses_legacy_label_with_the_real_runner() {
+    let (server_state, _dir) = test_server_state();
+    let real = boss_tmux::Tmux::from_path_with_socket("/opt/homebrew/bin/tmux", boss_tmux::TEST_SOCKET_PATH).unwrap();
+    let error = server_state.tmux_for_run(&real, boss_tmux::SERVER_LABEL).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("refusing to construct a legacy `-L boss` tmux handle"),
+        "error was: {error:#}"
     );
 }
 

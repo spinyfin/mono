@@ -571,14 +571,17 @@ mod tests {
     /// override later calls.
     ///
     /// Does not redirect `AUDIT_PATH_ENV`: `resolve_path` now always
-    /// resolves to this test process's isolated root (installed by
-    /// `boss-test-isolation`'s ctor — see `boss_log_files::is_test_process`),
-    /// deterministically, on every call, regardless of which test in this
-    /// binary calls it first. Other tests elsewhere in this binary (e.g.
-    /// `coordinator_tmux`'s reset tests) append their own, differently-shaped
-    /// records to that same shared file concurrently, so this test locates
-    /// its own record by the `engine_version: "test"` marker below — a value
-    /// no production code path ever sets — rather than by file position.
+    /// resolves to this test process's isolated root (installed lazily by
+    /// `boss_log_files::default_state_root()` when the executable is
+    /// recognised as a test process — see `boss_log_files::is_test_process`).
+    /// `TEST_STATE_ROOT` is a first-writer-wins OnceLock that sibling tests
+    /// in this binary may populate, so the path is stable on every call
+    /// regardless of which test in this binary calls it first. Other tests
+    /// elsewhere in this binary (e.g. `coordinator_tmux`'s reset tests)
+    /// append their own, differently-shaped records to that same shared
+    /// file concurrently, so this test locates its own record by the
+    /// `engine_version: "test"` marker below — a value no production code
+    /// path ever sets — rather than by file position.
     #[test]
     fn public_start_and_shutdown_path_emits_two_records() {
         let _globals = lock_globals();

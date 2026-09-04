@@ -120,9 +120,10 @@ impl LogSource {
 /// see [`is_production_shaped`].
 pub const STATE_ROOT_SUFFIX: &str = "Library/Application Support/Boss";
 
-/// Isolated state root installed lazily for a Bazel-output executable.
+/// Isolated state root installed lazily for a Bazel *test* process.
 /// `None` until a state path is resolved, and in ordinary production
-/// executables that never run from Bazel output.
+/// executables — including `bazel run` of production binaries, which
+/// also live under `bazel-out`.
 ///
 /// This is the chokepoint every `default_*_path` function in this module
 /// ultimately derives from ([`default_state_root`]), so a test process gets
@@ -131,38 +132,79 @@ pub const STATE_ROOT_SUFFIX: &str = "Library/Application Support/Boss";
 static TEST_STATE_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 /// Install the isolated state root for this process. Idempotent — only the
-/// first call wins.
+/// first call wins. Test-only: production installs via
+/// [`install_bazel_test_root_if_needed`]'s `get_or_init`.
+#[cfg(test)]
 fn install_test_state_root(root: PathBuf) {
     let _ = TEST_STATE_ROOT.set(root);
 }
 
-/// True for a process with an isolated state root or an executable resolved
-/// from a Bazel output tree. The latter identifies direct `bazel-bin/...`
-/// test execution even when Bazel's test-only environment variables are
-/// absent.
+/// True for a process with an isolated state root already installed, or
+/// a Bazel-built *test* executable (see [`is_bazel_test_executable`]).
+/// `bazel run` of a production binary is not a test process: those
+/// executables also live under `bazel-out`, and must keep production's
+/// state root, tmux socket, and audit path.
 pub fn is_test_process() -> bool {
-    TEST_STATE_ROOT.get().is_some() || running_from_bazel_output()
+    TEST_STATE_ROOT.get().is_some() || running_as_bazel_test_process()
 }
 
-fn running_from_bazel_output() -> bool {
-    std::env::current_exe()
-        .ok()
-        .is_some_and(|path| path.components().any(|component| component.as_os_str() == "bazel-out"))
+fn bazel_test_harness_env_present() -> bool {
+    ["TEST_TMPDIR", "TEST_SRCDIR", "BAZEL_TEST"]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some())
+}
+
+fn path_is_bazel_output(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == "bazel-out" || component.as_os_str() == "bazel-bin")
+}
+
+fn executable_stem_ends_with_test(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.ends_with("_test"))
+}
+
+/// Pure discriminator: a Bazel-built *test* binary, not every binary
+/// that happens to live under `bazel-out` / `bazel-bin`.
+///
+/// `bazel run` of production targets (`engine`, `Boss`, `boss`) also
+/// produces executables under those trees; those must keep production's
+/// state root. A test binary is identified by Bazel's test harness env
+/// (`TEST_TMPDIR` / `TEST_SRCDIR` / `BAZEL_TEST`, present under
+/// `bazel test`) or by the `_test` file-stem convention
+/// `boss_rust_test` enforces — covering a direct
+/// `bazel-bin/.../engine_lib_test` invocation that has no harness env.
+fn is_bazel_test_executable(exe: &Path, bazel_test_env: bool) -> bool {
+    path_is_bazel_output(exe) && (bazel_test_env || executable_stem_ends_with_test(exe))
+}
+
+fn running_as_bazel_test_process() -> bool {
+    let exe = match std::env::current_exe() {
+        Ok(path) => std::fs::canonicalize(&path).unwrap_or(path),
+        Err(_) => return false,
+    };
+    is_bazel_test_executable(&exe, bazel_test_harness_env_present())
 }
 
 fn install_bazel_test_root_if_needed() {
-    if TEST_STATE_ROOT.get().is_some() || !running_from_bazel_output() {
+    if TEST_STATE_ROOT.get().is_some() || !running_as_bazel_test_process() {
         return;
     }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let root = std::env::temp_dir().join(format!("boss-test-isolation-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&root).unwrap_or_else(|error| {
-        panic!("boss-log-files: refusing to run Bazel test without an isolated state root: {error}")
+    // `get_or_init` serializes the path choice so two racing callers cannot
+    // each `create_dir_all` a distinct nanos-suffixed directory and leak
+    // the loser. The path is pid-keyed, so repeated resolutions in one
+    // process reuse the same directory; a recycled pid wipes any leftover.
+    let _ = TEST_STATE_ROOT.get_or_init(|| {
+        let root = std::env::temp_dir().join(format!("boss-test-isolation-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        std::fs::create_dir_all(&root).unwrap_or_else(|error| {
+            panic!("boss-log-files: refusing to run Bazel test without an isolated state root: {error}")
+        });
+        root
     });
-    install_test_state_root(root);
 }
 
 /// The default Boss state root. In a production process this is
@@ -190,7 +232,7 @@ fn resolve_state_root(is_test_process: bool, installed_root: Option<&Path>, home
         let root = installed_root.unwrap_or_else(|| {
             panic!(
                 "boss-log-files: refusing to resolve Boss's production state root (~/{STATE_ROOT_SUFFIX}) \
-                 from a Bazel-output process — no isolated test root could be installed. Ensure the \
+                 from a Bazel test process — no isolated test root could be installed. Ensure the \
                  system temporary directory is writable."
             )
         });
@@ -473,13 +515,12 @@ mod tests {
 
     #[test]
     fn engine_runtime_files_resolve_under_state_root() {
-        // This crate's own test target deliberately does not link
-        // `boss-test-isolation` (see log-files/BUILD.bazel), so
-        // `default_state_root` here resolves from `$HOME` unless a sibling
-        // test has installed a root. `ensure_test_root_installed` pins that
-        // down deterministically so this test doesn't race
-        // `install_test_state_root_is_idempotent` for which one installs
-        // first — either way, the result must stay internally consistent
+        // The isolated root is installed lazily by `default_state_root()`
+        // when this executable is recognised as a test process.
+        // `TEST_STATE_ROOT` is a first-writer-wins OnceLock that sibling
+        // tests in this binary may populate, so this pins it via
+        // `ensure_test_root_installed` rather than assuming a starting
+        // state. Either way, the result must stay internally consistent
         // with the other `default_*_path` functions, which is all this
         // asserts.
         let root = ensure_test_root_installed();
@@ -693,21 +734,14 @@ mod tests {
 
     #[test]
     fn install_test_state_root_is_idempotent() {
-        // This crate's own `rust_test` target is deliberately plain
-        // `rust_test`, not `boss_rust_test` — see log-files/BUILD.bazel's
-        // comment on why linking `boss-test-isolation` here would install
-        // onto a second, separately-compiled copy of this very crate rather
-        // than the one under test. So `TEST_STATE_ROOT` starts unset here,
-        // and this test drives `install_test_state_root` directly rather
-        // than relying on a ctor — confirming the OnceLock's first-writer-
-        // wins semantics is exactly what `boss-test-isolation`'s own
-        // end-to-end test (`tools/boss/test-isolation/src/lib.rs`) then
-        // relies on when it calls the real thing through the real ctor.
-        //
-        // `ensure_test_root_installed` may already have raced this test to
-        // be the first writer (libtest runs tests concurrently by default),
-        // so this asserts first-writer-wins against whatever already won,
-        // rather than assuming this test itself is the first writer.
+        // The isolated root is installed lazily by `default_state_root()`
+        // when this executable is recognised as a test process.
+        // `TEST_STATE_ROOT` is a first-writer-wins OnceLock that sibling
+        // tests in this binary may already have populated, so this pins
+        // it via `ensure_test_root_installed` rather than assuming a
+        // starting state, then asserts a later `install_test_state_root`
+        // cannot replace the winner.
+
         let already_installed = ensure_test_root_installed();
         assert!(is_test_process());
         assert_eq!(TEST_STATE_ROOT.get(), Some(&already_installed));
@@ -717,6 +751,54 @@ mod tests {
             TEST_STATE_ROOT.get(),
             Some(&already_installed),
             "an already-installed root always wins over a later install_test_state_root call"
+        );
+    }
+
+    // -- is_bazel_test_executable -------------------------------------------
+
+    #[test]
+    fn bazel_run_production_binary_is_not_a_test_executable() {
+        let exe = Path::new(
+            "/private/var/tmp/_bazel/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/core/engine",
+        );
+        assert!(
+            !is_bazel_test_executable(exe, false),
+            "`bazel run` of a production binary lives under bazel-out but must not isolate"
+        );
+    }
+
+    #[test]
+    fn bazel_bin_production_binary_is_not_a_test_executable() {
+        let exe = Path::new("/Users/dev/mono/bazel-bin/tools/boss/engine/core/engine");
+        assert!(!is_bazel_test_executable(exe, false));
+    }
+
+    #[test]
+    fn bazel_test_harness_env_marks_bazel_out_executable_as_test() {
+        let exe = Path::new(
+            "/private/var/tmp/_bazel/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/core/engine",
+        );
+        assert!(
+            is_bazel_test_executable(exe, true),
+            "TEST_TMPDIR / TEST_SRCDIR / BAZEL_TEST identify `bazel test` even when the stem is not `_test`"
+        );
+    }
+
+    #[test]
+    fn test_stem_marks_direct_bazel_bin_test_invocation() {
+        let exe = Path::new("/Users/dev/mono/bazel-bin/tools/boss/engine/core/engine_lib_test");
+        assert!(
+            is_bazel_test_executable(exe, false),
+            "direct bazel-bin invocation of a `_test` binary must isolate even without harness env"
+        );
+    }
+
+    #[test]
+    fn non_bazel_output_test_stem_is_not_isolated() {
+        let exe = Path::new("/Applications/Boss.app/Contents/MacOS/engine_lib_test");
+        assert!(
+            !is_bazel_test_executable(exe, false),
+            "the `_test` stem is only meaningful for Bazel-output binaries"
         );
     }
 

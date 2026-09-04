@@ -123,9 +123,10 @@ checks:
           severity: warning
 
   # Structural guard for the test-process state-isolation policy. The resolver
-  # in tools/boss/log-files/src/paths.rs isolates every Bazel-output process
-  # at its chokepoint; this macro keeps the Boss test-target convention
-  # explicit and mechanically enforced.
+  # in tools/boss/log-files/src/paths.rs isolates a Bazel-output *test*
+  # binary (harness env or `_test` file stem) at its chokepoint; this macro
+  # enforces the `_test` stem so a direct bazel-bin invocation is isolated
+  # while `bazel run` of a production binary is not.
   # Word-boundary anchored (`\b`) so it does not also flag calls to the
   # macro itself, `boss_rust_test(...)`.
   - id: boss/raw-rust-test-forbidden
@@ -141,5 +142,5 @@ checks:
       patterns:
         - name: raw-rust-test-rule
           pattern: '\brust_test\s*\('
-          message: "Use the boss_rust_test macro instead of raw rust_test: load(\"//tools/boss/test-isolation:boss_rust_test.bzl\", \"boss_rust_test\"). It keeps the enforced Boss test-target convention aligned with resolver-level state isolation — see tools/boss/log-files/src/paths.rs."
+          message: "Use the boss_rust_test macro instead of raw rust_test: load(\"//tools/boss/test-isolation:boss_rust_test.bzl\", \"boss_rust_test\"). The macro requires a `_test` name suffix, which the state-root resolver keys on to distinguish test binaries from `bazel run` production binaries — see tools/boss/log-files/src/paths.rs."
           severity: error
