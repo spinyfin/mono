@@ -1889,10 +1889,9 @@ mod tests {
         assert_eq!(outcome.proposal.state, ProposalState::Applied);
     }
 
-    /// An already-bound `pr_url` is left alone (opportunistic "set if not
-    /// set" semantics, mirroring `WorkDb::reconciler_attach_pr_url`) — the
-    /// proposal still applies, since the URL/repo/branch it declared were
-    /// themselves valid.
+    /// A declaration must not replace an existing binding. Rejecting it keeps
+    /// the durable proposal state aligned with the completion reader, which
+    /// must never finalize against a URL the applier declined to bind.
     #[test]
     fn pr_created_does_not_overwrite_an_already_bound_pr_url() {
         let (_dir, db) = open_db();
@@ -1914,7 +1913,7 @@ mod tests {
             "key-1",
         )
         .unwrap();
-        assert_eq!(outcome.proposal.state, ProposalState::Applied);
+        assert_eq!(outcome.proposal.state, ProposalState::Rejected);
 
         let pr_url = match db.get_work_item(&chore_id).unwrap() {
             boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t.pr_url,

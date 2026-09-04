@@ -596,11 +596,62 @@ impl WorkerCompletionHandler {
             return StopOutcome::DeferredForProbeTurn;
         }
 
+        // Worker-proposal seam (design implementation task 12 — the last of
+        // the per-seam migrations, sequenced after
+        // `automation_outcome_proposals_seam`): read the durable
+        // `pr_created` proposal row before touching the staging cache /
+        // driver-prose / cold-reconstruction ladder below. Task 6's applier
+        // already verified the URL/repo-slug and any worker-supplied branch
+        // synchronously at submission time, so a hit here finalizes
+        // straight from a row that — unlike `StagedPrUrlCache` — survives
+        // an engine restart between the worker's `cube pr create`/`cube pr
+        // update` and this Stop. Every other source below still runs as a
+        // counted fallback whenever the seam is on (see
+        // `finalize_pr_transition`'s `PR_CREATED_FALLBACK_HIT` accounting).
+        let pr_created_proposals_first = self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("pr_created_proposals_seam");
+        let (proposed_pr_url, pr_created_proposal_row_existed) = if pr_created_proposals_first {
+            self.pr_created_from_proposal(&execution).await
+        } else {
+            (None, false)
+        };
+        if let Some(proposed_pr_url) = proposed_pr_url {
+            tracing::info!(
+                execution_id,
+                pr_url = %proposed_pr_url,
+                "stop event: using PR URL from pr_created worker-proposal row; skipping the staging \
+                 cache / cold-reconstruction ladder",
+            );
+            if execution.kind == ExecutionKind::RevisionImplementation {
+                self.stamp_revision_stop_contributed_head_from_staged_url(execution_id, &execution, &proposed_pr_url)
+                    .await;
+            }
+            let proposal_outcome = self
+                .finalize_pr_transition(
+                    execution_id,
+                    proposed_pr_url.clone(),
+                    WorkerPrCompletionTarget::InReview,
+                    PR_CREATED_PROPOSAL_STOP_SOURCE,
+                )
+                .await;
+            if execution.kind != ExecutionKind::RevisionImplementation
+                || !matches!(proposal_outcome, StopOutcome::AwaitingInput)
+            {
+                return proposal_outcome;
+            }
+            tracing::info!(
+                execution_id,
+                pr_url = %proposed_pr_url,
+                "stop event: proposal-URL finalize refused by revision contribution gate; falling through to SHA-delta / no-op / nudge path (incident-004 AI-3)",
+            );
+        }
+
         // A remote worker writes this artifact on its own host; collect it
         // before reading so the primary channel remains usable off-host.
         let _ = self
             .collect_remote_structured_output(&execution, crate::structured_output::StructuredOutputKind::PrUrl)
             .await;
+
         // Primary channel: the structured-output PR-URL artifact the worker
         // wrote (file contract — no transcript or hook-stream knowledge
         // needed, so every driver can satisfy it). It fills the same staging
@@ -667,6 +718,12 @@ impl WorkerCompletionHandler {
                         "stop_staged",
                     )
                     .await;
+                self.record_pr_created_fallback_after_success(
+                    &execution,
+                    "stop_staged",
+                    pr_created_proposal_row_existed,
+                    &staged_outcome,
+                );
                 if !matches!(staged_outcome, StopOutcome::AwaitingInput) {
                     return staged_outcome;
                 }
@@ -677,7 +734,7 @@ impl WorkerCompletionHandler {
                      falling through to SHA-delta / no-op / nudge path (incident-004 AI-3)",
                 );
             } else {
-                return self
+                let staged_outcome = self
                     .finalize_pr_transition(
                         execution_id,
                         staged_url,
@@ -685,6 +742,13 @@ impl WorkerCompletionHandler {
                         "stop_staged",
                     )
                     .await;
+                self.record_pr_created_fallback_after_success(
+                    &execution,
+                    "stop_staged",
+                    pr_created_proposal_row_existed,
+                    &staged_outcome,
+                );
+                return staged_outcome;
             }
         }
 
@@ -820,7 +884,7 @@ impl WorkerCompletionHandler {
                 pr_url = %recovered_url,
                 "stop event: using PR URL recovered by the driver's final-message producer; skipping detector",
             );
-            return self
+            let driver_outcome = self
                 .finalize_pr_transition(
                     execution_id,
                     recovered_url,
@@ -828,6 +892,13 @@ impl WorkerCompletionHandler {
                     "stop_driver_fallback",
                 )
                 .await;
+            self.record_pr_created_fallback_after_success(
+                &execution,
+                "stop_driver_fallback",
+                pr_created_proposal_row_existed,
+                &driver_outcome,
+            );
+            return driver_outcome;
         }
 
         // Resume-bounce SHA-delta gate: when the chore already has a
@@ -864,7 +935,7 @@ impl WorkerCompletionHandler {
                                  recheck_for_pr transient-failure recovery may not fire",
                             );
                         }
-                        return self
+                        let sha_outcome = self
                             .finalize_pr_transition(
                                 execution_id,
                                 pr_url,
@@ -872,6 +943,13 @@ impl WorkerCompletionHandler {
                                 "stop_sha_delta",
                             )
                             .await;
+                        self.record_pr_created_fallback_after_success(
+                            &execution,
+                            "stop_sha_delta",
+                            pr_created_proposal_row_existed,
+                            &sha_outcome,
+                        );
+                        return sha_outcome;
                     }
                     // already_stop_seen=true with no push evidence: parent pushed.
                     // Absorb the head into the baseline and fall through to the
@@ -953,7 +1031,7 @@ impl WorkerCompletionHandler {
                         )
                         .await;
                 }
-                return self
+                let sha_outcome = self
                     .finalize_pr_transition(
                         execution_id,
                         pr_url,
@@ -961,6 +1039,13 @@ impl WorkerCompletionHandler {
                         "stop_sha_delta",
                     )
                     .await;
+                self.record_pr_created_fallback_after_success(
+                    &execution,
+                    "stop_sha_delta",
+                    pr_created_proposal_row_existed,
+                    &sha_outcome,
+                );
+                return sha_outcome;
             }
             ShaDeltaGateOutcome::NoContribution { pr_url, head_now: _ } => {
                 // Before nudging, check whether the blocking signal (conflict /
@@ -1483,6 +1568,8 @@ must not be asked to open one",
             PrStatus::Fresh { url } => (url, WorkerPrCompletionTarget::InReview),
             PrStatus::Merged { url } => (url, WorkerPrCompletionTarget::Done),
         };
-        self.finalize_pr_transition(execution_id, pr_url, target, "stop").await
+        let outcome = self.finalize_pr_transition(execution_id, pr_url, target, "stop").await;
+        self.record_pr_created_fallback_after_success(&execution, "stop", pr_created_proposal_row_existed, &outcome);
+        outcome
     }
 }

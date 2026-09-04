@@ -254,6 +254,19 @@ pub struct WorkerSetupInput {
     /// other worker kind.
     #[builder(default = false)]
     pub is_review_supervisor: bool,
+    /// Mirrors the `pr_created_proposals_seam` feature flag (composed with
+    /// the `worker_proposals` master flag) — gates the `boss propose
+    /// pr-created` teaching alongside the "print the PR URL" line in the
+    /// standard-worker branch of [`render_claude_md`] (design
+    /// implementation task 12). Ignored for [`WorkerKind::Triage`] /
+    /// [`WorkerKind::Reviewer`] / [`WorkerKind::AnswerAgent`] workers,
+    /// which never reach that branch. The caller must pass the same value
+    /// used to render this execution's prompt
+    /// (`runner::worker_spawn::WorkerSpawnOpts::pr_created_proposals_seam_enabled`)
+    /// so the preamble and CLAUDE.md never disagree about which
+    /// PR-declaration mechanism is live.
+    #[builder(default = false)]
+    pub pr_created_proposals_seam_enabled: bool,
 }
 
 /// Render the worker-facing agent-rules file (CLAUDE.md or equivalent).
@@ -316,6 +329,27 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
     // real bazel target label the way the pre-crate-split
     // `//tools/boss/engine:engine` string did.
     let engine_bazel_run_command = env!("BOSS_ENGINE_BAZEL_RUN_COMMAND");
+    // Design implementation task 12 (PR-created-declaration seam
+    // migration): when the seam is on, the worker's terminal action after
+    // opening/updating a PR is `boss propose pr-created --url ...`, not
+    // just the printed line. The printed line stays regardless — design:
+    // "the printed URL line is kept during the soak as human-readable
+    // redundancy, then dropped."
+    let execution_can_declare_created_pr = matches!(
+        input.execution_kind.as_str(),
+        "task_implementation" | "chore_implementation" | "project_design" | "investigation_implementation"
+    );
+    let declare_pr_directive = if input.pr_created_proposals_seam_enabled && execution_can_declare_created_pr {
+        "- Your terminal action after opening or updating a PR is `boss propose pr-created --url \
+         <the PR URL>` (add `--branch <branch-name>` when useful for verification). Submission is\n\
+         synchronous and validated immediately — a malformed URL or a URL from the wrong repo fails\n\
+         right away with a typed error you can fix and retry, unlike a printed line the engine only\n\
+         reads long after you've moved on.\n\
+         - Also print the PR URL on its own line as the last thing in your final response — kept as\n\
+           human-readable redundancy alongside the `boss propose` call.\n"
+    } else {
+        "- Print the PR URL on its own line as the last thing in your final response.\n"
+    };
     format!(
         "# Boss worker rules\n\
          \n\
@@ -345,7 +379,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
            evaluates backticks and `$(...)` inside double-quoted strings, which\n\
            corrupts any body that contains inline code. Always write the body to\n\
            a file and use `--body-file` (see the recipe below).\n\
-         - Print the PR URL on its own line as the last thing in your final response.\n\
+         {declare_pr_directive}\
          - Before pushing, run `jj diff -r @`. If the diff is empty,\n\
            do NOT commit, push, or open a PR — stop and explain.\n\
          \n\

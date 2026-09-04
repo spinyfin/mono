@@ -878,14 +878,14 @@ fn supersede_prior_automation_outcomes(tx: &Transaction<'_>, execution_id: &str,
 /// task 12), which reads this proposal row instead of the in-memory
 /// `StagedPrUrlCache`.
 ///
-/// On success, binds the PR to the work item by opportunistically attaching
-/// `pr_url` to the task — mirroring [`WorkDb::reconciler_attach_pr_url`]'s
-/// "set if not already set" semantics rather than
-/// [`WorkDb::record_worker_pr_completion`]'s full completion cascade (status
-/// transition, execution finalization, run-summary capture): that heavier
-/// lifting belongs to Stop-time finalization (task 12), not to a proposal
-/// applier that only knows "a worker declared a PR" and has not yet driven
-/// the execution to completion.
+/// A declaration that names a different PR than the task's existing binding
+/// is rejected; otherwise non-revision tasks are stamped with the declared
+/// URL. Revision tasks are never stamped because their chain root owns the
+/// binding. This remains narrower than [`WorkDb::record_worker_pr_completion`]'s
+/// full completion cascade (status transition, execution finalization, and
+/// run-summary capture): that heavier lifting belongs to Stop-time
+/// finalization, not to a proposal applier that only knows a worker declared
+/// a PR and has not yet completed the execution.
 ///
 /// An execution whose work item is not a task (e.g. an `automation_triage`
 /// execution, whose `work_item_id` is the automation id) is a typed
@@ -934,21 +934,21 @@ fn apply_pr_created(tx: &Transaction<'_>, execution_id: &str, payload_json: &str
     if let Some(existing) = task.pr_url.as_deref().filter(|s| !s.is_empty())
         && existing != payload.pr_url
     {
-        tracing::warn!(
-            execution_id,
-            task_id = %task.id,
-            existing_pr_url = existing,
-            declared_pr_url = %payload.pr_url,
-            "pr_created proposal declared a different PR than the task already has bound; \
-             keeping the existing binding",
-        );
+        return Ok(ApplyDecision::Rejected(format!(
+            "task {} is already bound to {existing}; refusing to replace it with declared PR {}",
+            task.id, payload.pr_url
+        )));
     }
 
-    tx.execute(
-        "UPDATE tasks SET pr_url = ?2, updated_at = ?3 \
-         WHERE id = ?1 AND deleted_at IS NULL AND (pr_url IS NULL OR pr_url = '')",
-        params![task.id, payload.pr_url, now_string()],
-    )?;
+    // Revision tasks do not own a PR: the chain root's `pr_url` is the source
+    // of truth, so this task row must remain NULL (see `pr_flow.rs`).
+    if task.kind != TaskKind::Revision {
+        tx.execute(
+            "UPDATE tasks SET pr_url = ?2, updated_at = ?3 \
+             WHERE id = ?1 AND deleted_at IS NULL AND (pr_url IS NULL OR pr_url = '')",
+            params![task.id, payload.pr_url, now_string()],
+        )?;
+    }
 
     Ok(ApplyDecision::Applied(ApplyOutcome {
         applied_ref: Some(task.id),
