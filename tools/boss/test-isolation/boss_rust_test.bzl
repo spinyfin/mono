@@ -1,14 +1,14 @@
-"""Compatibility wrapper for existing Boss Rust test targets.
+"""Structural wrapper for Boss Rust test targets.
 
 State-path isolation is enforced by the resolver chokepoint in
-`tools/boss/log-files/src/paths.rs`, which identifies Bazel test binaries
-without relying on an otherwise-unused crate being retained by the linker.
+`tools/boss/log-files/src/paths.rs`: a Bazel-output executable gets a private
+state root at first resolution, without linker-retained constructors.
 """
 
 load("@rules_rust//rust:defs.bzl", "rust_test")
 
 def boss_rust_test(name, deps = [], **kwargs):
-    """Drop-in replacement for `rust_test`.
+    """Drop-in replacement for `rust_test` used by every Boss test target.
 
     Args:
         name: target name, forwarded to `rust_test` verbatim.
