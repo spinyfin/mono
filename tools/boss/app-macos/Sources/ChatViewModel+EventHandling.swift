@@ -838,10 +838,13 @@ extension ChatViewModel {
     /// Confirmation text for `mergeWhenReadyAccepted`'s `action` wire value
     /// (`MergeAction::as_str()` on the engine — `merge_when_ready.rs`).
     /// The GitHub-native path reports a request while its derived state
-    /// converges; `"trunk_enqueued"` has its own queue-specific message.
+    /// converges; `"trunk_enqueued"` and `"trunk_already_enqueued"` have
+    /// distinct queue-specific messages so a no-op click is not presented
+    /// as a fresh submission.
     private static func mergeWhenReadyFeedbackText(for action: String) -> String {
         switch action {
         case "trunk_enqueued": return "Submitted to Trunk merge queue"
+        case "trunk_already_enqueued": return "Already in Trunk merge queue"
         default: return "Merge requested"
         }
     }

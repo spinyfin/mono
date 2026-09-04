@@ -294,6 +294,13 @@ async fn handle_trunk_queue_merge(
     let coords = match crate::trunk_merge::parse_trunk_pr_coordinates(&pr_url) {
         Ok(coords) => coords,
         Err(err) => {
+            tracing::warn!(
+                %work_item_id,
+                %pr_url,
+                error = %err,
+                outcome = "refused",
+                "merge_when_ready: PR URL is not a canonical GitHub PR URL",
+            );
             send_response(
                 &sink,
                 &request_id,
@@ -315,16 +322,24 @@ async fn handle_trunk_queue_merge(
         Ok(Some(intent)) => intent,
         Ok(None) => {
             // Duplicate click: an intent is already active for this work
-            // item. Only a genuine no-op when that intent is still for the
-            // *current* PR — re-report success without re-submitting to
-            // Trunk (design: "a second merge click on an already-active
-            // intent is a no-op that re-reports current queue state"). If
-            // the active intent is for a different PR (closed/reopened,
-            // replaced), reporting success here would tell the user the
-            // current PR was enqueued when nothing was submitted for it.
+            // item. Never re-submit — repeatedly POSTing the same PR to
+            // Trunk is the hazard the guard exists to prevent. The reply
+            // must still be honest: "already in the queue" only when the
+            // intent is still live there; a terminal/non-advancing state
+            // (the operator-visible `failed` case) is a refusal, not a
+            // success toast. Design: "a second merge click on an
+            // already-active intent is a no-op that re-reports current
+            // queue state".
             let active = match work_db.get_active_trunk_merge_intent(&work_item_id) {
                 Ok(active) => active,
                 Err(err) => {
+                    tracing::warn!(
+                        %work_item_id,
+                        %pr_url,
+                        error = %err,
+                        outcome = "refused",
+                        "merge_when_ready: failed to load active trunk merge intent after duplicate insert",
+                    );
                     send_response(
                         &sink,
                         &request_id,
@@ -336,28 +351,8 @@ async fn handle_trunk_queue_merge(
                 }
             };
             match active {
-                Some(active) if active.pr_url == pr_url => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::MergeWhenReadyAccepted {
-                            work_item_id,
-                            pr_url,
-                            action: merge_when_ready::MergeAction::TrunkEnqueued.as_str().to_owned(),
-                        },
-                    );
-                }
                 Some(active) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: format!(
-                                "merge_when_ready: a trunk merge intent is already active for {} (this work item's current PR is {pr_url}); resolve the stale intent before retrying",
-                                active.pr_url
-                            ),
-                        },
-                    );
+                    reply_duplicate_trunk_merge_click(&sink, &request_id, work_item_id, pr_url, active);
                 }
                 None => {
                     // The insert reported a duplicate but no active row is
@@ -365,6 +360,12 @@ async fn handle_trunk_queue_merge(
                     // `INSERT OR IGNORE` swallowed a genuine constraint
                     // violation unrelated to the dedup index) — do not claim
                     // success for a submission that never happened.
+                    tracing::warn!(
+                        %work_item_id,
+                        %pr_url,
+                        outcome = "refused",
+                        "merge_when_ready: intent insert was ignored but no active intent was found; not reporting success",
+                    );
                     send_response(
                         &sink,
                         &request_id,
@@ -379,6 +380,13 @@ async fn handle_trunk_queue_merge(
             return;
         }
         Err(err) => {
+            tracing::warn!(
+                %work_item_id,
+                %pr_url,
+                error = %err,
+                outcome = "refused",
+                "merge_when_ready: failed to record trunk merge intent",
+            );
             send_response(
                 &sink,
                 &request_id,
@@ -392,6 +400,13 @@ async fn handle_trunk_queue_merge(
 
     let trunk_client = server_state.trunk_client.clone();
     let publisher = server_state.publisher.clone();
+    tracing::info!(
+        %work_item_id,
+        %pr_url,
+        intent_id = %intent.id,
+        outcome = "submitting",
+        "merge_when_ready: submitting PR to Trunk merge queue",
+    );
     tokio::spawn(async move {
         let request = boss_trunk_client::SubmitPullRequestRequest::builder()
             .repo(boss_trunk_client::TrunkRepoRef::new(
@@ -428,6 +443,13 @@ async fn handle_trunk_queue_merge(
                         .publish_work_item_changed(&product_id, &work_item_id, "trunk_merge_submitted")
                         .await;
                 }
+                tracing::info!(
+                    %work_item_id,
+                    %pr_url,
+                    intent_id = %intent.id,
+                    outcome = "submitted",
+                    "merge_when_ready: submitted PR to Trunk merge queue",
+                );
                 send_response(
                     &sink,
                     &request_id,
@@ -441,6 +463,14 @@ async fn handle_trunk_queue_merge(
             Err(err) => {
                 // Loud, no fallback to `gh pr merge`: no intent row
                 // survives a failed submission.
+                tracing::warn!(
+                    %work_item_id,
+                    %pr_url,
+                    intent_id = %intent.id,
+                    error = %err,
+                    outcome = "refused",
+                    "merge_when_ready: Trunk submitPullRequest failed; rolling back intent",
+                );
                 if let Err(del_err) = work_db.delete_trunk_merge_intent(&intent.id) {
                     tracing::error!(
                         %work_item_id,
@@ -459,6 +489,81 @@ async fn handle_trunk_queue_merge(
             }
         }
     });
+}
+
+/// Reply to a Merge click when an active trunk merge intent already exists
+/// for this work item. Never calls `submitPullRequest`. Distinguishes
+/// "already in the queue" from "intent exists but is not advancing" so
+/// the operator is never told a submission happened that did not.
+fn reply_duplicate_trunk_merge_click(
+    sink: &Arc<SessionSink>,
+    request_id: &str,
+    work_item_id: String,
+    pr_url: String,
+    active: crate::work::TrunkMergeIntent,
+) {
+    if active.pr_url != pr_url {
+        tracing::warn!(
+            %work_item_id,
+            requested_pr_url = %pr_url,
+            active_pr_url = %active.pr_url,
+            intent_id = %active.id,
+            last_trunk_state = ?active.last_trunk_state,
+            outcome = "refused",
+            "merge_when_ready: duplicate click refused; active intent is for a different PR",
+        );
+        send_response(
+            sink,
+            request_id,
+            FrontendEvent::WorkError {
+                message: format!(
+                    "merge_when_ready: a trunk merge intent is already active for {} (this work item's current PR is {pr_url}); resolve the stale intent before retrying",
+                    active.pr_url
+                ),
+            },
+        );
+        return;
+    }
+    if crate::trunk_merge::intent_is_live_in_queue(active.last_trunk_state.as_deref()) {
+        tracing::info!(
+            %work_item_id,
+            %pr_url,
+            intent_id = %active.id,
+            last_trunk_state = ?active.last_trunk_state,
+            outcome = "already_enqueued",
+            "merge_when_ready: duplicate click; PR already in Trunk merge queue, not re-submitted",
+        );
+        send_response(
+            sink,
+            request_id,
+            FrontendEvent::MergeWhenReadyAccepted {
+                work_item_id,
+                pr_url,
+                action: merge_when_ready::MergeAction::TrunkAlreadyEnqueued.as_str().to_owned(),
+            },
+        );
+        return;
+    }
+    let state = active.last_trunk_state.as_deref().unwrap_or("unknown");
+    tracing::warn!(
+        %work_item_id,
+        %pr_url,
+        intent_id = %active.id,
+        last_trunk_state = %state,
+        outcome = "stuck",
+        "merge_when_ready: duplicate click; intent is not in the Trunk queue, not reporting success and not re-submitting",
+    );
+    send_response(
+        sink,
+        request_id,
+        FrontendEvent::WorkError {
+            message: format!(
+                "merge_when_ready: {pr_url} is not in the Trunk merge queue (last_trunk_state={state}). \
+                 This click did not submit it. An active merge intent still exists in that state, so \
+                 Boss will not claim a submission it did not make."
+            ),
+        },
+    );
 }
 
 pub(super) async fn handle_open_review_terminal(ctx: Dispatch, req: FrontendRequest) {
@@ -866,6 +971,28 @@ mod trunk_queue_tests {
         (product.id, chore.id)
     }
 
+    /// Insert an active trunk merge intent for `work_item_id` and optionally
+    /// stamp `last_trunk_state`. Used to drive the duplicate-click branches
+    /// without going through a first `submitPullRequest`.
+    fn seed_active_trunk_intent(db: &WorkDb, work_item_id: &str, pr_url: &str, last_trunk_state: Option<&str>) {
+        let coords = crate::trunk_merge::parse_trunk_pr_coordinates(pr_url).unwrap();
+        let intent = db
+            .insert_trunk_merge_intent(
+                crate::work::TrunkMergeIntentInsertInput::builder()
+                    .work_item_id(work_item_id)
+                    .pr_url(pr_url)
+                    .pr_number(coords.number as i64)
+                    .repo(format!("{}/{}", coords.owner, coords.repo))
+                    .target_branch("main")
+                    .build(),
+            )
+            .unwrap()
+            .expect("first insert for this work item is not a duplicate");
+        if let Some(state) = last_trunk_state {
+            db.record_trunk_merge_intent_state(&intent.id, state).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn trunk_queue_merge_submits_and_marks_task_queued() {
         let server = MockServer::start().await;
@@ -990,7 +1117,9 @@ mod trunk_queue_tests {
         .await;
         let second = sink.next().await.expect("second response");
         match second.payload {
-            FrontendEvent::MergeWhenReadyAccepted { action, .. } => assert_eq!(action, "trunk_enqueued"),
+            FrontendEvent::MergeWhenReadyAccepted { action, .. } => {
+                assert_eq!(action, "trunk_already_enqueued")
+            }
             other => panic!("expected a no-op MergeWhenReadyAccepted, got {other:?}"),
         }
 
@@ -1003,6 +1132,99 @@ mod trunk_queue_tests {
             .unwrap();
         assert_eq!(intent.submit_count, 1);
 
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn trunk_queue_merge_duplicate_click_while_testing_reports_already_enqueued() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/submitPullRequest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let (state, _temp) = test_server_state(trunk_client_for(server.uri()));
+        let pr_url = "https://github.com/brianduff/flunge/pull/984";
+        let (_product_id, work_item_id) = seed_trunk_queue_chore(&state.work_db, "trunk-chore-live", pr_url);
+        seed_active_trunk_intent(&state.work_db, &work_item_id, pr_url, Some("testing"));
+        let sink = make_session_sink();
+
+        handle_merge_when_ready(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::MergeWhenReady {
+                work_item_id: work_item_id.clone(),
+            },
+        )
+        .await;
+        let envelope = sink.next().await.expect("a response should be enqueued");
+        match envelope.payload {
+            FrontendEvent::MergeWhenReadyAccepted { action, .. } => {
+                assert_eq!(action, "trunk_already_enqueued")
+            }
+            other => panic!("expected already-enqueued MergeWhenReadyAccepted, got {other:?}"),
+        }
+
+        let intent = state
+            .work_db
+            .get_active_trunk_merge_intent(&work_item_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.submit_count, 1);
+        assert_eq!(intent.last_trunk_state.as_deref(), Some("testing"));
+        server.verify().await;
+    }
+
+    /// Regression: an active intent stuck at `last_trunk_state = "failed"`
+    /// used to reply `MergeWhenReadyAccepted { action: trunk_enqueued }`
+    /// without calling `submitPullRequest`. That is the toast that claimed
+    /// a Trunk submission the operator never got.
+    #[tokio::test]
+    async fn trunk_queue_merge_click_on_failed_intent_does_not_report_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/submitPullRequest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let (state, _temp) = test_server_state(trunk_client_for(server.uri()));
+        let pr_url = "https://github.com/brianduff/flunge/pull/985";
+        let (_product_id, work_item_id) = seed_trunk_queue_chore(&state.work_db, "trunk-chore-failed", pr_url);
+        seed_active_trunk_intent(&state.work_db, &work_item_id, pr_url, Some("failed"));
+        let sink = make_session_sink();
+
+        handle_merge_when_ready(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::MergeWhenReady {
+                work_item_id: work_item_id.clone(),
+            },
+        )
+        .await;
+        let envelope = sink.next().await.expect("a response should be enqueued");
+        match envelope.payload {
+            FrontendEvent::WorkError { message } => {
+                assert!(
+                    message.contains("last_trunk_state=failed"),
+                    "stuck-intent error must name the stored state, got: {message}"
+                );
+                assert!(
+                    message.contains("did not submit"),
+                    "stuck-intent error must say this click did not submit, got: {message}"
+                );
+            }
+            other => panic!("expected WorkError for a failed intent, got {other:?}"),
+        }
+
+        let intent = state
+            .work_db
+            .get_active_trunk_merge_intent(&work_item_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.submit_count, 1);
+        assert_eq!(intent.last_trunk_state.as_deref(), Some("failed"));
         server.verify().await;
     }
 

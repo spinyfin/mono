@@ -47,6 +47,25 @@ fn needs_remediation(last_trunk_state: Option<&str>) -> bool {
     )
 }
 
+/// Whether a duplicate Merge click may honestly report "already in the
+/// Trunk queue" without calling `submitPullRequest`.
+///
+/// Live Trunk PR states (`not_ready`/`pending`/`testing`/`tests_passed`),
+/// plus `None` (just submitted, poller has not observed yet), mean the
+/// entry is in — or was just put into — the queue. Everything else is
+/// out of the queue: terminal Trunk states (`failed`/`pending_failure`/
+/// `cancelled`/`merged`), Boss sentinels (`boss:awaiting_resubmit`,
+/// `boss:superseded_by_conflict`), and unknown future strings. Those
+/// must not be reported as a submission; the merge handler refuses
+/// rather than guessing a resubmit the intent state machine may still
+/// own.
+pub(crate) fn intent_is_live_in_queue(last_trunk_state: Option<&str>) -> bool {
+    matches!(
+        last_trunk_state,
+        None | Some("not_ready") | Some("pending") | Some("testing") | Some("tests_passed")
+    )
+}
+
 /// Called once the fix for an evicted or conflict-superseded Trunk intent
 /// has genuinely landed. Flips the intent's `last_trunk_state` sentinel to
 /// [`TRUNK_INTENT_AWAITING_RESUBMIT`] so the next `TrunkQueueProbe` pass
@@ -234,6 +253,40 @@ mod tests {
     #[test]
     fn rejects_a_malformed_url() {
         assert!(parse_trunk_pr_coordinates("not a url").is_err());
+    }
+
+    #[test]
+    fn live_in_queue_covers_observed_and_just_submitted_states() {
+        for state in [
+            None,
+            Some("not_ready"),
+            Some("pending"),
+            Some("testing"),
+            Some("tests_passed"),
+        ] {
+            assert!(
+                intent_is_live_in_queue(state),
+                "{state:?} must count as live in the queue",
+            );
+        }
+    }
+
+    #[test]
+    fn live_in_queue_rejects_terminal_sentinels_and_unknown_states() {
+        for state in [
+            Some("failed"),
+            Some("pending_failure"),
+            Some("cancelled"),
+            Some("merged"),
+            Some(TRUNK_INTENT_AWAITING_RESUBMIT),
+            Some(TRUNK_INTENT_SUPERSEDED_BY_CONFLICT),
+            Some("some_future_trunk_state"),
+        ] {
+            assert!(
+                !intent_is_live_in_queue(state),
+                "{state:?} must not be reported as already enqueued",
+            );
+        }
     }
 
     // ── awaiting_resubmit / superseded_by_conflict sentinel transitions ────
