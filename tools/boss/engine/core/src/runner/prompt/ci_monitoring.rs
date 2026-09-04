@@ -28,7 +28,7 @@ pub(super) fn ci_monitoring_directive(execution: &WorkExecution) -> String {
         }
     }
     out.push_str(
-        "A required CI check that has genuinely *failed* (not merely pending) is different — fix it and push, or escalate per the build-gate rules above. But a still-running or human-gated check never blocks your completion.\n",
+        "A required CI check that has genuinely *failed* (not merely pending) is different — classify it per the CI-failure rules at the top of this prompt (caused by you: fix; unrelated and trivial: fix and state the category in the PR; unrelated and not trivial: flag, do not absorb). Waiting for a CI-fix revision is not a substitute for fixing a failure you could handle in this run — that path is the fallback for a failure that genuinely needs a separate change. A still-running or human-gated check never blocks your completion.\n",
     );
     out
 }
