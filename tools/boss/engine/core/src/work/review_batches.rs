@@ -1052,6 +1052,14 @@ impl WorkDb {
             tx.commit()?;
             return Ok(ReviewBatchDispatch::ExistingBatch { batch, executions });
         }
+        if !can_admit_review_batch_in_tx(
+            &tx,
+            ReviewBatchPhase::PostMerge,
+            reservation_capacity(crate::coordinator::DEFAULT_REVIEW_POOL_SIZE),
+        )? {
+            tx.commit()?;
+            return Ok(ReviewBatchDispatch::AdmissionDeferred);
+        }
         let execution = insert_execution(
             &tx,
             CreateExecutionInput::builder()
