@@ -13,13 +13,15 @@ Decision records shipped as a store with no readers. This design gives them thre
 
 The central bet, stated so it can be disagreed with: **enforcement is a stack of three read points, and the mechanical one is the engine inlining the applicable decisions into every worker and reviewer prompt, not the coordinator's diligence.** The coordinator's consultation at brief time is the cheapest and the operator's preferred layer, and it is where the ask gets shaped, but it is a prompt rule an LLM can skip, and the exemplar violation was not visible in the ask at all. So the design builds all three, in this order:
 
-1. **Coordinator, at brief time** — a prompt section that tells the coordinator decisions exist, when to record one, and to read the applicable list before filing anything that changes architecture, policy, topology, credentials or CI; plus an engine-side create gate that refuses a colliding create unless the caller acknowledges the specific decision by id, which writes a collision row.
-2. **Worker, at approach-choice time** — the engine inlines every applicable active decision into the worker's initial prompt, with a directive to re-check the list at the moment its approach acquires a new credential, service, CI or policy dependency, and to stop with a `[blocked]` marker naming the decision instead of proceeding.
-3. **Reviewer, against the diff** — the engine inlines the same applicable set into the reviewer prompt; the rubric gains a decision check; a new `decision_violation` finding category carries the decision id, forces a revision regardless of severity (the same forcing treatment as regression and duplication), and is written to the collision ledger.
+1. **Coordinator, at brief time** — a prompt section that tells the coordinator decisions exist, when to record one, and to read the applicable _index_ (then `show` any row that bears on the ask) before filing anything that changes architecture, policy, topology, credentials or CI; plus an engine-side create gate that refuses a colliding create unless the caller acknowledges the specific decision by id, which writes a collision row.
+2. **Worker, at approach-choice time** — the engine inlines the applicable _index_ (label, kind, title) into the worker's initial prompt, plus as many full bodies as fit a hard budget, with a directive to re-check the list at the moment its approach acquires a new credential, service, CI or policy dependency, and to stop with a `[blocked]` marker naming the decision instead of proceeding.
+3. **Reviewer, against the diff** — the engine inlines the same applicable index into the reviewer prompt (bodies under a larger one-shot budget); the rubric gains a decision check; a new `decision_violation` finding category carries the decision id, forces a revision regardless of severity (the same forcing treatment as regression and duplication), and is written to the collision ledger.
 
 Scope: the per-product `D<n>` namespace stays; global decisions are the same table with `product_id = NULL` and their own `G<n>` label. "Which decisions apply here" is one query: active rows where the product matches or the product is null.
 
-Relevance: the deterministic matcher stays as the create gate (widened to read the work item's description and the decision's body), and no LLM matcher is added. The readers that need semantic judgement, the coordinator, the worker and the reviewer, are LLMs reading the _full_ applicable list, which is small by construction and must stay small.
+Relevance: the deterministic matcher stays as the create gate (widened to read the work item's description and the decision's body), and no LLM matcher is added. The readers that need semantic judgement, the coordinator, the worker and the reviewer, always have the _full applicable index_ in front of them. Bodies are a budgeted depth, fetched via `boss decision show` when omitted, never a reason to subset the catalog.
+
+Context budget: compactness is mechanical, not a hope that the corpus stays small. Authoring caps at create, a compact `list`/`context` shape that does not carry bodies, and a two-tier prompt layout (full index, budgeted bodies, visible remainder). See **Context budget** below.
 
 Awareness (the meta-cause): a golden test that fails the build when a `boss` verb is mentioned in none of the three agent prompts and is not on an explicit human-only list with a reason, plus a reviewer rubric bullet for "new agent-facing surface with no prompt route". The test is the floor; the rubric is the judgement.
 
@@ -30,6 +32,7 @@ Awareness (the meta-cause): a golden test that fails the build when a `boss` ver
 - A decision can span products.
 - Decisions are visible in the Boss app: the ruling, its rationale, what it supersedes and is superseded by, and which work items have collided with it.
 - The coordinator, workers and reviewers know the mechanism exists without having to discover it in `boss --help`, and the next agent-facing surface cannot ship equally invisible.
+- Decision text that reaches an agent (prompt block, `boss context`, `boss decision list`) stays bounded: the applicable index is always cheap, and full bodies never silently explode a prompt.
 
 ## Non-goals
 
@@ -39,6 +42,7 @@ Awareness (the meta-cause): a golden test that fails the build when a `boss` ver
 - **Workers do not create decisions.** `CreateDecision` stays outside the worker-tier allow set. A worker that concludes a ruling is needed says so in its final report; the coordinator files it.
 - **No change to the kinds vocabulary** (`wontfix`, `decided`) or to the lifecycle (`active`, `superseded`, `revoked`).
 - **No enforcement inside CI or checkleft.** Decisions are Boss-side rulings about how work is filed and reviewed; a ruling that is also a repo invariant should additionally become a checkleft rule, but that is a per-ruling judgement, not a mechanism this design builds.
+- **No LLM compression or summarisation of decision bodies.** A ruling that does not fit the authoring cap is not a ruling; the fix is to rewrite it, not to summarise it on the way into a prompt.
 
 ## What exists today, verified
 
@@ -77,7 +81,17 @@ Every claim below was checked against source or the running engine during this r
 
 **Add an LLM relevance judge at create time** through the engine's `UtilityModel` seam (precedent: the comment-intent classifier and the attentions backstop). Rejected for the _gate_ specifically: a refusal that depends on a model call is not reproducible (the same create can pass on retry), it adds a network round trip and a credential dependency to every `boss task create`, and it answers the wrong question. Whether a decision is _relevant_ to a piece of work is a judgement that the coordinator, worker and reviewer must make anyway while reading the full list, and they are already LLMs. The value of an automated matcher is only as a tripwire that fires when the coordinator has _not_ read the list; a deterministic tripwire over widened inputs is enough for that.
 
-**Deterministic matcher over widened inputs as the gate; full-list reading by the LLM readers as the judgement (chosen).** Stated at the load-bearing level: the property the system needs is that _every reader that can act on a decision has the whole applicable list in front of it_, not that a matcher picks the right subset. The matcher exists only to catch a create that skipped the reading.
+**Deterministic matcher over widened inputs as the gate; full-list reading by the LLM readers as the judgement (chosen).** Stated at the load-bearing level: the property the system needs is that _every reader that can act on a decision has the whole applicable index in front of it_, not that a matcher picks the right subset. The matcher exists only to catch a create that skipped the reading. "The whole list" means every applicable label, kind and title — not every body. Bodies are the budgeted depth described in Context budget.
+
+### Context budget
+
+**Dump full `Decision` rows into every agent surface** (`list --json`, `boss context`, prompt bodies). Rejected: that is the path the current code is on (`ListDecisions` serialises the full row, including body, keywords, timestamps and attribution), and it is the bloat this section exists to close. It is fine at one row. It is not a design that survives the tens of rows this document already treats as the expected corpus, and it is paid on every worker, every reviewer, and every coordinator consult.
+
+**Subset the prompt to "relevant" decisions via the matcher or an LLM.** Rejected: it reopens the relevance question this design already closed. The catalog is what makes a differently-worded ask unable to hide a ruling; subsetting it is how the Buildkite case would be missed again. Bodies can be on-demand. The catalog cannot.
+
+**A truncation fallback on the worker prompt only** (the 8 KiB combined cap previously sketched, degrading the whole block to titles). Necessary as a _backstop_, rejected as the _whole_ answer. It leaves `boss decision list --json` and `boss context` dumping full rows; it says nothing about authoring, so a single essay-length body blows the budget by itself; and a fallback that only trips once the prompt is already bloated is not a budget. A combined cap also truncates the catalog once a few long bodies land, which is the failure mode to prevent.
+
+**Two representations, authoring caps, and a split prompt budget (chosen).** An index form is what every catalog surface returns. A full form is what `show`, the UI detail, and the in-budget prompt bodies use. Create refuses a title or body over cap rather than truncating a ruling. The prompt always renders the index of the whole applicable set, then as many full bodies as fit, with the remainder named and pointed at `boss decision show`. Nothing is silent.
 
 ### How the awareness class is closed
 
@@ -94,7 +108,7 @@ Every claim below was checked against source or the running engine during this r
 - `product_decisions.product_id` becomes nullable. A row with `product_id IS NULL` is a **global decision**.
 - Global rows draw their short id from `decision_short_id_sequences` under the reserved scope key `global`, and display as `G<n>`. Product rows keep `D<n>`. `decision_short_id_label` takes the scope into account; `display_label` on `Decision` renders the right prefix.
 - **Applicability** is defined once, in the engine: the active decisions that apply to product `X` are `status = 'active' AND (product_id = X OR product_id IS NULL)`. Every reader in this design calls that one query; no reader re-derives it.
-- `ListDecisions` gains `scope`: `product` (current behaviour), `global` (only global rows), or `applicable` (the union above, the default for every agent-facing caller). The CLI exposes `boss decision list --product <p>` (now applicable by default), `--global` (global rows only), and `--product-only`.
+- `ListDecisions` gains `scope`: `product` (current behaviour), `global` (only global rows), or `applicable` (the union above, the default for every agent-facing caller), and `include_body` (default `false`, returning `DecisionIndex` rows). The CLI exposes `boss decision list --product <p>` (now applicable by default, compact), `--global` (global rows only), `--product-only`, and `--full` (bodies).
 - `boss decision create --global` creates a global row; `--product` and `--global` are mutually exclusive and one is required.
 - Selector parsing accepts `G<n>` (no product needed), `D<n>` (product required, as today), and canonical `dec_…` ids. `supersede` accepts any mix: a product decision may be superseded by a global one and vice versa, since the pointer is the canonical id.
 - Migration is a table rebuild (SQLite cannot drop `NOT NULL` in place): create the new table, copy rows, drop, rename, recreate the two indexes. `D1` keeps its id, short id and product.
@@ -109,13 +123,50 @@ Every claim below was checked against source or the running engine during this r
 - The CLI-side stderr warning is **deleted in the same PR that lands the engine gate**, and not before. The engine gate is strictly stronger (it reads more, refuses instead of warning, and fires for every caller including the materializer and automations), so removing the warning at that moment does not weaken the surface. The existing CLI test `task_create_warns_on_decision_overlap_without_breaking_json` pins the premise that the warning is the surface; it is replaced in the same PR by an engine test that the create is refused and a CLI test that `--json` stdout stays valid on refusal.
 - Engine-internal creates that must not be refused (the planner materializer creating rows from an approved design doc, automation-materialised rows) are not exempt: the materializer already passes `force_duplicate(true)`, and it must instead **fail the materialisation for that row and raise an attention item** naming the decision, because a design doc that contradicts a standing ruling is exactly the case the operator wants to see. This is a behaviour change for the populator and is called out in the task breakdown.
 
+### Context budget
+
+Stated at the load-bearing level: _the catalog of applicable decisions is always in front of every reader; the bodies are a budgeted depth, not the catalog._ Three surfaces carry decision text today or under this design — the prompt block, `boss context`, and `boss decision list` — and each is bounded the same way: index by default, full row only when asked or when it fits.
+
+**Authoring caps**, enforced on `CreateDecision` and on the successor body of `SupersedeDecision`. Typed error, no silent truncation (truncating a ruling is worse than refusing it):
+
+| field    | cap            | why                                                                            |
+| -------- | -------------- | ------------------------------------------------------------------------------ |
+| title    | 120 characters | one-line ruling; the label is `D<n>`/`G<n>`, the title is the sentence         |
+| body     | 2 KiB          | the ruling and the why; if it does not fit, it is a design doc, not a decision |
+| keywords | 200 characters | matcher tokens, not a second body                                              |
+
+These are the "small by construction" made mechanical. The coordinator prompt's "ruling, not note" framing is the social control; the cap is the floor the social control cannot skip. D1 as recorded fits easily; a paste of a Slack thread would not.
+
+**Index form** (`DecisionIndex`): `id`, `short_id`, `product_id`, `kind`, `status`, `title`. No body, no keywords, no timestamps, no attribution. `display_label` is derived. This is the default shape of:
+
+- `ListDecisions` (new `include_body: bool`, default `false`)
+- `boss decision list --json` (the coordinator consult path)
+- `WorkerContextBundle.decisions`
+
+The human `list` table is already this shape (ID, KIND, STATUS, TITLE, CREATED) and stays that way. `boss decision list --full` / `include_body: true` returns full `Decision` rows for the rare dump. `boss decision show` / `GetDecision` is unchanged (always full). Collision errors stay compact (id, label, title, kind) as already specified.
+
+**Prompt layout** (one renderer, used by the worker composer and handed to the reviewer as data):
+
+1. The directive (substance unchanged).
+2. The full applicable _index_, one line per decision: `G1 decided — Buildkite pipelines must not depend on a Buildkite API token`. Always. No budget on this part — thirty titles are a couple of kilobytes, and truncating the catalog is how a ruling becomes invisible again.
+3. Full bodies, oldest-first (the rulings that have lasted), until a body budget is exhausted: **4 KiB for workers** (they can `boss decision show`), **8 KiB for reviewers** (one-shot prompt, no CLI round-trip assumed).
+4. If any body was omitted: a visible line naming the remainder, `N more: run boss decision show <label> …`. Never silent, never a `…` mid-body.
+
+A combined 8 KiB cap on the whole block is _not_ used: it would drop catalog lines once a few long bodies landed. The index is not truncated; the bodies are.
+
+**Coordinator consult** uses the compact list, then `boss decision show` for any row that bears on the ask, and cites those in the brief by label with one sentence on why. It does not dump `--json` full rows into its own context as a matter of course. v1 does not add a structured `cited_decisions` field on the work item; the brief text is the citation, and the worker `show`s any title that bears on the approach.
+
+**Reviewer rule that follows from truncation:** a `decision_violation` finding is valid only against a decision whose _body_ was in the prompt. The parser already rejects an id that is not active and applicable; it also rejects an id that was index-only in this render. Title-only overreach is how a reviewer would stretch a ruling past its wording; if the body did not fit, there is no finding against it this pass.
+
+**Corpus signal.** The Decisions tab shows the active count per product and for global. Twenty-five active rows for one product is the number at which the index is still cheap and the body budget is almost certainly truncating; that is a cue to revoke or supersede, not a hard cap and not a new attention item in v1.
+
 ### Enforcement point 1: the coordinator at brief time
 
 A new `## Standing decisions` section in `bossSystemPrompt` (the Swift literal in `tools/boss/app-macos/Sources/Ghostty/BossPaneModel.swift`; never the runtime `CLAUDE.md`), placed immediately before "Judgement rules" so the filing rules can refer back to it. Its content, in substance:
 
 - What a decision is and is not: an operator-owned standing ruling (`decided`) or a considered-and-declined proposal (`wontfix`) that outlives any work item; not a note, not a TODO, not deferred work, not a bug report. Product-scoped `D<n>` or global `G<n>`.
-- **When to record one, in the same turn:** whenever the operator states a rule in standing terms ("always", "never", "must not", "we don't do X", "the plan is X") that binds future work rather than the current ask. Ask the operator to confirm the wording once, then `boss decision create --kind decided` (or `wontfix` when the operator declines a proposal on the record). Record the _why_ in the body; the body is what the worker and reviewer will read.
-- **When to consult:** before filing anything that changes architecture, topology, policy, credentials, secrets, CI, or an external dependency, run `boss decision list --product <p> --json` (applicable scope) and read it. Cite any decision that bears on the ask in the brief by label, with one sentence on _why it applies to this ask_, so the worker starts with the constraint and its reasoning.
+- **When to record one, in the same turn:** whenever the operator states a rule in standing terms ("always", "never", "must not", "we don't do X", "the plan is X") that binds future work rather than the current ask. Ask the operator to confirm the wording once, then `boss decision create --kind decided` (or `wontfix` when the operator declines a proposal on the record). Record the _why_ in the body, kept inside the authoring cap: the title is the one-line ruling, the body is the why, not the history. The body is what the worker and reviewer will read when it is inlined.
+- **When to consult:** before filing anything that changes architecture, topology, policy, credentials, secrets, CI, or an external dependency, run `boss decision list --product <p> --json` (applicable scope, compact index — not `--full`) and read the titles. For any row that bears on the ask, `boss decision show <label>` and cite it in the brief by label with one sentence on _why it applies to this ask_, so the worker starts with the constraint and its reasoning.
 - **On a collision refusal:** report the refusal to the operator verbatim with the decision's title. Pass `--acknowledge-decision` only when the current ask explicitly revisits or supersedes that decision, and say in the reason which ask authorised it. Never acknowledge to make a refusal go away.
 - The existing "Do not file fixes for deliberate design choices" bullet is amended so `boss decision list` heads its list of places to check. The handoff example's `## Decisions` section is renamed `## Session-scoped calls` with a one-line note that a standing ruling goes in `boss decision create`, not the handoff.
 
@@ -123,18 +174,18 @@ The coordinator's brief-time consultation is the operator's preferred layer and 
 
 ### Enforcement point 2: the worker at approach-choice time
 
-- The engine's worker prompt composer renders a `## Standing decisions` block into every implementation-kind initial prompt (task, chore, investigation, revision, conflict resolution, CI remediation, design): the applicable set for the work item's product, each as label, kind, title and body. If the rendered block would exceed a fixed budget (8 KiB is proposed), it degrades to label, kind and title per decision plus the instruction to run `boss decision show <label>`; that fallback must itself be visible in the block ("N decisions truncated to titles"), never silent.
-- The block carries the directive that closes the exemplar: _"Re-read this list at the moment your approach acquires a dependency the brief did not name: a credential or secret, an external service, a CI step, a schema or topology change, a policy. If the approach you are about to take collides with a decision here, do not proceed and do not work around it. Stop with `[blocked] reason="collides with D<n>: …"` (or `boss propose blocked --decision D<n>` where the proposal seam is enabled) so the operator can revisit the ruling or the approach."_ The `[blocked]` marker and `propose blocked` already exist; this adds an optional `decision_id` to the blocked proposal so the engine can write a ledger row with `source = worker_blocked`.
-- `boss context` gains `decisions: Vec<Decision>` (the applicable active set) so a worker can re-read after context compaction without knowing the product id. The worker CLAUDE.md template names `boss decision list` and `boss decision show` in its read-only verbs.
+- The engine's worker prompt composer renders a `## Standing decisions` block into every implementation-kind initial prompt (task, chore, investigation, revision, conflict resolution, CI remediation, design), using the two-tier layout in Context budget: the full applicable index, then oldest-first bodies up to 4 KiB, then a visible remainder pointing at `boss decision show`. Compose-prompt tests pin the index's presence per execution kind, the body budget, and that a remainder line appears when a fixture exceeds the budget.
+- The block carries the directive that closes the exemplar: _"Re-read this list at the moment your approach acquires a dependency the brief did not name: a credential or secret, an external service, a CI step, a schema or topology change, a policy. If a title looks applicable and its body is not inlined, run `boss decision show <label>` before deciding. If the approach you are about to take collides with a decision here, do not proceed and do not work around it. Stop with `[blocked] reason="collides with D<n>: …"` (or `boss propose blocked --decision D<n>` where the proposal seam is enabled) so the operator can revisit the ruling or the approach."_ The `[blocked]` marker and `propose blocked` already exist; this adds an optional `decision_id` to the blocked proposal so the engine can write a ledger row with `source = worker_blocked`.
+- `boss context` gains `decisions: Vec<DecisionIndex>` (the applicable active set, compact) so a worker can re-read the catalog after context compaction without knowing the product id, then `show` any body it needs. The worker CLAUDE.md template names `boss decision list` and `boss decision show` in its read-only verbs.
 - Nothing else changes for workers: the read RPCs are already allowed. Verified, see above.
 
 ### Enforcement point 3: the reviewer against the diff
 
-- The engine passes the applicable decision set into `render_reviewer_initial_prompt` and `render_batch_reviewer_initial_prompt` as data (the pr-review crate must not depend on the engine; it renders what it is handed). The prompt gains a `## Standing decisions` section and the code rubric gains a bullet: check every changed line against each decision; a finding is warranted only when the diff itself establishes the violation, cited at file and line as with any other finding, and confidence is stated. The docs-only rubric gets the same bullet; a design doc can propose a violating approach.
-- `ReviewFindingCategory::DecisionViolation` (`decision_violation` on the wire) with a required `decision_id` field on the finding. The parser rejects a `decision_violation` finding whose `decision_id` is not an active applicable decision, so the category cannot be used for a reviewer's own opinions.
+- The engine passes the applicable set into `render_reviewer_initial_prompt` and `render_batch_reviewer_initial_prompt` as data (the pr-review crate must not depend on the engine; it renders what it is handed): the full index plus bodies under the 8 KiB reviewer budget, and the set of ids whose bodies were actually inlined. The prompt gains a `## Standing decisions` section and the code rubric gains a bullet: check every changed line against each decision _whose body is in the prompt_; a finding is warranted only when the diff itself establishes the violation, cited at file and line as with any other finding, and confidence is stated. The docs-only rubric gets the same bullet; a design doc can propose a violating approach.
+- `ReviewFindingCategory::DecisionViolation` (`decision_violation` on the wire) with a required `decision_id` field on the finding. The parser rejects a `decision_violation` finding whose `decision_id` is not an active applicable decision _or whose body was not inlined in this prompt_, so the category cannot be used for a reviewer's own opinions and cannot be raised from a title alone.
 - `passes_severity_gate` adds `DecisionViolation` to the forced-revision set regardless of assigned severity, joining regression, duplication, deferred scope and agent-isms. The revision instructions render it under its own heading ("Standing decision violated"), quoting the decision's title and label, so the revision worker is told what rule it is up against rather than what line to change.
 - On accepting a report with such a finding, the engine writes a ledger row with `source = review_finding`, the decision id, the reviewed work item, the PR URL and head SHA.
-- False positives at scale are handled by three things, none of them a matcher: the applicable set is small and must stay small (the coordinator prompt says a decision is a ruling, not a note); a finding needs a diff citation; and a wrong finding costs one revision cycle in which the worker may take the disagreement path below.
+- False positives at scale are handled by four things, none of them a matcher: authoring caps keep each ruling short; a finding needs a diff citation _and_ an inlined body; a wrong finding costs one revision cycle in which the worker may take the disagreement path below; and the catalog stays in front of the reviewer even when bodies truncate.
 
 ### The disagreement path
 
@@ -162,7 +213,7 @@ Rows are append-only. `ListDecisionCollisions { decision_id }` and `ListDecision
 - A **Decisions** tab beside Designs and Automations in `ContentView.swift`, following the `AutomationsView` pattern. The list shows label, scope (product name or "Global"), kind, status, title, created by and date; filters for scope and status; inactive rows hidden by default.
 - The detail view shows the body rendered as markdown (the rationale is the body; the design does not add a separate field), the supersession chain in both directions (the predecessor is found by querying `superseded_by = this id`), `related_work_item_id` as a link, and the **collisions list** from the ledger: each row as source, work item (linked to the card), actor, reason, date.
 - Work cards for items with any ledger row show a small badge ("collides with D3"), consistent with the existing badge strip, so a collision is visible where the operator already looks.
-- App-side this is decoding `Decision` and the ledger row, three read RPCs, and the two events. No app-side logic decides applicability or relevance.
+- App-side this is decoding `DecisionIndex` for the tab, `Decision` for the detail (`GetDecision`), and the ledger row; three read RPCs, and the two events. No app-side logic decides applicability or relevance. The tab does not fetch bodies.
 
 ### Closing the awareness class
 
@@ -177,16 +228,16 @@ The invariant, stated at the level that is load-bearing: _no agent-facing surfac
 ### Wire and schema summary
 
 - Schema: `product_decisions.product_id` nullable (table rebuild); `decision_short_id_sequences` gains the `global` key; new `decision_collisions` table with indexes on `decision_id` and `work_item_id`.
-- Protocol: `Decision.product_id: Option<String>`; `DecisionScope` enum for `ListDecisions`; `DecisionAcknowledgement`; `acknowledged_decisions` on the three create inputs and on the blocked proposal; `DecisionCollision` type; `ListDecisionCollisions`, `ListDecisionCollisionsForWorkItem`; `DecisionCollisionRecorded` event; `decisions` on `WorkerContextBundle`; `decision_violation` finding category with `decision_id`.
-- Engine: `decision-match` crate; applicability query in `work/decisions.rs`; create-gate in `insert_helpers.rs` beside the duplicate guard; ledger writes in the create handlers, the blocked-proposal apply path, the review-report accept path, and the materializer; prompt blocks in `runner/prompt.rs`; reviewer data passed into `pr-review` renderers; the coverage test.
-- CLI: `--global`, scope flags on `list`, `G<n>` selectors, `--acknowledge-decision` and `--acknowledge-reason` on the create verbs, `propose blocked --decision`; the stderr warning removed with the gate.
+- Protocol: `Decision.product_id: Option<String>`; `DecisionIndex` (id, short_id, product_id, kind, status, title); `DecisionScope` enum and `include_body: bool` (default false) for `ListDecisions`; `DecisionAcknowledgement`; `acknowledged_decisions` on the three create inputs and on the blocked proposal; `DecisionCollision` type; `ListDecisionCollisions`, `ListDecisionCollisionsForWorkItem`; `DecisionCollisionRecorded` event; `decisions: Vec<DecisionIndex>` on `WorkerContextBundle`; `decision_violation` finding category with `decision_id`.
+- Engine: `decision-match` crate; applicability query in `work/decisions.rs`; authoring caps on create/supersede; create-gate in `insert_helpers.rs` beside the duplicate guard; ledger writes in the create handlers, the blocked-proposal apply path, the review-report accept path, and the materializer; two-tier prompt blocks in `runner/prompt.rs`; reviewer data (index, inlined bodies, inlined ids) passed into `pr-review` renderers; the coverage test.
+- CLI: `--global`, scope flags on `list`, `list --full` for bodies, `G<n>` selectors, `--acknowledge-decision` and `--acknowledge-reason` on the create verbs, `propose blocked --decision`; the stderr warning removed with the gate.
 - App: Decisions tab and detail, collision list, work-card badge, event handling.
 - Prompts: coordinator section and two amendments; worker block and directive; reviewer section, rubric bullet and revision rendering.
 
 ## Risks and open questions
 
 - **Friction calibration.** Refuse-with-acknowledgement is the middle option and the one this design defends, but whether the matcher's widened inputs produce refusals the coordinator finds tolerable is an empirical question. The crate's tests pin the exemplar and today's near-misses; the first month of collisions in the ledger is the real study, and it is a _validation_ of the chosen thresholds, not a comparison between gate designs. If refusals are noisy the fix is thresholds or keywords, not removing the gate.
-- **Corpus growth.** Every layer here reads the full applicable list. If a product accumulates dozens of decisions the prompt blocks bloat and the reviewer's precision falls. The coordinator prompt's "ruling, not note" framing is the control; the truncation fallback is the backstop. A per-product count is worth a metric so the operator sees it before it hurts.
+- **Corpus growth.** The context-budget section is the answer, not a hope. Authoring caps bound each row; the index stays in every prompt regardless of count; bodies truncate visibly. If a product still accumulates dozens of _short_ rulings, the index remains cheap (thirty titles are a couple of kilobytes) and the reviewer simply cannot raise `decision_violation` against a body that was not inlined. The Decisions tab count is the operator signal; the failure mode to watch is not bloat, it is a catalog of rulings nobody supersedes. If that happens the fix is hygiene (revoke/supersede), not dropping the catalog from the prompt.
 - **The materializer behaviour change.** Failing a planner-materialised row on collision and raising an attention item is the right call by the constraints, but it changes an existing idempotent path; the populator's tests need to cover the partial-materialisation case.
 - **Reviewer over-reach.** A reviewer told to hold rulings may stretch a ruling past its wording. The `decision_id` validation, the diff-citation requirement and the disagreement path bound the cost, but the operator should expect a few early findings that lead to a `supersede` with tighter wording, which is the system working.
 - **The coverage test reads a Swift file from Rust.** It is a text fixture, not a Swift build dependency; if the prompt literal ever moves to a resource file the test's data label moves with it. Whether the test should also cover `bossctl` verbs for the coordinator is a small open question; the design proposes yes, with the same human-only list.
@@ -200,7 +251,7 @@ Parallelism: after "Global decision scope" lands, "Engine create gate and collis
 
 ### Global decision scope
 
-Scope: make `product_decisions.product_id` nullable via a table-rebuild migration; allocate global short ids under the reserved `global` sequence key and render them as `G<n>`; add `DecisionScope` to `ListDecisions` with `applicable` as the agent-facing default and implement the single applicability query in `work/decisions.rs`; update `Decision.product_id` to `Option<String>` and `display_label`; CLI `boss decision create --global`, `list --global` / `--product-only`, and `G<n>` selector parsing; allow cross-scope `supersede`. Existing round-trip CLI test extended for a global row and for applicable listing. `D1` must survive unchanged (id, short id, product).
+Scope: make `product_decisions.product_id` nullable via a table-rebuild migration; allocate global short ids under the reserved `global` sequence key and render them as `G<n>`; add `DecisionScope` to `ListDecisions` with `applicable` as the agent-facing default and implement the single applicability query in `work/decisions.rs`; add `DecisionIndex` and `include_body` (default false) so list JSON is compact unless `--full`; update `Decision.product_id` to `Option<String>` and `display_label`; CLI `boss decision create --global`, `list --global` / `--product-only` / `--full`, and `G<n>` selector parsing; allow cross-scope `supersede`. Existing round-trip CLI test extended for a global row, applicable listing, and compact-vs-full JSON. `D1` must survive unchanged (id, short id, product).
 
 Effort: medium
 
@@ -210,7 +261,7 @@ Scope: in-scope
 
 ### Engine create gate and collision ledger
 
-Scope: extract the matcher into a new `tools/boss/engine/decision-match` crate with widened inputs (name plus description against title, keywords and body) and thresholds pinned by tests against the exemplar and today's near-miss fixtures; add the `decision_collisions` table, `DecisionCollision` type, the two list RPCs (worker-tier allowed) and the `DecisionCollisionRecorded` event; add `DecisionAcknowledgement` and `acknowledged_decisions` to the task, chore and investigation create inputs; run the gate in the engine create handlers before insert, refusing with a typed `DecisionCollisionError` and writing `create_acknowledged` ledger rows on acknowledged proceeds; reject acknowledgements that did not match; make the planner materializer fail the colliding row and raise an attention item (`materializer_refused`); CLI `--acknowledge-decision` / `--acknowledge-reason` on the three create verbs with error rendering that names the re-run flag; delete the CLI stderr warning and replace its test with the engine refusal test and a `--json`-stdout-stays-valid test in this same PR.
+Scope: extract the matcher into a new `tools/boss/engine/decision-match` crate with widened inputs (name plus description against title, keywords and body) and thresholds pinned by tests against the exemplar and today's near-miss fixtures; add the `decision_collisions` table, `DecisionCollision` type, the two list RPCs (worker-tier allowed) and the `DecisionCollisionRecorded` event; add `DecisionAcknowledgement` and `acknowledged_decisions` to the task, chore and investigation create inputs; run the gate in the engine create handlers before insert, refusing with a typed `DecisionCollisionError` and writing `create_acknowledged` ledger rows on acknowledged proceeds; reject acknowledgements that did not match; enforce the authoring caps (title 120, body 2 KiB, keywords 200) on `CreateDecision` / `SupersedeDecision` with a typed error and no silent truncation; make the planner materializer fail the colliding row and raise an attention item (`materializer_refused`); CLI `--acknowledge-decision` / `--acknowledge-reason` on the three create verbs with error rendering that names the re-run flag; delete the CLI stderr warning and replace its test with the engine refusal test and a `--json`-stdout-stays-valid test in this same PR.
 
 Effort: large
 
@@ -220,7 +271,7 @@ Scope: in-scope
 
 ### Worker prompt inlining and approach-time directive
 
-Scope: render a `## Standing decisions` block (applicable set, budgeted with a visible truncation fallback) into every implementation-kind initial prompt in `runner/prompt.rs`, carrying the approach-time re-check directive and the `[blocked]` stop instruction; add `decisions` to `WorkerContextBundle` and populate it in the `GetWorkerContext` handler; name `boss decision list` / `show` in the worker CLAUDE.md template's read-only verbs; add an optional `decision_id` to the blocked proposal and `propose blocked --decision`, and write a `worker_blocked` ledger row when it is set. Compose-prompt tests pin the block's presence per execution kind and the truncation fallback.
+Scope: render a `## Standing decisions` block into every implementation-kind initial prompt in `runner/prompt.rs` using the two-tier layout (full applicable index, oldest-first bodies up to 4 KiB, visible remainder pointing at `boss decision show`), carrying the approach-time re-check directive (including "show before deciding when the body is not inlined") and the `[blocked]` stop instruction; add `decisions: Vec<DecisionIndex>` to `WorkerContextBundle` and populate it in the `GetWorkerContext` handler; name `boss decision list` / `show` in the worker CLAUDE.md template's read-only verbs; add an optional `decision_id` to the blocked proposal and `propose blocked --decision`, and write a `worker_blocked` ledger row when it is set. Compose-prompt tests pin the index per execution kind, the body budget, and the remainder line.
 
 Effort: large
 
@@ -230,7 +281,7 @@ Scope: in-scope
 
 ### Reviewer decision check
 
-Scope: pass the applicable decision set from the engine into the reviewer and batch-reviewer prompt renderers as data; add the `## Standing decisions` section and the rubric bullet to both the code and docs-only rubrics; add `ReviewFindingCategory::DecisionViolation` with a required `decision_id`, parser validation that the id is an active applicable decision, and its addition to `passes_severity_gate`'s forced-revision set; render it distinctly in the revision instructions; write a `review_finding` ledger row when a report carrying one is accepted; state the disagreement path in the reviewer and revision prompts. Fixture-based tests for the rubric text, the gate, and the invalid-id rejection.
+Scope: pass the applicable index, inlined bodies (8 KiB reviewer budget) and the set of inlined ids from the engine into the reviewer and batch-reviewer prompt renderers as data; add the `## Standing decisions` section and the rubric bullet (judge only against inlined bodies) to both the code and docs-only rubrics; add `ReviewFindingCategory::DecisionViolation` with a required `decision_id`, parser validation that the id is an active applicable decision _and_ was inlined, and its addition to `passes_severity_gate`'s forced-revision set; render it distinctly in the revision instructions; write a `review_finding` ledger row when a report carrying one is accepted; state the disagreement path in the reviewer and revision prompts. Fixture-based tests for the rubric text, the gate, the invalid-id rejection, and rejection of a finding against an index-only id.
 
 Effort: large
 
@@ -240,7 +291,7 @@ Scope: in-scope
 
 ### Coordinator prompt: standing decisions
 
-Scope: edit `bossSystemPrompt` in `tools/boss/app-macos/Sources/Ghostty/BossPaneModel.swift` (never the runtime `CLAUDE.md`): add the `## Standing decisions` section (what a decision is and is not, record-in-the-same-turn trigger, consult-before-filing rule with the trigger list, brief citation form, collision-refusal handling and the acknowledgement rule); amend the "Do not file fixes for deliberate design choices" bullet to put `boss decision list` first; rename the handoff example's `## Decisions` section and add the one-line redirect to `boss decision create`. Prompt-only PR.
+Scope: edit `bossSystemPrompt` in `tools/boss/app-macos/Sources/Ghostty/BossPaneModel.swift` (never the runtime `CLAUDE.md`): add the `## Standing decisions` section (what a decision is and is not, record-in-the-same-turn trigger with the authoring-cap reminder, consult-before-filing rule that reads the compact list then `show`s rows that bear on the ask, brief citation form, collision-refusal handling and the acknowledgement rule); amend the "Do not file fixes for deliberate design choices" bullet to put `boss decision list` first; rename the handoff example's `## Decisions` section and add the one-line redirect to `boss decision create`. Prompt-only PR.
 
 Effort: small
 
@@ -250,7 +301,7 @@ Scope: in-scope
 
 ### Decisions tab in the app
 
-Scope: decode `Decision` (nullable product) and `DecisionCollision`; add the Decisions tab beside Designs and Automations following the `AutomationsView` pattern with scope and status filters; the detail view with markdown body, supersession chain in both directions, related work item link and the collisions list; handle `DecisionCreated` / `DecisionUpdated` / `DecisionCollisionRecorded`; add the work-card collision badge. Verify with an isolated capture instance and attach the PNG. App-only PR; no applicability or relevance logic app-side.
+Scope: decode `DecisionIndex` for the tab and `Decision` (nullable product) for the detail (`GetDecision`); decode `DecisionCollision`; add the Decisions tab beside Designs and Automations following the `AutomationsView` pattern with scope and status filters and the active count visible; the detail view with markdown body, supersession chain in both directions, related work item link and the collisions list; handle `DecisionCreated` / `DecisionUpdated` / `DecisionCollisionRecorded`; add the work-card collision badge. Verify with an isolated capture instance and attach the PNG. App-only PR; no applicability or relevance logic app-side. The tab does not fetch bodies.
 
 Effort: medium
 
