@@ -211,7 +211,9 @@ pub async fn compose_remote_spawn(request: ComposeRemoteSpawn<'_>) -> Result<Spa
         permission_mode: settings_input.worker_kind.forced_permission_mode().map(str::to_owned),
         agent_rules: Some(crate::worker_setup::render_claude_md(
             &settings_input,
-            driver.agent_rules_preamble(),
+            // Remote workspace: no REPOBIN.toml to read and no CHECKLEFT_BIN
+            // export, so the repo-neutral checkleft instruction applies.
+            &driver.agent_rules_preamble(false),
             driver.descriptor().config_dir,
         )),
         ..Default::default()

@@ -33,7 +33,7 @@ fn design_workers_receive_ci_classification_once_with_either_completion_channel(
                 .worker_kind(worker_kind_for_execution(&execution.kind))
                 .run_done_proposals_seam_enabled(seam)
                 .build();
-            let rules = render_claude_md(&input, ClaudeDriver.agent_rules_preamble(), ".claude");
+            let rules = render_claude_md(&input, &ClaudeDriver.agent_rules_preamble(true), ".claude");
             let prompt = compose_execution_prompt(
                 ExecutionPromptParams::builder()
                     .review_signal_checks(|_| &[])
