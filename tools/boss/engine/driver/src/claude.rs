@@ -398,7 +398,7 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     // whether a group came from before or after a delimiter, and whether it
     // spans one line or several -- `vars` carries across both.
     "vars={}\n",
-    "for k in ('BOSS_BIN','CUBE_BIN','BOSS_BIN_DIR','BOSS_WORKER_BIN_DIR'):\n",
+    "for k in ('BOSS_BIN','CUBE_BIN','CHECKLEFT_BIN','BOSS_BIN_DIR','BOSS_WORKER_BIN_DIR'):\n",
     "    v=os.environ.get(k)\n",
     "    if v:\n",
     "        vars[k]=v\n",
@@ -499,6 +499,10 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     // dir, so a bare name is not a trustworthy resolution even when this
     // hook's own PATH still has the launcher first.
     "WATCH={'boss','cube'}\n",
+    // Checkleft is pinned only for workspaces whose worker-bin setup wrote a
+    // launcher. Repositories that do not declare it in REPOBIN.toml retain
+    // their existing PATH-based checkleft behaviour.
+    "WATCH_CHECKLEFT=bool(vars.get('CHECKLEFT_BIN') or os.environ.get('CHECKLEFT_BIN'))\n",
     "REPOBIN='repobin'\n",
     "DOL=chr(36)\n",
     "def which(name):\n",
@@ -512,10 +516,31 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "    return None\n",
     "def is_shim(p):\n",
     "    if not p: return False\n",
-    "    if os.path.basename(p)==REPOBIN: return True\n",
+    "    if os.path.basename(p) in (REPOBIN,'repobin-shim.sh'): return True\n",
     "    try:\n",
-    "        return os.path.basename(os.path.realpath(p))==REPOBIN\n",
+    "        return os.path.basename(os.path.realpath(p)) in (REPOBIN,'repobin-shim.sh')\n",
     "    except Exception:\n",
+    "        return False\n",
+    // `bin/checkleft` is the repository-owned entry point documented to
+    // workers. It is intentionally a repobin shim, unlike engine-owned
+    // launchers: permit only the current workspace's lexical bin path, not
+    // an arbitrary path that happens to end in bin/checkleft.
+    //
+    // Resolved against the hook payload's own `cwd` field, not this guard
+    // process's os.getcwd(): the Codex driver materialises this same Python
+    // as a standalone script run by its own hook adapter, and Grok runs it
+    // through a Grok-owned adapter, so this process starting in the
+    // workspace root is not guaranteed the way it is for Claude's own hook
+    // runner. Falls back to os.getcwd() only when the payload omits `cwd`.
+    "hook_cwd=inp.get('cwd') or os.getcwd()\n",
+    "def is_workspace_checkleft(p):\n",
+    "    if os.path.basename(p)!='checkleft' or os.sep not in p: return False\n",
+    "    base=os.path.abspath(hook_cwd)\n",
+    "    workspace_bin=os.path.join(base,'bin')\n",
+    "    candidate=p if os.path.isabs(p) else os.path.join(base,p)\n",
+    "    try:\n",
+    "        return os.path.commonpath((os.path.normpath(candidate),workspace_bin))==workspace_bin\n",
+    "    except ValueError:\n",
     "        return False\n",
     "shim=None\n",
     "bare=None\n",
@@ -547,7 +572,7 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "    rest=peel_shell_c(strip_prefixes(g))\n",
     "    if not rest: continue\n",
     "    orig=rest[0]\n",
-    "    if orig in (DOL+'BOSS_BIN', DOL+'{BOSS_BIN}', DOL+'CUBE_BIN', DOL+'{CUBE_BIN}'):\n",
+    "    if orig in (DOL+'BOSS_BIN', DOL+'{BOSS_BIN}', DOL+'CUBE_BIN', DOL+'{CUBE_BIN}', DOL+'CHECKLEFT_BIN', DOL+'{CHECKLEFT_BIN}'):\n",
     "        key=orig.strip(DOL+'{}')\n",
     "        target=vars.get(key) or os.environ.get(key) or ''\n",
     "        if not target:\n",
@@ -558,14 +583,16 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "            break\n",
     "        continue\n",
     "    base=os.path.basename(orig)\n",
-    "    if orig in WATCH:\n",
+    "    if orig in WATCH or (orig=='checkleft' and WATCH_CHECKLEFT):\n",
     "        resolved=which(orig)\n",
     "        if resolved and is_shim(resolved):\n",
     "            shim=resolved\n",
     "        else:\n",
     "            bare=orig\n",
     "        break\n",
-    "    if base in WATCH:\n",
+    "    if base=='checkleft' and WATCH_CHECKLEFT and is_workspace_checkleft(orig):\n",
+    "        continue\n",
+    "    if base in WATCH or (base=='checkleft' and WATCH_CHECKLEFT):\n",
     "        candidate=orig if os.path.isfile(orig) else (which(orig) or orig)\n",
     "        if is_shim(candidate):\n",
     "            shim=candidate\n",
@@ -576,7 +603,7 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "    name=bare or os.path.basename(shim or '')\n",
     "    where=('repobin shim at '+shim) if shim else ('bare PATH lookup of '+name)\n",
     "    q=chr(34)\n",
-    "    _block('Blocked: this command would run '+name+' via '+where+'. That is a build-from-source multiplexer (repobin) or an untrusted PATH lookup: a driver shell snapshot can demote the launcher directory and silently bazel-build the CLI from a checkout for ~30s. Workers must name the engine-owned binary, not a PATH entry: '+q+DOL+'BOSS_BIN'+q+' / '+q+DOL+'CUBE_BIN'+q+'. Re-issue quoting the env var, e.g. '+q+DOL+'BOSS_BIN'+q+' pr status --json. Do not work around this gate and do not suppress bazel output.')\n",
+    "    _block('Blocked: this command would run '+name+' via '+where+'. That is a build-from-source multiplexer (repobin) or an untrusted PATH lookup: a driver shell snapshot can demote the launcher directory and silently bazel-build the CLI from a checkout for ~30s. Workers must name the pinned binary, not a PATH entry: '+q+DOL+'BOSS_BIN'+q+' / '+q+DOL+'CUBE_BIN'+q+' / '+q+DOL+'CHECKLEFT_BIN'+q+'. Re-issue quoting the env var, e.g. '+q+DOL+'CHECKLEFT_BIN'+q+' run. Do not work around this gate and do not suppress bazel output.')\n",
     "_approve()\n",
 );
 
@@ -723,12 +750,15 @@ pub const REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND: &str = python_command_guard!(
 /// The driver-specific preamble for the agent-rules file. Names the hook
 /// mechanism ("claude hooks") and is injected at the top of `CLAUDE.md` by
 /// `boss_engine::worker_setup::render_claude_md`.
-const CLAUDE_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
+///
+/// `{checkleft}` is filled in from [`checkleft_preamble_sentence`]:
+/// `bin/checkleft` only exists in a workspace whose `REPOBIN.toml` declares
+/// checkleft, so a repo that doesn't must not be told to run it (see
+/// [`crate::AgentDriver::agent_rules_preamble`]).
+const CLAUDE_AGENT_RULES_PREAMBLE_TEMPLATE: &str = "You are running inside a Boss-managed worker session. The engine\n\
      spawned you in a leased cube workspace and observes this session\n\
      via claude hooks.\n\
-     For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
-     `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
-     strong stated justification.";
+     {checkleft}";
 
 /// Reference implementation of [`AgentDriver`] for Claude Code.
 ///
@@ -1088,8 +1118,9 @@ impl AgentDriver for ClaudeDriver {
     /// The Claude-specific preamble injected at the top of `CLAUDE.md`.
     /// Names "claude hooks" as the observability mechanism and is distinct
     /// from the driver-agnostic body that follows it.
-    fn agent_rules_preamble(&self) -> &'static str {
-        CLAUDE_AGENT_RULES_PREAMBLE
+    fn agent_rules_preamble(&self, checkleft_pinned: bool) -> String {
+        CLAUDE_AGENT_RULES_PREAMBLE_TEMPLATE
+            .replace("{checkleft}", crate::checkleft_preamble_sentence(checkleft_pinned))
     }
 
     fn transcript_path_for_session(&self, raw: &serde_json::Value) -> Option<String> {
@@ -1687,7 +1718,7 @@ mod tests {
             "remote worker must not have the path guard: {cmds:?}",
         );
         assert!(
-            !cmds.iter().any(|c| c.contains("checkleft")),
+            !cmds.iter().any(|c| c.contains("boss-checkleft-push-guard.py")),
             "remote worker must not have the checkleft guard: {cmds:?}",
         );
     }
@@ -1963,7 +1994,7 @@ mod tests {
 
     #[test]
     fn agent_rules_preamble_names_claude_hooks() {
-        let preamble = ClaudeDriver.agent_rules_preamble();
+        let preamble = ClaudeDriver.agent_rules_preamble(true);
         assert!(
             preamble.contains("claude hooks"),
             "preamble must name 'claude hooks': {preamble}"
@@ -1973,8 +2004,18 @@ mod tests {
             "preamble must describe Boss session: {preamble}"
         );
         assert!(
-            preamble.contains("checkleft run") && preamble.contains("checkleft --all"),
+            preamble.contains("bin/checkleft run") && preamble.contains("bin/checkleft --all"),
             "preamble must direct ordinary validation to scoped checkleft: {preamble}"
+        );
+    }
+
+    #[test]
+    fn agent_rules_preamble_unpinned_does_not_say_bin_checkleft() {
+        let preamble = ClaudeDriver.agent_rules_preamble(false);
+        assert!(
+            !preamble.contains("bin/checkleft"),
+            "a repo whose REPOBIN.toml does not declare checkleft has no bin/ dir, \
+             so the preamble must not tell workers to run bin/checkleft: {preamble}"
         );
     }
 

@@ -749,7 +749,7 @@ mod tests {
         ) -> crate::driver::ToolUseInterceptionWiring {
             unimplemented!()
         }
-        fn agent_rules_preamble(&self) -> &'static str {
+        fn agent_rules_preamble(&self, _checkleft_pinned: bool) -> String {
             unimplemented!()
         }
         fn transcript_path_for_session(&self, _: &serde_json::Value) -> Option<String> {

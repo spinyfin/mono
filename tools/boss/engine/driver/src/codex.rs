@@ -287,12 +287,10 @@ static CODEX_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
 /// observes that cell through its `wait` continuations and ultimately receives
 /// the command's real `exit_code`; a separate polling cell has no attributable
 /// command.
-const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
+const CODEX_AGENT_RULES_PREAMBLE_TEMPLATE: &str = "You are running inside a Boss-managed worker session. The engine\n\
      spawned you in a leased cube workspace and observes this session\n\
      via the Codex rollout JSONL file in this run's isolated CODEX_HOME.\n\
-     For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
-     `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
-     strong stated justification.\n\
+     {checkleft}\n\
      \n\
      Two tool routes are blocked in this session, because Boss's command\n\
      guardrails cannot see them:\n\
@@ -1890,8 +1888,8 @@ impl AgentDriver for CodexDriver {
         })
     }
 
-    fn agent_rules_preamble(&self) -> &'static str {
-        CODEX_AGENT_RULES_PREAMBLE
+    fn agent_rules_preamble(&self, checkleft_pinned: bool) -> String {
+        CODEX_AGENT_RULES_PREAMBLE_TEMPLATE.replace("{checkleft}", crate::checkleft_preamble_sentence(checkleft_pinned))
     }
 
     /// Codex does not read `.codex/AGENTS.md` at all (verified with `codex
