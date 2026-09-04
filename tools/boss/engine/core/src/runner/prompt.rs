@@ -1785,9 +1785,9 @@ fn compose_revision_directive(
     // the workspace is on main and the worker must position it manually.
     if pr_number != "?" {
         if is_conflict_resolution {
-            out.push_str("The engine pre-positioned this workspace via `cube workspace goto`, so you are already on a fresh editable commit whose parent is the PR head — no branch discovery or checkout is needed. Do NOT start making changes yet: this is a conflict-resolution revision, and the ground-truth block below requires you to check GitHub's mergeable status and re-run the rebase FIRST.\n");
+            out.push_str(&format!("The engine pre-positioned this workspace via `{cube} workspace goto`, so you are already on a fresh editable commit whose parent is the PR head — no branch discovery or checkout is needed. Do NOT start making changes yet: this is a conflict-resolution revision, and the ground-truth block below requires you to check GitHub's mergeable status and re-run the rebase FIRST.\n"));
         } else {
-            out.push_str("The engine pre-positioned this workspace via `cube workspace goto`, so you are already on a fresh editable commit whose parent is the PR head. Start making your changes directly — no branch discovery or checkout is needed.\n");
+            out.push_str(&format!("The engine pre-positioned this workspace via `{cube} workspace goto`, so you are already on a fresh editable commit whose parent is the PR head. Start making your changes directly — no branch discovery or checkout is needed.\n"));
         }
         out.push('\n');
         out.push_str(
