@@ -1,9 +1,0 @@
-[package]
-name = "boss-test-isolation"
-version.workspace = true
-edition.workspace = true
-workspace = "../../.."
-
-[dependencies]
-boss-log-files = { path = "../log-files" }
-ctor = { workspace = true }

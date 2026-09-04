@@ -47,8 +47,8 @@ pub use paths::{
     SPAWN_DIAGNOSTICS_PREFIX, STATE_DB_FILENAME, STATE_ROOT_SUFFIX, TMUX_SOCKET_FILENAME, audit_path_override,
     day_rotated_files, default_audit_log_path, default_control_token_path, default_engine_pid_path,
     default_engine_text_log_path, default_events_socket_path, default_frontend_socket_path, default_state_db_path,
-    default_state_root, default_tmux_socket_path, install_test_state_root, is_production_shaped, is_test_process,
-    merge_day_rotated_files, resolve_log_source_files, resolve_log_source_path,
+    default_state_root, default_tmux_socket_path, is_production_shaped, is_test_process, merge_day_rotated_files,
+    resolve_log_source_files, resolve_log_source_path,
 };
 pub use query::{
     LogFilter, QueryResult, follow_line_matches, line_matches, now_epoch_ms, parse_time_spec, query_log_files,

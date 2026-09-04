@@ -120,9 +120,9 @@ impl LogSource {
 /// see [`is_production_shaped`].
 pub const STATE_ROOT_SUFFIX: &str = "Library/Application Support/Boss";
 
-/// Isolated state root installed by `boss-test-isolation`'s process
-/// constructor for any binary that links it (via the `boss_rust_test` Bazel
-/// macro). `None` in a production binary, which never links that crate.
+/// Isolated state root installed lazily for a Bazel-output executable.
+/// `None` until a state path is resolved, and in ordinary production
+/// executables that never run from Bazel output.
 ///
 /// This is the chokepoint every `default_*_path` function in this module
 /// ultimately derives from ([`default_state_root`]), so a test process gets
@@ -131,17 +131,15 @@ pub const STATE_ROOT_SUFFIX: &str = "Library/Application Support/Boss";
 static TEST_STATE_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 /// Install the isolated state root for this process. Idempotent — only the
-/// first call wins. Called exactly once, by `boss-test-isolation`'s ctor,
-/// before any application code (including `main`) runs.
-pub fn install_test_state_root(root: PathBuf) {
+/// first call wins.
+fn install_test_state_root(root: PathBuf) {
     let _ = TEST_STATE_ROOT.set(root);
 }
 
-/// True when this process has installed an isolated test state root — i.e.
-/// it links `boss-test-isolation`, which every `rust_test` target under
-/// `tools/boss/**` does via the `boss_rust_test` Bazel macro. `false` in a
-/// production binary (`engine`, `bossctl`, the `boss` CLI), none of which
-/// link that crate.
+/// True for a process with an isolated state root or an executable resolved
+/// from a Bazel output tree. The latter identifies direct `bazel-bin/...`
+/// test execution even when Bazel's test-only environment variables are
+/// absent.
 pub fn is_test_process() -> bool {
     TEST_STATE_ROOT.get().is_some() || running_from_bazel_output()
 }
@@ -170,15 +168,10 @@ fn install_bazel_test_root_if_needed() {
 /// The default Boss state root. In a production process this is
 /// `$HOME/Library/Application Support/Boss` (`None` when `HOME` is unset).
 /// In a test process (see [`is_test_process`]) this is the isolated root
-/// [`install_test_state_root`] installed — **never** `$HOME`, so a test
+/// installed at first resolution — **never** `$HOME`, so a test
 /// binary invoked directly (bypassing `bazel test`'s `HOME` redirect and
 /// seatbelt) still cannot resolve production's state root.
 ///
-/// Panics if this is a test process and no isolated root was installed: a
-/// `rust_test` target that reaches this point without having linked
-/// `boss-test-isolation` has escaped the `boss_rust_test` macro (which the
-/// `tools/boss/**` build-time check should have caught) — refusing loudly
-/// here is the last line of defense against writing into production state.
 pub fn default_state_root() -> Option<PathBuf> {
     install_bazel_test_root_if_needed();
     resolve_state_root(
@@ -190,17 +183,15 @@ pub fn default_state_root() -> Option<PathBuf> {
 
 /// Pure decision logic behind [`default_state_root`], split out so tests can
 /// exercise every branch — including the refusal — without depending on the
-/// real process-global installed-root state (which, once `boss-test-isolation`
-/// is linked, is populated before any test body runs, making the "no root
-/// installed" branch otherwise unreachable from an ordinary test).
+/// real process-global installed-root state, which sibling tests may populate
+/// while running concurrently.
 fn resolve_state_root(is_test_process: bool, installed_root: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
     if is_test_process {
         let root = installed_root.unwrap_or_else(|| {
             panic!(
                 "boss-log-files: refusing to resolve Boss's production state root (~/{STATE_ROOT_SUFFIX}) \
-                 from a test process — no isolated test root has been installed. This binary must run \
-                 under `bazel test` (which links the `boss-test-isolation` guard crate via the \
-                 `boss_rust_test` Bazel macro), not be invoked directly as a bazel-bin binary."
+                 from a Bazel-output process — no isolated test root could be installed. Ensure the \
+                 system temporary directory is writable."
             )
         });
         return Some(root.to_path_buf());
@@ -721,7 +712,7 @@ mod tests {
         assert!(is_test_process());
         assert_eq!(TEST_STATE_ROOT.get(), Some(&already_installed));
 
-        install_test_state_root(PathBuf::from("/tmp/boss-test-isolation-late-writer"));
+        install_test_state_root(PathBuf::from("/tmp/boss-test-root-late-writer"));
         assert_eq!(
             TEST_STATE_ROOT.get(),
             Some(&already_installed),
