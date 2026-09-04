@@ -178,6 +178,44 @@ final class ChatViewModelIdeasTests: XCTestCase {
         }
     }
 
+    // MARK: (d2) Reverting an edit back to the loaded text must not be dropped
+
+    func testRevertingToLoadedTextAfterAConfirmedEditIsStillTreatedAsAnEdit() {
+        withScratchDirectory { dir in
+            let model = makeModel(cacheDirectory: dir)
+            let idea = makeIdea(id: "idea_revert", name: "N", body: "abc")
+            model.ideasByProductID["prod_1"] = [idea]
+            model.isConnected = true
+
+            model.selectIdea(idea.id)
+            XCTAssertEqual(model.ideaSaveStatus, .savedToEngine)
+
+            // Real edit, confirmed by the engine echo — this is the
+            // assignment whose snapshot must not go on suppressing edits
+            // forever.
+            model.ideaDraftBody = "abcd"
+            model.noteIdeaDraftEdited()
+            model.flushIdeaDraft()
+            model.handleIdeaUpdated(makeIdea(id: idea.id, name: "N", body: "abcd"))
+            XCTAssertEqual(model.ideaSaveStatus, .savedToEngine)
+
+            // The user reverts back to exactly what was loaded (a typo
+            // undo, or cmd-Z).
+            model.ideaDraftBody = "abc"
+            model.noteIdeaDraftEdited()
+
+            XCTAssertEqual(
+                model.ideaSaveStatus, .pendingLocal,
+                "reverting to the originally-loaded text after a confirmed edit must still register as a real edit"
+            )
+            model.flushIdeaDraft()
+            XCTAssertEqual(
+                IdeaDraftCache.read(ideaID: idea.id, in: dir)?.body, "abc",
+                "the revert must actually be written to the crash-floor cache rather than being a no-op"
+            )
+        }
+    }
+
     // MARK: (e) The cache entry is stamped with the idea's own product id
 
     func testWriteIdeaDraftToLocalCacheUsesTheIdeasOwnProductID() {

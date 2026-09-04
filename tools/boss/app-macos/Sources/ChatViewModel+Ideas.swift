@@ -132,6 +132,13 @@ extension ChatViewModel {
            lastLoadedIdeaDraft.body == ideaDraftBody {
             return
         }
+        // Once a real edit is registered, the snapshot must stop suppressing
+        // future calls — otherwise typing away from the loaded text and then
+        // back to it exactly (a revert, or cmd-Z) would match the snapshot
+        // again and be silently dropped. `loadIdeaDraft` / `handleIdeaCreated`
+        // re-establish it on the next load, so programmatic-load suppression
+        // is unaffected.
+        lastLoadedIdeaDraft = nil
         ideaSaveStatus = .pendingLocal
         scheduleIdeaLocalCacheWrite()
         scheduleIdeaEngineSave(immediate: false)
