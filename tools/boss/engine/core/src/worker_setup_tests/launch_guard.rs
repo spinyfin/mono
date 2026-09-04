@@ -18,6 +18,14 @@ fn run_launch_guard(bash_command: &str) -> (String, String) {
 }
 
 fn run_launch_guard_with_env(bash_command: &str, extra_env: &[(&str, &str)]) -> (String, String) {
+    run_launch_guard_with_env_in_dir(bash_command, extra_env, None)
+}
+
+fn run_launch_guard_with_env_in_dir(
+    bash_command: &str,
+    extra_env: &[(&str, &str)],
+    current_dir: Option<&std::path::Path>,
+) -> (String, String) {
     use std::io::Write as _;
     let stdin_payload = serde_json::json!({
         "tool_input": {"command": bash_command}
@@ -26,6 +34,9 @@ fn run_launch_guard_with_env(bash_command: &str, extra_env: &[(&str, &str)]) -> 
 
     let mut cmd = std::process::Command::new("sh");
     cmd.arg("-c").arg(BOSS_LAUNCH_GUARD_COMMAND);
+    if let Some(current_dir) = current_dir {
+        cmd.current_dir(current_dir);
+    }
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
@@ -353,7 +364,6 @@ fn launch_guard_blocks_bare_engine_owned_path_lookups() {
     for command in [
         "boss pr status --json",
         "cube pr create --branch x",
-        "checkleft run",
         "boss propose blocked --reason x",
     ] {
         let (decision, reason) = run_launch_guard(command);
@@ -367,6 +377,41 @@ fn launch_guard_blocks_bare_engine_owned_path_lookups() {
             "reason must tell the worker to name the env var: {reason}"
         );
     }
+}
+
+#[test]
+fn launch_guard_blocks_bare_checkleft_only_when_worker_bin_pins_it() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let checkleft = tmp.path().join("checkleft");
+    std::fs::write(&checkleft, b"#!/bin/sh\n").unwrap();
+    assert_eq!(
+        run_launch_guard_with_env("checkleft run", &[("CHECKLEFT_BIN", checkleft.to_str().unwrap())]).0,
+        "block",
+    );
+    assert_eq!(launch_decision("checkleft run"), "approve");
+}
+
+#[test]
+fn launch_guard_allows_workspace_bin_checkleft_linked_to_repobin_shim() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let shim_dir = workspace.join("tools/repobin/shim");
+    let bin = workspace.join("bin");
+    std::fs::create_dir_all(&shim_dir).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let shim = shim_dir.join("repobin-shim.sh");
+    std::fs::write(&shim, b"#!/bin/sh\n").unwrap();
+    let checkleft = bin.join("checkleft");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&shim, &checkleft).unwrap();
+    #[cfg(not(unix))]
+    std::fs::copy(&shim, &checkleft).unwrap();
+    let (decision, reason) = run_launch_guard_with_env_in_dir(
+        "bin/checkleft run",
+        &[("CHECKLEFT_BIN", checkleft.to_str().unwrap())],
+        Some(&workspace),
+    );
+    assert_eq!(decision, "approve", "workspace bin/checkleft must be allowed: {reason}");
 }
 
 /// `"$BOSS_BIN"` / `"$CUBE_BIN"` pointing at a real non-shim binary is the
