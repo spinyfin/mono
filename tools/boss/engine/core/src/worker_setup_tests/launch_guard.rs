@@ -26,11 +26,29 @@ fn run_launch_guard_with_env_in_dir(
     extra_env: &[(&str, &str)],
     current_dir: Option<&std::path::Path>,
 ) -> (String, String) {
+    run_launch_guard_with_env_dir_and_payload_cwd(bash_command, extra_env, current_dir, None)
+}
+
+/// Like [`run_launch_guard_with_env_in_dir`], but also lets the caller set
+/// the hook payload's own `cwd` field independently of the guard process's
+/// actual `current_dir` — this is what proves `is_workspace_checkleft`
+/// resolves relative paths against the payload, not `os.getcwd()`, since
+/// Codex and Grok run this same guard script from an adapter whose process
+/// cwd is not guaranteed to be the workspace root.
+fn run_launch_guard_with_env_dir_and_payload_cwd(
+    bash_command: &str,
+    extra_env: &[(&str, &str)],
+    current_dir: Option<&std::path::Path>,
+    payload_cwd: Option<&std::path::Path>,
+) -> (String, String) {
     use std::io::Write as _;
-    let stdin_payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "tool_input": {"command": bash_command}
-    })
-    .to_string();
+    });
+    if let Some(payload_cwd) = payload_cwd {
+        payload["cwd"] = serde_json::json!(payload_cwd.to_str().unwrap());
+    }
+    let stdin_payload = payload.to_string();
 
     let mut cmd = std::process::Command::new("sh");
     cmd.arg("-c").arg(BOSS_LAUNCH_GUARD_COMMAND);
@@ -412,6 +430,42 @@ fn launch_guard_allows_workspace_bin_checkleft_linked_to_repobin_shim() {
         Some(&workspace),
     );
     assert_eq!(decision, "approve", "workspace bin/checkleft must be allowed: {reason}");
+}
+
+/// The companion the prior review flagged as missing: the guard process's
+/// own working directory is NOT the workspace root (e.g. Codex's own hook
+/// adapter invoking this script from elsewhere), but the hook payload's
+/// `cwd` field names the workspace. `is_workspace_checkleft` must resolve
+/// `bin/checkleft` against that payload `cwd`, not `os.getcwd()`, or this
+/// sanctioned invocation is wrongly blocked as an arbitrary repobin shim.
+#[test]
+fn launch_guard_allows_workspace_bin_checkleft_via_payload_cwd_when_process_cwd_differs() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let elsewhere = tmp.path().join("elsewhere");
+    let shim_dir = workspace.join("tools/repobin/shim");
+    let bin = workspace.join("bin");
+    std::fs::create_dir_all(&shim_dir).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let shim = shim_dir.join("repobin-shim.sh");
+    std::fs::write(&shim, b"#!/bin/sh\n").unwrap();
+    let checkleft = bin.join("checkleft");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&shim, &checkleft).unwrap();
+    #[cfg(not(unix))]
+    std::fs::copy(&shim, &checkleft).unwrap();
+    let (decision, reason) = run_launch_guard_with_env_dir_and_payload_cwd(
+        "bin/checkleft run",
+        &[("CHECKLEFT_BIN", checkleft.to_str().unwrap())],
+        Some(&elsewhere),
+        Some(&workspace),
+    );
+    assert_eq!(
+        decision, "approve",
+        "workspace bin/checkleft must be allowed via payload cwd even when the guard process's \
+         own cwd differs: {reason}"
+    );
 }
 
 /// `"$BOSS_BIN"` / `"$CUBE_BIN"` pointing at a real non-shim binary is the
