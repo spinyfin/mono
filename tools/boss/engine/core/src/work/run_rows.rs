@@ -37,6 +37,15 @@ fn map_tmux_run_handle(row: &Row) -> rusqlite::Result<TmuxRunHandle> {
     })
 }
 
+/// Result of [`WorkDb::backfill_durable_transcript_paths`]: how many rows
+/// were rewritten onto the durable store, and how many were left alone
+/// because the reconstructed durable path does not exist on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BackfillDurableTranscriptPathsOutcome {
+    pub updated: u64,
+    pub skipped: u64,
+}
+
 impl WorkDb {
     pub fn create_run(&self, input: CreateRunInput) -> Result<WorkRun> {
         let mut conn = self.connect()?;
@@ -185,8 +194,13 @@ impl WorkDb {
     ///
     /// Idempotent: a second pass is a no-op. Does not invent a path when the
     /// stamped location cannot be rewritten — those rows stay as they are so
-    /// a missing transcript remains visible.
-    pub fn backfill_durable_transcript_paths(&self) -> Result<u64> {
+    /// a missing transcript remains visible. Also skips (and warns on) a
+    /// reconstructed durable path that does not actually exist on disk
+    /// (e.g. the durable sessions dir was never provisioned for that run):
+    /// writing that path would replace a dead-but-still-diagnosable pointer
+    /// with a dead one that no longer matches this backfill's query, making
+    /// the missing transcript permanently invisible.
+    pub fn backfill_durable_transcript_paths(&self) -> Result<BackfillDurableTranscriptPathsOutcome> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT id, transcript_path FROM work_runs
@@ -199,10 +213,22 @@ impl WorkDb {
             .collect::<rusqlite::Result<_>>()?;
         drop(stmt);
         let mut updated = 0u64;
+        let mut skipped = 0u64;
         for (id, path) in rows {
             let rewritten = crate::driver::transcript_store::persistable_transcript_path(Path::new(&path));
             let new_path = rewritten.to_string_lossy();
             if new_path == path {
+                continue;
+            }
+            if !rewritten.exists() {
+                skipped += 1;
+                tracing::warn!(
+                    run_id = %id,
+                    old = %path,
+                    candidate = %new_path,
+                    "backfill found a reconstructed durable transcript path that does not exist on disk; \
+                     leaving the stamped value in place so the missing transcript stays visible"
+                );
                 continue;
             }
             let n = conn.execute(
@@ -211,7 +237,7 @@ impl WorkDb {
             )?;
             updated += n as u64;
         }
-        Ok(updated)
+        Ok(BackfillDurableTranscriptPathsOutcome { updated, skipped })
     }
 
     /// [`Self::backfill_durable_transcript_paths`] with the log line the
@@ -219,9 +245,10 @@ impl WorkDb {
     /// must still run.
     pub fn apply_durable_transcript_path_backfill(&self) {
         match self.backfill_durable_transcript_paths() {
-            Ok(0) => {}
-            Ok(updated) => tracing::info!(
+            Ok(BackfillDurableTranscriptPathsOutcome { updated: 0, skipped: 0 }) => {}
+            Ok(BackfillDurableTranscriptPathsOutcome { updated, skipped }) => tracing::info!(
                 updated,
+                skipped,
                 "rewrote work_runs.transcript_path values onto the durable transcript store"
             ),
             Err(err) => tracing::warn!(

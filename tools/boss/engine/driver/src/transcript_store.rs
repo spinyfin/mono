@@ -86,10 +86,11 @@ pub fn durable_sessions_dir(store_root: &Path, driver: &str, run_id: &str) -> an
         .join("sessions"))
 }
 
-/// Default leaf names of the per-run homes roots. Must match
-/// `grok::home::GROK_HOMES_DIR_NAME` and `codex::CODEX_HOMES_DIR_NAME`.
-const GROK_HOMES_DIR_MARKER: &str = "boss-grok-homes";
-const CODEX_HOMES_DIR_MARKER: &str = "boss-codex-homes";
+/// Default leaf names of the per-run homes roots, reused directly so a rename
+/// of either original cannot silently desync this rewrite from where the
+/// homes actually live.
+use crate::codex::CODEX_HOMES_DIR_NAME as CODEX_HOMES_DIR_MARKER;
+use crate::grok::GROK_HOMES_DIR_NAME as GROK_HOMES_DIR_MARKER;
 
 /// Rewrite a driver-stamped transcript path onto Boss's durable store.
 ///
@@ -132,17 +133,30 @@ fn rewrite_through_sessions_symlink(path: &Path) -> Option<PathBuf> {
         if name != "sessions" {
             continue;
         }
-        let meta = fs::symlink_metadata(ancestor).ok()?;
+        let Ok(meta) = fs::symlink_metadata(ancestor) else {
+            continue;
+        };
         if !meta.file_type().is_symlink() {
             continue;
         }
-        let target = fs::canonicalize(ancestor).ok()?;
+        let Ok(target) = fs::canonicalize(ancestor) else {
+            continue;
+        };
         let suffix = path.strip_prefix(ancestor).ok()?;
         return Some(target.join(suffix));
     }
     None
 }
 
+/// The run id segment recovered here is read back out of the path itself, so
+/// it is whatever [`grok::home::sanitize_run_id_for_home`] /
+/// [`codex::sanitize_run_id_for_home`] mapped the real run id to (any
+/// character outside `[A-Za-z0-9_-]` becomes `_`), not the raw run id.
+/// [`durable_sessions_dir`] is then called with that sanitized value even
+/// though production always calls it with the raw run id elsewhere. This is
+/// a no-op today because every run id Boss issues (`exec_<hex>`) is already
+/// a fixed point of the sanitizer, but if that ever stops holding, this
+/// reconstructs a directory that was never provisioned.
 fn rewrite_known_ephemeral_layout(path: &Path) -> Option<PathBuf> {
     let comps: Vec<_> = path.iter().collect();
     let marker_idx = comps

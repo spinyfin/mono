@@ -52,6 +52,7 @@ mod progress;
 mod transcript;
 mod turn_end_recovery;
 
+pub(crate) use home::GROK_HOMES_DIR_NAME;
 pub use home::{
     COMPAT_SURFACES, COMPAT_VENDORS, GROK_AUTH_SOURCE_ENV, GROK_HOMES_ENV_TEST_LOCK, GROK_HOMES_ROOT_ENV,
     GROK_SKIP_POSTURE_ASSERT_ENV, GrokRuntimeState, assert_grok_home_safe_to_delete, assert_inspect_json_posture,
