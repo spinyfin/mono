@@ -262,6 +262,14 @@ impl Tmux {
         &self.program
     }
 
+    /// Process runner this handle uses. Callers that need a second handle
+    /// against a different server (the pre-move `-L boss` server) pass this
+    /// to [`Self::for_legacy_label_server_with_runner`] so a stubbed socket
+    /// handle stays stubbed instead of swapping in [`RealCommandRunner`].
+    pub fn runner(&self) -> Arc<dyn CommandRunner> {
+        Arc::clone(&self.runner)
+    }
+
     /// Socket this handle addresses. `None` for a legacy `-L boss` handle.
     pub fn socket_path(&self) -> Option<&Path> {
         match &self.server {

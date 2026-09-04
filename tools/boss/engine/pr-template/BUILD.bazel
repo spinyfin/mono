@@ -16,7 +16,7 @@ rust_library(
 )
 
 boss_rust_test(
-    name = "pr-template-test",
+    name = "pr-template_test",
     size = "small",
     crate = ":pr-template",
     edition = "2024",

@@ -154,6 +154,20 @@ fn for_legacy_label_server_with_runner_allows_a_fake_runner() {
     assert_eq!(tmux.socket_path(), None);
 }
 
+/// A socket handle's runner is reusable: constructing a `-L boss` handle
+/// from it keeps the same executable and the same (fake) runner.
+#[test]
+fn for_legacy_label_server_reuses_socket_handle_runner() {
+    let runner = StubRunner::replies([]);
+    let socket = Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", runner.clone(), TEST_SOCKET_PATH).unwrap();
+    let legacy = Tmux::for_legacy_label_server_with_runner(socket.program().to_path_buf(), socket.runner()).unwrap();
+    assert_eq!(
+        legacy.operator_prefix(),
+        format!("tmux -L {}", quote_for_shell(SERVER_LABEL))
+    );
+    assert_eq!(legacy.program(), socket.program());
+}
+
 #[test]
 fn relative_executable_path_is_rejected() {
     let error = Tmux::with_runner_and_socket("tmux", StubRunner::replies([]), TEST_SOCKET_PATH).unwrap_err();
