@@ -1546,3 +1546,186 @@ fn moved_head_fails_the_supervising_batch_instead_of_retrying() {
         "a second call against an already-failed batch is a no-op"
     );
 }
+
+fn post_merge_batch_input(cycle_root_id: String, merge_sha: &str) -> ReviewBatchCreateInput {
+    ReviewBatchCreateInput::builder()
+        .cycle_root_id(cycle_root_id)
+        .base_sha("base-sha")
+        .classification(classification())
+        .phase(ReviewBatchPhase::PostMerge)
+        .pr_number(42)
+        .pr_url("https://github.com/example/repo/pull/42")
+        .target_sha(merge_sha)
+        .merge_sha(merge_sha)
+        .build()
+}
+
+/// The review pool's 16-unit reservation capacity divided by the four-unit
+/// pre-merge weight admits exactly four concurrent pre-merge batches and
+/// denies a fifth — the property that stops a fifth wave of leaves from
+/// occupying every slot just as earlier batches become ready to collate.
+#[test]
+fn can_admit_review_batch_allows_four_concurrent_pre_merge_batches_and_denies_a_fifth() {
+    let db = WorkDb::open(temp_db_path("review-pool-admission-pre-merge")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id.clone(), "review target");
+
+    for i in 0..4 {
+        assert!(
+            db.can_admit_review_batch(ReviewBatchPhase::PreMerge).unwrap(),
+            "batch {i} should still be admitted below the four-batch cap"
+        );
+        db.create_review_batch(
+            batch_input(
+                cycle_root.id.clone(),
+                &format!("head-sha-{i}"),
+                ReviewBatchPhase::PreMerge,
+            ),
+            &[member(ReviewBatchMemberRole::ClaudeReviewer, None)],
+        )
+        .unwrap();
+    }
+
+    assert!(
+        !db.can_admit_review_batch(ReviewBatchPhase::PreMerge).unwrap(),
+        "a fifth concurrent pre-merge batch must be denied at the 16-unit cap"
+    );
+}
+
+/// Pre-merge admission is checked against pre-merge reservations alone, so
+/// it never has to wait on post-merge safety-net work — this is the
+/// design's "pre-merge work has priority over post-merge safety-net work".
+#[test]
+fn pre_merge_admission_ignores_post_merge_reservations_giving_it_priority() {
+    let db = WorkDb::open(temp_db_path("review-pool-admission-priority")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id.clone(), "review target");
+
+    // Reserve all 16 of the pool's units with post-merge batches alone.
+    for i in 0..16 {
+        db.create_review_batch(
+            post_merge_batch_input(cycle_root.id.clone(), &format!("merge-sha-{i}")),
+            &[member(ReviewBatchMemberRole::PostMergeReviewer, None)],
+        )
+        .unwrap();
+    }
+
+    // Post-merge itself is now denied: 16 + 1 > 16.
+    assert!(!db.can_admit_review_batch(ReviewBatchPhase::PostMerge).unwrap());
+
+    // But pre-merge is unaffected: its check only looks at pre-merge
+    // reservations (currently zero), so it is still admitted even though
+    // the pool's raw remaining capacity (0 units) is far below the four
+    // units a pre-merge batch reserves.
+    assert!(db.can_admit_review_batch(ReviewBatchPhase::PreMerge).unwrap());
+}
+
+/// Post-merge admission, unlike pre-merge, is checked against BOTH
+/// reservations — it only starts when spare capacity remains after every
+/// open pre-merge batch's block.
+#[test]
+fn post_merge_admission_accounts_for_pre_merge_reservations() {
+    let db = WorkDb::open(temp_db_path("review-pool-admission-post-merge")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id.clone(), "review target");
+
+    for i in 0..4 {
+        db.create_review_batch(
+            batch_input(
+                cycle_root.id.clone(),
+                &format!("head-sha-{i}"),
+                ReviewBatchPhase::PreMerge,
+            ),
+            &[member(ReviewBatchMemberRole::ClaudeReviewer, None)],
+        )
+        .unwrap();
+    }
+
+    assert!(
+        !db.can_admit_review_batch(ReviewBatchPhase::PostMerge).unwrap(),
+        "post-merge must be denied once pre-merge batches alone reserve the full 16 units"
+    );
+}
+
+/// A batch's reservation lasts through its whole non-terminal lifetime and
+/// is released only once it reaches `completed` or `failed` — not merely
+/// once its leaves have reported.
+#[test]
+fn a_completed_batch_releases_its_reservation() {
+    let db = WorkDb::open(temp_db_path("review-pool-admission-release")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id.clone(), "review target");
+
+    let mut batches = Vec::new();
+    for i in 0..4 {
+        let (batch, _) = db
+            .create_review_batch(
+                batch_input(
+                    cycle_root.id.clone(),
+                    &format!("head-sha-{i}"),
+                    ReviewBatchPhase::PreMerge,
+                ),
+                &[member(ReviewBatchMemberRole::ClaudeReviewer, None)],
+            )
+            .unwrap();
+        batches.push(batch);
+    }
+    assert!(!db.can_admit_review_batch(ReviewBatchPhase::PreMerge).unwrap());
+
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_batches SET status = 'completed' WHERE id = ?1",
+            rusqlite::params![batches[0].id],
+        )
+        .unwrap();
+
+    assert!(
+        db.can_admit_review_batch(ReviewBatchPhase::PreMerge).unwrap(),
+        "completing one batch must free its four-unit reservation for a new one"
+    );
+}
+
+/// The production entry point (`create_pre_merge_review_batch`) defers
+/// rather than creating a batch once the pool is at capacity, and leaves no
+/// batch or member execution rows behind.
+#[test]
+fn create_pre_merge_review_batch_defers_when_the_pool_is_at_capacity() {
+    let db = WorkDb::open(temp_db_path("review-pool-admission-deferred-dispatch")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id.clone(), "review target");
+
+    for i in 0..4 {
+        db.create_review_batch(
+            batch_input(
+                cycle_root.id.clone(),
+                &format!("head-sha-{i}"),
+                ReviewBatchPhase::PreMerge,
+            ),
+            &[member(ReviewBatchMemberRole::ClaudeReviewer, None)],
+        )
+        .unwrap();
+    }
+
+    let deferred_cycle_root = create_test_chore_manual(&db, product.id, "another review target");
+    match db
+        .create_pre_merge_review_batch(
+            batch_input(
+                deferred_cycle_root.id.clone(),
+                "new-head-sha",
+                ReviewBatchPhase::PreMerge,
+            ),
+            "https://github.com/example/repo",
+        )
+        .unwrap()
+    {
+        ReviewBatchDispatch::AdmissionDeferred => {}
+        other => panic!("expected AdmissionDeferred once the pool is at capacity, got {other:?}"),
+    }
+    assert!(
+        db.review_batch_for_target(&deferred_cycle_root.id, ReviewBatchPhase::PreMerge, "new-head-sha")
+            .unwrap()
+            .is_none(),
+        "a deferred admission must not create a batch row"
+    );
+}

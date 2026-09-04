@@ -699,7 +699,7 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
 
     ### Dispatch concurrency cap is admission-only
 
-    `bossctl dispatch concurrency --set N` gates **admission only**. Lowering it never preempts, reaps, or drains a running worker — they keep their slots until they exit naturally; new mainline rows hold with `reason=interactive_concurrency_cap` until `busy_count()` falls below N. It is **not a token-spend lever**: the cap applies only to `is_main` rows. The review pool (slots 25–32) keeps dispatching regardless, so lowering the cap throttles mainline work while PR-review churn continues. Slot ranges: interactive 1–16, automation 17–24, review 25–32. The cap compares against aggregate `busy_count()`, never a slot index. `bossctl agents launch` bypasses the cap by design.
+    `bossctl dispatch concurrency --set N` gates **admission only**. Lowering it never preempts, reaps, or drains a running worker — they keep their slots until they exit naturally; new mainline rows hold with `reason=interactive_concurrency_cap` until `busy_count()` falls below N. It is **not a token-spend lever**: the cap applies only to `is_main` rows. The review pool (slots 25–40) keeps dispatching regardless, so lowering the cap throttles mainline work while PR-review churn continues. Slot ranges: interactive 1–16, automation 17–24, review 25–40. The cap compares against aggregate `busy_count()`, never a slot index. `bossctl agents launch` bypasses the cap by design.
 
     ### Concurrent subagents share one scratchpad
 

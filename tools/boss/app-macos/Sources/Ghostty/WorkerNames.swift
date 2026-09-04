@@ -5,8 +5,8 @@ import Foundation
 /// We pick a fixed roster of Starfleet crew (TNG/DS9/VOY/ENT) and
 /// index it by slot id, so slot 1 always renders as "Riker", slot 2
 /// as "Data", etc. Slot ranges are disjoint across pools (interactive
-/// 1-16, automation 17-24, review 25-32), so as long as the roster
-/// has at least one entry per live slot (32), every concurrently live
+/// 1-16, automation 17-24, review 25-40), so as long as the roster
+/// has at least one entry per live slot (40), every concurrently live
 /// worker gets a distinct name regardless of which pool it's in.
 /// Captains (Picard, Sisko, Janeway) are intentionally omitted.
 ///
@@ -25,7 +25,7 @@ enum WorkerNames {
     /// Order is load-bearing — slot 1 = roster[0], slot 2 = roster[1], …
     /// New names should be appended, not inserted, so existing slot
     /// labels stay stable across releases. Must have at least one
-    /// entry per live slot (currently 32) so no two concurrently live
+    /// entry per live slot (currently 40) so no two concurrently live
     /// workers ever collide on name.
     static let roster: [String] = [
         "Riker",      // TNG
@@ -60,6 +60,14 @@ enum WorkerNames {
         "Tucker",     // ENT
         "Reed",       // ENT
         "Sato",       // ENT
+        "T'Pol",      // ENT
+        "Phlox",      // ENT
+        "Mayweather", // ENT
+        "Vash",       // TNG
+        "Ro",         // TNG / DS9
+        "Shelby",     // TNG
+        "Brahms",     // TNG
+        "Sela",       // TNG
     ]
 
     /// Returns a stable display name for the given 1-based slot id.

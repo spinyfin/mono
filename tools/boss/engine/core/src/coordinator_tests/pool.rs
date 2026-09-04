@@ -90,7 +90,7 @@ fn worker_id_for_slot_round_trips_with_slot_id_from_worker_id() {
         assert_eq!(wid, format!("auto-worker-{expected_ordinal}"));
         assert_eq!(slot_id_from_worker_id(&wid), Some(slot));
     }
-    // Review pool: slots 25..=32 → "review-M" → back to the same slot.
+    // Review pool: slots 25..=40 → "review-M" → back to the same slot.
     for slot in (automation_end + 1)..=(automation_end + MAX_REVIEW_POOL_SIZE as u8) {
         let wid = worker_id_for_slot(slot);
         let expected_ordinal = slot as usize - MAX_WORKER_POOL_SIZE - MAX_AUTOMATION_POOL_SIZE;
@@ -102,7 +102,7 @@ fn worker_id_for_slot_round_trips_with_slot_id_from_worker_id() {
 #[test]
 fn slot_id_from_worker_id_accepts_review_pool_format() {
     // Review-pool ordinals are offset past both the interactive (16) and
-    // automation (8) ranges, so they occupy slots 25..=32 — disjoint
+    // automation (8) ranges, so they occupy slots 25..=40 — disjoint
     // from every other pool.
     for ordinal in 1u8..=MAX_REVIEW_POOL_SIZE as u8 {
         let review_worker_id = format!("review-{ordinal}");
@@ -120,7 +120,7 @@ fn slot_id_from_worker_id_accepts_review_pool_format() {
 
 #[test]
 fn review_pool_slots_are_disjoint_from_other_pools() {
-    // The slot IDs produced by review-N (25..=32) must not overlap
+    // The slot IDs produced by review-N (25..=40) must not overlap
     // with any interactive-pool (1..=16) or automation-pool (17..=24) slot.
     let automation_ceiling = MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE;
     for ordinal in 1u8..=MAX_REVIEW_POOL_SIZE as u8 {
@@ -1509,8 +1509,9 @@ async fn claim_worker_force_grows_review_pool_with_review_prefix_and_own_hard_ca
     );
     assert_eq!(pool.capacity().await, 2);
 
-    // Fill up to the review pool's OWN hard cap (MAX_REVIEW_POOL_SIZE),
-    // never MAX_WORKER_POOL_SIZE (16, and much larger).
+    // Fill up to the review pool's OWN hard cap (MAX_REVIEW_POOL_SIZE) —
+    // this pool started at size 1, so growth is bounded by that cap and
+    // not by the (unrelated) MAX_WORKER_POOL_SIZE ceiling of the main pool.
     for i in 2..MAX_REVIEW_POOL_SIZE {
         pool.claim_worker_force(&format!("exec-{i}"), None)
             .await
@@ -1520,7 +1521,7 @@ async fn claim_worker_force_grows_review_pool_with_review_prefix_and_own_hard_ca
     assert!(
         pool.claim_worker_force("overflow", None).await.is_none(),
         "claim_worker_force must reject once the review pool hits its OWN hard cap \
-         ({MAX_REVIEW_POOL_SIZE}), not the much larger MAX_WORKER_POOL_SIZE",
+         ({MAX_REVIEW_POOL_SIZE}), independent of MAX_WORKER_POOL_SIZE",
     );
     assert_eq!(pool.capacity().await, MAX_REVIEW_POOL_SIZE);
 }

@@ -340,6 +340,16 @@ impl WorkerCompletionHandler {
                                         );
                                         true
                                     }
+                                    Ok(crate::work::ReviewBatchDispatch::AdmissionDeferred) => {
+                                        tracing::info!(
+                                            execution_id,
+                                            pr_url = %pr_url,
+                                            "review pool's weighted reservation accounting has no room for a new \
+                                             pre-merge batch; holding the task pending review — the next \
+                                             pr_recheck pass retries once an existing batch completes",
+                                        );
+                                        true
+                                    }
                                     Err(error) => {
                                         tracing::warn!(
                                             execution_id,

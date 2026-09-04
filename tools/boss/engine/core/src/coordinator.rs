@@ -200,12 +200,21 @@ pub const MAX_AUTOMATION_POOL_SIZE: usize = 8;
 /// clamped. The third pool, modeled on the automation pool, that runs the
 /// always-Opus `pr_review` reviewer agents. See design:
 /// automated-reviewer-pass-on-every-agent-authored-pr.md
-pub const MAX_REVIEW_POOL_SIZE: usize = 8;
+///
+/// Raised from 8 to 16 (design: multi-agent-code-review.md, "Expand the
+/// static review pool to 16 slots") so a four-unit pre-merge batch
+/// reservation ([`crate::work::can_admit_review_batch_in_tx`]) can admit up
+/// to four concurrent pre-merge PRs without leaf reviewers starving their
+/// own supervisors. Global review-pool slot ids now span 25–40 (was
+/// 25–32) — see [`slot_id_from_worker_id`] and [`worker_id_for_slot`].
+pub const MAX_REVIEW_POOL_SIZE: usize = 16;
 
 /// Default review-pool slot count when `BOSS_REVIEW_POOL_SIZE` is unset.
-/// Raised to 8 to match the main worker pool and reduce review-queue
-/// contention when many PRs land simultaneously.
-pub const DEFAULT_REVIEW_POOL_SIZE: usize = 8;
+/// Raised to 16 to match [`MAX_REVIEW_POOL_SIZE`] so the pool's weighted
+/// admission accounting (four units per pre-merge batch, one per post-merge
+/// batch) has its full static capacity available by default rather than
+/// requiring an operator override.
+pub const DEFAULT_REVIEW_POOL_SIZE: usize = 16;
 
 /// Default (and compile-time floor) for the interactive-pool concurrency
 /// cap on concurrently-live INTERACTIVE ("normal") pool workers — a *row
@@ -1462,7 +1471,7 @@ impl WorkerPool {
 /// slot `N + MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE` so the
 /// three pools occupy disjoint slot ranges. With the current geometry
 /// (`MAX_WORKER_POOL_SIZE = 16`) that is `1..=16` interactive (Bridge
-/// Crew 1..=8, Lower Decks 9..=16), `17..=24` automation, `25..=32`
+/// Crew 1..=8, Lower Decks 9..=16), `17..=24` automation, `25..=40`
 /// review — so "auto-worker-1" → slot 17, "review-1" → slot 25, never
 /// colliding with another pool's range. Every boundary is derived from
 /// the pool-size constants, so bumping [`WORKER_PAGE_COUNT`] shifts the

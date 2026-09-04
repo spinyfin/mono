@@ -64,6 +64,83 @@ pub enum ReviewBatchDispatch {
         executions: Vec<WorkExecution>,
     },
     LegacyExecution(WorkExecution),
+    /// The review pool's weighted reservation accounting (see
+    /// [`can_admit_review_batch_in_tx`]) has no room for a new batch of this
+    /// target's phase right now. No batch and no member executions were
+    /// created — the caller must not treat this as a failure to retry with
+    /// backoff; it is expected to happen whenever the pool is at its static
+    /// capacity, and the next reconciliation pass (e.g. the merge poller's
+    /// `pr_recheck` sweep) tries again once an existing batch completes and
+    /// releases its reservation.
+    AdmissionDeferred,
+}
+
+/// Reservation-unit capacity of the review pool for admission-accounting
+/// purposes. One unit corresponds to one physical review-pool slot
+/// ([`crate::coordinator::MAX_REVIEW_POOL_SIZE`]): the review pool has one
+/// physical slot per reservation unit, so exhausting every unit also fills
+/// every physical slot once every reserved batch is actively dispatching
+/// all of its members at once.
+const REVIEW_POOL_RESERVATION_CAPACITY: i64 = crate::coordinator::MAX_REVIEW_POOL_SIZE as i64;
+
+/// Reservation weight of one non-terminal pre-merge batch: three parallel
+/// leaf reviewers plus the supervisor that follows them once they settle,
+/// held as one block from batch creation through supervisor completion so a
+/// later batch's leaves can never occupy the slot this batch's own
+/// supervisor will eventually need. See docs/designs/multi-agent-code-review.md,
+/// "Expand the static review pool to 16 slots".
+const PRE_MERGE_BATCH_RESERVATION_UNITS: i64 = 4;
+
+/// Reservation weight of one non-terminal post-merge batch: a single
+/// safety-net reviewer against the already-landed tree.
+const POST_MERGE_BATCH_RESERVATION_UNITS: i64 = 1;
+
+/// Count non-terminal (reservation-holding) batches of `phase`. `completed`
+/// and `failed` are the only statuses that release a batch's reservation —
+/// `collecting`, `supervising`, and `applying` all still hold it, matching
+/// "from creation through supervisor completion".
+fn reserved_batch_count_in_tx(tx: &Transaction<'_>, phase: ReviewBatchPhase) -> Result<i64> {
+    let count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pr_review_batches WHERE phase = ?1 AND status NOT IN ('completed', 'failed')",
+        params![phase.as_str()],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+/// Whether one more non-terminal batch of `phase` can be admitted into the
+/// review pool's weighted reservation accounting right now.
+///
+/// Pre-merge admission is checked against pre-merge reservations alone,
+/// which is what gives pre-merge work priority over post-merge safety-net
+/// work: a pre-merge batch is admitted whenever fewer than four pre-merge
+/// batches (`REVIEW_POOL_RESERVATION_CAPACITY /
+/// PRE_MERGE_BATCH_RESERVATION_UNITS`) are already open, regardless of how
+/// many post-merge units are currently reserved. Post-merge admission is
+/// checked against BOTH reservations, so a safety-net batch only starts
+/// when genuinely spare capacity remains after every open pre-merge batch's
+/// block.
+///
+/// This is static, conservative admission accounting, not a live count of
+/// claimed physical worker-pool slots: a batch keeps its reservation for its
+/// whole lifetime (through supervisor completion), even while some of its
+/// member executions are still queued behind a busy pool. See
+/// docs/designs/multi-agent-code-review.md, "Expand the static review pool
+/// to 16 slots".
+pub(crate) fn can_admit_review_batch_in_tx(tx: &Transaction<'_>, phase: ReviewBatchPhase) -> Result<bool> {
+    let pre_merge_units =
+        reserved_batch_count_in_tx(tx, ReviewBatchPhase::PreMerge)? * PRE_MERGE_BATCH_RESERVATION_UNITS;
+    match phase {
+        ReviewBatchPhase::PreMerge => {
+            Ok(pre_merge_units + PRE_MERGE_BATCH_RESERVATION_UNITS <= REVIEW_POOL_RESERVATION_CAPACITY)
+        }
+        ReviewBatchPhase::PostMerge => {
+            let post_merge_units =
+                reserved_batch_count_in_tx(tx, ReviewBatchPhase::PostMerge)? * POST_MERGE_BATCH_RESERVATION_UNITS;
+            Ok(pre_merge_units + post_merge_units + POST_MERGE_BATCH_RESERVATION_UNITS
+                <= REVIEW_POOL_RESERVATION_CAPACITY)
+        }
+    }
 }
 
 fn conversion_error(index: usize, error: impl std::error::Error + Send + Sync + 'static) -> rusqlite::Error {
@@ -679,6 +756,18 @@ impl WorkDb {
         Ok(created)
     }
 
+    /// Whether the review pool's weighted reservation accounting has room
+    /// for one more non-terminal batch of `phase` right now. See
+    /// [`can_admit_review_batch_in_tx`] for the pre-merge-priority rule.
+    /// Read-only — opens its own connection rather than a transaction, since
+    /// callers that need this check inside an existing write use the `_in_tx`
+    /// function directly.
+    pub fn can_admit_review_batch(&self, phase: ReviewBatchPhase) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        can_admit_review_batch_in_tx(&tx, phase)
+    }
+
     /// Atomically create an immutable pre-merge batch and the three ready leaf
     /// executions. The durable member policy, rather than mutable task driver
     /// or effort settings, controls every later spawn and retry.
@@ -716,6 +805,14 @@ impl WorkDb {
                 tx.commit()?;
                 return Ok(ReviewBatchDispatch::LegacyExecution(execution));
             }
+        }
+        if !can_admit_review_batch_in_tx(&tx, ReviewBatchPhase::PreMerge)? {
+            // Read-only so far — nothing to roll back. The caller must hold
+            // the producing task pending review rather than treat this as a
+            // legacy fallback; the next reconciliation pass retries once an
+            // existing batch completes and frees its reservation.
+            tx.commit()?;
+            return Ok(ReviewBatchDispatch::AdmissionDeferred);
         }
         let executions = (0..3)
             .map(|_| {
