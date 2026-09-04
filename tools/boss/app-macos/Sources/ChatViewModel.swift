@@ -299,17 +299,11 @@ final class ChatViewModel: ObservableObject {
     /// debounce. See `ChatViewModel+Ideas.swift`.
     var ideaLocalCacheTask: Task<Void, Never>?
     var ideaEngineSaveTask: Task<Void, Never>?
-    /// The exact name/body last sent to the engine via `update_idea`, keyed
-    /// by idea id, kept until the matching `idea_updated` echo arrives.
-    /// Lets `handleIdeaUpdated` recognize its own save and clear the
-    /// crash-floor cache for that idea even after the editor has already
-    /// moved on to a different one. See `ChatViewModel+Ideas.swift`.
-    var ideaInFlightSaves: [String: (name: String, body: String)] = [:]
-    /// Set while `loadIdeaDraft`/`handleIdeaCreated` assign the published
-    /// draft fields programmatically, so `noteIdeaDraftEdited()` (driven by
-    /// `IdeasView`'s `.onChange`) can tell that apart from a real keystroke
-    /// and skip marking a freshly-opened idea dirty.
-    var isLoadingIdeaDraft = false
+    /// The values most recently assigned while opening or creating an idea.
+    /// `noteIdeaDraftEdited()` compares against this durable snapshot so a
+    /// later SwiftUI `.onChange` can distinguish that assignment from a
+    /// real keystroke without relying on a synchronous transient flag.
+    var lastLoadedIdeaDraft: (id: String, name: String, body: String)?
     /// Directory `IdeaDraftCache` reads/writes for this view model. Tests
     /// override with a scratch directory so state machine coverage never
     /// touches the real Application Support tree.

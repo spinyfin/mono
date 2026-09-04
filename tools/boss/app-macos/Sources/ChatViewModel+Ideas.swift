@@ -99,11 +99,10 @@ extension ChatViewModel {
     /// the reconciliation the design calls for happens the moment the
     /// idea is revisited rather than waiting on the next keystroke.
     private func loadIdeaDraft(_ ideaID: String?) {
-        isLoadingIdeaDraft = true
-        defer { isLoadingIdeaDraft = false }
         guard let ideaID, let idea = ideasByProductID.values.flatMap({ $0 }).first(where: { $0.id == ideaID }) else {
             ideaDraftName = ""
             ideaDraftBody = ""
+            lastLoadedIdeaDraft = nil
             ideaSaveStatus = .idle
             return
         }
@@ -117,15 +116,22 @@ extension ChatViewModel {
             ideaDraftBody = idea.body
             ideaSaveStatus = .savedToEngine
         }
+        lastLoadedIdeaDraft = (id: ideaID, name: ideaDraftName, body: ideaDraftBody)
     }
 
     /// Called on every editor keystroke (`IdeasView`'s `.onChange` on the
     /// published `ideaDraftName` / `ideaDraftBody`). Resets both debounce
-    /// timers. A no-op while a draft is being loaded programmatically
-    /// (`isLoadingIdeaDraft`) — `.onChange` fires for that assignment too,
+    /// timers. A no-op when the draft still matches the values most recently
+    /// loaded programmatically — `.onChange` fires for those assignments too,
     /// and it must not be mistaken for a real edit.
     func noteIdeaDraftEdited() {
-        guard selectedIdeaID != nil, !isLoadingIdeaDraft else { return }
+        guard let selectedIdeaID else { return }
+        if let lastLoadedIdeaDraft,
+           lastLoadedIdeaDraft.id == selectedIdeaID,
+           lastLoadedIdeaDraft.name == ideaDraftName,
+           lastLoadedIdeaDraft.body == ideaDraftBody {
+            return
+        }
         ideaSaveStatus = .pendingLocal
         scheduleIdeaLocalCacheWrite()
         scheduleIdeaEngineSave(immediate: false)
@@ -187,11 +193,6 @@ extension ChatViewModel {
             return
         }
         ideaSaveStatus = .savingToEngine
-        // Recorded by id, independent of `selectedIdeaID`, so the matching
-        // `idea_updated` echo can be recognized and the crash-floor cache
-        // cleared for this idea even if the editor has already switched to
-        // a different one by the time the reply arrives.
-        ideaInFlightSaves[ideaID] = (name: ideaDraftName, body: ideaDraftBody)
         engine.sendUpdateIdea(id: ideaID, name: ideaDraftName, body: ideaDraftBody)
     }
 
@@ -219,11 +220,10 @@ extension ChatViewModel {
     /// the new row and opens it for editing.
     func handleIdeaCreated(_ idea: WorkIdea) {
         upsertIdea(idea)
-        isLoadingIdeaDraft = true
         selectedIdeaID = idea.id
         ideaDraftName = idea.name
         ideaDraftBody = idea.body
-        isLoadingIdeaDraft = false
+        lastLoadedIdeaDraft = (id: idea.id, name: idea.name, body: idea.body)
         ideaSaveStatus = .savedToEngine
     }
 
@@ -235,22 +235,20 @@ extension ChatViewModel {
     /// whether that idea is still selected: `selectIdea` flushes and sends
     /// `update_idea` for the idea being left *before* reassigning
     /// `selectedIdeaID`, so this reply for the outgoing idea routinely
-    /// arrives after the editor has already moved on. Matching against
-    /// `ideaInFlightSaves[idea.id]` (recorded when the save was sent, by
-    /// id) rather than the currently-selected draft reconciles it either
-    /// way. A reply that doesn't match the recorded in-flight save — a
-    /// stale echo for an earlier debounce cycle whose text has since been
-    /// superseded by further typing — leaves the cache alone rather than
-    /// marking a still-unsent edit as safe.
+    /// arrives after the editor has already moved on. The cache itself is
+    /// the reconciliation record: it is cleared only when its contents
+    /// exactly match this echoed engine snapshot. This preserves a newer
+    /// local write when an earlier save's echo arrives after more typing.
     ///
     /// The `ideaSaveStatus` transition, in contrast, genuinely is about
     /// the open editor, so it stays gated on `selectedIdeaID`.
     func handleIdeaUpdated(_ idea: WorkIdea) {
         upsertIdea(idea)
-        if let inFlight = ideaInFlightSaves[idea.id], idea.name == inFlight.name, idea.body == inFlight.body {
+        if let cached = IdeaDraftCache.read(ideaID: idea.id, in: ideaDraftCacheDirectory),
+           cached.name == idea.name,
+           cached.body == idea.body {
             IdeaDraftCache.clear(ideaID: idea.id, in: ideaDraftCacheDirectory)
             ideaIDsWithPendingLocalDraft.remove(idea.id)
-            ideaInFlightSaves.removeValue(forKey: idea.id)
         }
         guard idea.id == selectedIdeaID, idea.body == ideaDraftBody, idea.name == ideaDraftName else { return }
         ideaSaveStatus = .savedToEngine

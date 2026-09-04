@@ -85,10 +85,10 @@ enum IdeaDraftCache {
         try? FileManager.default.removeItem(at: path(for: ideaID, in: directory))
     }
 
-    /// Whether an unsynced local draft exists for `ideaID`. Drives the
-    /// sidebar's "unsaved local changes" indicator so a draft that never
-    /// got reconciled (the app crashed, then a different idea was opened)
-    /// stays visible instead of silently waiting to be rediscovered.
+    /// Whether an unsynced local draft file exists for `ideaID`. Used to
+    /// assert cache state directly; the sidebar indicator reads
+    /// `ChatViewModel.ideaIDsWithPendingLocalDraft`, which mirrors this
+    /// state in memory.
     static func hasPendingDraft(ideaID: String, in directory: URL = defaultDirectory) -> Bool {
         FileManager.default.fileExists(atPath: path(for: ideaID, in: directory).path)
     }

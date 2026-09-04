@@ -117,7 +117,7 @@ final class ChatViewModelIdeasTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 300_000_000)
 
             XCTAssertEqual(
-                model.ideaInFlightSaves[idea.id]?.body, "unsynced local body",
+                model.ideaSaveStatus, .savingToEngine,
                 "the cached draft must be re-sent to the engine the moment the idea is reopened"
             )
         }
@@ -136,8 +136,6 @@ final class ChatViewModelIdeasTests: XCTestCase {
             model.ideaDraftBody = "second edit"
             model.noteIdeaDraftEdited()
             model.flushIdeaDraft()
-            XCTAssertEqual(model.ideaInFlightSaves[idea.id]?.body, "second edit")
-
             // A reply confirming an earlier, already-superseded edit.
             let staleEcho = makeIdea(id: idea.id, name: "D", body: "first edit")
             model.handleIdeaUpdated(staleEcho)
@@ -151,7 +149,36 @@ final class ChatViewModelIdeasTests: XCTestCase {
         }
     }
 
-    // MARK: (d) The cache entry is stamped with the idea's own product id
+    // MARK: (d) An earlier echo must not clear a newer crash-floor entry
+
+    func testEchoForAnEarlierSavePreservesNewerCachedDraft() {
+        withScratchDirectory { dir in
+            let model = makeModel(cacheDirectory: dir)
+            let idea = makeIdea(id: "idea_newer", name: "N", body: "original")
+            model.ideasByProductID["prod_1"] = [idea]
+            model.isConnected = true
+
+            model.selectIdea(idea.id)
+            model.ideaDraftBody = "abc"
+            model.noteIdeaDraftEdited()
+            model.flushIdeaDraft()
+
+            // The next edit has reached the crash-floor cache before the
+            // engine reply for the prior save arrives.
+            model.ideaDraftBody = "abcd"
+            model.noteIdeaDraftEdited()
+            model.flushIdeaDraft()
+            XCTAssertEqual(IdeaDraftCache.read(ideaID: idea.id, in: dir)?.body, "abcd")
+
+            model.handleIdeaUpdated(makeIdea(id: idea.id, name: "N", body: "abc"))
+
+            XCTAssertEqual(IdeaDraftCache.read(ideaID: idea.id, in: dir)?.body, "abcd")
+            XCTAssertTrue(model.ideaHasPendingLocalDraft(idea.id))
+            XCTAssertNotEqual(model.ideaSaveStatus, .savedToEngine)
+        }
+    }
+
+    // MARK: (e) The cache entry is stamped with the idea's own product id
 
     func testWriteIdeaDraftToLocalCacheUsesTheIdeasOwnProductID() {
         withScratchDirectory { dir in
@@ -178,9 +205,9 @@ final class ChatViewModelIdeasTests: XCTestCase {
         }
     }
 
-    // MARK: (e) noteIdeaDraftEdited ignores programmatic draft loads
+    // MARK: (f) noteIdeaDraftEdited ignores programmatic draft loads
 
-    func testNoteIdeaDraftEditedIsANoOpWhileLoadingADraft() {
+    func testNoteIdeaDraftEditedIsANoOpAfterSelectingAnIdea() {
         withScratchDirectory { dir in
             let model = makeModel(cacheDirectory: dir)
             let idea = makeIdea(id: "idea_f", name: "F", body: "F body")
@@ -190,11 +217,9 @@ final class ChatViewModelIdeasTests: XCTestCase {
             model.selectIdea(idea.id)
             XCTAssertEqual(model.ideaSaveStatus, .savedToEngine)
 
-            // Simulate the assignment inside loadIdeaDraft/handleIdeaCreated
-            // re-entering noteIdeaDraftEdited() via IdeasView's onChange.
-            model.isLoadingIdeaDraft = true
+            // Mirrors the bare callback that IdeasView's .onChange runs
+            // after selectIdea assigns the published draft fields.
             model.noteIdeaDraftEdited()
-            model.isLoadingIdeaDraft = false
 
             XCTAssertEqual(model.ideaSaveStatus, .savedToEngine, "opening an idea must not mark it dirty")
             XCTAssertFalse(IdeaDraftCache.hasPendingDraft(ideaID: idea.id, in: dir))
