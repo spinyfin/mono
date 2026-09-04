@@ -1,0 +1,21 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+package(default_visibility = ["//visibility:private"])
+
+# repobin-shim.sh and install-workspace-shims.sh are not bazel-built: cube
+# runs the installer from `.cube/setup.yaml` on every lease, and the shim is
+# reached through the symlinks it writes into the gitignored bin/. This
+# package exists to test them hermetically (fake bazel, decoy PATH copies).
+sh_test(
+    name = "repobin_shim_test",
+    size = "small",
+    srcs = ["repobin_shim_test.sh"],
+    args = [
+        "$(location repobin-shim.sh)",
+        "$(location install-workspace-shims.sh)",
+    ],
+    data = [
+        "install-workspace-shims.sh",
+        "repobin-shim.sh",
+    ],
+)

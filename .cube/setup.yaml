@@ -4,6 +4,10 @@
 # tools/cube/src/setup.rs). Steps run through `sh -c` with cwd = the
 # workspace root; a step that exits non-zero fails the lease, so every step
 # must be safe to run on any host cube provisions a mono workspace on.
+#
+# Leases are time-bounded (the Boss engine budgets ~90s for the whole
+# `cube workspace lease`), so no step here may run bazel: a cold workspace
+# build blows that budget and fails the lease.
 version: 1
 steps:
   # Materialize a placeholder GhosttyKit.xcframework so Bazel *analysis* of
@@ -20,4 +24,21 @@ steps:
   # after the first and self-heals if the stub is ever wiped.
   - id: ghosttykit-spm-stub
     command: bash tools/boss/app-macos/scripts/stub-ghosttykit-xcframework.sh
+    run_when: always
+
+  # Populate the gitignored bin/ with repobin shims — one per REPOBIN.toml
+  # tool plus `repobin` — so `bin/checkleft` exists in every leased workspace
+  # exactly as it does in CI (.buildkite/steps/ci-env.sh runs the real
+  # `repobin install --bin-dir bin/`). Each shim builds //tools/repobin:repobin
+  # with bazel on first use and dispatches through `repobin exec`, so the
+  # checkleft a worker runs is //tools/checkleft:checkleft built from this
+  # checkout — the binary CI runs — and never a PATH copy such as an old
+  # `cargo install checkleft`. Only symlinks are written here (the bazel
+  # build is deferred to first use, see the lease budget note above), so
+  # `run_when: always` is free and self-heals a wiped bin/. The installer
+  # exits non-zero if bin/checkleft is not executable afterwards, failing
+  # the lease loudly rather than handing out a workspace whose checkleft
+  # gate a worker would have to improvise.
+  - id: repobin-tool-shims
+    command: bash tools/repobin/shim/install-workspace-shims.sh
     run_when: always

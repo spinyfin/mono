@@ -632,15 +632,29 @@ fn ensure_worker_bin_dir_for_engine(settings_dir: &Path, workspace_path: &Path, 
     } else {
         None
     };
-    let environment =
-        boss_engine_worker_bin::environment::sync_checkleft_launcher(&dir, workspace_path, repobin.as_deref())
-            .and_then(|_| boss_engine_worker_bin::environment::write_shell_environment(&dir));
-    if let Err(err) = environment {
-        tracing::error!(
-            ?err,
-            "could not materialize the worker tool environment; aborting spawn"
-        );
-        return None;
+    match boss_engine_worker_bin::environment::sync_checkleft_launcher(&dir, workspace_path, repobin.as_deref())
+        .and_then(|_| boss_engine_worker_bin::environment::write_shell_environment(&dir))
+    {
+        Ok(_) => {
+            if boss_engine_worker_bin::environment::workspace_declares_repo_tool(workspace_path, "checkleft") {
+                tracing::debug!(
+                    dir = %dir.display(),
+                    "worker `checkleft` launcher written (the workspace's REPOBIN.toml declares checkleft)",
+                );
+            } else {
+                tracing::debug!(
+                    workspace = %workspace_path.display(),
+                    "no `checkleft` launcher: the workspace's REPOBIN.toml does not declare checkleft",
+                );
+            }
+        }
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                "could not materialize the worker tool environment; aborting spawn"
+            );
+            return None;
+        }
     }
     Some(dir)
 }
