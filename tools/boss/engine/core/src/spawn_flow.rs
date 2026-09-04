@@ -1332,8 +1332,6 @@ mod tests {
             vec![
                 "intent",
                 "server-bootstrap",
-                "server-bootstrap",
-                "server-bootstrap",
                 "new-session",
                 "presentation",
                 "presentation",
@@ -1348,30 +1346,30 @@ mod tests {
         );
 
         let calls = runner.calls();
-        assert_eq!(calls[0], vec!["-S", boss_tmux::TEST_SOCKET_PATH, "start-server"]);
         assert_eq!(
-            calls[1],
+            calls[0],
             vec![
                 "-S",
                 boss_tmux::TEST_SOCKET_PATH,
+                "start-server",
+                ";",
+                "set-option",
+                "-s",
+                "exit-empty",
+                "off",
+                ";",
                 "set-option",
                 "-g",
                 "history-limit",
-                "2000"
-            ]
-        );
-        assert_eq!(
-            calls[2],
-            vec![
-                "-S",
-                boss_tmux::TEST_SOCKET_PATH,
+                "2000",
+                ";",
                 "set-option",
                 "-g",
                 "remain-on-exit",
                 "on"
             ]
         );
-        let create = &calls[3];
+        let create = &calls[1];
         assert_eq!(
             &create[..5],
             ["-S", boss_tmux::TEST_SOCKET_PATH, "new-session", "-d", "-s"]
@@ -1394,7 +1392,7 @@ mod tests {
             "tmux must launch through WorkerPaneLaunch's interactive login shell: {create:?}"
         );
         assert_eq!(
-            calls[9],
+            calls[7],
             [
                 "-S",
                 boss_tmux::TEST_SOCKET_PATH,
@@ -1427,7 +1425,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            &calls[10][..6],
+            &calls[8][..6],
             [
                 "-S",
                 boss_tmux::TEST_SOCKET_PATH,
@@ -1458,7 +1456,7 @@ mod tests {
             "server options must be set before the attach identity is returned"
         );
         assert_eq!(
-            calls[11],
+            calls[9],
             vec![
                 "-S",
                 boss_tmux::TEST_SOCKET_PATH,

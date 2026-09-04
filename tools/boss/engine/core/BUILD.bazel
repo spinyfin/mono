@@ -472,6 +472,47 @@ rust_test(
     ),
 )
 
+# Drives the production local spawn and recovery chain against a private tmux
+# server. The fixture redraws continuously with a non-driver process title,
+# then exercises restart adoption, token-verified stale reaping, lease/slot
+# release, and orphan redispatch with short test-only timing windows.
+rust_test(
+    name = "tmux_recovery_integration_test",
+    size = "medium",
+    timeout = "moderate",
+    srcs = ["tests/tmux_recovery_integration.rs"],
+    compile_data = ["tests/fixtures/repainting-worker.sh"],
+    # This is deliberately test-local data rather than part of the shared
+    # test runtime: the hermetic wrapper permits precisely declared runfiles
+    # to execute, while unrelated tests never gain a host tmux capability.
+    data = ["@host_tmux//:tmux"],
+    edition = "2024",
+    env = {"HOME": "/tmp"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    # `bazel-any` is a heterogeneous queue: the four Linux amd64 agents
+    # (empiricist-1/2, zoologist-1, diziet-1) are not yet confirmed to carry
+    # a host tmux package (see the `tmux` entry in
+    # .buildkite/gce-agent-runbook.md § Packages), and `host_tmux_repository`
+    # silently falls back to an exit-127 stub when it finds none. Without
+    # this tag, `bazel test //...` would put this target on the required
+    # buildkite/mono/bazel-build-test check and it would flap red purely by
+    # host assignment. Remove once every `bazel-any` Linux host is confirmed
+    # to have tmux installed — an operator/fleet-provisioning decision, not
+    # one this target can make for itself.
+    tags = ["manual"],
+    deps = [
+        ":engine_lib",
+        "//tools/boss/protocol",
+        "//tools/boss/tmux",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 rust_test(
     name = "background_work_rpc_test",
     size = "small",

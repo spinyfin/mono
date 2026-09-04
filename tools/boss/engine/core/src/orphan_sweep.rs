@@ -244,7 +244,15 @@ pub async fn run_one_pass(
     dispatch_events: &dyn DispatchEventSink,
     convergence: &dyn LiveWorkerConvergence,
 ) -> OrphanSweepOutcome {
-    run_one_pass_filtered(work_db, coordinator, dispatch_events, convergence, None).await
+    run_one_pass_filtered(
+        work_db,
+        coordinator,
+        dispatch_events,
+        convergence,
+        None,
+        ORPHAN_MIN_AGE_SECS,
+    )
+    .await
 }
 
 /// Event-driven counterpart of [`run_one_pass`]: re-evaluates only
@@ -269,7 +277,38 @@ pub async fn run_one_pass_for_item(
     convergence: &dyn LiveWorkerConvergence,
     work_item_id: &str,
 ) -> OrphanSweepOutcome {
-    run_one_pass_filtered(work_db, coordinator, dispatch_events, convergence, Some(work_item_id)).await
+    run_one_pass_for_item_with_min_age(
+        work_db,
+        coordinator,
+        dispatch_events,
+        convergence,
+        work_item_id,
+        ORPHAN_MIN_AGE_SECS,
+    )
+    .await
+}
+
+/// Event-driven orphan-active pass for one work item with an explicit
+/// candidate-age threshold. Kept alongside [`run_one_pass_for_item`] so a
+/// real recovery fixture can exercise redispatch without waiting through the
+/// production anti-race window.
+pub async fn run_one_pass_for_item_with_min_age(
+    work_db: &WorkDb,
+    coordinator: Arc<ExecutionCoordinator>,
+    dispatch_events: &dyn DispatchEventSink,
+    convergence: &dyn LiveWorkerConvergence,
+    work_item_id: &str,
+    min_age_secs: i64,
+) -> OrphanSweepOutcome {
+    run_one_pass_filtered(
+        work_db,
+        coordinator,
+        dispatch_events,
+        convergence,
+        Some(work_item_id),
+        min_age_secs,
+    )
+    .await
 }
 
 /// Shared implementation behind [`run_one_pass`] and
@@ -282,6 +321,7 @@ async fn run_one_pass_filtered(
     dispatch_events: &dyn DispatchEventSink,
     convergence: &dyn LiveWorkerConvergence,
     only_work_item_id: Option<&str>,
+    min_age_secs: i64,
 ) -> OrphanSweepOutcome {
     let mut outcome = OrphanSweepOutcome::default();
 
@@ -303,7 +343,7 @@ async fn run_one_pass_filtered(
     // incorrectly treat it as dead and abandon it.
     let claimed: HashSet<String> = coordinator.all_claimed_execution_ids().await;
 
-    let candidates = match work_db.list_orphan_active_candidates(ORPHAN_MIN_AGE_SECS) {
+    let candidates = match work_db.list_orphan_active_candidates(min_age_secs) {
         Ok(ids) => ids,
         Err(err) => {
             tracing::warn!(?err, "orphan sweep: failed to list candidates; skipping pass");
@@ -380,8 +420,9 @@ async fn run_one_pass_filtered(
                         .with_work_item(&work_item_id)
                         .with_details(serde_json::json!({
                             "loop": "orphan_active_sweep",
-                            "predicate": "tasks.status='active' AND no ready execution AND \
-                                          updated_at age >= ORPHAN_MIN_AGE_SECS",
+                            "predicate": format!(
+                                "tasks.status='active' AND no ready execution AND updated_at age >= {min_age_secs}s"
+                            ),
                             "live_execution_id": live.id,
                             "live_execution_status": live.status,
                             "live_execution_claimed": live_claimed,

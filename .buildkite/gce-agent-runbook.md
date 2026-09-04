@@ -79,7 +79,7 @@ sudo apt-get update
 sudo apt-get install -y \
   build-essential git perl python3 unzip zip \
   jq curl ca-certificates gnupg patch coreutils \
-  pkg-config libssl-dev
+  pkg-config libssl-dev tmux
 ```
 
 Why each — this list is derived from the build graph, not generic:
@@ -89,6 +89,7 @@ Why each — this list is derived from the build graph, not generic:
 - **`jq`** — used by the release scripts on Linux agents.
 - **`patch`** — `MODULE.bazel` patches `rules_rust` and `rules_apple`.
 - **`pkg-config` + `libssl-dev`** — **flunge only, not mono.** The `openssl-sys` crate's build script shells out to `pkg-config` and fails with exit code 101 without it. The error names only `pkg-config` because that check runs first; installing it alone gets you the missing-headers failure next.
+- **`tmux`** — `//tools/boss/engine/core:tmux_recovery_integration_test` drives a real private tmux server through `tools/test-sandbox/repositories.bzl`'s `host_tmux_repository`, which falls back to an exit-127 stub when no host tmux is found on `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, or `/bin`. The target is `tags = ["manual"]` until this package is confirmed installed on every `bazel-any` Linux host — see the tag's comment in `tools/boss/engine/core/BUILD.bazel`.
 
 **Not needed:** pnpm, and npm as a package manager — no `package.json`, no `rules_js`. Node and `npx` **are** required; see § Node. Not rustup either: Rust comes hermetically from `rules_rust` via `rust-toolchain.toml`, and `rustup` appears only in the darwin-only cross-build phase.
 

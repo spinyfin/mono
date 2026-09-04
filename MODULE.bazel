@@ -39,6 +39,13 @@ test_runtime_repository = use_repo_rule(
 
 test_runtime_repository(name = "test_runtime_tools")
 
+host_tmux_repository = use_repo_rule(
+    "//tools/test-sandbox:repositories.bzl",
+    "host_tmux_repository",
+)
+
+host_tmux_repository(name = "host_tmux")
+
 # Zig-based hermetic CC toolchain used for musl cross-compilation.
 # Provides @zig_sdk//libc_aware/toolchain:linux_amd64_musl (and arm64 variant)
 # which cross-compile C/C++ code from any host to a fully-static musl binary.
