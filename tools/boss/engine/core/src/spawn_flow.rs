@@ -486,6 +486,7 @@ pub struct StartWorkerInput {
     /// Extra env vars to thread to the worker on top of the ones the
     /// worker settings template injects (`BOSS_EVENTS_SOCKET`,
     /// `BOSS_LEASE_ID`).
+    #[builder(default)]
     pub extra_env: Vec<(String, String)>,
     /// Optional 2–4 word gerund summary to display in the pane
     /// titlebar (e.g. `"fixing the fencer scraper"`). Set only when
@@ -508,6 +509,7 @@ pub struct StartWorkerInput {
     /// When `true`, the engine-injected CLAUDE.md includes a directive
     /// to pass `--draft` to `gh pr create` by default. Sourced from
     /// the `default_pr_draft_mode` per-installation setting.
+    #[builder(default)]
     pub draft_pr_mode: bool,
     /// Execution kind (e.g. `"chore_implementation"`, `"revision_implementation"`).
     /// Forwarded to `WorkerSetupInput` so the worker settings file can
@@ -527,6 +529,7 @@ pub struct StartWorkerInput {
     /// tool denylist. Defaults to [`WorkerKind::Standard`] for all
     /// current callers; set to [`WorkerKind::Reviewer`] when spawning a
     /// reviewer worker.
+    #[builder(default = WorkerKind::Standard)]
     pub worker_kind: WorkerKind,
     /// Resolved agent driver for this worker. Production callers look the
     /// slug up once via [`crate::driver::DriverRegistry::require`] and pass
@@ -539,12 +542,15 @@ pub struct StartWorkerInput {
     pub tmux_host: Option<TmuxWorkerHost>,
     /// Forwarded to `WorkerSetupInput` — see that field's doc. Ignored
     /// unless `worker_kind` is [`WorkerKind::Triage`].
+    #[builder(default)]
     pub automation_outcome_proposals_seam_enabled: bool,
     /// Forwarded to `WorkerSetupInput` — see that field's doc. Ignored
     /// unless `worker_kind` is [`WorkerKind::Reviewer`].
+    #[builder(default)]
     pub is_review_supervisor: bool,
     /// Forwarded to `WorkerSetupInput` — see that field's doc. Ignored
     /// unless `worker_kind` is [`WorkerKind::Reviewer`].
+    #[builder(default)]
     pub is_post_merge_reviewer: bool,
 }
 
@@ -701,20 +707,22 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
 
     // 1. Write CLAUDE.md + .gitignore into the workspace and the worker
     //    settings file outside it (see worker_setup module docs).
-    let setup = WorkerSetupInput {
-        run_id: input.run_id.clone(),
-        lease_id: input.lease_id.clone(),
-        workspace_path: input.workspace_path.clone(),
-        events_socket_path: input.events_socket_path.clone(),
-        boss_event_path: input.boss_event_path.clone(),
-        draft_pr_mode: input.draft_pr_mode,
-        execution_kind: input.execution_kind.clone(),
-        task_kind: input.task_kind.clone(),
-        worker_kind: input.worker_kind.clone(),
-        automation_outcome_proposals_seam_enabled: input.automation_outcome_proposals_seam_enabled,
-        is_review_supervisor: input.is_review_supervisor,
-        is_post_merge_reviewer: input.is_post_merge_reviewer,
-    };
+    // Deliberately use the builder: forwarding a new setting here is one
+    // explicit edit, instead of requiring every WorkerSetupInput caller to change.
+    let setup = WorkerSetupInput::builder()
+        .run_id(input.run_id.clone())
+        .lease_id(input.lease_id.clone())
+        .workspace_path(input.workspace_path.clone())
+        .events_socket_path(input.events_socket_path.clone())
+        .boss_event_path(input.boss_event_path.clone())
+        .draft_pr_mode(input.draft_pr_mode)
+        .execution_kind(input.execution_kind.clone())
+        .maybe_task_kind(input.task_kind.clone())
+        .worker_kind(input.worker_kind.clone())
+        .automation_outcome_proposals_seam_enabled(input.automation_outcome_proposals_seam_enabled)
+        .is_review_supervisor(input.is_review_supervisor)
+        .is_post_merge_reviewer(input.is_post_merge_reviewer)
+        .build();
     let written = write_workspace_files(&setup, input.driver.as_ref()).map_err(StartWorkerError::WriteFiles)?;
     spawner
         .prepare_progress_ingress(&input.run_id, input.driver.clone(), progress_ingress)

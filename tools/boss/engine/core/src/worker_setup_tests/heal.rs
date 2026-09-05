@@ -81,13 +81,7 @@ fn heal_worker_settings_json_updates_all_hook_events() {
         workspace_path: PathBuf::from("/some/workspace/mono-agent-heal"),
         events_socket_path: PathBuf::from("/tmp/events.sock"),
         boss_event_path: PathBuf::from("/old/bazel-bin/tools/boss/event-shim/boss-event"),
-        draft_pr_mode: false,
-        execution_kind: "chore_implementation".into(),
-        task_kind: Some("chore".into()),
-        worker_kind: WorkerKind::Standard,
-        automation_outcome_proposals_seam_enabled: false,
-        is_review_supervisor: false,
-        is_post_merge_reviewer: false,
+        ..sample_input()
     };
     let settings_file = settings_dir.path().join("mono-agent-heal.json");
     std::fs::write(&settings_file, render_settings_json(&input, &ClaudeDriver)).unwrap();

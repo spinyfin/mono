@@ -113,13 +113,7 @@ fn write_workspace_files_writes_checkleft_push_guard_script_outside_workspace() 
         workspace_path: dir.path().to_path_buf(),
         events_socket_path: PathBuf::from("/tmp/events.sock"),
         boss_event_path: PathBuf::from("/tmp/boss-event"),
-        draft_pr_mode: false,
-        execution_kind: "chore_implementation".into(),
-        task_kind: Some("chore".into()),
-        worker_kind: WorkerKind::Standard,
-        automation_outcome_proposals_seam_enabled: false,
-        is_review_supervisor: false,
-        is_post_merge_reviewer: false,
+        ..sample_input()
     };
     write_workspace_files(&input, &ClaudeDriver).unwrap();
 

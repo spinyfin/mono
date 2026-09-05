@@ -932,27 +932,27 @@ impl HostAdapter for SshHostAdapter {
         let is_review_supervisor = review_batch_member_role == Some(boss_protocol::ReviewBatchMemberRole::Supervisor);
         let is_post_merge_reviewer =
             review_batch_member_role == Some(boss_protocol::ReviewBatchMemberRole::PostMergeReviewer);
-        let settings_input = WorkerSetupInput {
-            run_id: run_id.clone(),
-            lease_id: lease_id.clone(),
-            workspace_path: PathBuf::from(&workspace),
-            events_socket_path: PathBuf::from(&remote_socket),
-            boss_event_path: PathBuf::from(REMOTE_BOSS_EVENT_BIN),
-            draft_pr_mode: false,
-            execution_kind: execution.kind.as_str().to_owned(),
-            task_kind: work_item_task_kind(work_item).map(str::to_owned),
+        // Deliberately use the builder: forwarding a new setting here is one
+        // explicit edit, instead of requiring every WorkerSetupInput caller to change.
+        let settings_input = WorkerSetupInput::builder()
+            .run_id(run_id.clone())
+            .lease_id(lease_id.clone())
+            .workspace_path(PathBuf::from(&workspace))
+            .events_socket_path(PathBuf::from(&remote_socket))
+            .boss_event_path(PathBuf::from(REMOTE_BOSS_EVENT_BIN))
+            .execution_kind(execution.kind.as_str().to_owned())
+            .maybe_task_kind(work_item_task_kind(work_item).map(str::to_owned))
             // Derive the restricted posture the same way the local path does,
             // so a reviewer/triage/answer-agent dispatched remotely still gets
             // its reduced surface instead of silently becoming Standard.
-            worker_kind: crate::worker_setup::worker_kind_for_execution(&execution.kind),
-            is_review_supervisor,
-            is_post_merge_reviewer,
+            .worker_kind(crate::worker_setup::worker_kind_for_execution(&execution.kind))
+            .is_review_supervisor(is_review_supervisor)
+            .is_post_merge_reviewer(is_post_merge_reviewer)
             // Mirrors `WorkerSpawnOpts` above: a remotely dispatched triage
             // worker always gets the legacy marker-only CLAUDE.md, since
             // SshHostAdapter has no FeatureFlagsStore to read
             // `automation_outcome_proposals_seam` from.
-            automation_outcome_proposals_seam_enabled: false,
-        };
+            .build();
         // Resolve the same driver `compose_worker_spawn` already validated
         // against the registry — settings wiring (ProgressObservation +
         // ToolUseInterception) must come from that driver, not a hardcoded
@@ -1604,20 +1604,14 @@ mod tests {
     /// A `WorkerSetupInput` shaped like the one the remote spawn builds.
     /// Only the fields `progress_observation_wiring` reads matter here.
     fn remote_settings_input() -> WorkerSetupInput {
-        WorkerSetupInput {
-            run_id: "exec_1".to_owned(),
-            lease_id: "lease-1".to_owned(),
-            workspace_path: PathBuf::from("/remote/ws"),
-            events_socket_path: PathBuf::from("/tmp/boss-events-exec_1.sock"),
-            boss_event_path: PathBuf::from(REMOTE_BOSS_EVENT_BIN),
-            draft_pr_mode: false,
-            execution_kind: "chore_implementation".to_owned(),
-            task_kind: None,
-            worker_kind: crate::worker_setup::WorkerKind::Standard,
-            automation_outcome_proposals_seam_enabled: false,
-            is_review_supervisor: false,
-            is_post_merge_reviewer: false,
-        }
+        WorkerSetupInput::builder()
+            .run_id("exec_1")
+            .lease_id("lease-1")
+            .workspace_path(PathBuf::from("/remote/ws"))
+            .events_socket_path(PathBuf::from("/tmp/boss-events-exec_1.sock"))
+            .boss_event_path(PathBuf::from(REMOTE_BOSS_EVENT_BIN))
+            .execution_kind("chore_implementation")
+            .build()
     }
 
     /// A driver whose hooks land in the worker settings file is exactly what

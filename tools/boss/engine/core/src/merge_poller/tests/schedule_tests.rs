@@ -8,25 +8,14 @@ use super::*;
 /// schedule instead of re-probed.
 #[test]
 fn poll_tier_classifies_open_pr_signals() {
-    let base = |state: PrLifecycleState, in_merge_queue: bool| PrLifecycleProbe {
-        url: "https://github.com/foo/bar/pull/1".to_owned(),
-        state,
-        base_ref_oid: None,
-        head_ref_oid: None,
-        head_ref_name: None,
-        base_ref_name: None,
-        labels: Vec::new(),
-        review: PrReviewState::Unknown,
-        in_merge_queue,
-        merge_queue_entry_state: None,
-        merge_queue_position: None,
-        merge_queue_enqueued_at: None,
-        raw_mergeable: String::new(),
-        raw_merge_state_status: String::new(),
-        auto_merge_enabled: false,
-        auto_merge_enabled_at: None,
-        trunk_queue_check_failure: None,
-        merge_commit_oid: None,
+    let base = |state: PrLifecycleState, in_merge_queue: bool| {
+        PrLifecycleProbe::builder()
+            .url("https://github.com/foo/bar/pull/1")
+            .state(state)
+            .labels(Vec::new())
+            .review(PrReviewState::Unknown)
+            .in_merge_queue(in_merge_queue)
+            .build()
     };
 
     assert_eq!(
