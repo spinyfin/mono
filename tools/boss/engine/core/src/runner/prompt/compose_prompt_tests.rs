@@ -764,6 +764,14 @@ fn ci_monitoring_directive_present_for_implementation_chore() {
         prompt.contains("effectively green"),
         "directive should reference the engine's effectively-green definition:\n{prompt}",
     );
+    assert!(
+        prompt.contains("classify it per the CI-failure rules at the top of this prompt"),
+        "a failed required check must point at the opening CI classification, not a vague escalate:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("Waiting for a CI-fix revision is not a substitute"),
+        "CI-fix revisions must not be a licence to punt a failure this run could fix:\n{prompt}",
+    );
 }
 
 #[test]

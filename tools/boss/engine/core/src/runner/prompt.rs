@@ -15,8 +15,10 @@ use boss_protocol::{EditorialRules, ExecutionKind, TaskKind, TemplatePolicy};
 
 use super::work_item::{project_details, work_item_details, work_item_name, work_item_pr_url};
 
+mod block_boundary;
 mod ci_monitoring;
 mod design;
+use block_boundary::block_boundary_fragment;
 use ci_monitoring::ci_monitoring_directive;
 use design::{compose_design_directive, compose_design_postmortem_directive};
 
@@ -449,7 +451,21 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
     prompt.push_str("You are a reusable Boss worker running one execution inside a dedicated repo workspace.\n");
     prompt.push_str("The current session cwd is already set to that workspace.\n");
     prompt.push_str("Do the work directly in the repository checkout before ending this run.\n");
-    prompt.push_str("Avoid asking the human for permission during this pass; when you need review or direction, stop and summarize it clearly.\n\n");
+    if matches!(
+        execution.kind,
+        ExecutionKind::TaskImplementation
+            | ExecutionKind::ChoreImplementation
+            | ExecutionKind::InvestigationImplementation
+            | ExecutionKind::RevisionImplementation
+            | ExecutionKind::ConflictResolution
+    ) {
+        prompt.push_str(block_boundary_fragment());
+    } else {
+        prompt.push_str(
+            "Avoid asking the human for permission during this pass; when you need review or \
+             direction, stop and summarize it clearly.\n\n",
+        );
+    }
 
     // If the chore already has a PR, inject a high-prominence resume
     // directive BEFORE the execution context so it outweighs the
@@ -477,8 +493,9 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
              {cube} pr update --branch <branch-name>\n\
              ```\n\
              \n\
-             If the branch cannot be resumed (deleted upstream, conflict you cannot resolve, etc.),\n\
-             STOP and surface the blocker — do NOT silently open a parallel PR.\n\n",
+             If the branch cannot be resumed (deleted upstream, etc.),\n\
+             STOP and surface the blocker — do NOT silently open a parallel PR.\n\
+             A merge conflict on that branch is not a resume failure: rebase, resolve, verify, and continue.\n\n",
         ));
     } else if let Some(report) =
         boss_engine_recovery::recovery_apply::RecoveryReport::read_for(workspace_path, &execution.id)
