@@ -871,12 +871,12 @@ impl ExecutionRunner for PaneSpawnRunner {
         let worker_kind = crate::worker_setup::worker_kind_for_execution(&execution.kind);
         let permission_mode_override = worker_kind.forced_permission_mode();
         // Only a review-batch's Supervisor-role member gets the supervisor
-        // CLAUDE.md instead of the leaf reviewer's; every other `pr_review`
-        // execution (leaf members, and legacy memberless reviewers) keeps
-        // the existing reviewer posture unchanged.
-        let is_review_supervisor = execution.kind == ExecutionKind::PrReview
-            && self
-                .work_db
+        // CLAUDE.md, and only a PostMergeReviewer-role member gets the
+        // post-merge one, instead of the leaf reviewer's; every other
+        // `pr_review` execution (leaf members, and legacy memberless
+        // reviewers) keeps the existing reviewer posture unchanged.
+        let review_batch_member_role = if execution.kind == ExecutionKind::PrReview {
+            self.work_db
                 .review_batch_member_for_execution(&execution.id)
                 .map_err(|error| {
                     anyhow::anyhow!(
@@ -884,7 +884,12 @@ impl ExecutionRunner for PaneSpawnRunner {
                         execution.id
                     )
                 })?
-                .is_some_and(|member| member.role == ReviewBatchMemberRole::Supervisor);
+                .map(|member| member.role)
+        } else {
+            None
+        };
+        let is_review_supervisor = review_batch_member_role == Some(ReviewBatchMemberRole::Supervisor);
+        let is_post_merge_reviewer = review_batch_member_role == Some(ReviewBatchMemberRole::PostMergeReviewer);
         // Any environment scrubbing/exporting a driver's spawn needs (e.g.
         // Claude unsetting ANTHROPIC_API_KEY so it authenticates via OAuth
         // credentials instead of a stray shell-profile key) is the driver's
@@ -1067,15 +1072,15 @@ impl ExecutionRunner for PaneSpawnRunner {
 
         let started = start_worker(
             spawner.as_ref(),
-            StartWorkerInput {
-                run_id: execution.id.clone(),
-                lease_id,
-                slot_id,
-                workspace_path: workspace_path.to_path_buf(),
-                events_socket_path: self.events_socket_path(),
-                boss_event_path: self.boss_event_binary(),
-                initial_input,
-                extra_env: {
+            StartWorkerInput::builder()
+                .run_id(execution.id.clone())
+                .lease_id(lease_id)
+                .slot_id(slot_id)
+                .workspace_path(workspace_path.to_path_buf())
+                .events_socket_path(self.events_socket_path())
+                .boss_event_path(self.boss_event_binary())
+                .initial_input(initial_input)
+                .extra_env({
                     let mut env = structured_output_env;
                     if let Some(dir) = worker_bin_dir.as_ref() {
                         env.push((
@@ -1084,28 +1089,29 @@ impl ExecutionRunner for PaneSpawnRunner {
                         ));
                     }
                     env
-                },
-                title_summary,
-                task_title: Some(work_item_name(work_item).to_owned()),
-                work_item_binding,
-                model: spawn_config.model.clone(),
-                draft_pr_mode: spawner.draft_pr_mode(),
-                execution_kind: execution.kind.as_str().to_owned(),
-                pool: Some(pool.to_owned()),
-                task_kind: work_item_task_kind(work_item).map(str::to_owned),
+                })
+                .maybe_title_summary(title_summary)
+                .task_title(work_item_name(work_item).to_owned())
+                .maybe_work_item_binding(work_item_binding)
+                .model(spawn_config.model.clone())
+                .draft_pr_mode(spawner.draft_pr_mode())
+                .execution_kind(execution.kind.as_str().to_owned())
+                .pool(pool.to_owned())
+                .maybe_task_kind(work_item_task_kind(work_item).map(str::to_owned))
                 // Per-kind worker posture (reviewer/triage/answer-agent are
                 // restricted; everything else is a Standard implementer),
                 // derived once above via the shared `worker_kind_for_execution`
                 // so the settings posture and the forced CLI permission mode
                 // are driven by one value and cannot diverge.
-                worker_kind,
+                .worker_kind(worker_kind)
                 // Same Arc resolved above for provision/spawn — settings
                 // wiring and live-state capability flags use it too.
-                driver: driver.clone(),
-                tmux_host,
-                automation_outcome_proposals_seam_enabled,
-                is_review_supervisor,
-            },
+                .driver(driver.clone())
+                .maybe_tmux_host(tmux_host)
+                .automation_outcome_proposals_seam_enabled(automation_outcome_proposals_seam_enabled)
+                .is_review_supervisor(is_review_supervisor)
+                .is_post_merge_reviewer(is_post_merge_reviewer)
+                .build(),
             StdDuration::from_secs(30),
         )
         .await

@@ -33,7 +33,6 @@ use boss_engine::tmux_adoption::run_adoption_pass;
 use boss_engine::work::WorkDb;
 use boss_engine::worker_readoption::NoopLiveWorkerConvergence;
 use boss_engine::worker_registry::WorkerRegistry;
-use boss_engine::worker_setup::WorkerKind;
 use boss_protocol::{
     AttachWorkerPaneResult, CreateChoreInput, CreateProductInput, EngineToAppRequest, EngineToAppResponse,
     RequestExecutionInput, WorkerEvent,
@@ -330,29 +329,23 @@ async fn production_tmux_recovery_ignores_repaint_and_process_title_then_redispa
     let attaching_spawner = AttachingSpawner::default();
     let started = start_worker(
         &attaching_spawner,
-        StartWorkerInput {
-            run_id: execution.id.clone(),
-            lease_id: "fixture-lease".to_owned(),
-            slot_id: 1,
-            workspace_path: workspace.clone(),
-            events_socket_path: temp.path().join("events.sock"),
-            boss_event_path: PathBuf::from("/usr/bin/true"),
-            initial_input: "fixture prompt".to_owned(),
-            extra_env: Vec::new(),
-            title_summary: Some("repainting fixture".to_owned()),
-            task_title: Some("exercise tmux recovery".to_owned()),
-            work_item_binding: None,
-            model: "claude-opus-4-7".to_owned(),
-            draft_pr_mode: false,
-            execution_kind: "chore_implementation".to_owned(),
-            pool: Some("main".to_owned()),
-            task_kind: Some("chore".to_owned()),
-            worker_kind: WorkerKind::Standard,
-            driver: Arc::new(ClaudeDriver),
-            tmux_host: Some(TmuxWorkerHost::new(tmux.clone(), spawn_store, session_name.clone())),
-            automation_outcome_proposals_seam_enabled: false,
-            is_review_supervisor: false,
-        },
+        StartWorkerInput::builder()
+            .run_id(execution.id.clone())
+            .lease_id("fixture-lease")
+            .slot_id(1)
+            .workspace_path(workspace.clone())
+            .events_socket_path(temp.path().join("events.sock"))
+            .boss_event_path(PathBuf::from("/usr/bin/true"))
+            .initial_input("fixture prompt")
+            .title_summary("repainting fixture")
+            .task_title("exercise tmux recovery")
+            .model("claude-opus-4-7")
+            .execution_kind("chore_implementation")
+            .pool("main")
+            .task_kind("chore")
+            .driver(Arc::new(ClaudeDriver))
+            .tmux_host(TmuxWorkerHost::new(tmux.clone(), spawn_store, session_name.clone()))
+            .build(),
         SHORT_WINDOW,
     )
     .await?;

@@ -12,12 +12,7 @@ fn write_workspace_files_creates_claude_dir_and_writes_all_files() {
         workspace_path: dir.path().to_path_buf(),
         events_socket_path: PathBuf::from("/tmp/events.sock"),
         boss_event_path: PathBuf::from("/tmp/boss-event"),
-        draft_pr_mode: false,
-        execution_kind: "chore_implementation".into(),
-        task_kind: Some("chore".into()),
-        worker_kind: WorkerKind::Standard,
-        automation_outcome_proposals_seam_enabled: false,
-        is_review_supervisor: false,
+        ..sample_input()
     };
 
     let written = write_workspace_files(&input, &ClaudeDriver).unwrap();
@@ -74,12 +69,7 @@ fn write_workspace_files_pre_trusts_workspace_in_claude_json() {
         workspace_path: dir.path().to_path_buf(),
         events_socket_path: PathBuf::from("/tmp/events.sock"),
         boss_event_path: PathBuf::from("/tmp/boss-event"),
-        draft_pr_mode: false,
-        execution_kind: "chore_implementation".into(),
-        task_kind: Some("chore".into()),
-        worker_kind: WorkerKind::Standard,
-        automation_outcome_proposals_seam_enabled: false,
-        is_review_supervisor: false,
+        ..sample_input()
     };
 
     write_workspace_files(&input, &ClaudeDriver).unwrap();
@@ -113,12 +103,7 @@ fn write_workspace_files_overwrites_existing_files() {
         workspace_path: dir.path().to_path_buf(),
         events_socket_path: PathBuf::from("/tmp/events.sock"),
         boss_event_path: PathBuf::from("/tmp/boss-event"),
-        draft_pr_mode: false,
-        execution_kind: "chore_implementation".into(),
-        task_kind: Some("chore".into()),
-        worker_kind: WorkerKind::Standard,
-        automation_outcome_proposals_seam_enabled: false,
-        is_review_supervisor: false,
+        ..sample_input()
     };
 
     write_workspace_files(&input, &ClaudeDriver).unwrap();
@@ -152,12 +137,7 @@ fn write_workspace_files_uses_resolved_non_claude_driver() {
         workspace_path: dir.path().to_path_buf(),
         events_socket_path: PathBuf::from("/tmp/events.sock"),
         boss_event_path: PathBuf::from("/tmp/boss-event"),
-        draft_pr_mode: false,
-        execution_kind: "chore_implementation".into(),
-        task_kind: Some("chore".into()),
-        worker_kind: WorkerKind::Standard,
-        automation_outcome_proposals_seam_enabled: false,
-        is_review_supervisor: false,
+        ..sample_input()
     };
 
     let mut descriptor = stub_descriptor();
@@ -230,12 +210,7 @@ fn write_workspace_files_does_not_pre_trust_claude_json_for_non_claude_driver() 
         workspace_path: dir.path().to_path_buf(),
         events_socket_path: PathBuf::from("/tmp/events.sock"),
         boss_event_path: PathBuf::from("/tmp/boss-event"),
-        draft_pr_mode: false,
-        execution_kind: "chore_implementation".into(),
-        task_kind: Some("chore".into()),
-        worker_kind: WorkerKind::Standard,
-        automation_outcome_proposals_seam_enabled: false,
-        is_review_supervisor: false,
+        ..sample_input()
     };
 
     let mut descriptor = stub_descriptor();

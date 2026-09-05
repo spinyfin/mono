@@ -798,7 +798,7 @@ fn render_merged_parent_deletion_block(deletions: &[String]) -> String {
     out
 }
 
-fn render_rubric_section(scope: &ReviewScope) -> String {
+pub(crate) fn render_rubric_section(scope: &ReviewScope) -> String {
     match scope {
         ReviewScope::Code => "## Review rubric — code PR\n\
              \n\

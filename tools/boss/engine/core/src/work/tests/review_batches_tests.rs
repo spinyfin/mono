@@ -99,6 +99,25 @@ fn verdict_payload(batch_id: &str, target_sha: &str) -> String {
     )
 }
 
+fn post_merge_verdict_payload(batch_id: &str, merge_sha: &str) -> String {
+    format!(
+        r#"{{"batch_id":"{batch_id}","verdict":{{"batch_id":"{batch_id}","pr_url":"https://github.com/example/repo/pull/42","target_sha":"{merge_sha}","phase":"post_merge","summary":"Clean.","revision_warranted":false,"findings":[],"contradictions":[]}}}}"#
+    )
+}
+
+fn post_merge_batch_input(cycle_root_id: String, merge_sha: &str) -> ReviewBatchCreateInput {
+    ReviewBatchCreateInput::builder()
+        .cycle_root_id(cycle_root_id)
+        .base_sha("base-sha")
+        .classification(classification())
+        .phase(ReviewBatchPhase::PostMerge)
+        .pr_number(42)
+        .pr_url("https://github.com/example/repo/pull/42")
+        .target_sha(merge_sha)
+        .merge_sha(merge_sha)
+        .build()
+}
+
 /// Like [`member`] but with an explicit attempt/status, for driving
 /// [`try_advance_review_batch_quorum_in_tx`]'s branches directly without
 /// standing up the full report-submission flow.
@@ -1605,19 +1624,6 @@ fn moved_head_fails_the_supervising_batch_instead_of_retrying() {
     );
 }
 
-fn post_merge_batch_input(cycle_root_id: String, merge_sha: &str) -> ReviewBatchCreateInput {
-    ReviewBatchCreateInput::builder()
-        .cycle_root_id(cycle_root_id)
-        .base_sha("base-sha")
-        .classification(classification())
-        .phase(ReviewBatchPhase::PostMerge)
-        .pr_number(42)
-        .pr_url("https://github.com/example/repo/pull/42")
-        .target_sha(merge_sha)
-        .merge_sha(merge_sha)
-        .build()
-}
-
 /// The review pool's 16-unit reservation capacity divided by the four-unit
 /// pre-merge weight admits exactly four concurrent pre-merge batches and
 /// denies a fifth — the property that stops a fifth wave of leaves from
@@ -2007,4 +2013,294 @@ fn reap_inert_review_batches_files_attention_on_a_done_cycle_root() {
             .any(|item| item.kind == crate::work::PR_REVIEW_BATCH_STALE_ATTENTION_KIND),
         "reaping a still-visible cycle root must file an attention item; got {attentions:?}"
     );
+}
+
+/// [`WorkDb::create_post_merge_review_batch`] dispatches exactly one
+/// `PostMergeReviewer` execution at `large` effort (Opus/high — the task's
+/// dispatch policy for a solo landed-tree review), and is idempotent on the
+/// same `(cycle_root_id, PostMerge, merge_sha)` target — a redundant call
+/// (a racing or retried merge-poller trigger) must read back the existing
+/// batch rather than mint a second one.
+#[test]
+fn create_post_merge_review_batch_dispatches_the_sole_member_and_is_idempotent() {
+    let db = WorkDb::open(temp_db_path("post-merge-batch-dispatch")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let input = post_merge_batch_input(cycle_root.id.clone(), "merge-sha-1");
+
+    let (batch, executions) = match db
+        .create_post_merge_review_batch(input.clone(), "https://github.com/example/repo")
+        .unwrap()
+    {
+        ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+        other => panic!("expected a newly-created review batch, got {other:?}"),
+    };
+    assert_eq!(batch.phase, ReviewBatchPhase::PostMerge);
+    assert_eq!(batch.merge_sha.as_deref(), Some("merge-sha-1"));
+    assert_eq!(batch.target_sha, "merge-sha-1");
+    assert_eq!(executions.len(), 1);
+    assert_eq!(executions[0].status, ExecutionStatus::Ready);
+
+    let members = db.review_batch_members(&batch.id).unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].role, ReviewBatchMemberRole::PostMergeReviewer);
+    assert_eq!(members[0].requested_driver, "claude");
+    assert_eq!(members[0].provider_effort, "large");
+    assert_eq!(members[0].execution_id.as_deref(), Some(executions[0].id.as_str()));
+
+    match db
+        .create_post_merge_review_batch(input, "https://github.com/example/repo")
+        .unwrap()
+    {
+        ReviewBatchDispatch::ExistingBatch {
+            batch: existing,
+            executions: existing_executions,
+        } => {
+            assert_eq!(existing.id, batch.id);
+            assert_eq!(existing_executions.len(), 1);
+            assert_eq!(existing_executions[0].id, executions[0].id);
+        }
+        other => panic!("expected the existing batch to be read back, got {other:?}"),
+    }
+}
+
+/// [`WorkDb::create_post_merge_review_batch`] only accepts `post_merge`
+/// batches — it is a distinct dispatch path from
+/// [`WorkDb::create_pre_merge_review_batch`], not a superset.
+#[test]
+fn create_post_merge_review_batch_rejects_pre_merge_phase() {
+    let db = WorkDb::open(temp_db_path("post-merge-batch-wrong-phase")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let input = batch_input(cycle_root.id, "head-sha", ReviewBatchPhase::PreMerge);
+
+    let error = db
+        .create_post_merge_review_batch(input, "https://github.com/example/repo")
+        .unwrap_err();
+    assert!(error.to_string().contains("post_merge"));
+}
+
+/// A `post_merge` batch is keyed on the merge commit SHA: `target_sha` and
+/// `merge_sha` must match. [`validate_batch_input`] enforces this rather than
+/// merely documenting it — a caller passing different values is rejected,
+/// not silently accepted.
+#[test]
+fn create_post_merge_review_batch_rejects_target_sha_merge_sha_mismatch() {
+    let db = WorkDb::open(temp_db_path("post-merge-batch-sha-mismatch")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let input = ReviewBatchCreateInput::builder()
+        .cycle_root_id(cycle_root.id)
+        .base_sha("base-sha")
+        .classification(classification())
+        .phase(ReviewBatchPhase::PostMerge)
+        .pr_number(42)
+        .pr_url("https://github.com/example/repo/pull/42")
+        .target_sha("target-sha")
+        .merge_sha("different-merge-sha")
+        .build();
+
+    let error = db
+        .create_post_merge_review_batch(input, "https://github.com/example/repo")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("target_sha == merge_sha"),
+        "error must name the violated invariant: {error}"
+    );
+}
+
+/// A post-merge batch has no leaf/supervisor split: its sole
+/// `PostMergeReviewer` member submits the verdict directly while the batch
+/// is still `collecting` (the phase never reaches `supervising`), and that
+/// single report IS the batch's verdict — quorum moves straight from
+/// `collecting` to `applying` on it, unlike the two-of-three leaf gate.
+#[test]
+fn post_merge_verdict_stages_proposed_and_moves_the_batch_straight_to_applying() {
+    let db = WorkDb::open(temp_db_path("post-merge-verdict-proposal")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            post_merge_batch_input(cycle_root.id.clone(), "merge-sha-1"),
+            &[member(
+                ReviewBatchMemberRole::PostMergeReviewer,
+                Some(execution.id.clone()),
+            )],
+        )
+        .unwrap();
+    assert_eq!(batch.status, ReviewBatchStatus::Collecting);
+
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &execution.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &post_merge_verdict_payload(&batch.id, "merge-sha-1"),
+            idempotency_key: "verdict-1",
+        })
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(outcome.proposal.state, ProposalState::Proposed);
+    let applying = db.review_batch(&batch.id).unwrap().unwrap();
+    assert_eq!(applying.status, ReviewBatchStatus::Applying);
+    assert_eq!(
+        applying.final_verdict_proposal_id.as_deref(),
+        Some(outcome.proposal.id.as_str())
+    );
+
+    let member = db
+        .review_batch_members(&batch.id)
+        .unwrap()
+        .into_iter()
+        .find(|member| member.role == ReviewBatchMemberRole::PostMergeReviewer)
+        .unwrap();
+    assert_eq!(member.status, ReviewBatchMemberStatus::Reported);
+    assert_eq!(member.report_proposal_id.as_deref(), Some(outcome.proposal.id.as_str()));
+}
+
+/// A `Supervisor`-only verdict submission is rejected against a post-merge
+/// batch's `PostMergeReviewer` member, and vice versa — `apply_review_verdict`
+/// gates on the role actually entitled to submit for the batch's phase, not
+/// merely on `ProposalKind::ReviewVerdict`.
+#[test]
+fn post_merge_verdict_is_rejected_from_a_role_not_entitled_to_submit_one() {
+    let db = WorkDb::open(temp_db_path("post-merge-verdict-wrong-role")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    // A `ClaudeReviewer` leaf member on a (synthetic, test-only) batch never
+    // submits a verdict — only `Supervisor` (pre-merge) or `PostMergeReviewer`
+    // (post-merge) may.
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member(
+                ReviewBatchMemberRole::ClaudeReviewer,
+                Some(execution.id.clone()),
+            )],
+        )
+        .unwrap();
+
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &execution.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &verdict_payload(&batch.id, "head-sha"),
+            idempotency_key: "verdict-1",
+        })
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(outcome.proposal.state, ProposalState::Rejected);
+    assert!(
+        outcome
+            .proposal
+            .decision_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("never submits a review-verdict directly")
+    );
+}
+
+/// A dead post-merge reviewer (host death before Stop) is retried once with
+/// the same driver/model/effort, then terminal-fails the batch on the
+/// second death — the same one-retry bound the supervisor gets, applied to
+/// the solo post-merge topology. The candidate query must find it even
+/// though its owning task is already `done` (unlike the pre-merge query,
+/// which explicitly excludes `done`/`archived` tasks).
+#[test]
+fn dead_post_merge_reviewer_retries_once_then_fails_the_batch() {
+    let db = WorkDb::open(temp_db_path("dead-post-merge-reviewer-retry")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            post_merge_batch_input(cycle_root.id.clone(), "merge-sha-1"),
+            &[member(
+                ReviewBatchMemberRole::PostMergeReviewer,
+                Some(execution.id.clone()),
+            )],
+        )
+        .unwrap();
+    // The owning task is `done` in the real flow (the post-merge batch only
+    // exists because the PR already merged) — mirror that here rather than
+    // leaving it in whatever `create_test_chore_manual` defaults to, since
+    // that is exactly the condition the post-merge candidate query must not
+    // filter out.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'done' WHERE id = ?1",
+            rusqlite::params![cycle_root.id],
+        )
+        .unwrap();
+    stamp_execution_status(&db, &execution.id, "orphaned");
+
+    let candidates = db.list_dead_post_merge_review_batch_member_candidates().unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].execution_id, execution.id);
+    assert!(
+        db.list_dead_review_batch_member_candidates().unwrap().is_empty(),
+        "the pre-merge candidate query must never pick up a post-merge member"
+    );
+
+    let RetryDeadReviewBatchMember::Retried(retry) = db.retry_dead_review_batch_member(&execution.id).unwrap() else {
+        panic!("post-merge reviewer gets one retry");
+    };
+    let members = db.review_batch_members(&batch.id).unwrap();
+    let retry_member = members
+        .iter()
+        .find(|member| member.execution_id.as_deref() == Some(retry.id.as_str()))
+        .unwrap();
+    assert_eq!(retry_member.role, ReviewBatchMemberRole::PostMergeReviewer);
+    assert_eq!(retry_member.attempt, 2);
+    // The retry inherits the dead member's own persisted policy — the test's
+    // `member()` fixture uses `medium`, not the `large` effort
+    // `create_post_merge_review_batch` actually dispatches with (covered by
+    // `create_post_merge_review_batch_dispatches_the_sole_member_and_is_idempotent`).
+    assert_eq!(retry_member.provider_effort, "medium");
+    assert_eq!(
+        db.review_batch(&batch.id).unwrap().unwrap().status,
+        ReviewBatchStatus::Collecting,
+        "a retried post-merge reviewer must keep the batch collecting, not complete it"
+    );
+
+    stamp_execution_status(&db, &retry.id, "orphaned");
+    assert!(matches!(
+        db.retry_dead_review_batch_member(&retry.id).unwrap(),
+        RetryDeadReviewBatchMember::BatchFailed
+    ));
+    let failed = db.review_batch(&batch.id).unwrap().unwrap();
+    assert_eq!(failed.status, ReviewBatchStatus::Failed);
+    let attention = find_quorum_failed_attention(&db, &cycle_root.id)
+        .expect("exhausted post-merge reviewer retry must file pr_review_quorum_failed");
+    assert!(attention.title.to_lowercase().contains("post-merge"));
 }

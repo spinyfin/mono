@@ -471,25 +471,18 @@ fn probe_with_queue_fields(
     auto_merge_enabled: bool,
     auto_merge_enabled_at: Option<&str>,
 ) -> PrLifecycleProbe {
-    PrLifecycleProbe {
-        url: "https://github.com/foo/bar/pull/1".to_owned(),
-        state: PrLifecycleState::Open(OpenPrStatus::clean()),
-        base_ref_oid: None,
-        head_ref_oid: None,
-        head_ref_name: None,
-        base_ref_name: None,
-        labels: Vec::new(),
-        review: PrReviewState::Unknown,
-        in_merge_queue,
-        merge_queue_entry_state: merge_queue_entry_state.map(str::to_owned),
-        merge_queue_position,
-        merge_queue_enqueued_at: merge_queue_enqueued_at.map(str::to_owned),
-        raw_mergeable: String::new(),
-        raw_merge_state_status: String::new(),
-        auto_merge_enabled,
-        auto_merge_enabled_at: auto_merge_enabled_at.map(str::to_owned),
-        trunk_queue_check_failure: None,
-    }
+    PrLifecycleProbe::builder()
+        .url("https://github.com/foo/bar/pull/1")
+        .state(PrLifecycleState::Open(OpenPrStatus::clean()))
+        .labels(Vec::new())
+        .review(PrReviewState::Unknown)
+        .in_merge_queue(in_merge_queue)
+        .maybe_merge_queue_entry_state(merge_queue_entry_state.map(str::to_owned))
+        .maybe_merge_queue_position(merge_queue_position)
+        .maybe_merge_queue_enqueued_at(merge_queue_enqueued_at.map(str::to_owned))
+        .auto_merge_enabled(auto_merge_enabled)
+        .maybe_auto_merge_enabled_at(auto_merge_enabled_at.map(str::to_owned))
+        .build()
 }
 
 /// Second (or later) chore in an existing product, moved straight to
@@ -557,6 +550,7 @@ mod adaptive_tests;
 mod classify_tests;
 mod merge_queue_tests;
 mod metrics_tests;
+mod post_merge_review_trigger_tests;
 mod probe_snapshot_tests;
 mod probe_tests;
 mod remediation_tests;

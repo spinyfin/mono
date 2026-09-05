@@ -215,7 +215,7 @@ pub struct WorkerSetupInput {
     /// When `true`, the CLAUDE.md includes a directive to use
     /// `--draft` when running `gh pr create`. Omitted when `false`
     /// so workers on default installs see no behaviour change.
-    #[builder(default = false)]
+    #[builder(default)]
     pub draft_pr_mode: bool,
     /// Execution kind (e.g. `"chore_implementation"`, `"revision_implementation"`).
     /// Used to install kind-specific hook guards — currently a PreToolUse deny
@@ -245,15 +245,24 @@ pub struct WorkerSetupInput {
     /// (`runner::worker_spawn::WorkerSpawnOpts::automation_outcome_proposals_seam_enabled`)
     /// so the preamble and CLAUDE.md never disagree about which
     /// decision-declaration mechanism is live.
-    #[builder(default = false)]
+    #[builder(default)]
     pub automation_outcome_proposals_seam_enabled: bool,
     /// `true` when this [`WorkerKind::Reviewer`] execution is the batch's
     /// consolidating supervisor rather than a leaf reviewer — selects
     /// [`crate::pr_review::render_supervisor_claude_md`] over
     /// [`crate::pr_review::render_reviewer_claude_md`]. Ignored for every
     /// other worker kind.
-    #[builder(default = false)]
+    #[builder(default)]
     pub is_review_supervisor: bool,
+    /// `true` when this [`WorkerKind::Reviewer`] execution is a batch's sole
+    /// post-merge reviewer — selects
+    /// [`crate::pr_review::render_post_merge_reviewer_claude_md`], which
+    /// authorises `boss propose review-verdict` (the supervisor's submission
+    /// command; a post-merge reviewer submits its own verdict directly
+    /// rather than a `review-report`). Mutually exclusive with
+    /// `is_review_supervisor`; ignored for every other worker kind.
+    #[builder(default = false)]
+    pub is_post_merge_reviewer: bool,
 }
 
 /// Render the worker-facing agent-rules file (CLAUDE.md or equivalent).
@@ -271,6 +280,14 @@ pub struct WorkerSetupInput {
 pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &str) -> String {
     if input.worker_kind == WorkerKind::Reviewer && input.is_review_supervisor {
         return crate::pr_review::render_supervisor_claude_md(
+            &input.lease_id,
+            &input.workspace_path.display().to_string(),
+            crate::prompt_fragments::absolute_paths_fragment(),
+            crate::prompt_fragments::boundaries_and_coordinator_fragment(),
+        );
+    }
+    if input.worker_kind == WorkerKind::Reviewer && input.is_post_merge_reviewer {
+        return crate::pr_review::render_post_merge_reviewer_claude_md(
             &input.lease_id,
             &input.workspace_path.display().to_string(),
             crate::prompt_fragments::absolute_paths_fragment(),

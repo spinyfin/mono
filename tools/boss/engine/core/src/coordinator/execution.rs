@@ -3,8 +3,18 @@
 //! module split; see [`super`] for the struct and shared types.
 use crate::work::CancelExecutionOpts;
 use anyhow::bail;
+use boss_protocol::ReviewBatchPhase;
 
 use super::*;
+
+/// Where `cube workspace goto` should position the working copy: a PR
+/// branch head, or (for a post-merge review batch member) a frozen
+/// revision such as a merge commit SHA.
+#[derive(Clone, Copy, Debug)]
+enum GotoTarget<'a> {
+    Pr(u64),
+    Revision(&'a str),
+}
 
 impl ExecutionCoordinator {
     /// Reject an explicit host request before the work DB can create or
@@ -1034,32 +1044,75 @@ impl ExecutionCoordinator {
             )
             .await;
 
+        // A `PrReview` execution that is a member of a PostMerge review batch
+        // must position on the frozen merge commit rather than the PR head:
+        // the PR is MERGED by construction (the batch only exists because it
+        // merged), and `cube workspace goto --pr` hard-errors on a non-open
+        // PR. Resolved once here so both `pr_for_goto` below and the
+        // post-lease positioning step special-case it via
+        // `goto_workspace_revision` instead of `goto_workspace`.
+        let post_merge_target_sha: Option<String> = if execution.kind == ExecutionKind::PrReview {
+            let member = self
+                .work_db
+                .review_batch_member_for_execution(&execution.id)
+                .unwrap_or_else(|err| {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        error = %format!("{err:#}"),
+                        "spawn: failed to resolve review batch member for post-merge target lookup; \
+                         falling back to `--pr` positioning",
+                    );
+                    None
+                });
+            member
+                .and_then(|member| {
+                    self.work_db.review_batch(&member.batch_id).unwrap_or_else(|err| {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            batch_id = %member.batch_id,
+                            error = %format!("{err:#}"),
+                            "spawn: failed to resolve review batch for post-merge target lookup; \
+                             falling back to `--pr` positioning",
+                        );
+                        None
+                    })
+                })
+                .filter(|batch| batch.phase == ReviewBatchPhase::PostMerge)
+                .map(|batch| batch.target_sha)
+        } else {
+            None
+        };
+
         // PR number to pass to `cube workspace goto` after the lease.
         // Set for pr_review and revision_implementation executions that have a PR URL.
-        let pr_for_goto: Option<u64> = match execution.kind {
-            ExecutionKind::RevisionImplementation => execution
-                .pr_url
-                .as_deref()
-                .and_then(boss_github::pr_url::pr_number_from_url)
-                // `execution.pr_url` is not reliably stamped on every revision dispatch
-                // path (e.g. orphan-sweep re-dispatch, user-initiated `bossctl work start`).
-                // Fall back to the chain root's PR URL — the same authoritative lookup
-                // used by completion.rs — so positioning is never skipped for revisions.
-                .or_else(|| {
-                    self.work_db
-                        .get_revision_chain_root_pr_url(&execution.work_item_id)
-                        .as_deref()
-                        .and_then(boss_github::pr_url::pr_number_from_url)
-                }),
-            ExecutionKind::PrReview => match &work_item {
-                WorkItem::Task(task) | WorkItem::Chore(task) => task
+        let pr_for_goto: Option<u64> = if post_merge_target_sha.is_some() {
+            None
+        } else {
+            match execution.kind {
+                ExecutionKind::RevisionImplementation => execution
                     .pr_url
                     .as_deref()
-                    .filter(|u| !u.is_empty())
-                    .and_then(boss_github::pr_url::pr_number_from_url),
+                    .and_then(boss_github::pr_url::pr_number_from_url)
+                    // `execution.pr_url` is not reliably stamped on every revision dispatch
+                    // path (e.g. orphan-sweep re-dispatch, user-initiated `bossctl work start`).
+                    // Fall back to the chain root's PR URL — the same authoritative lookup
+                    // used by completion.rs — so positioning is never skipped for revisions.
+                    .or_else(|| {
+                        self.work_db
+                            .get_revision_chain_root_pr_url(&execution.work_item_id)
+                            .as_deref()
+                            .and_then(boss_github::pr_url::pr_number_from_url)
+                    }),
+                ExecutionKind::PrReview => match &work_item {
+                    WorkItem::Task(task) | WorkItem::Chore(task) => task
+                        .pr_url
+                        .as_deref()
+                        .filter(|u| !u.is_empty())
+                        .and_then(boss_github::pr_url::pr_number_from_url),
+                    _ => None,
+                },
                 _ => None,
-            },
-            _ => None,
+            }
         };
 
         let lease = match self
@@ -1332,27 +1385,62 @@ impl ExecutionCoordinator {
 
         // For PR-targeting executions, run `cube workspace goto --workspace <path>
         // --pr <n>` AFTER the lease to position the working copy on the PR branch
-        // head. This must happen before handing the workspace to the worker.
-        // If positioning fails, abort dispatch with a diagnosable stage.
-        if let Some(pr) = pr_for_goto {
-            let goto_repr = adapter.command_repr(&[
-                "--json",
-                "workspace",
-                "goto",
-                "--workspace",
-                &lease.workspace_path.display().to_string(),
-                "--pr",
-                &pr.to_string(),
-            ]);
-            match adapter.goto_workspace(&lease.workspace_path, pr).await {
+        // head; for a post-merge review batch member, position on the frozen
+        // merge commit via `--revision <sha>` instead (see `post_merge_target_sha`
+        // above — the PR is MERGED by construction, which `--pr` refuses
+        // outright). Both must happen before handing the workspace to the
+        // worker. If positioning fails, abort dispatch with a diagnosable stage.
+        let goto_target = match (pr_for_goto, post_merge_target_sha.as_deref()) {
+            (_, Some(sha)) => Some(GotoTarget::Revision(sha)),
+            (Some(pr), None) => Some(GotoTarget::Pr(pr)),
+            (None, None) => None,
+        };
+        if let Some(target) = goto_target {
+            let workspace_path_str = lease.workspace_path.display().to_string();
+            let goto_repr = match target {
+                GotoTarget::Pr(pr) => adapter.command_repr(&[
+                    "--json",
+                    "workspace",
+                    "goto",
+                    "--workspace",
+                    &workspace_path_str,
+                    "--pr",
+                    &pr.to_string(),
+                ]),
+                GotoTarget::Revision(sha) => adapter.command_repr(&[
+                    "--json",
+                    "workspace",
+                    "goto",
+                    "--workspace",
+                    &workspace_path_str,
+                    "--revision",
+                    sha,
+                ]),
+            };
+            let goto_result = match target {
+                GotoTarget::Pr(pr) => adapter.goto_workspace(&lease.workspace_path, pr).await,
+                GotoTarget::Revision(sha) => adapter.goto_workspace_revision(&lease.workspace_path, sha).await,
+            };
+            match goto_result {
                 Ok(()) => {
                     tracing::info!(
                         execution_id = %execution.id,
                         kind = execution.kind.as_str(),
                         workspace_path = %lease.workspace_path.display(),
-                        pr,
+                        target = ?target,
                         "workspace positioned via cube workspace goto",
                     );
+                    let details = match target {
+                        GotoTarget::Pr(pr) => serde_json::json!({
+                            "pr": pr,
+                            "kind": execution.kind.as_str(),
+                        }),
+                        GotoTarget::Revision(sha) => serde_json::json!({
+                            "target_sha": sha,
+                            "kind": execution.kind.as_str(),
+                            "post_merge": true,
+                        }),
+                    };
                     self.dispatch_events
                         .emit(
                             DispatchEvent::new(Stage::CubeWorkspacePositioned, DispatchOutcome::Ok, &execution.id)
@@ -1362,10 +1450,7 @@ impl ExecutionCoordinator {
                                 .with_cube_lease(&lease.lease_id)
                                 .with_cube_workspace(&lease.workspace_id)
                                 .with_cube_invocation(goto_repr)
-                                .with_details(serde_json::json!({
-                                    "pr": pr,
-                                    "kind": execution.kind.as_str(),
-                                })),
+                                .with_details(details),
                         )
                         .await;
                 }
@@ -1393,15 +1478,16 @@ impl ExecutionCoordinator {
                             .with_cube_invocation(goto_repr),
                         )
                         .await;
+                    let failure_label = match target {
+                        GotoTarget::Pr(_) => "Cube `workspace goto` positioning failed",
+                        GotoTarget::Revision(_) => "Cube `workspace goto --revision` positioning failed",
+                    };
                     self.record_start_failure(
                         Arc::clone(self),
                         execution,
                         worker_id,
                         Some(repo.repo_id.as_str()),
-                        (
-                            "cube_workspace_positioning_failed",
-                            "Cube `workspace goto` positioning failed",
-                        ),
+                        ("cube_workspace_positioning_failed", failure_label),
                         &err,
                     )?;
                     return Err(err);
@@ -1410,10 +1496,11 @@ impl ExecutionCoordinator {
         }
 
         // For PR-targeting executions the workspace is now positioned on the PR
-        // head — skip create_change (there is nothing to create; the worker edits
-        // or reviews the branch directly). For all other executions create a fresh
-        // jj change via `cube change create`.
-        let change: Option<CubeChangeHandle> = if pr_for_goto.is_some() {
+        // head (or, for a post-merge review, on the merge commit) — skip
+        // create_change (there is nothing to create; the worker edits or
+        // reviews the branch/commit directly). For all other executions
+        // create a fresh jj change via `cube change create`.
+        let change: Option<CubeChangeHandle> = if pr_for_goto.is_some() || post_merge_target_sha.is_some() {
             None
         } else {
             // Normal path (pr_review without a PR URL, and all non-review/

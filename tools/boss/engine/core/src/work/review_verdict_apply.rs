@@ -137,8 +137,22 @@ impl WorkDb {
         let original_revision_warranted = crate::pr_review::passes_severity_gate(&review_result);
         let created_via = format!("{CREATED_VIA_PR_REVIEW_PREFIX}{}", proposal.id);
 
+        // The duplicate-head guard exists to suppress a re-review of an
+        // unchanged pre-merge head (e.g. a recovery retry that resubmits a
+        // verdict against the same SHA the prior pass already applied). It
+        // has no meaning for a `PostMerge` batch: its `target_sha` is the
+        // frozen merge commit, reviewed exactly once, so there is no earlier
+        // pass to suppress. On a fast-forward or rebase merge that commit can
+        // equal the SHA the pre-merge verdict stamped into `last_reviewed_sha`
+        // via `commit_applied_review_verdict`, which would make the guard
+        // silently discard the post-merge findings with no attention item —
+        // worse than never triggering the pass at all. Exempt PostMerge so
+        // its findings always materialise a follow-up when the severity gate
+        // warrants one.
         let mut duplicate_head = false;
-        if let Ok((_, prior_sha)) = self.get_task_review_cycle_state(&batch.cycle_root_id) {
+        if batch.phase != boss_protocol::ReviewBatchPhase::PostMerge
+            && let Ok((_, prior_sha)) = self.get_task_review_cycle_state(&batch.cycle_root_id)
+        {
             duplicate_head = prior_sha.as_deref() == Some(verdict.target_sha.as_str());
         }
         let revision_warranted = original_revision_warranted && !duplicate_head;
@@ -506,9 +520,11 @@ impl WorkDb {
 
     /// Per-task `repo_remote_url` is NULL when the product owns the repo
     /// (`enforce_task_repo_invariant`); fall back to the product, then any
-    /// member execution, matching the completion-path tripwire's need for
-    /// a GitHub slug.
-    fn repo_remote_url_for_tripwire(&self, origin_task: &Task) -> Option<String> {
+    /// member execution. Originally the completion-path tripwire's own
+    /// helper for resolving a GitHub slug; `pub(crate)` so the merge
+    /// poller's post-merge review trigger (`merge_poller::sweep`) can reuse
+    /// the same fallback chain instead of a second copy.
+    pub(crate) fn repo_remote_url_for_tripwire(&self, origin_task: &Task) -> Option<String> {
         if let Some(url) = origin_task.repo_remote_url.as_deref().filter(|s| !s.is_empty()) {
             return Some(url.to_owned());
         }
