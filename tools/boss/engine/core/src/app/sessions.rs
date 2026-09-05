@@ -8,7 +8,7 @@
 use super::*;
 use crate::coordinator_tmux::ClaudeVersionProbe;
 
-const COORDINATOR_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const COORDINATOR_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
@@ -334,12 +334,13 @@ pub(super) async fn request_coordinator_attachment(
 }
 
 /// Re-probe an already attached coordinator at a deliberately low cadence.
-/// `claude` upgrades happen on the order of days, so one short version
-/// process per attached session/day is enough to surface an update without
-/// turning the supervisor's 10-second health check into recurring process
-/// churn. Re-using `request_coordinator_attachment` pushes the same pane
-/// descriptor the app already renders, but only after the optional banner
-/// value changed; `Some` to `None` clears a banner after a downgrade or reset.
+/// `claude` upgrades happen at most a few times a week, so one short version
+/// process every [`COORDINATOR_UPDATE_CHECK_INTERVAL`] per attached session is
+/// enough to surface an update without turning the supervisor's 10-second
+/// health check into recurring process churn. Re-using
+/// `request_coordinator_attachment` pushes the same pane descriptor the app
+/// already renders, but only after the optional banner value changed; `Some`
+/// to `None` clears a banner after a downgrade or reset.
 pub(super) async fn refresh_coordinator_update_available(
     server_state: Arc<ServerState>,
     tmux: &boss_tmux::Tmux,
@@ -352,19 +353,36 @@ pub(super) async fn refresh_coordinator_update_available(
         .clone()
         .filter(|entry| entry.spawn_token == record.spawn_token);
 
-    // Only the subprocess spawn needs rate-limiting to once a day; the
-    // comparison against the cached installed version below is free, so it
-    // always runs. This makes an un-acked push (the app's 5s attach timeout,
-    // a busy/disconnected app) self-healing on the very next 10s supervisor
-    // pass instead of being deferred by a full day alongside the probe.
+    // Only the subprocess spawn needs rate-limiting to
+    // `COORDINATOR_UPDATE_CHECK_INTERVAL`; the comparison against the cached
+    // installed version below is free, so it always runs. This makes an
+    // un-acked push (the app's 5s attach timeout, a busy/disconnected app)
+    // self-healing on the very next 10s supervisor pass instead of being
+    // deferred by a full interval alongside the probe.
     let should_probe = coordinator_update_probe_due(existing_entry.as_ref(), &record.spawn_token);
     let freshly_probed = if should_probe {
-        Some(crate::coordinator_tmux::RealClaudeVersionProbe.probe().await)
+        let probed = crate::coordinator_tmux::RealClaudeVersionProbe.probe().await;
+        tracing::info!(
+            spawn_token = %record.spawn_token,
+            installed_version = ?probed,
+            "coordinator update probe ran",
+        );
+        Some(probed)
     } else {
         None
     };
 
     let decision = refresh_decision(existing_entry.as_ref(), &record, freshly_probed);
+    if decision.should_push {
+        tracing::info!(
+            spawn_token = %record.spawn_token,
+            previous_advertised = ?existing_entry
+                .as_ref()
+                .and_then(|entry| entry.advertised_update_available_version.as_deref()),
+            advertised = ?decision.update_available_version,
+            "coordinator update availability changed; pushing to app",
+        );
+    }
     let probed_at = if should_probe {
         Instant::now()
     } else {
@@ -396,10 +414,12 @@ fn coordinator_update_probe_due(cache: Option<&CoordinatorInstalledVersionCacheE
 /// Pure decision core of [`refresh_coordinator_update_available`]: given the
 /// cached entry (if any, already filtered to this spawn token), the
 /// coordinator record, and this pass's fresh probe result (`None` when the
-/// daily probe was not due), determines the installed version to carry
-/// forward and whether the advertised banner needs to be pushed again.
+/// probe was not yet due), determines the installed version to carry
+/// forward, the banner value this pass would advertise, and whether that
+/// advertised value needs to be pushed again.
 struct RefreshDecision {
     installed_version: Option<String>,
+    update_available_version: Option<String>,
     should_push: bool,
 }
 
@@ -419,6 +439,7 @@ fn refresh_decision(
     let should_push = advertised_update_available_version != update_available_version;
     RefreshDecision {
         installed_version,
+        update_available_version,
         should_push,
     }
 }
@@ -454,6 +475,7 @@ mod update_available_tests {
         // upgrade must push.
         let decision = refresh_decision(None, &older, Some(Some("2.1.238".to_owned())));
         assert_eq!(decision.installed_version.as_deref(), Some("2.1.238"));
+        assert_eq!(decision.update_available_version.as_deref(), Some("2.1.238"));
         assert!(decision.should_push, "the changed value is pushed to show the banner");
 
         let advertised_shown = CoordinatorInstalledVersionCacheEntry {
@@ -466,6 +488,7 @@ mod update_available_tests {
         // still push, since the advertised value changes from Some to None.
         let clearing = refresh_decision(Some(&advertised_shown), &older, Some(Some("2.1.237".to_owned())));
         assert_eq!(clearing.installed_version.as_deref(), Some("2.1.237"));
+        assert_eq!(clearing.update_available_version, None);
         assert!(clearing.should_push, "the clear is another push-worthy transition");
 
         let advertised_cleared = CoordinatorInstalledVersionCacheEntry {
@@ -501,6 +524,11 @@ mod update_available_tests {
             Some("2.1.238"),
             "the cached installed version is carried forward when no probe ran"
         );
+        assert_eq!(
+            decision.update_available_version.as_deref(),
+            Some("2.1.238"),
+            "the advertised banner value is derived from the cached installed version"
+        );
         assert!(
             decision.should_push,
             "an un-acked push must retry on the next pass instead of waiting a full day"
@@ -508,7 +536,12 @@ mod update_available_tests {
     }
 
     #[test]
-    fn attached_update_probe_runs_daily_not_on_every_supervisor_pass() {
+    fn attached_update_probe_runs_on_the_configured_interval_not_on_every_supervisor_pass() {
+        assert!(
+            COORDINATOR_UPDATE_CHECK_INTERVAL <= Duration::from_secs(20 * 60),
+            "the probe must fire well within a typical app uptime, or the banner only appears after a UI restart",
+        );
+
         let recent = CoordinatorInstalledVersionCacheEntry {
             spawn_token: "token".to_owned(),
             installed_version: Some("2.1.237".to_owned()),
@@ -517,14 +550,27 @@ mod update_available_tests {
         };
         assert!(
             !coordinator_update_probe_due(Some(&recent), "token"),
-            "a healthy supervisor pass reuses the recent result"
+            "a healthy supervisor pass (10s cadence) reuses the recent result instead of \
+             spawning a subprocess every pass"
+        );
+
+        let halfway = CoordinatorInstalledVersionCacheEntry {
+            probed_at: Instant::now() - COORDINATOR_UPDATE_CHECK_INTERVAL / 2,
+            ..recent
+        };
+        assert!(
+            !coordinator_update_probe_due(Some(&halfway), "token"),
+            "the probe is not yet due at half the interval"
         );
 
         let old = CoordinatorInstalledVersionCacheEntry {
             probed_at: Instant::now() - COORDINATOR_UPDATE_CHECK_INTERVAL,
-            ..recent
+            ..halfway
         };
-        assert!(coordinator_update_probe_due(Some(&old), "token"));
+        assert!(
+            coordinator_update_probe_due(Some(&old), "token"),
+            "once the configured interval has elapsed, the probe is due again"
+        );
         assert!(coordinator_update_probe_due(Some(&old), "replacement-token"));
     }
 }
