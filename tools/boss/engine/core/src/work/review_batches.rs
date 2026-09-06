@@ -16,7 +16,7 @@ use boss_protocol::{
     ReviewBatchMemberStatus, ReviewBatchPhase, ReviewBatchStatus, ReviewClassification,
 };
 use rusqlite::types::Type;
-use rusqlite::{OptionalExtension, Row, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
 use super::{
     CreateExecutionInput, DeadPrReviewCandidate, PendingEvents, WorkDb, WorkExecution, commit_and_publish,
@@ -103,6 +103,12 @@ pub const PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND: &str = "pr_review_admissi
 /// reaped because its cycle root is gone or its members have been inert
 /// past [`REVIEW_BATCH_STALE_SECS`].
 pub const PR_REVIEW_BATCH_STALE_ATTENTION_KIND: &str = "pr_review_batch_stale";
+
+/// `work_attention_items.kind` filed when an accepted review report still
+/// owns a live execution. Report acceptance must immediately terminalize the
+/// leaf, so this is an invariant violation rather than a recoverable idle
+/// state.
+pub const PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND: &str = "pr_review_reported_member_live";
 
 /// Staleness bound for reaping a wedged non-terminal review batch,
 /// matching the merge poller's stalled-reviewer cutoff.
@@ -701,6 +707,60 @@ fn fail_review_batch_with_attention(
     Ok(())
 }
 
+/// File one durable, work-item-scoped alarm for every batch that has an
+/// accepted report but a still-live member execution. Both recovery paths
+/// call this before their ordinary candidate/reap queries: neither is allowed
+/// to mistake the impossible `reported` + live combination for harmless
+/// ineligibility.
+fn file_reported_live_review_batch_member_attentions(conn: &mut Connection) -> Result<()> {
+    let reported_live_members: Vec<(String, String, String)> = {
+        let mut statement = conn.prepare(
+            "SELECT batch.cycle_root_id, batch.id, member.execution_id
+             FROM pr_review_batch_members member
+             JOIN pr_review_batches batch ON batch.id = member.batch_id
+             JOIN work_executions execution ON execution.id = member.execution_id
+             WHERE batch.status NOT IN ('completed', 'failed')
+               AND member.status = 'reported'
+               AND execution.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')
+             ORDER BY batch.id, member.execution_id",
+        )?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    if reported_live_members.is_empty() {
+        return Ok(());
+    }
+
+    let tx = conn.transaction()?;
+    for (cycle_root_id, batch_id, execution_id) in reported_live_members {
+        super::attention_filing::warn_if_lifecycle_undeclared(PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND);
+        if super::attention_filing::reraise_open_work_item_attention(
+            &tx,
+            &cycle_root_id,
+            PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND,
+        )?
+        .is_none()
+        {
+            super::workitems::insert_attention_item_row(
+                &tx,
+                &CreateAttentionItemInput::builder()
+                    .work_item_id(cycle_root_id)
+                    .kind(PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND)
+                    .title("Automated reviewer: accepted report still owns a live pane")
+                    .body_markdown(format!(
+                        "Review batch `{batch_id}` member execution `{execution_id}` accepted its report but \
+                         remains live. Report acceptance must terminalize the reviewer and release its pane; \
+                         inspect the execution and its teardown failure before resuming the batch."
+                    ))
+                    .build(),
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// The two-of-three quorum state machine for one review batch.
 ///
 /// Idempotent and safe to call redundantly from multiple hook points (a leaf
@@ -1177,9 +1237,10 @@ impl WorkDb {
         Ok(changed > 0)
     }
 
-    /// True only when two executions are read-only leaf roles of the same
-    /// persisted pre-merge batch. This narrowly permits fan-out while keeping
-    /// the ordinary single-writer chain guard intact.
+    /// True only when two executions are compatible roles of the same
+    /// persisted pre-merge batch. This narrowly permits leaf fan-out and the
+    /// supervisor that consumes those leaf reports while keeping the ordinary
+    /// single-writer chain guard intact.
     pub fn are_same_review_batch_leaves(&self, execution_id: &str, other_execution_id: &str) -> Result<bool> {
         let conn = self.connect()?;
         let found = conn
@@ -1190,8 +1251,9 @@ impl WorkDb {
                  JOIN pr_review_batches batch ON batch.id = current.batch_id
                  WHERE current.execution_id = ?1 AND other.execution_id = ?2
                    AND batch.phase = 'pre_merge'
-                   AND current.role IN ('claude_reviewer', 'codex_reviewer', 'grok_reviewer')
-                   AND other.role IN ('claude_reviewer', 'codex_reviewer', 'grok_reviewer')",
+                   AND current.role IN ('claude_reviewer', 'codex_reviewer', 'grok_reviewer', 'supervisor')
+                   AND other.role IN ('claude_reviewer', 'codex_reviewer', 'grok_reviewer', 'supervisor')
+                   AND (current.role != 'supervisor' OR other.role != 'supervisor')",
                 params![execution_id, other_execution_id],
                 |_| Ok(()),
             )
@@ -1221,7 +1283,8 @@ impl WorkDb {
     /// sweep is the only durable hook that will then fail the batch. Once
     /// the batch is `failed` it drops out via `batch.status NOT IN (...)`.
     pub fn list_dead_review_batch_member_candidates(&self) -> Result<Vec<DeadPrReviewCandidate>> {
-        let conn = self.connect()?;
+        let mut conn = self.connect()?;
+        file_reported_live_review_batch_member_attentions(&mut conn)?;
         let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
         let sql = format!(
             "SELECT we.work_item_id, we.id, we.status
@@ -1532,6 +1595,7 @@ impl WorkDb {
              ORDER BY b.updated_at ASC, b.id ASC"
         );
         let mut conn = self.connect()?;
+        file_reported_live_review_batch_member_attentions(&mut conn)?;
         let rows: Vec<(String, String, String, Option<String>)> = {
             let mut statement = conn.prepare(&sql)?;
             let mapped = statement.query_map(params![cutoff], |row| {

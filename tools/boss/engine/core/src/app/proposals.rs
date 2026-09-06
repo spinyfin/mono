@@ -374,6 +374,32 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
             if review_batch_quorum_outcome == Some(crate::work::ReviewBatchQuorumOutcome::SupervisorDispatched) {
                 server_state.publisher.kick_scheduler();
             }
+            // A review report's acceptance is itself the completion signal
+            // for a batch leaf. Do not wait for another, driver-specific
+            // turn boundary: that boundary may never arrive after the worker
+            // has delivered its report. The batch finalizer owns both the
+            // execution terminal row and pane/lease teardown.
+            if !already_submitted
+                && kind == ProposalKind::ReviewReport
+                && proposal.state == boss_protocol::ProposalState::Applied
+            {
+                match server_state
+                    .completion_handler
+                    .finalize_accepted_review_batch_member(&caller.execution_id)
+                    .await
+                {
+                    Some(crate::completion::StopOutcome::ReviewPassCompleted { .. }) => {}
+                    Some(outcome) => tracing::error!(
+                        execution_id = %caller.execution_id,
+                        ?outcome,
+                        "accepted review report did not cleanly finalize its batch member",
+                    ),
+                    None => tracing::error!(
+                        execution_id = %caller.execution_id,
+                        "accepted review report has no live batch member to finalize",
+                    ),
+                }
+            }
             // Mirror completion.rs's legacy marker-detector paths
             // (`file_worker_signal_attention` / `record_deferred_scope_item`):
             // both publish `AttentionItemCreated` on the work item's product

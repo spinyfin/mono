@@ -1294,6 +1294,111 @@ fn are_same_review_batch_leaves_rejects_cross_batch_and_memberless_pairs() {
     );
 }
 
+/// The consolidator reads every leaf's report and is therefore the one
+/// additional batch role allowed through the single-writer admission guard.
+/// This is deliberately exercised after the real quorum transition creates
+/// the supervisor, rather than by hand-writing a member row.
+#[test]
+fn are_same_review_batch_leaves_admits_supervisor_leaf_pairs() {
+    let db = WorkDb::open(temp_db_path("review-batch-supervisor-admission")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let (batch, executions) = match db
+        .create_pre_merge_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            "https://github.com/example/repo",
+        )
+        .unwrap()
+    {
+        ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+        other => panic!("expected a newly-created review batch, got {other:?}"),
+    };
+
+    for (index, execution) in executions.iter().enumerate() {
+        submit_review_report(
+            &db,
+            &execution.id,
+            &cycle_root.id,
+            &batch.id,
+            "head-sha",
+            &format!("report-{index}"),
+        );
+    }
+    let supervisor_execution_id = db
+        .review_batch_members(&batch.id)
+        .unwrap()
+        .into_iter()
+        .find(|member| member.role == ReviewBatchMemberRole::Supervisor)
+        .and_then(|member| member.execution_id)
+        .expect("quorum must create a supervisor execution");
+
+    assert!(
+        db.are_same_review_batch_leaves(&supervisor_execution_id, &executions[0].id)
+            .unwrap(),
+        "the supervisor must be admitted alongside a leaf from its own batch"
+    );
+    assert!(
+        db.are_same_review_batch_leaves(&executions[0].id, &supervisor_execution_id)
+            .unwrap(),
+        "pair admission must be symmetric"
+    );
+}
+
+/// A reported member must not be silently omitted from either recovery path
+/// while it still owns a live execution. The normal report-acceptance seam
+/// terminalizes it immediately; this alarm protects the invariant if that
+/// seam regresses or its teardown fails after the report becomes durable.
+#[test]
+fn reported_live_member_files_attention_from_both_recovery_paths() {
+    let db = WorkDb::open(temp_db_path("review-batch-reported-live-attention")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member(
+                ReviewBatchMemberRole::ClaudeReviewer,
+                Some(execution.id.clone()),
+            )],
+        )
+        .unwrap();
+    submit_review_report(
+        &db,
+        &execution.id,
+        &cycle_root.id,
+        &batch.id,
+        "head-sha",
+        "report-accepted",
+    );
+
+    assert!(
+        db.list_dead_review_batch_member_candidates().unwrap().is_empty(),
+        "a reported member is not eligible for retry"
+    );
+    assert!(
+        db.reap_inert_review_batches(0).unwrap().is_empty(),
+        "a live execution must prevent inert-batch reaping"
+    );
+    let attentions = db.list_attention_items_for_work_item(&cycle_root.id).unwrap();
+    assert_eq!(
+        attentions
+            .iter()
+            .filter(|item| item.kind == crate::work::PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND)
+            .count(),
+        1,
+        "both recovery paths must re-raise one durable alarm, not silently skip the anomaly"
+    );
+}
+
 /// A batch still live for the current target — one leaf settled with an
 /// informative verdict, two still outstanding — must keep reporting
 /// `ExistingBatch` for that exact target, never `AlreadyReviewed`. The

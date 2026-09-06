@@ -20,7 +20,7 @@ use super::*;
 use crate::app::proposals;
 use boss_protocol::{
     PROPOSAL_CAP_PER_KIND_PER_EXECUTION, ProposalErrorCode, ProposalKind, ProposalState, ProposalSubmissionError,
-    WorkerProposal,
+    ReviewBatchPhase, ReviewClassification, ReviewLanguageBucket, ReviewProfile, WorkerProposal,
 };
 use serde_json::{Value, json};
 
@@ -135,6 +135,76 @@ async fn submit(fx: &WorkerFixture, kind: ProposalKind, payload: Value) -> Front
     .await
 }
 
+fn review_classification() -> ReviewClassification {
+    ReviewClassification::builder()
+        .changed_files(vec!["src/lib.rs".to_owned()])
+        .complexity_flags(vec![])
+        .has_production_code(true)
+        .metadata_missing(vec![])
+        .production_languages(vec![ReviewLanguageBucket::Rust])
+        .profile(ReviewProfile::Light)
+        .subsystem_buckets(vec!["src".to_owned()])
+        .build()
+}
+
+fn review_report_payload(batch_id: &str, target_sha: &str) -> Value {
+    json!({
+        "batch_id": batch_id,
+        "target_sha": target_sha,
+        "report": {
+            "batch_id": batch_id,
+            "pr_url": "https://github.com/example/repo/pull/42",
+            "target_sha": target_sha,
+            "phase": "pre_merge",
+            "summary": "Clean.",
+            "coverage": {"files_inspected": [], "files_omitted": [], "limitations": []},
+            "findings": []
+        }
+    })
+}
+
+/// Build one live batch leaf against a fake app runtime. Returning the same
+/// data a real proposal RPC sees keeps the acceptance test below on the
+/// complete attributed request → apply → teardown path.
+fn live_batch_leaf() -> (Arc<ServerState>, tempfile::TempDir, String, String, String) {
+    let (server_state, dir) = test_server_state_with_fakes();
+    let (_ordinary_execution_id, work_item_id) = new_execution(&server_state, "Review target");
+    let dispatch = server_state
+        .work_db
+        .create_pre_merge_review_batch(
+            crate::work::ReviewBatchCreateInput::builder()
+                .cycle_root_id(work_item_id.clone())
+                .base_sha("base-sha")
+                .classification(review_classification())
+                .phase(ReviewBatchPhase::PreMerge)
+                .pr_number(42)
+                .pr_url("https://github.com/example/repo/pull/42")
+                .target_sha("head-sha")
+                .build(),
+            "https://github.com/example/repo",
+        )
+        .unwrap();
+    let (batch_id, leaf_execution_id) = match dispatch {
+        crate::work::ReviewBatchDispatch::Created { batch, executions } => (batch.id, executions[0].id.clone()),
+        other => panic!("expected a fresh review batch, got {other:?}"),
+    };
+    server_state
+        .work_db
+        .start_execution_run(
+            &leaf_execution_id,
+            "reviewer",
+            "repo",
+            "lease-reviewer",
+            "workspace-reviewer",
+            dir.path().to_str().unwrap(),
+        )
+        .unwrap();
+    server_state
+        .worker_registry
+        .register(std::process::id() as libc::pid_t, leaf_execution_id.clone());
+    (server_state, dir, work_item_id, batch_id, leaf_execution_id)
+}
+
 // ── Response accessors ───────────────────────────────────────────────────────
 
 /// The `(proposal, already_submitted)` pair from a successful submission, or
@@ -161,6 +231,93 @@ fn rejected(event: FrontendEvent) -> ProposalSubmissionError {
         }
         other => panic!("expected ProposalRejected, got {other:?}"),
     }
+}
+
+/// An accepted review report is terminal on its own. This is the full app
+/// seam, including PID attribution and RPC response: it must not depend on a
+/// later driver Stop/turn-completed event to release the reviewer pane.
+#[tokio::test]
+async fn accepted_review_report_immediately_terminalizes_its_live_leaf() {
+    let (server_state, _dir, _work_item_id, batch_id, execution_id) = live_batch_leaf();
+    let peer_pid = std::process::id() as libc::pid_t;
+
+    let (proposal, already_submitted) = submitted(
+        call_with_peer(
+            &server_state,
+            Some(peer_pid),
+            submit_request(
+                &execution_id,
+                ProposalKind::ReviewReport,
+                review_report_payload(&batch_id, "head-sha"),
+            ),
+        )
+        .await,
+    );
+    assert!(!already_submitted);
+    assert_eq!(proposal.state, ProposalState::Applied);
+    assert!(
+        server_state
+            .work_db
+            .get_execution(&execution_id)
+            .unwrap()
+            .status
+            .is_terminal(),
+        "report acceptance must complete the leaf before the RPC returns"
+    );
+    let member = server_state
+        .work_db
+        .review_batch_member_for_execution(&execution_id)
+        .unwrap()
+        .expect("leaf must remain addressable through its persisted member row");
+    assert_eq!(member.status, boss_protocol::ReviewBatchMemberStatus::Reported);
+}
+
+/// A rejected report does not masquerade as completion. Once the worker's
+/// turn ends, the existing batch finalizer records the missing accepted report
+/// as a member failure and releases the pane, making the error observable and
+/// retryable instead of leaving a zombie leaf.
+#[tokio::test]
+async fn rejected_review_report_becomes_a_visible_member_failure_on_stop() {
+    let (server_state, _dir, _work_item_id, batch_id, execution_id) = live_batch_leaf();
+    let peer_pid = std::process::id() as libc::pid_t;
+
+    let (proposal, already_submitted) = submitted(
+        call_with_peer(
+            &server_state,
+            Some(peer_pid),
+            submit_request(
+                &execution_id,
+                ProposalKind::ReviewReport,
+                review_report_payload(&batch_id, "wrong-head"),
+            ),
+        )
+        .await,
+    );
+    assert!(!already_submitted);
+    assert_eq!(proposal.state, ProposalState::Rejected);
+    let outcome = server_state.completion_handler.on_stop(&execution_id).await;
+    assert!(matches!(
+        outcome,
+        crate::completion::StopOutcome::ReviewPassCompleted { .. }
+    ));
+    assert!(
+        server_state
+            .work_db
+            .get_execution(&execution_id)
+            .unwrap()
+            .status
+            .is_terminal(),
+        "a rejected report must end as an explicit member failure, not a live pane"
+    );
+    assert_eq!(
+        server_state
+            .work_db
+            .review_batch_member_for_execution(&execution_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        boss_protocol::ReviewBatchMemberStatus::Failed,
+    );
 }
 
 fn listed(event: FrontendEvent) -> (String, Vec<WorkerProposal>) {

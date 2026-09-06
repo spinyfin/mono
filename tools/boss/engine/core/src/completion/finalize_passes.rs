@@ -679,6 +679,35 @@ impl WorkerCompletionHandler {
         Some(self.finalize_answer_agent(&execution).await)
     }
 
+    /// Finalize a persisted review-batch member after its report proposal has
+    /// been accepted. This is intentionally callable from the proposal seam:
+    /// acceptance is the terminal signal for a batch reviewer, independent of
+    /// whether its driver later sends another turn-boundary event.
+    ///
+    /// Returns `None` when the execution is no longer a live batch member.
+    /// Those cases are benign races (for example, a concurrent terminalizer
+    /// already released the pane), not permission to route an ordinary
+    /// `pr_review` execution through this batch-only finalizer.
+    pub async fn finalize_accepted_review_batch_member(&self, execution_id: &str) -> Option<StopOutcome> {
+        let execution = self.work_db.get_execution(execution_id).ok()?;
+        if execution.kind != ExecutionKind::PrReview || execution.status.is_terminal() {
+            return None;
+        }
+        let member = match self.work_db.review_batch_member_for_execution(execution_id) {
+            Ok(Some(member)) => member,
+            Ok(None) => return None,
+            Err(err) => {
+                tracing::error!(
+                    execution_id,
+                    ?err,
+                    "pr_review proposal acceptance: could not load batch member for finalization",
+                );
+                return Some(StopOutcome::DbError);
+            }
+        };
+        Some(self.finalize_review_batch_member(&execution, member).await)
+    }
+
     /// Finalise a `pr_review` reviewer execution when its Stop
     /// hook fires. The reviewer never opens a PR; instead, it reads the
     /// producing task's PR diff and emits structured `ReviewResult` JSON in
