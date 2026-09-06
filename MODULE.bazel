@@ -6,16 +6,29 @@ bazel_dep(name = "platforms", version = "1.0.0")
 bazel_dep(name = "buildifier_prebuilt", version = "7.3.1")
 bazel_dep(name = "rules_rust", version = "0.70.0")
 
-# EXPERIMENT: backport of rules_rust#3774 — native Bazel test sharding
-# for rust_test via an opt-in `experimental_enable_sharding` attribute. The
-# patch teaches the test runner to honour TEST_SHARD_INDEX/TEST_TOTAL_SHARDS
-# and touch TEST_SHARD_STATUS_FILE, so `shard_count` on a rust_test runs one
-# compile + N parallel shard executions instead of silently re-running the
-# full suite N times. See docs/investigations/rust-test-sharding-engine-lib-test.md.
+# rust_test execution wrapper. Bazel hands a test binary two things purely
+# through the environment that a libtest binary cannot read on its own, so
+# stock rules_rust 0.70.0 silently ignores both:
+#
+#   * TESTBRIDGE_TEST_ONLY — `bazel test --test_filter=…` is accepted and then
+#     does nothing; the whole suite runs and reports PASSED, which is worse
+#     than an error because it looks like the filter worked.
+#   * TEST_SHARD_INDEX / TEST_TOTAL_SHARDS / TEST_SHARD_STATUS_FILE —
+#     `shard_count` silently re-runs the full suite N times.
+#
+# The patch runs every rust_test through a small wrapper that translates both
+# into libtest arguments (filter → positional substring filter; sharding →
+# `--list` + partition + `--exact`), composes them (the filter is applied
+# during enumeration, so shards partition the filtered set), and fails loudly
+# on every path where it cannot honour the request rather than reporting a
+# green run that executed something other than what was asked for.
+# Sharding remains opt-in behind `experimental_enable_sharding` (backport of
+# rules_rust#3774); `--test_filter` support is unconditional.
+# See docs/investigations/rust-test-sharding-engine-lib-test.md.
 single_version_override(
     module_name = "rules_rust",
     patch_strip = 1,
-    patches = ["//third_party/patches:rules_rust-0.70.0-test-sharding.patch"],
+    patches = ["//third_party/patches:rules_rust-0.70.0-test-wrapper.patch"],
     version = "0.70.0",
 )
 

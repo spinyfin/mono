@@ -60,6 +60,27 @@ sh_test(
     ],
 )
 
+# Fixture for :test_filter_guard_test. Tagged manual: it is executed *by* that
+# guard test (which drives its wrapper with the Bazel test-protocol environment
+# variables), not run as a test in its own right.
+rust_test(
+    name = "test_filter_fixture",
+    size = "small",
+    srcs = ["test_filter_fixture.rs"],
+    experimental_enable_sharding = True,
+    tags = ["manual"],
+)
+
+# Asserts `bazel test --test_filter=...` and `shard_count` actually take effect
+# for rust_test. Both are silent no-ops in stock rules_rust 0.70.0; mono patches
+# them in via third_party/patches/rules_rust-0.70.0-test-wrapper.patch.
+sh_test(
+    name = "test_filter_guard_test",
+    size = "small",
+    srcs = ["test_filter_guard_test.sh"],
+    data = [":test_filter_fixture"],
+)
+
 sh_test(
     name = "linux_policy_source_test",
     size = "small",
