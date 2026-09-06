@@ -1132,7 +1132,7 @@ impl WorkDb {
     /// Return every non-terminal batch (`collecting` / `supervising` /
     /// `applying`) engine-wide, oldest first, so a stuck batch — one whose
     /// members should long since have settled — sorts to the front.
-    /// Operator diagnostics (`bossctl review batches --live`) uses this to
+    /// Operator diagnostics (`bossctl review live-batches`) uses this to
     /// answer "is anything stuck right now" without knowing which work item
     /// to look at first; `reap_inert_review_batches` is the automated
     /// counterpart that acts on staleness rather than merely reporting it.

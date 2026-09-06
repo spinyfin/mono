@@ -70,7 +70,8 @@ pub(crate) enum ReviewAction {
     /// live — without a hand-rolled `state.db` query.
     Batches {
         /// Work item id (task/chore). Accepts primary id or friendly
-        /// short id (`T42`); short ids resolve via the shared choke point.
+        /// short id; the friendly short-id forms accepted here are
+        /// documented on `boss_protocol::work_item_id`.
         #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
         work_item: String,
         /// Override the Boss state-root directory.
@@ -83,11 +84,11 @@ pub(crate) enum ReviewAction {
     /// Answers "is anything stuck right now" without knowing which work item
     /// to look at first — the operator-facing counterpart to
     /// `reap_inert_review_batches`, which acts on staleness rather than
-    /// merely reporting it.
+    /// merely reporting it. Invoked as `bossctl review live-batches`.
     LiveBatches {
         /// Maximum number of batches to return.
         #[arg(long, default_value_t = 25)]
-        limit: i64,
+        limit: u32,
         /// Override the Boss state-root directory.
         #[arg(long)]
         state_root: Option<PathBuf>,
@@ -270,16 +271,16 @@ pub(crate) fn review_batches(json: bool, state_root: Option<PathBuf>, work_item:
         rendered.len()
     );
     for (batch, members) in &rendered {
-        print_batch(batch, members);
+        print_batch(batch, members, None);
     }
     Ok(())
 }
 
-/// `bossctl review batches --live` — see [`ReviewAction::LiveBatches`].
-pub(crate) fn review_live_batches(json: bool, state_root: Option<PathBuf>, limit: i64) -> Result<()> {
+/// `bossctl review live-batches` — see [`ReviewAction::LiveBatches`].
+pub(crate) fn review_live_batches(json: bool, state_root: Option<PathBuf>, limit: u32) -> Result<()> {
     let db = super::open_state_db(state_root)?;
     let batches = db
-        .list_live_review_batches(limit)
+        .list_live_review_batches(i64::from(limit))
         .context("reading live review batches")?;
     let mut rendered = Vec::with_capacity(batches.len());
     for batch in &batches {
@@ -305,14 +306,16 @@ pub(crate) fn review_live_batches(json: bool, state_root: Option<PathBuf>, limit
     }
     println!("{} live review batch(es), oldest first:", rendered.len());
     for (batch, members) in &rendered {
-        println!("  cycle root: {}", batch.cycle_root_id);
-        print_batch(batch, members);
+        print_batch(batch, members, Some(batch.cycle_root_id.as_str()));
     }
     Ok(())
 }
 
-fn print_batch(batch: &ReviewBatch, members: &[ReviewBatchMember]) {
+fn print_batch(batch: &ReviewBatch, members: &[ReviewBatchMember], cycle_root: Option<&str>) {
     println!("batch {} [{}/{}]", batch.id, batch.phase, batch.status);
+    if let Some(cycle_root) = cycle_root {
+        println!("  cycle root:  {cycle_root}");
+    }
     println!("  pr:          {}", batch.pr_url);
     println!("  profile:     {}", batch.classification.profile);
     println!("  target sha:  {}", batch.target_sha);

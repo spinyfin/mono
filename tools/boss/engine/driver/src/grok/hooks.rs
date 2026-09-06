@@ -794,10 +794,10 @@ mod tests {
     /// tests above do for the PR-redirect guard.
     #[test]
     fn reviewer_static_analysis_guard_denies_a_build_command_via_grok_payload() {
-        if !python3_available() {
-            eprintln!("python3 not available; skipping adapter acceptance test");
-            return;
-        }
+        assert!(
+            python3_available(),
+            "python3 is required for the reviewer guard acceptance test"
+        );
         let tmp = tempfile::TempDir::new().unwrap();
         let adapter_path = write_adapter_script(tmp.path());
 
