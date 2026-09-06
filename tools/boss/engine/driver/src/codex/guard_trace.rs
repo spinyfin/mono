@@ -902,6 +902,40 @@ mod tests {
         assert_eq!(lines[0]["decision"], "block");
     }
 
+    /// Acceptance: the real reviewer static-analysis guard — not a stub —
+    /// materialised the exact way `materialize_guards` ships it for a Codex
+    /// reviewer (`python_c_to_script` extracting the shared Python body from
+    /// [`crate::claude::REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND`]), run
+    /// through this same trust-wrapped shim. Prior coverage only asserted
+    /// the guard file gets materialised
+    /// (`materialize_guards_adds_static_analysis_guard_for_reviewer` in
+    /// `codex_tests.rs`); it never executed the script to check a build
+    /// command is actually denied through Codex's own invocation path, the
+    /// way Claude's `reviewer_static_analysis_guard_blocks_execution_and_allows_reads`
+    /// does for Claude.
+    #[test]
+    fn codex_reviewer_static_analysis_guard_blocks_a_build_command() {
+        let guard_body = crate::codex::python_c_to_script(crate::claude::REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND)
+            .expect("extract the reviewer guard body from the shared python3 -c constant");
+
+        let block_payload =
+            serde_json::json!({"tool_input": {"command": "bazel test //tools/boss/engine/core:engine_lib_test"}})
+                .to_string();
+        let (verdict, _lines) = run_shim("codex-reviewer-guard-block", &guard_body, &block_payload);
+        assert!(
+            matches!(verdict, Verdict::Block(_)),
+            "codex reviewer guard must block a bazel test command, got {verdict:?}"
+        );
+
+        let approve_payload = serde_json::json!({"tool_input": {"command": "jj diff --stat"}}).to_string();
+        let (verdict, _lines) = run_shim("codex-reviewer-guard-approve", &guard_body, &approve_payload);
+        assert_eq!(
+            verdict,
+            Verdict::Allow,
+            "codex reviewer guard must still allow a read-only command"
+        );
+    }
+
     #[test]
     fn a_guard_whose_bytes_do_not_match_the_attested_hash_is_refused() {
         // Wrapping cost the trust gate its content binding on the guard file

@@ -330,6 +330,78 @@ fn quorum_fails_the_batch_when_fewer_than_two_leaves_report() {
     assert!(attention.title.to_lowercase().contains("insufficient quorum"));
 }
 
+/// The zero-valid-reports degenerate case: every leaf exhausted its retry
+/// with no report at all. This must fail exactly the same way as the
+/// one-valid-report case above — `Failed`, an attention filed, and no
+/// verdict/revision ever materialised — rather than treating "nobody
+/// reported" as somehow different from "not enough reporters".
+#[test]
+fn quorum_fails_the_batch_when_zero_leaves_report() {
+    let db = WorkDb::open(temp_db_path("quorum-zero-reported")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let executions: Vec<_> = (0..3)
+        .map(|_| {
+            db.create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(cycle_root.id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[
+                member_with(
+                    ReviewBatchMemberRole::ClaudeReviewer,
+                    Some(executions[0].id.clone()),
+                    2,
+                    ReviewBatchMemberStatus::Failed,
+                ),
+                member_with(
+                    ReviewBatchMemberRole::CodexReviewer,
+                    Some(executions[1].id.clone()),
+                    2,
+                    ReviewBatchMemberStatus::Failed,
+                ),
+                member_with(
+                    ReviewBatchMemberRole::GrokReviewer,
+                    Some(executions[2].id.clone()),
+                    2,
+                    ReviewBatchMemberStatus::Failed,
+                ),
+            ],
+        )
+        .unwrap();
+
+    let outcome = advance_quorum(&db, &batch.id);
+    assert!(matches!(outcome, ReviewBatchQuorumOutcome::InsufficientQuorum));
+
+    let updated = db.review_batch(&batch.id).unwrap().unwrap();
+    assert_eq!(updated.status, ReviewBatchStatus::Failed);
+    assert!(updated.completed_at.is_some());
+    assert!(
+        updated.final_verdict_proposal_id.is_none(),
+        "a sub-quorum batch must never acquire a verdict proposal"
+    );
+
+    let attention =
+        find_quorum_failed_attention(&db, &cycle_root.id).expect("a pr_review_quorum_failed attention must be filed");
+    assert!(attention.title.to_lowercase().contains("insufficient quorum"));
+
+    // Fail-closed, not merely "no supervisor dispatched": the batch must
+    // never be able to produce a clean verdict from zero sources. No
+    // `pr_review_verdicts` row (and therefore no revision) exists at all.
+    assert!(
+        db.review_verdicts_for_work_item(&cycle_root.id).unwrap().is_empty(),
+        "zero valid reports must never materialise a review verdict"
+    );
+}
+
 /// (d) One leaf still pending/running: the quorum must not act prematurely —
 /// no-op, no supervisor member created.
 #[test]
@@ -1748,6 +1820,70 @@ fn a_completed_batch_releases_its_reservation() {
         db.can_admit_review_batch(ReviewBatchPhase::PreMerge).unwrap(),
         "completing one batch must free its four-unit reservation for a new one"
     );
+}
+
+/// Operator diagnostics (`bossctl review batches --live`): only non-terminal
+/// batches come back, oldest first, and a `limit` bounds the result — the
+/// same "is anything stuck" question `reap_inert_review_batches` answers by
+/// acting rather than reporting.
+#[test]
+fn list_live_review_batches_excludes_terminal_batches_and_respects_limit() {
+    let db = WorkDb::open(temp_db_path("review-batches-list-live")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+
+    let mut live_ids = Vec::new();
+    for i in 0..3 {
+        let (batch, _) = db
+            .create_review_batch(
+                batch_input(
+                    cycle_root.id.clone(),
+                    &format!("live-head-sha-{i}"),
+                    ReviewBatchPhase::PreMerge,
+                ),
+                &[member(ReviewBatchMemberRole::ClaudeReviewer, None)],
+            )
+            .unwrap();
+        live_ids.push(batch.id);
+    }
+
+    // A completed and a failed batch must both be excluded.
+    let (completed, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "completed-head-sha", ReviewBatchPhase::PreMerge),
+            &[member(ReviewBatchMemberRole::ClaudeReviewer, None)],
+        )
+        .unwrap();
+    let (failed, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "failed-head-sha", ReviewBatchPhase::PreMerge),
+            &[member(ReviewBatchMemberRole::ClaudeReviewer, None)],
+        )
+        .unwrap();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE pr_review_batches SET status = 'completed' WHERE id = ?1",
+            rusqlite::params![completed.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE pr_review_batches SET status = 'failed' WHERE id = ?1",
+            rusqlite::params![failed.id],
+        )
+        .unwrap();
+    }
+
+    let live = db.list_live_review_batches(100).unwrap();
+    let live_returned_ids: Vec<_> = live.iter().map(|b| b.id.clone()).collect();
+    assert_eq!(
+        live_returned_ids, live_ids,
+        "expected exactly the three non-terminal batches, oldest first"
+    );
+
+    let limited = db.list_live_review_batches(2).unwrap();
+    assert_eq!(limited.len(), 2, "limit must bound the result");
+    assert_eq!(limited[0].id, live_ids[0], "limit must keep the oldest batches");
 }
 
 /// The production entry point (`create_pre_merge_review_batch`) defers

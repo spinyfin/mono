@@ -1129,6 +1129,29 @@ impl WorkDb {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Return every non-terminal batch (`collecting` / `supervising` /
+    /// `applying`) engine-wide, oldest first, so a stuck batch — one whose
+    /// members should long since have settled — sorts to the front.
+    /// Operator diagnostics (`bossctl review batches --live`) uses this to
+    /// answer "is anything stuck right now" without knowing which work item
+    /// to look at first; `reap_inert_review_batches` is the automated
+    /// counterpart that acts on staleness rather than merely reporting it.
+    pub fn list_live_review_batches(&self, limit: i64) -> Result<Vec<ReviewBatch>> {
+        let conn = self.connect()?;
+        let mut statement = conn.prepare(
+            "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
+                    phase, pr_number, pr_url, status, target_sha, updated_at,
+                    completed_at, final_verdict_proposal_id, merge_sha
+             FROM pr_review_batches
+             WHERE status NOT IN ('completed', 'failed')
+             ORDER BY created_at ASC, id ASC
+             LIMIT ?1",
+        )?;
+        Ok(statement
+            .query_map(params![limit], map_review_batch)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Return every role-specific attempt in deterministic role/attempt order.
     pub fn review_batch_members(&self, batch_id: &str) -> Result<Vec<ReviewBatchMember>> {
         let conn = self.connect()?;
