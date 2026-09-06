@@ -47,7 +47,9 @@ mono pins `rules_rust 0.70.0` (BCR, official release tarball). #3774 is based on
 dirty`), so it does not apply verbatim, but the conflicts are shallow: the PR bundles a
 review-driven refactor of `rustc_compile_action` to return a **dict** of providers instead
 of a list, and 0.70.0's surrounding code has drifted slightly. The backport
-(`third_party/patches/rules_rust-0.70.0-test-sharding.patch`, 432 lines):
+(`third_party/patches/rules_rust-0.70.0-test-sharding.patch`, 432 lines — since renamed to
+`rules_rust-0.70.0-test-wrapper.patch` when `--test_filter` support was folded into the
+same wrapper; see the "Ad-hoc filtering" bullet below):
 
 - `rust/private/test_sharding_wrapper.sh` / `.bat` — new files, **byte-identical** to the PR's.
 - `rust/private/BUILD.bazel` — `exports_files` for the two wrappers, verbatim.
@@ -73,7 +75,7 @@ module fetch, so `bazel clean --expunge` is a non-event):
 single_version_override(
     module_name = "rules_rust",
     patch_strip = 1,
-    patches = ["//third_party/patches:rules_rust-0.70.0-test-sharding.patch"],
+    patches = ["//third_party/patches:rules_rust-0.70.0-test-wrapper.patch"],
     version = "0.70.0",
 )
 ```
@@ -264,9 +266,13 @@ bash`; both CI platforms (linux-amd64, macos-arm64) are POSIX. The `.bat` path i
   having run nothing. Low likelihood (the binary just compiled; a startup crash also
   breaks today's layout — but _loudly_). Our patch should add: fail unless `--list`
   exits 0 and yields ≥ 1 test when `TEST_TOTAL_SHARDS` is set.
-- **Ad-hoc filtering:** `bazel test --test_filter=…` has never worked for `rust_test`
+- **Ad-hoc filtering:** `bazel test --test_filter=…` had never worked for `rust_test`
   (`rules_rust` 0.70.0 has no `TESTBRIDGE_TEST_ONLY` handling — verified), so no
-  regression. But `--test_arg` positional filters change meaning under sharding: the
+  regression at the time of this experiment. **This has since been fixed**: the sharding
+  wrapper was generalised into a single `rust_test` execution wrapper that also translates
+  `TESTBRIDGE_TEST_ONLY` into a libtest positional filter, applied during enumeration so it
+  composes with sharding. A filter matching nothing now fails loudly instead of reporting an
+  empty green run. Guarded by `//tools/test-sandbox:test_filter_guard_test`. But `--test_arg` positional filters change meaning under sharding: the
   wrapper appends user args **after** its `--exact` name list
   (`binary "${shard_tests[@]}" --exact "$@"`), so a module prefix like `work::` no longer
   narrows anything (not an exact name → matches nothing extra), and an exact test name

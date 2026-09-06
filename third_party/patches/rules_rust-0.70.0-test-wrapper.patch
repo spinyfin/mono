@@ -1,22 +1,22 @@
 diff --git a/rust/private/BUILD.bazel b/rust/private/BUILD.bazel
-index 89444bb..ea92ed7 100644
+index 89444bb..8dcc671 100644
 --- a/rust/private/BUILD.bazel
 +++ b/rust/private/BUILD.bazel
 @@ -5,6 +5,12 @@ load("//rust/private:rustc.bzl", "is_proc_macro_dep", "is_proc_macro_dep_enabled
  # Exported for docs
  exports_files(["providers.bzl"])
  
-+# Test sharding wrapper scripts
++# rust_test execution wrapper scripts (test filtering + sharding)
 +exports_files([
-+    "test_sharding_wrapper.sh",
-+    "test_sharding_wrapper.bat",
++    "test_wrapper.sh",
++    "test_wrapper.bat",
 +])
 +
  bzl_library(
      name = "bazel_tools_bzl_lib",
      srcs = ["@bazel_tools//tools:bzl_srcs"],
 diff --git a/rust/private/rust.bzl b/rust/private/rust.bzl
-index bd78468..ba94349 100644
+index bd78468..14e4dd8 100644
 --- a/rust/private/rust.bzl
 +++ b/rust/private/rust.bzl
 @@ -219,7 +219,7 @@ def _rust_library_common(ctx, crate_type):
@@ -57,58 +57,80 @@ index bd78468..ba94349 100644
  
  def get_rust_test_flags(attr):
      """Determine the desired rustc flags for test targets.
-@@ -499,6 +499,50 @@ def _rust_test_impl(ctx):
+@@ -499,6 +499,72 @@ def _rust_test_impl(ctx):
          rust_flags = get_rust_test_flags(ctx.attr),
          skip_expanding_rustc_env = True,
      )
 +
-+    # If sharding is enabled and we're using libtest harness, wrap the test binary
-+    # with a script that handles test enumeration and shard partitioning
-+    if ctx.attr.experimental_enable_sharding and ctx.attr.use_libtest_harness:
-+        default_info = providers["DefaultInfo"]
++    # Always run the test through the wrapper script. Bazel communicates two
++    # things to a test binary purely through the environment, and a libtest
++    # binary can read neither: TESTBRIDGE_TEST_ONLY (`bazel test
++    # --test_filter=...`) and the TEST_SHARD_* protocol (`shard_count`). Without
++    # a wrapper, `--test_filter` is accepted by Bazel and then silently ignored
++    # -- the full suite runs and reports PASSED. The wrapper translates both into
++    # libtest command-line arguments, and refuses to report success on any path
++    # where it cannot honour the request.
++    #
++    # When neither variable is set (the common case, and every `bazel run`), the
++    # wrapper `exec`s the test binary immediately, so it does not appear in the
++    # process tree.
++    default_info = providers["DefaultInfo"]
 +
-+        # Get the test binary from CrateInfo (or TestCrateInfo for staticlib/cdylib)
-+        crate_info_provider = providers.get("crate_info") or providers.get("test_crate_info")
-+        if crate_info_provider:
-+            # TestCrateInfo wraps the actual CrateInfo
-+            if hasattr(crate_info_provider, "crate"):
-+                crate_info_provider = crate_info_provider.crate
-+            test_binary = crate_info_provider.output
++    # Get the test binary from CrateInfo (or TestCrateInfo for staticlib/cdylib).
++    # Every rust_test produces exactly one of these. If neither is present we
++    # cannot generate the wrapper, and continuing would hand back an unwrapped
++    # test binary that silently ignores TESTBRIDGE_TEST_ONLY -- precisely the
++    # defect this patch exists to remove. Fail the analysis instead.
++    crate_info_provider = providers.get("crate_info") or providers.get("test_crate_info")
++    if not crate_info_provider:
++        fail(
++            "rust_test {}: rustc_compile_action returned neither CrateInfo nor ".format(ctx.label) +
++            "TestCrateInfo, so the test wrapper cannot be generated. Refusing to " +
++            "produce a test that would silently ignore `bazel test --test_filter` " +
++            "and `shard_count`.",
++        )
 +
-+            # Select the appropriate wrapper template based on target OS
-+            if toolchain.target_os == "windows":
-+                wrapper = ctx.actions.declare_file(ctx.label.name + "_sharding_wrapper.bat")
-+                wrapper_template = ctx.file._test_sharding_wrapper_windows
-+            else:
-+                wrapper = ctx.actions.declare_file(ctx.label.name + "_sharding_wrapper.sh")
-+                wrapper_template = ctx.file._test_sharding_wrapper_unix
++    # TestCrateInfo wraps the actual CrateInfo
++    if hasattr(crate_info_provider, "crate"):
++        crate_info_provider = crate_info_provider.crate
++    test_binary = crate_info_provider.output
 +
-+            # Generate wrapper script with test binary path substituted
-+            ctx.actions.expand_template(
-+                template = wrapper_template,
-+                output = wrapper,
-+                substitutions = {
-+                    "{{TEST_BINARY}}": test_binary.short_path,
-+                },
-+                is_executable = True,
-+            )
++    # Select the appropriate wrapper template based on target OS
++    if toolchain.target_os == "windows":
++        wrapper = ctx.actions.declare_file(ctx.label.name + "_test_wrapper.bat")
++        wrapper_template = ctx.file._test_wrapper_windows
++    else:
++        wrapper = ctx.actions.declare_file(ctx.label.name + "_test_wrapper.sh")
++        wrapper_template = ctx.file._test_wrapper_unix
 +
-+            # Update runfiles to include both wrapper and test binary
-+            new_runfiles = default_info.default_runfiles.merge(
-+                ctx.runfiles(files = [test_binary]),
-+            )
++    # Generate wrapper script with test binary path substituted
++    ctx.actions.expand_template(
++        template = wrapper_template,
++        output = wrapper,
++        substitutions = {
++            "{{LIBTEST_HARNESS}}": "1" if ctx.attr.use_libtest_harness else "0",
++            "{{SHARDING_ENABLED}}": "1" if (ctx.attr.experimental_enable_sharding and ctx.attr.use_libtest_harness) else "0",
++            "{{TEST_BINARY}}": test_binary.short_path,
++        },
++        is_executable = True,
++    )
 +
-+            # Replace DefaultInfo with wrapper as executable
-+            providers["DefaultInfo"] = DefaultInfo(
-+                files = default_info.files,
-+                runfiles = new_runfiles,
-+                executable = wrapper,
-+            )
++    # Update runfiles to include both wrapper and test binary
++    new_runfiles = default_info.default_runfiles.merge(
++        ctx.runfiles(files = [test_binary]),
++    )
++
++    # Replace DefaultInfo with wrapper as executable
++    providers["DefaultInfo"] = DefaultInfo(
++        files = default_info.files,
++        runfiles = new_runfiles,
++        executable = wrapper,
++    )
 +
      data = getattr(ctx.attr, "data", [])
  
      env = expand_dict_value_locations(
-@@ -534,12 +578,12 @@ def _rust_test_impl(ctx):
+@@ -534,12 +600,12 @@ def _rust_test_impl(ctx):
          env["CC_CODE_COVERAGE_SCRIPT"] = ctx.executable._collect_cc_coverage.path
      components = "{}/{}".format(ctx.label.workspace_root, ctx.label.package).split("/")
      env["CARGO_MANIFEST_DIR"] = "/".join([c for c in components if c])
@@ -124,7 +146,7 @@ index bd78468..ba94349 100644
  
  def _rust_library_group_impl(ctx):
      dep_variant_infos = []
-@@ -920,6 +964,30 @@ _RUST_TEST_ATTRS = {
+@@ -920,6 +986,36 @@ _RUST_TEST_ATTRS = {
              E.g. `bazel test //src:rust_test --test_arg=foo::test::test_fn`.
          """),
      ),
@@ -134,22 +156,28 @@ index bd78468..ba94349 100644
 +        doc = dedent("""\
 +            If True, enable support for Bazel test sharding (shard_count attribute).
 +
-+            When enabled, tests are executed via a wrapper script that:
++            When enabled, the test wrapper additionally:
 +            1. Enumerates tests using libtest's --list flag
 +            2. Partitions tests across shards based on TEST_SHARD_INDEX/TEST_TOTAL_SHARDS
 +            3. Runs only the tests assigned to the current shard
 +
++            Sharding composes with `bazel test --test_filter=...`: the filter is
++            applied during enumeration, so the shards partition the filtered set.
++
 +            This attribute only has an effect when use_libtest_harness is True.
++            Note that `--test_filter` support does not depend on this attribute --
++            every rust_test is run through the wrapper so that TESTBRIDGE_TEST_ONLY
++            is always honoured.
 +
 +            This is experimental and may change in future releases.
 +        """),
 +    ),
-+    "_test_sharding_wrapper_unix": attr.label(
-+        default = Label("//rust/private:test_sharding_wrapper.sh"),
++    "_test_wrapper_unix": attr.label(
++        default = Label("//rust/private:test_wrapper.sh"),
 +        allow_single_file = True,
 +    ),
-+    "_test_sharding_wrapper_windows": attr.label(
-+        default = Label("//rust/private:test_sharding_wrapper.bat"),
++    "_test_wrapper_windows": attr.label(
++        default = Label("//rust/private:test_wrapper.bat"),
 +        allow_single_file = True,
 +    ),
  } | _COVERAGE_ATTRS | _EXPERIMENTAL_USE_CC_COMMON_LINK_ATTRS
@@ -250,12 +278,12 @@ index f43ddab..7c37b30 100644
  
      return providers
  
-diff --git b/rust/private/test_sharding_wrapper.bat b/rust/private/test_sharding_wrapper.bat
+diff --git a/rust/private/test_wrapper.bat b/rust/private/test_wrapper.bat
 new file mode 100644
-index 0000000..e363aed
+index 0000000..df7bcfe
 --- /dev/null
-+++ b/rust/private/test_sharding_wrapper.bat
-@@ -0,0 +1,118 @@
++++ b/rust/private/test_wrapper.bat
+@@ -0,0 +1,169 @@
 +@REM Copyright 2024 The Bazel Authors. All rights reserved.
 +@REM
 +@REM Licensed under the Apache License, Version 2.0 (the "License");
@@ -270,15 +298,19 @@ index 0000000..e363aed
 +@REM See the License for the specific language governing permissions and
 +@REM limitations under the License.
 +
-+@REM Wrapper script for rust_test that enables Bazel test sharding support.
-+@REM This script intercepts test execution, enumerates tests using libtest's
-+@REM --list flag, partitions them by shard index, and runs only the relevant subset.
++@REM Wrapper script for rust_test. Translates TESTBRIDGE_TEST_ONLY (from
++@REM `bazel test --test_filter=...`) and the TEST_SHARD_* protocol into libtest
++@REM command-line arguments. See test_wrapper.sh for the full contract; this is
++@REM the Windows mirror of it.
 +
 +@ECHO OFF
 +SETLOCAL EnableDelayedExpansion
 +
 +SET TEST_BINARY_RAW={{TEST_BINARY}}
++SET LIBTEST_HARNESS={{LIBTEST_HARNESS}}
++SET SHARDING_ENABLED={{SHARDING_ENABLED}}
 +SET TEST_BINARY_PATH=!TEST_BINARY_RAW:/=\!
++SET TEST_FILTER=%TESTBRIDGE_TEST_ONLY%
 +
 +@REM Try to find the binary using RUNFILES_DIR if set
 +IF DEFINED RUNFILES_DIR (
@@ -316,7 +348,7 @@ index 0000000..e363aed
 +    )
 +)
 +
-+@REM Try 3: RUNFILES_DIR based path  
++@REM Try 3: RUNFILES_DIR based path
 +IF !FOUND_BINARY! EQU 0 IF DEFINED RUNFILES_DIR (
 +    SET TEST_BINARY_RF=!RUNFILES_DIR!\_main\!TEST_BINARY_PATH!
 +    SET TEST_BINARY_RF=!TEST_BINARY_RF:/=\!
@@ -327,38 +359,65 @@ index 0000000..e363aed
 +)
 +
 +IF !FOUND_BINARY! EQU 0 (
-+    ECHO ERROR: Could not find test binary at any expected location
++    ECHO ERROR: Could not find test binary at any expected location 1>&2
 +    EXIT /B 1
 +)
 +
-+@REM If sharding is not enabled, run test binary directly
-+IF "%TEST_TOTAL_SHARDS%"=="" (
++@REM A binary with its own main^(^) cannot honour a libtest filter. Refuse rather
++@REM than running the whole suite and reporting it as a filtered run.
++IF NOT "!LIBTEST_HARNESS!"=="1" (
++    IF NOT "!TEST_FILTER!"=="" (
++        ECHO rust_test wrapper: --test_filter=!TEST_FILTER! ^(TESTBRIDGE_TEST_ONLY^) cannot be honoured: 1>&2
++        ECHO   !BINARY_NAME! is built with use_libtest_harness = False. 1>&2
++        EXIT /B 1
++    )
++    !TEST_BINARY_PATH! %*
++    EXIT /B !ERRORLEVEL!
++)
++
++SET SHARDING=0
++IF "!SHARDING_ENABLED!"=="1" IF NOT "%TEST_TOTAL_SHARDS%"=="" SET SHARDING=1
++
++@REM Nothing to translate: run the binary with the invocation verbatim.
++IF !SHARDING! EQU 0 IF "!TEST_FILTER!"=="" (
 +    !TEST_BINARY_PATH! %*
 +    EXIT /B !ERRORLEVEL!
 +)
 +
 +@REM Touch status file to advertise sharding support to Bazel
-+IF NOT "%TEST_SHARD_STATUS_FILE%"=="" (
++IF !SHARDING! EQU 1 IF NOT "%TEST_SHARD_STATUS_FILE%"=="" (
 +    TYPE NUL > "%TEST_SHARD_STATUS_FILE%"
 +)
 +
 +@REM Create a temporary file for test list
 +SET TEMP_LIST=%TEMP%\rust_test_list_%RANDOM%.txt
 +
-+@REM Enumerate all tests using libtest's --list flag
-+!TEST_BINARY_PATH! --list --format terse 2>NUL > "!TEMP_LIST!"
++@REM Enumerate tests using libtest's --list flag, letting libtest apply the
++@REM filter so the wrapper never reimplements libtest matching semantics.
++IF "!TEST_FILTER!"=="" (
++    !TEST_BINARY_PATH! --list --format terse > "!TEMP_LIST!"
++) ELSE (
++    !TEST_BINARY_PATH! --list --format terse -- "!TEST_FILTER!" > "!TEMP_LIST!"
++)
++IF NOT !ERRORLEVEL! EQU 0 (
++    ECHO rust_test wrapper: test enumeration exited non-zero; cannot enumerate tests. 1>&2
++    DEL "!TEMP_LIST!" 2>NUL
++    EXIT /B 1
++)
 +
 +@REM Count tests and filter for this shard
 +SET INDEX=0
 +SET SHARD_TESTS=
 +
 +FOR /F "tokens=1 delims=:" %%T IN ('TYPE "!TEMP_LIST!" ^| FINDSTR /E ": test"') DO (
-+    SET /A MOD=!INDEX! %% %TEST_TOTAL_SHARDS%
-+    IF !MOD! EQU %TEST_SHARD_INDEX% (
-+        IF "!SHARD_TESTS!"=="" (
-+            SET SHARD_TESTS=%%T
-+        ) ELSE (
-+            SET SHARD_TESTS=!SHARD_TESTS! %%T
++    IF !SHARDING! EQU 1 (
++        SET /A MOD=!INDEX! %% %TEST_TOTAL_SHARDS%
++        IF !MOD! EQU %TEST_SHARD_INDEX% (
++            IF "!SHARD_TESTS!"=="" (
++                SET SHARD_TESTS=%%T
++            ) ELSE (
++                SET SHARD_TESTS=!SHARD_TESTS! %%T
++            )
 +        )
 +    )
 +    SET /A INDEX=!INDEX! + 1
@@ -366,20 +425,40 @@ index 0000000..e363aed
 +
 +DEL "!TEMP_LIST!" 2>NUL
 +
-+@REM If no tests for this shard, exit successfully
++@REM An empty enumeration is never a reason to report success.
++IF !INDEX! EQU 0 (
++    IF NOT "!TEST_FILTER!"=="" (
++        ECHO rust_test wrapper: --test_filter=!TEST_FILTER! matched no tests; refusing to report success. 1>&2
++    ) ELSE (
++        ECHO rust_test wrapper: enumerated zero tests; refusing to report success. 1>&2
++    )
++    EXIT /B 1
++)
++
++@REM Unsharded, filtered: hand the filter straight to libtest.
++IF !SHARDING! EQU 0 (
++    !TEST_BINARY_PATH! %* -- "!TEST_FILTER!"
++    EXIT /B !ERRORLEVEL!
++)
++
++@REM A shard is legitimately empty only when there are fewer tests than shards.
 +IF "!SHARD_TESTS!"=="" (
++    IF !INDEX! GTR %TEST_SHARD_INDEX% (
++        ECHO rust_test wrapper: partitioned 0 of !INDEX! tests into shard %TEST_SHARD_INDEX%; refusing to report success. 1>&2
++        EXIT /B 1
++    )
 +    EXIT /B 0
 +)
 +
 +@REM Run the filtered tests with --exact to match exact test names
 +!TEST_BINARY_PATH! !SHARD_TESTS! --exact %*
 +EXIT /B !ERRORLEVEL!
-diff --git b/rust/private/test_sharding_wrapper.sh b/rust/private/test_sharding_wrapper.sh
-new file mode 100644
-index 0000000..e05970b
+diff --git a/rust/private/test_wrapper.sh b/rust/private/test_wrapper.sh
+new file mode 100755
+index 0000000..ed7735d
 --- /dev/null
-+++ b/rust/private/test_sharding_wrapper.sh
-@@ -0,0 +1,86 @@
++++ b/rust/private/test_wrapper.sh
+@@ -0,0 +1,158 @@
 +#!/usr/bin/env bash
 +# Copyright 2024 The Bazel Authors. All rights reserved.
 +#
@@ -395,39 +474,111 @@ index 0000000..e05970b
 +# See the License for the specific language governing permissions and
 +# limitations under the License.
 +
-+# Wrapper script for rust_test that enables Bazel test sharding support.
-+# This script intercepts test execution, enumerates tests using libtest's
-+# --list flag, partitions them by shard index, and runs only the relevant subset.
++# Wrapper script for rust_test. It translates the two Bazel test-protocol
++# environment variables that a libtest binary cannot read on its own into
++# libtest command-line arguments:
++#
++#   TESTBRIDGE_TEST_ONLY  (set by `bazel test --test_filter=...`)
++#       -> a libtest positional filter (substring match, same semantics as
++#          `cargo test <filter>`).
++#   TEST_SHARD_INDEX / TEST_TOTAL_SHARDS / TEST_SHARD_STATUS_FILE
++#       (set by Bazel when `shard_count` is used)
++#       -> enumerate with `--list`, partition, run the shard's slice with
++#          `--exact`.
++#
++# The two compose: the filter is applied during enumeration, so sharding
++# partitions the *filtered* set rather than the whole suite.
++#
++# This script never silently degrades to "run something other than what was
++# asked for". Every path either honours the request or exits non-zero with a
++# message saying why it could not.
 +
 +set -euo pipefail
 +
 +TEST_BINARY="{{TEST_BINARY}}"
++# "1" when the target is built with libtest (use_libtest_harness = True).
++LIBTEST_HARNESS="{{LIBTEST_HARNESS}}"
++# "1" when the target opted into sharding (experimental_enable_sharding = True).
++SHARDING_ENABLED="{{SHARDING_ENABLED}}"
 +
-+# If sharding is not enabled, run test binary directly
-+if [[ -z "${TEST_TOTAL_SHARDS:-}" ]]; then
++test_filter="${TESTBRIDGE_TEST_ONLY:-}"
++
++# A test binary with its own main() does not accept libtest's filter
++# arguments, so --test_filter cannot be honoured. Running the whole suite and
++# reporting PASSED would be exactly the silent no-op this wrapper exists to
++# prevent, so refuse instead.
++if [[ "${LIBTEST_HARNESS}" != "1" ]]; then
++    if [[ -n "${test_filter}" ]]; then
++        echo "rust_test wrapper: --test_filter=${test_filter} (TESTBRIDGE_TEST_ONLY) cannot be honoured:" >&2
++        echo "  ${TEST_BINARY} is built with use_libtest_harness = False, so it supplies its own" >&2
++        echo "  main() and does not accept libtest filter arguments. Refusing to run the full suite" >&2
++        echo "  and report it as a filtered run." >&2
++        exit 1
++    fi
 +    exec "./${TEST_BINARY}" "$@"
 +fi
 +
-+# Touch status file to advertise sharding support to Bazel
-+if [[ -n "${TEST_SHARD_STATUS_FILE:-}" ]]; then
++sharding=0
++if [[ "${SHARDING_ENABLED}" == "1" && -n "${TEST_TOTAL_SHARDS:-}" ]]; then
++    sharding=1
++fi
++
++# Nothing to translate: hand the binary the invocation verbatim. `exec` keeps
++# the wrapper out of the process tree, so `bazel run` and --run_under see the
++# test binary itself.
++if [[ "${sharding}" -eq 0 && -z "${test_filter}" ]]; then
++    exec "./${TEST_BINARY}" "$@"
++fi
++
++# Touch the status file to advertise sharding support to Bazel. Bazel fails the
++# test if sharding was requested and this file was never created, which is what
++# keeps a non-opted-in target from silently ignoring shard_count.
++if [[ "${sharding}" -eq 1 && -n "${TEST_SHARD_STATUS_FILE:-}" ]]; then
 +    touch "${TEST_SHARD_STATUS_FILE}"
 +fi
 +
-+# Enumerate all tests using libtest's --list flag
-+# Output format: "test_name: test" - we need to strip the ": test" suffix
-+test_list=$("./${TEST_BINARY}" --list --format terse 2>/dev/null | grep ': test$' | sed 's/: test$//' || true)
++# Enumerate the tests, letting libtest itself apply the filter so the wrapper
++# never reimplements libtest's matching semantics.
++# Output format is "test_name: test" -- strip the ": test" suffix.
++list_args=(--list --format terse)
++if [[ -n "${test_filter}" ]]; then
++    # `--` so a filter that begins with `-` is still treated as a filter.
++    list_args+=(-- "${test_filter}")
++fi
 +
-+# An empty enumeration means the binary crashed, hung, or --list is broken --
-+# not that there are zero tests (a genuinely test-less *shard* is a separate,
-+# legitimate case handled after partitioning below). Failing loudly here turns
-+# what would otherwise be a silent all-shards-green run into a visible
-+# failure instead of masking a broken test harness.
-+if [[ -z "$test_list" ]]; then
-+    echo "test_sharding_wrapper: '${TEST_BINARY} --list --format terse' enumerated zero tests; refusing to report success for a broken/empty test binary under sharding" >&2
++if ! list_output=$("./${TEST_BINARY}" "${list_args[@]}" 2>&1); then
++    echo "rust_test wrapper: '${TEST_BINARY} ${list_args[*]}' exited non-zero; cannot enumerate tests." >&2
++    printf '%s\n' "${list_output}" >&2
 +    exit 1
 +fi
 +
-+# Filter tests for this shard
++test_list=$(printf '%s\n' "${list_output}" | grep ': test$' | sed 's/: test$//' || true)
++
++# An empty enumeration is never a reason to report success.
++#  - With a filter: the filter matched nothing, so the run the user asked for
++#    would execute zero tests and still exit 0. That is the silent pass this
++#    whole change exists to remove.
++#  - Without a filter: the binary crashed, hung, or --list is broken -- not
++#    that there are zero tests. (A genuinely test-less *shard* is a separate,
++#    legitimate case, handled after partitioning below.)
++if [[ -z "${test_list}" ]]; then
++    if [[ -n "${test_filter}" ]]; then
++        echo "rust_test wrapper: --test_filter=${test_filter} matched none of the tests in ${TEST_BINARY};" >&2
++        echo "  refusing to report success for a run that would execute nothing." >&2
++    else
++        echo "rust_test wrapper: '${TEST_BINARY} --list --format terse' enumerated zero tests;" >&2
++        echo "  refusing to report success for a broken/empty test binary under sharding." >&2
++    fi
++    exit 1
++fi
++
++# Unsharded, filtered: hand the filter straight to libtest so its own
++# "N filtered out" accounting appears in the test log.
++if [[ "${sharding}" -eq 0 ]]; then
++    exec "./${TEST_BINARY}" "$@" -- "${test_filter}"
++fi
++
++# Filter tests for this shard.
 +# test_index % TEST_TOTAL_SHARDS == TEST_SHARD_INDEX
 +# Split on newlines via IFS word-splitting, NOT a `<<<` here-string. bash
 +# implements a here-string by writing a temp file under $TMPDIR, and a Bazel
@@ -458,7 +609,7 @@ index 0000000..e05970b
 +# of reporting the green that used to mask exactly that.
 +if [[ ${#shard_tests[@]} -eq 0 ]]; then
 +    if (( index > TEST_SHARD_INDEX )); then
-+        echo "test_sharding_wrapper: partitioned 0 of ${index} enumerated tests into shard ${TEST_SHARD_INDEX} of ${TEST_TOTAL_SHARDS}; refusing to report success" >&2
++        echo "rust_test wrapper: partitioned 0 of ${index} enumerated tests into shard ${TEST_SHARD_INDEX} of ${TEST_TOTAL_SHARDS}; refusing to report success" >&2
 +        exit 1
 +    fi
 +    exit 0
