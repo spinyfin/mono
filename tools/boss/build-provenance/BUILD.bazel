@@ -1,5 +1,4 @@
-load("@rules_rust//rust:defs.bzl", "rust_library")
-load("//tools/boss/test-isolation:boss_rust_test.bzl", "boss_rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 exports_files(["Cargo.toml"])
 
@@ -29,7 +28,7 @@ rust_library(
     ],
 )
 
-boss_rust_test(
+rust_test(
     name = "build-provenance_test",
     size = "small",
     crate = ":build-provenance",

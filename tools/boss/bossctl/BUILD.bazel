@@ -1,6 +1,5 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_binary")
-load("//tools/boss/test-isolation:boss_rust_test.bzl", "boss_rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
 
 rust_binary(
     name = "bossctl",
@@ -46,7 +45,7 @@ rust_binary(
     ] + all_crate_deps(normal = True),
 )
 
-boss_rust_test(
+rust_test(
     name = "bossctl_test",
     size = "small",
     crate = ":bossctl",

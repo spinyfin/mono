@@ -1,6 +1,5 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_library")
-load("//tools/boss/test-isolation:boss_rust_test.bzl", "boss_rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 exports_files(["Cargo.toml"])
 
@@ -23,7 +22,7 @@ rust_library(
     ],
 )
 
-boss_rust_test(
+rust_test(
     name = "trunk_client_test",
     size = "small",
     crate = ":trunk_client",

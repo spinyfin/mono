@@ -120,20 +120,32 @@ impl LogSource {
 /// see [`is_production_shaped`].
 pub const STATE_ROOT_SUFFIX: &str = "Library/Application Support/Boss";
 
-/// Isolated state root installed lazily for a Bazel *test* process.
-/// `None` until a state path is resolved, and in ordinary production
-/// executables — including `bazel run` of production binaries, which
-/// also live under `bazel-out`.
+/// Isolated state root for a Bazel *test* process. `None` in ordinary
+/// production executables — including `bazel run` of production binaries,
+/// which also live under `bazel-out` — and until a test process either
+/// has a unit-test-installed root or accepts the `TEST_TMPDIR` the
+/// `bazel test` wrapper already created.
 ///
 /// This is the chokepoint every `default_*_path` function in this module
-/// ultimately derives from ([`default_state_root`]), so a test process gets
-/// exactly one place to install isolation and every derived path (db,
+/// ultimately derives from ([`default_state_root`]), so a test process has
+/// exactly one place that decides isolation and every derived path (db,
 /// sockets, pid, control token, audit/trace/dispatch logs) follows.
 static TEST_STATE_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
+/// Cached [`running_as_bazel_test_process`] result, including the negative
+/// (production) result. `default_state_root` is on the path of every
+/// `default_*_path` helper; without this, production would re-run
+/// `current_exe` + `canonicalize` on each call.
+static BAZEL_TEST_PROCESS: OnceLock<BazelTestProcess> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+struct BazelTestProcess {
+    is_test: bool,
+    stem_ends_with_test: bool,
+}
+
 /// Install the isolated state root for this process. Idempotent — only the
-/// first call wins. Test-only: production installs via
-/// [`install_bazel_test_root_if_needed`]'s `get_or_init`.
+/// first call wins. Test-only.
 #[cfg(test)]
 fn install_test_state_root(root: PathBuf) {
     let _ = TEST_STATE_ROOT.set(root);
@@ -172,50 +184,91 @@ fn executable_stem_ends_with_test(path: &Path) -> bool {
 /// produces executables under those trees; those must keep production's
 /// state root. A test binary is identified by Bazel's test harness env
 /// (`TEST_TMPDIR` / `TEST_SRCDIR` / `BAZEL_TEST`, present under
-/// `bazel test`) or by the `_test` file-stem convention
-/// `boss_rust_test` enforces — covering a direct
-/// `bazel-bin/.../engine_lib_test` invocation that has no harness env.
+/// `bazel test`) or by the `_test` file-stem convention the resolver
+/// keys on — covering a direct `bazel-bin/.../engine_lib_test`
+/// invocation that has no harness env. That `_test` suffix is
+/// conventional rather than mechanically enforced; the resolver
+/// depends on it.
 fn is_bazel_test_executable(exe: &Path, bazel_test_env: bool) -> bool {
     path_is_bazel_output(exe) && (bazel_test_env || executable_stem_ends_with_test(exe))
 }
 
-fn running_as_bazel_test_process() -> bool {
+fn detect_bazel_test_process() -> BazelTestProcess {
     let exe = match std::env::current_exe() {
         Ok(path) => std::fs::canonicalize(&path).unwrap_or(path),
-        Err(_) => return false,
+        Err(_) => {
+            return BazelTestProcess {
+                is_test: false,
+                stem_ends_with_test: false,
+            };
+        }
     };
-    is_bazel_test_executable(&exe, bazel_test_harness_env_present())
+    BazelTestProcess {
+        is_test: is_bazel_test_executable(&exe, bazel_test_harness_env_present()),
+        stem_ends_with_test: executable_stem_ends_with_test(&exe),
+    }
 }
 
-fn install_bazel_test_root_if_needed() {
-    if TEST_STATE_ROOT.get().is_some() || !running_as_bazel_test_process() {
-        return;
+fn bazel_test_process() -> BazelTestProcess {
+    *BAZEL_TEST_PROCESS.get_or_init(detect_bazel_test_process)
+}
+
+fn running_as_bazel_test_process() -> bool {
+    bazel_test_process().is_test
+}
+
+/// Isolated root the `bazel test` wrapper already created (`TEST_TMPDIR`),
+/// or `None` when this process must refuse rather than invent a directory.
+///
+/// A `_test` binary under `bazel test` gets `TEST_TMPDIR`. A `_test` binary
+/// invoked directly from `bazel-bin/` has no wrapper root. A production
+/// binary whose environment leaked `TEST_TMPDIR` must not silently divert
+/// onto that temp dir either — that is the misclassification this guard
+/// exists to make loud.
+fn wrapper_test_root(stem_ends_with_test: bool, test_tmpdir: Option<&Path>) -> Option<PathBuf> {
+    if stem_ends_with_test {
+        test_tmpdir.map(Path::to_path_buf)
+    } else {
+        None
     }
-    // `get_or_init` serializes the path choice so two racing callers cannot
-    // each `create_dir_all` a distinct nanos-suffixed directory and leak
-    // the loser. The path is pid-keyed, so repeated resolutions in one
-    // process reuse the same directory; a recycled pid wipes any leftover.
+}
+
+fn panic_refusing_production_state_root() -> ! {
+    panic!(
+        "boss-log-files: refusing to resolve Boss's production state root (~/{STATE_ROOT_SUFFIX}) \
+         from a Bazel test process — no isolated test root is installed. Run this binary under \
+         `bazel test` instead of invoking it directly from bazel-bin/. To see the test's output, \
+         pass `--test_output=streamed` and `--test_filter=<test_name>`."
+    );
+}
+
+/// Bind [`TEST_STATE_ROOT`] from the `bazel test` wrapper, or panic. Never
+/// creates a directory: a guard that cannot establish an isolated root
+/// fails loudly instead of inventing `$TMPDIR/boss-test-isolation-<pid>`
+/// and continuing against it.
+fn bind_wrapper_test_root_or_refuse() {
     let _ = TEST_STATE_ROOT.get_or_init(|| {
-        let root = std::env::temp_dir().join(format!("boss-test-isolation-{}", std::process::id()));
-        if root.exists() {
-            let _ = std::fs::remove_dir_all(&root);
+        let kind = bazel_test_process();
+        let tmpdir = std::env::var_os("TEST_TMPDIR").map(PathBuf::from);
+        match wrapper_test_root(kind.stem_ends_with_test, tmpdir.as_deref()) {
+            Some(root) => root,
+            None => panic_refusing_production_state_root(),
         }
-        std::fs::create_dir_all(&root).unwrap_or_else(|error| {
-            panic!("boss-log-files: refusing to run Bazel test without an isolated state root: {error}")
-        });
-        root
     });
 }
 
 /// The default Boss state root. In a production process this is
 /// `$HOME/Library/Application Support/Boss` (`None` when `HOME` is unset).
-/// In a test process (see [`is_test_process`]) this is the isolated root
-/// installed at first resolution — **never** `$HOME`, so a test
-/// binary invoked directly (bypassing `bazel test`'s `HOME` redirect and
-/// seatbelt) still cannot resolve production's state root.
-///
+/// In a test process (see [`is_test_process`]) this is an isolated root —
+/// the `TEST_TMPDIR` `bazel test` already created, or a root a unit test
+/// installed — **never** `$HOME`. A test-shaped process with no wrapper
+/// root (a direct `bazel-bin/` invocation, or a production binary whose
+/// environment leaked test-harness vars) panics instead of silently
+/// creating a private temp directory and running against it.
 pub fn default_state_root() -> Option<PathBuf> {
-    install_bazel_test_root_if_needed();
+    if running_as_bazel_test_process() {
+        bind_wrapper_test_root_or_refuse();
+    }
     resolve_state_root(
         is_test_process(),
         TEST_STATE_ROOT.get().map(PathBuf::as_path),
@@ -229,13 +282,7 @@ pub fn default_state_root() -> Option<PathBuf> {
 /// while running concurrently.
 fn resolve_state_root(is_test_process: bool, installed_root: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
     if is_test_process {
-        let root = installed_root.unwrap_or_else(|| {
-            panic!(
-                "boss-log-files: refusing to resolve Boss's production state root (~/{STATE_ROOT_SUFFIX}) \
-                 from a Bazel test process — no isolated test root could be installed. Ensure the \
-                 system temporary directory is writable."
-            )
-        });
+        let root = installed_root.unwrap_or_else(|| panic_refusing_production_state_root());
         return Some(root.to_path_buf());
     }
     Some(home?.join(STATE_ROOT_SUFFIX))
@@ -515,10 +562,9 @@ mod tests {
 
     #[test]
     fn engine_runtime_files_resolve_under_state_root() {
-        // The isolated root is installed lazily by `default_state_root()`
-        // when this executable is recognised as a test process.
         // `TEST_STATE_ROOT` is a first-writer-wins OnceLock that sibling
-        // tests in this binary may populate, so this pins it via
+        // tests in this binary may populate (including `default_state_root`
+        // binding `TEST_TMPDIR` under `bazel test`), so this pins it via
         // `ensure_test_root_installed` rather than assuming a starting
         // state. Either way, the result must stay internally consistent
         // with the other `default_*_path` functions, which is all this
@@ -733,9 +779,46 @@ mod tests {
     }
 
     #[test]
+    fn refusal_message_names_bazel_test_and_how_to_see_output() {
+        let result = std::panic::catch_unwind(|| {
+            resolve_state_root(true, None, Some(Path::new("/Users/tester")));
+        });
+        let err = result.expect_err("expected a panic refusing the production state root");
+        let message = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            message.contains("`bazel test`")
+                && message.contains("--test_output=streamed")
+                && message.contains("--test_filter"),
+            "refusal must tell the reader how to proceed, got: {message}"
+        );
+    }
+
+    #[test]
+    fn wrapper_root_is_test_tmpdir_for_a_test_binary() {
+        let tmp = Path::new("/tmp/bazel-test-tmpdir");
+        assert_eq!(wrapper_test_root(true, Some(tmp)), Some(tmp.to_path_buf()));
+    }
+
+    #[test]
+    fn wrapper_root_is_absent_when_a_test_binary_has_no_test_tmpdir() {
+        assert_eq!(wrapper_test_root(true, None), None);
+    }
+
+    #[test]
+    fn wrapper_root_is_absent_for_a_production_binary_with_leaked_test_tmpdir() {
+        assert_eq!(
+            wrapper_test_root(false, Some(Path::new("/tmp/bazel-test-tmpdir"))),
+            None,
+            "a production binary whose environment leaked TEST_TMPDIR must refuse, not divert"
+        );
+    }
+
+    #[test]
     fn install_test_state_root_is_idempotent() {
-        // The isolated root is installed lazily by `default_state_root()`
-        // when this executable is recognised as a test process.
         // `TEST_STATE_ROOT` is a first-writer-wins OnceLock that sibling
         // tests in this binary may already have populated, so this pins
         // it via `ensure_test_root_installed` rather than assuming a
@@ -789,7 +872,7 @@ mod tests {
         let exe = Path::new("/Users/dev/mono/bazel-bin/tools/boss/engine/core/engine_lib_test");
         assert!(
             is_bazel_test_executable(exe, false),
-            "direct bazel-bin invocation of a `_test` binary must isolate even without harness env"
+            "direct bazel-bin invocation of a `_test` binary is a test process even without harness env"
         );
     }
 
