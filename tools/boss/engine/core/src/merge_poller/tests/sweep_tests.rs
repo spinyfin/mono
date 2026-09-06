@@ -2134,28 +2134,21 @@ async fn rebounce_settles_then_conflicting_base_rebuckets_via_sweep() {
     let probe = StubProbe::new();
     probe.states.lock().unwrap().insert(
         pr.into(),
-        Ok(PrLifecycleProbe {
-            url: pr.into(),
-            state: PrLifecycleState::Open(OpenPrStatus {
+        Ok(PrLifecycleProbe::builder()
+            .url(pr)
+            .state(PrLifecycleState::Open(OpenPrStatus {
                 mergeability: OpenPrMergeability::Conflict,
                 ci: OpenPrCiStatus::Clean,
-            }),
-            base_ref_oid: Some("main-sha-2".into()),
-            head_ref_oid: Some("rebased-head-sha".into()),
-            head_ref_name: Some("feature-branch".into()),
-            base_ref_name: Some("main".into()),
-            labels: Vec::new(),
-            review: PrReviewState::Unknown,
-            in_merge_queue: false,
-            merge_queue_entry_state: None,
-            merge_queue_position: None,
-            merge_queue_enqueued_at: None,
-            raw_mergeable: "CONFLICTING".into(),
-            raw_merge_state_status: "DIRTY".into(),
-            auto_merge_enabled: false,
-            auto_merge_enabled_at: None,
-            trunk_queue_check_failure: None,
-        }),
+            }))
+            .base_ref_oid("main-sha-2")
+            .head_ref_oid("rebased-head-sha")
+            .head_ref_name("feature-branch")
+            .base_ref_name("main")
+            .labels(Vec::new())
+            .review(PrReviewState::Unknown)
+            .raw_mergeable("CONFLICTING")
+            .raw_merge_state_status("DIRTY")
+            .build()),
     );
     let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(

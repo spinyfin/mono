@@ -350,6 +350,79 @@ pub async fn run_one_pass(
         }
     }
 
+    // Post-merge batch members are a different topology from the pre-merge
+    // loop above: their batch exists precisely *because* the PR already
+    // merged, so none of that loop's "is the PR still open?" / "did the PR
+    // head move past the frozen target?" checks apply — a post-merge
+    // target's SHA is a landed commit, which by definition never moves.
+    // Retry (or terminal-fail on an exhausted attempt) is therefore a direct
+    // call into the same role-scoped mechanics the pre-merge loop uses.
+    let post_merge_candidates = match work_db.list_dead_post_merge_review_batch_member_candidates() {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                "pr_review recovery: failed to list dead post-merge batch members; skipping post-merge recovery"
+            );
+            Vec::new()
+        }
+    };
+    for candidate in post_merge_candidates {
+        let DeadPrReviewCandidate {
+            work_item_id,
+            execution_id: dead_execution_id,
+            execution_status: dead_status,
+        } = candidate;
+        match work_db.retry_dead_review_batch_member(&dead_execution_id) {
+            Ok(RetryDeadReviewBatchMember::Retried(retry)) => {
+                file_dead_review_attention(work_db, &work_item_id, &dead_execution_id, dead_status.as_str());
+                dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::PrReviewDeadRecovery, Outcome::Ok, &retry.id)
+                            .with_work_item(&work_item_id)
+                            .with_details(serde_json::json!({
+                                "dead_execution_id": dead_execution_id,
+                                "dead_execution_status": dead_status.as_str(),
+                                "recovery_mode": "post_merge_review_batch_member",
+                            })),
+                    )
+                    .await;
+                tracing::warn!(
+                    work_item_id = %work_item_id,
+                    dead_execution_id = %dead_execution_id,
+                    retry_execution_id = %retry.id,
+                    "pr_review recovery: refired one dead post-merge reviewer (retry 1 of 1)",
+                );
+                coordinator.kick();
+                outcome.refired += 1;
+            }
+            Ok(RetryDeadReviewBatchMember::BatchFailed) => {
+                tracing::warn!(
+                    work_item_id = %work_item_id,
+                    dead_execution_id = %dead_execution_id,
+                    "pr_review recovery: post-merge reviewer exhausted its retry; batch failed with attention",
+                );
+                outcome.terminal_failed += 1;
+            }
+            Ok(RetryDeadReviewBatchMember::NotRetried) => {
+                tracing::info!(
+                    work_item_id = %work_item_id,
+                    dead_execution_id = %dead_execution_id,
+                    "pr_review recovery: post-merge reviewer already exhausted its one retry",
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    work_item_id = %work_item_id,
+                    dead_execution_id = %dead_execution_id,
+                    ?error,
+                    "pr_review recovery: failed to recover post-merge reviewer batch member",
+                );
+                outcome.error_skipped += 1;
+            }
+        }
+    }
+
     let candidates = match work_db.list_dead_pr_review_candidates() {
         Ok(c) => c,
         Err(err) => {

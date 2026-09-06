@@ -629,6 +629,20 @@ pub trait CubeClient: Send + Sync {
     /// child commit atop PR `pr`'s current head. Delegates to
     /// `cube workspace goto --workspace <path> --pr <n>`. Idempotent.
     async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()>;
+    /// Position the working copy in `workspace_path` as a fresh editable
+    /// child commit atop an arbitrary commit `sha` (e.g. a merge commit),
+    /// bypassing the PR-state resolution `goto_workspace` performs — the
+    /// only entry point that works once the PR has merged or closed.
+    /// Delegates to `cube workspace goto --workspace <path> --revision
+    /// <sha>`. Idempotent.
+    ///
+    /// The default implementation errors so the many test doubles and the
+    /// host-adapter layers need no change; only [`CommandCubeClient`]
+    /// provides a real implementation.
+    async fn goto_workspace_revision(&self, workspace_path: &Path, sha: &str) -> Result<()> {
+        let _ = (workspace_path, sha);
+        Err(anyhow!("goto_workspace_revision is not supported by this CubeClient"))
+    }
     /// Run an engine-direct `cube workspace rebase --pr <pr>` inside the
     /// leased workspace at `workspace_path`, rebasing the PR's boss branch
     /// onto the repo's integration branch. On a clean rebase the command
@@ -924,6 +938,22 @@ impl CubeClient for CommandCubeClient {
                 &workspace_arg,
                 "--pr",
                 &pr_str,
+            ])
+            .await?;
+        Ok(())
+    }
+
+    async fn goto_workspace_revision(&self, workspace_path: &Path, sha: &str) -> Result<()> {
+        let workspace_arg = workspace_path.display().to_string();
+        let _ = self
+            .run_json(&[
+                "--json",
+                "workspace",
+                "goto",
+                "--workspace",
+                &workspace_arg,
+                "--revision",
+                sha,
             ])
             .await?;
         Ok(())

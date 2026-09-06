@@ -79,8 +79,10 @@ use boss_protocol::ExecutionKind;
 use boss_protocol::{self, CreateAttentionItemInput, TaskKind};
 
 mod classify;
+mod deferred_review_admission;
 mod merge_queue;
 mod metrics;
+mod post_merge_review;
 mod probe;
 mod schedule;
 mod sweep;
@@ -88,6 +90,8 @@ mod sweep;
 pub use classify::*;
 pub use merge_queue::*;
 pub use metrics::*;
+#[cfg(test)]
+pub(crate) use post_merge_review::maybe_trigger_post_merge_review;
 pub use probe::*;
 pub use schedule::*;
 pub use sweep::*;

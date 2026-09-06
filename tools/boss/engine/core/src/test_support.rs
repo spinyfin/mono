@@ -499,12 +499,13 @@ impl ExecutionRunner for AlwaysSucceedsRunner {
 /// Overrides are written as ordinary `async fn`s with their real bodies
 /// and **must appear in the trait's declaration order** (the order the
 /// arms below enumerate: `ensure_repo`, `lease_workspace`, `create_change`,
-/// `goto_workspace`, `rebase_workspace`, `rebase_workspace_no_push`,
-/// `push_resolution`, `release_workspace`, `workspace_status`,
-/// `heartbeat_lease`, `force_release_lease`, `list_workspaces`, `list_repos`).
-/// `rebase_workspace`, `rebase_workspace_no_push`, and `push_resolution` all
-/// have trait defaults (erroring), so leaving any unlisted keeps that
-/// default rather than an
+/// `goto_workspace`, `goto_workspace_revision`, `rebase_workspace`,
+/// `rebase_workspace_no_push`, `push_resolution`, `release_workspace`,
+/// `workspace_status`, `heartbeat_lease`, `force_release_lease`,
+/// `list_workspaces`, `list_repos`).
+/// `goto_workspace_revision`, `rebase_workspace`, `rebase_workspace_no_push`,
+/// and `push_resolution` all have trait defaults (erroring), so leaving any
+/// unlisted keeps that default rather than an
 /// `unimplemented!()`. The macro emits the `#[async_trait]` impl for you.
 ///
 /// ```ignore
@@ -553,12 +554,23 @@ macro_rules! stub_cube_client {
 
     // ── goto_workspace ──────────────────────────────────────────────────────
     (@munch $ty:ty [$($acc:tt)*] @goto_workspace async fn goto_workspace $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn goto_workspace $a -> $r $b] @rebase_workspace $($rest)*);
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn goto_workspace $a -> $r $b] @goto_workspace_revision $($rest)*);
     };
     (@munch $ty:ty [$($acc:tt)*] @goto_workspace $($rest:tt)*) => {
         $crate::stub_cube_client!(@munch $ty [$($acc)*
             async fn goto_workspace(&self, _workspace_path: &::std::path::Path, _pr: u64) -> ::anyhow::Result<()> { ::core::unimplemented!() }
-        ] @rebase_workspace $($rest)*);
+        ] @goto_workspace_revision $($rest)*);
+    };
+
+    // ── goto_workspace_revision ──────────────────────────────────────────────
+    // Has a trait default (erroring) — same "unlisted keeps the default"
+    // convention as rebase_workspace, since most doubles never exercise the
+    // post-merge-review positioning path.
+    (@munch $ty:ty [$($acc:tt)*] @goto_workspace_revision async fn goto_workspace_revision $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn goto_workspace_revision $a -> $r $b] @rebase_workspace $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @goto_workspace_revision $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)*] @rebase_workspace $($rest)*);
     };
 
     // ── rebase_workspace ────────────────────────────────────────────────────

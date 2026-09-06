@@ -295,13 +295,21 @@ pub enum WorkspaceCommand {
         workspace: Option<String>,
         /// Branch bookmark to position on (e.g. `boss/exec_18b7d99_2af`).
         /// A trailing `@<remote>` suffix is accepted and stripped.
-        /// Mutually exclusive with `--pr`.
-        #[arg(long, conflicts_with = "pr")]
+        /// Mutually exclusive with `--pr` and `--revision`.
+        #[arg(long, conflicts_with_all = ["pr", "revision"])]
         bookmark: Option<String>,
         /// Position on the head of PR N. Resolves the head branch from
-        /// GitHub (`gh pr view`). Mutually exclusive with `--bookmark`.
-        #[arg(long, conflicts_with = "bookmark")]
+        /// GitHub (`gh pr view`). Mutually exclusive with `--bookmark` and
+        /// `--revision`. Refuses a MERGED or CLOSED PR — use `--revision`
+        /// with the merge commit SHA to position on landed history instead.
+        #[arg(long, conflicts_with_all = ["bookmark", "revision"])]
         pr: Option<u64>,
+        /// Position on an arbitrary commit SHA (e.g. a merge commit), rather
+        /// than a PR branch head. Skips PR-state resolution entirely, so it
+        /// works on a MERGED PR's merge commit. Mutually exclusive with
+        /// `--bookmark` and `--pr`.
+        #[arg(long, conflicts_with_all = ["bookmark", "pr"])]
+        revision: Option<String>,
     },
     /// Rebase the current workspace's boss branch onto the repo's integration branch.
     ///
@@ -1218,11 +1226,13 @@ mod tests {
                         workspace,
                         bookmark,
                         pr,
+                        revision,
                     },
             } => {
                 assert!(workspace.is_none());
                 assert!(bookmark.is_none());
                 assert_eq!(pr, Some(1467));
+                assert!(revision.is_none());
             }
             _ => panic!("expected workspace goto command"),
         }
@@ -1238,11 +1248,13 @@ mod tests {
                         workspace,
                         bookmark,
                         pr,
+                        revision,
                     },
             } => {
                 assert!(workspace.is_none());
                 assert_eq!(bookmark.as_deref(), Some("boss/exec_abc_01"));
                 assert!(pr.is_none());
+                assert!(revision.is_none());
             }
             _ => panic!("expected workspace goto command"),
         }
@@ -1266,11 +1278,13 @@ mod tests {
                         workspace,
                         bookmark,
                         pr,
+                        revision,
                     },
             } => {
                 assert_eq!(workspace.as_deref(), Some("/ws/mono-agent-007"));
                 assert!(bookmark.is_none());
                 assert_eq!(pr, Some(42));
+                assert!(revision.is_none());
             }
             _ => panic!("expected workspace goto command"),
         }
@@ -1280,6 +1294,48 @@ mod tests {
     fn workspace_goto_rejects_both_bookmark_and_pr() {
         let result = Cli::try_parse_from(["cube", "workspace", "goto", "--bookmark", "boss/exec_abc", "--pr", "42"]);
         assert!(result.is_err(), "--bookmark and --pr must be mutually exclusive");
+    }
+
+    #[test]
+    fn workspace_goto_accepts_revision_flag() {
+        let cli = Cli::parse_from(["cube", "workspace", "goto", "--revision", "abc123def456"]);
+        match cli.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::Goto {
+                        workspace,
+                        bookmark,
+                        pr,
+                        revision,
+                    },
+            } => {
+                assert!(workspace.is_none());
+                assert!(bookmark.is_none());
+                assert!(pr.is_none());
+                assert_eq!(revision.as_deref(), Some("abc123def456"));
+            }
+            _ => panic!("expected workspace goto command"),
+        }
+    }
+
+    #[test]
+    fn workspace_goto_rejects_revision_with_pr() {
+        let result = Cli::try_parse_from(["cube", "workspace", "goto", "--revision", "abc123", "--pr", "42"]);
+        assert!(result.is_err(), "--revision and --pr must be mutually exclusive");
+    }
+
+    #[test]
+    fn workspace_goto_rejects_revision_with_bookmark() {
+        let result = Cli::try_parse_from([
+            "cube",
+            "workspace",
+            "goto",
+            "--revision",
+            "abc123",
+            "--bookmark",
+            "boss/exec_abc",
+        ]);
+        assert!(result.is_err(), "--revision and --bookmark must be mutually exclusive");
     }
 
     #[test]

@@ -11,12 +11,9 @@ fn remote_settings_drop_data_dir_sandbox_but_keep_hooks_and_static_denies() {
         workspace_path: PathBuf::from("/Users/zak/Documents/dev/workspaces/mono-agent-003"),
         events_socket_path: PathBuf::from("/tmp/boss-events-exec_remote_1.sock"),
         boss_event_path: PathBuf::from("boss-event"),
-        draft_pr_mode: false,
         execution_kind: "task_implementation".into(),
         task_kind: Some("task".into()),
-        worker_kind: WorkerKind::Standard,
-        automation_outcome_proposals_seam_enabled: false,
-        is_review_supervisor: false,
+        ..sample_input()
     };
     let parsed: serde_json::Value = serde_json::from_str(&render_remote_settings_json(&input, &ClaudeDriver)).unwrap();
 

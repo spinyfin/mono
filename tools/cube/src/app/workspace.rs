@@ -2101,7 +2101,8 @@ pub(super) fn run_workspace(
             workspace,
             bookmark,
             pr,
-        } => workspace_goto(database_path, runner, workspace, bookmark, pr),
+            revision,
+        } => workspace_goto(database_path, runner, workspace, bookmark, pr, revision),
         WorkspaceCommand::Rebase { bookmark, pr, no_push } => {
             workspace_rebase(&mut store, database_path, runner, bookmark, pr, no_push)
         }

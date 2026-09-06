@@ -80,7 +80,33 @@ fn run_goto(runner: &FakeRunner, bookmark: Option<&str>, pr: Option<u64>) -> Res
         Some(GOTO_CWD.to_string()),
         bookmark.map(str::to_string),
         pr,
+        None,
     )
+}
+
+fn run_goto_revision(runner: &FakeRunner, revision: &str) -> Result<crate::app::errors::RunResult> {
+    workspace_goto(
+        None,
+        runner,
+        Some(GOTO_CWD.to_string()),
+        None,
+        None,
+        Some(revision.to_string()),
+    )
+}
+
+fn goto_revision_positioned_cmd(sha: &str, found_sha: &str) -> ExpectedCommand {
+    let revset = format!("parents(@) & {sha}");
+    ExpectedCommand::ok(
+        goto_cwd(),
+        "jj",
+        &["log", "-r", &revset, "--no-graph", "-T", "commit_id"],
+        found_sha,
+    )
+}
+
+fn goto_revision_new_cmd(sha: &str) -> ExpectedCommand {
+    ExpectedCommand::ok(goto_cwd(), "jj", &["new", sha], "")
 }
 
 #[test]
@@ -173,4 +199,45 @@ fn goto_requires_bookmark_or_pr() {
     let err = run_goto(&runner, None, None).expect_err("requires arg");
     let msg = format!("{err}");
     assert!(msg.contains("--bookmark") || msg.contains("--pr"), "{msg}");
+}
+
+#[test]
+fn goto_revision_not_yet_positioned_creates_new_commit() {
+    // Regression coverage: the probe must test `parents(@) & {sha}`, not
+    // ancestry (`{sha} & ::@`). A merge SHA on the default branch is an
+    // ancestor of `@` in almost any workspace whose `@` descends from a
+    // `main` that already contains the merge — but `@` is not actually
+    // positioned there. `parents(@) & {sha}` must come back empty in that
+    // case so `jj new` still runs, even though the old ancestor revset
+    // would have reported `already_positioned: true` here. The assertion
+    // below on the probe's revset argument (via `goto_revision_positioned_cmd`
+    // building `parents(@) & {sha}`, which `FakeRunner` requires an exact
+    // match against) is what actually pins this down — the ancestor revset
+    // cannot be reintroduced without this test failing.
+    let sha = "merge-sha-1";
+    let cmds = vec![
+        goto_remote_list_cmd(),
+        goto_fetch_cmd(),
+        goto_revision_positioned_cmd(sha, ""), // not yet positioned
+        goto_revision_new_cmd(sha),
+    ];
+    let runner = FakeRunner::new(cmds);
+    let result = run_goto_revision(&runner, sha).expect("revision goto succeeds");
+    runner.assert_exhausted();
+    assert_eq!(result.payload["revision"], sha);
+    assert_eq!(result.payload["already_positioned"], false);
+}
+
+#[test]
+fn goto_revision_already_positioned_skips_new() {
+    let sha = "merge-sha-2";
+    let cmds = vec![
+        goto_remote_list_cmd(),
+        goto_fetch_cmd(),
+        goto_revision_positioned_cmd(sha, sha), // already positioned
+    ];
+    let runner = FakeRunner::new(cmds);
+    let result = run_goto_revision(&runner, sha).expect("idempotent revision goto");
+    runner.assert_exhausted();
+    assert_eq!(result.payload["already_positioned"], true);
 }

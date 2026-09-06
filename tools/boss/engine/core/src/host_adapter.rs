@@ -117,6 +117,22 @@ pub trait HostAdapter: Send + Sync {
     /// no-op when `@` is already positioned on the PR branch head.
     async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()>;
 
+    /// Position the working copy in `workspace_path` as a fresh editable
+    /// child commit atop an arbitrary commit `sha` (e.g. a post-merge
+    /// review's merge commit). Unlike [`Self::goto_workspace`], this never
+    /// resolves or checks PR state, so it is the only entry point that
+    /// works once a PR has merged or closed. Delegates to `cube workspace
+    /// goto --workspace <path> --revision <sha>`. Idempotent.
+    ///
+    /// Default errors so most test doubles need no change; only the real
+    /// adapters below provide it.
+    async fn goto_workspace_revision(&self, workspace_path: &Path, sha: &str) -> Result<()> {
+        let _ = (workspace_path, sha);
+        Err(anyhow::anyhow!(
+            "goto_workspace_revision is not supported by this adapter"
+        ))
+    }
+
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus>;
 
     async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>>;
@@ -328,6 +344,10 @@ impl HostAdapter for LocalHostAdapter {
 
     async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()> {
         self.cube_client.goto_workspace(workspace_path, pr).await
+    }
+
+    async fn goto_workspace_revision(&self, workspace_path: &Path, sha: &str) -> Result<()> {
+        self.cube_client.goto_workspace_revision(workspace_path, sha).await
     }
 
     async fn release_workspace(&self, lease_id: &str) -> Result<()> {
@@ -716,6 +736,22 @@ impl HostAdapter for SshHostAdapter {
         Ok(())
     }
 
+    async fn goto_workspace_revision(&self, workspace_path: &Path, sha: &str) -> Result<()> {
+        let workspace_arg = workspace_path.display().to_string();
+        let _ = self
+            .run_cube_json(&[
+                "--json",
+                "workspace",
+                "goto",
+                "--workspace",
+                workspace_arg.as_str(),
+                "--revision",
+                sha,
+            ])
+            .await?;
+        Ok(())
+    }
+
     async fn release_workspace(&self, lease_id: &str) -> Result<()> {
         crate::cube_commands::release_workspace(self, lease_id).await
     }
@@ -878,10 +914,10 @@ impl HostAdapter for SshHostAdapter {
         //    mirroring the local runner.
         let remote_socket = remote_events_socket_path(&run_id);
         // Mirrors the local pane-spawn path's own lookup: only a review
-        // batch's Supervisor-role member gets the supervisor CLAUDE.md.
-        let is_review_supervisor = execution.kind == boss_protocol::ExecutionKind::PrReview
-            && self
-                .work_db
+        // batch's Supervisor-role member gets the supervisor CLAUDE.md, and
+        // only a PostMergeReviewer-role member gets the post-merge one.
+        let review_batch_member_role = if execution.kind == boss_protocol::ExecutionKind::PrReview {
+            self.work_db
                 .review_batch_member_for_execution(&execution.id)
                 .map_err(|error| {
                     anyhow::anyhow!(
@@ -889,27 +925,34 @@ impl HostAdapter for SshHostAdapter {
                         execution.id
                     )
                 })?
-                .is_some_and(|member| member.role == boss_protocol::ReviewBatchMemberRole::Supervisor);
-        let settings_input = WorkerSetupInput {
-            run_id: run_id.clone(),
-            lease_id: lease_id.clone(),
-            workspace_path: PathBuf::from(&workspace),
-            events_socket_path: PathBuf::from(&remote_socket),
-            boss_event_path: PathBuf::from(REMOTE_BOSS_EVENT_BIN),
-            draft_pr_mode: false,
-            execution_kind: execution.kind.as_str().to_owned(),
-            task_kind: work_item_task_kind(work_item).map(str::to_owned),
+                .map(|member| member.role)
+        } else {
+            None
+        };
+        let is_review_supervisor = review_batch_member_role == Some(boss_protocol::ReviewBatchMemberRole::Supervisor);
+        let is_post_merge_reviewer =
+            review_batch_member_role == Some(boss_protocol::ReviewBatchMemberRole::PostMergeReviewer);
+        // Deliberately use the builder: forwarding a new setting here is one
+        // explicit edit, instead of requiring every WorkerSetupInput caller to change.
+        let settings_input = WorkerSetupInput::builder()
+            .run_id(run_id.clone())
+            .lease_id(lease_id.clone())
+            .workspace_path(PathBuf::from(&workspace))
+            .events_socket_path(PathBuf::from(&remote_socket))
+            .boss_event_path(PathBuf::from(REMOTE_BOSS_EVENT_BIN))
+            .execution_kind(execution.kind.as_str().to_owned())
+            .maybe_task_kind(work_item_task_kind(work_item).map(str::to_owned))
             // Derive the restricted posture the same way the local path does,
             // so a reviewer/triage/answer-agent dispatched remotely still gets
             // its reduced surface instead of silently becoming Standard.
-            worker_kind: crate::worker_setup::worker_kind_for_execution(&execution.kind),
-            is_review_supervisor,
+            .worker_kind(crate::worker_setup::worker_kind_for_execution(&execution.kind))
+            .is_review_supervisor(is_review_supervisor)
+            .is_post_merge_reviewer(is_post_merge_reviewer)
             // Mirrors `WorkerSpawnOpts` above: a remotely dispatched triage
             // worker always gets the legacy marker-only CLAUDE.md, since
             // SshHostAdapter has no FeatureFlagsStore to read
             // `automation_outcome_proposals_seam` from.
-            automation_outcome_proposals_seam_enabled: false,
-        };
+            .build();
         // Resolve the same driver `compose_worker_spawn` already validated
         // against the registry — settings wiring (ProgressObservation +
         // ToolUseInterception) must come from that driver, not a hardcoded
@@ -1327,6 +1370,10 @@ impl CubeClient for HostAdapterCubeClient {
         self.adapter.goto_workspace(workspace_path, pr).await
     }
 
+    async fn goto_workspace_revision(&self, workspace_path: &Path, sha: &str) -> Result<()> {
+        self.adapter.goto_workspace_revision(workspace_path, sha).await
+    }
+
     async fn release_workspace(&self, lease_id: &str) -> Result<()> {
         self.adapter.release_workspace(lease_id).await
     }
@@ -1557,19 +1604,14 @@ mod tests {
     /// A `WorkerSetupInput` shaped like the one the remote spawn builds.
     /// Only the fields `progress_observation_wiring` reads matter here.
     fn remote_settings_input() -> WorkerSetupInput {
-        WorkerSetupInput {
-            run_id: "exec_1".to_owned(),
-            lease_id: "lease-1".to_owned(),
-            workspace_path: PathBuf::from("/remote/ws"),
-            events_socket_path: PathBuf::from("/tmp/boss-events-exec_1.sock"),
-            boss_event_path: PathBuf::from(REMOTE_BOSS_EVENT_BIN),
-            draft_pr_mode: false,
-            execution_kind: "chore_implementation".to_owned(),
-            task_kind: None,
-            worker_kind: crate::worker_setup::WorkerKind::Standard,
-            automation_outcome_proposals_seam_enabled: false,
-            is_review_supervisor: false,
-        }
+        WorkerSetupInput::builder()
+            .run_id("exec_1")
+            .lease_id("lease-1")
+            .workspace_path(PathBuf::from("/remote/ws"))
+            .events_socket_path(PathBuf::from("/tmp/boss-events-exec_1.sock"))
+            .boss_event_path(PathBuf::from(REMOTE_BOSS_EVENT_BIN))
+            .execution_kind("chore_implementation")
+            .build()
     }
 
     /// A driver whose hooks land in the worker settings file is exactly what

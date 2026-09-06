@@ -306,20 +306,22 @@ fn advance_review_batch_quorum_best_effort(
     }
 }
 
-/// Stage the supervisor's consolidated verdict for a batch. Verifies the
-/// submitting execution owns the batch's supervisor member, that the
-/// verdict's identity matches the persisted batch, then marks that member
-/// reported and hands off to [`try_advance_review_batch_quorum_in_tx`] to
-/// move the batch to `applying`. The proposal itself stays `proposed`
-/// until [`super::review_verdict_apply`] records the durable batch verdict
-/// and its clean/remediation result — application probes GitHub and may
-/// create a work item, so it must not run inside the submission
-/// transaction.
+/// Stage a batch's verdict — the pre-merge supervisor's consolidated
+/// verdict, or a post-merge batch's sole reviewer's own verdict. Verifies
+/// the submitting execution owns the role entitled to submit one for this
+/// batch's phase, that the verdict's identity matches the persisted batch,
+/// then marks that member reported and hands off to
+/// [`try_advance_review_batch_quorum_in_tx`] to move the batch to
+/// `applying`. The proposal itself stays `proposed` until
+/// [`super::review_verdict_apply`] records the durable batch verdict and
+/// its clean/remediation result — application probes GitHub and may create
+/// a work item, so it must not run inside the submission transaction.
 ///
-/// A resubmission from the SAME supervisor member that already staged
-/// this exact batch (`existing_verdict == final_verdict_proposal_id`) is
-/// accepted as a correction rather than rejected while the batch is still
-/// `supervising` or `applying` (the prior proposal is still undecided):
+/// A resubmission from the SAME member that already staged this exact
+/// batch (`existing_verdict == final_verdict_proposal_id`) is accepted as a
+/// correction rather than rejected while the batch is still awaiting one
+/// (`supervising` for a supervisor, `collecting` for a post-merge reviewer)
+/// or `applying` (the prior proposal is still undecided):
 /// [`supersede_verdict_proposal`] marks the prior proposal superseded and
 /// this call re-points the member and the batch's
 /// `final_verdict_proposal_id` at the new one. Once the reconciler has
@@ -377,24 +379,36 @@ fn apply_review_verdict(
         )));
     };
     let role: ReviewBatchMemberRole = role.parse().map_err(anyhow::Error::msg)?;
-    if role != ReviewBatchMemberRole::Supervisor {
-        return Ok(ApplyDecision::Rejected(format!(
-            "review batch member `{member_id}` is a `{role}`, not the batch's supervisor; only the \
-             supervisor member may submit a review-verdict",
-        )));
-    }
+    // A pre-merge batch's verdict comes from its consolidating supervisor,
+    // reached once two-of-three leaves have reported (`supervising`). A
+    // post-merge batch has no leaf/supervisor split — its sole
+    // `PostMergeReviewer` member submits the verdict directly while the
+    // batch is still `collecting` (see `try_advance_review_batch_quorum_in_tx`'s
+    // `Collecting`-and-`PostMerge` arm, which reads this call's staged
+    // `report_proposal_id` straight off that member instead of through an
+    // intermediate supervisor dispatch).
+    let awaiting_status = match role {
+        ReviewBatchMemberRole::Supervisor => ReviewBatchStatus::Supervising,
+        ReviewBatchMemberRole::PostMergeReviewer => ReviewBatchStatus::Collecting,
+        _ => {
+            return Ok(ApplyDecision::Rejected(format!(
+                "review batch member `{member_id}` is a `{role}`, which never submits a review-verdict \
+                 directly; only the batch's supervisor or a solo post-merge reviewer may",
+            )));
+        }
+    };
     // A correction: this exact member already staged this exact batch
     // with its previously accepted (still-undecided) verdict proposal.
     // Anything else — another member, a batch this member didn't stage, or
     // a batch the reconciler has already completed — falls through to the
-    // ordinary `supervising`-only rule below.
+    // ordinary awaiting-status-only rule below.
     let batch_awaiting_apply =
-        batch_status == ReviewBatchStatus::Supervising.as_str() || batch_status == ReviewBatchStatus::Applying.as_str();
+        batch_status == awaiting_status.as_str() || batch_status == ReviewBatchStatus::Applying.as_str();
     let is_own_undecided_verdict =
         batch_awaiting_apply && existing_verdict.is_some() && existing_verdict == final_verdict_proposal_id;
-    if batch_status != ReviewBatchStatus::Supervising.as_str() && !is_own_undecided_verdict {
+    if batch_status != awaiting_status.as_str() && !is_own_undecided_verdict {
         return Ok(ApplyDecision::Rejected(format!(
-            "review batch `{}` is `{batch_status}`, not `supervising`; a verdict can only be accepted \
+            "review batch `{}` is `{batch_status}`, not `{awaiting_status}`; a verdict can only be accepted \
              while the batch is awaiting one",
             payload.batch_id
         )));
@@ -513,11 +527,19 @@ fn supersede_other_undecided_review_verdicts(
 /// Every source role cited in the verdict must belong to a reported leaf of
 /// this batch. A supervisor may not invent a source the batch never
 /// accepted, including a missing role in a degraded two-of-three quorum.
+///
+/// Does not apply to a post-merge verdict: that batch has no leaf members to
+/// corroborate against — its sole reviewer's `sources` entry names the
+/// model that produced the finding, not a claim of independent corroboration
+/// from a separately-reported leaf.
 fn review_verdict_unknown_source_reason(
     tx: &Transaction<'_>,
     batch_id: &str,
     verdict: &boss_pr_review::SupervisorVerdict,
 ) -> Result<Option<String>> {
+    if verdict.phase == boss_protocol::ReviewBatchPhase::PostMerge {
+        return Ok(None);
+    }
     let mut statement = tx.prepare(
         "SELECT role FROM pr_review_batch_members
          WHERE batch_id = ?1 AND status = 'reported'

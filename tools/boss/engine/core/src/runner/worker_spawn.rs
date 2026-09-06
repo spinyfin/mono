@@ -887,6 +887,15 @@ pub(crate) async fn compose_worker_spawn(
                         &reviewer_repo_slug,
                     )
                 }
+                Some((ReviewBatchMemberRole::PostMergeReviewer, destination)) => {
+                    crate::pr_review::render_post_merge_reviewer_initial_prompt(
+                        task_name,
+                        task_description,
+                        destination,
+                        scope,
+                        &reviewer_repo_slug,
+                    )
+                }
                 Some((_, destination)) => crate::pr_review::render_batch_reviewer_initial_prompt(
                     task_name,
                     task_description,

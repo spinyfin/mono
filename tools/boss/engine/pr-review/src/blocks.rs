@@ -1,10 +1,15 @@
-//! Engine-flagged prompt blocks embedded verbatim in the reviewer prompt.
+//! Renderable prompt blocks shared across reviewer roles.
 //!
-//! Both blocks are pure `&[String] -> String` renderers over the *already
-//! scanned* hit lines the engine carries on [`crate::PrReviewContext`]. The
-//! deterministic scans that produce those lines live in the engine
-//! (`supersession_scan`, `boss_construct_scan`); only the reviewer-facing
-//! rendering lives here, next to the prompt it is interpolated into.
+//! [`render_supersession_flag_block`] and [`render_boss_construct_sweep_block`]
+//! are pure `&[String] -> String` renderers over the *already scanned* hit
+//! lines the engine carries on [`crate::PrReviewContext`]. The deterministic
+//! scans that produce those lines live in the engine (`supersession_scan`,
+//! `boss_construct_scan`); only the reviewer-facing rendering lives here,
+//! next to the prompt it is interpolated into.
+//!
+//! [`render_verdict_submission_block`] is unrelated to those scans: it
+//! renders the fixed instructions telling a reviewer/supervisor role how to
+//! submit its verdict for a given review batch.
 
 /// Render an authoritative reviewer-prompt block for a set of deterministic
 /// supersession flag lines (from the engine's `hit_lines` helper). Returns an empty string when
@@ -87,4 +92,39 @@ pub fn render_boss_construct_sweep_block(flag_lines: &[String]) -> String {
     }
     out.push('\n');
     out
+}
+
+/// Render the shared "Required output — CRITICAL" verdict-submission
+/// contract block embedded in both the supervisor's and the post-merge
+/// reviewer's initial prompt: the write-then-submit steps and the exact
+/// `boss propose review-verdict` invocation. Both roles submit the same
+/// [`crate::supervisor_types::SupervisorVerdict`] shape through the same
+/// command, so this text — including a future flag rename or a new
+/// required field in the write-then-submit contract — must never drift
+/// between the two prompts. The caller appends its own `Schema:` section
+/// immediately after, since the JSON schema itself differs per role.
+pub fn render_verdict_submission_block(batch_id: &str, body_path: &str) -> String {
+    format!(
+        "## Required output — CRITICAL\n\
+         \n\
+         You must submit exactly one structured verdict while this session is alive.\n\
+         \n\
+         1. Write the JSON object below to this exact engine-owned body file:\n\
+         \n\
+         `{body_path}`\n\
+         \n\
+         2. Submit it immediately with:\n\
+         \n\
+         ```sh\n\
+         boss propose review-verdict --batch-id {batch_id} --verdict-file \"{body_path}\"\n\
+         ```\n\
+         \n\
+         The command validates the verdict immediately. If it rejects the file, correct the\n\
+         reported field errors and submit again before ending your turn. Do not put the JSON\n\
+         in your final response: transcript recovery is intentionally unavailable for batch\n\
+         reviews. The one body-file write and this local `boss propose` call are permitted;\n\
+         do not edit repository files or publish anything.\n",
+        body_path = body_path,
+        batch_id = batch_id,
+    )
 }

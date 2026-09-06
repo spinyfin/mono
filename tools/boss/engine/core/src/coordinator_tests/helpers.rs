@@ -50,6 +50,12 @@ pub(super) struct FakeCubeClient {
     pub(super) ensure_calls: Mutex<Vec<String>>,
     pub(super) lease_calls: Mutex<Vec<LeaseCall>>,
     pub(super) goto_calls: Mutex<Vec<(String, u64)>>,
+    /// Recorded args for each `goto_workspace_revision` call:
+    /// `(workspace_path, sha)`. Distinct from `goto_calls` so a test can
+    /// assert a post-merge review batch member positions via `--revision`
+    /// and never through the PR-head path (which hard-errors on a merged
+    /// PR).
+    pub(super) goto_revision_calls: Mutex<Vec<(String, String)>>,
     pub(super) create_calls: Mutex<Vec<(String, String)>>,
     pub(super) release_calls: Mutex<Vec<String>>,
     pub(super) status_calls: Mutex<Vec<PathBuf>>,
@@ -235,6 +241,17 @@ crate::stub_cube_client! { FakeCubeClient {
             .push((workspace_path.display().to_string(), pr));
         if self.fail_goto {
             return Err(anyhow!("cube workspace goto failed"));
+        }
+        Ok(())
+    }
+
+    async fn goto_workspace_revision(&self, workspace_path: &std::path::Path, sha: &str) -> Result<()> {
+        self.goto_revision_calls
+            .lock()
+            .await
+            .push((workspace_path.display().to_string(), sha.to_owned()));
+        if self.fail_goto {
+            return Err(anyhow!("cube workspace goto --revision failed"));
         }
         Ok(())
     }
