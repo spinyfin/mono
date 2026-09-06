@@ -21,7 +21,8 @@
 //! 2. [`crate::live_worker_state::LiveWorkerStateRegistry::mark_stalled_spawns`]
 //!    — declines to promote, because grok omits
 //!    `Capability::AwaitingInputSignal`.
-//! 3. [`crate::spawn_ack_sweep`] pass 1 — declines, because `shell_pid > 0`.
+//! 3. [`crate::spawn_ack_sweep`] pass 1 — declines, because re-adoption did
+//!    not create a new pane awaiting acknowledgement.
 //!
 //! Then pass 2 fires and the resources are actually returned. The point of
 //! asserting steps 1–3 rather than only step 4 is that a future change
@@ -36,7 +37,8 @@ use boss_protocol::{WorkItemBinding, WorkerActivity};
 
 use crate::dispatch_events::RecordingDispatchEventSink;
 use crate::live_worker_state::{
-    DRIVER_START_GRACE_SECS, LiveSpawnRouting, LiveWorkerStateRegistry, STALLED_SPAWN_THRESHOLD_SECS,
+    DRIVER_START_GRACE_SECS, LiveSpawnRouting, LiveWorkerStateRegistry, ReadoptionEvidence,
+    STALLED_SPAWN_THRESHOLD_SECS,
 };
 use crate::spawn_ack_sweep::{DRIVER_START_ATTENTION_KIND, SPAWN_ACK_GRACE_SECS, SpawnAckReaper, run_one_pass};
 use crate::spawn_health::SpawnHealthTracker;
@@ -136,6 +138,23 @@ async fn a_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released()
         false,
         LiveSpawnRouting::none(),
     );
+    // Tmux adoption observes the same live login shell on its periodic
+    // convergence pass. That must not turn a shell-only observation into a
+    // permanent driver-start exemption.
+    live_states.register_readoption(
+        1,
+        &execution_id,
+        "grok-4.6",
+        shell_pid,
+        Some(WorkItemBinding {
+            work_item_id: work_item_id.clone(),
+            work_item_name: "chore whose driver never starts".to_owned(),
+            execution_id: execution_id.clone(),
+        }),
+        false,
+        LiveSpawnRouting::none(),
+        ReadoptionEvidence::LiveShellPid,
+    );
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
     live_states.set_spawn_time_for_test(1, now - (DRIVER_START_GRACE_SECS + 60));
 
@@ -179,7 +198,7 @@ async fn a_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released()
     );
 
     // ── Gate 3 + the fix: spawn_ack_sweep. ───────────────────────────────
-    // Pass 1 still declines (a pid was reported); pass 2 is what fires.
+    // Pass 1 still declines the re-adopted slot; pass 2 is what fires.
     let reaper = Arc::new(RecordingReaper {
         reaped: std::sync::Mutex::new(Vec::new()),
     });
@@ -199,8 +218,8 @@ async fn a_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released()
     .await;
 
     assert_eq!(
-        outcome.skipped.has_pid, 1,
-        "gate 3: pass 1 still declines a slot that reported a pid",
+        outcome.skipped.readopted, 1,
+        "gate 3: pass 1 still declines a slot this engine did not spawn",
     );
     assert_eq!(
         outcome.reaped, 0,

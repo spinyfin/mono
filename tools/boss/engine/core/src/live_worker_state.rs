@@ -229,8 +229,10 @@ struct SlotMeta {
     /// pid as evidence of a working worker is what the 2026-07-30
     /// incident walked through untouched.
     driver_signal_at: Option<i64>,
-    /// Whether this registration is one driver-start verification may
-    /// judge at all. See [`DriverStartExpectation`].
+    /// Whether this registration is a newly spawned pane or an adopted
+    /// existing worker. Used by the spawn-ack timeout, whose question only
+    /// applies to a pane this engine process attempted to create. See
+    /// [`DriverStartExpectation`].
     #[builder(default = DriverStartExpectation::EngineSpawned)]
     driver_start_expectation: DriverStartExpectation,
     /// Last **driver-originated** progress time, stamped only by
@@ -244,27 +246,23 @@ struct SlotMeta {
     semantic_tool_condition: SemanticToolCondition,
 }
 
-/// Whether the engine is entitled to expect a driver start for a slot's
-/// current registration.
+/// Whether the engine created this slot's current registration.
 ///
-/// [`LiveWorkerStateRegistry::unverified_driver_starts`] asks "did the
-/// driver binary Boss launched ever come up?". That question presupposes
-/// Boss launched one, and one registration path does not launch anything:
-/// re-adoption ([`crate::app::ServerState`]'s convergence for a worker
-/// that outlived the execution the engine wrongly terminalized) registers
-/// a slot for a process that has been running, unobserved, for however
-/// long. Its `spawned_at` is the moment the engine noticed, not the moment
-/// anything exec'd, so aging that stamp answers a question nobody asked.
+/// The spawn-ack timeout asks whether a pane this engine process launched
+/// ever acknowledged. That question presupposes Boss launched a pane; a
+/// re-adoption registers a worker that was already running before this
+/// engine process began tracking it. Its `spawned_at` is therefore the
+/// moment the engine noticed, not the moment anything exec'd.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverStartExpectation {
     /// The engine launched a driver for this registration and is owed
     /// proof it came up. The normal spawn path.
     EngineSpawned,
-    /// The registration re-adopted an already-running worker. Driver-start
-    /// verification does not apply; the convergence rules that already own
-    /// a running worker — `crate::dead_pid_sweep`, `crate::husk_pane_sweep`,
-    /// `crate::stale_worker_sweep` and `crate::orphan_sweep`'s redispatch
-    /// guard — judge it on evidence about the process that actually exists.
+    /// The registration re-adopted an already-running worker. The
+    /// spawn-ack timeout does not apply, because this engine process did not
+    /// launch a pane. Driver-start verification still requires a
+    /// driver-originated signal; a live login shell alone is not proof that
+    /// the driver ever ran.
     Readopted,
 }
 
@@ -504,16 +502,11 @@ impl LiveWorkerStateRegistry {
     /// plus the three things re-adoption must not get wrong:
     ///
     /// 1. The entry is marked [`DriverStartExpectation::Readopted`], so
-    ///    [`Self::unverified_driver_starts`] leaves it alone. Registration
-    ///    stamps `spawned_at` with the current time — correct for a spawn,
-    ///    a fiction for a re-adoption, where the process may have been
-    ///    running for hours. Aging that fiction against
-    ///    [`DRIVER_START_GRACE_SECS`] would report a healthy long-running
-    ///    worker as a driver that never started and reap it: pane torn
-    ///    down (which signals the recorded shell pid's process *group*),
-    ///    workspace torn down, cube lease force-released. That is the
-    ///    incident re-adoption exists to prevent, re-created by the check
-    ///    meant to prevent a different one.
+    ///    the spawn-ack timeout does not mistake this engine process for
+    ///    the pane's creator. Registration stamps `spawned_at` with the
+    ///    current time — correct for a spawn, a fiction for a re-adoption.
+    ///    Driver-start verification still applies after its ordinary grace
+    ///    window unless a real driver signal was observed for this run.
     /// 2. When the re-adoption was triggered by a worker hook
     ///    ([`ReadoptionEvidence::DriverHook`]) the driver signal is
     ///    recorded, because that hook *is* driver-originated proof and
@@ -621,12 +614,24 @@ impl LiveWorkerStateRegistry {
     /// the in-memory fields are newer than the checkpoint. Never writes
     /// `last_event_at` — that field is also stamped by engine inference, and
     /// seeding it would let `downgrade_stale_activity` coerce unknown
-    /// (`Spawning`) to idle once the restored stamp ages.
+    /// (`Spawning`) to idle once the restored stamp ages. The checkpoint is
+    /// itself durable proof of a driver-originated event, so it also restores
+    /// `driver_signal_at`; that preserves the driver-start exemption across
+    /// an engine restart without treating shell liveness as proof.
     pub fn seed_semantic_progress(&self, slot_id: u8, checkpoint: &SemanticProgressCheckpoint) {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         let Some(entry) = guard.get_mut(&slot_id) else {
             return;
         };
+        if entry.meta.driver_signal_at.is_none() {
+            // `progress_at` is written only at worker-event ingress. Prefer
+            // its original timestamp, but retain the proof even if a legacy
+            // row carries an unparsable timestamp.
+            entry.meta.driver_signal_at = Some(
+                boss_engine_utils::iso8601::parse_iso8601_to_epoch(&checkpoint.progress_at)
+                    .unwrap_or_else(boss_engine_utils::epoch_time::now_epoch_secs),
+            );
+        }
         if entry.state.last_event_at.is_some() {
             return;
         }
@@ -902,24 +907,15 @@ impl LiveWorkerStateRegistry {
     /// The result is that this check fires for every driver, with any
     /// capability set, in any activity, with or without a reported pid.
     ///
-    /// ## The one exemption, and why it is not a hole
+    /// ## Re-adoption preserves proof, not an exemption
     ///
-    /// A slot registered by [`Self::register_readoption`] —
-    /// [`DriverStartExpectation::Readopted`] — is skipped. That path
-    /// re-registers a worker that was **already running**, so its
-    /// `spawned_at` records when the engine noticed the process, not when
-    /// anything exec'd; a worker re-adopted after six hours of work would
-    /// otherwise be 300 s "silent" the instant it was re-adopted and be
-    /// reaped for a driver start that happened long before Boss lost
-    /// track of it. The exemption is narrow in the way that matters: it
-    /// turns off *this* check only, and a re-adopted worker remains fully
-    /// owned by the rules that judge a process on evidence about the
-    /// process — `crate::dead_pid_sweep`, `crate::husk_pane_sweep`,
-    /// `crate::stale_worker_sweep`, and `crate::orphan_sweep`'s redispatch
-    /// guard, which is itself one of the two triggers that produce a
-    /// re-adoption. A re-adoption triggered by a worker hook additionally
-    /// carries a real `driver_signal_at`, so it would be skipped by the
-    /// first check above regardless.
+    /// A re-adopted slot remains subject to this check. Its registration
+    /// timestamp starts a fresh grace window, during which durable semantic
+    /// progress is restored if the driver had signalled before an engine
+    /// restart. That checkpoint restores `driver_signal_at`, so a genuine
+    /// long-running worker remains protected. A re-adoption supported only
+    /// by a live login shell has no such proof and must time out: shell
+    /// liveness says nothing about whether the driver ever executed.
     ///
     /// A slot whose `spawned_at` is in the future is skipped as too
     /// recent, the same as any other in-window spawn.
@@ -929,9 +925,6 @@ impl LiveWorkerStateRegistry {
         let mut out = Vec::new();
         for (slot_id, entry) in guard.iter() {
             if entry.meta.driver_signal_at.is_some() {
-                continue;
-            }
-            if entry.meta.driver_start_expectation == DriverStartExpectation::Readopted {
                 continue;
             }
             if entry.meta.spawned_at > cutoff {
@@ -2716,12 +2709,11 @@ mod tests {
     }
 
     /// A worker re-adopted on a live shell pid alone has no driver-start
-    /// proof and never will — a worker parked at `waiting_human` emits no
-    /// further hook by definition. Aging its re-registration would reap a
-    /// live worker mid-work, which is the incident re-adoption exists to
-    /// prevent.
+    /// proof. The fresh re-adoption grace window gives durable progress a
+    /// chance to restore proof after restart; after that, the slot must be
+    /// reported rather than permanently exempted by the login shell.
     #[test]
-    fn a_readopted_slot_is_never_reported_as_a_never_started_driver() {
+    fn a_live_shell_readoption_is_reported_when_its_driver_never_signalled() {
         let reg = LiveWorkerStateRegistry::new();
         aged_readopted_slot(&reg, 1, "run-a", ReadoptionEvidence::LiveShellPid);
 
@@ -2732,10 +2724,9 @@ mod tests {
         );
 
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
-        assert!(
-            reg.unverified_driver_starts(now, DRIVER_START_GRACE_SECS).is_empty(),
-            "driver-start verification does not apply to a registration that spawned nothing",
-        );
+        let found = reg.unverified_driver_starts(now, DRIVER_START_GRACE_SECS);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].run_id, "run-a");
     }
 
     /// A hook arriving after the engine terminalized the run came from the
