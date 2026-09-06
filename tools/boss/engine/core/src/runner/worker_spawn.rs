@@ -427,6 +427,29 @@ fn resolve_batch_reviewer_spawn(
         .map_err(|error| anyhow::anyhow!("review batch effort/model resolution: {error}"))
 }
 
+/// Effort-level prompt addenda tell the worker to plan files it will
+/// touch and start editing. That framing is implementation-only.
+///
+/// Restricted worker kinds — [`crate::worker_setup::WorkerKind::Reviewer`],
+/// [`crate::worker_setup::WorkerKind::Triage`],
+/// [`crate::worker_setup::WorkerKind::AnswerAgent`] — are read-only or
+/// decision-only. Prepending the addendum would contradict their mandate
+/// (the observed failure: a reviewer prompt opened with "Begin with a
+/// written plan… Identify the files you expect to touch").
+///
+/// Effort resolution is unchanged: `SpawnConfig.prompt_addendum` still
+/// reflects the level. This is the single prepend gate, keyed off the
+/// same exhaustive [`crate::worker_setup::worker_kind_for_execution`]
+/// mapping that already classifies implementing vs restricted kinds.
+fn prompt_addendum_to_prepend(kind: &ExecutionKind, addendum: Option<&'static str>) -> Option<&'static str> {
+    match crate::worker_setup::worker_kind_for_execution(kind) {
+        crate::worker_setup::WorkerKind::Standard => addendum,
+        crate::worker_setup::WorkerKind::Reviewer
+        | crate::worker_setup::WorkerKind::Triage
+        | crate::worker_setup::WorkerKind::AnswerAgent => None,
+    }
+}
+
 /// Per-execution prompt + spawn-config composition shared by every
 /// worker transport.
 ///
@@ -1082,7 +1105,14 @@ pub(crate) async fn compose_worker_spawn(
     // BEFORE the existing prompt body"). The existing task /
     // design / conflict-resolution framing must stay byte-identical
     // when the addendum is `None`.
-    let prompt_text = match spawn_config.prompt_addendum {
+    //
+    // Implementation-only: the addendum tells the worker to plan files
+    // it will touch and start editing. Restricted kinds (reviewer,
+    // triage, answer-agent) are read-only or decision-only — prepending
+    // that framing contradicts their mandate. Effort resolution is
+    // unchanged (`spawn_config.prompt_addendum` still reflects the
+    // level); this is the single prepend gate.
+    let prompt_text = match prompt_addendum_to_prepend(&execution.kind, spawn_config.prompt_addendum) {
         Some(addendum) => format!("{}\n\n{}", addendum, prompt_text),
         None => prompt_text,
     };
@@ -1226,6 +1256,19 @@ mod reviewer_pool_policy_tests {
         assert_eq!(config.driver, "codex");
         assert_eq!(config.model, "gpt-5.6-terra");
         assert_eq!(config.effort_level, Some(boss_protocol::EffortLevel::Medium));
+        // Effort resolution still produces the medium addendum; the prepend
+        // gate (not the resolver) is what keeps it off a reviewer prompt.
+        assert!(
+            config
+                .prompt_addendum
+                .unwrap()
+                .starts_with("Sketch a brief plan before you start editing."),
+            "batch reviewer spawn must still resolve the medium addendum",
+        );
+        assert_eq!(
+            super::prompt_addendum_to_prepend(&boss_protocol::ExecutionKind::PrReview, config.prompt_addendum),
+            None,
+        );
     }
 }
 
@@ -1299,8 +1342,11 @@ mod compose_worker_spawn_tests {
     //! prompt rendered when the PR metadata fetch fails.
     use super::*;
     use crate::work::Task;
-    use boss_protocol::{ExecutionKind, ExecutionStatus, TaskKind, TaskStatus};
+    use boss_protocol::{EffortLevel, ExecutionKind, ExecutionStatus, TaskKind, TaskStatus};
     use tempfile::TempDir;
+
+    const MEDIUM_ADDENDUM: &str = "Sketch a brief plan before you start editing.";
+    const LARGE_ADDENDUM_PREFIX: &str = "Begin with a written plan";
 
     fn pr_review_execution() -> WorkExecution {
         WorkExecution::builder()
@@ -1350,6 +1396,30 @@ mod compose_worker_spawn_tests {
             }
             other => other,
         }
+    }
+
+    fn task_with_pr_and_effort(task_id: &str, pr_url: &str, effort: EffortLevel) -> WorkItem {
+        match task_with_pr(task_id, pr_url) {
+            WorkItem::Chore(mut task) => {
+                task.effort_level = Some(effort);
+                WorkItem::Chore(task)
+            }
+            other => other,
+        }
+    }
+
+    fn chore_with_effort(task_id: &str, effort: EffortLevel) -> WorkItem {
+        match task_without_pr(task_id) {
+            WorkItem::Chore(mut task) => {
+                task.effort_level = Some(effort);
+                WorkItem::Chore(task)
+            }
+            other => other,
+        }
+    }
+
+    fn prompt_carries_implementation_addendum(prompt: &str) -> bool {
+        prompt.starts_with(MEDIUM_ADDENDUM) || prompt.starts_with(LARGE_ADDENDUM_PREFIX)
     }
 
     fn open_memory_db() -> WorkDb {
@@ -1536,6 +1606,204 @@ mod compose_worker_spawn_tests {
             "reviewer prompt must not include the expected branch name directive:\n{}",
             composed.prompt_text,
         );
+    }
+
+    /// The effort addendum is implementation-only. Restricted kinds
+    /// (reviewer / triage / answer-agent) must never receive it, even
+    /// when spawn-config resolution still populates the field from the
+    /// effort level. Exhaustive over WorkerKind via
+    /// `worker_kind_for_execution`.
+    #[test]
+    fn prompt_addendum_is_prepended_only_for_implementing_kinds() {
+        let addendum = Some(MEDIUM_ADDENDUM);
+        for kind in [
+            ExecutionKind::PrReview,
+            ExecutionKind::AutomationTriage,
+            ExecutionKind::AnswerAgent,
+        ] {
+            assert_eq!(
+                prompt_addendum_to_prepend(&kind, addendum),
+                None,
+                "{kind:?} must not receive the implementation addendum",
+            );
+        }
+        for kind in [
+            ExecutionKind::ChoreImplementation,
+            ExecutionKind::CiRemediation,
+            ExecutionKind::ConflictResolution,
+            ExecutionKind::InvestigationImplementation,
+            ExecutionKind::ProductDesign,
+            ExecutionKind::ProjectDesign,
+            ExecutionKind::RevisionImplementation,
+            ExecutionKind::TaskImplementation,
+        ] {
+            assert_eq!(
+                prompt_addendum_to_prepend(&kind, addendum),
+                addendum,
+                "{kind:?} is an implementing kind and must keep the addendum",
+            );
+        }
+        assert_eq!(
+            prompt_addendum_to_prepend(&ExecutionKind::PrReview, None),
+            None,
+            "None stays None even for restricted kinds",
+        );
+    }
+
+    /// A reviewer-kind spawn must not receive the effort addendum at any
+    /// effort level. Medium/Large/Max still *resolve* an addendum (effort
+    /// mapping is unchanged); it just must not be prepended. After the
+    /// gate, the rendered prompt starts with the reviewer header.
+    #[tokio::test]
+    async fn pr_review_spawn_omits_effort_addendum_at_every_level() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let execution = pr_review_execution();
+        let pr_url = "https://github.com/org/repo/pull/42";
+
+        for level in EffortLevel::ALL {
+            let work_item = task_with_pr_and_effort("task-pr-1", pr_url, *level);
+            let composed = compose_worker_spawn(
+                &db,
+                "review-1",
+                &execution,
+                &work_item,
+                workspace.path(),
+                None,
+                WorkerSpawnOpts::default(),
+            )
+            .await
+            .unwrap();
+
+            match level {
+                EffortLevel::Trivial | EffortLevel::Small => {
+                    assert_eq!(
+                        composed.spawn_config.prompt_addendum, None,
+                        "{level:?}: trivial/small resolve no addendum",
+                    );
+                }
+                EffortLevel::Medium | EffortLevel::Large | EffortLevel::Max => {
+                    assert!(
+                        composed.spawn_config.prompt_addendum.is_some(),
+                        "{level:?}: effort resolution must still populate prompt_addendum",
+                    );
+                }
+            }
+            assert!(
+                composed.prompt_text.starts_with("# PR review"),
+                "{level:?}: reviewer prompt must start with the review header, got first line: {:?}",
+                composed.prompt_text.lines().next(),
+            );
+            assert!(
+                !prompt_carries_implementation_addendum(&composed.prompt_text),
+                "{level:?}: reviewer prompt must not prepend the implementation addendum:\n{}",
+                composed.prompt_text,
+            );
+            assert!(
+                !composed.prompt_text.contains(MEDIUM_ADDENDUM),
+                "{level:?}: reviewer prompt must not contain the medium addendum",
+            );
+            assert!(
+                !composed.prompt_text.contains(LARGE_ADDENDUM_PREFIX),
+                "{level:?}: reviewer prompt must not contain the large addendum",
+            );
+        }
+    }
+
+    /// An implementation worker at the same effort levels still receives
+    /// the addendum — the gate is kind-keyed, not a deletion of the
+    /// addendum itself.
+    #[tokio::test]
+    async fn implementation_spawn_still_prepends_effort_addendum() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let execution = chore_execution();
+
+        for (level, expected_prefix) in [
+            (EffortLevel::Medium, MEDIUM_ADDENDUM),
+            (EffortLevel::Large, LARGE_ADDENDUM_PREFIX),
+            (EffortLevel::Max, LARGE_ADDENDUM_PREFIX),
+        ] {
+            let work_item = chore_with_effort("task-chore-1", level);
+            let composed = compose_worker_spawn(
+                &db,
+                "worker-1",
+                &execution,
+                &work_item,
+                workspace.path(),
+                None,
+                WorkerSpawnOpts::default(),
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                composed.spawn_config.prompt_addendum.is_some(),
+                "{level:?}: implementation spawn must still resolve an addendum",
+            );
+            assert!(
+                composed.prompt_text.starts_with(expected_prefix),
+                "{level:?}: implementation prompt must start with the effort addendum, got first line: {:?}",
+                composed.prompt_text.lines().next(),
+            );
+        }
+    }
+
+    /// Triage and answer-agent sit in the same non-editing bucket as
+    /// reviewers. Even when the work-item row carries a medium/large
+    /// effort (so resolution populates `prompt_addendum`), the prepend
+    /// must not land.
+    #[tokio::test]
+    async fn triage_and_answer_agent_spawns_omit_effort_addendum() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let work_item = chore_with_effort("task-restricted-1", EffortLevel::Large);
+
+        for (kind, worker_id, exec_id, work_item_id) in [
+            (
+                ExecutionKind::AutomationTriage,
+                "worker-1",
+                "exec_triage_addendum_01",
+                "automation-missing",
+            ),
+            (
+                ExecutionKind::AnswerAgent,
+                "worker-1",
+                "exec_answer_addendum_01",
+                "comment-missing",
+            ),
+        ] {
+            let execution = WorkExecution::builder()
+                .id(exec_id)
+                .work_item_id(work_item_id)
+                .kind(kind.clone())
+                .status(ExecutionStatus::Running)
+                .repo_remote_url("git@github.com:org/repo.git")
+                .workspace_path("/tmp/workspace")
+                .created_at("2026-05-15T00:00:00Z")
+                .build();
+            let composed = compose_worker_spawn(
+                &db,
+                worker_id,
+                &execution,
+                &work_item,
+                workspace.path(),
+                None,
+                WorkerSpawnOpts::default(),
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                composed.spawn_config.prompt_addendum.is_some(),
+                "{kind:?}: resolution still populates the addendum from the row's large effort",
+            );
+            assert!(
+                !prompt_carries_implementation_addendum(&composed.prompt_text),
+                "{kind:?}: must not prepend the implementation addendum; first line: {:?}",
+                composed.prompt_text.lines().next(),
+            );
+        }
     }
 
     /// A `Product`-scoped execution picks up the product's
