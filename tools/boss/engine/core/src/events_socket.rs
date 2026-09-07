@@ -376,10 +376,8 @@ pub async fn handle_connection(
 /// Decode a fully-read hook payload into an [`IncomingHookEvent`],
 /// without touching the socket. Split out from [`handle_connection`] so
 /// every error path funnels through one place ([`reject_connection`])
-/// that writes the rejection reason back to the peer before the
-/// connection drops -- the bug this exists to fix was every one of
-/// these `?`-early-returns leaving the shim's `boss-event` process with
-/// nothing on the wire to distinguish "rejected" from "delivered fine".
+/// that reports the rejection reason back to the peer before the
+/// connection drops.
 fn decode_incoming_event(
     bytes: &[u8],
     registry: &DriverRegistry,

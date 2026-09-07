@@ -32,8 +32,10 @@
 //!    reopens once and resends.
 //! 3. **Drain on success.** Before sending the current event the shim
 //!    opportunistically drains any buffered events from previous
-//!    engine-down windows, oldest first. Drain stops on the first
-//!    failure; unsent events stay queued.
+//!    engine-down windows, oldest first. A permanently rejected event
+//!    is reported and discarded so it cannot block later events; a
+//!    transient failure stops the drain and leaves its unsent suffix
+//!    queued.
 //! 4. **Bounded buffer.** The buffer is capped at the most recent
 //!    [`MAX_BUFFERED_EVENTS`] events. A persistently-down engine can't
 //!    cause the buffer to grow unbounded.
@@ -370,8 +372,8 @@ fn retry_delays() -> Vec<Duration> {
 
 /// One connect attempt, no retry. Applies `write_timeout` so a
 /// subsequent `write_all` cannot block unbounded if the peer stalls.
-/// The shim never reads from this socket (it only writes and
-/// half-closes), so no read timeout is set here.
+/// `send_to_stream` sets a short read timeout after half-closing so it
+/// can observe an engine rejection notice.
 fn connect_once(path: &str, write_timeout: Duration) -> Result<UnixStream> {
     let stream = UnixStream::connect(path).with_context(|| format!("connecting to events socket at {path}"))?;
     // Best-effort: a platform that rejects SO_SNDTIMEO still delivers
@@ -452,32 +454,44 @@ fn read_rejection(stream: &mut UnixStream, deadline: Instant) -> Result<Option<S
     // its write side once it's done (success or rejection).
     let _ = stream.set_read_timeout(Some(timeout));
     let mut buf = Vec::new();
-    if let Err(err) = stream.read_to_end(&mut buf)
-        && !matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+    let read_error = stream
+        .read_to_end(&mut buf)
+        .err()
+        .filter(|err| !matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut));
+    if let Some(reason) = String::from_utf8_lossy(&buf)
+        .strip_prefix(REJECTION_PREFIX)
+        .map(|reason| reason.trim().to_owned())
     {
+        // A peer can deliver its rejection and then reset the
+        // connection. The bytes are authoritative, so do not let the
+        // trailing read error reclassify this as a transient failure.
+        return Ok(Some(reason));
+    }
+    if let Some(err) = read_error {
         return Err(err).context("reading engine response from events socket");
     }
-    if buf.is_empty() {
-        return Ok(None);
-    }
-    let text = String::from_utf8_lossy(&buf);
-    Ok(text
-        .strip_prefix(REJECTION_PREFIX)
-        .map(|reason| reason.trim().to_owned()))
+    Ok(None)
+}
+
+enum BufferedSendError {
+    Rejected(String),
+    Transient(anyhow::Error),
 }
 
 /// Send one buffered event in its own connection. Used by drain. No
 /// retry: a failure here means the engine just went down again and the
 /// remaining buffered events should stay on disk for next time. Also
 /// fails fast once `deadline` has passed, without attempting a connect.
-fn send_one(socket_path: &str, payload: &[u8], deadline: Instant) -> Result<()> {
+fn send_one(socket_path: &str, payload: &[u8], deadline: Instant) -> std::result::Result<(), BufferedSendError> {
     if budget_exhausted(deadline) {
-        return Err(anyhow!("shim wall-clock budget exhausted before send"));
+        return Err(BufferedSendError::Transient(anyhow!(
+            "shim wall-clock budget exhausted before send"
+        )));
     }
-    let stream = connect_once(socket_path, write_timeout_for(deadline))?;
-    match send_to_stream(stream, payload, deadline)? {
+    let stream = connect_once(socket_path, write_timeout_for(deadline)).map_err(BufferedSendError::Transient)?;
+    match send_to_stream(stream, payload, deadline).map_err(BufferedSendError::Transient)? {
         None => Ok(()),
-        Some(reason) => Err(anyhow!("engine rejected buffered hook event: {reason}")),
+        Some(reason) => Err(BufferedSendError::Rejected(reason)),
     }
 }
 
@@ -516,12 +530,13 @@ fn append_to_buffer(buffer_path: &Path, payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Read the buffer line by line and try to deliver each event. Stops
-/// at the first failure — including the shim's wall-clock budget
-/// running out — and rewrites the file with the unsent suffix (FIFO).
-/// Removes the file when fully drained. No-op when the buffer is
-/// absent. If another shim is already draining, returns successfully
-/// without waiting so that process can preserve FIFO order.
+/// Read the buffer line by line and try to deliver each event. A
+/// permanently rejected event is reported and discarded; a transient
+/// failure — including the shim's wall-clock budget running out — stops
+/// the drain and retains that event plus its FIFO suffix. Removes the
+/// file when every event was delivered or discarded. No-op when the
+/// buffer is absent. If another shim is already draining, returns
+/// successfully without waiting so that process can preserve FIFO order.
 fn drain_buffer(socket_path: &str, buffer_path: &Path, deadline: Instant) -> Result<()> {
     if !buffer_path.exists() {
         return Ok(());
@@ -539,29 +554,31 @@ fn drain_buffer(socket_path: &str, buffer_path: &Path, deadline: Instant) -> Res
     let _guard = LockGuard(&file);
 
     let lines = read_lines(&file)?;
-    let mut sent = 0usize;
     let mut drain_err: Option<anyhow::Error> = None;
-    for line in &lines {
+    let mut unsent_start = lines.len();
+    for (index, line) in lines.iter().enumerate() {
         if budget_exhausted(deadline) {
             drain_err = Some(anyhow!("shim wall-clock budget exhausted during buffer drain"));
+            unsent_start = index;
             break;
         }
         match send_one(socket_path, line, deadline) {
-            Ok(()) => sent += 1,
-            Err(err) => {
+            Ok(()) => {}
+            Err(BufferedSendError::Rejected(reason)) => {
+                eprintln!(
+                    "boss-event: discarding permanently rejected buffered hook event from {}: {reason}",
+                    buffer_path.display()
+                );
+            }
+            Err(BufferedSendError::Transient(err)) => {
                 drain_err = Some(err);
+                unsent_start = index;
                 break;
             }
         }
     }
 
-    if sent == lines.len() {
-        // All drained. Truncate the file to zero so a stale empty
-        // buffer file doesn't keep showing up in `.boss/`.
-        rewrite_lines(&file, &[])?;
-    } else if sent > 0 {
-        rewrite_lines(&file, &lines[sent..])?;
-    }
+    rewrite_lines(&file, &lines[unsent_start..])?;
 
     if let Some(err) = drain_err {
         return Err(err);
@@ -792,6 +809,36 @@ mod tests {
 
         let contents = std::fs::read(&buf).unwrap();
         assert_eq!(contents, original);
+    }
+
+    /// A permanent rejection must not poison the FIFO queue: discard the
+    /// rejected record and continue draining later records on fresh
+    /// connections.
+    #[test]
+    fn drain_discards_rejected_event_and_delivers_later_events() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let buf = dir.path().join(".boss/events-pending.jsonl");
+        std::fs::create_dir_all(buf.parent().unwrap()).unwrap();
+        std::fs::write(&buf, b"bad-event\ngood-event\n").unwrap();
+        let socket = dir.path().join("events.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut rejected, _) = listener.accept().unwrap();
+            let mut payload = Vec::new();
+            rejected.read_to_end(&mut payload).unwrap();
+            assert_eq!(payload, b"bad-event");
+            rejected.write_all(b"BOSS-EVENT-REJECTED: malformed event\n").unwrap();
+
+            let (mut accepted, _) = listener.accept().unwrap();
+            let mut payload = Vec::new();
+            accepted.read_to_end(&mut payload).unwrap();
+            payload
+        });
+
+        drain_buffer(socket.to_str().unwrap(), &buf, Instant::now() + Duration::from_secs(2)).unwrap();
+        assert_eq!(server.join().unwrap(), b"good-event");
+        assert_eq!(std::fs::read(&buf).unwrap(), b"");
     }
 
     #[test]
