@@ -19,8 +19,22 @@ use thiserror::Error;
 
 use crate::driver::{AgentDriver, DriverRegistry, TurnEnd};
 use crate::work::WorkDb;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+
+/// Marker line the engine writes back to the peer when it rejects a
+/// connection (malformed JSON, unrecognized hook shape, unresolved
+/// driver, ...), so `boss-event` can tell "the engine actively refused
+/// this event" apart from "delivered fine". The shim never reads
+/// anything on a successful connection -- it only looks for this
+/// prefix, best-effort, after it finishes writing and half-closes.
+///
+/// Deliberately duplicated (not shared via a crate dependency) in
+/// `tools/boss/event-shim/src/main.rs`'s `REJECTION_PREFIX`: the shim is
+/// intentionally a tiny, dependency-free binary with no link to the
+/// engine, so the two copies of this literal are the whole contract.
+/// Keep them byte-for-byte identical if either changes.
+const REJECTION_PREFIX: &str = "BOSS-EVENT-REJECTED: ";
 
 /// `level` for `getsockopt(SOL_LOCAL, LOCAL_PEERPID)` on macOS.
 #[cfg(target_os = "macos")]
@@ -345,8 +359,34 @@ pub async fn handle_connection(
     let peer_pid_value = peer_pid(&stream).ok();
     let mut stream = stream;
     let mut bytes = Vec::new();
-    stream.read_to_end(&mut bytes).await?;
-    let raw: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if let Err(err) = stream.read_to_end(&mut bytes).await {
+        let err = SocketError::from(err);
+        reject_connection(&mut stream, &err).await;
+        return Err(err);
+    }
+    match decode_incoming_event(&bytes, registry, work_db, peer_pid_value) {
+        Ok(incoming) => Ok(incoming),
+        Err(err) => {
+            reject_connection(&mut stream, &err).await;
+            Err(err)
+        }
+    }
+}
+
+/// Decode a fully-read hook payload into an [`IncomingHookEvent`],
+/// without touching the socket. Split out from [`handle_connection`] so
+/// every error path funnels through one place ([`reject_connection`])
+/// that writes the rejection reason back to the peer before the
+/// connection drops -- the bug this exists to fix was every one of
+/// these `?`-early-returns leaving the shim's `boss-event` process with
+/// nothing on the wire to distinguish "rejected" from "delivered fine".
+fn decode_incoming_event(
+    bytes: &[u8],
+    registry: &DriverRegistry,
+    work_db: &WorkDb,
+    peer_pid_value: Option<libc::pid_t>,
+) -> Result<IncomingHookEvent, SocketError> {
+    let raw: serde_json::Value = serde_json::from_slice(bytes)?;
     let payload_run_id = extract_run_id_from_payload(&raw);
     let run_id = if payload_run_id.is_none() {
         tracing::warn!("incoming hook event missing _boss_run_id field");
@@ -369,6 +409,23 @@ pub async fn handle_connection(
         transcript_path,
         peer_pid_value,
     ))
+}
+
+/// Write [`REJECTION_PREFIX`] plus `err`'s message back to `stream`
+/// before the connection is dropped. Best-effort: by the time this
+/// runs, the shim has already half-closed its write side and is
+/// (per its own bounded read) waiting briefly for exactly this, but if
+/// it has already given up and closed (a slow engine past the shim's
+/// wait window, or an old shim that never reads at all) the write here
+/// simply fails and is swallowed -- the caller already has the real
+/// `SocketError` to return and log.
+async fn reject_connection(stream: &mut UnixStream, err: &SocketError) {
+    let message = format!("{REJECTION_PREFIX}{err:#}\n");
+    if let Err(write_err) = stream.write_all(message.as_bytes()).await {
+        tracing::debug!(%write_err, "events socket: failed to write rejection notice back to shim");
+        return;
+    }
+    let _ = stream.shutdown().await;
 }
 
 /// Resolve the driver that governs `run_id`'s worker, deterministically.
@@ -1171,6 +1228,52 @@ mod tests {
             }
             other => panic!("expected UnresolvedDriver{{run_id: Some(..)}}, got {other:?}"),
         }
+    }
+
+    /// The bug this write-back exists to fix: a rejected connection must
+    /// not just get logged server-side — the peer (`boss-event`) has to
+    /// see something too, or it reports success for an event the engine
+    /// never actually accepted. This drives the connection the way the
+    /// shim does (write, half-close, then read for a response) and
+    /// asserts the [`REJECTION_PREFIX`] notice actually carries the
+    /// engine's own reason.
+    #[tokio::test]
+    async fn rejected_connection_writes_reason_back_to_the_peer() {
+        let (_db_dir, db) = crate::test_support::open_db();
+        let registry = DriverRegistry::default();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+
+        let path_owned = path.clone();
+        let client = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
+            stream
+                .write_all(
+                    br#"{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"_boss_run_id":"no-such-execution"}"#,
+                )
+                .unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).unwrap();
+            response
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let result = handle_connection(stream, &registry, &db).await;
+        let response = client.await.unwrap();
+
+        assert!(result.is_err(), "the connection must still be rejected");
+        let response = String::from_utf8(response).unwrap();
+        assert!(
+            response.starts_with(REJECTION_PREFIX),
+            "peer should see the rejection notice, got: {response:?}",
+        );
+        assert!(
+            response.contains("no execution/task row found for run_id"),
+            "peer should see the engine's actual reason, got: {response:?}",
+        );
     }
 
     /// Regression for the answer-agent strand: an `answer_agent` execution's

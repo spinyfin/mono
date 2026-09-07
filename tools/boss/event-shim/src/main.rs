@@ -50,6 +50,26 @@
 //! The engine derives the worker's lease via `LOCAL_PEERPID`
 //! on its side, so the shim doesn't need to embed the lease id, only
 //! the raw hook JSON.
+//!
+//! ## Exit codes and engine-side rejection
+//!
+//! Every refusal to deliver — a missing `BOSS_EVENTS_SOCKET`, empty
+//! stdin, or a delivery that failed and could not even be buffered —
+//! exits non-zero with a diagnostic on stderr naming what failed. The
+//! one case that exits zero despite not (yet) reaching the engine is a
+//! connect/write failure that *was* successfully queued to the on-disk
+//! buffer for later delivery — see "Resilience" above; that is a real,
+//! bounded mitigation, not a silent loss, and callers can distinguish it
+//! from an outright failure by the "buffering event for later delivery"
+//! message on stderr.
+//!
+//! A write succeeding is not the same as the engine accepting the
+//! event: after the half-close, [`read_rejection`] waits briefly for a
+//! [`REJECTION_PREFIX`] notice the engine writes back when it rejects a
+//! connection (malformed payload, unresolved driver, ...). That case
+//! exits non-zero with the engine's own reason and is never buffered —
+//! resending a payload the engine actively refused would just be
+//! refused again.
 
 use std::env;
 use std::fs::{File, OpenOptions};
@@ -94,6 +114,30 @@ const DEFAULT_RETRY_DELAYS_MS: &[u64] = &[200, 500, 1500, 3000, 5000];
 /// of this and whatever remains of [`SHIM_TOTAL_BUDGET`] — see
 /// `write_timeout_for`.
 const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Marker line the engine writes back on the socket when it rejects a
+/// connection (malformed JSON, unrecognized hook shape, unresolved
+/// driver, ...) rather than accepting it. A successful delivery never
+/// gets a response at all -- the engine just processes the event and
+/// drops the connection -- so any bytes at all arriving with this
+/// prefix mean the write succeeded but the event was never actually
+/// accepted.
+///
+/// Deliberately duplicated (not shared via a crate dependency) from
+/// `tools/boss/engine/core/src/events_socket.rs`'s `REJECTION_PREFIX`:
+/// this shim is intentionally a tiny, dependency-free binary with no
+/// link to the engine crate, so the two copies of this literal are the
+/// whole contract. Keep them byte-for-byte identical if either changes.
+const REJECTION_PREFIX: &str = "BOSS-EVENT-REJECTED: ";
+
+/// Upper bound on how long the shim waits, after finishing its write and
+/// half-closing, for the engine to write back a [`REJECTION_PREFIX`]
+/// notice. A successful connection is silent, so this only delays the
+/// happy path by however long it actually takes the kernel to notice the
+/// peer closed with nothing sent -- normally sub-millisecond. Bounded by
+/// whatever remains of [`SHIM_TOTAL_BUDGET`] the same way every other
+/// socket stage is.
+const REJECTION_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Total wall-clock budget for one shim invocation, covering the
 /// buffer drain, the current event's connect-retry-and-write, and the
@@ -194,8 +238,9 @@ fn run() -> Result<()> {
     // by `deadline`, which was stamped before the drain above — so the
     // total across drain + this send can never exceed SHIM_TOTAL_BUDGET.
     match connect_with_retry(&socket_path, deadline) {
-        Ok(stream) => match send_to_stream(stream, &payload_line) {
-            Ok(()) => Ok(()),
+        Ok(stream) => match send_to_stream(stream, &payload_line, deadline) {
+            Ok(None) => Ok(()),
+            Ok(Some(reason)) => reject_delivery(&socket_path, &reason),
             Err(_first_err) => {
                 // Mid-send failure: the engine may have bounced
                 // between connect and write. Reopen once and resend,
@@ -208,9 +253,10 @@ fn run() -> Result<()> {
                     buffer_or_lose(buffer_path.as_deref(), &payload_line)
                 } else {
                     match connect_once(&socket_path, write_timeout_for(deadline))
-                        .and_then(|s| send_to_stream(s, &payload_line))
+                        .and_then(|s| send_to_stream(s, &payload_line, deadline))
                     {
-                        Ok(()) => Ok(()),
+                        Ok(None) => Ok(()),
+                        Ok(Some(reason)) => reject_delivery(&socket_path, &reason),
                         Err(err) => {
                             eprintln!(
                                 "boss-event: events socket {socket_path} dropped mid-send and \
@@ -230,6 +276,19 @@ fn run() -> Result<()> {
             buffer_or_lose(buffer_path.as_deref(), &payload_line)
         }
     }
+}
+
+/// The engine actively rejected the connection (malformed payload,
+/// unresolved driver, ...) rather than failing to receive it at all.
+/// This is never transient in the way an unreachable socket is, so
+/// unlike the connect/write failure paths above, this does not buffer
+/// for a later retry -- resending the same payload would just be
+/// rejected again. Surfaces the engine's own reason on stderr and exits
+/// non-zero so the caller can tell "configured and delivered" apart
+/// from "configured, connected, but refused".
+fn reject_delivery(socket_path: &str, reason: &str) -> Result<()> {
+    eprintln!("boss-event: engine rejected the hook event over {socket_path}: {reason}");
+    Err(anyhow!("engine rejected hook event: {reason}"))
 }
 
 /// Wall time remaining until `deadline`, saturating at zero.
@@ -358,14 +417,53 @@ fn connect_with_retry(path: &str, deadline: Instant) -> Result<UnixStream> {
 /// peer that accepts the connection but never drains the socket can
 /// block `write_all` until the outer hook runner kills the process
 /// (up to 600s for an unscoped Grok `Stop` hook — which freezes the TUI).
-fn send_to_stream(mut stream: UnixStream, payload: &[u8]) -> Result<()> {
+///
+/// After the half-close, waits briefly for a [`REJECTION_PREFIX`] notice
+/// (see [`read_rejection`]) and returns it as `Ok(Some(reason))` when
+/// present. `Ok(None)` covers both a genuinely successful delivery and
+/// the (transient-failure) case where the wait window elapsed with
+/// nothing on the wire — the write itself already succeeded either way,
+/// so silence here is never treated as an error.
+fn send_to_stream(mut stream: UnixStream, payload: &[u8], deadline: Instant) -> Result<Option<String>> {
     stream
         .write_all(payload)
         .context("writing hook payload to events socket")?;
     stream
         .shutdown(std::net::Shutdown::Write)
         .context("shutting down write half of events socket")?;
-    Ok(())
+    read_rejection(&mut stream, deadline)
+}
+
+/// Wait, bounded by [`REJECTION_READ_TIMEOUT`] and whatever remains of
+/// `deadline`, for the engine to write a [`REJECTION_PREFIX`] notice back
+/// on `stream` before it closes. Returns `Ok(Some(reason))` when one
+/// arrives, `Ok(None)` on a clean EOF, a timed-out read (nothing arrived
+/// in the window), or an exhausted budget — none of those distinguish
+/// from a successful delivery, which is also silent. A real I/O error
+/// other than a timeout is still surfaced, since that means something
+/// went wrong reading a response the shim is entitled to expect.
+fn read_rejection(stream: &mut UnixStream, deadline: Instant) -> Result<Option<String>> {
+    let timeout = remaining(deadline).min(REJECTION_READ_TIMEOUT);
+    if timeout.is_zero() {
+        return Ok(None);
+    }
+    // Best-effort: a platform that rejects SO_RCVTIMEO just risks a
+    // blocking read, bounded in practice by the engine always closing
+    // its write side once it's done (success or rejection).
+    let _ = stream.set_read_timeout(Some(timeout));
+    let mut buf = Vec::new();
+    if let Err(err) = stream.read_to_end(&mut buf)
+        && !matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+    {
+        return Err(err).context("reading engine response from events socket");
+    }
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&buf);
+    Ok(text
+        .strip_prefix(REJECTION_PREFIX)
+        .map(|reason| reason.trim().to_owned()))
 }
 
 /// Send one buffered event in its own connection. Used by drain. No
@@ -377,7 +475,10 @@ fn send_one(socket_path: &str, payload: &[u8], deadline: Instant) -> Result<()> 
         return Err(anyhow!("shim wall-clock budget exhausted before send"));
     }
     let stream = connect_once(socket_path, write_timeout_for(deadline))?;
-    send_to_stream(stream, payload)
+    match send_to_stream(stream, payload, deadline)? {
+        None => Ok(()),
+        Some(reason) => Err(anyhow!("engine rejected buffered hook event: {reason}")),
+    }
 }
 
 /// Append `payload` as a new line to the workspace's event buffer.
@@ -745,7 +846,7 @@ mod tests {
 
         let payload = vec![0u8; 8 * 1024 * 1024];
         let start = Instant::now();
-        let result = send_to_stream(stream, &payload);
+        let result = send_to_stream(stream, &payload, Instant::now() + Duration::from_secs(30));
         let elapsed = start.elapsed();
 
         assert!(result.is_err(), "write to a stalled peer must time out, not succeed");
