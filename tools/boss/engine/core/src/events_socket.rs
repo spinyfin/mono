@@ -1111,6 +1111,132 @@ mod tests {
         }
     }
 
+    /// Regression for the grok review-batch leaves that emitted no decoded
+    /// hook events (2026-09-06): a fan-out batch's `grok` leaf is a
+    /// `pr_review` execution on a `review-N` slot. `get_execution_driver_slug`
+    /// resolved it through the review pool's fixed driver (`claude`), so this
+    /// connection — a byte-faithful copy of Grok's real `stop` hook payload
+    /// (`docs/investigations/grok-pretooluse-decision-vocabulary-artifacts/hook_payloads/Stop.sample.json`)
+    /// plus the `_boss_run_id` the shim splices in — failed
+    /// `ClaudeDriver::normalize_progress_event` with `MissingField("session_id")`
+    /// and was logged as `events socket: failed to handle connection`. The
+    /// `Stop` never reached the completion path and the pane ran on. It
+    /// must decode as a Grok `Stop` under the production registry.
+    #[tokio::test]
+    async fn grok_review_batch_leaf_stop_decodes_as_grok_not_the_review_pool_driver() {
+        use crate::work::{ReviewBatchCreateInput, ReviewBatchDispatch};
+        use boss_protocol::{
+            CreateRunInput, ReviewBatchMemberRole, ReviewBatchPhase, ReviewClassification, ReviewLanguageBucket,
+            ReviewProfile,
+        };
+
+        let (_db_dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_test_product(&db);
+        let cycle_root = crate::test_support::create_test_chore_manual(&db, &product.id, "review target");
+        let classification = ReviewClassification::builder()
+            .changed_files(vec!["tools/boss/engine/core/src/events_socket.rs".to_owned()])
+            .complexity_flags(vec![])
+            .has_production_code(true)
+            .metadata_missing(vec![])
+            .production_languages(vec![ReviewLanguageBucket::Rust])
+            .profile(ReviewProfile::Standard)
+            .subsystem_buckets(vec!["tools/boss/engine".to_owned()])
+            .additions(10)
+            .deletions(2)
+            .build();
+        let input = ReviewBatchCreateInput::builder()
+            .cycle_root_id(cycle_root.id.clone())
+            .base_sha("base-sha")
+            .classification(classification)
+            .phase(ReviewBatchPhase::PreMerge)
+            .pr_number(42)
+            .pr_url("https://github.com/example/repo/pull/42")
+            .target_sha("head-sha")
+            .build();
+        let executions = match db
+            .create_pre_merge_review_batch(input, "https://github.com/example/repo")
+            .unwrap()
+        {
+            ReviewBatchDispatch::Created { executions, .. } => executions,
+            other => panic!("expected a newly-created review batch, got {other:?}"),
+        };
+        let grok_leaf = executions
+            .iter()
+            .find(|execution| {
+                db.review_batch_member_for_execution(&execution.id)
+                    .unwrap()
+                    .is_some_and(|member| member.role == ReviewBatchMemberRole::GrokReviewer)
+            })
+            .expect("a fan-out batch always has a grok leaf");
+        let run = db
+            .create_run(CreateRunInput {
+                execution_id: grok_leaf.id.clone(),
+                agent_id: "review-pending".to_owned(),
+                status: Some("active".to_owned()),
+                error_text: None,
+                result_summary: None,
+                transcript_path: None,
+                artifacts_path: None,
+                started_at: Some("100".to_owned()),
+                finished_at: None,
+            })
+            .unwrap();
+        db.set_run_agent_id(&run.id, "review-3").unwrap();
+        let run_id = grok_leaf.id.clone();
+
+        let registry = DriverRegistry::default();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+
+        let payload = format!(
+            concat!(
+                r#"{{"hookEventName":"stop","sessionId":"0c4c0914-5e64-432c-90fa-dcdad9ff5957","#,
+                r#""cwd":"/private/tmp/grok-t02-vocab/cwd","workspaceRoot":"/private/tmp/grok-t02-vocab/cwd","#,
+                r#""timestamp":"2026-07-28T00:54:12.157117+00:00","#,
+                r#""transcriptPath":"/tmp/grok-t02-vocab/home/sessions/%2Fprivate%2Ftmp%2Fgrok-t02-vocab%2Fcwd/0c4c0914-5e64-432c-90fa-dcdad9ff5957/updates.jsonl","#,
+                r#""promptId":"54c84245-f157-43cf-8439-bdf624d1f965","permissionMode":"bypassPermissions","#,
+                r#""reason":"end_turn","stopHookActive":false,"lastAssistantMessage":"TOOLMAP_DONE","#,
+                r#""backgroundTasks":[],"sessionCrons":[],"_boss_run_id":"{run_id}"}}"#,
+            ),
+            run_id = run_id,
+        );
+        let path_owned = path.clone();
+        let client = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
+            stream.write_all(payload.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let result = handle_connection(stream, &registry, &db).await;
+        client.await.unwrap();
+
+        let incoming = match result {
+            Ok(incoming) => incoming,
+            Err(err) => {
+                panic!("a grok review-batch leaf's Stop must decode via GrokDriver, not be dropped as Claude: {err:?}")
+            }
+        };
+        assert_eq!(incoming.run_id.as_deref(), Some(run_id.as_str()));
+        assert!(
+            incoming.is_turn_boundary(),
+            "the leaf's Stop is the turn boundary the completion path hangs off"
+        );
+        match incoming.event {
+            WorkerEvent::Stop {
+                session_id,
+                stop_hook_active,
+                ..
+            } => {
+                assert_eq!(session_id, "0c4c0914-5e64-432c-90fa-dcdad9ff5957");
+                assert!(!stop_hook_active);
+            }
+            other => panic!("expected Stop, got {other:?}"),
+        }
+    }
+
     /// A connection whose payload carries no `_boss_run_id` at all must fail
     /// loudly rather than silently falling back to a guessed driver.
     #[tokio::test]

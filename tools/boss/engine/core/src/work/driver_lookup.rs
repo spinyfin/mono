@@ -31,17 +31,30 @@ impl WorkDb {
     /// [`crate::work::driver_allocation::decide_execution_driver`]'s durable
     /// row decision and home-pool handling:
     ///
-    /// 1. A claimed review/automation worker slot resolves to that pool's
+    /// 1. A review-batch member execution resolves to its member row's
+    ///    `requested_driver`. The batch's durable member policy — not the
+    ///    review pool's fixed driver — is what `compose_worker_spawn`
+    ///    launches a leaf on (`resolve_batch_reviewer_spawn`), so the
+    ///    `codex` and `grok` leaves of a fan-out batch run on a `review-N`
+    ///    slot whose pool policy says `claude`. Resolving them through the
+    ///    pool policy pointed the events-socket normaliser at the wrong
+    ///    dialect: every hook event a Grok leaf sent was rejected with
+    ///    `MissingField("session_id")` (its payload carries `sessionId`),
+    ///    the leaf never produced a decoded `Stop`, and its pane ran on
+    ///    after the review was delivered. The member row is written in the
+    ///    same transaction as the leaf's execution row, so it is present
+    ///    before any hook can arrive.
+    /// 2. A claimed review/automation worker slot resolves to that pool's
     ///    fixed driver via [`crate::coordinator::pool_dispatch_policy_for_worker_id`].
     ///    A claimed ordinary `worker-N` slot deliberately has no pool policy,
     ///    including work that spilled from automation, and therefore falls
     ///    through to its own driver resolution.
-    /// 2. Before a worker slot is claimed, `pr_review` and
+    /// 3. Before a worker slot is claimed, `pr_review` and
     ///    `automation_triage` resolve to their home pool's fixed driver.
-    /// 3. A live pin (`tasks.driver`, then `products.default_driver`) that
+    /// 4. A live pin (`tasks.driver`, then `products.default_driver`) that
     ///    clears the capability gate for this execution kind.
-    /// 4. A recorded traffic-allocation decision.
-    /// 5. [`boss_engine_effort::ENGINE_DEFAULT_DRIVER`] via
+    /// 5. A recorded traffic-allocation decision.
+    /// 6. [`boss_engine_effort::ENGINE_DEFAULT_DRIVER`] via
     ///    [`boss_engine_effort::resolve_driver`].
     ///
     /// Returns `Ok(None)` only when the execution row itself cannot be found,
@@ -58,6 +71,11 @@ impl WorkDb {
     /// An `automation_triage` execution binds to an automation id; the
     /// non-task path still returns the pool driver.
     pub fn get_execution_driver_slug(&self, execution_id: &str) -> Result<Option<String>> {
+        // Each `WorkDb` call below takes and releases the (non-reentrant)
+        // pooled connection on its own; none may run while another holds it.
+        if let Some(member) = self.review_batch_member_for_execution(execution_id)? {
+            return Ok(Some(member.requested_driver));
+        }
         let claimed_worker_id = self.latest_run_agent_id_for_execution(execution_id)?;
         if let Some(pool_driver) = claimed_worker_id
             .as_deref()
@@ -608,6 +626,158 @@ mod tests {
             db.get_execution_driver_slug(&execution.id).unwrap().as_deref(),
             Some("claude"),
             "pr_review must resolve the review-pool driver, not the producing row's codex pin",
+        );
+    }
+
+    /// Build a pre-merge fan-out batch and return its three leaf executions
+    /// paired with the driver each member row requested (claude, codex,
+    /// grok — `leaf_member_inputs`' fixed role policy).
+    fn fan_out_batch_leaves(db: &WorkDb, cycle_root_id: &str) -> Vec<(boss_protocol::WorkExecution, String)> {
+        use crate::work::{ReviewBatchCreateInput, ReviewBatchDispatch};
+        use boss_protocol::{ReviewBatchPhase, ReviewClassification, ReviewLanguageBucket, ReviewProfile};
+
+        let classification = ReviewClassification::builder()
+            .changed_files(vec!["tools/boss/engine/core/src/work/driver_lookup.rs".to_owned()])
+            .complexity_flags(vec![])
+            .has_production_code(true)
+            .metadata_missing(vec![])
+            .production_languages(vec![ReviewLanguageBucket::Rust])
+            .profile(ReviewProfile::Standard)
+            .subsystem_buckets(vec!["tools/boss/engine".to_owned()])
+            .additions(10)
+            .deletions(2)
+            .build();
+        let input = ReviewBatchCreateInput::builder()
+            .cycle_root_id(cycle_root_id.to_owned())
+            .base_sha("base-sha")
+            .classification(classification)
+            .phase(ReviewBatchPhase::PreMerge)
+            .pr_number(42)
+            .pr_url("https://github.com/example/repo/pull/42")
+            .target_sha("head-sha")
+            .build();
+        let executions = match db
+            .create_pre_merge_review_batch(input, "https://github.com/example/repo")
+            .unwrap()
+        {
+            ReviewBatchDispatch::Created { executions, .. } => executions,
+            other => panic!("expected a newly-created review batch, got {other:?}"),
+        };
+        executions
+            .into_iter()
+            .map(|execution| {
+                let member = db
+                    .review_batch_member_for_execution(&execution.id)
+                    .unwrap()
+                    .expect("every batch leaf has a member row");
+                (execution, member.requested_driver)
+            })
+            .collect()
+    }
+
+    /// Regression for the grok review-batch leaves that emitted no decoded
+    /// hook events: a fan-out batch leaf is a `pr_review` execution that
+    /// spawns on the driver its member row requested, but the lookup
+    /// resolved it through the review pool's fixed driver instead — before a
+    /// slot was claimed via the `pr_review` home-pool rule, and after via the
+    /// `review-N` slot's pool policy. Both paths said `claude` for the
+    /// `codex` and `grok` leaves, so every Grok leaf hook payload was
+    /// normalised as Claude and dropped with `MissingField("session_id")`.
+    /// The member row must win on both paths, for every leaf.
+    #[test]
+    fn review_batch_leaf_resolves_its_member_rows_driver_not_the_review_pools() {
+        use boss_protocol::CreateRunInput;
+
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let cycle_root = crate::test_support::create_test_chore_manual(&db, &product.id, "review target");
+        let leaves = fan_out_batch_leaves(&db, &cycle_root.id);
+        assert_eq!(
+            leaves.iter().map(|(_, driver)| driver.as_str()).collect::<Vec<_>>(),
+            vec!["claude", "codex", "grok"],
+        );
+
+        for (execution, requested_driver) in &leaves {
+            assert_eq!(
+                db.get_execution_driver_slug(&execution.id).unwrap().as_deref(),
+                Some(requested_driver.as_str()),
+                "before a slot is claimed, leaf {} must resolve its member row's driver",
+                execution.id,
+            );
+        }
+
+        // Every leaf runs on a review-pool slot, whose pool policy is the
+        // fixed reviewer driver — exactly the input that used to win.
+        for (index, (execution, requested_driver)) in leaves.iter().enumerate() {
+            let run = db
+                .create_run(CreateRunInput {
+                    execution_id: execution.id.clone(),
+                    agent_id: "review-pending".to_owned(),
+                    status: Some("active".to_owned()),
+                    error_text: None,
+                    result_summary: None,
+                    transcript_path: None,
+                    artifacts_path: None,
+                    started_at: Some("100".to_owned()),
+                    finished_at: None,
+                })
+                .unwrap();
+            db.set_run_agent_id(&run.id, &format!("review-{}", index + 1)).unwrap();
+            assert_eq!(
+                db.get_execution_driver_slug(&execution.id).unwrap().as_deref(),
+                Some(requested_driver.as_str()),
+                "on a claimed review-pool slot, leaf {} must resolve its member row's driver",
+                execution.id,
+            );
+        }
+    }
+
+    /// The member-row rule is scoped to batch members: a legacy memberless
+    /// `pr_review` execution on a review-pool slot still resolves the pool
+    /// driver (the case `pr_review_execution_resolves_the_pool_driver_not_the_reviewed_rows_pin`
+    /// pins before a slot exists).
+    #[test]
+    fn memberless_pr_review_on_a_review_slot_still_resolves_the_pool_driver() {
+        use boss_protocol::{CreateExecutionInput, CreateRunInput, DRIVER_SLUG_CODEX, ExecutionKind, ExecutionStatus};
+
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, &product.id, "reviewed chore");
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                driver: Some(DRIVER_SLUG_CODEX.to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        let run = db
+            .create_run(CreateRunInput {
+                execution_id: execution.id.clone(),
+                agent_id: "review-pending".to_owned(),
+                status: Some("active".to_owned()),
+                error_text: None,
+                result_summary: None,
+                transcript_path: None,
+                artifacts_path: None,
+                started_at: Some("100".to_owned()),
+                finished_at: None,
+            })
+            .unwrap();
+        db.set_run_agent_id(&run.id, "review-1").unwrap();
+
+        assert_eq!(
+            db.get_execution_driver_slug(&execution.id).unwrap().as_deref(),
+            Some("claude"),
         );
     }
 }
