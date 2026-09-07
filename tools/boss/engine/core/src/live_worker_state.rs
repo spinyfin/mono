@@ -215,11 +215,15 @@ struct SlotMeta {
     /// [`LiveWorkerStateRegistry::mark_errored`] stamps one on an
     /// engine-side verdict. Treating it as proof of driver start would
     /// let the engine's own guesses vouch for a driver that never ran.
-    /// This field is written by exactly one method
-    /// ([`LiveWorkerStateRegistry::record_driver_signal`]) from exactly
-    /// two call sites in the hook ingress — a real worker hook, and
-    /// receipt of a `transcript_path` — so "has this driver started?"
-    /// has a single, unforgeable answer.
+    /// This field is written by [`LiveWorkerStateRegistry::record_driver_signal`]
+    /// from exactly two call sites in the hook ingress — a real worker
+    /// hook, and receipt of a `transcript_path` — and additionally
+    /// restored (not fabricated) by
+    /// [`LiveWorkerStateRegistry::seed_semantic_progress`] from a durable
+    /// checkpoint on re-adoption, carrying forward proof this same field
+    /// already held before an engine restart. Every writer is either a
+    /// direct driver-originated signal or a restoration of one, so "has
+    /// this driver started?" still has a single, unforgeable answer.
     ///
     /// Note what is deliberately absent: `shell_pid`. A reported
     /// foreground pid is the *shell hosting the pane*, not the driver
@@ -602,7 +606,7 @@ impl LiveWorkerStateRegistry {
             run_id = %run_id,
             evidence = ?evidence,
             "live-state registry: slot re-adopted for an already-running worker; \
-             driver-start verification does not apply to this registration",
+             driver-start verification still applies and starts a fresh grace window",
         );
     }
 
@@ -831,9 +835,12 @@ impl LiveWorkerStateRegistry {
     /// Record that a **driver-originated** signal arrived for `run_id` —
     /// positive proof the driver binary is running.
     ///
-    /// This is the single writer of `driver_signal_at`, and the only
-    /// thing in Boss that may answer "has this driver started?". It is
-    /// deliberately keyed by `run_id` rather than slot: the hook ingress
+    /// This is the writer of `driver_signal_at` for a live-observed
+    /// signal — [`LiveWorkerStateRegistry::seed_semantic_progress`] is the
+    /// only other writer, and it only restores a value this method (or a
+    /// prior engine process's call to it) already established, so this
+    /// remains the sole source of a *new* "has this driver started?"
+    /// answer. It is deliberately keyed by `run_id` rather than slot: the hook ingress
     /// resolves `transcript_path` *before* it looks up the slot mapping
     /// (`worker_events.rs`), and that lookup can legitimately miss for a
     /// hook racing `register_run_slot`. Keying on the run means the
@@ -873,8 +880,11 @@ impl LiveWorkerStateRegistry {
         guard.get(&slot_id).and_then(|entry| entry.meta.driver_signal_at)
     }
 
-    /// Whether driver-start verification applies to `slot_id`'s current
-    /// registration. `None` for a slot with no live entry.
+    /// Whether `slot_id`'s current registration is owed spawn-ack proof
+    /// (`EngineSpawned`) or was re-adopted (`Readopted`) — see
+    /// [`DriverStartExpectation`]. Driver-start verification itself
+    /// applies to both cases; this only distinguishes which timeout
+    /// question is in play. `None` for a slot with no live entry.
     pub fn driver_start_expectation(&self, slot_id: u8) -> Option<DriverStartExpectation> {
         let guard = self.inner.lock().expect("registry mutex poisoned");
         guard.get(&slot_id).map(|entry| entry.meta.driver_start_expectation)

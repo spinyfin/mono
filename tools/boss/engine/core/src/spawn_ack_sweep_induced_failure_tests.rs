@@ -138,9 +138,19 @@ async fn a_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released()
         false,
         LiveSpawnRouting::none(),
     );
+    // Age `spawned_at` *before* re-adoption, matching the incident: this is
+    // periodic same-run adoption of a slot whose original spawn is already
+    // stale, not a fresh spawn immediately re-adopted. Ageing afterward
+    // would mask a regression where the retain path started refreshing
+    // `spawned_at` to "now" on re-adoption — the artificial ageing call
+    // would silently overwrite that refresh and the test would stay green
+    // even though production would have an immortal shell-only pane.
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    live_states.set_spawn_time_for_test(1, now - (DRIVER_START_GRACE_SECS + 60));
+
     // Tmux adoption observes the same live login shell on its periodic
     // convergence pass. That must not turn a shell-only observation into a
-    // permanent driver-start exemption.
+    // permanent driver-start exemption, and must not refresh `spawned_at`.
     live_states.register_readoption(
         1,
         &execution_id,
@@ -155,8 +165,19 @@ async fn a_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released()
         LiveSpawnRouting::none(),
         ReadoptionEvidence::LiveShellPid,
     );
-    let now = boss_engine_utils::epoch_time::now_epoch_secs();
-    live_states.set_spawn_time_for_test(1, now - (DRIVER_START_GRACE_SECS + 60));
+    let post_readoption = live_states.unverified_driver_starts(now, 0);
+    assert_eq!(
+        post_readoption.len(),
+        1,
+        "the slot must still be silent post-readoption"
+    );
+    assert!(
+        post_readoption[0].silent_secs >= DRIVER_START_GRACE_SECS + 60,
+        "re-adoption must not refresh spawned_at for an already-aged slot (silent_secs={}); \
+         refreshing it would reset the grace window and mask a periodic same-run adoption of an \
+         already-stale spawn",
+        post_readoption[0].silent_secs,
+    );
 
     let coordinator = make_coordinator(db.clone(), 1);
     coordinator.worker_pool().claim_worker(&execution_id, None).await;
