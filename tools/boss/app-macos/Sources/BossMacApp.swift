@@ -534,7 +534,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func makeQuitConfirmationAlert() -> NSAlert? {
         QuitConfirmation.alert(
             agentCount: liveWorkerStates?.activeAgentCount ?? 0,
-            tmuxHostingEnabled: chatModel?.tmuxHostingEnabled ?? false
+            hostingMakeup: QuitConfirmation.HostingMakeup.classify(
+                liveWorkerStates?.activeAgentTmuxHostedFlags ?? []
+            )
         )
     }
 

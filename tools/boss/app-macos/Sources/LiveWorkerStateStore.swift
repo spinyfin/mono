@@ -23,6 +23,17 @@ final class LiveWorkerStateStore: ObservableObject {
         return bySlot.values.filter { live.contains($0.activity) }.count
     }
 
+    /// `tmuxHosted` of every currently active worker (same "alive" filter
+    /// as `activeAgentCount`), in no particular order. Feeds the
+    /// quit-confirmation dialog's hosting-mode claim — see
+    /// `QuitConfirmation.HostingMakeup.classify`. Each entry mirrors the
+    /// worker's actual dispatch-time hosting mode, not the current
+    /// `workers.tmux_hosting` setting value.
+    var activeAgentTmuxHostedFlags: [Bool?] {
+        let live: Set<WorkerActivity> = [.spawning, .working, .waitingForInput]
+        return bySlot.values.filter { live.contains($0.activity) }.map(\.tmuxHosted)
+    }
+
     /// Replace the snapshot with `states`. Skips the publish when the
     /// new snapshot is value-equal to the previous one — a hook event
     /// that nudged `lastEventAt` but left every per-slot field

@@ -1048,7 +1048,8 @@ final class WorkCardSnapshotTests: XCTestCase {
             activity: .working,
             liveStatus: "Editing Models.swift",
             liveStatusAt: "2026-06-01T00:00:00Z",
-            recoveryStatus: nil
+            recoveryStatus: nil,
+            tmuxHosted: nil
         )
         let snap = WorkCardSnapshot.build(
             task: task,
@@ -1079,7 +1080,8 @@ final class WorkCardSnapshotTests: XCTestCase {
             activity: .working,
             liveStatus: "stale",
             liveStatusAt: "t",
-            recoveryStatus: nil
+            recoveryStatus: nil,
+            tmuxHosted: nil
         )
         let snap = WorkCardSnapshot.build(
             task: task,
@@ -1754,7 +1756,8 @@ final class WorkCardSnapshotTests: XCTestCase {
             activity: .working,
             liveStatus: liveStatus,
             liveStatusAt: "t",
-            recoveryStatus: recoveryStatus
+            recoveryStatus: recoveryStatus,
+            tmuxHosted: nil
         )
     }
 
