@@ -1113,6 +1113,19 @@ impl WorkDb {
         Ok(found.is_some())
     }
 
+    /// Resolve `task_id` to the review-cycle root that owns its PR.
+    ///
+    /// A revision task is never its own cycle root: all of a chain's review
+    /// batches are filed under the chain root's id, so a caller that passes
+    /// a revision id straight to [`Self::review_batches_for_cycle_root`]
+    /// gets an empty result even when the chain root holds a full batch
+    /// history. Callers that accept an arbitrary work-item id (e.g.
+    /// `bossctl review batches`) must resolve through here first.
+    pub fn resolve_review_cycle_root(&self, task_id: &str) -> Result<String> {
+        let conn = self.connect()?;
+        super::chain_helpers::chain_root(&conn, task_id)
+    }
+
     /// Return all persisted batches for a review cycle root, newest first.
     pub fn review_batches_for_cycle_root(&self, cycle_root_id: &str) -> Result<Vec<ReviewBatch>> {
         let conn = self.connect()?;
@@ -1132,7 +1145,7 @@ impl WorkDb {
     /// Return every non-terminal batch (`collecting` / `supervising` /
     /// `applying`) engine-wide, oldest first, so a stuck batch — one whose
     /// members should long since have settled — sorts to the front.
-    /// Operator diagnostics (`bossctl review live-batches`) uses this to
+    /// The `bossctl review live-batches` diagnostic uses this to
     /// answer "is anything stuck right now" without knowing which work item
     /// to look at first; `reap_inert_review_batches` is the automated
     /// counterpart that acts on staleness rather than merely reporting it.

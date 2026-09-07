@@ -786,12 +786,12 @@ mod tests {
     /// Acceptance: a reviewer's build-command guard (shared unchanged with
     /// Claude and Codex — see [`REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND`])
     /// through Grok's own adapter/translation layer, the way a Grok reviewer
-    /// session would actually see it. Prior coverage
-    /// (`reviewer_gets_the_shared_static_analysis_guard`) only asserted the
-    /// guard is wired into `guard_commands`'s output; it never executed the
-    /// script through the adapter to check a build command is actually
-    /// denied for Grok, the way the `pr_redirect_guard_*_via_grok_payload`
-    /// tests above do for the PR-redirect guard.
+    /// session would actually see it. This executes the script through the
+    /// adapter to confirm a build command is actually denied for Grok —
+    /// `reviewer_gets_the_shared_static_analysis_guard` only checks that the
+    /// guard is wired into `guard_commands`'s output and does not execute
+    /// it — the way the `pr_redirect_guard_*_via_grok_payload` tests above
+    /// do for the PR-redirect guard.
     #[test]
     fn reviewer_static_analysis_guard_denies_a_build_command_via_grok_payload() {
         assert!(

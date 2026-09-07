@@ -906,12 +906,12 @@ mod tests {
     /// materialised the exact way `materialize_guards` ships it for a Codex
     /// reviewer (`python_c_to_script` extracting the shared Python body from
     /// [`crate::claude::REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND`]), run
-    /// through this same trust-wrapped shim. Prior coverage only asserted
-    /// the guard file gets materialised
-    /// (`materialize_guards_adds_static_analysis_guard_for_reviewer` in
-    /// `codex_tests.rs`); it never executed the script to check a build
-    /// command is actually denied through Codex's own invocation path, the
-    /// way Claude's `reviewer_static_analysis_guard_blocks_execution_and_allows_reads`
+    /// through this same trust-wrapped shim. This executes the script to
+    /// confirm a build command is actually denied through Codex's own
+    /// invocation path — `materialize_guards_adds_static_analysis_guard_for_reviewer`
+    /// (`codex_tests.rs`) only checks that the guard file gets materialised
+    /// and does not execute it — the way Claude's
+    /// `reviewer_static_analysis_guard_blocks_execution_and_allows_reads`
     /// does for Claude.
     #[test]
     fn codex_reviewer_static_analysis_guard_blocks_a_build_command() {

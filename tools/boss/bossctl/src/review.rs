@@ -82,7 +82,7 @@ pub(crate) enum ReviewAction {
     /// `applying`) review batch engine-wide, oldest first.
     ///
     /// Answers "is anything stuck right now" without knowing which work item
-    /// to look at first — the operator-facing counterpart to
+    /// to look at first — the read-only counterpart to
     /// `reap_inert_review_batches`, which acts on staleness rather than
     /// merely reporting it. Invoked as `bossctl review live-batches`.
     LiveBatches {
@@ -240,8 +240,16 @@ pub(crate) fn review_batches(json: bool, state_root: Option<PathBuf>, work_item:
     let work_item = db
         .resolve_work_item_ref_strict(&work_item)
         .map_err(|err| anyhow::anyhow!("{err}"))?;
+    // A revision task is never its own review-cycle root — its batches are
+    // filed under the chain root that owns the PR — so resolve to the root
+    // before querying. Without this, handing the command a revision's own
+    // id silently reads as "no batches exist" even when the chain root
+    // holds the full history for that revision cycle.
+    let cycle_root_id = db
+        .resolve_review_cycle_root(&work_item)
+        .context("resolving review cycle root")?;
     let batches = db
-        .review_batches_for_cycle_root(&work_item)
+        .review_batches_for_cycle_root(&cycle_root_id)
         .context("reading review batches")?;
     let mut rendered = Vec::with_capacity(batches.len());
     for batch in &batches {
@@ -256,18 +264,29 @@ pub(crate) fn review_batches(json: bool, state_root: Option<PathBuf>, work_item:
             "{}",
             serde_json::json!({
                 "work_item_id": work_item,
+                "cycle_root_id": cycle_root_id,
                 "batches": rendered.iter().map(|(batch, members)| batch_json(batch, members)).collect::<Vec<_>>(),
             })
         );
         return Ok(());
     }
 
+    // Always name the resolved cycle root when it differs from the id the
+    // caller passed in, so an empty result (a real "no batches" for that
+    // root) never reads the same as a lookup that silently resolved to the
+    // wrong row.
+    let resolved_suffix = if cycle_root_id == work_item {
+        String::new()
+    } else {
+        format!(" (resolved to chain root {cycle_root_id})")
+    };
+
     if rendered.is_empty() {
-        println!("no review batches recorded for {work_item}");
+        println!("no review batches recorded for {work_item}{resolved_suffix}");
         return Ok(());
     }
     println!(
-        "review batches for {work_item} ({} total, newest first):",
+        "review batches for {work_item}{resolved_suffix} ({} total, newest first):",
         rendered.len()
     );
     for (batch, members) in &rendered {

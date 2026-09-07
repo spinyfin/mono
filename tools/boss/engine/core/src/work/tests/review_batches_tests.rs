@@ -2440,3 +2440,59 @@ fn dead_post_merge_reviewer_retries_once_then_fails_the_batch() {
         .expect("exhausted post-merge reviewer retry must file pr_review_quorum_failed");
     assert!(attention.title.to_lowercase().contains("post-merge"));
 }
+
+/// A revision task is never its own review-cycle root — its batches are
+/// filed under the chain root that owns the PR. `resolve_review_cycle_root`
+/// must walk a revision id to that root so `bossctl review batches` (and
+/// any other caller) can hand it an in-hand revision id and still find the
+/// chain's batch history, instead of silently reading back empty.
+#[test]
+fn resolve_review_cycle_root_walks_a_revision_to_its_chain_root() {
+    let db = WorkDb::open(temp_db_path("review-batch-chain-root")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id.clone(), "review target");
+
+    let revision_id = next_id("task");
+    let now = now_string();
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id)
+                 VALUES (?1, ?2, 'revision', 'address findings', '', 'todo', ?3, ?3, ?4)",
+            params![revision_id, product.id, now, cycle_root.id],
+        )
+        .unwrap();
+
+    db.create_review_batch(
+        batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+        &[
+            member(ReviewBatchMemberRole::ClaudeReviewer, None),
+            member(ReviewBatchMemberRole::CodexReviewer, None),
+            member(ReviewBatchMemberRole::GrokReviewer, None),
+        ],
+    )
+    .unwrap();
+
+    let resolved = db.resolve_review_cycle_root(&revision_id).unwrap();
+    assert_eq!(resolved, cycle_root.id, "a revision must resolve to its chain root");
+
+    let batches = db.review_batches_for_cycle_root(&resolved).unwrap();
+    assert_eq!(
+        batches.len(),
+        1,
+        "querying by the resolved chain root must find the batch filed under it"
+    );
+
+    // A genuinely unrelated task (not part of any chain, no batches filed
+    // under it) must still resolve to itself and come back empty — an
+    // empty result is only meaningful once resolution is known to be
+    // correct, which this asserts directly rather than by absence.
+    let unrelated = create_test_chore_manual(&db, product.id, "unrelated");
+    let resolved_unrelated = db.resolve_review_cycle_root(&unrelated.id).unwrap();
+    assert_eq!(resolved_unrelated, unrelated.id);
+    assert!(
+        db.review_batches_for_cycle_root(&resolved_unrelated)
+            .unwrap()
+            .is_empty()
+    );
+}
