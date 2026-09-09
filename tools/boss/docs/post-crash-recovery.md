@@ -57,17 +57,20 @@ not yet expired; the verdict is one of:
   when the app session registers — never a silent pass.
 - `Dead` — cube says the workspace is free, the lease id has changed,
   or the lease has logically expired (TTL passed). The engine marks
-  the execution `orphaned` immediately and inherits the workspace_id
-  into the next ready row's `preferred_workspace_id` so the redispatch
-  resumes against the same branch.
+  the execution `orphaned` immediately. The next automatic resume
+  dispatch inherits both the workspace_id into
+  `preferred_workspace_id` and `allow_dirty = true`, so cube can
+  re-lease the same branch without resetting it.
 - `Unknown` — the probe couldn't decide (cube call failed, workspace
   not in the snapshot, sparse persisted state). The row is left
   alone; a loud `tracing::warn!` is emitted so the operator can
   resolve manually.
 
-After the reaper passes, `reconcile_active_dispatch` runs as before
-and creates fresh `ready` rows for work items whose Doing-column
-status no longer matches a live execution.
+At startup, `reconcile_active_dispatch` creates that fresh `ready` row.
+During steady-state reaping, `release_worker_and_kick` runs
+`rescan_active_dispatch` before it kicks the scheduler; it creates the
+same inherited `ready` row. The two redispatch paths preserve the same
+workspace-recovery handoff.
 
 ### Manual escape hatch: `bossctl agents reap <run-id>`
 
@@ -111,11 +114,11 @@ Once the predecessor is `orphaned`:
 
 1. The work item's kanban status is unchanged. If it was `active`
    (Doing), it stays there — the dispatcher will pick it back up.
-2. `bossctl work start <work-item>` or the auto-dispatcher creates a
-   new `work_executions` row in `ready`. The new row's
-   `preferred_workspace_id` defaults to the orphan's
-   `cube_workspace_id`, so cube will re-lease the same workspace
-   when one is free.
+2. The automatic redispatcher creates a new `work_executions` row in
+   `ready`. Both startup reconcile and the steady-state on-free rescan
+   set its `preferred_workspace_id` to the orphan's
+   `cube_workspace_id` and carry `allow_dirty = true`, so cube can
+   re-lease the same workspace without resetting it when one is free.
 3. The fresh worker spawns into that workspace. Inside the lease,
    `jj git fetch && jj edit <bookmark>` brings it back to the branch
    the orphan was working on; from there it can push and open / update
@@ -176,7 +179,10 @@ there.
 The engine replays these patches itself — you do not normally need to
 apply one by hand. `tools/boss/engine/core/src/recovery_apply.rs` is the
 read side, driven from `coordinator.rs::reconcile_workspace_recovery`
-on every resume dispatch:
+on every automatic resume dispatch. Both automatic redispatch paths —
+startup `reconcile_active_dispatch` and steady-state
+`rescan_active_dispatch` after a worker release — carry the orphan's
+workspace preference and `allow_dirty` flag into that successor:
 
 1. **Cube first.** The resume leases `--prefer <workspace> --allow-dirty`,
    which reclaims the dead worker's own workspace _without_ resetting it.
