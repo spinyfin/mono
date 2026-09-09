@@ -930,10 +930,28 @@ async fn run_one_pass_filtered(
         // A non-terminal execution that is NOT claimed means the worker
         // died without updating the DB — `request_execution_with_live_check`
         // will mark it `abandoned` and create a new `ready` row.
+        //
+        // This is the redispatch path a dead-pid reap actually lands on
+        // (`dead_pid_sweep::reap_dead_execution` marks the execution
+        // `orphaned` and releases the slot; it does not itself mint a
+        // successor). Mirror `rescan_active_dispatch`'s orphan handoff here
+        // so a reaped item's successor inherits the dead worker's dirty
+        // workspace instead of starting clean and losing the recovery
+        // patch.
+        let latest_execution = work_db.latest_execution_for_work_item(&work_item_id).ok().flatten();
+        let is_orphaned_predecessor = latest_execution
+            .as_ref()
+            .is_some_and(|prev| prev.status == ExecutionStatus::Orphaned);
+        let preferred_workspace_id = latest_execution
+            .as_ref()
+            .filter(|_| is_orphaned_predecessor)
+            .and_then(|prev| prev.cube_workspace_id.clone());
         let is_live = |exec_id: &str| claimed.contains(exec_id);
         let new_execution = match work_db.request_execution_with_live_check(
             RequestExecutionInput::builder()
                 .work_item_id(work_item_id.clone())
+                .maybe_preferred_workspace_id(preferred_workspace_id)
+                .allow_dirty(is_orphaned_predecessor)
                 .build(),
             is_live,
         ) {

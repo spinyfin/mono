@@ -67,10 +67,24 @@ not yet expired; the verdict is one of:
   resolve manually.
 
 At startup, `reconcile_active_dispatch` creates that fresh `ready` row.
-During steady-state reaping, `release_worker_and_kick` runs
-`rescan_active_dispatch` before it kicks the scheduler; it creates the
-same inherited `ready` row. The two redispatch paths preserve the same
-workspace-recovery handoff.
+Steady-state redispatch splits across two paths depending on how the
+predecessor was released:
+
+- Releases that go through `release_worker_and_kick` (the stale-worker
+  sweep, the spawn-ack sweep, and app-driven pane teardown) run
+  `rescan_active_dispatch` before kicking the scheduler; it creates the
+  same inherited `ready` row.
+- A dead-pid reap (`dead_pid_sweep::reap_dead_execution`) does not call
+  `release_worker_and_kick` — it releases the slot directly and leaves
+  the work item for the periodic orphan-active sweep
+  (`orphan_sweep::run_one_pass_filtered`) to pick back up on its next
+  pass. That sweep looks up the work item's latest execution, and when
+  it is the just-reaped `orphaned` row, inherits its
+  `cube_workspace_id`/`allow_dirty` the same way `rescan_active_dispatch`
+  does.
+
+All three redispatch paths preserve the same workspace-recovery
+handoff.
 
 ### Manual escape hatch: `bossctl agents reap <run-id>`
 
@@ -179,9 +193,10 @@ there.
 The engine replays these patches itself — you do not normally need to
 apply one by hand. `tools/boss/engine/core/src/recovery_apply.rs` is the
 read side, driven from `coordinator.rs::reconcile_workspace_recovery`
-on every automatic resume dispatch. Both automatic redispatch paths —
-startup `reconcile_active_dispatch` and steady-state
-`rescan_active_dispatch` after a worker release — carry the orphan's
+on every automatic resume dispatch. All automatic redispatch paths —
+startup `reconcile_active_dispatch`, steady-state `rescan_active_dispatch`
+after a `release_worker_and_kick` release, and the periodic
+`orphan_sweep` pass that picks up a dead-pid reap — carry the orphan's
 workspace preference and `allow_dirty` flag into that successor:
 
 1. **Cube first.** The resume leases `--prefer <workspace> --allow-dirty`,
