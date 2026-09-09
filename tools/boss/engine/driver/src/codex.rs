@@ -36,10 +36,12 @@ mod guard_chain;
 pub mod guard_trace;
 mod pane_monitor;
 mod progress;
+mod reviewer_publish_guard;
 mod rollout_calls;
 mod tool_surface_guard;
 
 use guard_trace::{GUARD_TRACE_SHIM_FILENAME, GUARD_TRACE_SHIM_SCRIPT, guard_trace_path, wrapper_body};
+use reviewer_publish_guard::CODEX_REVIEWER_PUBLISH_GUARD_SCRIPT;
 use tool_surface_guard::CODEX_TOOL_SURFACE_GUARD_SCRIPT;
 
 use crate::transcript_store::{
@@ -473,14 +475,23 @@ pub fn codex_homes_root_and_home_for_run(run_id: &str) -> anyhow::Result<(PathBu
 /// `PATH_GUARD_SCRIPT` PreToolUse hook remains the Boss-data-dir fence
 /// either way.
 ///
-/// Reviewer deliberately has no Codex OS sandbox at all, matching the
-/// Claude and local Grok reviewer paths. Its report-delivery and hook events
-/// both need the engine socket and `boss-event` shim; a narrow reviewer
-/// seatbelt previously allowed only the former and made every reviewer appear
-/// never-started. Its reviewer prompt and static-analysis PreToolUse guard
-/// remain in force. This is the single source of truth for
-/// [`CodexDriver::write_permission_config`]'s `extra_args` — the spawn plan's
-/// default is overridden when pane_spawn applies those args.
+/// Reviewer deliberately has no Codex OS sandbox at all. The previous
+/// reviewer seatbelt relocated the session's sandbox working root to
+/// engine-owned scratch via `--cd` so a single report-body write was
+/// permitted while the checkout stayed OS read-only — but that same `--cd`
+/// also relocated the hooks `cwd` Boss armed and trust-attested against
+/// away from the checkout, desyncing it from the pane's real working
+/// directory and making every Codex reviewer appear never-started. Removing
+/// the sandbox removes the `--cd` that caused the mismatch: hook `cwd` now
+/// falls back to the checkout (see [`CodexDriver::write_permission_config`]),
+/// matching the pane's real cwd. Reviewer mutation/publication is instead
+/// fenced by [`reviewer_publish_guard`] (Codex has no declarative
+/// `permissions.deny` surface to mirror Claude's `reviewer_deny_rules`), and
+/// its reviewer prompt and static-analysis
+/// PreToolUse guard remain in force. This is the single source of truth for
+/// [`CodexDriver::write_permission_config`]'s `extra_args`; the spawn plan
+/// emits no `--sandbox` of its own, so these args are the only source of
+/// sandbox policy (see [`build_codex_command`]).
 pub fn codex_sandbox_for_worker_kind(worker_kind: WorkerKind, sandbox_enforced: bool) -> Option<&'static str> {
     match worker_kind {
         WorkerKind::Reviewer => None,
@@ -654,6 +665,23 @@ impl CodexRuntimeState {
 /// keys set — the import path is structurally unreachable from `codex exec`.
 pub fn render_base_config_toml(workspace: &Path) -> String {
     render_config_toml(workspace, render_sandbox_workspace_write_toml(workspace))
+}
+
+/// The hooks `cwd` and base `config.toml` [`CodexDriver::write_permission_config`]
+/// arms and trust-attests, for `workspace` — identical for every
+/// [`WorkerKind`], reviewer included.
+///
+/// Extracted into its own pure function (rather than left inline in
+/// `write_permission_config`'s async body) so this invariant is a one-line
+/// diff to break and a hermetic unit test to pin down. The removed reviewer
+/// OS sandbox used to special-case this: it relocated Codex's sandbox root
+/// (and, with it, the attested hooks `cwd`) to engine scratch via `--cd`,
+/// desyncing the attested cwd from the pane's real cwd and making every
+/// Codex reviewer appear never-started. A future regression that
+/// reintroduces a per-kind `cwd`/config split here would reproduce exactly
+/// that bug.
+fn codex_hook_context(workspace: &Path) -> (String, PathBuf) {
+    (render_base_config_toml(workspace), workspace.to_path_buf())
 }
 
 fn render_config_toml(workspace: &Path, sandbox_workspace_write: String) -> String {
@@ -979,9 +1007,13 @@ pub fn build_codex_command(request: &SpawnRequest<'_>) -> String {
     );
 
     // Sandbox policy is fully supplied by PermissionArtifacts::extra_args.
-    // In particular, reviewers intentionally receive no `--sandbox` flag:
-    // their hook events must reach the engine's events socket. Do not add a
-    // default here, or an empty reviewer policy could silently retain it.
+    // In particular, reviewers intentionally receive no `--sandbox` flag: the
+    // sandbox required a `--cd` into engine scratch to permit its one report
+    // write, and that `--cd` desynced the hooks `cwd` Boss trust-attests from
+    // the pane's real cwd, which is what made every Codex reviewer appear
+    // never-started (see `codex_sandbox_for_worker_kind`'s doc comment). Do
+    // not add a default here, or an empty reviewer policy could silently
+    // retain one.
     let mut cmd = String::from("codex --strict-config --no-alt-screen -a never");
     cmd.push_str(" -m ");
     // Model / effort tokens come from operator config and work-item metadata;
@@ -1117,12 +1149,23 @@ fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> 
 
     // 5. Reviewer static-analysis guard blocks build/test/format/generate
     // and executable-code commands. Codex reviewers intentionally have no
-    // OS sandbox so their driver hooks can reach the engine.
+    // OS sandbox (see `codex_sandbox_for_worker_kind`'s doc comment).
     if config.is_reviewer {
         planned.push(Planned {
             name: "reviewer_static_analysis_guard",
             source: GuardSource::Inline(python_c_to_script(REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND)?),
             matcher: "Bash",
+            extra_env: Vec::new(),
+        });
+        // Codex-specific replacement for Claude/Grok's declarative
+        // `reviewer_deny_rules`: no OS sandbox and no `permissions.deny`
+        // equivalent means nothing else stops a Codex reviewer from editing
+        // the checkout or publishing. `.*` because it must see `apply_patch`
+        // (not just `Bash`). See `reviewer_publish_guard`.
+        planned.push(Planned {
+            name: "reviewer_publish_guard",
+            source: GuardSource::Inline(CODEX_REVIEWER_PUBLISH_GUARD_SCRIPT.to_owned()),
+            matcher: ".*",
             extra_env: Vec::new(),
         });
     }
@@ -1642,10 +1685,9 @@ impl AgentDriver for CodexDriver {
 
         // When path/checkleft scripts are supplied via PermissionInput they
         // win; otherwise leave those guards off (remote / early unit tests).
-        let base_config = render_base_config_toml(&input.workspace_path);
-        let hook_cwd = input.workspace_path.as_path();
+        let (base_config, hook_cwd) = codex_hook_context(&input.workspace_path);
         let codex_bin = resolve_codex_bin();
-        write_hooks_and_attest(&codex_home, hook_cwd, &base_config, &interception, &codex_bin)?;
+        write_hooks_and_attest(&codex_home, &hook_cwd, &base_config, &interception, &codex_bin)?;
 
         let extra_args = codex_sandbox_extra_args(input.worker_kind, input.codex_sandbox_enforced);
 

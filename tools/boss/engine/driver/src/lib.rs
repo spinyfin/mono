@@ -114,8 +114,12 @@ pub struct PermissionInput {
     /// workers get `--sandbox danger-full-access` instead of the OS-enforced
     /// `workspace-write` seatbelt, matching the Claude driver's no-OS-sandbox
     /// posture (see `codex::codex_sandbox_for_worker_kind`). Codex reviewers
-    /// intentionally receive no OS sandbox, matching the Claude and local
-    /// Grok reviewer paths, so their hooks can reach the engine events socket.
+    /// intentionally receive no OS sandbox at all: the sandbox previously
+    /// required relocating the session's sandbox root (and, with it, the
+    /// hooks `cwd` Boss trust-attests) away from the checkout, which desynced
+    /// the attested cwd from the pane's real cwd and made every reviewer
+    /// appear never-started. Mutation/publication is instead fenced by a
+    /// Codex-specific `PreToolUse` guard (`codex::reviewer_publish_guard`).
     /// Ignored by every other driver.
     #[builder(default)]
     pub codex_sandbox_enforced: bool,
@@ -174,9 +178,13 @@ pub fn tmux_session_config_for(driver_name: &str) -> Option<&'static str> {
 ///
 /// Permission args win over defaults already present on the command: each
 /// flag in `extra_args` that already appears in `command` is stripped (with
-/// its value when the next extra_arg is not a flag) and then re-inserted so
-/// Codex's default `--sandbox workspace-write` is replaced or augmented by
-/// the worker policy rather than duplicated.
+/// its value when the next extra_arg is not a flag) and then re-inserted, so
+/// a driver whose base spawn command bakes in a default flag never ends up
+/// with that default duplicated alongside the worker policy's own value.
+/// Codex's spawn command emits no baked-in `--sandbox` (see
+/// `codex::build_codex_command`), so today this strip-and-reinsert only
+/// matters for a future driver or flag that does bake one in; it is a no-op
+/// otherwise.
 ///
 /// Args are shell-quoted for safe insertion into the pane command string.
 /// Empty `extra_args` leaves `command` unchanged (Claude path).

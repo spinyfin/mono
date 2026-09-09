@@ -685,9 +685,12 @@ pub const REVISION_PR_GUARD_COMMAND: &str = python_command_guard!(
 
 /// Inline Python decision hook for static-analysis-only reviewer sessions.
 ///
-/// Mutation and publication remain fenced by the existing reviewer deny rules
-/// and driver sandboxes. This complementary guard closes the command surface
-/// those controls intentionally leave open: builds, tests, formatters,
+/// Mutation and publication remain fenced by each driver's own reviewer
+/// fence — Claude and Grok's declarative reviewer deny rules
+/// (`reviewer_deny_rules`), Codex's `PreToolUse`-based equivalent
+/// (`codex::reviewer_publish_guard`, since Codex reviewers carry no OS
+/// sandbox and no declarative deny surface). This complementary guard closes
+/// the command surface those controls intentionally leave open: builds, tests, formatters,
 /// generators, language runners, shell interpreters, and direct execution of
 /// checked-out artifacts. It is shared unchanged by Claude, Codex, and Grok.
 pub const REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND: &str = python_command_guard!(

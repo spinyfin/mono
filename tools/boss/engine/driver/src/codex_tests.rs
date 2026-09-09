@@ -1008,6 +1008,39 @@ fn reviewer_has_no_os_sandbox_or_relocated_cwd() {
     assert_eq!(merged, plan.command, "empty reviewer policy must not add a sandbox");
 }
 
+/// Pins the invariant `codex_hook_context` exists to protect: every
+/// `WorkerKind` — reviewer included — gets the checkout as its hooks `cwd`
+/// and the plain [`render_base_config_toml`] output, with no per-kind
+/// scratch-dir relocation. The removed reviewer OS sandbox broke exactly
+/// this (a `--cd` into engine scratch desynced the attested cwd from the
+/// pane's real cwd, making every Codex reviewer appear never-started); a
+/// regression reintroducing a per-kind split here would compile and pass
+/// every other test in this file.
+#[test]
+fn reviewer_hook_context_matches_checkout_like_every_other_worker_kind() {
+    let workspace = Path::new("/ws/example-checkout");
+    let (base_config, hook_cwd) = codex_hook_context(workspace);
+
+    assert_eq!(
+        hook_cwd, workspace,
+        "hooks cwd must be the checkout itself, not a relocated scratch dir"
+    );
+    assert_eq!(
+        base_config,
+        render_base_config_toml(workspace),
+        "reviewer (and every other kind) must get the plain base config, no reviewer-only variant"
+    );
+    assert_eq!(
+        base_config.matches("[projects.").count(),
+        1,
+        "exactly one trust stanza — the checkout's own — must be present, not a second scratch-dir entry: {base_config}"
+    );
+    assert!(
+        base_config.contains(&format!("[projects.\"{}\"]", workspace.display())),
+        "the one trust stanza must name the checkout: {base_config}"
+    );
+}
+
 #[test]
 fn standard_worker_sandbox_defaults_to_danger_full_access() {
     // codex_sandbox_enforced=false (the feature-flag default): Standard,
