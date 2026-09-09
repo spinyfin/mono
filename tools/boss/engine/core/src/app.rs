@@ -2510,6 +2510,7 @@ async fn handle_frontend_connection(
                 Ok(line) => line,
                 Err(err) => {
                     tracing::error!(?err, "failed to serialize frontend event");
+                    writer_sink.complete_response_delivery(event.request_id.as_deref(), false);
                     continue;
                 }
             };

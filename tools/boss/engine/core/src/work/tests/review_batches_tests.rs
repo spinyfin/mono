@@ -1469,7 +1469,7 @@ fn supervisor_reported_live_within_grace_window_does_not_alarm() {
 
 /// The grace-window exemption must not become a way to permanently hide a
 /// genuinely stuck consolidator. Once a supervisor has been `reported` + live for longer than
-/// [`crate::work::REVIEW_BATCH_SUPERVISOR_REPORTED_GRACE_SECS`], it is
+/// [`crate::work::REVIEW_BATCH_REPORTED_MEMBER_GRACE_SECS`], it is
 /// exactly as alarming as a stuck leaf always was.
 #[test]
 fn supervisor_reported_live_past_grace_window_still_alarms() {
@@ -1541,7 +1541,7 @@ fn supervisor_reported_live_alarm_auto_clears_once_torn_down() {
 /// a supervisor that was never torn down eventually reaches.
 fn backdate_supervisor_terminal_at(db: &WorkDb, batch_id: &str, grace_secs_past: u64) {
     let cutoff = (boss_engine_utils::epoch_time::now_epoch_secs() as u64)
-        .saturating_sub(crate::work::REVIEW_BATCH_SUPERVISOR_REPORTED_GRACE_SECS + grace_secs_past)
+        .saturating_sub(crate::work::REVIEW_BATCH_REPORTED_MEMBER_GRACE_SECS + grace_secs_past)
         .to_string();
     db.connect()
         .unwrap()

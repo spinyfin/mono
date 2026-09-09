@@ -115,15 +115,15 @@ pub const PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND: &str = "pr_review_repor
 pub const REVIEW_BATCH_STALE_SECS: u64 = 10 * 60;
 
 /// Grace window for [`file_reported_live_review_batch_member_attentions`]'s
-/// supervisor exemption: a consolidator that just reported its verdict is
-/// `reported` + live for the brief span between its member row committing
-/// (which moves the batch to `applying`) and
+/// reporting-member exemption: any member (leaf or supervisor) that just
+/// reported its verdict is `reported` + live for the brief span between its
+/// member row committing (which moves the batch to `applying`) and
 /// `finalize_accepted_review_batch_member` reaping its pane — a normal,
 /// self-resolving window, not the invariant violation the alarm exists to
-/// catch. A supervisor still `reported` and live past this many seconds is
-/// no longer that window; it is indistinguishable from the leaf case the
-/// alarm has always covered.
-pub const REVIEW_BATCH_SUPERVISOR_REPORTED_GRACE_SECS: u64 = 120;
+/// catch. A member still `reported` and live past this many seconds is no
+/// longer that window; it is indistinguishable from the stuck-member case
+/// the alarm has always covered.
+pub const REVIEW_BATCH_REPORTED_MEMBER_GRACE_SECS: u64 = 120;
 
 /// Reservation weight of one non-terminal pre-merge batch: three parallel
 /// leaf reviewers plus the supervisor that follows them once they settle,
@@ -719,13 +719,14 @@ fn fail_review_batch_with_attention(
 }
 
 /// File one durable, work-item-scoped alarm for every batch that has an
-/// accepted report but a still-live member execution. Both recovery paths
-/// call this before their ordinary candidate/reap queries: neither is allowed
-/// to mistake the impossible `reported` + live combination for harmless
-/// ineligibility.
+/// accepted report but a still-live member execution. Both recovery sweeps
+/// call [`crate::work::WorkDb::sweep_reported_live_review_batch_members`],
+/// which calls this, before their ordinary candidate/reap queries: neither
+/// is allowed to mistake the impossible `reported` + live combination for
+/// harmless ineligibility.
 ///
 /// A reporting member is exempted while it reported less than
-/// [`REVIEW_BATCH_SUPERVISOR_REPORTED_GRACE_SECS`]
+/// [`REVIEW_BATCH_REPORTED_MEMBER_GRACE_SECS`]
 /// ago: that is the normal, self-resolving span between the verdict's member
 /// row committing and `finalize_accepted_review_batch_member` reaping its
 /// pane, not the invariant violation this alarm exists to catch. Past the
@@ -738,7 +739,7 @@ fn fail_review_batch_with_attention(
 /// grace window is not yet a bug this pass needs to keep asserting.
 fn file_reported_live_review_batch_member_attentions(conn: &mut Connection) -> Result<()> {
     let grace_cutoff = (boss_engine_utils::epoch_time::now_epoch_secs() as u64)
-        .saturating_sub(REVIEW_BATCH_SUPERVISOR_REPORTED_GRACE_SECS)
+        .saturating_sub(REVIEW_BATCH_REPORTED_MEMBER_GRACE_SECS)
         .to_string();
     let reported_live_members: Vec<(String, String, String)> = {
         let mut statement = conn.prepare(

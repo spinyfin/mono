@@ -484,11 +484,13 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                     },
                     Ok(Ok(false)) | Ok(Err(_)) => tracing::error!(
                         execution_id = %caller.execution_id,
-                        "accepted review report/verdict response was not delivered; preserving worker for retry",
+                        "accepted review report/verdict response was not delivered; teardown skipped, \
+                         the reported-plus-live sweep will raise an attention item",
                     ),
                     Err(_) => tracing::error!(
                         execution_id = %caller.execution_id,
-                        "timed out waiting for accepted review report/verdict response delivery; preserving worker for retry",
+                        "timed out waiting for accepted review report/verdict response delivery; teardown skipped, \
+                         the reported-plus-live sweep will raise an attention item",
                     ),
                 }
             }
