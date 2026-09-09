@@ -317,18 +317,10 @@ fn advance_review_batch_quorum_best_effort(
 /// its clean/remediation result — application probes GitHub and may create
 /// a work item, so it must not run inside the submission transaction.
 ///
-/// A resubmission from the SAME member that already staged this exact
-/// batch (`existing_verdict == final_verdict_proposal_id`) is accepted as a
-/// correction rather than rejected while the batch is still awaiting one
-/// (`supervising` for a supervisor, `collecting` for a post-merge reviewer)
-/// or `applying` (the prior proposal is still undecided):
-/// [`supersede_verdict_proposal`] marks the prior proposal superseded and
-/// this call re-points the member and the batch's
-/// `final_verdict_proposal_id` at the new one. Once the reconciler has
-/// marked the batch `completed`, further verdicts are rejected. A
-/// different member, or a stale/foreign proposal, can never trigger this
-/// path: it is keyed on the exact prior proposal id this member itself
-/// was recorded against, not merely on role or batch id.
+/// Each batch member submits at most one verdict. Its acknowledgement is
+/// delivered before the member is torn down, so a corrected submission from
+/// the same worker cannot be accepted after that durable handoff; subsequent
+/// verdicts are rejected rather than leaving an unreachable correction path.
 fn apply_review_verdict(
     tx: &Transaction<'_>,
     execution_id: &str,
@@ -370,7 +362,7 @@ fn apply_review_verdict(
         pr_url,
         target_sha,
         phase,
-        final_verdict_proposal_id,
+        _final_verdict_proposal_id,
     )) = member
     else {
         return Ok(ApplyDecision::Rejected(format!(
@@ -397,16 +389,7 @@ fn apply_review_verdict(
             )));
         }
     };
-    // A correction: this exact member already staged this exact batch
-    // with its previously accepted (still-undecided) verdict proposal.
-    // Anything else — another member, a batch this member didn't stage, or
-    // a batch the reconciler has already completed — falls through to the
-    // ordinary awaiting-status-only rule below.
-    let batch_awaiting_apply =
-        batch_status == awaiting_status.as_str() || batch_status == ReviewBatchStatus::Applying.as_str();
-    let is_own_undecided_verdict =
-        batch_awaiting_apply && existing_verdict.is_some() && existing_verdict == final_verdict_proposal_id;
-    if batch_status != awaiting_status.as_str() && !is_own_undecided_verdict {
+    if batch_status != awaiting_status.as_str() {
         return Ok(ApplyDecision::Rejected(format!(
             "review batch `{}` is `{batch_status}`, not `{awaiting_status}`; a verdict can only be accepted \
              while the batch is awaiting one",
@@ -422,20 +405,16 @@ fn apply_review_verdict(
             "verdict identity does not match its persisted batch target".to_owned(),
         ));
     }
-    if let Some(existing_verdict) = &existing_verdict
-        && !is_own_undecided_verdict
-    {
+    if let Some(existing_verdict) = &existing_verdict {
         return Ok(ApplyDecision::Rejected(format!(
             "review batch member `{member_id}` already accepted verdict proposal `{existing_verdict}`",
         )));
     }
     let status: ReviewBatchMemberStatus = status.parse().map_err(anyhow::Error::msg)?;
-    if !is_own_undecided_verdict
-        && !matches!(
-            status,
-            ReviewBatchMemberStatus::Pending | ReviewBatchMemberStatus::Running
-        )
-    {
+    if !matches!(
+        status,
+        ReviewBatchMemberStatus::Pending | ReviewBatchMemberStatus::Running
+    ) {
         return Ok(ApplyDecision::Rejected(format!(
             "review batch member `{member_id}` cannot accept a verdict while status is `{status}`",
         )));
@@ -445,26 +424,6 @@ fn apply_review_verdict(
     }
 
     let now = now_string();
-    if is_own_undecided_verdict {
-        let prior_proposal_id = existing_verdict.expect("is_own_undecided_verdict implies existing_verdict is Some");
-        supersede_verdict_proposal(tx, &prior_proposal_id, proposal_id, &now)?;
-        tx.execute(
-            "UPDATE pr_review_batch_members
-             SET report_proposal_id = ?1, terminal_at = ?2, updated_at = ?2
-             WHERE id = ?3",
-            rusqlite::params![proposal_id, now, member_id],
-        )?;
-        tx.execute(
-            "UPDATE pr_review_batches SET final_verdict_proposal_id = ?1, updated_at = ?2 WHERE id = ?3",
-            rusqlite::params![proposal_id, now, payload.batch_id],
-        )?;
-        supersede_other_undecided_review_verdicts(tx, &payload.batch_id, proposal_id, &now)?;
-        return Ok(ApplyDecision::Staged(ApplyOutcome {
-            applied_ref: None,
-            post_commit_audit_line: None,
-            review_batch_quorum_outcome: None,
-        }));
-    }
     tx.execute(
         "UPDATE pr_review_batch_members
          SET status = ?1, report_proposal_id = ?2, terminal_at = ?3, updated_at = ?3
@@ -478,28 +437,6 @@ fn apply_review_verdict(
         post_commit_audit_line: None,
         review_batch_quorum_outcome: quorum_outcome,
     }))
-}
-
-/// Mark a prior `review_verdict` proposal superseded by the corrected one
-/// that just replaced it. Scoped deliberately to the single
-/// corrected-resubmission case in [`apply_review_verdict`] — keyed on the
-/// exact prior proposal id this same supervisor member was recorded
-/// against — so it can never fire for a different member or an unrelated
-/// completed batch.
-fn supersede_verdict_proposal(
-    tx: &Transaction<'_>,
-    prior_proposal_id: &str,
-    new_proposal_id: &str,
-    now: &str,
-) -> Result<()> {
-    tx.execute(
-        "UPDATE worker_proposals
-         SET state = 'superseded', decided_by = 'policy', decided_at = ?1,
-             decision_reason = 'superseded by a corrected review_verdict resubmission (' || ?2 || ') from the same supervisor'
-         WHERE id = ?3",
-        rusqlite::params![now, new_proposal_id, prior_proposal_id],
-    )?;
-    Ok(())
 }
 
 /// A newer verdict supersedes any earlier undecided verdict for the same

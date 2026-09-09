@@ -126,6 +126,12 @@ pub async fn run_one_pass(
     // each role exactly once from its durable member policy; this preserves
     // the assigned driver/model and never turns one failed leaf into a second
     // single-reviewer pass.
+    if let Err(error) = work_db.sweep_reported_live_review_batch_members() {
+        tracing::warn!(
+            ?error,
+            "pr_review recovery: failed to sweep reported live batch members"
+        );
+    }
     let batch_candidates = match work_db.list_dead_review_batch_member_candidates() {
         Ok(candidates) => candidates,
         Err(error) => {

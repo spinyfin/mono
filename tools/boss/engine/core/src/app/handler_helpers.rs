@@ -543,6 +543,16 @@ pub(super) fn send_response(sink: &SessionSink, request_id: &str, payload: Front
     sink.enqueue(FrontendEventEnvelope::response(request_id.to_owned(), payload));
 }
 
+/// Enqueue a response whose caller needs proof that the session writer has
+/// flushed it before proceeding with a destructive follow-up action.
+pub(super) fn send_response_awaiting_delivery(
+    sink: &SessionSink,
+    request_id: &str,
+    payload: FrontendEvent,
+) -> oneshot::Receiver<bool> {
+    sink.enqueue_response_awaiting_delivery(FrontendEventEnvelope::response(request_id.to_owned(), payload))
+}
+
 /// Reply to `request_id` with a `WorkError` carrying `err`'s display
 /// string. Factors out the identical error-response arm repeated across
 /// every `FrontendRequest` handler module. The `impl Display` bound lets

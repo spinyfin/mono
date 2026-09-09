@@ -88,6 +88,7 @@ pub(super) struct QueueStats {
     pub(super) closed: bool,
 }
 
+#[derive(bon::Builder)]
 pub(super) struct SessionQueue {
     /// Priority lane: small engine→app control pushes (`EngineRequest`)
     /// only, drained ahead of everything in `items`. Each entry is
@@ -95,6 +96,7 @@ pub(super) struct SessionQueue {
     /// distinct request awaiting its own reply — and bounded independently
     /// by [`MAX_PRIORITY_QUEUE`], so a saturated bulk lane never blocks (or
     /// wedges) a reveal / pane-release. See [`is_priority_event`].
+    #[builder(default)]
     pub(super) priority: VecDeque<(Instant, FrontendEventEnvelope)>,
     /// Bulk lane: everything that isn't a priority control push — `WorkTree`
     /// snapshot responses, `TopicEvent` invalidations, list/result replies,
@@ -102,11 +104,14 @@ pub(super) struct SessionQueue {
     /// instant is stamped at enqueue time (preserved across coalesce) so
     /// [`SessionQueue::stats`] can report how long the head-of-line envelope
     /// has been waiting.
+    #[builder(default)]
     pub(super) items: VecDeque<(Instant, FrontendEventEnvelope)>,
     /// For each topic with a pending unsent TopicEvent, the index of that
     /// envelope in `items` (front-relative; decremented on pop). Lets us
     /// overwrite stale invalidations instead of growing the queue.
+    #[builder(default)]
     pub(super) pending_topics: HashMap<String, usize>,
+    #[builder(default = false)]
     pub(super) closed: bool,
     /// One-shot backpressure latch. Set when an enqueue overflows
     /// `MAX_SESSION_QUEUE`; while set, further enqueues report `Slow`
@@ -114,7 +119,16 @@ pub(super) struct SessionQueue {
     /// clears it once the queue drains to empty, so a session that
     /// briefly overflowed but then caught up accepts events again instead
     /// of silently dropping every subsequent enqueue forever.
+    #[builder(default = false)]
     pub(super) slow: bool,
+    /// `request_id`s of response envelopes [`SessionQueue::admit_under_pressure`]
+    /// dropped to make room, rather than actually delivering. Drained by
+    /// [`SessionSink::enqueue`] after each call so it can fail fast any
+    /// delivery waiter for a dropped response instead of leaving it to time
+    /// out. Never populated by [`SessionQueue::pop_front`]'s ordinary drain
+    /// — only an eviction under pressure is a drop.
+    #[builder(default)]
+    pub(super) dropped_response_request_ids: Vec<String>,
 }
 
 impl SessionQueue {
@@ -125,6 +139,7 @@ impl SessionQueue {
             pending_topics: HashMap::new(),
             closed: false,
             slow: false,
+            dropped_response_request_ids: Vec::new(),
         }
     }
 
@@ -208,9 +223,13 @@ impl SessionQueue {
             return EnqueueOutcome::Slow;
         }
 
-        self.evict_oldest_bulk();
+        if let Some((_, dropped)) = self.evict_oldest_bulk() {
+            self.record_dropped_response(dropped);
+        }
         if !self.pending_topics.contains_key(RESYNC_TOPIC) {
-            self.evict_oldest_bulk();
+            if let Some((_, dropped)) = self.evict_oldest_bulk() {
+                self.record_dropped_response(dropped);
+            }
             let idx = self.items.len();
             self.items.push_back((Instant::now(), resync_envelope()));
             self.pending_topics.insert(RESYNC_TOPIC.to_owned(), idx);
@@ -239,6 +258,16 @@ impl SessionQueue {
         }
         self.pending_topics = next;
         Some(popped)
+    }
+
+    /// Record that `env` was dropped (never sent) by [`Self::admit_under_pressure`],
+    /// so [`SessionSink::enqueue`] can fail fast any delivery waiter registered
+    /// for it instead of leaving the caller blocked for the full delivery
+    /// timeout.
+    fn record_dropped_response(&mut self, env: FrontendEventEnvelope) {
+        if let Some(request_id) = env.request_id {
+            self.dropped_response_request_ids.push(request_id);
+        }
     }
 
     pub(super) fn pop_front(&mut self) -> Option<FrontendEventEnvelope> {
@@ -347,6 +376,10 @@ pub(super) struct SessionSink {
     /// flushes. Empty for every non-population request. See
     /// [`crate::population_timing`].
     pop_traces: StdMutex<HashMap<String, crate::population_timing::PopulationTrace>>,
+    /// One-shot acknowledgements for responses whose producer must know that
+    /// the writer has flushed the frame before it can safely tear down the
+    /// caller's process tree.
+    delivery_waiters: StdMutex<HashMap<String, oneshot::Sender<bool>>>,
 }
 
 impl SessionSink {
@@ -356,6 +389,7 @@ impl SessionSink {
             notify: Notify::new(),
             shutdown: StdMutex::new(Some(shutdown_tx)),
             pop_traces: StdMutex::new(HashMap::new()),
+            delivery_waiters: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -378,15 +412,50 @@ impl SessionSink {
     }
 
     pub(super) fn enqueue(&self, env: FrontendEventEnvelope) -> EnqueueOutcome {
-        let outcome = {
+        let (outcome, dropped_response_request_ids) = {
             let mut q = self.queue.lock().expect("session queue lock poisoned");
-            q.enqueue(env)
+            let outcome = q.enqueue(env);
+            (outcome, std::mem::take(&mut q.dropped_response_request_ids))
         };
+        for request_id in &dropped_response_request_ids {
+            self.complete_response_delivery(Some(request_id), false);
+        }
         match outcome {
             EnqueueOutcome::Enqueued | EnqueueOutcome::Coalesced | EnqueueOutcome::Degraded => self.notify.notify_one(),
             EnqueueOutcome::Closed | EnqueueOutcome::Slow => {}
         }
         outcome
+    }
+
+    /// Enqueue a response and return a receiver completed by the writer after
+    /// the response frame is flushed. `false` means the response could not be
+    /// queued or written.
+    pub(super) fn enqueue_response_awaiting_delivery(&self, env: FrontendEventEnvelope) -> oneshot::Receiver<bool> {
+        let request_id = env.request_id.clone().expect("response envelope has request id");
+        let (tx, rx) = oneshot::channel();
+        self.delivery_waiters
+            .lock()
+            .expect("delivery_waiters lock poisoned")
+            .insert(request_id.clone(), tx);
+        match self.enqueue(env) {
+            EnqueueOutcome::Enqueued | EnqueueOutcome::Coalesced | EnqueueOutcome::Degraded => {}
+            EnqueueOutcome::Closed | EnqueueOutcome::Slow => self.complete_response_delivery(Some(&request_id), false),
+        }
+        rx
+    }
+
+    /// Complete a response-delivery acknowledgement after the writer has
+    /// either flushed its frame or encountered a socket failure.
+    pub(super) fn complete_response_delivery(&self, request_id: Option<&str>, delivered: bool) {
+        if let Some(request_id) = request_id
+            && let Some(tx) = self
+                .delivery_waiters
+                .lock()
+                .expect("delivery_waiters lock poisoned")
+                .remove(request_id)
+        {
+            let _ = tx.send(delivered);
+        }
     }
 
     /// Snapshot this session's outbound queue depth, head-of-line age, and

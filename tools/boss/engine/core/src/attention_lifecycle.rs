@@ -336,6 +336,17 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          successful review of a different PR does not un-do it.",
     ),
     entry(
+        crate::work::PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "The producer (`file_reported_live_review_batch_member_attentions`) re-evaluates the exact \
+         reported+live condition on every recovery-sweep pass and resolves the item itself once the \
+         member it named is no longer in that set — teardown finally succeeded, or (for a \
+         consolidating supervisor) the report turned out to be within its normal, brief \
+         report-then-teardown grace window rather than a stuck pane. A generic run-started rule \
+         cannot stand in for this: an unrelated later execution proves nothing about whether THIS \
+         member's pane was released.",
+    ),
+    entry(
         crate::completion::REVIEW_RESULT_GIVEUP_ATTENTION_KIND,
         ClearedBy::HumanDecision,
         "Records that a PR advanced to Review with NO automated review — a fact a later pass does \
@@ -609,6 +620,7 @@ mod tests {
             crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND,
             crate::work::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
             crate::work::PR_REVIEW_BATCH_STALE_ATTENTION_KIND,
+            crate::work::PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND,
             crate::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND,
             crate::worker_escalation::WORKER_BLOCKED_ATTENTION_KIND,
             crate::abandoned_branch_pr_sweep::ATTENTION_KIND_ABANDONED_BRANCH_NO_PR,

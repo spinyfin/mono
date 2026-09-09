@@ -967,13 +967,11 @@ fn review_verdict_stages_proposed_and_moves_the_batch_to_applying() {
     assert_eq!(member.report_proposal_id.as_deref(), Some(outcome.proposal.id.as_str()));
 }
 
-/// A second, corrected verdict submission from the SAME supervisor member
-/// that already staged this exact batch is accepted, not rejected: it
-/// supersedes the first (still-undecided) verdict and re-points the batch
-/// at the corrected one. Once the reconciler has applied the verdict the
-/// batch is `completed` and this path is closed.
+/// A member that has already staged its verdict cannot replace it: report
+/// acceptance hands the worker off to teardown, so only its first verdict
+/// can be used for the batch.
 #[test]
-fn a_corrected_review_verdict_from_the_same_supervisor_supersedes_the_prior_one() {
+fn a_second_review_verdict_from_the_same_supervisor_is_rejected() {
     let db = WorkDb::open(temp_db_path("review-verdict-correction")).unwrap();
     let product = create_test_product(&db);
     let cycle_root = create_test_chore_manual(&db, product.id, "review target");
@@ -1016,15 +1014,14 @@ fn a_corrected_review_verdict_from_the_same_supervisor_supersedes_the_prior_one(
         })
         .unwrap()
         .unwrap();
-    assert_eq!(second.proposal.state, ProposalState::Proposed);
-    assert_eq!(second.proposal.applied_ref, None);
+    assert_eq!(second.proposal.state, ProposalState::Rejected);
 
     let applying = db.review_batch(&batch.id).unwrap().unwrap();
     assert_eq!(applying.status, ReviewBatchStatus::Applying);
     assert_eq!(
         applying.final_verdict_proposal_id.as_deref(),
-        Some(second.proposal.id.as_str()),
-        "the batch must now point at the corrected verdict"
+        Some(first.proposal.id.as_str()),
+        "the batch must retain the first verdict"
     );
 
     let member = db
@@ -1033,15 +1030,7 @@ fn a_corrected_review_verdict_from_the_same_supervisor_supersedes_the_prior_one(
         .into_iter()
         .find(|member| member.role == ReviewBatchMemberRole::Supervisor)
         .unwrap();
-    assert_eq!(member.report_proposal_id.as_deref(), Some(second.proposal.id.as_str()));
-
-    let prior = db
-        .list_worker_proposals_for_execution(&execution.id, ProposalKind::ReviewVerdict)
-        .unwrap()
-        .into_iter()
-        .find(|proposal| proposal.id == first.proposal.id)
-        .expect("the prior verdict proposal must still exist");
-    assert_eq!(prior.state, ProposalState::Superseded);
+    assert_eq!(member.report_proposal_id.as_deref(), Some(first.proposal.id.as_str()));
 }
 
 /// A resubmission from a DIFFERENT member/execution than the one that
@@ -1216,7 +1205,7 @@ fn leaf_dispatch_creates_three_atomic_role_pinned_executions() {
         ]
     );
     assert!(
-        db.are_same_review_batch_leaves(&executions[0].id, &executions[1].id)
+        db.are_admissible_same_review_batch_pair(&executions[0].id, &executions[1].id)
             .unwrap()
     );
 
@@ -1235,13 +1224,13 @@ fn leaf_dispatch_creates_three_atomic_role_pinned_executions() {
     }
 }
 
-/// `are_same_review_batch_leaves` relaxes the ordinary single-writer chain
+/// `are_admissible_same_review_batch_pair` relaxes the ordinary single-writer chain
 /// guard for exactly one case: two leaf executions of the SAME persisted
 /// batch. Its false cases are the safety-critical ones — a too-permissive
 /// predicate would let genuinely unrelated executions run concurrently on
 /// one work item, which is precisely what the guard exists to stop.
 #[test]
-fn are_same_review_batch_leaves_rejects_cross_batch_and_memberless_pairs() {
+fn admissible_same_review_batch_pair_rejects_cross_batch_and_memberless_pairs() {
     let db = WorkDb::open(temp_db_path("review-batch-leaves-negative")).unwrap();
     let product = create_test_product(&db);
     let cycle_root = create_test_chore_manual(&db, product.id, "review target");
@@ -1271,7 +1260,7 @@ fn are_same_review_batch_leaves_rejects_cross_batch_and_memberless_pairs() {
         other => panic!("expected a newly-created review batch, got {other:?}"),
     };
     assert!(
-        !db.are_same_review_batch_leaves(&executions_a[0].id, &executions_b[0].id)
+        !db.are_admissible_same_review_batch_pair(&executions_a[0].id, &executions_b[0].id)
             .unwrap(),
         "leaves from different batches must not be treated as the same batch's leaves"
     );
@@ -1288,10 +1277,279 @@ fn are_same_review_batch_leaves_rejects_cross_batch_and_memberless_pairs() {
         )
         .unwrap();
     assert!(
-        !db.are_same_review_batch_leaves(&executions_a[0].id, &bare_execution.id)
+        !db.are_admissible_same_review_batch_pair(&executions_a[0].id, &bare_execution.id)
             .unwrap(),
         "an execution with no batch member row must not be treated as a batch leaf"
     );
+}
+
+/// The consolidator reads every leaf's report and is therefore the one
+/// additional batch role allowed through the single-writer admission guard.
+/// This is deliberately exercised after the real quorum transition creates
+/// the supervisor, rather than by hand-writing a member row.
+#[test]
+fn admissible_same_review_batch_pair_admits_supervisor_leaf_pairs() {
+    let db = WorkDb::open(temp_db_path("review-batch-supervisor-admission")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let (batch, executions) = match db
+        .create_pre_merge_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            "https://github.com/example/repo",
+        )
+        .unwrap()
+    {
+        ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+        other => panic!("expected a newly-created review batch, got {other:?}"),
+    };
+
+    for (index, execution) in executions.iter().enumerate() {
+        submit_review_report(
+            &db,
+            &execution.id,
+            &cycle_root.id,
+            &batch.id,
+            "head-sha",
+            &format!("report-{index}"),
+        );
+    }
+    let supervisor_execution_id = db
+        .review_batch_members(&batch.id)
+        .unwrap()
+        .into_iter()
+        .find(|member| member.role == ReviewBatchMemberRole::Supervisor)
+        .and_then(|member| member.execution_id)
+        .expect("quorum must create a supervisor execution");
+
+    assert!(
+        db.are_admissible_same_review_batch_pair(&supervisor_execution_id, &executions[0].id)
+            .unwrap(),
+        "the supervisor must be admitted alongside a leaf from its own batch"
+    );
+    assert!(
+        db.are_admissible_same_review_batch_pair(&executions[0].id, &supervisor_execution_id)
+            .unwrap(),
+        "pair admission must be symmetric"
+    );
+}
+
+/// A reported member must not be silently omitted from either recovery path
+/// while it still owns a live execution. The normal report-acceptance seam
+/// terminalizes it immediately; this alarm protects the invariant if that
+/// seam regresses or its teardown fails after the report becomes durable.
+#[test]
+fn reported_live_leaf_is_graced_then_files_attention_from_both_recovery_paths() {
+    let db = WorkDb::open(temp_db_path("review-batch-reported-live-attention")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member(
+                ReviewBatchMemberRole::ClaudeReviewer,
+                Some(execution.id.clone()),
+            )],
+        )
+        .unwrap();
+    submit_review_report(
+        &db,
+        &execution.id,
+        &cycle_root.id,
+        &batch.id,
+        "head-sha",
+        "report-accepted",
+    );
+    db.sweep_reported_live_review_batch_members().unwrap();
+    assert!(
+        db.list_attention_items_for_work_item(&cycle_root.id)
+            .unwrap()
+            .iter()
+            .all(|item| item.kind != crate::work::PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND),
+        "a leaf inside its normal report-then-teardown window must not trip the alarm"
+    );
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_batch_members SET terminal_at = '1' WHERE batch_id = ?1",
+            rusqlite::params![batch.id],
+        )
+        .unwrap();
+    db.sweep_reported_live_review_batch_members().unwrap();
+
+    assert!(
+        db.list_dead_review_batch_member_candidates().unwrap().is_empty(),
+        "a reported member is not eligible for retry"
+    );
+    assert!(
+        db.reap_inert_review_batches(0).unwrap().is_empty(),
+        "a live execution must prevent inert-batch reaping"
+    );
+    let attentions = db.list_attention_items_for_work_item(&cycle_root.id).unwrap();
+    assert_eq!(
+        attentions
+            .iter()
+            .filter(|item| item.kind == crate::work::PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND)
+            .count(),
+        1,
+        "both recovery paths must re-raise one durable alarm, not silently skip the anomaly"
+    );
+}
+
+/// Build a `supervising` batch with a live `Supervisor` member and submit its
+/// verdict, returning `(db, cycle_root_id, batch_id, execution_id)`. Shared
+/// setup for the grace-window tests below: after this call the member is
+/// `reported`, the batch is `applying`, and (because this is a DB-only test
+/// with no finalizer running) the execution is still live — the exact shape
+/// a healthy consolidator has for the brief span before
+/// `finalize_accepted_review_batch_member` reaps its pane.
+fn reported_live_supervisor() -> (WorkDb, String, String, String) {
+    let db = WorkDb::open(temp_db_path("review-batch-supervisor-grace")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member(ReviewBatchMemberRole::Supervisor, Some(execution.id.clone()))],
+        )
+        .unwrap();
+    force_batch_supervising(&db, &batch.id);
+    db.submit_worker_proposal(SubmitWorkerProposalInput {
+        execution_id: &execution.id,
+        work_item_id: &cycle_root.id,
+        kind: ProposalKind::ReviewVerdict,
+        payload_json: &verdict_payload(&batch.id, "head-sha"),
+        idempotency_key: "verdict-grace",
+    })
+    .unwrap()
+    .unwrap();
+    (db, cycle_root.id, batch.id, execution.id)
+}
+
+/// A consolidator inside its normal report-then-teardown window must not trip
+/// the reported-plus-live alarm.
+#[test]
+fn supervisor_reported_live_within_grace_window_does_not_alarm() {
+    let (db, cycle_root_id, _batch_id, _execution_id) = reported_live_supervisor();
+    db.sweep_reported_live_review_batch_members().unwrap();
+
+    assert!(
+        db.list_dead_review_batch_member_candidates().unwrap().is_empty(),
+        "a reported supervisor is not eligible for retry"
+    );
+    assert!(
+        db.reap_inert_review_batches(0).unwrap().is_empty(),
+        "a live execution must prevent inert-batch reaping"
+    );
+    let attentions = db.list_attention_items_for_work_item(&cycle_root_id).unwrap();
+    assert!(
+        attentions
+            .iter()
+            .all(|item| item.kind != crate::work::PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND),
+        "a supervisor within its normal report-then-teardown grace window must not trip the alarm"
+    );
+}
+
+/// The grace-window exemption must not become a way to permanently hide a
+/// genuinely stuck consolidator. Once a supervisor has been `reported` + live for longer than
+/// [`crate::work::REVIEW_BATCH_REPORTED_MEMBER_GRACE_SECS`], it is
+/// exactly as alarming as a stuck leaf always was.
+#[test]
+fn supervisor_reported_live_past_grace_window_still_alarms() {
+    let (db, cycle_root_id, batch_id, _execution_id) = reported_live_supervisor();
+    backdate_supervisor_terminal_at(&db, &batch_id, 1);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_batches SET status = 'completed' WHERE id = ?1",
+            rusqlite::params![batch_id],
+        )
+        .unwrap();
+
+    db.sweep_reported_live_review_batch_members().unwrap();
+    let attentions = db.list_attention_items_for_work_item(&cycle_root_id).unwrap();
+    assert_eq!(
+        attentions
+            .iter()
+            .filter(
+                |item| item.kind == crate::work::PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND && item.status == "open"
+            )
+            .count(),
+        1,
+        "a supervisor stuck reported+live past the grace window must still be caught"
+    );
+}
+
+/// Once the reported-plus-live condition resolves, the next sweep must resolve
+/// the alarm itself rather than leaving a permanent card.
+#[test]
+fn supervisor_reported_live_alarm_auto_clears_once_torn_down() {
+    let (db, cycle_root_id, batch_id, execution_id) = reported_live_supervisor();
+    backdate_supervisor_terminal_at(&db, &batch_id, 1);
+
+    db.sweep_reported_live_review_batch_members().unwrap();
+    assert_eq!(
+        db.list_attention_items_for_work_item(&cycle_root_id)
+            .unwrap()
+            .iter()
+            .filter(
+                |item| item.kind == crate::work::PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND && item.status == "open"
+            )
+            .count(),
+        1,
+        "precondition: the alarm must be open before it can be observed clearing"
+    );
+
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            rusqlite::params![execution_id],
+        )
+        .unwrap();
+
+    db.sweep_reported_live_review_batch_members().unwrap();
+    let attentions = db.list_attention_items_for_work_item(&cycle_root_id).unwrap();
+    assert!(
+        attentions
+            .iter()
+            .filter(|item| item.kind == crate::work::PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND)
+            .all(|item| item.status == "resolved"),
+        "the alarm must auto-clear once its own producer no longer observes the condition"
+    );
+}
+
+/// Backdate the supervisor member's `terminal_at` on `batch_id` so it reads
+/// as reported `grace_secs_past` seconds beyond the grace window — the shape
+/// a supervisor that was never torn down eventually reaches.
+fn backdate_supervisor_terminal_at(db: &WorkDb, batch_id: &str, grace_secs_past: u64) {
+    let cutoff = (boss_engine_utils::epoch_time::now_epoch_secs() as u64)
+        .saturating_sub(crate::work::REVIEW_BATCH_REPORTED_MEMBER_GRACE_SECS + grace_secs_past)
+        .to_string();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_batch_members SET terminal_at = ?1 WHERE batch_id = ?2 AND role = 'supervisor'",
+            rusqlite::params![cutoff, batch_id],
+        )
+        .unwrap();
 }
 
 /// A batch still live for the current target — one leaf settled with an

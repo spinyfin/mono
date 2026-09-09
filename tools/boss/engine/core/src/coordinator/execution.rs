@@ -392,7 +392,10 @@ impl ExecutionCoordinator {
             .get_live_execution_for_work_item(&execution.work_item_id, &execution.id)
         {
             Ok(Some(live)) => {
-                if self.work_db.are_same_review_batch_leaves(&execution.id, &live.id)? {
+                if self
+                    .work_db
+                    .are_admissible_same_review_batch_pair(&execution.id, &live.id)?
+                {
                     tracing::info!(
                         execution_id = %execution.id,
                         live_execution_id = %live.id,

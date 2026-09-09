@@ -578,6 +578,9 @@ pub async fn run_one_pass_observed(
             .unwrap_or(crate::coordinator::DEFAULT_REVIEW_POOL_SIZE);
         sweep_deferred_review_admission(work_db, publisher, None, pool_size, &mut outcome).await;
     }
+    if let Err(err) = work_db.sweep_reported_live_review_batch_members() {
+        tracing::warn!(?err, "merge poller: failed to sweep reported live batch members");
+    }
     match work_db.reap_inert_review_batches(crate::work::REVIEW_BATCH_STALE_SECS) {
         Ok(reaped) => {
             outcome.review_batches_reaped = reaped.len();

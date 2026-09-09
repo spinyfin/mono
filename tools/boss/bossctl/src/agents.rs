@@ -1861,20 +1861,20 @@ fn format_live_state_short(state: &LiveWorkerState, tmux: TmuxListEvidence<'_>) 
         TmuxListEvidence::Present(status) => {
             let session = status.session_name.as_deref().unwrap_or("-");
             let pane_dead = status.pane_dead.map_or("-", |dead| if dead { "true" } else { "false" });
-            let last_output = status.last_output_at.as_deref().unwrap_or("-");
+            let window_activity = status.last_output_at.as_deref().unwrap_or("-");
             line.push_str(&format!(
-                "  tmux_session={}  adoption_state={}  pane_dead={}  last_output_at={}",
+                "  tmux_session={}  adoption_state={}  pane_dead={}  window_activity_at={}",
                 session,
                 tmux_adoption_state_label(status.adoption_state),
                 pane_dead,
-                last_output,
+                window_activity,
             ));
         }
         TmuxListEvidence::FetchFailed => {
-            line.push_str("  tmux_session=-  adoption_state=probe_unavailable  pane_dead=-  last_output_at=-")
+            line.push_str("  tmux_session=-  adoption_state=probe_unavailable  pane_dead=-  window_activity_at=-")
         }
         TmuxListEvidence::Missing => {
-            line.push_str("  tmux_session=-  adoption_state=no_status  pane_dead=-  last_output_at=-")
+            line.push_str("  tmux_session=-  adoption_state=no_status  pane_dead=-  window_activity_at=-")
         }
     }
     line
@@ -1956,7 +1956,7 @@ mod tests {
         );
         assert!(line.contains("pane_dead=false"), "missing pane state: {line}");
         assert!(
-            line.contains("last_output_at=2026-08-19T12:00:00Z"),
+            line.contains("window_activity_at=2026-08-19T12:00:00Z"),
             "missing output time: {line}"
         );
     }

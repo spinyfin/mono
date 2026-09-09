@@ -581,7 +581,8 @@ pub(crate) use products_design::resolve_task_doc_pointer;
 pub(crate) use proposal_apply::*;
 pub(crate) use query_ensure::*;
 pub use review_batches::{
-    PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND, PR_REVIEW_BATCH_STALE_ATTENTION_KIND, REVIEW_BATCH_STALE_SECS,
+    PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND, PR_REVIEW_BATCH_STALE_ATTENTION_KIND,
+    PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND, REVIEW_BATCH_REPORTED_MEMBER_GRACE_SECS, REVIEW_BATCH_STALE_SECS,
     RetryDeadReviewBatchMember, ReviewBatchCreateInput, ReviewBatchDispatch, ReviewBatchMemberCreateInput,
     ReviewBatchQuorumOutcome,
 };

@@ -20,7 +20,7 @@ use super::*;
 use crate::app::proposals;
 use boss_protocol::{
     PROPOSAL_CAP_PER_KIND_PER_EXECUTION, ProposalErrorCode, ProposalKind, ProposalState, ProposalSubmissionError,
-    WorkerProposal,
+    ReviewBatchPhase, ReviewClassification, ReviewLanguageBucket, ReviewProfile, WorkerProposal,
 };
 use serde_json::{Value, json};
 
@@ -78,19 +78,6 @@ fn dispatch_with_peer(state: &Arc<ServerState>, sink: &Arc<SessionSink>, peer_pi
         .build()
 }
 
-/// The single response a handler enqueued. Closes the sink first so a
-/// handler that replied with nothing surfaces as a panic rather than hanging
-/// until Bazel's timeout.
-async fn sole_response(sink: &SessionSink) -> FrontendEvent {
-    sink.close();
-    let response = sink.next().await.expect("handler must send a response").payload;
-    assert!(
-        sink.next().await.is_none(),
-        "handler must send exactly one response, got a second",
-    );
-    response
-}
-
 /// Drive one proposal verb through its handler and return the reply.
 /// Mirrors `app.rs`'s dispatch table for these two verbs.
 async fn call_with_peer(
@@ -100,12 +87,25 @@ async fn call_with_peer(
 ) -> FrontendEvent {
     let sink = make_session_sink();
     let ctx = dispatch_with_peer(state, &sink, peer_pid);
-    match req {
-        r @ FrontendRequest::SubmitProposal { .. } => proposals::handle_submit_proposal(ctx, r).await,
-        r @ FrontendRequest::ListProposals { .. } => proposals::handle_list_proposals(ctx, r).await,
-        other => panic!("not a proposal verb: {other:?}"),
+    let handler = async {
+        match req {
+            r @ FrontendRequest::SubmitProposal { .. } => proposals::handle_submit_proposal(ctx, r).await,
+            r @ FrontendRequest::ListProposals { .. } => proposals::handle_list_proposals(ctx, r).await,
+            other => panic!("not a proposal verb: {other:?}"),
+        }
+    };
+    tokio::pin!(handler);
+    let (response, handler_finished) = tokio::select! {
+        response = sink.next() => (response.expect("handler must send a response"), false),
+        _ = &mut handler => (sink.next().await.expect("handler must send a response"), true),
+    };
+    sink.complete_response_delivery(response.request_id.as_deref(), true);
+    if !handler_finished {
+        handler.await;
     }
-    sole_response(&sink).await
+    sink.close();
+    assert!(sink.next().await.is_none(), "handler must send exactly one response");
+    response.payload
 }
 
 fn submit_request(run_id: &str, kind: ProposalKind, payload: Value) -> FrontendRequest {
@@ -135,6 +135,164 @@ async fn submit(fx: &WorkerFixture, kind: ProposalKind, payload: Value) -> Front
     .await
 }
 
+fn review_classification() -> ReviewClassification {
+    ReviewClassification::builder()
+        .changed_files(vec!["src/lib.rs".to_owned()])
+        .complexity_flags(vec![])
+        .has_production_code(true)
+        .metadata_missing(vec![])
+        .production_languages(vec![ReviewLanguageBucket::Rust])
+        .profile(ReviewProfile::Light)
+        .subsystem_buckets(vec!["src".to_owned()])
+        .build()
+}
+
+fn review_report_payload(batch_id: &str, target_sha: &str) -> Value {
+    json!({
+        "batch_id": batch_id,
+        "target_sha": target_sha,
+        "report": {
+            "batch_id": batch_id,
+            "pr_url": "https://github.com/example/repo/pull/42",
+            "target_sha": target_sha,
+            "phase": "pre_merge",
+            "summary": "Clean.",
+            "coverage": {"files_inspected": [], "files_omitted": [], "limitations": []},
+            "findings": []
+        }
+    })
+}
+
+/// Build one live batch leaf against a fake app runtime. Returning the same
+/// data a real proposal RPC sees keeps the acceptance test below on the
+/// complete attributed request → apply → teardown path.
+fn live_batch_leaf() -> (Arc<ServerState>, tempfile::TempDir, String, String, String) {
+    let (server_state, dir) = test_server_state_with_fakes();
+    let (_ordinary_execution_id, work_item_id) = new_execution(&server_state, "Review target");
+    let dispatch = server_state
+        .work_db
+        .create_pre_merge_review_batch(
+            crate::work::ReviewBatchCreateInput::builder()
+                .cycle_root_id(work_item_id.clone())
+                .base_sha("base-sha")
+                .classification(review_classification())
+                .phase(ReviewBatchPhase::PreMerge)
+                .pr_number(42)
+                .pr_url("https://github.com/example/repo/pull/42")
+                .target_sha("head-sha")
+                .build(),
+            "https://github.com/example/repo",
+        )
+        .unwrap();
+    let (batch_id, leaf_execution_id) = match dispatch {
+        crate::work::ReviewBatchDispatch::Created { batch, executions } => (batch.id, executions[0].id.clone()),
+        other => panic!("expected a fresh review batch, got {other:?}"),
+    };
+    server_state
+        .work_db
+        .start_execution_run(
+            &leaf_execution_id,
+            "reviewer",
+            "repo",
+            "lease-reviewer",
+            "workspace-reviewer",
+            dir.path().to_str().unwrap(),
+        )
+        .unwrap();
+    server_state
+        .worker_registry
+        .register(std::process::id() as libc::pid_t, leaf_execution_id.clone());
+    (server_state, dir, work_item_id, batch_id, leaf_execution_id)
+}
+
+fn verdict_payload(batch_id: &str, target_sha: &str) -> Value {
+    json!({
+        "batch_id": batch_id,
+        "verdict": {
+            "batch_id": batch_id,
+            "pr_url": "https://github.com/example/repo/pull/42",
+            "target_sha": target_sha,
+            "phase": "pre_merge",
+            "summary": "Clean.",
+            "revision_warranted": false,
+            "findings": [],
+            "contradictions": []
+        }
+    })
+}
+
+/// Build one live batch consolidator (the `Supervisor`-role member) against a
+/// fake app runtime, mirroring [`live_batch_leaf`] but for the role a
+/// `review_verdict` submission targets. The batch is forced straight to
+/// `supervising` — the state `apply_review_verdict` requires — the same
+/// shortcut `work/tests/review_batches_tests.rs::force_batch_supervising`
+/// uses, since standing up three leaf reports first is not the point of
+/// these tests.
+fn live_batch_supervisor() -> (Arc<ServerState>, tempfile::TempDir, String, String, String) {
+    use crate::work::{CreateExecutionInput, ReviewBatchCreateInput, ReviewBatchMemberCreateInput};
+    use boss_protocol::{ExecutionKind, ReviewBatchMemberRole, ReviewBatchMemberStatus};
+
+    let (server_state, dir) = test_server_state_with_fakes();
+    let (_ordinary_execution_id, work_item_id) = new_execution(&server_state, "Review target");
+    let execution = server_state
+        .work_db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(work_item_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _members) = server_state
+        .work_db
+        .create_review_batch(
+            ReviewBatchCreateInput::builder()
+                .cycle_root_id(work_item_id.clone())
+                .base_sha("base-sha")
+                .classification(review_classification())
+                .phase(ReviewBatchPhase::PreMerge)
+                .pr_number(42)
+                .pr_url("https://github.com/example/repo/pull/42")
+                .target_sha("head-sha")
+                .build(),
+            &[ReviewBatchMemberCreateInput::builder()
+                .attempt(1)
+                .provider_effort("medium")
+                .requested_driver("claude")
+                .resolved_model("test-model")
+                .role(ReviewBatchMemberRole::Supervisor)
+                .status(ReviewBatchMemberStatus::Pending)
+                .maybe_execution_id(Some(execution.id.clone()))
+                .build()],
+        )
+        .unwrap();
+    server_state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_batches SET status = 'supervising' WHERE id = ?1",
+            rusqlite::params![batch.id],
+        )
+        .unwrap();
+    server_state
+        .work_db
+        .start_execution_run(
+            &execution.id,
+            "supervisor",
+            "repo",
+            "lease-supervisor",
+            "workspace-supervisor",
+            dir.path().to_str().unwrap(),
+        )
+        .unwrap();
+    server_state
+        .worker_registry
+        .register(std::process::id() as libc::pid_t, execution.id.clone());
+    (server_state, dir, work_item_id, batch.id, execution.id)
+}
+
 // ── Response accessors ───────────────────────────────────────────────────────
 
 /// The `(proposal, already_submitted)` pair from a successful submission, or
@@ -161,6 +319,247 @@ fn rejected(event: FrontendEvent) -> ProposalSubmissionError {
         }
         other => panic!("expected ProposalRejected, got {other:?}"),
     }
+}
+
+/// An accepted review report is terminal on its own. This is the full app
+/// seam, including PID attribution and RPC response: it must not depend on a
+/// later driver Stop/turn-completed event to release the reviewer pane.
+#[tokio::test]
+async fn accepted_review_report_immediately_terminalizes_its_live_leaf() {
+    let (server_state, _dir, _work_item_id, batch_id, execution_id) = live_batch_leaf();
+    let peer_pid = std::process::id() as libc::pid_t;
+
+    let (proposal, already_submitted) = submitted(
+        call_with_peer(
+            &server_state,
+            Some(peer_pid),
+            submit_request(
+                &execution_id,
+                ProposalKind::ReviewReport,
+                review_report_payload(&batch_id, "head-sha"),
+            ),
+        )
+        .await,
+    );
+    assert!(!already_submitted);
+    assert_eq!(proposal.state, ProposalState::Applied);
+    assert!(
+        server_state
+            .work_db
+            .get_execution(&execution_id)
+            .unwrap()
+            .status
+            .is_terminal(),
+        "report acceptance must complete the leaf before the RPC returns"
+    );
+    let member = server_state
+        .work_db
+        .review_batch_member_for_execution(&execution_id)
+        .unwrap()
+        .expect("leaf must remain addressable through its persisted member row");
+    assert_eq!(member.status, boss_protocol::ReviewBatchMemberStatus::Reported);
+}
+
+/// A rejected report does not masquerade as completion. Once the worker's
+/// turn ends, the existing batch finalizer records the missing accepted report
+/// as a member failure and releases the pane, making the error observable and
+/// retryable instead of leaving a zombie leaf.
+#[tokio::test]
+async fn rejected_review_report_becomes_a_visible_member_failure_on_stop() {
+    let (server_state, _dir, _work_item_id, batch_id, execution_id) = live_batch_leaf();
+    let peer_pid = std::process::id() as libc::pid_t;
+
+    let (proposal, already_submitted) = submitted(
+        call_with_peer(
+            &server_state,
+            Some(peer_pid),
+            submit_request(
+                &execution_id,
+                ProposalKind::ReviewReport,
+                review_report_payload(&batch_id, "wrong-head"),
+            ),
+        )
+        .await,
+    );
+    assert!(!already_submitted);
+    assert_eq!(proposal.state, ProposalState::Rejected);
+    let outcome = server_state.completion_handler.on_stop(&execution_id).await;
+    assert!(matches!(
+        outcome,
+        crate::completion::StopOutcome::ReviewPassCompleted { .. }
+    ));
+    assert!(
+        server_state
+            .work_db
+            .get_execution(&execution_id)
+            .unwrap()
+            .status
+            .is_terminal(),
+        "a rejected report must end as an explicit member failure, not a live pane"
+    );
+    assert_eq!(
+        server_state
+            .work_db
+            .review_batch_member_for_execution(&execution_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        boss_protocol::ReviewBatchMemberStatus::Failed,
+    );
+}
+
+/// The consolidating supervisor must be torn down the same way a leaf is. A
+/// `review_verdict` acceptance stages the member `reported` and moves the
+/// batch to `applying` synchronously, exactly like a `review_report`
+/// acceptance does for a leaf — so it must reach the same finalize/teardown
+/// path, not just the leaf's own `ReviewReport` branch.
+#[tokio::test]
+async fn accepted_review_verdict_immediately_terminalizes_its_live_supervisor() {
+    let (server_state, _dir, _work_item_id, batch_id, execution_id) = live_batch_supervisor();
+    let peer_pid = std::process::id() as libc::pid_t;
+
+    let (proposal, already_submitted) = submitted(
+        call_with_peer(
+            &server_state,
+            Some(peer_pid),
+            submit_request(
+                &execution_id,
+                ProposalKind::ReviewVerdict,
+                verdict_payload(&batch_id, "head-sha"),
+            ),
+        )
+        .await,
+    );
+    assert!(!already_submitted);
+    // `review_verdict` applies asynchronously — the RPC response reports the
+    // synchronous staging outcome (`Proposed`), not the reconciler's later
+    // materialisation.
+    assert_eq!(proposal.state, ProposalState::Proposed);
+    assert!(
+        server_state
+            .work_db
+            .get_execution(&execution_id)
+            .unwrap()
+            .status
+            .is_terminal(),
+        "verdict acceptance must complete the consolidator before the RPC returns, exactly as \
+         report acceptance does for a leaf"
+    );
+    let member = server_state
+        .work_db
+        .review_batch_member_for_execution(&execution_id)
+        .unwrap()
+        .expect("supervisor must remain addressable through its persisted member row");
+    assert_eq!(member.status, boss_protocol::ReviewBatchMemberStatus::Reported);
+}
+
+/// A replayed acceptance (the same idempotency key resubmitted, e.g. by a
+/// worker retrying after a crash between apply and this handler's own
+/// teardown call) must still reach the finalizer. The finalizer itself is
+/// idempotent — it no-ops on an execution that is already terminal — so the
+/// only way a replay can leave a pane stuck open is if the caller never
+/// calls it a second time.
+#[tokio::test]
+async fn a_replayed_review_report_acceptance_still_reaches_the_finalizer() {
+    let (server_state, _dir, _work_item_id, batch_id, execution_id) = live_batch_leaf();
+    let peer_pid = std::process::id() as libc::pid_t;
+    let payload = review_report_payload(&batch_id, "head-sha");
+
+    let (first, already_submitted) = submitted(
+        call_with_peer(
+            &server_state,
+            Some(peer_pid),
+            submit_request_keyed(&execution_id, ProposalKind::ReviewReport, payload.clone(), "replay-key"),
+        )
+        .await,
+    );
+    assert!(!already_submitted);
+    assert_eq!(first.state, ProposalState::Applied);
+    assert!(
+        server_state
+            .work_db
+            .get_execution(&execution_id)
+            .unwrap()
+            .status
+            .is_terminal(),
+        "the first acceptance must already have torn the leaf down"
+    );
+
+    // Replay: same idempotency key, same execution — the shape a crashed
+    // worker's retry takes. This must not error, and the (already-terminal)
+    // finalizer call it triggers must be a harmless no-op rather than a
+    // panic or a spurious error log path.
+    let (replay, replay_already_submitted) = submitted(
+        call_with_peer(
+            &server_state,
+            Some(peer_pid),
+            submit_request_keyed(&execution_id, ProposalKind::ReviewReport, payload, "replay-key"),
+        )
+        .await,
+    );
+    assert!(replay_already_submitted);
+    assert_eq!(replay.id, first.id);
+    assert_eq!(replay.state, ProposalState::Applied);
+    assert!(
+        server_state
+            .work_db
+            .get_execution(&execution_id)
+            .unwrap()
+            .status
+            .is_terminal()
+    );
+}
+
+/// A leaf with a real durable `shell_pid` must be genuinely reaped by the
+/// pane releaser on report acceptance. `live_batch_leaf`'s execution has no durable
+/// `work_runs.shell_pid`, so `release_worker_pane` finds nothing to signal
+/// and the reap is a no-op. Give the leaf a real OS process as its
+/// durable pid (the same fixture `worker_process_reaping.rs` uses for its
+/// own "genuinely reaps a real process" coverage), submit an accepted
+/// report through the real RPC handler, and confirm the process actually
+/// dies — proving this is a genuine kill, not a simulated one.
+///
+/// The handler waits for the session writer to flush the acknowledgement
+/// before it calls the finalizer, so the reap cannot kill a client still
+/// blocked waiting for this response.
+#[tokio::test]
+async fn accepted_review_report_reaps_a_real_worker_process() {
+    let (server_state, _dir, _work_item_id, batch_id, execution_id) = live_batch_leaf();
+    let peer_pid = std::process::id() as libc::pid_t;
+
+    let mut child = crate::test_support::spawn_group_leader_sleeper();
+    let pid = child.id() as i64;
+    assert!(
+        server_state
+            .work_db
+            .set_run_shell_pid_for_execution(&execution_id, pid)
+            .unwrap(),
+        "live_batch_leaf's start_execution_run must have left a run row to record the pid against"
+    );
+
+    let (proposal, _) = submitted(
+        call_with_peer(
+            &server_state,
+            Some(peer_pid),
+            submit_request(
+                &execution_id,
+                ProposalKind::ReviewReport,
+                review_report_payload(&batch_id, "head-sha"),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(proposal.state, ProposalState::Applied);
+
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .expect("join wait task")
+        .expect("wait on child");
+    assert!(
+        !status.success(),
+        "the live pane releaser must have actually reaped the leaf's real worker process — a \
+         no-op releaser (or one that only ever ran against a fake) would leave it running"
+    );
 }
 
 fn listed(event: FrontendEvent) -> (String, Vec<WorkerProposal>) {
