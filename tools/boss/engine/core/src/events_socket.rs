@@ -36,6 +36,20 @@ use tokio::net::{UnixListener, UnixStream};
 /// Keep them byte-for-byte identical if either changes.
 const REJECTION_PREFIX: &str = "BOSS-EVENT-REJECTED: ";
 
+/// Marker line the engine writes back to the peer when a connection failed
+/// for a reason [`SocketError::is_permanent`] classifies as transient (a
+/// socket I/O hiccup, or a busy/locked `WorkDb` lookup) rather than
+/// permanent. Distinct from [`REJECTION_PREFIX`] so `boss-event` can tell
+/// "the engine will never accept this payload" apart from "the engine hit a
+/// transient error and this payload should be retried" — see
+/// [`retry_connection`].
+///
+/// Deliberately duplicated (not shared via a crate dependency) in
+/// `tools/boss/event-shim/src/main.rs`'s `RETRY_PREFIX`, for the same
+/// dependency-free-shim reason as [`REJECTION_PREFIX`]. Keep them
+/// byte-for-byte identical if either changes.
+const RETRY_PREFIX: &str = "BOSS-EVENT-RETRY: ";
+
 /// `level` for `getsockopt(SOL_LOCAL, LOCAL_PEERPID)` on macOS.
 #[cfg(target_os = "macos")]
 const SOL_LOCAL: libc::c_int = 0;
@@ -194,10 +208,12 @@ impl SocketError {
     /// so it is safe to report back to the peer as a [`REJECTION_PREFIX`]
     /// notice (which the shim treats as a permanent rejection: the buffered
     /// copy, if any, is discarded rather than retried). A `false` result
-    /// means the connection is simply dropped with no notice — see
-    /// [`handle_connection`] — so the shim's silence-on-failure path can
-    /// still redeliver it later instead of the event being irrecoverably
-    /// discarded for what may be a purely transient hiccup.
+    /// means the connection is reported back to the peer as a
+    /// [`RETRY_PREFIX`] notice instead — see [`handle_connection`] and
+    /// [`retry_connection`] — which the shim treats as a transient failure:
+    /// the payload is queued back onto its on-disk buffer for redelivery
+    /// rather than being irrecoverably discarded for what may be a purely
+    /// transient hiccup.
     fn is_permanent(&self) -> bool {
         match self {
             SocketError::Io(_) => false,
@@ -389,16 +405,20 @@ pub async fn handle_connection(
     let mut bytes = Vec::new();
     if let Err(err) = stream.read_to_end(&mut bytes).await {
         // A read failure is a transient socket-level hiccup, not a verdict
-        // on the payload — drop the connection with no notice so the
-        // shim's silence-on-failure path can redeliver it rather than
-        // treating it as a definitive rejection.
-        return Err(SocketError::from(err));
+        // on the payload — report it back as a RETRY_PREFIX notice so the
+        // shim queues the payload for redelivery rather than treating a
+        // silently dropped connection as a successful delivery.
+        let err = SocketError::from(err);
+        retry_connection(&mut stream, &err).await;
+        return Err(err);
     }
     match decode_incoming_event(&bytes, registry, work_db, peer_pid_value) {
         Ok(incoming) => Ok(incoming),
         Err(err) => {
             if err.is_permanent() {
                 reject_connection(&mut stream, &err).await;
+            } else {
+                retry_connection(&mut stream, &err).await;
             }
             Err(err)
         }
@@ -407,9 +427,10 @@ pub async fn handle_connection(
 
 /// Decode a fully-read hook payload into an [`IncomingHookEvent`],
 /// without touching the socket. Split out from [`handle_connection`] so
-/// every error path funnels through one place ([`reject_connection`])
-/// that reports the rejection reason back to the peer before the
-/// connection drops.
+/// decode failures are produced without touching the socket;
+/// `handle_connection` then decides, via [`SocketError::is_permanent`],
+/// whether to report the reason back to the peer as a [`REJECTION_PREFIX`]
+/// notice or a [`RETRY_PREFIX`] one.
 fn decode_incoming_event(
     bytes: &[u8],
     registry: &DriverRegistry,
@@ -453,6 +474,22 @@ async fn reject_connection(stream: &mut UnixStream, err: &SocketError) {
     let message = format!("{REJECTION_PREFIX}{err:#}\n");
     if let Err(write_err) = stream.write_all(message.as_bytes()).await {
         tracing::debug!(%write_err, "events socket: failed to write rejection notice back to shim");
+        return;
+    }
+    let _ = stream.shutdown().await;
+}
+
+/// Write [`RETRY_PREFIX`] plus `err`'s message back to `stream` before the
+/// connection is dropped, for a [`SocketError`] that
+/// [`SocketError::is_permanent`] classifies as transient. Mirrors
+/// [`reject_connection`]'s best-effort write — a shim past its own read
+/// window (or an old shim built before this marker existed) simply
+/// doesn't see it, and the caller already has the real `SocketError` to
+/// return and log.
+async fn retry_connection(stream: &mut UnixStream, err: &SocketError) {
+    let message = format!("{RETRY_PREFIX}{err:#}\n");
+    if let Err(write_err) = stream.write_all(message.as_bytes()).await {
+        tracing::debug!(%write_err, "events socket: failed to write retry notice back to shim");
         return;
     }
     let _ = stream.shutdown().await;
@@ -1302,6 +1339,50 @@ mod tests {
         );
         assert!(
             response.contains("no execution/task row found for run_id"),
+            "peer should see the engine's actual reason, got: {response:?}",
+        );
+    }
+
+    /// Counterpart to `rejected_connection_writes_reason_back_to_the_peer`:
+    /// a transient [`SocketError`] must produce a [`RETRY_PREFIX`] notice,
+    /// not silence — silence is exactly what the shim treats as a
+    /// successful delivery (see `read_response` in
+    /// `tools/boss/event-shim/src/main.rs`), so a transient failure that
+    /// wrote nothing back would make the shim discard the event as if the
+    /// engine had accepted it.
+    #[tokio::test]
+    async fn transient_error_writes_retry_notice_back_to_the_peer() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+
+        let path_owned = path.clone();
+        let client = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
+            stream.write_all(b"anything").unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).unwrap();
+            response
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = stream;
+        let err = SocketError::DriverSlugLookupTransient {
+            run_id: "run-1".to_owned(),
+            error: "database is locked".to_owned(),
+        };
+        retry_connection(&mut stream, &err).await;
+        let response = client.await.unwrap();
+
+        let response = String::from_utf8(response).unwrap();
+        assert!(
+            response.starts_with(RETRY_PREFIX),
+            "peer should see the retry notice, got: {response:?}",
+        );
+        assert!(
+            response.contains("database is locked"),
             "peer should see the engine's actual reason, got: {response:?}",
         );
     }

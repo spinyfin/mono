@@ -66,12 +66,15 @@
 //! message on stderr.
 //!
 //! A write succeeding is not the same as the engine accepting the
-//! event: after the half-close, [`read_rejection`] waits briefly for a
+//! event: after the half-close, [`read_response`] waits briefly for a
 //! [`REJECTION_PREFIX`] notice the engine writes back when it rejects a
-//! connection (malformed payload, unresolved driver, ...). That case
-//! exits non-zero with the engine's own reason and is never buffered —
-//! resending a payload the engine actively refused would just be
-//! refused again.
+//! connection (malformed payload, unresolved driver, ...), or a
+//! [`RETRY_PREFIX`] notice when the failure was transient (a socket
+//! hiccup, a busy database lookup). The rejection case exits non-zero
+//! with the engine's own reason and is never buffered — resending a
+//! payload the engine actively refused would just be refused again. The
+//! retry case is treated exactly like an unreachable engine: the event is
+//! queued to the on-disk buffer for later redelivery.
 
 use std::env;
 use std::fs::{File, OpenOptions};
@@ -139,6 +142,20 @@ const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(3);
 /// link to the engine crate, so the two copies of this literal are the
 /// whole contract. Keep them byte-for-byte identical if either changes.
 const REJECTION_PREFIX: &str = "BOSS-EVENT-REJECTED: ";
+
+/// Marker line the engine writes back on the socket when it hit a
+/// transient error (a socket I/O hiccup, or a busy/locked database lookup)
+/// rather than a permanent, guaranteed-to-fail-again one. Unlike
+/// [`REJECTION_PREFIX`], this means the identical payload could well
+/// succeed on the very next attempt, so the shim treats it the same as an
+/// unreachable engine: queue the payload back onto the on-disk buffer for
+/// later redelivery rather than discarding it.
+///
+/// Deliberately duplicated (not shared via a crate dependency) from
+/// `tools/boss/engine/core/src/events_socket.rs`'s `RETRY_PREFIX`, for the
+/// same dependency-free-shim reason as [`REJECTION_PREFIX`]. Keep them
+/// byte-for-byte identical if either changes.
+const RETRY_PREFIX: &str = "BOSS-EVENT-RETRY: ";
 
 /// Upper bound on how long the shim waits, after finishing its write and
 /// half-closing, for the engine to write back a [`REJECTION_PREFIX`]
@@ -250,8 +267,15 @@ fn run() -> Result<()> {
     // total across drain + this send can never exceed SHIM_TOTAL_BUDGET.
     match connect_with_retry(&socket_path, deadline) {
         Ok(stream) => match send_to_stream(stream, &payload_line, deadline) {
-            Ok(None) => Ok(()),
-            Ok(Some(reason)) => reject_delivery(&socket_path, &reason),
+            Ok(EngineResponse::None) => Ok(()),
+            Ok(EngineResponse::Rejected(reason)) => reject_delivery(&socket_path, &reason),
+            Ok(EngineResponse::Retry(reason)) => {
+                eprintln!(
+                    "boss-event: engine hit a transient error over {socket_path}: {reason}; \
+                     buffering event for later delivery",
+                );
+                buffer_or_lose(buffer_path.as_deref(), &payload_line)
+            }
             Err(_first_err) => {
                 // Mid-send failure: the engine may have bounced
                 // between connect and write. Reopen once and resend,
@@ -266,8 +290,15 @@ fn run() -> Result<()> {
                     match connect_once(&socket_path, write_timeout_for(deadline))
                         .and_then(|s| send_to_stream(s, &payload_line, deadline))
                     {
-                        Ok(None) => Ok(()),
-                        Ok(Some(reason)) => reject_delivery(&socket_path, &reason),
+                        Ok(EngineResponse::None) => Ok(()),
+                        Ok(EngineResponse::Rejected(reason)) => reject_delivery(&socket_path, &reason),
+                        Ok(EngineResponse::Retry(reason)) => {
+                            eprintln!(
+                                "boss-event: engine hit a transient error over {socket_path} on \
+                                 reconnect: {reason}; buffering event for later delivery",
+                            );
+                            buffer_or_lose(buffer_path.as_deref(), &payload_line)
+                        }
                         Err(err) => {
                             eprintln!(
                                 "boss-event: events socket {socket_path} dropped mid-send and \
@@ -439,57 +470,69 @@ fn connect_with_retry(path: &str, deadline: Instant) -> Result<UnixStream> {
 /// block `write_all` until the outer hook runner kills the process
 /// (up to 600s for an unscoped Grok `Stop` hook — which freezes the TUI).
 ///
-/// After the half-close, waits briefly for a [`REJECTION_PREFIX`] notice
-/// (see [`read_rejection`]) and returns it as `Ok(Some(reason))` when
-/// present. `Ok(None)` covers both a genuinely successful delivery and
-/// the (transient-failure) case where the wait window elapsed with
-/// nothing on the wire — the write itself already succeeded either way,
-/// so silence here is never treated as an error.
-fn send_to_stream(mut stream: UnixStream, payload: &[u8], deadline: Instant) -> Result<Option<String>> {
+/// After the half-close, waits briefly for a [`REJECTION_PREFIX`] or
+/// [`RETRY_PREFIX`] notice (see [`read_response`]) and returns the
+/// decoded [`EngineResponse`]. `Ok(EngineResponse::None)` covers both a
+/// genuinely successful delivery and the case where the wait window
+/// elapsed with nothing on the wire — the write itself already succeeded
+/// either way, so silence here is never treated as an error.
+fn send_to_stream(mut stream: UnixStream, payload: &[u8], deadline: Instant) -> Result<EngineResponse> {
     stream
         .write_all(payload)
         .context("writing hook payload to events socket")?;
     stream
         .shutdown(std::net::Shutdown::Write)
         .context("shutting down write half of events socket")?;
-    read_rejection(&mut stream, deadline)
+    read_response(&mut stream, deadline)
+}
+
+/// The engine's write-back on the events socket after a connection closes:
+/// a permanent rejection, a transient-error retry request, or silence
+/// (a successful delivery, or a window that elapsed with nothing on the
+/// wire — the two are indistinguishable and both treated as success).
+enum EngineResponse {
+    Rejected(String),
+    Retry(String),
+    None,
 }
 
 /// Wait, bounded by [`REJECTION_READ_TIMEOUT`] and whatever remains of
-/// `deadline`, for the engine to write a [`REJECTION_PREFIX`] notice back
-/// on `stream` before it closes. Returns `Ok(Some(reason))` when one
-/// arrives, `Ok(None)` on a clean EOF, a timed-out read (nothing arrived
-/// in the window), or an exhausted budget — none of those distinguish
-/// from a successful delivery, which is also silent. A real I/O error
-/// other than a timeout is still surfaced, since that means something
-/// went wrong reading a response the shim is entitled to expect.
-fn read_rejection(stream: &mut UnixStream, deadline: Instant) -> Result<Option<String>> {
+/// `deadline`, for the engine to write a [`REJECTION_PREFIX`] or
+/// [`RETRY_PREFIX`] notice back on `stream` before it closes. Returns
+/// [`EngineResponse::None`] on a clean EOF, a timed-out read (nothing
+/// arrived in the window), or an exhausted budget — none of those
+/// distinguish from a successful delivery, which is also silent. A real
+/// I/O error other than a timeout is still surfaced, since that means
+/// something went wrong reading a response the shim is entitled to
+/// expect.
+fn read_response(stream: &mut UnixStream, deadline: Instant) -> Result<EngineResponse> {
     let timeout = remaining(deadline).min(REJECTION_READ_TIMEOUT);
     if timeout.is_zero() {
-        return Ok(None);
+        return Ok(EngineResponse::None);
     }
     // Best-effort: a platform that rejects SO_RCVTIMEO just risks a
     // blocking read, bounded in practice by the engine always closing
-    // its write side once it's done (success or rejection).
+    // its write side once it's done (success, rejection, or retry).
     let _ = stream.set_read_timeout(Some(timeout));
     let mut buf = Vec::new();
     let read_error = stream
         .read_to_end(&mut buf)
         .err()
         .filter(|err| !matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut));
-    if let Some(reason) = String::from_utf8_lossy(&buf)
-        .strip_prefix(REJECTION_PREFIX)
-        .map(|reason| reason.trim().to_owned())
-    {
+    let text = String::from_utf8_lossy(&buf);
+    if let Some(reason) = text.strip_prefix(REJECTION_PREFIX) {
         // A peer can deliver its rejection and then reset the
         // connection. The bytes are authoritative, so do not let the
         // trailing read error reclassify this as a transient failure.
-        return Ok(Some(reason));
+        return Ok(EngineResponse::Rejected(reason.trim().to_owned()));
+    }
+    if let Some(reason) = text.strip_prefix(RETRY_PREFIX) {
+        return Ok(EngineResponse::Retry(reason.trim().to_owned()));
     }
     if let Some(err) = read_error {
         return Err(err).context("reading engine response from events socket");
     }
-    Ok(None)
+    Ok(EngineResponse::None)
 }
 
 enum BufferedSendError {
@@ -509,8 +552,11 @@ fn send_one(socket_path: &str, payload: &[u8], deadline: Instant) -> std::result
     }
     let stream = connect_once(socket_path, write_timeout_for(deadline)).map_err(BufferedSendError::Transient)?;
     match send_to_stream(stream, payload, deadline).map_err(BufferedSendError::Transient)? {
-        None => Ok(()),
-        Some(reason) => Err(BufferedSendError::Rejected(reason)),
+        EngineResponse::None => Ok(()),
+        EngineResponse::Rejected(reason) => Err(BufferedSendError::Rejected(reason)),
+        EngineResponse::Retry(reason) => Err(BufferedSendError::Transient(anyhow!(
+            "engine reported a transient error: {reason}"
+        ))),
     }
 }
 
@@ -922,6 +968,51 @@ mod tests {
         let record: serde_json::Value = serde_json::from_str(quarantined.trim()).unwrap();
         assert_eq!(record["rejected_reason"], "malformed event");
         assert_eq!(record["event_raw"], "bad-event");
+    }
+
+    /// A transient [`RETRY_PREFIX`] response must be treated exactly like
+    /// an unreachable engine — not like a rejection: the drain stops and
+    /// retains the record plus its FIFO suffix, rather than discarding it
+    /// as if the engine had accepted (or permanently refused) it. This is
+    /// the shim-side half of the fix for the class of bug where a
+    /// transient engine error (e.g. a locked sqlite during a restart)
+    /// silently dropped the buffered event.
+    #[test]
+    fn drain_stops_and_retains_record_on_retry_notice() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let buf = dir.path().join(".boss/events-pending.jsonl");
+        std::fs::create_dir_all(buf.parent().unwrap()).unwrap();
+        std::fs::write(&buf, b"transient-event\nlater-event\n").unwrap();
+        let socket = dir.path().join("events.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut payload = Vec::new();
+            stream.read_to_end(&mut payload).unwrap();
+            assert_eq!(payload, b"transient-event");
+            stream.write_all(b"BOSS-EVENT-RETRY: database is locked\n").unwrap();
+            // No second accept: the drain must stop after the retry
+            // notice rather than moving on to `later-event`.
+        });
+
+        let result = drain_buffer(
+            socket.to_str().unwrap(),
+            &buf,
+            None,
+            Instant::now() + Duration::from_secs(2),
+        );
+        assert!(
+            result.is_err(),
+            "a retry notice must surface as a drain error, not success"
+        );
+        server.join().unwrap();
+
+        assert_eq!(
+            std::fs::read(&buf).unwrap(),
+            b"transient-event\nlater-event\n",
+            "both the retried record and its FIFO suffix must remain buffered"
+        );
     }
 
     #[test]
