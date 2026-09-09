@@ -45,11 +45,10 @@
 //! quoting.
 //!
 //! Fails **closed**: a payload it cannot read is blocked, never approved.
+use super::guard_python::with_command_tokenizer;
 
 /// The Codex tool-surface guard, materialised verbatim as an executable
 /// `.py`. Emits a Claude-compatible `{"decision": …}` object on stdout.
-use super::guard_python::with_command_tokenizer;
-
 const SCRIPT_TEMPLATE: &str = r#"#!/usr/bin/env python3
 """Codex tool-surface PreToolUse gate (Boss).
 

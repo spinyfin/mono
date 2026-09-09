@@ -251,8 +251,10 @@ macro_rules! python_command_guard {
 /// sets `commenters=''` itself). This is the same lexer configuration used
 /// by `boss_engine::worker_setup`'s `PATH_GUARD_SCRIPT` for the
 /// `BOSS_DATA_DIR` path guard, and by
-/// [`crate::codex::tool_surface_guard::CODEX_TOOL_SURFACE_GUARD_SCRIPT`]'s
-/// `command_groups`.
+/// `crate::codex::guard_python::CODEX_COMMAND_TOKENIZER_PY`'s
+/// `command_groups` — the Codex-side copy of this fragment, spliced into
+/// both Codex guard scripts. It is kept separate only because this macro
+/// must expand to string literals for `concat!`.
 ///
 /// A plain string-literal macro (not a `const`) for the same reason
 /// [`python_command_guard!`] is one: it is spliced into other `concat!`

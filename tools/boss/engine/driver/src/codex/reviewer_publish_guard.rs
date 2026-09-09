@@ -28,6 +28,21 @@
 //!
 //! Armed only when `ToolUseInterceptionConfig::is_reviewer` is set (see
 //! `materialize_guards`), so no other worker kind is affected.
+//!
+//! # Heredoc bodies are out of scope for this guard, by design
+//!
+//! The shared tokenizer (`command_groups` in
+//! [`crate::codex::guard_python`]) skips every line of a heredoc body, so a
+//! publish command written as the *body* of a heredoc fed to a shell
+//! (`sh <<'EOF'` / `git push` / `EOF`) is invisible to
+//! `matched_publish_command` here. That gap is intentionally left to
+//! [`crate::codex::tool_surface_guard`], which is armed with matcher `.*`
+//! for every worker and blocks the bare `sh`/`bash`/`python3` stdin-reading
+//! invocation that shape depends on before this guard's command matching
+//! ever gets a chance to run. If `tool_surface_guard`'s REPL block is ever
+//! narrowed or removed, this heredoc gap reopens and must be reassessed
+//! here too.
+use super::guard_python::with_command_tokenizer;
 
 /// The Codex reviewer publish/no-write guard, materialised verbatim as an
 /// executable `.py`. Emits a Claude-compatible `{"decision": …}` object on
@@ -37,8 +52,6 @@
 /// Approves silently on every tool call it has nothing to say about (`Read`,
 /// `Grep`, plain `Bash` reads, …) — only `apply_patch` and a `Bash` command
 /// matching a publish shape are blocked.
-use super::guard_python::with_command_tokenizer;
-
 const SCRIPT_TEMPLATE: &str = r#"#!/usr/bin/env python3
 """Codex reviewer read-only / no-publish PreToolUse gate (Boss).
 
@@ -77,6 +90,28 @@ PUBLISH_BLOCK = (
 # COMMAND_TOKENIZER_FRAGMENT
 
 
+GIT_GLOBAL_VALUE_FLAGS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+JJ_GLOBAL_VALUE_FLAGS = {"-R", "--repository", "--config", "--config-file", "--at-operation", "--at-op"}
+
+
+def skip_global_flags(args, value_flags):
+    """Drop leading global option tokens (and their operands) up to the
+    first non-flag token, which is the subcommand."""
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if not token.startswith("-"):
+            break
+        if "=" in token:
+            index += 1
+            continue
+        if token in value_flags:
+            index += 2
+            continue
+        index += 1
+    return args[index:]
+
+
 def matched_publish_command(cmd):
     dol = chr(36)
     for group in command_groups(cmd):
@@ -85,10 +120,14 @@ def matched_publish_command(cmd):
             continue
         prog = os.path.basename(rest[0])
         is_cube = prog == "cube" or rest[0] in (dol + "CUBE_BIN", dol + "{CUBE_BIN}")
-        if len(rest) >= 3 and prog == "jj" and rest[1] == "git" and rest[2] == "push":
-            return "jj git push"
-        if len(rest) >= 2 and prog == "git" and rest[1] == "push":
-            return "git push"
+        if prog == "git":
+            sub = skip_global_flags(rest[1:], GIT_GLOBAL_VALUE_FLAGS)
+            if sub and sub[0] == "push":
+                return "git push"
+        if prog == "jj":
+            sub = skip_global_flags(rest[1:], JJ_GLOBAL_VALUE_FLAGS)
+            if len(sub) >= 2 and sub[0] == "git" and sub[1] == "push":
+                return "jj git push"
         if len(rest) >= 3 and prog == "gh" and rest[1] == "pr" and rest[2] in (
             "create", "merge", "close", "edit", "comment", "review",
         ):
@@ -206,6 +245,12 @@ mod tests {
             "sudo git push",
             "timeout 60 gh pr create",
             "nohup git push",
+            "git -C /tmp push",
+            "git -c a=b push",
+            "git -c user.name=x -C /tmp push",
+            "git --git-dir=/tmp/.git push",
+            "jj -R /tmp git push",
+            "jj --repository /tmp git push",
         ] {
             assert_eq!(bash(command).0, "block", "{command:?} must be blocked");
         }
@@ -219,7 +264,13 @@ mod tests {
                 "approve"
             );
         }
-        for command in ["gh pr view", "jj log", "git status"] {
+        for command in [
+            "gh pr view",
+            "jj log",
+            "git status",
+            "git -C /tmp status",
+            "jj -R /tmp log",
+        ] {
             assert_eq!(bash(command).0, "approve", "{command:?} must be approved");
         }
     }
