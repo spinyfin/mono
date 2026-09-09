@@ -113,10 +113,10 @@ pub struct PermissionInput {
     /// `false` (the flag's default), Codex's Standard/Triage/AnswerAgent
     /// workers get `--sandbox danger-full-access` instead of the OS-enforced
     /// `workspace-write` seatbelt, matching the Claude driver's no-OS-sandbox
-    /// posture (see `codex::codex_sandbox_for_worker_kind`). Reviewer uses a
-    /// workspace-write sandbox rooted at engine-owned structured output so it
-    /// can submit its report without gaining checkout write access. Ignored by
-    /// every other driver.
+    /// posture (see `codex::codex_sandbox_for_worker_kind`). Codex reviewers
+    /// intentionally receive no OS sandbox, matching the Claude and local
+    /// Grok reviewer paths, so their hooks can reach the engine events socket.
+    /// Ignored by every other driver.
     #[builder(default)]
     pub codex_sandbox_enforced: bool,
 }

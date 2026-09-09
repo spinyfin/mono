@@ -197,13 +197,10 @@ pub fn render_revision_instructions(result: &ReviewResult, origin: ReviewOrigin)
 /// as forbidden by the line below it (`cube pr create`/`cube pr update` or
 /// any Boss PR helper) and could decline to submit its report at all.
 ///
-/// Some Codex reviewer sandboxes also relocate the session's cwd to an
-/// engine-owned scratch directory outside the checkout (`--cd`, see
-/// `codex::reviewer_output_sandbox_extra_args`), so a bare `jj log`/`jj
-/// show`/`jj diff` has no `.jj` in its ancestry there. `-R
-/// {workspace_path}` makes every jj invocation resolve against the
-/// checkout regardless of cwd, and is a harmless no-op when cwd is
-/// already the checkout.
+/// `-R {workspace_path}` makes every jj invocation resolve against the
+/// checkout regardless of a caller's cwd. Codex reviewers now inherit the
+/// checkout as their cwd, while other delivery paths may not; keeping the
+/// explicit root is therefore both robust and harmless.
 ///
 /// `absolute_paths` and `boundaries_and_coordinator` are shared blocks
 /// supplied by the engine rather than owned here: the same text is used
@@ -1071,11 +1068,8 @@ mod tests {
 
     #[test]
     fn reviewer_claude_md_names_the_workspace_for_jj_navigation() {
-        // The reviewer's sandbox cwd is relocated away from the checkout
-        // (Codex's `--cd` points at engine scratch, see
-        // `reviewer_output_sandbox_extra_args` in the codex driver), so a
-        // bare `jj log` would resolve against the wrong workspace. The rules
-        // file must tell the reviewer to name the checkout explicitly.
+        // Delivery paths do not all guarantee a checkout cwd, so the rules
+        // file must tell every reviewer to name the checkout explicitly.
         let rendered = render_reviewer_claude_md("lease-1", "/tmp/ws-for-jj", "", "");
         assert!(
             rendered.contains("jj log -R /tmp/ws-for-jj"),

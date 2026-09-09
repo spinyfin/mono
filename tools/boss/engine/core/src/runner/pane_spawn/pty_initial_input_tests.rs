@@ -96,7 +96,7 @@ fn claude_initial_input_stays_under_the_limit_with_a_long_settings_path() {
 }
 
 #[test]
-fn codex_initial_input_stays_under_the_limit_with_reviewer_sandbox_extra_args() {
+fn codex_initial_input_stays_under_the_limit_for_reviewer() {
     let mut plan = CodexDriver::default().spawn_invocation(SpawnRequest {
         model: "gpt-5.6-terra-with-a-deliberately-long-model-slug",
         effort: Some("high"),

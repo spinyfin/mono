@@ -462,31 +462,33 @@ pub fn codex_homes_root_and_home_for_run(run_id: &str) -> anyhow::Result<(PathBu
 
 /// Sandbox mode for Codex `exec --sandbox` from Boss's abstract worker kind.
 ///
-/// Reviewer uses an OS-enforced workspace-write sandbox whose working root is
-/// the engine-owned structured-output directory, never the checkout. This
-/// grants the single report-body write required for `boss propose` while the
-/// reviewed workspace remains outside every writable root.
-///
-/// Every other kind is gated by the `codex_sandbox_enforced` feature flag
+/// Standard, Triage, and AnswerAgent are gated by the `codex_sandbox_enforced` feature flag
 /// (default off): Codex's seatbelt template hardcodes a mach-service
 /// allowlist that excludes LaunchServices, so `xcode-locator` fails under
 /// `workspace-write` and every bazel build using `apple_support`'s crosstool
 /// breaks with it — see `tools/boss/docs/designs/codex-as-a-first-class-agent-driver.md`.
-/// With the flag off, Standard/Triage/AnswerAgent get `danger-full-access`,
+/// With the flag off, they get `danger-full-access`,
 /// the same no-OS-sandbox posture the Claude driver has always run workers
 /// at (`claude.rs`'s `--permission-mode auto`); the advisory
 /// `PATH_GUARD_SCRIPT` PreToolUse hook remains the Boss-data-dir fence
-/// either way. Single source of truth for
+/// either way.
+///
+/// Reviewer deliberately has no Codex OS sandbox at all, matching the
+/// Claude and local Grok reviewer paths. Its report-delivery and hook events
+/// both need the engine socket and `boss-event` shim; a narrow reviewer
+/// seatbelt previously allowed only the former and made every reviewer appear
+/// never-started. Its reviewer prompt and static-analysis PreToolUse guard
+/// remain in force. This is the single source of truth for
 /// [`CodexDriver::write_permission_config`]'s `extra_args` — the spawn plan's
 /// default is overridden when pane_spawn applies those args.
-pub fn codex_sandbox_for_worker_kind(worker_kind: WorkerKind, sandbox_enforced: bool) -> &'static str {
+pub fn codex_sandbox_for_worker_kind(worker_kind: WorkerKind, sandbox_enforced: bool) -> Option<&'static str> {
     match worker_kind {
-        WorkerKind::Reviewer => "workspace-write",
+        WorkerKind::Reviewer => None,
         WorkerKind::Standard | WorkerKind::Triage | WorkerKind::AnswerAgent => {
             if sandbox_enforced {
-                "workspace-write"
+                Some("workspace-write")
             } else {
-                "danger-full-access"
+                Some("danger-full-access")
             }
         }
     }
@@ -494,21 +496,9 @@ pub fn codex_sandbox_for_worker_kind(worker_kind: WorkerKind, sandbox_enforced: 
 
 /// CLI `extra_args` that encode sandbox policy for the spawn flow.
 pub fn codex_sandbox_extra_args(worker_kind: WorkerKind, sandbox_enforced: bool) -> Vec<String> {
-    vec![
-        "--sandbox".into(),
-        codex_sandbox_for_worker_kind(worker_kind, sandbox_enforced).into(),
-    ]
-}
-
-/// Extra Codex CLI arguments for a reviewer's output-only sandbox.
-///
-/// The pane itself still starts in the leased checkout, but Codex's `--cd`
-/// changes its sandbox working root to engine scratch before it processes any
-/// tool calls. Consequently `workspace-write` permits the report body file
-/// while the checkout stays OS read-only. The reviewer prompt already names
-/// the checkout explicitly for all source inspection.
-fn reviewer_output_sandbox_extra_args(output_dir: &Path) -> Vec<String> {
-    vec!["--cd".to_owned(), output_dir.display().to_string()]
+    codex_sandbox_for_worker_kind(worker_kind, sandbox_enforced)
+        .map(|sandbox| vec!["--sandbox".into(), sandbox.into()])
+        .unwrap_or_default()
 }
 
 /// Reclaim a Boss-owned per-run `CODEX_HOME` after retention policy says it
@@ -663,24 +653,13 @@ impl CodexRuntimeState {
 /// `codex debug prompt-input`'s model-visible output, with or without these
 /// keys set — the import path is structurally unreachable from `codex exec`.
 pub fn render_base_config_toml(workspace: &Path) -> String {
-    render_config_toml(workspace, None, render_sandbox_workspace_write_toml(workspace))
+    render_config_toml(workspace, render_sandbox_workspace_write_toml(workspace))
 }
 
-/// Render Codex configuration for a reviewer whose sandbox root is engine
-/// scratch rather than the checkout. The checkout remains trusted for source
-/// inspection, while the scratch root is trusted because Boss creates it.
-fn render_reviewer_base_config_toml(workspace: &Path, output_dir: &Path) -> String {
-    render_config_toml(
-        workspace,
-        Some(output_dir),
-        render_reviewer_sandbox_workspace_write_toml(output_dir),
-    )
-}
-
-fn render_config_toml(workspace: &Path, sandbox_root: Option<&Path>, sandbox_workspace_write: String) -> String {
+fn render_config_toml(workspace: &Path, sandbox_workspace_write: String) -> String {
     // TOML basic-string escape for paths that may contain backslashes or quotes.
     let workspace_key = toml_basic_string(&workspace.display().to_string());
-    let mut config = format!(
+    let config = format!(
         "# Boss-owned per-run Codex config. Do not hand-edit; regenerated every dispatch.\n\
          \n\
          # Suppress the external-agent (Claude Code) config-migration notice\n\
@@ -724,10 +703,6 @@ fn render_config_toml(workspace: &Path, sandbox_root: Option<&Path>, sandbox_wor
          trust_level = \"trusted\"\n\
          \n"
     );
-    if let Some(sandbox_root) = sandbox_root.filter(|root| *root != workspace) {
-        let sandbox_root_key = toml_basic_string(&sandbox_root.display().to_string());
-        config.push_str(&format!("[projects.{sandbox_root_key}]\ntrust_level = \"trusted\"\n\n"));
-    }
     config
 }
 
@@ -755,8 +730,8 @@ fn render_config_toml(workspace: &Path, sandbox_root: Option<&Path>, sandbox_wor
 ///
 /// This table takes effect under `--sandbox workspace-write`, i.e. for
 /// Standard/Triage/AnswerAgent when the `codex_sandbox_enforced` feature flag
-/// is on. Reviewer has a separate minimal workspace-write configuration that
-/// permits only its engine-owned output root. The default
+/// is on. Reviewer has no Codex OS sandbox, so this table does not apply to
+/// reviewer leaves. The default
 /// `danger-full-access` path ignores this table (see
 /// [`codex_sandbox_for_worker_kind`]).
 ///
@@ -812,43 +787,6 @@ fn render_sandbox_workspace_write_toml(workspace: &Path) -> String {
     }
     out.push('\n');
     out
-}
-
-/// Reviewer sandbox configuration grants only `output_dir` for writes.
-/// `network_access = true` is required despite the reviewer's read-only
-/// intent: the reviewer's only report-delivery channel is `boss
-/// propose review-report`, a Unix-domain-socket connect to the engine
-/// control socket (`BossClient::connect_socket`), and Codex's seatbelt
-/// classifies an `AF_UNIX connect()` as a `network-outbound` operation that
-/// `network_access = false` denies — the same class of local-socket denial
-/// this repo already documented for Bazel's TCP handshake (see
-/// [`render_sandbox_workspace_write_toml`]'s doc comment). Granting it here
-/// widens outbound network reachability, not filesystem writes: it does not
-/// add to `writable_roots`, so the checkout stays outside every writable
-/// root. `exclude_tmpdir_env_var` and `exclude_slash_tmp` narrow the
-/// filesystem grant instead — without them Codex's workspace-write profile
-/// additionally grants all of `$TMPDIR` and `/tmp`, which (since
-/// `boss_engine_structured_output::default_dir()` is a `boss-worker-output`
-/// subdirectory of `std::env::temp_dir()`, keyed by filename) would let the
-/// reviewer overwrite concurrent executions' artifacts and reach the engine
-/// control socket at `/tmp/boss-engine.sock` by filesystem write, not just
-/// the sanctioned `boss propose` connect.
-///
-/// `output_dir` (the `--cd` target, see [`reviewer_output_sandbox_extra_args`])
-/// is listed explicitly in `writable_roots` in addition to relying on
-/// Codex's own cwd grant. This repo has not verified, against the installed
-/// Codex build, whether `exclude_tmpdir_env_var`/`exclude_slash_tmp` are
-/// applied as deny rules that could subsume a bare cwd grant nested under
-/// `$TMPDIR`; an explicit `writable_roots` entry is the same defense already
-/// relied on elsewhere in this file to keep a root out from under a
-/// surrounding exclusion (see the `root.join(".git")` entry in
-/// [`render_sandbox_workspace_write_toml`]). If report delivery ever starts
-/// failing with no report and no diagnosis, check this assumption first.
-fn render_reviewer_sandbox_workspace_write_toml(output_dir: &Path) -> String {
-    format!(
-        "[sandbox_workspace_write]\nnetwork_access = true\nexclude_tmpdir_env_var = true\nexclude_slash_tmp = true\nwritable_roots = [{}]\n\n",
-        toml_basic_string(&output_dir.display().to_string())
-    )
 }
 
 /// Resolve the writable roots Bazel needs outside the workspace.
@@ -1040,15 +978,11 @@ pub fn build_codex_command(request: &SpawnRequest<'_>) -> String {
         CODEX_DESCRIPTOR.config_dir, CODEX_DESCRIPTOR.initial_prompt_filename,
     );
 
-    // Baked-in fallback sandbox is workspace-write, but permission policy
-    // confirms or replaces it via [`PermissionArtifacts::extra_args`] (see
-    // `codex_sandbox_for_worker_kind`: Reviewer keeps workspace-write but
-    // relocates its root to engine-owned output; every other kind gets
-    // `--sandbox danger-full-access` unless the
-    // `codex_sandbox_enforced` feature flag is on, in which case
-    // `workspace-write`) applied by the spawn flow — do not hardcode a
-    // second source of truth here without also applying extra_args.
-    let mut cmd = String::from("codex --strict-config --no-alt-screen -a never --sandbox workspace-write");
+    // Sandbox policy is fully supplied by PermissionArtifacts::extra_args.
+    // In particular, reviewers intentionally receive no `--sandbox` flag:
+    // their hook events must reach the engine's events socket. Do not add a
+    // default here, or an empty reviewer policy could silently retain it.
+    let mut cmd = String::from("codex --strict-config --no-alt-screen -a never");
     cmd.push_str(" -m ");
     // Model / effort tokens come from operator config and work-item metadata;
     // shell-quote so a future slug with spaces/metacharacters cannot break
@@ -1181,9 +1115,9 @@ fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> 
         });
     }
 
-    // 5. Reviewer static-analysis guard. The output-only sandbox preserves
-    // checkout immutability; this independent guard blocks
-    // build/test/format/generate and executable-code commands.
+    // 5. Reviewer static-analysis guard blocks build/test/format/generate
+    // and executable-code commands. Codex reviewers intentionally have no
+    // OS sandbox so their driver hooks can reach the engine.
     if config.is_reviewer {
         planned.push(Planned {
             name: "reviewer_static_analysis_guard",
@@ -1708,24 +1642,12 @@ impl AgentDriver for CodexDriver {
 
         // When path/checkleft scripts are supplied via PermissionInput they
         // win; otherwise leave those guards off (remote / early unit tests).
-        let reviewer_output_dir = boss_engine_structured_output::default_dir();
-        let base_config = if input.worker_kind == WorkerKind::Reviewer {
-            render_reviewer_base_config_toml(&input.workspace_path, &reviewer_output_dir)
-        } else {
-            render_base_config_toml(&input.workspace_path)
-        };
-        let hook_cwd = if input.worker_kind == WorkerKind::Reviewer {
-            reviewer_output_dir.as_path()
-        } else {
-            input.workspace_path.as_path()
-        };
+        let base_config = render_base_config_toml(&input.workspace_path);
+        let hook_cwd = input.workspace_path.as_path();
         let codex_bin = resolve_codex_bin();
         write_hooks_and_attest(&codex_home, hook_cwd, &base_config, &interception, &codex_bin)?;
 
-        let mut extra_args = codex_sandbox_extra_args(input.worker_kind, input.codex_sandbox_enforced);
-        if input.worker_kind == WorkerKind::Reviewer {
-            extra_args.extend(reviewer_output_sandbox_extra_args(&reviewer_output_dir));
-        }
+        let extra_args = codex_sandbox_extra_args(input.worker_kind, input.codex_sandbox_enforced);
 
         // Sandbox mode is the permission-policy artifact the spawn flow must
         // apply (see pane_spawn apply_permission_extra_args). `--strict-config`
