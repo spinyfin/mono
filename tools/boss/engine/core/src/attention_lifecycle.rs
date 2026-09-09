@@ -337,10 +337,14 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     ),
     entry(
         crate::work::PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND,
-        ClearedBy::HumanDecision,
-        "Records an invariant violation: an accepted review report still owns a live reviewer \
-         execution. The report is already durable, so a later review cannot establish whether the \
-         original pane and lease were safely released; an operator must inspect the failed teardown.",
+        ClearedBy::ProducerReconciles,
+        "The producer (`file_reported_live_review_batch_member_attentions`) re-evaluates the exact \
+         reported+live condition on every recovery-sweep pass and resolves the item itself once the \
+         member it named is no longer in that set — teardown finally succeeded, or (for a \
+         consolidating supervisor) the report turned out to be within its normal, brief \
+         report-then-teardown grace window rather than a stuck pane. A generic run-started rule \
+         cannot stand in for this: an unrelated later execution proves nothing about whether THIS \
+         member's pane was released.",
     ),
     entry(
         crate::completion::REVIEW_RESULT_GIVEUP_ATTENTION_KIND,

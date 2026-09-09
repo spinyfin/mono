@@ -374,32 +374,34 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
             if review_batch_quorum_outcome == Some(crate::work::ReviewBatchQuorumOutcome::SupervisorDispatched) {
                 server_state.publisher.kick_scheduler();
             }
-            // A review report's acceptance is itself the completion signal
-            // for a batch leaf. Do not wait for another, driver-specific
-            // turn boundary: that boundary may never arrive after the worker
-            // has delivered its report. The batch finalizer owns both the
-            // execution terminal row and pane/lease teardown.
-            if !already_submitted
-                && kind == ProposalKind::ReviewReport
-                && proposal.state == boss_protocol::ProposalState::Applied
-            {
-                match server_state
-                    .completion_handler
-                    .finalize_accepted_review_batch_member(&caller.execution_id)
-                    .await
-                {
-                    Some(crate::completion::StopOutcome::ReviewPassCompleted { .. }) => {}
-                    Some(outcome) => tracing::error!(
-                        execution_id = %caller.execution_id,
-                        ?outcome,
-                        "accepted review report did not cleanly finalize its batch member",
-                    ),
-                    None => tracing::error!(
-                        execution_id = %caller.execution_id,
-                        "accepted review report has no live batch member to finalize",
-                    ),
-                }
-            }
+            // A review report's or review verdict's acceptance is itself the
+            // completion signal for its batch member (leaf or consolidating
+            // supervisor alike): both mark the member `reported` synchronously
+            // in the same submission transaction that already committed. Do
+            // not wait for another, driver-specific turn boundary — that
+            // boundary may never arrive after the worker has delivered its
+            // report/verdict. The batch finalizer owns both the execution
+            // terminal row and pane/lease teardown.
+            //
+            // No `!already_submitted` guard: the finalizer is idempotent (it
+            // no-ops on an execution that is already terminal), so a replay —
+            // including one that lands after a crash between apply and the
+            // teardown below — must still reach it rather than silently
+            // skipping the only path that releases the pane.
+            let finalize_reporting_member = match kind {
+                ProposalKind::ReviewReport => proposal.state == boss_protocol::ProposalState::Applied,
+                // `ReviewVerdict` applies asynchronously (GitHub probes,
+                // possible remediation creation), so its proposal is still
+                // `Proposed` right after submission; it only reaches
+                // `Applied` once the reconciler in the `tokio::spawn` below
+                // (or a prior pass, on replay) finishes. Either state means
+                // the member itself was already accepted as `reported`.
+                ProposalKind::ReviewVerdict => matches!(
+                    proposal.state,
+                    boss_protocol::ProposalState::Proposed | boss_protocol::ProposalState::Applied
+                ),
+                _ => false,
+            };
             // Mirror completion.rs's legacy marker-detector paths
             // (`file_worker_signal_attention` / `record_deferred_scope_item`):
             // both publish `AttentionItemCreated` on the work item's product
@@ -456,6 +458,30 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                     already_submitted,
                 },
             );
+            // Acknowledge the RPC before initiating teardown. The production
+            // pane releaser reaps the reporting member's whole worker process
+            // tree, which can include the very `boss propose` client still
+            // waiting on the response above — tearing down first can kill
+            // that client before it ever observes the ack it is blocked on.
+            if finalize_reporting_member {
+                match server_state
+                    .completion_handler
+                    .finalize_accepted_review_batch_member(&caller.execution_id)
+                    .await
+                {
+                    Some(crate::completion::StopOutcome::ReviewPassCompleted { .. })
+                    | Some(crate::completion::StopOutcome::AlreadyTerminal) => {}
+                    Some(outcome) => tracing::error!(
+                        execution_id = %caller.execution_id,
+                        ?outcome,
+                        "accepted review report/verdict did not cleanly finalize its batch member",
+                    ),
+                    None => tracing::error!(
+                        execution_id = %caller.execution_id,
+                        "accepted review report/verdict has no live batch member to finalize",
+                    ),
+                }
+            }
             // Apply after the worker has the `proposed` ack so GitHub probes
             // and remediation creation cannot stall the submission socket.
             // The periodic sweep is the crash-recovery path for the same work.

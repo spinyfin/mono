@@ -1399,6 +1399,151 @@ fn reported_live_member_files_attention_from_both_recovery_paths() {
     );
 }
 
+/// Build a `supervising` batch with a live `Supervisor` member and submit its
+/// verdict, returning `(db, cycle_root_id, batch_id, execution_id)`. Shared
+/// setup for the grace-window tests below: after this call the member is
+/// `reported`, the batch is `applying`, and (because this is a DB-only test
+/// with no finalizer running) the execution is still live — the exact shape
+/// a healthy consolidator has for the brief span before
+/// `finalize_accepted_review_batch_member` reaps its pane.
+fn reported_live_supervisor() -> (WorkDb, String, String, String) {
+    let db = WorkDb::open(temp_db_path("review-batch-supervisor-grace")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member(ReviewBatchMemberRole::Supervisor, Some(execution.id.clone()))],
+        )
+        .unwrap();
+    force_batch_supervising(&db, &batch.id);
+    db.submit_worker_proposal(SubmitWorkerProposalInput {
+        execution_id: &execution.id,
+        work_item_id: &cycle_root.id,
+        kind: ProposalKind::ReviewVerdict,
+        payload_json: &verdict_payload(&batch.id, "head-sha"),
+        idempotency_key: "verdict-grace",
+    })
+    .unwrap()
+    .unwrap();
+    (db, cycle_root.id, batch.id, execution.id)
+}
+
+/// Finding 2: a healthy consolidator sitting `reported` + live in its normal,
+/// brief window right after accepting its verdict must not trip the shared
+/// invariant-violation alarm — that would desensitise the very alarm the
+/// admission fix in this PR depends on.
+#[test]
+fn supervisor_reported_live_within_grace_window_does_not_alarm() {
+    let (db, cycle_root_id, _batch_id, _execution_id) = reported_live_supervisor();
+
+    assert!(
+        db.list_dead_review_batch_member_candidates().unwrap().is_empty(),
+        "a reported supervisor is not eligible for retry"
+    );
+    assert!(
+        db.reap_inert_review_batches(0).unwrap().is_empty(),
+        "a live execution must prevent inert-batch reaping"
+    );
+    let attentions = db.list_attention_items_for_work_item(&cycle_root_id).unwrap();
+    assert!(
+        attentions
+            .iter()
+            .all(|item| item.kind != crate::work::PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND),
+        "a supervisor within its normal report-then-teardown grace window must not trip the alarm"
+    );
+}
+
+/// The other half of finding 2's contract: the grace-window exemption must
+/// not become a way to permanently hide a genuinely stuck consolidator. Once
+/// a supervisor has been `reported` + live for longer than
+/// [`crate::work::REVIEW_BATCH_SUPERVISOR_REPORTED_GRACE_SECS`], it is
+/// exactly as alarming as a stuck leaf always was.
+#[test]
+fn supervisor_reported_live_past_grace_window_still_alarms() {
+    let (db, cycle_root_id, batch_id, _execution_id) = reported_live_supervisor();
+    backdate_supervisor_terminal_at(&db, &batch_id, 1);
+
+    db.list_dead_review_batch_member_candidates().unwrap();
+    let attentions = db.list_attention_items_for_work_item(&cycle_root_id).unwrap();
+    assert_eq!(
+        attentions
+            .iter()
+            .filter(
+                |item| item.kind == crate::work::PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND && item.status == "open"
+            )
+            .count(),
+        1,
+        "a supervisor stuck reported+live past the grace window must still be caught"
+    );
+}
+
+/// Finding 2's auto-clear requirement: once the condition the alarm named
+/// resolves (teardown finally completes), the next sweep pass must resolve
+/// the item itself rather than leaving a permanent card for a human to
+/// dismiss by hand.
+#[test]
+fn supervisor_reported_live_alarm_auto_clears_once_torn_down() {
+    let (db, cycle_root_id, batch_id, execution_id) = reported_live_supervisor();
+    backdate_supervisor_terminal_at(&db, &batch_id, 1);
+
+    db.list_dead_review_batch_member_candidates().unwrap();
+    assert_eq!(
+        db.list_attention_items_for_work_item(&cycle_root_id)
+            .unwrap()
+            .iter()
+            .filter(
+                |item| item.kind == crate::work::PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND && item.status == "open"
+            )
+            .count(),
+        1,
+        "precondition: the alarm must be open before it can be observed clearing"
+    );
+
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            rusqlite::params![execution_id],
+        )
+        .unwrap();
+
+    db.list_dead_review_batch_member_candidates().unwrap();
+    let attentions = db.list_attention_items_for_work_item(&cycle_root_id).unwrap();
+    assert!(
+        attentions
+            .iter()
+            .filter(|item| item.kind == crate::work::PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND)
+            .all(|item| item.status == "resolved"),
+        "the alarm must auto-clear once its own producer no longer observes the condition"
+    );
+}
+
+/// Backdate the supervisor member's `terminal_at` on `batch_id` so it reads
+/// as reported `grace_secs_past` seconds beyond the grace window — the shape
+/// a supervisor that was never torn down eventually reaches.
+fn backdate_supervisor_terminal_at(db: &WorkDb, batch_id: &str, grace_secs_past: u64) {
+    let cutoff = (boss_engine_utils::epoch_time::now_epoch_secs() as u64)
+        .saturating_sub(crate::work::REVIEW_BATCH_SUPERVISOR_REPORTED_GRACE_SECS + grace_secs_past)
+        .to_string();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_batch_members SET terminal_at = ?1 WHERE batch_id = ?2 AND role = 'supervisor'",
+            rusqlite::params![cutoff, batch_id],
+        )
+        .unwrap();
+}
+
 /// A batch still live for the current target — one leaf settled with an
 /// informative verdict, two still outstanding — must keep reporting
 /// `ExistingBatch` for that exact target, never `AlreadyReviewed`. The

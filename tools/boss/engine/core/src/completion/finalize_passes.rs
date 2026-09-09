@@ -684,14 +684,24 @@ impl WorkerCompletionHandler {
     /// acceptance is the terminal signal for a batch reviewer, independent of
     /// whether its driver later sends another turn-boundary event.
     ///
-    /// Returns `None` when the execution is no longer a live batch member.
-    /// Those cases are benign races (for example, a concurrent terminalizer
-    /// already released the pane), not permission to route an ordinary
-    /// `pr_review` execution through this batch-only finalizer.
+    /// Returns `None` when the execution is not (or no longer) a batch
+    /// member's own `pr_review` execution — not permission to route an
+    /// ordinary `pr_review` execution through this batch-only finalizer.
+    ///
+    /// Returns `Some(StopOutcome::AlreadyTerminal)` — distinct from `None` —
+    /// when the execution is already terminal: the caller is expected to
+    /// call this redundantly on a replayed report/verdict acceptance (the
+    /// finalizer is the only path that releases the member's pane, so a
+    /// retry after a crash between apply and teardown must still reach it),
+    /// and an execution a prior pass already tore down is that retry's
+    /// ordinary success case, not an anomaly worth logging as one.
     pub async fn finalize_accepted_review_batch_member(&self, execution_id: &str) -> Option<StopOutcome> {
         let execution = self.work_db.get_execution(execution_id).ok()?;
-        if execution.kind != ExecutionKind::PrReview || execution.status.is_terminal() {
+        if execution.kind != ExecutionKind::PrReview {
             return None;
+        }
+        if execution.status.is_terminal() {
+            return Some(StopOutcome::AlreadyTerminal);
         }
         let member = match self.work_db.review_batch_member_for_execution(execution_id) {
             Ok(Some(member)) => member,

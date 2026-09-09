@@ -114,6 +114,17 @@ pub const PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND: &str = "pr_review_repor
 /// matching the merge poller's stalled-reviewer cutoff.
 pub const REVIEW_BATCH_STALE_SECS: u64 = 10 * 60;
 
+/// Grace window for [`file_reported_live_review_batch_member_attentions`]'s
+/// supervisor exemption: a consolidator that just reported its verdict is
+/// `reported` + live for the brief span between its member row committing
+/// (which moves the batch to `applying`) and
+/// `finalize_accepted_review_batch_member` reaping its pane — a normal,
+/// self-resolving window, not the invariant violation the alarm exists to
+/// catch. A supervisor still `reported` and live past this many seconds is
+/// no longer that window; it is indistinguishable from the leaf case the
+/// alarm has always covered.
+pub const REVIEW_BATCH_SUPERVISOR_REPORTED_GRACE_SECS: u64 = 120;
+
 /// Reservation weight of one non-terminal pre-merge batch: three parallel
 /// leaf reviewers plus the supervisor that follows them once they settle,
 /// held as one block from batch creation through supervisor completion so a
@@ -712,7 +723,23 @@ fn fail_review_batch_with_attention(
 /// call this before their ordinary candidate/reap queries: neither is allowed
 /// to mistake the impossible `reported` + live combination for harmless
 /// ineligibility.
+///
+/// A consolidating supervisor is exempted while its batch is `applying` and
+/// its member reported less than [`REVIEW_BATCH_SUPERVISOR_REPORTED_GRACE_SECS`]
+/// ago: that is the normal, self-resolving span between the verdict's member
+/// row committing and `finalize_accepted_review_batch_member` reaping its
+/// pane, not the invariant violation this alarm exists to catch. Past the
+/// grace window a stuck supervisor is exactly as alarming as a stuck leaf.
+///
+/// `ClearedBy::ProducerReconciles`: this function IS the producer, called on
+/// every sweep pass, so it also resolves any open item whose cycle root no
+/// longer appears in the freshly recomputed reported-live set — the
+/// consolidator (or leaf) that was genuinely stuck got torn down, or the
+/// grace window is not yet a bug this pass needs to keep asserting.
 fn file_reported_live_review_batch_member_attentions(conn: &mut Connection) -> Result<()> {
+    let grace_cutoff = (boss_engine_utils::epoch_time::now_epoch_secs() as u64)
+        .saturating_sub(REVIEW_BATCH_SUPERVISOR_REPORTED_GRACE_SECS)
+        .to_string();
     let reported_live_members: Vec<(String, String, String)> = {
         let mut statement = conn.prepare(
             "SELECT batch.cycle_root_id, batch.id, member.execution_id
@@ -722,17 +749,46 @@ fn file_reported_live_review_batch_member_attentions(conn: &mut Connection) -> R
              WHERE batch.status NOT IN ('completed', 'failed')
                AND member.status = 'reported'
                AND execution.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')
+               AND NOT (
+                 member.role = 'supervisor'
+                 AND batch.status = 'applying'
+                 AND member.terminal_at IS NOT NULL
+                 AND CAST(member.terminal_at AS INTEGER) >= CAST(?1 AS INTEGER)
+               )
              ORDER BY batch.id, member.execution_id",
         )?;
         statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .query_map(params![grace_cutoff], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?
     };
-    if reported_live_members.is_empty() {
-        return Ok(());
-    }
 
     let tx = conn.transaction()?;
+
+    // Auto-clear first: a cycle root with an open alarm that no longer
+    // appears in the set just recomputed above has had its condition
+    // resolve (teardown succeeded, or a supervisor is within its normal
+    // grace window) since the last pass raised it.
+    let still_flagged: std::collections::HashSet<&str> = reported_live_members
+        .iter()
+        .map(|(cycle_root_id, _, _)| cycle_root_id.as_str())
+        .collect();
+    let previously_open: Vec<String> = {
+        let mut statement =
+            tx.prepare("SELECT DISTINCT work_item_id FROM work_attention_items WHERE kind = ?1 AND status = 'open'")?;
+        statement
+            .query_map(params![PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    for work_item_id in previously_open {
+        if !still_flagged.contains(work_item_id.as_str()) {
+            super::dispatch_helpers::resolve_attention_kind_in_tx(
+                &tx,
+                &work_item_id,
+                PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND,
+            )?;
+        }
+    }
+
     for (cycle_root_id, batch_id, execution_id) in reported_live_members {
         super::attention_filing::warn_if_lifecycle_undeclared(PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND);
         if super::attention_filing::reraise_open_work_item_attention(
