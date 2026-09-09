@@ -356,14 +356,23 @@ async fn pr_created_proposal_for_revision_rejects_a_url_other_than_the_bound_cha
         bound_pr_url,
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     );
+    // The applier's revision no-stamp hardening is gated on the seam too
+    // (see `apply_pr_created`'s doc) — call `submit_worker_proposal_with_flags`
+    // directly with it on, so the submission this test makes actually
+    // exercises the hardened path it asserts on. `WorkDb` has no
+    // `FeatureFlagsStore` of its own; the flag's live value is always
+    // supplied by the caller that resolved it.
     let submitted = db
-        .submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
-            execution_id: &execution_id,
-            work_item_id: &revision_id,
-            kind: ProposalKind::PrCreated,
-            payload_json: r#"{"pr_url":"https://github.com/spinyfin/mono/pull/999"}"#,
-            idempotency_key: "key-1",
-        })
+        .submit_worker_proposal_with_flags(
+            crate::work::SubmitWorkerProposalInput {
+                execution_id: &execution_id,
+                work_item_id: &revision_id,
+                kind: ProposalKind::PrCreated,
+                payload_json: r#"{"pr_url":"https://github.com/spinyfin/mono/pull/999"}"#,
+                idempotency_key: "key-1",
+            },
+            true,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(submitted.proposal.state, ProposalState::Applied);
