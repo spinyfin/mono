@@ -430,6 +430,21 @@ impl ServerState {
                     "readopt: no positive shell pid was observable; registering the live-state entry with the provisional zero-pid sentinel",
                 );
             }
+            // Same durable hosting-mode snapshot spawn stamps. Missing or
+            // unreadable folds to legacy — the conservative bucket, matching
+            // classify treating unknown as terminate-on-quit.
+            let tmux_hosted = match self.work_db.latest_run_tmux_hosting_for_execution(run_id) {
+                Ok(Some(hosted)) => hosted,
+                Ok(None) => false,
+                Err(err) => {
+                    tracing::warn!(
+                        run_id,
+                        error = %format!("{err:#}"),
+                        "readopt: could not read durable tmux hosting; treating as legacy-hosted",
+                    );
+                    false
+                }
+            };
             self.live_worker_states.register_readoption(
                 slot_id,
                 run_id.to_owned(),
@@ -437,7 +452,11 @@ impl ServerState {
                 observed_shell_pid.unwrap_or(0),
                 binding,
                 awaiting_input_capable,
-                crate::live_worker_state::LiveSpawnRouting::new(pool, restored.kind.as_str()),
+                crate::live_worker_state::LiveSpawnRouting::new_with_hosting(
+                    Some(pool.to_owned()),
+                    restored.kind.as_str(),
+                    tmux_hosted,
+                ),
                 evidence,
             );
             match self.work_db.get_run_semantic_progress_checkpoint(run_id) {

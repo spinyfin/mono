@@ -1061,11 +1061,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             // non-empty snake_case kind, tests that leave the field at a
             // placeholder still surface it on the wire. Pool may be
             // `None` for tests that never set `StartWorkerInput.pool`.
-            crate::live_worker_state::LiveSpawnRouting {
-                pool: input.pool,
-                kind: Some(input.execution_kind),
-                tmux_hosted: Some(tmux_hosted),
-            },
+            crate::live_worker_state::LiveSpawnRouting::new_with_hosting(input.pool, input.execution_kind, tmux_hosted),
         );
         // Declare this slot's driver-reported progress fidelity so
         // `stale_worker_sweep` judges cadence-based staleness against the

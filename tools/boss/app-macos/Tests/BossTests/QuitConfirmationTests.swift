@@ -152,6 +152,25 @@ final class QuitConfirmationTests: XCTestCase {
         )
     }
 
+    /// A worker re-registered after engine restart or boot-time tmux
+    /// adoption still carries `tmuxHosted: true` on its live-state
+    /// snapshot. The store must feed that through to classify as
+    /// `.allTmux` — the same path the quit dialog uses — rather than
+    /// treating a missing/unrelated setting as legacy.
+    func testReadoptedTmuxHostedWorkerClassifiesAsAllTmux() {
+        let store = LiveWorkerStateStore()
+        store.update(states: [
+            liveState(slotId: 1, tmuxHosted: true),
+            liveState(slotId: 2, activity: .idle, tmuxHosted: false),
+        ])
+        XCTAssertEqual(store.activeAgentCount, store.activeAgentTmuxHostedFlags.count)
+        XCTAssertEqual(store.activeAgentCount, 1)
+        XCTAssertEqual(
+            QuitConfirmation.HostingMakeup.classify(store.activeAgentTmuxHostedFlags),
+            .allTmux
+        )
+    }
+
     // MARK: - AppDelegate wiring: hosting mode comes from each active worker, not the setting
 
     func testAppDelegateLegacyPathUsesTerminationWarning() {
@@ -294,7 +313,11 @@ final class QuitConfirmationTests: XCTestCase {
         return (delegate, model)
     }
 
-    private func liveState(slotId: Int, tmuxHosted: Bool?) -> WorkerLiveState {
+    private func liveState(
+        slotId: Int,
+        activity: WorkerActivity = .working,
+        tmuxHosted: Bool?
+    ) -> WorkerLiveState {
         WorkerLiveState(
             slotId: slotId,
             runId: "exec-\(slotId)",
@@ -303,7 +326,7 @@ final class QuitConfirmationTests: XCTestCase {
             lastEventAt: "2026-06-01T00:00:00Z",
             currentTool: nil,
             lastToolEndedAt: nil,
-            activity: .working,
+            activity: activity,
             liveStatus: "Working",
             liveStatusAt: "2026-06-01T00:00:00Z",
             recoveryStatus: nil,

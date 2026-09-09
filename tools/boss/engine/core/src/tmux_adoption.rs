@@ -1663,8 +1663,17 @@ mod tests {
         let execution = db
             .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
             .unwrap();
-        db.start_execution_run_on_host(&execution.id, agent_id, "mono", "lease-1", "ws-1", "/tmp/ws-1", "local")
-            .unwrap();
+        db.start_execution_run_on_host_with_tmux_hosting(
+            &execution.id,
+            agent_id,
+            "mono",
+            "lease-1",
+            "ws-1",
+            "/tmp/ws-1",
+            "local",
+            true,
+        )
+        .unwrap();
         execution.id
     }
 
@@ -1864,6 +1873,11 @@ mod tests {
         assert_eq!(live_state.run_id, execution_id);
         assert_eq!(live_state.shell_pid, 4321);
         assert_eq!(
+            live_state.tmux_hosted,
+            Some(true),
+            "a run adopted from a live tmux session must carry the durable tmux_hosted bit, not None (which classify folds into the legacy terminate-on-quit claim)",
+        );
+        assert_eq!(
             db.latest_local_pane_pid_snapshot_for_execution(&execution_id).unwrap(),
             (Some(4321), Some(4321)),
             "adoption must propagate the fresh tmux pid into durable liveness before rebuilding state",
@@ -1986,6 +2000,11 @@ mod tests {
         let live_state = spawner.live_states.get(1).expect("slot 1 must be registered");
         assert_eq!(live_state.run_id, execution_id);
         assert_eq!(live_state.shell_pid, 4321);
+        assert_eq!(
+            live_state.tmux_hosted,
+            Some(true),
+            "a run adopted from a live tmux session must carry the durable tmux_hosted bit",
+        );
         assert_eq!(
             db.latest_local_pane_pid_snapshot_for_execution(&execution_id).unwrap(),
             (None, None),
