@@ -903,6 +903,31 @@ fn codex_tool_surface_guard_is_always_armed_on_every_tool() {
 }
 
 #[test]
+fn reviewer_publish_guard_is_armed_only_for_reviewers() {
+    let tmp = TempDir::new().unwrap();
+    let (home, mut reviewer) = full_interception(tmp.path());
+    reviewer.is_reviewer = true;
+    let guards = materialize_guards(&home, &reviewer).unwrap();
+    let reviewer_guard = guards.iter().find(|guard| {
+        guard
+            .command_path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().contains("reviewer_publish_guard"))
+    });
+    assert_eq!(reviewer_guard.map(|guard| guard.matcher), Some(Some(".*")));
+
+    let non_reviewer_home = tmp.path().join("non-reviewer");
+    reviewer.is_reviewer = false;
+    let guards = materialize_guards(&non_reviewer_home, &reviewer).unwrap();
+    assert!(guards.iter().all(|guard| {
+        !guard
+            .command_path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().contains("reviewer_publish_guard"))
+    }));
+}
+
+#[test]
 fn path_guard_keeps_its_data_dir_env_through_the_wrapper() {
     // The path gate reads BOSS_DATA_DIR from its environment; wrapping it
     // in the trace shim must not drop that.

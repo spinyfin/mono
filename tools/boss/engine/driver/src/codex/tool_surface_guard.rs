@@ -48,7 +48,9 @@
 
 /// The Codex tool-surface guard, materialised verbatim as an executable
 /// `.py`. Emits a Claude-compatible `{"decision": …}` object on stdout.
-pub const CODEX_TOOL_SURFACE_GUARD_SCRIPT: &str = r#"#!/usr/bin/env python3
+use super::guard_python::with_command_tokenizer;
+
+const SCRIPT_TEMPLATE: &str = r#"#!/usr/bin/env python3
 """Codex tool-surface PreToolUse gate (Boss).
 
 Denies the two Codex execution routes Boss's command-inspecting guards cannot
@@ -161,16 +163,7 @@ INLINE_PROGRAM_FLAGS = {
 # A short-flag cluster such as `-lc` or `-ic`, as shells accept it.
 SHELL_FLAG_CLUSTER = re.compile(r"^-[A-Za-z]+$")
 
-# Shell delimiters that separate independent commands.
-DELIMS = {"&&", "||", ";", "|", "&"}
-
-# Launcher prefixes that wrap the real program.
-WRAPPERS = {
-    "nohup", "env", "sudo", "exec", "command", "stdbuf", "setsid",
-    "caffeinate", "xargs", "time",
-}
-
-ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# COMMAND_TOKENIZER_FRAGMENT
 
 
 def emit(decision, reason=None):
@@ -179,45 +172,6 @@ def emit(decision, reason=None):
         out["reason"] = reason
     sys.stdout.write(json.dumps(out))
     sys.exit(0)
-
-
-def command_groups(command):
-    """Split a command string into independent argv groups."""
-    groups = []
-    for line in command.split("\n"):
-        try:
-            lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|")
-            lexer.whitespace_split = True
-            lexer.commenters = ""
-            tokens = list(lexer)
-        except Exception:
-            tokens = line.split()
-        current = []
-        for token in tokens:
-            if token in DELIMS:
-                if current:
-                    groups.append(current)
-                current = []
-            else:
-                current.append(token)
-        if current:
-            groups.append(current)
-    return groups
-
-
-def strip_prefixes(group):
-    """Drop env assignments and launcher wrappers to reach the real program."""
-    index = 0
-    while index < len(group):
-        base = os.path.basename(group[index])
-        if ASSIGNMENT.match(group[index]) or base in WRAPPERS:
-            index += 1
-            continue
-        if base == "timeout" and index + 1 < len(group):
-            index += 2
-            continue
-        break
-    return group[index:]
 
 
 def has_inline_program(program, arguments):
@@ -315,6 +269,11 @@ if __name__ == "__main__":
     main()
 "#;
 
+/// Render the tool-surface guard with the shared shell-command tokenizer.
+pub fn codex_tool_surface_guard_script() -> String {
+    with_command_tokenizer(SCRIPT_TEMPLATE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,7 +288,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("boss-codex-tool-surface-{}-{seq}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("guard.py");
-        std::fs::write(&script, CODEX_TOOL_SURFACE_GUARD_SCRIPT).unwrap();
+        std::fs::write(&script, codex_tool_surface_guard_script()).unwrap();
 
         let mut child = std::process::Command::new("python3")
             .arg(&script)

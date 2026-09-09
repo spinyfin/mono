@@ -350,9 +350,10 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              kLSExecutableIncorrectFormat and every bazel build using apple_support's crosstool breaks \
              under it — this blocks Codex workers from building anything in mono. DEFAULT OFF: \
              danger-full-access puts Codex workers at the same no-OS-sandbox posture Claude workers have \
-             always run at (advisory PATH_GUARD_SCRIPT PreToolUse hook remains either way). Reviewer \
-             always stays `--sandbox read-only` regardless of this flag — it never runs build gates, and \
-             materialize_guards wires no reviewer denylist for Codex. Enable to put the kernel-enforced \
+             always run at (advisory PATH_GUARD_SCRIPT PreToolUse hook remains either way). Reviewers are \
+             unaffected by this flag: they receive no `--sandbox` at all (see \
+             codex::codex_sandbox_for_worker_kind), and their read-only/no-publish mandate is enforced by \
+             the reviewer_publish_guard PreToolUse hook. Enable to put the kernel-enforced \
              workspace-write fence back once the LaunchServices allowlist gap is fixed upstream.",
         category: "codex",
         default_enabled: false,

@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 
 mod decision;
 mod guard_chain;
+mod guard_python;
 pub mod guard_trace;
 mod pane_monitor;
 mod progress;
@@ -41,8 +42,8 @@ mod rollout_calls;
 mod tool_surface_guard;
 
 use guard_trace::{GUARD_TRACE_SHIM_FILENAME, GUARD_TRACE_SHIM_SCRIPT, guard_trace_path, wrapper_body};
-use reviewer_publish_guard::CODEX_REVIEWER_PUBLISH_GUARD_SCRIPT;
-use tool_surface_guard::CODEX_TOOL_SURFACE_GUARD_SCRIPT;
+use reviewer_publish_guard::codex_reviewer_publish_guard_script;
+use tool_surface_guard::codex_tool_surface_guard_script;
 
 use crate::transcript_store::{
     durable_sessions_dir, provision_durable_sessions, transcript_store_root, verified_durable_sessions_dir,
@@ -1120,7 +1121,7 @@ fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> 
     //    its own. See [`tool_surface_guard`].
     planned.push(Planned {
         name: "codex_tool_surface_guard",
-        source: GuardSource::Inline(CODEX_TOOL_SURFACE_GUARD_SCRIPT.to_owned()),
+        source: GuardSource::Inline(codex_tool_surface_guard_script()),
         matcher: ".*",
         extra_env: Vec::new(),
     });
@@ -1164,7 +1165,7 @@ fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> 
         // (not just `Bash`). See `reviewer_publish_guard`.
         planned.push(Planned {
             name: "reviewer_publish_guard",
-            source: GuardSource::Inline(CODEX_REVIEWER_PUBLISH_GUARD_SCRIPT.to_owned()),
+            source: GuardSource::Inline(codex_reviewer_publish_guard_script()),
             matcher: ".*",
             extra_env: Vec::new(),
         });
@@ -2067,7 +2068,7 @@ impl AgentDriver for CodexDriver {
     fn structured_output_fallback(&self, kind: StructuredOutputKind, text: &str) -> Vec<FallbackCandidate> {
         match kind {
             // The probe in `finalize_pr_review_pass` tells a Codex reviewer
-            // whose artifact write is denied by `--sandbox read-only` to end
+            // whose artifact write is blocked by the reviewer publish/no-write guard to end
             // its reply with the JSON in a fenced ```json block — that is
             // the *only* actionable channel it has (see
             // `docs/investigations/codex-review-eligibility-sandbox-and-structured-output-2026-07-31.md`).

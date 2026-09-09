@@ -24,7 +24,7 @@
 //!   because the Claude reviewer *does* write one engine-owned artifact).
 //! - The same publish commands `publish_deny_rules` denies for Claude/Grok
 //!   are blocked here too: `jj git push` / `git push`, `gh pr`/`gh issue`
-//!   mutations, and `cube pr create`/`update`/`ensure`.
+//!   mutations, and all `cube pr` subcommands.
 //!
 //! Armed only when `ToolUseInterceptionConfig::is_reviewer` is set (see
 //! `materialize_guards`), so no other worker kind is affected.
@@ -37,7 +37,9 @@
 /// Approves silently on every tool call it has nothing to say about (`Read`,
 /// `Grep`, plain `Bash` reads, …) — only `apply_patch` and a `Bash` command
 /// matching a publish shape are blocked.
-pub const CODEX_REVIEWER_PUBLISH_GUARD_SCRIPT: &str = r#"#!/usr/bin/env python3
+use super::guard_python::with_command_tokenizer;
+
+const SCRIPT_TEMPLATE: &str = r#"#!/usr/bin/env python3
 """Codex reviewer read-only / no-publish PreToolUse gate (Boss).
 
 Replaces, for Codex, the two controls the Claude/Grok reviewer gets from
@@ -72,37 +74,13 @@ PUBLISH_BLOCK = (
     "publish."
 )
 
-DELIMS = {"&&", "||", ";", "|", "&"}
-
-ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-
-
-def command_groups(cmd):
-    try:
-        toks = shlex.split(cmd, posix=True)
-    except Exception:
-        toks = cmd.split()
-    groups = []
-    cur = []
-    for t in toks:
-        if t in DELIMS:
-            if cur:
-                groups.append(cur)
-            cur = []
-        else:
-            cur.append(t)
-    if cur:
-        groups.append(cur)
-    return groups
+# COMMAND_TOKENIZER_FRAGMENT
 
 
 def matched_publish_command(cmd):
     dol = chr(36)
     for group in command_groups(cmd):
-        i = 0
-        while i < len(group) and ASSIGNMENT_RE.match(group[i]):
-            i += 1
-        rest = group[i:]
+        rest = strip_prefixes(group)
         if not rest:
             continue
         prog = os.path.basename(rest[0])
@@ -119,10 +97,8 @@ def matched_publish_command(cmd):
             "create", "comment", "close", "edit",
         ):
             return "gh issue " + rest[2]
-        if len(rest) >= 3 and is_cube and rest[1] == "pr" and rest[2] in (
-            "create", "update", "ensure",
-        ):
-            return "cube pr " + rest[2]
+        if len(rest) >= 2 and is_cube and rest[1] == "pr":
+            return "cube pr"
     return None
 
 
@@ -161,3 +137,97 @@ if matched:
 
 emit({"decision": "approve"})
 "#;
+
+/// Render the reviewer guard with the shared shell-command tokenizer.
+pub fn codex_reviewer_publish_guard_script() -> String {
+    with_command_tokenizer(SCRIPT_TEMPLATE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    fn decide(payload: serde_json::Value) -> (String, String) {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("boss-codex-reviewer-publish-{0}-{seq}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("guard.py");
+        std::fs::write(&script, codex_reviewer_publish_guard_script()).unwrap();
+        let mut child = std::process::Command::new("python3")
+            .arg(script)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("python3 must be available");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        drop(child.stdin.take());
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+        (
+            output["decision"].as_str().unwrap().to_owned(),
+            output["reason"].as_str().unwrap_or_default().to_owned(),
+        )
+    }
+
+    fn bash(command: &str) -> (String, String) {
+        decide(serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}}))
+    }
+
+    #[test]
+    fn blocks_writes_and_publish_commands() {
+        assert_eq!(
+            decide(serde_json::json!({"tool_name": "apply_patch", "tool_input": {}})).0,
+            "block"
+        );
+        for command in [
+            "jj git push",
+            "git push -f origin x",
+            "gh pr create",
+            "gh issue comment",
+            "cube pr update",
+            "cube pr arbitrary-verb",
+            "git status&&git push",
+            "x;git push",
+            "git status\ngit push",
+            "env git push",
+            "sudo git push",
+            "timeout 60 gh pr create",
+            "nohup git push",
+        ] {
+            assert_eq!(bash(command).0, "block", "{command:?} must be blocked");
+        }
+    }
+
+    #[test]
+    fn approves_read_only_tools_and_commands() {
+        for tool in ["Read", "Grep"] {
+            assert_eq!(
+                decide(serde_json::json!({"tool_name": tool, "tool_input": {}})).0,
+                "approve"
+            );
+        }
+        for command in ["gh pr view", "jj log", "git status"] {
+            assert_eq!(bash(command).0, "approve", "{command:?} must be approved");
+        }
+    }
+
+    #[test]
+    fn blocks_malformed_payload() {
+        let (decision, reason) = decide(serde_json::json!({"tool_name": "Bash", "tool_input": {}}));
+        assert_eq!(decision, "block");
+        assert!(reason.contains("fail-closed"));
+    }
+}
