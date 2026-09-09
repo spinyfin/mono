@@ -1299,9 +1299,9 @@ mod model_driver_gate_tests {
     fn rejects_a_codex_model_dispatched_on_the_claude_driver() {
         let registry = crate::driver::DriverRegistry::default();
         let claude = registry.get("claude").expect("claude is registered");
-        let err = check_model_driver_compatibility(claude.descriptor(), "gpt-5.6-sol").unwrap_err();
+        let err = check_model_driver_compatibility(claude.descriptor(), "gpt-6-astra").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("gpt-5.6-sol"));
+        assert!(msg.contains("gpt-6-astra"));
         assert!(msg.contains("claude"));
     }
 

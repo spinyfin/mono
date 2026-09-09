@@ -605,7 +605,7 @@ mod tests {
             events_socket_path: "/tmp/boss-events-run-1.sock".into(),
             wrapper_path: "~/.boss-remote/bin/boss-remote-run".into(),
             driver_binary: "codex".into(),
-            driver_command: "codex -m gpt-5.6-sol \"$(cat .codex/initial-prompt.txt)\"".into(),
+            driver_command: "codex -m gpt-6-astra \"$(cat .codex/initial-prompt.txt)\"".into(),
             driver_env: "export CODEX_HOME='/tmp/codex'; ".into(),
             structured_output_kind: Some("review-result".into()),
             pr_url_output: true,
