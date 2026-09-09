@@ -965,6 +965,62 @@ fn reconcile_inherits_workspace_id_from_orphaned_predecessor() {
     let _ = std::fs::remove_file(path);
 }
 
+/// The steady-state on-free rescan is the redispatch path reached by
+/// `release_worker_and_kick` after a dead-worker reap. It must retain the
+/// same orphan handoff as startup reconcile so the successor can lease the
+/// prior workspace with `--allow-dirty` and run workspace recovery.
+#[test]
+fn rescan_inherits_dirty_workspace_from_orphaned_predecessor() {
+    let path = temp_db_path("rescan-orphan-workspace");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Resumable reap orphan");
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let execution = create_ready_chore_execution(&db, chore.id.clone());
+    db.start_execution_run(
+        &execution.id,
+        "worker-orphan",
+        "mono",
+        "lease-ORPH",
+        "mono-agent-005",
+        "/tmp/mono-agent-005",
+    )
+    .unwrap();
+    db.mark_execution_orphaned(&execution.id, "test reap orphan").unwrap();
+    // Starting a run consumes `autostart`; model the steady-state requeue
+    // candidate that the on-free rescan admits after a reap.
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".to_owned()),
+            autostart: Some(true),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let redispatched = db.rescan_active_dispatch().unwrap();
+    assert_eq!(redispatched, vec![chore.id.clone()]);
+
+    let executions = db.list_executions(Some(&chore.id)).unwrap();
+    let fresh = executions.iter().find(|e| e.id != execution.id).unwrap();
+    assert_eq!(fresh.status, ExecutionStatus::Ready);
+    assert_eq!(fresh.preferred_workspace_id.as_deref(), Some("mono-agent-005"));
+    assert!(
+        fresh.allow_dirty,
+        "rescan successor must permit dirty workspace recovery"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
 /// `reconcile_active_dispatch` does NOT inherit workspace_id from
 /// predecessors that landed in a different terminal status
 /// (`abandoned`, `cancelled`, `failed`). Those are intentional

@@ -9,6 +9,7 @@ use crate::work::Task;
 
 mod blocked_recovery;
 mod invocation;
+mod recovery_branch;
 
 fn base_execution() -> WorkExecution {
     WorkExecution::builder()

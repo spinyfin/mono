@@ -7,7 +7,9 @@ use std::path::Path;
 use anyhow::Context as _;
 use boss_engine_gh_invocation::gh_output;
 use boss_gh_telemetry::{callers, scope as gh_scope};
+use boss_github::gh_runner::{CommandGhRunner, GhRunner};
 
+use crate::completion::{expected_branch_name, parse_repo_slug};
 use crate::coordinator::pool_dispatch_policy_for_worker_id;
 use crate::effort::{SpawnConfig, SpawnResolutionInput, resolve_spawn_config_in};
 use crate::structured_output::StructuredOutputKind;
@@ -466,6 +468,51 @@ fn prompt_addendum_to_prepend(kind: &ExecutionKind, addendum: Option<&'static st
 /// Transport-agnostic: it reads only from `work_db` (and, for `pr_review`
 /// executions, calls `gh pr view` to pre-fetch the PR metadata for the
 /// reviewer's initial prompt).
+async fn prior_recovery_branch_exists(execution: &WorkExecution, workspace_path: &Path) -> Option<bool> {
+    let report = boss_engine_recovery::recovery_apply::RecoveryReport::read_for(workspace_path, &execution.id)?;
+    if report.from_execution_id.is_empty() {
+        return None;
+    }
+    let remote_url = execution.repo_remote_url.trim();
+    if remote_url.is_empty() {
+        return None;
+    }
+    let repo_slug = match parse_repo_slug(remote_url) {
+        Ok(slug) => slug,
+        Err(err) => {
+            tracing::warn!(
+                execution_id = %execution.id,
+                remote_url,
+                error = %format!("{err:#}"),
+                "recovery prompt could not parse repository remote; omitting prior-branch resume guidance",
+            );
+            return None;
+        }
+    };
+    let branch = expected_branch_name(
+        &report.from_execution_id,
+        &execution.branch_naming,
+        execution.worker_branch_prefix.as_deref(),
+    );
+    match CommandGhRunner
+        .rest_get(&format!("repos/{repo_slug}/git/ref/heads/{branch}"), None)
+        .await
+    {
+        Ok(_) => Some(true),
+        Err(err) if err.http_status == Some(404) => Some(false),
+        Err(err) => {
+            tracing::warn!(
+                execution_id = %execution.id,
+                prior_execution_id = %report.from_execution_id,
+                branch,
+                error = ?err,
+                "recovery prompt could not verify prior branch; omitting branch-resume guidance",
+            );
+            None
+        }
+    }
+}
+
 pub(crate) async fn compose_worker_spawn(
     work_db: &WorkDb,
     worker_id: &str,
@@ -489,6 +536,7 @@ pub(crate) async fn compose_worker_spawn(
         review_batch_fanout_enabled,
         run_done_proposals_seam_enabled,
     } = editorial_opts;
+    let prior_branch_exists = prior_recovery_branch_exists(execution, workspace_path).await;
     // For any project-scoped task (the synthetic `kind = 'design'`
     // task and ordinary `project_task` rows alike), the richer
     // brief — what the project is for, what its goal is — lives
@@ -716,6 +764,7 @@ pub(crate) async fn compose_worker_spawn(
                         .maybe_editorial_rules(product_editorial_rules.as_ref())
                         .maybe_design_guidance(product_design_guidance.as_deref())
                         .pr_template_set(&pr_template_set)
+                        .maybe_prior_branch_exists(prior_branch_exists)
                         .editorial_enabled(editorial_enabled)
                         .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
                         .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
@@ -752,6 +801,7 @@ pub(crate) async fn compose_worker_spawn(
                     .maybe_editorial_rules(product_editorial_rules.as_ref())
                     .maybe_design_guidance(product_design_guidance.as_deref())
                     .pr_template_set(&pr_template_set)
+                    .maybe_prior_branch_exists(prior_branch_exists)
                     .editorial_enabled(editorial_enabled)
                     .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
                     .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
@@ -957,6 +1007,7 @@ pub(crate) async fn compose_worker_spawn(
                 .maybe_editorial_rules(product_editorial_rules.as_ref())
                 .maybe_design_guidance(product_design_guidance.as_deref())
                 .pr_template_set(&pr_template_set)
+                .maybe_prior_branch_exists(prior_branch_exists)
                 .editorial_enabled(editorial_enabled)
                 .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
                 .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
