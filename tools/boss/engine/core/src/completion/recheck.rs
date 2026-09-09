@@ -501,7 +501,7 @@ impl WorkerCompletionHandler {
             PrStatus::EmptyDiff { url } => return StopOutcome::EmptyDiffPr { pr_url: url },
             PrStatus::Fresh { url } | PrStatus::Merged { url } => url,
         };
-        match self
+        let outcome = match self
             .work_db
             .bind_pr_to_active_task_from_terminal_execution(&candidate.work_item_id, &pr_url)
         {
@@ -524,6 +524,24 @@ impl WorkerCompletionHandler {
                 );
                 StopOutcome::DbError
             }
+        };
+        // Worker-proposal seam (design implementation task 12): this sweep —
+        // the double-spawn-recovery counterpart to `recheck_for_pr` above —
+        // still finalizes purely through the cold `detect_pr` ladder; it
+        // never reads a `pr_created` proposal first the way `on_stop_inner`
+        // and `recheck_for_pr` do. Deliberately not wired to do so here: it
+        // runs for a TERMINAL execution recovering a task-row-only bind
+        // (see this method's doc), a narrower shape than the live-execution
+        // finalization the proposal read is designed to short-circuit, and
+        // folding it in would need its own verification pass against that
+        // shape rather than reusing `pr_created_from_proposal` as-is. But the
+        // counter is this seam's own stated exit criterion for eventually
+        // deleting the legacy ladder, so an uncounted finalization here would
+        // under-report and could wrongly green-light deleting a path this
+        // sweep still depends on — so count the hit regardless.
+        if let Ok(execution) = self.work_db.get_execution(&candidate.execution_id) {
+            self.record_pr_created_fallback_after_success(&execution, "pr_recheck_late", false, &outcome);
         }
+        outcome
     }
 }

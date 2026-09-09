@@ -167,9 +167,31 @@ impl WorkDb {
     /// `Ok(Err(ProposalSubmissionError))` for a rate-cap refusal — the
     /// refusal is a normal, typed outcome the worker is meant to see, not an
     /// engine fault.
+    ///
+    /// Equivalent to [`Self::submit_worker_proposal_with_flags`] with
+    /// `pr_created_proposals_seam_enabled: false` — the pre-migration apply
+    /// behaviour (see [`proposal_apply::apply_pr_created`]'s doc). `WorkDb`
+    /// has no `FeatureFlagsStore` of its own to query (it is a pure data
+    /// layer), so callers that know the flag's live value — currently only
+    /// `app::proposals::handle_submit_proposal`, which has `ServerState`'s
+    /// store — call [`Self::submit_worker_proposal_with_flags`] directly
+    /// instead. Every other caller (background sweeps, and the many tests
+    /// that submit kinds this flag never affects) keeps calling this one.
     pub fn submit_worker_proposal(
         &self,
         input: SubmitWorkerProposalInput<'_>,
+    ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
+        self.submit_worker_proposal_with_flags(input, false)
+    }
+
+    /// See [`Self::submit_worker_proposal`]. `pr_created_proposals_seam_enabled`
+    /// is the caller's already-composed `worker_proposals && pr_created_proposals_seam`
+    /// value; only [`proposal_apply::apply_pr_created`] reads it, and every
+    /// other proposal kind ignores it.
+    pub fn submit_worker_proposal_with_flags(
+        &self,
+        input: SubmitWorkerProposalInput<'_>,
+        pr_created_proposals_seam_enabled: bool,
     ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
         // The transaction-holding half. Scoped to a block so the `conn`
         // guard (a lock over `WorkDb`'s single shared connection — see
@@ -254,6 +276,7 @@ impl WorkDb {
                     input.payload_json,
                     input.kind,
                     &id,
+                    pr_created_proposals_seam_enabled,
                 )?),
                 ProposalApplyPolicy::Gated => None,
             };
@@ -1891,7 +1914,13 @@ mod tests {
 
     /// A declaration must not replace an existing binding. Rejecting it keeps
     /// the durable proposal state aligned with the completion reader, which
-    /// must never finalize against a URL the applier declined to bind.
+    /// must never finalize against a URL the applier declined to bind. This
+    /// hardening is gated on `pr_created_proposals_seam` (see
+    /// `proposal_apply::apply_pr_created`'s doc) — call
+    /// `submit_worker_proposal_with_flags` directly with the flag on so this
+    /// test actually exercises the hardened branch, rather than the
+    /// pre-migration one `submit_worker_proposal` (and every other test
+    /// using the `submit` helper) reproduces.
     #[test]
     fn pr_created_does_not_overwrite_an_already_bound_pr_url() {
         let (_dir, db) = open_db();
@@ -1904,15 +1933,19 @@ mod tests {
             )
             .unwrap();
 
-        let outcome = submit(
-            &db,
-            &execution_id,
-            &chore_id,
-            ProposalKind::PrCreated,
-            r#"{"pr_url":"https://github.com/spinyfin/mono/pull/2"}"#,
-            "key-1",
-        )
-        .unwrap();
+        let outcome = db
+            .submit_worker_proposal_with_flags(
+                SubmitWorkerProposalInput {
+                    execution_id: &execution_id,
+                    work_item_id: &chore_id,
+                    kind: ProposalKind::PrCreated,
+                    payload_json: r#"{"pr_url":"https://github.com/spinyfin/mono/pull/2"}"#,
+                    idempotency_key: "key-1",
+                },
+                true,
+            )
+            .unwrap()
+            .unwrap();
         assert_eq!(outcome.proposal.state, ProposalState::Rejected);
 
         let pr_url = match db.get_work_item(&chore_id).unwrap() {

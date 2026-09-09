@@ -1054,56 +1054,88 @@ fn render_editorial_rules_block(
     out
 }
 
-/// Directive that warns workers PR creation is terminal: the engine reaps
-/// them immediately after the PR is opened. No followup turn is possible.
-/// Workers must finish all work — including consuming any in-flight reviews
-/// they started — BEFORE opening the PR. Incident: a worker opened a PR,
-/// then tried to wait for background review subagents and address their
-/// findings as followup commits. The engine terminated the worker the moment
-/// the PR was created, so the review was never consumed. This universal
-/// guidance applies to every execution kind and prevents that pattern.
-/// `run_done_proposals_seam_enabled` mirrors `run_done_proposals_seam`. When
-/// enabled, [`run_done_directive`]'s declaration is terminal and follows all
-/// PR operations and proposal declarations.
+/// Directive that warns workers PR creation is terminal: no followup turn is
+/// possible after it. Workers must finish all work — including consuming
+/// any in-flight reviews they started — BEFORE opening the PR. Incident: a
+/// worker opened a PR, then tried to wait for background review subagents
+/// and address their findings as followup commits. The engine terminated
+/// the worker before the review was consumed. This universal guidance
+/// applies to every execution kind and prevents that pattern.
 ///
-/// `pr_created_proposals_seam_enabled` mirrors the `pr_created_proposals_seam`
-/// feature flag: it requires a `pr-created` declaration immediately after a
-/// successful PR push so the durable proposal row is available to the engine.
-fn pr_terminal_directive(
-    run_done_proposals_seam_enabled: bool,
-    pr_created_proposals_seam_enabled: bool,
-) -> String {
+/// States the worker's terminal sequence exactly once, in the order it must
+/// happen, rather than as several directives that can read as contradicting
+/// each other (a prior version literally did: "opening the PR is the LAST
+/// thing you do", followed later by "you will not get another turn after
+/// `gh pr create` *and* the `boss propose pr-created` call" — two different
+/// claims about what the last step is). It also does not claim the engine
+/// reaps the worker "immediately after the PR is created": the PR-created
+/// hook only stages and arms the URL (`pr_url_capture.rs`); finalization —
+/// and the termination that comes with it — happens at the worker's next
+/// Stop boundary, not synchronously inside the `gh pr create` call.
+///
+/// `run_done_proposals_seam_enabled` mirrors `run_done_proposals_seam`: when
+/// on, the sequence gains a `{boss} propose done` declaration step after
+/// the push and any PR-created declaration, because accepting it finalizes
+/// the run synchronously.
+///
+/// `pr_created_proposals_seam_enabled` mirrors `pr_created_proposals_seam`
+/// (design implementation task 12): when on, the sequence gains a `{boss}
+/// propose pr-created --url ...` declaration step after the push, since
+/// finalization now reads that proposal row first (see
+/// `crate::completion::pr_transition`). With both flags `false` this
+/// reproduces the pre-migration two-step sequence (just push, then stop).
+fn pr_terminal_directive(run_done_proposals_seam_enabled: bool, pr_created_proposals_seam_enabled: bool) -> String {
     let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
     let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
-    let mut out = String::new();
-    if run_done_proposals_seam_enabled {
-        out.push_str("\n## Important: declaring done is your terminal act\n\n");
-    } else {
-        out.push_str("\n## Important: PR creation is your terminal act\n\n");
-    }
-    if run_done_proposals_seam_enabled {
-        out.push_str(&format!(
-            "Opening the PR is normally the LAST thing you do, and the engine may reap you \
-             immediately after the PR is created. But with your run-done declaration enabled, \
-             `{boss} propose done` (see below) is the thing that is ALWAYS terminal, and it ends \
-             your run the instant the engine accepts it — before you even see the response, with \
-             no turn boundary in between. So the order is: finish everything, open or update the \
-             PR with `{cube} pr create` / `{cube} pr update`, and only THEN declare done, as the \
-             very last tool call you make. Declaring before the push would end your run before you \
-             ever reach the push at all — do not do that.\n\n"
-        ));
-    } else {
-        out.push_str(
-            "Opening the PR is the LAST thing you do. The engine reaps you immediately after the PR is created.\n\n",
-        );
-    }
+    let push_step = format!(
+        "push and open/update the PR (`gh pr create` / `{cube} pr create`, or `{cube} pr update` for an existing PR)"
+    );
+    let mut steps = Vec::new();
+    steps.push(push_step);
     if pr_created_proposals_seam_enabled {
-        out.push_str(&format!("After `gh pr create` / `{cube} pr create` (or `{cube} pr update`), immediately submit `{boss} propose pr-created --url ...`; then make the run-done declaration last. Do not plan followup commits, defer work to \"after the PR\", or open the PR while background work is still in flight.\n\n"));
-    } else if run_done_proposals_seam_enabled {
-        out.push_str(&format!("You will NOT get another turn after `{boss} propose done` (see below); PR creation itself still leaves a turn to declare done. Do not plan followup commits, defer work to \"after the PR\", or open the PR while background work is still in flight.\n\n"));
-    } else {
-        out.push_str(&format!("You will NOT get another turn after `gh pr create` / `{cube} pr create` (or `{cube} pr update` for an existing PR). Do not plan followup commits, defer work to \"after the PR\", or open the PR while background work is still in flight.\n\n"));
+        steps.push(format!("declare `{boss} propose pr-created --url ...`"));
     }
+    if run_done_proposals_seam_enabled {
+        steps.push(format!("declare `{boss} propose done` (see below)"));
+    }
+    let sequence = steps
+        .iter()
+        .enumerate()
+        .map(|(i, step)| format!("{}. {step}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let terminal_action_sentence = if run_done_proposals_seam_enabled {
+        format!(
+            "You will NOT get another turn after `{boss} propose done` — that declaration is the \
+             terminal action, not an afterthought."
+        )
+    } else if pr_created_proposals_seam_enabled {
+        format!(
+            "You will NOT get another turn after `gh pr create` / `{cube} pr create` (or `{cube} \
+             pr update` for an existing PR) and the `{boss} propose pr-created --url ...` call \
+             that declares it — that declaration IS the terminal action, not an afterthought."
+        )
+    } else {
+        format!(
+            "You will NOT get another turn after `gh pr create` / `{cube} pr create` (or `{cube} \
+             pr update` for an existing PR) — that is the terminal action, not an afterthought."
+        )
+    };
+
+    let mut out = String::new();
+    out.push_str("\n## Important: PR creation is your terminal act\n\n");
+    out.push_str(
+        "Everything else in this run happens BEFORE the sequence below. Do this, in order, as \
+         your last actions:\n\n",
+    );
+    out.push_str(&sequence);
+    out.push_str("\n\n");
+    out.push_str(&format!(
+        "{terminal_action_sentence} Do not plan followup commits, do not defer work to \
+         \"after the PR\", do not open the PR while background work (parallel/sub-agent runs, \
+         backgrounded builds, code reviews) is still in flight expecting to consume its \
+         results.\n\n"
+    ));
     out.push_str("Therefore: finish everything — including consuming any review/self-review findings you started — BEFORE you open the PR. If a background review is still running and you care about its results, wait for it and address all findings FIRST, then open the PR. If you don't intend to wait, don't start the review.\n");
     out
 }
