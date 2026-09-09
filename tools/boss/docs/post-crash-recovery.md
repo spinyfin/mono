@@ -129,13 +129,23 @@ Once the predecessor is `orphaned`:
 1. The work item's kanban status is unchanged. If it was `active`
    (Doing), it stays there — the dispatcher will pick it back up.
 2. The automatic redispatcher creates a new `work_executions` row in
-   `ready`. Both startup reconcile and the steady-state on-free rescan
-   set its `preferred_workspace_id` to the orphan's
-   `cube_workspace_id` and carry `allow_dirty = true`, so cube can
-   re-lease the same workspace without resetting it when one is free.
-3. The fresh worker spawns into that workspace. Inside the lease,
-   `jj git fetch && jj edit <bookmark>` brings it back to the branch
-   the orphan was working on; from there it can push and open / update
+   `ready`. All three redispatch paths — startup reconcile, the
+   steady-state on-free rescan, and the periodic `orphan_sweep` pass
+   that picks up a dead-pid reap — set its `preferred_workspace_id` to
+   the orphan's `cube_workspace_id` and carry `allow_dirty = true`, so
+   cube can re-lease the same workspace without resetting it when one
+   is free. A dead-pid reap in particular does not go through the
+   on-free rescan at all — `dead_pid_sweep::reap_dead_execution`
+   releases the slot directly and leaves the item for `orphan_sweep`
+   to pick back up on its next pass, so that sweep is the path an
+   actual dead-pid reap takes.
+3. The fresh worker spawns into that workspace. When the engine holds
+   a durable recovery-report marker for the predecessor's pushed
+   branch, its prompt renders a probe-verified `jj edit
+<branch>@origin` command — the branch string it verified against
+   the remote, not a guessed one — or, if the probe found no pushed
+   branch, says so explicitly instead of handing the worker a command
+   that would fail. From there the worker can push and open / update
    the PR as if no crash had happened.
 
 ## Automatic workspace patch backup

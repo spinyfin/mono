@@ -584,14 +584,10 @@ impl WorkDb {
             // reclaims the dirty workspace in place (uncommitted WIP
             // intact) rather than cube resetting it or falling back to
             // a fresh workspace that has no patch.
-            let is_orphaned_predecessor = existing
-                .as_ref()
-                .map(|prev| prev.status == ExecutionStatus::Orphaned)
-                .unwrap_or(false);
-            let preferred_workspace_id = existing
-                .as_ref()
-                .filter(|_| is_orphaned_predecessor)
-                .and_then(|prev| prev.cube_workspace_id.clone());
+            let OrphanHandoff {
+                is_orphaned_predecessor,
+                preferred_workspace_id,
+            } = orphan_handoff_for(existing.as_ref());
             request_execution_in_tx_with_live_check(
                 &mut pending,
                 &tx,
@@ -674,13 +670,10 @@ impl WorkDb {
             // dead-worker reap. Keep its orphan handoff identical to the
             // startup reconcile so recovery gets the same dirty workspace
             // first and can apply its captured patch when it cannot.
-            let is_orphaned_predecessor = existing
-                .as_ref()
-                .is_some_and(|prev| prev.status == ExecutionStatus::Orphaned);
-            let preferred_workspace_id = existing
-                .as_ref()
-                .filter(|_| is_orphaned_predecessor)
-                .and_then(|prev| prev.cube_workspace_id.clone());
+            let OrphanHandoff {
+                is_orphaned_predecessor,
+                preferred_workspace_id,
+            } = orphan_handoff_for(existing.as_ref());
             request_execution_in_tx_with_live_check(
                 &mut pending,
                 &tx,

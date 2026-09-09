@@ -22,6 +22,7 @@ mod recovery_branch;
 use block_boundary::block_boundary_fragment;
 use ci_monitoring::ci_monitoring_directive;
 use design::{compose_design_directive, compose_design_postmortem_directive};
+pub(super) use recovery_branch::PriorBranchProbe;
 use recovery_branch::prior_branch_block;
 
 #[derive(bon::Builder)]
@@ -43,7 +44,7 @@ pub(super) struct ExecutionPromptParams<'a> {
     /// entirely — see `worker_spawn.rs`).
     design_guidance: Option<&'a str>,
     pr_template_set: &'a crate::pr_template::PrTemplateSet,
-    prior_branch_exists: Option<bool>,
+    prior_branch: Option<PriorBranchProbe>,
     #[builder(default)]
     editorial_enabled: bool,
     /// Whether `worker_signal_proposals_seam` is on — gates the worker-facing
@@ -420,7 +421,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
         editorial_rules,
         design_guidance,
         pr_template_set,
-        prior_branch_exists,
+        prior_branch,
         editorial_enabled,
         worker_signal_proposals_seam_enabled,
         deferred_scope_proposals_seam_enabled,
@@ -505,7 +506,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
         // branch name" / `jj new main` guidance further down is the correct,
         // honest instruction, so no block is rendered at all.
         prompt.push_str(&startup_recovery_block(&report));
-        if let Some(prior_branch_block) = prior_branch_block(&report, execution, prior_branch_exists) {
+        if let Some(prior_branch_block) = prior_branch_block(&report, prior_branch.as_ref()) {
             prompt.push_str(&prior_branch_block);
         }
     } else if execution.allow_dirty {
