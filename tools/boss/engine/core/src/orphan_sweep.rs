@@ -104,7 +104,7 @@ use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::work::{
     ChurnTrip, ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD, ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD,
-    ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS, WorkDb,
+    ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS, OrphanHandoff, WorkDb,
 };
 use crate::worker_readoption::LiveWorkerConvergence;
 
@@ -880,13 +880,10 @@ async fn run_one_pass_filtered(
         // workspace instead of starting clean and losing the recovery
         // patch.
         let latest_execution = work_db.latest_execution_for_work_item(&work_item_id).ok().flatten();
-        let is_orphaned_predecessor = latest_execution
-            .as_ref()
-            .is_some_and(|prev| prev.status == ExecutionStatus::Orphaned);
-        let preferred_workspace_id = latest_execution
-            .as_ref()
-            .filter(|_| is_orphaned_predecessor)
-            .and_then(|prev| prev.cube_workspace_id.clone());
+        let OrphanHandoff {
+            is_orphaned_predecessor,
+            preferred_workspace_id,
+        } = crate::work::orphan_handoff_for(latest_execution.as_ref());
         let is_live = |exec_id: &str| claimed.contains(exec_id);
         let new_execution = match work_db.request_execution_with_live_check(
             RequestExecutionInput::builder()
