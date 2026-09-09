@@ -116,12 +116,13 @@ pub(super) struct ExecutionPromptParams<'a> {
 ///
 /// The engine's operating rule for recovery is that it fires only on an
 /// unambiguous durable pointer the system itself wrote — restart fresh on
-/// doubt. A prior worker's branch name is derived, not recorded: an orphaned
-/// execution has no `pr_url` because it never reached completion. The spawn
-/// path therefore checks that derived ref on the remote before setting
-/// `prior_branch_exists`. Only a confirmed ref gets a `jj edit ...@origin`
-/// instruction; a confirmed absence explicitly tells the worker not to run
-/// one, and an inconclusive probe renders neither claim.
+/// doubt. A branch-resume instruction is therefore emitted only once the
+/// predecessor's expected remote ref (computed from *its own* frozen
+/// `branch_naming`/`worker_branch_prefix`, not the successor's) has been
+/// verified against GitHub: a confirmed ref gets a `jj edit ...@origin`
+/// instruction, a confirmed 404 absence explicitly tells the worker not to
+/// run one, and any other probe failure is inconclusive and renders
+/// neither claim.
 ///
 /// The only thing the engine *does* durably record is [recovered workspace
 /// state](boss_engine_recovery::recovery_apply): a marker
