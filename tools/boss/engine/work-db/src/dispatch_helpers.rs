@@ -2513,6 +2513,37 @@ pub(crate) fn existing_nonterminal_pr_review_execution(
     }
 }
 
+/// `allow_dirty` / `preferred_workspace_id` to hand a fresh `RequestExecutionInput`
+/// for a redispatched work item, derived from its immediately preceding execution.
+pub struct OrphanHandoff {
+    pub is_orphaned_predecessor: bool,
+    pub preferred_workspace_id: Option<String>,
+}
+
+/// When the predecessor execution was orphaned (the worker pane died
+/// without the DB being updated — e.g. across an engine restart, or a
+/// dead-pid reap), the successor should inherit its `cube_workspace_id`
+/// and `allow_dirty` so the recovering worker reclaims the dirty
+/// workspace in place instead of cube resetting it or the dispatcher
+/// leasing an unrelated free workspace. Abandoned / failed / cancelled
+/// predecessors are intentional throwaways and don't carry forward.
+///
+/// Shared by every automatic redispatch path so they agree on orphan
+/// inheritance: [`super::WorkDb::reconcile_active_dispatch`],
+/// [`super::WorkDb::rescan_active_dispatch`], and
+/// `orphan_sweep::run_one_pass_filtered`. Recovered work itself is
+/// restaged from the engine-owned `preserved/<execution>` bookmark.
+pub fn orphan_handoff_for(existing: Option<&WorkExecution>) -> OrphanHandoff {
+    let is_orphaned_predecessor = existing.is_some_and(|prev| prev.status == ExecutionStatus::Orphaned);
+    let preferred_workspace_id = existing
+        .filter(|_| is_orphaned_predecessor)
+        .and_then(|prev| prev.cube_workspace_id.clone());
+    OrphanHandoff {
+        is_orphaned_predecessor,
+        preferred_workspace_id,
+    }
+}
+
 #[cfg(test)]
 #[path = "dispatch_helpers_tests.rs"]
 mod tests;
