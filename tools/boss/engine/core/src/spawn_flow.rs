@@ -2067,7 +2067,7 @@ mod tests {
         let mut input = sample_input(workspace);
         input.run_id = run_id.to_owned();
         input.slot_id = slot_id;
-        input.model = "gpt-5.6-sol".into();
+        input.model = "gpt-6-astra".into();
         input.initial_input = "exec codex exec --json\n".into();
         input.work_item_binding = Some(WorkItemBinding {
             work_item_id: "task-codex-1".into(),
@@ -2152,7 +2152,7 @@ mod tests {
             .get(4)
             .expect("a Codex spawn must register a LiveWorkerState — `agents list` reads only this registry");
         assert_eq!(state.run_id, "exec-codex-1");
-        assert_eq!(state.model, "gpt-5.6-sol");
+        assert_eq!(state.model, "gpt-6-astra");
         assert_eq!(state.shell_pid, 4242);
         assert_eq!(state.pool.as_deref(), Some("main"));
         assert_eq!(state.kind.as_deref(), Some("chore_implementation"));

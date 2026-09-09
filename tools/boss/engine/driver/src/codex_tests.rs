@@ -6,13 +6,13 @@ use tempfile::TempDir;
 #[test]
 fn codex_model_belongs_to_driver_recognises_codex_vocabulary() {
     for model in [
-        "gpt-5.6-sol",
+        "gpt-6-astra",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
         "gpt-5.5",
         "gpt-5.4-mini",
         "codex-auto-review",
-        "GPT-5.6-SOL",
+        "GPT-6-ASTRA",
     ] {
         assert!(
             codex_model_belongs_to_driver(model),
@@ -25,7 +25,7 @@ fn codex_model_belongs_to_driver_recognises_codex_vocabulary() {
 fn codex_model_belongs_to_driver_rejects_other_drivers_models() {
     // The exact bug this gate exists to catch: a Claude family alias
     // reaching the Codex CLI verbatim.
-    for model in ["opus", "sonnet", "claude-opus-4-7", "grok-4.6"] {
+    for model in ["opus", "sonnet", "claude-opus-4-7", "grok-4.6", "gpt-7-future"] {
         assert!(
             !codex_model_belongs_to_driver(model),
             "{model:?} should not be recognised as a Codex model"
@@ -73,7 +73,7 @@ fn codex_descriptor_matches_design() {
     assert_eq!(d.config_dir, ".codex");
     assert_eq!(d.agent_rules_filename, "AGENTS.md");
     assert_eq!(d.initial_prompt_filename, "initial-prompt.txt");
-    assert_eq!(d.model_menu.engine_default, "gpt-5.6-sol");
+    assert_eq!(d.model_menu.engine_default, "gpt-6-astra");
 }
 
 #[test]
@@ -150,11 +150,11 @@ fn codex_model_menu_sourced_from_debug_models_vocabulary() {
     assert_eq!((menu.effort_value_for_level)(EffortLevel::Large), Some("xhigh"));
     assert_eq!((menu.effort_value_for_level)(EffortLevel::Max), Some("max"));
     assert_eq!((menu.model_for_reasoning)(ReasoningMode::Standard), "gpt-5.6-terra");
-    assert_eq!((menu.model_for_reasoning)(ReasoningMode::Investigation), "gpt-5.6-sol");
+    assert_eq!((menu.model_for_reasoning)(ReasoningMode::Investigation), "gpt-6-astra");
     assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Fast), "gpt-5.6-luna");
     assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Balanced), "gpt-5.6-terra");
-    assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Strong), "gpt-5.6-sol");
-    assert!(!(menu.model_requires_auto_permissions)("gpt-5.6-sol"));
+    assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Strong), "gpt-6-astra");
+    assert!(!(menu.model_requires_auto_permissions)("gpt-6-astra"));
 }
 
 #[test]
@@ -325,7 +325,7 @@ fn spawn_invocation_meets_codex_tui_contract() {
 /// on to accept later `SendToPane` turns.
 #[test]
 fn pane_launch_spec_does_not_use_shell_exec() {
-    let plan = CodexDriver::default().spawn_invocation(spawn_request("gpt-5.6-sol", "run-pane-a"));
+    let plan = CodexDriver::default().spawn_invocation(spawn_request("gpt-6-astra", "run-pane-a"));
     let trimmed = plan.command.trim_start();
     assert!(
         trimmed.starts_with("codex "),

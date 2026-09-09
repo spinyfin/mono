@@ -1368,7 +1368,7 @@ mod tests {
         assert!((menu.model_belongs_to_driver)("GROK-4.6"));
         // A Claude/Codex family alias must not be recognised as Grok's.
         assert!(!(menu.model_belongs_to_driver)("opus"));
-        assert!(!(menu.model_belongs_to_driver)("gpt-5.6-sol"));
+        assert!(!(menu.model_belongs_to_driver)("gpt-6-astra"));
     }
 
     #[test]

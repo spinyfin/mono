@@ -1691,7 +1691,7 @@ mod tests {
         // CLI rejected with an HTTP 400 before emitting a token. The override
         // must resolve through the *resolved driver's* strong tier instead —
         // a Claude row still lands on Opus, a Codex row lands on Codex's own
-        // strong-tier model (`gpt-5.6-sol`), never on Claude's alias.
+        // strong-tier model (`gpt-6-astra`), never on Claude's alias.
         let claude_cfg = resolve_spawn_config(
             &SpawnResolutionInput::builder()
                 .task_driver("claude")
@@ -1709,7 +1709,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            codex_cfg.model, "gpt-5.6-sol",
+            codex_cfg.model, "gpt-6-astra",
             "codex pool override must resolve to codex's own strong-tier model, not a Claude alias"
         );
         assert_ne!(codex_cfg.model, "opus");
@@ -1734,8 +1734,8 @@ mod tests {
     // --- dedicated design/investigation tier ---
 
     #[test]
-    fn design_and_investigation_tier_use_fable_or_sol_at_default_effort() {
-        for (driver, expected_model) in [("claude", "fable"), ("codex", "gpt-5.6-sol")] {
+    fn design_and_investigation_tier_use_fable_or_astra_at_default_effort() {
+        for (driver, expected_model) in [("claude", "fable"), ("codex", "gpt-6-astra")] {
             for (kind, reasoning) in [
                 (TaskKind::Design, ReasoningMode::Standard),
                 (TaskKind::Chore, ReasoningMode::Investigation),

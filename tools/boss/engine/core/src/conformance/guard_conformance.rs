@@ -5,7 +5,7 @@
 //!
 //! The design doc's evidence for reusing Claude's hook grammar was a payload
 //! captured on `gpt-5.5` — a model with no code mode at all. Every model Boss
-//! actually dispatches (`gpt-5.6-terra`, `gpt-5.6-sol`) is a code-mode model.
+//! actually dispatches (`gpt-5.6-terra`, `gpt-6-astra`) is a code-mode model.
 //! Nothing detected that divergence until it was probed by hand (see
 //! `tools/boss/docs/investigations/codex-pretooluse-guard-coverage-2026-07-29.md`,
 //! whose findings landed as guard corrections plus the `guard_trace` shim
@@ -138,11 +138,10 @@ fn dispatched_codex_models() -> Vec<&'static str> {
     models
 }
 
-/// `tool_mode` values this harness has actually probed live (see
-/// [`codex_guard_conformance_against_live_dispatched_models`]) and confirmed
-/// the guard set behaves as [`EXPECTED_PROBES`] describes. `gpt-5.6-terra`
-/// reports `code_mode_only` and `gpt-5.6-sol` reports `code_mode` via `codex
-/// debug models` (0.145.0, 2026-07-30) — both covered. A dispatched model
+/// `tool_mode` values covered by the live guard harness
+/// ([`codex_guard_conformance_against_live_dispatched_models`]).
+/// `gpt-5.6-terra` and `gpt-6-astra` report `code_mode_only` via `codex
+/// debug models` (0.153.4, 2026-09-08), a covered mode. A dispatched model
 /// reporting anything else (including no `tool_mode` at all, the `gpt-5.5`
 /// shape the original design doc evidence came from) means this harness has
 /// never verified that model's tool surface and must not be trusted for it.
@@ -150,13 +149,14 @@ const COVERED_TOOL_MODES: &[&str] = &["code_mode", "code_mode_only"];
 
 /// Checked-in `codex debug models` `(slug, tool_mode)` capture — the fixture
 /// that makes [`codex_dispatched_models_have_covered_tool_mode`] hermetic.
-/// Captured live against codex-cli 0.145.0 (`PINNED_CODEX_CLI_VERSION`) on
-/// 2026-07-30: `gpt-5.6-terra` reports `code_mode_only`, `gpt-5.6-sol`
-/// reports `code_mode`. Re-capture via a live `codex debug models` run and
+/// Captured from `codex debug models` on codex-cli 0.153.4 on 2026-09-08:
+/// `gpt-5.6-terra` and `gpt-6-astra` report `code_mode_only`.
+/// Re-capture via a live `codex debug models` run and
 /// update deliberately on genuine drift — do not hand-edit these values from
 /// belief; [`captured_tool_mode_table_matches_installed_codex_cli`] is what
 /// catches a table that has gone stale.
-const CAPTURED_CODEX_TOOL_MODES: &[(&str, &str)] = &[("gpt-5.6-terra", "code_mode_only"), ("gpt-5.6-sol", "code_mode")];
+const CAPTURED_CODEX_TOOL_MODES: &[(&str, &str)] =
+    &[("gpt-5.6-terra", "code_mode_only"), ("gpt-6-astra", "code_mode_only")];
 
 fn captured_tool_mode(slug: &str) -> Option<&'static str> {
     CAPTURED_CODEX_TOOL_MODES
@@ -266,7 +266,7 @@ fn captured_tool_mode_table_matches_installed_codex_cli() {
 /// the same six calls in the same order every run. Steps 1-5 mirror the
 /// shapes captured live during the 2026-07-29 guard-coverage investigation
 /// and re-verified live against the shipped guard set on 2026-07-30 for both
-/// `gpt-5.6-terra` and `gpt-5.6-sol` (identical shape on both); step 6
+/// then-dispatched code-mode models (identical shape on both); step 6
 /// exercises the path guard this harness now arms.
 const PROBE_PROMPT: &str = r#"You are running a fixed diagnostic probe. Execute the following six steps IN ORDER, each as its own code cell action (do not combine them). Do not deviate from the literal code given. Do not add extra tool calls beyond what is listed.
 
@@ -307,7 +307,7 @@ struct ProbeExpectation {
 /// non-revision worker with the path guard armed (`boss_launch_guard`,
 /// `codex_tool_surface_guard`, `pr_redirect_guard`, `path_guard`) decided for
 /// each [`PROBE_PROMPT`] step, captured live against codex-cli 0.145.0 on
-/// 2026-07-30 for both `gpt-5.6-terra` and `gpt-5.6-sol` (byte-identical
+/// 2026-07-30 for both then-dispatched code-mode models (byte-identical
 /// shape on both). Re-capture and update deliberately on a genuine drift —
 /// do not hand-edit these values to match a belief about the tool surface;
 /// re-capture them from a live probe run (`BOSS_CODEX_GUARD_LIVE_PROBE=1`),

@@ -159,9 +159,10 @@ pub(crate) fn guard_chain_broken_notification(detail: &str) -> String {
 // Codex model / effort menu
 // ---------------------------------------------------------------------------
 //
-// Sourced from `codex debug models` on codex-cli 0.145.0 (2026-07-24 design
-// spike; re-verified on this host for the skeleton row). Catalog snapshot:
+// Sourced from `codex debug models` on codex-cli 0.153.4 (2026-09-08). Catalog
+// snapshot:
 //
+//   gpt-6-astra          default=medium  levels=low,medium,high,xhigh,max,ultra
 //   gpt-5.6-sol          default=low     levels=low,medium,high,xhigh,max,ultra
 //   gpt-5.6-terra        default=medium  levels=low,medium,high,xhigh,max,ultra
 //   gpt-5.6-luna         default=medium  levels=low,medium,high,xhigh,max
@@ -180,7 +181,7 @@ pub(crate) fn guard_chain_broken_notification(detail: &str) -> String {
 /// Map a Boss effort level onto Codex's reasoning-effort vocabulary.
 ///
 /// Mirrors Claude's five-rung ladder so operator-facing effort names stay
-/// consistent across drivers. Codex's sixth rung (`ultra` on `gpt-5.6-sol` /
+/// consistent across drivers. Codex's sixth rung (`ultra` on `gpt-6-astra` /
 /// `gpt-5.6-terra`) is unreachable through [`EffortLevel`] by design.
 fn codex_effort_value_for_level(level: EffortLevel) -> Option<&'static str> {
     Some(match level {
@@ -193,23 +194,23 @@ fn codex_effort_value_for_level(level: EffortLevel) -> Option<&'static str> {
 }
 
 /// Capability-lever model choice. `terra` is the well-articulated coding tier;
-/// `sol` is the frontier model reserved for investigation/design work —
+/// `astra` is the frontier model reserved for investigation/design work —
 /// analogous to Claude's sonnet/opus split.
 fn codex_model_for_reasoning(reasoning: ReasoningMode) -> &'static str {
     match reasoning {
         ReasoningMode::Standard => "gpt-5.6-terra",
-        ReasoningMode::Investigation => "gpt-5.6-sol",
+        ReasoningMode::Investigation => "gpt-6-astra",
     }
 }
 
 /// Concrete model mapping for metadata-derived review tiers. The Luna → Terra
-/// → Sol progression is review-only and does not infer anything from task
+/// → Astra progression is review-only and does not infer anything from task
 /// effort or reasoning.
 fn codex_review_model_for_tier(tier: ReviewModelTier) -> &'static str {
     match tier {
         ReviewModelTier::Fast => "gpt-5.6-luna",
         ReviewModelTier::Balanced => "gpt-5.6-terra",
-        ReviewModelTier::Strong => "gpt-5.6-sol",
+        ReviewModelTier::Strong => "gpt-6-astra",
     }
 }
 
@@ -217,7 +218,7 @@ fn codex_review_model_for_tier(tier: ReviewModelTier) -> &'static str {
 /// [`ReasoningMode`]. Keeps untagged rows on the frontier default rather than
 /// inventing a size→model progression Codex has not validated.
 fn codex_default_model_for_level(_level: EffortLevel) -> &'static str {
-    "gpt-5.6-sol"
+    "gpt-6-astra"
 }
 
 fn codex_prompt_addendum_for_level(level: EffortLevel) -> Option<&'static str> {
@@ -233,13 +234,16 @@ fn codex_model_requires_auto_permissions(_model: &str) -> bool {
     false
 }
 
-/// Returns `true` iff `model` names a Codex model — the `gpt-5.*`/`gpt-4.*`
+/// Returns `true` iff `model` names a Codex model — the `gpt-6-*`/`gpt-5.*`/`gpt-4.*`
 /// SKU family `codex debug models` lists, plus the hidden `codex-auto-review`
 /// SKU. Case-insensitive. Guards against a Claude/Grok family alias (e.g.
 /// `"opus"`) reaching the Codex CLI verbatim.
 fn codex_model_belongs_to_driver(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
-    lower.starts_with("gpt-") || lower == "codex-auto-review"
+    ["gpt-4.", "gpt-5.", "gpt-6-"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+        || lower == "codex-auto-review"
 }
 
 /// Session-scoped tmux config sourced into every codex worker's tmux session
@@ -256,15 +260,15 @@ static CODEX_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     agent_rules_filename: "AGENTS.md",
     initial_prompt_filename: "initial-prompt.txt",
     model_menu: ModelMenu {
-        // Highest-priority model in `codex debug models` (0.145.0): frontier
+        // Highest-priority model in `codex debug models` (0.153.4): frontier
         // agentic coding. Step-5 fall-through only — classified rows resolve
         // through `model_for_reasoning`.
-        engine_default: "gpt-5.6-sol",
+        engine_default: "gpt-6-astra",
         effort_value_for_level: codex_effort_value_for_level,
         default_model_for_level: codex_default_model_for_level,
         model_for_reasoning: codex_model_for_reasoning,
         review_model_for_tier: codex_review_model_for_tier,
-        design_investigation_model: Some(|| "gpt-5.6-sol"),
+        design_investigation_model: Some(|| "gpt-6-astra"),
         prompt_addendum_for_level: codex_prompt_addendum_for_level,
         model_requires_auto_permissions: codex_model_requires_auto_permissions,
         model_belongs_to_driver: codex_model_belongs_to_driver,

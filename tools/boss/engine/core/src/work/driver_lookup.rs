@@ -423,7 +423,7 @@ mod tests {
     /// A Design row with a live `tasks.driver = codex` pin must resolve to
     /// `codex` at lookup, matching what `resolve_spawn_config_in` actually
     /// spawns the worker on: `codex`'s `ModelMenu::design_investigation_model`
-    /// is `Some("gpt-5.6-sol")`, so the pin clears both the capability gate
+    /// is `Some("gpt-6-astra")`, so the pin clears both the capability gate
     /// and the tier model requirement. Before this fixed, the tier gating
     /// suppressed the pin here and fell through to the engine default
     /// (`claude`) — pointing the events-socket normaliser at a driver the
