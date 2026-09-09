@@ -179,6 +179,34 @@ pub enum SocketError {
     /// Claude" bug this per-connection resolution replaces.
     #[error("could not resolve driver for events-socket connection (run_id={run_id:?}): {reason}")]
     UnresolvedDriver { run_id: Option<String>, reason: String },
+    /// The `WorkDb` lookup for `run_id`'s driver slug itself failed (a
+    /// locked/busy sqlite database, most often during an engine restart).
+    /// Unlike [`Self::UnresolvedDriver`] this says nothing about whether
+    /// `run_id` names a real run — the identical payload could resolve
+    /// cleanly on the very next attempt — so it must never be treated as a
+    /// permanent verdict on the payload.
+    #[error("driver-slug lookup failed for run_id={run_id}: {error}")]
+    DriverSlugLookupTransient { run_id: String, error: String },
+}
+
+impl SocketError {
+    /// Whether the same payload is guaranteed to fail identically on retry,
+    /// so it is safe to report back to the peer as a [`REJECTION_PREFIX`]
+    /// notice (which the shim treats as a permanent rejection: the buffered
+    /// copy, if any, is discarded rather than retried). A `false` result
+    /// means the connection is simply dropped with no notice — see
+    /// [`handle_connection`] — so the shim's silence-on-failure path can
+    /// still redeliver it later instead of the event being irrecoverably
+    /// discarded for what may be a purely transient hiccup.
+    fn is_permanent(&self) -> bool {
+        match self {
+            SocketError::Io(_) => false,
+            SocketError::DriverSlugLookupTransient { .. } => false,
+            SocketError::Json(_) => true,
+            SocketError::Normalize(_) => true,
+            SocketError::UnresolvedDriver { .. } => true,
+        }
+    }
 }
 
 /// Bind+listen on the events socket at `path` and chmod the file to
@@ -360,14 +388,18 @@ pub async fn handle_connection(
     let mut stream = stream;
     let mut bytes = Vec::new();
     if let Err(err) = stream.read_to_end(&mut bytes).await {
-        let err = SocketError::from(err);
-        reject_connection(&mut stream, &err).await;
-        return Err(err);
+        // A read failure is a transient socket-level hiccup, not a verdict
+        // on the payload — drop the connection with no notice so the
+        // shim's silence-on-failure path can redeliver it rather than
+        // treating it as a definitive rejection.
+        return Err(SocketError::from(err));
     }
     match decode_incoming_event(&bytes, registry, work_db, peer_pid_value) {
         Ok(incoming) => Ok(incoming),
         Err(err) => {
-            reject_connection(&mut stream, &err).await;
+            if err.is_permanent() {
+                reject_connection(&mut stream, &err).await;
+            }
             Err(err)
         }
     }
@@ -460,9 +492,9 @@ fn resolve_connection_driver(
             %error,
             "events socket: driver-slug lookup failed for this connection's run_id",
         );
-        SocketError::UnresolvedDriver {
-            run_id: Some(run_id.to_owned()),
-            reason: format!("driver-slug lookup failed: {error:#}"),
+        SocketError::DriverSlugLookupTransient {
+            run_id: run_id.to_owned(),
+            error: format!("{error:#}"),
         }
     })?;
     let Some(slug) = slug else {
@@ -1271,6 +1303,37 @@ mod tests {
         assert!(
             response.contains("no execution/task row found for run_id"),
             "peer should see the engine's actual reason, got: {response:?}",
+        );
+    }
+
+    /// The shim's buffer-drain path treats any [`REJECTION_PREFIX`] notice
+    /// as a permanent, safe-to-discard verdict on the payload (see
+    /// `tools/boss/event-shim/src/main.rs`'s `BufferedSendError::Rejected`).
+    /// That contract only holds if the engine reserves the notice for
+    /// errors where the identical payload is guaranteed to fail again —
+    /// never for a transient socket or database hiccup, which the same
+    /// payload could sail through on the very next attempt.
+    #[test]
+    fn only_genuinely_permanent_errors_are_reported_as_rejections() {
+        assert!(
+            !SocketError::Io(io::Error::other("reset")).is_permanent(),
+            "a socket read failure says nothing about the payload"
+        );
+        assert!(
+            !SocketError::DriverSlugLookupTransient {
+                run_id: "run-1".to_owned(),
+                error: "database is locked".to_owned(),
+            }
+            .is_permanent(),
+            "a DB lookup failure is not a verdict that the run doesn't exist"
+        );
+        assert!(
+            SocketError::UnresolvedDriver {
+                run_id: Some("run-1".to_owned()),
+                reason: "no execution/task row found for run_id".to_owned(),
+            }
+            .is_permanent(),
+            "a definitively-unknown run_id will fail identically on retry"
         );
     }
 

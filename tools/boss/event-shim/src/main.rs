@@ -101,6 +101,14 @@ const RETRY_DELAYS_ENV: &str = "BOSS_EVENT_RETRY_DELAYS_MS";
 /// On-disk buffer path, relative to the workspace root.
 const BUFFER_REL_PATH: &str = ".boss/events-pending.jsonl";
 
+/// On-disk quarantine path, relative to the workspace root, that a
+/// permanently rejected buffered event is appended to before it is
+/// discarded from [`BUFFER_REL_PATH`]. Hook stderr on a non-blocking hook
+/// is not surfaced to anyone by default, so without this a discard is
+/// invisible; this keeps the payload and the engine's rejection reason
+/// around for forensics without re-queuing it for redelivery.
+const QUARANTINE_REL_PATH: &str = ".boss/events-rejected.jsonl";
+
 /// Cap on buffered events. Past this the oldest events are dropped so
 /// a long engine-down window can't grow the file without bound.
 const MAX_BUFFERED_EVENTS: usize = 1000;
@@ -221,6 +229,7 @@ fn run() -> Result<()> {
     };
 
     let buffer_path = resolve_buffer_path();
+    let quarantine_path = resolve_quarantine_path();
 
     // Drain leftover buffered events FIRST (oldest first). Each drain
     // attempt uses a fresh single-shot connection with no retry: if
@@ -230,7 +239,7 @@ fn run() -> Result<()> {
     // the current event's connect would otherwise sit in the backlog
     // ahead of the drained connections.
     if let Some(buf) = buffer_path.as_deref()
-        && let Err(err) = drain_buffer(&socket_path, buf, deadline)
+        && let Err(err) = drain_buffer(&socket_path, buf, quarantine_path.as_deref(), deadline)
     {
         eprintln!("boss-event: drain of {} skipped: {err:#}", buf.display());
     }
@@ -350,6 +359,16 @@ fn resolve_buffer_path() -> Option<PathBuf> {
         _ => env::current_dir().ok()?,
     };
     Some(root.join(BUFFER_REL_PATH))
+}
+
+/// Locate the per-workspace quarantine file, by the same root resolution
+/// as [`resolve_buffer_path`].
+fn resolve_quarantine_path() -> Option<PathBuf> {
+    let root = match env::var(WORKSPACE_ENV) {
+        Ok(s) if !s.is_empty() => PathBuf::from(s),
+        _ => env::current_dir().ok()?,
+    };
+    Some(root.join(QUARANTINE_REL_PATH))
 }
 
 /// Parse `BOSS_EVENT_RETRY_DELAYS_MS` if set, else return the default
@@ -531,13 +550,25 @@ fn append_to_buffer(buffer_path: &Path, payload: &[u8]) -> Result<()> {
 }
 
 /// Read the buffer line by line and try to deliver each event. A
-/// permanently rejected event is reported and discarded; a transient
-/// failure — including the shim's wall-clock budget running out — stops
-/// the drain and retains that event plus its FIFO suffix. Removes the
-/// file when every event was delivered or discarded. No-op when the
-/// buffer is absent. If another shim is already draining, returns
-/// successfully without waiting so that process can preserve FIFO order.
-fn drain_buffer(socket_path: &str, buffer_path: &Path, deadline: Instant) -> Result<()> {
+/// permanently rejected event is reported on stderr, appended to
+/// `quarantine_path` (best-effort — a quarantine-write failure is only
+/// logged, it never re-queues the event or aborts the drain) for later
+/// forensics, and discarded from the buffer; a transient failure —
+/// including the shim's wall-clock budget running out — stops the drain
+/// and retains that event plus its FIFO suffix. Truncates the buffer file
+/// to zero length when every event was delivered or discarded; leaves it
+/// untouched when nothing changed (nothing to send, or the very first
+/// record hit a transient failure), so a kill between truncate and
+/// rewrite can never lose more than what this drain actually consumed.
+/// No-op when the buffer is absent. If another shim is already draining,
+/// returns successfully without waiting so that process can preserve FIFO
+/// order.
+fn drain_buffer(
+    socket_path: &str,
+    buffer_path: &Path,
+    quarantine_path: Option<&Path>,
+    deadline: Instant,
+) -> Result<()> {
     if !buffer_path.exists() {
         return Ok(());
     }
@@ -556,6 +587,7 @@ fn drain_buffer(socket_path: &str, buffer_path: &Path, deadline: Instant) -> Res
     let lines = read_lines(&file)?;
     let mut drain_err: Option<anyhow::Error> = None;
     let mut unsent_start = lines.len();
+    let mut discarded = 0usize;
     for (index, line) in lines.iter().enumerate() {
         if budget_exhausted(deadline) {
             drain_err = Some(anyhow!("shim wall-clock budget exhausted during buffer drain"));
@@ -569,6 +601,15 @@ fn drain_buffer(socket_path: &str, buffer_path: &Path, deadline: Instant) -> Res
                     "boss-event: discarding permanently rejected buffered hook event from {}: {reason}",
                     buffer_path.display()
                 );
+                if let Some(quarantine_path) = quarantine_path
+                    && let Err(err) = append_to_quarantine(quarantine_path, line, &reason)
+                {
+                    eprintln!(
+                        "boss-event: failed to quarantine rejected event to {}: {err:#}",
+                        quarantine_path.display()
+                    );
+                }
+                discarded += 1;
             }
             Err(BufferedSendError::Transient(err)) => {
                 drain_err = Some(err);
@@ -578,12 +619,31 @@ fn drain_buffer(socket_path: &str, buffer_path: &Path, deadline: Instant) -> Res
         }
     }
 
-    rewrite_lines(&file, &lines[unsent_start..])?;
+    if unsent_start > 0 || discarded > 0 {
+        rewrite_lines(&file, &lines[unsent_start..])?;
+    }
 
     if let Some(err) = drain_err {
         return Err(err);
     }
     Ok(())
+}
+
+/// Append a rejected buffered event, plus the engine's rejection reason,
+/// as one JSON line to `quarantine_path`. Reuses [`append_to_buffer`]'s
+/// create-parent/lock/append shape and its [`MAX_BUFFERED_EVENTS`] trim, so
+/// a persistently-failing engine can't grow the quarantine file unbounded
+/// either.
+fn append_to_quarantine(quarantine_path: &Path, payload: &[u8], reason: &str) -> Result<()> {
+    let record = match serde_json::from_slice::<serde_json::Value>(payload) {
+        Ok(event) => serde_json::json!({ "rejected_reason": reason, "event": event }),
+        Err(_) => serde_json::json!({
+            "rejected_reason": reason,
+            "event_raw": String::from_utf8_lossy(payload),
+        }),
+    };
+    let line = serde_json::to_vec(&record).context("encoding quarantined event")?;
+    append_to_buffer(quarantine_path, &line)
 }
 
 /// Count the lines (newline-terminated records) in the buffer file.
@@ -804,22 +864,34 @@ mod tests {
 
         let socket = dir.path().join("never-bound.sock");
         let deadline = Instant::now() + Duration::from_secs(1);
-        let result = drain_buffer(socket.to_str().unwrap(), &buf, deadline);
+        let mtime_before = std::fs::metadata(&buf).unwrap().modified().unwrap();
+        let result = drain_buffer(socket.to_str().unwrap(), &buf, None, deadline);
         assert!(result.is_err(), "drain must surface connect failure");
 
         let contents = std::fs::read(&buf).unwrap();
         assert_eq!(contents, original);
+        // Nothing was sent or discarded, so the file must not even have
+        // been rewritten (truncated + re-written byte-identically) —
+        // proof there is no kill window here that could lose the buffer.
+        assert_eq!(
+            std::fs::metadata(&buf).unwrap().modified().unwrap(),
+            mtime_before,
+            "a drain that sends nothing must not touch the buffer file at all"
+        );
     }
 
     /// A permanent rejection must not poison the FIFO queue: discard the
     /// rejected record and continue draining later records on fresh
-    /// connections.
+    /// connections. The rejected record must also land in the quarantine
+    /// file alongside the engine's rejection reason, so the discard is
+    /// recoverable instead of vanishing into hook stderr.
     #[test]
     fn drain_discards_rejected_event_and_delivers_later_events() {
         let dir = tempfile::TempDir::new().unwrap();
         let buf = dir.path().join(".boss/events-pending.jsonl");
         std::fs::create_dir_all(buf.parent().unwrap()).unwrap();
         std::fs::write(&buf, b"bad-event\ngood-event\n").unwrap();
+        let quarantine = dir.path().join(".boss/events-rejected.jsonl");
         let socket = dir.path().join("events.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
 
@@ -836,9 +908,20 @@ mod tests {
             payload
         });
 
-        drain_buffer(socket.to_str().unwrap(), &buf, Instant::now() + Duration::from_secs(2)).unwrap();
+        drain_buffer(
+            socket.to_str().unwrap(),
+            &buf,
+            Some(&quarantine),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
         assert_eq!(server.join().unwrap(), b"good-event");
         assert_eq!(std::fs::read(&buf).unwrap(), b"");
+
+        let quarantined = std::fs::read_to_string(&quarantine).unwrap();
+        let record: serde_json::Value = serde_json::from_str(quarantined.trim()).unwrap();
+        assert_eq!(record["rejected_reason"], "malformed event");
+        assert_eq!(record["event_raw"], "bad-event");
     }
 
     #[test]
@@ -851,7 +934,12 @@ mod tests {
 
         let socket = dir.path().join("never-bound.sock");
         let start = Instant::now();
-        let result = drain_buffer(socket.to_str().unwrap(), &buf, Instant::now() - Duration::from_secs(1));
+        let result = drain_buffer(
+            socket.to_str().unwrap(),
+            &buf,
+            None,
+            Instant::now() - Duration::from_secs(1),
+        );
 
         assert!(result.is_err(), "an expired budget must stop the drain");
         assert!(
