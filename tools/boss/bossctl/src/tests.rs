@@ -21,6 +21,7 @@ fn live(slot: u8, run: &str) -> LiveWorkerState {
         live_status_at: None,
         recovery_status: None,
         held: false,
+        tmux_hosted: None,
     }
 }
 

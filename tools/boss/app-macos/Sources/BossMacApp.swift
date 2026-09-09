@@ -528,28 +528,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Builds the quit confirmation for the current worker count and
+    /// hosting mode without presenting it. `applicationShouldTerminate`
+    /// presents the result; tests inspect the same `NSAlert`.
+    func makeQuitConfirmationAlert() -> NSAlert? {
+        QuitConfirmation.alert(
+            agentCount: liveWorkerStates?.activeAgentCount ?? 0,
+            hostingMakeup: QuitConfirmation.HostingMakeup.classify(
+                liveWorkerStates?.activeAgentTmuxHostedFlags ?? []
+            )
+        )
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         // Capture runs always exit cleanly — no agent-running prompt.
         if BossCaptureArgs.shared.isCaptureMode {
             return .terminateNow
         }
-        let count = liveWorkerStates?.activeAgentCount ?? 0
-        guard count > 0 else { return .terminateNow }
-
-        let alert = NSAlert()
-        alert.messageText = "Quit Boss?"
-        let agentWord = count == 1 ? "agent is" : "agents are"
-        alert.informativeText =
-            "\(count) \(agentWord) currently working. Quitting will terminate them and discard any unsaved progress."
-        alert.addButton(withTitle: "Cancel")
-        alert.addButton(withTitle: "Quit Anyway")
-        alert.alertStyle = .warning
-
-        // Make Cancel (index 0) the default so a stray Cmd-Q doesn't
-        // accidentally confirm through the dialog.
-        alert.buttons[0].keyEquivalent = "\r"
-        alert.buttons[1].keyEquivalent = ""
-        alert.buttons[1].hasDestructiveAction = true
+        guard let alert = makeQuitConfirmationAlert() else { return .terminateNow }
 
         let response = alert.runModal()
         if response == .alertFirstButtonReturn {

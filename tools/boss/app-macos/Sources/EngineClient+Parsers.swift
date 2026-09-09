@@ -583,7 +583,8 @@ extension EngineClient {
             activity: activity,
             liveStatus: payload["live_status"] as? String,
             liveStatusAt: payload["live_status_at"] as? String,
-            recoveryStatus: payload["recovery_status"] as? String
+            recoveryStatus: payload["recovery_status"] as? String,
+            tmuxHosted: (payload["tmux_hosted"] as? NSNumber)?.boolValue
         )
     }
 

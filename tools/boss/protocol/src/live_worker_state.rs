@@ -246,6 +246,19 @@ pub struct LiveWorkerState {
     /// tolerant of payloads from older engines that omit the key.
     #[serde(default)]
     pub held: bool,
+    /// Whether this run was actually dispatched onto the tmux-hosting path
+    /// (`Some(true)`) or the legacy app-owned pty path (`Some(false)`) —
+    /// stamped once, at spawn, from the spawn decision itself
+    /// (`StartWorkerInput::tmux_host.is_some()`), not from the current
+    /// `workers.tmux_hosting` setting value. The two diverge whenever the
+    /// setting is toggled while a worker dispatched under the old value is
+    /// still running: `settings.rs` documents that disabling the setting
+    /// "affects only new dispatches; already-running tmux workers keep
+    /// their durable teardown path". `None` for spawns where hosting mode
+    /// isn't meaningful (remote workers, which have no local pane at all)
+    /// or for payloads from an older engine that predates this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_hosted: Option<bool>,
 }
 
 impl LiveWorkerState {
@@ -284,6 +297,25 @@ impl LiveWorkerState {
         pool: Option<String>,
         kind: Option<String>,
     ) -> Self {
+        Self::new_spawning_with_routing_and_hosting(slot_id, run_id, model, shell_pid, binding, pool, kind, None)
+    }
+
+    /// Like [`Self::new_spawning_with_routing`], but also stamps
+    /// [`Self::tmux_hosted`] — the actual hosting mode this spawn was
+    /// dispatched under, resolved once at the spawn decision. See the
+    /// field doc for why this must not be re-derived from the current
+    /// settings value later.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_spawning_with_routing_and_hosting(
+        slot_id: u8,
+        run_id: impl Into<String>,
+        model: impl Into<String>,
+        shell_pid: i32,
+        binding: Option<WorkItemBinding>,
+        pool: Option<String>,
+        kind: Option<String>,
+        tmux_hosted: Option<bool>,
+    ) -> Self {
         let (work_item_id, work_item_name, execution_id) = match binding {
             Some(b) => (Some(b.work_item_id), Some(b.work_item_name), Some(b.execution_id)),
             None => (None, None, None),
@@ -307,6 +339,7 @@ impl LiveWorkerState {
             pool,
             kind,
             held: false,
+            tmux_hosted,
         }
     }
 }
@@ -458,6 +491,7 @@ mod tests {
             pool: Some("main".into()),
             kind: Some("task_implementation".into()),
             held: false,
+            tmux_hosted: Some(true),
         };
         let json = serde_json::to_string(&original).unwrap();
         let parsed: LiveWorkerState = serde_json::from_str(&json).unwrap();
@@ -511,6 +545,7 @@ mod tests {
             pool: None,
             kind: None,
             held: false,
+            tmux_hosted: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let parsed: LiveWorkerState = serde_json::from_str(&json).unwrap();
@@ -538,5 +573,29 @@ mod tests {
         assert!(parsed.live_status_at.is_none());
         assert!(parsed.pool.is_none());
         assert!(parsed.kind.is_none());
+        assert!(parsed.tmux_hosted.is_none());
+    }
+
+    #[test]
+    fn new_spawning_with_routing_and_hosting_stamps_tmux_hosted() {
+        let state = LiveWorkerState::new_spawning_with_routing_and_hosting(
+            2,
+            "exec-9",
+            "claude-opus-4-7",
+            0,
+            None,
+            Some("main".into()),
+            Some("task_implementation".into()),
+            Some(false),
+        );
+        assert_eq!(state.tmux_hosted, Some(false));
+    }
+
+    #[test]
+    fn live_worker_state_omits_tmux_hosted_when_unset() {
+        let state = LiveWorkerState::new_spawning(1, "exec-1", "claude-opus-4-7", 0, None);
+        assert!(state.tmux_hosted.is_none());
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(!json.contains("tmux_hosted"), "json: {json}");
     }
 }

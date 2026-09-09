@@ -49,19 +49,39 @@ pub struct LiveSpawnRouting {
     pub pool: Option<String>,
     /// Execution kind snake_case string (see [`ExecutionKind::as_str`]).
     pub kind: Option<String>,
+    /// Whether this spawn actually went onto the tmux-hosting path
+    /// (`Some(true)`) or the legacy app-owned pty path (`Some(false)`),
+    /// resolved once at the spawn decision (see `spawn_flow`'s use of
+    /// `StartWorkerInput::tmux_host`). `None` where hosting mode isn't
+    /// meaningful — e.g. remote workers, which have no local pane.
+    pub tmux_hosted: Option<bool>,
 }
 
 impl LiveSpawnRouting {
-    /// Both fields unset — the historical test/default shape.
+    /// All fields unset — the historical test/default shape.
     pub fn none() -> Self {
         Self::default()
     }
 
-    /// Stamp both fields for a production dispatch.
+    /// Stamp pool + kind for a production dispatch that does not (yet)
+    /// know its hosting mode — e.g. the remote-worker registration path,
+    /// which has no local pane at all. Use
+    /// [`Self::new_with_hosting`] for a spawn that does know it.
     pub fn new(pool: impl Into<String>, kind: impl Into<String>) -> Self {
         Self {
             pool: Some(pool.into()),
             kind: Some(kind.into()),
+            tmux_hosted: None,
+        }
+    }
+
+    /// Stamp pool, kind, and the resolved hosting mode for a production
+    /// dispatch that made a real spawn decision (local `start_worker`).
+    pub fn new_with_hosting(pool: Option<String>, kind: impl Into<String>, tmux_hosted: bool) -> Self {
+        Self {
+            pool,
+            kind: Some(kind.into()),
+            tmux_hosted: Some(tmux_hosted),
         }
     }
 }
@@ -424,7 +444,7 @@ impl LiveWorkerStateRegistry {
         routing: LiveSpawnRouting,
     ) {
         let caller = std::panic::Location::caller();
-        let state = LiveWorkerState::new_spawning_with_routing(
+        let state = LiveWorkerState::new_spawning_with_routing_and_hosting(
             slot_id,
             run_id,
             model,
@@ -432,6 +452,7 @@ impl LiveWorkerStateRegistry {
             binding,
             routing.pool,
             routing.kind,
+            routing.tmux_hosted,
         );
         // Copy what the trace line needs before `state` is moved into the
         // map. The line itself is emitted *after* the mutation, mirroring

@@ -1034,6 +1034,17 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     //    see "Spawning" with the launch-default model — no more
     //    "Claude Unknown" while we wait for SessionStart to fire.
     if let Some(live_states) = spawner.live_worker_state_registry() {
+        // Resolved before `input.pool`/`input.model` are moved below —
+        // `input.tmux_host` is the spawn decision itself (set iff this
+        // spawn actually went onto the tmux-hosting path), the same
+        // per-execution fact `dispatch_hosting_stamp` documents as only
+        // being free to read right here. Stamping it onto the
+        // `LiveWorkerState` at spawn time — rather than having a later
+        // reader re-derive it from the current `workers.tmux_hosting`
+        // setting — is what lets the quit-confirmation dialog (and any
+        // other consumer) describe what a running worker actually is,
+        // independent of the setting having since been toggled.
+        let tmux_hosted = input.tmux_host.is_some();
         // Ask the resolved driver, rather than assume: this derives the
         // capability from the actual driver's declared capabilities and
         // passes it straight into registration, so there is no window
@@ -1050,10 +1061,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             // non-empty snake_case kind, tests that leave the field at a
             // placeholder still surface it on the wire. Pool may be
             // `None` for tests that never set `StartWorkerInput.pool`.
-            crate::live_worker_state::LiveSpawnRouting {
-                pool: input.pool,
-                kind: Some(input.execution_kind),
-            },
+            crate::live_worker_state::LiveSpawnRouting::new_with_hosting(input.pool, input.execution_kind, tmux_hosted),
         );
         // Declare this slot's driver-reported progress fidelity so
         // `stale_worker_sweep` judges cadence-based staleness against the

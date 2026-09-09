@@ -12,15 +12,31 @@ final class LiveWorkerStateStore: ObservableObject {
     @Published private(set) var byRunID: [String: WorkerLiveState] = [:]
     @Published private(set) var bySlot: [Int: WorkerLiveState] = [:]
 
-    /// Count of workers in a non-terminal "alive" state: `spawning`,
-    /// `working`, or `waitingForInput`. Used by the quit-confirmation
+    /// Workers in a non-terminal "alive" state: `spawning`, `working`,
+    /// or `waitingForInput`. Shared by `activeAgentCount` and
+    /// `activeAgentTmuxHostedFlags` so the quit dialog's count and
+    /// classified makeup cannot drift. Excludes `idle`, `errored`, and
+    /// `terminated`.
+    private static let aliveActivities: Set<WorkerActivity> = [
+        .spawning, .working, .waitingForInput,
+    ]
+
+    /// Count of currently alive workers. Used by the quit-confirmation
     /// guard — from the user's perspective a worker idle at a Claude
     /// prompt is still kill-worthy (live conversation history,
-    /// possibly in-progress edits in its leased workspace). Excludes
-    /// `idle`, `errored`, and `terminated`.
+    /// possibly in-progress edits in its leased workspace).
     var activeAgentCount: Int {
-        let live: Set<WorkerActivity> = [.spawning, .working, .waitingForInput]
-        return bySlot.values.filter { live.contains($0.activity) }.count
+        activeAgentTmuxHostedFlags.count
+    }
+
+    /// `tmuxHosted` of every currently active worker (same "alive" filter
+    /// as `activeAgentCount`), in no particular order. Feeds the
+    /// quit-confirmation dialog's hosting-mode claim — see
+    /// `QuitConfirmation.HostingMakeup.classify`. Each entry mirrors the
+    /// worker's actual dispatch-time hosting mode, not the current
+    /// `workers.tmux_hosting` setting value.
+    var activeAgentTmuxHostedFlags: [Bool?] {
+        bySlot.values.filter { Self.aliveActivities.contains($0.activity) }.map(\.tmuxHosted)
     }
 
     /// Replace the snapshot with `states`. Skips the publish when the
