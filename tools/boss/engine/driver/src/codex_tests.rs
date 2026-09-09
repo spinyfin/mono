@@ -11,6 +11,8 @@ fn codex_model_belongs_to_driver_recognises_codex_vocabulary() {
         "gpt-5.6-luna",
         "gpt-5.5",
         "gpt-5.4-mini",
+        "gpt-reserve",
+        "gpt-7-future",
         "codex-auto-review",
         "GPT-6-ASTRA",
     ] {
@@ -25,7 +27,7 @@ fn codex_model_belongs_to_driver_recognises_codex_vocabulary() {
 fn codex_model_belongs_to_driver_rejects_other_drivers_models() {
     // The exact bug this gate exists to catch: a Claude family alias
     // reaching the Codex CLI verbatim.
-    for model in ["opus", "sonnet", "claude-opus-4-7", "grok-4.6", "gpt-7-future"] {
+    for model in ["opus", "sonnet", "claude-opus-4-7", "grok-4.6"] {
         assert!(
             !codex_model_belongs_to_driver(model),
             "{model:?} should not be recognised as a Codex model"

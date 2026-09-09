@@ -562,7 +562,7 @@ async fn large_standard_row_spawns_sonnet_but_keeps_xhigh_and_the_addendum() {
     );
 }
 
-/// A `small` investigation row gets the dedicated Fable/Sol tier while
+/// A `small` investigation row gets the dedicated Fable/Astra tier while
 /// preserving the driver's default effort. The row's work-size estimate
 /// stays honest and does not imply a driver effort override.
 #[tokio::test]

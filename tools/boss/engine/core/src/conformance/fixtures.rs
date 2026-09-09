@@ -30,16 +30,24 @@ use boss_protocol::{EffortLevel, ReasoningMode};
 /// the only defence against unannounced drift (removed flags, item-id base
 /// changes, widened `error` meanings, new enum variants). Bump only after
 /// re-running the investigation harness and updating fixtures.
-pub const PINNED_CODEX_CLI_VERSION: &str = "0.145.0";
+///
+/// Stream fixtures (`CODEX_STDOUT_SESSION_JSONL`) were originally captured
+/// on 0.145.0. Re-verified live against 0.153.4 (2026-09-08):
+/// `thread.started` / `turn.started` / `item.completed` still fire, item
+/// ids still use [`PINNED_CODEX_ITEM_ID_BASE`], and `error` items still
+/// carry operational warnings. The checked-in JSONL is unchanged because
+/// those invariants still hold.
+pub const PINNED_CODEX_CLI_VERSION: &str = "0.153.4";
 
 /// Item-id base observed on the pinned Codex CLI.
 ///
 /// On 0.137.0 item ids were 1-based (`item_1`, `item_2`, …). On 0.145.0 the
 /// investigation still saw `item_2`/`item_3` mid-turn (ids are opaque tokens
 /// with a numeric suffix, not a dense 0-based counter starting at the first
-/// envelope). The harness pins the *prefix form* `item_<n>` and the concrete
-/// ids present in the fixtures; a base change that renumbers those ids must
-/// break the pin, not be absorbed.
+/// envelope). Re-verified on 0.153.4: a live turn still emits `item_0`
+/// (same prefix). The harness pins the *prefix form* `item_<n>` and the
+/// concrete ids present in the fixtures; a base change that renumbers those
+/// ids must break the pin, not be absorbed.
 pub const PINNED_CODEX_ITEM_ID_BASE: &str = "item_";
 
 /// Canonical session id shared by both fixture sides so `WorkerEvent`
@@ -74,7 +82,8 @@ pub const CLAUDE_HOOK_SESSION_JSONL: &str = concat!(
 /// Codex stdout-JSONL ingress for the same logical session.
 ///
 /// **Shape-aligned and identity-rewritten**, not wire-identical to a live
-/// capture: envelope types and item shapes come from the 0.145.0 investigation,
+/// capture: envelope types and item shapes come from the 0.145.0 investigation
+/// (re-verified on [`PINNED_CODEX_CLI_VERSION`] / 0.153.4),
 /// with `thread_id` and command text rewritten to [`CANONICAL_SESSION_ID`] /
 /// [`FIXTURE_BASH_COMMAND`] so the two fixture sides compare under
 /// [`PartialEq`]. Only `thread.started` carries `thread_id` on the wire;

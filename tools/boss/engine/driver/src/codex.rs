@@ -160,16 +160,18 @@ pub(crate) fn guard_chain_broken_notification(detail: &str) -> String {
 // ---------------------------------------------------------------------------
 //
 // Sourced from `codex debug models` on codex-cli 0.153.4 (2026-09-08). Catalog
-// snapshot:
+// snapshot in CLI priority order (visibility=list unless marked hidden):
 //
-//   gpt-6-astra          default=medium  levels=low,medium,high,xhigh,max,ultra
-//   gpt-5.6-sol          default=low     levels=low,medium,high,xhigh,max,ultra
-//   gpt-5.6-terra        default=medium  levels=low,medium,high,xhigh,max,ultra
-//   gpt-5.6-luna         default=medium  levels=low,medium,high,xhigh,max
-//   gpt-5.5              default=medium  levels=low,medium,high,xhigh
-//   gpt-5.4 / gpt-5.4-mini               levels=low,medium,high,xhigh
-//   gpt-5.3-codex-spark  default=high    levels=low,medium,high,xhigh
-//   codex-auto-review    (hidden)        levels=low,medium,high,xhigh
+//   gpt-6-astra               default=low     levels=low,medium,high,xhigh,max,ultra
+//   gpt-5.6-sol               default=low     levels=low,medium,high,xhigh,max,ultra
+//   gpt-5.6-terra             default=medium  levels=low,medium,high,xhigh,max,ultra
+//   gpt-5.6-luna              default=medium  levels=low,medium,high,xhigh,max
+//   gpt-daybreak-blue-latest  (hidden) default=low     levels=low,medium,high,xhigh,max,ultra
+//   gpt-daybreak-red-latest   (hidden) default=medium  levels=low,medium,high,xhigh,max,ultra
+//   gpt-5.5                   default=medium  levels=low,medium,high,xhigh
+//   gpt-5.4 / gpt-5.4-mini    (hidden) default=medium  levels=low,medium,high,xhigh
+//   gpt-5.2                   default=medium  levels=low,medium,high,xhigh
+//   codex-auto-review         (hidden) default=medium  levels=low,medium,high,xhigh,max
 //
 // `ModelMenu` is static function pointers today, so this is a baked snapshot
 // rather than a live `codex debug models` parse. Per-model effort filtering
@@ -234,16 +236,16 @@ fn codex_model_requires_auto_permissions(_model: &str) -> bool {
     false
 }
 
-/// Returns `true` iff `model` names a Codex model — the `gpt-6-*`/`gpt-5.*`/`gpt-4.*`
-/// SKU family `codex debug models` lists, plus the hidden `codex-auto-review`
-/// SKU. Case-insensitive. Guards against a Claude/Grok family alias (e.g.
-/// `"opus"`) reaching the Codex CLI verbatim.
+/// Returns `true` iff `model` names a Codex model — any `gpt-*` slug plus the
+/// hidden `codex-auto-review` SKU. Case-insensitive. This is a real
+/// predicate: it still rejects Claude/Grok family aliases (`"opus"`,
+/// `"sonnet"`, `"claude-opus-4-7"`, `"grok-4.6"`) that must not reach the
+/// Codex CLI verbatim. Prefix-matching the whole `gpt-` family is
+/// deliberate so a catalog SKU such as `gpt-reserve` or a later
+/// generation (`gpt-7-*`) is not silently swapped for `engine_default`.
 fn codex_model_belongs_to_driver(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
-    ["gpt-4.", "gpt-5.", "gpt-6-"]
-        .iter()
-        .any(|prefix| lower.starts_with(prefix))
-        || lower == "codex-auto-review"
+    lower.starts_with("gpt-") || lower == "codex-auto-review"
 }
 
 /// Session-scoped tmux config sourced into every codex worker's tmux session

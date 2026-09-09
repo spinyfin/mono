@@ -141,7 +141,8 @@ fn dispatched_codex_models() -> Vec<&'static str> {
 /// `tool_mode` values covered by the live guard harness
 /// ([`codex_guard_conformance_against_live_dispatched_models`]).
 /// `gpt-5.6-terra` and `gpt-6-astra` report `code_mode_only` via `codex
-/// debug models` (0.153.4, 2026-09-08), a covered mode. A dispatched model
+/// debug models` (`PINNED_CODEX_CLI_VERSION` / 0.153.4, 2026-09-08), a
+/// covered mode. A dispatched model
 /// reporting anything else (including no `tool_mode` at all, the `gpt-5.5`
 /// shape the original design doc evidence came from) means this harness has
 /// never verified that model's tool surface and must not be trusted for it.
@@ -149,8 +150,9 @@ const COVERED_TOOL_MODES: &[&str] = &["code_mode", "code_mode_only"];
 
 /// Checked-in `codex debug models` `(slug, tool_mode)` capture — the fixture
 /// that makes [`codex_dispatched_models_have_covered_tool_mode`] hermetic.
-/// Captured from `codex debug models` on codex-cli 0.153.4 on 2026-09-08:
-/// `gpt-5.6-terra` and `gpt-6-astra` report `code_mode_only`.
+/// Captured from `codex debug models` on `PINNED_CODEX_CLI_VERSION`
+/// (codex-cli 0.153.4) on 2026-09-08: `gpt-5.6-terra` and `gpt-6-astra`
+/// report `code_mode_only`.
 /// Re-capture via a live `codex debug models` run and
 /// update deliberately on genuine drift — do not hand-edit these values from
 /// belief; [`captured_tool_mode_table_matches_installed_codex_cli`] is what
@@ -265,9 +267,9 @@ fn captured_tool_mode_table_matches_installed_codex_cli() {
 /// room to phrase a different tool-call shape — the assertions below need
 /// the same six calls in the same order every run. Steps 1-5 mirror the
 /// shapes captured live during the 2026-07-29 guard-coverage investigation
-/// and re-verified live against the shipped guard set on 2026-07-30 for both
-/// then-dispatched code-mode models (identical shape on both); step 6
-/// exercises the path guard this harness now arms.
+/// and re-verified live against the shipped guard set on 2026-07-30 on
+/// codex-cli 0.145.0 for `gpt-5.6-terra` and `gpt-5.6-sol`, identical
+/// shape on both; step 6 exercises the path guard this harness now arms.
 const PROBE_PROMPT: &str = r#"You are running a fixed diagnostic probe. Execute the following six steps IN ORDER, each as its own code cell action (do not combine them). Do not deviate from the literal code given. Do not add extra tool calls beyond what is listed.
 
 STEP boss-probe-1: call `await tools.exec_command({cmd: "echo boss-guard-probe-baseline", yield_time_ms: 5000})` and print its output.
@@ -307,7 +309,7 @@ struct ProbeExpectation {
 /// non-revision worker with the path guard armed (`boss_launch_guard`,
 /// `codex_tool_surface_guard`, `pr_redirect_guard`, `path_guard`) decided for
 /// each [`PROBE_PROMPT`] step, captured live against codex-cli 0.145.0 on
-/// 2026-07-30 for both then-dispatched code-mode models (byte-identical
+/// 2026-07-30 for `gpt-5.6-terra` and `gpt-5.6-sol` (byte-identical
 /// shape on both). Re-capture and update deliberately on a genuine drift —
 /// do not hand-edit these values to match a belief about the tool surface;
 /// re-capture them from a live probe run (`BOSS_CODEX_GUARD_LIVE_PROBE=1`),

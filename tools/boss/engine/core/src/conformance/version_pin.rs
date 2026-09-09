@@ -33,7 +33,8 @@ use crate::driver::{AgentDriver, GrokDriver};
 /// Parse `codex-cli X.Y.Z` (or `codex X.Y.Z`) stdout from `codex --version`.
 fn parse_codex_version(stdout: &str) -> Option<String> {
     let line = stdout.lines().next()?.trim();
-    // Observed forms: "codex-cli 0.145.0", "codex 0.145.0".
+    // Observed forms: "codex-cli 0.153.4", "codex 0.153.4", and the same
+    // `codex-cli X.Y.Z` / `codex X.Y.Z` shape on earlier pins.
     let version = line.split_whitespace().last()?;
     if version.split('.').count() >= 2 {
         Some(version.to_owned())
