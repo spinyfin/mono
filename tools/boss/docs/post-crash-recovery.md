@@ -166,10 +166,24 @@ not yet expired; the verdict is one of:
   resolve manually.
 
 At startup, `reconcile_active_dispatch` creates that fresh `ready` row.
-During steady-state reaping, `release_worker_and_kick` runs
-`rescan_active_dispatch` before it kicks the scheduler; it creates the
-same inherited `ready` row. The two redispatch paths preserve the same
-workspace-recovery handoff.
+Steady-state redispatch splits across two paths depending on how the
+predecessor was released:
+
+- Releases that go through `release_worker_and_kick` (the stale-worker
+  sweep, the spawn-ack sweep, and app-driven pane teardown) run
+  `rescan_active_dispatch` before kicking the scheduler; it creates the
+  same inherited `ready` row.
+- A dead-pid reap (`dead_pid_sweep::reap_dead_execution`) does not call
+  `release_worker_and_kick` — it releases the slot directly and leaves
+  the work item for the periodic orphan-active sweep
+  (`orphan_sweep::run_one_pass_filtered`) to pick back up on its next
+  pass. That sweep looks up the work item's latest execution, and when
+  it is the just-reaped `orphaned` row, inherits its
+  `cube_workspace_id`/`allow_dirty` the same way `rescan_active_dispatch`
+  does.
+
+All three redispatch paths preserve the same workspace-recovery
+handoff.
 
 ### Manual escape hatch: `bossctl agents reap <run-id>`
 
@@ -221,10 +235,16 @@ Once the predecessor is `orphaned`:
 1. The work item's kanban status is unchanged. If it was `active`
    (Doing), it stays there — the dispatcher will pick it back up.
 2. The automatic redispatcher creates a new `work_executions` row in
-   `ready`. Both startup reconcile and the steady-state on-free rescan
-   set its `preferred_workspace_id` to the orphan's
-   `cube_workspace_id` and carry `allow_dirty = true`, so cube can
-   re-lease the same workspace without resetting it when one is free.
+   `ready`. All three redispatch paths — startup reconcile, the
+   steady-state on-free rescan, and the periodic `orphan_sweep` pass
+   that picks up a dead-pid reap — set its `preferred_workspace_id` to
+   the orphan's `cube_workspace_id` and carry `allow_dirty = true`, so
+   cube can re-lease the same workspace without resetting it when one
+   is free. A dead-pid reap in particular does not go through the
+   on-free rescan at all — `dead_pid_sweep::reap_dead_execution`
+   releases the slot directly and leaves the item for `orphan_sweep`
+   to pick back up on its next pass, so that sweep is the path an
+   actual dead-pid reap takes.
 3. The fresh worker spawns into that workspace. Inside the lease,
    `jj git fetch && jj edit <bookmark>` brings it back to the branch
    the orphan was working on; from there it can push and open / update
