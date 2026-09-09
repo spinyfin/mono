@@ -1822,7 +1822,7 @@ fn a_completed_batch_releases_its_reservation() {
     );
 }
 
-/// Operator diagnostics (`bossctl review live-batches`): only non-terminal
+/// The `bossctl review live-batches` diagnostic: only non-terminal
 /// batches come back, oldest first, and a `limit` bounds the result — the
 /// same "is anything stuck" question `reap_inert_review_batches` answers by
 /// acting rather than reporting.
