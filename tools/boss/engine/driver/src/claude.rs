@@ -251,8 +251,10 @@ macro_rules! python_command_guard {
 /// sets `commenters=''` itself). This is the same lexer configuration used
 /// by `boss_engine::worker_setup`'s `PATH_GUARD_SCRIPT` for the
 /// `BOSS_DATA_DIR` path guard, and by
-/// [`crate::codex::tool_surface_guard::CODEX_TOOL_SURFACE_GUARD_SCRIPT`]'s
-/// `command_groups`.
+/// `crate::codex::guard_python::CODEX_COMMAND_TOKENIZER_PY`'s
+/// `command_groups` — the Codex-side copy of this fragment, spliced into
+/// both Codex guard scripts. It is kept separate only because this macro
+/// must expand to string literals for `concat!`.
 ///
 /// A plain string-literal macro (not a `const`) for the same reason
 /// [`python_command_guard!`] is one: it is spliced into other `concat!`
@@ -685,9 +687,12 @@ pub const REVISION_PR_GUARD_COMMAND: &str = python_command_guard!(
 
 /// Inline Python decision hook for static-analysis-only reviewer sessions.
 ///
-/// Mutation and publication remain fenced by the existing reviewer deny rules
-/// and driver sandboxes. This complementary guard closes the command surface
-/// those controls intentionally leave open: builds, tests, formatters,
+/// Mutation and publication remain fenced by each driver's own reviewer
+/// fence — Claude and Grok's declarative reviewer deny rules
+/// (`reviewer_deny_rules`), Codex's `PreToolUse`-based equivalent
+/// (`codex::reviewer_publish_guard`, since Codex reviewers carry no OS
+/// sandbox and no declarative deny surface). This complementary guard closes
+/// the command surface those controls intentionally leave open: builds, tests, formatters,
 /// generators, language runners, shell interpreters, and direct execution of
 /// checked-out artifacts. It is shared unchanged by Claude, Codex, and Grok.
 pub const REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND: &str = python_command_guard!(

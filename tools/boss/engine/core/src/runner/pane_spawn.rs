@@ -80,7 +80,7 @@ mod apply_permission_extra_args_tests {
     }
 
     #[test]
-    fn reviewer_sandbox_replaces_workspace_write_default() {
+    fn reviewer_has_no_os_sandbox() {
         let plan = CodexDriver::default().spawn_invocation(SpawnRequest {
             model: "gpt-5.6-terra",
             effort: None,
@@ -89,15 +89,10 @@ mod apply_permission_extra_args_tests {
             permission_mode_override: None,
             run_id: Some("exec-review-1"),
         });
-        assert!(
-            plan.command.contains("workspace-write"),
-            "Codex spawn default includes workspace-write: {}",
-            plan.command
-        );
         let merged = apply_permission_extra_args(&plan.command, &codex_sandbox_extra_args(WorkerKind::Reviewer, false));
         assert!(
-            merged.contains("workspace-write"),
-            "Reviewer must get --sandbox workspace-write: {merged}"
+            !merged.contains("--sandbox"),
+            "Reviewer must receive no OS sandbox: {merged}"
         );
         // Required contract flags survive the rewrite.
         assert!(merged.contains("--strict-config"), "{merged}");
@@ -106,7 +101,7 @@ mod apply_permission_extra_args_tests {
     }
 
     #[test]
-    fn standard_sandbox_unenforced_replaces_workspace_write_default_with_danger_full_access() {
+    fn standard_sandbox_unenforced_adds_danger_full_access() {
         let plan = CodexDriver::default().spawn_invocation(SpawnRequest {
             model: "gpt-5.6-terra",
             effort: None,
@@ -115,11 +110,6 @@ mod apply_permission_extra_args_tests {
             permission_mode_override: None,
             run_id: Some("exec-standard-1"),
         });
-        assert!(
-            plan.command.contains("workspace-write"),
-            "Codex spawn default includes workspace-write: {}",
-            plan.command
-        );
         let merged = apply_permission_extra_args(&plan.command, &codex_sandbox_extra_args(WorkerKind::Standard, false));
         assert!(
             merged.contains("danger-full-access"),
@@ -127,7 +117,7 @@ mod apply_permission_extra_args_tests {
         );
         assert!(
             !merged.contains("workspace-write"),
-            "default sandbox must be replaced: {merged}"
+            "unexpected workspace-write sandbox: {merged}"
         );
         // Required contract flags survive the rewrite.
         assert!(merged.contains("--strict-config"), "{merged}");
