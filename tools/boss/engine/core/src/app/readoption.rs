@@ -466,8 +466,9 @@ impl ServerState {
                     tracing::warn!(
                         run_id,
                         error = %format!("{err:#}"),
-                        "readopt: could not load the semantic-progress checkpoint; leaving live state \
-                         unknown until a driver event arrives",
+                        "readopt: could not load the semantic-progress checkpoint; this worker will be \
+                         reaped as a never-started driver if no checkpoint or hook arrives within the \
+                         grace window",
                     );
                 }
             }

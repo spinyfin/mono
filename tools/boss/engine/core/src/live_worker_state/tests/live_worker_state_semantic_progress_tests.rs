@@ -34,6 +34,18 @@ fn seed_semantic_progress_restores_in_flight_without_display_timestamp() {
     let seeded = reg.semantic_progress_for_slot(1).unwrap();
     assert_eq!(seeded.progress_at, "2026-09-02T12:00:00Z");
     assert_eq!(seeded.tool_condition, SemanticToolCondition::InFlight);
+    assert!(
+        reg.driver_signal_at(1).is_some(),
+        "a durable checkpoint proves this re-adopted driver signalled before restart",
+    );
+    assert!(
+        reg.unverified_driver_starts(
+            boss_engine_utils::epoch_time::now_epoch_secs() + DRIVER_START_GRACE_SECS + 60,
+            DRIVER_START_GRACE_SECS,
+        )
+        .is_empty(),
+        "restored driver proof must keep a re-adopted worker out of the timeout set",
+    );
 }
 
 #[test]

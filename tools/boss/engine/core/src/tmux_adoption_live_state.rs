@@ -72,8 +72,9 @@ pub(crate) async fn register_adopted_live_state<S>(
             tracing::warn!(
                 execution_id,
                 error = %format!("{err:#}"),
-                "tmux boot adoption: could not load the semantic-progress checkpoint; \
-                 leaving re-adopted live state unknown until a driver event arrives",
+                "tmux boot adoption: could not load the semantic-progress checkpoint; this worker will \
+                 be reaped as a never-started driver if no checkpoint or hook arrives within the grace \
+                 window",
             );
         }
     }

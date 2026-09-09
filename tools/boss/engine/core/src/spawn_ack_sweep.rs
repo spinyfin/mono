@@ -454,6 +454,44 @@ pub async fn run_one_pass(
             continue;
         }
 
+        // A re-adopted slot's in-memory `driver_signal_at` was seeded only
+        // once, at adoption time, from the durable checkpoint. If that
+        // one-shot read failed or found nothing yet (the checkpoint write
+        // can race run-row creation — see `record_semantic_progress`), the
+        // slot is stuck here with no further chance to recover: a worker
+        // parked at `waiting_human` emits no more hooks by definition, so
+        // the checkpoint is its only protection. Re-read the checkpoint
+        // now, right before reaping, rather than trusting the one-shot
+        // restore. An `Err` is treated as inconclusive — never as
+        // permission to reap — because we cannot tell it apart from a real
+        // checkpoint the read simply failed to fetch.
+        if live_states.driver_start_expectation(candidate.slot_id) == Some(DriverStartExpectation::Readopted) {
+            match work_db.get_run_semantic_progress_checkpoint(execution_id) {
+                Ok(Some(checkpoint)) => {
+                    live_states.seed_semantic_progress(candidate.slot_id, &checkpoint);
+                    tracing::info!(
+                        execution_id,
+                        slot_id = candidate.slot_id,
+                        "driver-start check: re-read the durable checkpoint and found driver-start proof \
+                         that the one-shot adoption-time restore missed; skipping the reap",
+                    );
+                    continue;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id,
+                        slot_id = candidate.slot_id,
+                        error = %format!("{err:#}"),
+                        "driver-start check: could not re-read the semantic-progress checkpoint for a \
+                         re-adopted slot; treating as inconclusive and skipping this pass's reap rather \
+                         than reaping on an unreadable checkpoint",
+                    );
+                    continue;
+                }
+            }
+        }
+
         tracing::error!(
             execution_id,
             work_item_id = %execution.work_item_id,
@@ -874,6 +912,7 @@ mod tests {
     use crate::coordinator::ExecutionCoordinator;
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::live_worker_state::{DRIVER_START_GRACE_SECS, LiveWorkerStateRegistry};
+    use crate::semantic_progress::{SemanticProgressCheckpoint, SemanticToolCondition};
     use crate::test_support::*;
     use crate::work::ExecutionStatus;
 
@@ -1798,21 +1837,16 @@ mod tests {
         assert!(sink.events().await.iter().all(|e| e.stage != "driver_start_timeout"));
     }
 
-    /// Re-adoption then sweep: the engine re-registers an already-running
-    /// worker, and the sweep must leave it entirely alone.
+    /// Re-adoption then sweep: a durable driver signal from before the
+    /// engine restart must leave the worker entirely alone.
     ///
-    /// `readopt_live_worker` restores the row to `waiting_human` and
-    /// re-registers the slot, which stamps `spawned_at` with the current
-    /// time for a process that has been running for however long. The
-    /// `redispatch_guard` trigger carries no driver-originated evidence at
-    /// all (it fires off a recorded-*shell*-pid probe), and a worker parked
-    /// at `waiting_human` emits no further hook by definition — so without
-    /// the re-adoption exemption nothing would ever supply the missing
-    /// proof and this pass would reap a live worker one grace window later:
-    /// pane killed by process group, workspace torn down, cube lease
-    /// force-released.
+    /// `readopt_live_worker` restores the durable semantic-progress
+    /// checkpoint after reconstructing the slot. That checkpoint came from
+    /// a driver-originated event before restart, so it proves this run is
+    /// not a never-started driver even though this registration itself was
+    /// triggered by a shell-pid probe.
     #[tokio::test]
-    async fn a_readopted_live_worker_is_not_reaped_as_a_never_started_driver() {
+    async fn a_readopted_worker_with_durable_driver_proof_is_not_reaped() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
@@ -1841,9 +1875,16 @@ mod tests {
             1,
             boss_engine_utils::epoch_time::now_epoch_secs() - (DRIVER_START_GRACE_SECS + 60),
         );
+        live_states.seed_semantic_progress(
+            1,
+            &SemanticProgressCheckpoint {
+                progress_at: "2026-09-02T12:00:00Z".to_owned(),
+                tool_condition: SemanticToolCondition::Unknown,
+            },
+        );
         assert!(
-            live_states.driver_signal_at(1).is_none(),
-            "precondition: a pid-less re-adoption records no driver proof",
+            live_states.driver_signal_at(1).is_some(),
+            "a durable checkpoint restores proof that the driver signalled before restart",
         );
 
         let coordinator = make_coordinator(db.clone(), 1);
@@ -1854,7 +1895,7 @@ mod tests {
 
         assert_eq!(
             outcome.driver_start_reaped, 0,
-            "a re-adopted worker is not a spawn, so it has no driver start to verify",
+            "a re-adopted worker with durable driver proof must not be reaped",
         );
         assert_eq!(outcome.reaped, 0);
         assert_eq!(
