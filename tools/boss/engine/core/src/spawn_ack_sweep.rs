@@ -454,6 +454,44 @@ pub async fn run_one_pass(
             continue;
         }
 
+        // A re-adopted slot's in-memory `driver_signal_at` was seeded only
+        // once, at adoption time, from the durable checkpoint. If that
+        // one-shot read failed or found nothing yet (the checkpoint write
+        // can race run-row creation — see `record_semantic_progress`), the
+        // slot is stuck here with no further chance to recover: a worker
+        // parked at `waiting_human` emits no more hooks by definition, so
+        // the checkpoint is its only protection. Re-read the checkpoint
+        // now, right before reaping, rather than trusting the one-shot
+        // restore. An `Err` is treated as inconclusive — never as
+        // permission to reap — because we cannot tell it apart from a real
+        // checkpoint the read simply failed to fetch.
+        if live_states.driver_start_expectation(candidate.slot_id) == Some(DriverStartExpectation::Readopted) {
+            match work_db.get_run_semantic_progress_checkpoint(execution_id) {
+                Ok(Some(checkpoint)) => {
+                    live_states.seed_semantic_progress(candidate.slot_id, &checkpoint);
+                    tracing::info!(
+                        execution_id,
+                        slot_id = candidate.slot_id,
+                        "driver-start check: re-read the durable checkpoint and found driver-start proof \
+                         that the one-shot adoption-time restore missed; skipping the reap",
+                    );
+                    continue;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id,
+                        slot_id = candidate.slot_id,
+                        error = %format!("{err:#}"),
+                        "driver-start check: could not re-read the semantic-progress checkpoint for a \
+                         re-adopted slot; treating as inconclusive and skipping this pass's reap rather \
+                         than reaping on an unreadable checkpoint",
+                    );
+                    continue;
+                }
+            }
+        }
+
         tracing::error!(
             execution_id,
             work_item_id = %execution.work_item_id,

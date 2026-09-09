@@ -21,14 +21,19 @@
 //! 2. [`crate::live_worker_state::LiveWorkerStateRegistry::mark_stalled_spawns`]
 //!    — declines to promote, because grok omits
 //!    `Capability::AwaitingInputSignal`.
-//! 3. [`crate::spawn_ack_sweep`] pass 1 — declines, because re-adoption did
-//!    not create a new pane awaiting acknowledgement.
+//! 3. [`crate::spawn_ack_sweep`] pass 1 — declines. On the slot this engine
+//!    spawned itself, it declines because a reported pid narrows pass 1's
+//!    question to "is what came up the driver?", a question pass 2 owns
+//!    (`skipped.has_pid`); on a re-adopted slot it declines because
+//!    re-adoption did not create a new pane awaiting acknowledgement
+//!    (`skipped.readopted`).
 //!
 //! Then pass 2 fires and the resources are actually returned. The point of
 //! asserting steps 1–3 rather than only step 4 is that a future change
 //! which "fixes" this by loosening one of those three would be silently
 //! reintroducing the false positives each guard exists to prevent — this
-//! test makes that visible.
+//! test makes that visible. Two `#[tokio::test]`s below share the same
+//! fixture, one for each pass-1 decline shape.
 
 use std::sync::Arc;
 
@@ -100,9 +105,26 @@ struct RecordingCube {
     released: std::sync::Mutex<Vec<String>>,
 }
 
-/// The full incident, start to finish.
-#[tokio::test]
-async fn a_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released() {
+/// Common fixture for both real-process incident reproductions below: a
+/// live child process standing in for the pane's login shell, a matching
+/// DB row, and a `Spawning`, grok-modeled live-state entry with an aged
+/// `spawned_at` and no driver-originated signal.
+///
+/// `readopted` selects which pass-1 decline this reproduction exercises:
+/// `true` re-adopts the slot (as tmux's periodic convergence pass would),
+/// so pass 1 declines via `skipped.readopted`; `false` leaves the slot as
+/// this engine spawned it, so pass 1 declines via `skipped.has_pid`
+/// instead — the original 2026-07-30 shape, still real OS process, still
+/// unexercised anywhere else in this file.
+struct IncidentFixture {
+    shell: LiveShell,
+    db: Arc<crate::work::WorkDb>,
+    execution_id: String,
+    live_states: Arc<LiveWorkerStateRegistry>,
+    coordinator: Arc<crate::coordinator::ExecutionCoordinator>,
+}
+
+fn setup_incident(readopted: bool) -> IncidentFixture {
     let shell = LiveShell::spawn();
     let shell_pid = shell.pid();
 
@@ -148,45 +170,70 @@ async fn a_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released()
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
     live_states.set_spawn_time_for_test(1, now - (DRIVER_START_GRACE_SECS + 60));
 
-    // Tmux adoption observes the same live login shell on its periodic
-    // convergence pass. That must not turn a shell-only observation into a
-    // permanent driver-start exemption, and must not refresh `spawned_at`.
-    live_states.register_readoption(
-        1,
-        &execution_id,
-        "grok-4.6",
-        shell_pid,
-        Some(WorkItemBinding {
-            work_item_id: work_item_id.clone(),
-            work_item_name: "chore whose driver never starts".to_owned(),
-            execution_id: execution_id.clone(),
-        }),
-        false,
-        LiveSpawnRouting::none(),
-        ReadoptionEvidence::LiveShellPid,
-    );
-    let post_readoption = live_states.unverified_driver_starts(now, 0);
-    assert_eq!(
-        post_readoption.len(),
-        1,
-        "the slot must still be silent post-readoption"
-    );
+    if readopted {
+        // Tmux adoption observes the same live login shell on its periodic
+        // convergence pass. That must not turn a shell-only observation
+        // into a permanent driver-start exemption, and must not refresh
+        // `spawned_at`.
+        live_states.register_readoption(
+            1,
+            &execution_id,
+            "grok-4.6",
+            shell_pid,
+            Some(WorkItemBinding {
+                work_item_id: work_item_id.clone(),
+                work_item_name: "chore whose driver never starts".to_owned(),
+                execution_id: execution_id.clone(),
+            }),
+            false,
+            LiveSpawnRouting::none(),
+            ReadoptionEvidence::LiveShellPid,
+        );
+    }
+
+    let post_setup = live_states.unverified_driver_starts(now, 0);
+    assert_eq!(post_setup.len(), 1, "the slot must be silent after setup");
     assert!(
-        post_readoption[0].silent_secs >= DRIVER_START_GRACE_SECS + 60,
+        post_setup[0].silent_secs >= DRIVER_START_GRACE_SECS + 60,
         "re-adoption must not refresh spawned_at for an already-aged slot (silent_secs={}); \
          refreshing it would reset the grace window and mask a periodic same-run adoption of an \
          already-stale spawn",
-        post_readoption[0].silent_secs,
+        post_setup[0].silent_secs,
     );
 
     let coordinator = make_coordinator(db.clone(), 1);
-    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+    IncidentFixture {
+        shell,
+        db,
+        execution_id,
+        live_states,
+        coordinator,
+    }
+}
+
+/// Runs gates 1-3 plus the fix against `fixture`, asserting the common
+/// downstream outcome (reap, lease release, attention item, dispatch
+/// event). `expect_has_pid` selects which pass-1 skip counter the caller
+/// expects: `true` for an engine-spawned pane (`skipped.has_pid`), `false`
+/// for a re-adopted one (`skipped.readopted`).
+async fn assert_incident_detected_and_released(fixture: &IncidentFixture, expect_has_pid: bool) {
+    let IncidentFixture {
+        shell,
+        db,
+        execution_id,
+        live_states,
+        coordinator,
+    } = fixture;
+    let shell_pid = shell.pid();
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+
+    coordinator.worker_pool().claim_worker(execution_id, None).await;
     assert!(
         coordinator
             .worker_pool()
             .claimed_execution_ids()
             .await
-            .contains(&execution_id),
+            .contains(execution_id),
         "precondition: the worker slot is held",
     );
 
@@ -194,7 +241,7 @@ async fn a_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released()
     let sink = Arc::new(RecordingDispatchEventSink::new());
     let dead_pid_outcome = crate::dead_pid_sweep::run_one_pass(
         db.as_ref(),
-        &live_states,
+        live_states,
         coordinator.clone(),
         sink.as_ref(),
         &NoopCube,
@@ -219,7 +266,7 @@ async fn a_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released()
     );
 
     // ── Gate 3 + the fix: spawn_ack_sweep. ───────────────────────────────
-    // Pass 1 still declines the re-adopted slot; pass 2 is what fires.
+    // Pass 1 still declines the slot; pass 2 is what fires.
     let reaper = Arc::new(RecordingReaper {
         reaped: std::sync::Mutex::new(Vec::new()),
     });
@@ -227,7 +274,7 @@ async fn a_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released()
     let spawn_health = SpawnHealthTracker::new();
     let outcome = run_one_pass(
         db.as_ref(),
-        &live_states,
+        live_states,
         coordinator.clone(),
         sink.as_ref(),
         reaper.as_ref(),
@@ -238,10 +285,22 @@ async fn a_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released()
     )
     .await;
 
-    assert_eq!(
-        outcome.skipped.readopted, 1,
-        "gate 3: pass 1 still declines a slot this engine did not spawn",
-    );
+    if expect_has_pid {
+        assert_eq!(
+            outcome.skipped.has_pid, 1,
+            "gate 3: pass 1 declines an engine-spawned pane with a reported pid via has_pid",
+        );
+        assert_eq!(outcome.skipped.readopted, 0, "gate 3: this slot was never re-adopted");
+    } else {
+        assert_eq!(
+            outcome.skipped.readopted, 1,
+            "gate 3: pass 1 still declines a slot this engine did not spawn",
+        );
+        assert_eq!(
+            outcome.skipped.has_pid, 0,
+            "gate 3: readopted skip takes precedence over has_pid"
+        );
+    }
     assert_eq!(
         outcome.reaped, 0,
         "gate 3: pass 1 must not be the thing that catches this",
@@ -254,7 +313,7 @@ async fn a_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released()
     );
 
     assert_eq!(
-        db.get_execution(&execution_id).unwrap().status,
+        db.get_execution(execution_id).unwrap().status,
         ExecutionStatus::Orphaned,
         "the execution must be terminalized rather than parked forever",
     );
@@ -264,7 +323,7 @@ async fn a_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released()
             .worker_pool()
             .claimed_execution_ids()
             .await
-            .contains(&execution_id),
+            .contains(execution_id),
         "the worker slot must be released",
     );
 
@@ -281,7 +340,7 @@ async fn a_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released()
          stops a live pid being left under an orphaned row",
     );
 
-    let attentions = db.list_attention_items(&execution_id).unwrap();
+    let attentions = db.list_attention_items(execution_id).unwrap();
     assert_eq!(attentions.len(), 1, "an attention item must be raised");
     assert_eq!(attentions[0].kind, DRIVER_START_ATTENTION_KIND);
     assert!(
@@ -295,6 +354,24 @@ async fn a_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released()
         1,
         "exactly one driver_start_timeout dispatch event",
     );
+}
+
+/// The full incident, start to finish, on a re-adopted slot.
+#[tokio::test]
+async fn a_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released() {
+    let fixture = setup_incident(true);
+    assert_incident_detected_and_released(&fixture, false).await;
+}
+
+/// The same incident against a pane this engine spawned itself — never
+/// re-adopted — so pass 1 declines via `skipped.has_pid` rather than
+/// `skipped.readopted`. This is the original 2026-07-30 reproduction shape;
+/// nothing else in this file exercises `has_pid` end to end against a real
+/// OS process.
+#[tokio::test]
+async fn an_engine_spawned_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released() {
+    let fixture = setup_incident(false);
+    assert_incident_detected_and_released(&fixture, true).await;
 }
 
 /// The control: the identical setup, with the one difference that the

@@ -620,8 +620,8 @@ impl LiveWorkerStateRegistry {
     /// seeding it would let `downgrade_stale_activity` coerce unknown
     /// (`Spawning`) to idle once the restored stamp ages. The checkpoint is
     /// itself durable proof of a driver-originated event, so it also restores
-    /// `driver_signal_at`; that preserves the driver-start exemption across
-    /// an engine restart without treating shell liveness as proof.
+    /// `driver_signal_at` — carrying the driver-start proof across an engine
+    /// restart without treating shell liveness as proof.
     pub fn seed_semantic_progress(&self, slot_id: u8, checkpoint: &SemanticProgressCheckpoint) {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         let Some(entry) = guard.get_mut(&slot_id) else {
@@ -2828,10 +2828,11 @@ mod tests {
         assert_eq!(reg.driver_start_expectation(1), Some(DriverStartExpectation::Readopted));
     }
 
-    /// The exemption belongs to the registration, not the slot: recycling
-    /// the slot for a genuine spawn must restore verification.
+    /// The registration, not the slot, carries the expectation: recycling
+    /// the slot for a genuine spawn must restore `EngineSpawned` so pass
+    /// 1's spawn-ack timeout applies again.
     #[test]
-    fn recycling_a_readopted_slot_for_a_real_spawn_restores_verification() {
+    fn recycling_a_readopted_slot_for_a_real_spawn_restores_the_engine_spawned_expectation() {
         let reg = LiveWorkerStateRegistry::new();
         aged_readopted_slot(&reg, 1, "run-a", ReadoptionEvidence::LiveShellPid);
 
