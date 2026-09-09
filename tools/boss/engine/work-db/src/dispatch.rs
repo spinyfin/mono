@@ -817,7 +817,8 @@ impl WorkDb {
             if delivered_or_completed(&tx, &work_item_id)? {
                 continue;
             }
-            let needs_dispatch = match query_latest_execution_for_work_item(&tx, &work_item_id)? {
+            let existing = query_latest_execution_for_work_item(&tx, &work_item_id)?;
+            let needs_dispatch = match &existing {
                 Some(existing) => existing.status.is_terminal(),
                 None => true,
             };
@@ -847,11 +848,24 @@ impl WorkDb {
                     continue;
                 }
             }
+            // The on-free rescan is the normal redispatch path after a
+            // dead-worker reap. Keep its orphan handoff identical to the
+            // startup reconcile so recovery gets the same dirty workspace
+            // first and can restage preserved work into it.
+            let is_orphaned_predecessor = existing
+                .as_ref()
+                .is_some_and(|prev| prev.status == ExecutionStatus::Orphaned);
+            let preferred_workspace_id = existing
+                .as_ref()
+                .filter(|_| is_orphaned_predecessor)
+                .and_then(|prev| prev.cube_workspace_id.clone());
             request_execution_in_tx_with_live_check(
                 &mut pending,
                 &tx,
                 RequestExecutionInput::builder()
                     .work_item_id(work_item_id.clone())
+                    .maybe_preferred_workspace_id(preferred_workspace_id)
+                    .allow_dirty(is_orphaned_predecessor)
                     .audit_basis("rescan_active_dispatch")
                     .build(),
                 // `|_| true` keeps any non-terminal execution intact —
