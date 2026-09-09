@@ -19,8 +19,36 @@ use thiserror::Error;
 
 use crate::driver::{AgentDriver, DriverRegistry, TurnEnd};
 use crate::work::WorkDb;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+
+/// Marker line the engine writes back to the peer when it rejects a
+/// connection (malformed JSON, unrecognized hook shape, unresolved
+/// driver, ...), so `boss-event` can tell "the engine actively refused
+/// this event" apart from "delivered fine". The shim never reads
+/// anything on a successful connection -- it only looks for this
+/// prefix, best-effort, after it finishes writing and half-closes.
+///
+/// Deliberately duplicated (not shared via a crate dependency) in
+/// `tools/boss/event-shim/src/main.rs`'s `REJECTION_PREFIX`: the shim is
+/// intentionally a tiny, dependency-free binary with no link to the
+/// engine, so the two copies of this literal are the whole contract.
+/// Keep them byte-for-byte identical if either changes.
+const REJECTION_PREFIX: &str = "BOSS-EVENT-REJECTED: ";
+
+/// Marker line the engine writes back to the peer when a connection failed
+/// for a reason [`SocketError::is_permanent`] classifies as transient (a
+/// socket I/O hiccup, or a busy/locked `WorkDb` lookup) rather than
+/// permanent. Distinct from [`REJECTION_PREFIX`] so `boss-event` can tell
+/// "the engine will never accept this payload" apart from "the engine hit a
+/// transient error and this payload should be retried" — see
+/// [`retry_connection`].
+///
+/// Deliberately duplicated (not shared via a crate dependency) in
+/// `tools/boss/event-shim/src/main.rs`'s `RETRY_PREFIX`, for the same
+/// dependency-free-shim reason as [`REJECTION_PREFIX`]. Keep them
+/// byte-for-byte identical if either changes.
+const RETRY_PREFIX: &str = "BOSS-EVENT-RETRY: ";
 
 /// `level` for `getsockopt(SOL_LOCAL, LOCAL_PEERPID)` on macOS.
 #[cfg(target_os = "macos")]
@@ -165,6 +193,36 @@ pub enum SocketError {
     /// Claude" bug this per-connection resolution replaces.
     #[error("could not resolve driver for events-socket connection (run_id={run_id:?}): {reason}")]
     UnresolvedDriver { run_id: Option<String>, reason: String },
+    /// The `WorkDb` lookup for `run_id`'s driver slug itself failed (a
+    /// locked/busy sqlite database, most often during an engine restart).
+    /// Unlike [`Self::UnresolvedDriver`] this says nothing about whether
+    /// `run_id` names a real run — the identical payload could resolve
+    /// cleanly on the very next attempt — so it must never be treated as a
+    /// permanent verdict on the payload.
+    #[error("driver-slug lookup failed for run_id={run_id}: {error}")]
+    DriverSlugLookupTransient { run_id: String, error: String },
+}
+
+impl SocketError {
+    /// Whether the same payload is guaranteed to fail identically on retry,
+    /// so it is safe to report back to the peer as a [`REJECTION_PREFIX`]
+    /// notice (which the shim treats as a permanent rejection: the buffered
+    /// copy, if any, is discarded rather than retried). A `false` result
+    /// means the connection is reported back to the peer as a
+    /// [`RETRY_PREFIX`] notice instead — see [`handle_connection`] and
+    /// [`retry_connection`] — which the shim treats as a transient failure:
+    /// the payload is queued back onto its on-disk buffer for redelivery
+    /// rather than being irrecoverably discarded for what may be a purely
+    /// transient hiccup.
+    fn is_permanent(&self) -> bool {
+        match self {
+            SocketError::Io(_) => false,
+            SocketError::DriverSlugLookupTransient { .. } => false,
+            SocketError::Json(_) => true,
+            SocketError::Normalize(_) => true,
+            SocketError::UnresolvedDriver { .. } => true,
+        }
+    }
 }
 
 /// Bind+listen on the events socket at `path` and chmod the file to
@@ -345,8 +403,41 @@ pub async fn handle_connection(
     let peer_pid_value = peer_pid(&stream).ok();
     let mut stream = stream;
     let mut bytes = Vec::new();
-    stream.read_to_end(&mut bytes).await?;
-    let raw: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if let Err(err) = stream.read_to_end(&mut bytes).await {
+        // A read failure is a transient socket-level hiccup, not a verdict
+        // on the payload — report it back as a RETRY_PREFIX notice so the
+        // shim queues the payload for redelivery rather than treating a
+        // silently dropped connection as a successful delivery.
+        let err = SocketError::from(err);
+        retry_connection(&mut stream, &err).await;
+        return Err(err);
+    }
+    match decode_incoming_event(&bytes, registry, work_db, peer_pid_value) {
+        Ok(incoming) => Ok(incoming),
+        Err(err) => {
+            if err.is_permanent() {
+                reject_connection(&mut stream, &err).await;
+            } else {
+                retry_connection(&mut stream, &err).await;
+            }
+            Err(err)
+        }
+    }
+}
+
+/// Decode a fully-read hook payload into an [`IncomingHookEvent`],
+/// without touching the socket. Split out from [`handle_connection`] so
+/// decode failures are produced without touching the socket;
+/// `handle_connection` then decides, via [`SocketError::is_permanent`],
+/// whether to report the reason back to the peer as a [`REJECTION_PREFIX`]
+/// notice or a [`RETRY_PREFIX`] one.
+fn decode_incoming_event(
+    bytes: &[u8],
+    registry: &DriverRegistry,
+    work_db: &WorkDb,
+    peer_pid_value: Option<libc::pid_t>,
+) -> Result<IncomingHookEvent, SocketError> {
+    let raw: serde_json::Value = serde_json::from_slice(bytes)?;
     let payload_run_id = extract_run_id_from_payload(&raw);
     let run_id = if payload_run_id.is_none() {
         tracing::warn!("incoming hook event missing _boss_run_id field");
@@ -369,6 +460,39 @@ pub async fn handle_connection(
         transcript_path,
         peer_pid_value,
     ))
+}
+
+/// Write [`REJECTION_PREFIX`] plus `err`'s message back to `stream`
+/// before the connection is dropped. Best-effort: by the time this
+/// runs, the shim has already half-closed its write side and is
+/// (per its own bounded read) waiting briefly for exactly this, but if
+/// it has already given up and closed (a slow engine past the shim's
+/// wait window, or an old shim that never reads at all) the write here
+/// simply fails and is swallowed -- the caller already has the real
+/// `SocketError` to return and log.
+async fn reject_connection(stream: &mut UnixStream, err: &SocketError) {
+    let message = format!("{REJECTION_PREFIX}{err:#}\n");
+    if let Err(write_err) = stream.write_all(message.as_bytes()).await {
+        tracing::debug!(%write_err, "events socket: failed to write rejection notice back to shim");
+        return;
+    }
+    let _ = stream.shutdown().await;
+}
+
+/// Write [`RETRY_PREFIX`] plus `err`'s message back to `stream` before the
+/// connection is dropped, for a [`SocketError`] that
+/// [`SocketError::is_permanent`] classifies as transient. Mirrors
+/// [`reject_connection`]'s best-effort write — a shim past its own read
+/// window (or an old shim built before this marker existed) simply
+/// doesn't see it, and the caller already has the real `SocketError` to
+/// return and log.
+async fn retry_connection(stream: &mut UnixStream, err: &SocketError) {
+    let message = format!("{RETRY_PREFIX}{err:#}\n");
+    if let Err(write_err) = stream.write_all(message.as_bytes()).await {
+        tracing::debug!(%write_err, "events socket: failed to write retry notice back to shim");
+        return;
+    }
+    let _ = stream.shutdown().await;
 }
 
 /// Resolve the driver that governs `run_id`'s worker, deterministically.
@@ -405,9 +529,9 @@ fn resolve_connection_driver(
             %error,
             "events socket: driver-slug lookup failed for this connection's run_id",
         );
-        SocketError::UnresolvedDriver {
-            run_id: Some(run_id.to_owned()),
-            reason: format!("driver-slug lookup failed: {error:#}"),
+        SocketError::DriverSlugLookupTransient {
+            run_id: run_id.to_owned(),
+            error: format!("{error:#}"),
         }
     })?;
     let Some(slug) = slug else {
@@ -1297,6 +1421,127 @@ mod tests {
             }
             other => panic!("expected UnresolvedDriver{{run_id: Some(..)}}, got {other:?}"),
         }
+    }
+
+    /// The bug this write-back exists to fix: a rejected connection must
+    /// not just get logged server-side — the peer (`boss-event`) has to
+    /// see something too, or it reports success for an event the engine
+    /// never actually accepted. This drives the connection the way the
+    /// shim does (write, half-close, then read for a response) and
+    /// asserts the [`REJECTION_PREFIX`] notice actually carries the
+    /// engine's own reason.
+    #[tokio::test]
+    async fn rejected_connection_writes_reason_back_to_the_peer() {
+        let (_db_dir, db) = crate::test_support::open_db();
+        let registry = DriverRegistry::default();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+
+        let path_owned = path.clone();
+        let client = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
+            stream
+                .write_all(
+                    br#"{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"_boss_run_id":"no-such-execution"}"#,
+                )
+                .unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).unwrap();
+            response
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let result = handle_connection(stream, &registry, &db).await;
+        let response = client.await.unwrap();
+
+        assert!(result.is_err(), "the connection must still be rejected");
+        let response = String::from_utf8(response).unwrap();
+        assert!(
+            response.starts_with(REJECTION_PREFIX),
+            "peer should see the rejection notice, got: {response:?}",
+        );
+        assert!(
+            response.contains("no execution/task row found for run_id"),
+            "peer should see the engine's actual reason, got: {response:?}",
+        );
+    }
+
+    /// Counterpart to `rejected_connection_writes_reason_back_to_the_peer`:
+    /// a transient [`SocketError`] must produce a [`RETRY_PREFIX`] notice,
+    /// not silence — silence is exactly what the shim treats as a
+    /// successful delivery (see `read_response` in
+    /// `tools/boss/event-shim/src/main.rs`), so a transient failure that
+    /// wrote nothing back would make the shim discard the event as if the
+    /// engine had accepted it.
+    #[tokio::test]
+    async fn transient_error_writes_retry_notice_back_to_the_peer() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+
+        let path_owned = path.clone();
+        let client = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
+            stream.write_all(b"anything").unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).unwrap();
+            response
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = stream;
+        let err = SocketError::DriverSlugLookupTransient {
+            run_id: "run-1".to_owned(),
+            error: "database is locked".to_owned(),
+        };
+        retry_connection(&mut stream, &err).await;
+        let response = client.await.unwrap();
+
+        let response = String::from_utf8(response).unwrap();
+        assert!(
+            response.starts_with(RETRY_PREFIX),
+            "peer should see the retry notice, got: {response:?}",
+        );
+        assert!(
+            response.contains("database is locked"),
+            "peer should see the engine's actual reason, got: {response:?}",
+        );
+    }
+
+    /// The shim's buffer-drain path treats any [`REJECTION_PREFIX`] notice
+    /// as a permanent, safe-to-discard verdict on the payload (see
+    /// `tools/boss/event-shim/src/main.rs`'s `BufferedSendError::Rejected`).
+    /// That contract only holds if the engine reserves the notice for
+    /// errors where the identical payload is guaranteed to fail again —
+    /// never for a transient socket or database hiccup, which the same
+    /// payload could sail through on the very next attempt.
+    #[test]
+    fn only_genuinely_permanent_errors_are_reported_as_rejections() {
+        assert!(
+            !SocketError::Io(io::Error::other("reset")).is_permanent(),
+            "a socket read failure says nothing about the payload"
+        );
+        assert!(
+            !SocketError::DriverSlugLookupTransient {
+                run_id: "run-1".to_owned(),
+                error: "database is locked".to_owned(),
+            }
+            .is_permanent(),
+            "a DB lookup failure is not a verdict that the run doesn't exist"
+        );
+        assert!(
+            SocketError::UnresolvedDriver {
+                run_id: Some("run-1".to_owned()),
+                reason: "no execution/task row found for run_id".to_owned(),
+            }
+            .is_permanent(),
+            "a definitively-unknown run_id will fail identically on retry"
+        );
     }
 
     /// Regression for the answer-agent strand: an `answer_agent` execution's

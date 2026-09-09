@@ -452,6 +452,100 @@ fn buffers_to_cwd_when_workspace_env_unset() {
     );
 }
 
+/// When the engine writes a `BOSS-EVENT-REJECTED: ...` notice back after
+/// the shim half-closes (mirroring how the real engine responds to an
+/// unresolved-driver connection), the shim must exit non-zero and print
+/// the engine's own reason — not report success just because the write
+/// itself went through. Never buffers this: resending an event the
+/// engine actively refused would just be refused again.
+#[test]
+fn surfaces_engine_side_rejection_as_a_failure() {
+    let dir = TempDir::new().unwrap();
+    let socket_path = dir.path().join("events.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    let server = thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        let mut received = Vec::new();
+        conn.read_to_end(&mut received).unwrap();
+        conn.write_all(b"BOSS-EVENT-REJECTED: no execution/task row found for run_id\n")
+            .unwrap();
+        received
+    });
+
+    let workspace = TempDir::new().unwrap();
+    let payload = br#"{"hook_event_name":"Stop","session_id":"sess-1","stop_hook_active":false}"#;
+    let out = run_shim(
+        Some(&socket_path),
+        Some(workspace.path()),
+        Some("10"),
+        Some(payload),
+        Duration::from_secs(5),
+    );
+
+    assert!(
+        !out.status.success(),
+        "shim must exit non-zero on an engine-side rejection; stdout: {}",
+        String::from_utf8_lossy(&out.stdout),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("engine rejected") && stderr.contains("no execution/task row found for run_id"),
+        "stderr should surface the engine's own reason: {stderr}",
+    );
+
+    server.join().unwrap();
+
+    // Must not have been buffered — resending would just be rejected again.
+    let buffer_path = workspace.path().join(".boss/events-pending.jsonl");
+    assert!(
+        !buffer_path.exists() || fs::read(&buffer_path).unwrap().is_empty(),
+        "an engine rejection must not be queued for retry",
+    );
+}
+
+/// A successful delivery — the engine accepts and closes with no
+/// response — must still exit zero with nothing unusual on stderr, even
+/// though the shim now waits briefly for a rejection notice that never
+/// comes.
+#[test]
+fn successful_delivery_still_exits_zero_silently() {
+    let dir = TempDir::new().unwrap();
+    let socket_path = dir.path().join("events.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    let payload = br#"{"hook_event_name":"Stop","session_id":"sess-1","stop_hook_active":false}"#;
+    let server = thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        let mut received = Vec::new();
+        conn.read_to_end(&mut received).unwrap();
+        received
+    });
+
+    let workspace = TempDir::new().unwrap();
+    let out = run_shim(
+        Some(&socket_path),
+        Some(workspace.path()),
+        Some("10"),
+        Some(payload),
+        Duration::from_secs(5),
+    );
+    assert!(
+        out.status.success(),
+        "shim exit: {:?}, stderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "a successful delivery must be silent on stderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let received = server.join().unwrap();
+    assert_eq!(received, payload);
+}
+
 /// Ensure stale ECONNREFUSED detection still happens — we want a
 /// missing-socket attempt to exhaust retries and surface a "buffering"
 /// stderr message rather than silently succeeding with no delivery.

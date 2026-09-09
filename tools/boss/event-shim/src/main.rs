@@ -32,8 +32,10 @@
 //!    reopens once and resends.
 //! 3. **Drain on success.** Before sending the current event the shim
 //!    opportunistically drains any buffered events from previous
-//!    engine-down windows, oldest first. Drain stops on the first
-//!    failure; unsent events stay queued.
+//!    engine-down windows, oldest first. A permanently rejected event
+//!    is reported and discarded so it cannot block later events; a
+//!    transient failure stops the drain and leaves its unsent suffix
+//!    queued.
 //! 4. **Bounded buffer.** The buffer is capped at the most recent
 //!    [`MAX_BUFFERED_EVENTS`] events. A persistently-down engine can't
 //!    cause the buffer to grow unbounded.
@@ -50,6 +52,29 @@
 //! The engine derives the worker's lease via `LOCAL_PEERPID`
 //! on its side, so the shim doesn't need to embed the lease id, only
 //! the raw hook JSON.
+//!
+//! ## Exit codes and engine-side rejection
+//!
+//! Every refusal to deliver — a missing `BOSS_EVENTS_SOCKET`, empty
+//! stdin, or a delivery that failed and could not even be buffered —
+//! exits non-zero with a diagnostic on stderr naming what failed. The
+//! one case that exits zero despite not (yet) reaching the engine is a
+//! connect/write failure that *was* successfully queued to the on-disk
+//! buffer for later delivery — see "Resilience" above; that is a real,
+//! bounded mitigation, not a silent loss, and callers can distinguish it
+//! from an outright failure by the "buffering event for later delivery"
+//! message on stderr.
+//!
+//! A write succeeding is not the same as the engine accepting the
+//! event: after the half-close, [`read_response`] waits briefly for a
+//! [`REJECTION_PREFIX`] notice the engine writes back when it rejects a
+//! connection (malformed payload, unresolved driver, ...), or a
+//! [`RETRY_PREFIX`] notice when the failure was transient (a socket
+//! hiccup, a busy database lookup). The rejection case exits non-zero
+//! with the engine's own reason and is never buffered — resending a
+//! payload the engine actively refused would just be refused again. The
+//! retry case is treated exactly like an unreachable engine: the event is
+//! queued to the on-disk buffer for later redelivery.
 
 use std::env;
 use std::fs::{File, OpenOptions};
@@ -79,6 +104,14 @@ const RETRY_DELAYS_ENV: &str = "BOSS_EVENT_RETRY_DELAYS_MS";
 /// On-disk buffer path, relative to the workspace root.
 const BUFFER_REL_PATH: &str = ".boss/events-pending.jsonl";
 
+/// On-disk quarantine path, relative to the workspace root, that a
+/// permanently rejected buffered event is appended to before it is
+/// discarded from [`BUFFER_REL_PATH`]. Hook stderr on a non-blocking hook
+/// is not surfaced to anyone by default, so without this a discard is
+/// invisible; this keeps the payload and the engine's rejection reason
+/// around for forensics without re-queuing it for redelivery.
+const QUARANTINE_REL_PATH: &str = ".boss/events-rejected.jsonl";
+
 /// Cap on buffered events. Past this the oldest events are dropped so
 /// a long engine-down window can't grow the file without bound.
 const MAX_BUFFERED_EVENTS: usize = 1000;
@@ -94,6 +127,44 @@ const DEFAULT_RETRY_DELAYS_MS: &[u64] = &[200, 500, 1500, 3000, 5000];
 /// of this and whatever remains of [`SHIM_TOTAL_BUDGET`] — see
 /// `write_timeout_for`.
 const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Marker line the engine writes back on the socket when it rejects a
+/// connection (malformed JSON, unrecognized hook shape, unresolved
+/// driver, ...) rather than accepting it. A successful delivery never
+/// gets a response at all -- the engine just processes the event and
+/// drops the connection -- so any bytes at all arriving with this
+/// prefix mean the write succeeded but the event was never actually
+/// accepted.
+///
+/// Deliberately duplicated (not shared via a crate dependency) from
+/// `tools/boss/engine/core/src/events_socket.rs`'s `REJECTION_PREFIX`:
+/// this shim is intentionally a tiny, dependency-free binary with no
+/// link to the engine crate, so the two copies of this literal are the
+/// whole contract. Keep them byte-for-byte identical if either changes.
+const REJECTION_PREFIX: &str = "BOSS-EVENT-REJECTED: ";
+
+/// Marker line the engine writes back on the socket when it hit a
+/// transient error (a socket I/O hiccup, or a busy/locked database lookup)
+/// rather than a permanent, guaranteed-to-fail-again one. Unlike
+/// [`REJECTION_PREFIX`], this means the identical payload could well
+/// succeed on the very next attempt, so the shim treats it the same as an
+/// unreachable engine: queue the payload back onto the on-disk buffer for
+/// later redelivery rather than discarding it.
+///
+/// Deliberately duplicated (not shared via a crate dependency) from
+/// `tools/boss/engine/core/src/events_socket.rs`'s `RETRY_PREFIX`, for the
+/// same dependency-free-shim reason as [`REJECTION_PREFIX`]. Keep them
+/// byte-for-byte identical if either changes.
+const RETRY_PREFIX: &str = "BOSS-EVENT-RETRY: ";
+
+/// Upper bound on how long the shim waits, after finishing its write and
+/// half-closing, for the engine to write back a [`REJECTION_PREFIX`]
+/// notice. A successful connection is silent, so this only delays the
+/// happy path by however long it actually takes the kernel to notice the
+/// peer closed with nothing sent -- normally sub-millisecond. Bounded by
+/// whatever remains of [`SHIM_TOTAL_BUDGET`] the same way every other
+/// socket stage is.
+const REJECTION_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Total wall-clock budget for one shim invocation, covering the
 /// buffer drain, the current event's connect-retry-and-write, and the
@@ -175,6 +246,7 @@ fn run() -> Result<()> {
     };
 
     let buffer_path = resolve_buffer_path();
+    let quarantine_path = resolve_quarantine_path();
 
     // Drain leftover buffered events FIRST (oldest first). Each drain
     // attempt uses a fresh single-shot connection with no retry: if
@@ -184,7 +256,7 @@ fn run() -> Result<()> {
     // the current event's connect would otherwise sit in the backlog
     // ahead of the drained connections.
     if let Some(buf) = buffer_path.as_deref()
-        && let Err(err) = drain_buffer(&socket_path, buf, deadline)
+        && let Err(err) = drain_buffer(&socket_path, buf, quarantine_path.as_deref(), deadline)
     {
         eprintln!("boss-event: drain of {} skipped: {err:#}", buf.display());
     }
@@ -194,8 +266,16 @@ fn run() -> Result<()> {
     // by `deadline`, which was stamped before the drain above — so the
     // total across drain + this send can never exceed SHIM_TOTAL_BUDGET.
     match connect_with_retry(&socket_path, deadline) {
-        Ok(stream) => match send_to_stream(stream, &payload_line) {
-            Ok(()) => Ok(()),
+        Ok(stream) => match send_to_stream(stream, &payload_line, deadline) {
+            Ok(EngineResponse::None) => Ok(()),
+            Ok(EngineResponse::Rejected(reason)) => reject_delivery(&socket_path, &reason),
+            Ok(EngineResponse::Retry(reason)) => {
+                eprintln!(
+                    "boss-event: engine hit a transient error over {socket_path}: {reason}; \
+                     buffering event for later delivery",
+                );
+                buffer_or_lose(buffer_path.as_deref(), &payload_line)
+            }
             Err(_first_err) => {
                 // Mid-send failure: the engine may have bounced
                 // between connect and write. Reopen once and resend,
@@ -208,9 +288,17 @@ fn run() -> Result<()> {
                     buffer_or_lose(buffer_path.as_deref(), &payload_line)
                 } else {
                     match connect_once(&socket_path, write_timeout_for(deadline))
-                        .and_then(|s| send_to_stream(s, &payload_line))
+                        .and_then(|s| send_to_stream(s, &payload_line, deadline))
                     {
-                        Ok(()) => Ok(()),
+                        Ok(EngineResponse::None) => Ok(()),
+                        Ok(EngineResponse::Rejected(reason)) => reject_delivery(&socket_path, &reason),
+                        Ok(EngineResponse::Retry(reason)) => {
+                            eprintln!(
+                                "boss-event: engine hit a transient error over {socket_path} on \
+                                 reconnect: {reason}; buffering event for later delivery",
+                            );
+                            buffer_or_lose(buffer_path.as_deref(), &payload_line)
+                        }
                         Err(err) => {
                             eprintln!(
                                 "boss-event: events socket {socket_path} dropped mid-send and \
@@ -230,6 +318,19 @@ fn run() -> Result<()> {
             buffer_or_lose(buffer_path.as_deref(), &payload_line)
         }
     }
+}
+
+/// The engine actively rejected the connection (malformed payload,
+/// unresolved driver, ...) rather than failing to receive it at all.
+/// This is never transient in the way an unreachable socket is, so
+/// unlike the connect/write failure paths above, this does not buffer
+/// for a later retry -- resending the same payload would just be
+/// rejected again. Surfaces the engine's own reason on stderr and exits
+/// non-zero so the caller can tell "configured and delivered" apart
+/// from "configured, connected, but refused".
+fn reject_delivery(socket_path: &str, reason: &str) -> Result<()> {
+    eprintln!("boss-event: engine rejected the hook event over {socket_path}: {reason}");
+    Err(anyhow!("engine rejected hook event: {reason}"))
 }
 
 /// Wall time remaining until `deadline`, saturating at zero.
@@ -291,6 +392,16 @@ fn resolve_buffer_path() -> Option<PathBuf> {
     Some(root.join(BUFFER_REL_PATH))
 }
 
+/// Locate the per-workspace quarantine file, by the same root resolution
+/// as [`resolve_buffer_path`].
+fn resolve_quarantine_path() -> Option<PathBuf> {
+    let root = match env::var(WORKSPACE_ENV) {
+        Ok(s) if !s.is_empty() => PathBuf::from(s),
+        _ => env::current_dir().ok()?,
+    };
+    Some(root.join(QUARANTINE_REL_PATH))
+}
+
 /// Parse `BOSS_EVENT_RETRY_DELAYS_MS` if set, else return the default
 /// schedule. Malformed values fall back to the default so a typo in env
 /// can't accidentally disable retries in production.
@@ -311,8 +422,8 @@ fn retry_delays() -> Vec<Duration> {
 
 /// One connect attempt, no retry. Applies `write_timeout` so a
 /// subsequent `write_all` cannot block unbounded if the peer stalls.
-/// The shim never reads from this socket (it only writes and
-/// half-closes), so no read timeout is set here.
+/// `send_to_stream` sets a short read timeout after half-closing so it
+/// can observe an engine rejection notice.
 fn connect_once(path: &str, write_timeout: Duration) -> Result<UnixStream> {
     let stream = UnixStream::connect(path).with_context(|| format!("connecting to events socket at {path}"))?;
     // Best-effort: a platform that rejects SO_SNDTIMEO still delivers
@@ -358,26 +469,95 @@ fn connect_with_retry(path: &str, deadline: Instant) -> Result<UnixStream> {
 /// peer that accepts the connection but never drains the socket can
 /// block `write_all` until the outer hook runner kills the process
 /// (up to 600s for an unscoped Grok `Stop` hook — which freezes the TUI).
-fn send_to_stream(mut stream: UnixStream, payload: &[u8]) -> Result<()> {
+///
+/// After the half-close, waits briefly for a [`REJECTION_PREFIX`] or
+/// [`RETRY_PREFIX`] notice (see [`read_response`]) and returns the
+/// decoded [`EngineResponse`]. `Ok(EngineResponse::None)` covers both a
+/// genuinely successful delivery and the case where the wait window
+/// elapsed with nothing on the wire — the write itself already succeeded
+/// either way, so silence here is never treated as an error.
+fn send_to_stream(mut stream: UnixStream, payload: &[u8], deadline: Instant) -> Result<EngineResponse> {
     stream
         .write_all(payload)
         .context("writing hook payload to events socket")?;
     stream
         .shutdown(std::net::Shutdown::Write)
         .context("shutting down write half of events socket")?;
-    Ok(())
+    read_response(&mut stream, deadline)
+}
+
+/// The engine's write-back on the events socket after a connection closes:
+/// a permanent rejection, a transient-error retry request, or silence
+/// (a successful delivery, or a window that elapsed with nothing on the
+/// wire — the two are indistinguishable and both treated as success).
+enum EngineResponse {
+    Rejected(String),
+    Retry(String),
+    None,
+}
+
+/// Wait, bounded by [`REJECTION_READ_TIMEOUT`] and whatever remains of
+/// `deadline`, for the engine to write a [`REJECTION_PREFIX`] or
+/// [`RETRY_PREFIX`] notice back on `stream` before it closes. Returns
+/// [`EngineResponse::None`] on a clean EOF, a timed-out read (nothing
+/// arrived in the window), or an exhausted budget — none of those
+/// distinguish from a successful delivery, which is also silent. A real
+/// I/O error other than a timeout is still surfaced, since that means
+/// something went wrong reading a response the shim is entitled to
+/// expect.
+fn read_response(stream: &mut UnixStream, deadline: Instant) -> Result<EngineResponse> {
+    let timeout = remaining(deadline).min(REJECTION_READ_TIMEOUT);
+    if timeout.is_zero() {
+        return Ok(EngineResponse::None);
+    }
+    // Best-effort: a platform that rejects SO_RCVTIMEO just risks a
+    // blocking read, bounded in practice by the engine always closing
+    // its write side once it's done (success, rejection, or retry).
+    let _ = stream.set_read_timeout(Some(timeout));
+    let mut buf = Vec::new();
+    let read_error = stream
+        .read_to_end(&mut buf)
+        .err()
+        .filter(|err| !matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut));
+    let text = String::from_utf8_lossy(&buf);
+    if let Some(reason) = text.strip_prefix(REJECTION_PREFIX) {
+        // A peer can deliver its rejection and then reset the
+        // connection. The bytes are authoritative, so do not let the
+        // trailing read error reclassify this as a transient failure.
+        return Ok(EngineResponse::Rejected(reason.trim().to_owned()));
+    }
+    if let Some(reason) = text.strip_prefix(RETRY_PREFIX) {
+        return Ok(EngineResponse::Retry(reason.trim().to_owned()));
+    }
+    if let Some(err) = read_error {
+        return Err(err).context("reading engine response from events socket");
+    }
+    Ok(EngineResponse::None)
+}
+
+enum BufferedSendError {
+    Rejected(String),
+    Transient(anyhow::Error),
 }
 
 /// Send one buffered event in its own connection. Used by drain. No
 /// retry: a failure here means the engine just went down again and the
 /// remaining buffered events should stay on disk for next time. Also
 /// fails fast once `deadline` has passed, without attempting a connect.
-fn send_one(socket_path: &str, payload: &[u8], deadline: Instant) -> Result<()> {
+fn send_one(socket_path: &str, payload: &[u8], deadline: Instant) -> std::result::Result<(), BufferedSendError> {
     if budget_exhausted(deadline) {
-        return Err(anyhow!("shim wall-clock budget exhausted before send"));
+        return Err(BufferedSendError::Transient(anyhow!(
+            "shim wall-clock budget exhausted before send"
+        )));
     }
-    let stream = connect_once(socket_path, write_timeout_for(deadline))?;
-    send_to_stream(stream, payload)
+    let stream = connect_once(socket_path, write_timeout_for(deadline)).map_err(BufferedSendError::Transient)?;
+    match send_to_stream(stream, payload, deadline).map_err(BufferedSendError::Transient)? {
+        EngineResponse::None => Ok(()),
+        EngineResponse::Rejected(reason) => Err(BufferedSendError::Rejected(reason)),
+        EngineResponse::Retry(reason) => Err(BufferedSendError::Transient(anyhow!(
+            "engine reported a transient error: {reason}"
+        ))),
+    }
 }
 
 /// Append `payload` as a new line to the workspace's event buffer.
@@ -415,13 +595,26 @@ fn append_to_buffer(buffer_path: &Path, payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Read the buffer line by line and try to deliver each event. Stops
-/// at the first failure — including the shim's wall-clock budget
-/// running out — and rewrites the file with the unsent suffix (FIFO).
-/// Removes the file when fully drained. No-op when the buffer is
-/// absent. If another shim is already draining, returns successfully
-/// without waiting so that process can preserve FIFO order.
-fn drain_buffer(socket_path: &str, buffer_path: &Path, deadline: Instant) -> Result<()> {
+/// Read the buffer line by line and try to deliver each event. A
+/// permanently rejected event is reported on stderr, appended to
+/// `quarantine_path` (best-effort — a quarantine-write failure is only
+/// logged, it never re-queues the event or aborts the drain) for later
+/// forensics, and discarded from the buffer; a transient failure —
+/// including the shim's wall-clock budget running out — stops the drain
+/// and retains that event plus its FIFO suffix. Truncates the buffer file
+/// to zero length when every event was delivered or discarded; leaves it
+/// untouched when nothing changed (nothing to send, or the very first
+/// record hit a transient failure), so a kill between truncate and
+/// rewrite can never lose more than what this drain actually consumed.
+/// No-op when the buffer is absent. If another shim is already draining,
+/// returns successfully without waiting so that process can preserve FIFO
+/// order.
+fn drain_buffer(
+    socket_path: &str,
+    buffer_path: &Path,
+    quarantine_path: Option<&Path>,
+    deadline: Instant,
+) -> Result<()> {
     if !buffer_path.exists() {
         return Ok(());
     }
@@ -438,34 +631,65 @@ fn drain_buffer(socket_path: &str, buffer_path: &Path, deadline: Instant) -> Res
     let _guard = LockGuard(&file);
 
     let lines = read_lines(&file)?;
-    let mut sent = 0usize;
     let mut drain_err: Option<anyhow::Error> = None;
-    for line in &lines {
+    let mut unsent_start = lines.len();
+    let mut discarded = 0usize;
+    for (index, line) in lines.iter().enumerate() {
         if budget_exhausted(deadline) {
             drain_err = Some(anyhow!("shim wall-clock budget exhausted during buffer drain"));
+            unsent_start = index;
             break;
         }
         match send_one(socket_path, line, deadline) {
-            Ok(()) => sent += 1,
-            Err(err) => {
+            Ok(()) => {}
+            Err(BufferedSendError::Rejected(reason)) => {
+                eprintln!(
+                    "boss-event: discarding permanently rejected buffered hook event from {}: {reason}",
+                    buffer_path.display()
+                );
+                if let Some(quarantine_path) = quarantine_path
+                    && let Err(err) = append_to_quarantine(quarantine_path, line, &reason)
+                {
+                    eprintln!(
+                        "boss-event: failed to quarantine rejected event to {}: {err:#}",
+                        quarantine_path.display()
+                    );
+                }
+                discarded += 1;
+            }
+            Err(BufferedSendError::Transient(err)) => {
                 drain_err = Some(err);
+                unsent_start = index;
                 break;
             }
         }
     }
 
-    if sent == lines.len() {
-        // All drained. Truncate the file to zero so a stale empty
-        // buffer file doesn't keep showing up in `.boss/`.
-        rewrite_lines(&file, &[])?;
-    } else if sent > 0 {
-        rewrite_lines(&file, &lines[sent..])?;
+    if unsent_start > 0 || discarded > 0 {
+        rewrite_lines(&file, &lines[unsent_start..])?;
     }
 
     if let Some(err) = drain_err {
         return Err(err);
     }
     Ok(())
+}
+
+/// Append a rejected buffered event, plus the engine's rejection reason,
+/// as one JSON line to `quarantine_path`. Reuses [`append_to_buffer`]'s
+/// create-parent/lock/append shape and its [`MAX_BUFFERED_EVENTS`] trim, so
+/// a persistently-failing engine can't grow the quarantine file unbounded
+/// either.
+fn append_to_quarantine(quarantine_path: &Path, payload: &[u8], reason: &str) -> Result<()> {
+    let record = match serde_json::from_slice::<serde_json::Value>(payload) {
+        Ok(event) => serde_json::json!({ "rejected_reason": reason, "event": event }),
+        Err(_) => serde_json::json!({
+            "rejected_reason": reason,
+            "event_raw": String::from_utf8_lossy(payload),
+        }),
+    };
+    let line = serde_json::to_vec(&record).context("encoding quarantined event")?;
+    append_to_buffer(quarantine_path, &line)
 }
 
 /// Count the lines (newline-terminated records) in the buffer file.
@@ -686,11 +910,109 @@ mod tests {
 
         let socket = dir.path().join("never-bound.sock");
         let deadline = Instant::now() + Duration::from_secs(1);
-        let result = drain_buffer(socket.to_str().unwrap(), &buf, deadline);
+        let mtime_before = std::fs::metadata(&buf).unwrap().modified().unwrap();
+        let result = drain_buffer(socket.to_str().unwrap(), &buf, None, deadline);
         assert!(result.is_err(), "drain must surface connect failure");
 
         let contents = std::fs::read(&buf).unwrap();
         assert_eq!(contents, original);
+        // Nothing was sent or discarded, so the file must not even have
+        // been rewritten (truncated + re-written byte-identically) —
+        // proof there is no kill window here that could lose the buffer.
+        assert_eq!(
+            std::fs::metadata(&buf).unwrap().modified().unwrap(),
+            mtime_before,
+            "a drain that sends nothing must not touch the buffer file at all"
+        );
+    }
+
+    /// A permanent rejection must not poison the FIFO queue: discard the
+    /// rejected record and continue draining later records on fresh
+    /// connections. The rejected record must also land in the quarantine
+    /// file alongside the engine's rejection reason, so the discard is
+    /// recoverable instead of vanishing into hook stderr.
+    #[test]
+    fn drain_discards_rejected_event_and_delivers_later_events() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let buf = dir.path().join(".boss/events-pending.jsonl");
+        std::fs::create_dir_all(buf.parent().unwrap()).unwrap();
+        std::fs::write(&buf, b"bad-event\ngood-event\n").unwrap();
+        let quarantine = dir.path().join(".boss/events-rejected.jsonl");
+        let socket = dir.path().join("events.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut rejected, _) = listener.accept().unwrap();
+            let mut payload = Vec::new();
+            rejected.read_to_end(&mut payload).unwrap();
+            assert_eq!(payload, b"bad-event");
+            rejected.write_all(b"BOSS-EVENT-REJECTED: malformed event\n").unwrap();
+
+            let (mut accepted, _) = listener.accept().unwrap();
+            let mut payload = Vec::new();
+            accepted.read_to_end(&mut payload).unwrap();
+            payload
+        });
+
+        drain_buffer(
+            socket.to_str().unwrap(),
+            &buf,
+            Some(&quarantine),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(server.join().unwrap(), b"good-event");
+        assert_eq!(std::fs::read(&buf).unwrap(), b"");
+
+        let quarantined = std::fs::read_to_string(&quarantine).unwrap();
+        let record: serde_json::Value = serde_json::from_str(quarantined.trim()).unwrap();
+        assert_eq!(record["rejected_reason"], "malformed event");
+        assert_eq!(record["event_raw"], "bad-event");
+    }
+
+    /// A transient [`RETRY_PREFIX`] response must be treated exactly like
+    /// an unreachable engine — not like a rejection: the drain stops and
+    /// retains the record plus its FIFO suffix, rather than discarding it
+    /// as if the engine had accepted (or permanently refused) it. This is
+    /// the shim-side half of the fix for the class of bug where a
+    /// transient engine error (e.g. a locked sqlite during a restart)
+    /// silently dropped the buffered event.
+    #[test]
+    fn drain_stops_and_retains_record_on_retry_notice() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let buf = dir.path().join(".boss/events-pending.jsonl");
+        std::fs::create_dir_all(buf.parent().unwrap()).unwrap();
+        std::fs::write(&buf, b"transient-event\nlater-event\n").unwrap();
+        let socket = dir.path().join("events.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut payload = Vec::new();
+            stream.read_to_end(&mut payload).unwrap();
+            assert_eq!(payload, b"transient-event");
+            stream.write_all(b"BOSS-EVENT-RETRY: database is locked\n").unwrap();
+            // No second accept: the drain must stop after the retry
+            // notice rather than moving on to `later-event`.
+        });
+
+        let result = drain_buffer(
+            socket.to_str().unwrap(),
+            &buf,
+            None,
+            Instant::now() + Duration::from_secs(2),
+        );
+        assert!(
+            result.is_err(),
+            "a retry notice must surface as a drain error, not success"
+        );
+        server.join().unwrap();
+
+        assert_eq!(
+            std::fs::read(&buf).unwrap(),
+            b"transient-event\nlater-event\n",
+            "both the retried record and its FIFO suffix must remain buffered"
+        );
     }
 
     #[test]
@@ -703,7 +1025,12 @@ mod tests {
 
         let socket = dir.path().join("never-bound.sock");
         let start = Instant::now();
-        let result = drain_buffer(socket.to_str().unwrap(), &buf, Instant::now() - Duration::from_secs(1));
+        let result = drain_buffer(
+            socket.to_str().unwrap(),
+            &buf,
+            None,
+            Instant::now() - Duration::from_secs(1),
+        );
 
         assert!(result.is_err(), "an expired budget must stop the drain");
         assert!(
@@ -745,7 +1072,7 @@ mod tests {
 
         let payload = vec![0u8; 8 * 1024 * 1024];
         let start = Instant::now();
-        let result = send_to_stream(stream, &payload);
+        let result = send_to_stream(stream, &payload, Instant::now() + Duration::from_secs(30));
         let elapsed = start.elapsed();
 
         assert!(result.is_err(), "write to a stalled peer must time out, not succeed");
