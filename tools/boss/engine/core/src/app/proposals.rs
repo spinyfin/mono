@@ -450,7 +450,7 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                 && kind == ProposalKind::ReviewVerdict
                 && proposal.state == boss_protocol::ProposalState::Proposed;
             let apply_proposal_id = apply_after_submit.then(|| proposal.id.clone());
-            send_response(
+            let response_delivery = super::handler_helpers::send_response_awaiting_delivery(
                 &sink,
                 &request_id,
                 FrontendEvent::ProposalSubmitted {
@@ -458,27 +458,37 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                     already_submitted,
                 },
             );
-            // Acknowledge the RPC before initiating teardown. The production
+            // Deliver the RPC acknowledgement before initiating teardown. The production
             // pane releaser reaps the reporting member's whole worker process
             // tree, which can include the very `boss propose` client still
             // waiting on the response above — tearing down first can kill
             // that client before it ever observes the ack it is blocked on.
             if finalize_reporting_member {
-                match server_state
-                    .completion_handler
-                    .finalize_accepted_review_batch_member(&caller.execution_id)
-                    .await
-                {
-                    Some(crate::completion::StopOutcome::ReviewPassCompleted { .. })
-                    | Some(crate::completion::StopOutcome::AlreadyTerminal) => {}
-                    Some(outcome) => tracing::error!(
+                match tokio::time::timeout(std::time::Duration::from_secs(10), response_delivery).await {
+                    Ok(Ok(true)) => match server_state
+                        .completion_handler
+                        .finalize_accepted_review_batch_member(&caller.execution_id)
+                        .await
+                    {
+                        Some(crate::completion::StopOutcome::ReviewPassCompleted { .. })
+                        | Some(crate::completion::StopOutcome::AlreadyTerminal) => {}
+                        Some(outcome) => tracing::error!(
+                            execution_id = %caller.execution_id,
+                            ?outcome,
+                            "accepted review report/verdict did not cleanly finalize its batch member",
+                        ),
+                        None => tracing::error!(
+                            execution_id = %caller.execution_id,
+                            "accepted review report/verdict has no live batch member to finalize",
+                        ),
+                    },
+                    Ok(Ok(false)) | Ok(Err(_)) => tracing::error!(
                         execution_id = %caller.execution_id,
-                        ?outcome,
-                        "accepted review report/verdict did not cleanly finalize its batch member",
+                        "accepted review report/verdict response was not delivered; preserving worker for retry",
                     ),
-                    None => tracing::error!(
+                    Err(_) => tracing::error!(
                         execution_id = %caller.execution_id,
-                        "accepted review report/verdict has no live batch member to finalize",
+                        "timed out waiting for accepted review report/verdict response delivery; preserving worker for retry",
                     ),
                 }
             }

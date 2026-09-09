@@ -724,8 +724,8 @@ fn fail_review_batch_with_attention(
 /// to mistake the impossible `reported` + live combination for harmless
 /// ineligibility.
 ///
-/// A consolidating supervisor is exempted while its batch is `applying` and
-/// its member reported less than [`REVIEW_BATCH_SUPERVISOR_REPORTED_GRACE_SECS`]
+/// A reporting member is exempted while it reported less than
+/// [`REVIEW_BATCH_SUPERVISOR_REPORTED_GRACE_SECS`]
 /// ago: that is the normal, self-resolving span between the verdict's member
 /// row committing and `finalize_accepted_review_batch_member` reaping its
 /// pane, not the invariant violation this alarm exists to catch. Past the
@@ -746,13 +746,10 @@ fn file_reported_live_review_batch_member_attentions(conn: &mut Connection) -> R
              FROM pr_review_batch_members member
              JOIN pr_review_batches batch ON batch.id = member.batch_id
              JOIN work_executions execution ON execution.id = member.execution_id
-             WHERE batch.status NOT IN ('completed', 'failed')
-               AND member.status = 'reported'
+             WHERE member.status = 'reported'
                AND execution.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')
                AND NOT (
-                 member.role = 'supervisor'
-                 AND batch.status = 'applying'
-                 AND member.terminal_at IS NOT NULL
+                 member.terminal_at IS NOT NULL
                  AND CAST(member.terminal_at AS INTEGER) >= CAST(?1 AS INTEGER)
                )
              ORDER BY batch.id, member.execution_id",
@@ -1293,11 +1290,19 @@ impl WorkDb {
         Ok(changed > 0)
     }
 
+    /// Recompute the durable reported-plus-live alarm before a recovery
+    /// sweep. Kept separate from read-shaped candidate queries so callers
+    /// cannot accidentally mutate attention state while listing rows.
+    pub fn sweep_reported_live_review_batch_members(&self) -> Result<()> {
+        let mut conn = self.connect()?;
+        file_reported_live_review_batch_member_attentions(&mut conn)
+    }
+
     /// True only when two executions are compatible roles of the same
     /// persisted pre-merge batch. This narrowly permits leaf fan-out and the
     /// supervisor that consumes those leaf reports while keeping the ordinary
     /// single-writer chain guard intact.
-    pub fn are_same_review_batch_leaves(&self, execution_id: &str, other_execution_id: &str) -> Result<bool> {
+    pub fn are_admissible_same_review_batch_pair(&self, execution_id: &str, other_execution_id: &str) -> Result<bool> {
         let conn = self.connect()?;
         let found = conn
             .query_row(
@@ -1339,8 +1344,7 @@ impl WorkDb {
     /// sweep is the only durable hook that will then fail the batch. Once
     /// the batch is `failed` it drops out via `batch.status NOT IN (...)`.
     pub fn list_dead_review_batch_member_candidates(&self) -> Result<Vec<DeadPrReviewCandidate>> {
-        let mut conn = self.connect()?;
-        file_reported_live_review_batch_member_attentions(&mut conn)?;
+        let conn = self.connect()?;
         let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
         let sql = format!(
             "SELECT we.work_item_id, we.id, we.status
@@ -1651,7 +1655,6 @@ impl WorkDb {
              ORDER BY b.updated_at ASC, b.id ASC"
         );
         let mut conn = self.connect()?;
-        file_reported_live_review_batch_member_attentions(&mut conn)?;
         let rows: Vec<(String, String, String, Option<String>)> = {
             let mut statement = conn.prepare(&sql)?;
             let mapped = statement.query_map(params![cutoff], |row| {

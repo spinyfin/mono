@@ -954,18 +954,15 @@ fn seed_succeeded_conflict_resolution(db: &WorkDb, product_id: String, cycle_roo
         .unwrap();
 }
 
-/// Stages a corrected clean verdict from the same supervisor during the
-/// tripwire probe, so the in-flight proposal is superseded before
-/// `commit_applied_review_verdict` re-reads its state.
-struct ResubmitOnTripwireCheck {
+/// Supersedes an in-flight verdict during the tripwire probe, so
+/// `commit_applied_review_verdict` observes the race when it re-reads state.
+struct SupersedeOnTripwireCheck {
     inner: FakePrStateChecker,
     db: WorkDb,
-    execution_id: String,
-    work_item_id: String,
-    payload_json: String,
+    proposal_id: String,
 }
 
-impl PrStateChecker for ResubmitOnTripwireCheck {
+impl PrStateChecker for SupersedeOnTripwireCheck {
     fn check(&self, pr_url: &str) -> anyhow::Result<PrOpenState> {
         self.inner.check(pr_url)
     }
@@ -978,15 +975,13 @@ impl PrStateChecker for ResubmitOnTripwireCheck {
         _head_after: &str,
     ) -> Vec<String> {
         self.db
-            .submit_worker_proposal(SubmitWorkerProposalInput {
-                execution_id: &self.execution_id,
-                work_item_id: &self.work_item_id,
-                kind: ProposalKind::ReviewVerdict,
-                payload_json: &self.payload_json,
-                idempotency_key: "verdict-corrected",
-            })
-            .expect("corrected resubmission must store")
-            .expect("corrected resubmission must stage");
+            .connect()
+            .expect("connect")
+            .execute(
+                "UPDATE worker_proposals SET state = 'superseded' WHERE id = ?1",
+                rusqlite::params![self.proposal_id],
+            )
+            .expect("supersede in-flight proposal");
         Vec::new()
     }
 }
@@ -1330,12 +1325,10 @@ fn sweep_counts_a_proposal_superseded_during_apply() {
         .unwrap();
     assert_eq!(first.proposal.state, ProposalState::Proposed);
 
-    let checker = ResubmitOnTripwireCheck {
+    let checker = SupersedeOnTripwireCheck {
         inner: FakePrStateChecker::always(PrOpenState::Open),
         db: db.clone(),
-        execution_id: supervisor.id.clone(),
-        work_item_id: superseded_root.id.clone(),
-        payload_json: clean_verdict_payload(&batch.id, "head-sha"),
+        proposal_id: first.proposal.id,
     };
     let stats = db.apply_pending_review_verdicts(&checker).unwrap();
     assert_eq!(

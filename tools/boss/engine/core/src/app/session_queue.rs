@@ -347,6 +347,10 @@ pub(super) struct SessionSink {
     /// flushes. Empty for every non-population request. See
     /// [`crate::population_timing`].
     pop_traces: StdMutex<HashMap<String, crate::population_timing::PopulationTrace>>,
+    /// One-shot acknowledgements for responses whose producer must know that
+    /// the writer has flushed the frame before it can safely tear down the
+    /// caller's process tree.
+    delivery_waiters: StdMutex<HashMap<String, oneshot::Sender<bool>>>,
 }
 
 impl SessionSink {
@@ -356,6 +360,7 @@ impl SessionSink {
             notify: Notify::new(),
             shutdown: StdMutex::new(Some(shutdown_tx)),
             pop_traces: StdMutex::new(HashMap::new()),
+            delivery_waiters: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -387,6 +392,37 @@ impl SessionSink {
             EnqueueOutcome::Closed | EnqueueOutcome::Slow => {}
         }
         outcome
+    }
+
+    /// Enqueue a response and return a receiver completed by the writer after
+    /// the response frame is flushed. `false` means the response could not be
+    /// queued or written.
+    pub(super) fn enqueue_response_awaiting_delivery(&self, env: FrontendEventEnvelope) -> oneshot::Receiver<bool> {
+        let request_id = env.request_id.clone().expect("response envelope has request id");
+        let (tx, rx) = oneshot::channel();
+        self.delivery_waiters
+            .lock()
+            .expect("delivery_waiters lock poisoned")
+            .insert(request_id.clone(), tx);
+        match self.enqueue(env) {
+            EnqueueOutcome::Enqueued | EnqueueOutcome::Coalesced | EnqueueOutcome::Degraded => {}
+            EnqueueOutcome::Closed | EnqueueOutcome::Slow => self.complete_response_delivery(Some(&request_id), false),
+        }
+        rx
+    }
+
+    /// Complete a response-delivery acknowledgement after the writer has
+    /// either flushed its frame or encountered a socket failure.
+    pub(super) fn complete_response_delivery(&self, request_id: Option<&str>, delivered: bool) {
+        if let Some(request_id) = request_id
+            && let Some(tx) = self
+                .delivery_waiters
+                .lock()
+                .expect("delivery_waiters lock poisoned")
+                .remove(request_id)
+        {
+            let _ = tx.send(delivered);
+        }
     }
 
     /// Snapshot this session's outbound queue depth, head-of-line age, and

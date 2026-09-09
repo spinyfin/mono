@@ -967,13 +967,11 @@ fn review_verdict_stages_proposed_and_moves_the_batch_to_applying() {
     assert_eq!(member.report_proposal_id.as_deref(), Some(outcome.proposal.id.as_str()));
 }
 
-/// A second, corrected verdict submission from the SAME supervisor member
-/// that already staged this exact batch is accepted, not rejected: it
-/// supersedes the first (still-undecided) verdict and re-points the batch
-/// at the corrected one. Once the reconciler has applied the verdict the
-/// batch is `completed` and this path is closed.
+/// A member that has already staged its verdict cannot replace it: report
+/// acceptance hands the worker off to teardown, so only its first verdict
+/// can be used for the batch.
 #[test]
-fn a_corrected_review_verdict_from_the_same_supervisor_supersedes_the_prior_one() {
+fn a_second_review_verdict_from_the_same_supervisor_is_rejected() {
     let db = WorkDb::open(temp_db_path("review-verdict-correction")).unwrap();
     let product = create_test_product(&db);
     let cycle_root = create_test_chore_manual(&db, product.id, "review target");
@@ -1016,15 +1014,14 @@ fn a_corrected_review_verdict_from_the_same_supervisor_supersedes_the_prior_one(
         })
         .unwrap()
         .unwrap();
-    assert_eq!(second.proposal.state, ProposalState::Proposed);
-    assert_eq!(second.proposal.applied_ref, None);
+    assert_eq!(second.proposal.state, ProposalState::Rejected);
 
     let applying = db.review_batch(&batch.id).unwrap().unwrap();
     assert_eq!(applying.status, ReviewBatchStatus::Applying);
     assert_eq!(
         applying.final_verdict_proposal_id.as_deref(),
-        Some(second.proposal.id.as_str()),
-        "the batch must now point at the corrected verdict"
+        Some(first.proposal.id.as_str()),
+        "the batch must retain the first verdict"
     );
 
     let member = db
@@ -1033,15 +1030,7 @@ fn a_corrected_review_verdict_from_the_same_supervisor_supersedes_the_prior_one(
         .into_iter()
         .find(|member| member.role == ReviewBatchMemberRole::Supervisor)
         .unwrap();
-    assert_eq!(member.report_proposal_id.as_deref(), Some(second.proposal.id.as_str()));
-
-    let prior = db
-        .list_worker_proposals_for_execution(&execution.id, ProposalKind::ReviewVerdict)
-        .unwrap()
-        .into_iter()
-        .find(|proposal| proposal.id == first.proposal.id)
-        .expect("the prior verdict proposal must still exist");
-    assert_eq!(prior.state, ProposalState::Superseded);
+    assert_eq!(member.report_proposal_id.as_deref(), Some(first.proposal.id.as_str()));
 }
 
 /// A resubmission from a DIFFERENT member/execution than the one that
@@ -1216,7 +1205,7 @@ fn leaf_dispatch_creates_three_atomic_role_pinned_executions() {
         ]
     );
     assert!(
-        db.are_same_review_batch_leaves(&executions[0].id, &executions[1].id)
+        db.are_admissible_same_review_batch_pair(&executions[0].id, &executions[1].id)
             .unwrap()
     );
 
@@ -1235,13 +1224,13 @@ fn leaf_dispatch_creates_three_atomic_role_pinned_executions() {
     }
 }
 
-/// `are_same_review_batch_leaves` relaxes the ordinary single-writer chain
+/// `are_admissible_same_review_batch_pair` relaxes the ordinary single-writer chain
 /// guard for exactly one case: two leaf executions of the SAME persisted
 /// batch. Its false cases are the safety-critical ones — a too-permissive
 /// predicate would let genuinely unrelated executions run concurrently on
 /// one work item, which is precisely what the guard exists to stop.
 #[test]
-fn are_same_review_batch_leaves_rejects_cross_batch_and_memberless_pairs() {
+fn admissible_same_review_batch_pair_rejects_cross_batch_and_memberless_pairs() {
     let db = WorkDb::open(temp_db_path("review-batch-leaves-negative")).unwrap();
     let product = create_test_product(&db);
     let cycle_root = create_test_chore_manual(&db, product.id, "review target");
@@ -1271,7 +1260,7 @@ fn are_same_review_batch_leaves_rejects_cross_batch_and_memberless_pairs() {
         other => panic!("expected a newly-created review batch, got {other:?}"),
     };
     assert!(
-        !db.are_same_review_batch_leaves(&executions_a[0].id, &executions_b[0].id)
+        !db.are_admissible_same_review_batch_pair(&executions_a[0].id, &executions_b[0].id)
             .unwrap(),
         "leaves from different batches must not be treated as the same batch's leaves"
     );
@@ -1288,7 +1277,7 @@ fn are_same_review_batch_leaves_rejects_cross_batch_and_memberless_pairs() {
         )
         .unwrap();
     assert!(
-        !db.are_same_review_batch_leaves(&executions_a[0].id, &bare_execution.id)
+        !db.are_admissible_same_review_batch_pair(&executions_a[0].id, &bare_execution.id)
             .unwrap(),
         "an execution with no batch member row must not be treated as a batch leaf"
     );
@@ -1299,7 +1288,7 @@ fn are_same_review_batch_leaves_rejects_cross_batch_and_memberless_pairs() {
 /// This is deliberately exercised after the real quorum transition creates
 /// the supervisor, rather than by hand-writing a member row.
 #[test]
-fn are_same_review_batch_leaves_admits_supervisor_leaf_pairs() {
+fn admissible_same_review_batch_pair_admits_supervisor_leaf_pairs() {
     let db = WorkDb::open(temp_db_path("review-batch-supervisor-admission")).unwrap();
     let product = create_test_product(&db);
     let cycle_root = create_test_chore_manual(&db, product.id, "review target");
@@ -1333,12 +1322,12 @@ fn are_same_review_batch_leaves_admits_supervisor_leaf_pairs() {
         .expect("quorum must create a supervisor execution");
 
     assert!(
-        db.are_same_review_batch_leaves(&supervisor_execution_id, &executions[0].id)
+        db.are_admissible_same_review_batch_pair(&supervisor_execution_id, &executions[0].id)
             .unwrap(),
         "the supervisor must be admitted alongside a leaf from its own batch"
     );
     assert!(
-        db.are_same_review_batch_leaves(&executions[0].id, &supervisor_execution_id)
+        db.are_admissible_same_review_batch_pair(&executions[0].id, &supervisor_execution_id)
             .unwrap(),
         "pair admission must be symmetric"
     );
@@ -1349,7 +1338,7 @@ fn are_same_review_batch_leaves_admits_supervisor_leaf_pairs() {
 /// terminalizes it immediately; this alarm protects the invariant if that
 /// seam regresses or its teardown fails after the report becomes durable.
 #[test]
-fn reported_live_member_files_attention_from_both_recovery_paths() {
+fn reported_live_leaf_is_graced_then_files_attention_from_both_recovery_paths() {
     let db = WorkDb::open(temp_db_path("review-batch-reported-live-attention")).unwrap();
     let product = create_test_product(&db);
     let cycle_root = create_test_chore_manual(&db, product.id, "review target");
@@ -1379,6 +1368,22 @@ fn reported_live_member_files_attention_from_both_recovery_paths() {
         "head-sha",
         "report-accepted",
     );
+    db.sweep_reported_live_review_batch_members().unwrap();
+    assert!(
+        db.list_attention_items_for_work_item(&cycle_root.id)
+            .unwrap()
+            .iter()
+            .all(|item| item.kind != crate::work::PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND),
+        "a leaf inside its normal report-then-teardown window must not trip the alarm"
+    );
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_batch_members SET terminal_at = '1' WHERE batch_id = ?1",
+            rusqlite::params![batch.id],
+        )
+        .unwrap();
+    db.sweep_reported_live_review_batch_members().unwrap();
 
     assert!(
         db.list_dead_review_batch_member_candidates().unwrap().is_empty(),
@@ -1438,13 +1443,12 @@ fn reported_live_supervisor() -> (WorkDb, String, String, String) {
     (db, cycle_root.id, batch.id, execution.id)
 }
 
-/// Finding 2: a healthy consolidator sitting `reported` + live in its normal,
-/// brief window right after accepting its verdict must not trip the shared
-/// invariant-violation alarm — that would desensitise the very alarm the
-/// admission fix in this PR depends on.
+/// A consolidator inside its normal report-then-teardown window must not trip
+/// the reported-plus-live alarm.
 #[test]
 fn supervisor_reported_live_within_grace_window_does_not_alarm() {
     let (db, cycle_root_id, _batch_id, _execution_id) = reported_live_supervisor();
+    db.sweep_reported_live_review_batch_members().unwrap();
 
     assert!(
         db.list_dead_review_batch_member_candidates().unwrap().is_empty(),
@@ -1463,17 +1467,23 @@ fn supervisor_reported_live_within_grace_window_does_not_alarm() {
     );
 }
 
-/// The other half of finding 2's contract: the grace-window exemption must
-/// not become a way to permanently hide a genuinely stuck consolidator. Once
-/// a supervisor has been `reported` + live for longer than
+/// The grace-window exemption must not become a way to permanently hide a
+/// genuinely stuck consolidator. Once a supervisor has been `reported` + live for longer than
 /// [`crate::work::REVIEW_BATCH_SUPERVISOR_REPORTED_GRACE_SECS`], it is
 /// exactly as alarming as a stuck leaf always was.
 #[test]
 fn supervisor_reported_live_past_grace_window_still_alarms() {
     let (db, cycle_root_id, batch_id, _execution_id) = reported_live_supervisor();
     backdate_supervisor_terminal_at(&db, &batch_id, 1);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_batches SET status = 'completed' WHERE id = ?1",
+            rusqlite::params![batch_id],
+        )
+        .unwrap();
 
-    db.list_dead_review_batch_member_candidates().unwrap();
+    db.sweep_reported_live_review_batch_members().unwrap();
     let attentions = db.list_attention_items_for_work_item(&cycle_root_id).unwrap();
     assert_eq!(
         attentions
@@ -1487,16 +1497,14 @@ fn supervisor_reported_live_past_grace_window_still_alarms() {
     );
 }
 
-/// Finding 2's auto-clear requirement: once the condition the alarm named
-/// resolves (teardown finally completes), the next sweep pass must resolve
-/// the item itself rather than leaving a permanent card for a human to
-/// dismiss by hand.
+/// Once the reported-plus-live condition resolves, the next sweep must resolve
+/// the alarm itself rather than leaving a permanent card.
 #[test]
 fn supervisor_reported_live_alarm_auto_clears_once_torn_down() {
     let (db, cycle_root_id, batch_id, execution_id) = reported_live_supervisor();
     backdate_supervisor_terminal_at(&db, &batch_id, 1);
 
-    db.list_dead_review_batch_member_candidates().unwrap();
+    db.sweep_reported_live_review_batch_members().unwrap();
     assert_eq!(
         db.list_attention_items_for_work_item(&cycle_root_id)
             .unwrap()
@@ -1517,7 +1525,7 @@ fn supervisor_reported_live_alarm_auto_clears_once_torn_down() {
         )
         .unwrap();
 
-    db.list_dead_review_batch_member_candidates().unwrap();
+    db.sweep_reported_live_review_batch_members().unwrap();
     let attentions = db.list_attention_items_for_work_item(&cycle_root_id).unwrap();
     assert!(
         attentions

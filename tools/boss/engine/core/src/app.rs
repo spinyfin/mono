@@ -2542,6 +2542,7 @@ async fn handle_frontend_connection(
                 }
             }
 
+            writer_sink.complete_response_delivery(event.request_id.as_deref(), !write_failed);
             if write_failed {
                 break;
             }
