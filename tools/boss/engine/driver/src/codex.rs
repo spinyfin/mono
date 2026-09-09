@@ -162,15 +162,13 @@ pub(crate) fn guard_chain_broken_notification(detail: &str) -> String {
 // Sourced from `codex debug models` on codex-cli 0.153.4 (2026-09-08). Catalog
 // snapshot in CLI priority order (visibility=list unless marked hidden):
 //
-//   gpt-6-astra               default=low     levels=low,medium,high,xhigh,max,ultra
+//   gpt-6-astra               default=medium  levels=low,medium,high,xhigh,max,ultra
+//   gpt-reserve               (hidden) default=medium  levels=low,medium,high,xhigh,max
 //   gpt-5.6-sol               default=low     levels=low,medium,high,xhigh,max,ultra
 //   gpt-5.6-terra             default=medium  levels=low,medium,high,xhigh,max,ultra
 //   gpt-5.6-luna              default=medium  levels=low,medium,high,xhigh,max
-//   gpt-daybreak-blue-latest  (hidden) default=low     levels=low,medium,high,xhigh,max,ultra
-//   gpt-daybreak-red-latest   (hidden) default=medium  levels=low,medium,high,xhigh,max,ultra
 //   gpt-5.5                   default=medium  levels=low,medium,high,xhigh
-//   gpt-5.4 / gpt-5.4-mini    (hidden) default=medium  levels=low,medium,high,xhigh
-//   gpt-5.2                   default=medium  levels=low,medium,high,xhigh
+//   gpt-5.3-codex-spark       default=high    levels=low,medium,high,xhigh
 //   codex-auto-review         (hidden) default=medium  levels=low,medium,high,xhigh,max
 //
 // `ModelMenu` is static function pointers today, so this is a baked snapshot
