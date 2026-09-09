@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use boss_github::gh_runner::CommandGhRunner;
 use boss_protocol::ExecutionKind;
 use tokio::sync::Mutex;
 
@@ -840,6 +841,7 @@ impl HostAdapter for SshHostAdapter {
             work_item,
             workspace_path,
             cube_change_id,
+            &CommandGhRunner,
             // Editorial controls and every worker-proposal-seam prompt gate
             // default OFF on the remote path: SshHostAdapter does not hold a
             // FeatureFlagsStore (its `cfg` is "not yet read"; see struct
