@@ -18,9 +18,11 @@ use super::work_item::{project_details, work_item_details, work_item_name, work_
 mod block_boundary;
 mod ci_monitoring;
 mod design;
+mod recovery_branch;
 use block_boundary::block_boundary_fragment;
 use ci_monitoring::ci_monitoring_directive;
 use design::{compose_design_directive, compose_design_postmortem_directive};
+use recovery_branch::prior_branch_block;
 
 #[derive(bon::Builder)]
 pub(super) struct ExecutionPromptParams<'a> {
@@ -41,6 +43,7 @@ pub(super) struct ExecutionPromptParams<'a> {
     /// entirely — see `worker_spawn.rs`).
     design_guidance: Option<&'a str>,
     pr_template_set: &'a crate::pr_template::PrTemplateSet,
+    prior_branch_exists: Option<bool>,
     #[builder(default)]
     editorial_enabled: bool,
     /// Whether `worker_signal_proposals_seam` is on — gates the worker-facing
@@ -113,16 +116,12 @@ pub(super) struct ExecutionPromptParams<'a> {
 ///
 /// The engine's operating rule for recovery is that it fires only on an
 /// unambiguous durable pointer the system itself wrote — restart fresh on
-/// doubt. The old block violated that: alongside genuinely recovered state it
-/// also told the worker "the prior worker **may** have pushed commits to
-/// `boss/exec_<prior-id>`" and handed it a `jj edit <branch>@origin` line to
-/// try. That branch name is *derived*, not *recorded* — the engine has no
-/// column anywhere that confirms a push actually happened for an orphaned
-/// execution (`pr_url` is only ever stamped atomically with the transition to
-/// `completed`, which an orphaned execution never reaches). So the line was a
-/// name-match heuristic dressed up as a resume instruction, and it fails
-/// loudly and pointlessly whenever the prior worker died before pushing —
-/// which is the common case, not the exception.
+/// doubt. A prior worker's branch name is derived, not recorded: an orphaned
+/// execution has no `pr_url` because it never reached completion. The spawn
+/// path therefore checks that derived ref on the remote before setting
+/// `prior_branch_exists`. Only a confirmed ref gets a `jj edit ...@origin`
+/// instruction; a confirmed absence explicitly tells the worker not to run
+/// one, and an inconclusive probe renders neither claim.
 ///
 /// The only thing the engine *does* durably record is [recovered workspace
 /// state](boss_engine_recovery::recovery_apply): a marker
@@ -136,12 +135,9 @@ pub(super) struct ExecutionPromptParams<'a> {
 ///
 /// ## What the block says
 ///
-/// 1. whether state was recovered, and how — in place by cube (jj history
-///    intact) or replayed from a patch (uncommitted edits only);
-/// 2. what exactly was restored, in files and line counts, so the worker can
-///    check rather than guess;
-/// 3. to **inspect before building on it** — recovered work is a crashed
-///    worker's mid-thought, not a reviewed baseline, and must not be reset.
+/// It describes recovered state, tells the worker to inspect it before
+/// building on it, and includes a prior branch only when the remote confirms
+/// that branch exists.
 ///
 /// A `patch_error` on the report means recovery FAILED. That case gets its
 /// own paragraph telling the worker not to assume anything was resumed —
@@ -423,6 +419,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
         editorial_rules,
         design_guidance,
         pr_template_set,
+        prior_branch_exists,
         editorial_enabled,
         worker_signal_proposals_seam_enabled,
         deferred_scope_proposals_seam_enabled,
@@ -507,6 +504,9 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
         // branch name" / `jj new main` guidance further down is the correct,
         // honest instruction, so no block is rendered at all.
         prompt.push_str(&startup_recovery_block(&report));
+        if let Some(prior_branch_block) = prior_branch_block(&report, execution, prior_branch_exists) {
+            prompt.push_str(&prior_branch_block);
+        }
     } else if execution.allow_dirty {
         // No recovery marker, but the engine recorded this as a dirty
         // re-lease (see `reconcile_workspace_recovery`): cube handed the
