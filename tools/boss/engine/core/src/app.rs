@@ -1085,21 +1085,18 @@ impl ServerState {
         boss_tmux::Tmux::from_path_with_socket(program, self.tmux_socket_path.clone())
     }
 
-    /// Resolve the tmux handle that actually hosts a run recorded with
-    /// `server_label`, given an already-resolved socket handle: `socket_tmux`
-    /// itself, unless the label is the literal pre-move
-    /// [`boss_tmux::SERVER_LABEL`], in which case a handle for the `-L boss`
-    /// server built from the same resolved executable. Shared by every
-    /// caller that must address a specific run's tmux session rather than
-    /// always the current socket: teardown, pane delivery, and (mirrored
-    /// independently for its own dependency shape)
+    /// Resolve the tmux handle for a run recorded with `server_label`:
+    /// `socket_tmux` itself, unless the label is the pre-move
+    /// [`boss_tmux::SERVER_LABEL`], in which case a `-L boss` handle from the
+    /// same executable and runner. Shared by teardown, pane delivery, and
     /// [`crate::stale_worker_sweep::TmuxWorkerTerminalInspector::tmux_for_run`].
-    /// An empty/unset label (a row written before this column existed)
-    /// resolves to `socket_tmux`, matching this engine's behavior before the
-    /// migration.
+    /// An empty/unset label resolves to `socket_tmux`.
     fn tmux_for_run(&self, socket_tmux: &boss_tmux::Tmux, server_label: &str) -> anyhow::Result<boss_tmux::Tmux> {
         if server_label == boss_tmux::SERVER_LABEL {
-            boss_tmux::Tmux::for_legacy_label_server(socket_tmux.program().to_path_buf())
+            boss_tmux::Tmux::for_legacy_label_server_with_runner(
+                socket_tmux.program().to_path_buf(),
+                socket_tmux.runner(),
+            )
         } else {
             Ok(socket_tmux.clone())
         }

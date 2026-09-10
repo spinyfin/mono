@@ -97,6 +97,77 @@ fn tmux(replies: impl IntoIterator<Item = CommandOutput>) -> (Tmux, Arc<StubRunn
     (tmux, runner)
 }
 
+/// Guards [`Tmux::with_runner_and_socket`]'s production-socket refusal:
+/// the resolver identifies this Bazel test binary, so
+/// `boss_log_files::is_test_process()` is true here; this exercises the
+/// refusal a test process would hit if pointed at the live coordinator's tmux
+/// socket.
+#[test]
+fn with_runner_and_socket_refuses_a_production_shaped_socket() {
+    let error = Tmux::with_runner_and_socket(
+        "/opt/homebrew/bin/tmux",
+        StubRunner::replies([]),
+        "/Users/anyone/Library/Application Support/Boss/tmux.sock",
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("refusing to address the production tmux socket"),
+        "error was: {error:#}"
+    );
+}
+
+/// The shape check must not over-match: a private socket path under `/tmp`
+/// is unaffected even though this is a test process.
+#[test]
+fn with_runner_and_socket_allows_a_private_socket_path() {
+    let tmux = Tmux::with_runner_and_socket(
+        "/opt/homebrew/bin/tmux",
+        StubRunner::replies([]),
+        "/tmp/private/tmux.sock",
+    )
+    .unwrap();
+    assert_eq!(tmux.socket_path(), Some(Path::new("/tmp/private/tmux.sock")));
+}
+
+/// [`Tmux::for_legacy_label_server_with_runner`] must refuse the real
+/// command runner from a test process — `-L boss` cannot be scoped to a
+/// private path, so there is no way to isolate it other than gating on the
+/// runner's realness.
+#[test]
+fn for_legacy_label_server_with_runner_refuses_the_real_runner() {
+    let error =
+        Tmux::for_legacy_label_server_with_runner("/opt/homebrew/bin/tmux", Arc::new(RealCommandRunner)).unwrap_err();
+    assert!(
+        error.to_string().contains("refusing to construct a legacy"),
+        "error was: {error:#}"
+    );
+}
+
+/// A fake/stub runner can never reach a live server no matter what it is
+/// pointed at, so the same constructor must still succeed with one — this is
+/// what every other legacy-label test in this file relies on.
+#[test]
+fn for_legacy_label_server_with_runner_allows_a_fake_runner() {
+    let tmux = Tmux::for_legacy_label_server_with_runner("/opt/homebrew/bin/tmux", StubRunner::replies([])).unwrap();
+    assert_eq!(tmux.socket_path(), None);
+}
+
+/// A socket handle's runner is reusable: constructing a `-L boss` handle
+/// from it keeps the same executable and the same (fake) runner.
+#[test]
+fn for_legacy_label_server_reuses_socket_handle_runner() {
+    let runner = StubRunner::replies([]);
+    let socket = Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", runner.clone(), TEST_SOCKET_PATH).unwrap();
+    let legacy = Tmux::for_legacy_label_server_with_runner(socket.program().to_path_buf(), socket.runner()).unwrap();
+    assert_eq!(
+        legacy.operator_prefix(),
+        format!("tmux -L {}", quote_for_shell(SERVER_LABEL))
+    );
+    assert_eq!(legacy.program(), socket.program());
+}
+
 #[test]
 fn relative_executable_path_is_rejected() {
     let error = Tmux::with_runner_and_socket("tmux", StubRunner::replies([]), TEST_SOCKET_PATH).unwrap_err();
@@ -305,17 +376,21 @@ fn attach_session_command_for_legacy_label_server_still_uses_l_boss() {
 
 #[test]
 fn attach_session_command_quotes_a_socket_path_with_spaces() {
-    let socket = "/Users/operator/Library/Application Support/Boss/tmux.sock";
+    // Deliberately not production-shaped (see `is_production_shaped`): a
+    // private path is all this needs to exercise quoting, and a
+    // production-shaped one would now be refused by
+    // `with_runner_and_socket`'s test-process guard.
+    let socket = "/private/tmp/Application Support/Boss/tmux.sock";
     let tmux = Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", StubRunner::replies([]), socket).unwrap();
     let command = tmux.attach_session_command("boss-2-deadbeef");
     assert_eq!(
         command,
-        "'/opt/homebrew/bin/tmux' -S '/Users/operator/Library/Application Support/Boss/tmux.sock' \
+        "'/opt/homebrew/bin/tmux' -S '/private/tmp/Application Support/Boss/tmux.sock' \
          attach-session -t 'boss-2-deadbeef'"
     );
     assert_eq!(
         tmux.operator_prefix(),
-        "tmux -S '/Users/operator/Library/Application Support/Boss/tmux.sock'"
+        "tmux -S '/private/tmp/Application Support/Boss/tmux.sock'"
     );
 }
 

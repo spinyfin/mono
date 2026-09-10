@@ -15,7 +15,7 @@ rust_library(
 )
 
 rust_test(
-    name = "pr-template-test",
+    name = "pr-template_test",
     size = "small",
     crate = ":pr-template",
     edition = "2024",
