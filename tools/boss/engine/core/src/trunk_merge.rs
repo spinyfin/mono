@@ -8,6 +8,7 @@
 //! `(owner, repo, number)` Trunk needs from the task's PR URL.
 
 use anyhow::{Result, anyhow};
+use boss_trunk_client::TrunkPrState;
 
 use crate::work::WorkDb;
 
@@ -20,13 +21,9 @@ pub const TRUNK_REPO_HOST: &str = "github.com";
 //
 // Trunk's own PR states (`not_ready`/`pending`/…/`failed`/`cancelled`) are
 // the only values the `getQueue`/`getSubmittedPullRequest` transport ever
-// writes into this column. The two constants below are never sent by
-// Trunk — they are Boss's own bookkeeping for the auto-resubmit /
-// conflict-during-queue coordination (design
-// `trunk-merge-queue-integration-queue-backed-merges-merging-ui.md`
-// §"Eviction: a first-class failure signal" / §"Coordination with
-// conflict_watch / ci_watch"), namespaced with a `boss:` prefix so they can
-// never collide with a real (or future/unknown) Trunk state string.
+// writes into this column. The constants below are never sent by Trunk —
+// they are Boss's own bookkeeping, namespaced with a `boss:` prefix so they
+// can never collide with a real (or future/unknown) Trunk state string.
 //
 // State flow for an intent that needs Boss-driven remediation:
 //
@@ -35,6 +32,10 @@ pub const TRUNK_REPO_HOST: &str = "github.com";
 //    conflict_watch owns the fix, poller cancels the entry)          ─┘
 pub const TRUNK_INTENT_AWAITING_RESUBMIT: &str = "boss:awaiting_resubmit";
 pub const TRUNK_INTENT_SUPERSEDED_BY_CONFLICT: &str = "boss:superseded_by_conflict";
+/// Stamped when `submitPullRequest` failed and the subsequent intent-row
+/// delete also failed, so a later Merge click cannot treat `last_trunk_state
+/// = None` as "just submitted, already in the queue".
+pub const TRUNK_INTENT_SUBMIT_FAILED: &str = "boss:submit_failed";
 
 /// Whether an active intent's `last_trunk_state` marks it as needing a
 /// Boss-driven fix before it can be resubmitted: evicted (an active
@@ -45,6 +46,43 @@ fn needs_remediation(last_trunk_state: Option<&str>) -> bool {
         last_trunk_state,
         Some("failed") | Some("pending_failure") | Some(TRUNK_INTENT_SUPERSEDED_BY_CONFLICT)
     )
+}
+
+/// Whether an observed Trunk PR state is one the entry never leaves — the
+/// states that resolve an intent rather than describing a live entry.
+/// [`TrunkPrState::Unknown`] is deliberately non-terminal: a new state
+/// Trunk introduces is kept live so tracking degrades gracefully.
+pub(crate) fn is_terminal_trunk_state(state: &TrunkPrState) -> bool {
+    matches!(
+        state,
+        TrunkPrState::Merged | TrunkPrState::Cancelled | TrunkPrState::Failed | TrunkPrState::PendingFailure
+    )
+}
+
+/// Whether a duplicate Merge click may honestly report "already in the
+/// Trunk queue" without calling `submitPullRequest`.
+///
+/// Classification matches the queue poller:
+///
+/// - `None` is live: the intent was just submitted (or just resubmitted)
+///   and the poller has not observed a state yet.
+/// - Any `boss:` sentinel is not live, including
+///   [`TRUNK_INTENT_AWAITING_RESUBMIT`], [`TRUNK_INTENT_SUPERSEDED_BY_CONFLICT`],
+///   and [`TRUNK_INTENT_SUBMIT_FAILED`]. The last of those is the stamp
+///   written when `submitPullRequest` failed and rolling the intent row
+///   back also failed — without it, that row would look identical to the
+///   just-submitted `None` case and a later click would claim the PR was
+///   already in the queue.
+/// - Any other stored string is parsed as [`TrunkPrState`] and is live
+///   iff it is not [`is_terminal_trunk_state`]. Unknown future Trunk
+///   states are therefore live, matching the poller, rather than reported
+///   as "not in the queue".
+pub(crate) fn intent_is_live_in_queue(last_trunk_state: Option<&str>) -> bool {
+    match last_trunk_state {
+        None => true,
+        Some(state) if state.starts_with("boss:") => false,
+        Some(state) => !is_terminal_trunk_state(&TrunkPrState::from(state.to_owned())),
+    }
 }
 
 /// Called once the fix for an evicted or conflict-superseded Trunk intent
@@ -234,6 +272,53 @@ mod tests {
     #[test]
     fn rejects_a_malformed_url() {
         assert!(parse_trunk_pr_coordinates("not a url").is_err());
+    }
+
+    #[test]
+    fn live_in_queue_covers_observed_and_just_submitted_states() {
+        for state in [
+            None,
+            Some("not_ready"),
+            Some("pending"),
+            Some("testing"),
+            Some("tests_passed"),
+        ] {
+            assert!(
+                intent_is_live_in_queue(state),
+                "{state:?} must count as live in the queue",
+            );
+        }
+    }
+
+    #[test]
+    fn live_in_queue_treats_unknown_trunk_states_as_live() {
+        // Matches `is_terminal_trunk_state`: Unknown is non-terminal, so
+        // a new wire value Trunk introduces stays tracked as in-queue.
+        assert!(
+            intent_is_live_in_queue(Some("some_future_trunk_state")),
+            "an unrecognized Trunk state must count as live, matching the poller",
+        );
+        assert!(!is_terminal_trunk_state(&TrunkPrState::from(
+            "some_future_trunk_state".to_owned()
+        )));
+    }
+
+    #[test]
+    fn live_in_queue_rejects_terminal_states_and_boss_sentinels() {
+        for state in [
+            Some("failed"),
+            Some("pending_failure"),
+            Some("cancelled"),
+            Some("merged"),
+            Some(TRUNK_INTENT_AWAITING_RESUBMIT),
+            Some(TRUNK_INTENT_SUPERSEDED_BY_CONFLICT),
+            Some(TRUNK_INTENT_SUBMIT_FAILED),
+        ] {
+            assert!(
+                !intent_is_live_in_queue(state),
+                "{state:?} must not be reported as already enqueued",
+            );
+        }
     }
 
     // ── awaiting_resubmit / superseded_by_conflict sentinel transitions ────

@@ -32,6 +32,11 @@ pub enum MergeAction {
     /// `trunk-merge-queue-integration-queue-backed-merges-merging-ui.md`
     /// §"The merge verb: submit + standing merge intent".
     TrunkEnqueued,
+    /// A subsequent Merge click found an already-active intent that is
+    /// still live in the Trunk queue (or was just submitted and not yet
+    /// observed). Distinct from [`Self::TrunkEnqueued`]: this click did
+    /// **not** call `submitPullRequest`.
+    TrunkAlreadyEnqueued,
 }
 
 impl MergeAction {
@@ -41,6 +46,7 @@ impl MergeAction {
         match self {
             Self::Requested => "merge_requested",
             Self::TrunkEnqueued => "trunk_enqueued",
+            Self::TrunkAlreadyEnqueued => "trunk_already_enqueued",
         }
     }
 }
@@ -150,5 +156,10 @@ mod tests {
     #[test]
     fn merge_action_trunk_enqueued_as_str() {
         assert_eq!(MergeAction::TrunkEnqueued.as_str(), "trunk_enqueued");
+    }
+
+    #[test]
+    fn merge_action_trunk_already_enqueued_as_str() {
+        assert_eq!(MergeAction::TrunkAlreadyEnqueued.as_str(), "trunk_already_enqueued");
     }
 }

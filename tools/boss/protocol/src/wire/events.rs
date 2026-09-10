@@ -1452,11 +1452,14 @@ pub enum FrontendEvent {
     /// successfully initiated the merge process for the PR. `action`
     /// identifies what happened: `"merge_requested"` (GitHub accepted the
     /// request but its queue/auto-merge projection may still be converging),
-    /// or `"trunk_enqueued"` (PR submitted to a `trunk_queue`-mechanism
-    /// product's Trunk merge queue; also the reply for a duplicate click
-    /// while an intent is already active). The PR-reconciler is kicked on
-    /// the engine side so the kanban state refreshes promptly without
-    /// waiting for the next periodic sweep.
+    /// `"trunk_enqueued"` (PR submitted to a `trunk_queue`-mechanism
+    /// product's Trunk merge queue), or `"trunk_already_enqueued"` (duplicate
+    /// click while an intent is still live in that queue; `submitPullRequest`
+    /// was not called). A duplicate click against a terminal/non-advancing
+    /// intent (e.g. `last_trunk_state = "failed"`) is a [`Self::WorkError`],
+    /// not this event. The PR-reconciler is kicked on the engine side so the
+    /// kanban state refreshes promptly without waiting for the next periodic
+    /// sweep.
     MergeWhenReadyAccepted {
         work_item_id: String,
         pr_url: String,

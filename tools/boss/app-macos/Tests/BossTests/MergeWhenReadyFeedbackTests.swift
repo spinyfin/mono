@@ -5,8 +5,9 @@ import XCTest
 /// `merge_when_ready_accepted` reply (`MergeAction::as_str()` on the
 /// engine) drives an inline confirmation banner on the originating card
 /// (`ChatViewModel.mergeFeedbackNotice`), with `"trunk_enqueued"` getting
-/// its own "Submitted to Trunk merge queue" copy rather than a message
-/// shared with the GitHub-native paths.
+/// its own "Submitted to Trunk merge queue" copy and
+/// `"trunk_already_enqueued"` getting "Already in Trunk merge queue" so a
+/// duplicate click is not presented as a fresh submission.
 @MainActor
 final class MergeWhenReadyFeedbackTests: XCTestCase {
 
@@ -22,6 +23,20 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
 
         XCTAssertEqual(model.mergeFeedbackNotice?.taskID, "task_1")
         XCTAssertEqual(model.mergeFeedbackNotice?.message, "Submitted to Trunk merge queue")
+        XCTAssertFalse(model.mergingWhenReadyIDs.contains("task_1"), "in-flight guard must clear on any accepted action")
+    }
+
+    func testTrunkAlreadyEnqueuedSetsDistinctFeedbackText() {
+        let model = makeModel()
+        model.mergingWhenReadyIDs.insert("task_1")
+
+        model.applyEventForTest(.mergeWhenReadyAccepted(
+            workItemID: "task_1",
+            prURL: "https://github.com/x/y/pull/1",
+            action: "trunk_already_enqueued"
+        ))
+
+        XCTAssertEqual(model.mergeFeedbackNotice?.message, "Already in Trunk merge queue")
         XCTAssertFalse(model.mergingWhenReadyIDs.contains("task_1"), "in-flight guard must clear on any accepted action")
     }
 
