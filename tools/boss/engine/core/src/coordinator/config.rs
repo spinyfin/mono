@@ -3,6 +3,12 @@
 //! the shared types live in [`super`].
 use super::*;
 
+/// Hold reason reported while the local host's startup capability probe
+/// is still in flight. See
+/// [`ExecutionCoordinator::set_local_capability_discovery_pending`].
+pub const LOCAL_CAPABILITY_DISCOVERY_PENDING_REASON: &str =
+    "local host capability discovery has not completed yet (runs in the background at engine startup)";
+
 /// Check out a leased cube workspace to the head commit of a PR, so a reviewer
 /// worker can read full source at the PR head rather than working from a stale
 /// or arbitrary baseline.
@@ -90,6 +96,7 @@ impl ExecutionCoordinator {
             dispatch_pause_bypass_execution_ids: std::sync::Mutex::new(HashSet::new()),
             requested_host_ids: std::sync::Mutex::new(HashMap::new()),
             dispatch_preflight_block_reason: std::sync::Mutex::new(None),
+            local_capability_discovery_pending: AtomicBool::new(false),
             automation_paused: AtomicBool::new(false),
             automation_paused_since_epoch_s: AtomicU64::new(0),
             automation_paused_reason: std::sync::Mutex::new(None),
@@ -651,8 +658,30 @@ impl ExecutionCoordinator {
     }
 
     /// The reason local dispatch is blocked by startup preflight, if any.
+    /// A failed runtime preflight (tmux) wins; otherwise an in-flight local
+    /// capability probe holds dispatch with
+    /// [`LOCAL_CAPABILITY_DISCOVERY_PENDING_REASON`].
     pub fn dispatch_preflight_block_reason(&self) -> Option<String> {
-        self.dispatch_preflight_block_reason.lock().unwrap().clone()
+        if let Some(reason) = self.dispatch_preflight_block_reason.lock().unwrap().clone() {
+            return Some(reason);
+        }
+        self.local_capability_discovery_pending()
+            .then(|| LOCAL_CAPABILITY_DISCOVERY_PENDING_REASON.to_owned())
+    }
+
+    /// Mark the local host's startup capability probe as in flight
+    /// (`true`) or complete (`false`). While pending, no execution is
+    /// dispatched or force-dispatched; the caller that clears it should
+    /// `kick()` so held work drains promptly.
+    pub fn set_local_capability_discovery_pending(&self, pending: bool) {
+        self.local_capability_discovery_pending
+            .store(pending, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the local host's startup capability probe is still in flight.
+    pub fn local_capability_discovery_pending(&self) -> bool {
+        self.local_capability_discovery_pending
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Pause automation-originated activity — independent of

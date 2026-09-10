@@ -262,7 +262,20 @@ fn local_command_on_path_with(pane_launch: &crate::spawn_flow::WorkerPaneLaunch,
         return false;
     }
     let script = format!("command -v {binary} >/dev/null 2>&1");
-    let mut child = match pane_launch.login_shell_command(&script).spawn() {
+    let started = Instant::now();
+    let found = local_command_on_path_inner(pane_launch, binary, &script);
+    tracing::info!(
+        %binary,
+        found,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "host_capability_probe: local driver probe complete",
+    );
+    found
+}
+
+/// The probe itself: spawn `script` in the pane login shell and wait, bounded.
+fn local_command_on_path_inner(pane_launch: &crate::spawn_flow::WorkerPaneLaunch, binary: &str, script: &str) -> bool {
+    let mut child = match pane_launch.login_shell_command(script).spawn() {
         Ok(child) => child,
         Err(error) => {
             tracing::warn!(%binary, %error, "could not start local driver capability probe");

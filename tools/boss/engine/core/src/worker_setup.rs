@@ -2848,9 +2848,16 @@ pub(crate) fn heal_hook_command(command: &str, new_boss_event_path: &Path) -> St
 /// to `new_boss_event_path`. A missing directory is a no-op; per-file
 /// errors are logged but do not abort the sweep.
 pub fn heal_worker_settings_json(settings_dir: &Path, new_boss_event_path: &Path) {
+    let started = std::time::Instant::now();
     let entries = match std::fs::read_dir(settings_dir) {
         Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            tracing::info!(
+                dir = %settings_dir.display(),
+                "healing boss-event path in worker settings files: directory absent, nothing to heal",
+            );
+            return;
+        }
         Err(err) => {
             tracing::warn!(
                 dir = %settings_dir.display(),
@@ -2893,13 +2900,18 @@ pub fn heal_worker_settings_json(settings_dir: &Path, new_boss_event_path: &Path
         );
     }
 
+    let guard_scripts_elapsed = started.elapsed();
+
+    let (mut walked, mut healed, mut failed) = (0u32, 0u32, 0u32);
     for entry in entries.flatten() {
         let settings_path = entry.path();
         if settings_path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
+        walked += 1;
         match heal_single_settings_json(&settings_path, new_boss_event_path) {
             Ok(true) => {
+                healed += 1;
                 tracing::info!(
                     settings = %settings_path.display(),
                     "healed boss-event path in worker settings file",
@@ -2907,6 +2919,7 @@ pub fn heal_worker_settings_json(settings_dir: &Path, new_boss_event_path: &Path
             }
             Ok(false) => {}
             Err(err) => {
+                failed += 1;
                 tracing::warn!(
                     settings = %settings_path.display(),
                     ?err,
@@ -2915,6 +2928,18 @@ pub fn heal_worker_settings_json(settings_dir: &Path, new_boss_event_path: &Path
             }
         }
     }
+    // The completion line the startup ledger was missing: the sweep used
+    // to log only its start, so the whole post-bind stall sat unattributed
+    // after it.
+    tracing::info!(
+        dir = %settings_dir.display(),
+        files_walked = walked,
+        files_healed = healed,
+        files_failed = failed,
+        guard_scripts_ms = guard_scripts_elapsed.as_millis() as u64,
+        total_ms = started.elapsed().as_millis() as u64,
+        "healing boss-event path in worker settings files: sweep complete",
+    );
 }
 
 /// Returns `Ok(true)` if any hook commands were updated, `Ok(false)` if

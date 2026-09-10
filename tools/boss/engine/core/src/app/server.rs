@@ -572,6 +572,11 @@ pub async fn serve_with_overrides(
         }
         None => (None, None),
     };
+    // Cold-start ledger, phase 1: everything between the control token and
+    // the frontend socket bind ("gap A" in the cold-start investigation).
+    // The app cannot connect until this phase ends, so every step here is
+    // directly on the "no data after an update" path.
+    let mut pre_bind = crate::startup_timing::StartupTimeline::begin("pre_bind");
     let server_state = ServerState::new_arc_with_app_pid_and_merge_probe(
         cfg.clone(),
         app_pid,
@@ -582,6 +587,72 @@ pub async fn serve_with_overrides(
             ..Default::default()
         },
     )?;
+    pre_bind.mark("server_state");
+
+    // Local host capability discovery (`uname`, `gh auth status`, one login
+    // shell per registered driver — seconds of subprocess time). This used
+    // to run inside the schema migration chain, i.e. inside `WorkDb::open`
+    // above, before the socket existed. It now runs in the background so
+    // the socket binds first, with three guarantees that keep it as correct
+    // as the inline version was:
+    //
+    // 1. Stale rows are wiped *before* the probe starts, so a driver that
+    //    was uninstalled since the last boot never looks available on the
+    //    strength of last boot's row.
+    // 2. Dispatch is held (`local_capability_discovery_pending`) until the
+    //    probe has written its result, so nothing is scheduled against an
+    //    unverified host — and nothing is *failed* with "driver discovery
+    //    has not run" during the window either.
+    // 3. A probe that cannot write its result logs at `error` and leaves
+    //    the host with no `drivers-probed=true` row: driver-constrained
+    //    selection then reports `DriverProbeNotRun` loudly instead of
+    //    silently matching.
+    server_state
+        .execution_coordinator
+        .set_local_capability_discovery_pending(true);
+    if let Err(err) = server_state.work_db.clear_local_host_auto_capabilities() {
+        tracing::error!(
+            error = %format!("{err:#}"),
+            "startup: failed to clear the local host's stale auto capabilities before re-probing",
+        );
+    }
+    {
+        let state = server_state.clone();
+        tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            match state.work_db.refresh_local_host_auto_capabilities() {
+                Ok(refresh) => tracing::info!(
+                    capabilities = ?refresh.capabilities,
+                    driver_count = refresh.driver_count(),
+                    probe_ms = refresh.probe_elapsed.as_millis() as u64,
+                    total_ms = started.elapsed().as_millis() as u64,
+                    "startup: local host capability discovery complete; lifting the dispatch hold",
+                ),
+                Err(err) => {
+                    tracing::error!(
+                        error = %format!("{err:#}"),
+                        total_ms = started.elapsed().as_millis() as u64,
+                        "startup: local host capability discovery FAILED; the local host has no \
+                         verified capabilities, so driver-constrained dispatch will report \
+                         DriverProbeNotRun until the engine restarts",
+                    );
+                    // Belt and braces: make sure no stale row survived a
+                    // failed refresh so the failure stays visible.
+                    if let Err(err) = state.work_db.clear_local_host_auto_capabilities() {
+                        tracing::error!(
+                            error = %format!("{err:#}"),
+                            "startup: could not clear stale local auto capabilities after a failed probe",
+                        );
+                    }
+                }
+            }
+            state
+                .execution_coordinator
+                .set_local_capability_discovery_pending(false);
+            state.execution_coordinator.kick();
+        });
+    }
+    pre_bind.mark("local_capability_probe_spawned");
 
     let tmux_preflight = crate::tmux_preflight::TmuxPreflight::probe_with_socket(&server_state.tmux_socket_path).await;
     if let Some(reason) = tmux_preflight.unavailable_reason() {
@@ -732,6 +803,8 @@ pub async fn serve_with_overrides(
         }
     });
 
+    pre_bind.mark("tmux_preflight");
+
     // GitHub API usage telemetry: install the process-wide sink and start
     // its batching writer.
     //
@@ -749,6 +822,8 @@ pub async fn serve_with_overrides(
     // Tokio reactor.
     let _github_api_usage_handle =
         crate::github_api_usage::install(server_state.metrics.clone(), server_state.work_db.clone());
+
+    pre_bind.mark("github_api_usage_install");
 
     // A socket file with a live process behind it must never be unlinked;
     // only a crashed engine's leftover is safe to rebind. Same probe as the
@@ -769,6 +844,8 @@ pub async fn serve_with_overrides(
         ));
     }
 
+    pre_bind.mark("live_listener_check");
+
     // A Planner run can only be active inside this engine process. Recover
     // every durable `running` row after ruling out a live frontend owner but
     // before the replacement engine becomes reachable or installs Populator.
@@ -785,6 +862,8 @@ pub async fn serve_with_overrides(
         Ok(_) => tracing::debug!("no running planner runs to recover at startup"),
         Err(err) => tracing::error!(?err, "planner-run restart recovery failed; continuing"),
     }
+
+    pre_bind.mark("planner_run_recovery");
 
     // Always attempt to unlink any existing file at the path before
     // binding. `path.exists()` lies for dangling symlinks and races
@@ -824,6 +903,14 @@ pub async fn serve_with_overrides(
 
     tracing::info!(socket_path = %socket_path.display(), "frontend socket is ready");
     println!("boss-engine listening on {}", socket_path.display());
+    pre_bind.mark("frontend_socket_bind");
+    pre_bind.finish();
+
+    // Cold-start ledger, phase 2: everything between the frontend socket
+    // bind and its accept loop ("gap B"). The app can `connect()` during
+    // this phase but no request is answered until it ends, so a long step
+    // here is a connected-but-silent engine from the app's point of view.
+    let mut post_bind = crate::startup_timing::StartupTimeline::begin("post_bind");
 
     if let Some(path) = events_socket_path {
         let events_listener = match bind_events_socket(&path) {
@@ -843,6 +930,8 @@ pub async fn serve_with_overrides(
             run_events_accept_loop(events_listener, server_state_for_events).await;
         });
     }
+
+    post_bind.mark("events_socket");
 
     // First, sweep "ghost active" rows that the previous engine left
     // behind without ever spawning a worker — `tasks.status = 'active'`
@@ -883,6 +972,8 @@ pub async fn serve_with_overrides(
         }
     }
 
+    post_bind.mark("ghost_active_sweep");
+
     // Second, sweep any `queued`/`ready`/`waiting_dependency` execution
     // stranded against a work item that is already terminal (done/archived/
     // cancelled) or soft-deleted. These can only exist from a race the
@@ -905,6 +996,8 @@ pub async fn serve_with_overrides(
             tracing::error!(?err, "stranded-execution sweep failed; continuing");
         }
     }
+
+    post_bind.mark("stranded_execution_sweep");
 
     // Recover conflict-ladder attempts orphaned by the previous engine's
     // shutdown. The escalation ladder's mechanical rungs (0/1) run inline in
@@ -944,6 +1037,8 @@ pub async fn serve_with_overrides(
             tracing::error!(?err, "conflict-ladder orphan recovery sweep failed; continuing");
         }
     }
+
+    post_bind.mark("conflict_ladder_orphan_recovery");
 
     // Install boss-event to a stable location and heal existing worker
     // settings.json files. This ensures that hook paths baked into worker
@@ -1006,6 +1101,8 @@ pub async fn serve_with_overrides(
         }
     };
 
+    post_bind.mark("boss_event_install");
+
     // Heal existing worker settings files so a worker whose baked hook
     // path went stale (e.g. after a `bazel clean`) picks up the stable
     // boss-event path on the next engine restart. The settings files
@@ -1021,6 +1118,8 @@ pub async fn serve_with_overrides(
         crate::worker_setup::heal_worker_settings_json(&worker_settings_dir, &stable_boss_event_path);
     }
 
+    post_bind.mark("worker_settings_heal");
+
     // Reap cube workspace leases orphaned by a prior engine instance's
     // conflict-ladder rung-1 attempt (see the 2026-07-18 incident:
     // `crate::ladder_lease_reap`'s module doc comment has the full story).
@@ -1035,6 +1134,8 @@ pub async fn serve_with_overrides(
             "engine startup: reaped conflict-ladder rung-1 leases orphaned by a prior engine instance",
         );
     }
+
+    post_bind.mark("ladder_lease_reap");
 
     // Adopt tmux-hosted workers that survived the restart before the
     // cube-probe reconcile below gets a turn: enumerate the private `boss`
@@ -1102,6 +1203,8 @@ pub async fn serve_with_overrides(
         );
     }
 
+    post_bind.mark("tmux_adoption");
+
     // Rehydrate dispatch for any work items that were in "Doing"
     // (status=active) when the engine last shut down but whose
     // executions ended without being moved out of the column. See
@@ -1162,6 +1265,8 @@ pub async fn serve_with_overrides(
         }
     }
 
+    post_bind.mark("release_stale_claimed");
+
     let in_flight = match server_state.work_db.list_in_flight_executions() {
         Ok(rows) => rows
             .into_iter()
@@ -1198,6 +1303,8 @@ pub async fn serve_with_overrides(
         }
         report
     };
+    post_bind.mark("in_flight_cube_probe");
+
     // Union, not just the probe's own verdicts: a tmux-adopted execution was
     // filtered out of `in_flight` above (so it never got a cube-probe
     // verdict at all) but must still never be treated as stale — tmux
@@ -1223,6 +1330,8 @@ pub async fn serve_with_overrides(
             );
         }
     }
+
+    post_bind.mark("lease_reheartbeat");
 
     // Reap orphans before reconcile dispatch fires. For every Dead
     // verdict the cube probe returned, mark the execution row
@@ -1280,6 +1389,8 @@ pub async fn serve_with_overrides(
         }
     }
 
+    post_bind.mark("orphan_reap");
+
     // Re-drive pane spawn for Live `running` executions whose lease was
     // just re-adopted but whose pane was never issued (the previous
     // process died between `run_started` and `spawn_requested`). Runs
@@ -1294,6 +1405,8 @@ pub async fn serve_with_overrides(
             None,
         )
         .await;
+
+    post_bind.mark("unspawned_pane_reconcile");
 
     match server_state
         .work_db
@@ -1313,6 +1426,8 @@ pub async fn serve_with_overrides(
             tracing::error!(?err, "active-dispatch reconcile failed; continuing");
         }
     }
+
+    post_bind.mark("active_dispatch_reconcile");
 
     // Backfill design_doc_branch / doc_branch for in-review tasks whose PR
     // was detected before engine v1.0.135 (PR #1590). The fix in #1590 made
@@ -1780,6 +1895,8 @@ pub async fn serve_with_overrides(
         server_state.evidence_port.clone(),
     )
     .await;
+
+    post_bind.mark("background_loops_and_attachment_server");
 
     // Periodic evidence retention: reclaims stored screenshots past the age
     // window and the total-bytes backstop, and collects blobs no row
@@ -2313,6 +2430,8 @@ pub async fn serve_with_overrides(
         });
     }
 
+    post_bind.mark("remaining_loops_spawned");
+
     let coordinator = server_state.execution_coordinator.clone();
     coordinator.kick();
 
@@ -2346,6 +2465,8 @@ pub async fn serve_with_overrides(
         "frontend socket: accept loop started",
     );
     crate::audit::record_accept_loop_started("frontend", &socket_path);
+    post_bind.mark("accept_loop_start");
+    post_bind.finish();
 
     let shutdown_trigger_for_loop = server_state.shutdown_trigger.clone();
     let orphan_trigger_for_loop = orphan_trigger.clone();

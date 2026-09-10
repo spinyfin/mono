@@ -2173,6 +2173,16 @@ pub struct ExecutionCoordinator {
     /// cannot be dispatched until the engine has recorded a passing probe.
     #[builder(default)]
     dispatch_preflight_block_reason: std::sync::Mutex<Option<String>>,
+    /// `true` from engine startup until the local host's capability probe
+    /// has written its result. Startup clears the local host's stale `auto`
+    /// capability rows and then probes in the background so the frontend
+    /// socket can bind first; while this is set, `drain_ready_queue` holds
+    /// every execution instead of failing it with "driver discovery has
+    /// not run". Distinct from `dispatch_preflight_block_reason` so lifting
+    /// this hold can never lift a failed tmux preflight. See
+    /// [`crate::work::WorkDb::refresh_local_host_auto_capabilities`].
+    #[builder(default)]
+    local_capability_discovery_pending: AtomicBool,
     /// Global automation-pause flag — independent of `dispatch_paused`. When
     /// `true`: `drain_ready_queue` holds every execution bound for the
     /// automation pool (see [`Self::execution_targets_automation_pool`]),
@@ -2257,6 +2267,7 @@ mod execution;
 mod run;
 mod scheduler;
 
+pub use config::LOCAL_CAPABILITY_DISCOVERY_PENDING_REASON;
 pub use dispatch_admission::{PauseBypassOutcome, pause_bypass_decision};
 pub use run::PANE_SPAWN_FAILED_ATTENTION_KIND;
 pub use scheduler::ANSWER_AGENT_READY_AGE_ATTENTION_KIND;

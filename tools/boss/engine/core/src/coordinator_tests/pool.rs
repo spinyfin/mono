@@ -1486,6 +1486,56 @@ async fn force_dispatch_refuses_a_failed_startup_preflight() {
     assert!(error.to_string().contains("tmux 3.2 is required"));
 }
 
+/// Startup probes the local host's capabilities in the background after the
+/// socket binds. Until the probe has written its result, nothing may be
+/// dispatched — not even force-dispatched — and the hold must name itself.
+/// Lifting the hold must not lift a failed tmux preflight that shares the
+/// same gate.
+#[tokio::test]
+async fn local_capability_discovery_pending_holds_dispatch_until_cleared() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db,
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeExecutionRunner::default()),
+    ));
+    assert_eq!(coordinator.dispatch_preflight_block_reason(), None);
+
+    coordinator.set_local_capability_discovery_pending(true);
+    assert!(coordinator.local_capability_discovery_pending());
+    assert_eq!(
+        coordinator.dispatch_preflight_block_reason().as_deref(),
+        Some(crate::coordinator::LOCAL_CAPABILITY_DISCOVERY_PENDING_REASON),
+    );
+    let error = coordinator
+        .force_dispatch("exec-discovery-pending", DispatchAdmission::OperatorForced)
+        .await
+        .expect_err("force dispatch must wait for local capability discovery");
+    assert!(
+        error.to_string().contains("capability discovery has not completed"),
+        "hold must name itself: {error}"
+    );
+
+    // A failed runtime preflight takes precedence over the transient hold
+    // and must survive the hold being lifted.
+    coordinator.set_dispatch_preflight_block(Some("tmux 3.2 is required".to_owned()));
+    assert_eq!(
+        coordinator.dispatch_preflight_block_reason().as_deref(),
+        Some("tmux 3.2 is required"),
+    );
+    coordinator.set_local_capability_discovery_pending(false);
+    assert!(!coordinator.local_capability_discovery_pending());
+    assert_eq!(
+        coordinator.dispatch_preflight_block_reason().as_deref(),
+        Some("tmux 3.2 is required"),
+    );
+
+    coordinator.set_dispatch_preflight_block(None);
+    assert_eq!(coordinator.dispatch_preflight_block_reason(), None);
+}
+
 /// `force_dispatch`'s original bug: `claim_worker_force`'s pool-growth path
 /// always minted `worker-N` ids bounded by `MAX_WORKER_POOL_SIZE`, no matter
 /// which `WorkerPool` instance it was called on. Pin the fix directly at the
