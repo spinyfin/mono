@@ -409,6 +409,16 @@ fn stamped_events_socket_path(existing: Option<&Path>, bound: Option<&Path>) -> 
     }
 }
 
+/// Optional `serve` collaborators tests inject instead of production ones.
+#[derive(Default)]
+pub struct ServeOverrides {
+    /// Fake live-CI probe. `None` uses `CommandMergeProbe`.
+    pub merge_probe: Option<Arc<dyn crate::merge_poller::MergeProbe>>,
+    /// Shared worker pid map so a test can register its process as a
+    /// worker shell before a subprocess `boss` call is attributed.
+    pub worker_registry: Option<crate::worker_registry::WorkerRegistry>,
+}
+
 /// Same as [`serve`], but accepts an optional `MergeProbe` override, plumbed
 /// straight through to [`ServerState`]. Production callers (and most tests)
 /// go through `serve` and get the real `CommandMergeProbe`; tests that need
@@ -422,6 +432,32 @@ pub async fn serve_with_merge_probe(
     control_token_path: Option<std::path::PathBuf>,
     watched_parent_pid: Option<libc::pid_t>,
     merge_probe_override: Option<Arc<dyn crate::merge_poller::MergeProbe>>,
+) -> Result<()> {
+    serve_with_overrides(
+        cfg,
+        socket_path,
+        pid_file_path,
+        events_socket_path,
+        control_token_path,
+        watched_parent_pid,
+        ServeOverrides {
+            merge_probe: merge_probe_override,
+            worker_registry: None,
+        },
+    )
+    .await
+}
+
+/// Same as [`serve_with_merge_probe`], with a [`ServeOverrides`] bundle so
+/// callers can also inject a cloned [`crate::worker_registry::WorkerRegistry`].
+pub async fn serve_with_overrides(
+    cfg: Arc<RuntimeConfig>,
+    socket_path: std::path::PathBuf,
+    pid_file_path: Option<std::path::PathBuf>,
+    events_socket_path: Option<std::path::PathBuf>,
+    control_token_path: Option<std::path::PathBuf>,
+    watched_parent_pid: Option<libc::pid_t>,
+    overrides: ServeOverrides,
 ) -> Result<()> {
     let app_pid = current_parent_pid();
 
@@ -516,10 +552,11 @@ pub async fn serve_with_merge_probe(
         cfg.clone(),
         app_pid,
         control_token.clone(),
-        merge_probe_override,
+        overrides.merge_probe,
         None,
         None,
         None,
+        overrides.worker_registry,
     )?;
 
     let tmux_preflight = crate::tmux_preflight::TmuxPreflight::probe_with_socket(&server_state.tmux_socket_path).await;

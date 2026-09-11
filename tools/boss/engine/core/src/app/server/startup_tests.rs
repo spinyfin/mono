@@ -166,7 +166,8 @@ mod tmux_operator_prefix_tests {
                 .build(),
             None,
         ));
-        let state = ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, None, None, None, None).unwrap();
+        let state =
+            ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, None, None, None, None, None).unwrap();
 
         assert_eq!(
             state.tmux_operator_prefix(),

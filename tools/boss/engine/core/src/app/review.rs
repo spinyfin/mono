@@ -955,6 +955,7 @@ mod trunk_queue_tests {
             None,
             Some(trunk_client),
             direct_merge_executor,
+            None,
         )
         .unwrap();
         (state, temp)

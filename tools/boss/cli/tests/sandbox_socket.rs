@@ -1,21 +1,23 @@
-//! Grok scopes worker `$HOME` to a per-run process-home. The `boss` CLI
-//! used to resolve `engine.sock` from that fake home, miss the real engine,
-//! and wait 5s for a socket that will never appear. `--socket-path` at the
-//! production data dir is blocked by the path-guard hook.
-//!
-//! The fix is spawn-flow exporting the bound frontend socket as
-//! `BOSS_SOCKET_PATH`. These tests drive the compiled `boss` binary the way
-//! a Grok worker does: no `--socket-path`, `HOME` pointed at a process-home
-//! that has never contained `engine.sock`.
+//! The boss CLI resolves `engine.sock` relative to `$HOME` unless
+//! `BOSS_SOCKET_PATH` is set. Grok scopes worker `$HOME` to a per-run
+//! process-home that never contains `engine.sock`, so these tests drive the
+//! compiled `boss` binary the way a Grok worker does and assert both
+//! outcomes: success with `BOSS_SOCKET_PATH` set, and exit 5 without it.
+//! `--socket-path` at the production data dir is blocked by the path-guard
+//! hook; the bound frontend socket is how a worker reaches the engine.
 
 use std::process::Command;
 
 use anyhow::{Result, anyhow};
+use boss_client::BossClient;
+use boss_protocol::{
+    CreateExecutionInput, ExecutionKind, ExecutionStatus, ProposalKind, ProposalState, RunDoneOutcome,
+};
 use serde_json::Value;
 use tempfile::TempDir;
 
 use common::boss_binary;
-use harness::TestEngine;
+use harness::{TestEngine, create_chore, create_product};
 
 fn grok_process_home() -> Result<TempDir> {
     let home = tempfile::tempdir()?;
@@ -26,7 +28,12 @@ fn grok_process_home() -> Result<TempDir> {
     Ok(home)
 }
 
-fn boss_under_home(home: &std::path::Path, socket: Option<&str>, args: &[&str]) -> std::process::Output {
+fn boss_under_home(
+    home: &std::path::Path,
+    socket: Option<&str>,
+    run_id: Option<&str>,
+    args: &[&str],
+) -> std::process::Output {
     let mut cmd = Command::new(boss_binary());
     cmd.args(["--json", "--no-input", "--no-autostart", "--no-engine-autostart"])
         .args(args)
@@ -49,6 +56,14 @@ fn boss_under_home(home: &std::path::Path, socket: Option<&str>, args: &[&str]) 
             cmd.env_remove("BOSS_SOCKET_PATH");
         }
     }
+    match run_id {
+        Some(id) => {
+            cmd.env("BOSS_RUN_ID", id);
+        }
+        None => {
+            cmd.env_remove("BOSS_RUN_ID");
+        }
+    }
     cmd.output().expect("spawn boss")
 }
 
@@ -57,7 +72,7 @@ async fn boss_reaches_engine_from_grok_process_home_via_boss_socket_path() -> Re
     let engine = TestEngine::spawn().await?;
     let home = grok_process_home()?;
 
-    let output = boss_under_home(home.path(), Some(engine.socket_str()), &["product", "list"]);
+    let output = boss_under_home(home.path(), Some(engine.socket_str()), None, &["product", "list"]);
     if !output.status.success() {
         return Err(anyhow!(
             "boss product list under sandboxed HOME with BOSS_SOCKET_PATH failed (status={:?}):\nstdout: {}\nstderr: {}",
@@ -81,7 +96,7 @@ async fn boss_misses_engine_from_grok_process_home_without_boss_socket_path() ->
     // Engine is running, but the worker must not find it via the sandboxed HOME.
     let _ = engine.socket_str();
 
-    let output = boss_under_home(home.path(), None, &["product", "list"]);
+    let output = boss_under_home(home.path(), None, None, &["product", "list"]);
     assert_eq!(
         output.status.code(),
         Some(5),
@@ -100,6 +115,79 @@ async fn boss_misses_engine_from_grok_process_home_without_boss_socket_path() ->
             || combined.contains("failed to connect")
             || combined.contains("engine.sock"),
         "failure must name the missing engine socket, got: {combined}",
+    );
+    Ok(())
+}
+
+/// `boss propose done` from a Grok-scoped HOME: the CLI must reach the
+/// engine via `BOSS_SOCKET_PATH`, attribute the call through the worker
+/// registry's peer-pid walk (`BOSS_RUN_ID` is the cross-check), write a
+/// `worker_proposals` row, and stamp the terminal declaration on the
+/// execution.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boss_propose_done_from_grok_process_home_via_boss_socket_path() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let product = create_product(&mut client, "Boss").await?;
+    let chore = create_chore(&mut client, &product.id, "Sandbox propose done").await?;
+    let execution = engine.db()?.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::Ready)
+            .build(),
+    )?;
+    // The compiled `boss` child is a descendant of this test process. The
+    // engine walks the socket peer's ancestors to a registered worker pid,
+    // the same path a pane-spawned session uses.
+    engine.register_worker(std::process::id(), execution.id.clone());
+
+    let home = grok_process_home()?;
+    let output = boss_under_home(
+        home.path(),
+        Some(engine.socket_str()),
+        Some(&execution.id),
+        &[
+            "propose",
+            "done",
+            "--outcome",
+            "delivered",
+            "--summary",
+            "sandbox socket path reached the attributed propose-done path",
+        ],
+    );
+    if !output.status.success() {
+        return Err(anyhow!(
+            "boss propose done under sandboxed HOME with BOSS_SOCKET_PATH failed (status={:?}):\nstdout: {}\nstderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ));
+    }
+    let value: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        value["already_submitted"], false,
+        "first propose done must insert, not replay, got {value}"
+    );
+    assert_eq!(
+        value["proposal"]["kind"], "run_done",
+        "submitted proposal must be run_done, got {value}"
+    );
+
+    let db = engine.db()?;
+    let proposals = db.list_worker_proposals_for_execution(&execution.id, ProposalKind::RunDone)?;
+    assert_eq!(
+        proposals.len(),
+        1,
+        "exactly one run_done worker_proposals row, got {proposals:?}"
+    );
+    assert_eq!(proposals[0].execution_id, execution.id);
+    assert_eq!(proposals[0].work_item_id, Some(chore.id.clone()));
+    assert_eq!(proposals[0].state, ProposalState::Applied);
+    assert_eq!(
+        db.execution_run_done_outcome(&execution.id)?,
+        Some(RunDoneOutcome::Delivered),
+        "execution row must carry the terminal run_done declaration"
     );
     Ok(())
 }

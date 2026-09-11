@@ -124,7 +124,8 @@ rust_test(
 
 # Grok process-home sandbox: `boss` CLI verbs must reach the bound engine
 # via `BOSS_SOCKET_PATH` without `--socket-path` and without resolving
-# `engine.sock` from the fake `$HOME`.
+# `engine.sock` from the fake `$HOME`. Covers generic discovery (`product
+# list`) and the attributed `propose done` path.
 rust_test(
     name = "sandbox_socket_test",
     size = "small",
@@ -142,6 +143,9 @@ rust_test(
     deps = [
         ":common",
         ":harness",
+        "//tools/boss/client",
+        "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,

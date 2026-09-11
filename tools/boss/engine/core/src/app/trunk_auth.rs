@@ -274,9 +274,17 @@ mod tests {
                 .build(),
             None,
         ));
-        let state =
-            ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, None, Some(store), trunk_client, None)
-                .unwrap();
+        let state = ServerState::new_arc_with_app_pid_and_merge_probe(
+            cfg,
+            None,
+            None,
+            None,
+            Some(store),
+            trunk_client,
+            None,
+            None,
+        )
+        .unwrap();
         (state, temp)
     }
 

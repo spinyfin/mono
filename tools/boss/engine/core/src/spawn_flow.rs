@@ -760,8 +760,8 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     // scopes worker `HOME` to a per-run process-home; without this export
     // the `boss` CLI looks for a socket the engine has never created there,
     // and `--socket-path` at the production data dir is blocked by the
-    // path-guard hook. Claude and Codex keep the operator HOME today, but
-    // the same export makes every driver independent of that accident.
+    // path-guard hook. Claude and Codex currently keep the host HOME, but
+    // the same export makes every driver independent of that.
     if let Some(frontend_socket_path) = &input.frontend_socket_path {
         env.push(EnvVar {
             key: crate::config::FRONTEND_SOCKET_ENV.into(),
