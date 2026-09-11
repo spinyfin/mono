@@ -1087,7 +1087,7 @@ impl WorkerCompletionHandler {
                 // race rolled back in #1262. The on_stop path is safe
                 // because the Stop hook fires only when the worker
                 // completed a turn (real activity boundary, not a crash).
-                match self
+                let awaiting_declaration = match self
                     .evaluate_satisfied_deliverable_on_stop(execution_id, &execution, &pr_url, contribution_evidence)
                     .await
                 {
@@ -1098,11 +1098,9 @@ impl WorkerCompletionHandler {
                     // that is mid-investigation is exactly what must not be
                     // dogged here, and the backstop's first move is to hold
                     // quietly.
-                    SatisfiedDeliverableOutcome::AwaitingDeclaration => {
-                        return self.await_run_done_declaration(&execution, &pr_url).await;
-                    }
-                    SatisfiedDeliverableOutcome::NotSatisfied => {}
-                }
+                    SatisfiedDeliverableOutcome::AwaitingDeclaration => true,
+                    SatisfiedDeliverableOutcome::NotSatisfied => false,
+                };
                 // Sanctioned no-op terminal for a revision (the honest exit
                 // the gate above deliberately no longer manufactures). A
                 // revision that pushed nothing and emitted NO_CHANGES_NEEDED
@@ -1115,34 +1113,14 @@ impl WorkerCompletionHandler {
                 // stronger evidence (merged / queued / conflict cleared)
                 // wins where it applies.
                 if execution.kind == ExecutionKind::RevisionImplementation
-                    && self.worker_signalled_no_op(execution_id).await
+                    && let Some(outcome) = self
+                        .try_revision_no_op(&execution, &pr_url, contribution_evidence)
+                        .await
                 {
-                    // Same refusal the primary-implementation no-op gate
-                    // applies, for the same reason: an unobserved command
-                    // is exactly what undermines a "I checked, nothing is
-                    // needed" claim — Boss never saw whether the check ran.
-                    // `consume_unresolved` (not `list`) so one abandoned
-                    // command from turns ago cannot refuse every later
-                    // claim for the rest of a long multi-turn run.
-                    if self.staged_unobserved_commands.consume_unresolved(execution_id) {
-                        tracing::warn!(
-                            execution_id,
-                            bound_pr_url = %pr_url,
-                            "stop event: revision emitted NO_CHANGES_NEEDED but this run left a \
-                             command_execution unobserved since the gate last checked — refusing \
-                             the no-op claim; falling through to the nudge instead",
-                        );
-                    } else {
-                        tracing::info!(
-                            execution_id,
-                            bound_pr_url = %pr_url,
-                            "stop event: revision pushed nothing and declared NO_CHANGES_NEEDED — \
-                             closing it as a declared no-op (no PR, no nudge) and filing an \
-                             attention item so the unaddressed finding is visible",
-                        );
-                        self.file_revision_no_op_attention(&execution, &pr_url).await;
-                        return self.finalize_no_op_completion(&execution).await;
-                    }
+                    return outcome;
+                }
+                if awaiting_declaration {
+                    return self.await_run_done_declaration(&execution, &pr_url).await;
                 }
                 tracing::info!(
                     execution_id,
@@ -1198,8 +1176,8 @@ impl WorkerCompletionHandler {
                 // elsewhere: a Stop event only fires on real worker
                 // activity, never a crash. When the PR isn't satisfied yet
                 // (CI in flight/failing, or a conflict), return
-                // AwaitingInput quietly — no nudge — and let the next
-                // natural Stop (or a human/coordinator prompt) retry.
+                // a bounded completion-recheck probe. A silent return cannot
+                // rely on another natural Stop: the worker may have finished.
                 // `recheck_for_pr` (the periodic merge-poller sweep) does
                 // NOT run this check — it can't rule out a crashed worker —
                 // so it stays gated to the on-Stop path here.
@@ -1240,7 +1218,7 @@ impl WorkerCompletionHandler {
                     // because refusing would strand any revision whose
                     // dispatch-time snapshot failed in a state no Stop can
                     // ever finalize (the stuck-revision dead end).
-                    match self
+                    let awaiting_declaration = match self
                         .evaluate_satisfied_deliverable_on_stop(
                             execution_id,
                             &execution,
@@ -1250,25 +1228,37 @@ impl WorkerCompletionHandler {
                         .await
                     {
                         SatisfiedDeliverableOutcome::Finalized(outcome) => return outcome,
-                        // Same hand-off as the `NoContribution` arm above.
-                        // This arm matters more, not less: it is reached
-                        // when the SHA comparison could not be made at all,
-                        // so PR health was the *only* evidence — which is
-                        // precisely where a declaration is worth most.
-                        SatisfiedDeliverableOutcome::AwaitingDeclaration => {
-                            return self.await_run_done_declaration(&execution, &bound_pr_url).await;
-                        }
-                        SatisfiedDeliverableOutcome::NotSatisfied => {}
-                    }
+                        SatisfiedDeliverableOutcome::AwaitingDeclaration => true,
+                        SatisfiedDeliverableOutcome::NotSatisfied => false,
+                    };
+                    // Keep merged/queued completion precedence, but read the transcript
+                    // declaration before either waiting for proposals or requesting a retry.
                     tracing::info!(
                         execution_id,
-                        %bound_pr_url,
-                        pr_head_before_captured = execution.pr_head_before.is_some(),
-                        "stop event: revision_implementation with inconclusive SHA-delta gate and \
-                         deliverable not yet satisfied — skipping cold-path nudge to avoid a \
-                         push-to-existing-PR probe loop; will retry on the next Stop"
+                        awaiting_declaration,
+                        "stop event: SHA delta inconclusive; checking revision no-op after PR-health gate and before waiting"
                     );
-                    return StopOutcome::AwaitingInput;
+                    if let Some(outcome) = self
+                        .try_revision_no_op(&execution, &bound_pr_url, ContributionEvidence::Indeterminate)
+                        .await
+                    {
+                        return outcome;
+                    }
+                    if awaiting_declaration {
+                        return self.await_run_done_declaration(&execution, &bound_pr_url).await;
+                    }
+                    tracing::warn!(
+                        execution_id, %bound_pr_url,
+                        pr_head_before_captured = execution.pr_head_before.is_some(),
+                        "stop event: completion evidence inconclusive after no-op check; scheduling bounded recheck probe"
+                    );
+                    return self.nudge_or_park(
+                        &execution,
+                        &format!("The engine could not confirm completion for {bound_pr_url}: its head check was inconclusive and its deliverable check was not satisfied. Recheck the existing PR and report your current outcome. Do not create an empty commit or push unchanged code to satisfy this probe."),
+                        &format!("completion-inconclusive:{bound_pr_url}"),
+                        Some(&bound_pr_url),
+                        StopOutcome::AwaitingInput,
+                    ).await;
                 }
                 // No bound `chore.pr_url` resolvable. Fall through to the
                 // existing branch-keyed cold-path detector (new-PR flow).

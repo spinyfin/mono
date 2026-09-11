@@ -857,14 +857,9 @@ async fn revision_on_stop_sha_delta_contributed_finalizes_with_no_nudge() {
 }
 
 #[tokio::test]
-async fn revision_on_stop_sha_delta_api_failure_does_not_nudge() {
-    // Regression fix: when on_stop fires for a revision_implementation
-    // execution in waiting_human with pr_head_before set, but the GitHub
-    // API fails transiently (SHA-delta gate → Inapplicable), the engine
-    // must NOT queue a nudge probe. Queuing a probe causes the worker to
-    // respond, which fires another Stop, which nudges again — an infinite
-    // loop. Return AwaitingInput silently; the merge poller's recheck_for_pr
-    // will finalize once the API recovers.
+async fn revision_on_stop_sha_delta_api_failure_requests_completion_recheck() {
+    // A failed head check must schedule another completion opportunity.
+    // The bounded probe asks for a status recheck, never a cosmetic push.
     let workspace = tempdir().unwrap();
     let parent_pr_url = "https://github.com/spinyfin/mono/pull/1032";
     let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -886,15 +881,12 @@ async fn revision_on_stop_sha_delta_api_failure_does_not_nudge() {
         outcome,
         StopOutcome::AwaitingInput,
         "revision with pr_head_before set but transient SHA-delta failure must return \
-         AwaitingInput silently (no nudge loop); got {outcome:?}",
+         AwaitingInput with a bounded recheck; got {outcome:?}",
     );
-    // CRITICAL: no probe must be queued.
-    assert!(
-        probes.snapshot().is_empty(),
-        "revision must NOT be nudged when SHA-delta fails with pr_head_before set \
-         (regression guard); got {:?}",
-        probes.snapshot(),
-    );
+    let queued = probes.snapshot();
+    assert_eq!(queued.len(), 1);
+    assert!(queued[0].1.contains("Recheck the existing PR"));
+    assert!(queued[0].1.contains("Do not create an empty commit"));
     // Execution must still be waiting_human — not completed, not parked.
     let execution = db.get_execution(&execution_id).unwrap();
     assert_eq!(
@@ -1055,14 +1047,12 @@ async fn revision_on_stop_no_pr_head_before_snapshot_and_ci_not_ready_awaits_wit
     assert_eq!(
         outcome,
         StopOutcome::AwaitingInput,
-        "no baseline + CI not ready must await quietly, not finalize; got {outcome:?}",
+        "no baseline + CI not ready must request recheck, not finalize; got {outcome:?}",
     );
-    assert!(
-        probes.snapshot().is_empty(),
-        "no baseline + inconclusive PR state must NOT fall through to the \
-         push-to-existing-PR nudge (the stuck-revision failure mode); got {:?}",
-        probes.snapshot(),
-    );
+    let queued = probes.snapshot();
+    assert_eq!(queued.len(), 1);
+    assert!(queued[0].1.contains("Recheck the existing PR"));
+    assert!(queued[0].1.contains("Do not create an empty commit"));
     match db.get_work_item(&revision_id).unwrap() {
         WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::Active),
         other => panic!("expected task, got {other:?}"),

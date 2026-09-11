@@ -18,6 +18,48 @@ struct PaneParkedFailure<'a> {
 }
 
 impl WorkerCompletionHandler {
+    /// A worker's explicit no-op claim remains usable when GitHub cannot
+    /// establish a head delta. Never describe that as a measured empty diff.
+    pub(super) async fn try_revision_no_op(
+        &self,
+        execution: &crate::work::WorkExecution,
+        bound_pr_url: &str,
+        contribution: ContributionEvidence,
+    ) -> Option<StopOutcome> {
+        tracing::info!(execution_id = %execution.id, ?contribution,
+            "stop event: checking revision no-op before waiting for completion evidence");
+        if !self.worker_signalled_no_op(&execution.id).await {
+            return None;
+        }
+        if self.staged_unobserved_commands.consume_unresolved(&execution.id) {
+            tracing::warn!(execution_id = %execution.id,
+                "revision no-op: refusing claim after an unobserved command");
+            return None;
+        }
+        match self.work_db.get_revision_stop_contributed_head(&execution.id) {
+            Ok(Some(head)) if execution.pr_head_before.as_deref() != Some(head.as_str()) => {
+                tracing::warn!(execution_id = %execution.id,
+                    "revision no-op: refusing claim contradicted by an observed contribution");
+                return None;
+            }
+            Err(err) => {
+                tracing::warn!(execution_id = %execution.id, ?err,
+                    "revision no-op: contribution lookup failed; refusing unverified claim");
+                return None;
+            }
+            _ => {}
+        }
+        if let Err(err) = self
+            .file_revision_no_op_attention(execution, bound_pr_url, contribution)
+            .await
+        {
+            tracing::error!(execution_id = %execution.id, ?err,
+                "revision no-op: could not record declined finding; refusing silent completion");
+            return Some(StopOutcome::DbError);
+        }
+        Some(self.finalize_no_op_completion(execution).await)
+    }
+
     /// Finalize a sanctioned no-op completion: the worker verified its work
     /// is already done (empty diff, no PR produced and none bound), so the
     /// task is closed cleanly as `done` WITHOUT a PR and the execution is
@@ -97,41 +139,39 @@ impl WorkerCompletionHandler {
     /// Always filed, never conditional: this terminal is the one path on
     /// which a revision completes successfully with the finding
     /// unaddressed, so the human who asked for it has to be able to see
-    /// that it was declined rather than fixed. Best-effort — a filing
-    /// failure is logged and swallowed, exactly like the other attention
-    /// helpers here; it must never block the completion itself.
+    /// that it was declined rather than fixed. The caller must persist
+    /// this record before completing the execution.
     pub(super) async fn file_revision_no_op_attention(
         &self,
         execution: &crate::work::WorkExecution,
         bound_pr_url: &str,
-    ) {
+        contribution: ContributionEvidence,
+    ) -> Result<()> {
+        let evidence = match contribution {
+            ContributionEvidence::ProvenAbsent => {
+                "The bound PR's head SHA is unchanged from the dispatch-time snapshot."
+            }
+            ContributionEvidence::Indeterminate => {
+                "The engine could not establish a head delta (the baseline is unavailable or the GitHub head check was inconclusive). No observed contribution contradicted the worker's claim; absence of a push was not independently verified."
+            }
+        };
         let body = format!(
-            "This revision worker pushed no commits — the bound PR's head SHA is unchanged from \
-             the last known baseline (the dispatch-time snapshot, or a later baseline absorbed \
-             when a concurrently-active parent worker's push was observed) — and ended by emitting \
-             the sanctioned `NO_CHANGES_NEEDED` marker, its explicit claim that the review finding \
+            "This revision worker declared that it needed no code change, through the sanctioned \
+             `NO_CHANGES_NEEDED` marker or its run-done declaration. {evidence}\n\n\
+             This is the worker's explicit claim that the review finding \
              needs no code change.\n\n\
-             The revision has been closed as a declared no-op: no PR was opened, nothing was \
-             pushed, and the bound PR ({bound_pr_url}) is untouched. **The finding that produced \
-             this revision was therefore never addressed.** Read the worker's final message to \
+             The revision has been closed as a declared no-op against {bound_pr_url}. \
+             **The finding was declined rather than recorded as fixed.** Read the worker's final message to \
              judge whether declining it was right; re-dispatch the revision if it was not.\n\n\
              The execution's cube lease and worker slot have been released."
         );
-        if let Err(err) = self
-            .file_execution_attention(
-                execution,
-                REVISION_NO_OP_ATTENTION_KIND,
-                "Revision closed without addressing its finding",
-                body,
-            )
-            .await
-        {
-            tracing::warn!(
-                execution_id = %execution.id,
-                ?err,
-                "revision no-op: failed to file attention item; closing without a UI surface",
-            );
-        }
+        self.file_execution_attention(
+            execution,
+            REVISION_NO_OP_ATTENTION_KIND,
+            "Revision closed without addressing its finding",
+            body,
+        )
+        .await
     }
 
     /// Finalize an execution whose driver reported its own terminal turn
