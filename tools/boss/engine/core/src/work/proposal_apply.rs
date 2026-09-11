@@ -923,26 +923,13 @@ fn apply_pr_created(tx: &Transaction<'_>, execution_id: &str, payload_json: &str
 /// ([`WorkDb::execution_run_done_outcome`]), so a worker's declaration and
 /// the fact the engine gates on are the same commit.
 ///
-/// Unlike `pr_created`, this applier makes **no judgment about whether the
-/// claim is true**, and deliberately so — but what that buys the worker has
-/// changed. The declaration used to be a *necessary* condition only, never
-/// sufficient: it unblocked the Stop-boundary satisfied-deliverable gate's
-/// health-alone arm, which still ran its own evidence checks before
-/// finalizing anything. It is no longer only that. `app::proposals::handle_submit_proposal`
-/// now finalizes a `delivered` declaration with a resolvable PR
-/// (`completion::WorkerCompletionHandler::finalize_declared_delivery`)
-/// synchronously at submit, terminalizing the execution and advancing the
-/// task to `InReview` with **no SHA-delta / empty-diff / PR-health check in
-/// the loop** — see that function's module doc for why no network call may
-/// sit on this path. A worker that declares `delivered` having pushed
-/// nothing now DOES close its task immediately; the evidence checks this
-/// paragraph used to promise still run, but only as a non-blocking post-hoc
-/// audit (`spawn_declared_delivery_audit`) that can flag a contradicted
-/// declaration for a human, never reverse the completion. Validating the
-/// claim inside this applier would still be wrong — that inference belongs,
-/// if anywhere, in the synchronous finalize path above, not here — but do
-/// not read this function's unconditional stamp as proof the declaration
-/// is merely advisory.
+/// Unlike `pr_created`, this applier records the outcome atomically without
+/// validating delivery evidence. With the proposals seam enabled,
+/// `app::proposals::handle_submit_proposal` finalizes the accepted declaration
+/// after this commit. Evidence checks run after teardown as a non-blocking
+/// audit: they can flag a contradicted delivery but never reverse completion.
+/// Synchronous validation is intentionally forbidden here because it may
+/// require network I/O on the worker termination path.
 ///
 /// This is the only kind that is applicable to **every** execution kind: it
 /// records nothing about a PR, a task, or an automation, so a reviewer, an

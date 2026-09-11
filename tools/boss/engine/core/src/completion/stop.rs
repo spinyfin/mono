@@ -690,7 +690,7 @@ impl WorkerCompletionHandler {
                          declaration yet; declaration remains required — deferring staged \
                          finalization",
                     );
-                    return StopOutcome::AwaitingInput;
+                    return self.await_run_done_declaration(&execution, &staged_url).await;
                 }
                 return self
                     .finalize_pr_transition(

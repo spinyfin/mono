@@ -64,12 +64,9 @@
 //! stay exactly as designed, in `completion::metadata_gate` /
 //! `completion::stop`. They matter for:
 //!
-//! - a run that crashed or lost its channel between `apply_run_done`
-//!   committing and this module's finalize call running (the finalize call
-//!   happens after the RPC response is confirmed delivered — see
-//!   `app::proposals::handle_submit_proposal` — so a crash in that narrow
-//!   window is the one case a later Stop, or the merge poller, must still
-//!   recover);
+//! - a run that crashes between `apply_run_done` committing and this
+//!   module's finalize call returning. Submission finalizes regardless of
+//!   response delivery, so acknowledgement loss is not a recovery boundary;
 //! - a run that never calls `boss propose done` at all — the backstop's
 //!   hold/ask/park sequence is unchanged and is what catches those.
 
@@ -167,19 +164,6 @@ impl WorkerCompletionHandler {
     /// time either task runs, so a slow or failing `gh` call can delay those
     /// side effects, never a slot release.
     ///
-    /// [deferred-scope]: the background reviewer-enqueue path does not
-    /// replicate `finalize_pr_transition`'s pure-rebase-specific no-op nuance
-    /// (`check_pure_rebase_skip`, which reads the conflict/CI-fix attempt row)
-    /// — it only applies the plain SHA-unchanged / empty-diff / trivial-diff
-    /// checks. A `delivered` declaration for a pure-rebase push may therefore
-    /// consume one extra reviewer cycle it would have skipped on the
-    /// Stop-triggered path. It also does not replicate the followups /
-    /// attentions-questions reconciliation `finalize_pr_transition` performs:
-    /// proposal-submitted followups (`boss propose followup-task`) already
-    /// land synchronously at submission time regardless of this path (see
-    /// `proposal_apply::stage_followup_task_in_transaction`); the
-    /// artifact/transcript-backstop followup channels and the design-doc
-    /// questions detector do not yet run for a declared-delivery completion.
     async fn finalize_declared_delivery(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
         let Some(pr_url) = self.resolve_declared_pr_url_no_network(execution) else {
             return self.finalize_declared_delivery_without_pr(execution).await;
@@ -191,25 +175,32 @@ impl WorkerCompletionHandler {
         let workspace_path = execution.workspace_path.clone();
         // Marked before the terminalizing write — see `super::teardown`.
         let teardown = self.begin_teardown(&execution.id);
-        let completion = match self.work_db.record_worker_pr_completion(
-            &execution.id,
-            &pr_url,
-            None,
-            None,
-            WorkerPrCompletionTarget::InReview,
-            None,
-        ) {
-            Ok(Some(completion)) => completion,
-            Ok(None) => return StopOutcome::AlreadyTerminal,
-            Err(err) => {
-                tracing::error!(
-                    execution_id = %execution.id,
-                    ?err,
-                    "run_done finalize (delivered): failed to record PR completion",
-                );
-                return StopOutcome::DbError;
-            }
+        // The local completion write must preserve the same hold used by
+        // Stop-triggered reviewer admission. Network-dependent refinement
+        // and enqueue happen after teardown below.
+        let reviewer_triggering = should_enqueue_reviewer_for_primary(&execution.kind)
+            || (execution.kind == ExecutionKind::RevisionImplementation && self.enable_revision_triggered_reviews);
+        let target = if reviewer_triggering {
+            WorkerPrCompletionTarget::PendingReview
+        } else {
+            WorkerPrCompletionTarget::InReview
         };
+        let completion =
+            match self
+                .work_db
+                .record_worker_pr_completion(&execution.id, &pr_url, None, None, target, None)
+            {
+                Ok(Some(completion)) => completion,
+                Ok(None) => return StopOutcome::AlreadyTerminal,
+                Err(err) => {
+                    tracing::error!(
+                        execution_id = %execution.id,
+                        ?err,
+                        "run_done finalize (delivered): failed to record PR completion",
+                    );
+                    return StopOutcome::DbError;
+                }
+            };
         self.staged_pr_urls.forget(&execution.id);
         self.nudge_breaker.forget(&execution.id);
         self.build_wait_tracker.forget(&execution.id);
@@ -617,6 +608,7 @@ async fn maybe_enqueue_declared_delivery_reviewer(
             status: None,
             resolved_at: None,
         });
+        let _ = work_db.advance_pending_review_task_to_in_review(work_item_id);
         return;
     }
 
@@ -631,6 +623,7 @@ async fn maybe_enqueue_declared_delivery_reviewer(
                     work_item_id,
                     "run_done post-effects: pr_review noop skip (sha_unchanged)"
                 );
+                let _ = work_db.advance_pending_review_task_to_in_review(work_item_id);
                 return;
             }
             Ok(current_head) => match branch_verifier
@@ -639,6 +632,7 @@ async fn maybe_enqueue_declared_delivery_reviewer(
             {
                 Ok(0) => {
                     tracing::info!(work_item_id, "run_done post-effects: pr_review noop skip (empty_diff)");
+                    let _ = work_db.advance_pending_review_task_to_in_review(work_item_id);
                     return;
                 }
                 Ok(diff_lines) if min_review_changed_lines > 0 && diff_lines < min_review_changed_lines => {
@@ -646,6 +640,7 @@ async fn maybe_enqueue_declared_delivery_reviewer(
                         work_item_id,
                         "run_done post-effects: pr_review noop skip (trivial_diff)"
                     );
+                    let _ = work_db.advance_pending_review_task_to_in_review(work_item_id);
                     return;
                 }
                 Ok(_) => {}
@@ -691,6 +686,7 @@ async fn maybe_enqueue_declared_delivery_reviewer(
                         ?err,
                         "run_done post-effects: failed to create legacy reviewer after batch failure",
                     );
+                    let _ = work_db.advance_pending_review_task_to_in_review(work_item_id);
                 }
             }
         }
@@ -700,15 +696,12 @@ async fn maybe_enqueue_declared_delivery_reviewer(
             ?err,
             "run_done post-effects: failed to create legacy pr_review execution"
         );
+        let _ = work_db.advance_pending_review_task_to_in_review(work_item_id);
     }
 }
 
-/// Doc-link auto-population for a declared-delivery completion — the
-/// background counterpart to the per-task / per-project doc-link block in
-/// [`super::pr_transition::WorkerCompletionHandler::finalize_pr_transition`].
-/// Does not perform the attentions-questions / followups reconciliation that
-/// function also runs — see
-/// [`WorkerCompletionHandler::finalize_declared_delivery`]'s doc.
+/// Doc-link and design-question reconciliation for a declared-delivery
+/// completion, after the local termination write has completed.
 async fn run_declared_delivery_doc_link_detection(
     work_db: &crate::work::WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -733,5 +726,7 @@ async fn run_declared_delivery_doc_link_detection(
         publisher
             .publish_work_item_changed(&task.product_id, &task.id, "design_doc_pointer_set")
             .await;
+
+        let _ = attentions_detector::reconcile_design_doc_questions(work_db, &task.id, project_id, pr_url, false).await;
     }
 }

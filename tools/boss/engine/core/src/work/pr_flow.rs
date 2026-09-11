@@ -84,7 +84,7 @@ impl WorkDb {
             WorkerPrCompletionTarget::InReview if task.status == TaskStatus::InReview => task.status.clone(),
             WorkerPrCompletionTarget::InReview => TaskStatus::InReview,
             WorkerPrCompletionTarget::Done => TaskStatus::Done,
-            // P992: hold in current status while the reviewer runs.
+            // Hold the task in its current status while the automated reviewer runs.
             WorkerPrCompletionTarget::PendingReview => task.status.clone(),
             // incident-002 P2: halt in `blocked` pending operator sign-off.
             WorkerPrCompletionTarget::BlockedDeletionSignoff => TaskStatus::Blocked,
@@ -1610,7 +1610,7 @@ impl WorkDb {
     /// the end of the most recent pass, or `None` if no pass has completed yet.
     ///
     /// Used by the cycle-bound check in [`crate::completion::WorkerCompletionHandler`]
-    /// before enqueuing a new `pr_review` execution. P992 design §7, task 9.
+    /// before enqueuing a new `pr_review` execution.
     pub fn get_task_review_cycle_state(&self, task_id: &str) -> Result<(i64, Option<String>)> {
         let conn = self.connect()?;
         conn.query_row(
@@ -1627,7 +1627,7 @@ impl WorkDb {
     /// after a `pr_review` execution completes, regardless of whether a
     /// revision was warranted. A missing or empty `last_reviewed_sha` records
     /// `NULL` (the reviewer could not determine the HEAD SHA).
-    /// P992 design §7, task 9.
+    /// The cycle state is shared by a task and its revisions.
     pub fn increment_task_review_cycle(&self, task_id: &str, last_reviewed_sha: Option<&str>) -> Result<()> {
         let conn = self.connect()?;
         let rows = conn.execute(

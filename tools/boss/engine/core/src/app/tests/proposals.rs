@@ -652,7 +652,9 @@ async fn accepted_run_done_delivered_immediately_terminalizes_a_bound_pr() {
     );
     assert_eq!(
         task_status(&server_state, &work_item_id),
-        boss_protocol::TaskStatus::InReview
+        // PendingReview is represented by active plus the bound PR while
+        // the asynchronous reviewer-admission path is still deciding.
+        boss_protocol::TaskStatus::Active
     );
 }
 

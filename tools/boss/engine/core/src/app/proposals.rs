@@ -534,10 +534,10 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                         // after a successful commit previously left the
                         // declaration applied but never finalized — the
                         // exact stranded-live-execution failure mode this
-                        // seam exists to close — because neither a later
-                        // Stop (still gated on a network-touching evidence
-                        // check) nor the merge poller (`recheck_for_pr` never
-                        // reads a run_done declaration) actually recovers it.
+                        // seam exists to close. Submission is the primary
+                        // path; recheck can recover a delivered staged URL,
+                        // while blocked, no-changes-needed, and no-PR
+                        // deliveries have no poller recovery.
                         let delivery_outcome =
                             tokio::time::timeout(std::time::Duration::from_secs(10), response_delivery).await;
                         match &delivery_outcome {
