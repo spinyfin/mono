@@ -31,6 +31,10 @@ pub async fn run(cli: Cli) -> Result<()> {
     } else {
         work.tmux_socket_path = Some(crate::config::tmux_socket_path_beside_db(&work.db_path)?);
     }
+    // The socket this process is about to bind, not `$BOSS_SOCKET_PATH` /
+    // `$HOME`. Workers inherit this as `BOSS_SOCKET_PATH` so a driver that
+    // scopes `$HOME` (Grok) still reaches this engine.
+    work.frontend_socket_path = Some(socket_path.clone());
     let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(work, None));
 
     run_server(cli, cfg, isolation).await
@@ -429,9 +433,14 @@ pub async fn serve_with_merge_probe(
     // path alongside a config built without one. See
     // [`stamped_events_socket_path`] for the merge rule.
     let stamped = stamped_events_socket_path(cfg.work.events_socket_path.as_deref(), events_socket_path.as_deref());
-    let cfg = if stamped.as_deref() != cfg.work.events_socket_path.as_deref() {
+    let events_changed = stamped.as_deref() != cfg.work.events_socket_path.as_deref();
+    let frontend_changed = cfg.work.frontend_socket_path.as_deref() != Some(socket_path.as_path());
+    let cfg = if events_changed || frontend_changed {
         let mut work = cfg.work.clone();
-        work.events_socket_path = stamped;
+        if events_changed {
+            work.events_socket_path = stamped;
+        }
+        work.frontend_socket_path = Some(socket_path.clone());
         Arc::new(cfg.with_work(work))
     } else {
         cfg

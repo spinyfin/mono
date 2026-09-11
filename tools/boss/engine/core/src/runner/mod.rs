@@ -201,6 +201,20 @@ pub fn bound_events_socket_path(cfg: &RuntimeConfig) -> PathBuf {
     }
 }
 
+/// Frontend (control) socket this engine bound — exported to workers as
+/// `BOSS_SOCKET_PATH`.
+///
+/// Unlike [`bound_events_socket_path`], this does **not** fall back to
+/// `$BOSS_SOCKET_PATH` / `$HOME` when the config has no stamp. A spawn that
+/// re-derived the path from the environment would hand Grok workers (and
+/// any fixture) the production control socket: Grok scopes `$HOME`, and a
+/// fixture that isolated its own bind would still leak. `None` means "do
+/// not export"; [`crate::spawn_flow::start_worker`] then leaves the CLI
+/// on its default HOME-relative discovery.
+pub fn bound_frontend_socket_path(cfg: &RuntimeConfig) -> Option<PathBuf> {
+    cfg.work.frontend_socket_path.clone()
+}
+
 /// Resolve the events socket from the environment: `BOSS_EVENTS_SOCKET` if
 /// set, otherwise the production `~/Library/Application Support/Boss`
 /// location.

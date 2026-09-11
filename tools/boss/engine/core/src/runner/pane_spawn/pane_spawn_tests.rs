@@ -188,6 +188,7 @@ fn spawn_test_env(
         crate::config::WorkConfig::builder()
             .cwd(workspace.path().to_path_buf())
             .db_path(workspace.path().join("state.db"))
+            .frontend_socket_path(workspace.path().join("engine.sock"))
             .build(),
     );
     let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
@@ -967,6 +968,13 @@ async fn spawn_env_carries_sanitized_path_and_engine_keys() {
         input.env.iter().any(|EnvVar { key, .. }| key == "BOSS_EVENTS_SOCKET"),
         "expected BOSS_EVENTS_SOCKET to be set"
     );
+    assert!(
+        input
+            .env
+            .iter()
+            .any(|EnvVar { key, .. }| key == crate::config::FRONTEND_SOCKET_ENV),
+        "expected BOSS_SOCKET_PATH to be set so `boss` CLI verbs reach this engine from a scoped HOME"
+    );
 }
 
 /// Workers must be told about the socket the engine actually bound, which
@@ -1033,6 +1041,52 @@ async fn spawn_env_uses_the_bound_socket_from_config_not_the_environment() {
     );
 }
 
+/// Workers must inherit the frontend socket this engine bound as
+/// `BOSS_SOCKET_PATH`, not a HOME-relative default. Grok scopes `$HOME` to a
+/// per-run process-home; without this export `boss propose` looks for
+/// `engine.sock` inside that sandbox.
+#[tokio::test]
+async fn spawn_env_exports_the_bound_frontend_socket_as_boss_socket_path() {
+    let workspace = TempDir::new().unwrap();
+    let bound = workspace.path().join("boss-test-fixture.sock");
+
+    let (spawner, weak, _cfg, work_db) = spawn_test_env(&workspace);
+    let cfg = test_runtime_config(
+        crate::config::WorkConfig::builder()
+            .cwd(workspace.path().to_path_buf())
+            .db_path(workspace.path().join("state.db"))
+            .frontend_socket_path(bound.clone())
+            .build(),
+    );
+    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db, flags);
+    runner.set_server_state(weak);
+    runner
+        .run_execution(
+            "worker-1",
+            &sample_execution(workspace.path()),
+            &sample_chore(),
+            workspace.path(),
+            Some("change-1"),
+        )
+        .await
+        .unwrap();
+
+    let input = spawner.spawn_input();
+    let socket = input
+        .env
+        .iter()
+        .find(|EnvVar { key, .. }| key == crate::config::FRONTEND_SOCKET_ENV)
+        .expect("BOSS_SOCKET_PATH must be set on every worker spawn when the config stamped a frontend socket");
+    assert_eq!(
+        socket.value,
+        bound.display().to_string(),
+        "workers must be pointed at the frontend socket this engine bound",
+    );
+}
+
 #[test]
 fn bound_events_socket_path_prefers_the_config_over_the_environment() {
     let work = crate::config::WorkConfig::builder()
@@ -1042,6 +1096,28 @@ fn bound_events_socket_path_prefers_the_config_over_the_environment() {
         .build();
     let cfg = crate::config::RuntimeConfig::from_parts(work, None);
     assert_eq!(bound_events_socket_path(&cfg), PathBuf::from("/tmp/bound.events.sock"));
+}
+
+#[test]
+fn bound_frontend_socket_path_returns_the_config_stamp_and_not_an_env_fallback() {
+    let work = crate::config::WorkConfig::builder()
+        .cwd(PathBuf::from("/tmp"))
+        .db_path(PathBuf::from("/tmp/state.db"))
+        .frontend_socket_path(PathBuf::from("/tmp/bound.sock"))
+        .build();
+    let cfg = crate::config::RuntimeConfig::from_parts(work, None);
+    assert_eq!(bound_frontend_socket_path(&cfg), Some(PathBuf::from("/tmp/bound.sock")));
+
+    let unstamped = crate::config::WorkConfig::builder()
+        .cwd(PathBuf::from("/tmp"))
+        .db_path(PathBuf::from("/tmp/state.db"))
+        .build();
+    let cfg = crate::config::RuntimeConfig::from_parts(unstamped, None);
+    assert_eq!(
+        bound_frontend_socket_path(&cfg),
+        None,
+        "an unstamped config must not fall back to $BOSS_SOCKET_PATH / $HOME"
+    );
 }
 
 /// Only the "this engine bound no events socket" shape (in-process
