@@ -97,6 +97,22 @@ impl WorkerCompletionHandler {
                 );
                 return StopOutcome::AwaitingInput;
             }
+            // The declaration remains required (design doc, "Run
+            // completion"): a captured/verified PR URL is evidence the PR
+            // exists, never that the worker declared the run over. Scoped
+            // to the non-revision arm, mirroring
+            // `evaluate_satisfied_deliverable_on_stop`'s health-alone gate.
+            if execution.kind != ExecutionKind::RevisionImplementation
+                && !self.primary_staged_url_may_finalize(execution_id)
+            {
+                tracing::info!(
+                    execution_id,
+                    pr_url = %staged_url,
+                    "pr-recheck: staged PR URL present but no `delivered` run_done declaration \
+                     yet; declaration remains required — deferring staged finalization",
+                );
+                return StopOutcome::AwaitingInput;
+            }
             tracing::info!(
                 execution_id,
                 pr_url = %staged_url,

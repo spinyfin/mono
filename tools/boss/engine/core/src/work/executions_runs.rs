@@ -1438,7 +1438,7 @@ impl WorkDb {
     /// Stamp `revision_stop_contributed_head` to record that
     /// `on_stop_inner`'s SHA-delta `Contributed` arm observed `sha` as the
     /// current PR head for a `revision_implementation` execution. Used by
-    /// `recheck_for_pr` as the T848 recovery gate: it only finalizes when the
+    /// `recheck_for_pr` as the exact-head recovery gate: it only finalizes when the
     /// current head matches this stamped value — not on any arbitrary head
     /// movement from a concurrently-active parent worker.
     pub fn set_revision_stop_contributed_head(&self, execution_id: &str, sha: &str) -> Result<()> {

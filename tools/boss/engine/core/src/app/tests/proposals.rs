@@ -569,6 +569,12 @@ async fn accepted_review_report_reaps_a_real_worker_process() {
 /// machinery at all).
 fn live_chore_execution() -> (Arc<ServerState>, tempfile::TempDir, String, String) {
     let (server_state, dir) = test_server_state_with_fakes();
+    // Every test using this fixture exercises the `run_done` synchronous
+    // finalize path, which `handle_submit_proposal` only takes with both
+    // halves of the seam's kill switch on — see
+    // `finalize_run_done_declaration`'s gate in `app::proposals`.
+    server_state.feature_flags.set("worker_proposals", true).unwrap();
+    server_state.feature_flags.set("run_done_proposals_seam", true).unwrap();
     let (execution_id, work_item_id) = new_execution(&server_state, "Run-done target");
     server_state
         .work_db
@@ -809,6 +815,58 @@ async fn accepted_run_done_delivered_reaps_a_real_worker_process_without_network
         !status.success(),
         "the run_done finalize must have actually reaped the worker's real process — a no-op \
          releaser (or one that only ever ran against a fake) would leave it running"
+    );
+}
+
+/// With the `run_done_proposals_seam` kill switch off, an accepted
+/// `run_done` proposal must still apply (the durable stamp is
+/// unconditional — see `apply_run_done`'s doc comment) but must NOT tear
+/// the worker down or advance the task synchronously: that decision
+/// belongs to the legacy health-alone read inside the Stop-boundary
+/// satisfied-deliverable gate, not to this RPC path. Without this gate the
+/// flag is not actually a kill switch, contrary to its documented purpose
+/// and to every other `worker_proposals`-gated read site.
+#[tokio::test]
+async fn accepted_run_done_delivered_does_not_finalize_with_the_seam_off() {
+    let (server_state, _dir, execution_id, work_item_id) = live_chore_execution();
+    server_state
+        .feature_flags
+        .set("run_done_proposals_seam", false)
+        .unwrap();
+    set_task_pr_url(&server_state, &work_item_id, "https://github.com/example/repo/pull/9");
+    let peer_pid = std::process::id() as libc::pid_t;
+
+    let (proposal, _) = submitted(
+        call_with_peer(
+            &server_state,
+            Some(peer_pid),
+            submit_request(
+                &execution_id,
+                ProposalKind::RunDone,
+                json!({"outcome": "delivered", "summary": "Shipped it"}),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(
+        proposal.state,
+        ProposalState::Applied,
+        "the stamp itself is unconditional regardless of the seam flag"
+    );
+    assert!(
+        server_state
+            .work_db
+            .get_execution(&execution_id)
+            .unwrap()
+            .status
+            .is_live(),
+        "with the seam off, the RPC path must not terminalize the execution — that decision is \
+         still the legacy Stop-boundary gate's to make"
+    );
+    assert_eq!(
+        server_state.work_db.execution_run_done_outcome(&execution_id).unwrap(),
+        Some(boss_protocol::RunDoneOutcome::Delivered),
+        "the declaration must still be readable by the legacy gate"
     );
 }
 

@@ -1059,7 +1059,11 @@ fn pr_terminal_directive(seam_enabled: bool) -> String {
             "Opening the PR is the LAST thing you do. The engine reaps you immediately after the PR is created.\n\n",
         );
     }
-    out.push_str(&format!("You will NOT get another turn after `gh pr create` / `{cube} pr create` (or `{cube} pr update` for an existing PR). Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR while background work (parallel/sub-agent runs, backgrounded builds, code reviews) is still in flight expecting to consume its results.\n\n"));
+    if seam_enabled {
+        out.push_str(&format!("You will NOT get another turn after `{boss} propose done` (see below) — not after `gh pr create` / `{cube} pr create` / `{cube} pr update` themselves, those still give you a turn so you can go on to declare done. Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR while background work (parallel/sub-agent runs, backgrounded builds, code reviews) is still in flight expecting to consume its results.\n\n"));
+    } else {
+        out.push_str(&format!("You will NOT get another turn after `gh pr create` / `{cube} pr create` (or `{cube} pr update` for an existing PR). Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR while background work (parallel/sub-agent runs, backgrounded builds, code reviews) is still in flight expecting to consume its results.\n\n"));
+    }
     out.push_str("Therefore: finish everything — including consuming any review/self-review findings you started — BEFORE you open the PR. If a background review is still running and you care about its results, wait for it and address all findings FIRST, then open the PR. If you don't intend to wait, don't start the review.\n");
     out
 }
@@ -1189,14 +1193,15 @@ pub(crate) fn worker_escalation_protocol_directive(seam_enabled: bool) -> String
 /// terminate without creating anything the engine can point at — precisely
 /// the runs whose ending was previously guessed at.
 ///
-/// The declaration now ends the run synchronously the instant it is
-/// accepted (`completion::run_done_declaration` finalizes it at submit, no
-/// turn boundary needed), so it must come *after* the push, not before —
-/// the reverse of the ordering an earlier version of this directive taught,
-/// from back when the push alone could reap a worker (see
-/// [`pr_terminal_directive`]). And not declaring is no shortcut to being
-/// left alone: the wording states the real consequence — held, then asked,
-/// then parked for a human, never quietly successful.
+/// The declaration ends the run synchronously the instant it is accepted
+/// (`completion::run_done_declaration` finalizes it at submit, no turn
+/// boundary needed) — the worker gets no turn after the call commits, not
+/// even to see the response. It must therefore come *after* the push, as
+/// the very last tool call of the run: declaring first would end the run
+/// before the push ever happens (see [`pr_terminal_directive`]). And not
+/// declaring is no shortcut to being left alone: the wording states the
+/// real consequence — held, then asked, then parked for a human, never
+/// quietly successful.
 pub(crate) fn run_done_directive(seam_enabled: bool) -> String {
     if !seam_enabled {
         return String::new();

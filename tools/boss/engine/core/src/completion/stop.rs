@@ -677,6 +677,21 @@ impl WorkerCompletionHandler {
                      falling through to SHA-delta / no-op / nudge path (incident-004 AI-3)",
                 );
             } else {
+                // The declaration remains required (design doc, "Run
+                // completion"): a captured/verified PR URL is evidence the
+                // PR exists, never that the worker declared the run over.
+                // Mirrors `recheck_for_pr`'s identical primary-arm gate and
+                // `evaluate_satisfied_deliverable_on_stop`'s health-alone gate.
+                if !self.primary_staged_url_may_finalize(execution_id) {
+                    tracing::info!(
+                        execution_id,
+                        pr_url = %staged_url,
+                        "stop event: staged PR URL present but no `delivered` run_done \
+                         declaration yet; declaration remains required — deferring staged \
+                         finalization",
+                    );
+                    return StopOutcome::AwaitingInput;
+                }
                 return self
                     .finalize_pr_transition(
                         execution_id,

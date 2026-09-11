@@ -417,8 +417,21 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
             // replay — including one landing after a crash between apply and
             // the finalize call below — must still reach it rather than
             // silently leaving the slot held.
-            let finalize_run_done_declaration =
-                kind == ProposalKind::RunDone && proposal.state == boss_protocol::ProposalState::Applied;
+            // Gated on the same `worker_proposals` master flag +
+            // `run_done_proposals_seam` pair every other read site for this
+            // seam checks (`metadata_gate.rs`, `worker_signals.rs`,
+            // `pane_spawn.rs`): with the seam off, a `run_done` proposal
+            // still applies (the durable stamp `apply_run_done` writes is
+            // unconditional — see its doc comment) but must not tear the
+            // worker down or advance task state synchronously here. It
+            // falls back to the pre-existing health-alone read of the stamp
+            // inside the Stop-boundary satisfied-deliverable gate instead,
+            // exactly as it did before this seam's synchronous finalize
+            // existed.
+            let finalize_run_done_declaration = kind == ProposalKind::RunDone
+                && proposal.state == boss_protocol::ProposalState::Applied
+                && server_state.feature_flags.is_enabled("worker_proposals")
+                && server_state.feature_flags.is_enabled("run_done_proposals_seam");
             // Mirror completion.rs's legacy marker-detector paths
             // (`file_worker_signal_attention` / `record_deferred_scope_item`):
             // both publish `AttentionItemCreated` on the work item's product
@@ -513,31 +526,44 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
             } else if finalize_run_done_declaration {
                 match serde_json::from_str::<boss_protocol::RunDoneProposalPayload>(&validated.canonical_json) {
                     Ok(run_done_payload) => {
-                        match tokio::time::timeout(std::time::Duration::from_secs(10), response_delivery).await {
-                            Ok(Ok(true)) => {
-                                let stop_outcome = server_state
-                                    .completion_handler
-                                    .finalize_declared_run_done(&caller.execution_id, run_done_payload.outcome)
-                                    .await;
-                                tracing::info!(
-                                    execution_id = %caller.execution_id,
-                                    outcome = %run_done_payload.outcome,
-                                    ?stop_outcome,
-                                    "run_done proposal accepted: finalized synchronously at submit",
-                                );
-                            }
-                            Ok(Ok(false)) | Ok(Err(_)) => tracing::error!(
+                        // `apply_run_done` already committed the durable
+                        // stamp before this code runs; `finalize_declared_run_done`
+                        // re-checks liveness itself and is idempotent, so it
+                        // must run regardless of whether the ack below was
+                        // delivered. A disconnected/backpressured client
+                        // after a successful commit previously left the
+                        // declaration applied but never finalized — the
+                        // exact stranded-live-execution failure mode this
+                        // seam exists to close — because neither a later
+                        // Stop (still gated on a network-touching evidence
+                        // check) nor the merge poller (`recheck_for_pr` never
+                        // reads a run_done declaration) actually recovers it.
+                        let delivery_outcome =
+                            tokio::time::timeout(std::time::Duration::from_secs(10), response_delivery).await;
+                        match &delivery_outcome {
+                            Ok(Ok(true)) => {}
+                            Ok(Ok(false)) | Ok(Err(_)) => tracing::warn!(
                                 execution_id = %caller.execution_id,
-                                "accepted run_done proposal response was not delivered; finalize skipped — \
-                                 the execution stays live for a later Stop or the merge poller to recover",
+                                "accepted run_done proposal response was not delivered; finalizing anyway — \
+                                 the declaration's write is already durable and finalize is idempotent",
                             ),
-                            Err(_) => tracing::error!(
+                            Err(_) => tracing::warn!(
                                 execution_id = %caller.execution_id,
-                                "timed out waiting for accepted run_done proposal response delivery; finalize \
-                                 skipped — the execution stays live for a later Stop or the merge poller to \
-                                 recover",
+                                "timed out waiting for accepted run_done proposal response delivery; finalizing \
+                                 anyway — the declaration's write is already durable and finalize is idempotent",
                             ),
                         }
+                        let stop_outcome = server_state
+                            .completion_handler
+                            .finalize_declared_run_done(&caller.execution_id, run_done_payload.outcome)
+                            .await;
+                        tracing::info!(
+                            execution_id = %caller.execution_id,
+                            outcome = %run_done_payload.outcome,
+                            delivered = matches!(delivery_outcome, Ok(Ok(true))),
+                            ?stop_outcome,
+                            "run_done proposal accepted: finalized synchronously at submit",
+                        );
                     }
                     Err(err) => tracing::error!(
                         execution_id = %caller.execution_id,

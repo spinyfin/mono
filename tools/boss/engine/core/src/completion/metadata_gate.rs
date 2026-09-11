@@ -832,4 +832,42 @@ impl WorkerCompletionHandler {
             }
         }
     }
+
+    /// Whether a purely evidence-based finalize (a captured/verified PR URL,
+    /// with no run_done declaration behind it) may carry the decision for a
+    /// non-revision ("primary") execution right now.
+    ///
+    /// Shares the exact `worker_proposals` + `run_done_proposals_seam` gate
+    /// [`Self::evaluate_satisfied_deliverable_on_stop`]'s health-alone arm
+    /// uses (see that function's `declaration_required` comment for the
+    /// full rationale): with the seam off, every declaration read is a
+    /// no-op and this always returns `true` — the legacy inference-only
+    /// behaviour. With the seam on, only a `delivered` declaration may
+    /// carry a primary execution's staged-URL finalize; `recheck_for_pr`
+    /// and `on_stop_inner`'s staged-URL arms both call this before
+    /// finalizing a primary execution purely off a captured PR URL — a URL
+    /// proves the PR exists, never that the worker declared the run over.
+    pub(super) fn primary_staged_url_may_finalize(&self, execution_id: &str) -> bool {
+        let declaration_required = self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("run_done_proposals_seam");
+        if !declaration_required {
+            return true;
+        }
+        match self.work_db.execution_run_done_outcome(execution_id) {
+            Ok(outcome) => outcome == Some(boss_protocol::RunDoneOutcome::Delivered),
+            Err(err) => {
+                // Fails OPEN, matching every other proposals-first read in
+                // this subsystem (see `evaluate_satisfied_deliverable_on_stop`):
+                // a storage error must not hold a finished run open forever.
+                tracing::warn!(
+                    execution_id,
+                    ?err,
+                    "primary staged-url finalize gate: declaration lookup failed; allowing the \
+                     legacy evidence-only inference to carry this decision rather than holding \
+                     the run open",
+                );
+                true
+            }
+        }
+    }
 }

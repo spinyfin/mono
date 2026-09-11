@@ -158,15 +158,28 @@ impl WorkerCompletionHandler {
     /// [`Self::finalize_declared_delivery_without_pr`] when none exists.
     ///
     /// Mirrors [`Self::finalize_pr_transition`]'s termination write and
-    /// teardown exactly, but deliberately skips every network-touching step
-    /// that function layers on top (reviewer-batch enqueue, PR-metadata
-    /// fetch, doc-link detection, remote structured-output collection) — see
-    /// the module doc. Those are real, valuable side effects for a normal
-    /// Stop-triggered PR completion; they are not safe to run on this path,
-    /// which must never block a slot release on GitHub. A future task could
-    /// move them to the same best-effort background spawn
-    /// [`Self::spawn_declared_delivery_audit`] already uses, if that gap
-    /// proves worth closing.
+    /// teardown exactly, but never makes a network call inline — see the
+    /// module doc. Every network-touching step that function layers on top
+    /// (reviewer-batch enqueue, doc-link detection) instead runs in
+    /// [`Self::spawn_declared_delivery_post_effects`], the same best-effort,
+    /// fire-and-forget background spawn [`Self::spawn_declared_delivery_audit`]
+    /// already uses: the execution is already terminal and torn down by the
+    /// time either task runs, so a slow or failing `gh` call can delay those
+    /// side effects, never a slot release.
+    ///
+    /// [deferred-scope]: the background reviewer-enqueue path does not
+    /// replicate `finalize_pr_transition`'s pure-rebase-specific no-op nuance
+    /// (`check_pure_rebase_skip`, which reads the conflict/CI-fix attempt row)
+    /// — it only applies the plain SHA-unchanged / empty-diff / trivial-diff
+    /// checks. A `delivered` declaration for a pure-rebase push may therefore
+    /// consume one extra reviewer cycle it would have skipped on the
+    /// Stop-triggered path. It also does not replicate the followups /
+    /// attentions-questions reconciliation `finalize_pr_transition` performs:
+    /// proposal-submitted followups (`boss propose followup-task`) already
+    /// land synchronously at submission time regardless of this path (see
+    /// `proposal_apply::stage_followup_task_in_transaction`); the
+    /// artifact/transcript-backstop followup channels and the design-doc
+    /// questions detector do not yet run for a declared-delivery completion.
     async fn finalize_declared_delivery(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
         let Some(pr_url) = self.resolve_declared_pr_url_no_network(execution) else {
             return self.finalize_declared_delivery_without_pr(execution).await;
@@ -232,6 +245,7 @@ impl WorkerCompletionHandler {
         );
 
         self.spawn_declared_delivery_audit(execution, &work_item_id, &pr_url);
+        self.spawn_declared_delivery_post_effects(execution, &work_item_id, &pr_url);
 
         StopOutcome::PrDetected { pr_url }
     }
@@ -362,6 +376,51 @@ impl WorkerCompletionHandler {
             .await;
         });
     }
+
+    /// Best-effort, fire-and-forget background spawn for the side effects
+    /// [`Self::finalize_declared_delivery`] must not perform inline: the
+    /// reviewer-batch enqueue and doc-link detection
+    /// [`Self::finalize_pr_transition`] layers onto the same termination
+    /// write on the Stop-triggered path. See that method's doc for what is
+    /// intentionally narrower here.
+    fn spawn_declared_delivery_post_effects(
+        &self,
+        execution: &crate::work::WorkExecution,
+        work_item_id: &str,
+        pr_url: &str,
+    ) {
+        let work_db = Arc::clone(&self.work_db);
+        let publisher = Arc::clone(&self.publisher);
+        let branch_verifier = Arc::clone(&self.branch_verifier);
+        let review_batch_enqueuer = Arc::clone(&self.review_batch_enqueuer);
+        let feature_flags = Arc::clone(&self.feature_flags);
+        let execution_kind = execution.kind.clone();
+        let enable_revision_triggered_reviews = self.enable_revision_triggered_reviews;
+        let max_review_cycles = self.max_review_cycles;
+        let min_review_changed_lines = self.min_review_changed_lines;
+        let review_pool_size = self.review_pool_size;
+        let work_item_id = work_item_id.to_owned();
+        let repo_remote_url = execution.repo_remote_url.clone();
+        let pr_url = pr_url.to_owned();
+        tokio::spawn(async move {
+            run_declared_delivery_post_effects(
+                &work_db,
+                publisher.as_ref(),
+                branch_verifier.as_ref(),
+                review_batch_enqueuer.as_ref(),
+                &feature_flags,
+                execution_kind,
+                enable_revision_triggered_reviews,
+                max_review_cycles,
+                min_review_changed_lines,
+                review_pool_size,
+                &work_item_id,
+                &repo_remote_url,
+                &pr_url,
+            )
+            .await;
+        });
+    }
 }
 
 /// The body of [`WorkerCompletionHandler::spawn_declared_delivery_audit`]'s
@@ -379,7 +438,7 @@ impl WorkerCompletionHandler {
 /// best-effort audit, not a correctness requirement, and the execution it
 /// would have flagged is already terminal regardless.
 #[allow(clippy::too_many_arguments)]
-async fn audit_declared_delivery(
+pub(super) async fn audit_declared_delivery(
     branch_verifier: &dyn BranchVerifier,
     work_db: &crate::work::WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -462,5 +521,217 @@ async fn audit_declared_delivery(
             ?err,
             "run_done audit: failed to file flagged attention item"
         ),
+    }
+}
+
+/// Body of [`WorkerCompletionHandler::spawn_declared_delivery_post_effects`]'s
+/// background task: reviewer-batch enqueue, then doc-link detection. A free
+/// function (not a method) for the same reason [`audit_declared_delivery`]
+/// is one — it needs only the specific cloned collaborators it touches, not
+/// a whole `Arc<Self>`.
+#[allow(clippy::too_many_arguments)]
+async fn run_declared_delivery_post_effects(
+    work_db: &crate::work::WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    branch_verifier: &dyn BranchVerifier,
+    review_batch_enqueuer: &dyn ReviewBatchEnqueuer,
+    feature_flags: &crate::feature_flags::FeatureFlagsStore,
+    execution_kind: ExecutionKind,
+    enable_revision_triggered_reviews: bool,
+    max_review_cycles: usize,
+    min_review_changed_lines: u64,
+    review_pool_size: usize,
+    work_item_id: &str,
+    repo_remote_url: &str,
+    pr_url: &str,
+) {
+    let reviewer_triggering = should_enqueue_reviewer_for_primary(&execution_kind)
+        || (execution_kind == ExecutionKind::RevisionImplementation && enable_revision_triggered_reviews);
+    if reviewer_triggering {
+        maybe_enqueue_declared_delivery_reviewer(
+            work_db,
+            branch_verifier,
+            review_batch_enqueuer,
+            feature_flags,
+            max_review_cycles,
+            min_review_changed_lines,
+            review_pool_size,
+            work_item_id,
+            repo_remote_url,
+            pr_url,
+        )
+        .await;
+    }
+    run_declared_delivery_doc_link_detection(work_db, publisher, work_item_id, pr_url).await;
+}
+
+/// Reviewer-enqueue decision for a declared-delivery completion — the
+/// background counterpart to the inline gate in
+/// [`super::pr_transition::WorkerCompletionHandler::finalize_pr_transition`].
+/// See [`WorkerCompletionHandler::finalize_declared_delivery`]'s doc for the
+/// two respects in which this is deliberately narrower.
+#[allow(clippy::too_many_arguments)]
+async fn maybe_enqueue_declared_delivery_reviewer(
+    work_db: &crate::work::WorkDb,
+    branch_verifier: &dyn BranchVerifier,
+    review_batch_enqueuer: &dyn ReviewBatchEnqueuer,
+    feature_flags: &crate::feature_flags::FeatureFlagsStore,
+    max_review_cycles: usize,
+    min_review_changed_lines: u64,
+    review_pool_size: usize,
+    work_item_id: &str,
+    repo_remote_url: &str,
+    pr_url: &str,
+) {
+    let cycle_root_id = work_db.review_cycle_root_id(work_item_id);
+    let (review_cycle, last_reviewed_sha) = match work_db.get_task_review_cycle_state(&cycle_root_id) {
+        Ok(state) => state,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id,
+                cycle_root_id,
+                ?err,
+                "run_done post-effects: could not read review_cycle; assuming bound not reached",
+            );
+            (0i64, None)
+        }
+    };
+
+    if (review_cycle as usize) >= max_review_cycles {
+        tracing::info!(
+            work_item_id,
+            max_review_cycles,
+            "run_done post-effects: pr_review cycle bound reached; skipping reviewer",
+        );
+        let _ = work_db.create_attention_item(CreateAttentionItemInput {
+            work_item_id: Some(work_item_id.to_owned()),
+            kind: "pr_review_cycle_bound".to_owned(),
+            title: format!("Automated reviewer: cycle limit ({max_review_cycles}) reached"),
+            body_markdown: format!(
+                "The automated reviewer completed {max_review_cycles} cycle(s) on this PR \
+                 without resolving all findings. The PR has been advanced to human Review.\n\n\
+                 See the most recent revision task for the outstanding findings from the last \
+                 automated review cycle."
+            ),
+            execution_id: None,
+            status: None,
+            resolved_at: None,
+        });
+        return;
+    }
+
+    if let Some(last_sha) = last_reviewed_sha.as_deref()
+        && review_cycle > 0
+        && let Ok(repo_slug) = parse_repo_slug(repo_remote_url)
+        && let Some(pr_number) = pr_number_from_url(pr_url)
+    {
+        match branch_verifier.fetch_pr_head_oid(&repo_slug, pr_number).await {
+            Ok(current_head) if current_head == last_sha => {
+                tracing::info!(
+                    work_item_id,
+                    "run_done post-effects: pr_review noop skip (sha_unchanged)"
+                );
+                return;
+            }
+            Ok(current_head) => match branch_verifier
+                .fetch_diff_line_count(&repo_slug, last_sha, &current_head)
+                .await
+            {
+                Ok(0) => {
+                    tracing::info!(work_item_id, "run_done post-effects: pr_review noop skip (empty_diff)");
+                    return;
+                }
+                Ok(diff_lines) if min_review_changed_lines > 0 && diff_lines < min_review_changed_lines => {
+                    tracing::info!(
+                        work_item_id,
+                        "run_done post-effects: pr_review noop skip (trivial_diff)"
+                    );
+                    return;
+                }
+                Ok(_) => {}
+                Err(err) => tracing::debug!(
+                    work_item_id,
+                    ?err,
+                    "run_done post-effects: diff line count fetch failed; proceeding with review",
+                ),
+            },
+            Err(err) => tracing::debug!(
+                work_item_id,
+                ?err,
+                "run_done post-effects: pr head fetch failed; proceeding with review",
+            ),
+        }
+    }
+
+    if feature_flags.is_enabled("review_batch_fanout") {
+        match review_batch_enqueuer
+            .enqueue(work_db, work_item_id, repo_remote_url, pr_url, review_pool_size)
+            .await
+        {
+            Ok(crate::work::ReviewBatchDispatch::AdmissionDeferred)
+            | Ok(crate::work::ReviewBatchDispatch::AlreadyReviewed) => {
+                file_admission_deferred_attention(work_db, work_item_id, pr_url);
+            }
+            Ok(dispatch) => {
+                tracing::info!(
+                    work_item_id,
+                    pr_url,
+                    "run_done post-effects: review batch enqueued ({dispatch:?})"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    work_item_id,
+                    ?error,
+                    "run_done post-effects: failed to create immutable review batch; falling back to legacy reviewer",
+                );
+                if let Err(err) = work_db.create_pr_review_execution_dedup(work_item_id, repo_remote_url) {
+                    tracing::warn!(
+                        work_item_id,
+                        ?err,
+                        "run_done post-effects: failed to create legacy reviewer after batch failure",
+                    );
+                }
+            }
+        }
+    } else if let Err(err) = work_db.create_pr_review_execution_dedup(work_item_id, repo_remote_url) {
+        tracing::warn!(
+            work_item_id,
+            ?err,
+            "run_done post-effects: failed to create legacy pr_review execution"
+        );
+    }
+}
+
+/// Doc-link auto-population for a declared-delivery completion — the
+/// background counterpart to the per-task / per-project doc-link block in
+/// [`super::pr_transition::WorkerCompletionHandler::finalize_pr_transition`].
+/// Does not perform the attentions-questions / followups reconciliation that
+/// function also runs — see
+/// [`WorkerCompletionHandler::finalize_declared_delivery`]'s doc.
+async fn run_declared_delivery_doc_link_detection(
+    work_db: &crate::work::WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    work_item_id: &str,
+    pr_url: &str,
+) {
+    let Ok(work_item) = work_db.get_work_item(work_item_id) else {
+        return;
+    };
+    let (WorkItem::Task(task) | WorkItem::Chore(task)) = &work_item else {
+        return;
+    };
+    design_detector::on_task_doc_pr_detected(work_db, &task.id, &task.product_id, pr_url).await;
+    publisher
+        .publish_work_item_changed(&task.product_id, &task.id, "task_doc_pointer_set")
+        .await;
+
+    if matches!(task.kind, TaskKind::Design | TaskKind::DesignPostmortem)
+        && let Some(ref project_id) = task.project_id
+    {
+        design_detector::on_design_pr_detected(work_db, &task.id, &task.product_id, project_id, pr_url).await;
+        publisher
+            .publish_work_item_changed(&task.product_id, &task.id, "design_doc_pointer_set")
+            .await;
     }
 }
