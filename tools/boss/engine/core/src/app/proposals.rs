@@ -553,10 +553,23 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                                  anyway — the declaration's write is already durable and finalize is idempotent",
                             ),
                         }
-                        let stop_outcome = server_state
-                            .completion_handler
-                            .finalize_declared_run_done(&caller.execution_id, run_done_payload.outcome)
-                            .await;
+                        // Heap-allocate this call's future rather than awaiting it
+                        // inline. `finalize_declared_run_done` fans out into a long,
+                        // multi-await chain (`completion::run_done_declaration`);
+                        // holding its generated state inline here makes it the
+                        // largest branch of this function's own state machine,
+                        // which in turn is the largest variant of the top-level
+                        // per-request dispatch match in `app.rs` — the same
+                        // class of bug that match's own `Box::pin` was added for
+                        // (see the comment there): `control_verbs_test` aborted
+                        // with a Linux-CI stack overflow once this branch grew
+                        // large enough to tip an unrelated test's thread over.
+                        let stop_outcome = Box::pin(
+                            server_state
+                                .completion_handler
+                                .finalize_declared_run_done(&caller.execution_id, run_done_payload.outcome),
+                        )
+                        .await;
                         tracing::info!(
                             execution_id = %caller.execution_id,
                             outcome = %run_done_payload.outcome,
