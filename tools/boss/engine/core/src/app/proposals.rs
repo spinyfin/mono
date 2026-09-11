@@ -402,6 +402,23 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                 ),
                 _ => false,
             };
+            // A `run_done` declaration's acceptance is itself the completion
+            // signal for the WHOLE execution — not just a batch member, the
+            // way a review report/verdict is — mirroring the block above for
+            // exactly the reason its comment gives: do not wait for another,
+            // driver-specific turn boundary that may never arrive after the
+            // worker has delivered its declaration. Evidence checks stay in
+            // place, but move off this path entirely (never a network call
+            // here — see `completion::run_done_declaration`'s module doc).
+            //
+            // No `!already_submitted` guard, for the same reason
+            // `finalize_reporting_member` has none: the finalize is
+            // idempotent (every underlying write re-checks liveness), so a
+            // replay — including one landing after a crash between apply and
+            // the finalize call below — must still reach it rather than
+            // silently leaving the slot held.
+            let finalize_run_done_declaration =
+                kind == ProposalKind::RunDone && proposal.state == boss_protocol::ProposalState::Applied;
             // Mirror completion.rs's legacy marker-detector paths
             // (`file_worker_signal_attention` / `record_deferred_scope_item`):
             // both publish `AttentionItemCreated` on the work item's product
@@ -491,6 +508,43 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                         execution_id = %caller.execution_id,
                         "timed out waiting for accepted review report/verdict response delivery; teardown skipped, \
                          the reported-plus-live sweep will raise an attention item",
+                    ),
+                }
+            } else if finalize_run_done_declaration {
+                match serde_json::from_str::<boss_protocol::RunDoneProposalPayload>(&validated.canonical_json) {
+                    Ok(run_done_payload) => {
+                        match tokio::time::timeout(std::time::Duration::from_secs(10), response_delivery).await {
+                            Ok(Ok(true)) => {
+                                let stop_outcome = server_state
+                                    .completion_handler
+                                    .finalize_declared_run_done(&caller.execution_id, run_done_payload.outcome)
+                                    .await;
+                                tracing::info!(
+                                    execution_id = %caller.execution_id,
+                                    outcome = %run_done_payload.outcome,
+                                    ?stop_outcome,
+                                    "run_done proposal accepted: finalized synchronously at submit",
+                                );
+                            }
+                            Ok(Ok(false)) | Ok(Err(_)) => tracing::error!(
+                                execution_id = %caller.execution_id,
+                                "accepted run_done proposal response was not delivered; finalize skipped — \
+                                 the execution stays live for a later Stop or the merge poller to recover",
+                            ),
+                            Err(_) => tracing::error!(
+                                execution_id = %caller.execution_id,
+                                "timed out waiting for accepted run_done proposal response delivery; finalize \
+                                 skipped — the execution stays live for a later Stop or the merge poller to \
+                                 recover",
+                            ),
+                        }
+                    }
+                    Err(err) => tracing::error!(
+                        execution_id = %caller.execution_id,
+                        ?err,
+                        "run_done proposal applied but its own canonical payload_json did not deserialize; \
+                         finalize skipped — this should be unreachable since the payload already validated \
+                         at submission",
                     ),
                 }
             }

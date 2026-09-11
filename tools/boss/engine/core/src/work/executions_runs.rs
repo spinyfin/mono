@@ -1814,9 +1814,21 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        if execution.status != ExecutionStatus::Running {
+        // `is_live()` (`Running` or `WaitingHuman`), not `== Running`: every
+        // sibling terminalizer that can finish a run out from under a worker
+        // — `record_worker_pr_completion`, `record_worker_no_op_completion`,
+        // `record_worker_idle_abandonment` — already gates on `is_live()`.
+        // Gating this one function on the narrower `Running` alone let a
+        // `waiting_human` execution (live, pane possibly still alive) fall
+        // between the two: reapable by neither, because every path that
+        // could otherwise reach it required a *dead* pane. No current caller
+        // passes a current status other than `Running` (each starts one via
+        // `start_execution_run[_on_host]`, which always leaves it there), so
+        // this only closes the gap for future/other callers — it changes no
+        // existing caller's behaviour.
+        if !execution.status.is_live() {
             bail!(
-                "execution {execution_id} is not running and cannot finish a run from status `{}`",
+                "execution {execution_id} is not live and cannot finish a run from status `{}`",
                 execution.status
             );
         }
