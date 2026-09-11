@@ -313,6 +313,34 @@ rust_test(
     ),
 )
 
+# Regression: `boss task show` / `task executions` surface every work_runs
+# row, including under a still-running parent execution with NULL model.
+rust_test(
+    name = "task_show_runs_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = [
+        "tests/task_show_runs.rs",
+    ],
+    crate_root = "tests/task_show_runs.rs",
+    data = [":boss"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":common",
+        ":harness",
+        "//tools/boss/client",
+        "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 # End-to-end integration tests for the friendly-id selector semantics
 # (chore 3 of 5 — "Friendly numeric IDs"). Verifies that 42, #42,
 # boss/42, boss/#42, and primary-id forms all resolve correctly and
