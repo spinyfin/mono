@@ -1,8 +1,7 @@
 //! The one-time "engine starting (launch environment)" record.
 //!
-//! Split out of `app.rs` (which sits at the file-size limit) — pure
-//! structural move, no behavioural change. Called once from the
-//! `ServerState` constructor, right after the build-identity line.
+//! Called once from the `ServerState` constructor, right after the
+//! build-identity line.
 
 /// Record how this engine was started and what environment it inherited.
 ///

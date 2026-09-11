@@ -320,9 +320,7 @@ async fn requested_host_rejects_missing_resolved_driver_capability() {
     // Discovery ran on zakalwe and found only claude. `drivers-probed=true`
     // is what makes the missing codex a definite "missing driver" rather
     // than "driver discovery has not run" — the rejection under test must
-    // come from the requested host's own capability set. (Before the local
-    // probe moved out of schema init, the assertion was incidentally
-    // satisfied by the *local* host's line instead.)
+    // come from the requested host's own capability set.
     crate::test_support::insert_host_capability(&db, "zakalwe", "driver=claude", "auto");
     crate::test_support::insert_host_capability(&db, "zakalwe", "drivers-probed=true", "auto");
     let product = create_test_product(&db);

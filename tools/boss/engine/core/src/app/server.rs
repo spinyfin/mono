@@ -430,6 +430,27 @@ pub struct ServeOverrides {
     pub worker_registry: Option<crate::worker_registry::WorkerRegistry>,
 }
 
+/// Holds the local-capability-discovery dispatch hold for its lifetime and
+/// lifts it on drop, including on an unwinding panic — so a probe that
+/// panics still releases dispatch instead of wedging it for the life of the
+/// process.
+struct CapabilityDiscoveryPendingGuard {
+    coordinator: Arc<ExecutionCoordinator>,
+}
+
+impl CapabilityDiscoveryPendingGuard {
+    fn new(coordinator: Arc<ExecutionCoordinator>) -> Self {
+        Self { coordinator }
+    }
+}
+
+impl Drop for CapabilityDiscoveryPendingGuard {
+    fn drop(&mut self) {
+        self.coordinator.set_local_capability_discovery_pending(false);
+        self.coordinator.kick();
+    }
+}
+
 /// Same as [`serve`], but accepts an optional `MergeProbe` override, plumbed
 /// straight through to [`ServerState`]. Production callers (and most tests)
 /// go through `serve` and get the real `CommandMergeProbe`; tests that need
@@ -590,11 +611,9 @@ pub async fn serve_with_overrides(
     pre_bind.mark("server_state");
 
     // Local host capability discovery (`uname`, `gh auth status`, one login
-    // shell per registered driver — seconds of subprocess time). This used
-    // to run inside the schema migration chain, i.e. inside `WorkDb::open`
-    // above, before the socket existed. It now runs in the background so
-    // the socket binds first, with three guarantees that keep it as correct
-    // as the inline version was:
+    // shell per registered driver — seconds of subprocess time). It runs in
+    // the background so the socket binds first, with three guarantees that
+    // keep discovery correct:
     //
     // 1. Stale rows are wiped *before* the probe starts, so a driver that
     //    was uninstalled since the last boot never looks available on the
@@ -618,7 +637,22 @@ pub async fn serve_with_overrides(
     }
     {
         let state = server_state.clone();
+        let watchdog_coordinator = state.execution_coordinator.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            if watchdog_coordinator.local_capability_discovery_pending() {
+                tracing::error!(
+                    "startup: local host capability discovery has not completed after 30s; \
+                     dispatch remains held behind the probe (gh auth status / driver probes \
+                     can hang on a black-holed network) until it finishes or the engine restarts",
+                );
+            }
+        });
         tokio::task::spawn_blocking(move || {
+            // Cleared on every exit path, including a panic inside this
+            // closure, so a wedged or panicking probe can never leave
+            // dispatch held forever.
+            let _pending_guard = CapabilityDiscoveryPendingGuard::new(state.execution_coordinator.clone());
             let started = std::time::Instant::now();
             match state.work_db.refresh_local_host_auto_capabilities() {
                 Ok(refresh) => tracing::info!(
@@ -646,10 +680,6 @@ pub async fn serve_with_overrides(
                     }
                 }
             }
-            state
-                .execution_coordinator
-                .set_local_capability_discovery_pending(false);
-            state.execution_coordinator.kick();
         });
     }
     pre_bind.mark("local_capability_probe_spawned");

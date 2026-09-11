@@ -271,9 +271,7 @@ pub(crate) fn replace_auto_capabilities(conn: &Connection, host_id: &str, caps: 
 /// logged and skipped; the remainder still land.
 ///
 /// Not cached: the one caller is the once-per-boot startup refresh, and a
-/// cache here would turn a later re-probe into a no-op. (This used to be
-/// cached because schema init called it on every `WorkDb::open`, including
-/// every unit test's; it no longer does.)
+/// cache here would turn a later re-probe into a no-op.
 ///
 /// The tag *spelling* comes from [`crate::host_capability_probe`], shared
 /// with the remote probe: capability matching is exact string equality, so
@@ -283,7 +281,7 @@ pub(crate) fn replace_auto_capabilities(conn: &Connection, host_id: &str, caps: 
 /// Each sub-probe is timed and the breakdown logged at `info`, so a slow
 /// cold start can be attributed to `gh auth status` (network + keychain)
 /// versus the driver login shells versus `uname` without guessing.
-pub(crate) fn discover_local_capabilities() -> Vec<String> {
+fn discover_local_capabilities() -> Vec<String> {
     use crate::host_capability_probe::{
         arch_capability, discover_local_driver_capabilities, gh_authed_capability, os_capability,
     };

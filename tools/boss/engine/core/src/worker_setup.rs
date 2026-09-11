@@ -2928,9 +2928,9 @@ pub fn heal_worker_settings_json(settings_dir: &Path, new_boss_event_path: &Path
             }
         }
     }
-    // The completion line the startup ledger was missing: the sweep used
-    // to log only its start, so the whole post-bind stall sat unattributed
-    // after it.
+    // Closes the sweep's bracket for the post-bind startup ledger:
+    // guard_scripts_ms separates the content-addressed guard-script
+    // materialisation from the settings-file walk.
     tracing::info!(
         dir = %settings_dir.display(),
         files_walked = walked,

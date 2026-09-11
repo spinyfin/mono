@@ -90,11 +90,15 @@ mod tests {
     #[test]
     fn marks_measure_from_the_previous_mark_and_finish_reports_total() {
         let mut timeline = StartupTimeline::begin("test");
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(30));
         let first = timeline.mark("first");
-        assert!(first >= Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(5));
         let second = timeline.mark("second");
-        // Second mark measures from the first mark, not from the phase start.
+        assert!(first >= Duration::from_millis(30));
+        assert!(second >= Duration::from_millis(5));
+        // Second mark measures from the first mark, not from the phase start:
+        // the wide margin between the two sleeps keeps this from flaking
+        // under scheduler preemption or a loaded CI shard.
         assert!(second < first);
         assert_eq!(timeline.steps, 2);
         let total = timeline.finish();

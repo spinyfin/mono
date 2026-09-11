@@ -27,14 +27,22 @@ struct MigrationChainTimer {
     started: Instant,
     steps: u32,
     slow_steps: u32,
+    /// `"database"` for the real connection an engine boot opens, or
+    /// `"scratch_template"` for the in-memory capture
+    /// [`WorkDb::final_schema_ddl`] runs once per process to seed the
+    /// fresh-database fast path — so a reader of the startup ledger never
+    /// attributes the scratch capture's chain to the database that actually
+    /// took the template path.
+    target: &'static str,
 }
 
 impl MigrationChainTimer {
-    fn start() -> Self {
+    fn start(target: &'static str) -> Self {
         Self {
             started: Instant::now(),
             steps: 0,
             slow_steps: 0,
+            target,
         }
     }
 
@@ -48,6 +56,7 @@ impl MigrationChainTimer {
         if elapsed >= SLOW_STEP_THRESHOLD {
             self.slow_steps += 1;
             tracing::info!(
+                target_db = self.target,
                 step = name.rsplit("::").next().unwrap_or(name),
                 elapsed_ms = elapsed.as_millis() as u64,
                 ok = result.is_ok(),
@@ -58,13 +67,25 @@ impl MigrationChainTimer {
     }
 
     fn finish(&self) {
-        tracing::info!(
-            steps = self.steps,
-            slow_steps = self.slow_steps,
-            slow_threshold_ms = SLOW_STEP_THRESHOLD.as_millis() as u64,
-            total_ms = self.started.elapsed().as_millis() as u64,
-            "work db: migration chain complete",
-        );
+        if self.target == "scratch_template" {
+            tracing::debug!(
+                target_db = self.target,
+                steps = self.steps,
+                slow_steps = self.slow_steps,
+                slow_threshold_ms = SLOW_STEP_THRESHOLD.as_millis() as u64,
+                total_ms = self.started.elapsed().as_millis() as u64,
+                "work db: migration chain complete",
+            );
+        } else {
+            tracing::info!(
+                target_db = self.target,
+                steps = self.steps,
+                slow_steps = self.slow_steps,
+                slow_threshold_ms = SLOW_STEP_THRESHOLD.as_millis() as u64,
+                total_ms = self.started.elapsed().as_millis() as u64,
+                "work db: migration chain complete",
+            );
+        }
     }
 }
 
@@ -87,7 +108,7 @@ impl WorkDb {
     pub(crate) fn init(&self) -> Result<()> {
         let conn = self.connect()?;
         if Self::has_any_existing_table(&conn)? {
-            return Self::run_full_migration_chain(&conn);
+            return Self::run_full_migration_chain(&conn, "database");
         }
         Self::apply_final_schema_template(&conn)
     }
@@ -150,7 +171,8 @@ impl WorkDb {
         static DDL: OnceLock<Vec<String>> = OnceLock::new();
         DDL.get_or_init(|| {
             let scratch = Connection::open_in_memory().expect("open scratch db for schema template capture");
-            Self::run_full_migration_chain(&scratch).expect("run full migration chain against scratch db");
+            Self::run_full_migration_chain(&scratch, "scratch_template")
+                .expect("run full migration chain against scratch db");
             let mut stmt = scratch
                 .prepare(
                     "SELECT sql FROM sqlite_master \
@@ -174,8 +196,8 @@ impl WorkDb {
     /// [`Self::apply_final_schema_template`] reaches the same end state far
     /// faster; that fast path's own template is itself captured by running
     /// this function once, in [`Self::final_schema_ddl`].
-    pub(crate) fn run_full_migration_chain(conn: &Connection) -> Result<()> {
-        let mut timer = MigrationChainTimer::start();
+    pub(crate) fn run_full_migration_chain(conn: &Connection, target: &'static str) -> Result<()> {
+        let mut timer = MigrationChainTimer::start(target);
         let timer = &mut timer;
         step!(timer, conn, Self::schema_init_batch)?;
         step!(timer, conn, migrate_work_executions_v3)?;
@@ -1025,7 +1047,7 @@ mod tests {
     #[test]
     fn full_migration_chain_produces_current_schema() {
         let conn = Connection::open_in_memory().unwrap();
-        WorkDb::run_full_migration_chain(&conn).unwrap();
+        WorkDb::run_full_migration_chain(&conn, "database").unwrap();
 
         let schema_version: String = conn
             .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
@@ -1221,7 +1243,7 @@ mod tests {
     #[test]
     fn fresh_schema_template_matches_full_migration_chain() {
         let via_chain = Connection::open_in_memory().unwrap();
-        WorkDb::run_full_migration_chain(&via_chain).unwrap();
+        WorkDb::run_full_migration_chain(&via_chain, "database").unwrap();
 
         let via_template = Connection::open_in_memory().unwrap();
         WorkDb::apply_final_schema_template(&via_template).unwrap();
