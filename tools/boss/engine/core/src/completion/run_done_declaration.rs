@@ -163,7 +163,6 @@ impl WorkerCompletionHandler {
     /// already uses: the execution is already terminal and torn down by the
     /// time either task runs, so a slow or failing `gh` call can delay those
     /// side effects, never a slot release.
-    ///
     async fn finalize_declared_delivery(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
         let Some(pr_url) = self.resolve_declared_pr_url_no_network(execution) else {
             return self.finalize_declared_delivery_without_pr(execution).await;
@@ -554,6 +553,7 @@ async fn run_declared_delivery_post_effects(
             max_review_cycles,
             min_review_changed_lines,
             review_pool_size,
+            execution,
             work_item_id,
             repo_remote_url,
             pr_url,
@@ -572,13 +572,65 @@ async fn run_declared_delivery_post_effects(
     .await;
 }
 
+/// Release the `PendingReview` hold [`WorkerCompletionHandler::finalize_declared_delivery`]
+/// took, using `cycle_root_id` as the verdict source — this arm's decision
+/// not to enqueue a reviewer rests on a `pr_review_verdicts` row (the cycle
+/// bound or a no-op skip both require `review_cycle > 0`, i.e. at least one
+/// prior review ran and recorded a verdict), and for a revision that verdict
+/// lives on the review-cycle root, not the task row itself (see
+/// [`crate::work::WorkDb::advance_pending_review_task_to_in_review_with_verdict_source`]).
+/// Logs at `warn!` instead of silently discarding the result: a release that
+/// fails to match leaves the task stranded in `active` with no live
+/// execution and nothing left to un-stick it.
+fn release_pending_review_hold_with_verdict(work_db: &crate::work::WorkDb, work_item_id: &str, cycle_root_id: &str) {
+    match work_db.advance_pending_review_task_to_in_review_with_verdict_source(work_item_id, cycle_root_id) {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            work_item_id,
+            cycle_root_id,
+            "run_done post-effects: PendingReview hold did not release (no matching verdict under \
+             cycle_root_id, or a live non-review execution is blocking) — task remains stranded in \
+             `active`",
+        ),
+        Err(err) => tracing::warn!(
+            work_item_id,
+            cycle_root_id,
+            ?err,
+            "run_done post-effects: failed to release PendingReview hold",
+        ),
+    }
+}
+
+/// Release the `PendingReview` hold with no verdict-existence requirement —
+/// for arms whose decision not to enqueue a reviewer is NOT justified by an
+/// already-recorded verdict: a first delivery (`review_cycle == 0`, no
+/// verdict can exist yet) or a legacy-reviewer-creation failure. See
+/// [`crate::work::WorkDb::advance_held_pending_review_task_to_in_review`].
+fn release_pending_review_hold_unconditional(work_db: &crate::work::WorkDb, work_item_id: &str) {
+    match work_db.advance_held_pending_review_task_to_in_review(work_item_id) {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            work_item_id,
+            "run_done post-effects: PendingReview hold did not release (task not active+pr_url, or a \
+             live non-review execution is blocking) — task remains stranded in `active`",
+        ),
+        Err(err) => tracing::warn!(
+            work_item_id,
+            ?err,
+            "run_done post-effects: failed to release PendingReview hold",
+        ),
+    }
+}
+
 /// Reviewer-enqueue decision for a declared-delivery completion — the
 /// background counterpart to the inline gate in
 /// [`super::pr_transition::WorkerCompletionHandler::finalize_pr_transition`].
-/// See [`WorkerCompletionHandler::finalize_declared_delivery`]'s doc for the
-/// two respects in which this is deliberately narrower.
+/// Shares the exact pure-rebase and no-op skip rules that gate uses
+/// ([`super::finalize_passes::pure_rebase_skip_gate`],
+/// [`super::finalize_passes::noop_skip_reason`]) so the two completion paths
+/// can never silently diverge on the same input.
 #[allow(clippy::too_many_arguments)]
-async fn maybe_enqueue_declared_delivery_reviewer(
+pub(super) async fn maybe_enqueue_declared_delivery_reviewer(
     work_db: &crate::work::WorkDb,
     publisher: &dyn ExecutionPublisher,
     branch_verifier: &dyn BranchVerifier,
@@ -587,6 +639,7 @@ async fn maybe_enqueue_declared_delivery_reviewer(
     max_review_cycles: usize,
     min_review_changed_lines: u64,
     review_pool_size: usize,
+    execution: &crate::work::WorkExecution,
     work_item_id: &str,
     repo_remote_url: &str,
     pr_url: &str,
@@ -604,6 +657,41 @@ async fn maybe_enqueue_declared_delivery_reviewer(
             (0i64, None)
         }
     };
+
+    // No-op / trivial-diff / pure-rebase skip gate, in the same order
+    // `finalize_pr_transition` runs it: `pure_rebase_skip_gate` first (it is
+    // independent of `review_cycle` / `last_reviewed_sha`, so it also
+    // catches a pure rebase landing before the PR's very first review),
+    // then `noop_skip_reason` for the sha_unchanged / empty_diff /
+    // trivial_diff rules.
+    let pure_rebase_gate =
+        super::finalize_passes::pure_rebase_skip_gate(work_db, branch_verifier, pr_url, execution, &cycle_root_id)
+            .await;
+    let noop_skip_reason = match pure_rebase_gate.skip_reason {
+        Some(reason) => Some(reason),
+        None => {
+            super::finalize_passes::noop_skip_reason(
+                branch_verifier,
+                pr_url,
+                execution,
+                review_cycle,
+                last_reviewed_sha.as_deref(),
+                pure_rebase_gate.post_head,
+                min_review_changed_lines,
+            )
+            .await
+        }
+    };
+
+    if let Some(skip_reason) = noop_skip_reason {
+        tracing::info!(
+            work_item_id,
+            skip_reason,
+            "run_done post-effects: pr_review noop skip; advancing to in_review without reviewer pass",
+        );
+        release_pending_review_hold_with_verdict(work_db, work_item_id, &cycle_root_id);
+        return;
+    }
 
     if (review_cycle as usize) >= max_review_cycles {
         tracing::info!(
@@ -625,54 +713,8 @@ async fn maybe_enqueue_declared_delivery_reviewer(
             status: None,
             resolved_at: None,
         });
-        let _ = work_db.advance_pending_review_task_to_in_review(work_item_id);
+        release_pending_review_hold_with_verdict(work_db, work_item_id, &cycle_root_id);
         return;
-    }
-
-    if let Some(last_sha) = last_reviewed_sha.as_deref()
-        && review_cycle > 0
-        && let Ok(repo_slug) = parse_repo_slug(repo_remote_url)
-        && let Some(pr_number) = pr_number_from_url(pr_url)
-    {
-        match branch_verifier.fetch_pr_head_oid(&repo_slug, pr_number).await {
-            Ok(current_head) if current_head == last_sha => {
-                tracing::info!(
-                    work_item_id,
-                    "run_done post-effects: pr_review noop skip (sha_unchanged)"
-                );
-                let _ = work_db.advance_pending_review_task_to_in_review(work_item_id);
-                return;
-            }
-            Ok(current_head) => match branch_verifier
-                .fetch_diff_line_count(&repo_slug, last_sha, &current_head)
-                .await
-            {
-                Ok(0) => {
-                    tracing::info!(work_item_id, "run_done post-effects: pr_review noop skip (empty_diff)");
-                    let _ = work_db.advance_pending_review_task_to_in_review(work_item_id);
-                    return;
-                }
-                Ok(diff_lines) if min_review_changed_lines > 0 && diff_lines < min_review_changed_lines => {
-                    tracing::info!(
-                        work_item_id,
-                        "run_done post-effects: pr_review noop skip (trivial_diff)"
-                    );
-                    let _ = work_db.advance_pending_review_task_to_in_review(work_item_id);
-                    return;
-                }
-                Ok(_) => {}
-                Err(err) => tracing::debug!(
-                    work_item_id,
-                    ?err,
-                    "run_done post-effects: diff line count fetch failed; proceeding with review",
-                ),
-            },
-            Err(err) => tracing::debug!(
-                work_item_id,
-                ?err,
-                "run_done post-effects: pr head fetch failed; proceeding with review",
-            ),
-        }
     }
 
     if feature_flags.is_enabled("review_batch_fanout") {
@@ -704,7 +746,7 @@ async fn maybe_enqueue_declared_delivery_reviewer(
                         ?err,
                         "run_done post-effects: failed to create legacy reviewer after batch failure",
                     );
-                    let _ = work_db.advance_pending_review_task_to_in_review(work_item_id);
+                    release_pending_review_hold_unconditional(work_db, work_item_id);
                 } else {
                     publisher.kick_scheduler();
                 }
@@ -719,7 +761,7 @@ async fn maybe_enqueue_declared_delivery_reviewer(
                     ?err,
                     "run_done post-effects: failed to create legacy pr_review execution"
                 );
-                let _ = work_db.advance_pending_review_task_to_in_review(work_item_id);
+                release_pending_review_hold_unconditional(work_db, work_item_id);
             }
         }
     }

@@ -778,6 +778,44 @@ impl WorkDb {
     /// legacy single-reviewer verdict (a non-revision task is its own cycle
     /// root), which is exactly what the single-argument wrapper above
     /// preserves.
+    /// Release a `PendingReview` hold with no verdict-existence requirement:
+    /// for the declared-delivery completion path
+    /// (`completion::run_done_declaration::maybe_enqueue_declared_delivery_reviewer`),
+    /// which decides NOT to enqueue a reviewer for reasons other than an
+    /// already-recorded verdict — a first delivery (`review_cycle == 0`, no
+    /// `pr_review_verdicts` row can exist yet) or a legacy-reviewer-creation
+    /// failure. The decision not to review is itself the justification;
+    /// requiring a verdict row here (as
+    /// [`Self::advance_pending_review_task_to_in_review_with_verdict_source`]
+    /// does) makes the UPDATE match zero rows and strands the task in
+    /// `active` forever, since the producing execution is already terminal
+    /// by the time this runs. Keeps the same terminal-task and live-worker
+    /// guards as the verdict-gated variants — only the verdict `EXISTS`
+    /// clause is dropped.
+    pub fn advance_held_pending_review_task_to_in_review(&self, work_item_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let rows_changed = conn.execute(
+            "UPDATE tasks
+             SET status            = 'in_review',
+                 updated_at        = ?2,
+                 last_status_actor = 'engine'
+             WHERE id = ?1
+               AND status = 'active'
+               AND pr_url IS NOT NULL
+               AND pr_url != ''
+               AND deleted_at IS NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM work_executions we
+                 WHERE we.work_item_id = ?1
+                   AND we.status IN ('running', 'waiting_human')
+                   AND we.kind != 'pr_review'
+               )",
+            params![work_item_id, now],
+        )?;
+        Ok(rows_changed > 0)
+    }
+
     pub fn advance_pending_review_task_to_in_review_with_verdict_source(
         &self,
         work_item_id: &str,

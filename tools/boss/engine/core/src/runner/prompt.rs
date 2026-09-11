@@ -1042,7 +1042,11 @@ fn pr_terminal_directive(seam_enabled: bool) -> String {
     let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
     let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     let mut out = String::new();
-    out.push_str("\n## Important: PR creation is your terminal act\n\n");
+    if seam_enabled {
+        out.push_str("\n## Important: declaring done is your terminal act\n\n");
+    } else {
+        out.push_str("\n## Important: PR creation is your terminal act\n\n");
+    }
     if seam_enabled {
         out.push_str(&format!(
             "Opening the PR is normally the LAST thing you do, and the engine may reap you \

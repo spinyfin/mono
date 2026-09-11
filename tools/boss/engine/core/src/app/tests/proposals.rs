@@ -617,10 +617,12 @@ fn task_status(server_state: &Arc<ServerState>, work_item_id: &str) -> boss_prot
 
 /// This is the fix's central claim, exercised end to end through the real
 /// RPC handler: an accepted `delivered` declaration with a resolvable PR
-/// terminalizes its execution and advances the task before the RPC even
-/// returns — no later Stop boundary required. Mirrors
-/// `accepted_review_report_immediately_terminalizes_its_live_leaf` for the
-/// whole-execution (not batch-member) finalize path.
+/// terminalizes its execution and takes the `PendingReview` hold (active +
+/// bound PR) before the RPC even returns — no later Stop boundary required.
+/// The hold itself is released asynchronously once the reviewer-admission
+/// decision is made; see `completion::tests::t14` for direct coverage of
+/// that release. Mirrors `accepted_review_report_immediately_terminalizes_its_live_leaf`
+/// for the whole-execution (not batch-member) finalize path.
 #[tokio::test]
 async fn accepted_run_done_delivered_immediately_terminalizes_a_bound_pr() {
     let (server_state, _dir, execution_id, work_item_id) = live_chore_execution();
