@@ -372,8 +372,8 @@ impl WorkerCompletionHandler {
     /// [`Self::finalize_declared_delivery`] must not perform inline: the
     /// reviewer-batch enqueue and doc-link detection
     /// [`Self::finalize_pr_transition`] layers onto the same termination
-    /// write on the Stop-triggered path. See that method's doc for what is
-    /// intentionally narrower here.
+    /// write on the Stop-triggered path. It also reconciles the documented
+    /// design-question and follow-up fallback channels after teardown.
     fn spawn_declared_delivery_post_effects(
         &self,
         execution: &crate::work::WorkExecution,
@@ -390,6 +390,8 @@ impl WorkerCompletionHandler {
         let max_review_cycles = self.max_review_cycles;
         let min_review_changed_lines = self.min_review_changed_lines;
         let review_pool_size = self.review_pool_size;
+        let structured_output_dir = self.structured_output_dir.clone();
+        let execution = execution.clone();
         let work_item_id = work_item_id.to_owned();
         let repo_remote_url = execution.repo_remote_url.clone();
         let pr_url = pr_url.to_owned();
@@ -405,6 +407,8 @@ impl WorkerCompletionHandler {
                 max_review_cycles,
                 min_review_changed_lines,
                 review_pool_size,
+                &structured_output_dir,
+                &execution,
                 &work_item_id,
                 &repo_remote_url,
                 &pr_url,
@@ -532,6 +536,8 @@ async fn run_declared_delivery_post_effects(
     max_review_cycles: usize,
     min_review_changed_lines: u64,
     review_pool_size: usize,
+    structured_output_dir: &std::path::Path,
+    execution: &crate::work::WorkExecution,
     work_item_id: &str,
     repo_remote_url: &str,
     pr_url: &str,
@@ -541,6 +547,7 @@ async fn run_declared_delivery_post_effects(
     if reviewer_triggering {
         maybe_enqueue_declared_delivery_reviewer(
             work_db,
+            publisher,
             branch_verifier,
             review_batch_enqueuer,
             feature_flags,
@@ -553,7 +560,16 @@ async fn run_declared_delivery_post_effects(
         )
         .await;
     }
-    run_declared_delivery_doc_link_detection(work_db, publisher, work_item_id, pr_url).await;
+    run_declared_delivery_doc_link_detection(
+        work_db,
+        publisher,
+        feature_flags,
+        structured_output_dir,
+        execution,
+        work_item_id,
+        pr_url,
+    )
+    .await;
 }
 
 /// Reviewer-enqueue decision for a declared-delivery completion — the
@@ -564,6 +580,7 @@ async fn run_declared_delivery_post_effects(
 #[allow(clippy::too_many_arguments)]
 async fn maybe_enqueue_declared_delivery_reviewer(
     work_db: &crate::work::WorkDb,
+    publisher: &dyn ExecutionPublisher,
     branch_verifier: &dyn BranchVerifier,
     review_batch_enqueuer: &dyn ReviewBatchEnqueuer,
     feature_flags: &crate::feature_flags::FeatureFlagsStore,
@@ -673,6 +690,7 @@ async fn maybe_enqueue_declared_delivery_reviewer(
                     pr_url,
                     "run_done post-effects: review batch enqueued ({dispatch:?})"
                 );
+                publisher.kick_scheduler();
             }
             Err(error) => {
                 tracing::warn!(
@@ -687,16 +705,23 @@ async fn maybe_enqueue_declared_delivery_reviewer(
                         "run_done post-effects: failed to create legacy reviewer after batch failure",
                     );
                     let _ = work_db.advance_pending_review_task_to_in_review(work_item_id);
+                } else {
+                    publisher.kick_scheduler();
                 }
             }
         }
-    } else if let Err(err) = work_db.create_pr_review_execution_dedup(work_item_id, repo_remote_url) {
-        tracing::warn!(
-            work_item_id,
-            ?err,
-            "run_done post-effects: failed to create legacy pr_review execution"
-        );
-        let _ = work_db.advance_pending_review_task_to_in_review(work_item_id);
+    } else {
+        match work_db.create_pr_review_execution_dedup(work_item_id, repo_remote_url) {
+            Ok(_) => publisher.kick_scheduler(),
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id,
+                    ?err,
+                    "run_done post-effects: failed to create legacy pr_review execution"
+                );
+                let _ = work_db.advance_pending_review_task_to_in_review(work_item_id);
+            }
+        }
     }
 }
 
@@ -705,6 +730,9 @@ async fn maybe_enqueue_declared_delivery_reviewer(
 async fn run_declared_delivery_doc_link_detection(
     work_db: &crate::work::WorkDb,
     publisher: &dyn ExecutionPublisher,
+    feature_flags: &crate::feature_flags::FeatureFlagsStore,
+    structured_output_dir: &std::path::Path,
+    execution: &crate::work::WorkExecution,
     work_item_id: &str,
     pr_url: &str,
 ) {
@@ -727,6 +755,83 @@ async fn run_declared_delivery_doc_link_detection(
             .publish_work_item_changed(&task.product_id, &task.id, "design_doc_pointer_set")
             .await;
 
-        let _ = attentions_detector::reconcile_design_doc_questions(work_db, &task.id, project_id, pr_url, false).await;
+        if let Some((group, created)) =
+            attentions_detector::reconcile_design_doc_questions(work_db, &task.id, project_id, pr_url, false).await
+        {
+            for attention in created {
+                publisher
+                    .publish_frontend_event_on_product(
+                        &task.product_id,
+                        FrontendEvent::AttentionCreated {
+                            attention,
+                            group: group.clone(),
+                        },
+                    )
+                    .await;
+            }
+        } else if feature_flags.is_enabled("attentions_questions_backstop")
+            && let Some((group, created)) =
+                attentions_detector::extract_doc_questions_backstop(work_db, &task.id, project_id, pr_url, false).await
+        {
+            for attention in created {
+                publisher
+                    .publish_frontend_event_on_product(
+                        &task.product_id,
+                        FrontendEvent::AttentionCreated {
+                            attention,
+                            group: group.clone(),
+                        },
+                    )
+                    .await;
+            }
+        }
+    }
+
+    let transcript_path = work_db.transcript_path_for_execution(&execution.id).ok().flatten();
+    let proposals_first =
+        feature_flags.is_enabled("worker_proposals") && feature_flags.is_enabled("followup_proposals_seam");
+    if let Some((group, created)) = attentions_detector::reconcile_task_followups(
+        work_db,
+        work_item_id,
+        &execution.id,
+        Some(structured_output_dir),
+        transcript_path.as_deref(),
+    )
+    .await
+    {
+        if proposals_first {
+            tracing::info!(execution_id = %execution.id, count = created.len(), "run_done post-effects: reconciled uncovered follow-up fallback entries");
+        }
+        for attention in created {
+            publisher
+                .publish_frontend_event_on_product(
+                    &task.product_id,
+                    FrontendEvent::AttentionCreated {
+                        attention,
+                        group: group.clone(),
+                    },
+                )
+                .await;
+        }
+    } else if feature_flags.is_enabled("attentions_followups_backstop")
+        && let Some((group, created)) = attentions_detector::extract_followups_backstop(
+            work_db,
+            work_item_id,
+            &execution.id,
+            transcript_path.as_deref(),
+        )
+        .await
+    {
+        for attention in created {
+            publisher
+                .publish_frontend_event_on_product(
+                    &task.product_id,
+                    FrontendEvent::AttentionCreated {
+                        attention,
+                        group: group.clone(),
+                    },
+                )
+                .await;
+        }
     }
 }

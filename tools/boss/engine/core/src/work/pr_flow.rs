@@ -86,7 +86,7 @@ impl WorkDb {
             WorkerPrCompletionTarget::Done => TaskStatus::Done,
             // Hold the task in its current status while the automated reviewer runs.
             WorkerPrCompletionTarget::PendingReview => task.status.clone(),
-            // incident-002 P2: halt in `blocked` pending operator sign-off.
+            // Halt in `blocked` pending operator sign-off.
             WorkerPrCompletionTarget::BlockedDeletionSignoff => TaskStatus::Blocked,
         };
         // Revision tasks do not own a PR — their `pr_url` must stay NULL
