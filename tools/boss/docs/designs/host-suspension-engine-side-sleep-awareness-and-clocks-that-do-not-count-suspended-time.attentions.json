@@ -1,0 +1,18 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "Cube's 24 h lease TTL is wall-clock and the longest observed suspension was 25.05 h. The design adds only an engine-side heartbeat pass on resume and does not change cube. Is a cube-side change (a TTL that ignores suspended time, or a longer TTL) wanted as part of this project?",
+    "anchor": "risks--open-questions"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Retry budget for the SHA-delta gate on the Stop handler. The design proposes 3 attempts with 2 s base backoff capped at 4 s (about 10 s worst case). A larger budget recovers more blips but stalls the Stop handler longer.",
+    "choices": ["3 attempts, ~10 s (proposed)", "5 attempts, ~30 s", "2 attempts, ~5 s"],
+    "anchor": "piece-3-sha-delta-gate-retry-and-retry-on-wake"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Pull the deferred `pmset -g log` boot-time ledger backfill into v1? It closes the one ledger hole (sleep while the engine was down) but adds text parsing of a diagnostic tool.",
+    "anchor": "backfill-the-suspension-ledger-from-pmset--g-log-at-engine-boot"
+  }
+]
