@@ -3,8 +3,8 @@
 use super::*;
 
 /// A completed run under a still-`running` execution, with `model` left
-/// NULL, must still be returned. The CLI used to hide this shape by skipping
-/// `ListRuns` for non-terminal parents; the store itself never filtered it.
+/// NULL, must still be returned. `list_runs` keys only on `execution_id`;
+/// parent-execution status and `work_runs.model` are not predicates.
 #[test]
 fn list_runs_includes_completed_row_under_running_execution_with_null_model() {
     let db = WorkDb::open(temp_db_path("list-runs-null-model")).unwrap();

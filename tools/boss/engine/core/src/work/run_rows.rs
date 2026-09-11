@@ -90,8 +90,8 @@ impl WorkDb {
     /// Every `work_runs` row for `execution_id`. The query does not
     /// filter on parent-execution status or `work_runs.model` — a completed
     /// run under a still-`running` execution, or a row whose `model` is
-    /// NULL, is still returned. Callers that want a subset filter after
-    /// the fact.
+    /// NULL, is still returned. Callers that want a subset must filter
+    /// after the fact.
     pub fn list_runs(&self, execution_id: &str) -> Result<Vec<WorkRun>> {
         let conn = self.connect()?;
         ensure_execution_exists(&conn, execution_id)?;
