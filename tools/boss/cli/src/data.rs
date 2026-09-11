@@ -1,7 +1,7 @@
 //! RPC data-access helpers, resolvers, and selectors
 
 use crate::*;
-use boss_protocol::WorkRun;
+use boss_protocol::{WorkRun, WorkerTierDenial};
 
 // Re-export the shared selector grammar from boss_protocol so every
 // CLI surface uses the same choke-point types as bossctl / engine RPC.
@@ -1663,7 +1663,7 @@ pub(crate) async fn run_task_executions(
                         return;
                     }
                     for detail in &execution_runs {
-                        print_execution_history_row(&detail.execution, &detail.runs);
+                        print_execution_history_row(detail);
                     }
                 },
             )
@@ -1675,7 +1675,8 @@ pub(crate) async fn run_task_executions(
     }
 }
 
-fn print_execution_history_row(exec: &WorkExecution, runs: &[WorkRun]) {
+fn print_execution_history_row(detail: &ExecutionRuns) {
+    let exec = &detail.execution;
     let workspace = exec.cube_workspace_id.as_deref().unwrap_or("-");
     let started = exec.started_at.as_deref().unwrap_or("-");
     let finished = exec.finished_at.as_deref().unwrap_or("-");
@@ -1686,7 +1687,7 @@ fn print_execution_history_row(exec: &WorkExecution, runs: &[WorkRun]) {
     if let Some(pr_url) = &exec.pr_url {
         println!("  pr_url: {pr_url}");
     }
-    print_run_summaries(runs, "  ");
+    print_run_history(&detail.runs, detail.runs_unavailable.as_ref(), "  ");
 }
 
 /// Like [`list_executions_for_item`] but also pulls in every revision task's
@@ -1807,45 +1808,64 @@ pub(crate) struct ExecutionRuns {
     #[serde(flatten)]
     execution: WorkExecution,
     runs: Vec<WorkRun>,
+    /// Set when the engine refused to return this execution's runs (worker-tier
+    /// isolation of a sibling execution). Empty `runs` without this field
+    /// means the execution has no `work_runs` rows — not that they were hidden.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runs_unavailable: Option<WorkerTierDenial>,
 }
 
-/// Fetch the run history for terminal executions shown by a work-item detail.
-/// Only a terminal execution has a durable completion outcome to display, so
-/// avoiding live rows keeps detail views from making an RPC round trip per
-/// in-progress execution. A worker may only read runs for its own execution;
-/// sibling refusals intentionally yield an empty nested history instead of
-/// making the whole detail command fail.
+/// Fetch the run history for every execution shown by a work-item detail or
+/// `task executions`. The engine is the system of record: every `work_runs`
+/// row for the execution is returned, including when the parent execution is
+/// still live and when `work_runs.model` is NULL.
+///
+/// A worker may only read runs for its own execution. Sibling refusals yield
+/// an empty nested `runs` list *and* a `runs_unavailable` denial so the
+/// caller can tell "no rows" from "hidden by worker-tier isolation" instead
+/// of treating an empty list as missing evidence. The rest of the detail
+/// view still succeeds.
 pub(crate) async fn list_execution_runs(
     client: &mut BossClient,
     executions: &[WorkExecution],
 ) -> Result<Vec<ExecutionRuns>, CliError> {
     let mut details = Vec::with_capacity(executions.len());
     for execution in executions {
-        let runs = if execution.status.is_terminal() {
-            let event = client
-                .send_request(&FrontendRequest::ListRuns {
-                    execution_id: execution.id.clone(),
-                })
-                .await
-                .map_err(CliError::internal)?;
-            runs_from_list_event(event)?
-        } else {
-            Vec::new()
-        };
+        let event = client
+            .send_request(&FrontendRequest::ListRuns {
+                execution_id: execution.id.clone(),
+            })
+            .await
+            .map_err(CliError::internal)?;
+        let listed = listed_runs_from_event(event)?;
         details.push(ExecutionRuns {
             execution: execution.clone(),
-            runs,
+            runs: listed.runs,
+            runs_unavailable: listed.unavailable,
         });
     }
     Ok(details)
 }
 
-fn runs_from_list_event(event: FrontendEvent) -> Result<Vec<WorkRun>, CliError> {
+struct ListedRuns {
+    runs: Vec<WorkRun>,
+    unavailable: Option<WorkerTierDenial>,
+}
+
+fn listed_runs_from_event(event: FrontendEvent) -> Result<ListedRuns, CliError> {
     match event {
-        FrontendEvent::RunsList { runs, .. } => Ok(runs),
+        FrontendEvent::RunsList { runs, .. } => Ok(ListedRuns {
+            runs,
+            unavailable: None,
+        }),
         // ListExecutions remains visible to workers so they can inspect the
         // work item, but its sibling rows are outside the caller's run scope.
-        FrontendEvent::WorkerTierDenied { .. } => Ok(Vec::new()),
+        // Surface the denial instead of a silent empty list so an investigator
+        // does not conclude the evidence is missing.
+        FrontendEvent::WorkerTierDenied { denial } => Ok(ListedRuns {
+            runs: Vec::new(),
+            unavailable: Some(denial),
+        }),
         FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
             Err(CliError::application(message))
         }
@@ -1871,11 +1891,15 @@ pub(crate) fn print_executions_section(executions: &[ExecutionRuns]) {
             print!(" pr={pr}");
         }
         println!();
-        print_run_summaries(&detail.runs, "    ");
+        print_run_history(&detail.runs, detail.runs_unavailable.as_ref(), "    ");
     }
 }
 
-fn print_run_summaries(runs: &[WorkRun], indent: &str) {
+fn print_run_history(runs: &[WorkRun], unavailable: Option<&WorkerTierDenial>, indent: &str) {
+    if let Some(denial) = unavailable {
+        println!("{indent}runs unavailable: {}", denial.message);
+        return;
+    }
     for run in runs {
         println!("{indent}run {} [{}]", run.id, run.status);
         if let Some(summary) = &run.result_summary {
@@ -2710,7 +2734,7 @@ mod execution_run_tests {
     fn worker_scope_elides_a_sibling_execution_without_hiding_own_runs() {
         let own_execution_id = "exec_own";
         let sibling_execution_id = "exec_sibling";
-        let own_runs = runs_from_list_event(FrontendEvent::RunsList {
+        let own = listed_runs_from_event(FrontendEvent::RunsList {
             execution_id: own_execution_id.to_owned(),
             runs: vec![
                 WorkRun::builder()
@@ -2724,16 +2748,23 @@ mod execution_run_tests {
             ],
         })
         .expect("own execution runs should be visible");
-        let sibling_runs = runs_from_list_event(FrontendEvent::WorkerTierDenied {
+        let sibling = listed_runs_from_event(FrontendEvent::WorkerTierDenied {
             denial: WorkerTierDenial::closed("ListRuns", WorkerTierDenialReason::RuntimeIsolation),
         })
         .expect("a sibling execution denial should not fail the detail view");
 
-        assert_eq!(own_runs.len(), 1, "the caller's execution keeps its run history");
+        assert_eq!(own.runs.len(), 1, "the caller's execution keeps its run history");
+        assert!(own.unavailable.is_none(), "own ListRuns is not a denial");
         assert!(
-            sibling_runs.is_empty(),
+            sibling.runs.is_empty(),
             "a second execution on the same work item has its history elided when worker-scoped",
         );
+        let denial = sibling
+            .unavailable
+            .as_ref()
+            .expect("sibling ListRuns denial must be visible, not a silent empty list");
+        assert_eq!(denial.verb, "ListRuns");
+        assert_eq!(denial.reason, WorkerTierDenialReason::RuntimeIsolation);
         assert_ne!(own_execution_id, sibling_execution_id);
     }
 }
