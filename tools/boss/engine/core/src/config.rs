@@ -20,6 +20,16 @@ pub const EVENTS_SOCKET_ENV: &str = "BOSS_EVENTS_SOCKET";
 /// Read here to seed [`WorkConfig::frontend_socket_path`] and by the `boss`
 /// CLI's discovery. Downstream spawn must read the bound path off the
 /// config, not re-read this env — same isolation rule as [`EVENTS_SOCKET_ENV`].
+///
+/// Spawn deliberately exports this into every worker pane
+/// (`crate::spawn_flow::start_worker`) so `boss` CLI verbs reach the engine
+/// that bound the socket. The CLI ranks it above the HOME-derived default
+/// (`boss_client::Discovery::from_env`). A pane-launched fixture engine is
+/// kept off production by `agent_launch_guard`, not `IsolationPaths`:
+/// `EnginePaths::fields()` has no frontend-socket entry because the engine's
+/// own bind path comes from `--socket-path`. An inherited production value
+/// of this var is indistinguishable from operator intent by presence alone;
+/// the launch guard, not the isolation equality rule, is the backstop.
 pub const FRONTEND_SOCKET_ENV: &str = "BOSS_SOCKET_PATH";
 
 /// Environment override for the engine pid-file path.
@@ -162,6 +172,19 @@ pub struct WorkConfig {
     /// tests that never spawn a worker. Spawn then skips the env export
     /// rather than falling back to production's path.
     pub frontend_socket_path: Option<PathBuf>,
+    /// Control-token file this engine wrote — exported to workers as
+    /// `BOSS_ENGINE_CONTROL_TOKEN_PATH` so `boss engine stop` / `restart`
+    /// from a pane still find the token after `BOSS_SOCKET_PATH` has
+    /// switched CLI discovery into its sibling-derivation branch.
+    ///
+    /// Stamped in [`crate::app::serve`] from the path `resolve_engine_paths`
+    /// resolved (isolation-derived, else `$BOSS_ENGINE_CONTROL_TOKEN_PATH`,
+    /// else the production default). Never re-derived from the socket stem:
+    /// production writes `engine-control.token`, while sibling derivation
+    /// would look for `engine.control-token`.
+    ///
+    /// `None` skips the export — in-process tests that never spawn a worker.
+    pub control_token_path: Option<PathBuf>,
     /// Socket for Boss's private tmux server. Resolved once next to
     /// `db_path` (or overwritten by the isolation guard for a fixture).
     /// Everything downstream that talks to tmux reads it from here rather

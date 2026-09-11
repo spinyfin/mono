@@ -44,8 +44,16 @@ impl PrFixture {
                 .build(),
             None,
         ));
-        let server_state =
-            ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, probe, None, None, None, None).unwrap();
+        let server_state = ServerState::new_arc_with_app_pid_and_merge_probe(
+            cfg,
+            None,
+            None,
+            ServerStateOverrides {
+                merge_probe: probe,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let db = &server_state.work_db;
 
         let product = crate::test_support::create_test_product(db);

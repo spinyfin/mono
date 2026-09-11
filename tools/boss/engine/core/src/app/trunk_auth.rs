@@ -278,11 +278,11 @@ mod tests {
             cfg,
             None,
             None,
-            None,
-            Some(store),
-            trunk_client,
-            None,
-            None,
+            ServerStateOverrides {
+                trunk_token_store: Some(store),
+                trunk_client,
+                ..Default::default()
+            },
         )
         .unwrap();
         (state, temp)

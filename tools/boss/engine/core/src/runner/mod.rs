@@ -204,15 +204,30 @@ pub fn bound_events_socket_path(cfg: &RuntimeConfig) -> PathBuf {
 /// Frontend (control) socket this engine bound — exported to workers as
 /// `BOSS_SOCKET_PATH`.
 ///
-/// Unlike [`bound_events_socket_path`], this does **not** fall back to
-/// `$BOSS_SOCKET_PATH` / `$HOME` when the config has no stamp. A spawn that
-/// re-derived the path from the environment would hand Grok workers (and
-/// any fixture) the production control socket: Grok scopes `$HOME`, and a
-/// fixture that isolated its own bind would still leak. `None` means "do
-/// not export"; [`crate::spawn_flow::start_worker`] then leaves the CLI
-/// on its default HOME-relative discovery.
+/// Returns the stamp [`crate::app::serve`] wrote: the socket this engine
+/// actually bound. [`crate::config::WorkConfig::load_from`] pre-seeds this
+/// field from `$BOSS_SOCKET_PATH` or the production HOME-derived default;
+/// `serve` (and [`crate::app::run`]) overwrite it with the bound path
+/// before any worker is spawned. This getter itself does not re-read the
+/// environment — `None` means the config was never stamped (in-process
+/// tests that build via `WorkConfig::builder()`), and
+/// [`crate::spawn_flow::start_worker`] then skips the export rather than
+/// inventing a production path.
 pub fn bound_frontend_socket_path(cfg: &RuntimeConfig) -> Option<PathBuf> {
     cfg.work.frontend_socket_path.clone()
+}
+
+/// Control-token file this engine wrote — exported to workers as
+/// `BOSS_ENGINE_CONTROL_TOKEN_PATH`.
+///
+/// Returns the stamp [`crate::app::serve`] wrote from
+/// `resolve_engine_paths`'s `control_token`. Like
+/// [`bound_frontend_socket_path`], this getter does not re-derive a path
+/// from the socket stem or the environment: production writes
+/// `engine-control.token`, which is not the `<stem>.control-token` sibling
+/// CLI discovery would compute from `BOSS_SOCKET_PATH` alone.
+pub fn bound_control_token_path(cfg: &RuntimeConfig) -> Option<PathBuf> {
+    cfg.work.control_token_path.clone()
 }
 
 /// Resolve the events socket from the environment: `BOSS_EVENTS_SOCKET` if

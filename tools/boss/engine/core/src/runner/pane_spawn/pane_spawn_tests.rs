@@ -9,7 +9,7 @@
 //! Anything reachable via `WorkerSpawner` is fair game without
 //! standing up a full engine; the broadcast / coordinator side
 //! lives in `coordinator.rs` tests.
-use super::super::engine_events_socket_path;
+use super::super::{bound_control_token_path, engine_events_socket_path};
 use super::*;
 use crate::app::SendToAppError;
 use crate::driver::AgentDriver;
@@ -189,6 +189,7 @@ fn spawn_test_env(
             .cwd(workspace.path().to_path_buf())
             .db_path(workspace.path().join("state.db"))
             .frontend_socket_path(workspace.path().join("engine.sock"))
+            .control_token_path(workspace.path().join("engine-control.token"))
             .build(),
     );
     let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
@@ -975,6 +976,13 @@ async fn spawn_env_carries_sanitized_path_and_engine_keys() {
             .any(|EnvVar { key, .. }| key == crate::config::FRONTEND_SOCKET_ENV),
         "expected BOSS_SOCKET_PATH to be set so `boss` CLI verbs reach this engine from a scoped HOME"
     );
+    assert!(
+        input
+            .env
+            .iter()
+            .any(|EnvVar { key, .. }| key == crate::engine_control::TOKEN_PATH_ENV),
+        "expected BOSS_ENGINE_CONTROL_TOKEN_PATH so `boss engine stop` from a pane finds engine-control.token"
+    );
 }
 
 /// Workers must be told about the socket the engine actually bound, which
@@ -1056,6 +1064,7 @@ async fn spawn_env_exports_the_bound_frontend_socket_as_boss_socket_path() {
             .cwd(workspace.path().to_path_buf())
             .db_path(workspace.path().join("state.db"))
             .frontend_socket_path(bound.clone())
+            .control_token_path(workspace.path().join("engine-control.token"))
             .build(),
     );
     let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
@@ -1085,6 +1094,16 @@ async fn spawn_env_exports_the_bound_frontend_socket_as_boss_socket_path() {
         bound.display().to_string(),
         "workers must be pointed at the frontend socket this engine bound",
     );
+    let token = input
+        .env
+        .iter()
+        .find(|EnvVar { key, .. }| key == crate::engine_control::TOKEN_PATH_ENV)
+        .expect("BOSS_ENGINE_CONTROL_TOKEN_PATH must ride with BOSS_SOCKET_PATH");
+    assert_eq!(
+        token.value,
+        workspace.path().join("engine-control.token").display().to_string(),
+        "workers must inherit the bound control-token path, not a sibling of the socket",
+    );
 }
 
 #[test]
@@ -1099,7 +1118,7 @@ fn bound_events_socket_path_prefers_the_config_over_the_environment() {
 }
 
 #[test]
-fn bound_frontend_socket_path_returns_the_config_stamp_and_not_an_env_fallback() {
+fn bound_frontend_socket_path_returns_the_config_stamp() {
     let work = crate::config::WorkConfig::builder()
         .cwd(PathBuf::from("/tmp"))
         .db_path(PathBuf::from("/tmp/state.db"))
@@ -1116,8 +1135,29 @@ fn bound_frontend_socket_path_returns_the_config_stamp_and_not_an_env_fallback()
     assert_eq!(
         bound_frontend_socket_path(&cfg),
         None,
-        "an unstamped config must not fall back to $BOSS_SOCKET_PATH / $HOME"
+        "WorkConfig::builder() without a frontend_socket_path has no stamp"
     );
+}
+
+#[test]
+fn bound_control_token_path_returns_the_config_stamp() {
+    let work = crate::config::WorkConfig::builder()
+        .cwd(PathBuf::from("/tmp"))
+        .db_path(PathBuf::from("/tmp/state.db"))
+        .control_token_path(PathBuf::from("/tmp/engine-control.token"))
+        .build();
+    let cfg = crate::config::RuntimeConfig::from_parts(work, None);
+    assert_eq!(
+        bound_control_token_path(&cfg),
+        Some(PathBuf::from("/tmp/engine-control.token"))
+    );
+
+    let unstamped = crate::config::WorkConfig::builder()
+        .cwd(PathBuf::from("/tmp"))
+        .db_path(PathBuf::from("/tmp/state.db"))
+        .build();
+    let cfg = crate::config::RuntimeConfig::from_parts(unstamped, None);
+    assert_eq!(bound_control_token_path(&cfg), None);
 }
 
 /// Only the "this engine bound no events socket" shape (in-process

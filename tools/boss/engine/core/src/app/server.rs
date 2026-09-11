@@ -409,6 +409,17 @@ fn stamped_events_socket_path(existing: Option<&Path>, bound: Option<&Path>) -> 
     }
 }
 
+/// What `WorkConfig::frontend_socket_path` should be after this `serve` call.
+///
+/// `bound` is always authoritative: this call *is* the binding. `existing`
+/// is the config's current stamp — `None` (unstamped in-process config),
+/// a different path (`WorkConfig::load_from` seeds `$BOSS_SOCKET_PATH` /
+/// the production default), or already the bound path (`run` stamped it).
+/// All three yield `bound`.
+fn stamped_frontend_socket_path(_existing: Option<&Path>, bound: &Path) -> std::path::PathBuf {
+    bound.to_path_buf()
+}
+
 /// Optional `serve` collaborators tests inject instead of production ones.
 #[derive(Default)]
 pub struct ServeOverrides {
@@ -461,22 +472,35 @@ pub async fn serve_with_overrides(
 ) -> Result<()> {
     let app_pid = current_parent_pid();
 
-    // The socket this call is about to bind is the one every worker's
-    // `settings.json` must name. Stamp it onto the config so downstream
+    // The sockets / token this call is about to bind or write are the ones
+    // every worker must inherit. Stamp them onto the config so downstream
     // resolvers read the binding instead of re-deriving it from the
-    // environment. In production `run` already set this and the overwrite is
-    // a no-op; it matters for in-process callers that pass an explicit socket
-    // path alongside a config built without one. See
-    // [`stamped_events_socket_path`] for the merge rule.
-    let stamped = stamped_events_socket_path(cfg.work.events_socket_path.as_deref(), events_socket_path.as_deref());
-    let events_changed = stamped.as_deref() != cfg.work.events_socket_path.as_deref();
-    let frontend_changed = cfg.work.frontend_socket_path.as_deref() != Some(socket_path.as_path());
-    let cfg = if events_changed || frontend_changed {
+    // environment. In production `run` already set the frontend socket and
+    // the overwrite is a no-op; it matters for in-process callers that pass
+    // an explicit socket path alongside a config built without one. See
+    // [`stamped_events_socket_path`] / [`stamped_frontend_socket_path`] for
+    // the merge rules.
+    let stamped_events =
+        stamped_events_socket_path(cfg.work.events_socket_path.as_deref(), events_socket_path.as_deref());
+    let stamped_frontend = stamped_frontend_socket_path(cfg.work.frontend_socket_path.as_deref(), &socket_path);
+    let events_changed = stamped_events.as_deref() != cfg.work.events_socket_path.as_deref();
+    let frontend_changed = cfg.work.frontend_socket_path.as_deref() != Some(stamped_frontend.as_path());
+    let stamped_token = match &control_token_path {
+        Some(bound) => Some(bound.clone()),
+        None => cfg.work.control_token_path.clone(),
+    };
+    let token_changed = stamped_token != cfg.work.control_token_path;
+    let cfg = if events_changed || frontend_changed || token_changed {
         let mut work = cfg.work.clone();
         if events_changed {
-            work.events_socket_path = stamped;
+            work.events_socket_path = stamped_events;
         }
-        work.frontend_socket_path = Some(socket_path.clone());
+        if frontend_changed {
+            work.frontend_socket_path = Some(stamped_frontend);
+        }
+        if token_changed {
+            work.control_token_path = stamped_token;
+        }
         Arc::new(cfg.with_work(work))
     } else {
         cfg
@@ -552,11 +576,11 @@ pub async fn serve_with_overrides(
         cfg.clone(),
         app_pid,
         control_token.clone(),
-        overrides.merge_probe,
-        None,
-        None,
-        None,
-        overrides.worker_registry,
+        ServerStateOverrides {
+            merge_probe: overrides.merge_probe,
+            worker_registry: overrides.worker_registry,
+            ..Default::default()
+        },
     )?;
 
     let tmux_preflight = crate::tmux_preflight::TmuxPreflight::probe_with_socket(&server_state.tmux_socket_path).await;

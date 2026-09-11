@@ -39,7 +39,7 @@ fn server_state_with_app_pid(app_pid: libc::pid_t) -> (Arc<ServerState>, tempfil
         None,
     ));
     let state =
-        ServerState::new_arc_with_app_pid_and_merge_probe(cfg, Some(app_pid), None, None, None, None, None, None)
+        ServerState::new_arc_with_app_pid_and_merge_probe(cfg, Some(app_pid), None, ServerStateOverrides::default())
             .unwrap();
     (state, temp)
 }

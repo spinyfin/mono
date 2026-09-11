@@ -52,7 +52,7 @@ pub(super) fn test_server_state() -> (Arc<ServerState>, tempfile::TempDir) {
         None,
     ));
     let state =
-        ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, None, None, None, None, None).unwrap();
+        ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, ServerStateOverrides::default()).unwrap();
     (state, temp)
 }
 
@@ -74,17 +74,15 @@ pub(super) fn test_server_state_with_fakes() -> (Arc<ServerState>, tempfile::Tem
             .build(),
         None,
     ));
-    let state = ServerState::new_arc_with_app_pid_and_merge_probe_and_dispatch_fakes(
+    let state = ServerState::new_arc_with_app_pid_and_merge_probe(
         cfg,
         None,
         None,
-        None,
-        None,
-        None,
-        None,
-        Some(Arc::new(crate::test_support::AlwaysSucceedsCube)),
-        Some(Arc::new(crate::test_support::AlwaysSucceedsRunner)),
-        None,
+        ServerStateOverrides {
+            cube_client: Some(Arc::new(crate::test_support::AlwaysSucceedsCube)),
+            execution_runner: Some(Arc::new(crate::test_support::AlwaysSucceedsRunner)),
+            ..Default::default()
+        },
     )
     .unwrap();
     (state, temp)
