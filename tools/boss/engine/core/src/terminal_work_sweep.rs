@@ -188,8 +188,9 @@ pub struct TerminalWorkSweepOutcome {
     /// teardown is still in flight (see [`crate::teardown_registry`]).
     /// These are NOT strands — the pane already has an owner.
     pub teardown_in_flight_skipped: usize,
-    /// Slots skipped this pass because the execution lookup failed
-    /// (conservative — retried next pass).
+    /// Slots skipped this pass because a fallible lookup failed
+    /// (execution row, post-merge membership, …) — conservative, retried
+    /// next pass.
     pub lookup_failed_skipped: usize,
 }
 
@@ -307,19 +308,10 @@ pub async fn run_one_pass(
         // their completion sweep owns comment-terminal recovery so it can
         // finalize through the answer-agent path and file its lost-signal
         // attention item. Skip both here and fall back to execution status.
-        //
-        // A `post_merge` review batch member is a third case: its bound
-        // work item is the cycle root, which is `done` by construction (the
-        // merge poller creates the batch in the same pass that marks the
-        // root merged). Treating that as `work_item_terminal` would reap
-        // the reviewer within this sweep's interval of it starting, every
-        // time. It still falls back to `execution_terminal` below, so a
-        // post-merge reviewer whose own execution genuinely finished is
-        // reaped normally.
         let never_bound_work_item = matches!(
             execution.kind,
             boss_protocol::ExecutionKind::AutomationTriage | boss_protocol::ExecutionKind::AnswerAgent
-        ) || matches!(work_db.is_post_merge_review_batch_member(&execution.id), Ok(true));
+        );
 
         // The O'Brien signal: the bound work item is terminal (done /
         // archived / comment resolved|dismissed|answered) even though the
@@ -328,12 +320,45 @@ pub async fn run_one_pass(
         // than guessing, UNLESS the failure is because the row itself is
         // confirmed gone (deleted out from under this execution) — see
         // `work_item_missing` below.
+        //
+        // A `post_merge` review batch member is a carve-out on the
+        // *closedness* signal only: its bound work item is the cycle root,
+        // which is `done` by construction (the merge poller creates the
+        // batch in the same pass that marks the root merged). Treating that
+        // as `work_item_terminal` would reap the reviewer within this
+        // sweep's interval of it starting, every time. The bound-item
+        // lookup still runs so a confirmed-deleted cycle root
+        // (`work_item_missing`) recovers the reviewer the same way it
+        // recovers any other orphan. A membership-lookup error is
+        // inconclusive — skip this pass rather than silently dropping the
+        // exemption (a DB blip must not reintroduce the original bug).
+        // `execution_terminal` still applies, so a post-merge reviewer
+        // whose own execution genuinely finished is reaped normally.
         let mut work_item_missing = false;
         let work_item_terminal = if never_bound_work_item {
             false
         } else {
             match work_db.is_bound_work_item_closed(&execution.work_item_id) {
-                Ok(closed) => closed,
+                Ok(closed) => {
+                    if !closed {
+                        false
+                    } else {
+                        match work_db.is_post_merge_review_batch_member(&execution.id) {
+                            Ok(true) => false,
+                            Ok(false) => true,
+                            Err(err) => {
+                                tracing::warn!(
+                                    run_id = %run_id,
+                                    work_item_id = %execution.work_item_id,
+                                    ?err,
+                                    "terminal-work sweep: failed to look up post-merge review batch membership; skipping this pass",
+                                );
+                                outcome.lookup_failed_skipped += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
                 Err(err) => match work_db.work_item_row_missing(&execution.work_item_id) {
                     // The Deleting-a-work-item-orphans-its-worker case: the
                     // row is confirmed gone (never existed, or soft-deleted
@@ -654,6 +679,41 @@ mod tests {
             .id
     }
 
+    /// Spawn a `post_merge` reviewer bound to a fresh cycle-root chore.
+    /// Returns `(cycle_root_id, execution_id)`.
+    fn spawn_post_merge_reviewer(db: &WorkDb, product_id: &str) -> (String, String) {
+        let cycle_root_id = create_active_chore(db, product_id, "post-merge-root");
+        let classification = boss_protocol::ReviewClassification::builder()
+            .changed_files(vec!["tools/boss/engine/pr-review/src/parsing.rs".to_owned()])
+            .complexity_flags(vec![])
+            .has_production_code(true)
+            .metadata_missing(vec![])
+            .production_languages(vec![boss_protocol::ReviewLanguageBucket::Rust])
+            .profile(boss_protocol::ReviewProfile::Light)
+            .subsystem_buckets(vec!["tools/boss/engine".to_owned()])
+            .additions(12)
+            .deletions(3)
+            .build();
+        let input = crate::work::ReviewBatchCreateInput::builder()
+            .cycle_root_id(cycle_root_id.clone())
+            .base_sha("base-sha")
+            .classification(classification)
+            .phase(boss_protocol::ReviewBatchPhase::PostMerge)
+            .pr_number(42)
+            .pr_url("https://github.com/example/repo/pull/42")
+            .target_sha("merge-sha-1")
+            .merge_sha("merge-sha-1")
+            .build();
+        let execution_id = match db
+            .create_post_merge_review_batch(input, "git@github.com:example/repo.git")
+            .unwrap()
+        {
+            crate::work::ReviewBatchDispatch::Created { executions, .. } => executions[0].id.clone(),
+            other => panic!("expected a newly-created post-merge batch, got {other:?}"),
+        };
+        (cycle_root_id, execution_id)
+    }
+
     fn create_answer_agent_execution(db: &WorkDb, product_id: &str) -> (String, String) {
         const DOC_REPO: &str = "git@github.com:spinyfin/mono.git";
         const DOC_ARTIFACT: &str = "pr_doc:git@github.com:spinyfin/mono.git:main:docs/design.md";
@@ -840,35 +900,7 @@ mod tests {
     #[tokio::test]
     async fn does_not_reap_a_live_post_merge_reviewer_whose_cycle_root_is_done() {
         let (_dir, db, product_id) = setup();
-        let cycle_root_id = create_active_chore(&db, &product_id, "post-merge-root");
-        let classification = boss_protocol::ReviewClassification::builder()
-            .changed_files(vec!["tools/boss/engine/pr-review/src/parsing.rs".to_owned()])
-            .complexity_flags(vec![])
-            .has_production_code(true)
-            .metadata_missing(vec![])
-            .production_languages(vec![boss_protocol::ReviewLanguageBucket::Rust])
-            .profile(boss_protocol::ReviewProfile::Light)
-            .subsystem_buckets(vec!["tools/boss/engine".to_owned()])
-            .additions(12)
-            .deletions(3)
-            .build();
-        let input = crate::work::ReviewBatchCreateInput::builder()
-            .cycle_root_id(cycle_root_id.clone())
-            .base_sha("base-sha")
-            .classification(classification)
-            .phase(boss_protocol::ReviewBatchPhase::PostMerge)
-            .pr_number(42)
-            .pr_url("https://github.com/example/repo/pull/42")
-            .target_sha("merge-sha-1")
-            .merge_sha("merge-sha-1")
-            .build();
-        let execution_id = match db
-            .create_post_merge_review_batch(input, "git@github.com:example/repo.git")
-            .unwrap()
-        {
-            crate::work::ReviewBatchDispatch::Created { executions, .. } => executions[0].id.clone(),
-            other => panic!("expected a newly-created post-merge batch, got {other:?}"),
-        };
+        let (cycle_root_id, execution_id) = spawn_post_merge_reviewer(&db, &product_id);
 
         // The merge poller marks the cycle root done in the same pass it
         // creates the post-merge batch.
@@ -901,6 +933,109 @@ mod tests {
         }
         assert!(reaper.reaped().is_empty());
         assert!(sink.events().await.is_empty());
+    }
+
+    /// The post-merge carve-out suppresses only `work_item_terminal` for a
+    /// `done` cycle root. A confirmed-deleted root is still an orphan and
+    /// must be reaped via `work_item_missing` — folding membership into
+    /// `never_bound_work_item` would skip this recovery path entirely.
+    #[tokio::test]
+    async fn reaps_a_live_post_merge_reviewer_whose_cycle_root_was_deleted() {
+        let (_dir, db, product_id) = setup();
+        let (cycle_root_id, execution_id) = spawn_post_merge_reviewer(&db, &product_id);
+
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_live_worker(&live_states, 5, &execution_id, &cycle_root_id);
+
+        db.delete_work_item(&cycle_root_id).unwrap();
+        assert!(
+            db.get_work_item(&cycle_root_id).is_err(),
+            "precondition: the deleted cycle root must be unreachable via get_work_item"
+        );
+
+        let reaper = RecordingReaper::new(live_states.clone(), true);
+        let cube = RecordingCubeClient::default();
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let teardown = TeardownRegistry::new();
+        let mut seen = HashSet::new();
+
+        let first = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            &reaper,
+            &cube,
+            sink.as_ref(),
+            &teardown,
+            &mut seen,
+        )
+        .await;
+        assert_eq!(first.reaped, 0, "first pass must only record the candidate");
+        assert_eq!(first.pending_confirmation, 1);
+        assert!(reaper.reaped().is_empty());
+
+        let second = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            &reaper,
+            &cube,
+            sink.as_ref(),
+            &teardown,
+            &mut seen,
+        )
+        .await;
+        assert_eq!(second.reaped, 1, "second pass must reap the confirmed orphan");
+        assert_eq!(reaper.reaped(), vec![execution_id.clone()]);
+
+        let events = sink.events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].details["reason"], "work_item_missing");
+        assert_eq!(events[0].work_item_id.as_deref(), Some(cycle_root_id.as_str()));
+    }
+
+    /// A DB error looking up post-merge membership is inconclusive: skip
+    /// this pass rather than treating the worker as "not a member", which
+    /// would reap a live post-merge reviewer whose cycle root is `done`.
+    #[tokio::test]
+    async fn post_merge_membership_lookup_failure_is_conservative_skip() {
+        let (_dir, db, product_id) = setup();
+        let (cycle_root_id, execution_id) = spawn_post_merge_reviewer(&db, &product_id);
+        set_work_item_status(&db, &cycle_root_id, "done");
+
+        {
+            let conn = db.connect().unwrap();
+            conn.execute("DROP TABLE pr_review_batch_members", []).unwrap();
+        }
+
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_live_worker(&live_states, 5, &execution_id, &cycle_root_id);
+
+        let reaper = RecordingReaper::new(live_states.clone(), true);
+        let cube = RecordingCubeClient::default();
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let teardown = TeardownRegistry::new();
+        let mut seen = HashSet::new();
+
+        for _ in 0..3 {
+            let outcome = run_one_pass(
+                db.as_ref(),
+                &live_states,
+                &reaper,
+                &cube,
+                sink.as_ref(),
+                &teardown,
+                &mut seen,
+            )
+            .await;
+            assert_eq!(outcome.reaped, 0);
+            assert_eq!(outcome.lookup_failed_skipped, 1);
+        }
+        assert!(reaper.reaped().is_empty());
+        assert!(sink.events().await.is_empty());
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            boss_protocol::ExecutionStatus::Ready,
+            "execution must be left untouched when membership lookup fails",
+        );
     }
 
     /// A live worker whose EXECUTION is terminal (completion ran but the
