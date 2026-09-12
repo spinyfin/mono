@@ -215,15 +215,7 @@ impl CommandPrAutoCreator {
     /// to make cheap. Any other error is inconclusive (could be transient),
     /// so the caller falls through to the full path rather than guessing.
     async fn branch_ref_exists(&self, repo_slug: &str, branch: &str) -> Result<bool, GhRunnerError> {
-        match self
-            .gh
-            .rest_get(&format!("repos/{repo_slug}/git/ref/heads/{branch}"), None)
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(err) if err.http_status == Some(404) => Ok(false),
-            Err(err) => Err(err),
-        }
+        boss_github::gh_runner::branch_ref_exists(self.gh.as_ref(), repo_slug, branch).await
     }
 
     async fn default_branch(&self, repo_slug: &str) -> Result<String, GhRunnerError> {

@@ -266,6 +266,33 @@ fn parse_merge_queue_entry(body: &Value) -> Option<MergeQueueEntry> {
     })
 }
 
+/// `GET /repos/{slug}/git/ref/heads/{branch}` — tells the caller whether a
+/// branch was ever pushed to the remote at all. A clean 404 means it
+/// definitely was not; any other error is inconclusive (could be
+/// transient), so the caller should treat that case as "don't know" rather
+/// than "does not exist".
+///
+/// Shared so the Ok → `true` / 404 → `false` / other-error → propagated
+/// classification lives in exactly one place: the engine's abandoned-branch
+/// auto-PR sweep's pre-create existence precheck and its crash-recovery
+/// branch-resume probe both need the identical mapping, and a future fix
+/// to 404-detection or rate-limit handling here now reaches both instead of
+/// only whichever copy got patched.
+pub async fn branch_ref_exists(
+    gh: &dyn GhRunner,
+    repo_slug: &str,
+    branch: &str,
+) -> std::result::Result<bool, GhRunnerError> {
+    match gh
+        .rest_get(&format!("repos/{repo_slug}/git/ref/heads/{branch}"), None)
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(err) if err.http_status == Some(404) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 // ── CommandGhRunner (production) ──────────────────────────────────────────────
 
 /// Production [`GhRunner`] that spawns the `gh` CLI binary.

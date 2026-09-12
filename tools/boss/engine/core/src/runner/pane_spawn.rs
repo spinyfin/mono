@@ -8,6 +8,7 @@ use std::time::Duration as StdDuration;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use boss_github::gh_runner::CommandGhRunner;
 
 use crate::config::RuntimeConfig;
 use crate::coordinator::slot_id_from_worker_id;
@@ -715,6 +716,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             work_item,
             workspace_path,
             cube_change_id,
+            &CommandGhRunner,
             WorkerSpawnOpts::builder()
                 .editorial_enabled(editorial_enabled)
                 .max_embed_diff_lines(self.cfg.work.max_review_embed_diff_lines)
