@@ -7,7 +7,8 @@ async fn revision_no_op_survives_unavailable_proposals_and_github_for_every_driv
     for slug in ["claude", "codex", "grok"] {
         let workspace = tempdir().unwrap();
         let pr = "https://github.com/spinyfin/mono/pull/1613";
-        let (_dir, db, _, revision_id, execution_id) = revision_fixture(workspace.path(), pr, "unchanged-head");
+        let (_dir, db, product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), pr, "unchanged-head");
         set_work_item_driver(&db, &revision_id, slug);
         let text = "The finding needs no change.\nNO_CHANGES_NEEDED";
         let value = match slug {
@@ -45,7 +46,7 @@ async fn revision_no_op_survives_unavailable_proposals_and_github_for_every_driv
             cube,
             pane,
             probes,
-            ..
+            publisher,
         } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
         let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
             workspace.path().join("flags.toml"),
@@ -80,6 +81,23 @@ async fn revision_no_op_survives_unavailable_proposals_and_github_for_every_driv
             declined
                 .body_markdown
                 .contains("declined rather than recorded as fixed")
+        );
+        assert!(
+            !declined.body_markdown.contains("have been released"),
+            "{slug}: declined-finding body must not claim cube-lease/slot release as a completed fact: {}",
+            declined.body_markdown
+        );
+        let typed = publisher.typed_events.lock().await.clone();
+        assert!(
+            typed.iter().any(|(p, ev)| {
+                p == &product_id && matches!(ev, boss_protocol::FrontendEvent::AttentionItemCreated { .. })
+            }),
+            "{slug}: AttentionItemCreated must be published for the product; got {typed:?}"
+        );
+        assert_eq!(
+            publisher.attention_items_created().await,
+            1,
+            "{slug}: exactly one AttentionItemCreated event"
         );
         // The stored completion detail (surfaced in execution history/detail
         // views) must carry the same disclaimer as the attention item, not
@@ -203,4 +221,113 @@ async fn revision_no_op_requires_durable_declined_finding_record() {
     assert_eq!(outcome, StopOutcome::DbError);
     assert!(db.get_execution(&execution_id).unwrap().status.is_live());
     assert!(cube.release_calls.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn revision_run_done_no_changes_needed_files_declined_finding_record() {
+    let workspace = tempdir().unwrap();
+    let pr = "https://github.com/spinyfin/mono/pull/1613";
+    let (_dir, db, product_id, _, execution_id) = revision_fixture(workspace.path(), pr, "unchanged-head");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET result_summary = NULL WHERE execution_id = ?1",
+            [&execution_id],
+        )
+        .unwrap();
+    let TestHarness {
+        handler,
+        cube,
+        pane,
+        publisher,
+        ..
+    } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+
+    let outcome = handler
+        .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::NoChangesNeeded)
+        .await;
+    assert!(matches!(outcome, StopOutcome::NoChangesNeeded { .. }), "{outcome:?}");
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Completed
+    );
+    assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+    assert_eq!(pane.calls.lock().await.as_slice(), [execution_id.as_str()]);
+
+    let items = db.list_attention_items(&execution_id).unwrap();
+    let declined = items
+        .iter()
+        .find(|item| item.kind == REVISION_NO_OP_ATTENTION_KIND)
+        .expect("run-done no-op on a revision must file the declined-finding record");
+    assert!(declined.body_markdown.contains(pr));
+    assert!(
+        declined
+            .body_markdown
+            .contains("declined rather than recorded as fixed")
+    );
+    assert!(declined.body_markdown.contains("not independently verified"));
+    assert!(
+        !declined.body_markdown.contains("have been released"),
+        "declined-finding body must not claim cube-lease/slot release as a completed fact: {}",
+        declined.body_markdown
+    );
+
+    let typed = publisher.typed_events.lock().await.clone();
+    assert!(
+        typed.iter().any(|(p, ev)| {
+            p == &product_id && matches!(ev, boss_protocol::FrontendEvent::AttentionItemCreated { .. })
+        }),
+        "AttentionItemCreated must be published for the product; got {typed:?}"
+    );
+    assert_eq!(publisher.attention_items_created().await, 1);
+
+    let runs = db.list_runs(&execution_id).unwrap();
+    let result_summary = runs
+        .last()
+        .and_then(|run| run.result_summary.clone())
+        .expect("no-op completion must record a result summary");
+    assert!(
+        !result_summary.contains("measured"),
+        "run-done no-op must not claim a measured empty diff: {result_summary}"
+    );
+    assert!(
+        result_summary.contains("could not independently verify"),
+        "expected the Indeterminate disclaimer wording: {result_summary}"
+    );
+
+    assert_eq!(
+        handler
+            .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::NoChangesNeeded)
+            .await,
+        StopOutcome::AlreadyTerminal
+    );
+    assert_eq!(cube.release_calls.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn chore_run_done_no_changes_needed_does_not_file_revision_declined_record() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, chore_id, execution_id) = fixture(workspace.path());
+    let TestHarness {
+        handler,
+        cube,
+        publisher,
+        ..
+    } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+
+    let outcome = handler
+        .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::NoChangesNeeded)
+        .await;
+    assert!(
+        matches!(outcome, StopOutcome::NoChangesNeeded { ref work_item_id } if work_item_id == &chore_id),
+        "{outcome:?}"
+    );
+    assert!(cube.release_calls.lock().await.as_slice() == ["lease-1"]);
+    assert!(
+        !db.list_attention_items(&execution_id)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == REVISION_NO_OP_ATTENTION_KIND)
+    );
+    assert_eq!(publisher.attention_items_created().await, 0);
 }

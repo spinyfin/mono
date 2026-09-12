@@ -109,7 +109,9 @@ impl WorkerCompletionHandler {
 
         match outcome {
             boss_protocol::RunDoneOutcome::NoChangesNeeded => {
-                self.finalize_no_op_completion(&execution, None, None).await
+                let (contribution, attention) = self.declared_run_done_no_op_inputs(&execution);
+                self.finalize_no_op_completion(&execution, contribution, attention)
+                    .await
             }
             boss_protocol::RunDoneOutcome::Delivered => self.finalize_declared_delivery(&execution).await,
             boss_protocol::RunDoneOutcome::Blocked => self.finalize_declared_blocked(&execution).await,

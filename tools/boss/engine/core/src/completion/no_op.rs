@@ -114,18 +114,12 @@ impl WorkerCompletionHandler {
         // The declined-finding attention item (when requested) was filed in
         // the SAME transaction as the terminal write above, so it is either
         // both true or neither happened — never a record claiming a closure
-        // that didn't. Publish the frontend event for it now that the
-        // transaction has actually committed.
-        if let Some(item) = completion.filed_attention_item.clone()
-            && let Ok(work_item) = self.work_db.get_work_item(&completion.execution.work_item_id)
-        {
-            let product_id = work_item.product_id().to_string();
-            self.publisher
-                .publish_frontend_event_on_product(&product_id, FrontendEvent::AttentionItemCreated { item })
-                .await;
-        }
-        // The worker reached a clean terminal — drop any staged URL and reset
-        // the nudge counter so nothing lingers for this finalized execution.
+        // that didn't. Teardown (pane / driver / cube lease) runs next;
+        // the frontend event is published only after that attempt, so the
+        // interactive surface does not fire while release is still in flight.
+        // The record itself does not claim that cube release succeeded —
+        // `finish_worker_teardown` logs and continues on failure, leaving
+        // a timed-out cube release to TTL reclamation.
         self.staged_pr_urls.forget(&execution.id);
         self.nudge_breaker.forget(&execution.id);
         self.build_wait_tracker.forget(&execution.id);
@@ -141,6 +135,12 @@ impl WorkerCompletionHandler {
         )
         .await;
         let work_item_id = completion.execution.work_item_id.clone();
+        let product_id = completion.work_item.product_id().to_string();
+        if let Some(item) = completion.filed_attention_item.clone() {
+            self.publisher
+                .publish_frontend_event_on_product(&product_id, FrontendEvent::AttentionItemCreated { item })
+                .await;
+        }
         self.publisher
             .publish(
                 &completion.execution.id,
@@ -149,7 +149,6 @@ impl WorkerCompletionHandler {
                 "worker_no_op_completed",
             )
             .await;
-        let product_id = completion.work_item.product_id().to_string();
         self.publisher
             .publish_work_item_changed(&product_id, &work_item_id, "worker_no_op_completed")
             .await;
@@ -162,20 +161,45 @@ impl WorkerCompletionHandler {
         StopOutcome::NoChangesNeeded { work_item_id }
     }
 
-    /// Build the human-visible record that a `revision_implementation`
-    /// closed on the sanctioned `NO_CHANGES_NEEDED` marker without ever
-    /// moving the bound PR — i.e. the worker declared the review finding
-    /// it was dispatched for needs no code change.
+    /// Attention item and contribution evidence for a revision that
+    /// declared `no_changes_needed` through the run-done proposal seam.
+    /// Other execution kinds return `(None, None)`.
     ///
-    /// Returns the item to file rather than filing it itself: the caller
-    /// ([`Self::try_revision_no_op`]) threads it into
-    /// [`Self::finalize_no_op_completion`], which inserts it in the SAME
-    /// transaction as the terminal write. Filing it separately (as an
-    /// earlier version of this code did, before the terminal write) let a
-    /// subsequent `AlreadyTerminal` or `DbError` leave a record claiming the
-    /// execution was closed and its lease/slot released when it was in fact
-    /// still live — this record's claims are now only ever as true as the
-    /// transaction that carries them.
+    /// Contribution is always [`ContributionEvidence::Indeterminate`]: this
+    /// path is the submit-time termination and must not call GitHub, so the
+    /// record must not describe a measured empty diff.
+    pub(super) fn declared_run_done_no_op_inputs(
+        &self,
+        execution: &crate::work::WorkExecution,
+    ) -> (Option<ContributionEvidence>, Option<CreateAttentionItemInput>) {
+        if execution.kind != ExecutionKind::RevisionImplementation {
+            return (None, None);
+        }
+        let bound_pr_url = self
+            .resolve_bound_pr_url(execution)
+            .or_else(|| execution.pr_url.clone().filter(|u| !u.is_empty()))
+            .unwrap_or_else(|| "(unresolved parent PR)".to_owned());
+        (
+            Some(ContributionEvidence::Indeterminate),
+            Some(Self::revision_no_op_attention_input(
+                &bound_pr_url,
+                ContributionEvidence::Indeterminate,
+            )),
+        )
+    }
+
+    /// Build the human-visible record that a `revision_implementation`
+    /// closed as a sanctioned no-op without addressing its finding.
+    ///
+    /// Returns the item to insert rather than inserting it itself: the
+    /// caller ([`Self::try_revision_no_op`] or
+    /// [`Self::finalize_declared_run_done`]) threads it into
+    /// [`Self::finalize_no_op_completion`], which commits the attention
+    /// item and the terminal transition in one transaction so the record
+    /// can never assert closure that did not happen. The body does not
+    /// claim cube-lease or worker-slot release: those run after the
+    /// transaction, and a failed or timed-out cube release is left to
+    /// TTL reclamation.
     fn revision_no_op_attention_input(
         bound_pr_url: &str,
         contribution: ContributionEvidence,
@@ -195,8 +219,7 @@ impl WorkerCompletionHandler {
              needs no code change.\n\n\
              The revision has been closed as a declared no-op against {bound_pr_url}. \
              **The finding was declined rather than recorded as fixed.** Read the worker's final message to \
-             judge whether declining it was right; re-dispatch the revision if it was not.\n\n\
-             The execution's cube lease and worker slot have been released."
+             judge whether declining it was right; re-dispatch the revision if it was not."
         );
         CreateAttentionItemInput {
             kind: REVISION_NO_OP_ATTENTION_KIND.to_owned(),
