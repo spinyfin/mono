@@ -951,10 +951,11 @@ mod trunk_queue_tests {
             cfg,
             None,
             None,
-            None,
-            None,
-            Some(trunk_client),
-            direct_merge_executor,
+            ServerStateOverrides {
+                trunk_client: Some(trunk_client),
+                direct_merge_executor,
+                ..Default::default()
+            },
         )
         .unwrap();
         (state, temp)

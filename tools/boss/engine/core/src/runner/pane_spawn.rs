@@ -19,7 +19,10 @@ use boss_protocol::{ExecutionKind, ExecutionStatus, ReviewBatchMemberRole, WorkI
 use super::prompt::structured_output_env_vars;
 use super::work_item::{followup_pr_body_prefix_for_work_item, work_item_id, work_item_name, work_item_task_kind};
 use super::worker_spawn::{ComposedWorkerSpawn, WorkerSpawnOpts, compose_worker_spawn};
-use super::{ExecutionRunner, RunOutcome, RunWaitState, bound_events_socket_path};
+use super::{
+    ExecutionRunner, RunOutcome, RunWaitState, bound_control_token_path, bound_events_socket_path,
+    bound_frontend_socket_path,
+};
 
 /// Render one driver-supplied [`crate::driver::EnvDirective`] as a shell
 /// statement to prepend to the worker pane's spawn command. Generic over
@@ -1068,6 +1071,8 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .slot_id(slot_id)
                 .workspace_path(workspace_path.to_path_buf())
                 .events_socket_path(self.events_socket_path())
+                .maybe_frontend_socket_path(bound_frontend_socket_path(&self.cfg))
+                .maybe_control_token_path(bound_control_token_path(&self.cfg))
                 .boss_event_path(self.boss_event_binary())
                 .initial_input(initial_input)
                 .extra_env({

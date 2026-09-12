@@ -137,7 +137,7 @@ mod work_items;
 mod worker_events;
 
 // Re-export public items from server module for external callers.
-pub use server::{process_is_alive, run, serve, serve_with_merge_probe};
+pub use server::{ServeOverrides, process_is_alive, run, serve, serve_with_merge_probe, serve_with_overrides};
 
 use isolation::IsolationPaths;
 
@@ -569,6 +569,34 @@ struct CoordinatorInstalledVersionCacheEntry {
 }
 
 type CoordinatorInstalledVersionCache = Arc<StdMutex<Option<CoordinatorInstalledVersionCacheEntry>>>;
+
+/// Optional collaborators tests (and [`server::serve_with_overrides`]) inject
+/// instead of production ones when constructing [`ServerState`].
+///
+/// Bundled so an additive override does not grow a positional argument list
+/// or require `#[allow(clippy::too_many_arguments)]`. Production passes
+/// [`ServerStateOverrides::default`].
+#[derive(Default, bon::Builder)]
+#[builder(on(String, into))]
+struct ServerStateOverrides {
+    /// Fake live-CI probe. `None` uses `CommandMergeProbe`.
+    merge_probe: Option<Arc<dyn MergeProbe>>,
+    /// Fake Trunk token store. `None` uses `boss_trunk_auth::TrunkTokenStore`.
+    trunk_token_store: Option<Arc<dyn trunk_auth::TrunkTokenSource>>,
+    /// Fake Trunk REST client. `None` builds a production `TrunkClient`.
+    trunk_client: Option<boss_trunk_client::TrunkClient>,
+    /// Fake Direct-merge executor. `None` uses `CommandDirectMergeExecutor`.
+    direct_merge_executor: Option<Arc<dyn merge_when_ready::DirectMergeExecutor>>,
+    /// Fake cube client. `None` uses `CommandCubeClient`. Tests inject
+    /// [`crate::test_support::AlwaysSucceedsCube`] to claim without a real cube.
+    cube_client: Option<Arc<dyn CubeClient>>,
+    /// Fake execution runner. `None` uses `PaneSpawnRunner`. Tests inject
+    /// [`crate::test_support::AlwaysSucceedsRunner`] to skip a real pane.
+    execution_runner: Option<Arc<dyn ExecutionRunner>>,
+    /// Shared worker pid map so a test can register its process as a
+    /// worker shell before a subprocess `boss` call is attributed.
+    worker_registry: Option<WorkerRegistry>,
+}
 
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
@@ -1117,70 +1145,35 @@ impl ServerState {
             .map(boss_engine_attachments::http::base_url)
     }
 
-    /// Construct `ServerState` with optional `MergeProbe`, Trunk
-    /// token-store, and Trunk client overrides. Production (via
-    /// [`server::serve`]) passes `None` for all three and gets the real
+    /// Construct `ServerState` with optional collaborator overrides.
+    /// Production (via [`server::serve`]) passes
+    /// [`ServerStateOverrides::default`] and gets the real
     /// `CommandMergeProbe` (shell out to `gh`), `boss_trunk_auth::TrunkTokenStore`
-    /// (OS keychain), and a `TrunkClient` built from that same store; tests
-    /// that need to exercise the CI-remediation validation gates (green /
-    /// pending / red), the `TrunkSetToken`/`TrunkStatus` handlers, or the
-    /// `trunk_queue` merge-when-ready path without a live `gh` call, the
-    /// real OS keychain, or a live Trunk API call inject a fake/mock for
-    /// any of the three — see `MergeProbe`'s doc comment ("test doubles can
-    /// stub it directly"), `trunk_auth::TrunkTokenSource`, and
-    /// `boss_trunk_client::TrunkClient::new` (point `CallConfig::base_url`
-    /// at a `wiremock::MockServer`).
+    /// (OS keychain), a `TrunkClient` built from that same store,
+    /// `CommandDirectMergeExecutor`, `CommandCubeClient`, `PaneSpawnRunner`,
+    /// and a fresh [`WorkerRegistry`]. Tests inject fakes — see
+    /// `MergeProbe`'s doc comment ("test doubles can stub it directly"),
+    /// `trunk_auth::TrunkTokenSource`, `boss_trunk_client::TrunkClient::new`
+    /// (point `CallConfig::base_url` at a `wiremock::MockServer`),
+    /// [`crate::test_support::AlwaysSucceedsCube`] /
+    /// [`crate::test_support::AlwaysSucceedsRunner`] to claim without a
+    /// real cube/pane, or a cloned registry so a subprocess `boss propose`
+    /// can be attributed as a live worker.
     fn new_arc_with_app_pid_and_merge_probe(
         cfg: Arc<RuntimeConfig>,
         app_pid: Option<libc::pid_t>,
         control_token: Option<Arc<String>>,
-        merge_probe_override: Option<Arc<dyn MergeProbe>>,
-        trunk_token_store_override: Option<Arc<dyn trunk_auth::TrunkTokenSource>>,
-        trunk_client_override: Option<boss_trunk_client::TrunkClient>,
-        direct_merge_executor_override: Option<Arc<dyn merge_when_ready::DirectMergeExecutor>>,
+        overrides: ServerStateOverrides,
     ) -> Result<Arc<Self>> {
-        Self::new_arc_with_app_pid_and_merge_probe_and_dispatch_fakes(
-            cfg,
-            app_pid,
-            control_token,
-            merge_probe_override,
-            trunk_token_store_override,
-            trunk_client_override,
-            direct_merge_executor_override,
-            None,
-            None,
-        )
-    }
-
-    /// Same as [`Self::new_arc_with_app_pid_and_merge_probe`], with two
-    /// additional overrides for the cube client and execution runner that
-    /// `ExecutionCoordinator` dispatches through. Production (via that
-    /// function) always passes `None` for both and gets the real
-    /// `CommandCubeClient` (shells out to the `cube` binary) and
-    /// `PaneSpawnRunner` (spawns a real pane). Tests that need to drive a
-    /// dispatch past `drain_ready_queue` to a successful claim — without
-    /// leasing a real cube workspace or spawning a real pane — inject
-    /// [`crate::test_support::AlwaysSucceedsCube`] /
-    /// [`crate::test_support::AlwaysSucceedsRunner`] (or a purpose-built
-    /// fake) here instead of going through the production collaborators.
-    // This constructor exists solely to append two test-only dispatch-fake
-    // overrides onto the existing 7-parameter override list `[Self::
-    // new_arc_with_app_pid_and_merge_probe]` already carries (merge probe,
-    // trunk token store, trunk client, direct-merge executor) — the same
-    // "production passes None, tests inject a fake" shape repeated once
-    // more, not unrelated concerns that should be grouped into a struct.
-    #[allow(clippy::too_many_arguments)]
-    fn new_arc_with_app_pid_and_merge_probe_and_dispatch_fakes(
-        cfg: Arc<RuntimeConfig>,
-        app_pid: Option<libc::pid_t>,
-        control_token: Option<Arc<String>>,
-        merge_probe_override: Option<Arc<dyn MergeProbe>>,
-        trunk_token_store_override: Option<Arc<dyn trunk_auth::TrunkTokenSource>>,
-        trunk_client_override: Option<boss_trunk_client::TrunkClient>,
-        direct_merge_executor_override: Option<Arc<dyn merge_when_ready::DirectMergeExecutor>>,
-        cube_client_override: Option<Arc<dyn CubeClient>>,
-        execution_runner_override: Option<Arc<dyn ExecutionRunner>>,
-    ) -> Result<Arc<Self>> {
+        let ServerStateOverrides {
+            merge_probe: merge_probe_override,
+            trunk_token_store: trunk_token_store_override,
+            trunk_client: trunk_client_override,
+            direct_merge_executor: direct_merge_executor_override,
+            cube_client: cube_client_override,
+            execution_runner: execution_runner_override,
+            worker_registry: worker_registry_override,
+        } = overrides;
         // Constructed here (rather than left to `ServerState::builder`'s
         // default) so it can be injected into `work_db` via
         // `with_event_bus` below — without that, `WorkDb`'s state-transition
@@ -1629,9 +1622,11 @@ impl ServerState {
                     &attachment_state_root,
                 ))
                 .event_bus(event_bus)
-                .worker_registry(WorkerRegistry::with_sleep_assertion(Arc::new(
-                    crate::sleep_assertion::SleepAssertionController::new(),
-                )))
+                .worker_registry(worker_registry_override.unwrap_or_else(|| {
+                    WorkerRegistry::with_sleep_assertion(Arc::new(
+                        crate::sleep_assertion::SleepAssertionController::new(),
+                    ))
+                }))
                 .live_worker_states(live_worker_states)
                 .hold_registry(hold_registry_for_state)
                 .teardown_registry(teardown_registry_for_state)

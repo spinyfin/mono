@@ -20,9 +20,10 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use boss_client::BossClient;
 use boss_client::wait_for_socket;
-use boss_engine::app::serve;
+use boss_engine::app::{ServeOverrides, serve_with_overrides};
 use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_engine::work::WorkDb;
+use boss_engine::worker_registry::WorkerRegistry;
 use boss_protocol::{
     CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput, FrontendEvent, FrontendRequest, Product,
     Project, Task, WorkItem,
@@ -33,6 +34,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct TestEngine {
     socket_path: PathBuf,
     db_path: PathBuf,
+    worker_registry: WorkerRegistry,
     _temp: tempfile::TempDir,
     join: tokio::task::JoinHandle<Result<()>>,
 }
@@ -47,9 +49,28 @@ impl TestEngine {
             .db_path(db_path.clone())
             .build();
         let cfg = Arc::new(RuntimeConfig::from_parts(work_config, None));
+        // Cloneable (Arc inner): this handle and the engine's ServerState
+        // share the pid → run map, so tests can register the test process
+        // as a worker shell the way pane spawn does.
+        let worker_registry = WorkerRegistry::new();
 
         let socket_for_serve = socket_path.clone();
-        let join = tokio::spawn(async move { serve(cfg, socket_for_serve, None, None, None, None).await });
+        let registry_for_serve = worker_registry.clone();
+        let join = tokio::spawn(async move {
+            serve_with_overrides(
+                cfg,
+                socket_for_serve,
+                None,
+                None,
+                None,
+                None,
+                ServeOverrides {
+                    merge_probe: None,
+                    worker_registry: Some(registry_for_serve),
+                },
+            )
+            .await
+        });
 
         if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
             return Err(anyhow!("engine never bound socket {}", socket_path.display()));
@@ -57,6 +78,7 @@ impl TestEngine {
         Ok(Self {
             socket_path,
             db_path,
+            worker_registry,
             _temp: temp,
             join,
         })
@@ -68,6 +90,15 @@ impl TestEngine {
 
     pub fn db(&self) -> Result<WorkDb> {
         WorkDb::open(self.db_path.clone())
+    }
+
+    /// Record `pid` as the worker shell for `run_id`. The engine attributes
+    /// `SubmitProposal` by walking the socket peer's ancestors to a pid
+    /// registered here; a test that drives the compiled `boss` binary as a
+    /// child of this process registers `std::process::id()` so the walk
+    /// resolves the same way a live pane-spawned session does.
+    pub fn register_worker(&self, pid: u32, run_id: impl Into<String>) {
+        self.worker_registry.register(pid as _, run_id);
     }
 }
 

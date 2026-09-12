@@ -481,10 +481,24 @@ pub struct StartWorkerInput {
     pub slot_id: u8,
     pub workspace_path: PathBuf,
     pub events_socket_path: PathBuf,
+    /// Frontend (control) socket this engine bound. Exported as
+    /// `BOSS_SOCKET_PATH` so `boss` CLI verbs reach this engine even when a
+    /// driver has scoped `$HOME` (Grok's process-home sandbox). `None` skips
+    /// the export — tests that don't exercise CLI reachability. Must be the
+    /// bound path, never re-derived from `$BOSS_SOCKET_PATH` / `$HOME`.
+    pub frontend_socket_path: Option<PathBuf>,
+    /// Control-token file this engine wrote. Exported as
+    /// `BOSS_ENGINE_CONTROL_TOKEN_PATH` alongside [`Self::frontend_socket_path`]
+    /// so CLI discovery does not derive `<socket-stem>.control-token` (a
+    /// filename the engine never writes). Must be the bound path from
+    /// `resolve_engine_paths`, never re-derived from the socket stem.
+    /// `None` skips the export.
+    pub control_token_path: Option<PathBuf>,
     pub boss_event_path: PathBuf,
     pub initial_input: String,
     /// Extra env vars to thread to the worker on top of the ones the
     /// worker settings template injects (`BOSS_EVENTS_SOCKET`,
+    /// `BOSS_SOCKET_PATH`, `BOSS_ENGINE_CONTROL_TOKEN_PATH`,
     /// `BOSS_LEASE_ID`).
     #[builder(default)]
     pub extra_env: Vec<(String, String)>,
@@ -730,7 +744,11 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
 
     // 2. Build the SpawnWorkerPane request. Workers get a strict env
     //    allowlist (per `v2-design-risks.md` R3): a sanitized PATH
-    //    (no `bossctl`), the engine-injected `BOSS_EVENTS_SOCKET` and
+    //    (no `bossctl`), the engine-injected `BOSS_EVENTS_SOCKET`,
+    //    `BOSS_SOCKET_PATH` (the bound frontend socket, so `boss`
+    //    CLI verbs survive a driver that scopes `$HOME`),
+    //    `BOSS_ENGINE_CONTROL_TOKEN_PATH` (the bound token, so
+    //    `boss engine stop` does not derive a sibling of the socket),
     //    `BOSS_LEASE_ID`, and any caller-provided `extra_env` keys
     //    that survive the allowlist filter. Anything else is dropped.
     //
@@ -747,6 +765,45 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             key: "BOSS_EVENTS_SOCKET".into(),
             value: input.events_socket_path.display().to_string(),
         },
+    ];
+    // Bound frontend socket, not `$HOME/Library/.../engine.sock`. Grok
+    // scopes worker `HOME` to a per-run process-home; without this export
+    // the `boss` CLI looks for a socket the engine has never created there,
+    // and `--socket-path` at the production data dir is blocked by the
+    // path-guard hook. Claude and Codex currently keep the host HOME, but
+    // the same export makes every driver independent of that.
+    //
+    // Setting `BOSS_SOCKET_PATH` flips CLI discovery into its
+    // sibling-derivation branch, which would look for
+    // `<stem>.control-token`. Production writes `engine-control.token`, so
+    // the resolved token path must ride along as
+    // `BOSS_ENGINE_CONTROL_TOKEN_PATH` (checked first by `Discovery::from_env`).
+    if let Some(frontend_socket_path) = &input.frontend_socket_path {
+        env.push(EnvVar {
+            key: crate::config::FRONTEND_SOCKET_ENV.into(),
+            value: frontend_socket_path.display().to_string(),
+        });
+        if let Some(control_token_path) = &input.control_token_path {
+            env.push(EnvVar {
+                key: crate::engine_control::TOKEN_PATH_ENV.into(),
+                value: control_token_path.display().to_string(),
+            });
+        } else {
+            tracing::warn!(
+                run_id = %input.run_id,
+                "spawn_flow: no bound control-token path was stamped on the config; \
+                 worker `boss engine stop`/`restart` will derive <socket-stem>.control-token \
+                 from BOSS_SOCKET_PATH, which production does not write",
+            );
+        }
+    } else {
+        tracing::warn!(
+            run_id = %input.run_id,
+            "spawn_flow: no bound frontend socket was stamped on the config; \
+             worker `boss` verbs will fall back to HOME-relative discovery",
+        );
+    }
+    env.extend([
         EnvVar {
             key: "BOSS_LEASE_ID".into(),
             value: input.lease_id.clone(),
@@ -785,7 +842,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             key: "XAI_API_KEY".into(),
             value: WORKER_XAI_API_KEY_NO_INTERACTIVE_AUTH.into(),
         },
-    ];
+    ]);
     for (k, v) in input.extra_env {
         if WORKER_EXTRA_ENV_ALLOWLIST.contains(&k.as_str()) {
             env.push(EnvVar { key: k, value: v });
@@ -1146,6 +1203,8 @@ mod tests {
             slot_id: 3,
             workspace_path: workspace.path().to_path_buf(),
             events_socket_path: PathBuf::from("/tmp/events.sock"),
+            frontend_socket_path: Some(PathBuf::from("/tmp/engine.sock")),
+            control_token_path: Some(PathBuf::from("/tmp/engine-control.token")),
             boss_event_path: PathBuf::from("/tmp/boss-event"),
             initial_input: "claude\n".into(),
             extra_env: vec![],
@@ -2238,8 +2297,60 @@ mod tests {
             Some("/tmp/events.sock"),
         );
         assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == crate::config::FRONTEND_SOCKET_ENV)
+                .map(|(_, v)| v.as_str()),
+            Some("/tmp/engine.sock"),
+            "workers must inherit the bound frontend socket as BOSS_SOCKET_PATH so `boss` CLI verbs do not resolve engine.sock from a driver-scoped HOME",
+        );
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == crate::engine_control::TOKEN_PATH_ENV)
+                .map(|(_, v)| v.as_str()),
+            Some("/tmp/engine-control.token"),
+            "workers must inherit the bound control-token path so `boss engine stop` does not derive <stem>.control-token from BOSS_SOCKET_PATH",
+        );
+        assert_eq!(
             env.iter().find(|(k, _)| k == "BOSS_LEASE_ID").map(|(_, v)| v.as_str()),
             Some("lease-test"),
+        );
+    }
+
+    #[tokio::test]
+    async fn omitted_frontend_socket_is_not_exported() {
+        let workspace = TempDir::new().unwrap();
+        let spawner = ok_spawner_capturing();
+        let mut input = sample_input(&workspace);
+        input.frontend_socket_path = None;
+        start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
+        let env = spawner.last_spawn_env();
+        assert!(
+            !env.iter().any(|(k, _)| k == crate::config::FRONTEND_SOCKET_ENV),
+            "an unstamped config must not invent a production BOSS_SOCKET_PATH"
+        );
+        assert!(
+            !env.iter().any(|(k, _)| k == crate::engine_control::TOKEN_PATH_ENV),
+            "control-token export rides with the frontend-socket export"
+        );
+    }
+
+    #[tokio::test]
+    async fn omitted_control_token_is_not_exported() {
+        let workspace = TempDir::new().unwrap();
+        let spawner = ok_spawner_capturing();
+        let mut input = sample_input(&workspace);
+        input.control_token_path = None;
+        start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
+        let env = spawner.last_spawn_env();
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == crate::config::FRONTEND_SOCKET_ENV)
+                .map(|(_, v)| v.as_str()),
+            Some("/tmp/engine.sock"),
+        );
+        assert!(
+            !env.iter().any(|(k, _)| k == crate::engine_control::TOKEN_PATH_ENV),
+            "an unstamped control-token path must not invent a sibling of the socket"
         );
     }
 

@@ -109,6 +109,35 @@ mod resolve_engine_paths_tests {
     }
 }
 
+mod stamped_frontend_socket_path_tests {
+    use std::path::PathBuf;
+
+    use super::super::stamped_frontend_socket_path;
+
+    #[test]
+    fn unstamped_config_yields_the_bound_path() {
+        let bound = PathBuf::from("/tmp/bound.sock");
+        assert_eq!(stamped_frontend_socket_path(None, &bound), bound);
+    }
+
+    #[test]
+    fn load_from_seed_yields_the_bound_path() {
+        let existing = PathBuf::from("/Users/tester/Library/Application Support/Boss/engine.sock");
+        let bound = PathBuf::from("/tmp/bound.sock");
+        assert_eq!(
+            stamped_frontend_socket_path(Some(&existing), &bound),
+            bound,
+            "the socket actually bound must win over the production default WorkConfig::load_from seeds"
+        );
+    }
+
+    #[test]
+    fn already_stamped_with_the_bound_path_is_idempotent() {
+        let bound = PathBuf::from("/tmp/bound.sock");
+        assert_eq!(stamped_frontend_socket_path(Some(&bound), &bound), bound);
+    }
+}
+
 mod stamped_events_socket_path_tests {
     use std::path::PathBuf;
 
@@ -150,7 +179,7 @@ mod stamped_events_socket_path_tests {
 mod tmux_operator_prefix_tests {
     use std::sync::Arc;
 
-    use super::super::ServerState;
+    use super::super::{ServerState, ServerStateOverrides};
     use crate::config::{RuntimeConfig, WorkConfig};
     use crate::husk_pane_sweep::HuskPaneSweepSource;
 
@@ -166,7 +195,8 @@ mod tmux_operator_prefix_tests {
                 .build(),
             None,
         ));
-        let state = ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, None, None, None, None).unwrap();
+        let state = ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, ServerStateOverrides::default())
+            .unwrap();
 
         assert_eq!(
             state.tmux_operator_prefix(),

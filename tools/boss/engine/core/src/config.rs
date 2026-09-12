@@ -16,6 +16,22 @@ pub const DB_PATH_ENV: &str = "BOSS_DB_PATH";
 /// nothing else in the engine may re-read it — see the field's doc comment.
 pub const EVENTS_SOCKET_ENV: &str = "BOSS_EVENTS_SOCKET";
 
+/// Environment override for the engine frontend (control) socket path.
+/// Read here to seed [`WorkConfig::frontend_socket_path`] and by the `boss`
+/// CLI's discovery. Downstream spawn must read the bound path off the
+/// config, not re-read this env — same isolation rule as [`EVENTS_SOCKET_ENV`].
+///
+/// Spawn deliberately exports this into every worker pane
+/// (`crate::spawn_flow::start_worker`) so `boss` CLI verbs reach the engine
+/// that bound the socket. The CLI ranks it above the HOME-derived default
+/// (`boss_client::Discovery::from_env`). A pane-launched fixture engine is
+/// kept off production by `agent_launch_guard`, not `IsolationPaths`:
+/// `EnginePaths::fields()` has no frontend-socket entry because the engine's
+/// own bind path comes from `--socket-path`. An inherited production value
+/// of this var is indistinguishable from operator intent by presence alone;
+/// the launch guard, not the isolation equality rule, is the backstop.
+pub const FRONTEND_SOCKET_ENV: &str = "BOSS_SOCKET_PATH";
+
 /// Environment override for the engine pid-file path.
 pub const PID_PATH_ENV: &str = "BOSS_ENGINE_PID_PATH";
 
@@ -140,6 +156,35 @@ pub struct WorkConfig {
     /// `None` means "this engine binds no events socket" — the in-process
     /// `serve(..., None, ...)` shape used by tests.
     pub events_socket_path: Option<PathBuf>,
+    /// Frontend (control) socket this engine binds — the path every worker
+    /// pane must see as `BOSS_SOCKET_PATH` so `boss` CLI verbs (`propose`,
+    /// `pr status`, …) dial *this* engine.
+    ///
+    /// Resolved once (from `BOSS_SOCKET_PATH`, else the production default)
+    /// and overwritten in [`crate::app::run`] / [`crate::app::serve`] with
+    /// the socket this process actually binds. Everything downstream that
+    /// hands workers a control-socket path reads it from here rather than
+    /// re-deriving it from `$HOME` or `$BOSS_SOCKET_PATH`: a Grok worker's
+    /// scoped process `HOME` would otherwise make the CLI look for
+    /// `engine.sock` inside the sandbox, where the engine has never bound.
+    ///
+    /// `None` means "this config did not stamp a frontend socket" — in-process
+    /// tests that never spawn a worker. Spawn then skips the env export
+    /// rather than falling back to production's path.
+    pub frontend_socket_path: Option<PathBuf>,
+    /// Control-token file this engine wrote — exported to workers as
+    /// `BOSS_ENGINE_CONTROL_TOKEN_PATH` so `boss engine stop` / `restart`
+    /// from a pane still find the token after `BOSS_SOCKET_PATH` has
+    /// switched CLI discovery into its sibling-derivation branch.
+    ///
+    /// Stamped in [`crate::app::serve`] from the path `resolve_engine_paths`
+    /// resolved (isolation-derived, else `$BOSS_ENGINE_CONTROL_TOKEN_PATH`,
+    /// else the production default). Never re-derived from the socket stem:
+    /// production writes `engine-control.token`, while sibling derivation
+    /// would look for `engine.control-token`.
+    ///
+    /// `None` skips the export — in-process tests that never spawn a worker.
+    pub control_token_path: Option<PathBuf>,
     /// Socket for Boss's private tmux server. Resolved once next to
     /// `db_path` (or overwritten by the isolation guard for a fixture).
     /// Everything downstream that talks to tmux reads it from here rather
@@ -246,6 +291,10 @@ impl WorkConfig {
             Some(path) => Some(PathBuf::from(path)),
             None => boss_log_files::default_events_socket_path(),
         };
+        let frontend_socket_path = match lookup(FRONTEND_SOCKET_ENV) {
+            Some(path) => Some(PathBuf::from(path)),
+            None => boss_log_files::default_frontend_socket_path(),
+        };
         let tmux_socket_path = Some(tmux_socket_path_beside_db(&db_path)?);
         // Default to the hard cap so the engine pool tracks the macOS
         // app's slot count (`WorkersWorkspaceModel.workerSlotCount = 8`).
@@ -281,6 +330,7 @@ impl WorkConfig {
             .cwd(cwd)
             .db_path(db_path)
             .maybe_events_socket_path(events_socket_path)
+            .maybe_frontend_socket_path(frontend_socket_path)
             .maybe_tmux_socket_path(tmux_socket_path)
             .worker_pool_size(worker_pool_size)
             .automation_pool_size(automation_pool_size)
@@ -621,6 +671,20 @@ mod tests {
             config.resolved_tmux_socket_path(),
             tempdir.path().join(boss_log_files::TMUX_SOCKET_FILENAME)
         );
+    }
+
+    #[test]
+    fn frontend_socket_path_reads_boss_socket_path_override() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("state.db");
+        let socket = tempdir.path().join("fixture.sock");
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path)),
+            "BOSS_SOCKET_PATH" => Some(OsString::from(&socket)),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(config.frontend_socket_path.as_deref(), Some(socket.as_path()));
     }
 
     /// `WorkConfig::load_from` must default to the hard cap

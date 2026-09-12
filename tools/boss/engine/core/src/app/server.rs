@@ -31,6 +31,10 @@ pub async fn run(cli: Cli) -> Result<()> {
     } else {
         work.tmux_socket_path = Some(crate::config::tmux_socket_path_beside_db(&work.db_path)?);
     }
+    // The socket this process is about to bind, not `$BOSS_SOCKET_PATH` /
+    // `$HOME`. Workers inherit this as `BOSS_SOCKET_PATH` so a driver that
+    // scopes `$HOME` (Grok) still reaches this engine.
+    work.frontend_socket_path = Some(socket_path.clone());
     let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(work, None));
 
     run_server(cli, cfg, isolation).await
@@ -405,6 +409,27 @@ fn stamped_events_socket_path(existing: Option<&Path>, bound: Option<&Path>) -> 
     }
 }
 
+/// What `WorkConfig::frontend_socket_path` should be after this `serve` call.
+///
+/// `bound` is always authoritative: this call *is* the binding. `existing`
+/// is the config's current stamp — `None` (unstamped in-process config),
+/// a different path (`WorkConfig::load_from` seeds `$BOSS_SOCKET_PATH` /
+/// the production default), or already the bound path (`run` stamped it).
+/// All three yield `bound`.
+fn stamped_frontend_socket_path(_existing: Option<&Path>, bound: &Path) -> std::path::PathBuf {
+    bound.to_path_buf()
+}
+
+/// Optional `serve` collaborators tests inject instead of production ones.
+#[derive(Default)]
+pub struct ServeOverrides {
+    /// Fake live-CI probe. `None` uses `CommandMergeProbe`.
+    pub merge_probe: Option<Arc<dyn crate::merge_poller::MergeProbe>>,
+    /// Shared worker pid map so a test can register its process as a
+    /// worker shell before a subprocess `boss` call is attributed.
+    pub worker_registry: Option<crate::worker_registry::WorkerRegistry>,
+}
+
 /// Same as [`serve`], but accepts an optional `MergeProbe` override, plumbed
 /// straight through to [`ServerState`]. Production callers (and most tests)
 /// go through `serve` and get the real `CommandMergeProbe`; tests that need
@@ -419,19 +444,63 @@ pub async fn serve_with_merge_probe(
     watched_parent_pid: Option<libc::pid_t>,
     merge_probe_override: Option<Arc<dyn crate::merge_poller::MergeProbe>>,
 ) -> Result<()> {
+    serve_with_overrides(
+        cfg,
+        socket_path,
+        pid_file_path,
+        events_socket_path,
+        control_token_path,
+        watched_parent_pid,
+        ServeOverrides {
+            merge_probe: merge_probe_override,
+            worker_registry: None,
+        },
+    )
+    .await
+}
+
+/// Same as [`serve_with_merge_probe`], with a [`ServeOverrides`] bundle so
+/// callers can also inject a cloned [`crate::worker_registry::WorkerRegistry`].
+pub async fn serve_with_overrides(
+    cfg: Arc<RuntimeConfig>,
+    socket_path: std::path::PathBuf,
+    pid_file_path: Option<std::path::PathBuf>,
+    events_socket_path: Option<std::path::PathBuf>,
+    control_token_path: Option<std::path::PathBuf>,
+    watched_parent_pid: Option<libc::pid_t>,
+    overrides: ServeOverrides,
+) -> Result<()> {
     let app_pid = current_parent_pid();
 
-    // The socket this call is about to bind is the one every worker's
-    // `settings.json` must name. Stamp it onto the config so downstream
+    // The sockets / token this call is about to bind or write are the ones
+    // every worker must inherit. Stamp them onto the config so downstream
     // resolvers read the binding instead of re-deriving it from the
-    // environment. In production `run` already set this and the overwrite is
-    // a no-op; it matters for in-process callers that pass an explicit socket
-    // path alongside a config built without one. See
-    // [`stamped_events_socket_path`] for the merge rule.
-    let stamped = stamped_events_socket_path(cfg.work.events_socket_path.as_deref(), events_socket_path.as_deref());
-    let cfg = if stamped.as_deref() != cfg.work.events_socket_path.as_deref() {
+    // environment. In production `run` already set the frontend socket and
+    // the overwrite is a no-op; it matters for in-process callers that pass
+    // an explicit socket path alongside a config built without one. See
+    // [`stamped_events_socket_path`] / [`stamped_frontend_socket_path`] for
+    // the merge rules.
+    let stamped_events =
+        stamped_events_socket_path(cfg.work.events_socket_path.as_deref(), events_socket_path.as_deref());
+    let stamped_frontend = stamped_frontend_socket_path(cfg.work.frontend_socket_path.as_deref(), &socket_path);
+    let events_changed = stamped_events.as_deref() != cfg.work.events_socket_path.as_deref();
+    let frontend_changed = cfg.work.frontend_socket_path.as_deref() != Some(stamped_frontend.as_path());
+    let stamped_token = match &control_token_path {
+        Some(bound) => Some(bound.clone()),
+        None => cfg.work.control_token_path.clone(),
+    };
+    let token_changed = stamped_token != cfg.work.control_token_path;
+    let cfg = if events_changed || frontend_changed || token_changed {
         let mut work = cfg.work.clone();
-        work.events_socket_path = stamped;
+        if events_changed {
+            work.events_socket_path = stamped_events;
+        }
+        if frontend_changed {
+            work.frontend_socket_path = Some(stamped_frontend);
+        }
+        if token_changed {
+            work.control_token_path = stamped_token;
+        }
         Arc::new(cfg.with_work(work))
     } else {
         cfg
@@ -507,10 +576,11 @@ pub async fn serve_with_merge_probe(
         cfg.clone(),
         app_pid,
         control_token.clone(),
-        merge_probe_override,
-        None,
-        None,
-        None,
+        ServerStateOverrides {
+            merge_probe: overrides.merge_probe,
+            worker_registry: overrides.worker_registry,
+            ..Default::default()
+        },
     )?;
 
     let tmux_preflight = crate::tmux_preflight::TmuxPreflight::probe_with_socket(&server_state.tmux_socket_path).await;
