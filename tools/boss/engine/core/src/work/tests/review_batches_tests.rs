@@ -2273,6 +2273,135 @@ fn reap_inert_review_batches_files_attention_on_a_done_cycle_root() {
     );
 }
 
+/// A `post_merge` batch's cycle root is `done` by construction — the merge
+/// poller creates the batch in the same pass that marks the root merged —
+/// so the dead-root disjunct must not treat that as proof the batch is
+/// garbage. Without the phase carve-out this reaps every post-merge batch
+/// within seconds of it spawning, which is exactly the bug this test guards
+/// against.
+#[test]
+fn reap_inert_review_batches_does_not_reap_a_post_merge_batch_on_a_done_cycle_root() {
+    let db = WorkDb::open(temp_db_path("post-merge-reap-done-root-exempt")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            post_merge_batch_input(cycle_root.id.clone(), "merge-sha-1"),
+            &[member(
+                ReviewBatchMemberRole::PostMergeReviewer,
+                Some(execution.id.clone()),
+            )],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'done' WHERE id = ?1",
+            rusqlite::params![cycle_root.id],
+        )
+        .unwrap();
+
+    let reaped = db
+        .reap_inert_review_batches(crate::work::REVIEW_BATCH_STALE_SECS)
+        .unwrap();
+    assert!(
+        reaped.is_empty(),
+        "a post-merge batch must not be reaped merely because its cycle root is done: {reaped:?}"
+    );
+    let stored = db.review_batch(&batch.id).unwrap().unwrap();
+    assert_eq!(stored.status, ReviewBatchStatus::Collecting);
+}
+
+/// The phase carve-out only touches the dead-root branch's `done`/`archived`
+/// arm — a genuinely deleted cycle root must still reap a post-merge batch,
+/// same as it does for a pre-merge one.
+#[test]
+fn reap_inert_review_batches_still_reaps_a_post_merge_batch_with_a_deleted_cycle_root() {
+    let db = WorkDb::open(temp_db_path("post-merge-reap-deleted-root")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let (batch, _) = db
+        .create_review_batch(
+            post_merge_batch_input(cycle_root.id.clone(), "merge-sha-1"),
+            &[member(ReviewBatchMemberRole::PostMergeReviewer, None)],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET deleted_at = ?2 WHERE id = ?1",
+            rusqlite::params![cycle_root.id, now_string()],
+        )
+        .unwrap();
+
+    let reaped = db
+        .reap_inert_review_batches(crate::work::REVIEW_BATCH_STALE_SECS)
+        .unwrap();
+    assert_eq!(
+        reaped,
+        vec![batch.id.clone()],
+        "a deleted cycle root must still reap its post-merge batch"
+    );
+}
+
+/// The phase carve-out only touches the dead-root branch — a post-merge
+/// batch whose root is untouched (neither done nor deleted) still falls to
+/// the ordinary staleness branch once its sole member has no non-terminal
+/// execution and the batch itself has gone stale.
+#[test]
+fn reap_inert_review_batches_reaps_a_stale_post_merge_batch_with_no_non_terminal_member() {
+    let db = WorkDb::open(temp_db_path("post-merge-reap-stale")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    stamp_execution_status(&db, &execution.id, "failed");
+    let (batch, _) = db
+        .create_review_batch(
+            post_merge_batch_input(cycle_root.id.clone(), "merge-sha-1"),
+            &[member(
+                ReviewBatchMemberRole::PostMergeReviewer,
+                Some(execution.id.clone()),
+            )],
+        )
+        .unwrap();
+    let stale_updated_at = (boss_engine_utils::epoch_time::now_epoch_secs() as u64)
+        .saturating_sub(crate::work::REVIEW_BATCH_STALE_SECS + 1)
+        .to_string();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_batches SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![stale_updated_at, batch.id],
+        )
+        .unwrap();
+
+    let reaped = db
+        .reap_inert_review_batches(crate::work::REVIEW_BATCH_STALE_SECS)
+        .unwrap();
+    assert_eq!(
+        reaped,
+        vec![batch.id.clone()],
+        "a stale post-merge batch with no non-terminal member must still be reaped"
+    );
+}
+
 /// [`WorkDb::create_post_merge_review_batch`] dispatches exactly one
 /// `PostMergeReviewer` execution at `large` effort (Opus/high — the task's
 /// dispatch policy for a solo landed-tree review), and is idempotent on the

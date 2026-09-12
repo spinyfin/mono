@@ -324,6 +324,76 @@ fn abandon_stranded_executions_on_closed_work_items_sweep() {
     assert!(second_pass.is_empty(), "sweep must be idempotent: {second_pass:?}");
 }
 
+/// A `post_merge` review batch's cycle root is `done` by construction — the
+/// merge poller creates the batch in the same pass that marks the root
+/// merged — so a `post_merge_reviewer` execution still `ready` (waiting for
+/// a review-pool slot across an engine restart) must not be swept up by
+/// this startup backstop just because its bound work item reads `done`.
+#[test]
+fn abandon_stranded_executions_on_closed_work_items_exempts_post_merge_review_members() {
+    let db = WorkDb::open(temp_db_path("abandon-stranded-post-merge-exempt")).unwrap();
+    let product_id = make_revision_product(&db, "stranded-post-merge");
+    let cycle_root = create_test_chore_manual(&db, product_id, "post-merge-root");
+
+    let input = crate::work::ReviewBatchCreateInput::builder()
+        .cycle_root_id(cycle_root.id.clone())
+        .base_sha("base-sha")
+        .classification(
+            boss_protocol::ReviewClassification::builder()
+                .changed_files(vec!["tools/boss/engine/pr-review/src/parsing.rs".to_owned()])
+                .complexity_flags(vec![])
+                .has_production_code(true)
+                .metadata_missing(vec![])
+                .production_languages(vec![boss_protocol::ReviewLanguageBucket::Rust])
+                .profile(boss_protocol::ReviewProfile::Light)
+                .subsystem_buckets(vec!["tools/boss/engine".to_owned()])
+                .additions(12)
+                .deletions(3)
+                .build(),
+        )
+        .phase(ReviewBatchPhase::PostMerge)
+        .pr_number(42)
+        .pr_url("https://github.com/example/repo/pull/42")
+        .target_sha("merge-sha-1")
+        .merge_sha("merge-sha-1")
+        .build();
+    db.create_post_merge_review_batch(input, "https://github.com/example/repo")
+        .unwrap();
+
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'done' WHERE id = ?1",
+            rusqlite::params![cycle_root.id],
+        )
+        .unwrap();
+
+    let abandoned = db.abandon_stranded_executions_on_closed_work_items().unwrap();
+    assert!(
+        abandoned.is_empty(),
+        "a post-merge reviewer waiting for a slot must not be abandoned merely because its cycle root is done: \
+         {abandoned:?}"
+    );
+
+    // An ordinary execution on the same closed work item is unaffected —
+    // the exemption is scoped to the batch member, not the whole task.
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(cycle_root.id.clone())
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::Ready)
+            .repo_remote_url("https://github.com/example/repo")
+            .build(),
+    )
+    .unwrap();
+    let abandoned = db.abandon_stranded_executions_on_closed_work_items().unwrap();
+    assert_eq!(
+        abandoned.len(),
+        1,
+        "an ordinary ready execution on the same closed work item must still be abandoned: {abandoned:?}"
+    );
+}
+
 /// A human archive may omit free-text justification, but a caller-supplied
 /// reason must survive — `update_task` must not blanket-null it.
 #[test]
