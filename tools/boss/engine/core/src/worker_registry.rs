@@ -11,8 +11,9 @@
 //! peer pid, walk up the process tree until we hit a registered
 //! ancestor. That's the run the hook event belongs to.
 //!
-//! macOS-only walk via `proc_pidinfo` for reliability — `getppid()`
-//! is per-process and would require IPC.
+//! Platform-specific process-tree walks: macOS uses `proc_pidinfo`; Linux
+//! reads `/proc/<pid>/stat`. `getppid()` is per-process and would require
+//! IPC for either implementation.
 
 use std::collections::HashMap;
 use std::io;
@@ -351,11 +352,39 @@ pub fn parent_pid(pid: libc::pid_t) -> io::Result<Option<libc::pid_t>> {
     if ppid == 0 { Ok(None) } else { Ok(Some(ppid)) }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Look up the parent pid of `pid` from Linux's `/proc/<pid>/stat`.
+///
+/// The process name field is parenthesized and may itself contain spaces or
+/// closing parentheses, so split after its final closing parenthesis before
+/// reading the state and parent-pid fields that follow it.
+#[cfg(target_os = "linux")]
+pub fn parent_pid(pid: libc::pid_t) -> io::Result<Option<libc::pid_t>> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let (_, fields) = stat.rsplit_once(')').ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("/proc/{pid}/stat is missing its process-name terminator"),
+        )
+    })?;
+    let parent = fields
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("/proc/{pid}/stat is missing ppid")))?
+        .parse::<libc::pid_t>()
+        .map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid ppid in /proc/{pid}/stat: {err}"),
+            )
+        })?;
+    if parent <= 0 { Ok(None) } else { Ok(Some(parent)) }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn parent_pid(_pid: libc::pid_t) -> io::Result<Option<libc::pid_t>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "parent_pid is only implemented on macOS",
+        "parent_pid is only implemented on macOS and Linux",
     ))
 }
 
@@ -497,7 +526,7 @@ mod tests {
         assert!(fresh);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn parent_pid_of_self_is_some() {
         let self_pid = std::process::id() as libc::pid_t;
@@ -505,7 +534,7 @@ mod tests {
         assert!(parent.is_some(), "expected a parent pid for the test process");
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn ancestor_walk_finds_self_pid_when_registered() {
         let reg = WorkerRegistry::new();
@@ -515,7 +544,7 @@ mod tests {
         assert_eq!(reg.lookup_with_ancestor_walk(self_pid).as_deref(), Some("self-run"));
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn ancestor_walk_finds_parent_when_only_parent_registered() {
         let reg = WorkerRegistry::new();
@@ -529,7 +558,7 @@ mod tests {
         assert_eq!(reg.lookup_with_ancestor_walk(self_pid).as_deref(), Some("parent-run"));
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn ancestor_walk_returns_none_when_no_ancestor_registered() {
         let reg = WorkerRegistry::new();
