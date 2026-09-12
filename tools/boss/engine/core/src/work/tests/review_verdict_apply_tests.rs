@@ -211,6 +211,159 @@ fn clean_verdict_advances_the_origin_to_review_without_a_revision() {
     assert_eq!(revision_count, 0, "clean verdict must not mint a revision");
 }
 
+/// Helper: create a revision under `cycle_root_id`, simulate its worker
+/// completing (a terminal `revision_implementation` execution stamped with
+/// `revision_stop_contributed_head = contributed_sha`), and hold it `active`
+/// with the cycle root's `pr_url` stamped on it — exactly the state
+/// `pr_flow.rs`'s `PendingReview` completion target leaves a revision in
+/// while an automated review pass runs. Returns the revision's task id.
+fn make_held_revision(db: &WorkDb, cycle_root_id: &str, cycle_root_pr_url: &str, contributed_sha: &str) -> String {
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(cycle_root_id), &checker).unwrap();
+    let exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(revision.id.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            rusqlite::params![exec.id],
+        )
+        .unwrap();
+    db.set_revision_stop_contributed_head(&exec.id, contributed_sha)
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'active', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![revision.id, cycle_root_pr_url],
+        )
+        .unwrap();
+    revision.id
+}
+
+/// A revision under the cycle root, held `active` pending exactly the push
+/// this batch reviews, must ALSO reach `in_review` when the verdict lands —
+/// alongside the cycle root, which was already in Review the whole time.
+/// Nothing else advances the revision: its own worker never opens a PR, so
+/// the normal `record_worker_pr_completion` `InReview` target never applies
+/// to it directly.
+#[test]
+fn clean_verdict_advances_both_cycle_root_and_the_held_revision_it_reviewed() {
+    let db = WorkDb::open(temp_db_path("verdict-apply-advances-revision")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    bind_open_pr(&db, &cycle_root.id);
+    let revision_id = make_held_revision(&db, &cycle_root.id, PR_URL, "head-sha");
+
+    let supervisor = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha"),
+            &[member(
+                ReviewBatchMemberRole::Supervisor,
+                Some(supervisor.id.clone()),
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    force_batch_supervising(&db, &batch.id);
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &supervisor.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &clean_verdict_payload(&batch.id, "head-sha"),
+            idempotency_key: "verdict-1",
+        })
+        .unwrap()
+        .unwrap();
+
+    db.apply_review_verdict_proposal(&outcome.proposal.id, &FakePrStateChecker::always(PrOpenState::Open))
+        .unwrap();
+
+    let root_after = query_task(&db.connect().unwrap(), &cycle_root.id).unwrap().unwrap();
+    assert_eq!(root_after.status, TaskStatus::InReview, "cycle root must reach Review");
+    let revision_after = query_task(&db.connect().unwrap(), &revision_id).unwrap().unwrap();
+    assert_eq!(
+        revision_after.status,
+        TaskStatus::InReview,
+        "the held revision whose push this batch reviewed must ALSO reach Review, \
+         not stay stranded in Doing with no live worker"
+    );
+}
+
+/// A revision whose contributed head DIFFERS from the batch's reviewed
+/// `target_sha` must NOT be advanced — it was superseded by a later push
+/// before this verdict landed, so a verdict for that later push (not this
+/// one) is what should eventually release it. Guards against matching by
+/// heuristic (task/parent identity alone) instead of the exact SHA.
+#[test]
+fn clean_verdict_does_not_advance_a_revision_with_a_different_contributed_head() {
+    let db = WorkDb::open(temp_db_path("verdict-apply-wrong-sha-revision")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    bind_open_pr(&db, &cycle_root.id);
+    // The held revision contributed a DIFFERENT sha than the one this batch
+    // reviews below ("head-sha" vs "superseded-sha").
+    let revision_id = make_held_revision(&db, &cycle_root.id, PR_URL, "superseded-sha");
+
+    let supervisor = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha"),
+            &[member(
+                ReviewBatchMemberRole::Supervisor,
+                Some(supervisor.id.clone()),
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    force_batch_supervising(&db, &batch.id);
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &supervisor.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &clean_verdict_payload(&batch.id, "head-sha"),
+            idempotency_key: "verdict-1",
+        })
+        .unwrap()
+        .unwrap();
+
+    db.apply_review_verdict_proposal(&outcome.proposal.id, &FakePrStateChecker::always(PrOpenState::Open))
+        .unwrap();
+
+    let revision_after = query_task(&db.connect().unwrap(), &revision_id).unwrap().unwrap();
+    assert_eq!(
+        revision_after.status,
+        TaskStatus::Active,
+        "a revision whose contributed head differs from the reviewed sha must not be advanced"
+    );
+}
+
 /// incident-002 postmortem gate: a cycle root held `blocked:
 /// deletion_signoff` must not be silently advanced to `in_review` (with the
 /// hold erased) by the async verdict-apply path — that hold is an explicit

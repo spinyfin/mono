@@ -1602,18 +1602,15 @@ pub(crate) fn request_pr_review_in_tx(
         )?
     };
 
-    // A fresh review pass owns the row's pre-human-review phase. The derived
-    // badge distinguishes its `ready` state as review queued until the run
-    // actually starts, so the Doing lane never appears workerless.
-    conn.execute(
-        "UPDATE tasks
-         SET status = 'active',
-             updated_at = ?2,
-             last_status_actor = 'engine'
-         WHERE id = ?1
-           AND status = 'in_review'",
-        params![work_item_id, now_string()],
-    )?;
+    // A row that has already reached `in_review` stays there for as long as
+    // work continues against its PR, including while this fresh review pass
+    // runs — per `tools/boss/docs/designs/work-kanban.md`'s cycle-root
+    // status contract. There is deliberately no `tasks.status` write here:
+    // "the Doing lane never appears workerless" was the old rationale for
+    // pulling the row back to `active`, but that is a rendering concern,
+    // solved by the Review-lane card reading `ai_reviewing`/`ai_review_state`
+    // (`attach_ai_reviewing_flag` / `attach_ai_review_state` in
+    // `revision_helpers.rs`), not by rewriting the canonical status.
     resolve_attention_kind_in_tx(conn, work_item_id, CHURN_GUARD_PARKED_ATTENTION_KIND)?;
     Ok(execution)
 }
@@ -2492,8 +2489,16 @@ mod tests {
         assert_eq!(execution.work_item_id, work_item_id);
     }
 
+    /// Regression test for the operator mandate: a cycle root in `in_review`
+    /// stays `in_review` when a new review pass is enqueued via
+    /// `request_pr_review_in_tx`. This replaces
+    /// `request_pr_review_restores_in_review_task_to_doing`, which asserted
+    /// the OPPOSITE — that enqueuing a review flipped the row to `active`
+    /// ("restore the Doing lane") — that write is the regression itself;
+    /// see `tools/boss/docs/designs/work-kanban.md`'s cycle-root status
+    /// contract.
     #[test]
-    fn request_pr_review_restores_in_review_task_to_doing() {
+    fn request_pr_review_keeps_in_review_task_in_review() {
         let db = open_db();
         let work_item_id = chore_with_pr(&db, "https://github.com/test/repo/pull/8", "in_review");
         let checker = FakePrStateChecker::always(PrOpenState::Open);
@@ -2504,8 +2509,8 @@ mod tests {
         let task = query_task(&db.connect().unwrap(), &work_item_id).unwrap().unwrap();
         assert_eq!(
             task.status,
-            TaskStatus::Active,
-            "a replacement review must restore the Doing lane"
+            TaskStatus::InReview,
+            "enqueuing a review pass must NEVER move an in_review row out of Review"
         );
     }
 

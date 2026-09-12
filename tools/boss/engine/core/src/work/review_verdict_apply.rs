@@ -407,6 +407,16 @@ impl WorkDb {
         // `done`/`archived` and this no-ops.
         advance_cycle_root_to_in_review_in_tx(&mut pending, &tx, &batch.cycle_root_id, &now)?;
 
+        // A revision under this chain root that is held `active` pending
+        // exactly this reviewed push must ALSO reach `in_review` here — per
+        // the operator mandate, the revision's own card is what needs to
+        // leave Doing once its push is confirmed reviewed, not just the
+        // cycle root (which was already in Review the whole time). Nothing
+        // else ever advances it: a revision's worker never opens its own
+        // PR, so `record_worker_pr_completion`'s normal `InReview` target
+        // never applies to it.
+        advance_held_revision_after_verdict_in_tx(&tx, &batch.cycle_root_id, &batch.target_sha, &now)?;
+
         commit_and_publish(tx, pending, self.event_bus())?;
         Ok(Some(applied_ref).filter(|_| remediating_task_id.is_some()))
     }
@@ -690,5 +700,56 @@ fn advance_cycle_root_to_in_review_in_tx(
         return Ok(());
     }
     cascade_dependents_after_prereq_status_change(pending, tx, task_id, "in_review", now)?;
+    Ok(())
+}
+
+/// Advance the one `revision` task under `cycle_root_id` that is held
+/// `active` pending exactly the push this batch reviewed, to `in_review`.
+///
+/// A revision never opens its own PR: `pr_flow.rs`'s `PendingReview`
+/// completion target holds it in whatever status it was already in (with
+/// the cycle root's `pr_url` stamped onto it so the reviewer/operator can
+/// find it) while the automated reviewer runs. Once this batch's verdict
+/// lands, that hold must release — otherwise the revision sits in Doing
+/// forever with no live worker and no way to reach Review on its own.
+///
+/// Identified by SHA, never by heuristic (task name, PR number, or reviewer
+/// *start* timing are all explicitly forbidden): the revision's own
+/// terminal `revision_implementation` execution must have stamped
+/// `revision_stop_contributed_head` equal to `target_sha`, the exact head
+/// this batch reviewed. A revision already superseded by a later push
+/// before this verdict landed has a different contributed head and is
+/// correctly left alone — a verdict for its own (later) push will advance
+/// it instead. A no-op (not an error) when no such revision exists: most
+/// batches review a chain root's own push, with no revision involved at
+/// all.
+fn advance_held_revision_after_verdict_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    cycle_root_id: &str,
+    target_sha: &str,
+    now: &str,
+) -> Result<()> {
+    let revision_id: Option<String> = tx
+        .query_row(
+            "SELECT t.id
+             FROM tasks t
+             JOIN work_executions we ON we.work_item_id = t.id
+             WHERE t.parent_task_id = ?1
+               AND t.kind = 'revision'
+               AND t.status = 'active'
+               AND t.deleted_at IS NULL
+               AND we.kind = 'revision_implementation'
+               AND we.status = 'completed'
+               AND we.revision_stop_contributed_head = ?2
+             ORDER BY we.created_at DESC, we.id DESC
+             LIMIT 1",
+            params![cycle_root_id, target_sha],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(revision_id) = revision_id else {
+        return Ok(());
+    };
+    WorkDb::advance_pending_review_task_to_in_review_with_verdict_source_in_tx(tx, &revision_id, cycle_root_id, now)?;
     Ok(())
 }
