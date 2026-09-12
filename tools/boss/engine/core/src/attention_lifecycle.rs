@@ -230,7 +230,10 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         ClearedBy::WorkResumed,
         "Asserts the worker pane for a run never came up. A later run starting for the same item is \
          direct evidence the pane-spawn problem is no longer blocking it — the same reasoning as \
-         `driver_terminal_error`, one stage earlier in the run's lifecycle.",
+         `driver_terminal_error`, one stage earlier in the run's lifecycle. The qualifier matters \
+         most here: `work_runs.started_at` is stamped before the pane is asked for, so a redispatch \
+         that fails to spawn identically must NOT count, and the evidence clause excludes runs whose \
+         own execution raised this same kind.",
     ),
     entry(
         crate::coordinator::ANSWER_AGENT_READY_AGE_ATTENTION_KIND,

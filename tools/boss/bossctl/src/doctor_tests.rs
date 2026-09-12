@@ -70,6 +70,17 @@ fn sig4_matches_shell_pid_zero_on_ack_timeout_only() {
 }
 
 #[test]
+fn sig_i_reaches_match_dispatch_signatures() {
+    let hit = ev_from_json(
+        r#"{"ts_epoch_ms":1784895019484,"stage":"spawn_failed","outcome":"error","execution_id":"exec_sig_i_wiring","error_message":"spawning worker pane for run exec_sig_i_wiring: preparing progress ingress: /p/sessions is not a real directory","details":{"spawn_failure":{"class":"progress_ingress","cause":"/p/sessions is not a real directory"}}}"#,
+    );
+    let findings = match_dispatch_signatures(&[hit], 0, None, None, &scope(&["exec_sig_i_wiring"]));
+    let sig_i: Vec<_> = findings.iter().filter(|f| f.sig_id == "SIG-I").collect();
+    assert_eq!(sig_i.len(), 1, "{findings:?}");
+    assert_eq!(sig_i[0].severity, Severity::P0);
+}
+
+#[test]
 fn sig6_requires_reason_timeout() {
     let timeout = ev_from_json(
         r#"{"ts_epoch_ms":1784879999312,"stage":"cube_workspace_lease_failed","outcome":"error","execution_id":"exec_lease_to","error_message":"cube workspace lease timed out after 30s","details":{"attempt":1,"reason":"timeout","fallback_policy":"any_free"}}"#,
