@@ -520,17 +520,17 @@ extension ChatViewModel {
         case .attentionGroupsList(let productID, let groups, let members):
             applyAttentionGroupsList(productID: productID, groups: groups, members: members)
         case .attentionGroupResult(let group, let members):
-            upsertAttentionGroup(group)
-            attentionMembersByGroupID[group.id] = members
+            applyAttentionGroupSnapshot(group, members: members)
         case .attentionCreated(let attention, let group):
-            upsertAttentionGroup(group)
-            upsertAttentionMember(attention)
+            withSuppressedSelectedProductAttentionRefresh {
+                upsertAttentionGroup(group)
+                upsertAttentionMember(attention)
+            }
+            refreshSelectedProductAttentionCaches()
         case .attentionGroupUpdated(let group, let members):
-            upsertAttentionGroup(group)
-            attentionMembersByGroupID[group.id] = members
+            applyAttentionGroupSnapshot(group, members: members)
         case .attentionGroupActioned(let group, let members):
-            upsertAttentionGroup(group)
-            attentionMembersByGroupID[group.id] = members
+            applyAttentionGroupSnapshot(group, members: members)
         case .attentionMergesList(let attentionID, let merges):
             attentionMergesByAttentionID[attentionID] = merges
         case .reviewTerminalReady(let workItemID, let workspacePath, let leaseID):

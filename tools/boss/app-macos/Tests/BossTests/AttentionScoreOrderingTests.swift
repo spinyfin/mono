@@ -16,7 +16,14 @@ final class AttentionScoreOrderingTests: XCTestCase {
         return model
     }
 
-    private func makeGroup(id: String, productID: String, createdAt: String) -> AttentionGroup {
+    private func makeGroup(
+        id: String,
+        productID: String,
+        createdAt: String,
+        state: String = "open",
+        actionedAt: String? = nil,
+        dismissedAt: String? = nil
+    ) -> AttentionGroup {
         AttentionGroup(
             id: id,
             productID: productID,
@@ -32,12 +39,31 @@ final class AttentionScoreOrderingTests: XCTestCase {
             sourceDocBranch: nil,
             groupingKey: "k_\(id)",
             generation: 0,
-            state: "open",
+            state: state,
             producedArtifactKind: nil,
             producedArtifactRef: nil,
             createdAt: createdAt,
-            actionedAt: nil,
-            dismissedAt: nil
+            actionedAt: actionedAt,
+            dismissedAt: dismissedAt
+        )
+    }
+
+    private func makeAttentionItem(
+        id: String,
+        workItemID: String,
+        resolvedAt: String? = nil
+    ) -> WorkAttentionItem {
+        WorkAttentionItem(
+            id: id,
+            executionID: nil,
+            workItemID: workItemID,
+            kind: "external_tracker_auth_failed",
+            status: resolvedAt == nil ? "open" : "resolved",
+            title: "item \(id)",
+            bodyMarkdown: "",
+            createdAt: "2026-06-01T00:00:00Z",
+            resolvedAt: resolvedAt,
+            convertedTaskID: nil
         )
     }
 
@@ -94,6 +120,22 @@ final class AttentionScoreOrderingTests: XCTestCase {
         )
     }
 
+    func testCachedOpenGroupsRefreshWhenSelectedProductChanges() {
+        let model = makeModel(productID: "prod_one")
+        let first = makeGroup(id: "atg_first", productID: "prod_one", createdAt: "2026-06-01T00:00:00Z")
+        let second = makeGroup(id: "atg_second", productID: "prod_one", createdAt: "2026-06-02T00:00:00Z")
+        let other = makeGroup(id: "atg_other", productID: "prod_two", createdAt: "2026-06-03T00:00:00Z")
+
+        model.applyAttentionGroupsList(productID: "prod_one", groups: [first, second], members: [])
+        model.applyAttentionGroupsList(productID: "prod_two", groups: [other], members: [])
+
+        XCTAssertEqual(model.selectedProductOpenAttentionGroups.map(\.id), ["atg_second", "atg_first"])
+
+        model.selectedWorkProductID = "prod_two"
+
+        XCTAssertEqual(model.selectedProductOpenAttentionGroups.map(\.id), ["atg_other"])
+    }
+
     /// A group with no members loaded yet (or none folded) defaults to `1`,
     /// matching a freshly-created item's score — it must not crash or rank
     /// as if unscored items outrank scored ones.
@@ -104,5 +146,113 @@ final class AttentionScoreOrderingTests: XCTestCase {
         model.applyEventForTest(.attentionGroupsList(productID: "prod_test", groups: [group], members: []))
 
         XCTAssertEqual(model.maxItemScore(forGroup: "atg_empty"), 1)
+    }
+
+    /// Live `attentionGroupActioned` must drop the group from the cached
+    /// open list without waiting for a product switch or a full list reload.
+    func testCachedOpenGroupsRefreshWhenGroupActioned() {
+        let model = makeModel(productID: "prod_test")
+        let older = makeGroup(id: "atg_older", productID: "prod_test", createdAt: "2026-05-01T00:00:00Z")
+        let newer = makeGroup(id: "atg_newer", productID: "prod_test", createdAt: "2026-06-01T00:00:00Z")
+        let olderMember = makeMember(id: "atn_older", groupID: "atg_older", score: 1)
+        let newerMember = makeMember(id: "atn_newer", groupID: "atg_newer", score: 1)
+
+        model.applyEventForTest(.attentionGroupsList(
+            productID: "prod_test",
+            groups: [older, newer],
+            members: [olderMember, newerMember]
+        ))
+        XCTAssertEqual(model.selectedProductOpenAttentionGroups.map(\.id), ["atg_newer", "atg_older"])
+
+        let actionedNewer = makeGroup(
+            id: "atg_newer",
+            productID: "prod_test",
+            createdAt: "2026-06-01T00:00:00Z",
+            state: "actioned",
+            actionedAt: "2026-06-15T00:00:00Z"
+        )
+        model.applyEventForTest(.attentionGroupActioned(group: actionedNewer, members: [newerMember]))
+
+        XCTAssertEqual(model.selectedProductOpenAttentionGroups.map(\.id), ["atg_older"])
+        XCTAssertEqual(model.selectedProductAttentionGroups.map(\.id), ["atg_newer", "atg_older"])
+    }
+
+    /// Live `attentionGroupUpdated` to dismissed must likewise remove the
+    /// group from the cached open list.
+    func testCachedOpenGroupsRefreshWhenGroupDismissed() {
+        let model = makeModel(productID: "prod_test")
+        let keep = makeGroup(id: "atg_keep", productID: "prod_test", createdAt: "2026-05-01T00:00:00Z")
+        let drop = makeGroup(id: "atg_drop", productID: "prod_test", createdAt: "2026-06-01T00:00:00Z")
+        let keepMember = makeMember(id: "atn_keep", groupID: "atg_keep", score: 1)
+        let dropMember = makeMember(id: "atn_drop", groupID: "atg_drop", score: 1)
+
+        model.applyEventForTest(.attentionGroupsList(
+            productID: "prod_test",
+            groups: [keep, drop],
+            members: [keepMember, dropMember]
+        ))
+        XCTAssertEqual(model.selectedProductOpenAttentionGroups.map(\.id), ["atg_drop", "atg_keep"])
+
+        let dismissed = makeGroup(
+            id: "atg_drop",
+            productID: "prod_test",
+            createdAt: "2026-06-01T00:00:00Z",
+            state: "dismissed",
+            dismissedAt: "2026-06-15T00:00:00Z"
+        )
+        model.applyEventForTest(.attentionGroupUpdated(group: dismissed, members: [dropMember]))
+
+        XCTAssertEqual(model.selectedProductOpenAttentionGroups.map(\.id), ["atg_keep"])
+    }
+
+    /// A member-only score change (groups dictionary untouched, selected
+    /// product unchanged) must reorder the cached open list.
+    func testCachedOpenGroupsReorderWhenMemberScoreChanges() {
+        let model = makeModel(productID: "prod_test")
+        let older = makeGroup(id: "atg_older", productID: "prod_test", createdAt: "2026-05-01T00:00:00Z")
+        let newer = makeGroup(id: "atg_newer", productID: "prod_test", createdAt: "2026-06-01T00:00:00Z")
+        let olderMember = makeMember(id: "atn_older", groupID: "atg_older", score: 1)
+        let newerMember = makeMember(id: "atn_newer", groupID: "atg_newer", score: 1)
+
+        model.applyEventForTest(.attentionGroupsList(
+            productID: "prod_test",
+            groups: [older, newer],
+            members: [olderMember, newerMember]
+        ))
+        XCTAssertEqual(model.selectedProductOpenAttentionGroups.map(\.id), ["atg_newer", "atg_older"])
+
+        let selectedBefore = model.selectedWorkProductID
+        let groupsBefore = model.attentionGroupsByProductID["prod_test"]
+        model.upsertAttentionMember(makeMember(id: "atn_older", groupID: "atg_older", score: 5))
+
+        XCTAssertEqual(model.selectedWorkProductID, selectedBefore)
+        XCTAssertEqual(groupsBefore, model.attentionGroupsByProductID["prod_test"])
+        XCTAssertEqual(model.selectedProductOpenAttentionGroups.map(\.id), ["atg_older", "atg_newer"])
+    }
+
+    func testCachedOpenAttentionItemsRefreshWhenItemsOrProductChange() {
+        let model = makeModel(productID: "prod_one")
+        let open = makeAttentionItem(id: "attn_open", workItemID: "prod_one")
+        let resolved = makeAttentionItem(
+            id: "attn_resolved",
+            workItemID: "prod_one",
+            resolvedAt: "2026-06-02T00:00:00Z"
+        )
+        let other = makeAttentionItem(id: "attn_other", workItemID: "prod_two")
+
+        model.applyEventForTest(.attentionItemsForWorkItemList(
+            workItemID: "prod_one",
+            items: [open, resolved]
+        ))
+        model.applyEventForTest(.attentionItemsForWorkItemList(
+            workItemID: "prod_two",
+            items: [other]
+        ))
+
+        XCTAssertEqual(model.selectedProductOpenAttentionItems.map(\.id), ["attn_open"])
+
+        model.selectedWorkProductID = "prod_two"
+
+        XCTAssertEqual(model.selectedProductOpenAttentionItems.map(\.id), ["attn_other"])
     }
 }

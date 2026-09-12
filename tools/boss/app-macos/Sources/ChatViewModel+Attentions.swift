@@ -11,20 +11,37 @@ extension ChatViewModel {
         groups: [AttentionGroup],
         members: [Attention]
     ) {
-        let priorIDs = Set((attentionGroupsByProductID[productID] ?? []).map(\.id))
-        let nextIDs = Set(groups.map(\.id))
-        for goneID in priorIDs.subtracting(nextIDs) {
-            attentionMembersByGroupID.removeValue(forKey: goneID)
+        // Mutate local copies and assign each dictionary once so a full
+        // reload does not re-sort the selected-product caches once per
+        // key write. Suppress didSet during the two assignments and
+        // refresh exactly once after both stores are consistent.
+        withSuppressedSelectedProductAttentionRefresh {
+            let priorIDs = Set((attentionGroupsByProductID[productID] ?? []).map(\.id))
+            let nextIDs = Set(groups.map(\.id))
+            var membersByGroup = attentionMembersByGroupID
+            for goneID in priorIDs.subtracting(nextIDs) {
+                membersByGroup.removeValue(forKey: goneID)
+            }
+            var bucketed: [String: [Attention]] = [:]
+            for member in members {
+                bucketed[member.groupID, default: []].append(member)
+            }
+            for group in groups {
+                membersByGroup[group.id] =
+                    (bucketed[group.id] ?? []).sorted { $0.ordinal < $1.ordinal }
+            }
+            attentionMembersByGroupID = membersByGroup
+            var groupsByProduct = attentionGroupsByProductID
+            groupsByProduct[productID] = groups
+            attentionGroupsByProductID = groupsByProduct
         }
-        var bucketed: [String: [Attention]] = [:]
-        for member in members {
-            bucketed[member.groupID, default: []].append(member)
-        }
-        for group in groups {
-            attentionMembersByGroupID[group.id] =
-                (bucketed[group.id] ?? []).sorted { $0.ordinal < $1.ordinal }
-        }
-        attentionGroupsByProductID[productID] = groups
+        refreshSelectedProductAttentionCaches()
+    }
+
+    /// Store group members in their display order so card body evaluation only
+    /// reads the prepared collection.
+    func setAttentionMembers(_ members: [Attention], forGroup groupID: String) {
+        attentionMembersByGroupID[groupID] = members.sorted { $0.ordinal < $1.ordinal }
     }
 
     /// Insert or replace a group within its product bucket (live-update path).
@@ -38,6 +55,16 @@ extension ChatViewModel {
         attentionGroupsByProductID[group.productID] = list
     }
 
+    /// Replace a group and its members as one logical update so the
+    /// selected-product caches refresh once with both stores consistent.
+    func applyAttentionGroupSnapshot(_ group: AttentionGroup, members: [Attention]) {
+        withSuppressedSelectedProductAttentionRefresh {
+            upsertAttentionGroup(group)
+            setAttentionMembers(members, forGroup: group.id)
+        }
+        refreshSelectedProductAttentionCaches()
+    }
+
     /// Insert or replace one member within its group's row list.
     func upsertAttentionMember(_ member: Attention) {
         var list = attentionMembersByGroupID[member.groupID] ?? []
@@ -46,7 +73,7 @@ extension ChatViewModel {
         } else {
             list.append(member)
         }
-        attentionMembersByGroupID[member.groupID] = list.sorted { $0.ordinal < $1.ordinal }
+        setAttentionMembers(list, forGroup: member.groupID)
     }
 
     /// Record an answer for a question member (`yes`/`no`, a chosen value, or
@@ -322,37 +349,6 @@ extension ChatViewModel {
         return automationsForSelectedProduct.first { $0.id == id }
     }
 
-    /// Unresolved attention items for the currently selected product.
-    var selectedProductOpenAttentionItems: [WorkAttentionItem] {
-        guard let productID = currentSelectedProductID else { return [] }
-        return (attentionItemsByWorkItemID[productID] ?? []).filter { $0.resolvedAt == nil }
-    }
-
-    /// All known attention groups for the selected product (open plus any
-    /// recently actioned/dismissed this session), newest-first.
-    var selectedProductAttentionGroups: [AttentionGroup] {
-        guard let productID = currentSelectedProductID else { return [] }
-        return (attentionGroupsByProductID[productID] ?? [])
-            .sorted { $0.createdAt > $1.createdAt }
-    }
-
-    /// Open (actionable) attention groups for the selected product — the
-    /// Notifications window's primary list and the toolbar badge source.
-    /// Ordered max-item-score-desc, then created-at-desc, so cards holding
-    /// the most-corroborated items (design: notification-dedup-scoring.md
-    /// §8) rise to the top; groups with no scored items keep today's
-    /// newest-first order.
-    var selectedProductOpenAttentionGroups: [AttentionGroup] {
-        selectedProductAttentionGroups
-            .filter(\.isOpen)
-            .sorted { lhs, rhs in
-                let lhsScore = maxItemScore(forGroup: lhs.id)
-                let rhsScore = maxItemScore(forGroup: rhs.id)
-                if lhsScore != rhsScore { return lhsScore > rhsScore }
-                return lhs.createdAt > rhs.createdAt
-            }
-    }
-
     /// Count of open attention groups for the selected product. Drives the
     /// Notifications toolbar bell badge (hidden when 0).
     var openAttentionGroupCount: Int {
@@ -361,7 +357,7 @@ extension ChatViewModel {
 
     /// Members of a group, in display order.
     func attentionMembers(forGroup groupID: String) -> [Attention] {
-        (attentionMembersByGroupID[groupID] ?? []).sorted { $0.ordinal < $1.ordinal }
+        attentionMembersByGroupID[groupID] ?? []
     }
 
     /// Highest `score` among a group's members — the priority signal used to
