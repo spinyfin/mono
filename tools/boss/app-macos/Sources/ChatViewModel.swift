@@ -101,10 +101,21 @@ final class ChatViewModel: ObservableObject {
     /// `AttentionGroupUpdated` / `AttentionGroupActioned` pushes. Holds open
     /// groups plus any that flipped to actioned/dismissed this session (so the
     /// produced-artifact link lingers until the next full reload).
-    @Published var attentionGroupsByProductID: [String: [AttentionGroup]] = [:]
+    @Published var attentionGroupsByProductID: [String: [AttentionGroup]] = [:] {
+        didSet { refreshSelectedProductAttentionGroups() }
+    }
     /// Attention group *members* keyed by `AttentionGroup.id`, in display
     /// order. Populated alongside [[attentionGroupsByProductID]].
-    @Published var attentionMembersByGroupID: [String: [Attention]] = [:]
+    @Published var attentionMembersByGroupID: [String: [Attention]] = [:] {
+        didSet { refreshSelectedProductAttentionGroups() }
+    }
+    /// Groups for the selected product, newest first. Refreshed when either
+    /// attention input or the selected product changes so SwiftUI reads a
+    /// stored value rather than sorting during body evaluation.
+    @Published private(set) var selectedProductAttentionGroups: [AttentionGroup] = []
+    /// Open groups for the selected product, ordered by score then recency.
+    /// This is the Notifications toolbar badge source.
+    @Published private(set) var selectedProductOpenAttentionGroups: [AttentionGroup] = []
     /// `attention_merges` provenance rows keyed by canonical `Attention.id`,
     /// fetched on demand for the merge-provenance affordance (score badge
     /// detail). Absent key means "not yet fetched", not "no merges".
@@ -180,6 +191,7 @@ final class ChatViewModel: ObservableObject {
     @Published var selectedWorkProductID: String? {
         didSet {
             notePublishedWorkInputChanged()
+            refreshSelectedProductAttentionGroups()
             // Every path that changes the chooser funnels through this
             // property — explicit selection, card reveal, the archived-product
             // fallback — so reporting here is what keeps the engine's copy
@@ -188,6 +200,22 @@ final class ChatViewModel: ObservableObject {
                 reportSelectedProductToEngine()
             }
         }
+    }
+
+    /// Refresh derived selected-product collections whenever their inputs
+    /// change. Keeping the sort here removes it from SwiftUI body evaluation.
+    private func refreshSelectedProductAttentionGroups() {
+        let groups = currentSelectedProductID.flatMap { attentionGroupsByProductID[$0] } ?? []
+        let sortedGroups = groups.sorted { $0.createdAt > $1.createdAt }
+        selectedProductAttentionGroups = sortedGroups
+        selectedProductOpenAttentionGroups = sortedGroups
+            .filter(\.isOpen)
+            .sorted { lhs, rhs in
+                let lhsScore = maxItemScore(forGroup: lhs.id)
+                let rhsScore = maxItemScore(forGroup: rhs.id)
+                if lhsScore != rhsScore { return lhsScore > rhsScore }
+                return lhs.createdAt > rhs.createdAt
+            }
     }
     @Published var selectedProjectFilterIDs: Set<String> = [] {
         didSet { notePublishedWorkInputChanged() }

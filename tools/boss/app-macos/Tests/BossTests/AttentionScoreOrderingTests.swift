@@ -94,6 +94,22 @@ final class AttentionScoreOrderingTests: XCTestCase {
         )
     }
 
+    func testCachedOpenGroupsRefreshWhenSelectedProductChanges() {
+        let model = makeModel(productID: "prod_one")
+        let first = makeGroup(id: "atg_first", productID: "prod_one", createdAt: "2026-06-01T00:00:00Z")
+        let second = makeGroup(id: "atg_second", productID: "prod_one", createdAt: "2026-06-02T00:00:00Z")
+        let other = makeGroup(id: "atg_other", productID: "prod_two", createdAt: "2026-06-03T00:00:00Z")
+
+        model.applyAttentionGroupsList(productID: "prod_one", groups: [first, second], members: [])
+        model.applyAttentionGroupsList(productID: "prod_two", groups: [other], members: [])
+
+        XCTAssertEqual(model.selectedProductOpenAttentionGroups.map(\.id), ["atg_second", "atg_first"])
+
+        model.selectedWorkProductID = "prod_two"
+
+        XCTAssertEqual(model.selectedProductOpenAttentionGroups.map(\.id), ["atg_other"])
+    }
+
     /// A group with no members loaded yet (or none folded) defaults to `1`,
     /// matching a freshly-created item's score — it must not crash or rank
     /// as if unscored items outrank scored ones.
