@@ -859,6 +859,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "boss-command-runner",
  "boss-gh-telemetry",
  "jsonwebtoken",
  "reqwest",

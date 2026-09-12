@@ -281,7 +281,7 @@ pub(crate) fn replace_auto_capabilities(conn: &Connection, host_id: &str, caps: 
 /// Each sub-probe is timed and the breakdown logged at `info`, so a slow
 /// cold start can be attributed to `gh auth status` (network + keychain)
 /// versus the driver login shells versus `uname` without guessing.
-fn discover_local_capabilities() -> Vec<String> {
+pub(crate) fn discover_local_capabilities() -> Vec<String> {
     use crate::host_capability_probe::{
         arch_capability, discover_local_driver_capabilities, gh_authed_capability, os_capability,
     };

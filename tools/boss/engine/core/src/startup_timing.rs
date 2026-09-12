@@ -69,11 +69,6 @@ impl StartupTimeline {
         step_elapsed
     }
 
-    /// Time elapsed since the phase began.
-    pub fn elapsed(&self) -> Duration {
-        self.started.elapsed()
-    }
-
     /// Close the phase, logging its total. Any time since the last `mark`
     /// is attributed to an implicit `finish` step so nothing is dropped.
     pub fn finish(self) -> Duration {

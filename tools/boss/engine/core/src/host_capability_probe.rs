@@ -31,8 +31,7 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::ssh_transport::{SshOutput, SshTransport};
 
@@ -275,36 +274,15 @@ fn local_command_on_path_with(pane_launch: &crate::spawn_flow::WorkerPaneLaunch,
 
 /// The probe itself: spawn `script` in the pane login shell and wait, bounded.
 fn local_command_on_path_inner(pane_launch: &crate::spawn_flow::WorkerPaneLaunch, binary: &str, script: &str) -> bool {
-    let mut child = match pane_launch.login_shell_command(script).spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            tracing::warn!(%binary, %error, "could not start local driver capability probe");
-            return false;
-        }
-    };
+    let mut command = pane_launch.login_shell_command(script);
     // The probe runs a login shell, whose profile can legitimately do small
-    // amounts of setup. Two seconds is also too tight while the sharded engine
-    // test binary is under normal CI load. Keep the probe bounded, but allow
-    // enough time for the same pane-login setup that worker launch uses.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            Ok(None) => {
-                tracing::warn!(%binary, "local driver capability probe timed out");
-                if let Err(error) = child.kill() {
-                    tracing::warn!(%binary, %error, "could not terminate timed-out local driver capability probe");
-                }
-                if let Err(error) = child.wait() {
-                    tracing::warn!(%binary, %error, "could not reap timed-out local driver capability probe");
-                }
-                return false;
-            }
-            Err(error) => {
-                tracing::warn!(%binary, %error, "could not poll local driver capability probe");
-                return false;
-            }
+    // amounts of setup. Keep it bounded, but allow enough time for the same
+    // pane-login setup that worker launch uses.
+    match boss_command_runner::output_blocking_timeout(&mut command, std::time::Duration::from_secs(10)) {
+        Ok(output) => output.status.success(),
+        Err(error) => {
+            tracing::warn!(%binary, %error, "local driver capability probe failed");
+            false
         }
     }
 }

@@ -649,36 +649,41 @@ pub async fn serve_with_overrides(
     {
         let state = server_state.clone();
         tokio::spawn(async move {
-            // Drop covers return and panic-unwind only. A hang is bounded by
-            // the timeout below, which fail-closes the same way a failed
-            // probe does: clear auto rows, lift the discovery hold, kick.
+            // Drop covers return and panic-unwind only. The timeout below
+            // fail-closes the database state and lifts the discovery hold;
+            // a blocking discovery that outlives it is harmless because its
+            // closure is pure.
             let _pending_guard = CapabilityDiscoveryPendingGuard::new(state.execution_coordinator.clone());
             let started = std::time::Instant::now();
-            let work_db = state.work_db.clone();
-            let probe = tokio::task::spawn_blocking(move || work_db.refresh_local_host_auto_capabilities());
+            // Discovery itself is pure. Keeping the database write outside
+            // `spawn_blocking` means a timed-out JoinHandle cannot later
+            // repopulate capabilities after this task has failed closed.
+            let probe = tokio::task::spawn_blocking(crate::host_registry::discover_local_capabilities);
             match tokio::time::timeout(LOCAL_CAPABILITY_PROBE_TIMEOUT, probe).await {
-                Ok(Ok(Ok(refresh))) => tracing::info!(
-                    capabilities = ?refresh.capabilities,
-                    driver_count = refresh.driver_count(),
-                    probe_ms = refresh.probe_elapsed.as_millis() as u64,
-                    total_ms = started.elapsed().as_millis() as u64,
-                    "startup: local host capability discovery complete; lifting the dispatch hold",
-                ),
-                Ok(Ok(Err(err))) => {
-                    tracing::error!(
-                        error = %format!("{err:#}"),
+                Ok(Ok(capabilities)) => match state.work_db.replace_auto_host_capabilities("local", &capabilities) {
+                    Ok(()) => tracing::info!(
+                        capabilities = ?capabilities,
+                        driver_count = capabilities.iter().filter(|capability| capability.starts_with("driver=")).count(),
+                        probe_ms = started.elapsed().as_millis() as u64,
                         total_ms = started.elapsed().as_millis() as u64,
-                        "startup: local host capability discovery FAILED; the local host has no \
-                         verified capabilities, so driver-constrained dispatch will report \
-                         DriverProbeNotRun until the engine restarts",
-                    );
-                    if let Err(err) = state.work_db.clear_local_host_auto_capabilities() {
+                        "startup: local host capability discovery complete; lifting the dispatch hold",
+                    ),
+                    Err(err) => {
                         tracing::error!(
                             error = %format!("{err:#}"),
-                            "startup: could not clear stale local auto capabilities after a failed probe",
+                            total_ms = started.elapsed().as_millis() as u64,
+                            "startup: local host capability discovery FAILED; the local host has no \
+                             verified capabilities, so driver-constrained dispatch will report \
+                             DriverProbeNotRun until the engine restarts",
                         );
+                        if let Err(err) = state.work_db.clear_local_host_auto_capabilities() {
+                            tracing::error!(
+                                error = %format!("{err:#}"),
+                                "startup: could not clear stale local auto capabilities after a failed probe",
+                            );
+                        }
                     }
-                }
+                },
                 Ok(Err(join_err)) => {
                     tracing::error!(
                         error = %format!("{join_err:#}"),

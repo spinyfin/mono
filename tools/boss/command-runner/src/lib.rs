@@ -1,7 +1,10 @@
 //! Shared asynchronous process runner for Boss components.
 
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::Path;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
@@ -12,6 +15,52 @@ pub struct CommandOutput {
     pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+}
+
+/// Run a prepared command, capturing its output, and kill it if it does not
+/// exit before `timeout`.
+///
+/// Reader threads keep a command that writes heavily to both pipes from
+/// deadlocking. On timeout their output is intentionally discarded: child
+/// processes can inherit the pipe descriptors, so joining the readers after
+/// killing only the direct child could wait indefinitely for those descendants.
+pub fn output_blocking_timeout(command: &mut Command, timeout: Duration) -> std::io::Result<Output> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let mut stderr = child.stderr.take().expect("stderr piped");
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        stdout.read_to_end(&mut buf).map(|_| buf)
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        stderr.read_to_end(&mut buf).map(|_| buf)
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                drop(stdout_thread);
+                drop(stderr_thread);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("{program} exceeded {timeout:?} timeout"),
+                ));
+            }
+        }
+    };
+    let stdout = stdout_thread
+        .join()
+        .unwrap_or_else(|_| Err(std::io::Error::other("stdout reader panicked")))?;
+    let stderr = stderr_thread
+        .join()
+        .unwrap_or_else(|_| Err(std::io::Error::other("stderr reader panicked")))?;
+    Ok(Output { status, stdout, stderr })
 }
 
 /// Process-spawning seam for components that construct commands.
