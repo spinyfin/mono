@@ -69,6 +69,8 @@ struct UIStallsViewer: View {
             }
             .pickerStyle(.segmented)
             .fixedSize()
+            Toggle("Enable stall monitoring", isOn: $monitoringEnabled)
+                .toggleStyle(.switch)
             Spacer()
             Text("\(records.count) stall\(records.count == 1 ? "" : "s")")
                 .font(.caption)
@@ -110,7 +112,7 @@ struct UIStallsViewer: View {
 
     @ViewBuilder
     private var emptyState: some View {
-        if MainThreadStallMonitor.shared.isRunning {
+        if monitoringEnabled {
             monitoringOnEmptyState
         } else {
             monitoringOffEmptyState
@@ -144,9 +146,6 @@ struct UIStallsViewer: View {
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: 420)
-            Toggle("Enable stall monitoring", isOn: $monitoringEnabled)
-                .toggleStyle(.switch)
-                .padding(.top, 4)
         }
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity)
