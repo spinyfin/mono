@@ -20,9 +20,9 @@ use super::*;
 // Enum discriminants and inputs used only by these fixtures are not part of
 // the `wire` module's import set — bring them in explicitly from the crate root.
 use crate::{
-    AttachmentMediaType, AutomationTrigger, Decision, DecisionKind, DecisionStatus, DesignDocEntry, DesignDocTree,
-    DispatchAdmissionBlocker, DispatchPauseSnapshot, EffortLevel, ExecutionKind, ExecutionStatus, ListHostedPanesInput,
-    ProjectDesignDocState, ProposalFieldError, TaskKind, TaskStatus, WorkerTierDenialReason,
+    AttachmentMediaType, AutomationTrigger, BoothbyPass, Decision, DecisionKind, DecisionStatus, DesignDocEntry,
+    DesignDocTree, DispatchAdmissionBlocker, DispatchPauseSnapshot, EffortLevel, ExecutionKind, ExecutionStatus,
+    ListHostedPanesInput, ProjectDesignDocState, ProposalFieldError, TaskKind, TaskStatus, WorkerTierDenialReason,
 };
 
 /// One representative event paired with the exact `"type"` tag it must
@@ -2003,7 +2003,43 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "driver_quota_usage_result",
         },
+        TagCase {
+            label: "BoothbyPassesList",
+            event: FrontendEvent::BoothbyPassesList { passes: vec![] },
+            expected_tag: "boothby_passes_list",
+        },
+        TagCase {
+            label: "BoothbyState",
+            event: FrontendEvent::BoothbyState {
+                mode: "auto".to_string(),
+                open_pass: None,
+                last_pass: None,
+            },
+            expected_tag: "boothby_state",
+        },
+        TagCase {
+            label: "BoothbyPassStarted",
+            event: FrontendEvent::BoothbyPassStarted {
+                pass: sample_boothby_pass(),
+            },
+            expected_tag: "boothby_pass_started",
+        },
+        TagCase {
+            label: "BoothbyActivity",
+            event: FrontendEvent::BoothbyActivity {
+                pass: sample_boothby_pass(),
+            },
+            expected_tag: "boothby_activity",
+        },
     ]
+}
+
+fn sample_boothby_pass() -> BoothbyPass {
+    BoothbyPass::builder()
+        .id("bp_1")
+        .started_at("1700000000")
+        .trigger("schedule")
+        .build()
 }
 
 /// Compile-time guard that every `FrontendEvent` variant is represented in
@@ -2209,7 +2245,11 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::SelectedProductResult { .. }
         | FrontendEvent::SelectedProductReported { .. }
         | FrontendEvent::AttachmentStored { .. }
-        | FrontendEvent::AttachmentsList { .. } => {}
+        | FrontendEvent::AttachmentsList { .. }
+        | FrontendEvent::BoothbyPassesList { .. }
+        | FrontendEvent::BoothbyState { .. }
+        | FrontendEvent::BoothbyPassStarted { .. }
+        | FrontendEvent::BoothbyActivity { .. } => {}
     }
 }
 

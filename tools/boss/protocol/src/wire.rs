@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::boothby::BoothbyPass;
 use crate::engine_app::{EngineToAppRequest, EngineToAppResponse};
 use crate::health_wire::EngineHealthReport;
 use crate::host_registry_wire::HostSnapshot;
@@ -51,6 +52,14 @@ pub const TOPIC_GITHUB_AUTH: &str = "github.auth";
 /// health-state change (dispatch pause/resume, API key changes, etc.)
 /// out on this topic so subscribed frontends update without polling.
 pub const TOPIC_ENGINE_HEALTH: &str = "engine.health";
+
+/// Global topic carrying Boothby pass lifecycle pushes
+/// ([`FrontendEvent::BoothbyActivity`]). The engine publishes whenever a
+/// `boothby_passes` row opens or closes so the Boothby tab's pass history and
+/// audit feed update without polling. See
+/// `tools/boss/docs/designs/boothby.md` §"Interaction with the existing
+/// engine".
+pub const TOPIC_BOOTHBY_ACTIVITY: &str = "boothby.activity";
 
 pub fn work_product_topic(product_id: &str) -> String {
     format!("work.product.{product_id}")
@@ -768,6 +777,11 @@ pub enum FrontendRequest {
     /// this flag holds. Replies with [`FrontendEvent::AutomationStateResult`].
     GetAutomationState,
 
+    /// Snapshot of Boothby's current `boothby.mode`, its in-flight pass (if
+    /// any), and its most recent finished pass. Read-only; no side effects.
+    /// Replies with [`FrontendEvent::BoothbyState`].
+    GetBoothbyState,
+
     /// Read-only: snapshot a work item's CI attempt budget — the
     /// `tasks.ci_attempt_budget` override, the product's default, the
     /// effective value the engine uses, and the live
@@ -1265,6 +1279,14 @@ pub enum FrontendRequest {
     /// `created_at DESC`. Replies with [`FrontendEvent::AutomationTasksList`].
     ListAutomationTasks {
         automation_id: String,
+    },
+
+    /// List `boothby_passes` history, freshest first, capped at `limit`
+    /// (default 50 when omitted). Replies with
+    /// [`FrontendEvent::BoothbyPassesList`].
+    ListBoothbyPasses {
+        #[serde(default)]
+        limit: Option<i64>,
     },
 
     ListChores {
@@ -2175,6 +2197,15 @@ pub enum FrontendRequest {
         force: bool,
     },
 
+    /// Fire an immediate Boothby pass (`boss boothby run` / the tab's "Run
+    /// now" button). Bypasses the schedule and `boothby.min_pass_gap_secs` —
+    /// this is explicit human intent, same as `RunAutomation`'s `force` flag
+    /// bypassing the open-task cap — but still refuses if a pass is already
+    /// open (`boothby.md`'s "still one-at-a-time"). Replies with
+    /// [`FrontendEvent::BoothbyPassStarted`] on success or
+    /// [`FrontendEvent::WorkError`] when a pass is already in flight.
+    RunBoothbyPass,
+
     /// Boss-tier RPC: write `text` into the worker pane hosting
     /// `run_id` as if the user typed it. Resolves `run_id → slot_id`
     /// via the worker registry and forwards a `SendToPane` engine→app
@@ -2222,6 +2253,15 @@ pub enum FrontendRequest {
         paused: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+    },
+
+    /// Set `boothby.mode` (`"off"` | `"propose"` | `"auto"`). Persists via
+    /// the settings text registry and wakes the scheduler immediately (so
+    /// flipping off `off` doesn't wait out the current sleep). Replies with
+    /// [`FrontendEvent::BoothbyState`] or [`FrontendEvent::WorkError`] for an
+    /// unrecognized mode string.
+    SetBoothbyMode {
+        mode: String,
     },
 
     /// Set (or clear) a work item's per-PR `tasks.ci_attempt_budget`

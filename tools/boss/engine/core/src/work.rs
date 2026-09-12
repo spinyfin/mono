@@ -181,8 +181,10 @@ pub use boss_protocol::{
     ADMISSION_BLOCKER_INTERACTIVE_CONCURRENCY_CAP, ADMISSION_BLOCKER_UNMET_DEPENDENCY, ANSWER_AGENT_RUN_STATUS_FAILED,
     ANSWER_AGENT_RUN_STATUS_REPLIED, ANSWER_AGENT_RUN_STATUS_RUNNING, ANSWER_AGENT_RUN_STATUS_SUPERSEDED,
     AddDependencyInput, AnswerAgentRun, Attention, AttentionGroup, AttentionMerge, Automation, AutomationPatch,
-    AutomationRun, AutomationTrigger, BOOTHBY_REVERSIBILITY_IRREVERSIBLE, BOOTHBY_TARGET_ATTENTION,
-    BOOTHBY_TARGET_ATTENTION_ITEM, BOOTHBY_TARGET_PROJECT, BOOTHBY_TARGET_TASK, BlockedSignal, BoothbyAction,
+    AutomationRun, AutomationTrigger, BOOTHBY_OUTCOME_CAPPED, BOOTHBY_OUTCOME_COMPLETED, BOOTHBY_OUTCOME_FAILED,
+    BOOTHBY_OUTCOME_NOTHING_TO_DO, BOOTHBY_OUTCOME_TIMED_OUT, BOOTHBY_REVERSIBILITY_IRREVERSIBLE,
+    BOOTHBY_TARGET_ATTENTION, BOOTHBY_TARGET_ATTENTION_ITEM, BOOTHBY_TARGET_PROJECT, BOOTHBY_TARGET_TASK,
+    BOOTHBY_TRIGGER_EVENT_PREFIX, BOOTHBY_TRIGGER_MANUAL, BOOTHBY_TRIGGER_SCHEDULE, BlockedSignal, BoothbyAction,
     BoothbyCursor, BoothbyFinding, BoothbyPass, BranchNaming, COMMENT_STATUS_ACTIVE, COMMENT_STATUS_ANSWER_FAILED,
     COMMENT_STATUS_ANSWERED, COMMENT_STATUS_ANSWERING, COMMENT_STATUS_AWAITING_FOLLOWUP, COMMENT_STATUS_DISMISSED,
     COMMENT_STATUS_IN_REVISION, COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED, CREATED_VIA_ATTENTION,
@@ -204,10 +206,10 @@ pub use boss_protocol::{
     ResolvedComment, ResolvedDesignDoc, ResolvedDesignDocKind, ReviewBatch, ReviewBatchMember, ReviewBatchMemberRole,
     ReviewBatchMemberStatus, ReviewBatchPhase, ReviewBatchStatus, ReviewClassification, ReviseDocInput,
     ReviseDocOutcome, SetProjectDesignDocInput, SetTaskDocPointerInput, StatusActor, THREAD_ENTRY_AUTHOR_ENGINE,
-    THREAD_ENTRY_KIND_ANSWER, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, Task, TaskKind, TaskRuntime, TaskStatus,
-    WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
-    WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree, comment_status_is_closed,
-    is_known_created_via,
+    THREAD_ENTRY_KIND_ANSWER, THREAD_ENTRY_KIND_NUDGE, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, Task, TaskKind,
+    TaskRuntime, TaskStatus, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
+    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree,
+    comment_status_is_closed, is_known_created_via,
 };
 
 /// Outcome of [`WorkDb::claim_execution_for_dispatch`]: the Ready → Claimed
@@ -405,7 +407,7 @@ static NEXT_MEM_DB_ID: AtomicU64 = AtomicU64::new(1);
 /// by `WorkDb::conn` (below) holding the one live connection to it, not by
 /// this struct.
 #[derive(Clone)]
-struct InMemoryAnchor {
+pub struct InMemoryAnchor {
     uri: String,
 }
 
@@ -416,6 +418,7 @@ struct InMemoryAnchor {
 /// connection guarded by a mutex."
 pub(crate) type PooledConnection<'a> = std::sync::MutexGuard<'a, Connection>;
 
+#[derive(bon::Builder)]
 pub struct WorkDb {
     path: PathBuf,
     /// Present only when the database is in-memory (path == ":memory:").
@@ -448,6 +451,13 @@ pub struct WorkDb {
     /// it via [`Self::with_event_bus`] so every clone shares the one
     /// instance subscribers attach to.
     event_bus: Arc<EventBus>,
+    /// Registered once at boot via [`WorkDb::set_boothby_event_queue`]. Armed
+    /// by [`WorkDb::create_attention_item`] when a new legacy attention item
+    /// is created with a kind in
+    /// [`crate::boothby_events::BOOTHBY_TRIGGER_ATTENTION_KINDS`]. `None` in
+    /// every test `WorkDb` and any boot path that never registers one — a
+    /// missing queue means "no one is listening," not an error.
+    boothby_event_queue: Arc<Mutex<Option<Arc<crate::boothby_events::BoothbyEventQueue>>>>,
 }
 
 impl Clone for WorkDb {
@@ -458,6 +468,7 @@ impl Clone for WorkDb {
             conn: Arc::clone(&self.conn),
             boothby_action: Arc::clone(&self.boothby_action),
             event_bus: Arc::clone(&self.event_bus),
+            boothby_event_queue: Arc::clone(&self.boothby_event_queue),
         }
     }
 }
@@ -472,6 +483,7 @@ mod audit_misc;
 mod automations;
 mod blocking;
 mod boothby;
+mod boothby_passes;
 mod chain_helpers;
 mod comment_thread_entries;
 mod comments;
