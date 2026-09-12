@@ -101,8 +101,12 @@ fn rendered_prompt_uses_engine_owned_binary_invocations() {
         "blocked command must use the engine-owned boss binary:\n{chore_prompt}",
     );
     assert!(
-        chore_prompt.contains("`\"$CUBE_BIN\" pr create` / `\"$CUBE_BIN\" pr update`"),
-        "terminal-push command must use the engine-owned cube binary:\n{chore_prompt}",
+        chore_prompt.contains("`\"$CUBE_BIN\" pr create`"),
+        "terminal-push command must use the engine-owned cube binary for pr create:\n{chore_prompt}",
+    );
+    assert!(
+        chore_prompt.contains("`\"$CUBE_BIN\" pr update`"),
+        "terminal-push command must use the engine-owned cube binary for pr update:\n{chore_prompt}",
     );
 
     let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
