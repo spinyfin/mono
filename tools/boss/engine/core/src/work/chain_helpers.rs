@@ -644,7 +644,10 @@ pub(crate) fn cascade_project_id_to_revisions(
     project_id: Option<&str>,
     now: &str,
 ) -> Result<()> {
-    let revision_ids = collect_chain_revision_ids(conn, root_id)?;
+    // Tombstoned revisions still inherit their parent's project membership:
+    // an independently deleted revision may later be restored, and must not
+    // come back carrying a stale project_id.
+    let revision_ids = collect_chain_revision_ids_including_deleted(conn, root_id)?;
     for rev_id in &revision_ids {
         conn.execute(
             "UPDATE tasks SET project_id = ?2, updated_at = ?3 WHERE id = ?1 AND kind = 'revision'",

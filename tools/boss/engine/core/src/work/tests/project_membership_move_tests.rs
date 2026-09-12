@@ -436,6 +436,47 @@ fn cascade_reaches_a_multi_level_revision_chain() {
 }
 
 #[test]
+fn moving_a_parent_updates_an_independently_deleted_revision_before_restore() {
+    let path = temp_db_path("move-parent-with-deleted-revision");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let source_project = create_test_project(&db, product.id.clone(), "Source project");
+    let target_project = create_test_project(&db, product.id.clone(), "Target project");
+    let parent = create_test_project_task(&db, product.id.clone(), source_project.id.clone(), "Parent task");
+    let revision = insert_revision_row(&db, &product.id, &parent.id);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET project_id = ?2, deleted_at = 'independently-deleted' WHERE id = ?1",
+            rusqlite::params![revision, source_project.id],
+        )
+        .unwrap();
+
+    db.update_work_item(
+        &parent.id,
+        WorkItemPatch {
+            project_id: Some(target_project.id.clone()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    let restored = db.restore_work_item(&revision).unwrap();
+    let WorkItem::Task(restored) = restored else {
+        panic!("expected restored revision task");
+    };
+    assert_eq!(restored.deleted_at, None, "revision must be restored independently");
+    assert_eq!(
+        task_project_id(&db, &revision),
+        Some(target_project.id),
+        "restoring an independently deleted revision must retain the parent's moved project"
+    );
+    assert_no_revision_project_divergence(&db);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn reapplying_the_current_project_still_repairs_a_drifted_revision() {
     // Regression guard for the one divergent row the design doc describes:
     // a revision minted before this cascade existed can be stuck with a
