@@ -1464,7 +1464,6 @@ must not be asked to open one",
                             kind = %execution.kind,
                             "stop event: worker emitted NO_CHANGES_NEEDED without a recorded workspace path — refusing the no-op claim; falling through to the produce-a-PR nudge instead",
                         );
-                        return self.finalize_no_op_completion(&execution, None, None).await;
                     }
                 }
                 tracing::info!(
