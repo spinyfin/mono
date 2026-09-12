@@ -15,6 +15,13 @@ import SwiftUI
 /// symbolicated lazily here (and on export) — never on the capture path.
 struct UIStallsViewer: View {
     @AppStorage("boss.uiStalls.visible", store: BossDefaults.store) private var isOpen = false
+    /// Same `UserDefaults` key [[FeatureFlagsViewer]]'s Settings → Feature
+    /// Flags row binds — the single source of truth for the master switch.
+    /// AppDelegate observes this key and calls
+    /// `MainThreadStallMonitor.applyEnabledFromDefaults` live, so toggling
+    /// it here starts/stops the watchdog immediately, and toggling it in
+    /// Settings while this pane is open updates this control too.
+    @AppStorage(MainThreadStallMonitor.enabledKey, store: BossDefaults.store) private var monitoringEnabled = false
     @State private var records: [StallRecord] = []
     @State private var window: SinceWindow = .fiveMinutes
     @State private var expanded: Set<UUID> = []
@@ -62,6 +69,8 @@ struct UIStallsViewer: View {
             }
             .pickerStyle(.segmented)
             .fixedSize()
+            Toggle("Enable stall monitoring", isOn: $monitoringEnabled)
+                .toggleStyle(.switch)
             Spacer()
             Text("\(records.count) stall\(records.count == 1 ? "" : "s")")
                 .font(.caption)
@@ -101,28 +110,42 @@ struct UIStallsViewer: View {
         }
     }
 
+    @ViewBuilder
     private var emptyState: some View {
+        if monitoringEnabled {
+            monitoringOnEmptyState
+        } else {
+            monitoringOffEmptyState
+        }
+    }
+
+    private var monitoringOnEmptyState: some View {
         VStack(spacing: 10) {
-            Image(systemName: MainThreadStallMonitor.shared.isRunning
-                  ? "checkmark.seal"
-                  : "pause.circle")
+            Image(systemName: "checkmark.seal")
                 .font(.largeTitle)
-                .foregroundStyle(MainThreadStallMonitor.shared.isRunning ? .green : .secondary)
-            if MainThreadStallMonitor.shared.isRunning {
-                Text("No stalls in the last \(window.rawValue)")
-                    .font(.headline)
-                Text("The main-thread watchdog records here whenever a heartbeat lands more than \(Int(MainThreadStallMonitor.shared.thresholdMs)) ms late. An empty list means the UI stayed responsive.")
-                    .multilineTextAlignment(.center)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: 420)
-            } else {
-                Text("Stall monitoring is off")
-                    .font(.headline)
-                Text("Enable \(MainThreadStallMonitor.enabledKey) in Settings → Feature Flags to start the main-thread watchdog. Off is the default (zero cost — no timers).")
-                    .multilineTextAlignment(.center)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: 420)
-            }
+                .foregroundStyle(.green)
+            Text("Watching — no stalls in the last \(window.rawValue)")
+                .font(.headline)
+            Text("The main-thread watchdog is running and records here whenever a heartbeat lands more than \(Int(MainThreadStallMonitor.shared.thresholdMs)) ms late. An empty list for this window means the UI stayed responsive.")
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: 420)
+        }
+        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var monitoringOffEmptyState: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "pause.circle")
+                .font(.largeTitle)
+                .foregroundStyle(.secondary)
+            Text("Stall monitoring is off")
+                .font(.headline)
+            Text("Off is the default — zero cost, no timers. Turn it on to start the main-thread watchdog and see stalls here as they occur.")
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: 420)
         }
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity)
