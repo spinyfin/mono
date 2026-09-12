@@ -11,20 +11,31 @@ extension ChatViewModel {
         groups: [AttentionGroup],
         members: [Attention]
     ) {
-        let priorIDs = Set((attentionGroupsByProductID[productID] ?? []).map(\.id))
-        let nextIDs = Set(groups.map(\.id))
-        for goneID in priorIDs.subtracting(nextIDs) {
-            attentionMembersByGroupID.removeValue(forKey: goneID)
+        // Mutate local copies and assign each dictionary once so a full
+        // reload does not re-sort the selected-product caches once per
+        // key write. Suppress didSet during the two assignments and
+        // refresh exactly once after both stores are consistent.
+        withSuppressedSelectedProductAttentionRefresh {
+            let priorIDs = Set((attentionGroupsByProductID[productID] ?? []).map(\.id))
+            let nextIDs = Set(groups.map(\.id))
+            var membersByGroup = attentionMembersByGroupID
+            for goneID in priorIDs.subtracting(nextIDs) {
+                membersByGroup.removeValue(forKey: goneID)
+            }
+            var bucketed: [String: [Attention]] = [:]
+            for member in members {
+                bucketed[member.groupID, default: []].append(member)
+            }
+            for group in groups {
+                membersByGroup[group.id] =
+                    (bucketed[group.id] ?? []).sorted { $0.ordinal < $1.ordinal }
+            }
+            attentionMembersByGroupID = membersByGroup
+            var groupsByProduct = attentionGroupsByProductID
+            groupsByProduct[productID] = groups
+            attentionGroupsByProductID = groupsByProduct
         }
-        var bucketed: [String: [Attention]] = [:]
-        for member in members {
-            bucketed[member.groupID, default: []].append(member)
-        }
-        for group in groups {
-            attentionMembersByGroupID[group.id] =
-                (bucketed[group.id] ?? []).sorted { $0.ordinal < $1.ordinal }
-        }
-        attentionGroupsByProductID[productID] = groups
+        refreshSelectedProductAttentionCaches()
     }
 
     /// Store group members in their display order so card body evaluation only
@@ -42,6 +53,16 @@ extension ChatViewModel {
             list.append(group)
         }
         attentionGroupsByProductID[group.productID] = list
+    }
+
+    /// Replace a group and its members as one logical update so the
+    /// selected-product caches refresh once with both stores consistent.
+    func applyAttentionGroupSnapshot(_ group: AttentionGroup, members: [Attention]) {
+        withSuppressedSelectedProductAttentionRefresh {
+            upsertAttentionGroup(group)
+            setAttentionMembers(members, forGroup: group.id)
+        }
+        refreshSelectedProductAttentionCaches()
     }
 
     /// Insert or replace one member within its group's row list.
@@ -326,12 +347,6 @@ extension ChatViewModel {
     var selectedAutomation: AppAutomation? {
         guard let id = selectedAutomationID else { return nil }
         return automationsForSelectedProduct.first { $0.id == id }
-    }
-
-    /// Unresolved attention items for the currently selected product.
-    var selectedProductOpenAttentionItems: [WorkAttentionItem] {
-        guard let productID = currentSelectedProductID else { return [] }
-        return (attentionItemsByWorkItemID[productID] ?? []).filter { $0.resolvedAt == nil }
     }
 
     /// Count of open attention groups for the selected product. Drives the
