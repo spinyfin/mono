@@ -412,10 +412,10 @@ impl AgentDriver for StubDriver {
             pre_tool_use_hooks: Vec::new(),
         }
     }
-    fn agent_rules_preamble(&self) -> &'static str {
+    fn agent_rules_preamble(&self, _checkleft_pinned: bool) -> String {
         // Distinctive marker so write_workspace_files tests can prove
         // the rendered agent-rules file came from this stub, not Claude.
-        "# stub-driver preamble\n"
+        "# stub-driver preamble\n".to_owned()
     }
     fn transcript_path_for_session(&self, _: &serde_json::Value) -> Option<String> {
         None
