@@ -430,10 +430,16 @@ pub struct ServeOverrides {
     pub worker_registry: Option<crate::worker_registry::WorkerRegistry>,
 }
 
+/// Bound on the whole local-capability probe (`gh auth status` plus per-driver
+/// PATH probes). Expiry is a failed probe: auto rows are cleared and the
+/// discovery hold is lifted so dispatch is not held for the life of the process.
+const LOCAL_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Holds the local-capability-discovery dispatch hold for its lifetime and
-/// lifts it on drop, including on an unwinding panic — so a probe that
-/// panics still releases dispatch instead of wedging it for the life of the
-/// process.
+/// lifts it on drop. Drop runs on return and on unwind (a panic inside the
+/// probe), not on a hang — a wedged probe is bounded separately by
+/// [`LOCAL_CAPABILITY_PROBE_TIMEOUT`], which treats expiry as a failed
+/// probe. This guard never clears [`ExecutionCoordinator::startup_recovery_pending`].
 struct CapabilityDiscoveryPendingGuard {
     coordinator: Arc<ExecutionCoordinator>,
 }
@@ -621,11 +627,16 @@ pub async fn serve_with_overrides(
     // 2. Dispatch is held (`local_capability_discovery_pending`) until the
     //    probe has written its result, so nothing is scheduled against an
     //    unverified host — and nothing is *failed* with "driver discovery
-    //    has not run" during the window either.
-    // 3. A probe that cannot write its result logs at `error` and leaves
+    //    has not run" during the window either. A second hold
+    //    (`startup_recovery_pending`) independently covers post-bind
+    //    adoption and reconcile, so a finished probe cannot kick the
+    //    scheduler before those sweeps run.
+    // 3. A probe that cannot write its result — including one that exceeds
+    //    [`LOCAL_CAPABILITY_PROBE_TIMEOUT`] — logs at `error` and leaves
     //    the host with no `drivers-probed=true` row: driver-constrained
     //    selection then reports `DriverProbeNotRun` loudly instead of
     //    silently matching.
+    server_state.execution_coordinator.set_startup_recovery_pending(true);
     server_state
         .execution_coordinator
         .set_local_capability_discovery_pending(true);
@@ -637,32 +648,23 @@ pub async fn serve_with_overrides(
     }
     {
         let state = server_state.clone();
-        let watchdog_coordinator = state.execution_coordinator.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            if watchdog_coordinator.local_capability_discovery_pending() {
-                tracing::error!(
-                    "startup: local host capability discovery has not completed after 30s; \
-                     dispatch remains held behind the probe (gh auth status / driver probes \
-                     can hang on a black-holed network) until it finishes or the engine restarts",
-                );
-            }
-        });
-        tokio::task::spawn_blocking(move || {
-            // Cleared on every exit path, including a panic inside this
-            // closure, so a wedged or panicking probe can never leave
-            // dispatch held forever.
+            // Drop covers return and panic-unwind only. A hang is bounded by
+            // the timeout below, which fail-closes the same way a failed
+            // probe does: clear auto rows, lift the discovery hold, kick.
             let _pending_guard = CapabilityDiscoveryPendingGuard::new(state.execution_coordinator.clone());
             let started = std::time::Instant::now();
-            match state.work_db.refresh_local_host_auto_capabilities() {
-                Ok(refresh) => tracing::info!(
+            let work_db = state.work_db.clone();
+            let probe = tokio::task::spawn_blocking(move || work_db.refresh_local_host_auto_capabilities());
+            match tokio::time::timeout(LOCAL_CAPABILITY_PROBE_TIMEOUT, probe).await {
+                Ok(Ok(Ok(refresh))) => tracing::info!(
                     capabilities = ?refresh.capabilities,
                     driver_count = refresh.driver_count(),
                     probe_ms = refresh.probe_elapsed.as_millis() as u64,
                     total_ms = started.elapsed().as_millis() as u64,
                     "startup: local host capability discovery complete; lifting the dispatch hold",
                 ),
-                Err(err) => {
+                Ok(Ok(Err(err))) => {
                     tracing::error!(
                         error = %format!("{err:#}"),
                         total_ms = started.elapsed().as_millis() as u64,
@@ -670,12 +672,40 @@ pub async fn serve_with_overrides(
                          verified capabilities, so driver-constrained dispatch will report \
                          DriverProbeNotRun until the engine restarts",
                     );
-                    // Belt and braces: make sure no stale row survived a
-                    // failed refresh so the failure stays visible.
                     if let Err(err) = state.work_db.clear_local_host_auto_capabilities() {
                         tracing::error!(
                             error = %format!("{err:#}"),
                             "startup: could not clear stale local auto capabilities after a failed probe",
+                        );
+                    }
+                }
+                Ok(Err(join_err)) => {
+                    tracing::error!(
+                        error = %format!("{join_err:#}"),
+                        total_ms = started.elapsed().as_millis() as u64,
+                        "startup: local host capability discovery panicked; the local host has no \
+                         verified capabilities, so driver-constrained dispatch will report \
+                         DriverProbeNotRun until the engine restarts",
+                    );
+                    if let Err(err) = state.work_db.clear_local_host_auto_capabilities() {
+                        tracing::error!(
+                            error = %format!("{err:#}"),
+                            "startup: could not clear stale local auto capabilities after a panicked probe",
+                        );
+                    }
+                }
+                Err(_elapsed) => {
+                    tracing::error!(
+                        timeout_s = LOCAL_CAPABILITY_PROBE_TIMEOUT.as_secs(),
+                        total_ms = started.elapsed().as_millis() as u64,
+                        "startup: local host capability discovery did not complete in time; \
+                         treating the probe as failed and lifting the dispatch hold \
+                         (gh auth status / driver probes can hang on a black-holed network)",
+                    );
+                    if let Err(err) = state.work_db.clear_local_host_auto_capabilities() {
+                        tracing::error!(
+                            error = %format!("{err:#}"),
+                            "startup: could not clear stale local auto capabilities after a timed-out probe",
                         );
                     }
                 }
@@ -2463,6 +2493,10 @@ pub async fn serve_with_overrides(
     post_bind.mark("remaining_loops_spawned");
 
     let coordinator = server_state.execution_coordinator.clone();
+    // Adoption and the boot-only reconcile have finished. Lift the recovery
+    // gate independently of the capability-discovery hold; drain is permitted
+    // only once both are clear.
+    coordinator.set_startup_recovery_pending(false);
     coordinator.kick();
 
     install_panic_hook(&server_state);

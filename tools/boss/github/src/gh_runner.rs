@@ -21,8 +21,10 @@
 //! an instrumentation that sees only some of them under-reports, which
 //! is worse than none because it reads as a complete picture.
 
+use std::io::Read;
 use std::process::Output;
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -141,6 +143,10 @@ pub async fn gh_output(args: &[&str]) -> std::io::Result<Output> {
 /// [`boss_gh_telemetry::scope_blocking`] to attribute it; without that
 /// it lands in the `unattributed` bucket, identifiable only by its
 /// `verb`/`endpoint` in the persisted rows.
+///
+/// Unbounded: the process is waited to completion. Callers that must
+/// not hang the thread (startup capability discovery) use
+/// [`gh_output_blocking_timeout`] instead.
 pub fn gh_output_blocking(args: &[&str]) -> std::io::Result<Output> {
     let timer = GhCallTimer::start_args(args);
     let result = std::process::Command::new("gh")
@@ -151,6 +157,64 @@ pub fn gh_output_blocking(args: &[&str]) -> std::io::Result<Output> {
         .output();
     timer.finish_process(&result);
     result
+}
+
+/// Like [`gh_output_blocking`], but kills `gh` and returns
+/// [`std::io::ErrorKind::TimedOut`] if it has not exited by `timeout`.
+///
+/// Pipes are drained on helper threads so a chatty `gh` cannot deadlock
+/// the waiter by filling stdout/stderr, matching what
+/// [`std::process::Command::output`] does internally.
+pub fn gh_output_blocking_timeout(args: &[&str], timeout: Duration) -> std::io::Result<Output> {
+    let timer = GhCallTimer::start_args(args);
+    let result = command_output_blocking_timeout("gh", args, timeout);
+    timer.finish_process(&result);
+    result
+}
+
+/// Spawn `program`, wait up to `timeout`, kill on expiry. Shared with
+/// tests so the timeout/kill path can be exercised without a real `gh`.
+fn command_output_blocking_timeout(program: &str, args: &[&str], timeout: Duration) -> std::io::Result<Output> {
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let mut stderr = child.stderr.take().expect("stderr piped");
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        stdout.read_to_end(&mut buf).map(|_| buf)
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        stderr.read_to_end(&mut buf).map(|_| buf)
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("{program} exceeded {timeout:?} timeout"),
+                ));
+            }
+        }
+    };
+    let stdout = stdout_thread
+        .join()
+        .unwrap_or_else(|_| Err(std::io::Error::other("stdout reader panicked")))?;
+    let stderr = stderr_thread
+        .join()
+        .unwrap_or_else(|_| Err(std::io::Error::other("stderr reader panicked")))?;
+    Ok(Output { status, stdout, stderr })
 }
 
 /// Spawn `gh` via [`gh_output`] and return the trimmed stdout on success.
@@ -579,5 +643,26 @@ mod tests {
                 enqueued_at: None,
             })
         );
+    }
+
+    #[test]
+    fn blocking_timeout_kills_a_hung_child_and_returns_timed_out() {
+        let started = Instant::now();
+        let err = command_output_blocking_timeout("/bin/sleep", &["30"], Duration::from_millis(200))
+            .expect_err("sleep 30 must not outlive a 200ms bound");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "kill must return promptly, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn blocking_timeout_returns_output_when_the_child_exits_in_time() {
+        let output = command_output_blocking_timeout("/bin/echo", &["capability-probe"], Duration::from_secs(2))
+            .expect("echo must finish well inside the bound");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "capability-probe");
     }
 }

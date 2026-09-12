@@ -38,7 +38,10 @@ impl StartupTimeline {
     /// Start timing `phase`. Logs nothing — the first `mark` carries the
     /// elapsed time from here.
     pub fn begin(phase: &'static str) -> Self {
-        let now = Instant::now();
+        Self::begin_at(phase, Instant::now())
+    }
+
+    fn begin_at(phase: &'static str, now: Instant) -> Self {
         Self {
             phase,
             started: now,
@@ -49,7 +52,10 @@ impl StartupTimeline {
 
     /// Record that `step` just completed. Returns the step's duration.
     pub fn mark(&mut self, step: &'static str) -> Duration {
-        let now = Instant::now();
+        self.mark_at(step, Instant::now())
+    }
+
+    fn mark_at(&mut self, step: &'static str, now: Instant) -> Duration {
         let step_elapsed = now.duration_since(self.last_mark);
         self.last_mark = now;
         self.steps += 1;
@@ -71,11 +77,15 @@ impl StartupTimeline {
     /// Close the phase, logging its total. Any time since the last `mark`
     /// is attributed to an implicit `finish` step so nothing is dropped.
     pub fn finish(self) -> Duration {
-        let total = self.started.elapsed();
+        self.finish_at(Instant::now())
+    }
+
+    fn finish_at(self, now: Instant) -> Duration {
+        let total = now.duration_since(self.started);
         tracing::info!(
             phase = self.phase,
             steps = self.steps,
-            trailing_ms = self.last_mark.elapsed().as_millis() as u64,
+            trailing_ms = now.duration_since(self.last_mark).as_millis() as u64,
             total_ms = total.as_millis() as u64,
             "startup timing: phase complete",
         );
@@ -89,19 +99,24 @@ mod tests {
 
     #[test]
     fn marks_measure_from_the_previous_mark_and_finish_reports_total() {
-        let mut timeline = StartupTimeline::begin("test");
-        std::thread::sleep(Duration::from_millis(30));
-        let first = timeline.mark("first");
-        std::thread::sleep(Duration::from_millis(5));
-        let second = timeline.mark("second");
-        assert!(first >= Duration::from_millis(30));
-        assert!(second >= Duration::from_millis(5));
-        // Second mark measures from the first mark, not from the phase start:
-        // the wide margin between the two sleeps keeps this from flaking
-        // under scheduler preemption or a loaded CI shard.
-        assert!(second < first);
+        let t0 = Instant::now();
+        let mut timeline = StartupTimeline::begin_at("test", t0);
+        let first = timeline.mark_at("first", t0 + Duration::from_millis(30));
+        let second = timeline.mark_at("second", t0 + Duration::from_millis(35));
+        assert_eq!(first, Duration::from_millis(30));
+        assert_eq!(second, Duration::from_millis(5));
         assert_eq!(timeline.steps, 2);
+        let total = timeline.finish_at(t0 + Duration::from_millis(40));
+        assert_eq!(total, Duration::from_millis(40));
+    }
+
+    #[test]
+    fn wall_clock_marks_are_at_least_the_slept_lower_bound() {
+        let mut timeline = StartupTimeline::begin("test");
+        std::thread::sleep(Duration::from_millis(5));
+        let first = timeline.mark("first");
+        assert!(first >= Duration::from_millis(5));
         let total = timeline.finish();
-        assert!(total >= first + second);
+        assert!(total >= first);
     }
 }

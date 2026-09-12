@@ -9,6 +9,13 @@ use super::*;
 pub const LOCAL_CAPABILITY_DISCOVERY_PENDING_REASON: &str =
     "local host capability discovery has not completed yet (runs in the background at engine startup)";
 
+/// Hold reason reported while boot-only startup recovery (tmux adoption,
+/// stale-claim revert, in-flight reconcile) is still in flight. Independent
+/// of [`LOCAL_CAPABILITY_DISCOVERY_PENDING_REASON`] so a finished probe
+/// cannot kick the scheduler before those sweeps have run.
+pub const STARTUP_RECOVERY_PENDING_REASON: &str =
+    "engine startup recovery has not completed yet (tmux adoption and boot-only reconcile)";
+
 /// Check out a leased cube workspace to the head commit of a PR, so a reviewer
 /// worker can read full source at the PR head rather than working from a stale
 /// or arbitrary baseline.
@@ -97,6 +104,7 @@ impl ExecutionCoordinator {
             requested_host_ids: std::sync::Mutex::new(HashMap::new()),
             dispatch_preflight_block_reason: std::sync::Mutex::new(None),
             local_capability_discovery_pending: AtomicBool::new(false),
+            startup_recovery_pending: AtomicBool::new(false),
             automation_paused: AtomicBool::new(false),
             automation_paused_since_epoch_s: AtomicU64::new(0),
             automation_paused_reason: std::sync::Mutex::new(None),
@@ -658,12 +666,15 @@ impl ExecutionCoordinator {
     }
 
     /// The reason local dispatch is blocked by startup preflight, if any.
-    /// A failed runtime preflight (tmux) wins; otherwise an in-flight local
-    /// capability probe holds dispatch with
-    /// [`LOCAL_CAPABILITY_DISCOVERY_PENDING_REASON`].
+    /// A failed runtime preflight (tmux) wins; otherwise boot-time recovery
+    /// and the in-flight local capability probe each hold dispatch with
+    /// their own reason. Both must clear before a drain is permitted.
     pub fn dispatch_preflight_block_reason(&self) -> Option<String> {
         if let Some(reason) = self.dispatch_preflight_block_reason.lock().unwrap().clone() {
             return Some(reason);
+        }
+        if self.startup_recovery_pending() {
+            return Some(STARTUP_RECOVERY_PENDING_REASON.to_owned());
         }
         self.local_capability_discovery_pending()
             .then(|| LOCAL_CAPABILITY_DISCOVERY_PENDING_REASON.to_owned())
@@ -672,7 +683,8 @@ impl ExecutionCoordinator {
     /// Mark the local host's startup capability probe as in flight
     /// (`true`) or complete (`false`). While pending, no execution is
     /// dispatched or force-dispatched; the caller that clears it should
-    /// `kick()` so held work drains promptly.
+    /// `kick()` so held work drains promptly — the kick is a no-op drain
+    /// while [`Self::startup_recovery_pending`] is still set.
     pub fn set_local_capability_discovery_pending(&self, pending: bool) {
         self.local_capability_discovery_pending
             .store(pending, std::sync::atomic::Ordering::SeqCst);
@@ -682,6 +694,21 @@ impl ExecutionCoordinator {
     pub fn local_capability_discovery_pending(&self) -> bool {
         self.local_capability_discovery_pending
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Mark boot-only startup recovery as in flight (`true`) or complete
+    /// (`false`). Independent of the capability-discovery hold so a finished
+    /// probe cannot start the scheduler before tmux adoption and the
+    /// boot-only reconcile have run. The caller that clears it should
+    /// `kick()` so held work drains once both gates are down.
+    pub fn set_startup_recovery_pending(&self, pending: bool) {
+        self.startup_recovery_pending
+            .store(pending, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether boot-only startup recovery is still in flight.
+    pub fn startup_recovery_pending(&self) -> bool {
+        self.startup_recovery_pending.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Pause automation-originated activity — independent of

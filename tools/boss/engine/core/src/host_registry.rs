@@ -308,8 +308,12 @@ fn discover_local_capabilities() -> Vec<String> {
     // from the same shared budget as everything else and goes through the
     // instrumented spawn rather than a bare `Command`.
     let gh_started = Instant::now();
+    // Bound to match the per-driver PATH probe (`host_capability_probe` uses
+    // 10s). `gh auth status` talks to the network and the keychain; without
+    // a timeout a black-holed API or a never-returning prompt holds the
+    // startup dispatch gate for the life of the process.
     let gh_authed = boss_gh_telemetry::scope_blocking(boss_gh_telemetry::callers::HOST_REGISTRY, || {
-        boss_github::gh_runner::gh_output_blocking(&["auth", "status"])
+        boss_github::gh_runner::gh_output_blocking_timeout(&["auth", "status"], std::time::Duration::from_secs(10))
     })
     .map(|out| out.status.success())
     .unwrap_or(false);
@@ -750,7 +754,10 @@ fn pragma_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
 //
 // Behavioral coverage for the `WorkDb` host-registry methods. Everything
 // runs against a fresh `:memory:` database, which `WorkDb::open` seeds with
-// the migrations plus `ensure_local_host` / `refresh_local_host_auto_capabilities`.
+// the migrations plus `ensure_local_host` only; local auto-capabilities
+// are written by `WorkDb::refresh_local_host_auto_capabilities`, which
+// tests that need them must call (or seed via `insert_host_capability`)
+// themselves.
 // Assertions go through the public methods (returned values, `Host` /
 // `HostCapability` fields, error outcomes, post-state read back). Raw
 // connections are used only to plant fixture rows in tables that have no

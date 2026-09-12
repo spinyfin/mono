@@ -5,19 +5,10 @@ use std::time::Instant;
 
 use crate::startup_timing::SLOW_STEP_THRESHOLD;
 
-// Why no `migrate_*` step (and neither init path) probes the local host's
-// capabilities any more ("the capability-probe note"):
-//
-// Until 2026-09 the chain called `refresh_local_host_auto_capabilities`
-// between `ensure_local_host` and the revision-task migrations. That probe
-// spawns three interactive login shells (one `command -v` per registered
-// driver) plus a live `gh auth status`, and it ran on every engine boot,
-// inside `WorkDb::open`, before the frontend socket existed — the largest
-// single attributable contributor to the app showing no data after an
-// update. Schema migration must not perform host I/O, network calls, or
-// subprocess execution. Discovery now runs from engine startup
-// (`app::server::run_server`) after the database is open, with dispatch held
-// until it completes — see `WorkDb::refresh_local_host_auto_capabilities`.
+// Schema init must not spawn processes, touch the network, or probe the
+// host. Discovery runs from engine startup after the database is open,
+// with dispatch held until it completes — see
+// `WorkDb::refresh_local_host_auto_capabilities`.
 
 /// Per-step wall-clock ledger for one [`WorkDb::run_full_migration_chain`]
 /// run. The chain replays ~150 idempotent steps on every boot of an
@@ -36,6 +27,18 @@ struct MigrationChainTimer {
     target: &'static str,
 }
 
+/// `true` → debug (scratch capture); `false` → info (the real database).
+/// Field lists live once so a later addition cannot diverge across levels.
+macro_rules! migration_log {
+    ($scratch:expr, $($fields:tt)*) => {
+        if $scratch {
+            tracing::debug!($($fields)*);
+        } else {
+            tracing::info!($($fields)*);
+        }
+    };
+}
+
 impl MigrationChainTimer {
     fn start(target: &'static str) -> Self {
         Self {
@@ -44,6 +47,10 @@ impl MigrationChainTimer {
             slow_steps: 0,
             target,
         }
+    }
+
+    fn is_scratch(&self) -> bool {
+        self.target == "scratch_template"
     }
 
     /// Run one chain step under the clock. `name` is the step function's
@@ -55,7 +62,8 @@ impl MigrationChainTimer {
         self.steps += 1;
         if elapsed >= SLOW_STEP_THRESHOLD {
             self.slow_steps += 1;
-            tracing::info!(
+            migration_log!(
+                self.is_scratch(),
                 target_db = self.target,
                 step = name.rsplit("::").next().unwrap_or(name),
                 elapsed_ms = elapsed.as_millis() as u64,
@@ -67,25 +75,15 @@ impl MigrationChainTimer {
     }
 
     fn finish(&self) {
-        if self.target == "scratch_template" {
-            tracing::debug!(
-                target_db = self.target,
-                steps = self.steps,
-                slow_steps = self.slow_steps,
-                slow_threshold_ms = SLOW_STEP_THRESHOLD.as_millis() as u64,
-                total_ms = self.started.elapsed().as_millis() as u64,
-                "work db: migration chain complete",
-            );
-        } else {
-            tracing::info!(
-                target_db = self.target,
-                steps = self.steps,
-                slow_steps = self.slow_steps,
-                slow_threshold_ms = SLOW_STEP_THRESHOLD.as_millis() as u64,
-                total_ms = self.started.elapsed().as_millis() as u64,
-                "work db: migration chain complete",
-            );
-        }
+        migration_log!(
+            self.is_scratch(),
+            target_db = self.target,
+            steps = self.steps,
+            slow_steps = self.slow_steps,
+            slow_threshold_ms = SLOW_STEP_THRESHOLD.as_millis() as u64,
+            total_ms = self.started.elapsed().as_millis() as u64,
+            "work db: migration chain complete",
+        );
     }
 }
 
@@ -293,9 +291,9 @@ impl WorkDb {
         // host that fails every dispatch instead of retrying it forever.
         step!(timer, conn, crate::host_registry::migrate_hosts_health_columns)?;
         step!(timer, conn, crate::host_registry::ensure_local_host)?;
-        // The local host's capability *probe* used to run right here, inside
-        // the schema chain. It no longer does — see the capability-probe
-        // note at the top of this file.
+        // No host capability probe belongs in this chain — see the note at
+        // the top of this file.
+
         // Revision tasks (Phase 1): parent linkage column + index on tasks,
         // and soft-prefer signal on work_executions. Ships dark — the
         // `revision` kind is parseable but not yet dispatchable.

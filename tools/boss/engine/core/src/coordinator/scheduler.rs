@@ -866,7 +866,7 @@ impl ExecutionCoordinator {
         if let Some(reason) = self.dispatch_preflight_block_reason() {
             // A probe still in flight is the expected first seconds of every
             // boot, not a failure; a failed runtime preflight is.
-            if self.local_capability_discovery_pending() {
+            if self.local_capability_discovery_pending() || self.startup_recovery_pending() {
                 tracing::info!(%reason, "local dispatch held by startup preflight");
             } else {
                 tracing::error!(%reason, "local dispatch held by startup preflight");

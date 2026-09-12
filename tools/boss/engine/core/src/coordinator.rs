@@ -2183,6 +2183,14 @@ pub struct ExecutionCoordinator {
     /// [`crate::work::WorkDb::refresh_local_host_auto_capabilities`].
     #[builder(default)]
     local_capability_discovery_pending: AtomicBool,
+    /// `true` from engine startup until tmux adoption and the boot-only
+    /// reconcile have finished. Independent of
+    /// `local_capability_discovery_pending` so a completed capability probe
+    /// cannot `kick()` the scheduler into claiming a ready row that
+    /// `release_stale_claimed_executions` would then revert. See
+    /// [`ExecutionCoordinator::set_startup_recovery_pending`].
+    #[builder(default)]
+    startup_recovery_pending: AtomicBool,
     /// Global automation-pause flag — independent of `dispatch_paused`. When
     /// `true`: `drain_ready_queue` holds every execution bound for the
     /// automation pool (see [`Self::execution_targets_automation_pool`]),
@@ -2267,7 +2275,7 @@ mod execution;
 mod run;
 mod scheduler;
 
-pub use config::LOCAL_CAPABILITY_DISCOVERY_PENDING_REASON;
+pub use config::{LOCAL_CAPABILITY_DISCOVERY_PENDING_REASON, STARTUP_RECOVERY_PENDING_REASON};
 pub use dispatch_admission::{PauseBypassOutcome, pause_bypass_decision};
 pub use run::PANE_SPAWN_FAILED_ATTENTION_KIND;
 pub use scheduler::ANSWER_AGENT_READY_AGE_ATTENTION_KIND;
