@@ -380,7 +380,7 @@ fn record_worker_no_op_completion_sets_completed_at() {
         "completed_at must be NULL before no-op completion",
     );
 
-    db.record_worker_no_op_completion(&exec_id, "already done on main")
+    db.record_worker_no_op_completion(&exec_id, "already done on main", None)
         .unwrap();
 
     assert!(
@@ -396,7 +396,7 @@ fn record_worker_no_op_completion_coalesce_stability() {
     let db = WorkDb::open(temp_db_path("rwnoc-coalesce")).unwrap();
     let (_product_id, chore_id, exec_id) = make_waiting_human_chore(&db, "rwnoc-c");
 
-    db.record_worker_no_op_completion(&exec_id, "already done on main")
+    db.record_worker_no_op_completion(&exec_id, "already done on main", None)
         .unwrap();
     let first = task_completed_at(&db, &chore_id);
     assert!(first.is_some(), "completed_at must be set after first no-op");

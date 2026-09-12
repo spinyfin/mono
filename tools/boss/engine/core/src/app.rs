@@ -19,7 +19,8 @@ use crate::agent_jsonl_progress::{AgentJsonlProgressManager, IngressCheckpointSt
 use crate::audit_effort;
 use crate::cli::Cli;
 use crate::completion::{
-    CommandPrDetector, PaneReleaseOutcome, PrDetector, ProbeQueuer, WorkerCompletionHandler, WorkerPaneReleaser,
+    BranchVerifier, CommandPrDetector, PaneReleaseOutcome, PrDetector, ProbeQueuer, WorkerCompletionHandler,
+    WorkerPaneReleaser,
 };
 use crate::config::RuntimeConfig;
 use crate::coordinator::{
@@ -559,6 +560,10 @@ struct ServerStateOverrides {
     /// Shared worker pid map so a test can register its process as a
     /// worker shell before a subprocess `boss` call is attributed.
     worker_registry: Option<WorkerRegistry>,
+    /// Fake branch verifier for the completion handler. `None` uses
+    /// `CommandBranchVerifier` (shells out to `gh pr view`). Tests inject a
+    /// stub here to fail the GitHub head-fetch deterministically.
+    branch_verifier: Option<Arc<dyn BranchVerifier>>,
 }
 
 #[derive(bon::Builder)]
@@ -1136,6 +1141,7 @@ impl ServerState {
             cube_client: cube_client_override,
             execution_runner: execution_runner_override,
             worker_registry: worker_registry_override,
+            branch_verifier: branch_verifier_override,
         } = overrides;
         // Constructed here (rather than left to `ServerState::builder`'s
         // default) so it can be injected into `work_db` via
@@ -1431,36 +1437,36 @@ impl ServerState {
         // `crate::teardown_registry`.
         let teardown_registry = Arc::new(crate::teardown_registry::TeardownRegistry::new());
         let teardown_registry_for_state = teardown_registry.clone();
-        let completion_handler = Arc::new(
-            WorkerCompletionHandler::new(
-                work_db.clone(),
-                pr_detector,
-                cube_client.clone(),
-                publisher.clone(),
-                pane_releaser.clone(),
-                probe_queuer.clone(),
-            )
-            .with_dispatch_events(dispatch_events.clone())
-            .with_staged_pr_urls(staged_pr_urls.clone())
-            .with_live_worker_states(live_worker_states_for_completion.clone())
-            .with_staged_revision_pushes(staged_revision_pushes.clone())
-            .with_staged_proposal_channel_errors(staged_proposal_channel_errors.clone())
-            .with_staged_unobserved_commands(staged_unobserved_commands.clone())
-            .with_feature_flags(feature_flags_for_handler)
-            .with_merge_probe(ci_probe)
-            .with_metrics(metrics_for_completion)
-            .with_max_review_cycles(cfg.work.max_review_cycles)
-            .with_min_review_changed_lines(cfg.work.min_review_changed_lines)
-            .with_enable_revision_triggered_reviews(cfg.work.enable_revision_triggered_reviews)
-            .with_background_activity_probe(Arc::new(
-                crate::background_children::RegistryBackgroundActivityProbe::new(
-                    live_worker_states_for_completion.clone(),
-                ),
-            ))
-            .with_hold_registry(hold_registry)
-            .with_teardown_registry(teardown_registry)
-            .with_review_pool_size(cfg.work.review_pool_size),
-        );
+        let mut completion_handler_builder = WorkerCompletionHandler::new(
+            work_db.clone(),
+            pr_detector,
+            cube_client.clone(),
+            publisher.clone(),
+            pane_releaser.clone(),
+            probe_queuer.clone(),
+        )
+        .with_dispatch_events(dispatch_events.clone())
+        .with_staged_pr_urls(staged_pr_urls.clone())
+        .with_live_worker_states(live_worker_states_for_completion.clone())
+        .with_staged_revision_pushes(staged_revision_pushes.clone())
+        .with_staged_proposal_channel_errors(staged_proposal_channel_errors.clone())
+        .with_staged_unobserved_commands(staged_unobserved_commands.clone())
+        .with_feature_flags(feature_flags_for_handler)
+        .with_merge_probe(ci_probe)
+        .with_metrics(metrics_for_completion)
+        .with_max_review_cycles(cfg.work.max_review_cycles)
+        .with_min_review_changed_lines(cfg.work.min_review_changed_lines)
+        .with_enable_revision_triggered_reviews(cfg.work.enable_revision_triggered_reviews)
+        .with_background_activity_probe(Arc::new(
+            crate::background_children::RegistryBackgroundActivityProbe::new(live_worker_states_for_completion.clone()),
+        ))
+        .with_hold_registry(hold_registry)
+        .with_teardown_registry(teardown_registry)
+        .with_review_pool_size(cfg.work.review_pool_size);
+        if let Some(branch_verifier) = branch_verifier_override {
+            completion_handler_builder = completion_handler_builder.with_branch_verifier(branch_verifier);
+        }
+        let completion_handler = Arc::new(completion_handler_builder);
 
         // Build PaneSpawnRunner up front, hand its Weak<ServerState>
         // pointer back via set_server_state once the Arc exists. The

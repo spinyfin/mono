@@ -2827,21 +2827,13 @@ async fn revision_with_null_execution_pr_url_falls_back_to_chain_root_pr() {
     assert_eq!(
         outcome,
         StopOutcome::AwaitingInput,
-        "revision with no execution.pr_url and no SHA-delta baseline must await quietly",
+        "revision with no execution.pr_url must request a completion recheck",
     );
-    // Stuck-revision fix: with no `pr_head_before` snapshot to compare against and
-    // no wired merge probe (satisfied-deliverable check is inconclusive),
-    // the revision must NOT be nudged at all — in particular it must
-    // never receive PROBE_NO_PR (there is a chain-root PR; `gh pr create`
-    // would be wrong), and it must not receive the old "push to existing
-    // PR" nudge either, since that nudge can never be satisfied once the
-    // worker has already pushed (the stuck-revision dead end this fix
-    // closes).
+    // A chain-root PR must lead to a completion recheck, not a create/push request.
     let queued = probes.snapshot();
-    assert!(
-        queued.is_empty(),
-        "revision with an inconclusive SHA-delta gate must not be nudged at all; got {queued:?}",
-    );
+    assert_eq!(queued.len(), 1);
+    assert!(queued[0].1.contains("Recheck the existing PR"));
+    assert!(queued[0].1.contains("Do not create an empty commit"));
 }
 
 #[tokio::test]

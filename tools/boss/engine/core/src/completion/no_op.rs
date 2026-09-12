@@ -18,6 +18,44 @@ struct PaneParkedFailure<'a> {
 }
 
 impl WorkerCompletionHandler {
+    /// A worker's explicit no-op claim remains usable when GitHub cannot
+    /// establish a head delta. Never describe that as a measured empty diff.
+    pub(super) async fn try_revision_no_op(
+        &self,
+        execution: &crate::work::WorkExecution,
+        bound_pr_url: &str,
+        contribution: ContributionEvidence,
+    ) -> Option<StopOutcome> {
+        tracing::info!(execution_id = %execution.id, ?contribution,
+            "stop event: checking revision no-op before waiting for completion evidence");
+        if !self.worker_signalled_no_op(&execution.id).await {
+            return None;
+        }
+        if self.staged_unobserved_commands.consume_unresolved(&execution.id) {
+            tracing::warn!(execution_id = %execution.id,
+                "revision no-op: refusing claim after an unobserved command");
+            return None;
+        }
+        match self.work_db.get_revision_stop_contributed_head(&execution.id) {
+            Ok(Some(head)) if execution.pr_head_before.as_deref() != Some(head.as_str()) => {
+                tracing::warn!(execution_id = %execution.id,
+                    "revision no-op: refusing claim contradicted by an observed contribution");
+                return None;
+            }
+            Err(err) => {
+                tracing::warn!(execution_id = %execution.id, ?err,
+                    "revision no-op: contribution lookup failed; refusing unverified claim");
+                return None;
+            }
+            _ => {}
+        }
+        let attention = Self::revision_no_op_attention_input(bound_pr_url, contribution);
+        Some(
+            self.finalize_no_op_completion(execution, Some(contribution), Some(attention))
+                .await,
+        )
+    }
+
     /// Finalize a sanctioned no-op completion: the worker verified its work
     /// is already done (empty diff, no PR produced and none bound), so the
     /// task is closed cleanly as `done` WITHOUT a PR and the execution is
@@ -27,19 +65,41 @@ impl WorkerCompletionHandler {
     ///
     /// Idempotent against an already-finalized execution: the DB write
     /// returns `None` for a non-live row, which maps to `AlreadyTerminal`.
-    pub(super) async fn finalize_no_op_completion(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
+    pub(super) async fn finalize_no_op_completion(
+        &self,
+        execution: &crate::work::WorkExecution,
+        contribution: Option<ContributionEvidence>,
+        attention: Option<CreateAttentionItemInput>,
+    ) -> StopOutcome {
         // Captured before `record_worker_no_op_completion` below nulls
         // `workspace_path` in the same transaction that terminalizes the
         // execution — this path terminalizes a parked-live execution, so it
         // owns driver teardown.
         let workspace_path = execution.workspace_path.clone();
-        let detail = "Worker verified the assigned work was already done (empty diff — no changes \
-                      needed); closed as a no-op without a PR.";
+        // `None` (the plain task-implementation no-op path, which has no
+        // bound PR at all) and `ProvenAbsent` both back a genuinely measured
+        // empty diff. `Indeterminate` means GitHub's head check could not
+        // establish a delta — the claim is the worker's alone, never
+        // describe it as a measured empty diff (see `try_revision_no_op`).
+        let detail = match contribution {
+            None | Some(ContributionEvidence::ProvenAbsent) => {
+                "Worker verified the assigned work was already done (empty diff — no changes \
+                 needed); closed as a no-op without a PR."
+            }
+            Some(ContributionEvidence::Indeterminate) => {
+                "Worker declared the assigned work was already done; the engine could not \
+                 independently verify an empty diff (the baseline is unavailable or the GitHub \
+                 head check was inconclusive); closed as a no-op without a PR."
+            }
+        };
         // Marked before the terminalizing write so no sweep can observe
         // this execution terminal-with-a-live-pane without also seeing
         // that its own teardown owns the pane — see `super::teardown`.
         let teardown = self.begin_teardown(&execution.id);
-        let completion = match self.work_db.record_worker_no_op_completion(&execution.id, detail) {
+        let completion = match self
+            .work_db
+            .record_worker_no_op_completion(&execution.id, detail, attention)
+        {
             Ok(Some(completion)) => completion,
             Ok(None) => return StopOutcome::AlreadyTerminal,
             Err(err) => {
@@ -51,8 +111,15 @@ impl WorkerCompletionHandler {
                 return StopOutcome::DbError;
             }
         };
-        // The worker reached a clean terminal — drop any staged URL and reset
-        // the nudge counter so nothing lingers for this finalized execution.
+        // The declined-finding attention item (when requested) was filed in
+        // the SAME transaction as the terminal write above, so it is either
+        // both true or neither happened — never a record claiming a closure
+        // that didn't. Teardown (pane / driver / cube lease) runs next;
+        // the frontend event is published only after that attempt, so the
+        // interactive surface does not fire while release is still in flight.
+        // The record itself does not claim that cube release succeeded —
+        // `finish_worker_teardown` logs and continues on failure, leaving
+        // a timed-out cube release to TTL reclamation.
         self.staged_pr_urls.forget(&execution.id);
         self.nudge_breaker.forget(&execution.id);
         self.build_wait_tracker.forget(&execution.id);
@@ -68,6 +135,12 @@ impl WorkerCompletionHandler {
         )
         .await;
         let work_item_id = completion.execution.work_item_id.clone();
+        let product_id = completion.work_item.product_id().to_string();
+        if let Some(item) = completion.filed_attention_item.clone() {
+            self.publisher
+                .publish_frontend_event_on_product(&product_id, FrontendEvent::AttentionItemCreated { item })
+                .await;
+        }
         self.publisher
             .publish(
                 &completion.execution.id,
@@ -76,7 +149,6 @@ impl WorkerCompletionHandler {
                 "worker_no_op_completed",
             )
             .await;
-        let product_id = completion.work_item.product_id().to_string();
         self.publisher
             .publish_work_item_changed(&product_id, &work_item_id, "worker_no_op_completed")
             .await;
@@ -89,48 +161,71 @@ impl WorkerCompletionHandler {
         StopOutcome::NoChangesNeeded { work_item_id }
     }
 
-    /// File the human-visible record that a `revision_implementation`
-    /// closed on the sanctioned `NO_CHANGES_NEEDED` marker without ever
-    /// moving the bound PR — i.e. the worker declared the review finding
-    /// it was dispatched for needs no code change.
+    /// Attention item and contribution evidence for a revision that
+    /// declared `no_changes_needed` through the run-done proposal seam.
+    /// Other execution kinds return `(None, None)`.
     ///
-    /// Always filed, never conditional: this terminal is the one path on
-    /// which a revision completes successfully with the finding
-    /// unaddressed, so the human who asked for it has to be able to see
-    /// that it was declined rather than fixed. Best-effort — a filing
-    /// failure is logged and swallowed, exactly like the other attention
-    /// helpers here; it must never block the completion itself.
-    pub(super) async fn file_revision_no_op_attention(
+    /// Contribution is always [`ContributionEvidence::Indeterminate`]: this
+    /// path is the submit-time termination and must not call GitHub, so the
+    /// record must not describe a measured empty diff.
+    pub(super) fn declared_run_done_no_op_inputs(
         &self,
         execution: &crate::work::WorkExecution,
+    ) -> (Option<ContributionEvidence>, Option<CreateAttentionItemInput>) {
+        if execution.kind != ExecutionKind::RevisionImplementation {
+            return (None, None);
+        }
+        let bound_pr_url = self
+            .resolve_bound_pr_url(execution)
+            .or_else(|| execution.pr_url.clone().filter(|u| !u.is_empty()))
+            .unwrap_or_else(|| "(unresolved parent PR)".to_owned());
+        (
+            Some(ContributionEvidence::Indeterminate),
+            Some(Self::revision_no_op_attention_input(
+                &bound_pr_url,
+                ContributionEvidence::Indeterminate,
+            )),
+        )
+    }
+
+    /// Build the human-visible record that a `revision_implementation`
+    /// closed as a sanctioned no-op without addressing its finding.
+    ///
+    /// Returns the item to insert rather than inserting it itself: the
+    /// caller ([`Self::try_revision_no_op`] or
+    /// [`Self::finalize_declared_run_done`]) threads it into
+    /// [`Self::finalize_no_op_completion`], which commits the attention
+    /// item and the terminal transition in one transaction so the record
+    /// can never assert closure that did not happen. The body does not
+    /// claim cube-lease or worker-slot release: those run after the
+    /// transaction, and a failed or timed-out cube release is left to
+    /// TTL reclamation.
+    fn revision_no_op_attention_input(
         bound_pr_url: &str,
-    ) {
+        contribution: ContributionEvidence,
+    ) -> CreateAttentionItemInput {
+        let evidence = match contribution {
+            ContributionEvidence::ProvenAbsent => {
+                "The bound PR's head SHA is unchanged from the dispatch-time snapshot."
+            }
+            ContributionEvidence::Indeterminate => {
+                "The engine could not establish a head delta (the baseline is unavailable or the GitHub head check was inconclusive). No observed contribution contradicted the worker's claim; absence of a push was not independently verified."
+            }
+        };
         let body = format!(
-            "This revision worker pushed no commits — the bound PR's head SHA is unchanged from \
-             the last known baseline (the dispatch-time snapshot, or a later baseline absorbed \
-             when a concurrently-active parent worker's push was observed) — and ended by emitting \
-             the sanctioned `NO_CHANGES_NEEDED` marker, its explicit claim that the review finding \
+            "This revision worker declared that it needed no code change, through the sanctioned \
+             `NO_CHANGES_NEEDED` marker or its run-done declaration. {evidence}\n\n\
+             This is the worker's explicit claim that the review finding \
              needs no code change.\n\n\
-             The revision has been closed as a declared no-op: no PR was opened, nothing was \
-             pushed, and the bound PR ({bound_pr_url}) is untouched. **The finding that produced \
-             this revision was therefore never addressed.** Read the worker's final message to \
-             judge whether declining it was right; re-dispatch the revision if it was not.\n\n\
-             The execution's cube lease and worker slot have been released."
+             The revision has been closed as a declared no-op against {bound_pr_url}. \
+             **The finding was declined rather than recorded as fixed.** Read the worker's final message to \
+             judge whether declining it was right; re-dispatch the revision if it was not."
         );
-        if let Err(err) = self
-            .file_execution_attention(
-                execution,
-                REVISION_NO_OP_ATTENTION_KIND,
-                "Revision closed without addressing its finding",
-                body,
-            )
-            .await
-        {
-            tracing::warn!(
-                execution_id = %execution.id,
-                ?err,
-                "revision no-op: failed to file attention item; closing without a UI surface",
-            );
+        CreateAttentionItemInput {
+            kind: REVISION_NO_OP_ATTENTION_KIND.to_owned(),
+            title: "Revision closed without addressing its finding".to_owned(),
+            body_markdown: body,
+            ..Default::default()
         }
     }
 

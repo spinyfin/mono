@@ -315,7 +315,7 @@ fn record_worker_no_op_completion_closes_done_without_pr() {
     let (_product_id, chore_id, exec_id) = make_waiting_human_chore(&db, "rwnc-noop");
 
     let completion = db
-        .record_worker_no_op_completion(&exec_id, "already present on main")
+        .record_worker_no_op_completion(&exec_id, "already present on main", None)
         .unwrap()
         .expect("a live execution must return Some(WorkerPrCompletion)");
 
@@ -357,7 +357,7 @@ fn pr_completion_and_no_op_completion_differ_in_status_and_pr_binding() {
         .unwrap()
         .unwrap();
     let noop_done = db
-        .record_worker_no_op_completion(&noop_exec, "already done")
+        .record_worker_no_op_completion(&noop_exec, "already done", None)
         .unwrap()
         .unwrap();
 

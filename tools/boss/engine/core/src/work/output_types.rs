@@ -4,7 +4,7 @@ use super::*;
 /// `InReview` is the typical case (open PR, ready for human review);
 /// `Done` is used when the PR was already merged at the time the
 /// worker's Stop event fired, so we skip the review column entirely.
-/// `PendingReview` (P992) is used when an independent reviewer pass
+/// `PendingReview` is used when an independent reviewer pass
 /// is enqueued: the task's `pr_url` is stamped but its status is *not*
 /// advanced — the task stays in the Doing column until the reviewer resolves
 /// (or the fallback timeout fires).
@@ -13,7 +13,7 @@ pub enum WorkerPrCompletionTarget {
     InReview,
     Done,
     /// Task `pr_url` is stamped; task `status` is unchanged. The independent
-    /// reviewer pass (P992) drives the subsequent `active → in_review`
+    /// reviewer pass drives the subsequent `active → in_review`
     /// transition once the review pass resolves (or the timeout fires).
     PendingReview,
     /// incident-002 P2: the both-parents deletion tripwire fired — this PR
@@ -145,6 +145,11 @@ pub struct WorkerPrCompletion {
     pub work_item: WorkItem,
     pub released_lease_id: Option<String>,
     pub released_workspace_id: Option<String>,
+    /// Set only by [`WorkDb::record_worker_no_op_completion`] when it was
+    /// asked to file a declined-finding attention item in the same
+    /// transaction as the terminal transition. `None` for every other
+    /// caller, and for a no-op completion that didn't request one.
+    pub filed_attention_item: Option<WorkAttentionItem>,
 }
 
 /// Result of a successful [`WorkDb::record_worker_idle_abandonment`] call.

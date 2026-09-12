@@ -833,6 +833,11 @@ impl WorkerCompletionHandler {
     pub(super) async fn worker_signalled_no_op(&self, execution_id: &str) -> bool {
         let proposals_first = self.feature_flags.is_enabled("worker_proposals")
             && self.feature_flags.is_enabled("run_done_proposals_seam");
+        tracing::info!(
+            execution_id,
+            proposals_first,
+            "no-op claim: reading declaration before transcript fallback"
+        );
         if proposals_first {
             match self.work_db.execution_run_done_outcome(execution_id) {
                 Ok(Some(boss_protocol::RunDoneOutcome::NoChangesNeeded)) => return true,
@@ -851,9 +856,36 @@ impl WorkerCompletionHandler {
                 }
             }
         }
-        let signalled = match self.read_final_triage_message(execution_id).await.into_message() {
-            Some(text) => crate::no_op_signal::transcript_signals_no_op(&text),
-            None => false,
+        let signalled = match self.read_final_triage_message(execution_id).await {
+            TriageTranscript::FinalMessage(text) => {
+                let signalled = crate::no_op_signal::transcript_signals_no_op(&text);
+                let tail: String = text
+                    .chars()
+                    .rev()
+                    .take(160)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                tracing::info!(
+                    execution_id,
+                    proposals_first,
+                    transcript_bytes = text.len(),
+                    ?tail,
+                    signalled,
+                    "no-op claim: transcript scan completed"
+                );
+                signalled
+            }
+            unavailable => {
+                tracing::warn!(
+                    execution_id,
+                    proposals_first,
+                    ?unavailable,
+                    "no-op claim: transcript scan unavailable"
+                );
+                false
+            }
         };
         if proposals_first && signalled {
             // Count once per Stop that the marker actually carried the

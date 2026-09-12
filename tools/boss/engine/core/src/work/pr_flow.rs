@@ -194,6 +194,7 @@ impl WorkDb {
             work_item: task_to_item(updated_task),
             released_lease_id: original_lease_id,
             released_workspace_id: original_workspace_id,
+            filed_attention_item: None,
         }))
     }
 
@@ -222,10 +223,21 @@ impl WorkDb {
     /// Returns `Ok(None)` if the execution has already been finalised
     /// (terminal status), making this safe to call from a hook handler
     /// that may fire repeatedly.
+    ///
+    /// `attention`, when given, is filed as an execution-scoped attention
+    /// item in this SAME transaction as the terminal transition below —
+    /// both commit together or neither does. This is what keeps a
+    /// human-visible "this was closed and its slot released" record from
+    /// ever being written for a completion that didn't actually happen: if
+    /// the attention insert fails (e.g. a store-level guard rejects it),
+    /// the whole transaction rolls back and the execution is left live,
+    /// exactly as if this call had never been made. The caller reads the
+    /// filed item back from [`WorkerPrCompletion::filed_attention_item`].
     pub fn record_worker_no_op_completion(
         &self,
         execution_id: &str,
         detail: &str,
+        attention: Option<CreateAttentionItemInput>,
     ) -> Result<Option<WorkerPrCompletion>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -306,6 +318,19 @@ impl WorkDb {
             )?;
         }
 
+        let filed_attention_item = attention
+            .map(|input| {
+                super::workitems::insert_attention_item_row(
+                    &tx,
+                    &CreateAttentionItemInput {
+                        execution_id: Some(execution_id.to_owned()),
+                        work_item_id: None,
+                        ..input
+                    },
+                )
+            })
+            .transpose()?;
+
         let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let updated_task = query_task(&tx, &work_item_id).require("task", &work_item_id)?;
         stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
@@ -315,6 +340,7 @@ impl WorkDb {
             work_item: task_to_item(updated_task),
             released_lease_id: original_lease_id,
             released_workspace_id: original_workspace_id,
+            filed_attention_item,
         }))
     }
 
