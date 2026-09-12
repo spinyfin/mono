@@ -1028,30 +1028,46 @@ fn render_editorial_rules_block(
 /// findings as followup commits. The engine terminated the worker the moment
 /// the PR was created, so the review was never consumed. This universal
 /// guidance applies to every execution kind and prevents that pattern.
-/// `seam_enabled` mirrors `run_done_proposals_seam`. When on, this block
-/// gains one sentence resolving what would otherwise be a direct
-/// contradiction between two directives: this one says PR creation is the
-/// last thing you do, and [`run_done_directive`] asks for a declaration.
-/// Both are true — the declaration goes immediately BEFORE the push, since
-/// the push is what may reap the worker — but a worker left to reconcile
-/// them itself will reasonably conclude it cannot do both, and drop one.
+///
+/// `seam_enabled` mirrors `run_done_proposals_seam`. When on, [`run_done_directive`]'s
+/// declaration — not PR creation — is the act that is ALWAYS terminal:
+/// `boss propose done` ends the run synchronously the instant it is accepted
+/// (`completion::run_done_declaration` finalizes it at submit, no Stop
+/// boundary needed). The push must come first and the declaration last — the
+/// reverse of the ordering this block taught before declarations existed,
+/// when the push was the only thing that could reap a worker. Getting this
+/// backwards now would kill the worker's pane before it ever reaches `cube
+/// pr create`.
 fn pr_terminal_directive(seam_enabled: bool) -> String {
     let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
     let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     let mut out = String::new();
-    out.push_str("\n## Important: PR creation is your terminal act\n\n");
-    out.push_str(
-        "Opening the PR is the LAST thing you do. The engine reaps you immediately after the PR is created.\n\n",
-    );
+    if seam_enabled {
+        out.push_str("\n## Important: declaring done is your terminal act\n\n");
+    } else {
+        out.push_str("\n## Important: PR creation is your terminal act\n\n");
+    }
     if seam_enabled {
         out.push_str(&format!(
-            "The one thing that comes after everything else and BEFORE the push is your run-done \
-             declaration (`{boss} propose done`, see below) — submit it, then open/update the PR. \
-             Doing it in that order is deliberate: the push can reap you, so a declaration you \
-             planned to make afterwards may never happen.\n\n"
+            "Opening the PR is normally the LAST thing you do, and the engine may reap you \
+             immediately after the PR is created. But with your run-done declaration enabled, \
+             `{boss} propose done` (see below) is the thing that is ALWAYS terminal, and it ends \
+             your run the instant the engine accepts it — before you even see the response, with \
+             no turn boundary in between. So the order is: finish everything, open or update the \
+             PR with `{cube} pr create` / `{cube} pr update`, and only THEN declare done, as the \
+             very last tool call you make. Declaring before the push would end your run before you \
+             ever reach the push at all — do not do that.\n\n"
         ));
+    } else {
+        out.push_str(
+            "Opening the PR is the LAST thing you do. The engine reaps you immediately after the PR is created.\n\n",
+        );
     }
-    out.push_str(&format!("You will NOT get another turn after `gh pr create` / `{cube} pr create` (or `{cube} pr update` for an existing PR). Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR while background work (parallel/sub-agent runs, backgrounded builds, code reviews) is still in flight expecting to consume its results.\n\n"));
+    if seam_enabled {
+        out.push_str(&format!("You will NOT get another turn after `{boss} propose done` (see below) — not after `gh pr create` / `{cube} pr create` / `{cube} pr update` themselves, those still give you a turn so you can go on to declare done. Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR while background work (parallel/sub-agent runs, backgrounded builds, code reviews) is still in flight expecting to consume its results.\n\n"));
+    } else {
+        out.push_str(&format!("You will NOT get another turn after `gh pr create` / `{cube} pr create` (or `{cube} pr update` for an existing PR). Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR while background work (parallel/sub-agent runs, backgrounded builds, code reviews) is still in flight expecting to consume its results.\n\n"));
+    }
     out.push_str("Therefore: finish everything — including consuming any review/self-review findings you started — BEFORE you open the PR. If a background review is still running and you care about its results, wait for it and address all findings FIRST, then open the PR. If you don't intend to wait, don't start the review.\n");
     out
 }
@@ -1172,60 +1188,50 @@ pub(crate) fn worker_escalation_protocol_directive(seam_enabled: bool) -> String
 }
 
 /// Terminal run-done declaration directive — the worker-facing half of the
-/// `run_done_proposals_seam` migration.
+/// `run_done_proposals_seam` migration. `seam_enabled` mirrors the flag the
+/// engine's read path checks; with it off this contributes nothing, keeping
+/// the prompt at today's baseline.
 ///
-/// `seam_enabled` mirrors the feature flag the engine's read path reads
-/// (see [`crate::completion::WorkerCompletionHandler::evaluate_satisfied_deliverable_on_stop`]
-/// and [`crate::run_done_backstop`]), threaded here so the two halves move
-/// together: a worker must never be taught a verb the engine won't act on,
-/// and flipping the flag off must restore today's prompt exactly. With the
-/// seam off this contributes nothing at all.
+/// Emitted for **every** execution kind, unlike every other seam directive,
+/// because revisions, CI fixes, conflict resolutions and reviewer passes all
+/// terminate without creating anything the engine can point at — precisely
+/// the runs whose ending was previously guessed at.
 ///
-/// Unlike every other seam directive, this one is emitted for **every**
-/// execution kind. That is the requirement it exists to meet: revisions, CI
-/// fixes, conflict resolutions and reviewer passes all terminate without
-/// creating anything the engine can point at, so they are precisely the runs
-/// whose ending was previously guessed at. A directive scoped to
-/// PR-producing kinds would leave the failing cases uncovered.
-///
-/// Two things the wording works hard at, both learned from the incidents
-/// this closes:
-///
-/// - **When to declare.** Opening or updating a PR can reap the worker
-///   immediately, so "declare afterwards" is advice a worker cannot follow.
-///   The declaration goes immediately *before* the terminal push.
-/// - **Not declaring is not a shortcut to being left alone.** A worker that
-///   reads "the engine waits for my declaration" as "so I can just stop"
-///   would swap one silent failure for another. The directive states the
-///   real consequence: the run is held, then asked, then parked for a human
-///   — visibly unresolved, never quietly successful.
+/// The declaration ends the run synchronously the instant it is accepted
+/// (`completion::run_done_declaration` finalizes it at submit, no turn
+/// boundary needed) — the worker gets no turn after the call commits, not
+/// even to see the response. It must therefore come *after* the push, as
+/// the very last tool call of the run: declaring first would end the run
+/// before the push ever happens (see [`pr_terminal_directive`]). And not
+/// declaring is no shortcut to being left alone: the wording states the
+/// real consequence — held, then asked, then parked for a human, never
+/// quietly successful.
 pub(crate) fn run_done_directive(seam_enabled: bool) -> String {
     if !seam_enabled {
         return String::new();
     }
     let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
-    let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     format!(
         "\n## Declaring your run finished\n\n\
-     When your run is over, say so:\n\n\
+     When your run is over, say so — as the ABSOLUTE LAST thing you do:\n\n\
      ```\n\
      {boss} propose done --outcome <delivered|no-changes-needed|blocked> --summary \"<one line>\"\n\
      ```\n\n\
-     This is what ends your run. The engine does not decide it from the state of your PR — for a \
-     run dispatched against a PR that is already open and green, that state says nothing about \
-     whether you did anything, and reading it as \"finished\" is how mid-investigation runs used to \
-     get terminated with their work lost.\n\n\
+     **This immediately ends your run** — the moment it is accepted, the engine tears your pane \
+     down, with no turn after it, not even to see the response. Finish every other thing first, \
+     including opening or updating the PR; only declare once nothing is left to do. The engine no \
+     longer infers completion from PR state (a run dispatched against an already-open, already-green \
+     PR says nothing about whether you did anything — reading it as \"finished\" is how \
+     mid-investigation runs used to get terminated with their work lost); your declaration is what \
+     it acts on.\n\n\
      Pick the outcome that is true:\n\n\
      - `delivered` — the deliverable exists (you opened or pushed to the PR, wrote the review, \
      posted the reply).\n\
      - `no-changes-needed` — you verified there was nothing to produce. This replaces the \
      `NO_CHANGES_NEEDED` marker; you do not need both.\n\
      - `blocked` — you are stopping without delivering. File `{boss} propose blocked --reason \"...\"` \
-     alongside it so the blocker itself is recorded, not just the fact that you stopped.\n\n\
-     **Declare immediately BEFORE your terminal push**, not after: `{cube} pr create` / `{cube} pr \
-     update` can reap you the moment the PR moves, so a declaration you planned to make afterwards \
-     may never happen. Declaring first costs nothing if the push then fails — re-declare with the \
-     accurate outcome, the newest declaration wins.\n\n\
+     alongside it (before this call) so the blocker itself is recorded, not just the fact that you \
+     stopped.\n\n\
      If you simply stop without declaring, you are not left alone: the engine holds the run open \
      while it can see you working, then asks you once whether you are finished, then parks the run \
      for a human with the outcome recorded as unknown. That is worse for you and for the human than \

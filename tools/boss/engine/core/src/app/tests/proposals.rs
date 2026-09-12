@@ -562,6 +562,318 @@ async fn accepted_review_report_reaps_a_real_worker_process() {
     );
 }
 
+/// Build one live (`running`) `chore_implementation` execution against a
+/// fake app runtime — the shape a `run_done` declaration is actually
+/// submitted against (unlike a review-batch leaf/supervisor, most kinds
+/// declaring `run_done` are plain implementation workers with no batch
+/// machinery at all).
+fn live_chore_execution() -> (Arc<ServerState>, tempfile::TempDir, String, String) {
+    let (server_state, dir) = test_server_state_with_fakes();
+    // Every test using this fixture exercises the `run_done` synchronous
+    // finalize path, which `handle_submit_proposal` only takes with both
+    // halves of the seam's kill switch on — see
+    // `finalize_run_done_declaration`'s gate in `app::proposals`.
+    server_state.feature_flags.set("worker_proposals", true).unwrap();
+    server_state.feature_flags.set("run_done_proposals_seam", true).unwrap();
+    let (execution_id, work_item_id) = new_execution(&server_state, "Run-done target");
+    server_state
+        .work_db
+        .start_execution_run(
+            &execution_id,
+            "worker",
+            "repo",
+            "lease-run-done",
+            "workspace-run-done",
+            dir.path().to_str().unwrap(),
+        )
+        .unwrap();
+    server_state
+        .worker_registry
+        .register(std::process::id() as libc::pid_t, execution_id.clone());
+    (server_state, dir, execution_id, work_item_id)
+}
+
+/// Bind a PR to `work_item_id` directly — the same shortcut
+/// [`live_batch_supervisor`] takes for its batch's status column, since
+/// standing up a real PR-open flow first is not the point of these tests.
+fn set_task_pr_url(server_state: &Arc<ServerState>, work_item_id: &str, pr_url: &str) {
+    server_state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![work_item_id, pr_url],
+        )
+        .unwrap();
+}
+
+fn task_status(server_state: &Arc<ServerState>, work_item_id: &str) -> boss_protocol::TaskStatus {
+    match server_state.work_db.get_work_item(work_item_id).unwrap() {
+        crate::work::WorkItem::Task(task) | crate::work::WorkItem::Chore(task) => task.status,
+        other => panic!("expected a task/chore, got {other:?}"),
+    }
+}
+
+/// This is the fix's central claim, exercised end to end through the real
+/// RPC handler: an accepted `delivered` declaration with a resolvable PR
+/// terminalizes its execution and takes the `PendingReview` hold (active +
+/// bound PR) before the RPC even returns — no later Stop boundary required.
+/// The hold itself is released asynchronously once the reviewer-admission
+/// decision is made; see `completion::tests::t14` for direct coverage of
+/// that release. Mirrors `accepted_review_report_immediately_terminalizes_its_live_leaf`
+/// for the whole-execution (not batch-member) finalize path.
+#[tokio::test]
+async fn accepted_run_done_delivered_immediately_terminalizes_a_bound_pr() {
+    let (server_state, _dir, execution_id, work_item_id) = live_chore_execution();
+    set_task_pr_url(&server_state, &work_item_id, "https://github.com/example/repo/pull/9");
+    let peer_pid = std::process::id() as libc::pid_t;
+
+    let (proposal, already_submitted) = submitted(
+        call_with_peer(
+            &server_state,
+            Some(peer_pid),
+            submit_request(
+                &execution_id,
+                ProposalKind::RunDone,
+                json!({"outcome": "delivered", "summary": "Shipped it"}),
+            ),
+        )
+        .await,
+    );
+    assert!(!already_submitted);
+    assert_eq!(proposal.state, ProposalState::Applied);
+    assert!(
+        server_state
+            .work_db
+            .get_execution(&execution_id)
+            .unwrap()
+            .status
+            .is_terminal(),
+        "a `delivered` declaration with a resolvable PR must terminalize before the RPC returns"
+    );
+    assert_eq!(
+        task_status(&server_state, &work_item_id),
+        // PendingReview is represented by active plus the bound PR while
+        // the asynchronous reviewer-admission path is still deciding.
+        boss_protocol::TaskStatus::Active
+    );
+}
+
+/// A worker can declare `delivered` without the engine being able to resolve
+/// any PR (no bound `pr_url`, nothing staged, no artifact) — the declaration
+/// is still definitive: the run ends and its resources are released. The
+/// task is left untouched (there is nothing to bind it to) and a flagged
+/// attention records the mismatch, per the design's "post-hoc audit" split.
+#[tokio::test]
+async fn accepted_run_done_delivered_without_a_resolvable_pr_still_terminalizes() {
+    let (server_state, _dir, execution_id, work_item_id) = live_chore_execution();
+    let peer_pid = std::process::id() as libc::pid_t;
+    let original_status = task_status(&server_state, &work_item_id);
+
+    let (proposal, _) = submitted(
+        call_with_peer(
+            &server_state,
+            Some(peer_pid),
+            submit_request(
+                &execution_id,
+                ProposalKind::RunDone,
+                json!({"outcome": "delivered", "summary": "Shipped it, I think"}),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(proposal.state, ProposalState::Applied);
+    let execution = server_state.work_db.get_execution(&execution_id).unwrap();
+    assert_eq!(
+        execution.status,
+        boss_protocol::ExecutionStatus::Abandoned,
+        "still terminalizes — a declaration is definitive even when the engine cannot verify it"
+    );
+    assert_eq!(
+        task_status(&server_state, &work_item_id),
+        original_status,
+        "no PR to bind means no task-status advance"
+    );
+    let items = server_state.work_db.list_attention_items(&execution_id).unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|i| i.kind == crate::completion::RUN_DONE_AUDIT_FLAGGED_ATTENTION_KIND),
+        "the unresolved PR must be flagged for a human: {items:?}"
+    );
+}
+
+/// `no-changes-needed` closes the task as `done` without a PR, synchronously
+/// at submit — the same terminal `record_worker_no_op_completion` already
+/// reaches from a Stop boundary, now reached from the declaration itself.
+#[tokio::test]
+async fn accepted_run_done_no_changes_needed_immediately_closes_the_task() {
+    let (server_state, _dir, execution_id, work_item_id) = live_chore_execution();
+    let peer_pid = std::process::id() as libc::pid_t;
+
+    let (proposal, _) = submitted(
+        call_with_peer(
+            &server_state,
+            Some(peer_pid),
+            submit_request(
+                &execution_id,
+                ProposalKind::RunDone,
+                json!({"outcome": "no_changes_needed", "summary": "Already fixed on main"}),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(proposal.state, ProposalState::Applied);
+    assert_eq!(
+        server_state.work_db.get_execution(&execution_id).unwrap().status,
+        boss_protocol::ExecutionStatus::Completed
+    );
+    assert_eq!(
+        task_status(&server_state, &work_item_id),
+        boss_protocol::TaskStatus::Done
+    );
+}
+
+/// `blocked` ends the run without delivering: the execution terminalizes and
+/// releases its slot/lease, but — unlike `delivered`/`no-changes-needed` —
+/// there is no claim of positive progress, so the task/chore's own status is
+/// left untouched for a human to redirect.
+#[tokio::test]
+async fn accepted_run_done_blocked_immediately_terminalizes_without_advancing_the_task() {
+    let (server_state, _dir, execution_id, work_item_id) = live_chore_execution();
+    let peer_pid = std::process::id() as libc::pid_t;
+    let original_status = task_status(&server_state, &work_item_id);
+
+    let (proposal, _) = submitted(
+        call_with_peer(
+            &server_state,
+            Some(peer_pid),
+            submit_request(
+                &execution_id,
+                ProposalKind::RunDone,
+                json!({"outcome": "blocked", "summary": "Cannot proceed without operator input"}),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(proposal.state, ProposalState::Applied);
+    assert_eq!(
+        server_state.work_db.get_execution(&execution_id).unwrap().status,
+        boss_protocol::ExecutionStatus::Abandoned
+    );
+    assert_eq!(task_status(&server_state, &work_item_id), original_status);
+    let items = server_state.work_db.list_attention_items(&execution_id).unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|i| i.kind == crate::completion::RUN_DONE_BLOCKED_ATTENTION_KIND),
+        "the run's end must be visible to a human: {items:?}"
+    );
+}
+
+/// The end-to-end proof the incidents demand: submitting `run_done` reaps a
+/// REAL worker process — not a fake, not a later Stop boundary — and does so
+/// without ever touching the network. This test's own `branch_verifier` and
+/// `merge_probe` are the real production collaborators (`test_server_state_with_fakes`
+/// only fakes `cube`/pane-spawn); if the synchronous finalize path made a
+/// live `gh` call, this test would hang or fail in a sandboxed CI run with
+/// no GitHub credentials. It doesn't, because it never calls either
+/// collaborator — see `completion::run_done_declaration`'s module doc.
+/// Mirrors `accepted_review_report_reaps_a_real_worker_process`.
+#[tokio::test]
+async fn accepted_run_done_delivered_reaps_a_real_worker_process_without_network() {
+    let (server_state, _dir, execution_id, work_item_id) = live_chore_execution();
+    set_task_pr_url(&server_state, &work_item_id, "https://github.com/example/repo/pull/9");
+    let peer_pid = std::process::id() as libc::pid_t;
+
+    let mut child = crate::test_support::spawn_group_leader_sleeper();
+    let pid = child.id() as i64;
+    assert!(
+        server_state
+            .work_db
+            .set_run_shell_pid_for_execution(&execution_id, pid)
+            .unwrap(),
+        "live_chore_execution's start_execution_run must have left a run row to record the pid against"
+    );
+
+    let (proposal, _) = submitted(
+        call_with_peer(
+            &server_state,
+            Some(peer_pid),
+            submit_request(
+                &execution_id,
+                ProposalKind::RunDone,
+                json!({"outcome": "delivered", "summary": "Shipped it"}),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(proposal.state, ProposalState::Applied);
+
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .expect("join wait task")
+        .expect("wait on child");
+    assert!(
+        !status.success(),
+        "the run_done finalize must have actually reaped the worker's real process — a no-op \
+         releaser (or one that only ever ran against a fake) would leave it running"
+    );
+}
+
+/// With the `run_done_proposals_seam` kill switch off, an accepted
+/// `run_done` proposal must still apply (the durable stamp is
+/// unconditional — see `apply_run_done`'s doc comment) but must NOT tear
+/// the worker down or advance the task synchronously: that decision
+/// belongs to the legacy health-alone read inside the Stop-boundary
+/// satisfied-deliverable gate, not to this RPC path. Without this gate the
+/// flag is not actually a kill switch, contrary to its documented purpose
+/// and to every other `worker_proposals`-gated read site.
+#[tokio::test]
+async fn accepted_run_done_delivered_does_not_finalize_with_the_seam_off() {
+    let (server_state, _dir, execution_id, work_item_id) = live_chore_execution();
+    server_state
+        .feature_flags
+        .set("run_done_proposals_seam", false)
+        .unwrap();
+    set_task_pr_url(&server_state, &work_item_id, "https://github.com/example/repo/pull/9");
+    let peer_pid = std::process::id() as libc::pid_t;
+
+    let (proposal, _) = submitted(
+        call_with_peer(
+            &server_state,
+            Some(peer_pid),
+            submit_request(
+                &execution_id,
+                ProposalKind::RunDone,
+                json!({"outcome": "delivered", "summary": "Shipped it"}),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(
+        proposal.state,
+        ProposalState::Applied,
+        "the stamp itself is unconditional regardless of the seam flag"
+    );
+    assert!(
+        server_state
+            .work_db
+            .get_execution(&execution_id)
+            .unwrap()
+            .status
+            .is_live(),
+        "with the seam off, the RPC path must not terminalize the execution — that decision is \
+         still the legacy Stop-boundary gate's to make"
+    );
+    assert_eq!(
+        server_state.work_db.execution_run_done_outcome(&execution_id).unwrap(),
+        Some(boss_protocol::RunDoneOutcome::Delivered),
+        "the declaration must still be readable by the legacy gate"
+    );
+}
+
 fn listed(event: FrontendEvent) -> (String, Vec<WorkerProposal>) {
     match event {
         FrontendEvent::ProposalsList {

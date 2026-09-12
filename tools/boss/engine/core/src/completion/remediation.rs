@@ -310,6 +310,12 @@ impl WorkerCompletionHandler {
             // worker's turn loop is still live and will produce another
             // Stop, which re-runs this finalizer. Not a failure.
             StopOutcome::DeferredForProbeTurn => false,
+            // Unreachable here: a `run_done` declaration finalizes
+            // synchronously from the SubmitProposal RPC handler
+            // (`app::proposals`), never from `on_stop_inner` — this
+            // finalizer's `outcome` can never be this variant. Covered for
+            // exhaustiveness like the other unreachable arms above.
+            StopOutcome::RunDoneDeclaredWithoutDelivery { .. } => false,
         };
         if !should_mark_failed {
             return;

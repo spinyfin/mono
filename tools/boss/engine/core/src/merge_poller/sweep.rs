@@ -1150,7 +1150,11 @@ pub(crate) async fn sweep_pending_pr(
         // probe-delivery gate on the on-Stop path (it depends on this same
         // boundary's pre-completion probe pass), never from a PR-detection
         // recheck — covered for exhaustiveness.
-        | StopOutcome::DeferredForProbeTurn => {}
+        | StopOutcome::DeferredForProbeTurn
+        // A `run_done` declaration finalizes synchronously from the
+        // SubmitProposal RPC handler (`app::proposals`), never from
+        // `recheck_for_pr` — covered for exhaustiveness.
+        | StopOutcome::RunDoneDeclaredWithoutDelivery { .. } => {}
     }
 }
 
@@ -1248,7 +1252,11 @@ pub(crate) async fn sweep_late_pr(
         // DeferredForProbeTurn is only reachable via `on_stop_inner`'s
         // probe-delivery gate on the on-Stop path, never from a late-PR
         // recheck — covered for exhaustiveness.
-        | StopOutcome::DeferredForProbeTurn => {}
+        | StopOutcome::DeferredForProbeTurn
+        // A `run_done` declaration finalizes synchronously from the
+        // SubmitProposal RPC handler (`app::proposals`), never from a
+        // late-PR recheck — covered for exhaustiveness.
+        | StopOutcome::RunDoneDeclaredWithoutDelivery { .. } => {}
     }
 }
 

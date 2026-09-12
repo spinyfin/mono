@@ -91,6 +91,7 @@ mod pr_transition;
 mod recheck;
 mod release;
 mod remediation;
+mod run_done_declaration;
 mod stop;
 mod teardown;
 mod worker_signals;
@@ -289,6 +290,22 @@ crate::register_counter!(
 /// distinction is the whole point of the declaration, so it gets its own
 /// kind rather than being folded into a generic park.
 pub const RUN_UNDECLARED_ATTENTION_KIND: &str = "run_undeclared";
+
+/// Attention-item kind filed when a `run_done` declaration's synchronous
+/// finalize (see `completion::run_done_declaration`) could not fully trust
+/// the claim: `delivered` with no PR the engine could resolve, or a
+/// post-hoc audit finding the bound PR's head did not move. The execution
+/// still terminalizes either way — a worker's declaration is the completion
+/// signal, never a gate the engine gets to block on — this only flags the
+/// mismatch for a human, exactly as the design's "post-hoc audit" intends.
+pub const RUN_DONE_AUDIT_FLAGGED_ATTENTION_KIND: &str = "run_done_audit_flagged";
+
+/// Attention-item kind filed when a `run_done --outcome blocked` declaration
+/// terminalizes its execution. Distinct from [`crate::worker_escalation::WORKER_BLOCKED_ATTENTION_KIND`],
+/// which the companion (still-live-run) `blocked` proposal files with the
+/// blocker's own reason — this one marks that the *run itself* has ended,
+/// not merely that it hit a blocker while continuing.
+pub const RUN_DONE_BLOCKED_ATTENTION_KIND: &str = "run_done_declared_blocked";
 
 /// Register all PR-URL-capture counter handles with `registry`. Called from
 /// [`crate::metrics_init::init_all`] at engine startup so duplicate-name panics
@@ -2308,6 +2325,20 @@ pub enum StopOutcome {
     /// `pr_review`, the CI-remediation flaky-retrigger park) — still ran
     /// normally for this boundary; only the terminal decision was withheld.
     DeferredForProbeTurn,
+    /// A `run_done` declaration's acceptance IS the completion signal — see
+    /// `completion::run_done_declaration` and `app::proposals::handle_submit_proposal`.
+    /// The execution is finalised synchronously at submit time, not at a
+    /// later Stop boundary that may never arrive. Fired for `blocked` (the
+    /// run is over without delivering) or `delivered` with no PR the engine
+    /// could resolve — both terminalize without a positive task-status
+    /// change (mirrors [`Self::NudgeBreakerParked`]'s idle-park mechanics:
+    /// `abandoned`, lease/pane released, `autostart` cleared) and file a
+    /// [`RUN_DONE_AUDIT_FLAGGED_ATTENTION_KIND`] or
+    /// [`RUN_DONE_BLOCKED_ATTENTION_KIND`] attention so a human sees why.
+    /// `delivered` with a resolvable PR instead reaches [`Self::PrDetected`],
+    /// and `no_changes_needed` reaches [`Self::NoChangesNeeded`] — both
+    /// existing variants, reused because their semantics already fit.
+    RunDoneDeclaredWithoutDelivery { detail: String },
 }
 
 /// Number of transcript-read attempts [`WorkerCompletionHandler::read_final_triage_message`]
