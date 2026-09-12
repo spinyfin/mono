@@ -248,6 +248,13 @@ impl WorkDb {
     /// stranded executions from being created, this cleans up any that
     /// slipped through before the fix shipped (or from a future regression).
     /// Run alongside [`Self::heal_ghost_active_chores`] at engine startup.
+    ///
+    /// Excludes members of a `post_merge` review batch: that batch's cycle
+    /// root is `done` by construction (the merge poller creates the batch
+    /// in the same pass that marks the root merged), so `t.status IN
+    /// (done, archived)` is true for it from the instant it exists and
+    /// would otherwise strand a post-merge reviewer waiting for a slot
+    /// across an engine restart.
     pub fn abandon_stranded_executions_on_closed_work_items(&self) -> Result<Vec<AbandonedStrandedExecution>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -257,7 +264,18 @@ impl WorkDb {
                  FROM work_executions we
                  JOIN tasks t ON t.id = we.work_item_id
                  WHERE we.status IN ('queued', 'ready', 'waiting_dependency', 'claimed')
-                   AND (t.status IN ('done', 'archived') OR t.deleted_at IS NOT NULL)",
+                   AND (
+                     t.deleted_at IS NOT NULL
+                     OR (
+                       t.status IN ('done', 'archived')
+                       AND NOT EXISTS (
+                         SELECT 1
+                         FROM pr_review_batch_members m
+                         JOIN pr_review_batches b ON b.id = m.batch_id
+                         WHERE m.execution_id = we.id AND b.phase = 'post_merge'
+                       )
+                     )
+                   )",
             )?;
             stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?

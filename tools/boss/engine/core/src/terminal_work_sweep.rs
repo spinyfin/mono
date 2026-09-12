@@ -307,10 +307,19 @@ pub async fn run_one_pass(
         // their completion sweep owns comment-terminal recovery so it can
         // finalize through the answer-agent path and file its lost-signal
         // attention item. Skip both here and fall back to execution status.
+        //
+        // A `post_merge` review batch member is a third case: its bound
+        // work item is the cycle root, which is `done` by construction (the
+        // merge poller creates the batch in the same pass that marks the
+        // root merged). Treating that as `work_item_terminal` would reap
+        // the reviewer within this sweep's interval of it starting, every
+        // time. It still falls back to `execution_terminal` below, so a
+        // post-merge reviewer whose own execution genuinely finished is
+        // reaped normally.
         let never_bound_work_item = matches!(
             execution.kind,
             boss_protocol::ExecutionKind::AutomationTriage | boss_protocol::ExecutionKind::AnswerAgent
-        );
+        ) || matches!(work_db.is_post_merge_review_batch_member(&execution.id), Ok(true));
 
         // The O'Brien signal: the bound work item is terminal (done /
         // archived / comment resolved|dismissed|answered) even though the
@@ -820,6 +829,78 @@ mod tests {
         assert_eq!(third.reaped, 0);
         assert_eq!(third.pending_confirmation, 0);
         assert_eq!(third.active_skipped, 0);
+    }
+
+    /// A post-merge review batch's cycle root is `done` by construction —
+    /// the merge poller creates the batch in the same pass that marks the
+    /// root merged — so a live `post_merge_reviewer` execution must never be
+    /// treated as `work_item_terminal`. Without this exemption this sweep
+    /// reaps the reviewer within its own interval of it starting, which is
+    /// exactly why the post-merge review feature never completed once.
+    #[tokio::test]
+    async fn does_not_reap_a_live_post_merge_reviewer_whose_cycle_root_is_done() {
+        let (_dir, db, product_id) = setup();
+        let cycle_root_id = create_active_chore(&db, &product_id, "post-merge-root");
+        let classification = boss_protocol::ReviewClassification::builder()
+            .changed_files(vec!["tools/boss/engine/pr-review/src/parsing.rs".to_owned()])
+            .complexity_flags(vec![])
+            .has_production_code(true)
+            .metadata_missing(vec![])
+            .production_languages(vec![boss_protocol::ReviewLanguageBucket::Rust])
+            .profile(boss_protocol::ReviewProfile::Light)
+            .subsystem_buckets(vec!["tools/boss/engine".to_owned()])
+            .additions(12)
+            .deletions(3)
+            .build();
+        let input = crate::work::ReviewBatchCreateInput::builder()
+            .cycle_root_id(cycle_root_id.clone())
+            .base_sha("base-sha")
+            .classification(classification)
+            .phase(boss_protocol::ReviewBatchPhase::PostMerge)
+            .pr_number(42)
+            .pr_url("https://github.com/example/repo/pull/42")
+            .target_sha("merge-sha-1")
+            .merge_sha("merge-sha-1")
+            .build();
+        let execution_id = match db
+            .create_post_merge_review_batch(input, "git@github.com:example/repo.git")
+            .unwrap()
+        {
+            crate::work::ReviewBatchDispatch::Created { executions, .. } => executions[0].id.clone(),
+            other => panic!("expected a newly-created post-merge batch, got {other:?}"),
+        };
+
+        // The merge poller marks the cycle root done in the same pass it
+        // creates the post-merge batch.
+        set_work_item_status(&db, &cycle_root_id, "done");
+
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_live_worker(&live_states, 5, &execution_id, &cycle_root_id);
+
+        let reaper = RecordingReaper::new(live_states.clone(), true);
+        let cube = RecordingCubeClient::default();
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let teardown = TeardownRegistry::new();
+        let mut seen = HashSet::new();
+
+        for _ in 0..3 {
+            let outcome = run_one_pass(
+                db.as_ref(),
+                &live_states,
+                &reaper,
+                &cube,
+                sink.as_ref(),
+                &teardown,
+                &mut seen,
+            )
+            .await;
+            assert_eq!(
+                outcome.reaped, 0,
+                "a live post-merge reviewer must never be reaped merely because its cycle root is done"
+            );
+        }
+        assert!(reaper.reaped().is_empty());
+        assert!(sink.events().await.is_empty());
     }
 
     /// A live worker whose EXECUTION is terminal (completion ran but the

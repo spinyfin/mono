@@ -1272,6 +1272,27 @@ impl WorkDb {
         member_for_execution_in(&conn, execution_id)
     }
 
+    /// True when `execution_id` is a member of a `post_merge` phase review
+    /// batch. A post-merge batch's cycle root is `done` by construction
+    /// (the merge poller creates the batch in the same pass that marks the
+    /// root merged), so callers use this to exempt a live post-merge
+    /// reviewer from "cycle root is done/archived" reap heuristics that are
+    /// correct for every other execution bound to that root.
+    pub fn is_post_merge_review_batch_member(&self, execution_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let phase: Option<String> = conn
+            .query_row(
+                "SELECT b.phase
+                 FROM pr_review_batch_members m
+                 JOIN pr_review_batches b ON b.id = m.batch_id
+                 WHERE m.execution_id = ?1",
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(phase.as_deref() == Some(ReviewBatchPhase::PostMerge.as_str()))
+    }
+
     /// Record a batch member that stopped without submitting its required
     /// review-report proposal. This is intentionally a member failure rather
     /// than a transcript-recovery attempt: the proposal ledger is the only
@@ -1606,12 +1627,17 @@ impl WorkDb {
     /// Fail non-terminal review batches that can never settle, so they stop
     /// occupying global reservation units.
     ///
-    /// A batch is reaped when its cycle root is deleted or already terminal,
-    /// or when it has been `collecting`/`supervising`/`applying` past
-    /// `stale_secs` with no non-terminal member execution and no retryable
-    /// dead leaf (the leaf-retry sweep still owns those). Each reaped batch
-    /// is marked `failed` and gets a
-    /// [`PR_REVIEW_BATCH_STALE_ATTENTION_KIND`] item.
+    /// A batch is reaped when its cycle root is deleted, or when its cycle
+    /// root is already terminal (`done`/`archived`) **and the batch is not a
+    /// `post_merge` batch** — a post-merge batch's root is `done` by
+    /// construction (the merge poller creates the batch in the same pass
+    /// that marks the root merged), so that disjunct would reap every
+    /// post-merge batch on the sweep pass immediately after it spawns. Also
+    /// reaped: any batch (post-merge included) that has been
+    /// `collecting`/`supervising`/`applying` past `stale_secs` with no
+    /// non-terminal member execution and no retryable dead leaf (the
+    /// leaf-retry sweep still owns those). Each reaped batch is marked
+    /// `failed` and gets a [`PR_REVIEW_BATCH_STALE_ATTENTION_KIND`] item.
     pub fn reap_inert_review_batches(&self, stale_secs: u64) -> Result<Vec<String>> {
         let cutoff = (boss_engine_utils::epoch_time::now_epoch_secs() as u64)
             .saturating_sub(stale_secs)
@@ -1624,7 +1650,7 @@ impl WorkDb {
              WHERE b.status NOT IN ('completed', 'failed')
                AND (
                  t.deleted_at IS NOT NULL
-                 OR t.status IN ('done', 'archived')
+                 OR (b.phase != 'post_merge' AND t.status IN ('done', 'archived'))
                  OR (
                    CAST(b.updated_at AS INTEGER) < CAST(?1 AS INTEGER)
                    AND NOT EXISTS (
@@ -1683,11 +1709,12 @@ impl WorkDb {
                 tx.commit()?;
                 continue;
             }
-            // The dead-root branch (`deleted_at IS NOT NULL OR status IN
-            // (done, archived)`) bypasses the staleness branch's "no
-            // non-terminal member" guard, so a batch reaped this way can
-            // still have leaf reviewers actually running in review-pool
-            // slots. Terminalize them in the same transaction that frees
+            // The dead-root branch (`deleted_at IS NOT NULL`, or `status IN
+            // (done, archived)` for a non-post-merge batch) bypasses the
+            // staleness branch's "no non-terminal member" guard, so a batch
+            // reaped this way can still have leaf reviewers actually
+            // running in review-pool slots. Terminalize them in the same
+            // transaction that frees
             // the batch's reservation, so the physical slots are freed at
             // the same moment — otherwise admission would let another batch
             // in while up to `PRE_MERGE_BATCH_RESERVATION_UNITS` physical
