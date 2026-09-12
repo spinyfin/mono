@@ -864,7 +864,13 @@ impl ExecutionCoordinator {
     /// policy and its rationale.
     pub(super) async fn drain_ready_queue(self: &Arc<Self>) -> DrainOutcome {
         if let Some(reason) = self.dispatch_preflight_block_reason() {
-            tracing::error!(%reason, "local dispatch held by startup preflight");
+            // A probe still in flight is the expected first seconds of every
+            // boot, not a failure; a failed runtime preflight is.
+            if self.local_capability_discovery_pending() || self.startup_recovery_pending() {
+                tracing::info!(%reason, "local dispatch held by startup preflight");
+            } else {
+                tracing::error!(%reason, "local dispatch held by startup preflight");
+            }
             return DrainOutcome::QueueEmpty;
         }
         // Global pause gate, read once as a snapshot so "are we paused" and

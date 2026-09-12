@@ -63,7 +63,14 @@ impl WorkDb {
                 .with_context(|| format!("failed to create work db directory {}", parent.display()))?;
         }
 
+        // Timed in two halves so "opening the connection" (file open, WAL
+        // recovery, PRAGMAs) is separable from "bringing the schema up to
+        // date" (`init`) in the startup ledger — the two have different
+        // fixes when slow.
+        let started = std::time::Instant::now();
+        tracing::info!(path = %path.display(), "work db: opening");
         let conn = Self::open_raw_connection(&path, None)?;
+        let connect_elapsed = started.elapsed();
         let db = Self {
             path,
             memory: None,
@@ -71,7 +78,15 @@ impl WorkDb {
             boothby_action: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
         };
+        let init_started = std::time::Instant::now();
         db.init()?;
+        tracing::info!(
+            path = %db.path.display(),
+            connect_ms = connect_elapsed.as_millis() as u64,
+            init_ms = init_started.elapsed().as_millis() as u64,
+            total_ms = started.elapsed().as_millis() as u64,
+            "work db: open complete",
+        );
         Ok(db)
     }
 

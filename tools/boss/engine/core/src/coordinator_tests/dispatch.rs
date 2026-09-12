@@ -317,7 +317,12 @@ async fn requested_host_rejects_missing_resolved_driver_capability() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     db.add_host("zakalwe", "user@zakalwe", 1, &[]).unwrap();
+    // Discovery ran on zakalwe and found only claude. `drivers-probed=true`
+    // is what makes the missing codex a definite "missing driver" rather
+    // than "driver discovery has not run" — the rejection under test must
+    // come from the requested host's own capability set.
     crate::test_support::insert_host_capability(&db, "zakalwe", "driver=claude", "auto");
+    crate::test_support::insert_host_capability(&db, "zakalwe", "drivers-probed=true", "auto");
     let product = create_test_product(&db);
     db.set_product_default_driver(&product.id, Some("codex")).unwrap();
     let chore = create_test_chore(&db, product.id, "Codex-only requested host");
@@ -337,7 +342,7 @@ async fn requested_host_rejects_missing_resolved_driver_capability() {
             Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new()),
         )
         .unwrap_err();
-    assert!(err.to_string().contains("driver codex"), "got: {err}");
+    assert!(err.to_string().contains("zakalwe: missing driver codex"), "got: {err}");
     assert!(db.list_executions(Some(&chore.id)).unwrap().is_empty());
 }
 

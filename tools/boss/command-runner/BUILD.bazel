@@ -14,6 +14,7 @@ rust_library(
         "//tools/boss/bossctl:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/deterministic-resolvers:__pkg__",
+        "//tools/boss/github:__pkg__",
         "//tools/boss/tmux:__pkg__",
     ],
     deps = all_crate_deps(normal = True),

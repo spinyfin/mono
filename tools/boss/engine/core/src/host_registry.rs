@@ -4,10 +4,12 @@
 /// `host_capabilities`, and `work_capability_requirements` tables plus
 /// new columns on `work_executions`. No scheduler change; everything
 /// still runs locally. Auto-discovers capabilities for the `local` host
-/// on every engine startup via `uname` + `gh auth status`.
+/// on every engine startup via `uname` + `gh auth status` + a per-driver
+/// `command -v` — from engine startup, never from schema init (see
+/// [`WorkDb::refresh_local_host_auto_capabilities`]).
 use std::collections::{BTreeSet, HashMap};
 use std::process::Stdio;
-use std::sync::OnceLock;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use boss_event_bus::Event;
@@ -171,25 +173,73 @@ pub(crate) fn ensure_local_host(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Replace all `auto`-sourced capabilities for the `local` host with the
-/// result of the local probe. User-tagged rows (`source = 'user'`) are
-/// left untouched. Called every engine startup so auth drift and
-/// OS/arch changes surface immediately.
-pub(crate) fn refresh_local_host_auto_capabilities(conn: &Connection) -> Result<()> {
-    let caps = discover_local_capabilities();
-    replace_auto_capabilities(conn, "local", &caps)?;
-    let driver_count = caps.iter().filter(|cap| cap.starts_with("driver=")).count();
-    if driver_count == 0 {
-        tracing::warn!(
-            "host_registry: local host refresh found no installed drivers; driver-constrained dispatch will hold",
-        );
+/// What one [`WorkDb::refresh_local_host_auto_capabilities`] run found.
+#[derive(Debug, Clone)]
+pub struct LocalCapabilityRefresh {
+    /// Every `auto` capability now stored for the `local` host.
+    pub capabilities: Vec<String>,
+    /// How long the probes themselves took (no database time included).
+    pub probe_elapsed: std::time::Duration,
+}
+
+impl LocalCapabilityRefresh {
+    /// Number of `driver=` tags discovered.
+    pub fn driver_count(&self) -> usize {
+        self.capabilities
+            .iter()
+            .filter(|cap| cap.starts_with("driver="))
+            .count()
     }
-    tracing::debug!(
-        count = caps.len(),
-        driver_count,
-        "host_registry: refreshed local host auto capabilities",
-    );
-    Ok(())
+}
+
+impl WorkDb {
+    /// Delete every `auto`-sourced capability row for the `local` host,
+    /// leaving operator `--tag` rows alone. Startup calls this *before* the
+    /// background probe runs so a driver that was uninstalled (or a `gh`
+    /// login that lapsed) since the previous boot can never look available
+    /// on the strength of a stale row: until the probe writes fresh rows,
+    /// the host carries no `drivers-probed=true` and driver-constrained
+    /// selection reports `DriverProbeNotRun` rather than a match.
+    pub fn clear_local_host_auto_capabilities(&self) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "DELETE FROM host_capabilities WHERE host_id = 'local' AND source = 'auto'",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Probe the local host and replace all its `auto`-sourced capabilities
+    /// with the result. User-tagged rows (`source = 'user'`) are left
+    /// untouched. Called once per engine startup so auth drift and OS/arch
+    /// changes surface immediately.
+    ///
+    /// The probe spawns processes (`uname`, `gh auth status`, one login
+    /// shell per registered driver) and takes seconds, so it runs *before*
+    /// the shared connection is borrowed — never hold `WorkDb::conn` across
+    /// a subprocess. This is also why it is not part of schema init any
+    /// more: see the capability-probe note in `work/schema_init.rs`.
+    pub fn refresh_local_host_auto_capabilities(&self) -> Result<LocalCapabilityRefresh> {
+        let started = Instant::now();
+        let capabilities = discover_local_capabilities();
+        let probe_elapsed = started.elapsed();
+        self.replace_auto_host_capabilities("local", &capabilities)?;
+        let refresh = LocalCapabilityRefresh {
+            capabilities,
+            probe_elapsed,
+        };
+        if refresh.driver_count() == 0 {
+            tracing::warn!(
+                "host_registry: local host refresh found no installed drivers; driver-constrained dispatch will hold",
+            );
+        }
+        tracing::debug!(
+            count = refresh.capabilities.len(),
+            driver_count = refresh.driver_count(),
+            "host_registry: refreshed local host auto capabilities",
+        );
+        Ok(refresh)
+    }
 }
 
 /// Replace every `auto`-sourced capability row for `host_id` with `caps`.
@@ -220,28 +270,23 @@ pub(crate) fn replace_auto_capabilities(conn: &Connection, host_id: &str, caps: 
 /// is stored with `source = "auto"`. Failures for individual probes are
 /// logged and skipped; the remainder still land.
 ///
-/// Cached process-wide: `uname` + `gh auth status` are stable for the
-/// life of an engine process (design: probe once at startup). Without
-/// the cache, every fresh `WorkDb::open` / schema-template init re-ran
-/// the full probe — and `gh auth status` alone was ~0.7s against a real
-/// `gh` (network + keychain). That cost was paid once per unit test that
-/// opened a WorkDb, dominating suites that open many databases.
-fn discover_local_capabilities() -> Vec<String> {
-    static CACHED: OnceLock<Vec<String>> = OnceLock::new();
-    CACHED.get_or_init(discover_local_capabilities_uncached).clone()
-}
-
-/// Uncached probe body. See [`discover_local_capabilities`].
+/// Not cached: the one caller is the once-per-boot startup refresh, and a
+/// cache here would turn a later re-probe into a no-op.
 ///
 /// The tag *spelling* comes from [`crate::host_capability_probe`], shared
 /// with the remote probe: capability matching is exact string equality, so
 /// a local and a remote macOS host must describe themselves identically or
 /// a requirement written against one silently excludes the other.
-fn discover_local_capabilities_uncached() -> Vec<String> {
+///
+/// Each sub-probe is timed and the breakdown logged at `info`, so a slow
+/// cold start can be attributed to `gh auth status` (network + keychain)
+/// versus the driver login shells versus `uname` without guessing.
+pub(crate) fn discover_local_capabilities() -> Vec<String> {
     use crate::host_capability_probe::{
         arch_capability, discover_local_driver_capabilities, gh_authed_capability, os_capability,
     };
 
+    let started = Instant::now();
     let mut caps: Vec<String> = Vec::new();
 
     // OS family
@@ -255,23 +300,41 @@ fn discover_local_capabilities_uncached() -> Vec<String> {
         Some(raw) => caps.push(arch_capability(&raw)),
         None => tracing::warn!("host_registry: uname -m failed; arch= capability not set"),
     }
+    let uname_elapsed = started.elapsed();
 
     // gh auth state (per design open-question: catches credential drift
     // hours earlier than waiting for a `gh pr create` failure in a worker)
     // `gh auth status` validates the token against the API, so it spends
     // from the same shared budget as everything else and goes through the
     // instrumented spawn rather than a bare `Command`.
+    let gh_started = Instant::now();
+    // Bound to match the per-driver PATH probe (`host_capability_probe` uses
+    // 10s). `gh auth status` talks to the network and the keychain; without
+    // a timeout a black-holed API or a never-returning prompt holds the
+    // startup dispatch gate for the life of the process.
     let gh_authed = boss_gh_telemetry::scope_blocking(boss_gh_telemetry::callers::HOST_REGISTRY, || {
-        boss_github::gh_runner::gh_output_blocking(&["auth", "status"])
+        boss_github::gh_runner::gh_output_blocking_timeout(&["auth", "status"], std::time::Duration::from_secs(10))
     })
     .map(|out| out.status.success())
     .unwrap_or(false);
     caps.push(gh_authed_capability(gh_authed));
+    let gh_elapsed = gh_started.elapsed();
 
     // Installed agent drivers (same vocabulary as the remote probe). A
     // host that has none still gets `drivers-probed=true` so selection
     // can tell "checked, missing" from "never checked".
+    let drivers_started = Instant::now();
     caps.extend(discover_local_driver_capabilities());
+    let drivers_elapsed = drivers_started.elapsed();
+
+    tracing::info!(
+        uname_ms = uname_elapsed.as_millis() as u64,
+        gh_auth_status_ms = gh_elapsed.as_millis() as u64,
+        driver_probes_ms = drivers_elapsed.as_millis() as u64,
+        total_ms = started.elapsed().as_millis() as u64,
+        capabilities = ?caps,
+        "host_registry: local capability discovery complete",
+    );
 
     caps
 }
@@ -691,7 +754,10 @@ fn pragma_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
 //
 // Behavioral coverage for the `WorkDb` host-registry methods. Everything
 // runs against a fresh `:memory:` database, which `WorkDb::open` seeds with
-// the migrations plus `ensure_local_host` / `refresh_local_host_auto_capabilities`.
+// the migrations plus `ensure_local_host` only; local auto-capabilities
+// are written by `WorkDb::refresh_local_host_auto_capabilities`, which
+// tests that need them must call (or seed via `insert_host_capability`)
+// themselves.
 // Assertions go through the public methods (returned values, `Host` /
 // `HostCapability` fields, error outcomes, post-state read back). Raw
 // connections are used only to plant fixture rows in tables that have no
@@ -1250,6 +1316,54 @@ mod tests {
     }
 
     #[test]
+    fn schema_init_seeds_the_local_host_row_but_never_probes_its_capabilities() {
+        // Schema init must not perform host I/O, network calls, or
+        // subprocess execution. The local host row is data the schema
+        // needs; its capability rows come from the startup probe (see
+        // `WorkDb::refresh_local_host_auto_capabilities`), never from
+        // `init()`. This is the regression guard for the probe having
+        // lived inside the migration chain, where it spawned three login
+        // shells and a `gh auth status` on every boot.
+        let db = open_db();
+        assert!(db.get_host("local").unwrap().is_some(), "local host row must exist");
+        assert_eq!(cap_pairs(&db, "local"), Vec::<(String, String)>::new());
+    }
+
+    #[test]
+    fn clear_local_host_auto_capabilities_drops_auto_rows_and_keeps_operator_tags() {
+        let db = open_db();
+        // What a previous boot's probe left behind, plus an operator tag.
+        db.replace_auto_host_capabilities(
+            "local",
+            &[
+                "os=macos".to_owned(),
+                "driver=grok".to_owned(),
+                "drivers-probed=true".to_owned(),
+            ],
+        )
+        .unwrap();
+        db.add_user_host_capability("local", "role=builder").unwrap();
+
+        db.clear_local_host_auto_capabilities().unwrap();
+
+        // Every `auto` row is gone (so a driver uninstalled since the last
+        // boot cannot look available), and the operator tag survives.
+        assert_eq!(
+            cap_pairs(&db, "local"),
+            vec![("user".to_owned(), "role=builder".to_owned())]
+        );
+        // Other hosts are untouched.
+        db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
+        db.replace_auto_host_capabilities("zakalwe", &["os=linux".to_owned()])
+            .unwrap();
+        db.clear_local_host_auto_capabilities().unwrap();
+        assert_eq!(
+            cap_pairs(&db, "zakalwe"),
+            vec![("auto".to_owned(), "os=linux".to_owned())]
+        );
+    }
+
+    #[test]
     fn replace_auto_host_capabilities_writes_auto_rows_for_a_remote_host() {
         // The gap behind the anaplian `caps=0` report: the only writer of
         // `auto` rows hard-coded `host_id = 'local'`, so a remote host had
@@ -1434,15 +1548,26 @@ mod tests {
         db.add_user_host_capability("local", "team=infra").unwrap();
         insert_host_capability(&db, "local", "stale=auto", "auto");
 
-        {
-            let conn = db.connect().unwrap();
-            refresh_local_host_auto_capabilities(&conn).unwrap();
-        }
+        // Runs the real probe (uname, gh, one login shell per driver); it
+        // must not hold the shared connection while it does — a guard held
+        // here would deadlock the write inside.
+        let refresh = db.refresh_local_host_auto_capabilities().unwrap();
 
         let caps = db.list_host_capabilities("local").unwrap();
         // The user-sourced row survives the refresh.
         assert!(caps.iter().any(|c| c.capability == "team=infra" && c.source == "user"));
         // The stale auto row is replaced by the fresh probe set.
         assert!(!caps.iter().any(|c| c.capability == "stale=auto"));
+        // Whatever the host has installed, discovery always records that it
+        // ran, and the stored rows are exactly what the probe returned.
+        assert!(refresh.capabilities.iter().any(|c| c == "drivers-probed=true"));
+        let stored: Vec<&str> = caps
+            .iter()
+            .filter(|c| c.source == "auto")
+            .map(|c| c.capability.as_str())
+            .collect();
+        let mut probed: Vec<&str> = refresh.capabilities.iter().map(String::as_str).collect();
+        probed.sort_unstable();
+        assert_eq!(stored, probed);
     }
 }

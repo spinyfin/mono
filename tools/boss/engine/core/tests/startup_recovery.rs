@@ -1,7 +1,7 @@
 //! Integration tests for durable state recovered during engine startup.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use boss_client::wait_for_socket;
@@ -11,6 +11,51 @@ use boss_engine::work::{ClaimPlannerRunInput, PLANNER_RUN_ENGINE_RESTART_SUMMARY
 use boss_protocol::{CreateProductInput, CreateProjectInput, CreateTaskInput, PLANNER_OUTCOME_PLANNER_FAILED};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Engine startup moves local capability discovery out of schema init so the
+/// frontend can bind first, but it must still replace the cleared auto rows.
+#[tokio::test]
+async fn serve_discovers_local_capabilities_after_binding_the_socket() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let socket_path = temp.path().join("engine.sock");
+    let db_path = temp.path().join("state.db");
+    WorkDb::open(db_path.clone())?;
+
+    let work = WorkConfig::builder()
+        .cwd(temp.path().to_path_buf())
+        .db_path(db_path.clone())
+        .build();
+    let cfg = Arc::new(RuntimeConfig::from_parts(work, None));
+    let join = tokio::spawn(async move { serve(cfg, socket_path, None, None, None, None).await });
+
+    let socket_for_wait = temp.path().join("engine.sock");
+    if !wait_for_socket(socket_for_wait.to_str().unwrap(), STARTUP_TIMEOUT).await {
+        join.abort();
+        return Err(anyhow!("engine never bound socket {}", socket_for_wait.display()));
+    }
+
+    let recovered_db = WorkDb::open(db_path)?;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let capabilities = recovered_db.list_host_capabilities("local")?;
+        if capabilities
+            .iter()
+            .any(|capability| capability.source == "auto" && capability.capability == "drivers-probed=true")
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            join.abort();
+            return Err(anyhow!(
+                "startup did not restore the local drivers-probed=true auto capability within {STARTUP_TIMEOUT:?}"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    join.abort();
+    Ok(())
+}
 
 /// Once the frontend socket is usable, recovery has completed: the inherited
 /// run is terminal, its project can be claimed again, and its follow-up is

@@ -132,12 +132,17 @@ fn register_trust_accepts_matching_pid_and_rejects_unknown_live_pid() {
     // root nor an engine ancestor must be rejected — this is the
     // guard that stops a second live app hijacking the trust root.
     // (self_pid is alive, so the dead-old-app branch can't fire.)
-    let other_live = if self_pid == 2 { 3 } else { 2 };
+    // A live child is guaranteed not to be an ancestor of the engine. Fixed
+    // PIDs such as 2 can be ancestors in Linux's CI PID namespace, which
+    // would correctly satisfy the engine-ancestor exception instead.
+    let mut other_live = crate::test_support::spawn_group_leader_sleeper();
     assert!(!register_app_session_trust_ok(
         Some(self_pid),
-        Some(other_live),
+        Some(other_live.id() as libc::pid_t),
         engine_pid,
     ));
+    other_live.kill().expect("kill child");
+    other_live.wait().expect("reap child");
     // A connection with no observable peer pid against a real trust
     // root is rejected.
     assert!(!register_app_session_trust_ok(Some(self_pid), None, engine_pid));

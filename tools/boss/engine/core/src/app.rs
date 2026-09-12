@@ -102,6 +102,7 @@ mod ideas;
 /// Public so `tests/isolation_guard.rs` can drive `IsolationPaths::derive*`
 /// directly.
 pub mod isolation;
+mod launch_environment;
 mod live_status;
 mod metrics;
 mod pane_delivery;
@@ -238,44 +239,6 @@ fn github_oauth_http_client() -> reqwest::Client {
         .timeout(Duration::from_secs(30))
         .build()
         .expect("reqwest::Client build should not fail with default config")
-}
-
-/// Record how this engine was started and what environment it inherited.
-///
-/// Both facts are load-bearing and neither was recoverable after the fact
-/// before this existed. A Finder/Dock launch hands the app launchd's
-/// environment, which contains no `LANG`/`LC_*` at all; an engine the app
-/// spawns inherits that, and tmux then treats it as a non-UTF-8 client and
-/// sanitizes non-printable bytes — including the TAB delimiter
-/// `boss_tmux::list_sessions` parses — out of everything it prints. An
-/// engine started instead by the CLI's transparent autostart inherits a
-/// shell's environment and has a locale, and the app adopts it rather than
-/// spawning its own. The two therefore behave differently in a way that is
-/// invisible from the outside.
-///
-/// Incident 006 had to establish which case applied by elimination, from a
-/// statistical argument about how often an unrelated parse failed, because
-/// nothing logged either fact. See `tools/boss/docs/postmortems/`.
-fn log_launch_environment() {
-    let locale = boss_command_runner::LocaleDiagnostics::probe();
-    // `BOSS_APP_PID` is set by the macOS app when it spawns the engine and
-    // by nothing else, so its presence is the launch-path discriminator —
-    // the same signal `app_pid_from_env` trusts to pin the app trust root.
-    let app_spawned = std::env::var_os("BOSS_APP_PID").is_some();
-    tracing::info!(
-        launched_by = if app_spawned { "app" } else { "standalone" },
-        locale_inherited = %locale.inherited_summary(),
-        locale_has_utf8 = locale.has_utf8_locale,
-        locale_forced = locale.forced.map(|(name, value)| format!("{name}={value}")),
-        "engine starting (launch environment)",
-    );
-    if !locale.has_utf8_locale {
-        tracing::warn!(
-            locale_inherited = %locale.inherited_summary(),
-            "engine inherited no UTF-8 locale; forcing LC_CTYPE=UTF-8 for child processes so tmux \
-             does not sanitize non-printable bytes out of its output",
-        );
-    }
 }
 
 /// Milliseconds since the Unix epoch, used to seed [`ServerState::boot_id`].
@@ -1181,9 +1144,12 @@ impl ServerState {
         // `Event::HostDisabled`) and `ServerState`'s subscribers (e.g.
         // `host_reconcile`) would sit on two disjoint bus instances and no
         // event would ever reach a subscriber.
+        let mut timeline = crate::startup_timing::StartupTimeline::begin("server_state");
         let event_bus = Arc::new(EventBus::new());
         let work_db = Arc::new(WorkDb::open(cfg.work.db_path.clone())?.with_event_bus(event_bus.clone()));
+        timeline.mark("work_db_open");
         let anthropic_api_key = cfg.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
+        timeline.mark("agent_config");
         // Resolve the engine's own inference provider once, here, and install
         // it process-wide so paths too deep to thread a handle through (the
         // attentions backstop, reached from the completion handler with only a
@@ -1227,6 +1193,7 @@ impl ServerState {
         // instead of triggering the version-mismatch restart from
         // T460. See `build_info::binary_fingerprint` doc comment.
         crate::build_info::init();
+        timeline.mark("build_info_init");
         tracing::info!(
             engine_build_sha = crate::build_info::git_sha(),
             engine_build_dirty = crate::build_info::git_dirty(),
@@ -1234,7 +1201,7 @@ impl ServerState {
             engine_binary_fingerprint = crate::build_info::binary_fingerprint(),
             "live_status: engine starting (build identity)",
         );
-        log_launch_environment();
+        launch_environment::log_launch_environment();
         // Phase 3 of distributed-agent-execution: sweep stale
         // OpenSSH ControlMaster sockets left behind by a previous
         // engine run that crashed before `SshTransport::close`. Per
@@ -1806,6 +1773,8 @@ impl ServerState {
                 ),
             }
         }
+        timeline.mark("coordinator_and_subsystems");
+        timeline.finish();
 
         Ok(server_state)
     }

@@ -23,6 +23,7 @@
 
 use std::process::Output;
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -141,6 +142,10 @@ pub async fn gh_output(args: &[&str]) -> std::io::Result<Output> {
 /// [`boss_gh_telemetry::scope_blocking`] to attribute it; without that
 /// it lands in the `unattributed` bucket, identifiable only by its
 /// `verb`/`endpoint` in the persisted rows.
+///
+/// Unbounded: the process is waited to completion. Callers that must
+/// not hang the thread (startup capability discovery) use
+/// [`gh_output_blocking_timeout`] instead.
 pub fn gh_output_blocking(args: &[&str]) -> std::io::Result<Output> {
     let timer = GhCallTimer::start_args(args);
     let result = std::process::Command::new("gh")
@@ -149,6 +154,21 @@ pub fn gh_output_blocking(args: &[&str]) -> std::io::Result<Output> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output();
+    timer.finish_process(&result);
+    result
+}
+
+/// Like [`gh_output_blocking`], but kills `gh` and returns
+/// [`std::io::ErrorKind::TimedOut`] if it has not exited by `timeout`.
+///
+/// Pipes are drained by the shared command runner so a chatty `gh` cannot
+/// deadlock the waiter by filling stdout/stderr, matching what
+/// [`std::process::Command::output`] does internally.
+pub fn gh_output_blocking_timeout(args: &[&str], timeout: Duration) -> std::io::Result<Output> {
+    let timer = GhCallTimer::start_args(args);
+    let mut command = std::process::Command::new("gh");
+    command.args(args).stdin(Stdio::null());
+    let result = boss_command_runner::output_blocking_timeout(&mut command, timeout);
     timer.finish_process(&result);
     result
 }
@@ -423,6 +443,7 @@ impl GhRunner for CommandGhRunner {
 mod tests {
     use std::os::unix::process::ExitStatusExt as _;
     use std::process::Output;
+    use std::time::Instant;
 
     use super::*;
 
@@ -579,5 +600,30 @@ mod tests {
                 enqueued_at: None,
             })
         );
+    }
+
+    #[test]
+    fn blocking_timeout_kills_a_hung_child_and_returns_timed_out() {
+        let started = Instant::now();
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30").stdin(Stdio::null());
+        let err = boss_command_runner::output_blocking_timeout(&mut command, Duration::from_millis(200))
+            .expect_err("sleep 30 must not outlive a 200ms bound");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "kill must return promptly, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn blocking_timeout_returns_output_when_the_child_exits_in_time() {
+        let mut command = std::process::Command::new("/bin/echo");
+        command.arg("capability-probe").stdin(Stdio::null());
+        let output = boss_command_runner::output_blocking_timeout(&mut command, Duration::from_secs(2))
+            .expect("echo must finish well inside the bound");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "capability-probe");
     }
 }
