@@ -6,9 +6,9 @@
   },
   {
     "question_type": "multiple_choice",
-    "prompt": "Retry budget for the SHA-delta gate on the Stop handler. The design proposes 3 attempts with 2 s base backoff capped at 4 s (about 10 s worst case). A larger budget recovers more blips but stalls the Stop handler longer.",
+    "prompt": "Retry budget for the three acceptance-side CommandBranchVerifier fetches. The design proposes 3 attempts with 2 s base backoff capped at 4 s. A larger budget recovers more blips but delays acceptance checks longer.",
     "choices": ["3 attempts, ~10 s (proposed)", "5 attempts, ~30 s", "2 attempts, ~5 s"],
-    "anchor": "piece-3-sha-delta-gate-retry-and-retry-on-wake"
+    "anchor": "piece-3-sha-delta-gate-bounded-retry"
   },
   {
     "question_type": "yes_no",
