@@ -1,0 +1,23 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Where should the shared remote Bazel cache be hosted for v1?",
+    "choices": [
+      "bazel-remote on an existing CI Linux host (cheapest ops if capacity exists)",
+      "bazel-remote on a new Hetzner (or similar) dedicated box",
+      "BuildBuddy Cloud Personal/Team as cache-only (no remote executor)",
+      "Defer hosting until distributed agent hosts are placed; design only for now"
+    ],
+    "anchor": "cost-and-hosting-numbers-first"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Accept the design recommendation to ship remote cache only and defer RBE until post-cache metrics (default: yes)?",
+    "anchor": "recommendation"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Should mono and flunge share one cache instance name (yes) or separate instances for blast-radius isolation (no)?",
+    "anchor": "chosen-approach"
+  }
+]
