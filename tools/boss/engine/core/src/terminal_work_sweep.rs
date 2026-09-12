@@ -331,7 +331,8 @@ pub async fn run_one_pass(
         // (`work_item_missing`) recovers the reviewer the same way it
         // recovers any other orphan. A membership-lookup error is
         // inconclusive — skip this pass rather than silently dropping the
-        // exemption (a DB blip must not reintroduce the original bug).
+        // exemption (a DB blip must not cause a destructive reap when
+        // membership is indeterminate).
         // `execution_terminal` still applies, so a post-merge reviewer
         // whose own execution genuinely finished is reaped normally.
         let mut work_item_missing = false;
@@ -894,9 +895,7 @@ mod tests {
     /// A post-merge review batch's cycle root is `done` by construction —
     /// the merge poller creates the batch in the same pass that marks the
     /// root merged — so a live `post_merge_reviewer` execution must never be
-    /// treated as `work_item_terminal`. Without this exemption this sweep
-    /// reaps the reviewer within its own interval of it starting, which is
-    /// exactly why the post-merge review feature never completed once.
+    /// treated as `work_item_terminal`.
     #[tokio::test]
     async fn does_not_reap_a_live_post_merge_reviewer_whose_cycle_root_is_done() {
         let (_dir, db, product_id) = setup();
