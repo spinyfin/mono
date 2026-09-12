@@ -2489,13 +2489,9 @@ mod tests {
         assert_eq!(execution.work_item_id, work_item_id);
     }
 
-    /// Regression test for the operator mandate: a cycle root in `in_review`
-    /// stays `in_review` when a new review pass is enqueued via
-    /// `request_pr_review_in_tx`. This replaces
-    /// `request_pr_review_restores_in_review_task_to_doing`, which asserted
-    /// the OPPOSITE — that enqueuing a review flipped the row to `active`
-    /// ("restore the Doing lane") — that write is the regression itself;
-    /// see `tools/boss/docs/designs/work-kanban.md`'s cycle-root status
+    /// Regression test: a cycle root in `in_review` stays `in_review` when a
+    /// new review pass is enqueued via `request_pr_review_in_tx`, per
+    /// `tools/boss/docs/designs/work-kanban.md`'s cycle-root status
     /// contract.
     #[test]
     fn request_pr_review_keeps_in_review_task_in_review() {

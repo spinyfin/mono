@@ -1759,16 +1759,10 @@ fn reviewer_fallback_keeps_live_reviewer_in_doing() {
 }
 
 /// A cycle root in `in_review` MUST stay `in_review` when a `pr_review`
-/// execution starts against it — the operator mandate this regression test
-/// guards: "the task for that original PR should always always always be
-/// in Review" while work (including an automated review pass) continues
-/// against it. This replaces the old (removed) behaviour asserted by the
-/// test this replaces, `starting_pr_review_restores_in_review_base_to_doing`,
-/// which asserted the OPPOSITE: that starting a `pr_review` execution
-/// against an `in_review` base flipped it to `active` (Doing) and that was
-/// "repairing" it. That was the regression itself — see
-/// `tools/boss/docs/designs/work-kanban.md`'s cycle-root status contract.
-/// The row now stays in Review the whole time, and the derived
+/// execution starts against it: per `tools/boss/docs/designs/work-kanban.md`'s
+/// cycle-root status contract, a row that has reached Review stays there for
+/// the life of its PR, including while an automated review pass runs
+/// against it. The row stays in Review the whole time, and the derived
 /// `ai_reviewing` / `ai_review_state` fields carry the "a pass is running"
 /// signal instead of a status write.
 #[test]
@@ -1875,6 +1869,65 @@ fn start_execution_run_non_pr_review_still_advances_todo_to_active() {
         task.status,
         TaskStatus::Active,
         "a non-pr_review execution starting must still advance an ordinary task to Doing"
+    );
+}
+
+/// A `kind = 'revision'` row in `in_review` with a live non-terminal
+/// revision child of its own is exactly the case the status-advance guard
+/// above refuses to move — a duplicate/stray run must not act on a row that
+/// already has a live child. `autostart` must stay symmetric with that: no
+/// run was sanctioned to start against this row, so `autostart` must NOT be
+/// consumed, matching the pre-split behavior where both writes shared one
+/// guard.
+#[test]
+fn start_execution_run_does_not_clear_autostart_for_revision_with_live_child() {
+    let db = WorkDb::open(temp_db_path("rev-live-child-keeps-autostart")).unwrap();
+    let product_id = make_revision_product(&db, "rev-live-child-autostart");
+    let pr_url = "https://github.com/spinyfin/mono/pull/3046";
+    let base_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&base_id), &checker).unwrap();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'in_review', autostart = 1 WHERE id = ?1",
+            rusqlite::params![revision.id],
+        )
+        .unwrap();
+    }
+    // Legacy nested child: parent_task_id = revision, non-terminal status.
+    let _child_id = insert_revision_row(&db, &product_id, &revision.id);
+    assert_eq!(task_status(&db, &revision.id), "in_review", "precondition");
+
+    let exec = db
+        .request_execution_with_live_check(
+            RequestExecutionInput::builder()
+                .work_item_id(revision.id.clone())
+                .build(),
+            |_| false,
+        )
+        .unwrap();
+    assert_eq!(exec.status, ExecutionStatus::Ready);
+    db.start_execution_run(
+        &exec.id,
+        "worker-1",
+        "mono",
+        "lease-1",
+        "mono-agent-001",
+        "/tmp/mono-agent-001",
+    )
+    .unwrap();
+
+    let task = query_task(&db.connect().unwrap(), &revision.id).unwrap().unwrap();
+    assert_eq!(
+        task.status,
+        TaskStatus::InReview,
+        "legacy nested child still blocks status advance"
+    );
+    assert!(
+        task.autostart,
+        "no run was sanctioned to start against a row a live child blocks — autostart must not be consumed"
     );
 }
 

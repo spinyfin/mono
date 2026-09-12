@@ -1272,17 +1272,36 @@ impl WorkDb {
         // `autostart` is cleared here (single-shot semantics): once a row
         // has ever had a run start against it, the flag is consumed so that
         // moving the card back to Backlog later does not trigger re-dispatch
-        // by the reconciler or orphan-active sweep. This is independent of
-        // the status-advance guard above — a `pr_review` execution starting
-        // against an `in_review` row still consumes `autostart` even though
-        // that row's status does not move.
+        // by the reconciler or orphan-active sweep. This is mostly, but not
+        // entirely, independent of the status-advance guard above: a
+        // `pr_review` (or other) execution starting against a non-revision
+        // `in_review` row still consumes `autostart` even though that row's
+        // status does not move — hence the separate `kind != 'revision'`
+        // disjunct below instead of just reusing the status guard verbatim.
+        // But a `kind = 'revision'` row in `in_review` with a live
+        // non-terminal revision child of its own is a case the status guard
+        // above explicitly refuses to act on (a duplicate/stray run must
+        // not touch a row that already has a live child) — no run was
+        // sanctioned to start against *this* row, so `autostart` must stay
+        // intact for it too, same as before this UPDATE was split off.
         tx.execute(
             "UPDATE tasks
              SET autostart = 0,
                  updated_at = ?2
              WHERE id = ?1
                AND deleted_at IS NULL
-               AND status NOT IN ('done', 'archived', 'blocked')",
+               AND status NOT IN ('done', 'archived', 'blocked')
+               AND (
+                 status != 'in_review'
+                 OR kind != 'revision'
+                 OR NOT EXISTS (
+                     SELECT 1 FROM tasks child
+                     WHERE child.parent_task_id = ?1
+                       AND child.kind = 'revision'
+                       AND child.deleted_at IS NULL
+                       AND child.status NOT IN ('done', 'archived')
+                 )
+               )",
             params![execution.work_item_id, now],
         )?;
 

@@ -364,6 +364,98 @@ fn clean_verdict_does_not_advance_a_revision_with_a_different_contributed_head()
     );
 }
 
+/// Nested variant of the above: a residual pre-flatten-migration chain
+/// (R2 -> R1 -> root) must still advance R2 when the verdict for its exact
+/// contributed head lands, not just a revision directly parented to the
+/// cycle root. `advance_held_revision_after_verdict_in_tx` sources
+/// candidates from the full review-cycle chain under `cycle_root_id`
+/// rather than a direct `parent_task_id` equality, so this must not regress
+/// to stranding R2 `active` in Doing.
+#[test]
+fn clean_verdict_advances_a_revision_nested_under_another_revision() {
+    let db = WorkDb::open(temp_db_path("verdict-apply-advances-nested-revision")).unwrap();
+    let product = create_test_product(&db);
+    let product_id = product.id.clone();
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    bind_open_pr(&db, &cycle_root.id);
+
+    // R1: an ordinary direct child under the cycle root, not itself held
+    // for review — just the intermediate hop the residual-nesting case
+    // requires.
+    let r1_id = insert_revision_row(&db, &product_id, &cycle_root.id);
+    // R2: nested under R1 (pre-flatten-migration shape), held `active`
+    // pending exactly this batch's reviewed push.
+    let r2_id = insert_revision_row(&db, &product_id, &r1_id);
+    let r2_exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(r2_id.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            rusqlite::params![r2_exec.id],
+        )
+        .unwrap();
+    db.set_revision_stop_contributed_head(&r2_exec.id, "head-sha").unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'active', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![r2_id, PR_URL],
+        )
+        .unwrap();
+
+    let supervisor = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha"),
+            &[member(
+                ReviewBatchMemberRole::Supervisor,
+                Some(supervisor.id.clone()),
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    force_batch_supervising(&db, &batch.id);
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &supervisor.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &clean_verdict_payload(&batch.id, "head-sha"),
+            idempotency_key: "verdict-1",
+        })
+        .unwrap()
+        .unwrap();
+
+    db.apply_review_verdict_proposal(&outcome.proposal.id, &FakePrStateChecker::always(PrOpenState::Open))
+        .unwrap();
+
+    let root_after = query_task(&db.connect().unwrap(), &cycle_root.id).unwrap().unwrap();
+    assert_eq!(root_after.status, TaskStatus::InReview, "cycle root must reach Review");
+    let r2_after = query_task(&db.connect().unwrap(), &r2_id).unwrap().unwrap();
+    assert_eq!(
+        r2_after.status,
+        TaskStatus::InReview,
+        "a revision nested under another revision must ALSO reach Review when the verdict \
+         covering its exact contributed head lands, not stay stranded in Doing"
+    );
+}
+
 /// incident-002 postmortem gate: a cycle root held `blocked:
 /// deletion_signoff` must not be silently advanced to `in_review` (with the
 /// hold erased) by the async verdict-apply path — that hold is an explicit

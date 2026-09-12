@@ -591,6 +591,69 @@ fn ai_reviewing_attributes_cycle_root_running_review_to_held_revision() {
     assert_eq!(revision_card.ai_review_state.as_deref(), Some("reviewing"));
 }
 
+/// Same attribution as above, but for a residual pre-flatten-migration
+/// nested revision (R2 -> R1 -> root) rather than a direct child of the
+/// cycle root. `review_execution_target_id` must walk the FULL chain to the
+/// true root — attributing R2's badge to its direct parent R1 (which has no
+/// `pr_review` execution of its own either) would silently drop the
+/// "reviewing" signal even while the root's reviewer is actually running.
+#[test]
+fn ai_reviewing_attributes_cycle_root_running_review_to_nested_held_revision() {
+    let db = WorkDb::open(temp_db_path("ai-reviewing-nested-held-revision")).unwrap();
+    let product_id = make_revision_product(&db, "nested-held-revision");
+    let pr_url = "https://github.com/spinyfin/mono/pull/6002";
+    let root_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    // R1: an ordinary direct child, not itself held for review (just the
+    // intermediate hop the residual-nesting case requires).
+    let r1_id = insert_revision_row(&db, &product_id, &root_id);
+    // R2: nested under R1, not under the root — the pre-flatten-migration
+    // shape. Held `active` pending review, exactly as the direct-child case
+    // above.
+    let r2_id = insert_revision_row(&db, &product_id, &r1_id);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'active', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![r2_id, pr_url],
+        )
+        .unwrap();
+
+    // The cycle root's own `pr_review` execution is running — there is NO
+    // execution against either revision.
+    let review = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(root_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.start_execution_run(
+        &review.id,
+        "review-worker",
+        "review-repo",
+        "review-lease",
+        "review-workspace",
+        "/tmp/review-workspace",
+    )
+    .unwrap();
+
+    let tree = db.get_work_tree(&product_id).unwrap();
+    let revision_card = tree
+        .tasks
+        .iter()
+        .find(|t| t.id == r2_id)
+        .expect("nested revision present");
+    assert!(
+        revision_card.ai_reviewing,
+        "a nested held revision must attribute its review cycle root's running review to itself, \
+         not just a direct child of the root"
+    );
+    assert_eq!(revision_card.ai_review_state.as_deref(), Some("reviewing"));
+}
+
 /// A parent already `in_review` with a completed (stale) verdict on record
 /// AND a fresh `pr_review` execution running against it must report the
 /// live `reviewing` state, not the stale verdict — a live pass in flight is

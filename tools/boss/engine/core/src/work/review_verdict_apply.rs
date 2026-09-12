@@ -408,13 +408,13 @@ impl WorkDb {
         advance_cycle_root_to_in_review_in_tx(&mut pending, &tx, &batch.cycle_root_id, &now)?;
 
         // A revision under this chain root that is held `active` pending
-        // exactly this reviewed push must ALSO reach `in_review` here — per
-        // the operator mandate, the revision's own card is what needs to
-        // leave Doing once its push is confirmed reviewed, not just the
-        // cycle root (which was already in Review the whole time). Nothing
-        // else ever advances it: a revision's worker never opens its own
-        // PR, so `record_worker_pr_completion`'s normal `InReview` target
-        // never applies to it.
+        // exactly this reviewed push must ALSO reach `in_review` here: the
+        // revision's own card needs to leave Doing once its push is
+        // confirmed reviewed, not just the cycle root (which was already in
+        // Review the whole time). Nothing else ever advances it: a
+        // revision's worker never opens its own PR, so
+        // `record_worker_pr_completion`'s normal `InReview` target never
+        // applies to it.
         advance_held_revision_after_verdict_in_tx(&tx, &batch.cycle_root_id, &batch.target_sha, &now)?;
 
         commit_and_publish(tx, pending, self.event_bus())?;
@@ -729,12 +729,29 @@ fn advance_held_revision_after_verdict_in_tx(
     target_sha: &str,
     now: &str,
 ) -> Result<()> {
+    // Candidate revision rows are sourced from the full review-cycle chain
+    // under `cycle_root_id`, not just its direct children: residual
+    // pre-flatten-migration rows can still nest a revision under another
+    // revision (see `get_chain_root_task` / `review_cycle_root_id`), and a
+    // direct `parent_task_id = cycle_root_id` predicate would exclude such a
+    // nested row before its contributed head could even be checked, leaving
+    // it stranded `active` even once its exact reviewed push lands. The
+    // recursive CTE mirrors that same chain traversal; the depth cap matches
+    // `chain_root`'s `MAX_CHAIN_DEPTH` guard against a corrupt parent cycle.
     let revision_id: Option<String> = tx
         .query_row(
-            "SELECT t.id
+            "WITH RECURSIVE chain(id, depth) AS (
+                 SELECT ?1, 0
+                 UNION ALL
+                 SELECT t.id, c.depth + 1
+                 FROM tasks t
+                 JOIN chain c ON t.parent_task_id = c.id
+                 WHERE t.kind = 'revision' AND c.depth < 64
+             )
+             SELECT t.id
              FROM tasks t
              JOIN work_executions we ON we.work_item_id = t.id
-             WHERE t.parent_task_id = ?1
+             WHERE t.parent_task_id IN (SELECT id FROM chain)
                AND t.kind = 'revision'
                AND t.status = 'active'
                AND t.deleted_at IS NULL
