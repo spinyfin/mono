@@ -697,7 +697,7 @@ mod tests {
     use crate::coordinator::{ExecutionCoordinator, WorkerPool};
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::test_support::*;
-    use crate::work::{ExecutionStatus, WorkDb};
+    use crate::work::{CreateRevisionInput, ExecutionStatus, PrOpenState, StaticPrStateChecker, WorkDb, WorkItemPatch};
     use crate::worker_readoption::NoopLiveWorkerConvergence;
 
     /// Stamp tasks.updated_at to 10 minutes ago so the age guard passes.
@@ -1692,24 +1692,13 @@ mod tests {
 
     // ── pending-review hold vs. genuine orphan ──────────────────────────────
 
-    /// Stamp `tasks.pr_head_sha` directly — there is no production setter
-    /// scoped this narrowly; production always writes it alongside other
-    /// polled PR fields (see `pr_flow.rs`), so a direct `UPDATE` is the
-    /// simplest way to pin just this column for a test.
-    fn set_pr_head_sha(db: &WorkDb, task_id: &str, sha: &str) {
-        let conn = db.connect().unwrap();
-        conn.execute(
-            "UPDATE tasks SET pr_head_sha = ?1 WHERE id = ?2",
-            rusqlite::params![sha, task_id],
-        )
-        .unwrap();
-    }
-
     /// Insert a minimal `pr_review_batches` row directly. Test-only: the
     /// production path (`WorkDb::create_pre_merge_review_batch_for_pool`)
     /// requires a `gh pr view` round trip and pool-admission bookkeeping
     /// this suite has no need to exercise — only the row shape
-    /// `list_orphan_active_candidates`'s new exclusion reads matters here.
+    /// `list_orphan_active_candidates`'s exclusion reads matters here.
+    /// Does not touch `tasks.pr_head_sha`: the hold path never writes that
+    /// column, so tests must not stamp it either.
     fn insert_review_batch(db: &WorkDb, cycle_root_id: &str, status: &str, target_sha: &str, pr_url: &str) {
         let conn = db.connect().unwrap();
         let now = boss_engine_utils::epoch_time::now_epoch_secs().to_string();
@@ -1719,7 +1708,7 @@ mod tests {
                  phase, pr_number, pr_url, status, target_sha, updated_at
              ) VALUES (?1, ?2, 'base-sha', '{}', ?3, 'pre_merge', 1, ?4, ?5, ?6, ?3)",
             rusqlite::params![
-                format!("batch-{cycle_root_id}"),
+                format!("batch-{cycle_root_id}-{status}-{target_sha}"),
                 cycle_root_id,
                 now,
                 pr_url,
@@ -1730,24 +1719,49 @@ mod tests {
         .unwrap();
     }
 
-    /// Acceptance: a task held `active` with a completed execution and a
-    /// non-terminal `pr_review` batch open on its PR at its current head is
-    /// NOT an orphan candidate — this is the deliberate hold, not a dead row.
+    /// The ReviewerEnqueued hold shape: a completed producing execution on
+    /// an `active` task, with no live execution left. Age last — execution
+    /// writes bump `tasks.updated_at`. The `connect()` guard is dropped
+    /// before `make_old`, which also connects; holding both deadlocks the
+    /// single-connection pool.
+    fn hold_with_completed_producer(db: &WorkDb, work_item_id: &str) {
+        let execution = db
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(work_item_id.to_owned())
+                    .build(),
+            )
+            .unwrap();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET status = 'completed', finished_at = '1' WHERE id = ?1",
+                rusqlite::params![execution.id],
+            )
+            .unwrap();
+        }
+        make_old(db, work_item_id);
+    }
+
+    /// First-PR chore: the chore is its own cycle root, `pr_head_sha` is
+    /// NULL (the hold path never writes it), and a live pre_merge batch
+    /// exists. This is the common production hold; a sha-keyed exclusion
+    /// would miss it.
     #[tokio::test]
-    async fn held_task_with_live_review_batch_at_current_head_is_not_an_orphan_candidate() {
+    async fn first_pr_chore_with_live_pre_merge_batch_and_null_pr_head_sha_is_not_an_orphan_candidate() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
-        make_old(&db, &work_item_id);
+        hold_with_completed_producer(&db, &work_item_id);
 
-        set_pr_head_sha(&db, &work_item_id, "sha-current");
         insert_review_batch(&db, &work_item_id, "supervising", "sha-current", "https://example/pr/1");
 
         assert!(
             !db.list_orphan_active_candidates(ORPHAN_MIN_AGE_SECS)
                 .unwrap()
                 .contains(&work_item_id),
-            "a task with a live review batch open at its current head must not be an orphan candidate"
+            "a first-PR chore held pending a live pre_merge batch must not be an orphan candidate, \
+             even with tasks.pr_head_sha still NULL"
         );
     }
 
@@ -1758,9 +1772,8 @@ mod tests {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
-        make_old(&db, &work_item_id);
+        hold_with_completed_producer(&db, &work_item_id);
 
-        set_pr_head_sha(&db, &work_item_id, "sha-current");
         insert_review_batch(&db, &work_item_id, "completed", "sha-current", "https://example/pr/1");
 
         assert!(
@@ -1789,24 +1802,72 @@ mod tests {
         );
     }
 
-    /// Acceptance: a held task whose head sha has moved on from the review
-    /// batch's target is still treated as an orphan candidate — a stale batch
-    /// for an old head must not grant indefinite immunity.
+    /// A live pre_merge batch still excludes even when its `target_sha`
+    /// would not match any cached `tasks.pr_head_sha` (NULL here, as in
+    /// production at hold time). Admission will not create a replacement
+    /// batch until this one terminates, so the hold must cover it.
     #[tokio::test]
-    async fn held_task_with_review_batch_for_a_stale_head_is_still_a_candidate() {
+    async fn live_pre_merge_batch_excludes_regardless_of_target_sha() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
-        make_old(&db, &work_item_id);
+        hold_with_completed_producer(&db, &work_item_id);
 
-        set_pr_head_sha(&db, &work_item_id, "sha-new");
         insert_review_batch(&db, &work_item_id, "supervising", "sha-old", "https://example/pr/1");
 
         assert!(
-            db.list_orphan_active_candidates(ORPHAN_MIN_AGE_SECS)
+            !db.list_orphan_active_candidates(ORPHAN_MIN_AGE_SECS)
                 .unwrap()
                 .contains(&work_item_id),
-            "a review batch targeting a superseded head must not exclude the task from orphan recovery"
+            "a live pre_merge batch must exclude the producer without a pr_head_sha match"
+        );
+    }
+
+    /// ReviewerEnqueued on a revision: the batch is keyed on the PR-owning
+    /// ancestor (the cycle root), not the revision's own id. The recursive
+    /// walk's UNION ALL branch has to fire for the exclusion to see it.
+    /// `pr_head_sha` stays NULL on both rows — production never stamps it
+    /// at hold time.
+    #[tokio::test]
+    async fn held_revision_with_batch_keyed_on_cycle_root_is_not_an_orphan_candidate() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let root_id = create_active_chore(&db, &product_id, "pr-owning chore");
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET pr_url = ?1, status = 'in_review' WHERE id = ?2",
+                rusqlite::params!["https://example/pr/1", root_id],
+            )
+            .unwrap();
+        }
+        let revision = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(root_id.clone())
+                    .description("address review findings")
+                    .autostart(false)
+                    .build(),
+                &StaticPrStateChecker(PrOpenState::Open),
+            )
+            .unwrap();
+        db.update_work_item(
+            &revision.id,
+            WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        hold_with_completed_producer(&db, &revision.id);
+        insert_review_batch(&db, &root_id, "supervising", "sha-current", "https://example/pr/1");
+
+        assert!(
+            !db.list_orphan_active_candidates(ORPHAN_MIN_AGE_SECS)
+                .unwrap()
+                .contains(&revision.id),
+            "a held revision must be excluded via the cycle-root walk, with the batch keyed on the \
+             PR-owning ancestor and pr_head_sha left NULL"
         );
     }
 

@@ -755,17 +755,23 @@ impl WorkDb {
     /// `ReviewerEnqueued` path leaves the producing task `active` with no
     /// live execution while a `pr_review_batches` row runs the review, and
     /// that is legitimate hold state, not an orphan. The exclusion is a
-    /// non-terminal (`collecting`/`supervising`/`applying`) batch on the
-    /// task's review-cycle root (resolved the same way
+    /// non-terminal (`collecting`/`supervising`/`applying`) **pre_merge**
+    /// batch on the task's review-cycle root (resolved the same way
     /// [`WorkDb::review_cycle_root_id`] does: walk `parent_task_id` while
-    /// `kind = 'revision'`) whose `target_sha` matches that root's current
-    /// `pr_head_sha`. Scoping to the current head — rather than merely "a
-    /// non-terminal batch exists" — matters: once the root's head moves on
-    /// from the batch's target, that batch no longer describes the task's
-    /// current PR state and must not grant indefinite immunity from the
-    /// sweep. And scoping to non-terminal status matters the other way: the
-    /// moment the review batch reaches `completed`/`failed`, the hold ends
-    /// and the item becomes a candidate again, so a review pass that never
+    /// `kind = 'revision'`). This matches
+    /// [`Self::list_tasks_awaiting_pre_merge_review_admission`]'s live-batch
+    /// predicate rather than comparing `b.target_sha` to `tasks.pr_head_sha`:
+    /// the hold path never writes `pr_head_sha` (`record_worker_pr_completion`
+    /// leaves it untouched; `enqueue_review_batch` stamps the fetched head
+    /// only onto the new batch row), so a sha match against that column
+    /// would miss the common first-PR case (`pr_head_sha` stays NULL for
+    /// the whole hold) and any revision whose ancestor has not been
+    /// re-polled. A live pre-merge batch already holds the cycle's review
+    /// reservation, so a newer push cannot admit a replacement batch until
+    /// this one terminates — excluding on "a live pre_merge batch exists"
+    /// is the same freshness signal as admission, without a second writer.
+    /// Scoping to non-terminal status still clears the hold the moment the
+    /// batch reaches `completed`/`failed`, so a review pass that never
     /// resolves does not permanently hide a genuinely stuck task.
     pub fn list_orphan_active_candidates(&self, min_age_secs: i64) -> Result<Vec<String>> {
         let conn = self.connect()?;
@@ -802,7 +808,10 @@ impl WorkDb {
                  SELECT walk.task_id, parent.id, parent.kind, parent.parent_task_id, walk.depth + 1
                  FROM walk
                  JOIN tasks parent ON parent.id = walk.parent_task_id
-                 WHERE walk.kind = 'revision' AND walk.depth < 64
+                 -- chain_root loops `0..MAX_CHAIN_DEPTH` (64 iterations, depths 0..=63).
+                 -- The recursive term extends the current row, so `depth < 63` emits
+                 -- at most depth 63 — one hop past that would overshoot the Rust walk.
+                 WHERE walk.kind = 'revision' AND walk.depth < 63
              ),
              roots AS (
                  SELECT w.task_id, w.current_id AS cycle_root_id
@@ -845,11 +854,9 @@ impl WorkDb {
                )
                AND NOT EXISTS (
                    SELECT 1 FROM pr_review_batches b
-                   JOIN tasks root_task ON root_task.id = roots.cycle_root_id
                    WHERE b.cycle_root_id = roots.cycle_root_id
+                     AND b.phase = 'pre_merge'
                      AND b.status NOT IN ('completed', 'failed')
-                     AND root_task.pr_head_sha IS NOT NULL
-                     AND b.target_sha = root_task.pr_head_sha
                )
              ORDER BY t.updated_at ASC, t.id ASC",
             permanent = ATTENTION_KIND_RECOVERY_PERMANENT,
