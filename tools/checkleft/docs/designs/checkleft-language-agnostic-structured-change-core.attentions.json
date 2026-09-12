@@ -1,0 +1,26 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Change-region restriction (T2060) default mode: should a finding survive if its span is strictly INSIDE a changed hunk, or if it merely OVERLAPS/touches a changed hunk? 'touching' is safer against hiding real regressions whose symptom lands just outside the edited lines; 'strict' is quieter on brushed files.",
+    "choices": [
+      "touching (overlap) — recommended default, checks may opt into strict",
+      "strict (contained) — quietest, checks may opt into touching"
+    ],
+    "anchor": "the-core-finding-fix-data-fileedit-model-and-t2060"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Ship the typed fix_data channel (FixHandle + Fixer, check emits opaque typed data, a registered fixer computes edits) in v1 — or defer it to a second phase and ship only the existing precomputed-edits (SuggestedFix) path plus the change-region gate first? Yes = include typed fix_data in v1; No = defer (the doc's recommendation).",
+    "anchor": "the-core-finding-fix-data-fileedit-model-and-t2060"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Which format should be the single v1 reference typed-projection (proof of the generic->typed graduation path)? proto is the doc's pick (semantic wire-compat is the clearest bounded case); the config-record family (yaml/json/toml) is the alternative because one small model serves three formats.",
+    "choices": [
+      "proto (recommended) — clearest semantic case",
+      "config-record (yaml/json/toml) — one model, three formats",
+      "both proto and config-record in v1 — more scope"
+    ],
+    "anchor": "the-tiered-polyglot-strategy-with-the-14-formats-categorized"
+  }
+]
