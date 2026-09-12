@@ -749,6 +749,24 @@ impl WorkDb {
     /// already-open PR instead of re-running the reviewer. Those items are
     /// handled exclusively by [`crate::pr_review_recovery`], which creates
     /// the correct `pr_review` execution kind.
+    ///
+    /// Also excludes a task **deliberately held** `active` pending an
+    /// automated review pass: `completion/pr_transition.rs`'s
+    /// `ReviewerEnqueued` path leaves the producing task `active` with no
+    /// live execution while a `pr_review_batches` row runs the review, and
+    /// that is legitimate hold state, not an orphan. The exclusion is a
+    /// non-terminal (`collecting`/`supervising`/`applying`) batch on the
+    /// task's review-cycle root (resolved the same way
+    /// [`WorkDb::review_cycle_root_id`] does: walk `parent_task_id` while
+    /// `kind = 'revision'`) whose `target_sha` matches that root's current
+    /// `pr_head_sha`. Scoping to the current head — rather than merely "a
+    /// non-terminal batch exists" — matters: once the root's head moves on
+    /// from the batch's target, that batch no longer describes the task's
+    /// current PR state and must not grant indefinite immunity from the
+    /// sweep. And scoping to non-terminal status matters the other way: the
+    /// moment the review batch reaches `completed`/`failed`, the hold ends
+    /// and the item becomes a candidate again, so a review pass that never
+    /// resolves does not permanently hide a genuinely stuck task.
     pub fn list_orphan_active_candidates(&self, min_age_secs: i64) -> Result<Vec<String>> {
         let conn = self.connect()?;
         let now_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
@@ -775,7 +793,26 @@ impl WorkDb {
         // legitimately picks the work item up on the pass after that.
         let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
         let stmt_sql = format!(
-            "SELECT t.id FROM tasks t
+            "WITH RECURSIVE walk(task_id, current_id, kind, parent_task_id, depth) AS (
+                 SELECT t.id, t.id, t.kind, t.parent_task_id, 0
+                 FROM tasks t
+                 WHERE t.status = 'active'
+                   AND t.deleted_at IS NULL
+                 UNION ALL
+                 SELECT walk.task_id, parent.id, parent.kind, parent.parent_task_id, walk.depth + 1
+                 FROM walk
+                 JOIN tasks parent ON parent.id = walk.parent_task_id
+                 WHERE walk.kind = 'revision' AND walk.depth < 64
+             ),
+             roots AS (
+                 SELECT w.task_id, w.current_id AS cycle_root_id
+                 FROM walk w
+                 WHERE w.depth = (
+                     SELECT MAX(w2.depth) FROM walk w2 WHERE w2.task_id = w.task_id
+                 )
+             )
+             SELECT t.id FROM tasks t
+             JOIN roots ON roots.task_id = t.id
              WHERE t.status = 'active'
                AND t.deleted_at IS NULL
                AND CAST(t.updated_at AS INTEGER) < ?1
@@ -805,6 +842,14 @@ impl WorkDb {
                            AND (we2.created_at > we.created_at
                                 OR (we2.created_at = we.created_at AND we2.id > we.id))
                      )
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM pr_review_batches b
+                   JOIN tasks root_task ON root_task.id = roots.cycle_root_id
+                   WHERE b.cycle_root_id = roots.cycle_root_id
+                     AND b.status NOT IN ('completed', 'failed')
+                     AND root_task.pr_head_sha IS NOT NULL
+                     AND b.target_sha = root_task.pr_head_sha
                )
              ORDER BY t.updated_at ASC, t.id ASC",
             permanent = ATTENTION_KIND_RECOVERY_PERMANENT,

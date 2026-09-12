@@ -1690,6 +1690,126 @@ mod tests {
         );
     }
 
+    // ── pending-review hold vs. genuine orphan ──────────────────────────────
+
+    /// Stamp `tasks.pr_head_sha` directly — there is no production setter
+    /// scoped this narrowly; production always writes it alongside other
+    /// polled PR fields (see `pr_flow.rs`), so a direct `UPDATE` is the
+    /// simplest way to pin just this column for a test.
+    fn set_pr_head_sha(db: &WorkDb, task_id: &str, sha: &str) {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET pr_head_sha = ?1 WHERE id = ?2",
+            rusqlite::params![sha, task_id],
+        )
+        .unwrap();
+    }
+
+    /// Insert a minimal `pr_review_batches` row directly. Test-only: the
+    /// production path (`WorkDb::create_pre_merge_review_batch_for_pool`)
+    /// requires a `gh pr view` round trip and pool-admission bookkeeping
+    /// this suite has no need to exercise — only the row shape
+    /// `list_orphan_active_candidates`'s new exclusion reads matters here.
+    fn insert_review_batch(db: &WorkDb, cycle_root_id: &str, status: &str, target_sha: &str, pr_url: &str) {
+        let conn = db.connect().unwrap();
+        let now = boss_engine_utils::epoch_time::now_epoch_secs().to_string();
+        conn.execute(
+            "INSERT INTO pr_review_batches (
+                 id, cycle_root_id, base_sha, classification_json, created_at,
+                 phase, pr_number, pr_url, status, target_sha, updated_at
+             ) VALUES (?1, ?2, 'base-sha', '{}', ?3, 'pre_merge', 1, ?4, ?5, ?6, ?3)",
+            rusqlite::params![
+                format!("batch-{cycle_root_id}"),
+                cycle_root_id,
+                now,
+                pr_url,
+                status,
+                target_sha
+            ],
+        )
+        .unwrap();
+    }
+
+    /// Acceptance: a task held `active` with a completed execution and a
+    /// non-terminal `pr_review` batch open on its PR at its current head is
+    /// NOT an orphan candidate — this is the deliberate hold, not a dead row.
+    #[tokio::test]
+    async fn held_task_with_live_review_batch_at_current_head_is_not_an_orphan_candidate() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        make_old(&db, &work_item_id);
+
+        set_pr_head_sha(&db, &work_item_id, "sha-current");
+        insert_review_batch(&db, &work_item_id, "supervising", "sha-current", "https://example/pr/1");
+
+        assert!(
+            !db.list_orphan_active_candidates(ORPHAN_MIN_AGE_SECS)
+                .unwrap()
+                .contains(&work_item_id),
+            "a task with a live review batch open at its current head must not be an orphan candidate"
+        );
+    }
+
+    /// Acceptance: the same task IS a candidate again once the review batch
+    /// reaches a terminal state — the hold must not become permanent immunity.
+    #[tokio::test]
+    async fn held_task_becomes_orphan_candidate_once_review_batch_terminates() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        make_old(&db, &work_item_id);
+
+        set_pr_head_sha(&db, &work_item_id, "sha-current");
+        insert_review_batch(&db, &work_item_id, "completed", "sha-current", "https://example/pr/1");
+
+        assert!(
+            db.list_orphan_active_candidates(ORPHAN_MIN_AGE_SECS)
+                .unwrap()
+                .contains(&work_item_id),
+            "a task whose review batch has already terminated must become a candidate again"
+        );
+    }
+
+    /// Acceptance: a genuinely orphaned `active` task — no live execution, no
+    /// open review batch at all — is still returned, so orphan recovery for
+    /// the ordinary case is not weakened by this exclusion.
+    #[tokio::test]
+    async fn genuinely_orphaned_task_with_no_review_batch_is_still_a_candidate() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        make_old(&db, &work_item_id);
+
+        assert!(
+            db.list_orphan_active_candidates(ORPHAN_MIN_AGE_SECS)
+                .unwrap()
+                .contains(&work_item_id),
+            "a task with no live execution and no review batch at all must remain an orphan candidate"
+        );
+    }
+
+    /// Acceptance: a held task whose head sha has moved on from the review
+    /// batch's target is still treated as an orphan candidate — a stale batch
+    /// for an old head must not grant indefinite immunity.
+    #[tokio::test]
+    async fn held_task_with_review_batch_for_a_stale_head_is_still_a_candidate() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        make_old(&db, &work_item_id);
+
+        set_pr_head_sha(&db, &work_item_id, "sha-new");
+        insert_review_batch(&db, &work_item_id, "supervising", "sha-old", "https://example/pr/1");
+
+        assert!(
+            db.list_orphan_active_candidates(ORPHAN_MIN_AGE_SECS)
+                .unwrap()
+                .contains(&work_item_id),
+            "a review batch targeting a superseded head must not exclude the task from orphan recovery"
+        );
+    }
+
     // ── event-driven path (run_one_pass_for_item / spawn_event_subscriber) ──
 
     /// `run_one_pass_for_item` redispatches the named orphan, same as a full
