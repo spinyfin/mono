@@ -2086,6 +2086,16 @@ pub enum FrontendRequest {
         project_id: String,
     },
 
+    /// The human decision that lifts a `worker_recovery_permanent_error` /
+    /// `worker_recovery_exhausted` dispatch gate on an open attention item
+    /// (`attn_…`) — see `WorkDb::resolve_worker_recovery_attention`. Once
+    /// resolved, the gated work item becomes a candidate for auto-redispatch
+    /// again. Refuses any other attention kind, and any item that is not
+    /// currently `open`. Replies with [`FrontendEvent::AttentionItemUpdated`].
+    ResolveWorkerRecoveryAttention {
+        id: String,
+    },
+
     /// Inverse of [`Self::DeleteWorkItem`]: clear the `deleted_at`
     /// tombstone on a soft-deleted task, making it visible again. The
     /// `id` accepts a canonical `task_…` id or a friendly short id
