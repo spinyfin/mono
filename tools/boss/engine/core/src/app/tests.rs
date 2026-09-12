@@ -88,6 +88,39 @@ pub(super) fn test_server_state_with_fakes() -> (Arc<ServerState>, tempfile::Tem
     (state, temp)
 }
 
+/// Like [`test_server_state_with_fakes`], but also swaps in a fake
+/// [`crate::completion::BranchVerifier`] so a test that drives a real
+/// `ServerState` through the production events-socket dispatch path (rather
+/// than calling a completion-handler method directly) can make the GitHub
+/// head-fetch fail deterministically. This reproduces an unreachable
+/// completion seam without a live network call and without relying on the
+/// test sandbox's `gh` process-exec denial to fail the call for us.
+pub(super) fn test_server_state_with_fakes_and_branch_verifier(
+    branch_verifier: Arc<dyn crate::completion::BranchVerifier>,
+) -> (Arc<ServerState>, tempfile::TempDir) {
+    let temp = tempfile::tempdir().unwrap();
+    let cfg = Arc::new(RuntimeConfig::from_parts(
+        crate::config::WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(temp.path().join("state.db"))
+            .build(),
+        None,
+    ));
+    let state = ServerState::new_arc_with_app_pid_and_merge_probe(
+        cfg,
+        None,
+        None,
+        ServerStateOverrides {
+            cube_client: Some(Arc::new(crate::test_support::AlwaysSucceedsCube)),
+            execution_runner: Some(Arc::new(crate::test_support::AlwaysSucceedsRunner)),
+            branch_verifier: Some(branch_verifier),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    (state, temp)
+}
+
 pub(super) fn make_session_sink() -> Arc<SessionSink> {
     let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
     Arc::new(SessionSink::new(shutdown_tx))
@@ -289,6 +322,7 @@ mod pr_status;
 mod probe_delivery;
 mod probe_interrupt;
 mod proposals;
+mod revision_no_op_live_seam_reproduction;
 mod selected_product;
 mod semantic_progress_ingress;
 mod session_sink_queue;
