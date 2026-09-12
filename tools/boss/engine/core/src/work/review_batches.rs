@@ -1227,6 +1227,19 @@ impl WorkDb {
         Ok(found.is_some())
     }
 
+    /// Resolve `task_id` to the review-cycle root that owns its PR.
+    ///
+    /// A revision task is never its own cycle root: all of a chain's review
+    /// batches are filed under the chain root's id, so a caller that passes
+    /// a revision id straight to [`Self::review_batches_for_cycle_root`]
+    /// gets an empty result even when the chain root holds a full batch
+    /// history. Callers that accept an arbitrary work-item id (e.g.
+    /// `bossctl review batches`) must resolve through here first.
+    pub fn resolve_review_cycle_root(&self, task_id: &str) -> Result<String> {
+        let conn = self.connect()?;
+        super::chain_helpers::chain_root(&conn, task_id)
+    }
+
     /// Return all persisted batches for a review cycle root, newest first.
     pub fn review_batches_for_cycle_root(&self, cycle_root_id: &str) -> Result<Vec<ReviewBatch>> {
         let conn = self.connect()?;
@@ -1240,6 +1253,29 @@ impl WorkDb {
         )?;
         Ok(statement
             .query_map(params![cycle_root_id], map_review_batch)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Return every non-terminal batch (`collecting` / `supervising` /
+    /// `applying`) engine-wide, oldest first, so a stuck batch — one whose
+    /// members should long since have settled — sorts to the front.
+    /// The `bossctl review live-batches` diagnostic uses this to
+    /// answer "is anything stuck right now" without knowing which work item
+    /// to look at first; `reap_inert_review_batches` is the automated
+    /// counterpart that acts on staleness rather than merely reporting it.
+    pub fn list_live_review_batches(&self, limit: i64) -> Result<Vec<ReviewBatch>> {
+        let conn = self.connect()?;
+        let mut statement = conn.prepare(
+            "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
+                    phase, pr_number, pr_url, status, target_sha, updated_at,
+                    completed_at, final_verdict_proposal_id, merge_sha
+             FROM pr_review_batches
+             WHERE status NOT IN ('completed', 'failed')
+             ORDER BY created_at ASC, id ASC
+             LIMIT ?1",
+        )?;
+        Ok(statement
+            .query_map(params![limit], map_review_batch)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 

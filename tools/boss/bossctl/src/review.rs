@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use boss_engine::work::{ReviewVerdict, is_informative_gate_outcome};
-use boss_protocol::{FrontendEvent, FrontendRequest};
+use boss_protocol::{FrontendEvent, FrontendRequest, ReviewBatch, ReviewBatchMember};
 use clap::Subcommand;
 
 use super::connect;
@@ -57,6 +57,38 @@ pub(crate) enum ReviewAction {
         /// short id (`T42`); short ids resolve via the shared choke point.
         #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
         work_item: String,
+        /// Override the Boss state-root directory.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// Show every review-batch/member row for a work item's review cycle:
+    /// phase, status, resolved model/driver/effort per role, and timestamps.
+    ///
+    /// Read-only, direct-DB (same pattern as `review show`). Answers "what
+    /// actually happened to this PR's automated review" at batch-member
+    /// granularity — which role reported, which retried, which is still
+    /// live — without a hand-rolled `state.db` query.
+    Batches {
+        /// Work item id (task/chore). Accepts primary id or friendly
+        /// short id; the friendly short-id forms accepted here are
+        /// documented on `boss_protocol::work_item_id`.
+        #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
+        work_item: String,
+        /// Override the Boss state-root directory.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// List every currently non-terminal (`collecting` / `supervising` /
+    /// `applying`) review batch engine-wide, oldest first.
+    ///
+    /// Answers "is anything stuck right now" without knowing which work item
+    /// to look at first — the read-only counterpart to
+    /// `reap_inert_review_batches`, which acts on staleness rather than
+    /// merely reporting it. Invoked as `bossctl review live-batches`.
+    LiveBatches {
+        /// Maximum number of batches to return.
+        #[arg(long, default_value_t = 25)]
+        limit: u32,
         /// Override the Boss state-root directory.
         #[arg(long)]
         state_root: Option<PathBuf>,
@@ -200,6 +232,181 @@ pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: St
     }
 
     Ok(())
+}
+
+/// `bossctl review batches <work-item>` — see [`ReviewAction::Batches`].
+pub(crate) fn review_batches(json: bool, state_root: Option<PathBuf>, work_item: String) -> Result<()> {
+    let db = super::open_state_db(state_root)?;
+    let work_item = db
+        .resolve_work_item_ref_strict(&work_item)
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
+    // A revision task is never its own review-cycle root — its batches are
+    // filed under the chain root that owns the PR — so resolve to the root
+    // before querying. Without this, handing the command a revision's own
+    // id silently reads as "no batches exist" even when the chain root
+    // holds the full history for that revision cycle.
+    let cycle_root_id = db
+        .resolve_review_cycle_root(&work_item)
+        .context("resolving review cycle root")?;
+    let batches = db
+        .review_batches_for_cycle_root(&cycle_root_id)
+        .context("reading review batches")?;
+    let mut rendered = Vec::with_capacity(batches.len());
+    for batch in &batches {
+        let members = db
+            .review_batch_members(&batch.id)
+            .with_context(|| format!("reading members for review batch {}", batch.id))?;
+        rendered.push((batch, members));
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "work_item_id": work_item,
+                "cycle_root_id": cycle_root_id,
+                "batches": rendered.iter().map(|(batch, members)| batch_json(batch, members)).collect::<Vec<_>>(),
+            })
+        );
+        return Ok(());
+    }
+
+    // Always name the resolved cycle root when it differs from the id the
+    // caller passed in, so an empty result (a real "no batches" for that
+    // root) never reads the same as a lookup that silently resolved to the
+    // wrong row.
+    let resolved_suffix = if cycle_root_id == work_item {
+        String::new()
+    } else {
+        format!(" (resolved to chain root {cycle_root_id})")
+    };
+
+    if rendered.is_empty() {
+        println!("no review batches recorded for {work_item}{resolved_suffix}");
+        return Ok(());
+    }
+    println!(
+        "review batches for {work_item}{resolved_suffix} ({} total, newest first):",
+        rendered.len()
+    );
+    for (batch, members) in &rendered {
+        print_batch(batch, members, None);
+    }
+    Ok(())
+}
+
+/// `bossctl review live-batches` — see [`ReviewAction::LiveBatches`].
+pub(crate) fn review_live_batches(json: bool, state_root: Option<PathBuf>, limit: u32) -> Result<()> {
+    let db = super::open_state_db(state_root)?;
+    let batches = db
+        .list_live_review_batches(i64::from(limit))
+        .context("reading live review batches")?;
+    let mut rendered = Vec::with_capacity(batches.len());
+    for batch in &batches {
+        let members = db
+            .review_batch_members(&batch.id)
+            .with_context(|| format!("reading members for review batch {}", batch.id))?;
+        rendered.push((batch, members));
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "batches": rendered.iter().map(|(batch, members)| batch_json(batch, members)).collect::<Vec<_>>(),
+            })
+        );
+        return Ok(());
+    }
+
+    if rendered.is_empty() {
+        println!("no live (non-terminal) review batches");
+        return Ok(());
+    }
+    println!("{} live review batch(es), oldest first:", rendered.len());
+    for (batch, members) in &rendered {
+        print_batch(batch, members, Some(batch.cycle_root_id.as_str()));
+    }
+    Ok(())
+}
+
+fn print_batch(batch: &ReviewBatch, members: &[ReviewBatchMember], cycle_root: Option<&str>) {
+    println!("batch {} [{}/{}]", batch.id, batch.phase, batch.status);
+    if let Some(cycle_root) = cycle_root {
+        println!("  cycle root:  {cycle_root}");
+    }
+    println!("  pr:          {}", batch.pr_url);
+    println!("  profile:     {}", batch.classification.profile);
+    println!("  target sha:  {}", batch.target_sha);
+    if let Some(merge_sha) = batch.merge_sha.as_deref() {
+        println!("  merge sha:   {merge_sha}");
+    }
+    println!("  created at:  {}", batch.created_at);
+    println!("  updated at:  {}", batch.updated_at);
+    println!(
+        "  completed:   {}",
+        batch.completed_at.as_deref().unwrap_or("(not yet)")
+    );
+    println!(
+        "  verdict:     {}",
+        batch.final_verdict_proposal_id.as_deref().unwrap_or("(none staged)")
+    );
+    println!("  members:");
+    for member in members {
+        println!(
+            "    [{role}] attempt={attempt} status={status} driver={driver} model={model} effort={effort}",
+            role = member.role,
+            attempt = member.attempt,
+            status = member.status,
+            driver = member.requested_driver,
+            model = member.resolved_model,
+            effort = member.provider_effort,
+        );
+        println!(
+            "      execution={exec} created={created} updated={updated} terminal={terminal} report={report}",
+            exec = member.execution_id.as_deref().unwrap_or("(none)"),
+            created = member.created_at,
+            updated = member.updated_at,
+            terminal = member.terminal_at.as_deref().unwrap_or("(not yet)"),
+            report = member.report_proposal_id.as_deref().unwrap_or("(none)"),
+        );
+    }
+}
+
+fn batch_json(batch: &ReviewBatch, members: &[ReviewBatchMember]) -> serde_json::Value {
+    serde_json::json!({
+        "id": batch.id,
+        "cycle_root_id": batch.cycle_root_id,
+        "phase": batch.phase,
+        "status": batch.status,
+        "profile": batch.classification.profile,
+        "pr_url": batch.pr_url,
+        "pr_number": batch.pr_number,
+        "target_sha": batch.target_sha,
+        "merge_sha": batch.merge_sha,
+        "created_at": batch.created_at,
+        "updated_at": batch.updated_at,
+        "completed_at": batch.completed_at,
+        "final_verdict_proposal_id": batch.final_verdict_proposal_id,
+        "members": members.iter().map(member_json).collect::<Vec<_>>(),
+    })
+}
+
+fn member_json(member: &ReviewBatchMember) -> serde_json::Value {
+    serde_json::json!({
+        "id": member.id,
+        "role": member.role,
+        "attempt": member.attempt,
+        "status": member.status,
+        "requested_driver": member.requested_driver,
+        "resolved_model": member.resolved_model,
+        "provider_effort": member.provider_effort,
+        "execution_id": member.execution_id,
+        "created_at": member.created_at,
+        "updated_at": member.updated_at,
+        "terminal_at": member.terminal_at,
+        "report_proposal_id": member.report_proposal_id,
+    })
 }
 
 /// Whether the head sha a review verdict was recorded against still matches
