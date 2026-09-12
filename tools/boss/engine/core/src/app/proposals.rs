@@ -323,13 +323,23 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
         None => derive_idempotency_key(&caller.execution_id, kind, &validated.canonical_json),
     };
 
-    let outcome = work_db.submit_worker_proposal(SubmitWorkerProposalInput {
-        execution_id: &caller.execution_id,
-        work_item_id: &caller.work_item_id,
-        kind,
-        payload_json: &validated.canonical_json,
-        idempotency_key: &idempotency_key,
-    });
+    // Only `apply_pr_created` reads this; every other kind ignores it.
+    // Composed the same way the prompt-composition call site does
+    // (`worker_proposals` master flag AND the per-seam flag) — see
+    // `work::proposal_apply::apply_pr_created`'s doc for why gating this
+    // unconditionally-hardened behaviour on the flag matters.
+    let pr_created_proposals_seam_enabled = server_state.feature_flags.is_enabled("worker_proposals")
+        && server_state.feature_flags.is_enabled("pr_created_proposals_seam");
+    let outcome = work_db.submit_worker_proposal_with_flags(
+        SubmitWorkerProposalInput {
+            execution_id: &caller.execution_id,
+            work_item_id: &caller.work_item_id,
+            kind,
+            payload_json: &validated.canonical_json,
+            idempotency_key: &idempotency_key,
+        },
+        pr_created_proposals_seam_enabled,
+    );
 
     match outcome {
         Ok(Ok(SubmitWorkerProposalOutcome {

@@ -848,7 +848,8 @@ impl HostAdapter for SshHostAdapter {
             // `false` applies — regardless of the engine's own (local) read
             // of `worker_signal_proposals_seam` /
             // `deferred_scope_proposals_seam` / `followup_proposals_seam` /
-            // `automation_outcome_proposals_seam` — the remote worker always
+            // `automation_outcome_proposals_seam` / `pr_created_proposals_seam`
+            // — the remote worker always
             // gets the legacy marker/artifact text, even when the engine's
             // read path is proposals-first. That marker/artifact then
             // always counts as a fallback hit in
@@ -952,6 +953,8 @@ impl HostAdapter for SshHostAdapter {
             // worker always gets the legacy marker-only CLAUDE.md, since
             // SshHostAdapter has no FeatureFlagsStore to read
             // `automation_outcome_proposals_seam` from.
+            .automation_outcome_proposals_seam_enabled(false)
+            .pr_created_proposals_seam_enabled(false)
             .build();
         // Resolve the same driver `compose_worker_spawn` already validated
         // against the registry — settings wiring (ProgressObservation +
@@ -1611,6 +1614,7 @@ mod tests {
             .events_socket_path(PathBuf::from("/tmp/boss-events-exec_1.sock"))
             .boss_event_path(PathBuf::from(REMOTE_BOSS_EVENT_BIN))
             .execution_kind("chore_implementation")
+            .pr_created_proposals_seam_enabled(false)
             .build()
     }
 

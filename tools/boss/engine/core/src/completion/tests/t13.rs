@@ -1,116 +1,392 @@
-//! Direct coverage for [`crate::completion::run_done_declaration::audit_declared_delivery`],
-//! the post-hoc (off the termination path) check that a `delivered` run_done
-//! declaration's bound PR actually moved. The RPC-level tests in
-//! `app/tests/proposals.rs` cover submit-time terminalization, but none of
-//! them drive this specific background task — every test execution there
-//! carries an empty `pr_head_before`, so the spawn in
-//! `finalize_declared_delivery` returns before ever calling
-//! `fetch_pr_head_oid`. These tests call the free function directly with a
-//! [`StubBranchVerifier`] instead.
+//! Split out of `completion.rs`'s `#[cfg(test)] mod tests`.
+//! Test functions only; shared fixtures, stubs, and helpers live
+//! in the parent [`super`] module (`completion/tests.rs`).
+//!
+//! Theme: PR-created-declaration worker-proposal seam
+//! (`pr_created_proposals_seam`, design implementation task 12 — the last
+//! of the per-seam migrations). Mirrors the `automation_outcome_proposals_seam`
+//! tests in `t11.rs`, adapted to the PR-detection ladder's shape: instead of
+//! one `finalize_*` entry point, `pr_created_from_proposal` is consulted from
+//! both `on_stop_inner` and `recheck_for_pr`, and every OTHER source that
+//! reaches the shared `finalize_pr_transition` funnel counts as a fallback.
 
 use super::*;
-use crate::completion::run_done_declaration::audit_declared_delivery;
 
-const PR_URL: &str = "https://github.com/spinyfin/mono/pull/42";
-
-#[tokio::test]
-async fn audit_flags_attention_when_pr_head_is_unchanged() {
-    let workspace = tempdir().unwrap();
-    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
-    db.set_execution_pr_head_before(&execution_id, "sha_before").unwrap();
-    let execution = db.get_execution(&execution_id).unwrap();
-    let publisher = Arc::new(RecordingPublisher::default());
-    let verifier = StubBranchVerifier::ok("boss/test");
-    verifier.set_head_oid(Ok("sha_before".into())).await;
-
-    audit_declared_delivery(
-        verifier.as_ref(),
-        &db,
-        publisher.as_ref(),
-        &execution_id,
-        &chore_id,
-        &execution.repo_remote_url,
-        "sha_before",
-        PR_URL,
-    )
-    .await;
-
-    let items = db.list_attention_items(&execution_id).unwrap();
-    assert!(
-        items
-            .iter()
-            .any(|i| i.kind == crate::completion::RUN_DONE_AUDIT_FLAGGED_ATTENTION_KIND),
-        "an unchanged head must flag a contradicted declaration for human review: {items:?}"
-    );
-    assert_eq!(
-        publisher.attention_items_created().await,
-        1,
-        "the flagged attention must also publish a live-update event"
-    );
+fn enable_pr_created_seam() -> (Arc<crate::feature_flags::FeatureFlagsStore>, TempDir) {
+    let flags_dir = tempdir().unwrap();
+    let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        flags_dir.path().join("feature-flags.toml"),
+    ));
+    flags.load().unwrap();
+    flags.set("worker_proposals", true).unwrap();
+    flags.set("pr_created_proposals_seam", true).unwrap();
+    (flags, flags_dir)
 }
 
+/// Proposal path wins over the cold-reconstruction ladder — and, because
+/// this test never populates `StagedPrUrlCache` (the default empty cache,
+/// exactly what an engine restart between the worker's `cube pr create` and
+/// this Stop would leave behind), it also demonstrates the seam's durability
+/// win: finalization succeeds from the durable `pr_created` proposal row
+/// alone, with no in-memory staging evidence at all.
 #[tokio::test]
-async fn audit_no_ops_when_pr_head_moved() {
+async fn pr_created_proposals_first_uses_proposal_url_surviving_an_empty_staging_cache() {
     let workspace = tempdir().unwrap();
     let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
-    db.set_execution_pr_head_before(&execution_id, "sha_before").unwrap();
-    let execution = db.get_execution(&execution_id).unwrap();
-    let publisher = Arc::new(RecordingPublisher::default());
-    let verifier = StubBranchVerifier::ok("boss/test");
-    verifier.set_head_oid(Ok("sha_after_moved".into())).await;
 
-    audit_declared_delivery(
-        verifier.as_ref(),
-        &db,
-        publisher.as_ref(),
-        &execution_id,
-        &chore_id,
-        &execution.repo_remote_url,
-        "sha_before",
-        PR_URL,
-    )
-    .await;
+    db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+        execution_id: &execution_id,
+        work_item_id: &chore_id,
+        kind: ProposalKind::PrCreated,
+        payload_json: r#"{"pr_url":"https://github.com/spinyfin/mono/pull/500"}"#,
+        idempotency_key: "key-1",
+    })
+    .unwrap()
+    .unwrap();
 
-    let items = db.list_attention_items(&execution_id).unwrap();
+    // If the ladder ran at all, the detector would supply THIS (different)
+    // URL — proves the proposal, not the cold path, decided the outcome.
+    let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/999"));
+
+    let (flags, _flags_dir) = enable_pr_created_seam();
+    let metrics = Arc::new(Registry::new());
+    register_metrics(&metrics);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+    let handler = handler
+        .with_feature_flags(flags)
+        .with_metrics(metrics.clone())
+        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(
+            &execution_id,
+            &BranchNaming::BossExecPrefix,
+            None,
+        )));
+
+    let outcome = handler.on_stop(&execution_id).await;
     assert!(
-        items
-            .iter()
-            .all(|i| i.kind != crate::completion::RUN_DONE_AUDIT_FLAGGED_ATTENTION_KIND),
-        "a moved head confirms the declaration; nothing should be flagged: {items:?}"
+        matches!(&outcome, StopOutcome::ReviewerEnqueued { pr_url } if pr_url == "https://github.com/spinyfin/mono/pull/500"),
+        "expected finalization via the proposal's URL, got {outcome:?}",
     );
     assert_eq!(
-        publisher.attention_items_created().await,
+        detector.call_count(),
         0,
-        "a confirmed declaration must not publish a flagged-attention event"
+        "the pr_created proposal must short-circuit the cold-reconstruction ladder entirely",
+    );
+    let item = db.get_work_item(&chore_id).unwrap();
+    match item {
+        WorkItem::Chore(t) => assert_eq!(t.pr_url.as_deref(), Some("https://github.com/spinyfin/mono/pull/500")),
+        other => panic!("expected chore, got {other:?}"),
+    }
+    assert_eq!(
+        metrics.counter_value("worker_proposals.fallback_hit.pr_created"),
+        Some(0),
+        "the proposal covered the URL; the legacy ladder must never fire",
     );
 }
 
+/// No `pr_created` proposal exists: the legacy staging-cache / cold-
+/// reconstruction ladder still runs exactly as before, and the fallback hit
+/// is counted — this seam's explicit exit criterion.
 #[tokio::test]
-async fn audit_no_ops_when_head_fetch_fails() {
+async fn pr_created_proposals_first_falls_back_to_the_ladder_and_counts_the_hit() {
     let workspace = tempdir().unwrap();
     let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
-    db.set_execution_pr_head_before(&execution_id, "sha_before").unwrap();
-    let execution = db.get_execution(&execution_id).unwrap();
-    let publisher = Arc::new(RecordingPublisher::default());
-    let verifier = StubBranchVerifier::ok("boss/test");
-    verifier.set_head_oid(Err("transient gh failure".into())).await;
+    let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/12"));
 
-    audit_declared_delivery(
-        verifier.as_ref(),
-        &db,
-        publisher.as_ref(),
-        &execution_id,
-        &chore_id,
-        &execution.repo_remote_url,
-        "sha_before",
-        PR_URL,
-    )
-    .await;
+    let (flags, _flags_dir) = enable_pr_created_seam();
+    let metrics = Arc::new(Registry::new());
+    register_metrics(&metrics);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+    let handler = handler
+        .with_feature_flags(flags)
+        .with_metrics(metrics.clone())
+        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(
+            &execution_id,
+            &BranchNaming::BossExecPrefix,
+            None,
+        )));
 
-    let items = db.list_attention_items(&execution_id).unwrap();
+    let outcome = handler.on_stop(&execution_id).await;
     assert!(
-        items.is_empty(),
-        "a failed head fetch is best-effort and must swallow, never flag on no evidence: {items:?}"
+        matches!(&outcome, StopOutcome::ReviewerEnqueued { pr_url } if pr_url == "https://github.com/spinyfin/mono/pull/12"),
+        "expected the legacy ladder to still finalize via the detector, got {outcome:?}",
     );
-    assert_eq!(publisher.attention_items_created().await, 0);
+    assert_eq!(
+        detector.call_count(),
+        1,
+        "no proposal existed — the cold detector must run"
+    );
+    let item = db.get_work_item(&chore_id).unwrap();
+    match item {
+        WorkItem::Chore(t) => assert_eq!(t.pr_url.as_deref(), Some("https://github.com/spinyfin/mono/pull/12")),
+        other => panic!("expected chore, got {other:?}"),
+    }
+    assert_eq!(
+        metrics.counter_value("worker_proposals.fallback_hit.pr_created"),
+        Some(1),
+        "no proposal existed, so the legacy ladder fired and must count as a fallback hit",
+    );
+}
+
+/// Even with an existing `pr_created` proposal present, the flag defaulting
+/// off must reproduce the exact pre-seam behavior: the legacy ladder always
+/// decides, the proposal is never consulted, and nothing is counted.
+#[tokio::test]
+async fn pr_created_proposals_first_flag_off_matches_pre_migration_behavior_exactly() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+
+    db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+        execution_id: &execution_id,
+        work_item_id: &chore_id,
+        kind: ProposalKind::PrCreated,
+        payload_json: r#"{"pr_url":"https://github.com/spinyfin/mono/pull/500"}"#,
+        idempotency_key: "key-1",
+    })
+    .unwrap()
+    .unwrap();
+    // Distinct from the proposal's URL, so a wrongly-proposal-first path
+    // would produce a detectably different (wrong) answer.
+    let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/12"));
+
+    let metrics = Arc::new(Registry::new());
+    register_metrics(&metrics);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+    let handler = handler.with_metrics(metrics.clone());
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(&outcome, StopOutcome::ReviewerEnqueued { pr_url } if pr_url == "https://github.com/spinyfin/mono/pull/12"),
+        "flag off: must decide via the legacy ladder, not the proposal, got {outcome:?}",
+    );
+    assert_eq!(detector.call_count(), 1);
+    assert_eq!(
+        metrics.counter_value("worker_proposals.fallback_hit.pr_created"),
+        Some(0),
+        "with the flag off nothing is counted",
+    );
+}
+
+/// Merge-poller mirror: `recheck_for_pr` also reads the `pr_created`
+/// proposal before its own staging-cache / SHA-delta / cold-reconstruction
+/// chain, and skips the detector entirely when a proposal covers it.
+#[tokio::test]
+async fn pr_created_proposals_first_via_recheck_for_pr_uses_proposal_and_skips_detector() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+
+    db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+        execution_id: &execution_id,
+        work_item_id: &chore_id,
+        kind: ProposalKind::PrCreated,
+        payload_json: r#"{"pr_url":"https://github.com/spinyfin/mono/pull/500"}"#,
+        idempotency_key: "key-1",
+    })
+    .unwrap()
+    .unwrap();
+    let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/999"));
+
+    let (flags, _flags_dir) = enable_pr_created_seam();
+    let metrics = Arc::new(Registry::new());
+    register_metrics(&metrics);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+    let handler = handler
+        .with_feature_flags(flags)
+        .with_metrics(metrics.clone())
+        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(
+            &execution_id,
+            &BranchNaming::BossExecPrefix,
+            None,
+        )));
+
+    let outcome = handler.recheck_for_pr(&execution_id).await;
+    assert!(
+        matches!(&outcome, StopOutcome::ReviewerEnqueued { pr_url } if pr_url == "https://github.com/spinyfin/mono/pull/500"),
+        "expected pr-recheck to finalize via the proposal's URL, got {outcome:?}",
+    );
+    assert_eq!(
+        detector.call_count(),
+        0,
+        "the proposal must short-circuit the cold detector on recheck too"
+    );
+    assert_eq!(
+        metrics.counter_value("worker_proposals.fallback_hit.pr_created"),
+        Some(0),
+        "the proposal covered the URL; the legacy ladder must never fire",
+    );
+}
+
+/// The durable proposal path has the same mid-turn safety boundary as the
+/// staged-URL path: a merge-poller sweep must leave a working revision for
+/// its own Stop boundary to finish PR reconciliation and review reporting.
+#[tokio::test]
+async fn pr_created_proposal_recheck_defers_a_mid_turn_revision() {
+    let workspace = tempdir().unwrap();
+    let parent_pr_url = "https://github.com/spinyfin/mono/pull/500";
+    let (_dir, db, _product_id, revision_id, execution_id) = revision_fixture(
+        workspace.path(),
+        parent_pr_url,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+        execution_id: &execution_id,
+        work_item_id: &revision_id,
+        kind: ProposalKind::PrCreated,
+        payload_json: r#"{"pr_url":"https://github.com/spinyfin/mono/pull/500"}"#,
+        idempotency_key: "key-1",
+    })
+    .unwrap()
+    .unwrap();
+
+    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+    live_states.register_spawn(
+        2,
+        &execution_id,
+        "claude-opus-5",
+        std::process::id() as i32,
+        Some(boss_protocol::WorkItemBinding {
+            work_item_id: revision_id.clone(),
+            work_item_name: "proposal mid-turn revision".to_owned(),
+            execution_id: execution_id.clone(),
+        }),
+    );
+    live_states.apply_event(
+        2,
+        &boss_protocol::WorkerEvent::PreToolUse {
+            session_id: "s".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+        },
+    );
+
+    let (flags, _flags_dir) = enable_pr_created_seam();
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let outcome = handler
+        .with_feature_flags(flags)
+        .with_live_worker_states(live_states)
+        .with_staged_pr_mid_turn_defer_secs(60)
+        .recheck_for_pr(&execution_id)
+        .await;
+
+    assert_eq!(outcome, StopOutcome::AwaitingInput);
+    match db.get_work_item(&revision_id).unwrap() {
+        WorkItem::Task(task) => assert_eq!(task.status, TaskStatus::Active),
+        other => panic!("expected revision task, got {other:?}"),
+    }
+    assert!(cube.release_calls.lock().await.is_empty());
+}
+
+/// A `pr_created` proposal rejected at submission (wrong repo/URL shape)
+/// carries no usable URL — the legacy ladder runs as the counted fallback,
+/// exactly like the "no proposal at all" case.
+#[tokio::test]
+async fn pr_created_proposals_first_rejected_proposal_falls_back_to_the_ladder() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+
+    // A PR URL from an unrelated repo fails `validate_pr_url`'s product-repo
+    // gate inside `apply_pr_created` — the proposal is submitted but ends up
+    // `Rejected`, not `Applied`.
+    let rejected = db
+        .submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+            execution_id: &execution_id,
+            work_item_id: &chore_id,
+            kind: ProposalKind::PrCreated,
+            payload_json: r#"{"pr_url":"https://github.com/some-other-org/other-repo/pull/1"}"#,
+            idempotency_key: "key-1",
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(rejected.proposal.state, ProposalState::Rejected);
+
+    let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/12"));
+    let (flags, _flags_dir) = enable_pr_created_seam();
+    let metrics = Arc::new(Registry::new());
+    register_metrics(&metrics);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+    let handler = handler.with_feature_flags(flags).with_metrics(metrics.clone());
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(&outcome, StopOutcome::ReviewerEnqueued { pr_url } if pr_url == "https://github.com/spinyfin/mono/pull/12"),
+        "a rejected proposal carries no usable URL; expected the legacy ladder to decide, got {outcome:?}",
+    );
+    assert_eq!(
+        metrics.counter_value("worker_proposals.fallback_hit.pr_created"),
+        Some(1),
+        "a rejected proposal still counts as 'the proposal did not cover this finalization'",
+    );
+}
+
+/// Completion paths that act on an already-bound PR are outside the
+/// PR-creation ladder. They must not affect this seam's deletion criterion.
+#[tokio::test]
+async fn pr_created_fallback_counter_ignores_non_ladder_finalization_sources() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    let (flags, _flags_dir) = enable_pr_created_seam();
+    let metrics = Arc::new(Registry::new());
+    register_metrics(&metrics);
+    let TestHarness { handler, .. } = TestHarness::new(db, StubPrDetector::ok(None));
+    let handler = handler.with_feature_flags(flags).with_metrics(metrics.clone());
+
+    let outcome = handler
+        .finalize_pr_transition(
+            &execution_id,
+            "https://github.com/spinyfin/mono/pull/500".to_owned(),
+            WorkerPrCompletionTarget::InReview,
+            "metadata_only_fix",
+        )
+        .await;
+    assert!(matches!(outcome, StopOutcome::ReviewerEnqueued { .. }));
+    assert_eq!(
+        metrics.counter_value("worker_proposals.fallback_hit.pr_created"),
+        Some(0),
+        "an already-bound-PR completion source is not a missing pr_created declaration",
+    );
+}
+
+/// Revision declarations are accepted durably without mutating the revision
+/// task row, but only the chain root's bound PR may be used at completion.
+#[tokio::test]
+async fn pr_created_proposal_for_revision_rejects_a_url_other_than_the_bound_chain_root_pr() {
+    let workspace = tempdir().unwrap();
+    let bound_pr_url = "https://github.com/spinyfin/mono/pull/500";
+    let (_dir, db, _product_id, revision_id, execution_id) = revision_fixture(
+        workspace.path(),
+        bound_pr_url,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    // The applier's revision no-stamp hardening is gated on the seam too
+    // (see `apply_pr_created`'s doc) — call `submit_worker_proposal_with_flags`
+    // directly with it on, so the submission this test makes actually
+    // exercises the hardened path it asserts on. `WorkDb` has no
+    // `FeatureFlagsStore` of its own; the flag's live value is always
+    // supplied by the caller that resolved it.
+    let submitted = db
+        .submit_worker_proposal_with_flags(
+            crate::work::SubmitWorkerProposalInput {
+                execution_id: &execution_id,
+                work_item_id: &revision_id,
+                kind: ProposalKind::PrCreated,
+                payload_json: r#"{"pr_url":"https://github.com/spinyfin/mono/pull/999"}"#,
+                idempotency_key: "key-1",
+            },
+            true,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(submitted.proposal.state, ProposalState::Applied);
+
+    let (flags, _flags_dir) = enable_pr_created_seam();
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let outcome = handler.with_feature_flags(flags).on_stop(&execution_id).await;
+    assert!(
+        !matches!(outcome, StopOutcome::ReviewerEnqueued { pr_url } if pr_url == "https://github.com/spinyfin/mono/pull/999"),
+        "a revision may not finalize against a declaration other than its bound chain-root PR",
+    );
+    let revision = match db.get_work_item(&revision_id).unwrap() {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task,
+        other => panic!("expected revision task, got {other:?}"),
+    };
+    assert!(revision.pr_url.is_none(), "revision tasks never own a PR URL");
 }

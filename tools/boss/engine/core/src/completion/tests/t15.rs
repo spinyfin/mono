@@ -1,6 +1,9 @@
 //! A stopped revision must not depend on another worker turn to declare a no-op.
 
 use super::*;
+use crate::completion::run_done_declaration::audit_declared_delivery;
+
+const AUDIT_PR_URL: &str = "https://github.com/spinyfin/mono/pull/42";
 
 #[tokio::test]
 async fn revision_no_op_survives_unavailable_proposals_and_github_for_every_driver() {
@@ -329,5 +332,93 @@ async fn chore_run_done_no_changes_needed_does_not_file_revision_declined_record
             .iter()
             .any(|item| item.kind == REVISION_NO_OP_ATTENTION_KIND)
     );
+    assert_eq!(publisher.attention_items_created().await, 0);
+}
+
+#[tokio::test]
+async fn audit_flags_attention_when_pr_head_is_unchanged() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    db.set_execution_pr_head_before(&execution_id, "sha_before").unwrap();
+    let execution = db.get_execution(&execution_id).unwrap();
+    let publisher = Arc::new(RecordingPublisher::default());
+    let verifier = StubBranchVerifier::ok("boss/test");
+    verifier.set_head_oid(Ok("sha_before".into())).await;
+
+    audit_declared_delivery(
+        verifier.as_ref(),
+        &db,
+        publisher.as_ref(),
+        &execution_id,
+        &chore_id,
+        &execution.repo_remote_url,
+        "sha_before",
+        AUDIT_PR_URL,
+    )
+    .await;
+
+    let items = db.list_attention_items(&execution_id).unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|item| item.kind == crate::completion::RUN_DONE_AUDIT_FLAGGED_ATTENTION_KIND)
+    );
+    assert_eq!(publisher.attention_items_created().await, 1);
+}
+
+#[tokio::test]
+async fn audit_no_ops_when_pr_head_moved() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    db.set_execution_pr_head_before(&execution_id, "sha_before").unwrap();
+    let execution = db.get_execution(&execution_id).unwrap();
+    let publisher = Arc::new(RecordingPublisher::default());
+    let verifier = StubBranchVerifier::ok("boss/test");
+    verifier.set_head_oid(Ok("sha_after_moved".into())).await;
+
+    audit_declared_delivery(
+        verifier.as_ref(),
+        &db,
+        publisher.as_ref(),
+        &execution_id,
+        &chore_id,
+        &execution.repo_remote_url,
+        "sha_before",
+        AUDIT_PR_URL,
+    )
+    .await;
+
+    let items = db.list_attention_items(&execution_id).unwrap();
+    assert!(
+        items
+            .iter()
+            .all(|item| item.kind != crate::completion::RUN_DONE_AUDIT_FLAGGED_ATTENTION_KIND)
+    );
+    assert_eq!(publisher.attention_items_created().await, 0);
+}
+
+#[tokio::test]
+async fn audit_no_ops_when_head_fetch_fails() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    db.set_execution_pr_head_before(&execution_id, "sha_before").unwrap();
+    let execution = db.get_execution(&execution_id).unwrap();
+    let publisher = Arc::new(RecordingPublisher::default());
+    let verifier = StubBranchVerifier::ok("boss/test");
+    verifier.set_head_oid(Err("transient gh failure".into())).await;
+
+    audit_declared_delivery(
+        verifier.as_ref(),
+        &db,
+        publisher.as_ref(),
+        &execution_id,
+        &chore_id,
+        &execution.repo_remote_url,
+        "sha_before",
+        AUDIT_PR_URL,
+    )
+    .await;
+
+    assert!(db.list_attention_items(&execution_id).unwrap().is_empty());
     assert_eq!(publisher.attention_items_created().await, 0);
 }

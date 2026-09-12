@@ -704,6 +704,13 @@ impl ExecutionRunner for PaneSpawnRunner {
         // taught to make would hold every run to the run-done backstop.
         let run_done_proposals_seam_enabled = self.feature_flags.is_enabled("worker_proposals")
             && self.feature_flags.is_enabled("run_done_proposals_seam");
+        // Mirrors `worker_signal_proposals_seam_enabled` above — see
+        // `pr_created_from_proposal`'s doc (`completion::pr_transition`) for
+        // why both halves of the PR-created-declaration seam migration
+        // (design implementation task 12, the last of the per-seam
+        // migrations) must move together.
+        let pr_created_proposals_seam_enabled = self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("pr_created_proposals_seam");
         let ComposedWorkerSpawn {
             prompt_text,
             spawn_config,
@@ -724,6 +731,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .automation_outcome_proposals_seam_enabled(automation_outcome_proposals_seam_enabled)
                 .review_batch_fanout_enabled(review_batch_fanout_enabled)
                 .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
+                .pr_created_proposals_seam_enabled(pr_created_proposals_seam_enabled)
                 .build(),
         )
         .await
@@ -1106,6 +1114,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .automation_outcome_proposals_seam_enabled(automation_outcome_proposals_seam_enabled)
                 .is_review_supervisor(is_review_supervisor)
                 .is_post_merge_reviewer(is_post_merge_reviewer)
+                .pr_created_proposals_seam_enabled(pr_created_proposals_seam_enabled)
                 .build(),
             StdDuration::from_secs(30),
         )
