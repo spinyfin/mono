@@ -108,7 +108,9 @@ impl WorkerCompletionHandler {
         }
 
         match outcome {
-            boss_protocol::RunDoneOutcome::NoChangesNeeded => self.finalize_no_op_completion(&execution, None).await,
+            boss_protocol::RunDoneOutcome::NoChangesNeeded => {
+                self.finalize_no_op_completion(&execution, None, None).await
+            }
             boss_protocol::RunDoneOutcome::Delivered => self.finalize_declared_delivery(&execution).await,
             boss_protocol::RunDoneOutcome::Blocked => self.finalize_declared_blocked(&execution).await,
         }

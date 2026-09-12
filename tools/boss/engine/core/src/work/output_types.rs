@@ -145,6 +145,11 @@ pub struct WorkerPrCompletion {
     pub work_item: WorkItem,
     pub released_lease_id: Option<String>,
     pub released_workspace_id: Option<String>,
+    /// Set only by [`WorkDb::record_worker_no_op_completion`] when it was
+    /// asked to file a declined-finding attention item in the same
+    /// transaction as the terminal transition. `None` for every other
+    /// caller, and for a no-op completion that didn't request one.
+    pub filed_attention_item: Option<WorkAttentionItem>,
 }
 
 /// Result of a successful [`WorkDb::record_worker_idle_abandonment`] call.

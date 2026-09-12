@@ -1435,7 +1435,7 @@ must not be asked to open one",
                             "stop event: worker emitted NO_CHANGES_NEEDED with no PR produced — \
                              work already done; closing task as a no-op (no PR, no nudge)"
                         );
-                        return self.finalize_no_op_completion(&execution).await;
+                        return self.finalize_no_op_completion(&execution, None, None).await;
                     }
                 }
                 tracing::info!(

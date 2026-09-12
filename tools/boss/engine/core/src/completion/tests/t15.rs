@@ -24,6 +24,18 @@ async fn revision_no_op_survives_unavailable_proposals_and_github_for_every_driv
         std::fs::write(&transcript, format!("{value}\n")).unwrap();
         db.set_run_transcript_path_if_unset(&execution_id, transcript.to_str().unwrap())
             .unwrap();
+        // Clear the fixture's placeholder run summary so the assertion below
+        // can tell whether `finalize_no_op_completion` actually wrote its
+        // own detail text, rather than `record_worker_no_op_completion`'s
+        // `COALESCE(NULLIF(result_summary, ''), ?2)` leaving the
+        // placeholder untouched.
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_runs SET result_summary = NULL WHERE execution_id = ?1",
+                [&execution_id],
+            )
+            .unwrap();
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
         verifier
             .set_head_oid(Err("error connecting to api.github.com".into()))
@@ -68,6 +80,25 @@ async fn revision_no_op_survives_unavailable_proposals_and_github_for_every_driv
             declined
                 .body_markdown
                 .contains("declined rather than recorded as fixed")
+        );
+        // The stored completion detail (surfaced in execution history/detail
+        // views) must carry the same disclaimer as the attention item, not
+        // the "measured empty diff" wording that applies only when the head
+        // delta was actually proven absent — see
+        // `finalize_no_op_completion`'s `contribution` match.
+        let runs = db.list_runs(&execution_id).unwrap();
+        let result_summary = runs
+            .last()
+            .and_then(|run| run.result_summary.clone())
+            .expect("no-op completion must record a result summary");
+        assert!(
+            !result_summary.contains("measured"),
+            "{slug}: Indeterminate evidence must never be described as a measured empty diff: \
+             {result_summary}"
+        );
+        assert!(
+            result_summary.contains("could not independently verify"),
+            "{slug}: expected the Indeterminate disclaimer wording: {result_summary}"
         );
         assert_eq!(handler.on_stop(&execution_id).await, StopOutcome::AlreadyTerminal);
         assert_eq!(cube.release_calls.lock().await.len(), 1);
