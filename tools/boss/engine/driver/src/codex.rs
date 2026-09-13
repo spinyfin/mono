@@ -193,25 +193,19 @@ fn codex_effort_value_for_level(level: EffortLevel) -> Option<&'static str> {
     })
 }
 
-/// Capability-lever model choice. `terra` is the well-articulated coding tier;
-/// `astra` is the frontier model reserved for investigation/design work —
-/// analogous to Claude's sonnet/opus split.
-fn codex_model_for_reasoning(reasoning: ReasoningMode) -> &'static str {
-    match reasoning {
-        ReasoningMode::Standard => "gpt-5.6-terra",
-        ReasoningMode::Investigation => "gpt-6-astra",
-    }
+/// One Codex model is selected for all worker sessions: both `Standard`
+/// and `Investigation` resolve to `gpt-6-astra`. Terra remains a known
+/// catalog SKU (`codex debug models`) but is not selected as a lower
+/// tier or fallback.
+fn codex_model_for_reasoning(_reasoning: ReasoningMode) -> &'static str {
+    "gpt-6-astra"
 }
 
-/// Concrete model mapping for metadata-derived review tiers. The Luna → Terra
-/// → Astra progression is review-only and does not infer anything from task
-/// effort or reasoning.
-fn codex_review_model_for_tier(tier: ReviewModelTier) -> &'static str {
-    match tier {
-        ReviewModelTier::Fast => "gpt-5.6-luna",
-        ReviewModelTier::Balanced => "gpt-5.6-terra",
-        ReviewModelTier::Strong => "gpt-6-astra",
-    }
+/// One Codex model is selected for all review tiers: Fast, Balanced, and
+/// Strong all resolve to `gpt-6-astra`. This table does not infer anything
+/// from task effort or reasoning.
+fn codex_review_model_for_tier(_tier: ReviewModelTier) -> &'static str {
+    "gpt-6-astra"
 }
 
 /// Legacy size-derived table. Consulted only for rows with no

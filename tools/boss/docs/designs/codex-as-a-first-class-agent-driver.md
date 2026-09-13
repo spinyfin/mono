@@ -473,7 +473,7 @@ This also names the load-balancing seam ahead of time (see [Load-balancing seams
 
 ### The rollout records cells, not commands — the largest single divergence from this design
 
-Every claim above about `command_execution`, `aggregated_output` and per-command exit status was derived from `gpt-5.5`, which has no code mode. **Every model Boss actually dispatches (`gpt-5.6-terra`, `gpt-5.6-sol`) runs `tool_mode = code_mode`,** and under code mode the model does not issue a shell call at all. It writes JavaScript — `tools.exec_command({cmd, workdir, yield_time_ms, max_output_tokens})` — inside a _cell_, choosing that command's timeout and output budget itself, and then authors its own projection of the result. The rollout therefore records the cell, not the command, and the two do not have the same lifetime.
+Every claim above about `command_execution`, `aggregated_output` and per-command exit status was derived from `gpt-5.5`, which has no code mode. **Every model Boss actually dispatches (`gpt-6-astra`) runs `tool_mode = code_mode`,** and under code mode the model does not issue a shell call at all. It writes JavaScript — `tools.exec_command({cmd, workdir, yield_time_ms, max_output_tokens})` — inside a _cell_, choosing that command's timeout and output budget itself, and then authors its own projection of the result. The rollout therefore records the cell, not the command, and the two do not have the same lifetime.
 
 Four consequences, each of which produced a real defect before it was understood (`investigations/codex-exit-code-surfacing.md`, mono#2507; fixes in mono#2509, mono#2519, mono#2546):
 

@@ -1734,6 +1734,39 @@ mod tests {
     // --- dedicated design/investigation tier ---
 
     #[test]
+    fn codex_standard_and_investigation_both_select_astra() {
+        // Both reasoning modes resolve to astra; Small still maps effort
+        // to medium, and Investigation still omits the effort override.
+        let standard = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .task_driver("codex")
+                .reasoning(ReasoningMode::Standard)
+                .effort_level(EffortLevel::Small)
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(standard.model, "gpt-6-astra");
+        assert_eq!(standard.model_source, ModelResolutionSource::Reasoning);
+        assert_eq!(standard.effort_value, Some("medium"));
+
+        let investigation = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .task_driver("codex")
+                .kind(&TaskKind::Chore)
+                .reasoning(ReasoningMode::Investigation)
+                .effort_level(EffortLevel::Small)
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(investigation.model, "gpt-6-astra");
+        assert_eq!(
+            investigation.model_source,
+            ModelResolutionSource::DesignInvestigationTier
+        );
+        assert_eq!(investigation.effort_value, None);
+    }
+
+    #[test]
     fn design_and_investigation_tier_use_fable_or_astra_at_default_effort() {
         for (driver, expected_model) in [("claude", "fable"), ("codex", "gpt-6-astra")] {
             for (kind, reasoning) in [

@@ -5,7 +5,7 @@
 //!
 //! The design doc's evidence for reusing Claude's hook grammar was a payload
 //! captured on `gpt-5.5` — a model with no code mode at all. Every model Boss
-//! actually dispatches (`gpt-5.6-terra`, `gpt-6-astra`) is a code-mode model.
+//! actually dispatches (`gpt-6-astra`) is a code-mode model.
 //! Nothing detected that divergence until it was probed by hand (see
 //! `tools/boss/docs/investigations/codex-pretooluse-guard-coverage-2026-07-29.md`,
 //! whose findings landed as guard corrections plus the `guard_trace` shim
@@ -140,7 +140,7 @@ fn dispatched_codex_models() -> Vec<&'static str> {
 
 /// `tool_mode` values covered by the live guard harness
 /// ([`codex_guard_conformance_against_live_dispatched_models`]).
-/// `gpt-5.6-terra` and `gpt-6-astra` report `code_mode_only` via `codex
+/// `gpt-6-astra` reports `code_mode_only` via `codex
 /// debug models` (`PINNED_CODEX_CLI_VERSION` / 0.153.4, 2026-09-08), a
 /// covered mode. A dispatched model
 /// reporting anything else (including no `tool_mode` at all, the `gpt-5.5`
@@ -151,14 +151,14 @@ const COVERED_TOOL_MODES: &[&str] = &["code_mode", "code_mode_only"];
 /// Checked-in `codex debug models` `(slug, tool_mode)` capture — the fixture
 /// that makes [`codex_dispatched_models_have_covered_tool_mode`] hermetic.
 /// Captured from `codex debug models` on `PINNED_CODEX_CLI_VERSION`
-/// (codex-cli 0.153.4) on 2026-09-08: `gpt-5.6-terra` and `gpt-6-astra`
-/// report `code_mode_only`.
+/// (codex-cli 0.153.4) on 2026-09-08: `gpt-6-astra` reports `code_mode_only`.
+/// This table lists the currently selected Codex models and excludes
+/// catalog-only models such as terra and luna.
 /// Re-capture via a live `codex debug models` run and
 /// update deliberately on genuine drift — do not hand-edit these values from
 /// belief; [`captured_tool_mode_table_matches_installed_codex_cli`] is what
 /// catches a table that has gone stale.
-const CAPTURED_CODEX_TOOL_MODES: &[(&str, &str)] =
-    &[("gpt-5.6-terra", "code_mode_only"), ("gpt-6-astra", "code_mode_only")];
+const CAPTURED_CODEX_TOOL_MODES: &[(&str, &str)] = &[("gpt-6-astra", "code_mode_only")];
 
 fn captured_tool_mode(slug: &str) -> Option<&'static str> {
     CAPTURED_CODEX_TOOL_MODES
