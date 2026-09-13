@@ -406,6 +406,28 @@ fn top_cost_report() -> crate::TopCostReport {
         .build()
 }
 
+fn metric_catalog() -> crate::MetricCatalog {
+    crate::MetricCatalog::builder()
+        .dimensions(vec![])
+        .generated_at_epoch_s(1_747_000_000)
+        .series(vec![])
+        .build()
+}
+
+fn metric_series_report() -> crate::MetricSeriesReport {
+    crate::MetricSeriesReport::builder()
+        .series("execution_outcomes")
+        .bucket_secs(86_400)
+        .buckets(vec![])
+        .coverage(crate::SeriesCoverage::default())
+        .generated_at_epoch_s(1_747_000_000)
+        .groups(vec!["all".into()])
+        .since_epoch_s(1_746_000_000)
+        .until_epoch_s(1_747_000_000)
+        .value_kind(crate::MetricValueKind::Count)
+        .build()
+}
+
 /// Every `FrontendEvent` variant paired with the exact `"type"` tag it
 /// must serialize under. Ordered to match the declaration order in
 /// [`events.rs`](super::events) so a reviewer can diff the two side by
@@ -1347,6 +1369,20 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "top_cost_consumers",
         },
+        TagCase {
+            label: "MetricCatalogResult",
+            event: FrontendEvent::MetricCatalogResult {
+                catalog: metric_catalog(),
+            },
+            expected_tag: "metric_catalog_result",
+        },
+        TagCase {
+            label: "MetricSeriesResult",
+            event: FrontendEvent::MetricSeriesResult {
+                report: metric_series_report(),
+            },
+            expected_tag: "metric_series_result",
+        },
         // --- Planner / project lifecycle ---
         TagCase {
             label: "PlannerRunsList",
@@ -2125,6 +2161,8 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::WorkItemCostReport { .. }
         | FrontendEvent::CostWindowReport { .. }
         | FrontendEvent::TopCostConsumers { .. }
+        | FrontendEvent::MetricCatalogResult { .. }
+        | FrontendEvent::MetricSeriesResult { .. }
         | FrontendEvent::PlannerRunsList { .. }
         | FrontendEvent::PlanProjectResult { .. }
         | FrontendEvent::ReleaseProjectResult { .. }

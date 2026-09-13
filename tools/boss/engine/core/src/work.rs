@@ -543,6 +543,7 @@ mod ideas;
 mod insert_helpers;
 mod list_filter;
 mod mappers;
+mod metric_series_db;
 mod metrics_db;
 mod migrations_a;
 mod migrations_attachments;

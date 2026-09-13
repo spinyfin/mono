@@ -97,6 +97,7 @@ macro_rules! rpc_call {
 mod automation_cmds;
 mod commands;
 mod comment_commands;
+mod cost_args;
 mod cost_cmds;
 mod data;
 mod decision_commands;
@@ -105,6 +106,8 @@ mod engine_cmds;
 mod handoff;
 mod idea_args;
 mod idea_commands;
+mod metric_args;
+mod metric_cmds;
 mod output;
 mod project_create_args;
 mod status_args;
@@ -115,12 +118,14 @@ mod work_cmds;
 pub(crate) use automation_cmds::*;
 pub(crate) use commands::*;
 pub(crate) use comment_commands::*;
+pub(crate) use cost_args::*;
 pub(crate) use data::*;
 pub(crate) use decision_commands::*;
 pub(crate) use dependency_filter_args::*;
 pub(crate) use engine_cmds::*;
 pub(crate) use idea_args::*;
 pub(crate) use idea_commands::*;
+pub(crate) use metric_args::*;
 pub(crate) use output::*;
 pub(crate) use project_create_args::*;
 pub(crate) use status_args::*;
@@ -332,6 +337,10 @@ pub(crate) async fn run_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Cost { command } => {
             let ctx = RunContext::from_flags(&cli.global)?;
             cost_cmds::run_cost_command(command, &ctx).await
+        }
+        Commands::Metrics { command } => {
+            let ctx = RunContext::from_flags(&cli.global)?;
+            metric_cmds::run_metric_command(command, &ctx).await
         }
     }
 }
