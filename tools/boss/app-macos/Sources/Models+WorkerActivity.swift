@@ -44,6 +44,19 @@ struct WorkerLiveState: Hashable {
     /// `workers.tmux_hosting` setting value. `nil` when the engine hasn't
     /// reported it (remote workers, or an older engine).
     let tmuxHosted: Bool?
+
+    /// False when two entries share a `runId` or a `slotId`. A snapshot
+    /// that fails this is malformed; callers must reject it rather than
+    /// building dictionaries with `uniqueKeysWithValues`.
+    static func hasUniqueIds(_ states: [WorkerLiveState]) -> Bool {
+        var runIds = Set<String>(minimumCapacity: states.count)
+        var slotIds = Set<Int>(minimumCapacity: states.count)
+        for state in states {
+            if !runIds.insert(state.runId).inserted { return false }
+            if !slotIds.insert(state.slotId).inserted { return false }
+        }
+        return true
+    }
 }
 
 enum WorkerActivity: String, Hashable {

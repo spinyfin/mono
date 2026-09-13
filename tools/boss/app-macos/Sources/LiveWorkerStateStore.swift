@@ -12,22 +12,20 @@ final class LiveWorkerStateStore: ObservableObject {
     @Published private(set) var byRunID: [String: WorkerLiveState] = [:]
     @Published private(set) var bySlot: [Int: WorkerLiveState] = [:]
 
-    /// Workers in a non-terminal "alive" state: `spawning`, `working`,
-    /// or `waitingForInput`. Shared by `activeAgentCount` and
-    /// `activeAgentTmuxHostedFlags` so the quit dialog's count and
-    /// classified makeup cannot drift. Excludes `idle`, `errored`, and
-    /// `terminated`.
+    /// Workers in a non-terminal "alive" state. Shared by
+    /// `activeAgentCount` and `activeAgentTmuxHostedFlags` so the quit
+    /// dialog's count and classified makeup cannot drift. Only `errored`
+    /// and `terminated` are excluded; an `idle` worker still holds its slot
+    /// and conversation state.
     private static let aliveActivities: Set<WorkerActivity> = [
-        .spawning, .working, .waitingForInput,
+        .idle, .spawning, .working, .waitingForInput,
     ]
 
     /// Count of currently alive workers. Used by the quit-confirmation
     /// guard — from the user's perspective a worker idle at a Claude
     /// prompt is still kill-worthy (live conversation history,
     /// possibly in-progress edits in its leased workspace).
-    var activeAgentCount: Int {
-        activeAgentTmuxHostedFlags.count
-    }
+    @Published private(set) var activeAgentCount = 0
 
     /// `tmuxHosted` of every currently active worker (same "alive" filter
     /// as `activeAgentCount`), in no particular order. Feeds the
@@ -45,13 +43,18 @@ final class LiveWorkerStateStore: ObservableObject {
     /// otherwise unchanged still reaches us, and republishing it would
     /// invalidate every observing card for no visible delta.
     func update(states: [WorkerLiveState]) {
+        guard WorkerLiveState.hasUniqueIds(states) else { return }
         let newByRunID = Dictionary(uniqueKeysWithValues: states.map { ($0.runId, $0) })
         let newBySlot = Dictionary(uniqueKeysWithValues: states.map { ($0.slotId, $0) })
+        let newActiveAgentCount = newBySlot.values.count { Self.aliveActivities.contains($0.activity) }
         if newByRunID != byRunID {
             byRunID = newByRunID
         }
         if newBySlot != bySlot {
             bySlot = newBySlot
+        }
+        if newActiveAgentCount != activeAgentCount {
+            activeAgentCount = newActiveAgentCount
         }
     }
 }

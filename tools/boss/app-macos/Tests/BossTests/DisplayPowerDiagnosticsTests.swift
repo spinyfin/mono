@@ -6,10 +6,9 @@ import XCTest
 /// `DisplayPowerSample` JSON contract, its ring/JSONL-mirror wiring in
 /// [[TerminalLoopLog]], and [[DisplayPowerMonitor]]'s notification
 /// plumbing (start records, stop silences, start is idempotent). The App
-/// Nap opt-out itself (`ProcessInfo.beginActivity` in `AppDelegate`) is a
-/// single unconditional call with no branching lifecycle to unit test —
-/// this suite instead pins the instrumentation half of the fix, which is
-/// what a future incident's grep depends on.
+/// Nap opt-out itself is owned and lifecycle-tested by
+/// [[AppNapActivityController]]. This suite pins the instrumentation half
+/// of the fix, which is what a future incident's grep depends on.
 final class DisplayPowerDiagnosticsTests: XCTestCase {
 
     // MARK: - JSON contract

@@ -8,6 +8,82 @@ import os
 /// `UIUpdateCounters.recordEngineEventMainActor` counting on delivery
 /// (not enqueue).
 final class EngineClientEventBatchingTests: XCTestCase {
+    func testMissingLiveWorkerSnapshotDoesNotPublishState() {
+        let client = EngineClient(socketPath: "/tmp/boss-event-batch-missing-\(UUID().uuidString).sock")
+        let delivered = expectation(description: "decode error delivered")
+        client.onEvent = { event in
+            guard case .error(let message) = event else {
+                XCTFail("missing snapshot must not publish worker state")
+                return
+            }
+            XCTAssertEqual(message, "worker_live_states_list missing states")
+            delivered.fulfill()
+        }
+
+        client.consumeLineForTesting("""
+        {"payload":{"type":"worker_live_states_list"}}
+        """)
+
+        wait(for: [delivered], timeout: 2)
+    }
+
+    func testMalformedLiveWorkerSnapshotDoesNotPublishPartialState() {
+        let client = EngineClient(socketPath: "/tmp/boss-event-batch-malformed-\(UUID().uuidString).sock")
+        let delivered = expectation(description: "decode error delivered")
+        client.onEvent = { event in
+            guard case .error(let message) = event else {
+                XCTFail("malformed snapshot must not publish worker state")
+                return
+            }
+            XCTAssertEqual(message, "worker_live_states_list contains invalid state")
+            delivered.fulfill()
+        }
+
+        client.consumeLineForTesting("""
+        {"payload":{"type":"worker_live_states_list","states":[{"slot_id":1,"run_id":"run-1","model":"model","activity":"working"},{"slot_id":2,"run_id":"run-2","model":"model","activity":"future_activity"}]}}
+        """)
+
+        wait(for: [delivered], timeout: 2)
+    }
+
+    func testDuplicateLiveWorkerRunIdDoesNotPublishState() {
+        let client = EngineClient(socketPath: "/tmp/boss-event-batch-dup-run-\(UUID().uuidString).sock")
+        let delivered = expectation(description: "duplicate run_id decode error delivered")
+        client.onEvent = { event in
+            guard case .error(let message) = event else {
+                XCTFail("duplicate run_id snapshot must not publish worker state")
+                return
+            }
+            XCTAssertEqual(message, "worker_live_states_list contains duplicate ids")
+            delivered.fulfill()
+        }
+
+        client.consumeLineForTesting("""
+        {"payload":{"type":"worker_live_states_list","states":[{"slot_id":1,"run_id":"run-1","model":"model","activity":"working"},{"slot_id":2,"run_id":"run-1","model":"model","activity":"idle"}]}}
+        """)
+
+        wait(for: [delivered], timeout: 2)
+    }
+
+    func testDuplicateLiveWorkerSlotIdDoesNotPublishState() {
+        let client = EngineClient(socketPath: "/tmp/boss-event-batch-dup-slot-\(UUID().uuidString).sock")
+        let delivered = expectation(description: "duplicate slot_id decode error delivered")
+        client.onEvent = { event in
+            guard case .error(let message) = event else {
+                XCTFail("duplicate slot_id snapshot must not publish worker state")
+                return
+            }
+            XCTAssertEqual(message, "worker_live_states_list contains duplicate ids")
+            delivered.fulfill()
+        }
+
+        client.consumeLineForTesting("""
+        {"payload":{"type":"worker_live_states_list","states":[{"slot_id":1,"run_id":"run-1","model":"model","activity":"working"},{"slot_id":1,"run_id":"run-2","model":"model","activity":"idle"}]}}
+        """)
+
+        wait(for: [delivered], timeout: 2)
+    }
+
     func testBurstDeliversInOrderOnSingleDrainTurn() {
         let client = EngineClient(socketPath: "/tmp/boss-event-batch-\(UUID().uuidString).sock")
         let n = 50

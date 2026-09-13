@@ -1,0 +1,63 @@
+import Foundation
+import XCTest
+@testable import Boss
+
+@MainActor
+final class AppNapActivityControllerTests: XCTestCase {
+    func testHoldsAssertionForTheProcessLifetime() {
+        let counts = Counts()
+        let controller = makeController(counts: counts)
+
+        controller.beginForProcessLifetime()
+        controller.beginForProcessLifetime()
+        XCTAssertEqual(counts.began, 1)
+        XCTAssertEqual(counts.ended, 0)
+
+        controller.release()
+        XCTAssertEqual(counts.ended, 1)
+    }
+
+    func testCanReacquireAfterTerminationRelease() {
+        let counts = Counts()
+        let controller = makeController(counts: counts)
+
+        controller.beginForProcessLifetime()
+        controller.release()
+        controller.beginForProcessLifetime()
+
+        XCTAssertEqual(counts.began, 2)
+        XCTAssertEqual(counts.ended, 1)
+    }
+
+    func testAppDelegateKeepsAssertionUntilApplicationTermination() {
+        let counts = Counts()
+        let delegate = AppDelegate(appNapActivity: makeController(counts: counts))
+
+        delegate.beginAppNapActivityForApplicationLifetime()
+        XCTAssertEqual(counts.began, 1)
+        XCTAssertEqual(counts.ended, 0)
+
+        delegate.endAppNapActivityForApplicationLifetime()
+        XCTAssertEqual(counts.ended, 1)
+    }
+
+    func testAppKitCanConstructAppDelegateViaObjCInit() {
+        let delegate = (AppDelegate.self as NSObject.Type).init() as? AppDelegate
+        XCTAssertNotNil(delegate)
+    }
+
+    private func makeController(counts: Counts) -> AppNapActivityController {
+        AppNapActivityController(
+            beginActivity: {
+                counts.began += 1
+                return NSObject()
+            },
+            endActivity: { _ in counts.ended += 1 }
+        )
+    }
+
+    private final class Counts {
+        var began = 0
+        var ended = 0
+    }
+}

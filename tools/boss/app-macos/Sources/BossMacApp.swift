@@ -414,20 +414,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return type.conforms(to: markdownType)
     }
 
-    /// App Nap opt-out token (App Nap incident, 2026-07-15): held for the
-    /// process lifetime so `ProcessInfo`/`NSApp` never throttles the main
-    /// run loop while the display sleeps. Worker fleets run unattended
-    /// overnight with the display off, so scoping this narrower (e.g. to
-    /// "while an engine connection is registered") buys nothing — the app
-    /// needs to stay prompt for the whole session. `endActivity` is
-    /// intentionally never called: releasing the token would re-enable App
-    /// Nap, and the token itself is released implicitly when the process
-    /// exits. `.userInitiatedAllowingIdleSystemSleep` opts out of App Nap
-    /// *without* pinning the display or system awake — display/system idle
-    /// sleep must still be allowed (the incident was about RPC handling
-    /// staying prompt during sleep, not preventing sleep); do not swap in
-    /// `.idleDisplaySleepDisabled` or similar, which would do the latter.
-    private var appNapOptOutToken: NSObjectProtocol?
+    private let appNapActivity: AppNapActivityController
+
+    /// AppKit instantiates the delegate via the Objective-C `init`
+    /// selector. A Swift `init(appNapActivity:)` with a default argument
+    /// is a different entry point and does not satisfy that call, so
+    /// launch would trap with "Use of unimplemented initializer 'init()'".
+    override init() {
+        self.appNapActivity = AppNapActivityController()
+        super.init()
+    }
+
+    init(appNapActivity: AppNapActivityController) {
+        self.appNapActivity = appNapActivity
+        super.init()
+    }
 
     /// Observes `UserDefaults.didChangeNotification` so flipping
     /// [[MainThreadStallMonitor.enabledKey]] in Settings starts/stops the
@@ -448,10 +449,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        appNapOptOutToken = ProcessInfo.processInfo.beginActivity(
-            options: [.userInitiatedAllowingIdleSystemSleep],
-            reason: "Keep engine RPC handling and diagnostics sampling prompt during display sleep"
-        )
+        // Keep this assertion for the complete process lifetime. A
+        // `worker.live_states` snapshot reaches the main actor through the
+        // same path as a spawn request, so it cannot safely be used to
+        // reacquire the assertion after App Nap has delayed that path.
+        beginAppNapActivityForApplicationLifetime()
 
         // Isolated / capture instances: policy was already set to `.accessory`
         // in `applicationWillFinishLaunching`. Do **not** call
@@ -566,11 +568,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Otherwise fall back to the best-effort automatic swap-on-quit. Non-blocking; a
     /// failed swap leaves the current bundle untouched and the startup path retries.
     func applicationWillTerminate(_ notification: Notification) {
+        endAppNapActivityForApplicationLifetime()
         if let plan = UpdateLifecycle.consumePendingRelaunch() {
             UpdateLifecycle.armRelaunchHelper(for: plan)
         } else {
             UpdateLifecycle.applyQuitSwapIfNeeded()
         }
+    }
+
+    /// Kept separate from the AppKit callbacks so the lifetime wiring can be
+    /// tested without creating an `NSApplication` in the test process.
+    func beginAppNapActivityForApplicationLifetime() {
+        appNapActivity.beginForProcessLifetime()
+    }
+
+    func endAppNapActivityForApplicationLifetime() {
+        appNapActivity.release()
     }
 
     /// When the last window is closed and workers are still alive, keep

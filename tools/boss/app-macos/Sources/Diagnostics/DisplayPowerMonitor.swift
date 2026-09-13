@@ -12,7 +12,7 @@ import os
 /// display asleep, and for how long" required external forensics (`pmset`
 /// logs, coordinator-side timeline reconstruction) instead of a grep over
 /// the app's own diagnostics stream. This is instrumentation only — the
-/// App Nap opt-out itself lives in `AppDelegate` (`ProcessInfo.beginActivity`).
+/// App Nap opt-out itself lives in `AppNapActivityController`.
 ///
 /// `NSWorkspace.screensDidSleepNotification` / `screensDidWakeNotification`
 /// specifically track *display* power (independent of full-system sleep),
