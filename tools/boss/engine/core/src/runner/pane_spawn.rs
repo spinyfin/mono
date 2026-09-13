@@ -3,6 +3,8 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, target_os = "macos"))]
+use std::process::Command;
 use std::sync::{Arc, Weak};
 use std::time::Duration as StdDuration;
 
@@ -369,9 +371,9 @@ pub(crate) fn path_prepend_clause(var: &str) -> String {
 
 /// Known absolute locations of `taskpolicy(8)`, tried in order.
 ///
-/// macOS has shipped this binary at `/usr/bin/taskpolicy` and at
-/// `/usr/sbin/taskpolicy` depending on version. Hardcoding only one is how
-/// worker de-prioritisation stayed silently broken across an OS move.
+/// macOS has shipped this binary at both `/usr/bin/taskpolicy` and
+/// `/usr/sbin/taskpolicy` depending on version; trying only one will miss
+/// some hosts.
 pub(crate) const TASKPOLICY_CANDIDATES: &[&str] = &["/usr/sbin/taskpolicy", "/usr/bin/taskpolicy"];
 
 /// First statement on every local worker pane's assembled command: marks
@@ -397,8 +399,11 @@ pub(crate) const TASKPOLICY_CANDIDATES: &[&str] = &["/usr/sbin/taskpolicy", "/us
 /// starting, but it is not silent: a missing binary or non-zero exit is
 /// printed to the pane's stderr naming the path attempted and the exit
 /// status. A pane that failed to enter background class is therefore
-/// distinguishable from one that succeeded. The engine also warns at spawn
-/// compose time when no candidate exists on this host.
+/// distinguishable from one that succeeded. At spawn compose time the
+/// engine also `tracing::warn`s when no candidate exists on this host, and
+/// probes a resolved binary (without applying `PRIO_DARWIN_BG` to the
+/// engine itself) so a present-but-failing `taskpolicy` is visible in
+/// engine diagnostics, not only pane scrollback.
 ///
 /// To check a live pane, run `ps -o pid,ni,pri,comm -p <pane pid>` (or
 /// `ps -Ao pid,ni,pri,comm` and find the worker). `PRIO_DARWIN_BG` shows
@@ -451,22 +456,65 @@ pub(crate) fn worker_background_priority_clause_with_candidates(candidates: &[&s
     )
 }
 
-/// Warn at spawn-compose time when this host has no `taskpolicy` at a known
-/// location. The pane clause still tries `PATH` and logs on failure; this
-/// is the engine-side counterpart so a missing binary is visible in engine
-/// logs, not only in pane scrollback.
-fn maybe_warn_unresolved_taskpolicy() {
-    #[cfg(target_os = "macos")]
-    {
-        if !TASKPOLICY_CANDIDATES.iter().any(|p| Path::new(p).is_file()) {
+/// First known `taskpolicy` path that exists as a file, if any.
+///
+/// Existence only — not executable-bit or a successful `-b` invocation.
+/// Callers that need to know the binary actually works must probe it.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn taskpolicy_known_location<'a>(candidates: &'a [&'a str]) -> Option<&'a str> {
+    candidates.iter().copied().find(|p| Path::new(p).is_file())
+}
+
+/// Probe `taskpolicy -b` by wrapping a trivial command so a present-but-failing
+/// binary is visible in engine logs. Uses `/usr/bin/true` so the probe does
+/// not apply `PRIO_DARWIN_BG` to the engine itself and does not leave a
+/// child running. The pane still applies the policy to its own shell with
+/// `-p $$`; this is diagnostics, not the de-prioritisation itself.
+#[cfg(any(test, target_os = "macos"))]
+fn probe_taskpolicy(path: &str) -> io::Result<std::process::Output> {
+    Command::new(path).args(["-b", "/usr/bin/true"]).output()
+}
+
+/// Engine-side counterpart of the pane clause: warn when no candidate exists
+/// on this host, and warn when a resolved binary exits non-zero (or cannot
+/// be invoked). The pane clause still tries `PATH` and logs on failure;
+/// workers still spawn either way.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn maybe_warn_taskpolicy_host(candidates: &[&str]) {
+    let Some(path) = taskpolicy_known_location(candidates) else {
+        tracing::warn!(
+            candidates = ?candidates,
+            "taskpolicy not found at known locations; worker de-prioritisation will try PATH \
+             inside the pane and log on failure, but the worker will still spawn at default \
+             priority if lookup fails"
+        );
+        return;
+    };
+    match probe_taskpolicy(path) {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
             tracing::warn!(
-                candidates = ?TASKPOLICY_CANDIDATES,
-                "taskpolicy not found at known locations; worker de-prioritisation will try PATH \
-                 inside the pane and log on failure, but the worker will still spawn at default \
-                 priority if lookup fails"
+                path,
+                status = output.status.code(),
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "taskpolicy is present but failed to set Darwin background priority; \
+                 workers still spawn, and the pane clause will log the same class of failure"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                path,
+                error = %err,
+                "failed to invoke taskpolicy while verifying Darwin background priority; \
+                 workers still spawn"
             );
         }
     }
+}
+
+fn maybe_warn_unresolved_taskpolicy() {
+    #[cfg(target_os = "macos")]
+    maybe_warn_taskpolicy_host(TASKPOLICY_CANDIDATES);
 }
 
 /// macOS tty canonical-mode line cap (`MAX_CANON`,

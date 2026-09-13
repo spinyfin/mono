@@ -2,7 +2,8 @@
 //! on failure, and that a failed de-prioritisation never blocks spawn.
 
 use super::{
-    TASKPOLICY_CANDIDATES, worker_background_priority_clause, worker_background_priority_clause_with_candidates,
+    TASKPOLICY_CANDIDATES, maybe_warn_taskpolicy_host, taskpolicy_known_location, worker_background_priority_clause,
+    worker_background_priority_clause_with_candidates,
 };
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
@@ -120,5 +121,99 @@ fn missing_taskpolicy_is_logged_and_the_script_continues() {
     assert!(
         stdout.contains("STILL_RUNNING"),
         "commands after a failed lookup must still run, stdout={stdout:?} stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn known_location_is_none_when_no_candidate_exists() {
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("no-such-taskpolicy");
+    assert_eq!(
+        taskpolicy_known_location(&[missing.to_str().unwrap()]),
+        None,
+        "a path that is not a file must not count as resolved"
+    );
+}
+
+#[test]
+fn known_location_returns_the_first_existing_candidate() {
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("missing");
+    let present = dir.path().join("present");
+    std::fs::write(&present, b"").unwrap();
+    let later = dir.path().join("later");
+    std::fs::write(&later, b"").unwrap();
+    assert_eq!(
+        taskpolicy_known_location(&[
+            missing.to_str().unwrap(),
+            present.to_str().unwrap(),
+            later.to_str().unwrap()
+        ]),
+        Some(present.to_str().unwrap()),
+        "must pick the first existing candidate, not a later one"
+    );
+}
+
+#[test]
+fn compose_time_unresolved_taskpolicy_emits_engine_warn() {
+    let buffer = crate::test_support::log_capture::install();
+    let start = buffer.lock().len();
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("compose-time-missing-taskpolicy");
+    let needle = missing.to_str().unwrap();
+    maybe_warn_taskpolicy_host(&[needle]);
+    let captured = String::from_utf8(buffer.lock()[start..].to_vec()).expect("utf8 log capture");
+    let line = captured
+        .lines()
+        .find(|line| line.contains(needle) && line.contains("not found at known locations"))
+        .unwrap_or_else(|| panic!("no unresolved-taskpolicy warn; captured: {captured}"));
+    assert!(
+        line.contains("WARN"),
+        "missing taskpolicy at compose time must be a warning: {line}"
+    );
+}
+
+#[test]
+fn compose_time_nonzero_taskpolicy_exit_emits_engine_warn() {
+    let buffer = crate::test_support::log_capture::install();
+    let start = buffer.lock().len();
+    let dir = TempDir::new().unwrap();
+    let fake = write_executable(
+        &dir,
+        "failing-taskpolicy",
+        "#!/bin/sh\necho probe-stderr >&2\nexit 17\n",
+    );
+    let needle = fake.to_str().unwrap();
+    maybe_warn_taskpolicy_host(&[needle]);
+    let captured = String::from_utf8(buffer.lock()[start..].to_vec()).expect("utf8 log capture");
+    let line = captured
+        .lines()
+        .find(|line| line.contains(needle) && line.contains("failed to set Darwin background priority"))
+        .unwrap_or_else(|| panic!("no present-but-failing taskpolicy warn; captured: {captured}"));
+    assert!(
+        line.contains("WARN"),
+        "a resolved-but-failing taskpolicy must be a warning: {line}"
+    );
+    assert!(line.contains("17"), "engine warn must name the exit status: {line}");
+    assert!(
+        line.contains("probe-stderr"),
+        "engine warn must keep taskpolicy's own output: {line}"
+    );
+}
+
+#[test]
+fn compose_time_successful_taskpolicy_probe_does_not_warn() {
+    let buffer = crate::test_support::log_capture::install();
+    let start = buffer.lock().len();
+    let dir = TempDir::new().unwrap();
+    let fake = write_executable(&dir, "ok-taskpolicy", "#!/bin/sh\nexit 0\n");
+    let needle = fake.to_str().unwrap();
+    maybe_warn_taskpolicy_host(&[needle]);
+    let captured = String::from_utf8(buffer.lock()[start..].to_vec()).expect("utf8 log capture");
+    let ours: Vec<&str> = captured.lines().filter(|line| line.contains(needle)).collect();
+    assert!(
+        ours.iter()
+            .all(|line| !line.contains("WARN") && !line.contains("ERROR")),
+        "a successful probe must not warn; lines: {ours:#?}"
     );
 }
