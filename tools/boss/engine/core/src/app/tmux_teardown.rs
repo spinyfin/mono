@@ -161,9 +161,28 @@ impl ServerState {
                 return TmuxTeardownOutcome::Refused;
             }
             Ok(None) => {
-                // Already gone (or never carried a Boss token at all).
-                // Nothing to signal or kill — fall straight through to
-                // clearing our own bookkeeping.
+                // Already gone (or never carried a Boss token at all). Record
+                // this as a `SessionMissing` observation — the same kind
+                // `pane_delivery::tmux_pane_confirmed_dead` and the
+                // stale-worker sweep persist for the identical physical
+                // situation — so an absent pane is always recorded
+                // distinguishably rather than left blank just because this
+                // was the path that happened to notice it first. Nothing to
+                // signal or kill — fall straight through to clearing our own
+                // bookkeeping.
+                crate::tmux_adoption::persist_observed_pane_state(
+                    &self.work_db,
+                    execution_id,
+                    &identity.spawn_token,
+                    &identity.session_name,
+                    &crate::tmux_adoption::TmuxIdentityObservation {
+                        adoption_state: boss_protocol::TmuxAdoptionState::SessionMissing,
+                        pane_dead: None,
+                        pane_dead_status: None,
+                        window_activity_epoch_secs: None,
+                        current_command: None,
+                    },
+                );
                 return self.finish_tmux_reap(execution_id, identity);
             }
             Err(err) => {
@@ -182,10 +201,30 @@ impl ServerState {
         // teardown observes `#{pane_dead}`/`#{pane_dead_status}` before the
         // session is destroyed below — persist it now so completion (not
         // just the stale-worker sweep's cadence over still-`Working` slots)
-        // leaves the run row's observation columns populated.
-        let observation =
-            crate::tmux_adoption::observe_tmux_identity(tmux, &identity.session_name, &identity.spawn_token, true)
-                .await;
+        // leaves the run row's observation columns populated. Uses the
+        // narrow probe (not `observe_tmux_identity`, which also reads
+        // `#{window_activity}`/`#{pane_current_command}` for the sweep's
+        // staleness classification this call has no use for): every extra
+        // tmux subprocess here widens the window between the verified token
+        // match above and `kill_session_verified`'s own re-check below.
+        let observation = match crate::tmux_adoption::observe_pane_dead_state(tmux, &identity.session_name).await {
+            Ok(observation) => observation,
+            Err(err) => {
+                tracing::debug!(
+                    execution_id,
+                    session = %identity.session_name,
+                    error = %format!("{err:#}"),
+                    "reap_tmux_worker: pane-dead probe failed; proceeding with the reap without an observation",
+                );
+                crate::tmux_adoption::TmuxIdentityObservation {
+                    adoption_state: boss_protocol::TmuxAdoptionState::ProbeUnavailable,
+                    pane_dead: None,
+                    pane_dead_status: None,
+                    window_activity_epoch_secs: None,
+                    current_command: None,
+                }
+            }
+        };
         crate::tmux_adoption::persist_observed_pane_state(
             &self.work_db,
             execution_id,

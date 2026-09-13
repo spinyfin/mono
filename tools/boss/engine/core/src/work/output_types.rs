@@ -159,7 +159,8 @@ impl TmuxPaneObservationKind {
 /// [`WorkDb::clear_tmux_identity_for_execution`] nulls the live identity
 /// columns. Self-describing: [`Self::session_name`] is a copy of the
 /// session name at observation time, not the live `tmux_session_name`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct TmuxPaneObservationRecord {
     pub kind: TmuxPaneObservationKind,
     /// `Some(true/false)` only when [`Self::kind`] is [`TmuxPaneObservationKind::Dead`]
@@ -167,6 +168,17 @@ pub struct TmuxPaneObservationRecord {
     pub pane_dead: Option<bool>,
     pub pane_dead_status: Option<String>,
     pub session_name: String,
+    /// The `work_runs.id` this observation was matched against, and the
+    /// epoch-seconds string [`WorkDb::record_tmux_pane_observation`] stamped
+    /// the write with. Both are `None` on the value a caller builds to pass
+    /// *into* that write — the run id and timestamp are only known once the
+    /// write has matched a row — and populated on the value
+    /// [`WorkDb::tmux_pane_observation_for_execution`] hands back, so a
+    /// caller reading the durable row after the fact can tell which run it
+    /// belongs to and when it was taken, rather than trusting it silently
+    /// matches "the current run".
+    pub run_id: Option<String>,
+    pub observed_at: Option<String>,
 }
 
 /// Outcome of [`WorkDb::record_tmux_pane_observation`].

@@ -5,36 +5,14 @@ use super::*;
 use crate::work::{TmuxPaneObservationKind, TmuxPaneObservationRecord};
 use rusqlite::Connection;
 
-fn started_tmux_run(db: &WorkDb) -> (String, String) {
-    let product = create_test_product(db);
-    let chore = create_test_chore(db, product.id.clone(), "Cleanup");
-    let execution = create_ready_chore_execution(db, chore.id.clone());
-    db.start_execution_run(
-        &execution.id,
-        "worker-1",
-        "mono",
-        "lease-1",
-        "mono-agent-001",
-        "/tmp/mono-agent-001",
-    )
-    .unwrap();
-    assert!(
-        db.record_tmux_spawn_intent_for_execution(&execution.id, "boss", "boss-worker-1", "tok-1")
-            .unwrap()
-    );
-    assert!(
-        db.record_tmux_session_created_for_execution(&execution.id, "tok-1", 4242)
-            .unwrap()
-    );
-    (execution.id, "tok-1".to_owned())
-}
-
 fn dead_record() -> TmuxPaneObservationRecord {
     TmuxPaneObservationRecord {
         kind: TmuxPaneObservationKind::Dead,
         pane_dead: Some(true),
         pane_dead_status: Some("0".to_owned()),
         session_name: "boss-worker-1".to_owned(),
+        run_id: None,
+        observed_at: None,
     }
 }
 
@@ -57,7 +35,8 @@ fn migrate_work_runs_tmux_pane_observation_adds_nullable_columns_to_existing_row
                  'tmux_observed_pane_dead',
                  'tmux_observed_pane_dead_status',
                  'tmux_observed_session_name',
-                 'tmux_pane_observation'
+                 'tmux_pane_observation',
+                 'tmux_pane_observation_at'
              )
              ORDER BY name",
         )
@@ -73,29 +52,39 @@ fn migrate_work_runs_tmux_pane_observation_adds_nullable_columns_to_existing_row
             ("tmux_observed_pane_dead_status".to_owned(), 0),
             ("tmux_observed_session_name".to_owned(), 0),
             ("tmux_pane_observation".to_owned(), 0),
+            ("tmux_pane_observation_at".to_owned(), 0),
         ],
-        "all four observation columns must be present and nullable",
+        "all five observation columns must be present and nullable",
     );
 
-    let (pane_dead, status, session, kind): (Option<i64>, Option<String>, Option<String>, Option<String>) = conn
+    let row_values: Vec<Option<String>> = conn
         .query_row(
             "SELECT tmux_observed_pane_dead, tmux_observed_pane_dead_status,
-                    tmux_observed_session_name, tmux_pane_observation
+                    tmux_observed_session_name, tmux_pane_observation, tmux_pane_observation_at
              FROM work_runs WHERE id = 'run_legacy'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok(vec![
+                    row.get::<_, Option<i64>>(0)?.map(|v| v.to_string()),
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ])
+            },
         )
         .unwrap();
-    assert_eq!(pane_dead, None);
-    assert_eq!(status, None);
-    assert_eq!(session, None);
-    assert_eq!(kind, None);
+    assert_eq!(
+        row_values,
+        vec![None, None, None, None, None],
+        "a legacy row must read every observation column (including the new timestamp) as unset",
+    );
 }
 
 #[test]
 fn pane_observation_survives_identity_clear() {
     let db = WorkDb::open(temp_db_path("tmux-pane-observation")).unwrap();
-    let (execution_id, token) = started_tmux_run(&db);
+    let (execution_id, token) = start_tmux_run(&db);
     let record = dead_record();
 
     let outcome = db
@@ -123,18 +112,32 @@ fn pane_observation_survives_identity_clear() {
         .tmux_pane_observation_for_execution(&execution_id)
         .unwrap()
         .expect("observation must remain after identity columns are nulled");
-    assert_eq!(stored, record);
+    assert_eq!(stored.kind, record.kind);
+    assert_eq!(stored.pane_dead, record.pane_dead);
+    assert_eq!(stored.pane_dead_status, record.pane_dead_status);
+    assert_eq!(stored.session_name, record.session_name);
+    assert_eq!(
+        stored.run_id.as_deref(),
+        Some(outcome.run_id.as_str()),
+        "the durable record must name the run it was matched against",
+    );
+    assert!(
+        stored.observed_at.is_some(),
+        "the durable record must carry when the observation was taken",
+    );
 }
 
 #[test]
 fn unreadable_observation_is_not_an_observed_dead_pane() {
     let db = WorkDb::open(temp_db_path("tmux-pane-observation-unreadable")).unwrap();
-    let (execution_id, token) = started_tmux_run(&db);
+    let (execution_id, token) = start_tmux_run(&db);
     let unreadable = TmuxPaneObservationRecord {
         kind: TmuxPaneObservationKind::Unreadable,
         pane_dead: None,
         pane_dead_status: None,
         session_name: "boss-worker-1".to_owned(),
+        run_id: None,
+        observed_at: None,
     };
     db.record_tmux_pane_observation(&execution_id, &token, &unreadable)
         .unwrap();
@@ -155,12 +158,14 @@ fn unreadable_observation_is_not_an_observed_dead_pane() {
 #[test]
 fn session_missing_observation_is_not_an_observed_dead_pane() {
     let db = WorkDb::open(temp_db_path("tmux-pane-observation-absent")).unwrap();
-    let (execution_id, token) = started_tmux_run(&db);
+    let (execution_id, token) = start_tmux_run(&db);
     let absent = TmuxPaneObservationRecord {
         kind: TmuxPaneObservationKind::SessionMissing,
         pane_dead: None,
         pane_dead_status: None,
         session_name: "boss-worker-1".to_owned(),
+        run_id: None,
+        observed_at: None,
     };
     db.record_tmux_pane_observation(&execution_id, &token, &absent).unwrap();
 
@@ -172,7 +177,7 @@ fn session_missing_observation_is_not_an_observed_dead_pane() {
 #[test]
 fn stale_spawn_token_matches_no_row_and_writes_nothing() {
     let db = WorkDb::open(temp_db_path("tmux-pane-observation-stale-token")).unwrap();
-    let (execution_id, _token) = started_tmux_run(&db);
+    let (execution_id, _token) = start_tmux_run(&db);
 
     // A token that changed between probe and write (e.g. a resume minted a
     // new one) matches no `(execution_id, tmux_spawn_token)` row.
@@ -193,7 +198,7 @@ fn stale_spawn_token_matches_no_row_and_writes_nothing() {
 #[test]
 fn latest_run_without_an_observation_does_not_fall_back_to_an_older_run() {
     let db = WorkDb::open(temp_db_path("tmux-pane-observation-current-run-only")).unwrap();
-    let (execution_id, token) = started_tmux_run(&db);
+    let (execution_id, token) = start_tmux_run(&db);
     db.record_tmux_pane_observation(&execution_id, &token, &dead_record())
         .unwrap()
         .expect("the original run must accept its observation");
@@ -226,7 +231,7 @@ fn latest_run_without_an_observation_does_not_fall_back_to_an_older_run() {
 #[test]
 fn dead_observation_is_not_clobbered_by_a_later_alive_poll() {
     let db = WorkDb::open(temp_db_path("tmux-pane-observation-dead-guard")).unwrap();
-    let (execution_id, token) = started_tmux_run(&db);
+    let (execution_id, token) = start_tmux_run(&db);
 
     let dead_outcome = db
         .record_tmux_pane_observation(&execution_id, &token, &dead_record())
@@ -239,6 +244,8 @@ fn dead_observation_is_not_clobbered_by_a_later_alive_poll() {
         pane_dead: Some(false),
         pane_dead_status: None,
         session_name: "boss-worker-1".to_owned(),
+        run_id: None,
+        observed_at: None,
     };
     let alive_outcome = db
         .record_tmux_pane_observation(&execution_id, &token, &alive)
@@ -254,9 +261,12 @@ fn dead_observation_is_not_clobbered_by_a_later_alive_poll() {
         .tmux_pane_observation_for_execution(&execution_id)
         .unwrap()
         .expect("the Dead record must still be present");
+    let expected = dead_record();
+    assert_eq!(stored.kind, expected.kind);
+    assert_eq!(stored.pane_dead, expected.pane_dead);
+    assert_eq!(stored.pane_dead_status, expected.pane_dead_status);
     assert_eq!(
-        stored,
-        dead_record(),
+        stored.session_name, expected.session_name,
         "the durable row must still read as the original Dead observation",
     );
 

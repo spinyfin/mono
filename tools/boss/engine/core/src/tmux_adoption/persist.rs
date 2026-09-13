@@ -319,52 +319,27 @@ fn pane_observation_record(
         pane_dead,
         pane_dead_status,
         session_name: session_name.to_owned(),
+        run_id: None,
+        observed_at: None,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{create_ready_chore_execution, create_test_chore, create_test_product, open_db};
+    use crate::test_support::{open_db, start_tmux_run};
 
-    fn started_tmux_run(work_db: &WorkDb) -> (String, String) {
-        let product = create_test_product(work_db);
-        let chore = create_test_chore(work_db, product.id.clone(), "Cleanup");
-        let execution = create_ready_chore_execution(work_db, chore.id.clone());
-        work_db
-            .start_execution_run(
-                &execution.id,
-                "worker-1",
-                "mono",
-                "lease-1",
-                "mono-agent-001",
-                "/tmp/mono-agent-001",
-            )
-            .unwrap();
-        assert!(
-            work_db
-                .record_tmux_spawn_intent_for_execution(&execution.id, "boss", "boss-worker-1", "tok-1")
-                .unwrap()
-        );
-        assert!(
-            work_db
-                .record_tmux_session_created_for_execution(&execution.id, "tok-1", 4242)
-                .unwrap()
-        );
-        (execution.id, "tok-1".to_owned())
-    }
-
-    /// The race-window case named in review: a spawn token that changed
-    /// between probe and write (e.g. a resume minted a new one) matches no
-    /// `(execution_id, tmux_spawn_token)` row. [`WorkDb::record_tmux_pane_observation`]
-    /// already asserts the underlying `Ok(None)` shape directly; this locks
-    /// in that [`persist_observed_pane_state`] — the wrapper every call site
+    /// A spawn token that changed between probe and write (e.g. a resume
+    /// minted a new one) matches no `(execution_id, tmux_spawn_token)` row.
+    /// [`WorkDb::record_tmux_pane_observation`] already asserts the
+    /// underlying `Ok(None)` shape directly; this locks in that
+    /// [`persist_observed_pane_state`] — the wrapper every call site
     /// actually uses — treats that outcome as a silent no-op rather than a
     /// panic or an error surfaced to the caller.
     #[test]
     fn stale_spawn_token_is_dropped_without_error_or_write() {
         let (_dir, work_db) = open_db();
-        let (execution_id, _current_token) = started_tmux_run(&work_db);
+        let (execution_id, _current_token) = start_tmux_run(&work_db);
 
         persist_observed_pane_state(
             &work_db,

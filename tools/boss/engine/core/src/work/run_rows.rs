@@ -1336,7 +1336,8 @@ impl WorkDb {
              SET tmux_observed_pane_dead = ?2,
                  tmux_observed_pane_dead_status = ?3,
                  tmux_observed_session_name = ?4,
-                 tmux_pane_observation = ?5
+                 tmux_pane_observation = ?5,
+                 tmux_pane_observation_at = ?6
              WHERE id = ?1",
             params![
                 run_id,
@@ -1344,6 +1345,7 @@ impl WorkDb {
                 record.pane_dead_status.as_deref(),
                 record.session_name,
                 record.kind.as_str(),
+                now_string(),
             ],
         )?;
         Ok(Some(TmuxPaneObservationWrite {
@@ -1362,7 +1364,8 @@ impl WorkDb {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT tmux_pane_observation, tmux_observed_pane_dead,
-                    tmux_observed_pane_dead_status, tmux_observed_session_name
+                    tmux_observed_pane_dead_status, tmux_observed_session_name,
+                    id, tmux_pane_observation_at
              FROM work_runs
              WHERE execution_id = ?1
              ORDER BY created_at DESC, id DESC
@@ -1384,6 +1387,8 @@ impl WorkDb {
                     pane_dead: row.get::<_, Option<i64>>(1)?.map(|value| value != 0),
                     pane_dead_status: row.get(2)?,
                     session_name: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    run_id: row.get(4)?,
+                    observed_at: row.get(5)?,
                 }))
             },
         )

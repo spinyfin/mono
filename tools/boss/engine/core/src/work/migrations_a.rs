@@ -575,6 +575,7 @@ pub(crate) fn migrate_work_runs_tmux_pane_observation(conn: &Connection) -> Resu
         ("tmux_observed_pane_dead_status", "TEXT"),
         ("tmux_observed_session_name", "TEXT"),
         ("tmux_pane_observation", "TEXT"),
+        ("tmux_pane_observation_at", "TEXT"),
     ] {
         if !table_has_column(conn, "work_runs", column)? {
             conn.execute(&format!("ALTER TABLE work_runs ADD COLUMN {column} {sql_type}"), [])?;

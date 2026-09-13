@@ -211,10 +211,7 @@ async fn release_worker_pane_reaps_the_tmux_session_for_a_slot_mapped_run() {
 
     let (tmux, runner) = fake_tmux([
         ok("BOSS_SPAWN_TOKEN=tok-y\n"),
-        ok("BOSS_SPAWN_TOKEN=tok-y\n"),
         ok("0"),
-        ok("1738000000"),
-        ok("claude"),
         ok("BOSS_SPAWN_TOKEN=tok-y\n"),
         ok(""),
     ]);
@@ -242,37 +239,11 @@ async fn release_worker_pane_reaps_the_tmux_session_for_a_slot_mapped_run() {
             vec![
                 "-S",
                 boss_tmux::TEST_SOCKET_PATH,
-                "show-environment",
-                "-t",
-                "boss-1-example",
-                "BOSS_SPAWN_TOKEN"
-            ],
-            vec![
-                "-S",
-                boss_tmux::TEST_SOCKET_PATH,
                 "display-message",
                 "-p",
                 "-t",
                 "boss-1-example",
                 "#{pane_dead}"
-            ],
-            vec![
-                "-S",
-                boss_tmux::TEST_SOCKET_PATH,
-                "display-message",
-                "-p",
-                "-t",
-                "boss-1-example",
-                "#{window_activity}"
-            ],
-            vec![
-                "-S",
-                boss_tmux::TEST_SOCKET_PATH,
-                "display-message",
-                "-p",
-                "-t",
-                "boss-1-example",
-                "#{pane_current_command}"
             ],
             vec![
                 "-S",
@@ -290,7 +261,7 @@ async fn release_worker_pane_reaps_the_tmux_session_for_a_slot_mapped_run() {
                 "boss-1-example"
             ],
         ],
-        "the slot-mapped reap path must issue show-environment, the pane-state probe, then kill-session",
+        "the slot-mapped reap path must issue show-environment, the narrow pane-state probe, then kill-session",
     );
 }
 

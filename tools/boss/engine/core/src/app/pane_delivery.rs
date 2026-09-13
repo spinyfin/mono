@@ -76,7 +76,7 @@
 use super::*;
 use crate::tmux_adoption::TmuxIdentityObservation;
 use boss_protocol::WorkerActivity;
-use boss_tmux::{DisplayField, Tmux};
+use boss_tmux::Tmux;
 
 /// Whether a pane write is permitted for a given `(activity, driver)` pair,
 /// and if so at which of the two delivery postures.
@@ -595,28 +595,16 @@ impl ServerState {
         if spawn_token.as_deref() != Some(expected_spawn_token) {
             return Ok(Some(Some("spawn_token_mismatch".to_owned())));
         }
-        let pane_dead = tmux.display_message(session_name, DisplayField::PaneDead).await? == "1";
-        let pane_dead_status = if pane_dead {
-            let status = tmux.display_message(session_name, DisplayField::PaneDeadStatus).await?;
-            (!status.is_empty()).then_some(status)
-        } else {
-            None
-        };
+        let observation = crate::tmux_adoption::observe_pane_dead_state(tmux, session_name).await?;
         crate::tmux_adoption::persist_observed_pane_state(
             work_db,
             execution_id,
             expected_spawn_token,
             session_name,
-            &TmuxIdentityObservation {
-                adoption_state: boss_protocol::TmuxAdoptionState::Adopted,
-                pane_dead: Some(pane_dead),
-                pane_dead_status: pane_dead_status.clone(),
-                window_activity_epoch_secs: None,
-                current_command: None,
-            },
+            &observation,
         );
-        if pane_dead {
-            return Ok(Some(Some(match pane_dead_status {
+        if observation.pane_dead == Some(true) {
+            return Ok(Some(Some(match observation.pane_dead_status {
                 Some(status) => format!("pane_dead_status={status}"),
                 None => "pane_dead".to_owned(),
             })));

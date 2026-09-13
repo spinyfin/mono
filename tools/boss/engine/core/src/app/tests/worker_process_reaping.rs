@@ -149,10 +149,7 @@ async fn release_worker_pane_still_reaps_a_tmux_session_for_a_dead_recorded_pid(
 
     let (tmux, runner) = fake_tmux([
         ok("BOSS_SPAWN_TOKEN=tok-x\n"),
-        ok("BOSS_SPAWN_TOKEN=tok-x\n"),
         ok("0"),
-        ok("1738000000"),
-        ok("claude"),
         ok("BOSS_SPAWN_TOKEN=tok-x\n"),
         ok(""),
     ]);
@@ -183,37 +180,11 @@ async fn release_worker_pane_still_reaps_a_tmux_session_for_a_dead_recorded_pid(
             vec![
                 "-S",
                 boss_tmux::TEST_SOCKET_PATH,
-                "show-environment",
-                "-t",
-                "boss-1-example",
-                "BOSS_SPAWN_TOKEN"
-            ],
-            vec![
-                "-S",
-                boss_tmux::TEST_SOCKET_PATH,
                 "display-message",
                 "-p",
                 "-t",
                 "boss-1-example",
                 "#{pane_dead}"
-            ],
-            vec![
-                "-S",
-                boss_tmux::TEST_SOCKET_PATH,
-                "display-message",
-                "-p",
-                "-t",
-                "boss-1-example",
-                "#{window_activity}"
-            ],
-            vec![
-                "-S",
-                boss_tmux::TEST_SOCKET_PATH,
-                "display-message",
-                "-p",
-                "-t",
-                "boss-1-example",
-                "#{pane_current_command}"
             ],
             vec![
                 "-S",
