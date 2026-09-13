@@ -748,6 +748,10 @@ impl WorkDb {
         step!(timer, conn, guide_feedback::migrate_guide_feedback_outcomes)?;
         step!(timer, conn, execution_bookmarks::migrate_execution_bookmarks)?;
         step!(timer, conn, migrate_work_executions_last_error)?;
+        // Read-time metric series: window filters on `finished_at`/`kind`
+        // and `work_runs.created_at`. Additive `CREATE INDEX IF NOT EXISTS`;
+        // rides the current schema marker.
+        step!(timer, conn, migrate_metric_series_indexes)?;
         step!(timer, conn, Self::stamp_schema_version)?;
         timer.finish();
         Ok(())
@@ -1140,6 +1144,20 @@ mod tests {
         assert!(
             work_attachments_exists,
             "expected work_attachments table from migrate_work_attachments_table"
+        );
+
+        let metric_series_indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index'
+                   AND name IN ('work_executions_kind_finished_at_idx', 'work_runs_created_at_idx')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            metric_series_indexes, 2,
+            "expected metric-series window indexes from migrate_metric_series_indexes"
         );
 
         let pr_review_verdicts_exists: bool = conn
