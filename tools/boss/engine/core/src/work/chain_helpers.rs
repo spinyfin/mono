@@ -39,6 +39,52 @@ pub(crate) fn is_moot_revision_kind(created_via: &str) -> bool {
     created_via.starts_with(CREATED_VIA_MERGE_CONFLICT_PREFIX) || created_via.starts_with(CREATED_VIA_CI_FIX_PREFIX)
 }
 
+/// Walk bound used by [`chain_root`]: 64 iterations visit depths 0..=63.
+pub(crate) const MAX_CHAIN_DEPTH: usize = 64;
+
+/// SQLite recursive-term bound matching [`MAX_CHAIN_DEPTH`]. The recursive
+/// arm extends the current row (`depth + 1`), so `depth < 63` emits at most
+/// depth 63 — one hop past that would overshoot the Rust walk. A previous
+/// copy of this CTE in `list_tasks_awaiting_pre_merge_review_admission` used
+/// `depth < 64` and could visit depth 64.
+pub(crate) const CYCLE_ROOT_WALK_SQL_DEPTH_BOUND: usize = MAX_CHAIN_DEPTH - 1;
+
+/// SQL `WITH RECURSIVE` fragment that resolves each matching task's
+/// review-cycle root the same way [`chain_root`] /
+/// [`WorkDb::review_cycle_root_id`] do: walk `parent_task_id` while
+/// `kind = 'revision'`, then pick the deepest visited row.
+///
+/// `base_filter_sql` is the base-case `WHERE` on `tasks t` (a caller-supplied
+/// SQL literal, never user input). The recursive arm and the `roots` CTE are
+/// shared so the two consumers (`list_orphan_active_candidates` and
+/// `list_tasks_awaiting_pre_merge_review_admission`) cannot drift on the
+/// depth bound again.
+///
+/// The fragment defines `walk` and `roots` (`roots.task_id`,
+/// `roots.cycle_root_id`). Callers append their `SELECT`.
+pub(crate) fn cycle_root_walk_cte(base_filter_sql: &str) -> String {
+    format!(
+        "WITH RECURSIVE walk(task_id, current_id, kind, parent_task_id, depth) AS (
+             SELECT t.id, t.id, t.kind, t.parent_task_id, 0
+             FROM tasks t
+             WHERE {base_filter_sql}
+             UNION ALL
+             SELECT walk.task_id, parent.id, parent.kind, parent.parent_task_id, walk.depth + 1
+             FROM walk
+             JOIN tasks parent ON parent.id = walk.parent_task_id
+             WHERE walk.kind = 'revision' AND walk.depth < {bound}
+         ),
+         roots AS (
+             SELECT w.task_id, w.current_id AS cycle_root_id
+             FROM walk w
+             WHERE w.depth = (
+                 SELECT MAX(w2.depth) FROM walk w2 WHERE w2.task_id = w.task_id
+             )
+         )",
+        bound = CYCLE_ROOT_WALK_SQL_DEPTH_BOUND,
+    )
+}
+
 /// Walk `tasks.parent_task_id` from `task_id` to find the originating
 /// non-revision task (the "chain root") — the task that owns the PR.
 ///
@@ -53,11 +99,10 @@ pub(crate) fn is_moot_revision_kind(created_via: &str) -> bool {
 /// caller receives the last successfully-resolved ID, which is the closest
 /// meaningful root we have. This matches the design doc (R8 mitigation).
 ///
-/// **Cycle guard**: the walk is bounded by `MAX_CHAIN_DEPTH` to prevent an
+/// **Cycle guard**: the walk is bounded by [`MAX_CHAIN_DEPTH`] to prevent an
 /// infinite loop if the data is corrupt. Hitting the cap is treated as a
 /// broken-parent condition — the deepest reached ID is returned.
 pub(crate) fn chain_root(conn: &Connection, task_id: &str) -> Result<String> {
-    const MAX_CHAIN_DEPTH: usize = 64;
     // `last_resolved` tracks the most recent ID that was successfully found
     // in the DB. We advance it only after a successful lookup so that if the
     // next candidate is missing we can return the last good one.
@@ -761,5 +806,20 @@ mod tests {
             root == a || root == b,
             "a corrupt parent cycle must terminate at a reachable id, got {root}"
         );
+    }
+
+    #[test]
+    fn cycle_root_walk_cte_uses_the_shared_depth_bound() {
+        let sql = cycle_root_walk_cte("t.status = 'active'");
+        assert!(
+            sql.contains(&format!("walk.depth < {CYCLE_ROOT_WALK_SQL_DEPTH_BOUND}")),
+            "shared CTE must splice CYCLE_ROOT_WALK_SQL_DEPTH_BOUND, got {sql}"
+        );
+        assert!(
+            !sql.contains("walk.depth < 64"),
+            "the SQL bound is MAX_CHAIN_DEPTH-1 so the walk cannot emit depth 64"
+        );
+        assert!(sql.contains("WHERE t.status = 'active'"));
+        assert!(sql.contains("w.current_id AS cycle_root_id"));
     }
 }

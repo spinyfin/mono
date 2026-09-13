@@ -767,6 +767,37 @@ impl WorkDb {
     /// already-open PR instead of re-running the reviewer. Those items are
     /// handled exclusively by [`crate::pr_review_recovery`], which creates
     /// the correct `pr_review` execution kind.
+    ///
+    /// Also excludes a task **deliberately held** `active` pending an
+    /// automated review pass: `completion/pr_transition.rs`'s
+    /// `ReviewerEnqueued` path leaves the producing task `active` with no
+    /// live execution while a `pr_review_batches` row runs the review, and
+    /// that is legitimate hold state, not an orphan. The exclusion is a
+    /// non-terminal (`collecting`/`supervising`/`applying`) **pre_merge**
+    /// batch on the task's review-cycle root (resolved the same way
+    /// [`WorkDb::review_cycle_root_id`] does: walk `parent_task_id` while
+    /// `kind = 'revision'`, via the shared [`super::cycle_root_walk_cte`]).
+    /// This matches
+    /// [`Self::list_tasks_awaiting_pre_merge_review_admission`]'s live-batch
+    /// predicate, with one extra freshness check: the live batch only masks
+    /// while the held task's latest producer `work_executions.pr_head_after`
+    /// is unknown or still equals `b.target_sha`. "Latest" is the newest
+    /// non-`pr_review` row by `finished_at`/`id`, **including** a NULL or
+    /// empty stamp — `fetch_pr_head_after` is fail-open, so an older known
+    /// SHA must not stand in for a newer unknown head. That column is
+    /// written by `record_worker_pr_completion` at hold time (unlike
+    /// `tasks.pr_head_sha`, which the hold path never stamps and the merge
+    /// poller does not probe on `active` rows). A later producer completion
+    /// that records a different head restores orphan-sweep visibility
+    /// without waiting for the batch-stale reaper. An unknown
+    /// `pr_head_after` still excludes, so the common first-PR hold (fetch
+    /// failed, or a test that does not stamp the column) is not treated as
+    /// an orphan. The COALESCE-to-`target_sha` fallback lives *inside* the
+    /// latest-producer SELECT, so a task with no producer row at all does
+    /// not inherit a sibling's live batch — multiple active task rows can
+    /// share one `cycle_root_id` (a chain root plus a revision). Scoping to
+    /// non-terminal status still clears the hold the moment the batch
+    /// reaches `completed`/`failed`.
     pub fn list_orphan_active_candidates(&self, min_age_secs: i64) -> Result<Vec<String>> {
         let conn = self.connect()?;
         let now_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
@@ -792,8 +823,11 @@ impl WorkDb {
         // and reconcile such a row to `orphaned`/`abandoned`. This query
         // legitimately picks the work item up on the pass after that.
         let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
+        let walk = super::cycle_root_walk_cte("t.status = 'active'\n               AND t.deleted_at IS NULL");
         let stmt_sql = format!(
-            "SELECT t.id FROM tasks t
+            "{walk}
+             SELECT t.id FROM tasks t
+             JOIN roots ON roots.task_id = t.id
              WHERE t.status = 'active'
                AND t.deleted_at IS NULL
                AND CAST(t.updated_at AS INTEGER) < ?1
@@ -824,7 +858,22 @@ impl WorkDb {
                                 OR (we2.created_at = we.created_at AND we2.id > we.id))
                      )
                )
+               AND NOT EXISTS (
+                   SELECT 1 FROM pr_review_batches b
+                   WHERE b.cycle_root_id = roots.cycle_root_id
+                     AND b.phase = 'pre_merge'
+                     AND b.status NOT IN ('completed', 'failed')
+                     AND (
+                           SELECT COALESCE(NULLIF(we.pr_head_after, ''), b.target_sha)
+                           FROM work_executions we
+                           WHERE we.work_item_id = t.id
+                             AND we.kind != 'pr_review'
+                           ORDER BY we.finished_at DESC, we.id DESC
+                           LIMIT 1
+                         ) = b.target_sha
+               )
              ORDER BY t.updated_at ASC, t.id ASC",
+            walk = walk,
             permanent = ATTENTION_KIND_RECOVERY_PERMANENT,
             exhausted = ATTENTION_KIND_RECOVERY_EXHAUSTED,
         );

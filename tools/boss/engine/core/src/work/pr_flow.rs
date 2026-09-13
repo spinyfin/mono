@@ -695,26 +695,18 @@ impl WorkDb {
         let inertia_cutoff = (boss_engine_utils::epoch_time::now_epoch_secs() as u64)
             .saturating_sub(super::REVIEW_BATCH_STALE_SECS)
             .to_string();
-        let sql = "WITH RECURSIVE walk(task_id, current_id, kind, parent_task_id, depth) AS (
-               SELECT t.id, t.id, t.kind, t.parent_task_id, 0
-               FROM tasks t
-               WHERE t.status = 'active'
+        // Shared with `list_orphan_active_candidates`: same walk, same
+        // `CYCLE_ROOT_WALK_SQL_DEPTH_BOUND` (`MAX_CHAIN_DEPTH - 1`). The
+        // previous inlined copy used `depth < 64`, which could emit depth 64
+        // and overshoot [`super::chain_root`].
+        let walk = super::cycle_root_walk_cte(
+            "t.status = 'active'
                  AND t.pr_url IS NOT NULL
                  AND t.pr_url != ''
-                 AND t.deleted_at IS NULL
-               UNION ALL
-               SELECT walk.task_id, parent.id, parent.kind, parent.parent_task_id, walk.depth + 1
-               FROM walk
-               JOIN tasks parent ON parent.id = walk.parent_task_id
-               WHERE walk.kind = 'revision' AND walk.depth < 64
-             ),
-             roots AS (
-               SELECT w.task_id, w.current_id AS cycle_root_id
-               FROM walk w
-               WHERE w.depth = (
-                 SELECT MAX(w2.depth) FROM walk w2 WHERE w2.task_id = w.task_id
-               )
-             )
+                 AND t.deleted_at IS NULL",
+        );
+        let sql = format!(
+            "{walk}
              SELECT t.id, t.product_id, t.pr_url,
                     COALESCE(
                       NULLIF(p.repo_remote_url, ''),
@@ -760,8 +752,10 @@ impl WorkDb {
                      )
                      OR t.updated_at < ?1
                    )
-             ORDER BY t.updated_at ASC";
-        let mut stmt = conn.prepare(sql)?;
+             ORDER BY t.updated_at ASC",
+            walk = walk
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([inertia_cutoff], |row| {
             Ok(DeferredReviewAdmissionCandidate {
                 task_id: row.get(0)?,
