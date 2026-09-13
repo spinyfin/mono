@@ -129,6 +129,7 @@ mod review;
 mod selected_product;
 mod server;
 mod sessions;
+mod shutdown;
 mod subscriptions;
 #[cfg(test)]
 mod tests;
@@ -2240,52 +2241,6 @@ impl ServerState {
         // A live process was signalled, so this IS a reap: the caller may free
         // the workspace lease.
         PaneReleaseOutcome::Reaped
-    }
-
-    /// Release every live worker pane the engine knows about. Called
-    /// from the engine-shutdown path: walks
-    /// `LiveWorkerStateRegistry::snapshot()` and dispatches
-    /// [`ServerState::release_worker_pane`] for each `run_id` in
-    /// parallel. The app teardown is the primary mechanism — once the
-    /// pane is released the worker shell exits and `claude` exits
-    /// with it.
-    ///
-    /// `total_timeout` bounds the whole walk. Each individual
-    /// `release_worker_pane` call already has its own ~5s round-trip
-    /// budget against the app, but on shutdown we'd rather forcibly
-    /// move on than block the engine exit on an unresponsive app.
-    ///
-    /// After the bounded join we send a best-effort `SIGTERM` (then
-    /// `SIGKILL` after `kill_grace`) to every recorded `shell_pid > 0`
-    /// — covers the case where the app is gone or didn't ack in time
-    /// and the shell would otherwise be reparented to launchd.
-    pub async fn shutdown_workers(self: &Arc<Self>, total_timeout: Duration, kill_grace: Duration) {
-        let snapshot = self.live_worker_states.snapshot();
-        if snapshot.is_empty() {
-            tracing::info!("shutdown_workers: no live workers to release");
-            return;
-        }
-        tracing::info!(count = snapshot.len(), "shutdown_workers: releasing live worker panes",);
-        let mut set = tokio::task::JoinSet::new();
-        for state in &snapshot {
-            let server = Arc::clone(self);
-            let run_id = state.run_id.clone();
-            set.spawn(async move {
-                server.release_worker_pane(&run_id).await;
-            });
-        }
-        let join_all = async { while set.join_next().await.is_some() {} };
-        if tokio::time::timeout(total_timeout, join_all).await.is_err() {
-            tracing::warn!(
-                timeout_secs = total_timeout.as_secs(),
-                "shutdown_workers: release timed out; falling back to direct kill",
-            );
-        }
-        let pids: Vec<libc::pid_t> = snapshot
-            .iter()
-            .filter_map(|s| (s.shell_pid > 0).then_some(s.shell_pid as libc::pid_t))
-            .collect();
-        signal_shell_pids(&pids, kill_grace);
     }
 
     fn current_work_revision(&self) -> u64 {

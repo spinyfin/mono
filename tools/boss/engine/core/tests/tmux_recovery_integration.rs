@@ -38,6 +38,7 @@ use boss_protocol::{
     RequestExecutionInput, WorkerEvent,
 };
 use boss_tmux::{KillSessionOutcome, Tmux};
+use tmux_fixture::{TmuxServerGuard, declared_tmux_binary, write_fixture_shell};
 
 const REPAINTING_WORKER: &str = include_str!("fixtures/repainting-worker.sh");
 const SHORT_WINDOW: Duration = Duration::from_secs(1);
@@ -199,63 +200,6 @@ impl StaleWorkerReaper for FixtureTmuxReaper {
     }
 }
 
-fn write_repainting_shell(root: &Path) -> Result<PathBuf> {
-    let shell_path = root.join("repainting-worker.sh");
-    std::fs::write(&shell_path, REPAINTING_WORKER)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&shell_path)?.permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&shell_path, permissions)?;
-    }
-    Ok(shell_path)
-}
-
-/// Resolves the sole host executable intentionally declared as data for this
-/// target. The test sandbox canonicalizes executable runfiles, so this keeps
-/// the production tmux binary available without widening every test's PATH.
-fn declared_tmux_binary() -> Result<PathBuf> {
-    let test_srcdir = PathBuf::from(std::env::var("TEST_SRCDIR")?);
-    let host_tmux_runfiles = std::fs::read_dir(&test_srcdir)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .is_some_and(|name| name.to_string_lossy().ends_with("host_tmux"))
-        })
-        .ok_or_else(|| anyhow!("Bazel did not provide the declared host tmux runfiles"))?;
-    let tmux = host_tmux_runfiles.join("tmux");
-    if !tmux.is_file() {
-        bail!("the declared tmux binary is unavailable at {}", tmux.display());
-    }
-    Ok(tmux)
-}
-
-/// Kills the private tmux server this fixture started, on drop.
-///
-/// `prepare_server`'s `exit-empty=off` (the fix this target exists to cover)
-/// deliberately stops the server from self-terminating once its last
-/// session is killed, so without this guard every run of this test leaks a
-/// tmux server process and its unlinked socket. Uses a plain synchronous
-/// `Command` rather than [`Tmux::kill_server`] so teardown still runs from a
-/// panicking assertion's unwind, with no dependency on the tokio runtime
-/// still being in a state that can drive an async call.
-struct TmuxServerGuard {
-    program: PathBuf,
-    socket: PathBuf,
-}
-
-impl Drop for TmuxServerGuard {
-    fn drop(&mut self) {
-        let _ = std::process::Command::new(&self.program)
-            .arg("-S")
-            .arg(&self.socket)
-            .arg("kill-server")
-            .output();
-    }
-}
-
 async fn wait_for_repaint(tmux: &Tmux, session_name: &str) -> Result<(i64, String)> {
     let first_activity = tmux
         .display_message(session_name, boss_tmux::DisplayField::WindowActivity)
@@ -286,7 +230,7 @@ async fn production_tmux_recovery_ignores_repaint_and_process_title_then_redispa
     std::fs::create_dir(&workspace)?;
     let home = temp.path().join("home");
     std::fs::create_dir(&home)?;
-    let repainting_shell = write_repainting_shell(temp.path())?;
+    let repainting_shell = write_fixture_shell(temp.path(), "repainting-worker.sh", REPAINTING_WORKER)?;
     let _home = boss_engine::driver::test_support::home_override(&home);
     let _shell = boss_engine::driver::test_support::shell_override(&repainting_shell);
 
@@ -320,10 +264,7 @@ async fn production_tmux_recovery_ignores_repaint_and_process_title_then_redispa
     let tmux_socket = temp.path().join("private.tmux.sock");
     let tmux_binary = declared_tmux_binary()?;
     let tmux = Tmux::from_path_with_socket(tmux_binary.clone(), &tmux_socket)?;
-    let _tmux_server_guard = TmuxServerGuard {
-        program: tmux_binary,
-        socket: tmux_socket,
-    };
+    let _tmux_server_guard = TmuxServerGuard::new(tmux_binary, tmux_socket);
     let session_name = "boss-worker-1-recovery-fixture".to_owned();
     let spawn_store: Arc<dyn boss_engine::spawn_flow::TmuxSpawnStore> = work_db.clone();
     let attaching_spawner = AttachingSpawner::default();

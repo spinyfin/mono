@@ -472,6 +472,23 @@ rust_test(
     ),
 )
 
+# Shared tmux-server lifecycle helpers for the two private-tmux integration
+# tests below (declared binary resolution, kill-on-drop server guard,
+# parameterized fixture-shell writer). A real testonly library rather than
+# `srcs` compiled into each binary so unused-pub items are not dead code.
+rust_library(
+    name = "tmux_fixture",
+    testonly = True,
+    srcs = ["tests/tmux_fixture.rs"],
+    crate_root = "tests/tmux_fixture.rs",
+    edition = "2024",
+    visibility = ["//visibility:private"],
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 # Drives the production local spawn and recovery chain against a private tmux
 # server. The fixture redraws continuously with a non-driver process title,
 # then exercises restart adoption, token-verified stale reaping, lease/slot
@@ -505,6 +522,42 @@ rust_test(
     tags = ["manual"],
     deps = [
         ":engine_lib",
+        ":tmux_fixture",
+        "//tools/boss/protocol",
+        "//tools/boss/tmux",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# Genuine end-to-end restart drill: boots the real `serve()` entry point
+# twice against a real private tmux server and a real worker OS process,
+# driving shutdown through the actual `Shutdown` RPC rather than a direct
+# call into `ServerState::shutdown_workers`. See the test file's module doc
+# for what this proves and why a unit test alone does not discharge it.
+rust_test(
+    name = "tmux_engine_restart_drill_integration_test",
+    size = "medium",
+    timeout = "moderate",
+    srcs = ["tests/tmux_engine_restart_drill_integration.rs"],
+    compile_data = ["tests/fixtures/still-working.sh"],
+    # Same rationale as `tmux_recovery_integration_test`: test-local declared
+    # tmux runfiles, not a shared host capability.
+    data = ["@host_tmux//:tmux"],
+    edition = "2024",
+    env = {"HOME": "/tmp"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    # Same `bazel-any` host-tmux-availability rationale as
+    # `tmux_recovery_integration_test` above.
+    tags = ["manual"],
+    deps = [
+        ":engine_lib",
+        ":tmux_fixture",
+        "//tools/boss/client",
         "//tools/boss/protocol",
         "//tools/boss/tmux",
     ] + all_crate_deps(
