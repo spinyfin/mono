@@ -20,23 +20,26 @@
 //!   `cancelled` — deliberately excludes `completed`, which is the
 //!   canonical record of shipped work and comparatively rare next to the
 //!   retry/abort noise this exists to bound), AND
-//! - never started (`started_at IS NULL`) — a row that actually spawned a
-//!   worker carries diagnostic weight (logs, cost, transcripts) that a
-//!   pre-spawn abort never accumulates, so once work has started its
-//!   terminal row is kept indefinitely regardless of age or status, AND
+//! - never started (`started_at IS NULL`) — `started_at` is recorded only
+//!   when a worker run actually begins. A row with a real worker run carries
+//!   diagnostic weight (logs, cost, transcripts) that a pre-spawn abort
+//!   never accumulates, so it is kept indefinitely regardless of age or
+//!   status, AND
 //! - older than [`ExecutionRetentionPolicy::max_age_secs`], AND
 //! - outside the most recent [`ExecutionRetentionPolicy::keep_per_work_item`]
-//!   prunable executions for their work item.
+//!   never-started prunable executions for their work item.
 //!
 //! The last condition is the diagnostics floor: incident forensics (T2217,
 //! T2233) leaned heavily on recent failure history, so a work item that
 //! fails repeatedly always keeps its most recent failures on hand even
-//! once they cross the age bound — only the long tail beyond the floor is
-//! ever removed. A later successful (`completed`) execution of the same
-//! work item does not itself delete anything; it is superseded implicitly
-//! once its sibling failures age out or fall outside the keep-window,
-//! which is simpler to reason about than an explicit "superseded by a
-//! later success" join and produces the same practical outcome.
+//! once they cross the age bound — only the long never-started tail beyond
+//! the floor is ever removed. Rows with a real worker run do not compete
+//! for that floor because they are never prunable. A later successful
+//! (`completed`) execution of the same work item does not itself delete
+//! anything; it is superseded implicitly once its never-started sibling
+//! failures age out or fall outside the keep-window, which is simpler to
+//! reason about than an explicit "superseded by a later success" join and
+//! produces the same practical outcome.
 //!
 //! `work_runs.execution_id`, `work_attention_items.execution_id`, and
 //! `worker_proposals.execution_id` are all `ON DELETE CASCADE`, so a pruned
@@ -143,10 +146,11 @@ fn prune_terminal_executions_on(
     dry_run: bool,
 ) -> Result<ExecutionPruneOutcome> {
     let cutoff = now_epoch.saturating_sub(policy.max_age_secs);
-    // The keep-window is computed over prunable-status rows only (a
-    // `completed` execution never occupies a `keep_per_work_item` slot),
-    // ranked newest-first per work item so `rn <= keep_per_work_item`
-    // picks the most recent ones.
+    // The keep-window is computed only over never-started rows in a
+    // prunable status: `completed` executions and rows with real worker
+    // runs never occupy a `keep_per_work_item` slot. Rows are ranked
+    // newest-first per work item so `rn <= keep_per_work_item` picks the
+    // most recent ones.
     let candidates_sql = format!(
         "SELECT id FROM work_executions
           WHERE status IN ({PRUNABLE_STATUSES_SQL})
@@ -569,6 +573,78 @@ mod tests {
             "a started execution's diagnostic weight (logs/cost/transcripts) is kept indefinitely"
         );
         assert_eq!(db.list_executions(Some(&work_item_id)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prunes_an_old_permanent_pre_start_failure() {
+        let db = open_db();
+        let product_id = create_test_product_with_repo(&db, "p", Some("https://github.com/test/repo")).id;
+        let work_item_id = create_chore(&db, &product_id, "c1");
+        let now = 1_800_000_000i64;
+        let execution = db
+            .request_execution(RequestExecutionInput::builder().work_item_id(&work_item_id).build())
+            .unwrap();
+
+        let (terminal, _run, outcome) = db
+            .record_pre_start_failure(&execution.id, "worker-1", Some("repo-1"), "workspace lease failed", &[])
+            .unwrap();
+        assert!(matches!(outcome, PreStartFailureOutcome::PermanentFail));
+        assert!(
+            terminal.started_at.is_none(),
+            "a pre-start terminalization must not claim that a worker ran"
+        );
+
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_executions SET created_at = ?2 WHERE id = ?1",
+            rusqlite::params![execution.id, (now - 20 * DAY).to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let outcome = db
+            .prune_terminal_executions(
+                ExecutionRetentionPolicy {
+                    max_age_secs: DEFAULT_RETENTION_MAX_AGE_SECS,
+                    keep_per_work_item: 0,
+                },
+                now,
+                false,
+            )
+            .unwrap();
+        assert_eq!(outcome.deleted, 1);
+        assert!(db.list_executions(Some(&work_item_id)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn started_sibling_does_not_consume_never_started_keep_floor_slot() {
+        let db = open_db();
+        let product_id = create_test_product_with_repo(&db, "p", Some("https://github.com/test/repo")).id;
+        let work_item_id = create_chore(&db, &product_id, "c1");
+        let now = 1_800_000_000i64;
+        let started_id = insert_execution(&db, &work_item_id, "failed", now - 20 * DAY);
+        db.force_started_at_for_test(&started_id, now - 20 * DAY).unwrap();
+        let never_started_id = insert_execution(&db, &work_item_id, "abandoned", now - 21 * DAY);
+
+        let outcome = db
+            .prune_terminal_executions(
+                ExecutionRetentionPolicy {
+                    max_age_secs: DEFAULT_RETENTION_MAX_AGE_SECS,
+                    keep_per_work_item: 1,
+                },
+                now,
+                false,
+            )
+            .unwrap();
+        assert_eq!(outcome.deleted, 0, "the never-started row owns the keep-1 slot");
+        let remaining_ids: Vec<_> = db
+            .list_executions(Some(&work_item_id))
+            .unwrap()
+            .into_iter()
+            .map(|execution| execution.id)
+            .collect();
+        assert!(remaining_ids.contains(&started_id));
+        assert!(remaining_ids.contains(&never_started_id));
     }
 
     #[test]

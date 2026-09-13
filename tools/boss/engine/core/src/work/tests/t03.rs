@@ -102,6 +102,7 @@ fn records_failed_execution_start_attempt() {
     assert_eq!(execution.cube_repo_id.as_deref(), Some("mono"));
     assert!(execution.cube_lease_id.is_none());
     assert!(execution.workspace_path.is_none());
+    assert!(execution.started_at.is_none());
     assert!(execution.finished_at.is_some());
     assert_eq!(run.status, "failed");
     assert_eq!(run.error_text.as_deref(), Some("cube workspace lease failed"));

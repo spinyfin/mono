@@ -1671,7 +1671,6 @@ impl WorkDb {
                  cube_lease_id = NULL,
                  cube_workspace_id = NULL,
                  workspace_path = NULL,
-                 started_at = COALESCE(started_at, ?3),
                  finished_at = ?3
              WHERE id = ?1",
             params![execution_id, cube_repo_id, now],
@@ -1794,7 +1793,6 @@ impl WorkDb {
                      cube_lease_id = NULL,
                      cube_workspace_id = NULL,
                      workspace_path = NULL,
-                     started_at = COALESCE(started_at, ?4),
                      finished_at = ?4
                  WHERE id = ?1
                    AND status IN ('ready', 'claimed')",
