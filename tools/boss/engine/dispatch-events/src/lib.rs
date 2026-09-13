@@ -829,6 +829,30 @@ pub enum Stage {
     /// `outcome=skipped` means a pane was already present. `details` carries
     /// `reason` and, when relevant, the oracle diagnostic.
     StartupPaneRespawn,
+    /// The engine's file-tailing progress ingress (a `ProgressIngress::AgentJsonlFile`
+    /// driver such as Codex, whose "hook events" are synthesized from the
+    /// rollout the engine tails rather than delivered over the events socket)
+    /// identified and attached to this run's rollout. `details` carries the
+    /// rollout `path`, the driver `session_id`, and `discovery_secs` — how
+    /// long after activation the rollout appeared. Before this stage existed
+    /// the only trace of a late rollout was the `transcript_path` column
+    /// going non-null, so the distribution of startup latency under
+    /// admission bursts was invisible.
+    FileIngressAttached,
+    /// The file ingress has been discovering for longer than its overdue
+    /// threshold without attaching. Discovery keeps going (the run's own
+    /// teardown is what ends it), so this is a warning, not a verdict:
+    /// `details` names the `root` being watched, `waited_secs`, and how many
+    /// new files matched the rollout name pattern but failed correlation.
+    /// A run that later reaps on `driver_start_timeout` with this record on
+    /// its timeline was a driver that started but was never observed — not
+    /// a driver that never started.
+    FileIngressDiscoveryOverdue,
+    /// The file ingress gave up on discovery: the watched root changed
+    /// identity, a scan failed, or more than one new rollout correlated to
+    /// this one run (`details.reason`). The run stays live but unobserved
+    /// until it is reaped or re-adopted; readoption re-arms discovery.
+    FileIngressDiscoveryFailed,
 }
 
 /// How a dispatch record participates in an execution timeline.
@@ -844,7 +868,7 @@ pub enum TimelineStageClass {
 
 impl Stage {
     /// Every stable stage name, for exhaustive schema-contract tests.
-    pub const ALL: [Stage; 62] = [
+    pub const ALL: [Stage; 65] = [
         Stage::StatusTransition,
         Stage::RequestRecorded,
         Stage::WorkerClaimed,
@@ -907,6 +931,9 @@ impl Stage {
         Stage::TmuxTokenMismatch,
         Stage::TmuxAdoptionOwnerConflict,
         Stage::StartupPaneRespawn,
+        Stage::FileIngressAttached,
+        Stage::FileIngressDiscoveryOverdue,
+        Stage::FileIngressDiscoveryFailed,
     ];
 
     /// Classify this stage's effect on an execution timeline.
@@ -988,6 +1015,9 @@ impl Stage {
             Stage::TmuxTokenMismatch => "tmux_token_mismatch",
             Stage::TmuxAdoptionOwnerConflict => "tmux_adoption_owner_conflict",
             Stage::StartupPaneRespawn => "startup_pane_respawn",
+            Stage::FileIngressAttached => "file_ingress_attached",
+            Stage::FileIngressDiscoveryOverdue => "file_ingress_discovery_overdue",
+            Stage::FileIngressDiscoveryFailed => "file_ingress_discovery_failed",
         }
     }
 
@@ -1106,7 +1136,14 @@ impl Stage {
             | Stage::TmuxRefuseSkew
             | Stage::TmuxLeakDetected
             | Stage::TmuxTokenMismatch
-            | Stage::TmuxAdoptionOwnerConflict => true,
+            | Stage::TmuxAdoptionOwnerConflict
+            // ---- Post-dispatch: the file-tailing ingress reporting on a
+            // pane that already exists. Observations of a live spawn, never
+            // pipeline progress — an overdue discovery must not look like a
+            // dispatch that is stuck before pane spawn. -----------------
+            | Stage::FileIngressAttached
+            | Stage::FileIngressDiscoveryOverdue
+            | Stage::FileIngressDiscoveryFailed => true,
         }
     }
 }
@@ -1886,6 +1923,15 @@ mod tests {
             "tmux_adoption_owner_conflict"
         );
         assert_eq!(Stage::StartupPaneRespawn.as_str(), "startup_pane_respawn");
+        assert_eq!(Stage::FileIngressAttached.as_str(), "file_ingress_attached");
+        assert_eq!(
+            Stage::FileIngressDiscoveryOverdue.as_str(),
+            "file_ingress_discovery_overdue"
+        );
+        assert_eq!(
+            Stage::FileIngressDiscoveryFailed.as_str(),
+            "file_ingress_discovery_failed"
+        );
         assert_eq!(Stage::ExecutionFinalized.as_str(), "execution_finalized");
     }
 
@@ -1924,7 +1970,17 @@ mod tests {
                 stage.as_str()
             );
         }
-        for stage in [Stage::TmuxAdopt, Stage::ExecutionFinalized, Stage::DeadPidReconcile] {
+        for stage in [
+            Stage::TmuxAdopt,
+            Stage::ExecutionFinalized,
+            Stage::DeadPidReconcile,
+            // The file ingress reports on a pane that already exists. An
+            // overdue discovery is a late driver, not a stuck dispatch — the
+            // 2026-09-13 breaker-incident chores were exactly that.
+            Stage::FileIngressAttached,
+            Stage::FileIngressDiscoveryOverdue,
+            Stage::FileIngressDiscoveryFailed,
+        ] {
             assert_eq!(
                 stage.timeline_class(),
                 TimelineStageClass::PostDispatch,

@@ -59,6 +59,73 @@ impl crate::stdout_progress::WorkerEventSink for Arc<ServerState> {
     async fn dispatch_worker_event(&self, incoming: crate::events_socket::IncomingHookEvent) {
         dispatch_worker_event_fanout(self, &incoming).await;
     }
+
+    /// Put the milestone on the run's dispatch timeline so `bossctl dispatch`
+    /// can answer "did the engine ever attach to this worker's rollout, and
+    /// how long did that take?" — the question the 2026-09-13 breaker
+    /// incident's two prior investigations could not answer from the run
+    /// row alone.
+    async fn record_ingress_observation(
+        &self,
+        run_id: &str,
+        observation: crate::agent_jsonl_progress::IngressObservation,
+    ) {
+        use crate::agent_jsonl_progress::IngressObservation;
+        use crate::dispatch_events::{DispatchEvent, Outcome, Stage};
+
+        let (stage, outcome, details) = match observation {
+            IngressObservation::Attached {
+                path,
+                session_id,
+                discovery_secs,
+            } => (
+                Stage::FileIngressAttached,
+                Outcome::Ok,
+                serde_json::json!({
+                    "path": path.display().to_string(),
+                    "session_id": session_id,
+                    "discovery_secs": discovery_secs,
+                }),
+            ),
+            IngressObservation::DiscoveryOverdue {
+                root,
+                waited_secs,
+                rejected_candidates,
+            } => (
+                Stage::FileIngressDiscoveryOverdue,
+                Outcome::Ok,
+                serde_json::json!({
+                    "root": root.display().to_string(),
+                    "waited_secs": waited_secs,
+                    "rejected_candidates": rejected_candidates,
+                    "overdue_after_secs": crate::agent_jsonl_progress::DISCOVERY_OVERDUE_AFTER.as_secs(),
+                }),
+            ),
+            IngressObservation::DiscoveryFailed {
+                root,
+                waited_secs,
+                rejected_candidates,
+                reason,
+            } => (
+                Stage::FileIngressDiscoveryFailed,
+                Outcome::Error,
+                serde_json::json!({
+                    "root": root.display().to_string(),
+                    "waited_secs": waited_secs,
+                    "rejected_candidates": rejected_candidates,
+                    "reason": reason,
+                }),
+            ),
+        };
+        // `run_id` is the execution id (see `dispatch_live_worker_state`).
+        // The work item is a convenience for readers filtering the timeline
+        // by item; a lookup miss must not lose the event.
+        let mut event = DispatchEvent::new(stage, outcome, run_id).with_details(details);
+        if let Ok(execution) = self.work_db.get_execution(run_id) {
+            event = event.with_work_item(execution.work_item_id);
+        }
+        self.dispatch_events.emit(event).await;
+    }
 }
 
 /// Fan one normalised worker event out to every engine subsystem that reacts

@@ -25,7 +25,22 @@ use crate::stdout_progress::{ProgressCheckpointSink, WorkerEventSink};
 
 const DISCOVERY_POLL: Duration = Duration::from_millis(100);
 const FILE_POLL: Duration = Duration::from_millis(50);
-const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long discovery may run before the run is reported as *overdue*.
+///
+/// This is a reporting threshold, not a give-up point. It used to be the
+/// latter (`DISCOVERY_TIMEOUT`): discovery returned an error after 120s and
+/// the ingress task exited, leaving the run permanently unobserved — no
+/// events, no `transcript_path`, no driver-start signal — even when the
+/// rollout appeared seconds later. During the 2026-09-13 admission burst
+/// five Codex workers' rollouts appeared 123–129s after activation, 3–9s
+/// past this window, and were reaped at 300s as "driver binary never
+/// started" while processing hundreds of thousands of tokens. The driver-
+/// start sweep ([`crate::live_worker_state::DRIVER_START_GRACE_SECS`]) is
+/// the liveness authority for a spawn that never reports; discovery does not
+/// get a shorter clock of its own. It now runs until the run is torn down
+/// ([`AgentJsonlProgressManager::stop_run`]) and merely *records* — durably,
+/// on the checkpoint, and as a dispatch event — that it is overdue.
+pub const DISCOVERY_OVERDUE_AFTER: Duration = Duration::from_secs(120);
 const MAX_DISCOVERY_DIRS: usize = 512;
 const MAX_DISCOVERY_MATCHES: usize = 8;
 const MAX_SESSION_META_BYTES: u64 = 64 * 1024;
@@ -61,6 +76,14 @@ pub enum IngressCheckpoint {
     Armed {
         ingress: AgentJsonlFileIngress,
         baseline: Vec<PathBuf>,
+        /// What discovery had to say for itself while still unattached: the
+        /// most recent overdue notice or the failure that ended it. Absent
+        /// until discovery has run past [`DISCOVERY_OVERDUE_AFTER`] or
+        /// failed. This is what turns the post-hoc question "did the driver
+        /// never start, or did the engine never look?" into a read of the
+        /// run row instead of a grep through a rotated trace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        discovery: Option<DiscoveryRecord>,
     },
     /// Attached to exactly one rollout and consumed through `consumed_bytes`.
     ///
@@ -88,6 +111,69 @@ pub enum IngressCheckpoint {
         identity: FileIdentity,
         #[serde(default)]
         session_state: Option<serde_json::Value>,
+    },
+}
+
+/// Discovery's verdict on an ingress that has not attached.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryVerdict {
+    /// Past [`DISCOVERY_OVERDUE_AFTER`] and still looking.
+    Overdue,
+    /// Discovery ended without attaching; see the record's `reason`.
+    Failed,
+}
+
+/// A durable note from discovery, stored on [`IngressCheckpoint::Armed`].
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DiscoveryRecord {
+    pub verdict: DiscoveryVerdict,
+    /// Wall-clock epoch seconds when the record was written.
+    pub at_epoch_secs: i64,
+    /// How long discovery had been running when the record was written,
+    /// measured from activation (the spawn acknowledgement), not arming.
+    pub waited_secs: u64,
+    /// New files under the root whose name matched the rollout pattern but
+    /// which failed correlation on the most recent scan — a non-zero count
+    /// here means "a rollout exists but is not this run's" (wrong `cwd`, an
+    /// unterminated `session_meta` line, or a name that does not carry its
+    /// own session id), which is a different failure from "no rollout yet".
+    pub rejected_candidates: usize,
+    pub reason: String,
+}
+
+/// A file-ingress lifecycle milestone, reported through
+/// [`crate::stdout_progress::WorkerEventSink::record_ingress_observation`]
+/// so the engine can put it on the run's dispatch timeline.
+///
+/// The ingress cannot emit a dispatch event itself — it has a sink and a
+/// checkpoint store, not the engine — and threading a third handle through
+/// every constructor for one line of telemetry is worse than one more
+/// method on the sink it already holds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IngressObservation {
+    /// Discovery identified this run's rollout.
+    Attached {
+        path: PathBuf,
+        session_id: String,
+        /// Seconds between activation and attachment. `None` when the run
+        /// was re-adopted rather than discovered — it was attached before
+        /// this engine existed.
+        discovery_secs: Option<u64>,
+    },
+    /// Discovery has run past [`DISCOVERY_OVERDUE_AFTER`] without attaching
+    /// and is still running.
+    DiscoveryOverdue {
+        root: PathBuf,
+        waited_secs: u64,
+        rejected_candidates: usize,
+    },
+    /// Discovery ended without attaching.
+    DiscoveryFailed {
+        root: PathBuf,
+        waited_secs: u64,
+        rejected_candidates: usize,
+        reason: String,
     },
 }
 
@@ -519,14 +605,34 @@ pub enum ResumeOutcome {
 }
 
 /// Owns at most one prepared/active file ingress per execution id.
-#[derive(Default)]
 pub struct AgentJsonlProgressManager {
     runs: Mutex<HashMap<String, RunHandle>>,
+    /// See [`DISCOVERY_OVERDUE_AFTER`]. A field so a test can drive the
+    /// overdue path in milliseconds rather than minutes.
+    discovery_overdue_after: Duration,
+}
+
+impl Default for AgentJsonlProgressManager {
+    fn default() -> Self {
+        Self {
+            runs: Mutex::new(HashMap::new()),
+            discovery_overdue_after: DISCOVERY_OVERDUE_AFTER,
+        }
+    }
 }
 
 impl AgentJsonlProgressManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Report discovery as overdue after `after` instead of
+    /// [`DISCOVERY_OVERDUE_AFTER`]. Reporting only: discovery keeps running
+    /// either way.
+    #[cfg(test)]
+    fn with_discovery_overdue_after(mut self, after: Duration) -> Self {
+        self.discovery_overdue_after = after;
+        self
     }
 
     /// Snapshot pre-existing candidates before the pane is spawned, then
@@ -551,6 +657,7 @@ impl AgentJsonlProgressManager {
         let armed = IngressCheckpoint::Armed {
             ingress: prepared.ingress.clone(),
             baseline: prepared.baseline.iter().cloned().collect(),
+            discovery: None,
         };
         store.store_ingress_checkpoint(run_id, &armed)?;
         self.spawn_ingress(run_id, driver, prepared, sink, store, IngressStart::Discover)
@@ -578,7 +685,10 @@ impl AgentJsonlProgressManager {
     {
         let (prepared, start) = match checkpoint {
             IngressCheckpoint::NotFileIngress => return Ok(ResumeOutcome::NotFileIngress),
-            IngressCheckpoint::Armed { ingress, baseline } => {
+            // A prior discovery verdict is deliberately not consulted: a
+            // fresh engine gets a fresh attempt, and a rollout that appeared
+            // after the old engine went down is exactly what it will find.
+            IngressCheckpoint::Armed { ingress, baseline, .. } => {
                 let prepared = PreparedSource::with_baseline(ingress, baseline.into_iter().collect())?;
                 (prepared, IngressStart::Discover)
             }
@@ -697,8 +807,20 @@ impl AgentJsonlProgressManager {
         let (activate_tx, activate_rx) = oneshot::channel();
         let (halt_tx, halt_rx) = watch::channel(StreamHalt::Running);
         let task_run_id = run_id.to_owned();
+        let overdue_after = self.discovery_overdue_after;
         tokio::spawn(async move {
-            run_prepared(task_run_id, driver, prepared, sink, store, start, activate_rx, halt_rx).await;
+            run_prepared(
+                task_run_id,
+                driver,
+                prepared,
+                sink,
+                store,
+                start,
+                overdue_after,
+                activate_rx,
+                halt_rx,
+            )
+            .await;
         });
         runs.insert(
             run_id.to_owned(),
@@ -749,6 +871,7 @@ async fn run_prepared<S>(
     sink: S,
     store: Arc<dyn IngressCheckpointStore>,
     start: IngressStart,
+    overdue_after: Duration,
     mut activate: oneshot::Receiver<()>,
     mut halt: watch::Receiver<StreamHalt>,
 ) where
@@ -766,13 +889,25 @@ async fn run_prepared<S>(
         }
     }
 
-    let (candidate, start_offset, session_state) = match start {
+    let (candidate, start_offset, session_state, discovery_secs) = match start {
         IngressStart::Discover => {
-            let candidate = match discover_candidate(&prepared, &mut halt).await {
-                Ok(Some(candidate)) => candidate,
+            let discovery = Discovery {
+                run_id: &run_id,
+                prepared: &prepared,
+                sink: &sink,
+                store: &store,
+                overdue_after,
+            };
+            let (candidate, discovery_secs) = match discovery.run(&mut halt).await {
+                Ok(Some(found)) => found,
                 Ok(None) => return,
                 Err(err) => {
-                    tracing::warn!(run_id, %err, "agent JSONL progress: discovery failed");
+                    tracing::error!(
+                        run_id,
+                        %err,
+                        "agent JSONL progress: discovery failed; this run is now unobserved until it is \
+                         reaped or re-adopted",
+                    );
                     return;
                 }
             };
@@ -796,21 +931,31 @@ async fn run_prepared<S>(
                     "agent JSONL progress: could not record the attached rollout",
                 );
             }
-            (candidate, 0, None)
+            (candidate, 0, None, Some(discovery_secs))
         }
         IngressStart::Resume {
             candidate,
             file_offset,
             session_state,
-        } => (candidate, file_offset, session_state),
+        } => (candidate, file_offset, session_state, None),
     };
     tracing::info!(
         run_id,
         session_id = %candidate.session_id,
         path = %candidate.path.display(),
         start_offset,
+        discovery_secs,
         "agent JSONL progress: attached rollout",
     );
+    sink.record_ingress_observation(
+        &run_id,
+        IngressObservation::Attached {
+            path: candidate.path.clone(),
+            session_id: candidate.session_id.clone(),
+            discovery_secs,
+        },
+    )
+    .await;
     let transcript_path = candidate.path.clone();
     // Resolved here, once, so the per-event write below is a single keyed
     // update. A store that cannot resolve it still gets its checkpoints — the
@@ -890,48 +1035,174 @@ struct Candidate {
     identity: FileIdentity,
 }
 
-async fn discover_candidate(
-    prepared: &PreparedSource,
-    halt: &mut watch::Receiver<StreamHalt>,
-) -> Result<Option<Candidate>, String> {
-    let deadline = tokio::time::Instant::now() + DISCOVERY_TIMEOUT;
-    loop {
-        // A `Cancel` during discovery stops it: the engine is tearing the
-        // ingress down and there is nothing left to attach to.
-        if *halt.borrow() != StreamHalt::Running {
-            return Ok(None);
-        }
-        prepared.root.revalidate()?;
-        let paths = scan_matching_paths(&prepared.root, &prepared.ingress)?;
-        let mut matches = paths
-            .difference(&prepared.baseline)
-            .filter_map(|path| validate_candidate(prepared, path).ok().flatten())
-            .collect::<Vec<_>>();
-        matches.sort_by(|left, right| left.path.cmp(&right.path));
-        match matches.len() {
-            1 => return Ok(matches.pop()),
-            count if count > 1 => {
-                return Err(format!(
-                    "{count} new rollout files matched one run; refusing ambiguous attachment"
-                ));
-            }
-            _ => {}
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "no correlated rollout appeared under {} within {}s",
-                prepared.root.path.display(),
-                DISCOVERY_TIMEOUT.as_secs()
-            ));
-        }
-        tokio::select! {
-            _ = tokio::time::sleep(DISCOVERY_POLL) => {}
-            changed = halt.changed() => {
-                let _ = changed;
+/// One run's discovery: the poll loop that waits for exactly one new,
+/// workspace-correlated rollout to appear under the prepared root.
+struct Discovery<'a, S> {
+    run_id: &'a str,
+    prepared: &'a PreparedSource,
+    sink: &'a S,
+    store: &'a Arc<dyn IngressCheckpointStore>,
+    overdue_after: Duration,
+}
+
+impl<S> Discovery<'_, S>
+where
+    S: WorkerEventSink,
+{
+    /// Poll until the rollout appears, the ingress is halted, or discovery
+    /// fails outright. Returns the candidate and how many seconds it took.
+    ///
+    /// There is no deadline. Past `overdue_after` the run is reported as
+    /// overdue — once, durably on its checkpoint and as an observation on
+    /// its timeline — and polling continues, because the alternative was
+    /// measured: a fixed give-up point shorter than the driver-start grace
+    /// left live workers permanently unobserved and reaped as never-started
+    /// (see [`DISCOVERY_OVERDUE_AFTER`]). What ends an unattached discovery
+    /// is the run's own teardown ([`StreamHalt::Cancel`]) or a failure that
+    /// polling cannot cure: the root changing identity, a scan error, or two
+    /// new rollouts both claiming this one run.
+    async fn run(&self, halt: &mut watch::Receiver<StreamHalt>) -> Result<Option<(Candidate, u64)>, String> {
+        let started = tokio::time::Instant::now();
+        let mut overdue_reported = false;
+        let mut rejected_candidates = 0usize;
+        loop {
+            // A `Cancel` during discovery stops it: the engine is tearing the
+            // ingress down and there is nothing left to attach to.
+            if *halt.borrow() != StreamHalt::Running {
                 return Ok(None);
+            }
+            let pass = self.scan_once();
+            let waited_secs = started.elapsed().as_secs();
+            let mut matches = match pass {
+                Ok(pass) => {
+                    rejected_candidates = pass.rejected_candidates;
+                    pass.matches
+                }
+                Err(err) => {
+                    self.record_failure(waited_secs, rejected_candidates, &err).await;
+                    return Err(err);
+                }
+            };
+            match matches.len() {
+                1 => {
+                    let candidate = matches.pop().expect("exactly one match");
+                    return Ok(Some((candidate, waited_secs)));
+                }
+                count if count > 1 => {
+                    let err = format!("{count} new rollout files matched one run; refusing ambiguous attachment");
+                    self.record_failure(waited_secs, rejected_candidates, &err).await;
+                    return Err(err);
+                }
+                _ => {}
+            }
+            if !overdue_reported && started.elapsed() >= self.overdue_after {
+                overdue_reported = true;
+                self.record_overdue(waited_secs, rejected_candidates).await;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(DISCOVERY_POLL) => {}
+                changed = halt.changed() => {
+                    let _ = changed;
+                    return Ok(None);
+                }
             }
         }
     }
+
+    fn scan_once(&self) -> Result<ScanPass, String> {
+        self.prepared.root.revalidate()?;
+        let paths = scan_matching_paths(&self.prepared.root, &self.prepared.ingress)?;
+        let new_paths = paths.difference(&self.prepared.baseline).collect::<Vec<_>>();
+        let mut matches = new_paths
+            .iter()
+            .filter_map(|path| validate_candidate(self.prepared, path).ok().flatten())
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(ScanPass {
+            rejected_candidates: new_paths.len().saturating_sub(matches.len()),
+            matches,
+        })
+    }
+
+    async fn record_overdue(&self, waited_secs: u64, rejected_candidates: usize) {
+        let root = self.prepared.root.path.clone();
+        let reason = format!(
+            "no correlated rollout under {} after {waited_secs}s; still looking",
+            root.display()
+        );
+        tracing::warn!(
+            run_id = self.run_id,
+            root = %root.display(),
+            waited_secs,
+            rejected_candidates,
+            "agent JSONL progress: discovery overdue — the driver has not written its rollout yet (or \
+             wrote one that does not correlate to this run). Still polling; a driver-start reap of this \
+             run is a driver that was never observed, not one that never started",
+        );
+        self.store_record(DiscoveryVerdict::Overdue, waited_secs, rejected_candidates, reason);
+        self.sink
+            .record_ingress_observation(
+                self.run_id,
+                IngressObservation::DiscoveryOverdue {
+                    root,
+                    waited_secs,
+                    rejected_candidates,
+                },
+            )
+            .await;
+    }
+
+    async fn record_failure(&self, waited_secs: u64, rejected_candidates: usize, reason: &str) {
+        let root = self.prepared.root.path.clone();
+        self.store_record(
+            DiscoveryVerdict::Failed,
+            waited_secs,
+            rejected_candidates,
+            reason.to_owned(),
+        );
+        self.sink
+            .record_ingress_observation(
+                self.run_id,
+                IngressObservation::DiscoveryFailed {
+                    root,
+                    waited_secs,
+                    rejected_candidates,
+                    reason: reason.to_owned(),
+                },
+            )
+            .await;
+    }
+
+    /// Re-write the run's `Armed` checkpoint carrying `verdict`. The
+    /// baseline is preserved so a re-armed discovery after an engine restart
+    /// still diffs against the pre-spawn snapshot.
+    fn store_record(&self, verdict: DiscoveryVerdict, waited_secs: u64, rejected_candidates: usize, reason: String) {
+        let checkpoint = IngressCheckpoint::Armed {
+            ingress: self.prepared.ingress.clone(),
+            baseline: self.prepared.baseline.iter().cloned().collect(),
+            discovery: Some(DiscoveryRecord {
+                verdict,
+                at_epoch_secs: boss_engine_utils::epoch_time::now_epoch_secs(),
+                waited_secs,
+                rejected_candidates,
+                reason,
+            }),
+        };
+        if let Err(err) = self.store.store_ingress_checkpoint(self.run_id, &checkpoint) {
+            tracing::warn!(
+                run_id = self.run_id,
+                %err,
+                "agent JSONL progress: could not record the discovery verdict on the run's checkpoint",
+            );
+        }
+    }
+}
+
+/// One discovery scan: the correlated candidates, and how many new files
+/// looked like rollouts but were not this run's.
+struct ScanPass {
+    matches: Vec<Candidate>,
+    rejected_candidates: usize,
 }
 
 fn scan_matching_paths(root: &VerifiedRoot, ingress: &AgentJsonlFileIngress) -> Result<HashSet<PathBuf>, String> {
@@ -1441,6 +1712,10 @@ async fn wait_for_cancel(halt: &mut watch::Receiver<StreamHalt>) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "agent_jsonl_progress_tests/discovery.rs"]
+mod discovery_tests;
 
 #[cfg(test)]
 mod tests {

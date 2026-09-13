@@ -84,6 +84,12 @@ Both funnel into `ServerState::converge_terminal_execution`, serialized per run.
 
 Plus one greppable trace line per direction: `execution terminalized: …` and `execution re-adopted: inferred death disproven by a live worker`.
 
+### A file-tailing driver's "hook" is the engine attaching to its rollout
+
+For a driver whose progress ingress is a file the engine tails (Codex: `ProgressIngress::AgentJsonlFile`), there is no `boss-event` shim and no `events.sock` traffic at all — its settings file carries an empty `hooks` map by design. Every `WorkerEvent` the engine attributes to such a run, and therefore `driver_signal_at`, comes from `engine/core/src/agent_jsonl_progress.rs` discovering the run's rollout under its per-run sessions directory and tailing it. "No hook event ever arrived" for such a run therefore has two readings — the driver never wrote a rollout, or the engine never attached to the one it wrote — and `work_runs.transcript_path` (written on the first tailed event, `NULL` if the ingress never attached) tells them apart.
+
+Discovery has no give-up point of its own: it runs until the run is torn down or hits a failure polling cannot cure, and at `DISCOVERY_OVERDUE_AFTER` (120 s) it records itself overdue — on the run's `IngressCheckpoint::Armed` as a `DiscoveryRecord`, and on the dispatch timeline as `file_ingress_discovery_overdue` — and keeps polling. A successful attach emits `file_ingress_attached` with `discovery_secs`; a terminal failure emits `file_ingress_discovery_failed`. The driver-start reap reads that checkpoint before it narrates, so a run reaped on `driver_start_timeout` with an overdue record is reported as "may have started and run unobserved", never as "binary never started". The 2026-09-13 breaker incident is the case this exists for: discovery used to return an error at 120 s and exit, 180 s before the reap, so five Codex workers whose rollouts appeared 123–129 s after activation were reaped as never-started mid-work — see [`investigations/chore-hook-silence-breaker-incident-2026-09-13.md`](investigations/chore-hook-silence-breaker-incident-2026-09-13.md).
+
 ### Boot-time tmux adoption: the other half of "empty after restart"
 
 `worker_readoption` resolves a live-vs-terminal contradiction whenever it is

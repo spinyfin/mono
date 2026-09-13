@@ -135,6 +135,7 @@ use std::time::Duration;
 
 use boss_protocol::{CreateAttentionItemInput, LiveWorkerState, WorkExecution, WorkerActivity};
 
+use crate::agent_jsonl_progress::{DiscoveryVerdict, IngressCheckpoint, IngressCheckpointStore};
 use crate::coordinator::{CubeClient, ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::{DriverStartExpectation, LiveWorkerStateRegistry};
@@ -515,6 +516,7 @@ pub async fn run_one_pass(
                 grace_secs: driver_start_grace_secs,
                 silent_secs: candidate.silent_secs,
                 activity: candidate.activity.as_str(),
+                file_ingress: file_ingress_state(work_db, execution_id),
             },
             now_epoch_secs,
         )
@@ -568,14 +570,107 @@ pub(crate) enum ReapCause<'a> {
     /// death report's clothing, and it is reaped as one.
     PaneDiedBeforeStart { detail: &'a str },
     /// A pane came up — possibly with a live shell pid — but no
-    /// driver-originated signal ever arrived, so the driver binary never
-    /// executed. Unlike the two above, this one also raises a
-    /// per-execution attention item: nothing else in Boss surfaces it.
+    /// driver-originated signal ever arrived. Either the driver binary
+    /// never executed, or it did and the engine never observed it: for a
+    /// driver whose progress is a rollout file the engine tails, the second
+    /// reading is a real one (the 2026-09-13 breaker incident was five of
+    /// them), and `file_ingress` is what tells the two apart. Unlike the two
+    /// above, this one also raises a per-execution attention item: nothing
+    /// else in Boss surfaces it.
     DriverStartTimeout {
         grace_secs: i64,
         silent_secs: i64,
         activity: &'static str,
+        /// What the run's file-ingress checkpoint says, when it has one.
+        file_ingress: Option<FileIngressState>,
     },
+}
+
+/// The file-ingress checkpoint's account of a run that produced no signal,
+/// rendered for the reap narrative and the dispatch event.
+#[derive(Clone, Debug)]
+pub(crate) struct FileIngressState {
+    /// One sentence for the orphan reason / audit note / attention body.
+    pub summary: String,
+    /// The same facts, structured, for `details.file_ingress`.
+    pub details: serde_json::Value,
+}
+
+/// Read the run's durable ingress checkpoint and say what it implies about
+/// the missing driver signal. `None` when the run has no file ingress (a
+/// hook-socket driver) or no record at all; every other state — including
+/// an unreadable record — is worth a sentence, because the default reading
+/// of a driver-start timeout ("the binary never ran") is the one that was
+/// wrong in the incident.
+pub(crate) fn file_ingress_state(work_db: &WorkDb, execution_id: &str) -> Option<FileIngressState> {
+    let checkpoint = match work_db.load_ingress_checkpoint(execution_id) {
+        Ok(Some(checkpoint)) => checkpoint,
+        Ok(None) => return None,
+        Err(err) => {
+            return Some(FileIngressState {
+                summary: format!("the run's file-ingress checkpoint could not be read ({err})"),
+                details: serde_json::json!({ "state": "unreadable", "error": err }),
+            });
+        }
+    };
+    match checkpoint {
+        IngressCheckpoint::NotFileIngress => None,
+        IngressCheckpoint::Armed { discovery: None, .. } => Some(FileIngressState {
+            summary: "the engine's file ingress was armed but never attached to a rollout and recorded \
+                      no discovery verdict"
+                .to_owned(),
+            details: serde_json::json!({ "state": "armed" }),
+        }),
+        IngressCheckpoint::Armed {
+            discovery: Some(record),
+            ..
+        } => {
+            let summary = match record.verdict {
+                DiscoveryVerdict::Overdue => format!(
+                    "the engine's file ingress never attached to a rollout: discovery was overdue at \
+                     {}s ({} rollout-shaped file(s) rejected as not this run's) and still looking, so the \
+                     driver may have started and run unobserved",
+                    record.waited_secs, record.rejected_candidates
+                ),
+                DiscoveryVerdict::Failed => format!(
+                    "the engine's file ingress never attached to a rollout: discovery failed after {}s \
+                     ({}), so the driver may have started and run unobserved",
+                    record.waited_secs, record.reason
+                ),
+            };
+            Some(FileIngressState {
+                summary,
+                details: serde_json::json!({
+                    "state": "armed",
+                    "discovery": record,
+                }),
+            })
+        }
+        IngressCheckpoint::Attached { path, session_id, .. } => Some(FileIngressState {
+            summary: format!(
+                "the engine's file ingress attached to {} (session {session_id}) but no event was ever \
+                 dispatched from it",
+                path.display()
+            ),
+            details: serde_json::json!({
+                "state": "attached",
+                "path": path.display().to_string(),
+                "session_id": session_id,
+            }),
+        }),
+    }
+}
+
+/// The clause that names the reading of a driver-start timeout: what the
+/// file ingress recorded, or — with no file ingress — that the binary most
+/// likely never ran.
+fn driver_start_reading(file_ingress: Option<&FileIngressState>) -> String {
+    match file_ingress {
+        Some(state) => state.summary.clone(),
+        None => "no file-ingress record exists for this run, so the driver binary most likely never \
+                 started"
+            .to_owned(),
+    }
 }
 
 /// The operator-facing narrative for one never-started reap: the orphan
@@ -621,20 +716,23 @@ fn reap_narrative(cause: &ReapCause<'_>, execution_id: &str) -> (String, String,
         ReapCause::DriverStartTimeout {
             grace_secs,
             silent_secs,
+            file_ingress,
             ..
-        } => (
-            format!(
-                "driver-start-timeout: pane spawned but no driver-originated signal (hook event or \
-                 transcript path) arrived within {grace_secs}s; driver binary never started \
-                 (silent for {silent_secs}s)"
-            ),
-            format!(
-                "driver-start timeout (exec {execution_id}) detected — pane came up but no hook event \
-                 or transcript path arrived within {grace_secs}s, so the driver binary never ran; \
-                 worker slot and cube workspace lease released, chore reset to todo for redispatch."
-            ),
-            Stage::DriverStartTimeout,
-        ),
+        } => {
+            let reading = driver_start_reading(file_ingress.as_ref());
+            (
+                format!(
+                    "driver-start-timeout: pane spawned but no driver-originated signal (hook event or \
+                     transcript path) arrived within {grace_secs}s (silent for {silent_secs}s); {reading}"
+                ),
+                format!(
+                    "driver-start timeout (exec {execution_id}) detected — pane came up but no hook event \
+                     or transcript path arrived within {grace_secs}s; {reading}; worker slot and cube \
+                     workspace lease released, chore reset to todo for redispatch."
+                ),
+                Stage::DriverStartTimeout,
+            )
+        }
     }
 }
 
@@ -768,11 +866,23 @@ pub(crate) async fn reap_never_started_spawn(
             grace_secs,
             silent_secs,
             activity,
+            file_ingress,
         } => {
             details["threshold_secs"] = serde_json::json!(grace_secs);
             details["silent_secs"] = serde_json::json!(silent_secs);
             details["activity"] = serde_json::json!(activity);
-            raise_driver_start_attention(ctx.work_db, execution, slot_id, shell_pid, *grace_secs, *silent_secs);
+            details["file_ingress"] = file_ingress
+                .as_ref()
+                .map_or(serde_json::Value::Null, |state| state.details.clone());
+            raise_driver_start_attention(
+                ctx.work_db,
+                execution,
+                slot_id,
+                shell_pid,
+                *grace_secs,
+                *silent_secs,
+                file_ingress.as_ref(),
+            );
         }
     }
     ctx.dispatch_events
@@ -850,8 +960,10 @@ fn raise_driver_start_attention(
     shell_pid: i32,
     grace_secs: i64,
     silent_secs: i64,
+    file_ingress: Option<&FileIngressState>,
 ) {
     let execution_id = execution.id.as_str();
+    let reading = driver_start_reading(file_ingress);
     let pid_note = if shell_pid > 0 {
         format!(
             "The pane reported shell pid `{shell_pid}`, which is why every existing check treated \
@@ -863,7 +975,7 @@ fn raise_driver_start_attention(
     let body = format!(
         "A worker pane was spawned for execution `{execution_id}` on slot {slot_id}, but no \
          driver-originated signal — no hook event, no `transcript_path` — arrived within \
-         {grace_secs}s (silent for {silent_secs}s). The driver binary never started.\n\n\
+         {grace_secs}s (silent for {silent_secs}s). Reading: {reading}.\n\n\
          {pid_note}\n\n\
          The engine has reaped the execution: the pane was torn down, the worker slot released, \
          and the cube workspace lease force-released. The work item is reset for redispatch.\n\n\
@@ -1077,6 +1189,55 @@ mod tests {
             !slot_never_started(&live_states, &progressed),
             "activity past Spawning is proof of life",
         );
+    }
+
+    /// A driver-start timeout must not assert "the binary never started"
+    /// when the run's file ingress says otherwise. In the 2026-09-13 breaker
+    /// incident five Codex workers were reaped with exactly that text while
+    /// their rollouts — created seconds after the ingress's old give-up
+    /// point — showed hundreds of thousands of tokens of work.
+    #[test]
+    fn driver_start_timeout_narrates_the_file_ingress_reading() {
+        let ingress = FileIngressState {
+            summary: "the engine's file ingress never attached to a rollout: discovery was overdue at \
+                      121s (0 rollout-shaped file(s) rejected as not this run's) and still looking, so \
+                      the driver may have started and run unobserved"
+                .to_owned(),
+            details: serde_json::json!({ "state": "armed" }),
+        };
+        let (reason, audit, stage) = reap_narrative(
+            &ReapCause::DriverStartTimeout {
+                grace_secs: 300,
+                silent_secs: 302,
+                activity: "spawning",
+                file_ingress: Some(ingress),
+            },
+            "exec-1",
+        );
+        assert_eq!(stage, Stage::DriverStartTimeout);
+        assert!(reason.starts_with("driver-start-timeout:"), "{reason}");
+        assert!(
+            !reason.contains("never started") && !audit.contains("never ran"),
+            "must not assert the binary never ran when the ingress says it may have; got: {reason} / {audit}",
+        );
+        assert!(
+            reason.contains("may have started and run unobserved")
+                && audit.contains("may have started and run unobserved"),
+            "both surfaces carry the ingress reading; got: {reason} / {audit}",
+        );
+
+        // With no file ingress at all (a hook-socket driver), the historical
+        // reading stands — but as a likelihood, not a fact.
+        let (reason, _, _) = reap_narrative(
+            &ReapCause::DriverStartTimeout {
+                grace_secs: 300,
+                silent_secs: 302,
+                activity: "spawning",
+                file_ingress: None,
+            },
+            "exec-2",
+        );
+        assert!(reason.contains("most likely never started"), "{reason}");
     }
 
     /// A never-started spawn reported to us as a pane death must not be
