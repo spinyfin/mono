@@ -26,7 +26,7 @@ enum AgentPoolKind: String, CaseIterable, Identifiable {
 
 /// Agents-tab shell. Observes the workspace and the live-state store —
 /// the two objects whose publishes actually change slot chrome — and
-/// receives live-status flags as values from `ContentView`. It does
+/// receives live-status flags and tab visibility as values from `ContentView`. It does
 /// **not** observe `ChatViewModel`: that type has ~100 `@Published`
 /// properties, and a grid that subscribed to it re-laid-out all 40
 /// slots on every unrelated write (transcript chunk, hover, panel
@@ -40,15 +40,39 @@ enum AgentPoolKind: String, CaseIterable, Identifiable {
 struct WorkersDetailView: View, @MainActor Equatable {
     @ObservedObject var workspace: WorkersWorkspaceModel
     @ObservedObject var liveStates: LiveWorkerStateStore
+    let isVisible: Bool
     let tmuxHostingEnabled: Bool
     let liveStatusDisabledSlotIDs: Set<Int>
     let onToggleLiveStatus: (Int, Bool) -> Void
 
     @State private var selectedPool: AgentPoolKind = .bridgeCrew
+    @State private var snapshotCache: WorkerSlotSnapshotCache
+
+    init(
+        workspace: WorkersWorkspaceModel,
+        liveStates: LiveWorkerStateStore,
+        isVisible: Bool,
+        tmuxHostingEnabled: Bool,
+        liveStatusDisabledSlotIDs: Set<Int>,
+        onToggleLiveStatus: @escaping (Int, Bool) -> Void
+    ) {
+        self.workspace = workspace
+        self.liveStates = liveStates
+        self.isVisible = isVisible
+        self.tmuxHostingEnabled = tmuxHostingEnabled
+        self.liveStatusDisabledSlotIDs = liveStatusDisabledSlotIDs
+        self.onToggleLiveStatus = onToggleLiveStatus
+        _snapshotCache = State(initialValue: WorkerSlotSnapshotCache(
+            workspace: workspace,
+            liveStates: liveStates,
+            liveStatusDisabledSlotIDs: liveStatusDisabledSlotIDs
+        ))
+    }
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.workspace === rhs.workspace
             && lhs.liveStates === rhs.liveStates
+            && lhs.isVisible == rhs.isVisible
             && lhs.tmuxHostingEnabled == rhs.tmuxHostingEnabled
             && lhs.liveStatusDisabledSlotIDs == rhs.liveStatusDisabledSlotIDs
     }
@@ -67,19 +91,19 @@ struct WorkersDetailView: View, @MainActor Equatable {
             ZStack {
                 // Bridge Crew and Lower Decks are the two pages of the same
                 // interactive pool, filtered out of the flat `slots` array.
-                grid(for: workspace.bridgeCrewSlots)
+                grid(for: workspace.bridgeCrewSlots, pool: .bridgeCrew)
                     .opacity(selectedPool == .bridgeCrew ? 1 : 0)
                     .allowsHitTesting(selectedPool == .bridgeCrew)
 
-                grid(for: workspace.lowerDecksSlots)
+                grid(for: workspace.lowerDecksSlots, pool: .lowerDecks)
                     .opacity(selectedPool == .lowerDecks ? 1 : 0)
                     .allowsHitTesting(selectedPool == .lowerDecks)
 
-                grid(for: workspace.automationSlots, columns: 3)
+                grid(for: workspace.automationSlots, pool: .automations, columns: 3)
                     .opacity(selectedPool == .automations ? 1 : 0)
                     .allowsHitTesting(selectedPool == .automations)
 
-                grid(for: workspace.reviewSlots)
+                grid(for: workspace.reviewSlots, pool: .reviewers)
                     .opacity(selectedPool == .reviewers ? 1 : 0)
                     .allowsHitTesting(selectedPool == .reviewers)
             }
@@ -88,16 +112,16 @@ struct WorkersDetailView: View, @MainActor Equatable {
         .background(Color(nsColor: .separatorColor))
     }
 
-    private func grid(for slots: [WorkerSlot], columns: Int = 4) -> some View {
+    private func grid(for slots: [WorkerSlot], pool: AgentPoolKind, columns: Int = 4) -> some View {
         WorkerGrid(
             runtime: workspace.runtime,
-            snapshots: slots.map { slot in
-                WorkerSlotSnapshot.build(
-                    slot: slot,
-                    liveState: liveStates.bySlot[slot.slotId],
-                    liveStatusEnabled: !liveStatusDisabledSlotIDs.contains(slot.slotId)
-                )
-            },
+            snapshots: snapshotCache.snapshots(
+                for: pool,
+                slots: slots,
+                liveStates: liveStates,
+                liveStatusDisabledSlotIDs: liveStatusDisabledSlotIDs,
+                refresh: isVisible
+            ),
             onToggleLiveStatus: onToggleLiveStatus,
             columns: columns
         )
@@ -126,6 +150,76 @@ struct WorkersDetailView: View, @MainActor Equatable {
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+}
+
+/// Keeps the last visible inputs for each permanently-mounted worker grid.
+/// `LiveWorkerStateStore` still invalidates the enclosing view while Agents
+/// is hidden, but those invalidations reuse these values. That avoids both
+/// snapshot construction and a changed `WorkerGrid` input, while retaining
+/// the existing terminal-view hierarchy and its libghostty surfaces.
+@MainActor
+private final class WorkerSlotSnapshotCache {
+    private var snapshotsByPool: [AgentPoolKind: [WorkerSlotSnapshot]]
+
+    init(
+        workspace: WorkersWorkspaceModel,
+        liveStates: LiveWorkerStateStore,
+        liveStatusDisabledSlotIDs: Set<Int>
+    ) {
+        snapshotsByPool = [:]
+        refresh(
+            .bridgeCrew,
+            slots: workspace.bridgeCrewSlots,
+            liveStates: liveStates,
+            liveStatusDisabledSlotIDs: liveStatusDisabledSlotIDs
+        )
+        refresh(
+            .lowerDecks,
+            slots: workspace.lowerDecksSlots,
+            liveStates: liveStates,
+            liveStatusDisabledSlotIDs: liveStatusDisabledSlotIDs
+        )
+        refresh(
+            .automations,
+            slots: workspace.automationSlots,
+            liveStates: liveStates,
+            liveStatusDisabledSlotIDs: liveStatusDisabledSlotIDs
+        )
+        refresh(
+            .reviewers,
+            slots: workspace.reviewSlots,
+            liveStates: liveStates,
+            liveStatusDisabledSlotIDs: liveStatusDisabledSlotIDs
+        )
+    }
+
+    func snapshots(
+        for pool: AgentPoolKind,
+        slots: [WorkerSlot],
+        liveStates: LiveWorkerStateStore,
+        liveStatusDisabledSlotIDs: Set<Int>,
+        refresh shouldRefresh: Bool
+    ) -> [WorkerSlotSnapshot] {
+        if shouldRefresh {
+            refresh(pool, slots: slots, liveStates: liveStates, liveStatusDisabledSlotIDs: liveStatusDisabledSlotIDs)
+        }
+        return snapshotsByPool[pool] ?? []
+    }
+
+    private func refresh(
+        _ pool: AgentPoolKind,
+        slots: [WorkerSlot],
+        liveStates: LiveWorkerStateStore,
+        liveStatusDisabledSlotIDs: Set<Int>
+    ) {
+        snapshotsByPool[pool] = slots.map { slot in
+            WorkerSlotSnapshot.build(
+                slot: slot,
+                liveState: liveStates.bySlot[slot.slotId],
+                liveStatusEnabled: !liveStatusDisabledSlotIDs.contains(slot.slotId)
+            )
+        }
     }
 }
 
@@ -210,7 +304,8 @@ struct WorkerSlotView: View, @MainActor Equatable {
     let onToggleLiveStatus: (Bool) -> Void
 
     static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.snapshot == rhs.snapshot
+        lhs.runtime === rhs.runtime
+            && lhs.snapshot == rhs.snapshot
     }
 
     var body: some View {

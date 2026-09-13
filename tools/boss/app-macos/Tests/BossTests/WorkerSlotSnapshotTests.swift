@@ -314,6 +314,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         let a = WorkersDetailView(
             workspace: workspace,
             liveStates: liveStates,
+            isVisible: true,
             tmuxHostingEnabled: true,
             liveStatusDisabledSlotIDs: [],
             onToggleLiveStatus: { _, _ in }
@@ -321,6 +322,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         let b = WorkersDetailView(
             workspace: workspace,
             liveStates: liveStates,
+            isVisible: true,
             tmuxHostingEnabled: true,
             liveStatusDisabledSlotIDs: [],
             onToggleLiveStatus: { _, _ in }
@@ -335,6 +337,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         let a = WorkersDetailView(
             workspace: workspace,
             liveStates: liveStates,
+            isVisible: true,
             tmuxHostingEnabled: true,
             liveStatusDisabledSlotIDs: [],
             onToggleLiveStatus: on
@@ -342,6 +345,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         let b = WorkersDetailView(
             workspace: workspace,
             liveStates: liveStates,
+            isVisible: true,
             tmuxHostingEnabled: false,
             liveStatusDisabledSlotIDs: [],
             onToggleLiveStatus: on
@@ -356,6 +360,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         let a = WorkersDetailView(
             workspace: workspace,
             liveStates: liveStates,
+            isVisible: true,
             tmuxHostingEnabled: true,
             liveStatusDisabledSlotIDs: [],
             onToggleLiveStatus: on
@@ -363,11 +368,35 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         let b = WorkersDetailView(
             workspace: workspace,
             liveStates: liveStates,
+            isVisible: true,
             tmuxHostingEnabled: true,
             liveStatusDisabledSlotIDs: [3],
             onToggleLiveStatus: on
         )
         XCTAssertNotEqual(a, b)
+    }
+
+    func testDetailViewEquatableTracksVisibility() {
+        let workspace = WorkersWorkspaceModel()
+        let liveStates = LiveWorkerStateStore()
+        let on: (Int, Bool) -> Void = { _, _ in }
+        let visible = WorkersDetailView(
+            workspace: workspace,
+            liveStates: liveStates,
+            isVisible: true,
+            tmuxHostingEnabled: true,
+            liveStatusDisabledSlotIDs: [],
+            onToggleLiveStatus: on
+        )
+        let hidden = WorkersDetailView(
+            workspace: workspace,
+            liveStates: liveStates,
+            isVisible: false,
+            tmuxHostingEnabled: true,
+            liveStatusDisabledSlotIDs: [],
+            onToggleLiveStatus: on
+        )
+        XCTAssertNotEqual(visible, hidden)
     }
 
     func testDetailViewEquatableIgnoresUnrelatedStoreIdentityStability() {
@@ -378,6 +407,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         let a = WorkersDetailView(
             workspace: workspace,
             liveStates: liveStates,
+            isVisible: true,
             tmuxHostingEnabled: true,
             liveStatusDisabledSlotIDs: [],
             onToggleLiveStatus: { _, _ in }
@@ -386,6 +416,7 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         let c = WorkersDetailView(
             workspace: otherWorkspace,
             liveStates: liveStates,
+            isVisible: true,
             tmuxHostingEnabled: true,
             liveStatusDisabledSlotIDs: [],
             onToggleLiveStatus: { _, _ in }

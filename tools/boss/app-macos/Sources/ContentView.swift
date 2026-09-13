@@ -47,11 +47,11 @@ struct ContentView: View {
         // (filesystem reads only) so structural conditional is safe here.
         //
         // Hidden-tab layout cost is cut without unmounting: `WorkersDetailView`
-        // is Equatable over workspace / live-state identity plus the two
-        // live-status flags, so an unrelated `ChatViewModel` publish (the
-        // kanban's usual invalidation) skips the Agents body. Per-slot
-        // `WorkerSlotSnapshot` + `.equatable()` then skips slots whose own
-        // data did not change. Same pattern as the kanban's `WorkCardSnapshot`.
+        // is Equatable over workspace / live-state identity, visibility, and
+        // the two live-status flags, so an unrelated `ChatViewModel` publish
+        // (the kanban's usual invalidation) skips the Agents body. While the
+        // tab is hidden, its snapshot cache also prevents live-state ticks
+        // from invalidating a grid or slot while preserving all surfaces.
         //
         // This ZStack must stay the root of the window's content: SwiftUI only
         // promotes a NavigationSplitView to the window's content view
@@ -628,6 +628,7 @@ struct ContentView: View {
         WorkersDetailView(
             workspace: workersWorkspace,
             liveStates: model.liveWorkerStates,
+            isVisible: model.navigationMode == .agents,
             tmuxHostingEnabled: model.tmuxHostingEnabled,
             liveStatusDisabledSlotIDs: model.liveStatusDisabledSlotIDs,
             onToggleLiveStatus: { slotId, enabled in
