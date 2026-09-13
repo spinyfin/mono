@@ -1034,6 +1034,16 @@ pub enum FrontendEvent {
     /// Response to [`FrontendRequest::GetTopCostConsumers`].
     #[worker(passthrough)]
     TopCostConsumers { report: crate::TopCostReport },
+    /// Response to [`FrontendRequest::GetMetricCatalog`].
+    #[worker(passthrough)]
+    MetricCatalogResult {
+        catalog: crate::MetricCatalog,
+    },
+    /// Response to [`FrontendRequest::GetMetricSeries`].
+    #[worker(passthrough)]
+    MetricSeriesResult {
+        report: crate::MetricSeriesReport,
+    },
     /// Response to [`FrontendRequest::ListPlannerRuns`]: every
     /// `planner_runs` audit row for the project, newest first.
     #[worker(passthrough)]
