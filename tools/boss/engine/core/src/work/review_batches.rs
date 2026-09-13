@@ -715,6 +715,47 @@ fn fail_review_batch_with_attention(
             .body_markdown(body_markdown)
             .build(),
     )?;
+    // A batch failure is a terminal review decision too. Release only the
+    // revision whose newest producing execution contributed this immutable
+    // target; an older push must never release a newer held revision.
+    release_held_revision_after_terminal_batch_in_tx(tx, &batch.cycle_root_id, &batch.target_sha, now)?;
+    Ok(())
+}
+
+fn release_held_revision_after_terminal_batch_in_tx(
+    tx: &Transaction<'_>,
+    cycle_root_id: &str,
+    target_sha: &str,
+    now: &str,
+) -> Result<()> {
+    let mut revision_ids = super::chain_helpers::collect_chain_revision_ids_including_deleted(tx, cycle_root_id)?;
+    revision_ids.push(cycle_root_id.to_owned());
+    let placeholders = revision_ids
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("?{}", index + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT t.id FROM tasks t
+         JOIN work_executions we ON we.id = (
+             SELECT latest.id FROM work_executions latest
+             WHERE latest.work_item_id = t.id
+               AND latest.kind = 'revision_implementation'
+               AND latest.status = 'completed'
+             ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
+         )
+         WHERE t.id IN ({placeholders}) AND t.kind = 'revision'
+           AND t.status = 'active' AND t.deleted_at IS NULL
+           AND we.revision_stop_contributed_head = ?{} LIMIT 1",
+        revision_ids.len() + 1,
+    );
+    let mut values: Vec<&dyn rusqlite::ToSql> = revision_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    values.push(&target_sha);
+    let revision_id: Option<String> = tx.query_row(&sql, values.as_slice(), |row| row.get(0)).optional()?;
+    if let Some(revision_id) = revision_id {
+        WorkDb::advance_held_pending_review_task_to_in_review_in_tx(tx, &revision_id, now)?;
+    }
     Ok(())
 }
 

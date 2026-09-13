@@ -415,7 +415,15 @@ impl WorkDb {
         // revision's worker never opens its own PR, so
         // `record_worker_pr_completion`'s normal `InReview` target never
         // applies to it.
-        advance_held_revision_after_verdict_in_tx(&mut pending, &tx, &batch.cycle_root_id, &batch.target_sha, &now)?;
+        let require_gate_passing_verdict = super::review_verdicts::is_informative_gate_outcome(input.gate_outcome);
+        advance_held_revision_after_verdict_in_tx(
+            &mut pending,
+            &tx,
+            &batch.cycle_root_id,
+            &batch.target_sha,
+            &now,
+            require_gate_passing_verdict,
+        )?;
 
         commit_and_publish(tx, pending, self.event_bus())?;
         Ok(Some(applied_ref).filter(|_| remediating_task_id.is_some()))
@@ -723,12 +731,13 @@ fn advance_cycle_root_to_in_review_in_tx(
 /// it instead. A no-op (not an error) when no such revision exists: most
 /// batches review a chain root's own push, with no revision involved at
 /// all.
-fn advance_held_revision_after_verdict_in_tx(
+pub(crate) fn advance_held_revision_after_verdict_in_tx(
     pending: &mut PendingEvents,
     tx: &rusqlite::Transaction<'_>,
     cycle_root_id: &str,
     target_sha: &str,
     now: &str,
+    require_gate_passing_verdict: bool,
 ) -> Result<()> {
     // Candidate revision rows are sourced from the full review-cycle chain
     // under `cycle_root_id`, not just its direct children: residual
@@ -751,7 +760,14 @@ fn advance_held_revision_after_verdict_in_tx(
     let sql = format!(
         "SELECT t.id
          FROM tasks t
-         JOIN work_executions we ON we.work_item_id = t.id
+         JOIN work_executions we ON we.id = (
+             SELECT latest.id FROM work_executions latest
+             WHERE latest.work_item_id = t.id
+               AND latest.kind = 'revision_implementation'
+               AND latest.status = 'completed'
+             ORDER BY latest.created_at DESC, latest.id DESC
+             LIMIT 1
+         )
          WHERE t.id IN ({placeholders})
            AND t.kind = 'revision'
            AND t.status = 'active'
@@ -759,7 +775,6 @@ fn advance_held_revision_after_verdict_in_tx(
            AND we.kind = 'revision_implementation'
            AND we.status = 'completed'
            AND we.revision_stop_contributed_head = ?{}
-         ORDER BY we.created_at DESC, we.id DESC
          LIMIT 1",
         revision_ids.len() + 1,
     );
@@ -769,8 +784,17 @@ fn advance_held_revision_after_verdict_in_tx(
     let Some(revision_id) = revision_id else {
         return Ok(());
     };
-    if WorkDb::advance_pending_review_task_to_in_review_with_verdict_source_in_tx(tx, &revision_id, cycle_root_id, now)?
-    {
+    let advanced = if require_gate_passing_verdict {
+        WorkDb::advance_pending_review_task_to_in_review_with_verdict_source_in_tx(
+            tx,
+            &revision_id,
+            cycle_root_id,
+            now,
+        )?
+    } else {
+        WorkDb::advance_held_pending_review_task_to_in_review_in_tx(tx, &revision_id, now)?
+    };
+    if advanced {
         cascade_dependents_after_prereq_status_change(pending, tx, &revision_id, "in_review", now)?;
     }
     Ok(())

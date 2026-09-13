@@ -457,9 +457,10 @@ pub(crate) fn attach_ready_for_review_flag(tasks: &mut [Task], chores: &mut [Tas
 /// attributed to `row` for the "AI reviewing" / "review queued" badges.
 ///
 /// For a non-revision row this is its own id. A `revision` task held
-/// `active` pending a review pass has NO `pr_review` execution of its own —
-/// review-batch leaves are always created against the review cycle root
-/// (`pr_review_batches.cycle_root_id`), so the target is that root's id,
+/// `active` pending a review pass checks its own id (legacy reviewers are
+/// created there) and the review cycle root (fan-out leaves are created
+/// against `pr_review_batches.cycle_root_id`), resolved by walking the full
+/// parent chain rather than trusting a single
 /// resolved by walking the full parent chain rather than trusting a single
 /// hop: most revisions parent directly to the chain root, but residual
 /// pre-flatten-migration rows can still nest a revision under another
@@ -473,16 +474,24 @@ pub(crate) fn attach_ready_for_review_flag(tasks: &mut [Task], chores: &mut [Tas
 /// `None` for a revision not currently `active` (e.g. `todo`, or already
 /// `in_review`/`done`, which roll up into the parent's card instead — see
 /// `revision-tasks.md`) or when the chain root can't be resolved (broken
-/// chain; fails closed rather than guessing).
-fn review_execution_target_id(conn: &Connection, row: &Task) -> Option<String> {
+/// chain; fails closed rather than guessing a root, while retaining the
+/// revision's own id for a legacy reviewer.
+fn review_execution_target_ids_for_row(conn: &Connection, row: &Task) -> Option<Vec<String>> {
     if row.kind == TaskKind::Revision {
         if row.status == TaskStatus::Active {
-            chain_root(conn, &row.id).ok()
+            // A revision can own a legacy reviewer even though fan-out reviewers
+            // belong to the cycle root. Keep its own id and add only a resolved
+            // root; a broken chain therefore degrades to own-id attribution.
+            let mut ids = vec![row.id.clone()];
+            if let Some(root) = chain_root(conn, &row.id).ok().filter(|root| root != &row.id) {
+                ids.push(root);
+            }
+            Some(ids)
         } else {
             None
         }
     } else {
-        Some(row.id.clone())
+        Some(vec![row.id.clone()])
     }
 }
 
@@ -492,16 +501,16 @@ fn review_execution_target_ids(
     conn: &Connection,
     tasks: &[Task],
     chores: &[Task],
-) -> std::collections::HashMap<String, String> {
+) -> std::collections::HashMap<String, Vec<String>> {
     tasks
         .iter()
         .chain(chores.iter())
-        .filter_map(|row| review_execution_target_id(conn, row).map(|target| (row.id.clone(), target)))
+        .filter_map(|row| review_execution_target_ids_for_row(conn, row).map(|targets| (row.id.clone(), targets)))
         .collect()
 }
 
 /// Set `ai_reviewing = true` on every task (and chore) whose
-/// [`review_execution_target_id`] has a non-terminal `pr_review` execution,
+/// [`review_execution_target_ids_for_row`] has a non-terminal `pr_review` execution,
 /// restricted to rows in `active` (Doing, awaiting its first review before
 /// ever reaching `in_review`, OR a revision held pending its cycle root's
 /// review pass) or already `in_review` (Review, an automated review pass
@@ -531,7 +540,7 @@ pub(crate) fn attach_ai_reviewing_flag(
 ) -> rusqlite::Result<()> {
     // Collect the target ids for every row that can possibly show the
     // badge: a non-revision row in `active`/`in_review` with a `pr_url`
-    // targets itself; a revision held `active` targets its review cycle root,
+    // targets itself; a revision held `active` targets itself and its review cycle root,
     // resolved by a full parent-chain walk (see `review_execution_target_id`).
     // If there are none we can skip the DB
     // query entirely.
@@ -543,7 +552,7 @@ pub(crate) fn attach_ai_reviewing_flag(
             matches!(t.status, TaskStatus::Active | TaskStatus::InReview)
                 && (t.kind == TaskKind::Revision || t.pr_url.is_some())
         })
-        .filter_map(|t| target_ids.get(&t.id).cloned())
+        .flat_map(|t| target_ids.get(&t.id).into_iter().flatten().cloned())
         .collect();
     if candidate_ids.is_empty() {
         return Ok(());
@@ -583,12 +592,18 @@ pub(crate) fn attach_ai_reviewing_flag(
         return Ok(());
     }
     for task in tasks.iter_mut() {
-        if target_ids.get(&task.id).is_some_and(|t| reviewing.contains(t)) {
+        if target_ids
+            .get(&task.id)
+            .is_some_and(|targets| targets.iter().any(|target| reviewing.contains(target)))
+        {
             task.ai_reviewing = true;
         }
     }
     for chore in chores.iter_mut() {
-        if target_ids.get(&chore.id).is_some_and(|t| reviewing.contains(t)) {
+        if target_ids
+            .get(&chore.id)
+            .is_some_and(|targets| targets.iter().any(|target| reviewing.contains(target)))
+        {
             chore.ai_reviewing = true;
         }
     }
@@ -831,10 +846,8 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
     // included alongside Active because a row that has already reached
     // `in_review` can still have a freshly-enqueued review pass sitting in
     // `ready` before it starts running (see `request_pr_review_in_tx`). Keyed
-    // by [`review_execution_target_id`], not the row's own id, so a
-    // revision held `active` pending its review cycle root's queued review
-    // pass is attributed correctly too (a revision never owns a
-    // `pr_review` execution of its own).
+    // by [`review_execution_target_ids_for_row`], so either a legacy reviewer
+    // on a held revision or a queued review-cycle-root batch is attributed.
     let mut queued_lookup_ids: Vec<String> = tasks
         .iter()
         .chain(chores.iter())
@@ -842,7 +855,7 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
             !task_kind_excluded_from_ai_review(&row.kind)
                 && matches!(row.status, TaskStatus::Active | TaskStatus::InReview)
         })
-        .filter_map(|row| review_targets.get(&row.id).cloned())
+        .flat_map(|row| review_targets.get(&row.id).into_iter().flatten().cloned())
         .collect();
     queued_lookup_ids.sort_unstable();
     queued_lookup_ids.dedup();
@@ -879,15 +892,12 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
         if task_kind_excluded_from_ai_review(&row.kind) {
             return (Some(AI_REVIEW_STATE_REVIEW_NOT_REQUIRED), None);
         }
-        // Queued-review membership is keyed by `review_execution_target_id`
-        // (self for a non-revision row, the review cycle root for a
-        // revision held `active`), matching how `attach_ai_reviewing_flag` attributes
-        // `ai_reviewing` — a revision has no `pr_review` execution of its
-        // own to look up directly.
+        // Queued-review membership checks every review-execution target: a
+        // non-revision's own id, or a held revision's own id and cycle root.
         let is_queued = || {
             review_targets
                 .get(&row.id)
-                .is_some_and(|target| queued_reviews.contains(target))
+                .is_some_and(|targets| targets.iter().any(|target| queued_reviews.contains(target)))
         };
         match row.status {
             TaskStatus::Active => {

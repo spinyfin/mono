@@ -727,6 +727,25 @@ pub(super) async fn maybe_enqueue_declared_delivery_reviewer(
                 file_admission_deferred_attention(work_db, work_item_id, pr_url);
             }
             Ok(dispatch) => {
+                if execution.kind == ExecutionKind::RevisionImplementation {
+                    let target_sha = match &dispatch {
+                        crate::work::ReviewBatchDispatch::Created { batch, .. }
+                        | crate::work::ReviewBatchDispatch::ExistingBatch { batch, .. } => {
+                            Some(batch.target_sha.as_str())
+                        }
+                        _ => None,
+                    };
+                    if let Some(target_sha) = target_sha
+                        && let Err(err) = work_db.set_revision_stop_contributed_head(&execution.id, target_sha)
+                    {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            target_sha,
+                            ?err,
+                            "run_done post-effects: failed to stamp revision contributed head for review batch",
+                        );
+                    }
+                }
                 tracing::info!(
                     work_item_id,
                     pr_url,

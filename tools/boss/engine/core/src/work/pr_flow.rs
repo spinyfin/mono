@@ -795,6 +795,14 @@ impl WorkDb {
     pub fn advance_held_pending_review_task_to_in_review(&self, work_item_id: &str) -> Result<bool> {
         let conn = self.connect()?;
         let now = now_string();
+        Self::advance_held_pending_review_task_to_in_review_in_tx(&conn, work_item_id, &now)
+    }
+
+    pub(crate) fn advance_held_pending_review_task_to_in_review_in_tx(
+        conn: &Connection,
+        work_item_id: &str,
+        now: &str,
+    ) -> Result<bool> {
         let rows_changed = conn.execute(
             "UPDATE tasks
              SET status            = 'in_review',

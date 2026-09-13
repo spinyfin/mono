@@ -1276,13 +1276,15 @@ impl WorkDb {
         // entirely, independent of the status-advance guard above: a
         // `pr_review` execution starting against an `in_review` row still
         // consumes `autostart` even though that row's status does not move.
-        // Other execution kinds preserve the prior scope and leave it intact.
+        // Every other execution kind leaves `autostart` intact on an
+        // `in_review` row.
         // But a `kind = 'revision'` row in `in_review` with a live
         // non-terminal revision child of its own is a case the status guard
         // above explicitly refuses to act on (a duplicate/stray run must
         // not touch a row that already has a live child) — no run was
         // sanctioned to start against *this* row, so `autostart` must stay
-        // intact for it too, same as before this UPDATE was split off.
+        // intact for it too. The guards differ only in the `pr_review`
+        // disjunct and must remain symmetric.
         tx.execute(
             "UPDATE tasks
              SET autostart = 0,

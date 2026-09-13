@@ -1845,8 +1845,8 @@ fn start_execution_run_pr_review_still_clears_autostart() {
 }
 
 /// An unrelated implementation execution must preserve `autostart` on a
-/// Review-lane cycle root. The split UPDATE keeps the pre-existing scope:
-/// only `pr_review` consumes this flag without a status advance.
+/// Review-lane cycle root. Only `pr_review` consumes this flag without a
+/// status advance; every other execution kind leaves it intact.
 #[test]
 fn start_execution_run_non_review_keeps_autostart_on_in_review_root() {
     let db = WorkDb::open(temp_db_path("non-review-keeps-review-autostart")).unwrap();
@@ -1917,8 +1917,8 @@ fn start_execution_run_non_pr_review_still_advances_todo_to_active() {
 /// above refuses to move — a duplicate/stray run must not act on a row that
 /// already has a live child. `autostart` must stay symmetric with that: no
 /// run was sanctioned to start against this row, so `autostart` must NOT be
-/// consumed, matching the pre-split behavior where both writes shared one
-/// guard.
+/// consumed. The autostart and status guards differ only in the `pr_review`
+/// disjunct and must remain symmetric.
 #[test]
 fn start_execution_run_does_not_clear_autostart_for_revision_with_live_child() {
     let db = WorkDb::open(temp_db_path("rev-live-child-keeps-autostart")).unwrap();

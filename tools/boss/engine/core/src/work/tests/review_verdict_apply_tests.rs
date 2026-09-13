@@ -364,6 +364,74 @@ fn clean_verdict_does_not_advance_a_revision_with_a_different_contributed_head()
     );
 }
 
+/// The newest producing execution controls a held revision. A historical
+/// matching stamp must not release a revision after it contributed a newer
+/// head that awaits its own review batch.
+#[test]
+fn clean_verdict_does_not_advance_revision_when_only_an_older_execution_matches() {
+    let db = WorkDb::open(temp_db_path("verdict-apply-historical-sha-revision")).unwrap();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id, "review target");
+    bind_open_pr(&db, &root.id);
+    let revision_id = make_held_revision(&db, &root.id, PR_URL, "head-a");
+    let later = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(revision_id.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    db.set_revision_stop_contributed_head(&later.id, "head-b").unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET created_at = '9999-01-01T00:00:00Z' WHERE id = ?1",
+            rusqlite::params![later.id],
+        )
+        .unwrap();
+    let supervisor = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(root.id.clone(), "head-a"),
+            &[member(
+                ReviewBatchMemberRole::Supervisor,
+                Some(supervisor.id.clone()),
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    force_batch_supervising(&db, &batch.id);
+    let proposal = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &supervisor.id,
+            work_item_id: &root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &clean_verdict_payload(&batch.id, "head-a"),
+            idempotency_key: "historical-head",
+        })
+        .unwrap()
+        .unwrap();
+    db.apply_review_verdict_proposal(&proposal.proposal.id, &FakePrStateChecker::always(PrOpenState::Open))
+        .unwrap();
+    assert_eq!(
+        query_task(&db.connect().unwrap(), &revision_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskStatus::Active
+    );
+}
+
 /// Nested variant of the above: a residual pre-flatten-migration chain
 /// (R2 -> R1 -> root) must still advance R2 when the verdict for its exact
 /// contributed head lands, not just a revision directly parented to the

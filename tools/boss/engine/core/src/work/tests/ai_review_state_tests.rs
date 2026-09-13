@@ -591,6 +591,48 @@ fn ai_reviewing_attributes_cycle_root_running_review_to_held_revision() {
     assert_eq!(revision_card.ai_review_state.as_deref(), Some("reviewing"));
 }
 
+/// A held revision can also own a legacy reviewer. Its own running execution
+/// must light the same badge even when the cycle root has no reviewer.
+#[test]
+fn ai_reviewing_attributes_own_running_review_to_held_revision() {
+    let db = WorkDb::open(temp_db_path("ai-reviewing-own-held-revision")).unwrap();
+    let product_id = make_revision_product(&db, "own-held-revision");
+    let pr_url = "https://github.com/spinyfin/mono/pull/6003";
+    let root_id = make_in_review_chore(&db, &product_id, pr_url);
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&root_id), &checker).unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'active', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![revision.id, pr_url],
+        )
+        .unwrap();
+    let review = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(revision.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.start_execution_run(
+        &review.id,
+        "review-worker",
+        "review-repo",
+        "review-lease",
+        "review-workspace",
+        "/tmp/review-workspace",
+    )
+    .unwrap();
+
+    let tree = db.get_work_tree(&product_id).unwrap();
+    let card = tree.tasks.iter().find(|task| task.id == revision.id).unwrap();
+    assert!(card.ai_reviewing);
+    assert_eq!(card.ai_review_state.as_deref(), Some("reviewing"));
+}
+
 /// Same attribution as above, but for a residual pre-flatten-migration
 /// nested revision (R2 -> R1 -> root) rather than a direct child of the
 /// cycle root. `review_execution_target_id` must walk the FULL chain to the
