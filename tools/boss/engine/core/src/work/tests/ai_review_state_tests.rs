@@ -50,6 +50,15 @@ fn ai_review_state_rolls_up_from_last_completed_revision_on_chain_root() {
     let followup_id = "task_followup_findings_test";
     {
         let conn = db.connect().unwrap();
+        // Real code (`pr_flow.rs`'s `record_worker_pr_completion`) always
+        // finalizes the producing execution to `completed` in the same
+        // transaction as the verdict it records — never leaves it `ready`.
+        // Match that here so the row isn't mistaken for a still-queued pass.
+        conn.execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            rusqlite::params![execution.id],
+        )
+        .unwrap();
         WorkDb::insert_review_verdict_in_tx(
             &conn,
             &execution.id,
@@ -248,6 +257,15 @@ fn ai_review_state_ignores_a_stale_open_pr_review_died_attention() {
         .unwrap();
     {
         let conn = db.connect().unwrap();
+        // See the matching comment in
+        // `ai_review_state_rolls_up_from_last_completed_revision_on_chain_root`:
+        // real code always finalizes the producing execution to `completed`
+        // in the same transaction as the verdict.
+        conn.execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            rusqlite::params![execution.id],
+        )
+        .unwrap();
         WorkDb::insert_review_verdict_in_tx(
             &conn,
             &execution.id,
@@ -480,6 +498,15 @@ fn ai_review_state_treats_gave_up_verdict_as_no_badge() {
         .unwrap();
     {
         let conn = db.connect().unwrap();
+        // See the matching comment in
+        // `ai_review_state_rolls_up_from_last_completed_revision_on_chain_root`:
+        // real code always finalizes the producing execution to `completed`
+        // in the same transaction as the verdict.
+        conn.execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            rusqlite::params![execution.id],
+        )
+        .unwrap();
         WorkDb::insert_review_verdict_in_tx(
             &conn,
             &execution.id,
@@ -499,5 +526,249 @@ fn ai_review_state_treats_gave_up_verdict_as_no_badge() {
     assert!(
         card.ai_review_state.is_none(),
         "gave_up must render exactly like no verdict at all — never a failure badge"
+    );
+}
+
+/// A revision held `active` pending its cycle root's review pass has NO
+/// `pr_review` execution of its own — batch leaves are created against the
+/// cycle root — so it must attribute the root's running pass to itself:
+/// `ai_reviewing = true` / `ai_review_state = "reviewing"`. Without this a
+/// held revision's Doing card shows no reviewing indicator at all while
+/// reviewer workers run against its parent (observed live: a held revision
+/// returned `ai_reviewing: null, ai_review_state: null` while three
+/// `pr_review` workers ran against its parent).
+#[test]
+fn ai_reviewing_attributes_cycle_root_running_review_to_held_revision() {
+    let db = WorkDb::open(temp_db_path("ai-reviewing-held-revision")).unwrap();
+    let product_id = make_revision_product(&db, "held-revision");
+    let pr_url = "https://github.com/spinyfin/mono/pull/6001";
+    let root_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&root_id), &checker).unwrap();
+    // Simulate the revision's worker completing and the engine holding it
+    // `active` pending review: `pr_flow.rs`'s `PendingReview` completion
+    // target stamps the cycle root's `pr_url` onto the revision too.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'active', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![revision.id, pr_url],
+        )
+        .unwrap();
+
+    // The cycle root's own `pr_review` execution is running — there is NO
+    // execution against the revision itself.
+    let review = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(root_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.start_execution_run(
+        &review.id,
+        "review-worker",
+        "review-repo",
+        "review-lease",
+        "review-workspace",
+        "/tmp/review-workspace",
+    )
+    .unwrap();
+
+    let tree = db.get_work_tree(&product_id).unwrap();
+    let revision_card = tree
+        .tasks
+        .iter()
+        .find(|t| t.id == revision.id)
+        .expect("revision present");
+    assert!(
+        revision_card.ai_reviewing,
+        "a held revision must attribute its cycle root's running review to itself"
+    );
+    assert_eq!(revision_card.ai_review_state.as_deref(), Some("reviewing"));
+}
+
+/// A held revision can also own a legacy reviewer. Its own running execution
+/// must light the same badge even when the cycle root has no reviewer.
+#[test]
+fn ai_reviewing_attributes_own_running_review_to_held_revision() {
+    let db = WorkDb::open(temp_db_path("ai-reviewing-own-held-revision")).unwrap();
+    let product_id = make_revision_product(&db, "own-held-revision");
+    let pr_url = "https://github.com/spinyfin/mono/pull/6003";
+    let root_id = make_in_review_chore(&db, &product_id, pr_url);
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&root_id), &checker).unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'active', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![revision.id, pr_url],
+        )
+        .unwrap();
+    let review = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(revision.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.start_execution_run(
+        &review.id,
+        "review-worker",
+        "review-repo",
+        "review-lease",
+        "review-workspace",
+        "/tmp/review-workspace",
+    )
+    .unwrap();
+
+    let tree = db.get_work_tree(&product_id).unwrap();
+    let card = tree.tasks.iter().find(|task| task.id == revision.id).unwrap();
+    assert!(card.ai_reviewing);
+    assert_eq!(card.ai_review_state.as_deref(), Some("reviewing"));
+}
+
+/// Same attribution as above, but for a residual pre-flatten-migration
+/// nested revision (R2 -> R1 -> root) rather than a direct child of the
+/// cycle root. `review_execution_target_id` must walk the FULL chain to the
+/// true root — attributing R2's badge to its direct parent R1 (which has no
+/// `pr_review` execution of its own either) would silently drop the
+/// "reviewing" signal even while the root's reviewer is actually running.
+#[test]
+fn ai_reviewing_attributes_cycle_root_running_review_to_nested_held_revision() {
+    let db = WorkDb::open(temp_db_path("ai-reviewing-nested-held-revision")).unwrap();
+    let product_id = make_revision_product(&db, "nested-held-revision");
+    let pr_url = "https://github.com/spinyfin/mono/pull/6002";
+    let root_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    // R1: an ordinary direct child, not itself held for review (just the
+    // intermediate hop the residual-nesting case requires).
+    let r1_id = insert_revision_row(&db, &product_id, &root_id);
+    // R2: nested under R1, not under the root — the pre-flatten-migration
+    // shape. Held `active` pending review, exactly as the direct-child case
+    // above.
+    let r2_id = insert_revision_row(&db, &product_id, &r1_id);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'active', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![r2_id, pr_url],
+        )
+        .unwrap();
+
+    // The cycle root's own `pr_review` execution is running — there is NO
+    // execution against either revision.
+    let review = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(root_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.start_execution_run(
+        &review.id,
+        "review-worker",
+        "review-repo",
+        "review-lease",
+        "review-workspace",
+        "/tmp/review-workspace",
+    )
+    .unwrap();
+
+    let tree = db.get_work_tree(&product_id).unwrap();
+    let revision_card = tree
+        .tasks
+        .iter()
+        .find(|t| t.id == r2_id)
+        .expect("nested revision present");
+    assert!(
+        revision_card.ai_reviewing,
+        "a nested held revision must attribute its review cycle root's running review to itself, \
+         not just a direct child of the root"
+    );
+    assert_eq!(revision_card.ai_review_state.as_deref(), Some("reviewing"));
+}
+
+/// A parent already `in_review` with a completed (stale) verdict on record
+/// AND a fresh `pr_review` execution running against it must report the
+/// live `reviewing` state, not the stale verdict — a live pass in flight is
+/// more relevant than history, exactly as already holds for an Active row
+/// (see the `Active` arm's "any older verdict is ignored" rule).
+#[test]
+fn ai_review_state_prefers_live_reviewing_over_stale_verdict_when_in_review() {
+    let db = WorkDb::open(temp_db_path("ai-review-state-in-review-live-over-stale")).unwrap();
+    let product_id = make_revision_product(&db, "in-review-live-over-stale");
+    let pr_url = "https://github.com/spinyfin/mono/pull/6101";
+    let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    // An earlier pass already completed clean.
+    let old_execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            rusqlite::params![old_execution.id],
+        )
+        .unwrap();
+        WorkDb::insert_review_verdict_in_tx(
+            &conn,
+            &old_execution.id,
+            &chore_id,
+            &crate::work::ReviewVerdictInput {
+                head_sha: Some("sha-old".to_owned()),
+                findings_count: 0,
+                revision_warranted: false,
+                gate_outcome: crate::work::REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+            },
+        )
+        .unwrap();
+    }
+
+    // A revision pushed a fresh commit; a new review pass is now running.
+    let fresh = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.start_execution_run(
+        &fresh.id,
+        "review-worker",
+        "review-repo",
+        "review-lease",
+        "review-workspace",
+        "/tmp/review-workspace",
+    )
+    .unwrap();
+
+    let tree = db.get_work_tree(&product_id).unwrap();
+    let card = tree.chores.iter().find(|c| c.id == chore_id).expect("chore present");
+    assert_eq!(
+        card.status,
+        TaskStatus::InReview,
+        "starting the fresh pr_review must not move the row"
+    );
+    assert_eq!(
+        card.ai_review_state.as_deref(),
+        Some("reviewing"),
+        "a live running pass must win over an older completed verdict"
     );
 }

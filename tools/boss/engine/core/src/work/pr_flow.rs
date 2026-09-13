@@ -815,6 +815,14 @@ impl WorkDb {
     pub fn advance_held_pending_review_task_to_in_review(&self, work_item_id: &str) -> Result<bool> {
         let conn = self.connect()?;
         let now = now_string();
+        Self::advance_held_pending_review_task_to_in_review_in_tx(&conn, work_item_id, &now)
+    }
+
+    pub(crate) fn advance_held_pending_review_task_to_in_review_in_tx(
+        conn: &Connection,
+        work_item_id: &str,
+        now: &str,
+    ) -> Result<bool> {
         let rows_changed = conn.execute(
             "UPDATE tasks
              SET status            = 'in_review',
@@ -843,6 +851,30 @@ impl WorkDb {
     ) -> Result<bool> {
         let conn = self.connect()?;
         let now = now_string();
+        Self::advance_pending_review_task_to_in_review_with_verdict_source_in_tx(
+            &conn,
+            work_item_id,
+            verdict_source_id,
+            &now,
+        )
+    }
+
+    /// Transaction-scoped body of
+    /// [`Self::advance_pending_review_task_to_in_review_with_verdict_source`],
+    /// factored out so [`super::review_verdict_apply`] can advance a held
+    /// revision in the same transaction as the cycle-root advance and the
+    /// verdict write it depends on, rather than in a separate connection
+    /// after `commit_applied_review_verdict`'s transaction has already
+    /// committed (which would let a crash between the two land the verdict
+    /// without ever releasing the revision's hold). `conn` may be a plain
+    /// [`Connection`] (the public wrapper above) or a `Transaction` — both
+    /// implement the same `execute` surface.
+    pub(crate) fn advance_pending_review_task_to_in_review_with_verdict_source_in_tx(
+        conn: &Connection,
+        work_item_id: &str,
+        verdict_source_id: &str,
+        now: &str,
+    ) -> Result<bool> {
         let review_result_outcomes = super::review_verdicts::review_result_gate_outcomes_sql();
         let sql = format!(
             "UPDATE tasks

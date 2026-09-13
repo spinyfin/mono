@@ -773,6 +773,23 @@ final class WorkCardSnapshotTests: XCTestCase {
         XCTAssertNil(snap.activityState)
     }
 
+    /// A cycle root stays `in_review` (Review lane) while an automated
+    /// review pass runs against it — `start_execution_run` and
+    /// `request_pr_review_in_tx` deliberately never pull it back to
+    /// `active` for this. The Review-lane card must still surface that a
+    /// pass is running via the same `aiReviewState` badge Doing would show,
+    /// since nothing moves the row to make the Doing-lane chip visible.
+    func testAIReviewStateBadgeVisibleOnReviewLaneCard() {
+        var task = Self.makeTask(status: "in_review", prURL: "https://github.com/spinyfin/mono/pull/1")
+        task.aiReviewing = true
+        task.aiReviewState = "reviewing"
+        let snap = WorkCardSnapshot.build(
+            task: task,
+            context: WorkCardSnapshotContext(column: .review)
+        )
+        XCTAssertEqual(snap.aiReviewState, "reviewing")
+    }
+
     // MARK: - Per-badge visibility
 
     func testConflictClearedBadgeMutualExclusion() {

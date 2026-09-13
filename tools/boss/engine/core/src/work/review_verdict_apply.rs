@@ -407,6 +407,24 @@ impl WorkDb {
         // `done`/`archived` and this no-ops.
         advance_cycle_root_to_in_review_in_tx(&mut pending, &tx, &batch.cycle_root_id, &now)?;
 
+        // A revision under this chain root that is held `active` pending
+        // exactly this reviewed push must ALSO reach `in_review` here: the
+        // revision's own card needs to leave Doing once its push is
+        // confirmed reviewed, not just the cycle root (which was already in
+        // Review the whole time). Nothing else ever advances it: a
+        // revision's worker never opens its own PR, so
+        // `record_worker_pr_completion`'s normal `InReview` target never
+        // applies to it.
+        let require_gate_passing_verdict = super::review_verdicts::is_informative_gate_outcome(input.gate_outcome);
+        advance_held_revision_after_verdict_in_tx(
+            &mut pending,
+            &tx,
+            &batch.cycle_root_id,
+            &batch.target_sha,
+            &now,
+            require_gate_passing_verdict,
+        )?;
+
         commit_and_publish(tx, pending, self.event_bus())?;
         Ok(Some(applied_ref).filter(|_| remediating_task_id.is_some()))
     }
@@ -690,5 +708,94 @@ fn advance_cycle_root_to_in_review_in_tx(
         return Ok(());
     }
     cascade_dependents_after_prereq_status_change(pending, tx, task_id, "in_review", now)?;
+    Ok(())
+}
+
+/// Advance the one `revision` task under `cycle_root_id` that is held
+/// `active` pending exactly the push this batch reviewed, to `in_review`.
+///
+/// A revision never opens its own PR: `pr_flow.rs`'s `PendingReview`
+/// completion target holds it in whatever status it was already in (with
+/// the cycle root's `pr_url` stamped onto it so the reviewer/operator can
+/// find it) while the automated reviewer runs. Once this batch's verdict
+/// lands, that hold must release — otherwise the revision sits in Doing
+/// forever with no live worker and no way to reach Review on its own.
+///
+/// Identified by SHA, never by heuristic (task name, PR number, or reviewer
+/// *start* timing are all explicitly forbidden): the revision's own
+/// terminal `revision_implementation` execution must have stamped
+/// `revision_stop_contributed_head` equal to `target_sha`, the exact head
+/// this batch reviewed. A revision already superseded by a later push
+/// before this verdict landed has a different contributed head and is
+/// correctly left alone — a verdict for its own (later) push will advance
+/// it instead. A no-op (not an error) when no such revision exists: most
+/// batches review a chain root's own push, with no revision involved at
+/// all.
+pub(crate) fn advance_held_revision_after_verdict_in_tx(
+    pending: &mut PendingEvents,
+    tx: &rusqlite::Transaction<'_>,
+    cycle_root_id: &str,
+    target_sha: &str,
+    now: &str,
+    require_gate_passing_verdict: bool,
+) -> Result<()> {
+    // Candidate revision rows are sourced from the full review-cycle chain
+    // under `cycle_root_id`, not just its direct children: residual
+    // pre-flatten-migration rows can still nest a revision under another
+    // revision (see `get_chain_root_task` / `review_cycle_root_id`), and a
+    // direct `parent_task_id = cycle_root_id` predicate would exclude such a
+    // nested row before its contributed head could even be checked, leaving
+    // it stranded `active` even once its exact reviewed push lands. The
+    // `collect_chain_revision_ids_including_deleted` owns this downward walk:
+    // it intentionally traverses tombstoned intermediate revisions so a live
+    // descendant is still found, and shares the chain helper's 64-hop bound.
+    let mut revision_ids = super::chain_helpers::collect_chain_revision_ids_including_deleted(tx, cycle_root_id)?;
+    revision_ids.push(cycle_root_id.to_owned());
+    let placeholders = revision_ids
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("?{}", index + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT t.id
+         FROM tasks t
+         JOIN work_executions we ON we.id = (
+             SELECT latest.id FROM work_executions latest
+             WHERE latest.work_item_id = t.id
+               AND latest.kind = 'revision_implementation'
+               AND latest.status = 'completed'
+             ORDER BY latest.created_at DESC, latest.id DESC
+             LIMIT 1
+         )
+         WHERE t.id IN ({placeholders})
+           AND t.kind = 'revision'
+           AND t.status = 'active'
+           AND t.deleted_at IS NULL
+           AND we.kind = 'revision_implementation'
+           AND we.status = 'completed'
+           AND we.revision_stop_contributed_head = ?{}
+         LIMIT 1",
+        revision_ids.len() + 1,
+    );
+    let mut values: Vec<&dyn rusqlite::ToSql> = revision_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    values.push(&target_sha);
+    let revision_id: Option<String> = tx.query_row(&sql, values.as_slice(), |row| row.get(0)).optional()?;
+    let Some(revision_id) = revision_id else {
+        return Ok(());
+    };
+    let advanced = if require_gate_passing_verdict {
+        WorkDb::advance_pending_review_task_to_in_review_with_verdict_source_in_tx(
+            tx,
+            &revision_id,
+            cycle_root_id,
+            now,
+        )?
+    } else {
+        WorkDb::advance_held_pending_review_task_to_in_review_in_tx(tx, &revision_id, now)?
+    };
+    if advanced {
+        cascade_dependents_after_prereq_status_change(pending, tx, &revision_id, "in_review", now)?;
+    }
     Ok(())
 }

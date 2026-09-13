@@ -1205,10 +1205,17 @@ impl WorkDb {
         // A row in Review owns an open PR. For a non-revision
         // base (chore/project_task/task), implementation work must ride a
         // `kind=revision` task on the base's branch — the base itself must
-        // never re-appear in Doing for an implementation redispatch.
-        // `pr_review` is the deliberate exception: an actual reviewer start
-        // means the base is once again in the pre-human-review phase, so it
-        // must return to Doing until that pass records a ReviewResult.
+        // never re-appear in Doing for an implementation redispatch, and
+        // that includes a `pr_review` execution starting against it: once a
+        // row has reached `in_review` it stays there for as long as work
+        // continues against its PR — including while an automated review
+        // pass runs — per `tools/boss/docs/designs/work-kanban.md`'s
+        // cycle-root status contract. The row leaves `in_review` only on a
+        // genuine terminal outcome or an explicit human action, never
+        // because a reviewer started. (A `pr_review` execution CAN still
+        // hold a row that has not yet reached `in_review` — see
+        // `work/pr_flow.rs`'s `PendingReview` outcome — that is a
+        // one-directional hold, not licence to reverse it here.)
         //
         // A revision task is different: its own re-dispatch IS the
         // sanctioned continuation, and revision rows themselves rest
@@ -1239,22 +1246,15 @@ impl WorkDb {
         // old blanket guard's incidental loop-halt for that specific
         // failure mode is given up in exchange for the live worker
         // actually showing on the kanban), not a defect in this query.
-        //
-        // `autostart` is cleared here (single-shot semantics): once a
-        // row has ever transitioned to Doing, the flag is consumed so
-        // that moving the card back to Backlog later does not trigger
-        // re-dispatch by the reconciler or orphan-active sweep.
         tx.execute(
             "UPDATE tasks
              SET status = 'active',
-                 autostart = 0,
                  updated_at = ?2
              WHERE id = ?1
                AND deleted_at IS NULL
                AND status NOT IN ('done', 'archived', 'blocked')
                AND (
                  status != 'in_review'
-                 OR ?3 = 'pr_review'
                  OR (
                      kind = 'revision'
                      AND NOT EXISTS (
@@ -1265,6 +1265,43 @@ impl WorkDb {
                            AND child.status NOT IN ('done', 'archived')
                      )
                  )
+               )",
+            params![execution.work_item_id, now],
+        )?;
+
+        // `autostart` is cleared here (single-shot semantics): once a row
+        // has ever had a run start against it, the flag is consumed so that
+        // moving the card back to Backlog later does not trigger re-dispatch
+        // by the reconciler or orphan-active sweep. This is mostly, but not
+        // entirely, independent of the status-advance guard above: a
+        // `pr_review` execution starting against an `in_review` row still
+        // consumes `autostart` even though that row's status does not move.
+        // Every other execution kind leaves `autostart` intact on an
+        // `in_review` row.
+        // But a `kind = 'revision'` row in `in_review` with a live
+        // non-terminal revision child of its own is a case the status guard
+        // above explicitly refuses to act on (a duplicate/stray run must
+        // not touch a row that already has a live child) — no run was
+        // sanctioned to start against *this* row, so `autostart` must stay
+        // intact for it too. The guards differ only in the `pr_review`
+        // disjunct and must remain symmetric.
+        tx.execute(
+            "UPDATE tasks
+             SET autostart = 0,
+                 updated_at = ?2
+             WHERE id = ?1
+               AND deleted_at IS NULL
+               AND status NOT IN ('done', 'archived', 'blocked')
+               AND (
+                 status != 'in_review'
+                 OR ?3 = 'pr_review'
+                 OR (kind = 'revision' AND NOT EXISTS (
+                     SELECT 1 FROM tasks child
+                     WHERE child.parent_task_id = ?1
+                       AND child.kind = 'revision'
+                       AND child.deleted_at IS NULL
+                       AND child.status NOT IN ('done', 'archived')
+                 ))
                )",
             params![execution.work_item_id, now, execution.kind.as_str()],
         )?;

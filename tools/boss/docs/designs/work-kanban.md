@@ -340,13 +340,62 @@ execution at all). Those items are in `Doing` per the kanban but no worker is
 running them, which violates the column's contract. The startup reconcile
 must re-issue `RequestExecution` for each so they re-enter the dispatch queue.
 
-The opposite case — `tasks.status != 'active'` but a non-terminal execution
-exists — is handled by the existing auto-advance path:
-`start_execution_run` already flips `tasks.status` to `active` whenever an
-execution moves to `running`, and the new broadcast (PR #171, PR #174) fires
-a work-tree invalidation so the board reflects it. So that direction
-self-heals; only the `active`-without-worker direction needs the new startup
-reconcile.
+The opposite case — a `todo` task with a non-terminal execution — is handled
+by the existing auto-advance path: `start_execution_run` flips
+`tasks.status` from `todo` to `active` whenever an execution moves to
+`running`, and the new broadcast (PR #171, PR #174) fires a work-tree
+invalidation so the board reflects it. So that direction self-heals for the
+`todo` → `active` case; only the `active`-without-worker direction needs the
+new startup reconcile.
+
+This auto-advance is a `todo` → `active` convenience for cycle roots only. It
+is NOT a licence to demote a cycle root out of Review — see the cycle-root status contract
+below, which `start_execution_run`'s own guard enforces.
+
+#### Cycle-root status contract: a cycle root in Review stays in Review
+
+A cycle root (task/chore/project_task) that owns an open PR holds
+`in_review` for the life of that PR: it leaves `in_review` only when the PR
+merges or closes, or when an operator moves it by hand. Nothing else may
+move it out — in particular:
+
+- an automated `pr_review` execution being enqueued (`request_pr_review_in_tx`)
+  or starting (`start_execution_run`) never returns an `in_review` cycle root to
+  `active`;
+- a revision task being created, dispatched, or pushing a commit never
+  touches the base row's status;
+- any execution on the cycle root entering `running` never moves a cycle root that has
+  already reached `in_review`.
+
+A revision's own row moves through its own statuses independently of its
+parent — the parent surfaces in-flight revisions to the operator through
+`has_in_progress_revision` and the Review-lane rollup (`inReviewRevisions`),
+never by leaving Review itself. Per
+[`revision-tasks.md`](revision-tasks.md): "On success the revision row
+flips to `in_review`; the parent's status is untouched."
+
+A `kind = revision` row is not a cycle root and is outside this contract:
+`start_execution_run` still advances it from `in_review` to `active` on its
+own re-dispatch when it has no live revision child, because revisions rest in
+Review between attempts; see that function's rationale comment.
+
+A review pass MAY hold a row that has not yet reached `in_review` — the
+`PendingReview` outcome in
+[`automated-reviewer-pass-on-every-agent-authored-pr.md`](automated-reviewer-pass-on-every-agent-authored-pr.md)
+leaves `task.status` unchanged (`work/pr_flow.rs`, `work/output_types.rs`).
+That is a one-directional hold: it may keep a row out of Review, but it may
+never return a row that has already reached `in_review` back to `active`.
+
+Forbidden patterns, named explicitly because both have shipped before:
+
+- widening `start_execution_run`'s `in_review` guard for any new execution
+  kind so that kind can pull a row back to `active`;
+- any `UPDATE tasks SET status = 'active' ... WHERE status = 'in_review'`
+  justified by keeping the Doing lane populated. "The Doing lane never
+  appears workerless" is a rendering concern — solved in the kanban
+  projection (the Review-lane card reads `ai_reviewing` / `ai_review_state`
+  to show a review pass in flight), never by rewriting the row's canonical
+  status.
 
 The reconcile must distinguish "card is in `Doing` because the human dropped
 it there post-restart, before the engine could re-dispatch" from "card is in

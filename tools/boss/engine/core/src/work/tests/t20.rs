@@ -1758,12 +1758,17 @@ fn reviewer_fallback_keeps_live_reviewer_in_doing() {
     assert_eq!(task.status, TaskStatus::Active);
 }
 
-/// Starting a replacement review repairs an already-advanced base row: the
-/// task returns to Doing and the derived review badge becomes visible.
+/// A cycle root in `in_review` MUST stay `in_review` when a `pr_review`
+/// execution starts against it: per `tools/boss/docs/designs/work-kanban.md`'s
+/// cycle-root status contract, a row that has reached Review stays there for
+/// the life of its PR, including while an automated review pass runs
+/// against it. The row stays in Review the whole time, and the derived
+/// `ai_reviewing` / `ai_review_state` fields carry the "a pass is running"
+/// signal instead of a status write.
 #[test]
-fn starting_pr_review_restores_in_review_base_to_doing() {
-    let db = WorkDb::open(temp_db_path("review-start-restores-doing")).unwrap();
-    let product_id = make_revision_product(&db, "review-start-restores-doing");
+fn starting_pr_review_keeps_in_review_base_in_review() {
+    let db = WorkDb::open(temp_db_path("review-start-keeps-in-review")).unwrap();
+    let product_id = make_revision_product(&db, "review-start-keeps-in-review");
     let chore_id = make_in_review_chore(&db, &product_id, "https://github.com/spinyfin/mono/pull/43");
     let review = db
         .create_execution(
@@ -1787,9 +1792,183 @@ fn starting_pr_review_restores_in_review_base_to_doing() {
 
     let tree = db.get_work_tree(&product_id).unwrap();
     let card = tree.chores.iter().find(|card| card.id == chore_id).unwrap();
-    assert_eq!(card.status, TaskStatus::Active);
-    assert!(card.ai_reviewing);
+    assert_eq!(
+        card.status,
+        TaskStatus::InReview,
+        "a pr_review execution starting must NEVER pull an in_review row back to Doing"
+    );
+    assert!(
+        card.ai_reviewing,
+        "the Review-lane card must still be able to tell a review pass is running"
+    );
     assert_eq!(card.ai_review_state.as_deref(), Some("reviewing"));
+}
+
+/// `start_execution_run` still clears `autostart` for a `pr_review`
+/// execution even though the row's status no longer moves — autostart's
+/// single-shot consumption is independent of the status-advance guard.
+#[test]
+fn start_execution_run_pr_review_still_clears_autostart() {
+    let db = WorkDb::open(temp_db_path("review-start-clears-autostart")).unwrap();
+    let product_id = make_revision_product(&db, "review-start-clears-autostart");
+    let chore_id = make_in_review_chore(&db, &product_id, "https://github.com/spinyfin/mono/pull/44");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET autostart = 1 WHERE id = ?1",
+            rusqlite::params![chore_id],
+        )
+        .unwrap();
+
+    let review = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.start_execution_run(
+        &review.id,
+        "review-worker",
+        "review-repo",
+        "review-lease",
+        "review-workspace",
+        "/tmp/review-workspace",
+    )
+    .unwrap();
+
+    let task = query_task(&db.connect().unwrap(), &chore_id).unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::InReview, "status must not move");
+    assert!(!task.autostart, "autostart must still be consumed on run start");
+}
+
+/// An unrelated implementation execution must preserve `autostart` on a
+/// Review-lane cycle root. Only `pr_review` consumes this flag without a
+/// status advance; every other execution kind leaves it intact.
+#[test]
+fn start_execution_run_non_review_keeps_autostart_on_in_review_root() {
+    let db = WorkDb::open(temp_db_path("non-review-keeps-review-autostart")).unwrap();
+    let product_id = make_revision_product(&db, "non-review-keeps-review-autostart");
+    let chore_id = make_in_review_chore(&db, &product_id, "https://github.com/spinyfin/mono/pull/44");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET autostart = 1 WHERE id = ?1",
+            rusqlite::params![chore_id],
+        )
+        .unwrap();
+
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.start_execution_run(
+        &execution.id,
+        "implementation-worker",
+        "implementation-repo",
+        "implementation-lease",
+        "implementation-workspace",
+        "/tmp/implementation-workspace",
+    )
+    .unwrap();
+
+    let task = query_task(&db.connect().unwrap(), &chore_id).unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::InReview, "status must not move");
+    assert!(task.autostart, "non-review execution must not consume autostart");
+}
+
+/// A non-`pr_review` execution starting must behave exactly as before this
+/// change: an ordinary `todo` task's status still advances to `active` when
+/// its execution starts. This change only narrows the `in_review` guard for
+/// `pr_review`; every other kind's happy path is untouched.
+#[test]
+fn start_execution_run_non_pr_review_still_advances_todo_to_active() {
+    let db = WorkDb::open(temp_db_path("non-pr-review-advances")).unwrap();
+    let product_id = make_revision_product(&db, "non-pr-review-advances");
+    let chore = create_test_chore_manual(&db, &product_id, "Ordinary chore");
+
+    let exec = db
+        .request_execution_with_live_check(
+            RequestExecutionInput::builder().work_item_id(chore.id.clone()).build(),
+            |_| false,
+        )
+        .unwrap();
+    assert_eq!(exec.status, ExecutionStatus::Ready);
+    db.start_execution_run(&exec.id, "worker-1", "mono", "lease-1", "ws-1", "/tmp/ws-1")
+        .unwrap();
+
+    let task = query_task(&db.connect().unwrap(), &chore.id).unwrap().unwrap();
+    assert_eq!(
+        task.status,
+        TaskStatus::Active,
+        "a non-pr_review execution starting must still advance an ordinary task to Doing"
+    );
+}
+
+/// A `kind = 'revision'` row in `in_review` with a live non-terminal
+/// revision child of its own is exactly the case the status-advance guard
+/// above refuses to move — a duplicate/stray run must not act on a row that
+/// already has a live child. `autostart` must stay symmetric with that: no
+/// run was sanctioned to start against this row, so `autostart` must NOT be
+/// consumed. The autostart and status guards differ only in the `pr_review`
+/// disjunct and must remain symmetric.
+#[test]
+fn start_execution_run_does_not_clear_autostart_for_revision_with_live_child() {
+    let db = WorkDb::open(temp_db_path("rev-live-child-keeps-autostart")).unwrap();
+    let product_id = make_revision_product(&db, "rev-live-child-autostart");
+    let pr_url = "https://github.com/spinyfin/mono/pull/3046";
+    let base_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&base_id), &checker).unwrap();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'in_review', autostart = 1 WHERE id = ?1",
+            rusqlite::params![revision.id],
+        )
+        .unwrap();
+    }
+    // Legacy nested child: parent_task_id = revision, non-terminal status.
+    let _child_id = insert_revision_row(&db, &product_id, &revision.id);
+    assert_eq!(task_status(&db, &revision.id), "in_review", "precondition");
+
+    let exec = db
+        .request_execution_with_live_check(
+            RequestExecutionInput::builder()
+                .work_item_id(revision.id.clone())
+                .build(),
+            |_| false,
+        )
+        .unwrap();
+    assert_eq!(exec.status, ExecutionStatus::Ready);
+    db.start_execution_run(
+        &exec.id,
+        "worker-1",
+        "mono",
+        "lease-1",
+        "mono-agent-001",
+        "/tmp/mono-agent-001",
+    )
+    .unwrap();
+
+    let task = query_task(&db.connect().unwrap(), &revision.id).unwrap().unwrap();
+    assert_eq!(
+        task.status,
+        TaskStatus::InReview,
+        "legacy nested child still blocks status advance"
+    );
+    assert!(
+        task.autostart,
+        "no run was sanctioned to start against a row a live child blocks — autostart must not be consumed"
+    );
 }
 
 /// End-to-end proof that `get_work_tree_instrumented` captures the

@@ -800,9 +800,9 @@ struct AIReviewStateBadge: View {
     private var tooltip: String {
         switch state {
         case "reviewing":
-            return "An AI reviewer pass is running on this PR. The card will move to Review once the pass completes (typically within a minute)."
+            return "An AI reviewer pass is running on this PR."
         case "review_queued":
-            return "An AI reviewer pass is queued for a review-pool slot. The card will remain in Doing until the pass starts."
+            return "An AI reviewer pass is queued for a review-pool slot."
         case "reviewed_with_findings":
             return onRevealFindings != nil
                 ? "The AI reviewer found issues on this PR — click to reveal the follow-up revision that addresses them."

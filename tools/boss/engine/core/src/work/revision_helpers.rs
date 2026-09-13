@@ -453,10 +453,77 @@ pub(crate) fn attach_ready_for_review_flag(tasks: &mut [Task], chores: &mut [Tas
 
 // ── AI reviewing flag ────────────────────────────────────────────────────────
 
-/// Set `ai_reviewing = true` on every task (and chore) that is currently held
-/// in `active` (Doing) with a `pr_url` AND has a non-terminal `pr_review`
-/// execution. Called from `get_work_tree` to surface the "Reviewing (AI)"
+/// Resolve the work-item id whose `pr_review` execution state should be
+/// attributed to `row` for the "AI reviewing" / "review queued" badges.
+///
+/// For a non-revision row this is its own id. A `revision` task held
+/// `active` pending a review pass checks its own id (legacy reviewers are
+/// created there) and the review cycle root (fan-out leaves are created
+/// against `pr_review_batches.cycle_root_id`), resolved by walking the full
+/// parent chain rather than trusting a single
+/// resolved by walking the full parent chain rather than trusting a single
+/// hop: most revisions parent directly to the chain root, but residual
+/// pre-flatten-migration rows can still nest a revision under another
+/// revision, and a single `parent_task_id` read would attribute the badge
+/// to that intermediate row instead of the actual review cycle root.
+/// Without this attribution a held revision derives `ai_reviewing = false`
+/// / `ai_review_state = None` even while the root has reviewer workers
+/// actively running against it, leaving the Doing card with no "reviewing"
+/// indicator at all.
+///
+/// `None` for a revision not currently `active` (e.g. `todo`, or already
+/// `in_review`/`done`, which roll up into the parent's card instead — see
+/// `revision-tasks.md`) or when the chain root can't be resolved (broken
+/// chain; fails closed rather than guessing a root, while retaining the
+/// revision's own id for a legacy reviewer.
+fn review_execution_target_ids_for_row(conn: &Connection, row: &Task) -> Option<Vec<String>> {
+    if row.kind == TaskKind::Revision {
+        if row.status == TaskStatus::Active {
+            // A revision can own a legacy reviewer even though fan-out reviewers
+            // belong to the cycle root. Keep its own id and add only a resolved
+            // root; a broken chain therefore degrades to own-id attribution.
+            let mut ids = vec![row.id.clone()];
+            if let Some(root) = chain_root(conn, &row.id).ok().filter(|root| root != &row.id) {
+                ids.push(root);
+            }
+            Some(ids)
+        } else {
+            None
+        }
+    } else {
+        Some(vec![row.id.clone()])
+    }
+}
+
+/// Resolve each rendered row's review-execution target once per projection
+/// pass. A revision's chain walk is otherwise an avoidable query fan-out.
+fn review_execution_target_ids(
+    conn: &Connection,
+    tasks: &[Task],
+    chores: &[Task],
+) -> std::collections::HashMap<String, Vec<String>> {
+    tasks
+        .iter()
+        .chain(chores.iter())
+        .filter_map(|row| review_execution_target_ids_for_row(conn, row).map(|targets| (row.id.clone(), targets)))
+        .collect()
+}
+
+/// Set `ai_reviewing = true` on every task (and chore) whose
+/// [`review_execution_target_ids_for_row`] has a non-terminal `pr_review` execution,
+/// restricted to rows in `active` (Doing, awaiting its first review before
+/// ever reaching `in_review`, OR a revision held pending its cycle root's
+/// review pass) or already `in_review` (Review, an automated review pass
+/// running against an already-open PR — e.g. triggered by a revision's
+/// push). Called from `get_work_tree` to surface the "Reviewing (AI)"
 /// badge on kanban cards while the reviewer pass is in flight.
+///
+/// The `in_review` case matters because `start_execution_run` and
+/// `request_pr_review_in_tx` deliberately never move a row that has already
+/// reached `in_review` back to `active` (see their doc comments and
+/// `tools/boss/docs/designs/work-kanban.md`'s cycle-root status contract) —
+/// so a review pass running against a Review-lane row must be surfaced from
+/// here, on the row's actual (`in_review`) status, rather than by moving it.
 ///
 /// "In flight" means the `pr_review` execution is `running` — a reviewer agent
 /// is actually reviewing. A `ready` execution (queued for a review-pool slot,
@@ -471,13 +538,21 @@ pub(crate) fn attach_ai_reviewing_flag(
     tasks: &mut [Task],
     chores: &mut [Task],
 ) -> rusqlite::Result<()> {
-    // Collect IDs of tasks currently in `active` with a `pr_url` — these are
-    // the only candidates. If there are none we can skip the DB query entirely.
-    let candidate_ids: Vec<&str> = tasks
+    // Collect the target ids for every row that can possibly show the
+    // badge: a non-revision row in `active`/`in_review` with a `pr_url`
+    // targets itself; a revision held `active` targets itself and its review cycle root,
+    // resolved by a full parent-chain walk (see `review_execution_target_id`).
+    // If there are none we can skip the DB
+    // query entirely.
+    let target_ids = review_execution_target_ids(conn, tasks, chores);
+    let candidate_ids: Vec<String> = tasks
         .iter()
         .chain(chores.iter())
-        .filter(|t| t.status == TaskStatus::Active && t.pr_url.is_some())
-        .map(|t| t.id.as_str())
+        .filter(|t| {
+            matches!(t.status, TaskStatus::Active | TaskStatus::InReview)
+                && (t.kind == TaskKind::Revision || t.pr_url.is_some())
+        })
+        .flat_map(|t| target_ids.get(&t.id).into_iter().flatten().cloned())
         .collect();
     if candidate_ids.is_empty() {
         return Ok(());
@@ -517,12 +592,18 @@ pub(crate) fn attach_ai_reviewing_flag(
         return Ok(());
     }
     for task in tasks.iter_mut() {
-        if reviewing.contains(&task.id) {
+        if target_ids
+            .get(&task.id)
+            .is_some_and(|targets| targets.iter().any(|target| reviewing.contains(target)))
+        {
             task.ai_reviewing = true;
         }
     }
     for chore in chores.iter_mut() {
-        if reviewing.contains(&chore.id) {
+        if target_ids
+            .get(&chore.id)
+            .is_some_and(|targets| targets.iter().any(|target| reviewing.contains(target)))
+        {
             chore.ai_reviewing = true;
         }
     }
@@ -666,11 +747,24 @@ pub(crate) const AI_REVIEW_STATE_REVIEW_NOT_REQUIRED: &str = "review_not_require
 ///    chain root's own card still reads `review_not_required`.
 /// 2. **Active (Doing)** → `reviewing` when [`attach_ai_reviewing_flag`]
 ///    already set `ai_reviewing`, `review_queued` when a review is waiting
-///    for a pool slot, else no badge ("not reviewed yet"). Any older verdict is ignored here: a row back in Doing has
+///    for a pool slot ([`review_execution_target_id`]-attributed, so a
+///    `revision` task held `active` pending its review cycle root's review
+///    pass reads that root's `pr_review` execution rather than its own — a
+///    revision never owns one), else no badge ("not reviewed yet"). Any older verdict is ignored here: a row back in Doing has
 ///    fresh, not-yet-reviewed work in flight, so a stale `reviewed_*` badge
 ///    would misrepresent the current head.
-/// 3. **In Review or Done** → resolve the most recent *informative* verdict
-///    (never `gave_up`/`dropped_duplicate_head` — see
+/// 3. **In Review** → same `reviewing` / `review_queued` check as Active
+///    (also fed by [`attach_ai_reviewing_flag`]) takes precedence first: a
+///    row that has already reached `in_review` stays there while a fresh
+///    automated review pass runs against it (`start_execution_run` /
+///    `request_pr_review_in_tx` deliberately never pull it back to
+///    `active` for this — see their doc comments and
+///    `tools/boss/docs/designs/work-kanban.md`'s cycle-root status
+///    contract), so the Review-lane card needs the same "a pass is running"
+///    signal Doing would have shown had the row still been there. Only when
+///    neither is true does it fall through to the verdict resolution below.
+/// 4. **In Review (no live pass) or Done** → resolve the most recent
+///    *informative* verdict (never `gave_up`/`dropped_duplicate_head` — see
 ///    [`query_latest_informative_review_verdicts`]; a give-up or dropped
 ///    duplicate is treated exactly like "no verdict at all," per the
 ///    deliberate absence of a "review failed" state), preferring the last
@@ -684,8 +778,9 @@ pub(crate) const AI_REVIEW_STATE_REVIEW_NOT_REQUIRED: &str = "review_not_require
 ///    review comments — `None` when revision creation itself failed, so
 ///    there is nothing to reveal). No informative verdict at either the
 ///    preferred target or the fallback → no badge.
-/// 4. Anything else (backlog/blocked/cancelled/archived) → no badge.
+/// 5. Anything else (backlog/blocked/cancelled/archived) → no badge.
 pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chores: &mut [Task]) -> Result<()> {
+    let review_targets = review_execution_target_ids(conn, tasks, chores);
     // The last completed (in_review/done) direct-child revision per parent
     // id, keyed by the highest `revision_seq`. Revisions always parent
     // directly to the chain root (never to another revision — see
@@ -745,14 +840,22 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
     lookup_ids.sort_unstable();
     lookup_ids.dedup();
     let verdicts = query_latest_informative_review_verdicts(conn, &lookup_ids)?;
-    // Queue lookup is for Active cards (`review_queued`), not the
-    // InReview/Done `lookup_ids` slice above. Scope to the tree being
-    // rendered rather than every ready `pr_review` in the database.
+    // Queue lookup is for Active/InReview cards (`review_queued`), not the
+    // verdict `lookup_ids` slice above. Scope to the tree being rendered
+    // rather than every ready `pr_review` in the database. InReview is
+    // included alongside Active because a row that has already reached
+    // `in_review` can still have a freshly-enqueued review pass sitting in
+    // `ready` before it starts running (see `request_pr_review_in_tx`). Keyed
+    // by [`review_execution_target_ids_for_row`], so either a legacy reviewer
+    // on a held revision or a queued review-cycle-root batch is attributed.
     let mut queued_lookup_ids: Vec<String> = tasks
         .iter()
         .chain(chores.iter())
-        .filter(|row| !task_kind_excluded_from_ai_review(&row.kind) && row.status == TaskStatus::Active)
-        .map(|row| row.id.clone())
+        .filter(|row| {
+            !task_kind_excluded_from_ai_review(&row.kind)
+                && matches!(row.status, TaskStatus::Active | TaskStatus::InReview)
+        })
+        .flat_map(|row| review_targets.get(&row.id).into_iter().flatten().cloned())
         .collect();
     queued_lookup_ids.sort_unstable();
     queued_lookup_ids.dedup();
@@ -789,16 +892,25 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
         if task_kind_excluded_from_ai_review(&row.kind) {
             return (Some(AI_REVIEW_STATE_REVIEW_NOT_REQUIRED), None);
         }
+        // Queued-review membership checks every review-execution target: a
+        // non-revision's own id, or a held revision's own id and cycle root.
+        let is_queued = || {
+            review_targets
+                .get(&row.id)
+                .is_some_and(|targets| targets.iter().any(|target| queued_reviews.contains(target)))
+        };
         match row.status {
             TaskStatus::Active => {
                 if row.ai_reviewing {
                     (Some(AI_REVIEW_STATE_REVIEWING), None)
-                } else if queued_reviews.contains(&row.id) {
+                } else if is_queued() {
                     (Some(AI_REVIEW_STATE_REVIEW_QUEUED), None)
                 } else {
                     (None, None)
                 }
             }
+            TaskStatus::InReview if row.ai_reviewing => (Some(AI_REVIEW_STATE_REVIEWING), None),
+            TaskStatus::InReview if is_queued() => (Some(AI_REVIEW_STATE_REVIEW_QUEUED), None),
             TaskStatus::InReview | TaskStatus::Done => {
                 let target = target_id(row);
                 let verdict = verdicts
