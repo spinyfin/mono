@@ -8,6 +8,25 @@ import os
 /// `UIUpdateCounters.recordEngineEventMainActor` counting on delivery
 /// (not enqueue).
 final class EngineClientEventBatchingTests: XCTestCase {
+    func testMalformedLiveWorkerSnapshotDoesNotPublishPartialState() {
+        let client = EngineClient(socketPath: "/tmp/boss-event-batch-malformed-\(UUID().uuidString).sock")
+        let delivered = expectation(description: "decode error delivered")
+        client.onEvent = { event in
+            guard case .error(let message) = event else {
+                XCTFail("malformed snapshot must not publish worker state")
+                return
+            }
+            XCTAssertEqual(message, "worker_live_states_list contains invalid state")
+            delivered.fulfill()
+        }
+
+        client.consumeLineForTesting("""
+        {"payload":{"type":"worker_live_states_list","states":[{"slot_id":1,"run_id":"run-1","model":"model","activity":"working"},{"slot_id":2,"run_id":"run-2","model":"model","activity":"future_activity"}]}}
+        """)
+
+        wait(for: [delivered], timeout: 2)
+    }
+
     func testBurstDeliversInOrderOnSingleDrainTurn() {
         let client = EngineClient(socketPath: "/tmp/boss-event-batch-\(UUID().uuidString).sock")
         let n = 50

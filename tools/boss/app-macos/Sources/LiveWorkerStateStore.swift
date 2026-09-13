@@ -16,13 +16,13 @@ final class LiveWorkerStateStore: ObservableObject {
     /// snapshot arrives.
     @Published private(set) var hasReceivedSnapshot = false
 
-    /// Workers in a non-terminal "alive" state: `spawning`, `working`,
-    /// or `waitingForInput`. Shared by `activeAgentCount` and
-    /// `activeAgentTmuxHostedFlags` so the quit dialog's count and
-    /// classified makeup cannot drift. Excludes `idle`, `errored`, and
-    /// `terminated`.
+    /// Workers in a non-terminal "alive" state. Shared by
+    /// `activeAgentCount` and `activeAgentTmuxHostedFlags` so the quit
+    /// dialog's count and classified makeup cannot drift. Only `errored`
+    /// and `terminated` are excluded; an `idle` worker still holds its slot
+    /// and conversation state.
     private static let aliveActivities: Set<WorkerActivity> = [
-        .spawning, .working, .waitingForInput,
+        .idle, .spawning, .working, .waitingForInput,
     ]
 
     /// Count of currently alive workers. Used by the quit-confirmation
@@ -59,6 +59,8 @@ final class LiveWorkerStateStore: ObservableObject {
         if newActiveAgentCount != activeAgentCount {
             activeAgentCount = newActiveAgentCount
         }
-        hasReceivedSnapshot = true
+        if !hasReceivedSnapshot {
+            hasReceivedSnapshot = true
+        }
     }
 }

@@ -161,10 +161,10 @@ final class QuitConfirmationTests: XCTestCase {
         let store = LiveWorkerStateStore()
         store.update(states: [
             liveState(slotId: 1, tmuxHosted: true),
-            liveState(slotId: 2, activity: .idle, tmuxHosted: false),
+            liveState(slotId: 2, activity: .idle, tmuxHosted: true),
         ])
         XCTAssertEqual(store.activeAgentCount, store.activeAgentTmuxHostedFlags.count)
-        XCTAssertEqual(store.activeAgentCount, 1)
+        XCTAssertEqual(store.activeAgentCount, 2)
         XCTAssertEqual(
             QuitConfirmation.HostingMakeup.classify(store.activeAgentTmuxHostedFlags),
             .allTmux

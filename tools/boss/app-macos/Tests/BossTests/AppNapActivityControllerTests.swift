@@ -4,38 +4,26 @@ import XCTest
 
 @MainActor
 final class AppNapActivityControllerTests: XCTestCase {
-    func testHoldsAssertionUntilAnIdleWorkerSnapshotArrives() {
+    func testHoldsAssertionForTheProcessLifetime() {
         let counts = Counts()
         let controller = makeController(counts: counts)
 
-        controller.beginUntilWorkerStateIsKnown()
+        controller.beginForProcessLifetime()
+        controller.beginForProcessLifetime()
         XCTAssertEqual(counts.began, 1)
         XCTAssertEqual(counts.ended, 0)
 
-        controller.setWorkersActive(false)
-        XCTAssertEqual(counts.ended, 1)
-    }
-
-    func testKeepsOneAssertionWhileWorkersRemainActiveThenReleasesIt() {
-        let counts = Counts()
-        let controller = makeController(counts: counts)
-
-        controller.setWorkersActive(true)
-        controller.setWorkersActive(true)
-        XCTAssertEqual(counts.began, 1)
-
-        controller.setWorkersActive(false)
         controller.release()
         XCTAssertEqual(counts.ended, 1)
     }
 
-    func testReacquiresAfterWorkersStartAgain() {
+    func testCanReacquireAfterTerminationRelease() {
         let counts = Counts()
         let controller = makeController(counts: counts)
 
-        controller.setWorkersActive(true)
-        controller.setWorkersActive(false)
-        controller.setWorkersActive(true)
+        controller.beginForProcessLifetime()
+        controller.release()
+        controller.beginForProcessLifetime()
 
         XCTAssertEqual(counts.began, 2)
         XCTAssertEqual(counts.ended, 1)

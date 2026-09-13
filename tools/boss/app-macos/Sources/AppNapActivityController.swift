@@ -1,13 +1,12 @@
 import Foundation
 
-/// Owns Boss's App Nap opt-out while the app must promptly receive engine
-/// events for live workers. The initial assertion remains held until the
-/// engine has delivered its first live-worker snapshot, so startup cannot
-/// briefly re-enable App Nap for workers that were already running.
+/// Owns Boss's process-lifetime App Nap opt-out. Engine requests which start
+/// workers and the live-worker snapshots that report them share the same main
+/// actor delivery path, so waiting for a snapshot to reacquire this assertion
+/// can delay the very spawn acknowledgement the assertion protects.
 @MainActor
 final class AppNapActivityController {
     private var token: NSObjectProtocol?
-    private var workerStateKnown = false
     private let beginActivity: () -> NSObjectProtocol
     private let endActivity: (NSObjectProtocol) -> Void
 
@@ -26,18 +25,8 @@ final class AppNapActivityController {
         self.endActivity = endActivity
     }
 
-    func beginUntilWorkerStateIsKnown() {
-        guard !workerStateKnown else { return }
+    func beginForProcessLifetime() {
         acquire()
-    }
-
-    func setWorkersActive(_ active: Bool) {
-        workerStateKnown = true
-        if active {
-            acquire()
-        } else {
-            release()
-        }
     }
 
     func release() {

@@ -535,8 +535,15 @@ final class EngineClient: @unchecked Sendable {
                     emit(.error(message:"engine_request unknown kind: \(kind)"))
                 }
             case "worker_live_states_list":
-                let raw = payload["states"] as? [[String: Any]] ?? []
+                guard let raw = payload["states"] as? [[String: Any]] else {
+                    emit(.error(message: "worker_live_states_list missing states"))
+                    return
+                }
                 let states = raw.compactMap(parseWorkerLiveState)
+                guard states.count == raw.count else {
+                    emit(.error(message: "worker_live_states_list contains invalid state"))
+                    return
+                }
                 emit(.workerLiveStatesList(states: states))
             case "live_status_disabled_slots_list":
                 let raw = payload["slot_ids"] as? [Any] ?? []

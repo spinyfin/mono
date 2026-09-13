@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import SwiftUI
 import UniformTypeIdentifiers
 import UpdateCore
@@ -339,20 +338,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Set by BossMacApp once the main window has appeared. Nil only in the
     /// brief window between launch and first-render — treated as "no agents
     /// working" so a very-early Cmd-Q is never held hostage.
-    var liveWorkerStates: LiveWorkerStateStore? {
-        didSet {
-            liveWorkerStateCancellable = nil
-            guard let liveWorkerStates else { return }
-            liveWorkerStateCancellable = Publishers.CombineLatest(
-                liveWorkerStates.$activeAgentCount,
-                liveWorkerStates.$hasReceivedSnapshot
-            )
-            .sink { [weak self] activeAgentCount, hasReceivedSnapshot in
-                guard hasReceivedSnapshot else { return }
-                self?.appNapActivity.setWorkersActive(activeAgentCount > 0)
-            }
-        }
-    }
+    var liveWorkerStates: LiveWorkerStateStore?
     /// Owned here so the App struct can inject it into CheckForUpdatesCommand and
     /// environment objects before any view renders or menu fires.
     let updateModel: UpdateModel = UpdateModel.makeForApp(defaults: BossDefaults.store)
@@ -429,7 +415,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private let appNapActivity = AppNapActivityController()
-    private var liveWorkerStateCancellable: AnyCancellable?
 
     /// Observes `UserDefaults.didChangeNotification` so flipping
     /// [[MainThreadStallMonitor.enabledKey]] in Settings starts/stops the
@@ -450,10 +435,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Keep the startup path responsive until the first authoritative
-        // worker snapshot arrives; it then remains held only while workers
-        // are alive, so idle Boss is eligible for App Nap.
-        appNapActivity.beginUntilWorkerStateIsKnown()
+        // Keep this assertion for the complete process lifetime. A
+        // `worker.live_states` snapshot reaches the main actor through the
+        // same path as a spawn request, so it cannot safely be used to
+        // reacquire the assertion after App Nap has delayed that path.
+        appNapActivity.beginForProcessLifetime()
 
         // Isolated / capture instances: policy was already set to `.accessory`
         // in `applicationWillFinishLaunching`. Do **not** call
