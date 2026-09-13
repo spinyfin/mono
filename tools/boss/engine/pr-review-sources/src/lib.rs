@@ -18,6 +18,15 @@ use sha2::{Digest, Sha256};
 /// optional fields.
 const PACKET_SCHEMA_VERSION: u32 = 2;
 
+/// Per-file capture budget. A single side larger than this is recorded as a
+/// [`SourceOmission`] instead of being inlined into the packet.
+pub const MAX_PINNED_SOURCE_BYTES: u64 = 1_048_576;
+
+const BINARY_SOURCE_OMISSION: &str =
+    "pinned source is binary or non-UTF-8; raw-byte SHA-256 was recorded without lossy decoding";
+const SYMLINK_SOURCE_OMISSION: &str =
+    "pinned tree entry is a symlink; omitted so Contents API cannot follow it and mis-attribute the target's bytes";
+
 /// Immutable endpoints supplied by a reconciler observation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PinnedComparison {
@@ -167,20 +176,21 @@ impl PinnedSource {
             content: None,
             content_hash: Some(hex_digest(&bytes)),
             byte_count: Some(bytes.len() as u64),
-            omission: Some(
-                "pinned source is binary or non-UTF-8; raw-byte SHA-256 was recorded without lossy decoding".to_owned(),
-            ),
+            omission: Some(BINARY_SOURCE_OMISSION.to_owned()),
         }
     }
 
     fn is_captured(&self) -> bool {
-        self.content.is_some() && self.content_hash.is_some() && self.omission.is_none()
+        self.object_sha.is_some()
+            && self.content_hash.is_some()
+            && self.byte_count.is_some()
+            && (self.content.is_some() || self.omission.as_deref() == Some(BINARY_SOURCE_OMISSION))
     }
 }
 
 /// GitHub's changed-file classification, preserving the API value instead of
 /// flattening a rename or deletion into an ordinary modification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeKind {
     Added,
@@ -189,6 +199,11 @@ pub enum ChangeKind {
     Modified,
     Renamed,
     Changed,
+    /// GitHub reported a status this collector does not recognise (including
+    /// documented values such as `unchanged`). Both sides are still fetched;
+    /// the raw status is retained so the packet does not silently claim a
+    /// modification.
+    Unknown(String),
 }
 
 impl ChangeKind {
@@ -199,15 +214,16 @@ impl ChangeKind {
             "deleted" | "removed" => Self::Deleted,
             "renamed" => Self::Renamed,
             "changed" => Self::Changed,
-            _ => Self::Modified,
+            "modified" => Self::Modified,
+            other => Self::Unknown(other.to_owned()),
         }
     }
 
-    fn has_before(self) -> bool {
+    fn has_before(&self) -> bool {
         !matches!(self, Self::Added | Self::Copied)
     }
 
-    fn has_after(self) -> bool {
+    fn has_after(&self) -> bool {
         !matches!(self, Self::Deleted)
     }
 }
@@ -327,6 +343,20 @@ pub async fn collect_pinned_source_packet(
     expected_head_branch: Option<&str>,
 ) -> Result<SourcePacket> {
     let metadata = boss_github::pr_files::fetch_pr_comparison_metadata(pr_url).await?;
+    collect_pinned_source_packet_with_metadata(pr_url, observed, expected_head_branch, metadata, true).await
+}
+
+/// Same as [`collect_pinned_source_packet`], but reuses metadata the caller
+/// already fetched. `endpoints_are_independently_observed` is true only when
+/// `observed` came from a distinct lifecycle probe (the merge poller), not
+/// from this same REST resource a moment earlier.
+pub async fn collect_pinned_source_packet_with_metadata(
+    pr_url: &str,
+    observed: &PinnedComparison,
+    expected_head_branch: Option<&str>,
+    metadata: boss_github::pr_files::PrComparisonMetadata,
+    endpoints_are_independently_observed: bool,
+) -> Result<SourcePacket> {
     if let Some(expected_head_branch) = expected_head_branch
         && metadata.head_ref_name != expected_head_branch
     {
@@ -335,14 +365,8 @@ pub async fn collect_pinned_source_packet(
             metadata.head_ref_name,
         );
     }
-    if metadata.base_sha != observed.base_sha || metadata.head_sha != observed.head_sha {
-        bail!(
-            "PR endpoints changed while collecting sources: observed {}/{} but metadata returned {}/{}",
-            observed.base_sha,
-            observed.head_sha,
-            metadata.base_sha,
-            metadata.head_sha,
-        );
+    if endpoints_are_independently_observed {
+        require_stable_endpoints(observed, &metadata)?;
     }
     let merge_base_sha =
         boss_github::pr_files::fetch_merge_base(&metadata.base_repository, &metadata.base_sha, &metadata.head_sha)
@@ -353,6 +377,8 @@ pub async fn collect_pinned_source_packet(
         metadata.changed_files,
     )
     .await?;
+    let latest = boss_github::pr_files::fetch_pr_comparison_metadata(pr_url).await?;
+    require_stable_endpoints(observed, &latest)?;
 
     let before_paths: HashSet<String> = inventory
         .iter()
@@ -364,10 +390,6 @@ pub async fn collect_pinned_source_packet(
         .filter(|file| ChangeKind::from_api(&file.status).has_after())
         .map(|file| file.filename.clone())
         .collect();
-    // A tree entry is the immutable source manifest for each requested path.
-    // A truncated response is fatal rather than an invisible subset: callers
-    // record the resulting collection error and do not publish a false claim
-    // of complete source coverage.
     let before_entries = fetch_pinned_tree_entries(&metadata.base_repository, &merge_base_sha, &before_paths).await?;
     let after_entries = fetch_pinned_tree_entries(&metadata.head_repository, &metadata.head_sha, &after_paths).await?;
 
@@ -375,6 +397,15 @@ pub async fn collect_pinned_source_packet(
     let mut files = Vec::with_capacity(inventory.len());
     for file in inventory {
         let change_kind = ChangeKind::from_api(&file.status);
+        if let ChangeKind::Unknown(status) = &change_kind {
+            omissions.push(SourceOmission {
+                path: Some(file.filename.clone()),
+                side: None,
+                reason: format!(
+                    "unrecognised GitHub file status `{status}`; fetched both sides without asserting a modification"
+                ),
+            });
+        }
         let before_path = file.previous_filename.clone().unwrap_or_else(|| file.filename.clone());
         let before = if change_kind.has_before() {
             let source = fetch_source(
@@ -437,6 +468,25 @@ pub async fn collect_pinned_source_packet(
     })
 }
 
+/// Reject a collection whose live PR metadata no longer matches the pinned
+/// comparison identity. Path/count equality is not enough: a same-count
+/// force-push would otherwise mix a new inventory into an old packet.
+pub fn require_stable_endpoints(
+    observed: &PinnedComparison,
+    metadata: &boss_github::pr_files::PrComparisonMetadata,
+) -> Result<()> {
+    if metadata.base_sha != observed.base_sha || metadata.head_sha != observed.head_sha {
+        bail!(
+            "PR endpoints changed while collecting sources: observed {}/{} but metadata returned {}/{}",
+            observed.base_sha,
+            observed.head_sha,
+            metadata.base_sha,
+            metadata.head_sha,
+        );
+    }
+    Ok(())
+}
+
 async fn fetch_pinned_tree_entries(
     repository: &str,
     sha: &str,
@@ -449,17 +499,43 @@ async fn fetch_pinned_tree_entries(
         .split_once('/')
         .filter(|(owner, repo)| !owner.is_empty() && !repo.is_empty())
         .with_context(|| format!("invalid pinned source repository identity `{repository}`"))?;
-    let tree = boss_github::trees::fetch_pinned_tree(owner, repo, sha, |candidate| paths.contains(candidate))
-        .await
-        .map_err(|error| anyhow::anyhow!("could not read pinned tree {repository}@{sha}: {error}"))?;
-    if tree.truncated {
-        bail!("pinned tree {repository}@{sha} was truncated; source capture cannot verify changed-file coverage");
+    let mut by_directory: HashMap<String, HashSet<String>> = HashMap::new();
+    for path in paths {
+        let (directory, name) = split_repo_path(path);
+        by_directory
+            .entry(directory.to_owned())
+            .or_default()
+            .insert(name.to_owned());
     }
-    Ok(tree
-        .entries
-        .into_iter()
-        .map(|entry| (entry.path.clone(), entry))
-        .collect())
+    let mut entries = HashMap::new();
+    for (directory, names) in by_directory {
+        let tree = boss_github::trees::fetch_pinned_tree_directory(owner, repo, sha, &directory, |candidate| {
+            names.contains(candidate)
+        })
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("could not read pinned tree {repository}@{sha} directory `{directory}`: {error}")
+        })?;
+        if tree.truncated {
+            bail!(
+                "pinned tree {repository}@{sha} directory `{directory}` was truncated; source capture cannot verify changed-file coverage"
+            );
+        }
+        for mut entry in tree.entries {
+            let full_path = if directory.is_empty() {
+                entry.path.clone()
+            } else {
+                format!("{directory}/{}", entry.path)
+            };
+            entry.path = full_path.clone();
+            entries.insert(full_path, entry);
+        }
+    }
+    Ok(entries)
+}
+
+fn split_repo_path(path: &str) -> (&str, &str) {
+    path.rsplit_once('/').unwrap_or(("", path))
 }
 
 async fn fetch_source(
@@ -477,17 +553,8 @@ async fn fetch_source(
             None,
         );
     };
-    if entry.object_type != "blob" {
-        return PinnedSource::omitted(
-            repository,
-            sha,
-            path,
-            format!(
-                "pinned tree entry is `{}` rather than a readable blob",
-                entry.object_type
-            ),
-            Some(entry),
-        );
+    if let Some(reason) = pinned_entry_omission(entry) {
+        return PinnedSource::omitted(repository, sha, path, reason, Some(entry));
     }
     let Some((owner, repo)) = repository.split_once('/') else {
         return PinnedSource::omitted(
@@ -499,10 +566,21 @@ async fn fetch_source(
         );
     };
     match boss_github::contents::fetch_repo_file_bytes(owner, repo, path, sha).await {
-        Ok(Some(bytes)) => match String::from_utf8(bytes) {
-            Ok(content) => PinnedSource::captured(repository, sha, path, content, entry),
-            Err(error) => PinnedSource::omitted_binary(repository, sha, path, error.into_bytes(), entry),
-        },
+        Ok(Some(bytes)) => {
+            if bytes.len() as u64 > MAX_PINNED_SOURCE_BYTES {
+                return PinnedSource::omitted(
+                    repository,
+                    sha,
+                    path,
+                    format!("pinned source exceeds the {MAX_PINNED_SOURCE_BYTES}-byte per-file capture budget"),
+                    Some(entry),
+                );
+            }
+            match String::from_utf8(bytes) {
+                Ok(content) => PinnedSource::captured(repository, sha, path, content, entry),
+                Err(error) => PinnedSource::omitted_binary(repository, sha, path, error.into_bytes(), entry),
+            }
+        }
         Ok(None) => PinnedSource::omitted(
             repository,
             sha,
@@ -518,6 +596,24 @@ async fn fetch_source(
             Some(entry),
         ),
     }
+}
+
+fn pinned_entry_omission(entry: &boss_github::trees::PinnedTreeEntry) -> Option<String> {
+    if entry.object_type != "blob" {
+        return Some(format!(
+            "pinned tree entry is `{}` rather than a readable blob",
+            entry.object_type
+        ));
+    }
+    if entry.mode == "120000" {
+        return Some(SYMLINK_SOURCE_OMISSION.to_owned());
+    }
+    if entry.size.is_some_and(|size| size > MAX_PINNED_SOURCE_BYTES) {
+        return Some(format!(
+            "pinned source exceeds the {MAX_PINNED_SOURCE_BYTES}-byte per-file capture budget"
+        ));
+    }
+    None
 }
 
 fn record_omission(omissions: &mut Vec<SourceOmission>, source: &PinnedSource, side: SourceSide) {
@@ -679,5 +775,83 @@ mod tests {
         assert_eq!(source.byte_count, Some(3));
         assert!(source.content_hash.is_some());
         assert!(source.omission.as_deref().unwrap().contains("non-UTF-8"));
+        assert!(source.is_captured());
+        let mut packet = packet();
+        packet.files[0].after = Some(source);
+        packet.omissions.push(SourceOmission {
+            path: Some("image.bin".to_owned()),
+            side: Some(SourceSide::After),
+            reason: BINARY_SOURCE_OMISSION.to_owned(),
+        });
+        assert!(
+            packet.is_complete(),
+            "a successfully hashed binary side must not make the packet incomplete"
+        );
+    }
+
+    #[test]
+    fn symlink_tree_entries_are_omitted_rather_than_followed() {
+        let link = boss_github::trees::PinnedTreeEntry {
+            path: "link".to_owned(),
+            object_sha: "e".repeat(40),
+            mode: "120000".to_owned(),
+            object_type: "blob".to_owned(),
+            size: Some(11),
+        };
+        let reason = pinned_entry_omission(&link).expect("symlink must be omitted");
+        assert!(reason.contains("symlink"));
+        let source = PinnedSource::omitted("acme/widget", &"c".repeat(40), "link", reason, Some(&link));
+        assert!(!source.is_captured());
+        assert_eq!(source.object_sha.as_deref(), Some(link.object_sha.as_str()));
+        assert_eq!(source.mode.as_deref(), Some("120000"));
+    }
+
+    #[test]
+    fn unrecognised_file_status_is_not_flattened_into_modified() {
+        assert_eq!(ChangeKind::from_api("renamed"), ChangeKind::Renamed);
+        assert_eq!(
+            ChangeKind::from_api("unchanged"),
+            ChangeKind::Unknown("unchanged".to_owned())
+        );
+        assert!(ChangeKind::from_api("unchanged").has_before());
+        assert!(ChangeKind::from_api("unchanged").has_after());
+    }
+
+    #[test]
+    fn same_count_force_push_is_rejected_by_endpoint_revalidation() {
+        let observed = PinnedComparison {
+            base_sha: "base".to_owned(),
+            head_sha: "head-one".to_owned(),
+        };
+        let moved = boss_github::pr_files::PrComparisonMetadata {
+            number: 4,
+            title: "Capture source".to_owned(),
+            body: None,
+            base_repository: "acme/widget".to_owned(),
+            head_repository: "acme/widget".to_owned(),
+            head_ref_name: "feature".to_owned(),
+            base_sha: "base".to_owned(),
+            head_sha: "head-two".to_owned(),
+            changed_files: 1,
+        };
+        let err = require_stable_endpoints(&observed, &moved).unwrap_err().to_string();
+        assert!(err.contains("head-one"));
+        assert!(err.contains("head-two"));
+    }
+
+    #[test]
+    fn oversized_tree_entry_is_omitted_before_contents_read() {
+        let entry = boss_github::trees::PinnedTreeEntry {
+            path: "huge.bin".to_owned(),
+            object_sha: "f".repeat(40),
+            mode: "100644".to_owned(),
+            object_type: "blob".to_owned(),
+            size: Some(MAX_PINNED_SOURCE_BYTES + 1),
+        };
+        assert!(
+            pinned_entry_omission(&entry)
+                .unwrap()
+                .contains("per-file capture budget")
+        );
     }
 }

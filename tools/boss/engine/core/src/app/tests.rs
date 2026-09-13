@@ -95,6 +95,32 @@ pub(super) fn test_server_state_with_fakes() -> (Arc<ServerState>, tempfile::Tem
 /// head-fetch fail deterministically. This reproduces an unreachable
 /// completion seam without a live network call and without relying on the
 /// test sandbox's `gh` process-exec denial to fail the call for us.
+pub(super) fn test_server_state_with_source_collector(
+    collector: crate::review_guide_capture::SourcePacketCollector,
+) -> (Arc<ServerState>, tempfile::TempDir) {
+    let temp = tempfile::tempdir().unwrap();
+    let cfg = Arc::new(RuntimeConfig::from_parts(
+        crate::config::WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(temp.path().join("state.db"))
+            .build(),
+        None,
+    ));
+    let state = ServerState::new_arc_with_app_pid_and_merge_probe(
+        cfg,
+        None,
+        None,
+        ServerStateOverrides {
+            cube_client: Some(Arc::new(crate::test_support::AlwaysSucceedsCube)),
+            execution_runner: Some(Arc::new(crate::test_support::AlwaysSucceedsRunner)),
+            source_packet_collector: Some(collector),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    (state, temp)
+}
+
 pub(super) fn test_server_state_with_fakes_and_branch_verifier(
     branch_verifier: Arc<dyn crate::completion::BranchVerifier>,
 ) -> (Arc<ServerState>, tempfile::TempDir) {
@@ -343,3 +369,113 @@ mod worker_probe_dispatch;
 mod worker_process_reaping;
 mod worker_readoption;
 mod worker_tier;
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::protocol::WorkerEvent;
+use crate::review_guide_capture::{REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, SourcePacketCollector};
+use crate::test_support::{create_test_chore_manual, create_test_product, finish_run_worker_pane_alive};
+use crate::work::PrSourceCaptureTrigger;
+use boss_pr_review_sources::SourcePacket;
+use boss_protocol::RequestExecutionInput;
+
+const SOURCE_CAPTURE_SLOT: u8 = 1;
+const SOURCE_CAPTURE_PR_URL: &str = "https://github.com/spinyfin/mono/pull/25";
+
+fn source_capture_packet() -> SourcePacket {
+    SourcePacket {
+        schema_version: 2,
+        canonical_pr_url: SOURCE_CAPTURE_PR_URL.to_owned(),
+        pr_number: 25,
+        title: "Captured".to_owned(),
+        body: None,
+        base_repository: "spinyfin/mono".to_owned(),
+        head_repository: "spinyfin/mono".to_owned(),
+        observed_base_sha: "base".to_owned(),
+        merge_base_sha: "merge-base".to_owned(),
+        head_sha: "head".to_owned(),
+        files: Vec::new(),
+        omissions: Vec::new(),
+    }
+}
+
+fn counting_source_collector(calls: Arc<AtomicUsize>, packet: SourcePacket) -> SourcePacketCollector {
+    Arc::new(move |url, _observed, _branch, _metadata| {
+        let packet = packet.clone();
+        let calls = calls.clone();
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(url, packet.canonical_pr_url);
+            Ok(packet)
+        })
+    })
+}
+
+async fn wait_for_source_capture(db: &crate::work::WorkDb, root: &str) {
+    let started = std::time::Instant::now();
+    loop {
+        if db.get_latest_pr_review_guide_source_capture(root).unwrap().is_some() {
+            return;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(2) {
+            panic!("timed out waiting for review-guide source capture");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+fn spawned_source_capture_worker(server_state: &ServerState) -> (String, String) {
+    let db = server_state.work_db.as_ref();
+    let product = create_test_product(db);
+    let chore = create_test_chore_manual(db, product.id.clone(), "source capture");
+    let execution = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    let (_exec, run) = db
+        .start_execution_run(&execution.id, "worker-1", "repo-1", "lease-1", "ws-1", "/tmp/ws")
+        .unwrap();
+    finish_run_worker_pane_alive(db, &execution.id, &run.id, Some("Spawned worker pane in slot 1."));
+    server_state.live_worker_states.register_spawn(
+        SOURCE_CAPTURE_SLOT,
+        execution.id.clone(),
+        "claude-opus-4-7",
+        4242,
+        None,
+    );
+    server_state
+        .worker_registry
+        .register_run_slot(&execution.id, SOURCE_CAPTURE_SLOT);
+    (execution.id, chore.id)
+}
+
+#[tokio::test]
+async fn finalization_armed_observation_captures_on_the_canonical_root() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (server_state, _dir) =
+        test_server_state_with_source_collector(counting_source_collector(calls.clone(), source_capture_packet()));
+    server_state
+        .feature_flags
+        .set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, true)
+        .unwrap();
+    let (execution_id, chore_id) = spawned_source_capture_worker(&server_state);
+    let event = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
+            session_id: "claude-sess-1".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({ "command": "gh pr create --title t --body b" }),
+            tool_response: serde_json::json!({ "stdout": format!("{SOURCE_CAPTURE_PR_URL}\n") }),
+        },
+        Some(execution_id.clone()),
+        None,
+    );
+    dispatch_worker_event_fanout(&server_state, &event).await;
+    wait_for_source_capture(&server_state.work_db, &chore_id).await;
+    let capture = server_state
+        .work_db
+        .get_latest_pr_review_guide_source_capture(&chore_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(capture.trigger, PrSourceCaptureTrigger::Creation.as_str());
+    assert_eq!(capture.packet.head_sha, "head");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}

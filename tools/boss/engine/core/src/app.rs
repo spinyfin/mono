@@ -564,6 +564,9 @@ struct ServerStateOverrides {
     /// `CommandBranchVerifier` (shells out to `gh pr view`). Tests inject a
     /// stub here to fail the GitHub head-fetch deterministically.
     branch_verifier: Option<Arc<dyn BranchVerifier>>,
+    /// Test-injected source-packet collector. `None` uses the GitHub-backed
+    /// default on the completion handler.
+    source_packet_collector: Option<crate::review_guide_capture::SourcePacketCollector>,
 }
 
 #[derive(bon::Builder)]
@@ -1142,6 +1145,7 @@ impl ServerState {
             execution_runner: execution_runner_override,
             worker_registry: worker_registry_override,
             branch_verifier: branch_verifier_override,
+            source_packet_collector: source_packet_collector_override,
         } = overrides;
         // Constructed here (rather than left to `ServerState::builder`'s
         // default) so it can be injected into `work_db` via
@@ -1465,6 +1469,9 @@ impl ServerState {
         .with_review_pool_size(cfg.work.review_pool_size);
         if let Some(branch_verifier) = branch_verifier_override {
             completion_handler_builder = completion_handler_builder.with_branch_verifier(branch_verifier);
+        }
+        if let Some(collector) = source_packet_collector_override {
+            completion_handler_builder = completion_handler_builder.with_source_packet_collector(collector);
         }
         let completion_handler = Arc::new(completion_handler_builder);
 

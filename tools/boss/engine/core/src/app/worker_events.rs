@@ -803,13 +803,13 @@ pub(super) async fn dispatch_live_worker_state(
                                 // itself remains rollout-gated and resolves
                                 // revision executions to their canonical root.
                                 if finalization_armed {
-                                    crate::review_guide_capture::reconcile_review_guide_source_for_execution(
-                                        server_state.work_db.clone(),
-                                        server_state.feature_flags.clone(),
-                                        run_id,
-                                        &pr_url,
-                                        crate::work::PrSourceCaptureTrigger::Creation,
-                                    );
+                                    server_state
+                                        .completion_handler
+                                        .reconcile_review_guide_source_for_execution(
+                                            run_id,
+                                            &pr_url,
+                                            crate::work::PrSourceCaptureTrigger::Creation,
+                                        );
                                 }
                             }
                             crate::pr_url_capture::RecordCommandObservationOutcome::Unchanged => {

@@ -6,12 +6,16 @@
 //! The packet crate owns pinned source collection and reference validation;
 //! this module owns engine lifetime and reconciliation semantics.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Result;
-use boss_pr_review_sources::{PinnedComparison, SourcePacket, collect_pinned_source_packet};
+use boss_github::pr_files::PrComparisonMetadata;
+use boss_pr_review_sources::{
+    PinnedComparison, SourcePacket, collect_pinned_source_packet, collect_pinned_source_packet_with_metadata,
+};
 
 use crate::feature_flags::FeatureFlagsStore;
 use crate::work::{PrSourceCapturePersistOutcome, PrSourceCaptureTrigger, WorkDb};
@@ -20,11 +24,71 @@ use crate::work::{PrSourceCapturePersistOutcome, PrSourceCaptureTrigger, WorkDb}
 pub const REVIEW_GUIDE_SOURCE_CAPTURE_FLAG: &str = "review_guide_source_capture";
 
 type SourcePacketFuture = Pin<Box<dyn Future<Output = Result<SourcePacket>> + Send>>;
-type SourcePacketCollector = Arc<dyn Fn(String, PinnedComparison, Option<String>) -> SourcePacketFuture + Send + Sync>;
+pub(crate) type SourcePacketCollector = Arc<
+    dyn Fn(String, Option<PinnedComparison>, Option<String>, Option<PrComparisonMetadata>) -> SourcePacketFuture
+        + Send
+        + Sync,
+>;
 
-fn github_source_packet_collector() -> SourcePacketCollector {
-    Arc::new(|pr_url, observed, expected_head_branch| {
-        Box::pin(async move { collect_pinned_source_packet(&pr_url, &observed, expected_head_branch.as_deref()).await })
+type CaptureKey = (String, String, String);
+
+fn in_flight_captures() -> &'static Mutex<HashSet<CaptureKey>> {
+    static SET: OnceLock<Mutex<HashSet<CaptureKey>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn try_begin_in_flight(key: CaptureKey) -> bool {
+    in_flight_captures()
+        .lock()
+        .map(|mut set| set.insert(key))
+        .unwrap_or(true)
+}
+
+fn end_in_flight(key: &CaptureKey) {
+    if let Ok(mut set) = in_flight_captures().lock() {
+        set.remove(key);
+    }
+}
+
+pub(crate) fn github_source_packet_collector() -> SourcePacketCollector {
+    Arc::new(|pr_url, observed, expected_head_branch, metadata| {
+        Box::pin(async move {
+            match (observed, metadata) {
+                (observed, Some(metadata)) => {
+                    let independently_observed = observed.is_some();
+                    let observed = observed.unwrap_or(PinnedComparison {
+                        base_sha: metadata.base_sha.clone(),
+                        head_sha: metadata.head_sha.clone(),
+                    });
+                    collect_pinned_source_packet_with_metadata(
+                        &pr_url,
+                        &observed,
+                        expected_head_branch.as_deref(),
+                        metadata,
+                        independently_observed,
+                    )
+                    .await
+                }
+                (Some(observed), None) => {
+                    collect_pinned_source_packet(&pr_url, &observed, expected_head_branch.as_deref()).await
+                }
+                (None, None) => {
+                    let metadata = boss_github::pr_files::fetch_pr_comparison_metadata(&pr_url).await?;
+                    let observed = PinnedComparison {
+                        base_sha: metadata.base_sha.clone(),
+                        head_sha: metadata.head_sha.clone(),
+                    };
+                    collect_pinned_source_packet_with_metadata(
+                        &pr_url,
+                        &observed,
+                        expected_head_branch.as_deref(),
+                        metadata,
+                        false,
+                    )
+                    .await
+                }
+            }
+        })
     })
 }
 
@@ -42,28 +106,7 @@ pub(crate) struct SourceCaptureRequest {
     pub observation_sequence: Option<i64>,
 }
 
-/// Request capture from an execution-owned lifecycle seam. Revisions are
-/// collapsed to their root before the asynchronous read begins, preserving
-/// one canonical PR series across the entire implementation chain.
-pub(crate) fn reconcile_review_guide_source_for_execution(
-    work_db: Arc<WorkDb>,
-    feature_flags: Arc<FeatureFlagsStore>,
-    execution_id: &str,
-    pr_url: &str,
-    trigger: PrSourceCaptureTrigger,
-) {
-    let _ = reconcile_review_guide_source_for_execution_with_collector(
-        work_db,
-        feature_flags,
-        execution_id,
-        pr_url,
-        trigger,
-        None,
-        github_source_packet_collector(),
-    );
-}
-
-fn reconcile_review_guide_source_for_execution_with_collector(
+pub(crate) fn reconcile_review_guide_source_for_execution_with_collector(
     work_db: Arc<WorkDb>,
     feature_flags: Arc<FeatureFlagsStore>,
     execution_id: &str,
@@ -120,20 +163,7 @@ fn reconcile_review_guide_source_for_execution_with_collector(
     )
 }
 
-/// Reconcile a root-owned source capture, optionally using a sequence
-/// allocated when a caller's
-/// lifecycle probe started. This lets the merge poller preserve observation
-/// order even if GitHub responds to a newer probe before an older one.
-pub(crate) fn reconcile_review_guide_source(
-    work_db: Arc<WorkDb>,
-    feature_flags: Arc<FeatureFlagsStore>,
-    request: SourceCaptureRequest,
-) {
-    let _ =
-        reconcile_review_guide_source_with_collector(work_db, feature_flags, request, github_source_packet_collector());
-}
-
-fn reconcile_review_guide_source_with_collector(
+pub(crate) fn reconcile_review_guide_source_with_collector(
     work_db: Arc<WorkDb>,
     feature_flags: Arc<FeatureFlagsStore>,
     request: SourceCaptureRequest,
@@ -150,11 +180,29 @@ fn reconcile_review_guide_source_with_collector(
         expected_head_branch,
         observation_sequence,
     } = request;
+    if let Some(observed) = &observed {
+        match work_db.pr_review_guide_source_capture_complete(&pr_url, &observed.base_sha, &observed.head_sha) {
+            Ok(Some(true)) => return None,
+            Ok(Some(false) | None) => {}
+            Err(error) => tracing::warn!(
+                root_task_id,
+                pr_url,
+                ?error,
+                "review-guide source capture: could not check existing comparison before collection",
+            ),
+        }
+        if !try_begin_in_flight((pr_url.clone(), observed.base_sha.clone(), observed.head_sha.clone())) {
+            return None;
+        }
+    }
     let observation_sequence = match observation_sequence {
         Some(sequence) => sequence,
         None => match work_db.allocate_pr_review_guide_source_observation_sequence() {
             Ok(sequence) => sequence,
             Err(error) => {
+                if let Some(observed) = &observed {
+                    end_in_flight(&(pr_url.clone(), observed.base_sha.clone(), observed.head_sha.clone()));
+                }
                 tracing::warn!(
                     root_task_id,
                     pr_url,
@@ -166,58 +214,81 @@ fn reconcile_review_guide_source_with_collector(
         },
     };
     Some(tokio::spawn(async move {
-        let observed = match observed {
-            Some(observed) => observed,
-            None => match boss_github::pr_files::fetch_pr_comparison_metadata(&pr_url).await {
-                Ok(metadata) => PinnedComparison {
-                    base_sha: metadata.base_sha,
-                    head_sha: metadata.head_sha,
+        let mut in_flight = InFlightGuard(
+            observed
+                .as_ref()
+                .map(|observed| (pr_url.clone(), observed.base_sha.clone(), observed.head_sha.clone())),
+        );
+        boss_gh_telemetry::scope(boss_gh_telemetry::callers::REVIEW_GUIDE_SOURCE_CAPTURE, async move {
+            if let Some(observed) = &observed
+                && !in_flight.arm((pr_url.clone(), observed.base_sha.clone(), observed.head_sha.clone()))
+            {
+                return;
+            }
+            match collector(pr_url.clone(), observed, expected_head_branch, None).await {
+                Ok(packet) => match work_db.persist_pr_review_guide_source_capture(
+                    &root_task_id,
+                    observation_sequence,
+                    trigger,
+                    &packet,
+                ) {
+                    Ok(PrSourceCapturePersistOutcome::Stored(capture)) => tracing::info!(
+                        root_task_id,
+                        pr_url,
+                        observation_sequence,
+                        packet_hash = %capture.packet_hash,
+                        complete = capture.complete,
+                        "review-guide source capture: stored immutable comparison packet",
+                    ),
+                    Ok(PrSourceCapturePersistOutcome::Existing(capture)) => tracing::debug!(
+                        root_task_id,
+                        pr_url,
+                        observation_sequence,
+                        existing_sequence = capture.observation_sequence,
+                        "review-guide source capture: comparison packet already present",
+                    ),
+                    Ok(PrSourceCapturePersistOutcome::IgnoredStaleObservation) => tracing::debug!(
+                        root_task_id,
+                        pr_url,
+                        observation_sequence,
+                        "review-guide source capture: ignored delayed observation",
+                    ),
+                    Err(error) => tracing::warn!(
+                        root_task_id,
+                        pr_url,
+                        observation_sequence,
+                        ?error,
+                        "review-guide source capture: could not persist packet",
+                    ),
                 },
-                Err(error) => {
-                    record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
-                    return;
-                }
-            },
-        };
-        match collector(pr_url.clone(), observed, expected_head_branch).await {
-            Ok(packet) => match work_db.persist_pr_review_guide_source_capture(
-                &root_task_id,
-                observation_sequence,
-                trigger,
-                &packet,
-            ) {
-                Ok(PrSourceCapturePersistOutcome::Stored(capture)) => tracing::info!(
-                    root_task_id,
-                    pr_url,
-                    observation_sequence,
-                    packet_hash = %capture.packet_hash,
-                    complete = capture.complete,
-                    "review-guide source capture: stored immutable comparison packet",
-                ),
-                Ok(PrSourceCapturePersistOutcome::Existing(capture)) => tracing::debug!(
-                    root_task_id,
-                    pr_url,
-                    observation_sequence,
-                    existing_sequence = capture.observation_sequence,
-                    "review-guide source capture: comparison packet already present",
-                ),
-                Ok(PrSourceCapturePersistOutcome::IgnoredStaleObservation) => tracing::debug!(
-                    root_task_id,
-                    pr_url,
-                    observation_sequence,
-                    "review-guide source capture: ignored delayed observation",
-                ),
-                Err(error) => tracing::warn!(
-                    root_task_id,
-                    pr_url,
-                    observation_sequence,
-                    ?error,
-                    "review-guide source capture: could not persist packet",
-                ),
-            },
-            Err(error) => record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error),
-        }
+                Err(error) => record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error),
+            }
+        })
+        .await;
     }))
+}
+
+struct InFlightGuard(Option<CaptureKey>);
+
+impl InFlightGuard {
+    fn arm(&mut self, key: CaptureKey) -> bool {
+        if self.0.is_some() {
+            return true;
+        }
+        if !try_begin_in_flight(key.clone()) {
+            return false;
+        }
+        self.0 = Some(key);
+        true
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Some(key) = &self.0 {
+            end_in_flight(key);
+        }
+    }
 }
 
 fn source_capture_enabled(feature_flags: &FeatureFlagsStore) -> bool {
@@ -281,7 +352,7 @@ mod tests {
         let work_db = Arc::new(work_db);
         let flag_directory = tempfile::tempdir().unwrap();
         let flags = Arc::new(FeatureFlagsStore::new(flag_directory.path().join("feature-flags.toml")));
-        reconcile_review_guide_source(
+        reconcile_review_guide_source_with_collector(
             work_db.clone(),
             flags,
             SourceCaptureRequest::builder()
@@ -293,6 +364,7 @@ mod tests {
                     head_sha: "head".to_owned(),
                 })
                 .build(),
+            github_source_packet_collector(),
         );
         assert_eq!(
             work_db.allocate_pr_review_guide_source_observation_sequence().unwrap(),
@@ -352,9 +424,12 @@ mod tests {
             files: Vec::new(),
             omissions: Vec::new(),
         };
-        let collector: SourcePacketCollector = Arc::new(move |url, observed, expected_head_branch| {
+        let collector: SourcePacketCollector = Arc::new(move |url, observed, expected_head_branch, _metadata| {
             let packet = packet.clone();
             Box::pin(async move {
+                let Some(observed) = observed else {
+                    anyhow::bail!("execution reconciler supplied unexpected comparison identity");
+                };
                 if url != packet.canonical_pr_url || observed.base_sha != "base" || observed.head_sha != "head" {
                     anyhow::bail!("execution reconciler supplied unexpected comparison identity");
                 }

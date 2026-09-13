@@ -143,6 +143,8 @@ pub mod callers {
     pub const HOST_REGISTRY: &str = "host_registry";
     /// PR open/merged state checks issued outside the poller.
     pub const PR_STATE_CHECK: &str = "pr_state_check";
+    /// Immutable source-packet collection for PR review guides.
+    pub const REVIEW_GUIDE_SOURCE_CAPTURE: &str = "review_guide_source_capture";
 }
 
 #[cfg(test)]

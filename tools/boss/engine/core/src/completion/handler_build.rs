@@ -58,6 +58,7 @@ impl WorkerCompletionHandler {
             now_fn: Arc::new(std::time::Instant::now),
             review_batch_enqueuer: Arc::new(GhReviewBatchEnqueuer),
             review_pool_size: crate::coordinator::DEFAULT_REVIEW_POOL_SIZE,
+            source_packet_collector: crate::review_guide_capture::github_source_packet_collector(),
         }
     }
 
@@ -341,12 +342,14 @@ impl WorkerCompletionHandler {
         pr_url: &str,
         trigger: crate::work::PrSourceCaptureTrigger,
     ) {
-        crate::review_guide_capture::reconcile_review_guide_source_for_execution(
+        crate::review_guide_capture::reconcile_review_guide_source_for_execution_with_collector(
             self.work_db.clone(),
             self.feature_flags.clone(),
             execution_id,
             pr_url,
             trigger,
+            None,
+            self.source_packet_collector.clone(),
         );
     }
 
@@ -359,7 +362,7 @@ impl WorkerCompletionHandler {
         observed: boss_pr_review_sources::PinnedComparison,
         observation_sequence: i64,
     ) {
-        crate::review_guide_capture::reconcile_review_guide_source(
+        crate::review_guide_capture::reconcile_review_guide_source_with_collector(
             self.work_db.clone(),
             self.feature_flags.clone(),
             crate::review_guide_capture::SourceCaptureRequest::builder()
@@ -369,7 +372,18 @@ impl WorkerCompletionHandler {
                 .observed(observed)
                 .observation_sequence(observation_sequence)
                 .build(),
+            self.source_packet_collector.clone(),
         );
+    }
+
+    /// Inject a source-packet collector. Tests use this to spy on capture
+    /// without calling GitHub; production keeps the default GitHub collector.
+    pub(crate) fn with_source_packet_collector(
+        mut self,
+        collector: crate::review_guide_capture::SourcePacketCollector,
+    ) -> Self {
+        self.source_packet_collector = collector;
+        self
     }
 
     pub(crate) fn review_guide_source_capture_enabled(&self) -> bool {

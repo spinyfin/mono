@@ -262,20 +262,7 @@ pub fn is_editorial_candidate(command: &str) -> bool {
 // sites reach them through this crate's `gh` vocabulary alongside
 // [`gh_compare_jq`].
 pub use boss_github::gh_runner::{gh_output, run_gh};
-
-/// GitHub JSON Accept header shared by every compare call.
-const GH_COMPARE_ACCEPT: &str = "Accept: application/vnd.github+json";
-
-/// `repos/{slug}/compare/{base}...{head}` endpoint used by both the async
-/// and blocking compare helpers.
-fn gh_compare_endpoint(repo_slug: &str, base: &str, head: &str) -> String {
-    format!("repos/{repo_slug}/compare/{base}...{head}")
-}
-
-/// `gh api` argv for a compare: endpoint, Accept header, jq projection.
-fn gh_compare_api_args<'a>(endpoint: &'a str, jq: &'a str) -> [&'a str; 6] {
-    ["api", endpoint, "-H", GH_COMPARE_ACCEPT, "--jq", jq]
-}
+pub use boss_github::pr_files::{GH_COMPARE_ACCEPT, gh_compare_api_args, gh_compare_endpoint};
 
 /// Shell out to `gh api repos/<repo_slug>/compare/<base>...<head>` with the
 /// GitHub JSON `Accept` header and the caller-supplied `jq` projection,

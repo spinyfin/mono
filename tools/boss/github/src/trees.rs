@@ -197,6 +197,23 @@ pub async fn fetch_head_sha(owner: &str, repo: &str, git_ref: &str) -> TreeResul
     Ok(sha)
 }
 
+/// Shared `gh api` + JSON parse for a Git tree. `recursive` is the
+/// whole-repo listing used by document browsers; source capture walks one
+/// changed directory at a time without `recursive=1` so GitHub's 100k-entry
+/// truncation limit cannot fail a monorepo capture.
+async fn fetch_tree_body(owner: &str, repo: &str, sha: &str, recursive: bool) -> TreeResult<serde_json::Value> {
+    let endpoint = if recursive {
+        format!("repos/{owner}/{repo}/git/trees/{sha}?recursive=1")
+    } else {
+        format!("repos/{owner}/{repo}/git/trees/{sha}")
+    };
+    let stdout = gh_api(&["api", &endpoint]).await?;
+    serde_json::from_slice(&stdout).map_err(|e| TreeApiError {
+        kind: TreeApiErrorKind::Unreachable,
+        message: format!("could not parse the tree response from `gh api {endpoint}`: {e}"),
+    })
+}
+
 /// The full recursive tree at `sha`, keeping only blobs whose path
 /// satisfies `keep_path`.
 ///
@@ -206,12 +223,7 @@ pub async fn fetch_tree<F>(owner: &str, repo: &str, sha: &str, keep_path: F) -> 
 where
     F: Fn(&str) -> bool,
 {
-    let endpoint = format!("repos/{owner}/{repo}/git/trees/{sha}?recursive=1");
-    let stdout = gh_api(&["api", &endpoint]).await?;
-    let body: serde_json::Value = serde_json::from_slice(&stdout).map_err(|e| TreeApiError {
-        kind: TreeApiErrorKind::Unreachable,
-        message: format!("could not parse the tree response from `gh api {endpoint}`: {e}"),
-    })?;
+    let body = fetch_tree_body(owner, repo, sha, true).await?;
     Ok(parse_tree(sha, &body, keep_path))
 }
 
@@ -223,13 +235,31 @@ pub async fn fetch_pinned_tree<F>(owner: &str, repo: &str, sha: &str, keep_path:
 where
     F: Fn(&str) -> bool,
 {
-    let endpoint = format!("repos/{owner}/{repo}/git/trees/{sha}?recursive=1");
-    let stdout = gh_api(&["api", &endpoint]).await?;
-    let body: serde_json::Value = serde_json::from_slice(&stdout).map_err(|e| TreeApiError {
-        kind: TreeApiErrorKind::Unreachable,
-        message: format!("could not parse the tree response from `gh api {endpoint}`: {e}"),
-    })?;
+    let body = fetch_tree_body(owner, repo, sha, true).await?;
     Ok(parse_pinned_tree(sha, &body, keep_path))
+}
+
+/// Immediate children of `directory` at `commit_sha`, without walking the
+/// rest of the repository. `directory` is empty for the tree root. Entry
+/// paths in the result are GitHub's directory-relative names (the file
+/// basename), not repo-relative paths.
+pub async fn fetch_pinned_tree_directory<F>(
+    owner: &str,
+    repo: &str,
+    commit_sha: &str,
+    directory: &str,
+    keep_path: F,
+) -> TreeResult<PinnedTree>
+where
+    F: Fn(&str) -> bool,
+{
+    let tree_ref = if directory.is_empty() {
+        commit_sha.to_owned()
+    } else {
+        format!("{commit_sha}:{directory}")
+    };
+    let body = fetch_tree_body(owner, repo, &tree_ref, false).await?;
+    Ok(parse_pinned_tree(commit_sha, &body, keep_path))
 }
 
 /// Map a `git/trees` response body into a [`RepoTree`], keeping only
