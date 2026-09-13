@@ -69,11 +69,23 @@ fn parse_filters(raw: &[String]) -> Result<Vec<MetricFilter>, CliError> {
                 "could not parse filter {item:?}; dimension name is empty"
             )));
         }
+        let mut any_nonempty = false;
         for value in values.split(',') {
             let value = value.trim();
             if !value.is_empty() {
                 by_dim.entry(dim.to_owned()).or_default().push(value.to_owned());
+                any_nonempty = true;
             }
+        }
+        // An unset shell variable expands to exactly this shape (e.g.
+        // `--filter status=$MAYBE_UNSET`); silently dropping the whole
+        // dimension would turn a scoped query into an unfiltered one with
+        // no diagnostic, so reject it instead — this also still validates
+        // the dimension name even when every value is empty.
+        if !any_nonempty {
+            return Err(CliError::usage(format!(
+                "could not parse filter {item:?}; no non-empty value after '='"
+            )));
         }
     }
     Ok(by_dim
@@ -222,6 +234,21 @@ mod tests {
     fn parse_filters_rejects_missing_equals() {
         let err = parse_filters(&["status:failed".into()]).unwrap_err();
         assert!(err.to_string().contains("expected dim=value"));
+    }
+
+    #[test]
+    fn parse_filters_rejects_an_all_empty_value_list() {
+        let err = parse_filters(&["status=".into()]).unwrap_err();
+        assert!(err.to_string().contains("no non-empty value"));
+
+        let err = parse_filters(&["driver=,".into()]).unwrap_err();
+        assert!(err.to_string().contains("no non-empty value"));
+    }
+
+    #[test]
+    fn parse_filters_rejects_an_unknown_dimension_with_an_empty_value() {
+        let err = parse_filters(&["not_a_real_dimension=".into()]).unwrap_err();
+        assert!(err.to_string().contains("no non-empty value"));
     }
 
     #[test]

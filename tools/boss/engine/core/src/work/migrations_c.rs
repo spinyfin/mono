@@ -756,10 +756,16 @@ pub(crate) fn migrate_work_comments_reopened_at_column(conn: &Connection) -> Res
 /// is the matching window index for the token/cost series that follow.
 /// Timestamps are 10-digit epoch-second TEXT, so queries compare them as
 /// TEXT against 10-digit bounds and this index stays usable.
+///
+/// `finished_at` leads `kind`, not the other way around: `execution_outcomes`
+/// and `prs_generated` pass no `kind` predicate at all (and the catalog scan
+/// passes neither), so those windowed range scans need `finished_at` first
+/// to seek at all. A `kind`-filtered series (e.g. `review_duration`) still
+/// seeks efficiently within the `finished_at` range.
 pub(crate) fn migrate_metric_series_indexes(conn: &Connection) -> Result<()> {
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS work_executions_kind_finished_at_idx
-            ON work_executions(kind, finished_at)
+        "CREATE INDEX IF NOT EXISTS work_executions_finished_at_kind_idx
+            ON work_executions(finished_at, kind)
             WHERE finished_at IS NOT NULL",
         [],
     )?;
