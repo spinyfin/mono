@@ -1559,6 +1559,17 @@ impl LiveWorkerStateRegistry {
         }
     }
 
+    /// Override `last_tool_ended_at` for `slot_id`. Test seam for a
+    /// duplicate `PostToolUse` whose ingress timestamp must advance even
+    /// though no tool is active.
+    #[cfg(test)]
+    pub fn set_last_tool_ended_at_for_test(&self, slot_id: u8, last_tool_ended_at: impl Into<String>) {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        if let Some(entry) = guard.get_mut(&slot_id) {
+            entry.state.last_tool_ended_at = Some(last_tool_ended_at.into());
+        }
+    }
+
     /// Override `activity` for `slot_id`. Test seam for a `Working` slot
     /// whose tool condition is still [`SemanticToolCondition::Unknown`]
     /// (no Pre/PostToolUse has ever established idle/in-flight).
@@ -2069,11 +2080,16 @@ mod tests {
         );
         reg.apply_event(1, &post_tool("Bash"));
         reg.set_last_event_at_for_test(1, "2000-01-01T00:00:00Z");
+        reg.set_last_tool_ended_at_for_test(1, "2000-01-01T00:00:00Z");
+        let before = reg.get(1).unwrap();
 
         assert!(
             !reg.apply_event(1, &post_tool("Bash")),
             "a PostToolUse with no active tool must not report a timestamp-only change"
         );
+        let after = reg.get(1).unwrap();
+        assert_ne!(before.last_event_at, after.last_event_at);
+        assert_ne!(before.last_tool_ended_at, after.last_tool_ended_at);
     }
 
     #[test]
