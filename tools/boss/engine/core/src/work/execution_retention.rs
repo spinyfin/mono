@@ -29,8 +29,8 @@
 //! - outside the most recent [`ExecutionRetentionPolicy::keep_per_work_item`]
 //!   never-started prunable executions for their work item.
 //!
-//! The last condition is the diagnostics floor: incident forensics (T2217,
-//! T2233) leaned heavily on recent failure history, so a work item that
+//! The last condition is the diagnostics floor: incident forensics on repeated
+//! work-item failures leaned heavily on recent failure history. As a result, a work item that
 //! fails repeatedly always keeps its most recent failures on hand even
 //! once they cross the age bound — only the long never-started tail beyond
 //! the floor is ever removed. Rows with a real worker run do not compete
