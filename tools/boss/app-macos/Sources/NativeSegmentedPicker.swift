@@ -47,6 +47,7 @@ struct NativeSegmentedPicker<Value: Hashable>: View {
     @Environment(\.isEnabled) private var isEnabled
     @Environment(\.colorScheme) private var colorScheme
     @FocusState private var isFocused: Bool
+    @Namespace private var selectionNamespace
 
     init(
         _ accessibilityLabel: String,
@@ -83,23 +84,38 @@ struct NativeSegmentedPicker<Value: Hashable>: View {
         .padding(2)
         .background(track)
         .opacity(isEnabled ? 1 : 0.5)
+        .animation(.easeInOut(duration: 0.12), value: selection)
         .focusable(true)
         .focused($isFocused)
         .onMoveCommand { direction in
-            let values = options.map(\.value)
-            if let next = NativeSegmentedPickerSelection.neighbor(
-                of: selection,
-                in: values,
-                moving: direction
-            ) {
-                selection = next
-            }
+            moveSelection(direction)
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(accessibilityLabel)
         .accessibilityValue(selectedTitle)
         .accessibilityIdentifier("native-segmented-picker")
+        .accessibilityAdjustableAction { direction in
+            switch direction {
+            case .increment:
+                moveSelection(.right)
+            case .decrement:
+                moveSelection(.left)
+            @unknown default:
+                break
+            }
+        }
         .allowsHitTesting(isEnabled)
+    }
+
+    private func moveSelection(_ direction: MoveCommandDirection) {
+        let values = options.map(\.value)
+        if let next = NativeSegmentedPickerSelection.neighbor(
+            of: selection,
+            in: values,
+            moving: direction
+        ) {
+            selection = next
+        }
     }
 
     private var selectedTitle: String {
@@ -138,7 +154,7 @@ struct NativeSegmentedPicker<Value: Hashable>: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(SegmentPressStyle())
         .focusable(false)
         .foregroundStyle(.primary)
         .background {
@@ -146,6 +162,7 @@ struct NativeSegmentedPicker<Value: Hashable>: View {
                 RoundedRectangle(cornerRadius: 5.5, style: .continuous)
                     .fill(selectionFill)
                     .shadow(color: selectionShadow, radius: 0.5, y: 0.5)
+                    .matchedGeometryEffect(id: "selection-pill", in: selectionNamespace)
             }
         }
         .overlay(alignment: .leading) {
@@ -168,6 +185,15 @@ struct NativeSegmentedPicker<Value: Hashable>: View {
         guard index > 0, index < options.count else { return false }
         return options[index].value != selection
             && options[index - 1].value != selection
+    }
+}
+
+/// Press feedback without AppKit button chrome. `.plain` still inherited a
+/// hover highlight from the toolbar in some macOS 26 configurations.
+private struct SegmentPressStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(configuration.isPressed ? 0.82 : 1)
     }
 }
 

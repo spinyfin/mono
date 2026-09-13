@@ -52,6 +52,41 @@ final class NativeSegmentedPickerTests: XCTestCase {
         )
     }
 
+    func testRepeatedLayoutStillDoesNotInstallNSSegmentedControl() throws {
+        let host = hostedPicker(width: 440, height: 32)
+        for _ in 0..<200 {
+            host.needsLayout = true
+            host.layoutSubtreeIfNeeded()
+        }
+        XCTAssertTrue(
+            segmentedControls(in: host).isEmpty,
+            "relayout must not re-enter the NSSegmentedControl representable path"
+        )
+    }
+
+    func testSelectedSegmentIsVisuallyDistinct() throws {
+        let agents = hostedPicker(
+            width: 440,
+            height: 32,
+            selection: ModeBinding(value: "agents")
+        )
+        let work = hostedPicker(
+            width: 440,
+            height: 32,
+            selection: ModeBinding(value: "work")
+        )
+        let agentsShot = try bitmap(of: agents)
+        let workShot = try bitmap(of: work)
+        if isUniformlyBlank(agentsShot) || isUniformlyBlank(workShot) {
+            throw XCTSkip("render came back uniformly blank; host does not support offscreen SwiftUI rendering")
+        }
+        XCTAssertNotEqual(
+            agentsShot.representation(using: .png, properties: [:]),
+            workShot.representation(using: .png, properties: [:]),
+            "the selected segment must paint differently from its neighbors"
+        )
+    }
+
     func testRespectsFixedWidthAndCompressesWhenNarrow() throws {
         let wide = hostedPicker(width: 440, height: 32)
         wide.layoutSubtreeIfNeeded()
@@ -167,10 +202,11 @@ final class NativeSegmentedPickerTests: XCTestCase {
     private func hostedPicker(
         width: CGFloat,
         height: CGFloat,
-        titles: [(String, String)]? = nil
+        titles: [(String, String)]? = nil,
+        selection: ModeBinding? = nil
     ) -> NSHostingView<some View> {
         let titles = titles ?? modeTitles
-        let selection = ModeBinding(value: titles[0].0)
+        let selection = selection ?? ModeBinding(value: titles[0].0)
         let root = NativeSegmentedPicker(
             "Mode",
             selection: selection.binding,
@@ -182,6 +218,15 @@ final class NativeSegmentedPickerTests: XCTestCase {
         host.appearance = NSAppearance(named: .aqua)
         host.frame = NSRect(x: 0, y: 0, width: width, height: height)
         return host
+    }
+
+    private func bitmap(of host: NSView) throws -> NSBitmapImageRep {
+        host.layoutSubtreeIfNeeded()
+        guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else {
+            throw XCTSkip("bitmapImageRepForCachingDisplay returned nil")
+        }
+        host.cacheDisplay(in: host.bounds, to: rep)
+        return rep
     }
 
     private func render(
