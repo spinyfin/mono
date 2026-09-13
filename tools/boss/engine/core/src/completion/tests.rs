@@ -98,6 +98,33 @@ impl PrDetector for StubPrDetector {
     }
 }
 
+struct StubWorkspaceDiffVerifier {
+    result: Result<bool, String>,
+}
+
+impl StubWorkspaceDiffVerifier {
+    fn empty() -> Arc<Self> {
+        Arc::new(Self { result: Ok(true) })
+    }
+
+    fn dirty() -> Arc<Self> {
+        Arc::new(Self { result: Ok(false) })
+    }
+
+    fn err(message: &str) -> Arc<Self> {
+        Arc::new(Self {
+            result: Err(message.to_owned()),
+        })
+    }
+}
+
+#[async_trait]
+impl WorkspaceDiffVerifier for StubWorkspaceDiffVerifier {
+    async fn is_workspace_contribution_empty(&self, _workspace_path: &Path) -> Result<bool> {
+        self.result.clone().map_err(anyhow::Error::msg)
+    }
+}
+
 /// Configurable branch verifier for tests. Returns a fixed
 /// `headRefName` (or error), a fixed `headRefOid` (or error), and a
 /// fixed diff line count (or error) without shelling out to `gh`.
@@ -441,6 +468,7 @@ impl TestHarness {
         // harness hermetic; tests that exercise branch-specific behaviour
         // replace this with their own verifier.
         .with_branch_verifier(StubBranchVerifier::ok("boss/test"))
+        .with_workspace_diff_verifier(StubWorkspaceDiffVerifier::empty())
         // Auto-advancing by default: most tests drive several `on_stop`
         // calls back-to-back to exercise the circuit breaker's *count*,
         // not its timing, and a synchronous test loop would otherwise
