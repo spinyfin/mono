@@ -90,17 +90,19 @@ struct WorkersDetailView: View {
 
     private var poolPickerHeader: some View {
         HStack {
-            Picker("Pool", selection: $selectedPool) {
-                ForEach(AgentPoolKind.allCases) { pool in
-                    Text(pool.label(
+            NativeSegmentedPicker(
+                "Pool",
+                selection: $selectedPool,
+                options: AgentPoolKind.allCases,
+                title: { pool in
+                    pool.label(
                         bridgeCrewCount: workspace.bridgeCrewSlots.count,
                         lowerDecksCount: workspace.lowerDecksSlots.count,
                         automationCount: WorkersWorkspaceModel.automationSlotCount,
                         reviewCount: workspace.reviewSlotCount
-                    )).tag(pool)
+                    )
                 }
-            }
-            .pickerStyle(.segmented)
+            )
             .frame(maxWidth: 460)
             if !liveStatusModel.tmuxHostingEnabled {
                 LegacyHostingBadge()

@@ -157,13 +157,26 @@ enum BossWindowCapture {
     /// Prefer a titled content window; fall back to any window with a contentView.
     @MainActor
     private static func pickWindow() -> NSWindow? {
-        let windows = NSApp.windows
-        if let titled = windows.first(where: {
+        pickWindow(from: NSApp.windows)
+    }
+
+    /// Prefer the agent-capture main window, then the largest titled window.
+    /// Auxiliary `Window` scenes (UI Stalls, Metrics, …) can appear first in
+    /// `NSApp.windows` on macOS 26 even when they are not the `WindowGroup`
+    /// content, which made `--capture-to` grab the wrong chrome.
+    @MainActor
+    static func pickWindow(from windows: [NSWindow]) -> NSWindow? {
+        let titled = windows.filter {
             $0.contentView != nil && $0.styleMask.contains(.titled)
-        }) {
-            return titled
         }
-        return windows.first(where: { $0.contentView != nil })
+        if let capture = titled.first(where: {
+            $0.title.localizedCaseInsensitiveContains("agent capture")
+        }) {
+            return capture
+        }
+        return titled.max(by: {
+            ($0.frame.width * $0.frame.height) < ($1.frame.width * $1.frame.height)
+        }) ?? windows.first(where: { $0.contentView != nil })
     }
 
     /// Count non-near-white / non-near-black samples across a coarse grid.
