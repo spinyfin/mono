@@ -265,16 +265,20 @@ struct ContentView: View {
         }
         .toolbar {
             ToolbarItem(placement: .navigation) {
-                Picker("Mode", selection: Binding(
-                    get: { model.navigationMode },
-                    set: { model.setNavigationMode($0) }
-                )) {
-                    ForEach(NavigationMode.allCases) { mode in
-                        Text(mode.rawValue).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
+                NativeSegmentedPicker(
+                    "Mode",
+                    selection: Binding(
+                        get: { model.navigationMode },
+                        set: { model.setNavigationMode($0) }
+                    ),
+                    options: NavigationMode.allCases,
+                    title: { $0.rawValue }
+                )
+                // Same 440pt box as the previous segmented Picker. Intrinsic
+                // size is label-based so NSToolbar can measure this item.
+                // `fixedSize` stops the toolbar proposing an unbounded width.
                 .frame(width: 440)
+                .fixedSize()
             }
 
             // Agent-capture badge: isolation signal only

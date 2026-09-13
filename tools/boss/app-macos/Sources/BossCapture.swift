@@ -157,13 +157,50 @@ enum BossWindowCapture {
     /// Prefer a titled content window; fall back to any window with a contentView.
     @MainActor
     private static func pickWindow() -> NSWindow? {
-        let windows = NSApp.windows
-        if let titled = windows.first(where: {
-            $0.contentView != nil && $0.styleMask.contains(.titled)
-        }) {
-            return titled
+        pickWindow(from: NSApp.windows)
+    }
+
+    /// Ranking inputs for `pickWindowIndex`. Extracted so tests can pin the
+    /// preference order without constructing `NSWindow` (the XCTest host
+    /// segfaults on window + `cacheDisplay`).
+    struct WindowCandidate: Equatable, Sendable {
+        var title: String
+        var area: CGFloat
+        var isTitled: Bool
+        var hasContentView: Bool
+    }
+
+    /// Prefer the agent-capture main window, then the largest titled window.
+    /// Auxiliary `Window` scenes (UI Stalls, Metrics, …) can appear first in
+    /// `NSApp.windows` on macOS 26 even when they are not the `WindowGroup`
+    /// content, which made `--capture-to` grab the wrong chrome.
+    static func pickWindowIndex(from windows: [WindowCandidate]) -> Int? {
+        let titled = windows.enumerated().filter {
+            $0.element.hasContentView && $0.element.isTitled
         }
-        return windows.first(where: { $0.contentView != nil })
+        if let capture = titled.first(where: {
+            $0.element.title.localizedCaseInsensitiveContains("agent capture")
+        }) {
+            return capture.offset
+        }
+        if let largest = titled.max(by: { $0.element.area < $1.element.area }) {
+            return largest.offset
+        }
+        return windows.firstIndex(where: \.hasContentView)
+    }
+
+    @MainActor
+    static func pickWindow(from windows: [NSWindow]) -> NSWindow? {
+        let candidates = windows.map { window in
+            WindowCandidate(
+                title: window.title,
+                area: window.frame.width * window.frame.height,
+                isTitled: window.styleMask.contains(.titled),
+                hasContentView: window.contentView != nil
+            )
+        }
+        guard let index = pickWindowIndex(from: candidates) else { return nil }
+        return windows[index]
     }
 
     /// Count non-near-white / non-near-black samples across a coarse grid.

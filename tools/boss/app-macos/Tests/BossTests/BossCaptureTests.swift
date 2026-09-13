@@ -167,6 +167,36 @@ final class BossCaptureTests: XCTestCase {
     func testCaptureSuiteName() {
         XCTAssertEqual(BossDefaults.captureSuiteName, "dev.spinyfin.bossmacapp.capture")
     }
+
+    func testPickWindowPrefersAgentCaptureTitleOverLargerAuxiliaryScenes() {
+        let windows: [BossWindowCapture.WindowCandidate] = [
+            .init(title: "UI Stalls", area: 900 * 700, isTitled: true, hasContentView: true),
+            .init(
+                title: "AGENT CAPTURE — isolated instance",
+                area: 400 * 300,
+                isTitled: true,
+                hasContentView: true
+            ),
+            .init(title: "Metrics", area: 1_200 * 800, isTitled: true, hasContentView: true),
+        ]
+        XCTAssertEqual(BossWindowCapture.pickWindowIndex(from: windows), 1)
+    }
+
+    func testPickWindowFallsBackToLargestTitledWindow() {
+        let windows: [BossWindowCapture.WindowCandidate] = [
+            .init(title: "UI Stalls", area: 400 * 300, isTitled: true, hasContentView: true),
+            .init(title: "Boss", area: 1_200 * 800, isTitled: true, hasContentView: true),
+            .init(title: "untitled", area: 2_000 * 1_000, isTitled: false, hasContentView: true),
+        ]
+        XCTAssertEqual(BossWindowCapture.pickWindowIndex(from: windows), 1)
+    }
+
+    func testPickWindowReturnsNilWhenNothingHasContent() {
+        let windows: [BossWindowCapture.WindowCandidate] = [
+            .init(title: "empty", area: 100, isTitled: true, hasContentView: false),
+        ]
+        XCTAssertNil(BossWindowCapture.pickWindowIndex(from: windows))
+    }
 }
 
 /// Opaque fill view used only by the cacheDisplay hermetic pin.
