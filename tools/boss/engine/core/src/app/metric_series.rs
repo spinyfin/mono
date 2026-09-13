@@ -10,6 +10,7 @@ use crate::metric_series::{
     CATALOG_LOOKBACK_SECS, SeriesQuery, SeriesSource, build_catalog, build_execution_series_report,
     build_task_series_report, parse_bucket, validate_query,
 };
+use crate::work::MetricExecutionFactOptions;
 
 pub(super) async fn handle_get_metric_catalog(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
@@ -24,7 +25,17 @@ pub(super) async fn handle_get_metric_catalog(ctx: Dispatch, req: FrontendReques
     let generated_at_epoch_s = boss_engine_utils::epoch_time::now_epoch_secs();
     let until = generated_at_epoch_s.saturating_add(1);
     let lookback_since = until.saturating_sub(CATALOG_LOOKBACK_SECS).max(0);
-    let execution_facts = match work_db.metric_execution_facts(lookback_since, until, None, None, false, false) {
+    let execution_facts = match work_db.metric_execution_facts(
+        lookback_since,
+        until,
+        None,
+        None,
+        false,
+        MetricExecutionFactOptions {
+            first_pr_only: false,
+            filters: &[],
+        },
+    ) {
         Ok(facts) => facts,
         Err(err) => return send_work_error(&sink, &request_id, &err),
     };
@@ -84,7 +95,10 @@ pub(super) async fn handle_get_metric_series(ctx: Dispatch, req: FrontendRequest
             kinds,
             statuses,
             require_pr_url,
-            unique_by_pr_url,
+            MetricExecutionFactOptions {
+                first_pr_only: unique_by_pr_url,
+                filters: &filters,
+            },
         ) {
             Ok(rows) => build_execution_series_report(&query, &rows, generated_at_epoch_s),
             Err(err) => return send_work_error(&sink, &request_id, &err),
