@@ -16,15 +16,19 @@ final class WorkerLiveStateDedupTests: XCTestCase {
         XCTAssertEqual(a.hashValue, b.hashValue, "hash must agree with the excluding equality")
     }
 
-    func testStatesDifferingInAnyOtherFieldCompareUnequal() {
+    func testStatesDifferingInEveryComparedFieldCompareUnequal() {
         let base = makeLiveState(lastEventAt: "2026-06-01T00:00:00Z", lastToolEndedAt: nil)
 
-        XCTAssertNotEqual(base, makeLiveState(activity: .idle, lastEventAt: "2026-06-01T00:00:00Z", lastToolEndedAt: nil))
-        XCTAssertNotEqual(
-            base,
-            makeLiveState(currentTool: "Edit", lastEventAt: "2026-06-01T00:00:00Z", lastToolEndedAt: nil)
-        )
         XCTAssertNotEqual(base, makeLiveState(slotId: 2, lastEventAt: "2026-06-01T00:00:00Z", lastToolEndedAt: nil))
+        XCTAssertNotEqual(base, makeLiveState(runId: "exec-2", lastEventAt: "2026-06-01T00:00:00Z", lastToolEndedAt: nil))
+        XCTAssertNotEqual(base, makeLiveState(model: "claude-sonnet-4-5", lastEventAt: "2026-06-01T00:00:00Z", lastToolEndedAt: nil))
+        XCTAssertNotEqual(base, makeLiveState(shellPid: 5678, lastEventAt: "2026-06-01T00:00:00Z", lastToolEndedAt: nil))
+        XCTAssertNotEqual(base, makeLiveState(currentTool: "Edit", lastEventAt: "2026-06-01T00:00:00Z", lastToolEndedAt: nil))
+        XCTAssertNotEqual(base, makeLiveState(activity: .idle, lastEventAt: "2026-06-01T00:00:00Z", lastToolEndedAt: nil))
+        XCTAssertNotEqual(base, makeLiveState(liveStatus: "Planning", lastEventAt: "2026-06-01T00:00:00Z", lastToolEndedAt: nil))
+        XCTAssertNotEqual(base, makeLiveState(liveStatusAt: "2026-06-01T00:00:05Z", lastEventAt: "2026-06-01T00:00:00Z", lastToolEndedAt: nil))
+        XCTAssertNotEqual(base, makeLiveState(recoveryStatus: "Recovering", lastEventAt: "2026-06-01T00:00:00Z", lastToolEndedAt: nil))
+        XCTAssertNotEqual(base, makeLiveState(tmuxHosted: true, lastEventAt: "2026-06-01T00:00:00Z", lastToolEndedAt: nil))
     }
 
     @MainActor
@@ -61,24 +65,31 @@ final class WorkerLiveStateDedupTests: XCTestCase {
 
     private func makeLiveState(
         slotId: Int = 1,
+        runId: String = "exec-1",
+        model: String = "claude-opus-4-7",
+        shellPid: Int32 = 1234,
         activity: WorkerActivity = .working,
         currentTool: String? = nil,
+        liveStatus: String? = nil,
+        liveStatusAt: String? = nil,
+        recoveryStatus: String? = nil,
+        tmuxHosted: Bool? = nil,
         lastEventAt: String?,
         lastToolEndedAt: String?
     ) -> WorkerLiveState {
         WorkerLiveState(
             slotId: slotId,
-            runId: "exec-1",
-            model: "claude-opus-4-7",
-            shellPid: 1234,
+            runId: runId,
+            model: model,
+            shellPid: shellPid,
             lastEventAt: lastEventAt,
             currentTool: currentTool,
             lastToolEndedAt: lastToolEndedAt,
             activity: activity,
-            liveStatus: nil,
-            liveStatusAt: nil,
-            recoveryStatus: nil,
-            tmuxHosted: nil
+            liveStatus: liveStatus,
+            liveStatusAt: liveStatusAt,
+            recoveryStatus: recoveryStatus,
+            tmuxHosted: tmuxHosted
         )
     }
 }

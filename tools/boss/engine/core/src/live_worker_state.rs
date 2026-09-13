@@ -1276,17 +1276,13 @@ impl LiveWorkerStateRegistry {
             }
         }
 
-        // `last_event_at` is stamped unconditionally above, on every
-        // event including a pure heartbeat (e.g. a duplicate `Stop`
-        // while already `Idle`, or a `SessionStart(Resume)`
-        // proof-of-life). Comparing `before` against the raw `*state`
-        // would therefore always see a difference and report
-        // `changed = true` for every event, defeating the caller's
-        // broadcast-dedup gate. Compare against a copy with
-        // `last_event_at` rolled back to its prior value instead, so
-        // only a change to some other field counts as a real change.
+        // These timestamps are stamped on hook ingress, including events
+        // that leave the observable worker state unchanged. Compare a copy
+        // with their prior values restored so only another field makes the
+        // broadcast-dedup gate report a change.
         let mut comparable_after = state.clone();
         comparable_after.last_event_at = before.last_event_at.clone();
+        comparable_after.last_tool_ended_at = before.last_tool_ended_at.clone();
         before != comparable_after
     }
 
@@ -2047,6 +2043,7 @@ mod tests {
         reg.apply_event(1, &post_tool("Bash"));
         let first_stop_changed = reg.apply_event(1, &stop_event());
         assert!(first_stop_changed, "Working -> Idle is a real change");
+        reg.set_last_event_at_for_test(1, "2000-01-01T00:00:00Z");
         let before = reg.get(1).unwrap();
 
         let heartbeat_changed = reg.apply_event(1, &stop_event());
@@ -2056,13 +2053,27 @@ mod tests {
             "a repeated Stop while already Idle must not report a change"
         );
         let after = reg.get(1).unwrap();
-        // `last_event_at` is still carried/stamped on every event — only
-        // the *reported* `changed` result is suppressed for a no-op event.
-        // (Not asserting it strictly advances: two calls in the same
-        // wall-clock second legitimately stamp the same second-granularity
-        // ISO-8601 value.)
-        assert!(before.last_event_at.is_some());
-        assert!(after.last_event_at.is_some());
+        assert_ne!(before.last_event_at, after.last_event_at);
+    }
+
+    #[test]
+    fn apply_event_reports_unchanged_for_a_spurious_post_tool_use() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        reg.apply_event(
+            1,
+            &WorkerEvent::UserPromptSubmit {
+                session_id: "s".into(),
+                prompt: "do the thing".into(),
+            },
+        );
+        reg.apply_event(1, &post_tool("Bash"));
+        reg.set_last_event_at_for_test(1, "2000-01-01T00:00:00Z");
+
+        assert!(
+            !reg.apply_event(1, &post_tool("Bash")),
+            "a PostToolUse with no active tool must not report a timestamp-only change"
+        );
     }
 
     #[test]
@@ -2076,21 +2087,11 @@ mod tests {
         assert!(changed, "Idle -> Working (current_tool set) must report a change");
     }
 
-    /// Rate measurement for this fix: replays a synthetic but
-    /// representative multi-worker hook trace through the real
-    /// `apply_event` and reports what fraction of events the dedup gate
-    /// now suppresses. This is not live production telemetry (that
-    /// would require running a real multi-worker Boss instance, which
-    /// this environment must not do) — it is a reproducible trace built
-    /// from the exact no-op shapes this defect names: a worker parked at
-    /// `Idle` receiving a duplicate `Stop` (multi-slot dup registration,
-    /// or a resume/reattach proof-of-life ping), and a `Notification`
-    /// hook the driver isn't capable-flagged to act on. Before this fix,
-    /// `apply_event`'s `before != *state` comparison was unconditionally
-    /// true (see `apply_event_reports_unchanged_for_a_pure_heartbeat`
-    /// above, which pins the now-fixed case), so "before" is exactly the
-    /// event count — every event broadcasts. "After" is the number of
-    /// calls that actually return `true` here.
+    /// Replays a representative multi-worker trace through `apply_event`.
+    /// Each turn has two duplicate `Stop`s while idle plus a redundant
+    /// `Notification` while already waiting for input; those three events
+    /// must be suppressed. The first `Notification` is meaningful because
+    /// `register_spawn` enables awaiting-input capability by default.
     #[test]
     fn apply_event_dedup_broadcast_rate_over_a_multi_worker_trace() {
         const WORKER_COUNT: u8 = 6; // matches the six-worker incident noted on `SessionEnd` above.
@@ -2121,16 +2122,19 @@ mod tests {
                     events.push(post_tool(&tool));
                 }
                 events.push(stop_event());
-                // No-op shapes named by this defect: duplicate Stop while
-                // already parked at Idle, and a Notification the driver
-                // isn't capability-flagged for (`awaiting_input_capable`
-                // defaults to false for `register_spawn`).
+                // The first Notification promotes Idle to WaitingForInput;
+                // the second is redundant. Force timestamp movement before
+                // every no-op so this trace cannot pass due to the clock's
+                // second-level granularity.
                 events.push(stop_event());
                 events.push(stop_event());
                 events.push(notification());
                 events.push(notification());
 
-                for event in &events {
+                for (index, event) in events.iter().enumerate() {
+                    if matches!(index, 8 | 9 | 11) {
+                        reg.set_last_event_at_for_test(slot, "2000-01-01T00:00:00Z");
+                    }
                     total_events += 1;
                     if reg.apply_event(slot, event) {
                         broadcast_events += 1;
@@ -2143,15 +2147,14 @@ mod tests {
         let broadcast_rate = broadcast_events as f64 / total_events as f64;
         println!(
             "apply_event dedup: {total_events} events, {broadcast_events} broadcasts, \
-             {suppressed} suppressed ({:.1}% broadcast rate; was 100% before this fix)",
+             {suppressed} suppressed ({:.1}% broadcast rate)",
             broadcast_rate * 100.0,
         );
 
-        assert!(
-            broadcast_events < total_events,
-            "the fixed dedup gate must suppress at least the duplicate-Stop/Notification \
-             no-ops in this trace, not broadcast on every event like the old comparison did"
-        );
+        assert!(broadcast_events < total_events);
+        assert_eq!(total_events, 1080);
+        assert_eq!(broadcast_events, 810);
+        assert_eq!(suppressed, 270);
     }
 
     #[test]
