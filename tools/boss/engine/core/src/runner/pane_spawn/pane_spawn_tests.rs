@@ -365,12 +365,12 @@ async fn initial_input_types_a_short_fixed_line_sourcing_the_workspace_script() 
     // and the clause is a no-op), then unsets the API key and invokes
     // claude. See the comment at the construction site.
     assert!(
-        script.starts_with(
-            "/usr/bin/taskpolicy -b -p $$ >/dev/null 2>&1; \
-                 [ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; \
-                 [ -n \"$BOSS_WORKER_BIN_DIR\" ] && export PATH=\"$BOSS_WORKER_BIN_DIR:$PATH\"; \
-                 unset ANTHROPIC_API_KEY; claude"
-        ),
+        script.starts_with(&format!(
+            "{}{}{}unset ANTHROPIC_API_KEY; claude",
+            worker_background_priority_clause(),
+            path_prepend_clause("BOSS_BIN_DIR"),
+            path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
+        )),
         "expected the initial-input script to mark itself background priority, re-prepend \
              BOSS_BIN_DIR then the worker launcher dir, unset ANTHROPIC_API_KEY, and invoke \
              claude, got: {script:?}",
@@ -499,10 +499,10 @@ async fn untagged_row_spawn_matches_engine_default() {
     assert_eq!(
         script,
         format!(
-            "/usr/bin/taskpolicy -b -p $$ >/dev/null 2>&1; \
-                 [ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; \
-                 [ -n \"$BOSS_WORKER_BIN_DIR\" ] && export PATH=\"$BOSS_WORKER_BIN_DIR:$PATH\"; \
-                 unset ANTHROPIC_API_KEY; claude --model {} --disallowedTools=AskUserQuestion --permission-mode auto --settings '{}' \"$(cat .claude/initial-prompt.txt)\"\n",
+            "{}{}{}unset ANTHROPIC_API_KEY; claude --model {} --disallowedTools=AskUserQuestion --permission-mode auto --settings '{}' \"$(cat .claude/initial-prompt.txt)\"\n",
+            worker_background_priority_clause(),
+            path_prepend_clause("BOSS_BIN_DIR"),
+            path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
             crate::driver::ClaudeDriver.descriptor().model_menu.engine_default,
             settings_path.display(),
         ),
