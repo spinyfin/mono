@@ -1286,6 +1286,87 @@ impl WorkDb {
         Ok(updated > 0)
     }
 
+    /// Persist a token-verified `#{pane_dead}` observation onto the run
+    /// identified by `(execution_id, spawn_token)`.
+    ///
+    /// Scoped like [`Self::persist_tmux_identity_after_observation`]: a
+    /// resume that minted a new token between probe and write must not
+    /// stamp the new run. Does **not** touch the live identity columns, so
+    /// [`Self::clear_tmux_identity_for_execution`] leaves this record in
+    /// place after teardown.
+    ///
+    /// Returns the updated `work_runs.id`, or `None` when no row matched.
+    pub fn record_tmux_pane_observation(
+        &self,
+        execution_id: &str,
+        spawn_token: &str,
+        record: &TmuxPaneObservationRecord,
+    ) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let run_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM work_runs
+                 WHERE execution_id = ?1 AND tmux_spawn_token = ?2",
+                params![execution_id, spawn_token],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(run_id) = run_id else {
+            return Ok(None);
+        };
+        let pane_dead = record.pane_dead.map(|dead| if dead { 1i64 } else { 0 });
+        conn.execute(
+            "UPDATE work_runs
+             SET tmux_observed_pane_dead = ?2,
+                 tmux_observed_pane_dead_status = ?3,
+                 tmux_observed_session_name = ?4,
+                 tmux_pane_observation = ?5
+             WHERE id = ?1",
+            params![
+                run_id,
+                pane_dead,
+                record.pane_dead_status.as_deref(),
+                record.session_name,
+                record.kind.as_str(),
+            ],
+        )?;
+        Ok(Some(run_id))
+    }
+
+    /// Latest token-verified pane observation for `execution_id`, if any
+    /// probe has written one. Does not require live identity columns — the
+    /// point of this record is to remain queryable after reap.
+    pub fn tmux_pane_observation_for_execution(&self, execution_id: &str) -> Result<Option<TmuxPaneObservationRecord>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT tmux_pane_observation, tmux_observed_pane_dead,
+                    tmux_observed_pane_dead_status, tmux_observed_session_name
+             FROM work_runs
+             WHERE execution_id = ?1 AND tmux_pane_observation IS NOT NULL
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+            params![execution_id],
+            |row| {
+                let kind_raw: String = row.get(0)?;
+                let Some(kind) = TmuxPaneObservationKind::parse(&kind_raw) else {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        format!("unknown tmux_pane_observation {kind_raw:?}").into(),
+                    ));
+                };
+                Ok(TmuxPaneObservationRecord {
+                    kind,
+                    pane_dead: row.get::<_, Option<i64>>(1)?.map(|value| value != 0),
+                    pane_dead_status: row.get(2)?,
+                    session_name: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// Test-only helper: force `transcript_path` back to NULL on an
     /// existing row. Used by the dispatcher regression test to model
     /// the production race where a SessionStart's payload-driven

@@ -615,6 +615,10 @@ impl WorkDb {
         // The spawn path does not use these columns until the tmux-hosting
         // rollout lands.
         step!(timer, conn, migrate_work_runs_tmux_columns)?;
+        // Token-verified `#{pane_dead}` observation. Survives the identity
+        // column clear on reap so the tmux confidence gate can query it
+        // after teardown.
+        step!(timer, conn, migrate_work_runs_tmux_pane_observation)?;
         // `work_runs.liveness_anchor_at`: mutable liveness-age for durable
         // reconcilers, so readoption can reset the pane-attach clock without
         // stomping the immutable pane-spawn `started_at`.
@@ -899,7 +903,11 @@ impl WorkDb {
                 tmux_spawn_token TEXT,
                 tmux_spawn_state TEXT,
                 tmux_pane_pid INTEGER,
-                tmux_hosted INTEGER NOT NULL DEFAULT 0
+                tmux_hosted INTEGER NOT NULL DEFAULT 0,
+                tmux_observed_pane_dead INTEGER,
+                tmux_observed_pane_dead_status TEXT,
+                tmux_observed_session_name TEXT,
+                tmux_pane_observation TEXT
             );
 
             CREATE INDEX IF NOT EXISTS work_runs_execution_idx
@@ -1197,6 +1205,24 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tmux_columns, 5, "expected all per-run tmux columns");
+
+        let pane_observation_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('work_runs')
+                 WHERE name IN (
+                     'tmux_observed_pane_dead',
+                     'tmux_observed_pane_dead_status',
+                     'tmux_observed_session_name',
+                     'tmux_pane_observation'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pane_observation_columns, 4,
+            "expected token-verified pane_dead observation columns",
+        );
 
         let liveness_anchor: i64 = conn
             .query_row(
