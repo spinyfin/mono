@@ -1,5 +1,5 @@
 //! Query layer behind `GetMetricSeries` / `GetMetricCatalog` — projects
-//! window-scoped `work_executions` and `tasks` rows into the fact types
+//! requested-window `work_executions` and `tasks` rows into the fact types
 //! the pure [`crate::metric_series`] module aggregates. SQL filters the
 //! window (and, for a series, kind/status) as TEXT against 10-digit,
 //! zero-padded epoch bounds so the `work_executions(finished_at, kind)`
@@ -92,10 +92,11 @@ impl WorkDb {
                 we.effort_level,
                 we.repo_remote_url,
                 we.pr_url,
-                p.slug
+                COALESCE(p.slug, p2.slug)
              FROM work_executions we
              LEFT JOIN tasks t ON t.id = we.work_item_id
              LEFT JOIN products p ON p.id = t.product_id
+             LEFT JOIN products p2 ON p2.id = we.work_item_id
              WHERE we.finished_at IS NOT NULL
                AND we.finished_at >= ?1
                AND we.finished_at < ?2",
@@ -170,8 +171,7 @@ impl WorkDb {
         Ok(out)
     }
 
-    /// Project the facts a catalog series reads. Test helper so integration
-    /// tests share the same source predicates the handlers use.
+    /// Project the requested window using a catalog series' source predicates.
     #[cfg(test)]
     pub(crate) fn metric_facts_for_spec(
         &self,
@@ -396,9 +396,23 @@ mod tests {
 
         let facts = db.metric_execution_facts(T0, T0 + 1_000, None, None, false).unwrap();
         assert_eq!(facts.len(), 2);
-        assert!(facts.iter().all(|f| f.product.is_none()));
-        assert!(facts.iter().any(|f| f.kind == "product_design"));
-        assert!(facts.iter().any(|f| f.kind == "answer_agent"));
+        assert_eq!(
+            facts
+                .iter()
+                .find(|f| f.kind == "product_design")
+                .unwrap()
+                .product
+                .as_deref(),
+            Some("test-product")
+        );
+        assert!(
+            facts
+                .iter()
+                .find(|f| f.kind == "answer_agent")
+                .unwrap()
+                .product
+                .is_none()
+        );
     }
 
     #[test]
@@ -506,12 +520,9 @@ mod tests {
         }
     }
 
-    /// Guards the *bucket/percentile aggregation* half of the design's
-    /// 150 ms p95 query-latency budget: an 8,000-execution table spanning
-    /// a five-month range, aggregated at day buckets. This does not assert
-    /// the full budget end-to-end (see the `[deferred-scope]` note on the
-    /// median assertion below) — the SQL projection half is timed once,
-    /// outside the loop, and is not part of what this test bounds.
+    /// Guards median bucket/percentile aggregation latency for an
+    /// 8,000-execution five-month window at day buckets. It intentionally
+    /// does not time SQLite projection or assert a p95 full-path budget.
     #[test]
     fn median_query_latency_over_five_month_synthetic_dataset_stays_under_budget() {
         let (_dir, db) = open_db();
@@ -562,11 +573,8 @@ mod tests {
             tx.commit().unwrap();
         }
 
-        // Project once (the SQL half, outside the timed loop below): this
-        // test does not measure that half. An 11-way sharded fastbuild
-        // `bazel test` run shares its host with the other shards, so SQLite
-        // wall-clock time here would reflect contention, not the query
-        // itself; see the `[deferred-scope]` note on the median assertion.
+        // Project the same requested lower bound used by the handler. The
+        // timed loop below deliberately measures aggregation only.
         let spec = series_spec(SERIES_EXECUTION_OUTCOMES).unwrap();
         let SeriesFacts::Executions(rows) = db.metric_facts_for_spec(spec, since, until).unwrap() else {
             panic!("execution_outcomes must project executions");
@@ -596,15 +604,8 @@ mod tests {
             samples_ms.push(started.elapsed().as_millis());
         }
         samples_ms.sort_unstable();
-        // [deferred-scope] This asserts a median over 20 in-process samples,
-        // not the design's 150 ms p95: the ten other engine_lib_test shards
-        // sharing this host under a sandboxed `bazel test` run produced
-        // 150-300 ms scheduling-noise spikes next to a 5 ms cluster in
-        // observed runs, which a p95 over only 20 samples cannot distinguish
-        // from a genuine regression. The SQL projection above is also timed
-        // once, outside this loop, so that half of the budget is unmeasured
-        // here. See this revision's `[deferred-scope]` marker for the
-        // outstanding p95-over-the-full-path assertion.
+        // This median assertion bounds repeatable in-process aggregation;
+        // it does not claim to measure a p95 or SQLite projection latency.
         let median = samples_ms[samples_ms.len() / 2];
         let in_budget = samples_ms.iter().filter(|ms| **ms <= 150).count();
         assert!(
