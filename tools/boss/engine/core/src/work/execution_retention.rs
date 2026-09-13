@@ -15,11 +15,15 @@
 //!
 //! ## The policy
 //!
-//! [`WorkDb::prune_terminal_executions`] deletes rows that are BOTH:
+//! [`WorkDb::prune_terminal_executions`] deletes rows that are ALL of:
 //! - in a prunable terminal status (`abandoned`, `failed`, `orphaned`,
 //!   `cancelled` — deliberately excludes `completed`, which is the
 //!   canonical record of shipped work and comparatively rare next to the
 //!   retry/abort noise this exists to bound), AND
+//! - never started (`started_at IS NULL`) — a row that actually spawned a
+//!   worker carries diagnostic weight (logs, cost, transcripts) that a
+//!   pre-spawn abort never accumulates, so once work has started its
+//!   terminal row is kept indefinitely regardless of age or status, AND
 //! - older than [`ExecutionRetentionPolicy::max_age_secs`], AND
 //! - outside the most recent [`ExecutionRetentionPolicy::keep_per_work_item`]
 //!   prunable executions for their work item.
@@ -146,6 +150,7 @@ fn prune_terminal_executions_on(
     let candidates_sql = format!(
         "SELECT id FROM work_executions
           WHERE status IN ({PRUNABLE_STATUSES_SQL})
+            AND started_at IS NULL
             AND CAST(created_at AS INTEGER) < ?1
             AND NOT EXISTS (
                 SELECT 1 FROM pr_review_batch_members AS m
@@ -160,6 +165,7 @@ fn prune_terminal_executions_on(
                     ) AS rn
                     FROM work_executions
                     WHERE status IN ({PRUNABLE_STATUSES_SQL})
+                      AND started_at IS NULL
                 )
                 WHERE rn <= ?2
             )"
@@ -536,6 +542,32 @@ mod tests {
             .prune_terminal_executions(ExecutionRetentionPolicy::default(), now, false)
             .unwrap();
         assert_eq!(outcome.deleted, 0);
+        assert_eq!(db.list_executions(Some(&work_item_id)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn never_prunes_a_started_execution_regardless_of_age_or_status() {
+        let db = open_db();
+        let product_id = create_test_product_with_repo(&db, "p", Some("https://github.com/test/repo")).id;
+        let work_item_id = create_chore(&db, &product_id, "c1");
+        let now = 1_800_000_000i64;
+        let execution_id = insert_execution(&db, &work_item_id, "failed", now - 400 * DAY);
+        db.force_started_at_for_test(&execution_id, now - 400 * DAY).unwrap();
+
+        let outcome = db
+            .prune_terminal_executions(
+                ExecutionRetentionPolicy {
+                    max_age_secs: DEFAULT_RETENTION_MAX_AGE_SECS,
+                    keep_per_work_item: 0,
+                },
+                now,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome.deleted, 0,
+            "a started execution's diagnostic weight (logs/cost/transcripts) is kept indefinitely"
+        );
         assert_eq!(db.list_executions(Some(&work_item_id)).unwrap().len(), 1);
     }
 
