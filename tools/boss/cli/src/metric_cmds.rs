@@ -10,7 +10,7 @@ use boss_protocol::{MetricCatalog, MetricFilter, MetricSeriesReport, MetricValue
 pub(crate) async fn run_metric_command(command: MetricCommand, ctx: &RunContext) -> Result<(), CliError> {
     let mut client = connect_for_work(ctx).await?;
     match command {
-        MetricCommand::Catalog => {
+        MetricCommand::Catalog(args) => {
             let response = client
                 .send_request(&FrontendRequest::GetMetricCatalog)
                 .await
@@ -23,7 +23,7 @@ pub(crate) async fn run_metric_command(command: MetricCommand, ctx: &RunContext)
                 other => return Err(unexpected_event("metrics catalog", &other)),
             };
             print_entity(ctx, &serde_json::json!({ "catalog": catalog }), || {
-                print_catalog(&catalog)
+                print_catalog(&catalog, &resolve_display_tz(args.utc))
             })
         }
         MetricCommand::Series(args) => {
@@ -94,8 +94,11 @@ fn parse_filters(raw: &[String]) -> Result<Vec<MetricFilter>, CliError> {
         .collect())
 }
 
-fn print_catalog(catalog: &MetricCatalog) {
-    println!("Metric catalog (generated {})", catalog.generated_at_epoch_s);
+fn print_catalog(catalog: &MetricCatalog, tz: &DisplayTz) {
+    println!(
+        "Metric catalog (generated {})",
+        format_epoch(catalog.generated_at_epoch_s, tz)
+    );
     println!();
     let mut table = new_dynamic_table(vec!["ID", "TITLE", "KIND", "GROUP-BY", "DIMENSIONS", "PRESETS"]);
     for series in &catalog.series {
@@ -115,6 +118,23 @@ fn print_catalog(catalog: &MetricCatalog) {
         ]);
     }
     print_table(table);
+    for series in &catalog.series {
+        if let Some(from) = series.coverage.data_from_epoch_s {
+            println!("  {}: data from {}", series.id, format_epoch(from, tz));
+        }
+        for note in &series.coverage.notes {
+            let instant = note
+                .epoch_s
+                .map(|e| format!(" @ {}", format_epoch(e, tz)))
+                .unwrap_or_default();
+            println!(
+                "  {}: note [{}]{instant}: {}",
+                series.id,
+                note.kind.as_str(),
+                note.detail
+            );
+        }
+    }
     println!();
     println!("Dimensions (observed values):");
     for dim in &catalog.dimensions {
