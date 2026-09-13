@@ -472,6 +472,23 @@ rust_test(
     ),
 )
 
+# Shared tmux-server lifecycle helpers for the two private-tmux integration
+# tests below (declared binary resolution, kill-on-drop server guard,
+# parameterized fixture-shell writer). A real testonly library rather than
+# `srcs` compiled into each binary so unused-pub items are not dead code.
+rust_library(
+    name = "tmux_fixture",
+    testonly = True,
+    srcs = ["tests/tmux_fixture.rs"],
+    crate_root = "tests/tmux_fixture.rs",
+    edition = "2024",
+    visibility = ["//visibility:private"],
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 # Drives the production local spawn and recovery chain against a private tmux
 # server. The fixture redraws continuously with a non-driver process title,
 # then exercises restart adoption, token-verified stale reaping, lease/slot
@@ -505,6 +522,7 @@ rust_test(
     tags = ["manual"],
     deps = [
         ":engine_lib",
+        ":tmux_fixture",
         "//tools/boss/protocol",
         "//tools/boss/tmux",
     ] + all_crate_deps(
@@ -538,6 +556,7 @@ rust_test(
     tags = ["manual"],
     deps = [
         ":engine_lib",
+        ":tmux_fixture",
         "//tools/boss/client",
         "//tools/boss/protocol",
         "//tools/boss/tmux",

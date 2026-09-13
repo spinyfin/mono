@@ -40,6 +40,7 @@ use boss_protocol::{
     FrontendEvent, FrontendRequest, RequestExecutionInput,
 };
 use boss_tmux::Tmux;
+use tmux_fixture::{TmuxServerGuard, declared_tmux_binary, write_fixture_shell};
 
 const STILL_WORKING: &str = include_str!("fixtures/still-working.sh");
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -76,56 +77,6 @@ impl WorkerSpawner for AttachingSpawner {
     }
 }
 
-fn write_still_working_shell(root: &Path) -> Result<PathBuf> {
-    let shell_path = root.join("still-working.sh");
-    std::fs::write(&shell_path, STILL_WORKING)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&shell_path)?.permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&shell_path, permissions)?;
-    }
-    Ok(shell_path)
-}
-
-/// Resolves the declared host tmux binary from Bazel runfiles — see
-/// `tmux_recovery_integration.rs`'s identical helper for the rationale
-/// (the hermetic test sandbox only permits precisely declared executables).
-fn declared_tmux_binary() -> Result<PathBuf> {
-    let test_srcdir = PathBuf::from(std::env::var("TEST_SRCDIR")?);
-    let host_tmux_runfiles = std::fs::read_dir(&test_srcdir)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .is_some_and(|name| name.to_string_lossy().ends_with("host_tmux"))
-        })
-        .ok_or_else(|| anyhow!("Bazel did not provide the declared host tmux runfiles"))?;
-    let tmux = host_tmux_runfiles.join("tmux");
-    if !tmux.is_file() {
-        bail!("the declared tmux binary is unavailable at {}", tmux.display());
-    }
-    Ok(tmux)
-}
-
-/// Kills the private tmux server this drill started, on drop — same
-/// rationale as `tmux_recovery_integration.rs`'s guard of the same name.
-struct TmuxServerGuard {
-    program: PathBuf,
-    socket: PathBuf,
-}
-
-impl Drop for TmuxServerGuard {
-    fn drop(&mut self) {
-        let _ = std::process::Command::new(&self.program)
-            .arg("-S")
-            .arg(&self.socket)
-            .arg("kill-server")
-            .output();
-    }
-}
-
 async fn heartbeat_len(path: &Path) -> u64 {
     tokio::fs::metadata(path).await.map(|m| m.len()).unwrap_or(0)
 }
@@ -146,35 +97,50 @@ async fn wait_for_growth(path: &Path, floor: u64, timeout: Duration) -> Result<u
     }
 }
 
-/// Poll the engine's own durable dispatch-event timeline
-/// (`<state_root>/dispatch-events/current.jsonl`) until at least
-/// `min_count` `stage` events have been recorded for `execution_id`. Used
-/// to detect real boot-time tmux adoption without reaching into engine
-/// internals: each `serve()` boot's own startup adoption pass emits a
-/// `tmux_adopt` dispatch event for every session it re-attaches.
+/// Count matching `stage` lines currently in the append-only
+/// `<state_root>/dispatch-events/current.jsonl` for `execution_id`.
+///
+/// Boot-time adoption and the husk-pane sweep (which fires immediately
+/// on spawn, with no initial sleep) can each emit a `tmux_adopt` for the
+/// same still-non-terminal run, because the adoptability predicate has
+/// no "already adopted by this process" guard. A cumulative `min_count=2`
+/// is therefore not proof that a second engine adopted anything: engine
+/// #1 can write both lines itself. Callers that need to attribute a line
+/// to a later engine must snapshot this count *after* the earlier engine
+/// has fully exited, then require growth past that floor.
+fn count_dispatch_events(state_root: &Path, execution_id: &str, stage: &str) -> usize {
+    let path = state_root.join("dispatch-events").join("current.jsonl");
+    let needle = format!("\"stage\":\"{stage}\"");
+    std::fs::read_to_string(path)
+        .map(|contents| {
+            contents
+                .lines()
+                .filter(|line| line.contains(execution_id) && line.contains(&needle))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Poll the engine's own durable dispatch-event timeline until at least
+/// `min_count` `stage` events have been recorded for `execution_id`.
+/// Returns the observed count so the caller can snapshot and later
+/// require strictly more lines from a subsequent engine.
 async fn wait_for_dispatch_event(
     state_root: &Path,
     execution_id: &str,
     stage: &str,
     min_count: usize,
     timeout: Duration,
-) -> Result<()> {
-    let path = state_root.join("dispatch-events").join("current.jsonl");
-    let needle = format!("\"stage\":\"{stage}\"");
+) -> Result<usize> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            let count = contents
-                .lines()
-                .filter(|line| line.contains(execution_id) && line.contains(&needle))
-                .count();
-            if count >= min_count {
-                return Ok(());
-            }
+        let count = count_dispatch_events(state_root, execution_id, stage);
+        if count >= min_count {
+            return Ok(count);
         }
         if tokio::time::Instant::now() >= deadline {
             bail!(
-                "dispatch-events never recorded {min_count} '{stage}' event(s) for {execution_id} within {timeout:?}"
+                "dispatch-events never recorded {min_count} '{stage}' event(s) for {execution_id} within {timeout:?} (saw {count})"
             );
         }
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -212,7 +178,7 @@ async fn engine_restart_preserves_and_reattaches_a_live_tmux_worker() -> Result<
     let home = temp.path().join("home");
     std::fs::create_dir(&home)?;
 
-    let worker_shell = write_still_working_shell(temp.path())?;
+    let worker_shell = write_fixture_shell(temp.path(), "still-working.sh", STILL_WORKING)?;
     let _home = boss_engine::driver::test_support::home_override(&home);
     let _shell = boss_engine::driver::test_support::shell_override(&worker_shell);
 
@@ -236,10 +202,7 @@ async fn engine_restart_preserves_and_reattaches_a_live_tmux_worker() -> Result<
     unsafe { std::env::set_var("PATH", &new_path) };
 
     let tmux = Tmux::from_path_with_socket(tmux_binary.clone(), &tmux_socket)?;
-    let _tmux_server_guard = TmuxServerGuard {
-        program: tmux_binary,
-        socket: tmux_socket.clone(),
-    };
+    let _tmux_server_guard = TmuxServerGuard::new(tmux_binary, tmux_socket.clone());
 
     // Pre-seed the durable tmux-hosted worker exactly as a prior engine's
     // own dispatch would have: a real private tmux session running a real
@@ -337,6 +300,21 @@ async fn engine_restart_preserves_and_reattaches_a_live_tmux_worker() -> Result<
     // into `ServerState::shutdown_workers`. ---
     shutdown_and_join(&control_token_path, engine1).await?;
 
+    // Snapshot the adopt count *after* engine #1 has fully exited, so any
+    // extra `tmux_adopt` its husk-pane sweep emitted during its own
+    // lifetime is already counted. Engine #2 must then add at least one
+    // new line — a hardcoded cumulative `min_count=2` would pass if
+    // engine #1 wrote both lines itself and engine #2 adopted nothing.
+    // `adopt_one` emits `tmux_adopt` only after it has rebuilt live-state
+    // and the pool claim, so a post-snapshot line is proof that *this*
+    // engine process performed the re-adoption, not merely that the OS
+    // process kept heartbeating.
+    let adopt_count_at_engine1_exit = count_dispatch_events(temp.path(), &execution_id, "tmux_adopt");
+    assert!(
+        adopt_count_at_engine1_exit >= 1,
+        "engine #1 must have recorded at least one tmux_adopt before exit, got {adopt_count_at_engine1_exit}"
+    );
+
     // The tmux session and its worker process must survive engine #1's
     // exit — real tmux evidence and continued file growth, not a mocked
     // assertion.
@@ -365,7 +343,14 @@ async fn engine_restart_preserves_and_reattaches_a_live_tmux_worker() -> Result<
         engine2.abort();
         bail!("engine #2 never bound its socket");
     }
-    wait_for_dispatch_event(temp.path(), &execution_id, "tmux_adopt", 2, ADOPTION_TIMEOUT).await?;
+    wait_for_dispatch_event(
+        temp.path(),
+        &execution_id,
+        "tmux_adopt",
+        adopt_count_at_engine1_exit + 1,
+        ADOPTION_TIMEOUT,
+    )
+    .await?;
 
     // The worker made progress the whole time — same OS process, no
     // respawn, across both the shutdown and the restart.
