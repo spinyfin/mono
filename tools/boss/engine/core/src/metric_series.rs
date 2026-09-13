@@ -617,12 +617,6 @@ fn build_from_points(
     let mut cells: BTreeMap<i64, BTreeMap<String, CellAcc>> = BTreeMap::new();
     for point in &windowed {
         let start = bucket_start(point.at_epoch_s, width);
-        if start < bucket_start(since_epoch_s, width) {
-            continue;
-        }
-        if start >= until_epoch_s {
-            continue;
-        }
         let acc = cells.entry(start).or_default().entry(point.group.clone()).or_default();
         acc.n += 1;
         if let Some(ms) = point.duration_ms {
@@ -632,7 +626,7 @@ fn build_from_points(
 
     let buckets: Vec<MetricBucket> = cells
         .into_iter()
-        .filter_map(|(start_epoch_s, by_group)| {
+        .map(|(start_epoch_s, by_group)| {
             let cells: Vec<MetricCell> = groups
                 .iter()
                 .filter_map(|group| {
@@ -660,13 +654,8 @@ fn build_from_points(
                     })
                 })
                 .collect();
-            // `groups` is built from `group_totals` over these same windowed
-            // points, so every group here has at least one cell; this guard
-            // cannot trigger, but the `filter_map` needs a fallible arm.
-            if cells.is_empty() {
-                return None;
-            }
-            Some(MetricBucket { start_epoch_s, cells })
+            debug_assert!(!cells.is_empty());
+            MetricBucket { start_epoch_s, cells }
         })
         .collect();
 
@@ -730,16 +719,7 @@ fn finish_report(
         .build()
 }
 
-/// Build a report from `facts`, which the caller must project back to the
-/// true start of history (not merely `query.since_epoch_s`) with no lower
-/// bound of its own: this function derives both the bucketed points (only
-/// those inside `[since_epoch_s, until_epoch_s)` render) and the honest
-/// `data_from`/`dimension_from` coverage instants (the true minima, so the
-/// reported capture boundary does not move when the query window zooms) from
-/// the same fact set. It's also what lets `unique_by_pr_url` attribute a URL
-/// to the first terminal execution it ever appeared on, even when that
-/// execution predates the window: `first_pr_facts` runs before any window
-/// filtering.
+/// Build a report from facts projected for the requested window.
 pub fn build_execution_series_report(
     query: &SeriesQuery<'_>,
     facts: &[ExecutionFact],
@@ -751,20 +731,20 @@ pub fn build_execution_series_report(
         .filter(|f| execution_matches_source(f, spec.source))
         .cloned()
         .collect();
+    let grouped = query.group_by.is_some();
+    facts.retain(|fact| {
+        matches_filters(query.filters, |dim| {
+            execution_dim(fact, dim).map(|v| dim_value(Some(v)).to_owned())
+        })
+    });
     if let SeriesSource::Executions {
         unique_by_pr_url: true, ..
     } = spec.source
     {
         facts = first_pr_facts(&facts);
     }
-    let grouped = query.group_by.is_some();
     let points: Vec<Point> = facts
         .iter()
-        .filter(|fact| {
-            matches_filters(query.filters, |dim| {
-                execution_dim(fact, dim).map(|v| dim_value(Some(v)).to_owned())
-            })
-        })
         .map(|fact| {
             let dim_present = query
                 .group_by
@@ -791,9 +771,7 @@ pub fn build_execution_series_report(
     Ok(finish_report(spec, query, built, generated_at_epoch_s))
 }
 
-/// Same contract as [`build_execution_series_report`]: `facts` must be
-/// projected with no `since` lower bound so `data_from`/`dimension_from`
-/// reflect the true capture start, not the query window.
+/// Build a task report from facts projected for the requested window.
 pub fn build_task_series_report(
     query: &SeriesQuery<'_>,
     facts: &[TaskFact],
@@ -856,9 +834,7 @@ fn coverage_for_spec(
     if lookback_since_epoch_s > 0 {
         notes.push(
             CoverageNote::builder()
-                .detail(format!(
-                    "catalog scan is bounded to history since {lookback_since_epoch_s}; earlier facts may exist but are not reflected here"
-                ))
+                .detail("catalog scan is bounded; earlier facts may exist but are not reflected here".to_owned())
                 .kind(CoverageNoteKind::RetentionBounded)
                 .epoch_s(lookback_since_epoch_s)
                 .build(),
