@@ -13,9 +13,13 @@ use super::*;
 
 use rusqlite::params_from_iter;
 
-use crate::metric_series::{ExecutionFact, TaskFact};
+use crate::metric_series::{
+    DIM_DRIVER, DIM_EFFORT_LEVEL, DIM_KIND, DIM_MODEL, DIM_PRODUCT, DIM_REPO, DIM_STATUS, ExecutionFact, NONE_KEY,
+    TaskFact,
+};
 #[cfg(test)]
 use crate::metric_series::{SeriesSource, SeriesSpec};
+use boss_protocol::MetricFilter;
 
 /// 10-digit, zero-padded epoch bound so lexicographic TEXT comparison
 /// against `finished_at`/`completed_at` agrees with numeric comparison
@@ -35,6 +39,68 @@ fn duration_ms(started_at: Option<i64>, finished_at: i64) -> Option<i64> {
 
 fn nonempty(value: Option<String>) -> Option<String> {
     value.and_then(|v| if v.is_empty() { None } else { Some(v) })
+}
+
+/// Add the validated metric-filter predicates for one execution-table alias.
+/// Keeping this in the DB layer lets `prs_generated` apply filters before its
+/// correlated first-appearance lookup without projecting pre-window rows.
+fn append_execution_filters(sql: &mut String, params: &mut Vec<String>, filters: &[MetricFilter], alias: &str) {
+    for filter in filters {
+        let expression = match filter.dimension.as_str() {
+            DIM_DRIVER => format!("{alias}.driver"),
+            DIM_EFFORT_LEVEL => format!("{alias}.effort_level"),
+            DIM_KIND => format!("{alias}.kind"),
+            DIM_MODEL => format!("{alias}.model"),
+            DIM_PRODUCT => {
+                if alias == "we" {
+                    "COALESCE(p.slug, p2.slug)".to_owned()
+                } else {
+                    "COALESCE(ep.slug, ep2.slug)".to_owned()
+                }
+            }
+            DIM_REPO => format!("{alias}.repo_remote_url"),
+            DIM_STATUS => format!("{alias}.status"),
+            // Query validation rejects unsupported dimensions before this
+            // layer is called; retain a false predicate for defensive use by
+            // direct callers rather than widening a query unexpectedly.
+            _ => {
+                sql.push_str(" AND 0");
+                continue;
+            }
+        };
+        let values: Vec<&str> = filter
+            .values
+            .iter()
+            .map(String::as_str)
+            .filter(|v| *v != NONE_KEY)
+            .collect();
+        let wants_none = filter.values.iter().any(|v| v == NONE_KEY);
+        sql.push_str(" AND (");
+        let mut needs_or = false;
+        if !values.is_empty() {
+            sql.push_str(&expression);
+            sql.push_str(" IN (");
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&format!("?{}", params.len() + 1));
+                params.push((*value).to_owned());
+            }
+            sql.push(')');
+            needs_or = true;
+        }
+        if wants_none {
+            if needs_or {
+                sql.push_str(" OR ");
+            }
+            sql.push_str(&format!("({expression} IS NULL OR {expression} = '')"));
+        }
+        if !needs_or && !wants_none {
+            sql.push('0');
+        }
+        sql.push(')');
+    }
 }
 
 fn map_execution_fact(row: &Row) -> rusqlite::Result<ExecutionFact> {
@@ -68,18 +134,26 @@ fn map_task_fact(row: &Row) -> rusqlite::Result<TaskFact> {
     })
 }
 
+/// Options that affect the execution projection independently of its source
+/// predicates. Grouping them avoids a long positional DB-query signature.
+#[derive(Clone, Copy)]
+pub(crate) struct MetricExecutionFactOptions<'a> {
+    pub(crate) first_pr_only: bool,
+    pub(crate) filters: &'a [MetricFilter],
+}
+
 impl WorkDb {
     /// Window-scoped execution facts for `[since_epoch_s, until_epoch_s)`.
     /// `kinds` / `statuses` are optional IN-list predicates; `require_pr_url`
     /// keeps only rows carrying a non-empty `pr_url`.
-    pub fn metric_execution_facts(
+    pub(crate) fn metric_execution_facts(
         &self,
         since_epoch_s: i64,
         until_epoch_s: i64,
         kinds: Option<&[&str]>,
         statuses: Option<&[&str]>,
         require_pr_url: bool,
-        first_pr_only: bool,
+        options: MetricExecutionFactOptions<'_>,
     ) -> Result<Vec<ExecutionFact>> {
         let conn = self.connect()?;
         let mut sql = String::from(
@@ -130,21 +204,29 @@ impl WorkDb {
         if require_pr_url {
             sql.push_str(" AND we.pr_url IS NOT NULL AND we.pr_url != ''");
         }
+        append_execution_filters(&mut sql, &mut params, options.filters, "we");
         // `prs_generated` attributes a URL to its first terminal execution
         // in the database.  The correlated lookup is index-friendly and,
         // unlike projecting from epoch zero, leaves the outer projection
         // constrained to the requested bucket window.
-        if first_pr_only {
+        if options.first_pr_only {
             sql.push_str(
                 " AND NOT EXISTS (
                     SELECT 1 FROM work_executions earlier
+                    LEFT JOIN tasks et ON et.id = earlier.work_item_id
+                    LEFT JOIN products ep ON ep.id = et.product_id
+                    LEFT JOIN products ep2 ON ep2.id = earlier.work_item_id
                     WHERE earlier.pr_url = we.pr_url
                       AND earlier.pr_url IS NOT NULL AND earlier.pr_url != ''
                       AND earlier.finished_at IS NOT NULL
                       AND (earlier.finished_at < we.finished_at
-                           OR (earlier.finished_at = we.finished_at AND earlier.id < we.id))
-                )",
+                           OR (earlier.finished_at = we.finished_at AND earlier.id < we.id))",
             );
+            // The first carrier must satisfy the same user filters as the
+            // visible row. Otherwise a review or a different kind could win
+            // deduplication and hide a matching execution in this query.
+            append_execution_filters(&mut sql, &mut params, options.filters, "earlier");
+            sql.push(')');
         }
         sql.push_str(" ORDER BY we.finished_at ASC, we.id ASC");
         let mut stmt = conn.prepare(&sql)?;
@@ -209,7 +291,10 @@ impl WorkDb {
                 kinds,
                 statuses,
                 require_pr_url,
-                unique_by_pr_url,
+                MetricExecutionFactOptions {
+                    first_pr_only: unique_by_pr_url,
+                    filters: &[],
+                },
             )?)),
             SeriesSource::Tasks => Ok(SeriesFacts::Tasks(
                 self.metric_task_facts(since_epoch_s, until_epoch_s)?,
@@ -299,7 +384,17 @@ mod tests {
         );
 
         let inside = db
-            .metric_execution_facts(1_780_000_000, 1_780_000_200, None, None, false, false)
+            .metric_execution_facts(
+                1_780_000_000,
+                1_780_000_200,
+                None,
+                None,
+                false,
+                MetricExecutionFactOptions {
+                    first_pr_only: false,
+                    filters: &[],
+                },
+            )
             .unwrap();
         assert_eq!(inside.len(), 1);
         assert_eq!(inside[0].finished_at_epoch_s, inside_at);
@@ -307,7 +402,17 @@ mod tests {
         assert_eq!(inside[0].product.as_deref(), Some("test-product"));
 
         let outside = db
-            .metric_execution_facts(1_780_000_200, 1_780_000_400, None, None, false, false)
+            .metric_execution_facts(
+                1_780_000_200,
+                1_780_000_400,
+                None,
+                None,
+                false,
+                MetricExecutionFactOptions {
+                    first_pr_only: false,
+                    filters: &[],
+                },
+            )
             .unwrap();
         assert!(outside.is_empty());
     }
@@ -332,7 +437,17 @@ mod tests {
         );
 
         let facts = db
-            .metric_execution_facts(978_307_200, 1_790_000_000, None, None, false, false)
+            .metric_execution_facts(
+                978_307_200,
+                1_790_000_000,
+                None,
+                None,
+                false,
+                MetricExecutionFactOptions {
+                    first_pr_only: false,
+                    filters: &[],
+                },
+            )
             .unwrap();
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].finished_at_epoch_s, 1_780_000_100);
@@ -372,13 +487,33 @@ mod tests {
         );
 
         let reviews = db
-            .metric_execution_facts(T0, T0 + 1_000, Some(&["pr_review"]), Some(&["completed"]), false, false)
+            .metric_execution_facts(
+                T0,
+                T0 + 1_000,
+                Some(&["pr_review"]),
+                Some(&["completed"]),
+                false,
+                MetricExecutionFactOptions {
+                    first_pr_only: false,
+                    filters: &[],
+                },
+            )
             .unwrap();
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].kind, "pr_review");
 
         let with_pr = db
-            .metric_execution_facts(T0, T0 + 1_000, None, None, true, false)
+            .metric_execution_facts(
+                T0,
+                T0 + 1_000,
+                None,
+                None,
+                true,
+                MetricExecutionFactOptions {
+                    first_pr_only: false,
+                    filters: &[],
+                },
+            )
             .unwrap();
         assert_eq!(with_pr.len(), 1);
         assert_eq!(with_pr[0].pr_url.as_deref(), Some("https://github.com/o/r/pull/1"));
@@ -410,9 +545,65 @@ mod tests {
         );
 
         let facts = db
-            .metric_execution_facts(T0 + 100, T0 + 200, None, None, true, true)
+            .metric_execution_facts(
+                T0 + 100,
+                T0 + 200,
+                None,
+                None,
+                true,
+                MetricExecutionFactOptions {
+                    first_pr_only: true,
+                    filters: &[],
+                },
+            )
             .unwrap();
         assert!(facts.is_empty(), "later revisions must not re-count a PR");
+    }
+
+    #[test]
+    fn first_pr_projection_applies_filters_before_deduplication() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let task = create_test_chore(&db, &product_id, "first-pr-filter");
+        let url = "https://github.com/o/r/pull/1";
+        stamp_execution(
+            &db,
+            &task.id,
+            ExecutionKind::PrReview,
+            ExecutionStatus::Completed,
+            T0 + 10,
+            T0 + 20,
+            Some(url),
+        );
+        stamp_execution(
+            &db,
+            &task.id,
+            ExecutionKind::TaskImplementation,
+            ExecutionStatus::Completed,
+            T0 + 110,
+            T0 + 120,
+            Some(url),
+        );
+
+        let filters = [MetricFilter {
+            dimension: DIM_KIND.to_owned(),
+            values: vec!["task_implementation".to_owned()],
+        }];
+        let facts = db
+            .metric_execution_facts(
+                T0 + 100,
+                T0 + 200,
+                None,
+                None,
+                true,
+                MetricExecutionFactOptions {
+                    first_pr_only: true,
+                    filters: &filters,
+                },
+            )
+            .unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].kind, "task_implementation");
     }
 
     #[test]
@@ -447,7 +638,17 @@ mod tests {
         drop(conn);
 
         let facts = db
-            .metric_execution_facts(T0, T0 + 1_000, None, None, false, false)
+            .metric_execution_facts(
+                T0,
+                T0 + 1_000,
+                None,
+                None,
+                false,
+                MetricExecutionFactOptions {
+                    first_pr_only: false,
+                    filters: &[],
+                },
+            )
             .unwrap();
         assert_eq!(facts.len(), 2);
         assert_eq!(
@@ -485,7 +686,17 @@ mod tests {
         );
         set_launch_config(&db, &id, "claude", "opus");
         let facts = db
-            .metric_execution_facts(T0, T0 + 1_000, None, None, false, false)
+            .metric_execution_facts(
+                T0,
+                T0 + 1_000,
+                None,
+                None,
+                false,
+                MetricExecutionFactOptions {
+                    first_pr_only: false,
+                    filters: &[],
+                },
+            )
             .unwrap();
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].driver.as_deref(), Some("claude"));
