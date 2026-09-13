@@ -153,7 +153,7 @@ fn codex_model_menu_sourced_from_debug_models_vocabulary() {
     assert_eq!((menu.effort_value_for_level)(EffortLevel::Max), Some("max"));
     assert_eq!((menu.model_for_reasoning)(ReasoningMode::Standard), "gpt-6-astra");
     assert_eq!((menu.model_for_reasoning)(ReasoningMode::Investigation), "gpt-6-astra");
-    assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Fast), "gpt-5.6-luna");
+    assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Fast), "gpt-6-astra");
     assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Balanced), "gpt-6-astra");
     assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Strong), "gpt-6-astra");
     assert!(!(menu.model_requires_auto_permissions)("gpt-6-astra"));

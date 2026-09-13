@@ -1735,8 +1735,8 @@ mod tests {
 
     #[test]
     fn codex_standard_and_investigation_both_select_astra() {
-        // Operator policy: one Codex model for worker sessions. Standard
-        // used to land on terra; that is retired. Effort mapping is unchanged.
+        // Both reasoning modes resolve to astra; Small still maps effort
+        // to medium, and Investigation still omits the effort override.
         let standard = resolve_spawn_config(
             &SpawnResolutionInput::builder()
                 .task_driver("codex")

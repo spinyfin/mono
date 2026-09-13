@@ -193,23 +193,19 @@ fn codex_effort_value_for_level(level: EffortLevel) -> Option<&'static str> {
     })
 }
 
-/// Capability-lever model choice. Operator policy is one Codex model for
-/// worker sessions: both `Standard` and `Investigation` resolve to
-/// `gpt-6-astra`. Terra remains a known catalog SKU (`codex debug models`)
-/// but is not selected — the same retirement shape used for Sol.
+/// One Codex model is selected for all worker sessions: both `Standard`
+/// and `Investigation` resolve to `gpt-6-astra`. Terra remains a known
+/// catalog SKU (`codex debug models`) but is not selected as a lower
+/// tier or fallback.
 fn codex_model_for_reasoning(_reasoning: ReasoningMode) -> &'static str {
     "gpt-6-astra"
 }
 
-/// Concrete model mapping for metadata-derived review tiers. Review policy
-/// still keeps Luna for the fast profile; balanced and strong both land on
-/// Astra now that Terra is retired from selection. This table does not infer
-/// anything from task effort or reasoning.
-fn codex_review_model_for_tier(tier: ReviewModelTier) -> &'static str {
-    match tier {
-        ReviewModelTier::Fast => "gpt-5.6-luna",
-        ReviewModelTier::Balanced | ReviewModelTier::Strong => "gpt-6-astra",
-    }
+/// One Codex model is selected for all review tiers: Fast, Balanced, and
+/// Strong all resolve to `gpt-6-astra`. This table does not infer anything
+/// from task effort or reasoning.
+fn codex_review_model_for_tier(_tier: ReviewModelTier) -> &'static str {
+    "gpt-6-astra"
 }
 
 /// Legacy size-derived table. Consulted only for rows with no

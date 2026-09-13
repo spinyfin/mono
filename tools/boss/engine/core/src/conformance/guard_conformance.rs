@@ -152,8 +152,8 @@ const COVERED_TOOL_MODES: &[&str] = &["code_mode", "code_mode_only"];
 /// that makes [`codex_dispatched_models_have_covered_tool_mode`] hermetic.
 /// Captured from `codex debug models` on `PINNED_CODEX_CLI_VERSION`
 /// (codex-cli 0.153.4) on 2026-09-08: `gpt-6-astra` reports `code_mode_only`.
-/// Terra remains a catalog SKU but is no longer dispatched, so it is not
-/// in this table — same retirement shape used for Sol.
+/// This table lists the currently selected Codex models and excludes
+/// catalog-only models such as terra and luna.
 /// Re-capture via a live `codex debug models` run and
 /// update deliberately on genuine drift — do not hand-edit these values from
 /// belief; [`captured_tool_mode_table_matches_installed_codex_cli`] is what
