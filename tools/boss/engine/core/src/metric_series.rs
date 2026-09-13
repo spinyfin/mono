@@ -17,6 +17,12 @@ use boss_protocol::{
 /// coarsens the bucket rather than truncating cells.
 pub const CELL_CAP: usize = 5_000;
 
+/// How far back `GetMetricCatalog` scans to compute observed dimension
+/// values and coverage: bounded rather than unbounded so the one query
+/// with no client-supplied window doesn't grow linearly with all of
+/// history. Two years comfortably covers any zoom range the app offers.
+pub const CATALOG_LOOKBACK_SECS: i64 = 2 * 365 * BucketWidth::DAY_SECS;
+
 /// Group key when the query does not name a `group_by` dimension.
 pub const UNGROUPED_KEY: &str = "all";
 
@@ -181,6 +187,7 @@ pub struct TaskFact {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SeriesError {
+    CellCapExceeded { groups: usize, cap: usize },
     InvalidWindow { since_epoch_s: i64, until_epoch_s: i64 },
     UnknownBucket(String),
     UnknownFilterDimension { series: String, dimension: String },
@@ -191,6 +198,12 @@ pub enum SeriesError {
 impl std::fmt::Display for SeriesError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::CellCapExceeded { groups, cap } => {
+                write!(
+                    f,
+                    "{groups} groups exceed the {cap}-cell cap even at the coarsest supported bucket width; narrow the window, add a filter, or drop the group_by"
+                )
+            }
             Self::InvalidWindow {
                 since_epoch_s,
                 until_epoch_s,
@@ -521,21 +534,37 @@ fn duration_value(samples: &mut [i64]) -> MetricValue {
     }
 }
 
-fn potential_cells(groups: usize, range_secs: i64, width: BucketWidth) -> usize {
-    let buckets = (range_secs.max(1) + width.secs() - 1) / width.secs();
+/// Number of occupied buckets at `width` across `[since_epoch_s,
+/// until_epoch_s)`, counted from aligned bucket boundaries rather than
+/// `ceil(range / width)`: a window whose `since` falls mid-bucket still
+/// spans the bucket containing `until - 1`, which the raw range length
+/// alone underestimates whenever `since` isn't already bucket-aligned.
+fn potential_cells(groups: usize, since_epoch_s: i64, until_epoch_s: i64, width: BucketWidth) -> usize {
+    let last_included = (until_epoch_s - 1).max(since_epoch_s);
+    let start_bucket = bucket_start(since_epoch_s, width);
+    let end_bucket = bucket_start(last_included, width);
+    let buckets = (end_bucket - start_bucket) / width.secs() + 1;
     groups.saturating_mul(buckets.max(1) as usize)
 }
 
-fn choose_width(requested: Option<BucketWidth>, range_secs: i64, groups: usize) -> (BucketWidth, bool) {
+fn choose_width(
+    requested: Option<BucketWidth>,
+    since_epoch_s: i64,
+    until_epoch_s: i64,
+    groups: usize,
+) -> Result<(BucketWidth, bool), SeriesError> {
+    let range_secs = until_epoch_s.saturating_sub(since_epoch_s);
     let mut width = requested.unwrap_or_else(|| pick_bucket_width(range_secs));
     let original = width;
-    while potential_cells(groups, range_secs, width) > CELL_CAP {
+    while potential_cells(groups, since_epoch_s, until_epoch_s, width) > CELL_CAP {
         match width.coarser() {
             Some(next) => width = next,
-            None => break,
+            None => {
+                return Err(SeriesError::CellCapExceeded { groups, cap: CELL_CAP });
+            }
         }
     }
-    (width, width != original)
+    Ok((width, width != original))
 }
 
 struct BuiltBuckets {
@@ -552,26 +581,41 @@ fn build_from_points(
     until_epoch_s: i64,
     requested_bucket: Option<BucketWidth>,
     grouped: bool,
-) -> BuiltBuckets {
-    let mut group_totals: BTreeMap<String, u32> = BTreeMap::new();
+) -> Result<BuiltBuckets, SeriesError> {
+    // Coverage (`data_from`/`dimension_from`) is computed over every point
+    // the series predicates and query filters admit, with no window lower
+    // bound: `points` may include facts from before `since_epoch_s` (the
+    // caller is expected to have projected history back to the true start,
+    // not just this query's window) so the reported capture boundary is a
+    // fact about the series, not an artifact of where the operator zoomed.
+    // Buckets and groups, in contrast, are built only from points inside
+    // the requested window.
     let mut data_from: Option<i64> = None;
     let mut dimension_from: Option<i64> = None;
     for point in points {
-        *group_totals.entry(point.group.clone()).or_insert(0) += 1;
         data_from = Some(data_from.map_or(point.at_epoch_s, |m| m.min(point.at_epoch_s)));
         if point.dim_present {
             dimension_from = Some(dimension_from.map_or(point.at_epoch_s, |m| m.min(point.at_epoch_s)));
         }
     }
+
+    let windowed: Vec<&Point> = points
+        .iter()
+        .filter(|p| p.at_epoch_s >= since_epoch_s && p.at_epoch_s < until_epoch_s)
+        .collect();
+
+    let mut group_totals: BTreeMap<String, u32> = BTreeMap::new();
+    for point in &windowed {
+        *group_totals.entry(point.group.clone()).or_insert(0) += 1;
+    }
     let mut groups: Vec<(String, u32)> = group_totals.into_iter().collect();
     groups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let groups: Vec<String> = groups.into_iter().map(|(g, _)| g).collect();
 
-    let range_secs = until_epoch_s.saturating_sub(since_epoch_s);
-    let (width, coarsened) = choose_width(requested_bucket, range_secs, groups.len());
+    let (width, coarsened) = choose_width(requested_bucket, since_epoch_s, until_epoch_s, groups.len())?;
 
     let mut cells: BTreeMap<i64, BTreeMap<String, CellAcc>> = BTreeMap::new();
-    for point in points {
+    for point in &windowed {
         let start = bucket_start(point.at_epoch_s, width);
         if start < bucket_start(since_epoch_s, width) {
             continue;
@@ -616,7 +660,9 @@ fn build_from_points(
                     })
                 })
                 .collect();
-            // Occupied groups that didn't make the totals sort still render.
+            // `groups` is built from `group_totals` over these same windowed
+            // points, so every group here has at least one cell; this guard
+            // cannot trigger, but the `filter_map` needs a fallible arm.
             if cells.is_empty() {
                 return None;
             }
@@ -647,7 +693,7 @@ fn build_from_points(
         );
     }
 
-    BuiltBuckets {
+    Ok(BuiltBuckets {
         groups,
         buckets,
         coverage: SeriesCoverage::builder()
@@ -656,7 +702,7 @@ fn build_from_points(
             .maybe_dimension_from_epoch_s(if grouped { dimension_from } else { None })
             .build(),
         bucket_secs: width.secs(),
-    }
+    })
 }
 
 #[derive(Clone, Default)]
@@ -684,6 +730,16 @@ fn finish_report(
         .build()
 }
 
+/// Build a report from `facts`, which the caller must project back to the
+/// true start of history (not merely `query.since_epoch_s`) with no lower
+/// bound of its own: this function derives both the bucketed points (only
+/// those inside `[since_epoch_s, until_epoch_s)` render) and the honest
+/// `data_from`/`dimension_from` coverage instants (the true minima, so the
+/// reported capture boundary does not move when the query window zooms) from
+/// the same fact set. It's also what lets `unique_by_pr_url` attribute a URL
+/// to the first terminal execution it ever appeared on, even when that
+/// execution predates the window: `first_pr_facts` runs before any window
+/// filtering.
 pub fn build_execution_series_report(
     query: &SeriesQuery<'_>,
     facts: &[ExecutionFact],
@@ -709,16 +765,6 @@ pub fn build_execution_series_report(
                 execution_dim(fact, dim).map(|v| dim_value(Some(v)).to_owned())
             })
         })
-        .filter(|fact| {
-            if let SeriesSource::Executions {
-                require_duration: true, ..
-            } = spec.source
-            {
-                fact.duration_ms.is_some()
-            } else {
-                true
-            }
-        })
         .map(|fact| {
             let dim_present = query
                 .group_by
@@ -741,10 +787,13 @@ pub fn build_execution_series_report(
         query.until_epoch_s,
         query.bucket,
         grouped,
-    );
+    )?;
     Ok(finish_report(spec, query, built, generated_at_epoch_s))
 }
 
+/// Same contract as [`build_execution_series_report`]: `facts` must be
+/// projected with no `since` lower bound so `data_from`/`dimension_from`
+/// reflect the true capture start, not the query window.
 pub fn build_task_series_report(
     query: &SeriesQuery<'_>,
     facts: &[TaskFact],
@@ -781,11 +830,20 @@ pub fn build_task_series_report(
         query.until_epoch_s,
         query.bucket,
         grouped,
-    );
+    )?;
     Ok(finish_report(spec, query, built, generated_at_epoch_s))
 }
 
-fn coverage_for_spec(spec: &SeriesSpec, execution_facts: &[ExecutionFact], task_facts: &[TaskFact]) -> SeriesCoverage {
+/// `lookback_since_epoch_s`: `0` means the catalog scan was unbounded; any
+/// other value means the scan started there, so `data_from` may understate
+/// the series' true start and a [`CoverageNoteKind::RetentionBounded`] note
+/// is attached to say so.
+fn coverage_for_spec(
+    spec: &SeriesSpec,
+    execution_facts: &[ExecutionFact],
+    task_facts: &[TaskFact],
+    lookback_since_epoch_s: i64,
+) -> SeriesCoverage {
     let data_from = match spec.source {
         SeriesSource::Executions { .. } => execution_facts
             .iter()
@@ -794,8 +852,20 @@ fn coverage_for_spec(spec: &SeriesSpec, execution_facts: &[ExecutionFact], task_
             .min(),
         SeriesSource::Tasks => task_facts.iter().map(|f| f.completed_at_epoch_s).min(),
     };
+    let mut notes = Vec::new();
+    if lookback_since_epoch_s > 0 {
+        notes.push(
+            CoverageNote::builder()
+                .detail(format!(
+                    "catalog scan is bounded to history since {lookback_since_epoch_s}; earlier facts may exist but are not reflected here"
+                ))
+                .kind(CoverageNoteKind::RetentionBounded)
+                .epoch_s(lookback_since_epoch_s)
+                .build(),
+        );
+    }
     SeriesCoverage::builder()
-        .notes(Vec::new())
+        .notes(notes)
         .maybe_data_from_epoch_s(data_from)
         .build()
 }
@@ -827,10 +897,16 @@ const ALL_DIMENSIONS: &[(&str, &str)] = &[
 
 /// Build the catalog from the current fact set: static series descriptors
 /// plus observed dimension values and per-series coverage.
+///
+/// `lookback_since_epoch_s` is `0` when `execution_facts`/`task_facts` span
+/// unbounded history, or the epoch the caller's scan was bounded to
+/// otherwise; each series' coverage carries a `RetentionBounded` note in
+/// the latter case so the catalog never silently understates history.
 pub fn build_catalog(
     execution_facts: &[ExecutionFact],
     task_facts: &[TaskFact],
     generated_at_epoch_s: i64,
+    lookback_since_epoch_s: i64,
 ) -> MetricCatalog {
     let mut observed: BTreeMap<&'static str, BTreeMap<String, (u32, i64)>> = BTreeMap::new();
     for fact in execution_facts {
@@ -929,7 +1005,12 @@ pub fn build_catalog(
                 .collect();
             MetricSeriesInfo::builder()
                 .id(spec.id)
-                .coverage(coverage_for_spec(spec, execution_facts, task_facts))
+                .coverage(coverage_for_spec(
+                    spec,
+                    execution_facts,
+                    task_facts,
+                    lookback_since_epoch_s,
+                ))
                 .dimensions(spec.dimensions.iter().map(|d| (*d).to_owned()).collect())
                 .presets(presets)
                 .title(spec.title)
@@ -1200,6 +1281,125 @@ mod tests {
     }
 
     #[test]
+    fn cell_cap_unaligned_window_still_counts_the_extra_partial_bucket() {
+        // 50 groups over a 100-hour window that starts 1s past an hour
+        // boundary: the true bucket count is 101 (the window spans 101
+        // distinct aligned hour buckets), not ceil(100h / 1h) = 100, so
+        // 50 * 101 = 5,050 must coarsen even though the naive estimate
+        // (50 * 100 = 5,000) would accept it.
+        let facts: Vec<ExecutionFact> = (0..50)
+            .map(|i| {
+                let mut f = exec_fact(1, "chore_implementation", "completed");
+                f.driver = Some(format!("d{i}"));
+                f
+            })
+            .collect();
+        let q = query(
+            SERIES_EXECUTION_OUTCOMES,
+            1,
+            1 + 100 * BucketWidth::HOUR_SECS,
+            Some(BucketWidth::Hour),
+            Some(DIM_DRIVER),
+            &[],
+        );
+        let report = build_execution_series_report(&q, &facts, 10).unwrap();
+        assert_eq!(report.bucket_secs, BucketWidth::DAY_SECS);
+        assert!(
+            report
+                .coverage
+                .notes
+                .iter()
+                .any(|n| n.kind == CoverageNoteKind::BucketCoarsened)
+        );
+    }
+
+    #[test]
+    fn cell_cap_exceeded_even_at_month_width_is_an_error() {
+        // 6,000 groups can never fit under 5,000 cells at any bucket width
+        // (a single Month bucket alone is already 6,000 cells), so this
+        // must return an error rather than silently overshoot the cap.
+        let facts: Vec<ExecutionFact> = (0..6_000)
+            .map(|i| {
+                let mut f = exec_fact(10, "chore_implementation", "completed");
+                f.driver = Some(format!("d{i}"));
+                f
+            })
+            .collect();
+        let q = query(
+            SERIES_EXECUTION_OUTCOMES,
+            0,
+            BucketWidth::DAY_SECS,
+            None,
+            Some(DIM_DRIVER),
+            &[],
+        );
+        assert!(matches!(
+            build_execution_series_report(&q, &facts, 10),
+            Err(SeriesError::CellCapExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn prs_generated_windowed_query_still_dedupes_against_pre_window_history() {
+        // Same URL first appears at t=10 (before the query window), then
+        // again at t=10+2h (inside it). The caller must have projected
+        // history back before `since`, so the pre-window fact wins the
+        // dedup and the revision inside the window contributes nothing.
+        let mut original = exec_fact(10, "chore_implementation", "completed");
+        original.pr_url = Some("https://github.com/o/r/pull/1".into());
+        let mut revision = exec_fact(10 + BucketWidth::HOUR_SECS * 2, "revision_implementation", "completed");
+        revision.pr_url = Some("https://github.com/o/r/pull/1".into());
+
+        let q = query(
+            SERIES_PRS_GENERATED,
+            BucketWidth::HOUR_SECS,
+            BucketWidth::HOUR_SECS * 4,
+            Some(BucketWidth::Hour),
+            None,
+            &[],
+        );
+        let report = build_execution_series_report(&q, &[original, revision], 10).unwrap();
+        assert!(report.buckets.is_empty(), "expected no cells, got {:?}", report.buckets);
+    }
+
+    #[test]
+    fn coverage_data_from_reflects_true_history_not_the_query_window() {
+        // The earliest fact predates the window entirely; a client zooming
+        // into a later slice must still see the true capture start, not
+        // "no coverage" just because nothing in-window happens to be first.
+        let early = exec_fact(5, "chore_implementation", "completed");
+        let q = query(
+            SERIES_EXECUTION_OUTCOMES,
+            1_000,
+            2_000,
+            Some(BucketWidth::Hour),
+            None,
+            &[],
+        );
+        let report = build_execution_series_report(&q, &[early], 10).unwrap();
+        assert!(report.buckets.is_empty());
+        assert_eq!(report.coverage.data_from_epoch_s, Some(5));
+    }
+
+    #[test]
+    fn coverage_data_from_is_stable_as_the_window_slides_past_it() {
+        let fact = exec_fact(5, "chore_implementation", "completed");
+        let early_window = query(SERIES_EXECUTION_OUTCOMES, 0, 100, Some(BucketWidth::Hour), None, &[]);
+        let late_window = query(
+            SERIES_EXECUTION_OUTCOMES,
+            1_000,
+            2_000,
+            Some(BucketWidth::Hour),
+            None,
+            &[],
+        );
+        let early_report = build_execution_series_report(&early_window, std::slice::from_ref(&fact), 10).unwrap();
+        let late_report = build_execution_series_report(&late_window, &[fact], 10).unwrap();
+        assert_eq!(early_report.coverage.data_from_epoch_s, Some(5));
+        assert_eq!(late_report.coverage.data_from_epoch_s, Some(5));
+    }
+
+    #[test]
     fn unknown_series_and_group_by_are_errors() {
         let q = query("not_a_series", 0, 10, None, None, &[]);
         assert!(matches!(
@@ -1226,7 +1426,7 @@ mod tests {
     fn catalog_includes_the_five_v1_series_and_failed_or_reaped_preset() {
         let mut fact = exec_fact(50, "chore_implementation", "failed");
         fact.driver = Some("claude".into());
-        let catalog = build_catalog(&[fact], &[], 99);
+        let catalog = build_catalog(&[fact], &[], 99, 0);
         let ids: Vec<&str> = catalog.series.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(
             ids,

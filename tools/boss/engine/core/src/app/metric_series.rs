@@ -1,14 +1,20 @@
 //! `FrontendRequest` handlers — metric catalog and series (`boss metrics`).
 //!
-//! Thin fetch-then-build shims: pull the windowed facts via `WorkDb`,
-//! hand them to the pure builders in [`crate::metric_series`], and send
-//! the result. See [`super::Dispatch`] for the per-request context.
+//! Thin fetch-then-build shims: pull the facts via `WorkDb`, hand them to
+//! the pure builders in [`crate::metric_series`], and send the result. A
+//! series fetch has no `since` lower bound of its own (`0` through
+//! `until_epoch_s`): the pure builder derives both the windowed buckets
+//! and the honest, window-independent `data_from`/`dimension_from`
+//! coverage from that same unbounded fact set, and needs history that
+//! predates the query window to attribute a `unique_by_pr_url` series'
+//! duplicate correctly. See [`super::Dispatch`] for the per-request
+//! context.
 
 use super::*;
 
 use crate::metric_series::{
-    SeriesQuery, SeriesSource, build_catalog, build_execution_series_report, build_task_series_report, parse_bucket,
-    validate_query,
+    CATALOG_LOOKBACK_SECS, SeriesQuery, SeriesSource, build_catalog, build_execution_series_report,
+    build_task_series_report, parse_bucket, validate_query,
 };
 
 pub(super) async fn handle_get_metric_catalog(ctx: Dispatch, req: FrontendRequest) {
@@ -23,15 +29,16 @@ pub(super) async fn handle_get_metric_catalog(ctx: Dispatch, req: FrontendReques
     };
     let generated_at_epoch_s = boss_engine_utils::epoch_time::now_epoch_secs();
     let until = generated_at_epoch_s.saturating_add(1);
-    let execution_facts = match work_db.metric_execution_facts(0, until, None, None, false) {
+    let lookback_since = until.saturating_sub(CATALOG_LOOKBACK_SECS).max(0);
+    let execution_facts = match work_db.metric_execution_facts(lookback_since, until, None, None, false) {
         Ok(facts) => facts,
         Err(err) => return send_work_error(&sink, &request_id, &err),
     };
-    let task_facts = match work_db.metric_task_facts(0, until) {
+    let task_facts = match work_db.metric_task_facts(lookback_since, until) {
         Ok(facts) => facts,
         Err(err) => return send_work_error(&sink, &request_id, &err),
     };
-    let catalog = build_catalog(&execution_facts, &task_facts, generated_at_epoch_s);
+    let catalog = build_catalog(&execution_facts, &task_facts, generated_at_epoch_s, lookback_since);
     send_response(&sink, &request_id, FrontendEvent::MetricCatalogResult { catalog });
 }
 
@@ -76,11 +83,11 @@ pub(super) async fn handle_get_metric_series(ctx: Dispatch, req: FrontendRequest
             require_pr_url,
             statuses,
             ..
-        } => match work_db.metric_execution_facts(since_epoch_s, until_epoch_s, kinds, statuses, require_pr_url) {
+        } => match work_db.metric_execution_facts(0, until_epoch_s, kinds, statuses, require_pr_url) {
             Ok(rows) => build_execution_series_report(&query, &rows, generated_at_epoch_s),
             Err(err) => return send_work_error(&sink, &request_id, &err),
         },
-        SeriesSource::Tasks => match work_db.metric_task_facts(since_epoch_s, until_epoch_s) {
+        SeriesSource::Tasks => match work_db.metric_task_facts(0, until_epoch_s) {
             Ok(rows) => build_task_series_report(&query, &rows, generated_at_epoch_s),
             Err(err) => return send_work_error(&sink, &request_id, &err),
         },
