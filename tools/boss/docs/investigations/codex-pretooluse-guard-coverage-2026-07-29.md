@@ -2,7 +2,7 @@
 
 - **Date:** 2026-07-29
 - **Kind:** investigation with code changes (guard corrections + guard-execution observability).
-- **Subject:** Boss's four/five `PreToolUse` guards materialised into `$CODEX_HOME/config.toml` by the Codex driver, against the tool surface the models Boss actually dispatches (`gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna`).
+- **Subject:** Boss's four/five `PreToolUse` guards materialised into `$CODEX_HOME/config.toml` by the Codex driver, against the tool surface of the models Boss dispatched at investigation time (`gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna`). Worker sessions now select `gpt-6-astra`; this document is the 2026-07-29 probe record.
 - **Apparatus:** `codex-cli 0.145.0` on this host, an isolated `CODEX_HOME` under a scratch dir (auth snapshot byte-copied in, never the operator's `~/.codex`), `codex exec --dangerously-bypass-hook-trust` so hook trust was never in question, and a canary hook armed with `matcher = ".*"` that appended every raw payload to a log. Guard scripts under test were extracted verbatim from the Rust constants they ship as.
 - **Question asked:** the guards are believed on. Are they? Two independent doubts had been raised and neither was settleable from captured state: (1) whether the current shell tool still reports `tool_name: "Bash"`, and (2) whether `tool_input` is still an object with a `command` string, given that the model now drives the shell through a JavaScript cell.
 
@@ -32,7 +32,7 @@ The design doc's live capture (`tool_name: "Bash"`, `tool_input: {"command": "ec
 | `gpt-5.4`             | _(none)_         | `shell_command` |
 | `gpt-5.3-codex-spark` | _(none)_         | `shell_command` |
 
-Boss dispatches `gpt-5.6-terra` for Standard work and `gpt-5.6-sol` for investigations, and `gpt-5.6-luna` is on the menu. **Every model Boss dispatches is a code-mode model; the model the evidence came from is not.** That is a real basis for doubt, and it is why re-testing on the dispatched model — not the documented one — was the right instinct.
+At investigation time Boss dispatched `gpt-5.6-terra` for Standard work and `gpt-5.6-sol` for investigations, and `gpt-5.6-luna` was on the menu. Worker sessions now select `gpt-6-astra`; Terra is no longer a selection tier. **Every model Boss dispatched then (and now) is a code-mode model; the model the evidence came from is not.** That is a real basis for doubt, and it is why re-testing on the dispatched model — not the documented one — was the right instinct.
 
 ## 2. What code mode actually does to the payload
 
@@ -176,7 +176,7 @@ The TUI was driven under a real pty (`pty.fork`, 160×50), with **no `exec` subc
 codex --no-alt-screen --strict-config -s workspace-write -a never -m gpt-5.6-terra '<prompt>'
 ```
 
-`gpt-5.6-terra` is what Boss dispatches for Standard work, and is `code_mode_only` — the model class the original investigation established is the hard case. The payload tee was installed as the `.*` path guard, so it saw every tool call and then delegated to the real guard.
+`gpt-5.6-terra` is what Boss dispatched for Standard work at investigation time, and is `code_mode_only` — the model class the original investigation established is the hard case. Worker sessions now select `gpt-6-astra`. The payload tee was installed as the `.*` path guard, so it saw every tool call and then delegated to the real guard.
 
 ## Measurement 1 — the shell surface
 

@@ -136,13 +136,13 @@ Only a Deep batch that contains production code is eligible for post-merge revie
 
 Extend the driver model menu with a review-specific `fast`, `balanced`, and `strong` mapping. The policy is concrete at current HEAD:
 
-| Review profile | Claude   | Codex           | Grok       | Provider effort |
-| -------------- | -------- | --------------- | ---------- | --------------- |
-| Light          | `sonnet` | `gpt-5.6-luna`  | `grok-4.6` | `medium`        |
-| Standard       | `sonnet` | `gpt-5.6-terra` | `grok-4.6` | `medium`        |
-| Deep           | `opus`   | `gpt-5.6-sol`   | `grok-4.6` | `medium`        |
+| Review profile | Claude   | Codex          | Grok       | Provider effort |
+| -------------- | -------- | -------------- | ---------- | --------------- |
+| Light          | `sonnet` | `gpt-5.6-luna` | `grok-4.6` | `medium`        |
+| Standard       | `sonnet` | `gpt-6-astra`  | `grok-4.6` | `medium`        |
+| Deep           | `opus`   | `gpt-6-astra`  | `grok-4.6` | `medium`        |
 
-The Claude mapping follows the requested example: small/simple work uses Sonnet, while large/complex work earns Opus. Codex's corresponding progression is Luna → Terra → Sol.
+The Claude mapping follows the requested example: small/simple work uses Sonnet, while large/complex work earns Opus. Codex keeps Luna for Light review and uses Astra for Standard and Deep; Terra is retired from selection.
 
 Grok has no equivalent fast tier in the authenticated menu recorded by the driver: it exposes current `grok-4.6` and retained `grok-4.5`, while the former fast-code model is retired and silently redirects. Selecting an old generation merely to manufacture variability would be an unverified downgrade, so all three profiles use `grok-4.6`. This is an explicit capability limit; a future active fast model can populate the menu mapping without changing the classifier or batch schema.
 
