@@ -48,13 +48,18 @@ async fn matched_token_signals_kills_and_clears_identity() {
     let execution_id = seed_tmux_run(db, &work_item_id, "boss-1-example", "tok-match", i64::from(pid));
     let identity = read_back_identity(db, &execution_id);
 
-    // Two `show-environment` reads are expected, not one: `reap_tmux_worker`
-    // verifies once before deciding it's safe to signal the process group,
-    // and `kill_session_verified` re-verifies on its own immediately before
-    // the actual `kill-session` — defense in depth at the one genuinely
-    // destructive call.
+    // A verified token match now also runs the same `#{pane_dead}` identity
+    // probe `TmuxWorkerTerminalInspector::inspect` runs — a second
+    // `show-environment` (`observe_tmux_identity`'s own token re-check),
+    // then `#{pane_dead}` / `#{window_activity}` / `#{pane_current_command}`
+    // — before `kill_session_verified` re-verifies the token a third time
+    // and issues `kill-session`.
     let (tmux, runner) = fake_tmux([
         ok("BOSS_SPAWN_TOKEN=tok-match\n"),
+        ok("BOSS_SPAWN_TOKEN=tok-match\n"),
+        ok("0"),
+        ok("1738000000"),
+        ok("claude"),
         ok("BOSS_SPAWN_TOKEN=tok-match\n"),
         ok(""),
     ]);
@@ -72,6 +77,41 @@ async fn matched_token_signals_kills_and_clears_identity() {
                 "-t",
                 "boss-1-example",
                 "BOSS_SPAWN_TOKEN"
+            ],
+            vec![
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
+                "show-environment",
+                "-t",
+                "boss-1-example",
+                "BOSS_SPAWN_TOKEN"
+            ],
+            vec![
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
+                "display-message",
+                "-p",
+                "-t",
+                "boss-1-example",
+                "#{pane_dead}"
+            ],
+            vec![
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
+                "display-message",
+                "-p",
+                "-t",
+                "boss-1-example",
+                "#{window_activity}"
+            ],
+            vec![
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
+                "display-message",
+                "-p",
+                "-t",
+                "boss-1-example",
+                "#{pane_current_command}"
             ],
             vec![
                 "-S",
@@ -103,6 +143,17 @@ async fn matched_token_signals_kills_and_clears_identity() {
     assert!(
         db.tmux_identity_for_execution(&execution_id).unwrap().is_none(),
         "identity columns must be cleared after a successful reap",
+    );
+
+    let observation = db
+        .tmux_pane_observation_for_execution(&execution_id)
+        .unwrap()
+        .expect("the completion-path probe must persist an observation, not just the sweep's");
+    assert_eq!(observation.kind, crate::work::TmuxPaneObservationKind::Alive);
+    assert_eq!(
+        observation.pane_dead,
+        Some(false),
+        "pane was alive at probe time; teardown's own signal/kill happens after this observation",
     );
 }
 

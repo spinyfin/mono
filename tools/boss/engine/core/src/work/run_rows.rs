@@ -1295,25 +1295,41 @@ impl WorkDb {
     /// [`Self::clear_tmux_identity_for_execution`] leaves this record in
     /// place after teardown.
     ///
-    /// Returns the updated `work_runs.id`, or `None` when no row matched.
+    /// A previously-recorded [`TmuxPaneObservationKind::Dead`] is never
+    /// overwritten by a weaker kind (`Alive`/`Unreadable`/`SessionMissing`):
+    /// once a probe has proven the pane exited, a later routine poll taken
+    /// before teardown clears identity must not clobber that evidence.
+    /// Returns [`TmuxPaneObservationWrite::written`] `false` when the guard
+    /// refused the write; the caller still gets the matched `run_id` and the
+    /// previously-recorded kind either way.
+    ///
+    /// Returns `None` when no row matched.
     pub fn record_tmux_pane_observation(
         &self,
         execution_id: &str,
         spawn_token: &str,
         record: &TmuxPaneObservationRecord,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<TmuxPaneObservationWrite>> {
         let conn = self.connect()?;
-        let run_id: Option<String> = conn
+        let row: Option<(String, Option<String>)> = conn
             .query_row(
-                "SELECT id FROM work_runs
+                "SELECT id, tmux_pane_observation FROM work_runs
                  WHERE execution_id = ?1 AND tmux_spawn_token = ?2",
                 params![execution_id, spawn_token],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let Some(run_id) = run_id else {
+        let Some((run_id, previous_kind_raw)) = row else {
             return Ok(None);
         };
+        let previous_kind = previous_kind_raw.as_deref().and_then(TmuxPaneObservationKind::parse);
+        if previous_kind == Some(TmuxPaneObservationKind::Dead) && record.kind != TmuxPaneObservationKind::Dead {
+            return Ok(Some(TmuxPaneObservationWrite {
+                run_id,
+                previous_kind,
+                written: false,
+            }));
+        }
         let pane_dead = record.pane_dead.map(|dead| if dead { 1i64 } else { 0 });
         conn.execute(
             "UPDATE work_runs
@@ -1330,7 +1346,11 @@ impl WorkDb {
                 record.kind.as_str(),
             ],
         )?;
-        Ok(Some(run_id))
+        Ok(Some(TmuxPaneObservationWrite {
+            run_id,
+            previous_kind,
+            written: true,
+        }))
     }
 
     /// Latest token-verified pane observation for `execution_id`, if any

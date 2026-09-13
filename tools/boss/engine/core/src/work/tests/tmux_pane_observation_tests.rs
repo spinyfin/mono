@@ -98,14 +98,17 @@ fn pane_observation_survives_identity_clear() {
     let (execution_id, token) = started_tmux_run(&db);
     let record = dead_record();
 
-    let run_id = db
+    let outcome = db
         .record_tmux_pane_observation(&execution_id, &token, &record)
         .unwrap()
         .expect("the spawned run must match");
     assert!(
-        run_id.starts_with("run_"),
-        "persist must return the work_runs id, got {run_id}"
+        outcome.run_id.starts_with("run_"),
+        "persist must return the work_runs id, got {}",
+        outcome.run_id
     );
+    assert!(outcome.written, "first observation on the row must be written");
+    assert_eq!(outcome.previous_kind, None, "row had no prior observation");
 
     assert!(
         db.clear_tmux_identity_for_execution(&execution_id, &token).unwrap(),
@@ -164,4 +167,71 @@ fn session_missing_observation_is_not_an_observed_dead_pane() {
     let stored = db.tmux_pane_observation_for_execution(&execution_id).unwrap().unwrap();
     assert_eq!(stored.kind, TmuxPaneObservationKind::SessionMissing);
     assert_eq!(stored.pane_dead, None);
+}
+
+#[test]
+fn stale_spawn_token_matches_no_row_and_writes_nothing() {
+    let db = WorkDb::open(temp_db_path("tmux-pane-observation-stale-token")).unwrap();
+    let (execution_id, _token) = started_tmux_run(&db);
+
+    // A token that changed between probe and write (e.g. a resume minted a
+    // new one) matches no `(execution_id, tmux_spawn_token)` row.
+    let outcome = db
+        .record_tmux_pane_observation(&execution_id, "stale-tok", &dead_record())
+        .unwrap();
+    assert!(
+        outcome.is_none(),
+        "a stale spawn token must match no row, not silently write against the wrong one",
+    );
+    assert_eq!(
+        db.tmux_pane_observation_for_execution(&execution_id).unwrap(),
+        None,
+        "no observation may be recorded when the token didn't match",
+    );
+}
+
+#[test]
+fn dead_observation_is_not_clobbered_by_a_later_alive_poll() {
+    let db = WorkDb::open(temp_db_path("tmux-pane-observation-dead-guard")).unwrap();
+    let (execution_id, token) = started_tmux_run(&db);
+
+    let dead_outcome = db
+        .record_tmux_pane_observation(&execution_id, &token, &dead_record())
+        .unwrap()
+        .expect("the spawned run must match");
+    assert!(dead_outcome.written, "the first Dead observation must be written");
+
+    let alive = TmuxPaneObservationRecord {
+        kind: TmuxPaneObservationKind::Alive,
+        pane_dead: Some(false),
+        pane_dead_status: None,
+        session_name: "boss-worker-1".to_owned(),
+    };
+    let alive_outcome = db
+        .record_tmux_pane_observation(&execution_id, &token, &alive)
+        .unwrap()
+        .expect("the row still matches");
+    assert!(
+        !alive_outcome.written,
+        "a weaker Alive poll must not overwrite an already-recorded Dead observation",
+    );
+    assert_eq!(alive_outcome.previous_kind, Some(TmuxPaneObservationKind::Dead));
+
+    let stored = db
+        .tmux_pane_observation_for_execution(&execution_id)
+        .unwrap()
+        .expect("the Dead record must still be present");
+    assert_eq!(
+        stored,
+        dead_record(),
+        "the durable row must still read as the original Dead observation",
+    );
+
+    // A second Dead observation (e.g. the reap's own probe re-confirming
+    // the same exit) is idempotent, not a "weaker kind" refusal.
+    let redead_outcome = db
+        .record_tmux_pane_observation(&execution_id, &token, &dead_record())
+        .unwrap()
+        .expect("the row still matches");
+    assert!(redead_outcome.written, "re-recording Dead over Dead is not a clobber");
 }

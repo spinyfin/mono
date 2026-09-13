@@ -147,7 +147,15 @@ async fn release_worker_pane_still_reaps_a_tmux_session_for_a_dead_recorded_pid(
         "creation write must find the intent row it just wrote",
     );
 
-    let (tmux, runner) = fake_tmux([ok("BOSS_SPAWN_TOKEN=tok-x\n"), ok("BOSS_SPAWN_TOKEN=tok-x\n"), ok("")]);
+    let (tmux, runner) = fake_tmux([
+        ok("BOSS_SPAWN_TOKEN=tok-x\n"),
+        ok("BOSS_SPAWN_TOKEN=tok-x\n"),
+        ok("0"),
+        ok("1738000000"),
+        ok("claude"),
+        ok("BOSS_SPAWN_TOKEN=tok-x\n"),
+        ok(""),
+    ]);
     server_state.set_tmux_override_for_test(tmux);
 
     assert_eq!(
@@ -183,12 +191,47 @@ async fn release_worker_pane_still_reaps_a_tmux_session_for_a_dead_recorded_pid(
             vec![
                 "-S",
                 boss_tmux::TEST_SOCKET_PATH,
+                "display-message",
+                "-p",
+                "-t",
+                "boss-1-example",
+                "#{pane_dead}"
+            ],
+            vec![
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
+                "display-message",
+                "-p",
+                "-t",
+                "boss-1-example",
+                "#{window_activity}"
+            ],
+            vec![
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
+                "display-message",
+                "-p",
+                "-t",
+                "boss-1-example",
+                "#{pane_current_command}"
+            ],
+            vec![
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
+                "show-environment",
+                "-t",
+                "boss-1-example",
+                "BOSS_SPAWN_TOKEN"
+            ],
+            vec![
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
                 "kill-session",
                 "-t",
                 "boss-1-example"
             ],
         ],
-        "the dead-pid reap path must issue show-environment then kill-session, nothing else",
+        "the dead-pid reap path must issue show-environment, the pane-state probe, then kill-session",
     );
 }
 

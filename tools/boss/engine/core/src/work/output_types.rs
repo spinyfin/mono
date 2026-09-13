@@ -169,6 +169,19 @@ pub struct TmuxPaneObservationRecord {
     pub session_name: String,
 }
 
+/// Outcome of [`WorkDb::record_tmux_pane_observation`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxPaneObservationWrite {
+    /// The `work_runs.id` the observation matched.
+    pub run_id: String,
+    /// The kind recorded on the row before this call, if any.
+    pub previous_kind: Option<TmuxPaneObservationKind>,
+    /// Whether the durable columns were actually updated. `false` means the
+    /// Dead-clobber guard refused a weaker observation over a previously
+    /// recorded [`TmuxPaneObservationKind::Dead`].
+    pub written: bool,
+}
+
 /// One non-terminal execution whose latest run landed on a host that is
 /// no longer eligible to run it — the host was disabled (operator
 /// `bossctl hosts disable` or the dispatch-health circuit breaker) or

@@ -207,6 +207,13 @@ pub(super) async fn persist_observed_pane_pid(
 /// mismatch is skipped: the live pane is not this run's, so its
 /// `#{pane_dead}` must not be recorded as this run's exit. Best-effort —
 /// a failed write is logged and never fails the probe.
+///
+/// [`WorkDb::record_tmux_pane_observation`] refuses to let a weaker kind
+/// (`Alive`/`Unreadable`/`SessionMissing`) clobber an already-recorded
+/// `Dead` row; logging mirrors that lifecycle: INFO only for `Dead` and for
+/// the first `Unreadable`/`SessionMissing` observation on a row that had
+/// none before, DEBUG for everything else (routine `Alive` polls included)
+/// so the log does not drown lifecycle-significant events in noise.
 pub(crate) fn persist_observed_pane_state(
     work_db: &WorkDb,
     execution_id: &str,
@@ -221,20 +228,53 @@ pub(crate) fn persist_observed_pane_state(
     let pane_dead_status = record.pane_dead_status.clone();
     let kind = record.kind;
     match work_db.record_tmux_pane_observation(execution_id, spawn_token, &record) {
-        Ok(Some(run_id)) => {
-            tracing::info!(
-                run_id,
-                execution_id,
-                session = session_name,
-                pane_dead = match pane_dead {
+        Ok(Some(outcome)) => {
+            if !outcome.written {
+                tracing::debug!(
+                    run_id = outcome.run_id,
+                    execution_id,
+                    session = session_name,
+                    observation = kind.as_str(),
+                    "tmux: weaker pane observation refused; a Dead observation is already recorded for this run",
+                );
+                return;
+            }
+            let lifecycle_significant = matches!(kind, TmuxPaneObservationKind::Dead)
+                || (matches!(
+                    kind,
+                    TmuxPaneObservationKind::Unreadable | TmuxPaneObservationKind::SessionMissing
+                ) && outcome.previous_kind.is_none());
+            let fields = (
+                outcome.run_id.as_str(),
+                match pane_dead {
                     Some(true) => "true",
                     Some(false) => "false",
                     None => "none",
                 },
-                pane_dead_status = pane_dead_status.as_deref().unwrap_or(""),
-                observation = kind.as_str(),
-                "tmux: token-verified pane observation",
+                pane_dead_status.as_deref().unwrap_or(""),
+                kind.as_str(),
             );
+            if lifecycle_significant {
+                tracing::info!(
+                    run_id = fields.0,
+                    execution_id,
+                    session = session_name,
+                    pane_dead = fields.1,
+                    pane_dead_status = fields.2,
+                    observation = fields.3,
+                    "tmux: token-verified pane observation",
+                );
+            } else {
+                tracing::debug!(
+                    run_id = fields.0,
+                    execution_id,
+                    session = session_name,
+                    pane_dead = fields.1,
+                    pane_dead_status = fields.2,
+                    observation = fields.3,
+                    "tmux: token-verified pane observation",
+                );
+            }
         }
         Ok(None) => {
             tracing::debug!(

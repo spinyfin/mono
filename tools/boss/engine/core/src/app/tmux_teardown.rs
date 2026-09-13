@@ -178,6 +178,22 @@ impl ServerState {
             }
         }
 
+        // Verified match: this is the only place a genuine normal-exit
+        // teardown observes `#{pane_dead}`/`#{pane_dead_status}` before the
+        // session is destroyed below — persist it now so completion (not
+        // just the stale-worker sweep's cadence over still-`Working` slots)
+        // leaves the run row's observation columns populated.
+        let observation =
+            crate::tmux_adoption::observe_tmux_identity(tmux, &identity.session_name, &identity.spawn_token, true)
+                .await;
+        crate::tmux_adoption::persist_observed_pane_state(
+            &self.work_db,
+            execution_id,
+            &identity.spawn_token,
+            &identity.session_name,
+            &observation,
+        );
+
         // Verified match: safe to signal the recorded pane pid's process
         // group. This is the same ladder every app-hosted release already
         // runs (`reap_worker_process_tree`) — it stays because the reason

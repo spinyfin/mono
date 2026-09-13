@@ -674,6 +674,7 @@ pub use output_types::StrandedCiRemediationAttempt;
 pub use output_types::TmuxIdentity;
 pub use output_types::TmuxPaneObservationKind;
 pub use output_types::TmuxPaneObservationRecord;
+pub use output_types::TmuxPaneObservationWrite;
 pub use output_types::TmuxRunHandle;
 pub use output_types::WorkerPrCompletion;
 pub use output_types::WorkerPrCompletionTarget;
