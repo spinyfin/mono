@@ -7,7 +7,7 @@
 //! failure) mints a `work_executions` row and immediately marks it
 //! `abandoned` — it never gets cleaned up. In one incident a
 //! `redundant_spawn` storm produced 2,087 such rows in a single night
-//! before the underlying inflow bug (T2168/T2215) was fixed. Because nothing
+//! before the underlying inflow bug was fixed. Because nothing
 //! ever prunes terminal executions, this stock only grows, dragging down
 //! every query that scans `work_executions` (including, transitively, the
 //! `automation_runs` history rendered by the Automations pane — see
@@ -83,7 +83,7 @@ const PRUNABLE_STATUSES_SQL: &str = "'abandoned', 'failed', 'orphaned', 'cancell
 /// Default age bound: prune eligible executions older than 14 days.
 /// Comfortably outlives the window an operator would plausibly need
 /// ("what happened to this task last week?") while still bounding the
-/// hot query path against a storm like T2168/T2215.
+/// hot query path against a pre-spawn-abort storm.
 pub const DEFAULT_RETENTION_MAX_AGE_SECS: i64 = 14 * 24 * 60 * 60;
 
 /// Default diagnostics floor: always keep at least this many of the most
