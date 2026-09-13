@@ -563,6 +563,26 @@ pub(crate) fn migrate_work_runs_tmux_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Token-verified `#{pane_dead}` observation for one spawned run.
+///
+/// Distinct from the live identity columns (`tmux_session_name` and
+/// friends): those are nulled on reap, which is exactly when this
+/// record must still be queryable. Nullable so legacy rows stay
+/// "never observed" rather than looking like a clean exit.
+pub(crate) fn migrate_work_runs_tmux_pane_observation(conn: &Connection) -> Result<()> {
+    for (column, sql_type) in [
+        ("tmux_observed_pane_dead", "INTEGER"),
+        ("tmux_observed_pane_dead_status", "TEXT"),
+        ("tmux_observed_session_name", "TEXT"),
+        ("tmux_pane_observation", "TEXT"),
+    ] {
+        if !table_has_column(conn, "work_runs", column)? {
+            conn.execute(&format!("ALTER TABLE work_runs ADD COLUMN {column} {sql_type}"), [])?;
+        }
+    }
+    Ok(())
+}
+
 /// Durable hosting-mode snapshot for the run, written before any tmux spawn
 /// attempt. Existing rows predate the snapshot and retain the legacy
 /// app-hosted reconciliation path.

@@ -107,6 +107,7 @@ use crate::work::{TmuxRunHandle, WorkDb};
 use crate::worker_readoption::LiveWorkerConvergence;
 
 mod persist;
+pub(crate) use persist::persist_observed_pane_state;
 use persist::{PaneObservation, PersistedPanePid, adoption_pid_snapshot, persist_observed_pane_pid};
 
 /// The tmux session environment variable carrying [`TMUX_SESSION_SCHEMA`].
