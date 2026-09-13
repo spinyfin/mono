@@ -6,11 +6,17 @@
 //! crate only reads pinned GitHub objects and validates references against the
 //! resulting packet.
 
+use std::collections::{HashMap, HashSet};
+
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const PACKET_SCHEMA_VERSION: u32 = 1;
+/// Version 2 adds the immutable Git-tree manifest (object SHA, mode, and
+/// type) to every captured source side. Consumers can distinguish legacy
+/// packets from the stronger object-verified contract without guessing from
+/// optional fields.
+const PACKET_SCHEMA_VERSION: u32 = 2;
 
 /// Immutable endpoints supplied by a reconciler observation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +92,13 @@ pub struct PinnedSource {
     pub repository: String,
     pub sha: String,
     pub path: String,
+    /// Git object identity from the tree manifest. It is distinct from the
+    /// commit SHA above and remains useful when textual content is omitted.
+    pub object_sha: Option<String>,
+    /// Git tree mode, preserving ordinary files, symlinks, and submodules.
+    pub mode: Option<String>,
+    /// GitHub tree-entry type, usually `blob` or `commit` for a submodule.
+    pub object_type: Option<String>,
     pub content: Option<String>,
     pub content_hash: Option<String>,
     pub byte_count: Option<u64>,
@@ -93,13 +106,22 @@ pub struct PinnedSource {
 }
 
 impl PinnedSource {
-    fn captured(repository: &str, sha: &str, path: &str, content: String) -> Self {
+    fn captured(
+        repository: &str,
+        sha: &str,
+        path: &str,
+        content: String,
+        entry: &boss_github::trees::PinnedTreeEntry,
+    ) -> Self {
         let byte_count = content.len() as u64;
         let content_hash = hex_digest(content.as_bytes());
         Self {
             repository: repository.to_owned(),
             sha: sha.to_owned(),
             path: path.to_owned(),
+            object_sha: Some(entry.object_sha.clone()),
+            mode: Some(entry.mode.clone()),
+            object_type: Some(entry.object_type.clone()),
             content: Some(content),
             content_hash: Some(content_hash),
             byte_count: Some(byte_count),
@@ -107,15 +129,47 @@ impl PinnedSource {
         }
     }
 
-    fn omitted(repository: &str, sha: &str, path: &str, omission: String) -> Self {
+    fn omitted(
+        repository: &str,
+        sha: &str,
+        path: &str,
+        omission: String,
+        entry: Option<&boss_github::trees::PinnedTreeEntry>,
+    ) -> Self {
         Self {
             repository: repository.to_owned(),
             sha: sha.to_owned(),
             path: path.to_owned(),
+            object_sha: entry.map(|entry| entry.object_sha.clone()),
+            mode: entry.map(|entry| entry.mode.clone()),
+            object_type: entry.map(|entry| entry.object_type.clone()),
             content: None,
             content_hash: None,
-            byte_count: None,
+            byte_count: entry.and_then(|entry| entry.size),
             omission: Some(omission),
+        }
+    }
+
+    fn omitted_binary(
+        repository: &str,
+        sha: &str,
+        path: &str,
+        bytes: Vec<u8>,
+        entry: &boss_github::trees::PinnedTreeEntry,
+    ) -> Self {
+        Self {
+            repository: repository.to_owned(),
+            sha: sha.to_owned(),
+            path: path.to_owned(),
+            object_sha: Some(entry.object_sha.clone()),
+            mode: Some(entry.mode.clone()),
+            object_type: Some(entry.object_type.clone()),
+            content: None,
+            content_hash: Some(hex_digest(&bytes)),
+            byte_count: Some(bytes.len() as u64),
+            omission: Some(
+                "pinned source is binary or non-UTF-8; raw-byte SHA-256 was recorded without lossy decoding".to_owned(),
+            ),
         }
     }
 
@@ -225,6 +279,10 @@ pub fn validate_pinned_reference(
         .content
         .as_deref()
         .with_context(|| format!("captured source `{path}` has no readable content"))?;
+    let actual_hash = hex_digest(text.as_bytes());
+    if source.content_hash.as_deref() != Some(actual_hash.as_str()) {
+        bail!("captured source `{path}` failed its immutable content-hash check");
+    }
     let line_count = text.lines().count() as u32;
     if end_line > line_count {
         bail!("source range {start_line}..{end_line} exceeds `{path}`'s {line_count} lines");
@@ -296,20 +354,49 @@ pub async fn collect_pinned_source_packet(
     )
     .await?;
 
+    let before_paths: HashSet<String> = inventory
+        .iter()
+        .filter(|file| ChangeKind::from_api(&file.status).has_before())
+        .map(|file| file.previous_filename.clone().unwrap_or_else(|| file.filename.clone()))
+        .collect();
+    let after_paths: HashSet<String> = inventory
+        .iter()
+        .filter(|file| ChangeKind::from_api(&file.status).has_after())
+        .map(|file| file.filename.clone())
+        .collect();
+    // A tree entry is the immutable source manifest for each requested path.
+    // A truncated response is fatal rather than an invisible subset: callers
+    // record the resulting collection error and do not publish a false claim
+    // of complete source coverage.
+    let before_entries = fetch_pinned_tree_entries(&metadata.base_repository, &merge_base_sha, &before_paths).await?;
+    let after_entries = fetch_pinned_tree_entries(&metadata.head_repository, &metadata.head_sha, &after_paths).await?;
+
     let mut omissions = Vec::new();
     let mut files = Vec::with_capacity(inventory.len());
     for file in inventory {
         let change_kind = ChangeKind::from_api(&file.status);
         let before_path = file.previous_filename.clone().unwrap_or_else(|| file.filename.clone());
         let before = if change_kind.has_before() {
-            let source = fetch_source(&metadata.base_repository, &merge_base_sha, &before_path).await;
+            let source = fetch_source(
+                &metadata.base_repository,
+                &merge_base_sha,
+                &before_path,
+                before_entries.get(&before_path),
+            )
+            .await;
             record_omission(&mut omissions, &source, SourceSide::Before);
             Some(source)
         } else {
             None
         };
         let after = if change_kind.has_after() {
-            let source = fetch_source(&metadata.head_repository, &metadata.head_sha, &file.filename).await;
+            let source = fetch_source(
+                &metadata.head_repository,
+                &metadata.head_sha,
+                &file.filename,
+                after_entries.get(&file.filename),
+            )
+            .await;
             record_omission(&mut omissions, &source, SourceSide::After);
             Some(source)
         } else {
@@ -350,19 +437,86 @@ pub async fn collect_pinned_source_packet(
     })
 }
 
-async fn fetch_source(repository: &str, sha: &str, path: &str) -> PinnedSource {
-    let Some((owner, repo)) = repository.split_once('/') else {
-        return PinnedSource::omitted(repository, sha, path, "repository is not owner/repo".to_owned());
+async fn fetch_pinned_tree_entries(
+    repository: &str,
+    sha: &str,
+    paths: &HashSet<String>,
+) -> Result<HashMap<String, boss_github::trees::PinnedTreeEntry>> {
+    if paths.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let (owner, repo) = repository
+        .split_once('/')
+        .filter(|(owner, repo)| !owner.is_empty() && !repo.is_empty())
+        .with_context(|| format!("invalid pinned source repository identity `{repository}`"))?;
+    let tree = boss_github::trees::fetch_pinned_tree(owner, repo, sha, |candidate| paths.contains(candidate))
+        .await
+        .map_err(|error| anyhow::anyhow!("could not read pinned tree {repository}@{sha}: {error}"))?;
+    if tree.truncated {
+        bail!("pinned tree {repository}@{sha} was truncated; source capture cannot verify changed-file coverage");
+    }
+    Ok(tree
+        .entries
+        .into_iter()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect())
+}
+
+async fn fetch_source(
+    repository: &str,
+    sha: &str,
+    path: &str,
+    entry: Option<&boss_github::trees::PinnedTreeEntry>,
+) -> PinnedSource {
+    let Some(entry) = entry else {
+        return PinnedSource::omitted(
+            repository,
+            sha,
+            path,
+            "path was absent from the pinned Git tree".to_owned(),
+            None,
+        );
     };
-    match boss_github::contents::fetch_repo_file(owner, repo, path, sha).await {
-        Ok(Some(content)) => PinnedSource::captured(repository, sha, path, content),
+    if entry.object_type != "blob" {
+        return PinnedSource::omitted(
+            repository,
+            sha,
+            path,
+            format!(
+                "pinned tree entry is `{}` rather than a readable blob",
+                entry.object_type
+            ),
+            Some(entry),
+        );
+    }
+    let Some((owner, repo)) = repository.split_once('/') else {
+        return PinnedSource::omitted(
+            repository,
+            sha,
+            path,
+            "repository is not owner/repo".to_owned(),
+            Some(entry),
+        );
+    };
+    match boss_github::contents::fetch_repo_file_bytes(owner, repo, path, sha).await {
+        Ok(Some(bytes)) => match String::from_utf8(bytes) {
+            Ok(content) => PinnedSource::captured(repository, sha, path, content, entry),
+            Err(error) => PinnedSource::omitted_binary(repository, sha, path, error.into_bytes(), entry),
+        },
         Ok(None) => PinnedSource::omitted(
             repository,
             sha,
             path,
             "file was absent at the pinned revision".to_owned(),
+            Some(entry),
         ),
-        Err(error) => PinnedSource::omitted(repository, sha, path, format!("pinned source read failed: {error:#}")),
+        Err(error) => PinnedSource::omitted(
+            repository,
+            sha,
+            path,
+            format!("pinned source read failed: {error:#}"),
+            Some(entry),
+        ),
     }
 }
 
@@ -395,6 +549,16 @@ fn encode_path(path: &str) -> String {
 mod tests {
     use super::*;
 
+    fn blob_entry() -> boss_github::trees::PinnedTreeEntry {
+        boss_github::trees::PinnedTreeEntry {
+            path: "src/with space.rs".to_owned(),
+            object_sha: "d".repeat(40),
+            mode: "100644".to_owned(),
+            object_type: "blob".to_owned(),
+            size: None,
+        }
+    }
+
     fn packet() -> SourcePacket {
         SourcePacket {
             schema_version: PACKET_SCHEMA_VERSION,
@@ -419,12 +583,14 @@ mod tests {
                     &"b".repeat(40),
                     "src/with space.rs",
                     "old\n".to_owned(),
+                    &blob_entry(),
                 )),
                 after: Some(PinnedSource::captured(
                     "acme/widget",
                     &"c".repeat(40),
                     "src/with space.rs",
                     "first\nsecond\n".to_owned(),
+                    &blob_entry(),
                 )),
             }],
             omissions: Vec::new(),
@@ -454,6 +620,13 @@ mod tests {
     }
 
     #[test]
+    fn reference_validation_rejects_a_tampered_source_hash() {
+        let mut packet = packet();
+        packet.files[0].after.as_mut().unwrap().content_hash = Some("wrong".to_owned());
+        assert!(validate_pinned_reference(&packet, SourceSide::After, "src/with space.rs", 1, 1).is_err());
+    }
+
+    #[test]
     fn rendered_navigation_defaults_to_an_explicit_pinned_fallback() {
         let reference = validate_pinned_reference(&packet(), SourceSide::After, "src/with space.rs", 1, 1).unwrap();
         assert!(matches!(
@@ -470,6 +643,7 @@ mod tests {
             &"c".repeat(40),
             "src/with space.rs",
             "blob is unavailable".to_owned(),
+            None,
         ));
         assert!(!packet.is_complete());
     }
@@ -484,5 +658,26 @@ mod tests {
             reason: "GitHub omitted the API patch; pinned source was collected instead".to_owned(),
         });
         assert!(packet.is_complete());
+    }
+
+    #[test]
+    fn binary_source_is_an_explicit_immutable_omission_without_lossy_text() {
+        let source = PinnedSource::omitted_binary(
+            "acme/widget",
+            &"c".repeat(40),
+            "image.bin",
+            vec![0, 0xff, 1],
+            &boss_github::trees::PinnedTreeEntry {
+                path: "image.bin".to_owned(),
+                object_sha: "d".repeat(40),
+                mode: "100644".to_owned(),
+                object_type: "blob".to_owned(),
+                size: Some(3),
+            },
+        );
+        assert!(source.content.is_none());
+        assert_eq!(source.byte_count, Some(3));
+        assert!(source.content_hash.is_some());
+        assert!(source.omission.as_deref().unwrap().contains("non-UTF-8"));
     }
 }

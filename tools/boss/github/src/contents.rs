@@ -101,6 +101,27 @@ pub async fn fetch_repo_file(owner: &str, repo: &str, path: &str, ref_name: &str
         .map_err(|e| anyhow::anyhow!("`gh api {endpoint}` failed (exit {:?}): {}", output.status.code(), e))
 }
 
+/// Fetch the raw bytes of `path` from `owner/repo` at an immutable ref.
+///
+/// Unlike [`fetch_repo_file`], this preserves non-UTF-8 bytes exactly. Source
+/// collectors that persist a content hash must use this form so a binary blob
+/// is recorded as an explicit omission rather than silently changed by lossy
+/// UTF-8 decoding.
+pub async fn fetch_repo_file_bytes(
+    owner: &str,
+    repo: &str,
+    path: &str,
+    ref_name: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let (endpoint, args) = raw_content_args(owner, repo, path, ref_name);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = gh_output(&arg_refs).await?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    classify_contents_bytes_response(output.status.success(), &output.stdout, &stderr)
+        .map_err(|e| anyhow::anyhow!("`gh api {endpoint}` failed (exit {:?}): {}", output.status.code(), e))
+}
+
 /// Contents-API GET with optional `If-None-Match`, returning headers
 /// (ETag / 304 / rate-limit remaining) in addition to the body.
 ///
@@ -136,8 +157,17 @@ pub async fn fetch_repo_file_conditional(
 /// Kept as a pure helper (no I/O) so the classification branching can be
 /// pinned by unit tests.
 fn classify_contents_response(status_success: bool, stdout: &[u8], stderr: &str) -> anyhow::Result<Option<String>> {
+    classify_contents_bytes_response(status_success, stdout, stderr)
+        .map(|content| content.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+fn classify_contents_bytes_response(
+    status_success: bool,
+    stdout: &[u8],
+    stderr: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
     if status_success {
-        return Ok(Some(String::from_utf8_lossy(stdout).into_owned()));
+        return Ok(Some(stdout.to_vec()));
     }
     if parse_http_status_from_stderr(stderr) == Some(404) || stderr.contains("Not Found") {
         return Ok(None);
@@ -268,6 +298,15 @@ mod tests {
         let body = b"fn main() {}\n";
         let result = classify_contents_response(true, body, "").unwrap();
         assert_eq!(result, Some("fn main() {}\n".to_string()));
+    }
+
+    #[test]
+    fn raw_classifier_preserves_non_utf8_bytes() {
+        let body = [0_u8, 0xff, b'\n'];
+        assert_eq!(
+            classify_contents_bytes_response(true, &body, "").unwrap(),
+            Some(body.to_vec())
+        );
     }
 
     #[test]

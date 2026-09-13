@@ -361,7 +361,7 @@ mod tests {
 
     fn packet(base: &str, head: &str) -> SourcePacket {
         SourcePacket {
-            schema_version: 1,
+            schema_version: 2,
             canonical_pr_url: "https://github.com/acme/widget/pull/11".to_owned(),
             pr_number: 11,
             title: "Capture immutable comparison".to_owned(),
