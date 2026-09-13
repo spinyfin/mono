@@ -1,9 +1,13 @@
 //! Query layer behind `GetMetricSeries` / `GetMetricCatalog` — projects
 //! window-scoped `work_executions` and `tasks` rows into the fact types
 //! the pure [`crate::metric_series`] module aggregates. SQL filters the
-//! window (and, for a series, kind/status) as TEXT against 10-digit
-//! epoch bounds so the `work_executions(kind, finished_at)` index is
-//! usable; duration and product slug are computed in the projection.
+//! window (and, for a series, kind/status) as TEXT against 10-digit,
+//! zero-padded epoch bounds so the `work_executions(finished_at, kind)`
+//! index is usable; duration and product slug are computed in the
+//! projection. The join to `tasks`/`products` is `LEFT`: a
+//! `product_design` execution's `work_item_id` is a `prod_` id and an
+//! `answer_agent` execution's is a `cmt_` comment id, neither of which
+//! exists in `tasks`, so an inner join would silently drop those rows.
 
 use super::*;
 
@@ -13,8 +17,11 @@ use crate::metric_series::{ExecutionFact, TaskFact};
 #[cfg(test)]
 use crate::metric_series::{SeriesSource, SeriesSpec};
 
+/// 10-digit, zero-padded epoch bound so lexicographic TEXT comparison
+/// against `finished_at`/`completed_at` agrees with numeric comparison
+/// regardless of the bound's own digit count (e.g. a pre-2001 `--since`).
 fn epoch_bound(epoch_s: i64) -> String {
-    epoch_s.to_string()
+    format!("{:010}", epoch_s.max(0))
 }
 
 fn duration_ms(started_at: Option<i64>, finished_at: i64) -> Option<i64> {
@@ -87,8 +94,8 @@ impl WorkDb {
                 we.pr_url,
                 p.slug
              FROM work_executions we
-             JOIN tasks t ON t.id = we.work_item_id
-             JOIN products p ON p.id = t.product_id
+             LEFT JOIN tasks t ON t.id = we.work_item_id
+             LEFT JOIN products p ON p.id = t.product_id
              WHERE we.finished_at IS NOT NULL
                AND we.finished_at >= ?1
                AND we.finished_at < ?2",
@@ -287,6 +294,32 @@ mod tests {
     }
 
     #[test]
+    fn execution_facts_match_a_sub_10_digit_since_bound_against_a_10_digit_row() {
+        // A pre-2001-09-09 --since (e.g. 2001-01-01T00:00:00Z -> 978307200,
+        // 9 digits) must still admit a 10-digit-epoch row: unpadded TEXT
+        // comparison would put "978307200" > "1780000100" lexicographically
+        // (leading '9' > '1'), excluding every real row.
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let task = create_test_chore(&db, &product_id, "nine-digit-bound");
+        stamp_execution(
+            &db,
+            &task.id,
+            ExecutionKind::ChoreImplementation,
+            ExecutionStatus::Completed,
+            1_780_000_070,
+            1_780_000_100,
+            None,
+        );
+
+        let facts = db
+            .metric_execution_facts(978_307_200, 1_790_000_000, None, None, false)
+            .unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].finished_at_epoch_s, 1_780_000_100);
+    }
+
+    #[test]
     fn execution_facts_honor_kind_status_and_pr_url_predicates() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
@@ -331,6 +364,44 @@ mod tests {
     }
 
     #[test]
+    fn execution_facts_include_non_task_work_items_with_no_product() {
+        // product_design executions carry the product's own `prod_` id as
+        // work_item_id, and answer_agent executions carry a `cmt_` comment
+        // id; neither exists in `tasks`, so an inner join would drop them.
+        // Inserted directly (rather than via `create_execution`, whose
+        // repo-remote-url resolution expects a task/chore work item) since
+        // the whole point is that these rows have no corresponding task.
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "INSERT INTO work_executions (
+                id, work_item_id, kind, status, repo_remote_url,
+                created_at, started_at, finished_at, branch_naming
+             ) VALUES ('exec_prod_design', ?1, 'product_design', 'completed',
+                       'https://github.com/test/repo', ?2, ?2, ?3, '{}')",
+            params![product_id, (T0 + 100).to_string(), (T0 + 130).to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO work_executions (
+                id, work_item_id, kind, status, repo_remote_url,
+                created_at, started_at, finished_at, branch_naming
+             ) VALUES ('exec_answer_agent', 'cmt_does_not_exist', 'answer_agent', 'completed',
+                       'https://github.com/test/repo', ?1, ?1, ?2, '{}')",
+            params![(T0 + 100).to_string(), (T0 + 140).to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let facts = db.metric_execution_facts(T0, T0 + 1_000, None, None, false).unwrap();
+        assert_eq!(facts.len(), 2);
+        assert!(facts.iter().all(|f| f.product.is_none()));
+        assert!(facts.iter().any(|f| f.kind == "product_design"));
+        assert!(facts.iter().any(|f| f.kind == "answer_agent"));
+    }
+
+    #[test]
     fn execution_facts_project_launch_config_and_skip_negative_duration() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
@@ -369,7 +440,7 @@ mod tests {
         db.connect()
             .unwrap()
             .execute(
-                "UPDATE tasks SET created_at = '100', completed_at = '250' WHERE id = ?1",
+                "UPDATE tasks SET created_at = '0000000100', completed_at = '0000000250' WHERE id = ?1",
                 params![task.id],
             )
             .unwrap();
@@ -435,11 +506,14 @@ mod tests {
         }
     }
 
-    /// p95 latency budget from the design: 150 ms for any single series
-    /// over a five-month range at day buckets, on a synthetic dataset
-    /// sized like the operator's live tables.
+    /// Guards the *bucket/percentile aggregation* half of the design's
+    /// 150 ms p95 query-latency budget: an 8,000-execution table spanning
+    /// a five-month range, aggregated at day buckets. This does not assert
+    /// the full budget end-to-end (see the `[deferred-scope]` note on the
+    /// median assertion below) — the SQL projection half is timed once,
+    /// outside the loop, and is not part of what this test bounds.
     #[test]
-    fn p95_query_latency_over_five_month_synthetic_dataset_stays_under_budget() {
+    fn median_query_latency_over_five_month_synthetic_dataset_stays_under_budget() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let task = create_test_chore(&db, &product_id, "synth");
@@ -488,10 +562,11 @@ mod tests {
             tx.commit().unwrap();
         }
 
-        // Project once (the SQL half). The 150 ms budget is asserted on
-        // the pure bucket/percentile path over that projection: bazel
-        // fastbuild + 11-way shard contention cannot fairly time SQLite
-        // wall-clock against the opt-build operator-machine budget.
+        // Project once (the SQL half, outside the timed loop below): this
+        // test does not measure that half. An 11-way sharded fastbuild
+        // `bazel test` run shares its host with the other shards, so SQLite
+        // wall-clock time here would reflect contention, not the query
+        // itself; see the `[deferred-scope]` note on the median assertion.
         let spec = series_spec(SERIES_EXECUTION_OUTCOMES).unwrap();
         let SeriesFacts::Executions(rows) = db.metric_facts_for_spec(spec, since, until).unwrap() else {
             panic!("execution_outcomes must project executions");
@@ -521,12 +596,15 @@ mod tests {
             samples_ms.push(started.elapsed().as_millis());
         }
         samples_ms.sort_unstable();
-        // Median, not p95: sharded fastbuild runs share the host with ten
-        // other engine_lib_test shards, so the tail of 20 wall-clock samples
-        // is scheduling noise (observed 150–300 ms spikes next to a 5 ms
-        // cluster). The production budget is 150 ms p95 on an opt engine;
-        // median of the same samples is the stable signal this harness can
-        // assert without raising that budget.
+        // [deferred-scope] This asserts a median over 20 in-process samples,
+        // not the design's 150 ms p95: the ten other engine_lib_test shards
+        // sharing this host under a sandboxed `bazel test` run produced
+        // 150-300 ms scheduling-noise spikes next to a 5 ms cluster in
+        // observed runs, which a p95 over only 20 samples cannot distinguish
+        // from a genuine regression. The SQL projection above is also timed
+        // once, outside this loop, so that half of the budget is unmeasured
+        // here. See this revision's `[deferred-scope]` marker for the
+        // outstanding p95-over-the-full-path assertion.
         let median = samples_ms[samples_ms.len() / 2];
         let in_budget = samples_ms.iter().filter(|ms| **ms <= 150).count();
         assert!(
