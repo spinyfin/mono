@@ -408,6 +408,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: merge_intent::migrate,
         },
         Migration {
+            id: "20261118_2100_metric_series_indexes".into(),
+            legacy_version: None,
+            apply: metric_series_db::migrate_metric_series_indexes,
+        },
+        Migration {
             id: "20261117_0212_no_op_completion_ready".into(),
             legacy_version: None,
             apply: |conn| {

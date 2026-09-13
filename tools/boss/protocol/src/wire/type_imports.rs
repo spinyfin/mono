@@ -57,6 +57,7 @@ pub(super) use crate::types::IdeaGraduationKind;
 pub(super) use crate::types::IdeaPatch;
 pub(super) use crate::types::LinkExternalRefInput;
 pub(super) use crate::types::ListDependenciesInput;
+pub(super) use crate::types::MetricFilter;
 pub(super) use crate::types::PrBodyView;
 pub(super) use crate::types::PrStatusView;
 pub(super) use crate::types::PrWorkItemMatch;

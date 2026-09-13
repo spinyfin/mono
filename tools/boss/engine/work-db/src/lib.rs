@@ -875,6 +875,11 @@ mod coordinator_guidance_cache;
 mod coordinator_handoff_store;
 mod coordinator_tmux;
 mod cost_report_db;
+mod metric_series_db;
+pub use metric_series_db::{
+    DIM_DRIVER, DIM_EFFORT_LEVEL, DIM_KIND, DIM_MODEL, DIM_PRODUCT, DIM_REASONING, DIM_REPO, DIM_STATUS, ExecutionFact,
+    MetricExecutionFactOptions, NONE_KEY, TaskFact,
+};
 mod create_entities;
 mod critical_priority;
 mod critical_requests;
