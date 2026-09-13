@@ -303,6 +303,44 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         XCTAssertNotEqual(a, b)
     }
 
+    func testSnapshotCacheKeepsLastVisibleSnapshotsWhileHidden() {
+        let workspace = WorkersWorkspaceModel()
+        let liveStates = LiveWorkerStateStore()
+        let slot = WorkerSlot(slotId: 1, idleFlavorCycle: 0)
+        let cache = WorkerSlotSnapshotCache(
+            workspace: workspace,
+            liveStates: liveStates,
+            liveStatusDisabledSlotIDs: []
+        )
+        let visibleSnapshots = cache.snapshots(
+            for: .bridgeCrew,
+            slots: [slot],
+            liveStates: liveStates,
+            liveStatusDisabledSlotIDs: [],
+            refresh: true
+        )
+
+        liveStates.update(states: [Self.makeLiveState(slotId: slot.slotId)])
+
+        let hiddenSnapshots = cache.snapshots(
+            for: .bridgeCrew,
+            slots: [slot],
+            liveStates: liveStates,
+            liveStatusDisabledSlotIDs: [],
+            refresh: false
+        )
+        let refreshedSnapshots = cache.snapshots(
+            for: .bridgeCrew,
+            slots: [slot],
+            liveStates: liveStates,
+            liveStatusDisabledSlotIDs: [],
+            refresh: true
+        )
+
+        XCTAssertEqual(hiddenSnapshots, visibleSnapshots)
+        XCTAssertNotEqual(refreshedSnapshots, visibleSnapshots)
+    }
+
     // MARK: - WorkersDetailView Equatable
 
     /// Closures must not participate in `==` — otherwise every ContentView

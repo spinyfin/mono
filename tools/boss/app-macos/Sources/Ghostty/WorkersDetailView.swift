@@ -159,7 +159,7 @@ struct WorkersDetailView: View, @MainActor Equatable {
 /// snapshot construction and a changed `WorkerGrid` input, while retaining
 /// the existing terminal-view hierarchy and its libghostty surfaces.
 @MainActor
-private final class WorkerSlotSnapshotCache {
+final class WorkerSlotSnapshotCache {
     private var snapshotsByPool: [AgentPoolKind: [WorkerSlotSnapshot]]
 
     init(
