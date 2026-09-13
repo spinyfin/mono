@@ -393,6 +393,7 @@ pub struct ConflictRemediationQueue {
     permits: Arc<Semaphore>,
     slots: Arc<Mutex<HashMap<String, SlotState>>>,
     cooldown: Duration,
+    clock: Arc<dyn Fn() -> Instant + Send + Sync>,
 }
 
 impl ConflictRemediationQueue {
@@ -404,11 +405,23 @@ impl ConflictRemediationQueue {
     /// Queue with explicit limits — tests use this to make the bound and the
     /// cooldown observable in a few milliseconds instead of minutes.
     pub fn with_limits(job: Arc<dyn ConflictRemediationJob>, max_concurrent: usize, cooldown: Duration) -> Self {
+        Self::with_clock(job, max_concurrent, cooldown, Arc::new(Instant::now))
+    }
+
+    /// [`with_limits`] with an explicit clock so cooldown tests can advance
+    /// time without sleeping. Production uses [`Instant::now`].
+    pub(crate) fn with_clock(
+        job: Arc<dyn ConflictRemediationJob>,
+        max_concurrent: usize,
+        cooldown: Duration,
+        clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+    ) -> Self {
         Self {
             job,
             permits: Arc::new(Semaphore::new(max_concurrent.max(1))),
             slots: Arc::new(Mutex::new(HashMap::new())),
             cooldown,
+            clock,
         }
     }
 
@@ -432,9 +445,10 @@ impl ConflictRemediationQueue {
             // Opportunistic prune so a long-lived engine doesn't accumulate
             // one map entry per PR it has ever remediated.
             let cooldown = self.cooldown;
+            let now = (self.clock)();
             slots.retain(|_, state| match state {
                 SlotState::InFlight => true,
-                SlotState::CompletedAt(at) => at.elapsed() < cooldown,
+                SlotState::CompletedAt(at) => now.saturating_duration_since(*at) < cooldown,
             });
             match slots.get(&key) {
                 Some(SlotState::InFlight) => return EnqueueOutcome::AlreadyInFlight,
@@ -449,6 +463,7 @@ impl ConflictRemediationQueue {
         let job = self.job.clone();
         let permits = self.permits.clone();
         let slots = self.slots.clone();
+        let clock = self.clock.clone();
         let candidate = candidate.clone();
         let attempt = attempt.clone();
         let probe = probe.clone();
@@ -460,6 +475,7 @@ impl ConflictRemediationQueue {
             let mut guard = SlotGuard {
                 slots,
                 key: key.clone(),
+                clock,
                 // Only meaningful once `started` is set. Left at
                 // `RetryAfterCooldown` so an unwind or a mid-run cancellation
                 // — the cases where we have no idea what state the ladder
@@ -524,6 +540,7 @@ impl ConflictRemediationQueue {
 struct SlotGuard {
     slots: Arc<Mutex<HashMap<String, SlotState>>>,
     key: String,
+    clock: Arc<dyn Fn() -> Instant + Send + Sync>,
     disposition: RemediationDisposition,
     started: bool,
 }
@@ -539,7 +556,7 @@ impl Drop for SlotGuard {
                 slots.remove(&self.key);
             }
             (true, RemediationDisposition::RetryAfterCooldown) => {
-                slots.insert(self.key.clone(), SlotState::CompletedAt(Instant::now()));
+                slots.insert(self.key.clone(), SlotState::CompletedAt((self.clock)()));
             }
         }
     }
@@ -547,10 +564,40 @@ impl Drop for SlotGuard {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use super::*;
     use crate::merge_poller::{OpenPrStatus, PrLifecycleState, PrReviewState};
+
+    /// Controllable Instant clock so cooldown tests advance time without a
+    /// real sleep. `origin` is `Instant::now()` at construction; `now()` is
+    /// that origin plus `offset_ms`.
+    struct ManualClock {
+        origin: Instant,
+        offset_ms: AtomicU64,
+    }
+
+    impl ManualClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                origin: Instant::now(),
+                offset_ms: AtomicU64::new(0),
+            })
+        }
+
+        fn now(&self) -> Instant {
+            self.origin + Duration::from_millis(self.offset_ms.load(Ordering::SeqCst))
+        }
+
+        fn advance(&self, d: Duration) {
+            self.offset_ms.fetch_add(d.as_millis() as u64, Ordering::SeqCst);
+        }
+
+        fn arc_fn(self: &Arc<Self>) -> Arc<dyn Fn() -> Instant + Send + Sync> {
+            let clock = Arc::clone(self);
+            Arc::new(move || clock.now())
+        }
+    }
 
     fn candidate(pr_url: &str) -> PendingMergeCheck {
         PendingMergeCheck {
@@ -738,7 +785,9 @@ mod tests {
             release,
             ..
         } = ParkingJob::parked_owing_retry();
-        let queue = ConflictRemediationQueue::with_limits(job, 2, Duration::from_millis(150));
+        let clock = ManualClock::new();
+        let cooldown = Duration::from_millis(150);
+        let queue = ConflictRemediationQueue::with_clock(job, 2, cooldown, clock.arc_fn());
         let pr = "https://github.com/foo/bar/pull/1";
 
         assert_eq!(
@@ -754,7 +803,7 @@ mod tests {
             "a PR whose ladder run just failed its rung-1 lease must not be immediately re-run",
         );
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        clock.advance(cooldown + Duration::from_millis(1));
         release.add_permits(1);
         assert_eq!(
             queue.try_enqueue(&candidate(pr), &attempt("att-3", pr), &probe(pr)),

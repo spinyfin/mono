@@ -109,89 +109,29 @@ fn pr_poll_schedule_observe_drain_and_reschedule() {
     assert!(schedule.next_due().is_none());
 }
 
-#[tokio::test]
-async fn activation_kick_quiesce_absorbs_rapid_repeats() {
-    use tokio::time::timeout;
-
-    let kick = Arc::new(Notify::new());
-    let quiesce_window = Duration::from_millis(200); // short for tests
-    let interval = Duration::from_secs(3600); // never fires
-
-    // Simulate: last run just finished.
-    let last_run_at = Instant::now();
-
-    // Fire a kick immediately (well within the quiesce window).
-    kick.notify_one();
-
-    // The 'wait loop should absorb the kick and NOT break out within
-    // a short window. We run one iteration of the select: if kick
-    // fires and elapsed < quiesce_window, the loop should continue
-    // (not break). We test this by trying to break out within 50 ms
-    // using only the kick arm; the timer is infinite so only the kick
-    // arm can fire.
-    let broke_out = timeout(Duration::from_millis(50), async {
-        loop {
-            let elapsed = last_run_at.elapsed();
-            let remaining = interval.saturating_sub(elapsed);
-            tokio::select! {
-                _ = tokio::time::sleep(remaining) => { return true; }
-                _ = kick.notified() => {
-                    let since_last = last_run_at.elapsed();
-                    if since_last >= quiesce_window {
-                        return true;
-                    }
-                    // absorbed — continue waiting
-                }
-            }
-        }
-    })
-    .await;
-
-    // The timeout must fire (broke_out = Err) because the kick was
-    // absorbed and the periodic timer (3600 s) never elapsed.
+#[test]
+fn activation_kick_quiesce_absorbs_rapid_repeats() {
+    // Anchor `now` ahead of process start so subtracting the age does
+    // not depend on host uptime.
+    let now = Instant::now() + Duration::from_secs(10);
+    let last_run_at = now - Duration::from_millis(50);
+    let quiesce_window = Duration::from_millis(200);
     assert!(
-        broke_out.is_err(),
-        "kick within quiesce window must be absorbed, not break out of wait",
+        !kick_clears_quiesce(last_run_at, now, quiesce_window),
+        "kick within the quiesce window must be absorbed",
     );
 }
 
-/// Acceptance test: a kick that arrives after the quiesce window
-/// has elapsed triggers an immediate pass (breaks out of the wait).
-#[tokio::test]
-async fn activation_kick_after_quiesce_window_triggers_pass() {
-    use tokio::time::timeout;
-
-    let kick = Arc::new(Notify::new());
-    let quiesce_window = Duration::from_millis(1); // essentially instant
-    let interval = Duration::from_secs(3600);
-
-    // Simulate: last run finished a long time ago (100 ms > 1 ms quiesce).
-    let last_run_at = Instant::now() - Duration::from_millis(100);
-
-    // Fire a kick.
-    kick.notify_one();
-
-    // The 'wait loop should break out immediately because elapsed > quiesce.
-    let broke_out = timeout(Duration::from_millis(500), async {
-        loop {
-            let elapsed = last_run_at.elapsed();
-            let remaining = interval.saturating_sub(elapsed);
-            tokio::select! {
-                _ = tokio::time::sleep(remaining) => { return true; }
-                _ = kick.notified() => {
-                    let since_last = last_run_at.elapsed();
-                    if since_last >= quiesce_window {
-                        return true; // break out — trigger pass
-                    }
-                }
-            }
-        }
-    })
-    .await;
-
+/// A kick that arrives after the quiesce window has elapsed triggers
+/// an immediate pass.
+#[test]
+fn activation_kick_after_quiesce_window_triggers_pass() {
+    let now = Instant::now() + Duration::from_secs(10);
+    let last_run_at = now - Duration::from_millis(100);
+    let quiesce_window = Duration::from_millis(1);
     assert!(
-        broke_out.is_ok(),
-        "kick after quiesce window must break out of wait loop",
+        kick_clears_quiesce(last_run_at, now, quiesce_window),
+        "kick after the quiesce window must start a sweep",
     );
 }
 
@@ -217,7 +157,8 @@ async fn pr_reconcile_requests_arm_reconciles_once_and_parks_after_close() {
     let mut sub = bus.subscribe(TopicFilter::kind(EventKind::PrReconcileRequested));
 
     let quiesce_window = Duration::from_millis(1);
-    let last_run_at = Instant::now() - Duration::from_millis(100);
+    let now = Instant::now() + Duration::from_secs(1);
+    let last_run_at = now - Duration::from_millis(100);
     let mut pr_requests_closed = false;
     let mut reconciled: Vec<String> = Vec::new();
     let mut none_branch_hits = 0u32;
@@ -241,8 +182,7 @@ async fn pr_reconcile_requests_arm_reconciles_once_and_parks_after_close() {
             event = sub.recv(), if !pr_requests_closed => {
                 match event {
                     Some(Event::PrReconcileRequested { pr_url }) => {
-                        let since_last = last_run_at.elapsed();
-                        if since_last >= quiesce_window {
+                        if kick_clears_quiesce(last_run_at, now, quiesce_window) {
                             reconciled.push(pr_url);
                         }
                     }

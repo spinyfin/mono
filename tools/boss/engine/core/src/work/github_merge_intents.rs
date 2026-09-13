@@ -286,13 +286,24 @@ mod tests {
             "{}",
         )
         .unwrap();
+        // Pin the intent's `created_at` so the dequeue event below is
+        // "later" by construction rather than by comparison with the live
+        // clock the insert stamped (a fixed far-future event epoch would
+        // flip this test on the day the real clock passed it).
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE github_merge_intents SET created_at = '100' WHERE work_item_id = ?1",
+                params![task],
+            )
+            .unwrap();
 
         assert!(
             db.retire_github_merge_intent_on_dequeue(
                 &task,
                 "https://github.com/acme/widgets/pull/1",
                 "other-head",
-                9_999_999_999,
+                200,
             )
             .unwrap()
             .is_none()
@@ -304,13 +315,8 @@ mod tests {
         );
 
         assert_eq!(
-            db.retire_github_merge_intent_on_dequeue(
-                &task,
-                "https://github.com/acme/widgets/pull/1",
-                "head-1",
-                9_999_999_999,
-            )
-            .unwrap(),
+            db.retire_github_merge_intent_on_dequeue(&task, "https://github.com/acme/widgets/pull/1", "head-1", 200,)
+                .unwrap(),
             Some(Some("queued".to_owned()))
         );
         assert!(

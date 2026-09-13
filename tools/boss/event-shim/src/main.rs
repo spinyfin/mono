@@ -333,14 +333,24 @@ fn reject_delivery(socket_path: &str, reason: &str) -> Result<()> {
     Err(anyhow!("engine rejected hook event: {reason}"))
 }
 
+/// Wall time remaining until `deadline` as of `now`, saturating at zero.
+fn remaining_at(deadline: Instant, now: Instant) -> Duration {
+    deadline.saturating_duration_since(now)
+}
+
 /// Wall time remaining until `deadline`, saturating at zero.
 fn remaining(deadline: Instant) -> Duration {
-    deadline.saturating_duration_since(Instant::now())
+    remaining_at(deadline, Instant::now())
+}
+
+/// Whether the shim's total wall-clock budget has already run out as of `now`.
+fn budget_exhausted_at(deadline: Instant, now: Instant) -> bool {
+    remaining_at(deadline, now).is_zero()
 }
 
 /// Whether the shim's total wall-clock budget has already run out.
 fn budget_exhausted(deadline: Instant) -> bool {
-    remaining(deadline).is_zero()
+    budget_exhausted_at(deadline, Instant::now())
 }
 
 /// The write timeout to use for a connect happening now: the smaller of
@@ -437,6 +447,12 @@ fn connect_once(path: &str, write_timeout: Duration) -> Result<UnixStream> {
 /// soon as the budget runs out or every attempt fails, whichever comes
 /// first.
 fn connect_with_retry(path: &str, deadline: Instant) -> Result<UnixStream> {
+    connect_with_retry_using(path, deadline, thread::sleep)
+}
+
+/// [`connect_with_retry`] with an explicit sleeper so tests can prove an
+/// expired budget never enters the retry schedule.
+fn connect_with_retry_using(path: &str, deadline: Instant, sleep: impl Fn(Duration)) -> Result<UnixStream> {
     if budget_exhausted(deadline) {
         return Err(anyhow!("shim wall-clock budget exhausted before first connect attempt"));
     }
@@ -450,7 +466,7 @@ fn connect_with_retry(path: &str, deadline: Instant) -> Result<UnixStream> {
         if time_left.is_zero() {
             return Err(last_err.unwrap_or_else(|| anyhow!("shim wall-clock budget exhausted during connect retries")));
         }
-        thread::sleep(delay.min(time_left));
+        sleep(delay.min(time_left));
         if budget_exhausted(deadline) {
             return Err(last_err.unwrap_or_else(|| anyhow!("shim wall-clock budget exhausted during connect retries")));
         }
@@ -855,17 +871,24 @@ mod tests {
     }
 
     #[test]
+    fn remaining_at_is_zero_once_now_reaches_the_deadline() {
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(1);
+        assert!(remaining_at(t0, later).is_zero());
+        assert!(budget_exhausted_at(t0, later));
+        assert_eq!(remaining_at(later, t0), Duration::from_secs(1));
+        assert!(!budget_exhausted_at(later, t0));
+    }
+
+    #[test]
     fn connect_with_retry_skips_attempts_after_budget_expires() {
         let dir = tempfile::TempDir::new().unwrap();
         let socket = dir.path().join("never-bound.sock");
-        let start = Instant::now();
-        let result = connect_with_retry(socket.to_str().unwrap(), Instant::now() - Duration::from_secs(1));
+        let result = connect_with_retry_using(socket.to_str().unwrap(), Instant::now(), |_| {
+            panic!("an expired budget must skip the retry schedule")
+        });
 
         assert!(result.is_err(), "an expired budget must reject the connect");
-        assert!(
-            start.elapsed() < Duration::from_millis(100),
-            "an expired budget must skip the retry schedule"
-        );
     }
 
     #[test]
@@ -1024,19 +1047,14 @@ mod tests {
         std::fs::write(&buf, original).unwrap();
 
         let socket = dir.path().join("never-bound.sock");
-        let start = Instant::now();
-        let result = drain_buffer(
-            socket.to_str().unwrap(),
-            &buf,
-            None,
-            Instant::now() - Duration::from_secs(1),
+        let deadline = Instant::now();
+        assert!(
+            budget_exhausted_at(deadline, Instant::now()),
+            "the fixture deadline must already be past so drain never reaches connect"
         );
+        let result = drain_buffer(socket.to_str().unwrap(), &buf, None, deadline);
 
         assert!(result.is_err(), "an expired budget must stop the drain");
-        assert!(
-            start.elapsed() < Duration::from_millis(100),
-            "an expired budget must not attempt a socket connect"
-        );
         assert_eq!(std::fs::read(&buf).unwrap(), original);
     }
 

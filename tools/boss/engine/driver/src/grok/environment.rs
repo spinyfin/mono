@@ -339,8 +339,17 @@ fn wait_for_grok_auth_refresh(auth_path: &Path) -> anyhow::Result<()> {
 }
 
 fn wait_for_grok_auth_refresh_with_timeout(auth_path: &Path, timeout: Duration) -> anyhow::Result<()> {
+    wait_for_grok_auth_refresh_at(auth_path, timeout, Instant::now, std::thread::sleep)
+}
+
+fn wait_for_grok_auth_refresh_at(
+    auth_path: &Path,
+    timeout: Duration,
+    now: impl Fn() -> Instant,
+    sleep: impl Fn(Duration),
+) -> anyhow::Result<()> {
     let lock_path = grok_auth_lock_path(auth_path);
-    let deadline = Instant::now() + timeout;
+    let deadline = now() + timeout;
     loop {
         let body = match fs::read_to_string(&lock_path) {
             Ok(body) => body,
@@ -366,7 +375,7 @@ fn wait_for_grok_auth_refresh_with_timeout(auth_path: &Path, timeout: Duration) 
                     );
                     return Ok(());
                 }
-                if Instant::now() >= deadline {
+                if now() >= deadline {
                     // Waiting is an optimisation, not a safety property. Fall
                     // through so ensure_auth_file_ready_for_probe and the
                     // bounded grok models probe can fail closed on real damage.
@@ -388,7 +397,7 @@ fn wait_for_grok_auth_refresh_with_timeout(auth_path: &Path, timeout: Duration) 
                 // Partial writes are observable while Grok creates the pidfile.
                 // Retry until the deadline rather than aborting a spawn on a
                 // single transient read of foreign state.
-                if Instant::now() >= deadline {
+                if now() >= deadline {
                     return Err(err).context(format!(
                         "Grok refresh lock {} remained malformed after {}s",
                         lock_path.display(),
@@ -402,7 +411,7 @@ fn wait_for_grok_auth_refresh_with_timeout(auth_path: &Path, timeout: Duration) 
                 );
             }
         }
-        std::thread::sleep(AUTH_LOCK_POLL);
+        sleep(AUTH_LOCK_POLL);
     }
 }
 
@@ -644,6 +653,7 @@ mod tests {
     use super::*;
     use crate::grok::GROK_HOMES_ENV_TEST_LOCK;
     use std::ffi::OsString;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     struct EnvGuard {
@@ -918,12 +928,24 @@ mod tests {
         let auth = tmp.path().join("auth.json");
         fs::write(grok_auth_lock_path(&auth), "not-a-pid").unwrap();
 
+        let origin = Instant::now();
+        let offset_ms = AtomicU64::new(0);
+        let sleeps = AtomicUsize::new(0);
+        let now = || origin + Duration::from_millis(offset_ms.load(Ordering::SeqCst));
+        let sleep = |d: Duration| {
+            sleeps.fetch_add(1, Ordering::SeqCst);
+            offset_ms.fetch_add(d.as_millis() as u64, Ordering::SeqCst);
+        };
+
         // Parse failures are retried until the deadline; only then fail closed.
-        let started = Instant::now();
-        let err = wait_for_grok_auth_refresh_with_timeout(&auth, Duration::from_millis(120)).unwrap_err();
+        let err = wait_for_grok_auth_refresh_at(&auth, Duration::from_millis(120), now, sleep).unwrap_err();
         assert!(
-            started.elapsed() >= Duration::from_millis(100),
+            sleeps.load(Ordering::SeqCst) >= 2,
             "malformed body must be retried until the deadline, not fail on first read"
+        );
+        assert!(
+            offset_ms.load(Ordering::SeqCst) >= 100,
+            "retries must consume the wait window on the injected clock"
         );
         let message = format!("{err:#}");
         assert!(

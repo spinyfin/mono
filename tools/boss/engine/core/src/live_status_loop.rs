@@ -835,7 +835,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         // The select! arm for the timer floor only matters while we're
         // in `Working` and have a `last_success_at` to count against.
         // Outside of that, idle out the loop on the channel only.
-        let timer_remaining = compute_timer_delay(last_activity, last_success_at, idle_since);
+        let timer_remaining = compute_timer_delay(last_activity, last_success_at, idle_since, Instant::now());
         let (trigger, synthetic) = tokio::select! {
             t = rx.recv() => match t {
                 Some(t) => (t, false),
@@ -1124,10 +1124,13 @@ fn compute_timer_delay(
     activity: WorkerActivity,
     last_success_at: Option<Instant>,
     idle_since: Option<Instant>,
+    now: Instant,
 ) -> Duration {
     match activity {
         WorkerActivity::Working => {
-            let elapsed = last_success_at.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
+            let elapsed = last_success_at
+                .map(|t| now.saturating_duration_since(t))
+                .unwrap_or(Duration::ZERO);
             WORKING_TIMER_FLOOR
                 .saturating_sub(elapsed)
                 .max(Duration::from_millis(50))
@@ -1135,7 +1138,7 @@ fn compute_timer_delay(
         WorkerActivity::Idle => {
             if let Some(t) = idle_since {
                 IDLE_CLEAR_AFTER
-                    .saturating_sub(t.elapsed())
+                    .saturating_sub(now.saturating_duration_since(t))
                     .max(Duration::from_millis(50))
             } else {
                 Duration::from_secs(3_600)
@@ -1610,34 +1613,39 @@ mod tests {
 
     #[test]
     fn timer_delay_working_uses_floor_until_cooldown_satisfied() {
+        // Anchor `now` ahead of the process start Instant so subtracting
+        // the 10s age does not depend on host uptime.
+        let now = Instant::now() + Duration::from_secs(60);
         // First Working tick with no prior success: full timer floor.
-        let d = compute_timer_delay(WorkerActivity::Working, None, None);
-        assert!(d >= Duration::from_secs(55), "expected ~60s, got {d:?}");
-        // Just after a successful set: timer ticks down.
-        let recent = Instant::now() - Duration::from_secs(10);
-        let d = compute_timer_delay(WorkerActivity::Working, Some(recent), None);
-        assert!(d <= Duration::from_secs(50) && d >= Duration::from_secs(45));
+        let d = compute_timer_delay(WorkerActivity::Working, None, None, now);
+        assert_eq!(d, WORKING_TIMER_FLOOR);
+        // Just after a successful set: timer ticks down by the pinned age.
+        let recent = now - Duration::from_secs(10);
+        let d = compute_timer_delay(WorkerActivity::Working, Some(recent), None, now);
+        assert_eq!(d, Duration::from_secs(50));
     }
 
     #[test]
     fn timer_delay_idle_clamps_to_grace_remaining() {
-        let recent = Instant::now() - Duration::from_secs(5);
-        let d = compute_timer_delay(WorkerActivity::Idle, None, Some(recent));
-        assert!(d <= Duration::from_secs(26) && d >= Duration::from_secs(20));
+        let now = Instant::now() + Duration::from_secs(60);
+        let recent = now - Duration::from_secs(5);
+        let d = compute_timer_delay(WorkerActivity::Idle, None, Some(recent), now);
+        assert_eq!(d, Duration::from_secs(25));
     }
 
     #[test]
     fn timer_delay_parks_in_quiet_states() {
         // Spawning / Terminated / Errored / WaitingForInput all park
         // the loop on the channel.
+        let now = Instant::now();
         for activity in [
             WorkerActivity::Spawning,
             WorkerActivity::Terminated,
             WorkerActivity::Errored,
             WorkerActivity::WaitingForInput,
         ] {
-            let d = compute_timer_delay(activity, None, None);
-            assert!(d >= Duration::from_secs(60), "{activity:?}: {d:?}");
+            let d = compute_timer_delay(activity, None, None, now);
+            assert_eq!(d, Duration::from_secs(3_600), "{activity:?}");
         }
     }
 

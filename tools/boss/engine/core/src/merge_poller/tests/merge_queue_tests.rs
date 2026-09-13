@@ -1239,12 +1239,19 @@ async fn observed_github_dequeue_retires_intent_and_clears_merging() {
         product_id: product.id.clone(),
         pr_url: "https://github.com/foo/bar/pull/2".to_owned(),
     };
+    // The intent row was just stamped with the live clock, and the retire
+    // predicate is `intent.created_at < event.created_at`, so the dequeue
+    // event must be later than *now* at runtime — a fixed future literal
+    // would silently flip this test on the day it passed.
+    let event_created_at = chrono::DateTime::from_timestamp(boss_engine_utils::epoch_time::now_epoch_secs() + 3600, 0)
+        .unwrap()
+        .to_rfc3339();
     let mut events = HashMap::new();
     events.insert(
         candidate.pr_url.clone(),
         vec![MergeQueueDequeueEvent {
             reason: "manual_removal".to_owned(),
-            created_at: Some("2100-01-01T00:00:00Z".to_owned()),
+            created_at: Some(event_created_at),
             pr_head_oid: Some("head-2".to_owned()),
             before_commit_oid: None,
         }],
