@@ -332,6 +332,51 @@ impl WorkerCompletionHandler {
         self.feature_flags.is_enabled("conflict_ladder_mechanical_rebase")
     }
 
+    /// Queue the rollout-gated immutable source capture after a lifecycle
+    /// seam has already verified and bound a PR to this execution. The
+    /// reconciler resolves revision executions to the owning root series.
+    pub(crate) fn reconcile_review_guide_source_for_execution(
+        &self,
+        execution_id: &str,
+        pr_url: &str,
+        trigger: crate::work::PrSourceCaptureTrigger,
+    ) {
+        crate::review_guide_capture::reconcile_review_guide_source_for_execution(
+            self.work_db.clone(),
+            self.feature_flags.clone(),
+            execution_id,
+            pr_url,
+            trigger,
+        );
+    }
+
+    /// Queue a source capture from the merge poller's successful, already
+    /// current probe without issuing a second endpoint observation.
+    pub(crate) fn reconcile_review_guide_source_from_probe(
+        &self,
+        root_task_id: &str,
+        pr_url: &str,
+        observed: boss_pr_review_sources::PinnedComparison,
+        observation_sequence: i64,
+    ) {
+        crate::review_guide_capture::reconcile_review_guide_source(
+            self.work_db.clone(),
+            self.feature_flags.clone(),
+            crate::review_guide_capture::SourceCaptureRequest::builder()
+                .root_task_id(root_task_id)
+                .pr_url(pr_url)
+                .trigger(crate::work::PrSourceCaptureTrigger::Poller)
+                .observed(observed)
+                .observation_sequence(observation_sequence)
+                .build(),
+        );
+    }
+
+    pub(crate) fn review_guide_source_capture_enabled(&self) -> bool {
+        self.feature_flags
+            .is_enabled(crate::review_guide_capture::REVIEW_GUIDE_SOURCE_CAPTURE_FLAG)
+    }
+
     /// Whether each eligible PR is dispatched as a three-leaf review batch.
     pub fn review_batch_fanout_enabled(&self) -> bool {
         self.feature_flags.is_enabled("review_batch_fanout")

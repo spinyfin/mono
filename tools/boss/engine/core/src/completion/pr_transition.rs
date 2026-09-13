@@ -629,6 +629,11 @@ impl WorkerCompletionHandler {
             elapsed_ms = record_started.elapsed().as_millis(),
             "pr completion: execution terminalized; teardown in flight",
         );
+        self.reconcile_review_guide_source_for_execution(
+            execution_id,
+            &pr_url,
+            crate::work::PrSourceCaptureTrigger::Completion,
+        );
         // Clear the staged URL now that the DB write succeeded.
         // Deliberately ordered after `record_worker_pr_completion` so a
         // failed DB write leaves the cache intact for the worker's next

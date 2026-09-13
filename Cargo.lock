@@ -859,6 +859,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bon",
  "boss-command-runner",
  "boss-gh-telemetry",
  "jsonwebtoken",
@@ -946,6 +947,18 @@ dependencies = [
  "boss-protocol",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "boss-pr-review-sources"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bon",
+ "boss-github",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

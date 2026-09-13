@@ -795,6 +795,22 @@ pub(super) async fn dispatch_live_worker_state(
                                     ?outcome,
                                     "pr_url_capture: bound PR URL from worker progress stream",
                                 );
+                                // A publishing command has supplied both a
+                                // repository-validated PR URL and a verified
+                                // execution association. Capture source
+                                // material immediately, before Stop or the
+                                // next merge-poller pass; the reconciler
+                                // itself remains rollout-gated and resolves
+                                // revision executions to their canonical root.
+                                if finalization_armed {
+                                    crate::review_guide_capture::reconcile_review_guide_source_for_execution(
+                                        server_state.work_db.clone(),
+                                        server_state.feature_flags.clone(),
+                                        run_id,
+                                        &pr_url,
+                                        crate::work::PrSourceCaptureTrigger::Creation,
+                                    );
+                                }
                             }
                             crate::pr_url_capture::RecordCommandObservationOutcome::Unchanged => {
                                 tracing::debug!(
