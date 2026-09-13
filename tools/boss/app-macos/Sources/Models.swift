@@ -11,7 +11,7 @@ import Foundation
 // Models+Products.swift, Models+WorkBoard.swift, Models+Transcript.swift,
 // Models+WorkerActivity.swift, Models+CI.swift, Models+Engine.swift,
 // Models+AttentionItems.swift, Models+GitHubAuth.swift,
-// Models+WorkCardSnapshot.swift.
+// Models+WorkCardSnapshot.swift, Models+WorkerSlotSnapshot.swift.
 // ===========================================================================
 
 struct WorkTask: Identifiable, Hashable {

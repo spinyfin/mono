@@ -24,16 +24,34 @@ enum AgentPoolKind: String, CaseIterable, Identifiable {
     }
 }
 
-struct WorkersDetailView: View {
+/// Agents-tab shell. Observes the workspace and the live-state store —
+/// the two objects whose publishes actually change slot chrome — and
+/// receives live-status flags as values from `ContentView`. It does
+/// **not** observe `ChatViewModel`: that type has ~100 `@Published`
+/// properties, and a grid that subscribed to it re-laid-out all 40
+/// slots on every unrelated write (transcript chunk, hover, panel
+/// width). Closures stay outside `==` so a parent rebuild of the
+/// toggle handler cannot defeat `.equatable()` at the call site.
+///
+/// The four pool grids stay permanently in the `ZStack` so switching
+/// pools is a display filter — no `dismantleNSView`, no libghostty
+/// surface teardown. Hidden grids skip body evaluation via
+/// `WorkerGrid.equatable()` when their snapshots have not moved.
+struct WorkersDetailView: View, @MainActor Equatable {
     @ObservedObject var workspace: WorkersWorkspaceModel
     @ObservedObject var liveStates: LiveWorkerStateStore
-    /// View model that owns the per-slot live-status enabled flags
-    /// and exposes the RPC to toggle them. Plumbed in from the
-    /// `ContentView` parent so this view can stay a thin shell over
-    /// `ChatViewModel`'s state.
-    @ObservedObject var liveStatusModel: ChatViewModel
+    let tmuxHostingEnabled: Bool
+    let liveStatusDisabledSlotIDs: Set<Int>
+    let onToggleLiveStatus: (Int, Bool) -> Void
 
     @State private var selectedPool: AgentPoolKind = .bridgeCrew
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.workspace === rhs.workspace
+            && lhs.liveStates === rhs.liveStates
+            && lhs.tmuxHostingEnabled == rhs.tmuxHostingEnabled
+            && lhs.liveStatusDisabledSlotIDs == rhs.liveStatusDisabledSlotIDs
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -43,49 +61,47 @@ struct WorkersDetailView: View {
             // switching pools is a pure display filter — no SwiftUI identity
             // churn, no dismantleNSView, no libghostty surface teardown.
             // Only the visible grid receives hit-testing and is rendered.
+            // Do not replace this ZStack with `if selectedPool ==` (or a
+            // lazy stack): `GhosttyTerminalView.dismantleNSView` frees the
+            // surface, and remounting restarts the worker's claude session.
             ZStack {
                 // Bridge Crew and Lower Decks are the two pages of the same
                 // interactive pool, filtered out of the flat `slots` array.
-                WorkerGrid(
-                    runtime: workspace.runtime,
-                    slots: workspace.bridgeCrewSlots,
-                    liveStates: liveStates,
-                    liveStatusModel: liveStatusModel
-                )
-                .opacity(selectedPool == .bridgeCrew ? 1 : 0)
-                .allowsHitTesting(selectedPool == .bridgeCrew)
+                grid(for: workspace.bridgeCrewSlots)
+                    .opacity(selectedPool == .bridgeCrew ? 1 : 0)
+                    .allowsHitTesting(selectedPool == .bridgeCrew)
 
-                WorkerGrid(
-                    runtime: workspace.runtime,
-                    slots: workspace.lowerDecksSlots,
-                    liveStates: liveStates,
-                    liveStatusModel: liveStatusModel
-                )
-                .opacity(selectedPool == .lowerDecks ? 1 : 0)
-                .allowsHitTesting(selectedPool == .lowerDecks)
+                grid(for: workspace.lowerDecksSlots)
+                    .opacity(selectedPool == .lowerDecks ? 1 : 0)
+                    .allowsHitTesting(selectedPool == .lowerDecks)
 
-                WorkerGrid(
-                    runtime: workspace.runtime,
-                    slots: workspace.automationSlots,
-                    liveStates: liveStates,
-                    liveStatusModel: liveStatusModel,
-                    columns: 3
-                )
-                .opacity(selectedPool == .automations ? 1 : 0)
-                .allowsHitTesting(selectedPool == .automations)
+                grid(for: workspace.automationSlots, columns: 3)
+                    .opacity(selectedPool == .automations ? 1 : 0)
+                    .allowsHitTesting(selectedPool == .automations)
 
-                WorkerGrid(
-                    runtime: workspace.runtime,
-                    slots: workspace.reviewSlots,
-                    liveStates: liveStates,
-                    liveStatusModel: liveStatusModel
-                )
-                .opacity(selectedPool == .reviewers ? 1 : 0)
-                .allowsHitTesting(selectedPool == .reviewers)
+                grid(for: workspace.reviewSlots)
+                    .opacity(selectedPool == .reviewers ? 1 : 0)
+                    .allowsHitTesting(selectedPool == .reviewers)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(Color(nsColor: .separatorColor))
+    }
+
+    private func grid(for slots: [WorkerSlot], columns: Int = 4) -> some View {
+        WorkerGrid(
+            runtime: workspace.runtime,
+            snapshots: slots.map { slot in
+                WorkerSlotSnapshot.build(
+                    slot: slot,
+                    liveState: liveStates.bySlot[slot.slotId],
+                    liveStatusEnabled: !liveStatusDisabledSlotIDs.contains(slot.slotId)
+                )
+            },
+            onToggleLiveStatus: onToggleLiveStatus,
+            columns: columns
+        )
+        .equatable()
     }
 
     private var poolPickerHeader: some View {
@@ -102,7 +118,7 @@ struct WorkersDetailView: View {
             }
             .pickerStyle(.segmented)
             .frame(maxWidth: 460)
-            if !liveStatusModel.tmuxHostingEnabled {
+            if !tmuxHostingEnabled {
                 LegacyHostingBadge()
             }
             Spacer()
@@ -138,34 +154,41 @@ private struct LegacyHostingBadge: View {
     }
 }
 
-private struct WorkerGrid: View {
+/// Eager 4-column (or 3-column automations) grid. Not lazy: every slot
+/// of a pool is on-screen in this full-bleed layout, and a `LazyVStack`
+/// would let SwiftUI dismantle off-screen `NSViewRepresentable`s —
+/// `GhosttyTerminalView.dismantleNSView` frees the libghostty surface.
+/// Equatable over the snapshot array so a live-state tick in another
+/// pool skips this grid's body.
+private struct WorkerGrid: View, @MainActor Equatable {
     let runtime: GhosttyRuntime
-    let slots: [WorkerSlot]
-    @ObservedObject var liveStates: LiveWorkerStateStore
-    @ObservedObject var liveStatusModel: ChatViewModel
+    let snapshots: [WorkerSlotSnapshot]
+    let onToggleLiveStatus: (Int, Bool) -> Void
     var columns: Int = 4
 
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.runtime === rhs.runtime
+            && lhs.snapshots == rhs.snapshots
+            && lhs.columns == rhs.columns
+    }
+
     var body: some View {
-        let rows = stride(from: 0, to: slots.count, by: columns).map { start in
-            Array(slots[start..<min(start + columns, slots.count)])
+        let rows = stride(from: 0, to: snapshots.count, by: columns).map { start in
+            Array(snapshots[start..<min(start + columns, snapshots.count)])
         }
 
         VStack(spacing: 1) {
             ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
                 HStack(spacing: 1) {
-                    ForEach(row) { slot in
+                    ForEach(row, id: \.slotId) { snapshot in
                         WorkerSlotView(
                             runtime: runtime,
-                            slot: slot,
-                            liveState: liveStates.bySlot[slot.slotId],
-                            liveStatusEnabled: liveStatusModel.isLiveStatusEnabled(slotId: slot.slotId),
+                            snapshot: snapshot,
                             onToggleLiveStatus: { enabled in
-                                liveStatusModel.setLiveStatusEnabled(
-                                    slotId: slot.slotId,
-                                    enabled: enabled
-                                )
+                                onToggleLiveStatus(snapshot.slotId, enabled)
                             }
                         )
+                        .equatable()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 }
@@ -174,18 +197,21 @@ private struct WorkerGrid: View {
     }
 }
 
-private struct WorkerSlotView: View {
+/// One worker slot. Equatable over `WorkerSlotSnapshot` so
+/// `.equatable()` at the call site skips body evaluation when this
+/// slot's own data has not changed. Closures are outside `==`.
+///
+/// The libghostty `NSViewRepresentable` lives in `WorkerPaneTerminalView`,
+/// which observes the session independently: skipping this body's
+/// evaluation leaves that representable mounted (no `dismantleNSView`).
+struct WorkerSlotView: View, @MainActor Equatable {
     let runtime: GhosttyRuntime
-    let slot: WorkerSlot
-    let liveState: WorkerLiveState?
-    /// Whether the live-status summarizer is currently enabled for
-    /// this slot. Drives the small toggle in the slot header (Q9
-    /// per-worker off-switch).
-    let liveStatusEnabled: Bool
-    /// Closure the toggle calls when the human flips the switch. The
-    /// parent threads this through to `ChatViewModel`, which sends
-    /// the RPC and updates the local mirror.
+    let snapshot: WorkerSlotSnapshot
     let onToggleLiveStatus: (Bool) -> Void
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.snapshot == rhs.snapshot
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -198,11 +224,11 @@ private struct WorkerSlotView: View {
 
     @ViewBuilder
     private var slotBody: some View {
-        if let session = slot.session {
+        if let session = snapshot.session {
             WorkerPaneTerminalView(
                 runtime: runtime,
                 session: session,
-                liveState: liveState
+                liveStatePresent: snapshot.live != nil
             )
             // Pin view identity to the session, not just to this `if`
             // branch's position in the tree. A slot can be released and
@@ -226,12 +252,12 @@ private struct WorkerSlotView: View {
 
     /// Idle / free slot treatment: large character portrait + crew name
     /// + a stable in-character recreational flavor line. The line is
-    /// keyed on `slot.idleFlavorCycle`, which the workspace model
+    /// keyed on `snapshot.idleFlavorCycle`, which the workspace model
     /// bumps when the slot re-enters idle, so within one idle bout
     /// the line never flickers.
     @ViewBuilder
     private var idlePaneView: some View {
-        let character = TrekCharacter.forSlot(slot.slotId)
+        let character = TrekCharacter.forSlot(snapshot.slotId)
         VStack(spacing: 14) {
             Spacer()
             if let character {
@@ -246,25 +272,25 @@ private struct WorkerSlotView: View {
                 Text(character.displayName)
                     .font(.title3.weight(.semibold))
                     .foregroundStyle(Color.white.opacity(0.85))
-                Text(TrekIdleFlavor.line(for: character, cycle: slot.idleFlavorCycle))
+                Text(TrekIdleFlavor.line(for: character, cycle: snapshot.idleFlavorCycle))
                     .font(.callout)
                     .foregroundStyle(Color.white.opacity(0.6))
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 24)
                     .lineLimit(3)
-            } else if WorkersWorkspaceModel.lowerDecksSlotRange.contains(slot.slotId) {
+            } else if WorkersWorkspaceModel.lowerDecksSlotRange.contains(snapshot.slotId) {
                 // Lower Decks has no bespoke portrait asset, but it is still a
                 // real crew: show the canonical name (same `WorkerNames` source
                 // as the running-pane title) so the page reads as a roster
                 // rather than bare slot numbers.
-                Text(WorkerNames.name(forSlot: slot.slotId))
+                Text(WorkerNames.name(forSlot: snapshot.slotId))
                     .font(.title3.weight(.semibold))
                     .foregroundStyle(Color.white.opacity(0.85))
                 Text("Free")
                     .font(.caption.weight(.medium))
                     .foregroundStyle(Color.white.opacity(0.7))
             } else {
-                Text("Slot \(slot.slotId)")
+                Text("Slot \(snapshot.slotId)")
                     .font(.caption2)
                     .foregroundStyle(Color.white.opacity(0.45))
                 Text("Free")
@@ -279,7 +305,7 @@ private struct WorkerSlotView: View {
 
     private var slotHeader: some View {
         HStack(spacing: 8) {
-            if let character = TrekCharacter.forSlot(slot.slotId),
+            if let character = TrekCharacter.forSlot(snapshot.slotId),
                let nsImage = TrekIconAssets.image(character, size: .small) {
                 Image(nsImage: nsImage)
                     .resizable()
@@ -299,15 +325,17 @@ private struct WorkerSlotView: View {
 
             // Prefer engine-supplied LiveWorkerState — its activity is
             // driven by hook events rather than a screen-scrape that
-            // always rendered "Agent Unknown". Fall back to the legacy
-            // paneMonitorState pill until the worker's first hook fires.
-            if let live = liveState {
+            // always rendered "Agent Unknown". Fall back to a session-
+            // observing pill until the worker's first hook fires, so
+            // `.equatable()` skipping this body does not freeze the
+            // fallback chrome.
+            if let live = snapshot.live {
                 statusPill(
                     live.activity.label,
                     color: liveActivityColor(live.activity)
                 )
-            } else if let state = slot.session?.paneMonitorState {
-                statusPill(state.label, color: paneMonitorStateColor(state))
+            } else if let session = snapshot.session {
+                WorkerSlotFallbackMonitorPill(session: session)
             }
 
             liveStatusToggle
@@ -325,7 +353,7 @@ private struct WorkerSlotView: View {
     /// trade-off so a curious user understands what the icon does.
     @ViewBuilder
     private var liveStatusToggle: some View {
-        let enabled = liveStatusEnabled
+        let enabled = snapshot.liveStatusEnabled
         Button {
             onToggleLiveStatus(!enabled)
         } label: {
@@ -354,8 +382,8 @@ private struct WorkerSlotView: View {
     }
 
     private var slotTooltip: String {
-        let base = "Worker \(slot.slotId)"
-        if let runId = slot.runId {
+        let base = "Worker \(snapshot.slotId)"
+        if let runId = snapshot.runId {
             return "\(base) · run \(runId)"
         }
         return "\(base) · idle"
@@ -371,19 +399,19 @@ private struct WorkerSlotView: View {
     /// and identifying the task without the gerund connector.
     @ViewBuilder
     private var slotTaskLine: some View {
-        let name = WorkerNames.name(forSlot: slot.slotId)
+        let name = WorkerNames.name(forSlot: snapshot.slotId)
         let text: String = {
-            if let summary = slot.summary, !summary.isEmpty {
+            if let summary = snapshot.summary, !summary.isEmpty {
                 // Success path: Claude-generated gerund phrase.
                 // Preserved verbatim — do NOT change this branch.
                 return "\(name) is \(summary)"
             }
-            if let taskTitle = slot.taskTitle, !taskTitle.isEmpty {
+            if let taskTitle = snapshot.taskTitle, !taskTitle.isEmpty {
                 // Fallback path: no gerund available (no API key or
                 // summarization failed). Use "<Name>: <task>" format.
                 return "\(name): \(taskTitle)"
             }
-            if slot.runId != nil {
+            if snapshot.runId != nil {
                 return "\(name) is working"
             }
             return name
@@ -392,7 +420,7 @@ private struct WorkerSlotView: View {
             .font(.caption.weight(.semibold))
             .foregroundStyle(.secondary)
             .lineLimit(1)
-            .help(slot.runId ?? "")
+            .help(snapshot.runId ?? "")
     }
 
     /// Second line in the titlebar — the engine's real-time
@@ -404,7 +432,7 @@ private struct WorkerSlotView: View {
     /// `slotTaskLine` and intentionally not duplicated here.
     @ViewBuilder
     private var slotSubtitle: some View {
-        if let recovering = liveState?.recoveryStatus,
+        if let recovering = snapshot.live?.recoveryStatus,
            !recovering.isEmpty
         {
             // Transient-recovery banner wins outright: it means the
@@ -419,25 +447,25 @@ private struct WorkerSlotView: View {
                     .font(.caption2)
                     .foregroundStyle(.orange)
                     .lineLimit(1)
-                    .help(slot.runId ?? "")
+                    .help(snapshot.runId ?? "")
                     .accessibilityLabel("Recovering: \(recovering)")
             }
-        } else if let live = liveState?.liveStatus,
+        } else if let live = snapshot.live?.liveStatus,
            !live.isEmpty
         {
             HStack(alignment: .firstTextBaseline, spacing: 4) {
                 WorkerWaitingIndicator(
-                    activity: liveState?.activity,
-                    lastEventAt: liveState?.lastEventAt
+                    activity: snapshot.live?.activity,
+                    lastEventAt: snapshot.live?.lastEventAt
                 )
                 Text(live)
                     .font(.caption2)
                     .foregroundStyle(liveStatusColor)
                     .lineLimit(1)
-                    .help(slot.runId ?? "")
+                    .help(snapshot.runId ?? "")
                     .accessibilityLabel("Live status: \(live)")
             }
-        } else if let runId = slot.runId {
+        } else if let runId = snapshot.runId {
             Text(runId)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -457,7 +485,7 @@ private struct WorkerSlotView: View {
     /// `WorkerWaitingIndicator` icon + tooltip in `slotSubtitle`
     /// instead, so the meaning is not carried by hue alone.
     private var liveStatusColor: Color {
-        switch liveState?.activity {
+        switch snapshot.live?.activity {
         case .errored:
             return .red
         case .idle:
@@ -466,32 +494,50 @@ private struct WorkerSlotView: View {
             return .secondary
         }
     }
+}
 
-    private func statusPill(_ text: String, color: Color) -> some View {
-        Text(text)
-            .font(.caption2.weight(.medium))
-            .lineLimit(1)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(color.opacity(0.14))
-            .foregroundStyle(color)
-            .clipShape(Capsule())
+/// Fallback titlebar pill driven by the session's pane-monitor scrape.
+/// Observes the session so it still updates while `WorkerSlotView` is
+/// skipped by `.equatable()`. Only mounted when no `LiveWorkerState`
+/// has arrived yet (the pre-hook window).
+private struct WorkerSlotFallbackMonitorPill: View {
+    @ObservedObject var session: TerminalPaneSession
+
+    var body: some View {
+        statusPill(
+            session.paneMonitorState.label,
+            color: paneMonitorStateColor(session.paneMonitorState)
+        )
     }
+}
 
-    private func paneMonitorStateColor(_ state: PaneMonitorState) -> Color {
-        switch state {
-        case .working: .blue
-        case .ready: .green
-        case .notDetected: .secondary
-        case .unavailable: .orange
-        }
+private func statusPill(_ text: String, color: Color) -> some View {
+    Text(text)
+        .font(.caption2.weight(.medium))
+        .lineLimit(1)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(color.opacity(0.14))
+        .foregroundStyle(color)
+        .clipShape(Capsule())
+}
+
+private func paneMonitorStateColor(_ state: PaneMonitorState) -> Color {
+    switch state {
+    case .working: .blue
+    case .ready: .green
+    case .notDetected: .secondary
+    case .unavailable: .orange
     }
 }
 
 private struct WorkerPaneTerminalView: View {
     let runtime: GhosttyRuntime
     @ObservedObject var session: TerminalPaneSession
-    let liveState: WorkerLiveState?
+    /// `true` once the engine has pushed a `LiveWorkerState` for this
+    /// worker, which makes the titlebar pill hook-driven and the
+    /// per-pane 0.5s viewport screen-scrape redundant.
+    let liveStatePresent: Bool
 
     var body: some View {
         // Once the engine pushes a LiveWorkerState for this worker the
@@ -500,14 +546,14 @@ private struct WorkerPaneTerminalView: View {
         // monitor so it only runs as the pre-hook fallback. Passing the
         // gate as a plain input (rather than mutating a @Published on
         // the session) keeps the reconcile out of the render pass —
-        // including the spawn case where liveState is already present
+        // including the spawn case where live state is already present
         // by the time this pane mounts (e.g. a re-render after a run
         // resumed).
         GhosttyTerminalView(
             runtime: runtime,
             session: session,
             launchSpec: session.launchSpec,
-            paneMonitorEnabled: liveState == nil
+            paneMonitorEnabled: !liveStatePresent
         )
         .background(Color(nsColor: .black))
     }
