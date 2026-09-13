@@ -263,9 +263,9 @@ struct ContentView: View {
                     options: NavigationMode.allCases,
                     title: { $0.rawValue }
                 )
-                // Same 440pt box as the previous segmented Picker. `fixedSize`
-                // keeps NSToolbar from proposing an infinite width, which
-                // dropped this item entirely with the custom layout.
+                // Same 440pt box as the previous segmented Picker. Intrinsic
+                // size is label-based so NSToolbar can measure this item.
+                // `fixedSize` stops the toolbar proposing an unbounded width.
                 .frame(width: 440)
                 .fixedSize()
             }

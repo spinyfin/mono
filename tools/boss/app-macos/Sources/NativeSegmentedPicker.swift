@@ -24,6 +24,56 @@ enum NativeSegmentedPickerSelection {
     }
 }
 
+/// Label-font metrics for ``NativeSegmentedPicker``.
+///
+/// Segment children use `frame(maxWidth: .infinity)` so they fill their slot
+/// and paint a full-width selection pill. That poisons `sizeThatFits(nil)` —
+/// each child reports a huge ideal width, which NSToolbar cannot measure.
+/// Ideal size is therefore the actual title string at the system control
+/// font, not the child's `sizeThatFits`. Measuring the string keeps Dynamic
+/// Type / locale working; it is not a hardcoded intrinsic size.
+enum NativeSegmentedPickerMetrics {
+    static let horizontalTitleInset: CGFloat = 6
+    static let verticalTitleInset: CGFloat = 3
+    static let trackPadding: CGFloat = 2
+    /// Proposals at or above this are treated as unbounded (NSToolbar's
+    /// infinite / "very large" measure pass), not as a real width to fill.
+    static let unboundedProposal: CGFloat = 2_000
+
+    static func segmentWidth(for title: String) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+        let text = ceil((title as NSString).size(withAttributes: [.font: font]).width)
+        return max(text + horizontalTitleInset * 2, 8)
+    }
+
+    static var segmentHeight: CGFloat {
+        let font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+        return ceil(font.ascender - font.descender) + verticalTitleInset * 2
+    }
+
+    static func intrinsicSize(titles: [String]) -> CGSize {
+        CGSize(
+            width: titles.map(segmentWidth(for:)).reduce(0, +) + trackPadding * 2,
+            height: segmentHeight + trackPadding * 2
+        )
+    }
+
+    static func boundedWidth(_ value: CGFloat?) -> CGFloat? {
+        guard let value, value.isFinite, value > 0, value < unboundedProposal else {
+            return nil
+        }
+        return value
+    }
+}
+
+private struct SegmentIdealWidthKey: LayoutValueKey {
+    static let defaultValue: CGFloat = 8
+}
+
+private struct SegmentIdealHeightKey: LayoutValueKey {
+    static let defaultValue: CGFloat = 22
+}
+
 /// SwiftUI-native segmented control. Replaces `Picker` + `.pickerStyle(.segmented)`,
 /// which is an `NSViewRepresentable` whose `_overrideSizeThatFits` re-enters
 /// SwiftUI with a nested ViewGraph update on every layout pass of the enclosing
@@ -81,10 +131,14 @@ struct NativeSegmentedPicker<Value: Hashable>: View {
                 segment(option, index: index)
             }
         }
-        .padding(2)
+        .padding(NativeSegmentedPickerMetrics.trackPadding)
         .background(track)
         .opacity(isEnabled ? 1 : 0.5)
         .animation(.easeInOut(duration: 0.12), value: selection)
+        // Hug height so a tall parent (the pool header, NSToolbar) cannot
+        // stretch this into a slab. Width still follows the proposal when
+        // the proposal is a real bounded width.
+        .fixedSize(horizontal: false, vertical: true)
         .focusable(true)
         .focused($isFocused)
         .onMoveCommand { direction in
@@ -146,11 +200,11 @@ struct NativeSegmentedPicker<Value: Hashable>: View {
             isFocused = true
         } label: {
             Text(option.title)
-                .font(.body)
+                .font(.system(size: NSFont.systemFontSize))
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
+                .padding(.horizontal, NativeSegmentedPickerMetrics.horizontalTitleInset)
+                .padding(.vertical, NativeSegmentedPickerMetrics.verticalTitleInset)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .contentShape(Rectangle())
         }
@@ -173,6 +227,14 @@ struct NativeSegmentedPicker<Value: Hashable>: View {
                     .padding(.vertical, 5)
             }
         }
+        .layoutValue(
+            key: SegmentIdealWidthKey.self,
+            value: NativeSegmentedPickerMetrics.segmentWidth(for: option.title)
+        )
+        .layoutValue(
+            key: SegmentIdealHeightKey.self,
+            value: NativeSegmentedPickerMetrics.segmentHeight
+        )
         .accessibilityLabel(option.title)
         .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
         .accessibilityIdentifier("native-segmented-picker.segment.\(index)")
@@ -197,11 +259,13 @@ private struct SegmentPressStyle: ButtonStyle {
     }
 }
 
-/// Distributes the proposed width across segments by ideal label size, then
+/// Distributes the proposed width across segments by label-string size, then
 /// shares leftover space equally. Longer titles (e.g. "Automations") keep
 /// their text at the toolbar's 440pt frame instead of truncating under
 /// equal-width slots. Compresses proportionally when the proposal is tighter
-/// than the ideal total — no hardcoded intrinsic sizes.
+/// than the ideal total. Ideal widths come from ``NativeSegmentedPickerMetrics``
+/// (the title at the system control font), not from `sizeThatFits(nil)` on a
+/// `maxWidth: .infinity` child.
 private struct SegmentDistributionLayout: Layout {
     func sizeThatFits(
         proposal: ProposedViewSize,
@@ -209,12 +273,11 @@ private struct SegmentDistributionLayout: Layout {
         cache: inout ()
     ) -> CGSize {
         // Height always hugs the labels. Taking the parent's proposed height
-        // made the Agents pool picker grow into a tall slab, and an infinite
-        // width proposal from NSToolbar dropped the Mode item entirely.
-        let ideals = idealSizes(subviews, height: nil)
-        let height = ideals.map(\.height).max() ?? 0
+        // made the Agents pool picker grow into a tall slab.
+        let ideals = idealSizes(subviews)
+        let height = ideals.map(\.height).max() ?? NativeSegmentedPickerMetrics.segmentHeight
         let idealWidth = ideals.map(\.width).reduce(0, +)
-        if let proposed = Self.finiteSize(proposal.width) {
+        if let proposed = NativeSegmentedPickerMetrics.boundedWidth(proposal.width) {
             return CGSize(width: proposed, height: height)
         }
         return CGSize(width: idealWidth, height: height)
@@ -226,10 +289,10 @@ private struct SegmentDistributionLayout: Layout {
         subviews: Subviews,
         cache: inout ()
     ) {
-        let ideals = idealSizes(subviews, height: nil)
-        let rowHeight = ideals.map(\.height).max() ?? bounds.height
+        let ideals = idealSizes(subviews)
+        let rowHeight = ideals.map(\.height).max() ?? NativeSegmentedPickerMetrics.segmentHeight
         let idealWidth = max(ideals.map(\.width).reduce(0, +), 1)
-        let availableWidth = Self.finiteSize(bounds.width) ?? idealWidth
+        let availableWidth = NativeSegmentedPickerMetrics.boundedWidth(bounds.width) ?? idealWidth
         let count = CGFloat(max(subviews.count, 1))
         let widths: [CGFloat]
         if idealWidth <= availableWidth {
@@ -252,19 +315,12 @@ private struct SegmentDistributionLayout: Layout {
         }
     }
 
-    private static func finiteSize(_ value: CGFloat?) -> CGFloat? {
-        guard let value, value.isFinite, value > 0, value < 10_000 else { return nil }
-        return value
-    }
-
-    private func idealSizes(_ subviews: Subviews, height: CGFloat?) -> [CGSize] {
-        // `nil` width asks for the child's ideal size. A finite cap is only a
-        // guard: `frame(maxWidth: .infinity)` plus a huge proposal would
-        // report the proposal, not the label.
+    private func idealSizes(_ subviews: Subviews) -> [CGSize] {
         subviews.map { subview in
-            let size = subview.sizeThatFits(ProposedViewSize(width: nil, height: height))
-            let width = size.width.isFinite && size.width < 4_000 ? size.width : 1
-            return CGSize(width: max(width, 1), height: size.height)
+            CGSize(
+                width: max(subview[SegmentIdealWidthKey.self], 1),
+                height: max(subview[SegmentIdealHeightKey.self], 1)
+            )
         }
     }
 }

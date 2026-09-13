@@ -52,6 +52,10 @@ Behaviour preserved:
   same. The control is one keyboard focus target.
 - Each segment keeps an accessible label; selected state is
   `.isSelected`; VoiceOver increment/decrement moves the selection.
+- Ideal width is the title string at the system control font, not
+  `sizeThatFits(nil)` on a `maxWidth: .infinity` child. That poisoned
+  measurement is what NSToolbar cannot size. Unit tests pin
+  `NSHostingView.fittingSize` in the label-sized range.
 
 Unit tests pin the mechanism: `NativeSegmentedPicker` installs no
 `NSSegmentedControl` even across 200 relayouts; a system segmented `Picker`

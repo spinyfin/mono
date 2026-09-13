@@ -43,6 +43,32 @@ final class NativeSegmentedPickerTests: XCTestCase {
         )
     }
 
+    func testUnconstrainedFittingSizeIsLabelSized() {
+        let host = hostedPicker(width: nil, height: nil)
+        let fitting = host.fittingSize
+        let expected = NativeSegmentedPickerMetrics.intrinsicSize(titles: modeTitles.map(\.1))
+        XCTAssertGreaterThan(
+            fitting.width, 200,
+            "fittingSize must be large enough to hold the Mode labels; got \(fitting)"
+        )
+        XCTAssertLessThan(
+            fitting.width, NativeSegmentedPickerMetrics.unboundedProposal,
+            "fittingSize must not be the NSToolbar-unbounded poisoned width; got \(fitting)"
+        )
+        XCTAssertEqual(fitting.width, expected.width, accuracy: 12)
+        XCTAssertGreaterThan(fitting.height, 16, "fittingSize.height=\(fitting.height)")
+        XCTAssertLessThan(fitting.height, 40, "fittingSize.height=\(fitting.height)")
+        XCTAssertEqual(fitting.height, expected.height, accuracy: 8)
+    }
+
+    func testFramedFittingSizeMatchesFrame() {
+        let host = hostedPicker(width: 440, height: nil)
+        let fitting = host.fittingSize
+        XCTAssertEqual(fitting.width, 440, accuracy: 1)
+        XCTAssertGreaterThan(fitting.height, 16)
+        XCTAssertLessThan(fitting.height, 40)
+    }
+
     func testDoesNotInstallNSSegmentedControl() throws {
         let host = hostedPicker(width: 440, height: 32)
         host.layoutSubtreeIfNeeded()
@@ -91,6 +117,7 @@ final class NativeSegmentedPickerTests: XCTestCase {
         let wide = hostedPicker(width: 440, height: 32)
         wide.layoutSubtreeIfNeeded()
         XCTAssertEqual(wide.bounds.width, 440)
+        XCTAssertEqual(wide.fittingSize.width, 440, accuracy: 1)
 
         let narrow = hostedPicker(
             width: 200,
@@ -104,7 +131,15 @@ final class NativeSegmentedPickerTests: XCTestCase {
         )
         narrow.layoutSubtreeIfNeeded()
         XCTAssertEqual(narrow.bounds.width, 200)
+        XCTAssertEqual(narrow.fittingSize.width, 200, accuracy: 1)
         XCTAssertLessThanOrEqual(narrow.bounds.height, 40)
+        XCTAssertLessThan(
+            narrow.fittingSize.width,
+            NativeSegmentedPickerMetrics.intrinsicSize(
+                titles: ["Bridge Crew (8)", "Lower Decks (8)", "Automations (8)", "Reviewers (16)"]
+            ).width,
+            "the 200pt frame must compress below the unconstrained label total"
+        )
     }
 
     func testRenderIsNonBlankInLightAndDark() throws {
@@ -200,23 +235,46 @@ final class NativeSegmentedPickerTests: XCTestCase {
     }
 
     private func hostedPicker(
-        width: CGFloat,
-        height: CGFloat,
+        width: CGFloat?,
+        height: CGFloat?,
         titles: [(String, String)]? = nil,
         selection: ModeBinding? = nil
     ) -> NSHostingView<some View> {
         let titles = titles ?? modeTitles
         let selection = selection ?? ModeBinding(value: titles[0].0)
-        let root = NativeSegmentedPicker(
+        let picker = NativeSegmentedPicker(
             "Mode",
             selection: selection.binding,
             options: titles.map { NativeSegmentedPicker.Option(value: $0.0, title: $0.1) }
         )
-        .frame(width: width, height: height)
-        .background(Color(nsColor: .windowBackgroundColor))
+        let root: AnyView
+        switch (width, height) {
+        case let (w?, h?):
+            root = AnyView(
+                picker
+                    .frame(width: w, height: h)
+                    .background(Color(nsColor: .windowBackgroundColor))
+            )
+        case let (w?, nil):
+            root = AnyView(
+                picker
+                    .frame(width: w)
+                    .background(Color(nsColor: .windowBackgroundColor))
+            )
+        case let (nil, h?):
+            root = AnyView(
+                picker
+                    .frame(height: h)
+                    .background(Color(nsColor: .windowBackgroundColor))
+            )
+        case (nil, nil):
+            root = AnyView(picker.background(Color(nsColor: .windowBackgroundColor)))
+        }
         let host = NSHostingView(rootView: root)
         host.appearance = NSAppearance(named: .aqua)
-        host.frame = NSRect(x: 0, y: 0, width: width, height: height)
+        if let width, let height {
+            host.frame = NSRect(x: 0, y: 0, width: width, height: height)
+        }
         return host
     }
 
