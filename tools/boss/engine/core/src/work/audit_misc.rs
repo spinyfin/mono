@@ -109,7 +109,7 @@ pub(crate) fn next_id(prefix: &str) -> String {
 }
 
 pub(crate) fn now_string() -> String {
-    boss_engine_utils::epoch_time::now_epoch_secs().to_string()
+    format!("{:010}", boss_engine_utils::epoch_time::now_epoch_secs().max(0))
 }
 
 pub(crate) fn normalize_optional_text(value: Option<String>) -> Option<String> {

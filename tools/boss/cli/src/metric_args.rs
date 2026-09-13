@@ -11,10 +11,17 @@ pub(crate) enum MetricCommand {
     /// List every engine-defined series, the dimensions it supports, its
     /// default group-by, named presets, observed dimension values, and
     /// coverage. `--json` renders the wire [`boss_protocol::MetricCatalog`].
-    Catalog,
+    Catalog(MetricCatalogArgs),
     /// One catalog series bucketed over a time window. `--json` renders
     /// the wire [`boss_protocol::MetricSeriesReport`].
     Series(MetricSeriesArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct MetricCatalogArgs {
+    /// Print timestamps in UTC instead of this host's local time.
+    #[arg(long)]
+    pub(crate) utc: bool,
 }
 
 #[derive(Debug, Clone, Args)]
