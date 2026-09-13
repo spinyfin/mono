@@ -24,7 +24,7 @@ pub(super) async fn handle_get_metric_catalog(ctx: Dispatch, req: FrontendReques
     let generated_at_epoch_s = boss_engine_utils::epoch_time::now_epoch_secs();
     let until = generated_at_epoch_s.saturating_add(1);
     let lookback_since = until.saturating_sub(CATALOG_LOOKBACK_SECS).max(0);
-    let execution_facts = match work_db.metric_execution_facts(lookback_since, until, None, None, false) {
+    let execution_facts = match work_db.metric_execution_facts(lookback_since, until, None, None, false, false) {
         Ok(facts) => facts,
         Err(err) => return send_work_error(&sink, &request_id, &err),
     };
@@ -76,8 +76,16 @@ pub(super) async fn handle_get_metric_series(ctx: Dispatch, req: FrontendRequest
             kinds,
             require_pr_url,
             statuses,
+            unique_by_pr_url,
             ..
-        } => match work_db.metric_execution_facts(since_epoch_s, until_epoch_s, kinds, statuses, require_pr_url) {
+        } => match work_db.metric_execution_facts(
+            since_epoch_s,
+            until_epoch_s,
+            kinds,
+            statuses,
+            require_pr_url,
+            unique_by_pr_url,
+        ) {
             Ok(rows) => build_execution_series_report(&query, &rows, generated_at_epoch_s),
             Err(err) => return send_work_error(&sink, &request_id, &err),
         },
