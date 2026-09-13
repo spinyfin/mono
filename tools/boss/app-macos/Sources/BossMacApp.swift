@@ -414,7 +414,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return type.conforms(to: markdownType)
     }
 
-    private let appNapActivity = AppNapActivityController()
+    private let appNapActivity: AppNapActivityController
+
+    init(appNapActivity: AppNapActivityController = AppNapActivityController()) {
+        self.appNapActivity = appNapActivity
+        super.init()
+    }
 
     /// Observes `UserDefaults.didChangeNotification` so flipping
     /// [[MainThreadStallMonitor.enabledKey]] in Settings starts/stops the
@@ -439,7 +444,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // `worker.live_states` snapshot reaches the main actor through the
         // same path as a spawn request, so it cannot safely be used to
         // reacquire the assertion after App Nap has delayed that path.
-        appNapActivity.beginForProcessLifetime()
+        beginAppNapActivityForApplicationLifetime()
 
         // Isolated / capture instances: policy was already set to `.accessory`
         // in `applicationWillFinishLaunching`. Do **not** call
@@ -554,12 +559,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Otherwise fall back to the best-effort automatic swap-on-quit. Non-blocking; a
     /// failed swap leaves the current bundle untouched and the startup path retries.
     func applicationWillTerminate(_ notification: Notification) {
-        appNapActivity.release()
+        endAppNapActivityForApplicationLifetime()
         if let plan = UpdateLifecycle.consumePendingRelaunch() {
             UpdateLifecycle.armRelaunchHelper(for: plan)
         } else {
             UpdateLifecycle.applyQuitSwapIfNeeded()
         }
+    }
+
+    /// Kept separate from the AppKit callbacks so the lifetime wiring can be
+    /// tested without creating an `NSApplication` in the test process.
+    func beginAppNapActivityForApplicationLifetime() {
+        appNapActivity.beginForProcessLifetime()
+    }
+
+    func endAppNapActivityForApplicationLifetime() {
+        appNapActivity.release()
     }
 
     /// When the last window is closed and workers are still alive, keep

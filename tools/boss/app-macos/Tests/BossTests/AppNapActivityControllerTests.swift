@@ -29,6 +29,18 @@ final class AppNapActivityControllerTests: XCTestCase {
         XCTAssertEqual(counts.ended, 1)
     }
 
+    func testAppDelegateKeepsAssertionUntilApplicationTermination() {
+        let counts = Counts()
+        let delegate = AppDelegate(appNapActivity: makeController(counts: counts))
+
+        delegate.beginAppNapActivityForApplicationLifetime()
+        XCTAssertEqual(counts.began, 1)
+        XCTAssertEqual(counts.ended, 0)
+
+        delegate.endAppNapActivityForApplicationLifetime()
+        XCTAssertEqual(counts.ended, 1)
+    }
+
     private func makeController(counts: Counts) -> AppNapActivityController {
         AppNapActivityController(
             beginActivity: {
