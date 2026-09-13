@@ -477,13 +477,27 @@ pub(crate) fn attach_ready_for_review_flag(tasks: &mut [Task], chores: &mut [Tas
 fn review_execution_target_id(conn: &Connection, row: &Task) -> Option<String> {
     if row.kind == TaskKind::Revision {
         if row.status == TaskStatus::Active {
-            get_chain_root_task(conn, &row.id).ok().flatten().map(|root| root.id)
+            chain_root(conn, &row.id).ok()
         } else {
             None
         }
     } else {
         Some(row.id.clone())
     }
+}
+
+/// Resolve each rendered row's review-execution target once per projection
+/// pass. A revision's chain walk is otherwise an avoidable query fan-out.
+fn review_execution_target_ids(
+    conn: &Connection,
+    tasks: &[Task],
+    chores: &[Task],
+) -> std::collections::HashMap<String, String> {
+    tasks
+        .iter()
+        .chain(chores.iter())
+        .filter_map(|row| review_execution_target_id(conn, row).map(|target| (row.id.clone(), target)))
+        .collect()
 }
 
 /// Set `ai_reviewing = true` on every task (and chore) whose
@@ -517,9 +531,11 @@ pub(crate) fn attach_ai_reviewing_flag(
 ) -> rusqlite::Result<()> {
     // Collect the target ids for every row that can possibly show the
     // badge: a non-revision row in `active`/`in_review` with a `pr_url`
-    // targets itself; a revision held `active` targets its parent (see
-    // `review_execution_target_id`). If there are none we can skip the DB
+    // targets itself; a revision held `active` targets its review cycle root,
+    // resolved by a full parent-chain walk (see `review_execution_target_id`).
+    // If there are none we can skip the DB
     // query entirely.
+    let target_ids = review_execution_target_ids(conn, tasks, chores);
     let candidate_ids: Vec<String> = tasks
         .iter()
         .chain(chores.iter())
@@ -527,7 +543,7 @@ pub(crate) fn attach_ai_reviewing_flag(
             matches!(t.status, TaskStatus::Active | TaskStatus::InReview)
                 && (t.kind == TaskKind::Revision || t.pr_url.is_some())
         })
-        .filter_map(|t| review_execution_target_id(conn, t))
+        .filter_map(|t| target_ids.get(&t.id).cloned())
         .collect();
     if candidate_ids.is_empty() {
         return Ok(());
@@ -567,12 +583,12 @@ pub(crate) fn attach_ai_reviewing_flag(
         return Ok(());
     }
     for task in tasks.iter_mut() {
-        if review_execution_target_id(conn, task).is_some_and(|t| reviewing.contains(&t)) {
+        if target_ids.get(&task.id).is_some_and(|t| reviewing.contains(t)) {
             task.ai_reviewing = true;
         }
     }
     for chore in chores.iter_mut() {
-        if review_execution_target_id(conn, chore).is_some_and(|t| reviewing.contains(&t)) {
+        if target_ids.get(&chore.id).is_some_and(|t| reviewing.contains(t)) {
             chore.ai_reviewing = true;
         }
     }
@@ -749,6 +765,7 @@ pub(crate) const AI_REVIEW_STATE_REVIEW_NOT_REQUIRED: &str = "review_not_require
 ///    preferred target or the fallback → no badge.
 /// 5. Anything else (backlog/blocked/cancelled/archived) → no badge.
 pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chores: &mut [Task]) -> Result<()> {
+    let review_targets = review_execution_target_ids(conn, tasks, chores);
     // The last completed (in_review/done) direct-child revision per parent
     // id, keyed by the highest `revision_seq`. Revisions always parent
     // directly to the chain root (never to another revision — see
@@ -825,7 +842,7 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
             !task_kind_excluded_from_ai_review(&row.kind)
                 && matches!(row.status, TaskStatus::Active | TaskStatus::InReview)
         })
-        .filter_map(|row| review_execution_target_id(conn, row))
+        .filter_map(|row| review_targets.get(&row.id).cloned())
         .collect();
     queued_lookup_ids.sort_unstable();
     queued_lookup_ids.dedup();
@@ -867,7 +884,11 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
         // revision held `active`), matching how `attach_ai_reviewing_flag` attributes
         // `ai_reviewing` — a revision has no `pr_review` execution of its
         // own to look up directly.
-        let is_queued = || review_execution_target_id(conn, row).is_some_and(|t| queued_reviews.contains(&t));
+        let is_queued = || {
+            review_targets
+                .get(&row.id)
+                .is_some_and(|target| queued_reviews.contains(target))
+        };
         match row.status {
             TaskStatus::Active => {
                 if row.ai_reviewing {

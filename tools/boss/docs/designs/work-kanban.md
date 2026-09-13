@@ -348,11 +348,11 @@ invalidation so the board reflects it. So that direction self-heals for the
 `todo` → `active` case; only the `active`-without-worker direction needs the
 new startup reconcile.
 
-This auto-advance is a `todo` → `active` convenience only. It is NOT a
-licence to demote a row out of Review — see the cycle-root status contract
+This auto-advance is a `todo` → `active` convenience for cycle roots only. It
+is NOT a licence to demote a cycle root out of Review — see the cycle-root status contract
 below, which `start_execution_run`'s own guard enforces.
 
-#### Cycle-root status contract: a row in Review stays in Review
+#### Cycle-root status contract: a cycle root in Review stays in Review
 
 A cycle root (task/chore/project_task) that owns an open PR holds
 `in_review` for the life of that PR: it leaves `in_review` only when the PR
@@ -360,11 +360,11 @@ merges or closes, or when an operator moves it by hand. Nothing else may
 move it out — in particular:
 
 - an automated `pr_review` execution being enqueued (`request_pr_review_in_tx`)
-  or starting (`start_execution_run`) never returns an `in_review` row to
+  or starting (`start_execution_run`) never returns an `in_review` cycle root to
   `active`;
 - a revision task being created, dispatched, or pushing a commit never
   touches the base row's status;
-- any execution on the row entering `running` never moves a row that has
+- any execution on the cycle root entering `running` never moves a cycle root that has
   already reached `in_review`.
 
 A revision's own row moves through its own statuses independently of its
@@ -373,6 +373,11 @@ parent — the parent surfaces in-flight revisions to the operator through
 never by leaving Review itself. Per
 [`revision-tasks.md`](revision-tasks.md): "On success the revision row
 flips to `in_review`; the parent's status is untouched."
+
+A `kind = revision` row is not a cycle root and is outside this contract:
+`start_execution_run` still advances it from `in_review` to `active` on its
+own re-dispatch when it has no live revision child, because revisions rest in
+Review between attempts; see that function's rationale comment.
 
 A review pass MAY hold a row that has not yet reached `in_review` — the
 `PendingReview` outcome in

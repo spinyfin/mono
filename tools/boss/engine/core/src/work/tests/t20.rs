@@ -1844,6 +1844,46 @@ fn start_execution_run_pr_review_still_clears_autostart() {
     assert!(!task.autostart, "autostart must still be consumed on run start");
 }
 
+/// An unrelated implementation execution must preserve `autostart` on a
+/// Review-lane cycle root. The split UPDATE keeps the pre-existing scope:
+/// only `pr_review` consumes this flag without a status advance.
+#[test]
+fn start_execution_run_non_review_keeps_autostart_on_in_review_root() {
+    let db = WorkDb::open(temp_db_path("non-review-keeps-review-autostart")).unwrap();
+    let product_id = make_revision_product(&db, "non-review-keeps-review-autostart");
+    let chore_id = make_in_review_chore(&db, &product_id, "https://github.com/spinyfin/mono/pull/44");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET autostart = 1 WHERE id = ?1",
+            rusqlite::params![chore_id],
+        )
+        .unwrap();
+
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.start_execution_run(
+        &execution.id,
+        "implementation-worker",
+        "implementation-repo",
+        "implementation-lease",
+        "implementation-workspace",
+        "/tmp/implementation-workspace",
+    )
+    .unwrap();
+
+    let task = query_task(&db.connect().unwrap(), &chore_id).unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::InReview, "status must not move");
+    assert!(task.autostart, "non-review execution must not consume autostart");
+}
+
 /// A non-`pr_review` execution starting must behave exactly as before this
 /// change: an ordinary `todo` task's status still advances to `active` when
 /// its execution starts. This change only narrows the `in_review` guard for

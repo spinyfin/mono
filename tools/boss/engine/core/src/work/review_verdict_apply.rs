@@ -415,7 +415,7 @@ impl WorkDb {
         // revision's worker never opens its own PR, so
         // `record_worker_pr_completion`'s normal `InReview` target never
         // applies to it.
-        advance_held_revision_after_verdict_in_tx(&tx, &batch.cycle_root_id, &batch.target_sha, &now)?;
+        advance_held_revision_after_verdict_in_tx(&mut pending, &tx, &batch.cycle_root_id, &batch.target_sha, &now)?;
 
         commit_and_publish(tx, pending, self.event_bus())?;
         Ok(Some(applied_ref).filter(|_| remediating_task_id.is_some()))
@@ -724,6 +724,7 @@ fn advance_cycle_root_to_in_review_in_tx(
 /// batches review a chain root's own push, with no revision involved at
 /// all.
 fn advance_held_revision_after_verdict_in_tx(
+    pending: &mut PendingEvents,
     tx: &rusqlite::Transaction<'_>,
     cycle_root_id: &str,
     target_sha: &str,
@@ -736,37 +737,41 @@ fn advance_held_revision_after_verdict_in_tx(
     // direct `parent_task_id = cycle_root_id` predicate would exclude such a
     // nested row before its contributed head could even be checked, leaving
     // it stranded `active` even once its exact reviewed push lands. The
-    // recursive CTE mirrors that same chain traversal; the depth cap matches
-    // `chain_root`'s `MAX_CHAIN_DEPTH` guard against a corrupt parent cycle.
-    let revision_id: Option<String> = tx
-        .query_row(
-            "WITH RECURSIVE chain(id, depth) AS (
-                 SELECT ?1, 0
-                 UNION ALL
-                 SELECT t.id, c.depth + 1
-                 FROM tasks t
-                 JOIN chain c ON t.parent_task_id = c.id
-                 WHERE t.kind = 'revision' AND c.depth < 64
-             )
-             SELECT t.id
-             FROM tasks t
-             JOIN work_executions we ON we.work_item_id = t.id
-             WHERE t.parent_task_id IN (SELECT id FROM chain)
-               AND t.kind = 'revision'
-               AND t.status = 'active'
-               AND t.deleted_at IS NULL
-               AND we.kind = 'revision_implementation'
-               AND we.status = 'completed'
-               AND we.revision_stop_contributed_head = ?2
-             ORDER BY we.created_at DESC, we.id DESC
-             LIMIT 1",
-            params![cycle_root_id, target_sha],
-            |row| row.get(0),
-        )
-        .optional()?;
+    // `collect_chain_revision_ids_including_deleted` owns this downward walk:
+    // it intentionally traverses tombstoned intermediate revisions so a live
+    // descendant is still found, and shares the chain helper's 64-hop bound.
+    let mut revision_ids = super::chain_helpers::collect_chain_revision_ids_including_deleted(tx, cycle_root_id)?;
+    revision_ids.push(cycle_root_id.to_owned());
+    let placeholders = revision_ids
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("?{}", index + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT t.id
+         FROM tasks t
+         JOIN work_executions we ON we.work_item_id = t.id
+         WHERE t.id IN ({placeholders})
+           AND t.kind = 'revision'
+           AND t.status = 'active'
+           AND t.deleted_at IS NULL
+           AND we.kind = 'revision_implementation'
+           AND we.status = 'completed'
+           AND we.revision_stop_contributed_head = ?{}
+         ORDER BY we.created_at DESC, we.id DESC
+         LIMIT 1",
+        revision_ids.len() + 1,
+    );
+    let mut values: Vec<&dyn rusqlite::ToSql> = revision_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    values.push(&target_sha);
+    let revision_id: Option<String> = tx.query_row(&sql, values.as_slice(), |row| row.get(0)).optional()?;
     let Some(revision_id) = revision_id else {
         return Ok(());
     };
-    WorkDb::advance_pending_review_task_to_in_review_with_verdict_source_in_tx(tx, &revision_id, cycle_root_id, now)?;
+    if WorkDb::advance_pending_review_task_to_in_review_with_verdict_source_in_tx(tx, &revision_id, cycle_root_id, now)?
+    {
+        cascade_dependents_after_prereq_status_change(pending, tx, &revision_id, "in_review", now)?;
+    }
     Ok(())
 }

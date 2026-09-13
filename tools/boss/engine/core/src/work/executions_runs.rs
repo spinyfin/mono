@@ -1274,10 +1274,9 @@ impl WorkDb {
         // moving the card back to Backlog later does not trigger re-dispatch
         // by the reconciler or orphan-active sweep. This is mostly, but not
         // entirely, independent of the status-advance guard above: a
-        // `pr_review` (or other) execution starting against a non-revision
-        // `in_review` row still consumes `autostart` even though that row's
-        // status does not move — hence the separate `kind != 'revision'`
-        // disjunct below instead of just reusing the status guard verbatim.
+        // `pr_review` execution starting against an `in_review` row still
+        // consumes `autostart` even though that row's status does not move.
+        // Other execution kinds preserve the prior scope and leave it intact.
         // But a `kind = 'revision'` row in `in_review` with a live
         // non-terminal revision child of its own is a case the status guard
         // above explicitly refuses to act on (a duplicate/stray run must
@@ -1293,16 +1292,16 @@ impl WorkDb {
                AND status NOT IN ('done', 'archived', 'blocked')
                AND (
                  status != 'in_review'
-                 OR kind != 'revision'
-                 OR NOT EXISTS (
+                 OR ?3 = 'pr_review'
+                 OR (kind = 'revision' AND NOT EXISTS (
                      SELECT 1 FROM tasks child
                      WHERE child.parent_task_id = ?1
                        AND child.kind = 'revision'
                        AND child.deleted_at IS NULL
                        AND child.status NOT IN ('done', 'archived')
-                 )
+                 ))
                )",
-            params![execution.work_item_id, now],
+            params![execution.work_item_id, now, execution.kind.as_str()],
         )?;
 
         // A run is starting for this work item, which refutes the one thing
