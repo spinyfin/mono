@@ -84,8 +84,6 @@ pub(crate) fn format_epoch(epoch_s: i64, tz: &DisplayTz) -> String {
     format!("{}{}", utc_form.trim_end_matches('Z'), offset_suffix(tz.offset_s))
 }
 
-/// Format a stored epoch-seconds string for human output. Falls back to the
-/// raw value when it does not parse as an `i64` (legacy non-epoch rows).
 /// Parse a `--since`/`--until` bound: an RFC3339 timestamp, or a
 /// relative duration ago (`24h`, `7d`, `2w`) resolved against `now`.
 pub(crate) fn parse_epoch_bound(input: &str, now: i64) -> Result<i64, CliError> {
@@ -125,6 +123,8 @@ pub(crate) fn resolve_window(since: &str, until: Option<&str>) -> Result<(i64, i
     Ok((since_epoch_s, until_epoch_s))
 }
 
+/// Format a stored epoch-seconds string for human output. Falls back to the
+/// raw value when it does not parse as an `i64` (legacy non-epoch rows).
 pub(crate) fn format_stored_epoch(raw: &str) -> String {
     let Ok(epoch_s) = raw.parse::<i64>() else {
         return raw.to_owned();
