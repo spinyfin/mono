@@ -41,6 +41,11 @@ final class AppNapActivityControllerTests: XCTestCase {
         XCTAssertEqual(counts.ended, 1)
     }
 
+    func testAppKitCanConstructAppDelegateViaObjCInit() {
+        let delegate = (AppDelegate.self as NSObject.Type).init() as? AppDelegate
+        XCTAssertNotNil(delegate)
+    }
+
     private func makeController(counts: Counts) -> AppNapActivityController {
         AppNapActivityController(
             beginActivity: {

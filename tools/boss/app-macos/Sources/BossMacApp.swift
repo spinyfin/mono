@@ -416,7 +416,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let appNapActivity: AppNapActivityController
 
-    init(appNapActivity: AppNapActivityController = AppNapActivityController()) {
+    /// AppKit instantiates the delegate via the Objective-C `init`
+    /// selector. A Swift `init(appNapActivity:)` with a default argument
+    /// is a different entry point and does not satisfy that call, so
+    /// launch would trap with "Use of unimplemented initializer 'init()'".
+    override init() {
+        self.appNapActivity = AppNapActivityController()
+        super.init()
+    }
+
+    init(appNapActivity: AppNapActivityController) {
         self.appNapActivity = appNapActivity
         super.init()
     }

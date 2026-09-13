@@ -544,6 +544,10 @@ final class EngineClient: @unchecked Sendable {
                     emit(.error(message: "worker_live_states_list contains invalid state"))
                     return
                 }
+                guard WorkerLiveState.hasUniqueIds(states) else {
+                    emit(.error(message: "worker_live_states_list contains duplicate ids"))
+                    return
+                }
                 emit(.workerLiveStatesList(states: states))
             case "live_status_disabled_slots_list":
                 let raw = payload["slot_ids"] as? [Any] ?? []

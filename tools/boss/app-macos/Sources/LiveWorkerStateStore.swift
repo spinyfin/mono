@@ -11,10 +11,6 @@ import Foundation
 final class LiveWorkerStateStore: ObservableObject {
     @Published private(set) var byRunID: [String: WorkerLiveState] = [:]
     @Published private(set) var bySlot: [Int: WorkerLiveState] = [:]
-    /// Becomes true only after the engine delivers a complete snapshot. This
-    /// distinguishes "there are no workers" from startup before the first
-    /// snapshot arrives.
-    @Published private(set) var hasReceivedSnapshot = false
 
     /// Workers in a non-terminal "alive" state. Shared by
     /// `activeAgentCount` and `activeAgentTmuxHostedFlags` so the quit
@@ -47,6 +43,7 @@ final class LiveWorkerStateStore: ObservableObject {
     /// otherwise unchanged still reaches us, and republishing it would
     /// invalidate every observing card for no visible delta.
     func update(states: [WorkerLiveState]) {
+        guard WorkerLiveState.hasUniqueIds(states) else { return }
         let newByRunID = Dictionary(uniqueKeysWithValues: states.map { ($0.runId, $0) })
         let newBySlot = Dictionary(uniqueKeysWithValues: states.map { ($0.slotId, $0) })
         let newActiveAgentCount = newBySlot.values.count { Self.aliveActivities.contains($0.activity) }
@@ -58,9 +55,6 @@ final class LiveWorkerStateStore: ObservableObject {
         }
         if newActiveAgentCount != activeAgentCount {
             activeAgentCount = newActiveAgentCount
-        }
-        if !hasReceivedSnapshot {
-            hasReceivedSnapshot = true
         }
     }
 }
