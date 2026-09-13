@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 import UniformTypeIdentifiers
 import UpdateCore
@@ -338,7 +339,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Set by BossMacApp once the main window has appeared. Nil only in the
     /// brief window between launch and first-render — treated as "no agents
     /// working" so a very-early Cmd-Q is never held hostage.
-    var liveWorkerStates: LiveWorkerStateStore?
+    var liveWorkerStates: LiveWorkerStateStore? {
+        didSet {
+            liveWorkerStateCancellable = nil
+            guard let liveWorkerStates else { return }
+            liveWorkerStateCancellable = Publishers.CombineLatest(
+                liveWorkerStates.$activeAgentCount,
+                liveWorkerStates.$hasReceivedSnapshot
+            )
+            .sink { [weak self] activeAgentCount, hasReceivedSnapshot in
+                guard hasReceivedSnapshot else { return }
+                self?.appNapActivity.setWorkersActive(activeAgentCount > 0)
+            }
+        }
+    }
     /// Owned here so the App struct can inject it into CheckForUpdatesCommand and
     /// environment objects before any view renders or menu fires.
     let updateModel: UpdateModel = UpdateModel.makeForApp(defaults: BossDefaults.store)
@@ -414,20 +428,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return type.conforms(to: markdownType)
     }
 
-    /// App Nap opt-out token (App Nap incident, 2026-07-15): held for the
-    /// process lifetime so `ProcessInfo`/`NSApp` never throttles the main
-    /// run loop while the display sleeps. Worker fleets run unattended
-    /// overnight with the display off, so scoping this narrower (e.g. to
-    /// "while an engine connection is registered") buys nothing — the app
-    /// needs to stay prompt for the whole session. `endActivity` is
-    /// intentionally never called: releasing the token would re-enable App
-    /// Nap, and the token itself is released implicitly when the process
-    /// exits. `.userInitiatedAllowingIdleSystemSleep` opts out of App Nap
-    /// *without* pinning the display or system awake — display/system idle
-    /// sleep must still be allowed (the incident was about RPC handling
-    /// staying prompt during sleep, not preventing sleep); do not swap in
-    /// `.idleDisplaySleepDisabled` or similar, which would do the latter.
-    private var appNapOptOutToken: NSObjectProtocol?
+    private let appNapActivity = AppNapActivityController()
+    private var liveWorkerStateCancellable: AnyCancellable?
 
     /// Observes `UserDefaults.didChangeNotification` so flipping
     /// [[MainThreadStallMonitor.enabledKey]] in Settings starts/stops the
@@ -448,10 +450,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        appNapOptOutToken = ProcessInfo.processInfo.beginActivity(
-            options: [.userInitiatedAllowingIdleSystemSleep],
-            reason: "Keep engine RPC handling and diagnostics sampling prompt during display sleep"
-        )
+        // Keep the startup path responsive until the first authoritative
+        // worker snapshot arrives; it then remains held only while workers
+        // are alive, so idle Boss is eligible for App Nap.
+        appNapActivity.beginUntilWorkerStateIsKnown()
 
         // Isolated / capture instances: policy was already set to `.accessory`
         // in `applicationWillFinishLaunching`. Do **not** call
@@ -566,6 +568,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Otherwise fall back to the best-effort automatic swap-on-quit. Non-blocking; a
     /// failed swap leaves the current bundle untouched and the startup path retries.
     func applicationWillTerminate(_ notification: Notification) {
+        appNapActivity.release()
         if let plan = UpdateLifecycle.consumePendingRelaunch() {
             UpdateLifecycle.armRelaunchHelper(for: plan)
         } else {

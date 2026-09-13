@@ -11,6 +11,10 @@ import Foundation
 final class LiveWorkerStateStore: ObservableObject {
     @Published private(set) var byRunID: [String: WorkerLiveState] = [:]
     @Published private(set) var bySlot: [Int: WorkerLiveState] = [:]
+    /// Becomes true only after the engine delivers a complete snapshot. This
+    /// distinguishes "there are no workers" from startup before the first
+    /// snapshot arrives.
+    @Published private(set) var hasReceivedSnapshot = false
 
     /// Workers in a non-terminal "alive" state: `spawning`, `working`,
     /// or `waitingForInput`. Shared by `activeAgentCount` and
@@ -25,9 +29,7 @@ final class LiveWorkerStateStore: ObservableObject {
     /// guard — from the user's perspective a worker idle at a Claude
     /// prompt is still kill-worthy (live conversation history,
     /// possibly in-progress edits in its leased workspace).
-    var activeAgentCount: Int {
-        activeAgentTmuxHostedFlags.count
-    }
+    @Published private(set) var activeAgentCount = 0
 
     /// `tmuxHosted` of every currently active worker (same "alive" filter
     /// as `activeAgentCount`), in no particular order. Feeds the
@@ -47,11 +49,16 @@ final class LiveWorkerStateStore: ObservableObject {
     func update(states: [WorkerLiveState]) {
         let newByRunID = Dictionary(uniqueKeysWithValues: states.map { ($0.runId, $0) })
         let newBySlot = Dictionary(uniqueKeysWithValues: states.map { ($0.slotId, $0) })
+        let newActiveAgentCount = newBySlot.values.count { Self.aliveActivities.contains($0.activity) }
         if newByRunID != byRunID {
             byRunID = newByRunID
         }
         if newBySlot != bySlot {
             bySlot = newBySlot
         }
+        if newActiveAgentCount != activeAgentCount {
+            activeAgentCount = newActiveAgentCount
+        }
+        hasReceivedSnapshot = true
     }
 }
