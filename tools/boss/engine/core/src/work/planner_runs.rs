@@ -131,8 +131,19 @@ impl WorkDb {
     /// `crate::background_work`'s stable "known starts oldest first"
     /// ordering contract.
     pub fn list_running_planner_runs_older_than(&self, min_age_secs: i64) -> Result<Vec<RunningPlannerRun>> {
-        let conn = self.connect()?;
         let now_secs: i64 = now_string().parse().unwrap_or(0);
+        self.list_running_planner_runs_older_than_at(min_age_secs, now_secs)
+    }
+
+    /// [`Self::list_running_planner_runs_older_than`] judged against an
+    /// explicit `now_secs` instead of the live clock, so a test can
+    /// backdate a row and query it against the same instant.
+    pub fn list_running_planner_runs_older_than_at(
+        &self,
+        min_age_secs: i64,
+        now_secs: i64,
+    ) -> Result<Vec<RunningPlannerRun>> {
+        let conn = self.connect()?;
         let cutoff = now_secs - min_age_secs;
         let mut stmt = conn.prepare(
             "SELECT pr.id, pr.project_id, pr.product_id, pr.created_at, p.name
@@ -720,13 +731,17 @@ mod tests {
         assert!(reclaimed.is_some(), "claim must succeed after undo delete");
     }
 
-    /// Directly rewrites a `planner_runs` row's `created_at` so age-gate
-    /// tests can simulate "this run started N seconds ago" without
-    /// sleeping the test. Pure test plumbing — production code never
-    /// touches `created_at` after insert.
+    /// Fixed "now" for the age-gate tests: rows are backdated relative to
+    /// it and queried against it, so the outcome never depends on the
+    /// real clock ticking between the two reads.
+    const NOW_SECS: i64 = 1_700_000_000;
+
+    /// Directly rewrites a `planner_runs` row's `created_at` to
+    /// `NOW_SECS - secs_ago` so age-gate tests can simulate "this run
+    /// started N seconds ago" without sleeping the test. Pure test
+    /// plumbing — production code never touches `created_at` after insert.
     fn backdate_planner_run(db: &WorkDb, run_id: &str, secs_ago: i64) {
-        let now_secs: i64 = now_string().parse().unwrap();
-        let new_ts = (now_secs - secs_ago).to_string();
+        let new_ts = (NOW_SECS - secs_ago).to_string();
         let conn = db.connect().unwrap();
         conn.execute(
             "UPDATE planner_runs SET created_at = ?2 WHERE id = ?1",
@@ -767,7 +782,7 @@ mod tests {
             .unwrap();
         // Exactly at the threshold: "at least N seconds old" is inclusive.
         backdate_planner_run(&db, &run.id, 15);
-        let rows = db.list_running_planner_runs_older_than(15).unwrap();
+        let rows = db.list_running_planner_runs_older_than_at(15, NOW_SECS).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, run.id);
         assert_eq!(rows[0].project_id, project_id);
@@ -789,7 +804,11 @@ mod tests {
             .unwrap()
             .unwrap();
         backdate_planner_run(&db, &run.id, 14);
-        assert!(db.list_running_planner_runs_older_than(15).unwrap().is_empty());
+        assert!(
+            db.list_running_planner_runs_older_than_at(15, NOW_SECS)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -812,7 +831,9 @@ mod tests {
         )
         .unwrap();
         assert!(
-            db.list_running_planner_runs_older_than(15).unwrap().is_empty(),
+            db.list_running_planner_runs_older_than_at(15, NOW_SECS)
+                .unwrap()
+                .is_empty(),
             "a staged row is no longer an in-flight background operation"
         );
     }
@@ -851,7 +872,7 @@ mod tests {
             .unwrap();
         backdate_planner_run(&db, &newer.id, 20);
         backdate_planner_run(&db, &older.id, 40);
-        let rows = db.list_running_planner_runs_older_than(15).unwrap();
+        let rows = db.list_running_planner_runs_older_than_at(15, NOW_SECS).unwrap();
         assert_eq!(
             rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
             vec![older.id, newer.id]

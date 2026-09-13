@@ -345,7 +345,8 @@ pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str, queries:
             Some((id, status)) => (Some(status), Some(id)),
             None => (None, None),
         };
-        let dispatch_retry_at = dispatch_retry_at_for_execution(&execution);
+        let dispatch_retry_at =
+            dispatch_retry_at_for_execution(&execution, boss_engine_utils::epoch_time::now_epoch_secs());
         let (dispatch_wait_reason, dispatch_wait_since) = dispatch_wait_for_execution(&execution);
         (
             Some(execution.status),
@@ -393,12 +394,14 @@ fn dispatch_wait_for_execution(execution: &WorkExecution) -> (Option<String>, Op
 /// is still in the future. `None` for a fresh `ready` execution (no
 /// failure yet — a genuine capacity wait) and once the backoff window
 /// has elapsed (the execution is a normal dispatch candidate again).
-fn dispatch_retry_at_for_execution(execution: &WorkExecution) -> Option<String> {
+///
+/// `now_secs` is the instant the backoff window is judged against; the
+/// caller passes the live clock so tests can pin it.
+fn dispatch_retry_at_for_execution(execution: &WorkExecution, now_secs: i64) -> Option<String> {
     if execution.status != ExecutionStatus::Ready || execution.pre_start_failure_count <= 0 {
         return None;
     }
     let dispatch_not_before: i64 = execution.dispatch_not_before.as_deref()?.parse().ok()?;
-    let now_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
     if dispatch_not_before > now_secs {
         Some(dispatch_not_before.to_string())
     } else {
@@ -1677,6 +1680,14 @@ mod tests {
 
     // ── dispatch_retry_at_for_execution ─────────────────────────────────────
 
+    /// Fixed "now" the retry-window tests judge `dispatch_not_before`
+    /// against, so the fixtures below never meet the real clock.
+    const NOW_SECS: i64 = 1_700_000_000;
+    /// A `dispatch_not_before` one hour after [`NOW_SECS`].
+    const FUTURE: &str = "1700003600";
+    /// A `dispatch_not_before` one hour before [`NOW_SECS`].
+    const PAST: &str = "1699996400";
+
     /// Minimal `ready` execution with a given `pre_start_failure_count`
     /// / `dispatch_not_before`, for exercising
     /// `dispatch_retry_at_for_execution`'s branches in isolation.
@@ -1695,39 +1706,42 @@ mod tests {
 
     #[test]
     fn dispatch_retry_at_none_for_non_ready_status() {
-        let mut exec = ready_execution(1, Some("9999999999"));
+        let mut exec = ready_execution(1, Some(FUTURE));
         exec.status = ExecutionStatus::Running;
-        assert_eq!(dispatch_retry_at_for_execution(&exec), None);
+        assert_eq!(dispatch_retry_at_for_execution(&exec, NOW_SECS), None);
     }
 
     #[test]
     fn dispatch_retry_at_none_when_no_prior_failure() {
-        let exec = ready_execution(0, Some("9999999999"));
-        assert_eq!(dispatch_retry_at_for_execution(&exec), None);
+        let exec = ready_execution(0, Some(FUTURE));
+        assert_eq!(dispatch_retry_at_for_execution(&exec, NOW_SECS), None);
     }
 
     #[test]
     fn dispatch_retry_at_none_when_dispatch_not_before_absent() {
         let exec = ready_execution(1, None);
-        assert_eq!(dispatch_retry_at_for_execution(&exec), None);
+        assert_eq!(dispatch_retry_at_for_execution(&exec, NOW_SECS), None);
     }
 
     #[test]
     fn dispatch_retry_at_none_when_dispatch_not_before_unparseable() {
         let exec = ready_execution(1, Some("not-a-number"));
-        assert_eq!(dispatch_retry_at_for_execution(&exec), None);
+        assert_eq!(dispatch_retry_at_for_execution(&exec, NOW_SECS), None);
     }
 
     #[test]
     fn dispatch_retry_at_none_when_dispatch_not_before_in_past() {
-        let exec = ready_execution(1, Some("1"));
-        assert_eq!(dispatch_retry_at_for_execution(&exec), None);
+        let exec = ready_execution(1, Some(PAST));
+        assert_eq!(dispatch_retry_at_for_execution(&exec, NOW_SECS), None);
     }
 
     #[test]
     fn dispatch_retry_at_some_when_dispatch_not_before_in_future() {
-        let exec = ready_execution(1, Some("9999999999"));
-        assert_eq!(dispatch_retry_at_for_execution(&exec), Some("9999999999".to_owned()));
+        let exec = ready_execution(1, Some(FUTURE));
+        assert_eq!(
+            dispatch_retry_at_for_execution(&exec, NOW_SECS),
+            Some(FUTURE.to_owned())
+        );
     }
 
     // ── attention_target_from_input ─────────────────────────────────────────

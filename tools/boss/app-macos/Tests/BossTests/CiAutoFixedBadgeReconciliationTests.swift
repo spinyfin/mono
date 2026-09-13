@@ -114,11 +114,16 @@ final class CiAutoFixedBadgeReconciliationTests: XCTestCase {
         let model = makeModel()
         let prURL = "https://github.com/x/y/pull/2679"
 
+        // The older row must be inside the freshness window, computed at
+        // runtime: if it were a fixed literal it would age out of the window
+        // and this test would pass even when the latest-attempt guard is
+        // broken, because a stale succeeded row never stamps the badge.
+        let recent = String(Int(Date().addingTimeInterval(-5 * 60).timeIntervalSince1970))
         model.applyEventForTest(.ciRemediationsList(attempts: [
             // Freshest first: a new attempt is running now...
             makeRemediation(id: "cir_7", prURL: prURL, status: "running", finishedAt: nil),
             // ...even though an older attempt on the same PR had succeeded.
-            makeRemediation(id: "cir_6", prURL: prURL, status: "succeeded", finishedAt: "1784174400"),
+            makeRemediation(id: "cir_6", prURL: prURL, status: "succeeded", finishedAt: recent),
         ]))
 
         XCTAssertFalse(
@@ -223,7 +228,11 @@ final class CiAutoFixedBadgeReconciliationTests: XCTestCase {
     }
 
     private func makeRemediation(id: String, prURL: String, status: String, finishedAt: String?) -> WorkCiRemediation {
-        WorkCiRemediation(
+        // `createdAt` is the freshness fallback when `finishedAt` is nil, so
+        // it is computed relative to now rather than pinned to a literal that
+        // would silently fall outside `badgeFreshnessWindow` as it ages.
+        let createdAt = String(Int(Date().addingTimeInterval(-10 * 60).timeIntervalSince1970))
+        return WorkCiRemediation(
             id: id,
             productID: "prod_test",
             workItemID: "task_1",
@@ -242,7 +251,7 @@ final class CiAutoFixedBadgeReconciliationTests: XCTestCase {
             cubeLeaseID: nil,
             cubeWorkspaceID: nil,
             workerID: nil,
-            createdAt: "1784160000",
+            createdAt: createdAt,
             startedAt: nil,
             finishedAt: finishedAt
         )

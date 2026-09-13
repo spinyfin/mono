@@ -413,8 +413,12 @@ pub mod grok {
     /// under a second issuer. RFC-3339 timestamps compare correctly as strings
     /// when they share an offset, and these are all written by the same CLI.
     ///
+    /// `now_epoch_s` is the instant expiry is judged against; the probe
+    /// passes the live clock and tests pass a fixed value so fixtures never
+    /// age into "expired".
+    ///
     /// Returns the token by value. Callers must not log or store it.
-    fn extract_bearer(document: &serde_json::Value) -> Result<String, TokenError> {
+    fn extract_bearer(document: &serde_json::Value, now_epoch_s: i64) -> Result<String, TokenError> {
         let Some(accounts) = document.as_object() else {
             return Err(TokenError {
                 kind: DriverQuotaFailureKind::NotAuthenticated,
@@ -439,7 +443,7 @@ pub mod grok {
             }
         }
         match best {
-            Some((expires, _)) if token_expired(expires) => Err(TokenError {
+            Some((expires, _)) if token_expired(expires, now_epoch_s) => Err(TokenError {
                 kind: DriverQuotaFailureKind::NotAuthenticated,
                 reason: "stored Grok token has expired — run any grok command or `grok login` to refresh".to_owned(),
             }),
@@ -451,16 +455,16 @@ pub mod grok {
         }
     }
 
-    /// `true` when `expires_at` parses as RFC-3339 and is strictly in the
-    /// past. Missing or unparseable timestamps are treated as live so a
-    /// document without an expiry still produces a request rather than a
-    /// false "expired" label.
-    fn token_expired(expires_at: &str) -> bool {
+    /// `true` when `expires_at` parses as RFC-3339 and is strictly before
+    /// `now_epoch_s`. Missing or unparseable timestamps are treated as live
+    /// so a document without an expiry still produces a request rather than
+    /// a false "expired" label.
+    fn token_expired(expires_at: &str, now_epoch_s: i64) -> bool {
         if expires_at.is_empty() {
             return false;
         }
         match chrono::DateTime::parse_from_rfc3339(expires_at) {
-            Ok(dt) => dt.timestamp() < crate::now_epoch_s(),
+            Ok(dt) => dt.timestamp() < now_epoch_s,
             Err(_) => false,
         }
     }
@@ -494,10 +498,11 @@ pub mod grok {
         }
 
         async fn probe(&self) -> DriverQuotaOutcome {
-            let bearer = match read_auth_document(&self.auth_path).and_then(|doc| extract_bearer(&doc)) {
-                Ok(bearer) => bearer,
-                Err(TokenError { kind, reason }) => return unavailable(kind, reason),
-            };
+            let bearer =
+                match read_auth_document(&self.auth_path).and_then(|doc| extract_bearer(&doc, crate::now_epoch_s())) {
+                    Ok(bearer) => bearer,
+                    Err(TokenError { kind, reason }) => return unavailable(kind, reason),
+                };
 
             let response = boss_http_retry::http_client()
                 .get(self.billing_url())
@@ -544,35 +549,47 @@ pub mod grok {
     mod tests {
         use super::*;
 
+        /// Fixed "now" every expiry fixture below is judged against:
+        /// 2026-06-01T00:00:00Z. Fixtures are written relative to this
+        /// instant so the tests never meet the real clock.
+        const NOW: i64 = 1_780_272_000;
+        const DAY: i64 = 86_400;
+
+        fn rfc3339(epoch_s: i64) -> String {
+            chrono::DateTime::from_timestamp(epoch_s, 0)
+                .expect("fixture epoch in range")
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        }
+
         #[test]
         fn bearer_taken_from_the_only_account() {
             let doc = serde_json::json!({
-                "https://auth.example::acct": { "key": "token-a", "expires_at": "2099-09-01T00:00:00Z" }
+                "https://auth.example::acct": { "key": "token-a", "expires_at": rfc3339(NOW + 30 * DAY) }
             });
-            assert_eq!(extract_bearer(&doc).ok(), Some("token-a".to_owned()));
+            assert_eq!(extract_bearer(&doc, NOW).ok(), Some("token-a".to_owned()));
         }
 
         #[test]
         fn furthest_future_account_wins_when_several_are_present() {
             let doc = serde_json::json!({
-                "issuer-a::1": { "key": "old", "expires_at": "2099-01-01T00:00:00Z" },
-                "issuer-b::2": { "key": "new", "expires_at": "2099-09-01T00:00:00Z" },
+                "issuer-a::1": { "key": "old", "expires_at": rfc3339(NOW + 7 * DAY) },
+                "issuer-b::2": { "key": "new", "expires_at": rfc3339(NOW + 30 * DAY) },
             });
-            assert_eq!(extract_bearer(&doc).ok(), Some("new".to_owned()));
+            assert_eq!(extract_bearer(&doc, NOW).ok(), Some("new".to_owned()));
         }
 
         #[test]
         fn empty_document_reads_as_not_authenticated() {
-            let err = extract_bearer(&serde_json::json!({})).unwrap_err();
+            let err = extract_bearer(&serde_json::json!({}), NOW).unwrap_err();
             assert_eq!(err.kind, DriverQuotaFailureKind::NotAuthenticated);
         }
 
         #[test]
         fn expired_token_is_named_as_expired_not_unsigned() {
             let doc = serde_json::json!({
-                "issuer-a::1": { "key": "old", "expires_at": "2020-01-01T00:00:00Z" }
+                "issuer-a::1": { "key": "old", "expires_at": rfc3339(NOW - DAY) }
             });
-            let err = extract_bearer(&doc).unwrap_err();
+            let err = extract_bearer(&doc, NOW).unwrap_err();
             assert_eq!(err.kind, DriverQuotaFailureKind::NotAuthenticated);
             assert!(
                 err.reason.contains("expired"),
@@ -583,13 +600,13 @@ pub mod grok {
 
         #[test]
         fn record_without_a_key_is_skipped_rather_than_treated_as_a_token() {
-            let doc = serde_json::json!({ "issuer::1": { "expires_at": "2099-09-01T00:00:00Z" } });
-            assert!(extract_bearer(&doc).is_err());
+            let doc = serde_json::json!({ "issuer::1": { "expires_at": rfc3339(NOW + 30 * DAY) } });
+            assert!(extract_bearer(&doc, NOW).is_err());
         }
 
         #[test]
         fn non_object_document_reads_as_not_authenticated() {
-            let err = extract_bearer(&serde_json::json!([])).unwrap_err();
+            let err = extract_bearer(&serde_json::json!([]), NOW).unwrap_err();
             assert_eq!(err.kind, DriverQuotaFailureKind::NotAuthenticated);
         }
 
