@@ -1141,7 +1141,7 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
                  WHERE type = 'index'
-                   AND name IN ('work_executions_kind_finished_at_idx', 'work_runs_created_at_idx')",
+                   AND name IN ('work_executions_finished_at_kind_idx', 'work_runs_created_at_idx')",
                 [],
                 |row| row.get(0),
             )
