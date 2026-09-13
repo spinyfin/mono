@@ -10,13 +10,17 @@ import Foundation
 /// Live runtime state for one allocated worker slot, mirroring the
 /// engine's `LiveWorkerState`. Keyed by `slotId` (1..=16) — survives
 /// run-record finalisation, which happens within a second of spawn.
-struct WorkerLiveState: Hashable {
+struct WorkerLiveState {
     let slotId: Int
     let runId: String
     let model: String
     let shellPid: Int32
+    /// ISO-8601 timestamp of the most recent hook event. Deliberately
+    /// excluded from `==`/`hash(into:)` below — see the note there.
     let lastEventAt: String?
     let currentTool: String?
+    /// ISO-8601 timestamp of the most recent `PostToolUse`. Deliberately
+    /// excluded from `==`/`hash(into:)` below — see the note there.
     let lastToolEndedAt: String?
     let activity: WorkerActivity
     /// Free-text one-sentence description of what the worker is doing
@@ -44,6 +48,47 @@ struct WorkerLiveState: Hashable {
     /// `workers.tmux_hosting` setting value. `nil` when the engine hasn't
     /// reported it (remote workers, or an older engine).
     let tmuxHosted: Bool?
+}
+
+extension WorkerLiveState: Hashable {
+    /// Custom `==`/`hash(into:)` that exclude `lastEventAt` and
+    /// `lastToolEndedAt`. Both fields advance on every hook event —
+    /// including a pure heartbeat that changes nothing else — so a
+    /// synthesized implementation would make two snapshots that differ
+    /// only in "when the last event happened" compare unequal. That is
+    /// exactly the case `LiveWorkerStateStore.update` relies on this
+    /// type's equality to detect and skip, to avoid republishing (and
+    /// invalidating every observing card) on every Claude tool call.
+    /// Timestamps are still carried on the struct for display — see
+    /// `WorkerStalenessIndicator`, which reads `lastEventAt` from
+    /// whatever snapshot last actually published and ticks its own
+    /// display forward on an independent `TimelineView` timer, so it
+    /// does not depend on a fresh publish for every elapsed second.
+    static func == (lhs: WorkerLiveState, rhs: WorkerLiveState) -> Bool {
+        lhs.slotId == rhs.slotId
+            && lhs.runId == rhs.runId
+            && lhs.model == rhs.model
+            && lhs.shellPid == rhs.shellPid
+            && lhs.currentTool == rhs.currentTool
+            && lhs.activity == rhs.activity
+            && lhs.liveStatus == rhs.liveStatus
+            && lhs.liveStatusAt == rhs.liveStatusAt
+            && lhs.recoveryStatus == rhs.recoveryStatus
+            && lhs.tmuxHosted == rhs.tmuxHosted
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(slotId)
+        hasher.combine(runId)
+        hasher.combine(model)
+        hasher.combine(shellPid)
+        hasher.combine(currentTool)
+        hasher.combine(activity)
+        hasher.combine(liveStatus)
+        hasher.combine(liveStatusAt)
+        hasher.combine(recoveryStatus)
+        hasher.combine(tmuxHosted)
+    }
 }
 
 enum WorkerActivity: String, Hashable {
