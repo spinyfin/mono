@@ -32,15 +32,26 @@ struct ContentView: View {
     @AppStorage(KanbanBoardStyle.storageKey, store: BossDefaults.store) private var kanbanBoardStyle: KanbanBoardStyle = .productDefault
 
     var body: some View {
-        // Work and Agents are kept alive via opacity + hit-testing so SwiftUI
-        // doesn't tear down the libghostty NSViews on tab switches (teardown
-        // would force ghostty_surface_new and restart every claude session).
-        // DesignsView is structurally conditional because it contains its own
+        // Work and Agents stay mounted via opacity + hit-testing. Switching
+        // either tree to `if navigationMode ==` would call
+        // `GhosttyTerminalView.dismantleNSView` → `ghostty_surface_free` on
+        // every tab change and `ghostty_surface_new` on the way back,
+        // restarting every claude session (Agents worker panes) and the
+        // coordinator pane (Work). Designs / Automations / Ideas have no
+        // libghostty NSViews, so they sit behind `if`. Designs is also
+        // structurally conditional because it contains its own
         // NavigationSplitView: two NSVs mounted concurrently share the same
         // NSWindow toolbar namespace and AppKit deduplicates their toggle
         // items, causing position thrash and a missing Designs sidebar. Only
         // one NSV may live in the tree at a time. Designs remounts cheaply
         // (filesystem reads only) so structural conditional is safe here.
+        //
+        // Hidden-tab layout cost is cut without unmounting: `WorkersDetailView`
+        // is Equatable over workspace / live-state identity, visibility, and
+        // the two live-status flags, so an unrelated `ChatViewModel` publish
+        // (the kanban's usual invalidation) skips the Agents body. While the
+        // tab is hidden, its snapshot cache also prevents live-state ticks
+        // from invalidating a grid or slot while preserving all surfaces.
         //
         // This ZStack must stay the root of the window's content: SwiftUI only
         // promotes a NavigationSplitView to the window's content view
@@ -617,8 +628,14 @@ struct ContentView: View {
         WorkersDetailView(
             workspace: workersWorkspace,
             liveStates: model.liveWorkerStates,
-            liveStatusModel: model
+            isVisible: model.navigationMode == .agents,
+            tmuxHostingEnabled: model.tmuxHostingEnabled,
+            liveStatusDisabledSlotIDs: model.liveStatusDisabledSlotIDs,
+            onToggleLiveStatus: { slotId, enabled in
+                model.setLiveStatusEnabled(slotId: slotId, enabled: enabled)
+            }
         )
+            .equatable()
             .background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea())
         #else
         VStack(alignment: .leading, spacing: 12) {
