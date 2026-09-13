@@ -15,13 +15,26 @@ key-path set. Observation plus `AnyKeyPath` hashing was ~43–56% of main-thread
 self time in the profiles that motivated this change.
 
 The two sites that accounted for the 31–45% share — the toolbar Mode picker
-and the Workers pool picker — now use one shared SwiftUI-native control,
-`NativeSegmentedPicker`: an `HStack` of buttons with a selection pill, no
-`NSViewRepresentable`, no `NSSegmentedControl`.
+and the Workers pool picker — now use one shared AppKit wrapper,
+`NativeSegmentedPicker`: an `NSViewRepresentable` around `NSSegmentedControl`
+that sets plain string labels via `setLabel(_:forSegment:)` and never hosts
+SwiftUI content per segment. Measurement is `sizeThatFits(_:nsView:context:)`
+calling AppKit `fittingSize` only; it does not re-enter the ViewGraph.
+
+The slow path was not "any `NSViewRepresentable`". It was this particular
+representable hosting SwiftUI labels. The codebase already has several thin
+AppKit wrappers (`CommentTextEditor`, `ResizeDivider`, `GhosttyTerminalView`)
+that do not pay the nested-ViewGraph cost.
+
+A prior SwiftUI-only approximation (`HStack` of buttons, no AppKit control)
+avoided the measurement cost but painted a click-to-focus ring around the
+whole control and guessed at track/pill metrics. The AppKit wrapper makes
+both structurally impossible.
 
 ## Measured impact (before)
 
-Three `sample` profiles of the running Boss app under normal use:
+Three `sample` profiles of the running Boss app under normal use, captured
+against `.pickerStyle(.segmented)`:
 
 | Attribution (one profile) | Share of main-thread time |
 | ------------------------- | ------------------------: |
@@ -48,18 +61,18 @@ Behaviour preserved:
 
 - Selection binds to the existing model. A value that is no longer in the
   option list is left alone (same as `Picker`).
-- Arrow keys move without wrapping; VoiceOver increment/decrement does the
-  same. The control is one keyboard focus target.
-- Each segment keeps an accessible label; selected state is
-  `.isSelected`; VoiceOver increment/decrement moves the selection.
-- Ideal width is the title string at the system control font, not
-  `sizeThatFits(nil)` on a `maxWidth: .infinity` child. That poisoned
-  measurement is what NSToolbar cannot size. Unit tests pin
-  `NSHostingView.fittingSize` in the label-sized range.
+- Arrow keys, click-versus-tab focus, and VoiceOver increment/decrement
+  come from `NSSegmentedControl` itself. The control is one keyboard focus
+  target; a mouse click does not paint a SwiftUI focus ring around the
+  whole control.
+- Each segment's accessible label is the string passed to `setLabel`.
+- Unbounded proposals (NSToolbar's measure pass) report AppKit's label
+  ideal, not a poisoned infinite width. Finite proposals, including 0,
+  are filled. Unit tests pin `NSHostingView.fittingSize` in the
+  label-sized range and pin labels via `setLabel(_:forSegment:)` on a
+  single `NSSegmentedControl`.
 
-Unit tests pin the mechanism: `NativeSegmentedPicker` installs no
-`NSSegmentedControl` even across 200 relayouts; a system segmented `Picker`
-still does.
+Do not revert these two sites to `Picker` + `.pickerStyle(.segmented)`.
 
 ## What this does not cover
 
@@ -84,8 +97,9 @@ Symbols to read: `_overrideSizeThatFits`, `NSSegmentedControl`,
 `SegmentedPickerStyle`, `AG::Graph` / `AnyKeyPath` hashing, main-thread
 on-CPU (total minus `mach_msg2_trap`).
 
-Prediction: Mode + Pool contribute ~0 inclusive samples under
-`NSSegmentedControl` / `_overrideSizeThatFits`. The 31–45% share should move
-to ordinary SwiftUI `Button` / `Layout` / `Text` frames at far lower cost.
-The UI Stalls "Since" picker is unchanged and will still show the
-representable path if that window is open.
+Prediction: Mode + Pool still contribute ~0 inclusive samples under
+Picker-style `_overrideSizeThatFits` / `SegmentedPickerStyle` / `AnyKeyPath`
+hashing. `NSSegmentedControl` will appear (it is the wrapper's view) but
+must not dominate main-thread self time. The UI Stalls "Since" picker is
+unchanged and will still show the representable path if that window is
+open.

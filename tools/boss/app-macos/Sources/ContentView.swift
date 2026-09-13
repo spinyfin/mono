@@ -274,9 +274,11 @@ struct ContentView: View {
                     options: NavigationMode.allCases,
                     title: { $0.rawValue }
                 )
-                // Same 440pt box as the previous segmented Picker. Intrinsic
-                // size is label-based so NSToolbar can measure this item.
-                // `fixedSize` stops the toolbar proposing an unbounded width.
+                // Same 440pt box as the previous segmented Picker. The
+                // representable's sizeThatFits reports a finite AppKit
+                // fitting size on NSToolbar's unbounded measure pass, so
+                // this frame is a width choice rather than a measurement
+                // workaround.
                 .frame(width: 440)
                 .fixedSize()
             }
