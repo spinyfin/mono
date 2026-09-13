@@ -286,6 +286,267 @@ fn design_task_kind_is_refused_for_project_move() {
     let _ = std::fs::remove_file(path);
 }
 
+// ── revision project-membership cascade ─────────────────────────────────
+//
+// A revision's project membership is derived from its parent at mint time
+// (`insert_revision_in_tx`) and it has no independent identity to
+// reassign — `update_task` refuses a direct `--set-project` on a
+// `revision` row (see `direct_set_project_on_a_revision_is_still_refused`
+// below). Moving the *parent's* project must therefore cascade onto every
+// revision already minted against it, or the refusal makes the resulting
+// divergence permanently unfixable through the CLI.
+
+fn task_project_id(db: &WorkDb, task_id: &str) -> Option<String> {
+    db.connect()
+        .unwrap()
+        .query_row(
+            "SELECT project_id FROM tasks WHERE id = ?1",
+            rusqlite::params![task_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .unwrap()
+}
+
+/// Assert the debug/consistency invariant this cascade exists to uphold:
+/// no revision's `project_id` may differ from its parent's. Walks
+/// `parent_task_id` one hop at a time so it also catches a revision whose
+/// immediate parent is itself a revision.
+fn assert_no_revision_project_divergence(db: &WorkDb) {
+    let conn = db.connect().unwrap();
+    let mut stmt = conn
+        .prepare("SELECT id, project_id, parent_task_id FROM tasks WHERE kind = 'revision' AND deleted_at IS NULL")
+        .unwrap();
+    let revisions: Vec<(String, Option<String>, Option<String>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    for (rev_id, rev_project_id, parent_id) in revisions {
+        let parent_id = parent_id.expect("a revision row must always carry a parent_task_id");
+        let parent_project_id: Option<String> = conn
+            .query_row(
+                "SELECT project_id FROM tasks WHERE id = ?1",
+                rusqlite::params![parent_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rev_project_id, parent_project_id,
+            "revision {rev_id} project_id must match its parent {parent_id}'s"
+        );
+    }
+}
+
+#[test]
+fn moving_a_chore_with_a_revision_into_a_project_cascades_to_the_revision() {
+    let path = temp_db_path("move-chore-with-revision-into-project");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let project = create_test_project(&db, product.id.clone(), "Target project");
+    let chore = create_test_chore_manual(&db, product.id.clone(), "A chore with a revision");
+    let revision = insert_revision_row(&db, &product.id, &chore.id);
+    assert_eq!(task_project_id(&db, &revision), None, "revision starts project-less");
+
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            project_id: Some(project.id.clone()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        task_project_id(&db, &revision),
+        Some(project.id.clone()),
+        "moving the parent into a project must cascade to its existing revision"
+    );
+    assert_no_revision_project_divergence(&db);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn moving_a_project_task_with_a_revision_out_of_its_project_clears_the_revision() {
+    let path = temp_db_path("unset-project-task-with-revision");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let project = create_test_project(&db, product.id.clone(), "Source project");
+    let project_task = create_test_project_task(&db, product.id.clone(), project.id.clone(), "A project task");
+    let revision = insert_revision_row(&db, &product.id, &project_task.id);
+    // Simulate the revision having inherited the parent's project at mint
+    // time, as `insert_revision_in_tx` does in production.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET project_id = ?2 WHERE id = ?1",
+            rusqlite::params![revision, project.id],
+        )
+        .unwrap();
+    assert_eq!(task_project_id(&db, &revision), Some(project.id.clone()));
+
+    db.update_work_item(
+        &project_task.id,
+        WorkItemPatch {
+            project_id: Some(String::new()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        task_project_id(&db, &revision),
+        None,
+        "moving the parent out of its project must clear the revision's project too, not leave it stale"
+    );
+    assert_no_revision_project_divergence(&db);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn cascade_reaches_a_multi_level_revision_chain() {
+    let path = temp_db_path("cascade-multi-level-revision-chain");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let project = create_test_project(&db, product.id.clone(), "Target project");
+    let chore = create_test_chore_manual(&db, product.id.clone(), "Root chore");
+    let revision_a = insert_revision_row(&db, &product.id, &chore.id);
+    // A revision of a revision — legacy nesting that `collect_chain_revision_ids`
+    // still walks (see its docs).
+    let revision_b = insert_revision_row(&db, &product.id, &revision_a);
+
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            project_id: Some(project.id.clone()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(task_project_id(&db, &revision_a), Some(project.id.clone()));
+    assert_eq!(
+        task_project_id(&db, &revision_b),
+        Some(project.id.clone()),
+        "cascade must reach a revision nested two levels below the moved parent"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn moving_a_parent_updates_an_independently_deleted_revision_before_restore() {
+    let path = temp_db_path("move-parent-with-deleted-revision");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let source_project = create_test_project(&db, product.id.clone(), "Source project");
+    let target_project = create_test_project(&db, product.id.clone(), "Target project");
+    let parent = create_test_project_task(&db, product.id.clone(), source_project.id.clone(), "Parent task");
+    let revision = insert_revision_row(&db, &product.id, &parent.id);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET project_id = ?2, deleted_at = 'independently-deleted' WHERE id = ?1",
+            rusqlite::params![revision, source_project.id],
+        )
+        .unwrap();
+
+    db.update_work_item(
+        &parent.id,
+        WorkItemPatch {
+            project_id: Some(target_project.id.clone()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    let restored = db.restore_work_item(&revision).unwrap();
+    let WorkItem::Task(restored) = restored else {
+        panic!("expected restored revision task");
+    };
+    assert_eq!(restored.deleted_at, None, "revision must be restored independently");
+    assert_eq!(
+        task_project_id(&db, &revision),
+        Some(target_project.id),
+        "restoring an independently deleted revision must retain the parent's moved project"
+    );
+    assert_no_revision_project_divergence(&db);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn reapplying_the_current_project_still_repairs_a_drifted_revision() {
+    // Regression guard for the one divergent row the design doc describes:
+    // a revision minted before this cascade existed can be stuck with a
+    // stale (or NULL) project_id even though its parent already carries the
+    // right one. Re-applying `--set-project` with the project the parent
+    // already has must still cascade and repair it, not short-circuit as a
+    // no-op.
+    let path = temp_db_path("noop-reapply-still-repairs-revision");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let project = create_test_project(&db, product.id.clone(), "Project");
+    let project_task = create_test_project_task(&db, product.id.clone(), project.id.clone(), "Task");
+    let revision = insert_revision_row(&db, &product.id, &project_task.id);
+    assert_eq!(
+        task_project_id(&db, &revision),
+        None,
+        "sanity: the revision starts divergent from its parent"
+    );
+
+    db.update_work_item(
+        &project_task.id,
+        WorkItemPatch {
+            project_id: Some(project.id.clone()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        task_project_id(&db, &revision),
+        Some(project.id.clone()),
+        "a no-op re-application of the parent's current project must still cascade and repair the revision"
+    );
+    assert_no_revision_project_divergence(&db);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn direct_set_project_on_a_revision_is_still_refused() {
+    let path = temp_db_path("direct-set-project-on-revision-refused");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let project = create_test_project(&db, product.id.clone(), "Some project");
+    let chore = create_test_chore_manual(&db, product.id.clone(), "Chore");
+    let revision = insert_revision_row(&db, &product.id, &chore.id);
+
+    let err = db
+        .update_work_item(
+            &revision,
+            WorkItemPatch {
+                project_id: Some(project.id.clone()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap_err();
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("kind `revision` has its own project-membership semantics"),
+        "expected the revision-specific refusal, got: {message}"
+    );
+    assert_eq!(
+        task_project_id(&db, &revision),
+        None,
+        "a refused patch must not have mutated the revision's project_id"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn unset_project_on_already_project_less_chore_is_a_noop() {
     let path = temp_db_path("unset-project-noop");

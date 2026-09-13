@@ -620,6 +620,43 @@ pub(crate) fn record_revision_archived_attention(
     Ok(())
 }
 
+/// Cascade a parent chore/project_task's `project_id` onto every revision in
+/// its chain, transitively. A revision's project membership is derived from
+/// its parent at mint time (see `insert_revision_in_tx`) and it has no
+/// independent project identity — the CLI refuses to reassign a revision's
+/// `project_id` directly (see `is_movable_project_membership_kind`). Moving
+/// the parent's project must keep that invariant true for every revision
+/// already minted against it, or the direct-reassignment refusal makes the
+/// resulting divergence permanently unfixable through the CLI.
+///
+/// `project_id` is the parent's new value (`None` clears membership). Called
+/// unconditionally whenever a `project_id` patch is present — including a
+/// no-op re-application of the parent's current value — so re-running
+/// `--set-project` with the project it already has is the repair path for
+/// any revision that drifted out of sync before this cascade existed.
+///
+/// Must run in the same transaction as the parent's own `project_id` write:
+/// a cascade that only partially lands would recreate exactly the
+/// divergence this closes.
+pub(crate) fn cascade_project_id_to_revisions(
+    conn: &Connection,
+    root_id: &str,
+    project_id: Option<&str>,
+    now: &str,
+) -> Result<()> {
+    // Tombstoned revisions still inherit their parent's project membership:
+    // an independently deleted revision may later be restored, and must not
+    // come back carrying a stale project_id.
+    let revision_ids = collect_chain_revision_ids_including_deleted(conn, root_id)?;
+    for rev_id in &revision_ids {
+        conn.execute(
+            "UPDATE tasks SET project_id = ?2, updated_at = ?3 WHERE id = ?1 AND kind = 'revision'",
+            params![rev_id, project_id, now],
+        )?;
+    }
+    Ok(())
+}
+
 /// Refuse a manual status change that the engine would immediately revert:
 /// moving a `revision` task off `archived` when its chain root's PR has
 /// already merged or closed. `reconcile_revision_execution`'s dispatch-time

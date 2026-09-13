@@ -550,6 +550,15 @@ impl WorkDb {
         // deliberately overrides any explicit `patch.ordinal` handled
         // above: a project move always needs a fresh ordinal scoped to
         // the target project, so a stale explicit value can't survive it.
+        // Whether to cascade the (possibly unchanged) project assignment onto
+        // this task's revision chain after the write below. Set whenever a
+        // `project_id` patch is present at all — including a no-op
+        // re-application of the current value — so re-running `--set-project`
+        // with the project a task already has is the repair path for any
+        // revision that drifted out of sync before this cascade existed (see
+        // `cascade_project_id_to_revisions`). A short-circuit here would make
+        // that repair path unreachable.
+        let mut cascade_project_to_revisions = false;
         if let Some(ref project_patch) = patch.project_id {
             let trimmed = project_patch.trim();
             let target_project_id = if trimmed.is_empty() {
@@ -573,6 +582,7 @@ impl WorkDb {
                 };
                 task.project_id = target_project_id;
             }
+            cascade_project_to_revisions = true;
         }
         task.updated_at = now_string();
 
@@ -705,6 +715,10 @@ impl WorkDb {
                 task.design_reasoning_effort_xhigh as i64,
             ],
         )?;
+
+        if cascade_project_to_revisions {
+            cascade_project_id_to_revisions(&tx, id, task.project_id.as_deref(), &task.updated_at)?;
+        }
 
         // Re-classifying an item as deferred pulls it out of the dispatch
         // pool immediately: abandon any not-yet-live execution so a row that
