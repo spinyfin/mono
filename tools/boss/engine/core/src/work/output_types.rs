@@ -114,6 +114,61 @@ pub struct TmuxIdentity {
     pub pane_pid: Option<i64>,
 }
 
+/// How a token-verified tmux probe classified `#{pane_dead}`.
+///
+/// Distinct from a missing row: `None` on
+/// [`WorkDb::tmux_pane_observation_for_execution`] means the probe never
+/// wrote. [`Self::Unreadable`] / [`Self::SessionMissing`] mean it wrote
+/// "we could not tell", which must not be confused with
+/// [`Self::Dead`] (an observed retained dead pane).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TmuxPaneObservationKind {
+    /// Token matched and `#{pane_dead}` was `0`.
+    Alive,
+    /// Token matched and `#{pane_dead}` was `1`.
+    Dead,
+    /// The session existed but `#{pane_dead}` (or the spawn token) could
+    /// not be read after the identity check started.
+    Unreadable,
+    /// The durable session name was absent from `list-sessions`.
+    SessionMissing,
+}
+
+impl TmuxPaneObservationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Alive => "alive",
+            Self::Dead => "dead",
+            Self::Unreadable => "unreadable",
+            Self::SessionMissing => "session_missing",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "alive" => Some(Self::Alive),
+            "dead" => Some(Self::Dead),
+            "unreadable" => Some(Self::Unreadable),
+            "session_missing" => Some(Self::SessionMissing),
+            _ => None,
+        }
+    }
+}
+
+/// Durable pane-dead observation for one run, retained after
+/// [`WorkDb::clear_tmux_identity_for_execution`] nulls the live identity
+/// columns. Self-describing: [`Self::session_name`] is a copy of the
+/// session name at observation time, not the live `tmux_session_name`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxPaneObservationRecord {
+    pub kind: TmuxPaneObservationKind,
+    /// `Some(true/false)` only when [`Self::kind`] is [`TmuxPaneObservationKind::Dead`]
+    /// or [`TmuxPaneObservationKind::Alive`]. `None` is "we could not tell".
+    pub pane_dead: Option<bool>,
+    pub pane_dead_status: Option<String>,
+    pub session_name: String,
+}
+
 /// One non-terminal execution whose latest run landed on a host that is
 /// no longer eligible to run it — the host was disabled (operator
 /// `bossctl hosts disable` or the dispatch-health circuit breaker) or

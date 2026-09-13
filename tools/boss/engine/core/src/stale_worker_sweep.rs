@@ -395,6 +395,13 @@ impl WorkerTerminalInspector for TmuxWorkerTerminalInspector {
             session_exists,
         )
         .await;
+        crate::tmux_adoption::persist_observed_pane_state(
+            &self.work_db,
+            &run.execution_id,
+            &run.tmux_spawn_token,
+            &run.tmux_session_name,
+            &observation,
+        );
         match observation.adoption_state {
             boss_protocol::TmuxAdoptionState::NotTmuxHosted => {
                 unreachable!("observe_tmux_identity never classifies NotTmuxHosted")
