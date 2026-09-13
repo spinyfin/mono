@@ -20,6 +20,7 @@ use std::time::{Duration, SystemTime};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{oneshot, watch};
 
+use crate::agent_jsonl_discovery::{CandidateRejection as DetailedCandidateRejection, scan_matching_paths};
 use crate::driver::{AgentDriver, AgentJsonlFileIngress, ProgressSessionConfig, ProgressStreamSource};
 use crate::stdout_progress::{ProgressCheckpointSink, WorkerEventSink};
 
@@ -45,7 +46,7 @@ const FILE_POLL: Duration = Duration::from_millis(50);
 pub const DISCOVERY_OVERDUE_AFTER: Duration = Duration::from_secs(120);
 const MAX_DISCOVERY_DIRS: usize = 512;
 const MAX_DISCOVERY_MATCHES: usize = 8;
-const MAX_SESSION_META_BYTES: u64 = 64 * 1024;
+pub(crate) const MAX_SESSION_META_BYTES: u64 = 64 * 1024;
 const FILE_CHUNK_BYTES: usize = 64 * 1024;
 const DUPLEX_BYTES: usize = 64 * 1024;
 
@@ -521,9 +522,9 @@ fn descriptor_is_unlinked(_metadata: &std::fs::Metadata) -> bool {
 }
 
 #[derive(Clone, Debug)]
-struct VerifiedRoot {
-    path: PathBuf,
-    canonical: PathBuf,
+pub(crate) struct VerifiedRoot {
+    pub(crate) path: PathBuf,
+    pub(crate) canonical: PathBuf,
     identity: FileIdentity,
 }
 
@@ -541,7 +542,7 @@ impl VerifiedRoot {
         })
     }
 
-    fn revalidate(&self) -> Result<(), String> {
+    pub(crate) fn revalidate(&self) -> Result<(), String> {
         let metadata =
             fs::symlink_metadata(&self.path).map_err(|err| format!("stat {}: {err}", self.path.display()))?;
         if metadata.file_type().is_symlink()
@@ -565,16 +566,16 @@ struct FileProgress {
 }
 
 #[derive(Clone, Debug)]
-struct PreparedSource {
-    ingress: AgentJsonlFileIngress,
-    root: VerifiedRoot,
-    canonical_workspace: PathBuf,
-    baseline: HashSet<PathBuf>,
-    baseline_progress: HashMap<PathBuf, FileProgress>,
+pub(crate) struct PreparedSource {
+    pub(crate) ingress: AgentJsonlFileIngress,
+    pub(crate) root: VerifiedRoot,
+    pub(crate) canonical_workspace: PathBuf,
+    pub(crate) baseline: HashSet<PathBuf>,
+    pub(crate) baseline_progress: HashMap<PathBuf, FileProgress>,
 }
 
 impl PreparedSource {
-    fn new(ingress: AgentJsonlFileIngress) -> Result<Self, String> {
+    pub(crate) fn new(ingress: AgentJsonlFileIngress) -> Result<Self, String> {
         let root = VerifiedRoot::new(&ingress.directory)?;
         let baseline = scan_matching_paths(&root, &ingress)?;
         Self::with_baseline(ingress, baseline)
@@ -585,7 +586,7 @@ impl PreparedSource {
     /// fresh snapshot on the readoption path would be worse than useless: the
     /// run's own rollout already exists by then, so it would be baselined away
     /// and discovery would wait out its timeout finding nothing.
-    fn with_baseline(ingress: AgentJsonlFileIngress, baseline: HashSet<PathBuf>) -> Result<Self, String> {
+    pub(crate) fn with_baseline(ingress: AgentJsonlFileIngress, baseline: HashSet<PathBuf>) -> Result<Self, String> {
         let root = VerifiedRoot::new(&ingress.directory)?;
         let canonical_workspace = fs::canonicalize(&ingress.workspace_path)
             .map_err(|err| format!("canonicalize workspace {}: {err}", ingress.workspace_path.display()))?;
@@ -618,7 +619,7 @@ enum IngressStart {
 /// [`Self::Cancel`] is teardown: the engine is releasing the pane and unread
 /// bytes are forfeit.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum StreamHalt {
+pub(crate) enum StreamHalt {
     /// Normal operation: keep tailing the growing file.
     #[default]
     Running,
@@ -951,11 +952,17 @@ async fn run_prepared<S>(
 
                 Ok(None) => return,
                 Err(err) => {
+                    // This ends the ingress for the run: no bytes will ever
+                    // be read, so no progress event and no driver-start
+                    // signal will ever come from this path. Whether the
+                    // rollout exists is a separate question the reaper asks
+                    // the filesystem directly (`transcript_liveness`); the
+                    // message here says what discovery actually saw so the
+                    // two are never confused again.
                     tracing::error!(
                         run_id,
                         %err,
-                        "agent JSONL progress: discovery failed; this run is now unobserved until it is \
-                         reaped or re-adopted",
+                        "agent JSONL progress: discovery failed; this run's rollout will not be tailed",
                     );
                     return;
                 }
@@ -1084,11 +1091,11 @@ async fn run_prepared<S>(
 }
 
 #[derive(Debug)]
-struct Candidate {
-    path: PathBuf,
-    session_id: String,
-    file: std::fs::File,
-    identity: FileIdentity,
+pub(crate) struct Candidate {
+    pub(crate) path: PathBuf,
+    pub(crate) session_id: String,
+    pub(crate) file: std::fs::File,
+    pub(crate) identity: FileIdentity,
 }
 
 /// One run's discovery: the poll loop that waits for exactly one new,
@@ -1381,83 +1388,30 @@ fn matching_file_shows_progress(prepared: &PreparedSource, paths: &HashSet<PathB
     false
 }
 
-fn scan_matching_paths(root: &VerifiedRoot, ingress: &AgentJsonlFileIngress) -> Result<HashSet<PathBuf>, String> {
-    root.revalidate()?;
-    let mut stack = vec![root.canonical.clone()];
-    let mut visited_dirs = 0usize;
-    let mut matches = HashSet::new();
-    while let Some(dir) = stack.pop() {
-        visited_dirs += 1;
-        if visited_dirs > MAX_DISCOVERY_DIRS {
-            return Err(format!(
-                "rollout discovery exceeded {MAX_DISCOVERY_DIRS} directories under {}",
-                root.path.display()
-            ));
-        }
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(format!("read {}: {err}", dir.display())),
-        };
-        for entry in entries.flatten() {
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(_) => continue,
-            };
-            if file_type.is_symlink() {
-                continue;
-            }
-            let path = entry.path();
-            if file_type.is_dir() {
-                let Ok(canonical) = fs::canonicalize(&path) else {
-                    continue;
-                };
-                if canonical.starts_with(&root.canonical) {
-                    stack.push(canonical);
-                }
-                continue;
-            }
-            if !file_type.is_file() {
-                continue;
-            }
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !name.starts_with(&ingress.filename_prefix) || !name.ends_with(&ingress.filename_suffix) {
-                continue;
-            }
-            let Ok(canonical) = fs::canonicalize(&path) else {
-                continue;
-            };
-            if canonical.starts_with(&root.canonical) {
-                matches.insert(canonical);
-                if matches.len() > MAX_DISCOVERY_MATCHES {
-                    return Err(format!(
-                        "rollout discovery exceeded {MAX_DISCOVERY_MATCHES} matching files under {}",
-                        root.path.display()
-                    ));
-                }
-            }
-        }
-    }
-    Ok(matches)
+/// [`validate_candidate_explained`] with the rejection reason dropped, for
+/// the tail's rotation and resume paths, which only need to know whether the
+/// file still correlates.
+pub(crate) fn validate_candidate(prepared: &PreparedSource, path: &Path) -> Result<Option<Candidate>, String> {
+    validate_candidate_explained(prepared, path).map(Result::ok)
 }
 
-fn validate_candidate(prepared: &PreparedSource, path: &Path) -> Result<Option<Candidate>, String> {
-    diagnose_candidate(prepared, path).map(Result::ok)
-}
-
-fn diagnose_candidate(
+/// Open `path` and decide whether it is this run's rollout.
+///
+/// `Ok(Err(reason))` is a file that exists but does not correlate — and says
+/// *why*, because discovery reports that reason instead of counting the file
+/// as absent. `Err` is an I/O failure on the way to a verdict.
+pub(crate) fn validate_candidate_explained(
     prepared: &PreparedSource,
     path: &Path,
-) -> Result<Result<Candidate, CandidateRejectReason>, String> {
+) -> Result<Result<Candidate, DetailedCandidateRejection>, String> {
     prepared.root.revalidate()?;
     let metadata = fs::symlink_metadata(path).map_err(|err| format!("stat {}: {err}", path.display()))?;
     if metadata.file_type().is_symlink() || !single_link_regular(&metadata) {
-        return Ok(Err(CandidateRejectReason::UnsafeFile));
+        return Ok(Err(DetailedCandidateRejection::NotSingleLinkRegularFile));
     }
     let canonical = fs::canonicalize(path).map_err(|err| format!("canonicalize {}: {err}", path.display()))?;
     if !canonical.starts_with(&prepared.root.canonical) {
-        return Ok(Err(CandidateRejectReason::OutsideRoot));
+        return Ok(Err(DetailedCandidateRejection::OutsideRoot));
     }
 
     let mut file = open_no_follow(&canonical)?;
@@ -1466,14 +1420,14 @@ fn diagnose_candidate(
         .map_err(|err| format!("metadata {}: {err}", canonical.display()))?;
     let identity = file_identity(&opened);
     if !single_link_regular(&opened) || identity != file_identity(&metadata) {
-        return Ok(Err(CandidateRejectReason::IdentityChanged));
+        return Ok(Err(DetailedCandidateRejection::IdentityChanged));
     }
-    let session_id = match diagnose_session_meta(prepared, &canonical, &mut file, None)? {
-        Ok(id) => id,
-        Err(reason) => return Ok(Err(reason)),
+    let session_id = match session_meta_verdict(prepared, &canonical, &mut file, None)? {
+        Ok(session_id) => session_id,
+        Err(rejection) => return Ok(Err(rejection)),
     };
     if !named_descriptor_matches(prepared, &canonical, &file, identity)? {
-        return Ok(Err(CandidateRejectReason::IdentityChanged));
+        return Ok(Err(DetailedCandidateRejection::IdentityChanged));
     }
     Ok(Ok(Candidate {
         path: canonical,
@@ -1548,21 +1502,30 @@ fn named_descriptor_matches(
     Ok(true)
 }
 
+/// [`session_meta_verdict`] with the rejection reason dropped.
 fn validated_session_meta(
     prepared: &PreparedSource,
     path: &Path,
     file: &mut std::fs::File,
     expected_session_id: Option<&str>,
 ) -> Result<Option<String>, String> {
-    diagnose_session_meta(prepared, path, file, expected_session_id).map(Result::ok)
+    session_meta_verdict(prepared, path, file, expected_session_id).map(Result::ok)
 }
 
-fn diagnose_session_meta(
+/// Read the rollout's first line and decide whether it correlates this file
+/// to the run: a complete `session_meta` record whose `cwd` canonicalizes to
+/// the run's workspace and whose session id the filename carries.
+///
+/// `Ok(Err(_))` names the first check that failed. Every one of those was a
+/// silent `Ok(None)` before 2026-09-13, which is how a rollout that was
+/// present and inspected on every discovery scan came to be reported as
+/// never having appeared.
+fn session_meta_verdict(
     prepared: &PreparedSource,
     path: &Path,
     file: &mut std::fs::File,
     expected_session_id: Option<&str>,
-) -> Result<Result<String, CandidateRejectReason>, String> {
+) -> Result<Result<String, DetailedCandidateRejection>, String> {
     file.seek(SeekFrom::Start(0))
         .map_err(|err| format!("seek session_meta {}: {err}", path.display()))?;
     let result = (|| {
@@ -1571,40 +1534,57 @@ fn diagnose_session_meta(
         let bytes = limited
             .read_until(b'\n', &mut first_line)
             .map_err(|err| format!("read session_meta {}: {err}", path.display()))?;
-        if bytes == 0 || first_line.last() != Some(&b'\n') {
-            return Ok(Err(if bytes as u64 == MAX_SESSION_META_BYTES {
-                CandidateRejectReason::OversizedSessionMeta
+        if bytes == 0 {
+            return Ok(Err(DetailedCandidateRejection::Empty));
+        }
+        if first_line.last() != Some(&b'\n') {
+            let bytes = bytes as u64;
+            return Ok(Err(if bytes >= MAX_SESSION_META_BYTES {
+                DetailedCandidateRejection::SessionMetaOversized {
+                    cap_bytes: MAX_SESSION_META_BYTES,
+                }
             } else {
-                CandidateRejectReason::IncompleteSessionMeta
+                DetailedCandidateRejection::SessionMetaUnterminated { bytes }
             }));
         }
         let record: serde_json::Value = serde_json::from_slice(&first_line)
             .map_err(|err| format!("parse session_meta {}: {err}", path.display()))?;
-        if record.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
-            return Ok(Err(CandidateRejectReason::InvalidSessionMeta));
+        let record_type = record.get("type").and_then(serde_json::Value::as_str);
+        if record_type != Some("session_meta") {
+            return Ok(Err(DetailedCandidateRejection::NotSessionMeta {
+                record_type: record_type.map(str::to_owned),
+            }));
         }
         let Some(payload) = record.get("payload").and_then(serde_json::Value::as_object) else {
-            return Ok(Err(CandidateRejectReason::InvalidSessionMeta));
+            return Ok(Err(DetailedCandidateRejection::MissingPayload));
         };
         let Some(session_id) = payload.get("id").and_then(serde_json::Value::as_str) else {
-            return Ok(Err(CandidateRejectReason::InvalidSessionMeta));
+            return Ok(Err(DetailedCandidateRejection::MissingSessionId));
         };
-        if expected_session_id.is_some_and(|expected| expected != session_id) {
-            return Ok(Err(CandidateRejectReason::SessionIdMismatch));
+        if let Some(expected) = expected_session_id
+            && expected != session_id
+        {
+            return Ok(Err(DetailedCandidateRejection::SessionIdMismatch {
+                found: session_id.to_owned(),
+                expected: expected.to_owned(),
+            }));
         }
         let Some(cwd) = payload.get("cwd").and_then(serde_json::Value::as_str) else {
-            return Ok(Err(CandidateRejectReason::InvalidSessionMeta));
+            return Ok(Err(DetailedCandidateRejection::MissingCwd));
         };
         let Ok(canonical_cwd) = fs::canonicalize(cwd) else {
-            return Ok(Err(CandidateRejectReason::WorkspaceMismatch));
+            return Ok(Err(DetailedCandidateRejection::CwdNotResolvable { cwd: cwd.to_owned() }));
         };
         if canonical_cwd != prepared.canonical_workspace {
-            return Ok(Err(CandidateRejectReason::WorkspaceMismatch));
+            return Ok(Err(DetailedCandidateRejection::CwdMismatch {
+                cwd: cwd.to_owned(),
+                expected: prepared.canonical_workspace.clone(),
+            }));
         }
         let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
         let expected_suffix = format!("-{session_id}{}", prepared.ingress.filename_suffix);
         if !name.ends_with(&expected_suffix) {
-            return Ok(Err(CandidateRejectReason::FilenameMismatch));
+            return Ok(Err(DetailedCandidateRejection::NameMismatch { expected_suffix }));
         }
         Ok(Ok(session_id.to_owned()))
     })();

@@ -197,21 +197,157 @@ struct FailureWindowConfig {
     window_secs: i64,
 }
 
+/// Which of the two distinct failure shapes a never-started reap observed.
+///
+/// [`crate::spawn_ack_sweep`] has two passes that ask different questions
+/// — "did a shell come up?" and "did the driver signal?" — and the app's
+/// own NACK and pane-death reports are the first kind. Until 2026-09-13
+/// every one of them fed the breaker as the same event and the breaker
+/// reported them all as "failed to spawn a worker shell". Four
+/// driver-start timeouts on panes whose shells had come up in 4–7 seconds
+/// were announced as a broken pane-spawn path, and the diagnosis went to
+/// the pane-spawn and task-policy subsystems, which were healthy.
+///
+/// The class is what the breaker's pause reason and attention item are
+/// composed from, so the operator reads what was observed for each failure
+/// that counted, not one wording for both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpawnFailureClass {
+    /// No shell ever came up for the pane: a spawn-ack timeout, an app
+    /// NACK, or a pane death before any proof of life. The app's
+    /// pane-spawn path is the thing to look at.
+    NoShell,
+    /// A pane and a shell came up and no driver-originated signal (hook
+    /// event, transcript path, transcript on disk) was observed within the
+    /// driver-start window. Either the driver never started or its signal
+    /// never reached the engine; the pane-spawn path is not implicated.
+    ShellWithoutDriverSignal,
+}
+
+impl SpawnFailureClass {
+    /// Stable, greppable label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SpawnFailureClass::NoShell => "no_shell",
+            SpawnFailureClass::ShellWithoutDriverSignal => "shell_without_driver_signal",
+        }
+    }
+
+    /// One clause describing what this class of failure actually observed.
+    pub fn observed(self) -> &'static str {
+        match self {
+            SpawnFailureClass::NoShell => "no shell ever came up for the pane",
+            SpawnFailureClass::ShellWithoutDriverSignal => {
+                "a pane and shell came up but no driver-originated signal was observed within the \
+                 driver-start window"
+            }
+        }
+    }
+}
+
 /// One concrete never-started-spawn failure, carrying enough detail (which
-/// execution, which slot, what shell pid was observed) to serve as durable
-/// trigger evidence for the breaker's trip audit record — see
+/// execution, which slot, what shell pid was observed, which failure class,
+/// what the reap actually saw) to serve as durable trigger evidence for the
+/// breaker's trip audit record — see
 /// [`Stage::DispatchPaused`](crate::dispatch_events::Stage::DispatchPaused).
 /// Kept separate from the `(work_item_id, epoch_secs)` pairs
 /// [`SpawnHealthTracker::record_failure`] tracks for the trip-threshold
 /// decision itself, so that method's existing contract and test suite stay
 /// untouched.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct SpawnFailureEvidence {
     pub execution_id: String,
     pub work_item_id: String,
     pub slot_id: String,
     pub shell_pid: i32,
     pub epoch_secs: i64,
+    /// Which failure shape the reap observed — see [`SpawnFailureClass`].
+    pub class: SpawnFailureClass,
+    /// The dispatch stage of the reap (`spawn_ack_timeout`, `spawn_nack`,
+    /// `pane_death_before_start`, `driver_start_timeout`).
+    pub cause: String,
+    /// What the reap observed, in the reap's own words: the orphan reason
+    /// it recorded, including its liveness-probe result.
+    pub observed: String,
+}
+
+/// The in-window failures grouped by [`SpawnFailureClass`], for composing a
+/// pause reason and attention item that say what was observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureComposition {
+    pub no_shell: usize,
+    pub shell_without_driver_signal: usize,
+}
+
+impl FailureComposition {
+    pub fn of(evidence: &[SpawnFailureEvidence]) -> Self {
+        let mut composition = Self {
+            no_shell: 0,
+            shell_without_driver_signal: 0,
+        };
+        for entry in evidence {
+            match entry.class {
+                SpawnFailureClass::NoShell => composition.no_shell += 1,
+                SpawnFailureClass::ShellWithoutDriverSignal => composition.shell_without_driver_signal += 1,
+            }
+        }
+        composition
+    }
+
+    /// The one-line description of what the in-window failures observed,
+    /// e.g. `4 driver-start timeouts (a pane and shell came up but ...)` or
+    /// `2 spawns with no shell (...) and 1 driver-start timeout (...)`.
+    ///
+    /// Names both classes whenever both are present, so a mixed window is
+    /// never summarised as one of them.
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if self.no_shell > 0 {
+            parts.push(format!(
+                "{} spawn(s) with no shell ({})",
+                self.no_shell,
+                SpawnFailureClass::NoShell.observed()
+            ));
+        }
+        if self.shell_without_driver_signal > 0 {
+            parts.push(format!(
+                "{} driver-start timeout(s) ({})",
+                self.shell_without_driver_signal,
+                SpawnFailureClass::ShellWithoutDriverSignal.observed()
+            ));
+        }
+        if parts.is_empty() {
+            "no per-failure evidence recorded in the window".to_owned()
+        } else {
+            parts.join(" and ")
+        }
+    }
+
+    /// Where the operator should look first, given what was observed.
+    pub fn diagnosis_hint(&self) -> &'static str {
+        match (self.no_shell, self.shell_without_driver_signal) {
+            (0, n) if n > 0 => {
+                "Every failure in the window had a working pane and shell, so the app's pane-spawn \
+                 path is NOT implicated. Look at the driver and its progress signal: for a \
+                 file-tailing driver (Codex, Grok) read the engine log for `agent JSONL progress` \
+                 discovery lines naming each reaped execution — they say whether a rollout existed \
+                 and why it was not attached — and check the rollout on disk before concluding the \
+                 driver never ran."
+            }
+            (n, 0) if n > 0 => {
+                "No shell came up for any failure in the window, so the app's pane-spawn path is \
+                 the thing to look at (most often `ghostty_surface_new` returning NULL after the \
+                 machine slept, i.e. no active display)."
+            }
+            _ => {
+                "The window mixes both classes: check the app's pane-spawn path for the no-shell \
+                 failures AND the driver's progress signal for the driver-start timeouts; one \
+                 explanation is unlikely to cover both."
+            }
+        }
+    }
 }
 
 /// The two parallel logs of in-window spawn failures — bundled into one
@@ -768,7 +904,17 @@ pub async fn trip_spawn_capability_circuit(
     let breaker_enabled = spawn_health.breaker_enabled();
     let window_secs = SPAWN_HEALTH_WINDOW_SECS;
     let threshold = SPAWN_HEALTH_DISTINCT_WORK_ITEM_THRESHOLD;
-    let rule = format!("{threshold} distinct work items failed to spawn a worker shell within {window_secs}s");
+    // The concrete failures that fed the trip — execution/work-item/slot ids,
+    // shell pids, timestamps, and which failure class each was — so the trip
+    // is diagnosable without separately grepping `spawn_nack` /
+    // `spawn_ack_timeout` / `driver_start_timeout` events out of the stream
+    // by hand, and so the reason text below can say what was observed.
+    let triggering_events = spawn_health.evidence_in_window(now_epoch_secs);
+    let composition = FailureComposition::of(&triggering_events);
+    let rule = format!(
+        "{threshold} distinct work items had a never-started spawn reaped within {window_secs}s: {}",
+        composition.describe()
+    );
 
     if breaker_enabled {
         if coordinator
@@ -789,7 +935,8 @@ pub async fn trip_spawn_capability_circuit(
         // `tripping_work_item_id` are the straw that broke it.
         let reason_text = format!(
             "spawn-capability circuit breaker tripped: {rule}; most recently execution \
-             {tripping_execution_id} (work item {tripping_work_item_id})",
+             {tripping_execution_id} (work item {tripping_work_item_id}). {}",
+            composition.diagnosis_hint(),
         );
         let reason = boss_protocol::PauseReason::new(reason_text).expect("format! output is never empty");
         coordinator.pause_dispatch(now_u64, DispatchPauseOrigin::Breaker, reason);
@@ -823,14 +970,17 @@ pub async fn trip_spawn_capability_circuit(
         return;
     }
 
+    let observed = composition.describe();
     if breaker_enabled {
         tracing::error!(
             distinct_work_items,
             window_secs,
             tripping_execution_id,
             tripping_work_item_id,
-            "app spawn capability unhealthy: {distinct_work_items} distinct work items failed to \
-             start a worker shell within {window_secs}s; pausing dispatch and raising attention",
+            no_shell = composition.no_shell,
+            shell_without_driver_signal = composition.shell_without_driver_signal,
+            "spawn capability unhealthy: {distinct_work_items} distinct work items had a never-started \
+             spawn reaped within {window_secs}s — {observed}; pausing dispatch and raising attention",
         );
     } else {
         tracing::error!(
@@ -838,37 +988,54 @@ pub async fn trip_spawn_capability_circuit(
             window_secs,
             tripping_execution_id,
             tripping_work_item_id,
-            "app spawn capability unhealthy: {distinct_work_items} distinct work items failed to \
-             start a worker shell within {window_secs}s; breaker is DISABLED by config \
+            no_shell = composition.no_shell,
+            shell_without_driver_signal = composition.shell_without_driver_signal,
+            "spawn capability unhealthy: {distinct_work_items} distinct work items had a never-started \
+             spawn reaped within {window_secs}s — {observed}; breaker is DISABLED by config \
              (BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER=false) — NOT pausing dispatch, raising attention only",
         );
     }
 
+    // The body states what each counted failure observed, and which pass
+    // of the sweep fired, before it says anything about causes. On
+    // 2026-09-13 a body that unconditionally said "no shell ever came up"
+    // for four driver-start timeouts sent the diagnosis into the healthy
+    // pane-spawn path while the reaped workers' transcripts sat unread.
+    let per_execution = triggering_events
+        .iter()
+        .map(|e| {
+            format!(
+                "- `{}` (work item `{}`, slot {}, shell pid {}): `{}` — {}",
+                e.execution_id, e.work_item_id, e.slot_id, e.shell_pid, e.cause, e.observed
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let what_happened = format!(
+        "Never-started-spawn reaps hit **{distinct_work_items} different work items** within \
+         {window_secs}s. What was observed: {observed}.\n\n\
+         {}\n\n\
+         Per execution:\n{per_execution}",
+        composition.diagnosis_hint(),
+    );
     let body = if breaker_enabled {
         format!(
-            "The Boss app accepted worker-pane spawn requests but no shell ever came up for \
-             **{distinct_work_items} different work items** within {window_secs}s — the app session's \
-             pane-spawn path is unhealthy (most often `ghostty_surface_new` returning NULL after the \
-             machine slept, i.e. no active display).\n\n\
-             Dispatch has been **paused** to stop the engine from burning spawn attempts against a \
-             dead app path. Each affected execution was reaped (see the `spawn_nack` / \
-             `spawn_ack_timeout` / `pane_death_before_start` / `driver_start_timeout` events in \
-             `dispatch-events/current.jsonl`).\n\n\
+            "{what_happened}\n\n\
+             Dispatch has been **paused** (reviews included) to stop the engine from burning spawn \
+             attempts against a path that is failing systemically. Each affected execution was reaped \
+             (see the `spawn_nack` / `spawn_ack_timeout` / `pane_death_before_start` / \
+             `driver_start_timeout` events in `dispatch-events/current.jsonl`).\n\n\
              **Recovery is automatic:** the engine periodically force-dispatches a single queued \
              execution as a recovery probe (backing off between attempts) and auto-resumes dispatch \
              the moment one reports a real shell pid — see `spawn_capability_recovered` in \
-             `dispatch-events/current.jsonl`. Relaunching the Boss app (e.g. after waking the display) \
-             also clears the breaker immediately on reconnect. No manual action is required, but you \
-             can still make sure the app is foreground with an active display and confirm new panes \
-             spawn, or force it with `bossctl dispatch resume` / the app's dispatch toggle if recovery \
-             is taking longer than expected."
+             `dispatch-events/current.jsonl`. Relaunching the Boss app also clears the breaker \
+             immediately on reconnect. No manual action is required, but you can force it with \
+             `bossctl dispatch resume` / the app's dispatch toggle if recovery is taking longer than \
+             expected."
         )
     } else {
         format!(
-            "The Boss app accepted worker-pane spawn requests but no shell ever came up for \
-             **{distinct_work_items} different work items** within {window_secs}s — the app session's \
-             pane-spawn path looks unhealthy (most often `ghostty_surface_new` returning NULL after \
-             the machine slept, i.e. no active display).\n\n\
+            "{what_happened}\n\n\
              The spawn-capability breaker is **disabled by config** \
              (`BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER=false` is set; the breaker defaults on) — dispatch \
              was **NOT** paused; this item is observability only. Each affected execution was reaped and \
@@ -880,10 +1047,15 @@ pub async fn trip_spawn_capability_circuit(
              per-work-item churn guard alone."
         )
     };
+    let title = match (composition.no_shell, composition.shell_without_driver_signal) {
+        (0, n) if n > 0 => "Worker spawns produced panes but no driver signal; dispatch breaker tripped",
+        (n, 0) if n > 0 => "App worker-pane spawn capability is unhealthy",
+        _ => "Worker spawn failures (no shell and no driver signal); dispatch breaker tripped",
+    };
     if let Err(err) = work_db.create_attention_item(CreateAttentionItemInput {
         body_markdown: body,
         kind: SPAWN_CAPABILITY_ATTENTION_KIND.to_owned(),
-        title: "App worker-pane spawn capability is unhealthy".to_owned(),
+        title: title.to_owned(),
         execution_id: Some(tripping_execution_id.to_owned()),
         resolved_at: None,
         status: None,
@@ -896,12 +1068,6 @@ pub async fn trip_spawn_capability_circuit(
         );
     }
 
-    // The concrete failures that fed the trip — execution/work-item/slot ids,
-    // shell pids, and timestamps — so the trip is diagnosable without
-    // separately grepping `spawn_nack` / `spawn_ack_timeout` events out of
-    // the stream by hand.
-    let triggering_events = spawn_health.evidence_in_window(now_epoch_secs);
-
     dispatch_events
         .emit(
             DispatchEvent::new(Stage::SpawnCapabilityUnhealthy, Outcome::Error, tripping_execution_id)
@@ -913,6 +1079,10 @@ pub async fn trip_spawn_capability_circuit(
                     "dispatch_paused": breaker_enabled,
                     "rule": rule,
                     "threshold": threshold,
+                    "failure_classes": {
+                        "no_shell": composition.no_shell,
+                        "shell_without_driver_signal": composition.shell_without_driver_signal,
+                    },
                     "triggering_events": triggering_events,
                 })),
         )
@@ -1707,23 +1877,195 @@ mod tests {
 
     // ─── evidence tracking (audit trail) ───────────────────────────────────
 
+    fn test_evidence(
+        execution_id: &str,
+        work_item_id: &str,
+        slot_id: &str,
+        shell_pid: i32,
+        epoch_secs: i64,
+        class: SpawnFailureClass,
+    ) -> SpawnFailureEvidence {
+        SpawnFailureEvidence::builder()
+            .execution_id(execution_id)
+            .work_item_id(work_item_id)
+            .slot_id(slot_id)
+            .shell_pid(shell_pid)
+            .epoch_secs(epoch_secs)
+            .class(class)
+            .cause(match class {
+                SpawnFailureClass::NoShell => "spawn_ack_timeout",
+                SpawnFailureClass::ShellWithoutDriverSignal => "driver_start_timeout",
+            })
+            .observed(format!("test observation for {execution_id}"))
+            .build()
+    }
+
+    /// The 2026-09-13 shape: every failure in the window was a driver-start
+    /// timeout on a pane whose shell had come up. The composition must say
+    /// so and must not describe a pane-spawn failure.
+    #[test]
+    fn composition_of_driver_start_timeouts_does_not_blame_the_pane_spawn_path() {
+        let evidence = (0..4)
+            .map(|i| {
+                test_evidence(
+                    &format!("exec-{i}"),
+                    &format!("wi-{i}"),
+                    &i.to_string(),
+                    1000 + i,
+                    100,
+                    SpawnFailureClass::ShellWithoutDriverSignal,
+                )
+            })
+            .collect::<Vec<_>>();
+        let composition = FailureComposition::of(&evidence);
+        assert_eq!(
+            composition,
+            FailureComposition {
+                no_shell: 0,
+                shell_without_driver_signal: 4,
+            }
+        );
+        let described = composition.describe();
+        assert!(
+            described.starts_with("4 driver-start timeout(s)"),
+            "must count the class that fired; got: {described}"
+        );
+        assert!(
+            described.contains("a pane and shell came up"),
+            "must state the shell was observed; got: {described}"
+        );
+        assert!(
+            !described.contains("no shell"),
+            "must not describe a no-shell failure that did not happen; got: {described}"
+        );
+        let hint = composition.diagnosis_hint();
+        assert!(
+            hint.contains("NOT implicated"),
+            "the hint must clear the pane-spawn path; got: {hint}"
+        );
+        assert!(
+            hint.contains("agent JSONL progress"),
+            "the hint must point at the progress-ingress discovery log; got: {hint}"
+        );
+    }
+
+    /// A mixed window names both classes rather than collapsing to either.
+    #[test]
+    fn composition_names_both_classes_when_both_are_present() {
+        let evidence = vec![
+            test_evidence("exec-a", "wi-a", "0", 0, 100, SpawnFailureClass::NoShell),
+            test_evidence(
+                "exec-b",
+                "wi-b",
+                "1",
+                4242,
+                100,
+                SpawnFailureClass::ShellWithoutDriverSignal,
+            ),
+            test_evidence("exec-c", "wi-c", "2", 0, 100, SpawnFailureClass::NoShell),
+        ];
+        let composition = FailureComposition::of(&evidence);
+        let described = composition.describe();
+        assert!(described.contains("2 spawn(s) with no shell"), "got: {described}");
+        assert!(described.contains("1 driver-start timeout(s)"), "got: {described}");
+        assert!(
+            composition.diagnosis_hint().contains("mixes both classes"),
+            "got: {}",
+            composition.diagnosis_hint()
+        );
+    }
+
+    /// The pause reason an operator reads on a tripped breaker must carry
+    /// the observed failure class, and the attention item must not claim no
+    /// shell came up when every failure had one.
+    #[tokio::test]
+    async fn trip_reason_and_attention_state_the_observed_failure_class() {
+        let (_dir, db) = open_db_arc();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution = create_ready_chore_execution(&db, &work_item_id);
+        let coordinator = make_coordinator(db.clone(), 1);
+
+        let spawn_health = SpawnHealthTracker::with_config(3, 300).with_breaker_enabled(true);
+        for (i, wi) in ["wi-1", "wi-2", "wi-3"].iter().enumerate() {
+            spawn_health.record_evidence(test_evidence(
+                &format!("exec-{i}"),
+                wi,
+                &i.to_string(),
+                90_000 + i as i32,
+                1000,
+                SpawnFailureClass::ShellWithoutDriverSignal,
+            ));
+        }
+        let sink = RecordingDispatchEventSink::new();
+        trip_spawn_capability_circuit(
+            &db,
+            &coordinator,
+            &sink,
+            &spawn_health,
+            TripSignal {
+                tripping_execution_id: &execution.id,
+                tripping_work_item_id: &work_item_id,
+                distinct_work_items: 3,
+                now_epoch_secs: 1000,
+            },
+        )
+        .await;
+
+        let reason = coordinator
+            .dispatch_paused_reason()
+            .expect("the trip must pause dispatch with a reason");
+        assert!(
+            reason.contains("driver-start timeout"),
+            "the pause reason must name the pass that fired; got: {reason}"
+        );
+        assert!(
+            !reason.contains("failed to spawn a worker shell"),
+            "the pause reason must not use the no-shell wording for driver-start timeouts; got: {reason}"
+        );
+        assert!(
+            reason.contains("NOT implicated"),
+            "the pause reason must say the pane-spawn path was healthy; got: {reason}"
+        );
+
+        let items = db.list_attention_items(&execution.id).unwrap();
+        let item = items
+            .iter()
+            .find(|item| item.kind == SPAWN_CAPABILITY_ATTENTION_KIND)
+            .expect("the trip raises the breaker attention item");
+        assert!(
+            !item.body_markdown.contains("no shell ever came up for"),
+            "the attention body must not claim no shell came up; got: {}",
+            item.body_markdown
+        );
+        assert!(
+            item.body_markdown.contains("exec-1") && item.body_markdown.contains("driver_start_timeout"),
+            "the attention body must list each counted execution with its cause; got: {}",
+            item.body_markdown
+        );
+        assert!(
+            item.title.contains("no driver signal"),
+            "the title must reflect the observed class; got: {}",
+            item.title
+        );
+
+        let events = sink.events().await;
+        let trip = events
+            .iter()
+            .find(|e| e.stage == "spawn_capability_unhealthy")
+            .expect("trip event");
+        assert_eq!(
+            trip.details["failure_classes"]["shell_without_driver_signal"],
+            serde_json::json!(3)
+        );
+        assert_eq!(trip.details["failure_classes"]["no_shell"], serde_json::json!(0));
+    }
+
     #[test]
     fn record_evidence_prunes_outside_window_and_is_cleared_by_success() {
         let tracker = SpawnHealthTracker::with_config(3, 300);
-        tracker.record_evidence(SpawnFailureEvidence {
-            execution_id: "exec-1".to_owned(),
-            work_item_id: "wi-1".to_owned(),
-            slot_id: "0".to_owned(),
-            shell_pid: 0,
-            epoch_secs: 0,
-        });
-        tracker.record_evidence(SpawnFailureEvidence {
-            execution_id: "exec-2".to_owned(),
-            work_item_id: "wi-2".to_owned(),
-            slot_id: "1".to_owned(),
-            shell_pid: 0,
-            epoch_secs: 301,
-        });
+        tracker.record_evidence(test_evidence("exec-1", "wi-1", "0", 0, 0, SpawnFailureClass::NoShell));
+        tracker.record_evidence(test_evidence("exec-2", "wi-2", "1", 0, 301, SpawnFailureClass::NoShell));
         // The t=0 entry is now outside the 300s window as of t=301.
         let in_window = tracker.evidence_in_window(301);
         assert_eq!(in_window.len(), 1);
@@ -1745,13 +2087,14 @@ mod tests {
         let coordinator = make_coordinator(db.clone(), 1);
 
         let spawn_health = SpawnHealthTracker::with_config(3, 300).with_breaker_enabled(true);
-        spawn_health.record_evidence(SpawnFailureEvidence {
-            execution_id: execution.id.clone(),
-            work_item_id: work_item_id.clone(),
-            slot_id: "0".to_owned(),
-            shell_pid: 0,
-            epoch_secs: 1000,
-        });
+        spawn_health.record_evidence(test_evidence(
+            &execution.id,
+            &work_item_id,
+            "0",
+            0,
+            1000,
+            SpawnFailureClass::NoShell,
+        ));
         let sink = RecordingDispatchEventSink::new();
 
         trip_spawn_capability_circuit(

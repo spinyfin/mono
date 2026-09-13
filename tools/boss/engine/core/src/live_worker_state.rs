@@ -325,6 +325,14 @@ pub enum DriverSignalKind {
     /// created its transcript, even if the hook's slot fan-out was
     /// dropped (a hook can race `register_run_slot`).
     TranscriptPath,
+    /// A transcript for the run was found on disk by the reaper's own
+    /// liveness probe ([`crate::transcript_liveness`]) — a rollout newer
+    /// than the pre-spawn baseline under the run's progress-ingress root,
+    /// or the recorded transcript path itself. Only the driver writes
+    /// either, so this is driver-start proof even when no ingress ever
+    /// delivered an event for the run (2026-09-13: four live Codex workers
+    /// reaped because discovery never attached rollouts that existed).
+    CorrelatedTranscript,
 }
 
 impl DriverSignalKind {
@@ -333,6 +341,7 @@ impl DriverSignalKind {
         match self {
             DriverSignalKind::HookEvent => "hook_event",
             DriverSignalKind::TranscriptPath => "transcript_path",
+            DriverSignalKind::CorrelatedTranscript => "correlated_transcript",
         }
     }
 }
