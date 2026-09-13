@@ -1,0 +1,17 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "The execution-retention sweep currently deletes failed/orphaned/abandoned/cancelled executions older than 14 days (beyond the newest five per work item), which is exactly the history the 'failed / reaped agents' and token/cost series read. Which policy should v1 take?",
+    "choices": [
+      "Narrow retention so only never-started executions (started_at IS NULL) are pruned; started executions are kept as performance facts (proposed)",
+      "Keep retention as is and add an append-only terminal-outcome ledger written in the finalize transaction, exempt from prune",
+      "Keep retention as is and accept a retention-bounded chart; the series report the 14-day bound as a coverage note"
+    ],
+    "anchor": "3-retention-stop-deleting-started-executions"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Ship the cost_usd series before the cost-attribution design's effective-dated rate table lands, priced at today's in-code flat rates for all history and labelled 'estimated at today's list rates' with unpriceable counts shown? (No means the cost chart waits for that rate table.)",
+    "anchor": "5-cost-model"
+  }
+]
