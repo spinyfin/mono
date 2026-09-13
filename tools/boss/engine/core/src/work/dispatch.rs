@@ -758,21 +758,21 @@ impl WorkDb {
     /// non-terminal (`collecting`/`supervising`/`applying`) **pre_merge**
     /// batch on the task's review-cycle root (resolved the same way
     /// [`WorkDb::review_cycle_root_id`] does: walk `parent_task_id` while
-    /// `kind = 'revision'`). This matches
+    /// `kind = 'revision'`, via the shared [`super::cycle_root_walk_cte`]).
+    /// This matches
     /// [`Self::list_tasks_awaiting_pre_merge_review_admission`]'s live-batch
-    /// predicate rather than comparing `b.target_sha` to `tasks.pr_head_sha`:
-    /// the hold path never writes `pr_head_sha` (`record_worker_pr_completion`
-    /// leaves it untouched; `enqueue_review_batch` stamps the fetched head
-    /// only onto the new batch row), so a sha match against that column
-    /// would miss the common first-PR case (`pr_head_sha` stays NULL for
-    /// the whole hold) and any revision whose ancestor has not been
-    /// re-polled. A live pre-merge batch already holds the cycle's review
-    /// reservation, so a newer push cannot admit a replacement batch until
-    /// this one terminates — excluding on "a live pre_merge batch exists"
-    /// is the same freshness signal as admission, without a second writer.
-    /// Scoping to non-terminal status still clears the hold the moment the
-    /// batch reaches `completed`/`failed`, so a review pass that never
-    /// resolves does not permanently hide a genuinely stuck task.
+    /// predicate, with one extra freshness check: the live batch only masks
+    /// while the held task's latest producer `work_executions.pr_head_after`
+    /// is unknown or still equals `b.target_sha`. That column is written by
+    /// `record_worker_pr_completion` at hold time (unlike `tasks.pr_head_sha`,
+    /// which the hold path never stamps and the merge poller does not probe
+    /// on `active` rows). A later producer completion that records a
+    /// different head restores orphan-sweep visibility without waiting for
+    /// the batch-stale reaper. An unknown `pr_head_after` still excludes, so
+    /// the common first-PR hold (fetch failed, or a test that does not stamp
+    /// the column) is not treated as an orphan. Scoping to non-terminal
+    /// status still clears the hold the moment the batch reaches
+    /// `completed`/`failed`.
     pub fn list_orphan_active_candidates(&self, min_age_secs: i64) -> Result<Vec<String>> {
         let conn = self.connect()?;
         let now_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
@@ -798,28 +798,9 @@ impl WorkDb {
         // and reconcile such a row to `orphaned`/`abandoned`. This query
         // legitimately picks the work item up on the pass after that.
         let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
+        let walk = super::cycle_root_walk_cte("t.status = 'active'\n               AND t.deleted_at IS NULL");
         let stmt_sql = format!(
-            "WITH RECURSIVE walk(task_id, current_id, kind, parent_task_id, depth) AS (
-                 SELECT t.id, t.id, t.kind, t.parent_task_id, 0
-                 FROM tasks t
-                 WHERE t.status = 'active'
-                   AND t.deleted_at IS NULL
-                 UNION ALL
-                 SELECT walk.task_id, parent.id, parent.kind, parent.parent_task_id, walk.depth + 1
-                 FROM walk
-                 JOIN tasks parent ON parent.id = walk.parent_task_id
-                 -- chain_root loops `0..MAX_CHAIN_DEPTH` (64 iterations, depths 0..=63).
-                 -- The recursive term extends the current row, so `depth < 63` emits
-                 -- at most depth 63 — one hop past that would overshoot the Rust walk.
-                 WHERE walk.kind = 'revision' AND walk.depth < 63
-             ),
-             roots AS (
-                 SELECT w.task_id, w.current_id AS cycle_root_id
-                 FROM walk w
-                 WHERE w.depth = (
-                     SELECT MAX(w2.depth) FROM walk w2 WHERE w2.task_id = w.task_id
-                 )
-             )
+            "{walk}
              SELECT t.id FROM tasks t
              JOIN roots ON roots.task_id = t.id
              WHERE t.status = 'active'
@@ -857,8 +838,22 @@ impl WorkDb {
                    WHERE b.cycle_root_id = roots.cycle_root_id
                      AND b.phase = 'pre_merge'
                      AND b.status NOT IN ('completed', 'failed')
+                     AND COALESCE(
+                           (
+                             SELECT we.pr_head_after
+                             FROM work_executions we
+                             WHERE we.work_item_id = t.id
+                               AND we.kind != 'pr_review'
+                               AND we.pr_head_after IS NOT NULL
+                               AND we.pr_head_after != ''
+                             ORDER BY we.finished_at DESC, we.id DESC
+                             LIMIT 1
+                           ),
+                           b.target_sha
+                         ) = b.target_sha
                )
              ORDER BY t.updated_at ASC, t.id ASC",
+            walk = walk,
             permanent = ATTENTION_KIND_RECOVERY_PERMANENT,
             exhausted = ATTENTION_KIND_RECOVERY_EXHAUSTED,
         );

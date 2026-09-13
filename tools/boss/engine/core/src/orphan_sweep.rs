@@ -1743,10 +1743,30 @@ mod tests {
         make_old(db, work_item_id);
     }
 
+    /// Stamp `pr_head_after` on the work item's latest execution. Production
+    /// writes this from `record_worker_pr_completion`; the hold helper above
+    /// uses a direct status update so tests that care about freshness must
+    /// set it themselves.
+    fn stamp_latest_pr_head_after(db: &WorkDb, work_item_id: &str, sha: &str) {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_executions SET pr_head_after = ?1
+             WHERE id = (
+                 SELECT id FROM work_executions
+                 WHERE work_item_id = ?2
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1
+             )",
+            rusqlite::params![sha, work_item_id],
+        )
+        .unwrap();
+    }
+
     /// First-PR chore: the chore is its own cycle root, `pr_head_sha` is
     /// NULL (the hold path never writes it), and a live pre_merge batch
     /// exists. This is the common production hold; a sha-keyed exclusion
-    /// would miss it.
+    /// against `tasks.pr_head_sha` would miss it. An unknown
+    /// `pr_head_after` still excludes.
     #[tokio::test]
     async fn first_pr_chore_with_live_pre_merge_batch_and_null_pr_head_sha_is_not_an_orphan_candidate() {
         let (_dir, db) = open_db();
@@ -1802,24 +1822,46 @@ mod tests {
         );
     }
 
-    /// A live pre_merge batch still excludes even when its `target_sha`
-    /// would not match any cached `tasks.pr_head_sha` (NULL here, as in
-    /// production at hold time). Admission will not create a replacement
-    /// batch until this one terminates, so the hold must cover it.
+    /// Acceptance: a held task whose latest producer `pr_head_after` has
+    /// moved on from the live batch's `target_sha` is an orphan candidate
+    /// again — a stale batch must not grant immunity until the reaper
+    /// fires. Uses `pr_head_after` (written at hold time), not
+    /// `tasks.pr_head_sha`.
     #[tokio::test]
-    async fn live_pre_merge_batch_excludes_regardless_of_target_sha() {
+    async fn held_task_whose_producer_head_moved_past_batch_target_is_an_orphan_candidate() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
         hold_with_completed_producer(&db, &work_item_id);
+        stamp_latest_pr_head_after(&db, &work_item_id, "sha-new");
 
         insert_review_batch(&db, &work_item_id, "supervising", "sha-old", "https://example/pr/1");
+
+        assert!(
+            db.list_orphan_active_candidates(ORPHAN_MIN_AGE_SECS)
+                .unwrap()
+                .contains(&work_item_id),
+            "a live pre_merge batch whose target_sha is behind the producer head must not mask the task"
+        );
+    }
+
+    /// Matching `pr_head_after` and `target_sha` is the live-hold shape
+    /// once GitHub head was captured at completion: still excluded.
+    #[tokio::test]
+    async fn live_pre_merge_batch_with_matching_producer_head_is_not_an_orphan_candidate() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        hold_with_completed_producer(&db, &work_item_id);
+        stamp_latest_pr_head_after(&db, &work_item_id, "sha-current");
+
+        insert_review_batch(&db, &work_item_id, "supervising", "sha-current", "https://example/pr/1");
 
         assert!(
             !db.list_orphan_active_candidates(ORPHAN_MIN_AGE_SECS)
                 .unwrap()
                 .contains(&work_item_id),
-            "a live pre_merge batch must exclude the producer without a pr_head_sha match"
+            "a live pre_merge batch still targeting the producer head must exclude the task"
         );
     }
 
