@@ -1353,21 +1353,25 @@ impl WorkDb {
         }))
     }
 
-    /// Latest token-verified pane observation for `execution_id`, if any
-    /// probe has written one. Does not require live identity columns — the
-    /// point of this record is to remain queryable after reap.
+    /// Token-verified pane observation for the latest run of `execution_id`,
+    /// if its probe has written one. Does not require live identity columns —
+    /// the point of this record is to remain queryable after reap. Never
+    /// falls back to an older run's observation: a resumed run with no probe
+    /// result must remain distinguishable from a prior run's clean exit.
     pub fn tmux_pane_observation_for_execution(&self, execution_id: &str) -> Result<Option<TmuxPaneObservationRecord>> {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT tmux_pane_observation, tmux_observed_pane_dead,
                     tmux_observed_pane_dead_status, tmux_observed_session_name
              FROM work_runs
-             WHERE execution_id = ?1 AND tmux_pane_observation IS NOT NULL
+             WHERE execution_id = ?1
              ORDER BY created_at DESC, id DESC
              LIMIT 1",
             params![execution_id],
             |row| {
-                let kind_raw: String = row.get(0)?;
+                let Some(kind_raw) = row.get::<_, Option<String>>(0)? else {
+                    return Ok(None);
+                };
                 let Some(kind) = TmuxPaneObservationKind::parse(&kind_raw) else {
                     return Err(rusqlite::Error::FromSqlConversionFailure(
                         0,
@@ -1375,15 +1379,16 @@ impl WorkDb {
                         format!("unknown tmux_pane_observation {kind_raw:?}").into(),
                     ));
                 };
-                Ok(TmuxPaneObservationRecord {
+                Ok(Some(TmuxPaneObservationRecord {
                     kind,
                     pane_dead: row.get::<_, Option<i64>>(1)?.map(|value| value != 0),
                     pane_dead_status: row.get(2)?,
                     session_name: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                })
+                }))
             },
         )
         .optional()
+        .map(|observation| observation.flatten())
         .map_err(Into::into)
     }
 

@@ -191,6 +191,39 @@ fn stale_spawn_token_matches_no_row_and_writes_nothing() {
 }
 
 #[test]
+fn latest_run_without_an_observation_does_not_fall_back_to_an_older_run() {
+    let db = WorkDb::open(temp_db_path("tmux-pane-observation-current-run-only")).unwrap();
+    let (execution_id, token) = started_tmux_run(&db);
+    db.record_tmux_pane_observation(&execution_id, &token, &dead_record())
+        .unwrap()
+        .expect("the original run must accept its observation");
+
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'ready' WHERE id = ?1",
+            [&execution_id],
+        )
+        .unwrap();
+
+    db.start_execution_run(
+        &execution_id,
+        "worker-2",
+        "mono",
+        "lease-2",
+        "mono-agent-002",
+        "/tmp/mono-agent-002",
+    )
+    .unwrap();
+
+    assert_eq!(
+        db.tmux_pane_observation_for_execution(&execution_id).unwrap(),
+        None,
+        "a new run without a probe must not inherit an older run's Dead observation",
+    );
+}
+
+#[test]
 fn dead_observation_is_not_clobbered_by_a_later_alive_poll() {
     let db = WorkDb::open(temp_db_path("tmux-pane-observation-dead-guard")).unwrap();
     let (execution_id, token) = started_tmux_run(&db);

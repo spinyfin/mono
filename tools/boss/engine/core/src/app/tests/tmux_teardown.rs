@@ -157,6 +157,68 @@ async fn matched_token_signals_kills_and_clears_identity() {
     );
 }
 
+#[tokio::test]
+async fn matched_token_persists_dead_pane_observation_and_logs_at_info() {
+    let buffer = crate::test_support::log_capture::install();
+    let start = buffer.lock().len();
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+
+    let mut child = spawn_group_leader_sleeper();
+    let pid = child.id() as i32;
+    let execution_id = seed_tmux_run(db, &work_item_id, "boss-1-dead", "tok-dead", i64::from(pid));
+    let identity = read_back_identity(db, &execution_id);
+    let (tmux, _runner) = fake_tmux([
+        ok("BOSS_SPAWN_TOKEN=tok-dead\n"),
+        ok("BOSS_SPAWN_TOKEN=tok-dead\n"),
+        ok("1"),
+        ok("7"),
+        ok("1738000000"),
+        ok("BOSS_SPAWN_TOKEN=tok-dead\n"),
+        ok(""),
+    ]);
+
+    assert_eq!(
+        server_state
+            .reap_tmux_worker_with(&tmux, &execution_id, &identity)
+            .await,
+        TmuxTeardownOutcome::Reaped,
+    );
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .expect("join wait task")
+        .expect("wait on child");
+    assert!(
+        !status.success(),
+        "the pane pid's process group must have been signalled"
+    );
+
+    let observation = db
+        .tmux_pane_observation_for_execution(&execution_id)
+        .unwrap()
+        .expect("the normal completion path must persist a Dead observation");
+    assert_eq!(observation.kind, crate::work::TmuxPaneObservationKind::Dead);
+    assert_eq!(observation.pane_dead, Some(true));
+    assert_eq!(observation.pane_dead_status.as_deref(), Some("7"));
+
+    let captured = String::from_utf8(buffer.lock()[start..].to_vec()).expect("utf8 log capture");
+    let line = captured
+        .lines()
+        .find(|line| line.contains("token-verified pane observation") && line.contains(&execution_id))
+        .unwrap_or_else(|| panic!("no pane-observation log for {execution_id}; captured:\n{captured}"));
+    assert!(line.contains("INFO"), "pane observation must be logged at INFO: {line}");
+    assert!(
+        line.contains("pane_dead=\"true\""),
+        "log must include pane_dead: {line}"
+    );
+    assert!(
+        line.contains("pane_dead_status=\"7\""),
+        "log must include pane_dead_status: {line}"
+    );
+}
+
 /// A live session by the same name but a DIFFERENT token — the "name
 /// recycled onto another execution" hazard the design calls out. Nothing
 /// may be signalled or killed, and the identity columns must survive so a
