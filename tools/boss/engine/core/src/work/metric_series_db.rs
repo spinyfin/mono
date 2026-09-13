@@ -79,6 +79,7 @@ impl WorkDb {
         kinds: Option<&[&str]>,
         statuses: Option<&[&str]>,
         require_pr_url: bool,
+        first_pr_only: bool,
     ) -> Result<Vec<ExecutionFact>> {
         let conn = self.connect()?;
         let mut sql = String::from(
@@ -128,6 +129,22 @@ impl WorkDb {
         }
         if require_pr_url {
             sql.push_str(" AND we.pr_url IS NOT NULL AND we.pr_url != ''");
+        }
+        // `prs_generated` attributes a URL to its first terminal execution
+        // in the database.  The correlated lookup is index-friendly and,
+        // unlike projecting from epoch zero, leaves the outer projection
+        // constrained to the requested bucket window.
+        if first_pr_only {
+            sql.push_str(
+                " AND NOT EXISTS (
+                    SELECT 1 FROM work_executions earlier
+                    WHERE earlier.pr_url = we.pr_url
+                      AND earlier.pr_url IS NOT NULL AND earlier.pr_url != ''
+                      AND earlier.finished_at IS NOT NULL
+                      AND (earlier.finished_at < we.finished_at
+                           OR (earlier.finished_at = we.finished_at AND earlier.id < we.id))
+                )",
+            );
         }
         sql.push_str(" ORDER BY we.finished_at ASC, we.id ASC");
         let mut stmt = conn.prepare(&sql)?;
@@ -184,6 +201,7 @@ impl WorkDb {
                 kinds,
                 require_pr_url,
                 statuses,
+                unique_by_pr_url,
                 ..
             } => Ok(SeriesFacts::Executions(self.metric_execution_facts(
                 since_epoch_s,
@@ -191,6 +209,7 @@ impl WorkDb {
                 kinds,
                 statuses,
                 require_pr_url,
+                unique_by_pr_url,
             )?)),
             SeriesSource::Tasks => Ok(SeriesFacts::Tasks(
                 self.metric_task_facts(since_epoch_s, until_epoch_s)?,
@@ -280,7 +299,7 @@ mod tests {
         );
 
         let inside = db
-            .metric_execution_facts(1_780_000_000, 1_780_000_200, None, None, false)
+            .metric_execution_facts(1_780_000_000, 1_780_000_200, None, None, false, false)
             .unwrap();
         assert_eq!(inside.len(), 1);
         assert_eq!(inside[0].finished_at_epoch_s, inside_at);
@@ -288,7 +307,7 @@ mod tests {
         assert_eq!(inside[0].product.as_deref(), Some("test-product"));
 
         let outside = db
-            .metric_execution_facts(1_780_000_200, 1_780_000_400, None, None, false)
+            .metric_execution_facts(1_780_000_200, 1_780_000_400, None, None, false, false)
             .unwrap();
         assert!(outside.is_empty());
     }
@@ -313,7 +332,7 @@ mod tests {
         );
 
         let facts = db
-            .metric_execution_facts(978_307_200, 1_790_000_000, None, None, false)
+            .metric_execution_facts(978_307_200, 1_790_000_000, None, None, false, false)
             .unwrap();
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].finished_at_epoch_s, 1_780_000_100);
@@ -353,14 +372,47 @@ mod tests {
         );
 
         let reviews = db
-            .metric_execution_facts(T0, T0 + 1_000, Some(&["pr_review"]), Some(&["completed"]), false)
+            .metric_execution_facts(T0, T0 + 1_000, Some(&["pr_review"]), Some(&["completed"]), false, false)
             .unwrap();
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].kind, "pr_review");
 
-        let with_pr = db.metric_execution_facts(T0, T0 + 1_000, None, None, true).unwrap();
+        let with_pr = db
+            .metric_execution_facts(T0, T0 + 1_000, None, None, true, false)
+            .unwrap();
         assert_eq!(with_pr.len(), 1);
         assert_eq!(with_pr[0].pr_url.as_deref(), Some("https://github.com/o/r/pull/1"));
+    }
+
+    #[test]
+    fn first_pr_projection_keeps_the_global_first_appearance_in_the_requested_window() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let task = create_test_chore(&db, &product_id, "first-pr");
+        let url = "https://github.com/o/r/pull/1";
+        stamp_execution(
+            &db,
+            &task.id,
+            ExecutionKind::ChoreImplementation,
+            ExecutionStatus::Completed,
+            T0 + 10,
+            T0 + 20,
+            Some(url),
+        );
+        stamp_execution(
+            &db,
+            &task.id,
+            ExecutionKind::RevisionImplementation,
+            ExecutionStatus::Completed,
+            T0 + 110,
+            T0 + 120,
+            Some(url),
+        );
+
+        let facts = db
+            .metric_execution_facts(T0 + 100, T0 + 200, None, None, true, true)
+            .unwrap();
+        assert!(facts.is_empty(), "later revisions must not re-count a PR");
     }
 
     #[test]
@@ -394,7 +446,9 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let facts = db.metric_execution_facts(T0, T0 + 1_000, None, None, false).unwrap();
+        let facts = db
+            .metric_execution_facts(T0, T0 + 1_000, None, None, false, false)
+            .unwrap();
         assert_eq!(facts.len(), 2);
         assert_eq!(
             facts
@@ -430,7 +484,9 @@ mod tests {
             None,
         );
         set_launch_config(&db, &id, "claude", "opus");
-        let facts = db.metric_execution_facts(T0, T0 + 1_000, None, None, false).unwrap();
+        let facts = db
+            .metric_execution_facts(T0, T0 + 1_000, None, None, false, false)
+            .unwrap();
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].driver.as_deref(), Some("claude"));
         assert_eq!(facts[0].model.as_deref(), Some("opus"));
