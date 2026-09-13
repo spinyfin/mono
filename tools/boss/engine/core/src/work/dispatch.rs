@@ -763,16 +763,23 @@ impl WorkDb {
     /// [`Self::list_tasks_awaiting_pre_merge_review_admission`]'s live-batch
     /// predicate, with one extra freshness check: the live batch only masks
     /// while the held task's latest producer `work_executions.pr_head_after`
-    /// is unknown or still equals `b.target_sha`. That column is written by
-    /// `record_worker_pr_completion` at hold time (unlike `tasks.pr_head_sha`,
-    /// which the hold path never stamps and the merge poller does not probe
-    /// on `active` rows). A later producer completion that records a
-    /// different head restores orphan-sweep visibility without waiting for
-    /// the batch-stale reaper. An unknown `pr_head_after` still excludes, so
-    /// the common first-PR hold (fetch failed, or a test that does not stamp
-    /// the column) is not treated as an orphan. Scoping to non-terminal
-    /// status still clears the hold the moment the batch reaches
-    /// `completed`/`failed`.
+    /// is unknown or still equals `b.target_sha`. "Latest" is the newest
+    /// non-`pr_review` row by `finished_at`/`id`, **including** a NULL or
+    /// empty stamp — `fetch_pr_head_after` is fail-open, so an older known
+    /// SHA must not stand in for a newer unknown head. That column is
+    /// written by `record_worker_pr_completion` at hold time (unlike
+    /// `tasks.pr_head_sha`, which the hold path never stamps and the merge
+    /// poller does not probe on `active` rows). A later producer completion
+    /// that records a different head restores orphan-sweep visibility
+    /// without waiting for the batch-stale reaper. An unknown
+    /// `pr_head_after` still excludes, so the common first-PR hold (fetch
+    /// failed, or a test that does not stamp the column) is not treated as
+    /// an orphan. The COALESCE-to-`target_sha` fallback lives *inside* the
+    /// latest-producer SELECT, so a task with no producer row at all does
+    /// not inherit a sibling's live batch — multiple active task rows can
+    /// share one `cycle_root_id` (a chain root plus a revision). Scoping to
+    /// non-terminal status still clears the hold the moment the batch
+    /// reaches `completed`/`failed`.
     pub fn list_orphan_active_candidates(&self, min_age_secs: i64) -> Result<Vec<String>> {
         let conn = self.connect()?;
         let now_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
@@ -838,18 +845,13 @@ impl WorkDb {
                    WHERE b.cycle_root_id = roots.cycle_root_id
                      AND b.phase = 'pre_merge'
                      AND b.status NOT IN ('completed', 'failed')
-                     AND COALESCE(
-                           (
-                             SELECT we.pr_head_after
-                             FROM work_executions we
-                             WHERE we.work_item_id = t.id
-                               AND we.kind != 'pr_review'
-                               AND we.pr_head_after IS NOT NULL
-                               AND we.pr_head_after != ''
-                             ORDER BY we.finished_at DESC, we.id DESC
-                             LIMIT 1
-                           ),
-                           b.target_sha
+                     AND (
+                           SELECT COALESCE(NULLIF(we.pr_head_after, ''), b.target_sha)
+                           FROM work_executions we
+                           WHERE we.work_item_id = t.id
+                             AND we.kind != 'pr_review'
+                           ORDER BY we.finished_at DESC, we.id DESC
+                           LIMIT 1
                          ) = b.target_sha
                )
              ORDER BY t.updated_at ASC, t.id ASC",
