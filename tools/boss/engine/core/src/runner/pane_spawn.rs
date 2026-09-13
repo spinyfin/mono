@@ -3,6 +3,8 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, target_os = "macos"))]
+use std::process::Command;
 use std::sync::{Arc, Weak};
 use std::time::Duration as StdDuration;
 
@@ -367,6 +369,13 @@ pub(crate) fn path_prepend_clause(var: &str) -> String {
     format!("[ -n \"${var}\" ] && export PATH=\"${var}:$PATH\"; ")
 }
 
+/// Known absolute locations of `taskpolicy(8)`, tried in order.
+///
+/// macOS has shipped this binary at both `/usr/bin/taskpolicy` and
+/// `/usr/sbin/taskpolicy` depending on version; trying only one will miss
+/// some hosts.
+pub(crate) const TASKPOLICY_CANDIDATES: &[&str] = &["/usr/sbin/taskpolicy", "/usr/bin/taskpolicy"];
+
 /// First statement on every local worker pane's assembled command: marks
 /// the pane's already-running login shell as Darwin background priority
 /// (`PRIO_DARWIN_BG`, via `taskpolicy -b`), which every process it
@@ -380,17 +389,28 @@ pub(crate) fn path_prepend_clause(var: &str) -> String {
 /// interactive pane for the same host's scheduler; this makes them yield
 /// under contention without touching the workers' own nice value (which
 /// would need `setpriority` per spawned tool-call subprocess to have the
-/// same reach) and without requiring root. Absolute path, matching this
-/// clause's care elsewhere about not depending on a PATH a login shell's
-/// own init scripts might still be rebuilding.
+/// same reach) and without requiring root.
 ///
-/// This is best-effort by design: `taskpolicy` failing (missing binary,
-/// unexpected sandbox) is swallowed by the trailing `>/dev/null 2>&1;` so a
-/// broken environment can never block a worker from starting, but that also
-/// means a pane that failed to enter background class looks identical to
-/// one that succeeded — there is no engine-side signal or scrollback trace.
-/// To check a live pane, run `ps -o nice -p <pane pid>` (background class
-/// shows up as nice 5) or `taskpolicy -p <pid>`.
+/// `taskpolicy` is resolved at runtime from [`TASKPOLICY_CANDIDATES`] then
+/// `PATH`, not via a single hardcoded path. A login shell's rc files may
+/// still be rebuilding `PATH`, so known absolute locations are tried first.
+///
+/// Failure is best-effort by design and must never block a worker from
+/// starting, but it is not silent: a missing binary or non-zero exit is
+/// printed to the pane's stderr naming the path attempted and the exit
+/// status. A pane that failed to enter background class is therefore
+/// distinguishable from one that succeeded. At spawn compose time the
+/// engine also `tracing::warn`s when no candidate exists on this host, and
+/// probes a resolved binary (without applying `PRIO_DARWIN_BG` to the
+/// engine itself) so a present-but-failing `taskpolicy` is visible in
+/// engine diagnostics, not only pane scrollback.
+///
+/// To check a live pane, run `ps -o pid,ni,pri,comm -p <pane pid>` (or
+/// `ps -Ao pid,ni,pri,comm` and find the worker). `PRIO_DARWIN_BG` shows
+/// up as a drop in `PRI` (typically 31 → 4 on macOS 26). `NI` / nice does
+/// *not* change — it stays 0 — so a nice-based check will falsely report
+/// that the feature is broken. `taskpolicy -p <pid>` also reports the
+/// policy.
 ///
 /// The policy also outlives the pane it was applied to: every long-lived
 /// daemon a tool call forks from this shell (most notably a workspace's
@@ -402,7 +422,100 @@ pub(crate) fn path_prepend_clause(var: &str) -> String {
 /// expected, that is why — clear it with `bazel shutdown` (from within the
 /// tainted workspace) or `taskpolicy -B -p <server pid>` (unprivileged for
 /// one's own processes).
-pub(crate) const WORKER_BACKGROUND_PRIORITY_CLAUSE: &str = "/usr/bin/taskpolicy -b -p $$ >/dev/null 2>&1; ";
+pub(crate) fn worker_background_priority_clause() -> String {
+    worker_background_priority_clause_with_candidates(TASKPOLICY_CANDIDATES)
+}
+
+/// Build the pane-local de-prioritisation clause, trying `candidates` in
+/// order before falling back to `command -v taskpolicy`.
+///
+/// Parameterised so tests can point at a mock binary (the real
+/// `/usr/sbin/taskpolicy` exists on developer machines and would otherwise
+/// mask the failure-logging path).
+pub(crate) fn worker_background_priority_clause_with_candidates(candidates: &[&str]) -> String {
+    let listed = candidates
+        .iter()
+        .map(|p| crate::ssh_transport::shell_quote(p))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "if [ \"$(/usr/bin/uname -s)\" = Darwin ]; then \
+         _boss_tp=\"\"; \
+         for _boss_cand in {listed}; do \
+         if [ -x \"$_boss_cand\" ]; then _boss_tp=\"$_boss_cand\"; break; fi; \
+         done; \
+         if [ -z \"$_boss_tp\" ]; then _boss_tp=$(command -v taskpolicy || true); fi; \
+         if [ -n \"$_boss_tp\" ]; then \
+         if _boss_tp_err=$(\"$_boss_tp\" -b -p $$ 2>&1); then :; \
+         else echo \"boss: failed to set Darwin background priority: $_boss_tp -b -p $$ exited $?; $_boss_tp_err\" >&2; \
+         fi; \
+         else echo \"boss: failed to set Darwin background priority: taskpolicy not found at candidate paths or on PATH; worker continues at default priority\" >&2; \
+         fi; \
+         unset _boss_tp _boss_cand _boss_tp_err; \
+         fi; "
+    )
+}
+
+/// First known `taskpolicy` path that exists as a file, if any.
+///
+/// Existence only — not executable-bit or a successful `-b` invocation.
+/// Callers that need to know the binary actually works must probe it.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn taskpolicy_known_location<'a>(candidates: &'a [&'a str]) -> Option<&'a str> {
+    candidates.iter().copied().find(|p| Path::new(p).is_file())
+}
+
+/// Probe `taskpolicy -b` by wrapping a trivial command so a present-but-failing
+/// binary is visible in engine logs. Uses `/usr/bin/true` so the probe does
+/// not apply `PRIO_DARWIN_BG` to the engine itself and does not leave a
+/// child running. The pane still applies the policy to its own shell with
+/// `-p $$`; this is diagnostics, not the de-prioritisation itself.
+#[cfg(any(test, target_os = "macos"))]
+fn probe_taskpolicy(path: &str) -> io::Result<std::process::Output> {
+    Command::new(path).args(["-b", "/usr/bin/true"]).output()
+}
+
+/// Engine-side counterpart of the pane clause: warn when no candidate exists
+/// on this host, and warn when a resolved binary exits non-zero (or cannot
+/// be invoked). The pane clause still tries `PATH` and logs on failure;
+/// workers still spawn either way.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn maybe_warn_taskpolicy_host(candidates: &[&str]) {
+    let Some(path) = taskpolicy_known_location(candidates) else {
+        tracing::warn!(
+            candidates = ?candidates,
+            "taskpolicy not found at known locations; worker de-prioritisation will try PATH \
+             inside the pane and log on failure, but the worker will still spawn at default \
+             priority if lookup fails"
+        );
+        return;
+    };
+    match probe_taskpolicy(path) {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            tracing::warn!(
+                path,
+                status = output.status.code(),
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "taskpolicy is present but failed to set Darwin background priority; \
+                 workers still spawn, and the pane clause will log the same class of failure"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                path,
+                error = %err,
+                "failed to invoke taskpolicy while verifying Darwin background priority; \
+                 workers still spawn"
+            );
+        }
+    }
+}
+
+fn maybe_warn_unresolved_taskpolicy() {
+    #[cfg(target_os = "macos")]
+    maybe_warn_taskpolicy_host(TASKPOLICY_CANDIDATES);
+}
 
 /// macOS tty canonical-mode line cap (`MAX_CANON`,
 /// `/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/syslimits.h:89`).
@@ -996,8 +1109,10 @@ impl ExecutionRunner for PaneSpawnRunner {
             })?;
         }
         let env_prefix: String = spawn_plan.env.iter().map(render_env_directive).collect();
+        maybe_warn_unresolved_taskpolicy();
         let assembled_command = format!(
-            "{WORKER_BACKGROUND_PRIORITY_CLAUSE}{}{}{env_prefix}{}",
+            "{}{}{}{env_prefix}{}",
+            worker_background_priority_clause(),
             path_prepend_clause("BOSS_BIN_DIR"),
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
             spawn_plan.command,
@@ -1251,5 +1366,7 @@ impl ExecutionRunner for PaneSpawnRunner {
     }
 }
 
+#[cfg(test)]
+mod background_priority_tests;
 #[cfg(test)]
 mod pane_spawn_tests;
