@@ -256,8 +256,8 @@ async fn shutdown_workers_mixed_reaps_only_app_hosted() {
 }
 
 /// Durable `tmux_hosted = 1` is enough even when the in-memory live-state
-/// stamp is missing — the brief's named criterion, and the fallback if a
-/// registry entry was recorded on the legacy app-hosted path.
+/// stamp is missing — the fallback if a registry entry was recorded on the
+/// legacy app-hosted path.
 #[tokio::test]
 async fn shutdown_workers_survives_when_only_the_durable_tmux_hosted_bit_is_set() {
     let (server_state, _dir) = test_server_state();

@@ -513,6 +513,40 @@ rust_test(
     ),
 )
 
+# Genuine end-to-end restart drill: boots the real `serve()` entry point
+# twice against a real private tmux server and a real worker OS process,
+# driving shutdown through the actual `Shutdown` RPC rather than a direct
+# call into `ServerState::shutdown_workers`. See the test file's module doc
+# for what this proves and why a unit test alone does not discharge it.
+rust_test(
+    name = "tmux_engine_restart_drill_integration_test",
+    size = "medium",
+    timeout = "moderate",
+    srcs = ["tests/tmux_engine_restart_drill_integration.rs"],
+    compile_data = ["tests/fixtures/still-working.sh"],
+    # Same rationale as `tmux_recovery_integration_test`: test-local declared
+    # tmux runfiles, not a shared host capability.
+    data = ["@host_tmux//:tmux"],
+    edition = "2024",
+    env = {"HOME": "/tmp"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    # Same `bazel-any` host-tmux-availability rationale as
+    # `tmux_recovery_integration_test` above.
+    tags = ["manual"],
+    deps = [
+        ":engine_lib",
+        "//tools/boss/client",
+        "//tools/boss/protocol",
+        "//tools/boss/tmux",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 rust_test(
     name = "background_work_rpc_test",
     size = "small",
