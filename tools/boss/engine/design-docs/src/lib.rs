@@ -371,7 +371,7 @@ fn describe_doc_failure(owner_repo: &str, err: &TreeApiError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use boss_github::trees::TreeBlob;
 
@@ -395,6 +395,9 @@ mod tests {
         blob: Mutex<String>,
         blob_etag: Mutex<Option<String>>,
         blob_calls: AtomicUsize,
+        /// When true, `fetch_blob` never returns. Cached-open tests set this
+        /// so a mistaken re-fetch hangs instead of racing a wall-clock bound.
+        blob_hang: AtomicBool,
         /// When set, `fetch_blob` returns this error regardless of etag.
         blob_error: Mutex<Option<TreeApiError>>,
         /// When true and the caller sent an etag, return NotModified.
@@ -499,6 +502,9 @@ mod tests {
             etag: Option<&str>,
         ) -> Result<BlobFetch, TreeApiError> {
             self.blob_calls.fetch_add(1, Ordering::SeqCst);
+            if self.blob_hang.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             self.blob_etags_seen.lock().unwrap().push(etag.map(str::to_owned));
             {
                 let mut script = self.blob_error_script.lock().unwrap();
@@ -821,15 +827,15 @@ mod tests {
         let svc = service(source.clone());
         svc.open_markdown_doc(FLUNGE, "docs/a.md", "main").await;
         assert_eq!(source.blob_calls(), 1);
-        let start = std::time::Instant::now();
-        let again = svc.open_markdown_doc(FLUNGE, "docs/a.md", "main").await;
-        let elapsed = start.elapsed();
+        source.blob_hang.store(true, Ordering::SeqCst);
+        let again = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            svc.open_markdown_doc(FLUNGE, "docs/a.md", "main"),
+        )
+        .await
+        .expect("cached open must not await GitHub");
         assert_eq!(again, DesignDocContent::loaded("# doc"));
         assert_eq!(source.blob_calls(), 1, "open must not revalidate");
-        assert!(
-            elapsed < std::time::Duration::from_millis(20),
-            "cached open must not wait on the network; took {elapsed:?}"
-        );
     }
 
     #[tokio::test]

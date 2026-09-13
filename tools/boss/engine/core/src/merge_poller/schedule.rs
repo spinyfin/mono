@@ -516,6 +516,12 @@ pub(crate) fn record_sweep_metrics(metrics: &Registry, outcome: &SweepOutcome) {
     REVIEW_POOL_DEFERRED_PRE_MERGE.set(metrics, outcome.deferred_pre_merge_count as i64);
 }
 
+/// Whether a kick arriving at `now` should start a full sweep rather than
+/// being absorbed into the post-sweep quiesce window.
+pub(crate) fn kick_clears_quiesce(last_run_at: Instant, now: Instant, window: Duration) -> bool {
+    now.saturating_duration_since(last_run_at) >= window
+}
+
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`.
 /// The returned `JoinHandle` is detached by callers — the poller has no
 /// shutdown path.
@@ -874,8 +880,9 @@ pub fn spawn_loop(
                         // continue listening in this same wait loop
                     }
                     _ = kick.notified() => {
-                        let since_last = last_run_at.elapsed();
-                        if since_last >= quiesce_window {
+                        let now = Instant::now();
+                        let since_last = now.saturating_duration_since(last_run_at);
+                        if kick_clears_quiesce(last_run_at, now, quiesce_window) {
                             tracing::debug!(
                                 since_last_ms = since_last.as_millis(),
                                 "merge poller: activation kick → immediate sweep",
@@ -892,8 +899,9 @@ pub fn spawn_loop(
                     event = pr_reconcile_requests.recv(), if !pr_requests_closed => {
                         match event {
                             Some(Event::PrReconcileRequested { pr_url }) => {
-                                let since_last = last_run_at.elapsed();
-                                if since_last < quiesce_window {
+                                let now = Instant::now();
+                                let since_last = now.saturating_duration_since(last_run_at);
+                                if !kick_clears_quiesce(last_run_at, now, quiesce_window) {
                                     tracing::debug!(
                                         pr_url,
                                         since_last_ms = since_last.as_millis(),

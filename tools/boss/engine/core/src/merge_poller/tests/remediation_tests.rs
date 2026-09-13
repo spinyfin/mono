@@ -14,11 +14,38 @@
 //! the merged PR is still detected and retired while that remediation is
 //! outstanding.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::*;
 use crate::conflict_remediation::{ConflictRemediationJob, ConflictRemediationQueue, RemediationDisposition};
 use crate::work::ConflictResolution;
+
+struct ManualClock {
+    origin: Instant,
+    offset_ms: AtomicU64,
+}
+
+impl ManualClock {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            origin: Instant::now(),
+            offset_ms: AtomicU64::new(0),
+        })
+    }
+
+    fn now(&self) -> Instant {
+        self.origin + Duration::from_millis(self.offset_ms.load(Ordering::SeqCst))
+    }
+
+    fn advance(&self, d: Duration) {
+        self.offset_ms.fetch_add(d.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    fn arc_fn(self: &Arc<Self>) -> Arc<dyn Fn() -> Instant + Send + Sync> {
+        let clock = Arc::clone(self);
+        Arc::new(move || clock.now())
+    }
+}
 
 /// Remediation job that records what it was handed and then parks until the
 /// test releases it — the stand-in for the ladder's minutes of cube lease,
@@ -297,16 +324,16 @@ async fn a_declined_enqueue_is_retried_by_a_later_pass_rather_than_stranding_the
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     // The rung-1-lease-failure outcome: the ladder ran, resolved nothing, and
     // deliberately left the attempt pending for a later tick.
-    let queue = ConflictRemediationQueue::with_limits(
+    let clock = ManualClock::new();
+    let cooldown = Duration::from_secs(2);
+    let queue = ConflictRemediationQueue::with_clock(
         Arc::new(ScriptedJob {
             seen: seen.clone(),
             disposition: RemediationDisposition::RetryAfterCooldown,
         }),
         2,
-        // Generous: the point is only that pass 2 lands inside the window and
-        // pass 3 outside it, and a tight window makes that a load-dependent
-        // race on a busy test runner rather than an assertion about the code.
-        std::time::Duration::from_secs(2),
+        cooldown,
+        clock.arc_fn(),
     );
 
     let pass = async || {
@@ -342,14 +369,13 @@ async fn a_declined_enqueue_is_retried_by_a_later_pass_rather_than_stranding_the
     // Inside the cooldown: re-entered and correctly declined — not silently
     // no-opped one layer up, which is what stranded the row.
     pass().await;
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     assert_eq!(
         seen.lock().unwrap().len(),
         1,
         "a pass inside the cooldown must not stack a second ladder run",
     );
 
-    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    clock.advance(cooldown + Duration::from_millis(1));
     pass().await;
     assert!(
         wait_until(|| seen.lock().unwrap().len() == 2).await,
