@@ -50,7 +50,12 @@
 //! [`crate::work::ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD`]/
 //! [`crate::work::ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS`] instead of its
 //! own — the 3-in-1h contract carries over unchanged rather than being
-//! diluted by the representation change.
+//! diluted by the representation change. For the same reason it also
+//! re-applies orphan_sweep's time-independent
+//! [`crate::work::ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD`] to
+//! such a row: that half exists because a slow failure loop outruns any
+//! trailing window, and a 10-minute cooldown here would un-park a row the
+//! moment it elapsed, re-creating the loop one cooldown at a time.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,7 +67,8 @@ use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::work::{
     CHURN_GUARD_DISPATCH_FAILED_REASON, DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_THRESHOLD,
     DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_WINDOW_SECS, DISPATCH_FAILURE_RECOVERY_MIN_AGE_SECS,
-    ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD, ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS, WorkDb,
+    ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD, ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD,
+    ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS, WorkDb,
 };
 
 /// Counts from one pass of the sweep; logged at `info` when non-zero.
@@ -184,10 +190,38 @@ pub async fn run_one_pass(
                 continue;
             }
         };
-        if recent_terminal >= churn_threshold {
+        // The consecutive half of orphan_sweep's guard is time-independent
+        // by construction, so it must be re-applied here for the same
+        // reason the windowed half is: this sweep's 10-minute cooldown is
+        // shorter than any window, and a row parked for an unbroken streak
+        // of dead runs would otherwise be un-parked by *this* sweep the
+        // moment the cooldown elapsed — turning a park into a slower
+        // redispatch loop instead of ending one. Only churn-park rows are
+        // subject to it; a row parked for an ordinary pre-spawn dispatch
+        // failure keeps this sweep's own looser contract.
+        let consecutive_terminal = if is_churn_park {
+            match work_db.list_consecutive_unproductive_terminal_execution_ids(&work_item_id) {
+                Ok(ids) => ids.len() as i64,
+                Err(err) => {
+                    tracing::warn!(
+                        work_item_id = %work_item_id,
+                        ?err,
+                        "dispatch-failure recovery sweep: failed to count consecutive terminal \
+                         executions; skipping item",
+                    );
+                    continue;
+                }
+            }
+        } else {
+            0
+        };
+        let consecutive_tripped = consecutive_terminal >= ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD;
+        if recent_terminal >= churn_threshold || consecutive_tripped {
             tracing::warn!(
                 work_item_id = %work_item_id,
                 recent_terminal,
+                consecutive_terminal,
+                consecutive_tripped,
                 threshold = churn_threshold,
                 window_secs = churn_window_secs,
                 is_churn_park,
@@ -439,7 +473,14 @@ mod tests {
             db.insert_terminal_execution_for_test(&work_item_id, "chore_implementation", "failed", now_epoch - i)
                 .unwrap();
         }
-        db.bounce_churn_guard_parked_to_backlog(&work_item_id, "orphan_sweep", 3, &[], "terminal executions");
+        db.bounce_churn_guard_parked_to_backlog(
+            &work_item_id,
+            "orphan_sweep",
+            3,
+            &[],
+            "terminal executions",
+            crate::work::ChurnTrip::Window,
+        );
         assert_eq!(
             get_task(&db, &work_item_id).dispatch_failed_reason.as_deref(),
             Some(crate::work::CHURN_GUARD_DISPATCH_FAILED_REASON),

@@ -47,6 +47,48 @@ pub const ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS: i64 = 60 * 60;
 /// go live; the 4th trips the guard.
 pub const ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD: i64 = 3;
 
+/// Time-independent half of the orphan-active redispatch churn guard: the
+/// number of *consecutive* unproductive terminal executions
+/// (`orphaned`/`abandoned`/`failed`/`cancelled`, counted back from the
+/// newest and stopped by the first `completed` run) after which the next
+/// orphan-redispatch is skipped, **regardless of how long the cycle took**.
+///
+/// [`ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS`] alone cannot catch a slow
+/// loop: a redispatch cycle that takes longer than
+/// `WINDOW_SECS / THRESHOLD` ages its own oldest evidence out of the
+/// trailing window before the next failure lands inside it, so the count
+/// never reaches the threshold no matter how many times the row burns a
+/// worker. That is not a tuning problem — a longer window is outrun by a
+/// slower loop — so the guard needs a second half that does not reference
+/// wall-clock time at all. A 40-50 minute cycle (observed 2026-09-13) sat
+/// permanently at two-in-the-window and redispatched indefinitely.
+///
+/// Deliberately the same strike count as the windowed half: the contract
+/// is still "three unproductive runs and the row is parked for a human",
+/// with the window only deciding how *fast* churn also trips it. A
+/// `completed` execution resets the chain, so a row that works, then later
+/// dies once, starts over from zero rather than carrying stale strikes.
+pub const ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD: i64 = 3;
+
+/// Which half of the orphan-redispatch churn guard tripped. Carried into
+/// the park text so the operator reading the bounced card is told which
+/// contract stopped the row, and what will un-stop it — the two halves
+/// clear on different events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChurnTrip {
+    /// [`ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD`] unproductive terminal
+    /// executions inside the trailing
+    /// [`ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS`]: fast churn. Clears on
+    /// its own as the window drains.
+    Window,
+    /// [`ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD`] consecutive
+    /// unproductive terminal executions with no successful run in between,
+    /// however long they took: slow churn, which no trailing window catches.
+    /// Does NOT clear with the passage of time — only a successful run or an
+    /// explicit operator start resets it.
+    Consecutive,
+}
+
 /// `work_attention_items.kind` filed when [`crate::pr_review_recovery`]
 /// trips the churn guard above and parks a work item instead of
 /// auto-redispatching it. [`crate::orphan_sweep`] used to file this same

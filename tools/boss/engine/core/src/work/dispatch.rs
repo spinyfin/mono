@@ -1027,6 +1027,93 @@ impl WorkDb {
         Ok(out)
     }
 
+    /// The ids of the trailing run of *unproductive* terminal executions
+    /// for `work_item_id` — newest first, stopping at the first execution
+    /// that is not one of `orphaned`/`abandoned`/`failed`/`cancelled`.
+    ///
+    /// Time-independent companion to
+    /// [`Self::count_recent_terminal_executions`], for the half of the
+    /// orphan-redispatch churn guard a slow failure loop cannot outrun (see
+    /// [`crate::work::ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD`]).
+    /// The trailing-window count answers "how hot is this row right now";
+    /// this answers "how many times in a row has this row burned a worker
+    /// without ever delivering", which no amount of elapsed time erodes.
+    ///
+    /// A `completed` execution ends the run and resets the count to zero —
+    /// including a non-terminal one (`ready`, `running`, ...), which is a
+    /// run that has not failed yet and must not be read as a strike. Only
+    /// an unbroken streak of dead executions counts, so a row that worked
+    /// and later died once starts from one strike, not from its lifetime
+    /// failure total.
+    ///
+    /// Every execution `kind` counts, matching the orphan sweep's own
+    /// `kind = None` trailing-window count: that sweep redispatches the
+    /// work item, not a particular kind, so every dead run on the row is
+    /// evidence about the row.
+    pub fn list_consecutive_unproductive_terminal_execution_ids(&self, work_item_id: &str) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, status FROM work_executions
+              WHERE work_item_id = ?1
+              ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map(params![work_item_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, status) = row?;
+            if !matches!(status.as_str(), "orphaned" | "abandoned" | "failed" | "cancelled") {
+                break;
+            }
+            out.push(id);
+        }
+        Ok(out)
+    }
+
+    /// `true` when any execution of `work_item_id` carries an OPEN
+    /// attention item of one of `kinds`.
+    ///
+    /// Execution-scoped attention items (`execution_id` set,
+    /// `work_item_id` NULL — see `WorkDb::create_attention_item`) are
+    /// invisible to a `work_attention_items.work_item_id = t.id` predicate,
+    /// so this joins through `work_executions` to ask the question at the
+    /// work-item level. Used by [`crate::orphan_sweep`] to recognise a run
+    /// that ended in a *deliberate* engine park rather than a lost pane.
+    ///
+    /// Self-clearing by construction: every kind a caller should pass here
+    /// is registered `ClearedBy::WorkResumed` in
+    /// [`crate::attention_lifecycle`], so the park ends the moment a fresh
+    /// run starts for the item — an operator's `bossctl work start` needs
+    /// no separate un-park step.
+    pub fn has_open_execution_attention_of_kind(&self, work_item_id: &str, kinds: &[&str]) -> Result<bool> {
+        if kinds.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.connect()?;
+        let placeholders = (2..2 + kinds.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT EXISTS(
+                 SELECT 1 FROM work_attention_items a
+                 JOIN work_executions we ON we.id = a.execution_id
+                 WHERE we.work_item_id = ?1
+                   AND a.status = 'open'
+                   AND a.kind IN ({placeholders})
+             )"
+        );
+        let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(kinds.len() + 1);
+        bound.push(&work_item_id);
+        for kind in kinds {
+            bound.push(kind);
+        }
+        conn.query_row(&sql, bound.as_slice(), |row| row.get::<_, i64>(0))
+            .map(|found| found != 0)
+            .map_err(Into::into)
+    }
+
     /// Count recent `pr_review` attempts that did not yield a durable
     /// judgement: dead terminal attempts plus completed give-ups (and
     /// post-`pr_review_verdicts` completions that never wrote a verdict).
