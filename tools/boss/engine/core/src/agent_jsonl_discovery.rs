@@ -60,11 +60,8 @@ use crate::driver::AgentJsonlFileIngress;
 
 /// How often discovery re-scans the root while waiting for the rollout.
 pub(crate) const DISCOVERY_POLL: Duration = Duration::from_millis(100);
-/// How long discovery waits for a correlated rollout before giving up.
-///
-/// Deliberately unchanged by the 2026-09-13 fix: a wider window does not help
-/// a scan that saw the file and rejected it, and the reaper no longer treats
-/// discovery's silence as evidence of anything.
+/// Historical discovery window, now the production overdue reporting threshold.
+/// Discovery continues after this interval until attachment or cancellation.
 pub(crate) const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(120);
 /// A gap between two consecutive scans above this is logged as evidence that
 /// the discovery task was not being scheduled. Twenty poll intervals: far
@@ -786,13 +783,30 @@ impl DiscoveryFailure {
 /// completed scan, so a task that wakes late still looks at the root before
 /// it concludes anything; the failure carries the scan count and the longest
 /// inter-scan gap so a late wake is visible in the log rather than inferred.
+#[cfg(test)]
 pub(crate) async fn discover_candidate(
     prepared: &PreparedSource,
     halt: &mut watch::Receiver<StreamHalt>,
     timeout: Duration,
 ) -> Result<Option<Candidate>, String> {
+    discover_candidate_observed(prepared, halt, timeout, |_, _, _, overdue| async move { overdue }).await
+}
+
+/// Poll until attachment or cancellation, reporting overdue diagnostics to
+/// the caller. Returning true from the observer ends the bounded test probe;
+/// production keeps observing late rollouts until its ingress is torn down.
+pub(crate) async fn discover_candidate_observed<F, Fut>(
+    prepared: &PreparedSource,
+    halt: &mut watch::Receiver<StreamHalt>,
+    overdue_after: Duration,
+    mut overdue: F,
+) -> Result<Option<Candidate>, String>
+where
+    F: FnMut(Vec<(PathBuf, CandidateRejection)>, String, u64, bool) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
     let started = tokio::time::Instant::now();
-    let deadline = started + timeout;
+    let deadline = started + overdue_after;
     let prepared = Arc::new(prepared.clone());
     let mut cadence = ScanCadence::start(started);
     let mut reported: HashSet<(PathBuf, String)> = HashSet::new();
@@ -812,6 +826,7 @@ pub(crate) async fn discover_candidate(
         if *halt.borrow() != StreamHalt::Running {
             return Ok(None);
         }
+        prepared.root.revalidate()?;
         let scan_source = Arc::clone(&prepared);
         let scan = match tokio::task::spawn_blocking(move || scan_once(&scan_source)).await {
             Err(err) => return Err(format!("rollout discovery scan task failed: {err}")),
@@ -826,17 +841,36 @@ pub(crate) async fn discover_candidate(
                 failed_scans += 1;
                 let now = tokio::time::Instant::now();
                 if now >= deadline {
-                    return Err(deadline_failure(
+                    let reason = deadline_failure(
                         &prepared,
                         started,
                         now,
                         cadence,
-                        ever_rejected,
+                        ever_rejected.clone(),
                         failed_scans,
-                        last_scan_error,
-                    ));
+                        last_scan_error.clone(),
+                    );
+                    if overdue(
+                        ever_rejected.clone().into_iter().collect(),
+                        reason.clone(),
+                        now.duration_since(started).as_secs(),
+                        true,
+                    )
+                    .await
+                    {
+                        return Err(reason);
+                    }
                 }
-                if wait_for_next_poll(halt).await {
+                if wait_for_next_poll(
+                    halt,
+                    if now >= deadline {
+                        Duration::from_secs(1)
+                    } else {
+                        DISCOVERY_POLL
+                    },
+                )
+                .await
+                {
                     return Ok(None);
                 }
                 continue;
@@ -862,30 +896,45 @@ pub(crate) async fn discover_candidate(
             }
             ever_rejected.insert(path.clone(), rejection.clone());
         }
-        let DiscoveryScan { mut matched, .. } = scan;
-        match matched.len() {
-            1 => return Ok(matched.pop()),
-            count if count > 1 => {
-                return Err(format!(
-                    "{count} new rollout files matched one run; refusing ambiguous attachment"
-                ));
-            }
-            _ => {}
+        let DiscoveryScan { mut matched, rejected } = scan;
+        if matched.len() == 1 {
+            return Ok(matched.pop());
         }
-        // Checked after the scan, never before it: the scan that precedes
-        // this test is the authoritative final look at the root.
-        if now >= deadline {
-            return Err(deadline_failure(
-                &prepared,
-                started,
-                now,
-                cadence,
-                ever_rejected,
-                failed_scans,
-                last_scan_error,
+        let reason = deadline_failure(
+            &prepared,
+            started,
+            now,
+            cadence,
+            ever_rejected.clone(),
+            failed_scans,
+            last_scan_error.clone(),
+        );
+        let stop = overdue(
+            rejected,
+            reason.clone(),
+            now.duration_since(started).as_secs(),
+            now >= deadline,
+        )
+        .await;
+        let count = matched.len();
+        if count > 1 {
+            return Err(format!(
+                "{count} new rollout files matched one run; refusing ambiguous attachment"
             ));
         }
-        if wait_for_next_poll(halt).await {
+        if stop {
+            return Err(reason);
+        }
+        if wait_for_next_poll(
+            halt,
+            if now >= deadline {
+                Duration::from_secs(1)
+            } else {
+                DISCOVERY_POLL
+            },
+        )
+        .await
+        {
             return Ok(None);
         }
     }
@@ -934,9 +983,9 @@ fn deadline_failure(
 
 /// Wait one discovery poll, or until the ingress is halted.
 /// Returns `true` when the caller should stop.
-async fn wait_for_next_poll(halt: &mut watch::Receiver<StreamHalt>) -> bool {
+async fn wait_for_next_poll(halt: &mut watch::Receiver<StreamHalt>, poll: Duration) -> bool {
     tokio::select! {
-        _ = tokio::time::sleep(DISCOVERY_POLL) => false,
+        _ = tokio::time::sleep(poll) => false,
         changed = halt.changed() => {
             let _ = changed;
             true

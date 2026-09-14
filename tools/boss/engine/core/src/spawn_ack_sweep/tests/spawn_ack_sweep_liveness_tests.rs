@@ -62,6 +62,7 @@ fn arm_file_ingress(
 ) {
     use crate::agent_jsonl_progress::{IngressCheckpoint, IngressCheckpointStore};
     let checkpoint = IngressCheckpoint::Armed {
+        discovery: None,
         ingress: crate::driver::AgentJsonlFileIngress {
             directory: root.to_path_buf(),
             filename_prefix: "rollout-".to_owned(),
@@ -1149,6 +1150,7 @@ fn failure_class_follows_observed_pid_and_probe() {
     let timeout = ReapCause::DriverStartTimeout {
         grace_secs: 300,
         silent_secs: 400,
+        file_ingress: None,
         activity: "spawning",
     };
     let absent = absent_liveness();

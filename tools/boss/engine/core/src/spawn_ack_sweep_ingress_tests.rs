@@ -15,7 +15,18 @@ fn checkpoint_variants_drive_reap_reading_and_attention() {
     db.store_ingress_checkpoint(&execution_id, &IngressCheckpoint::NotFileIngress)
         .unwrap();
     assert!(file_ingress_state(&db, &execution_id).is_none());
-    raise_driver_start_attention(&db, &execution, 1, 12345, 300, 301, None);
+    raise_driver_start_attention(
+        &db,
+        &execution,
+        1,
+        12345,
+        300,
+        301,
+        DriverStartEvidence {
+            file_ingress: None,
+            liveness: "no correlated transcript exists",
+        },
+    );
     let old = db.list_attention_items(&execution_id).unwrap();
     assert_eq!(old[0].title, "Worker driver never started on slot 1");
     assert!(old[0].body_markdown.contains("not the driver"));
@@ -104,7 +115,18 @@ fn checkpoint_variants_drive_reap_reading_and_attention() {
 }
 
 fn assert_attention(db: &WorkDb, execution: &WorkExecution, state: &FileIngressState) {
-    raise_driver_start_attention(db, execution, 1, 12345, 300, 301, Some(state));
+    raise_driver_start_attention(
+        db,
+        execution,
+        1,
+        12345,
+        300,
+        301,
+        DriverStartEvidence {
+            file_ingress: Some(state),
+            liveness: "no correlated transcript exists",
+        },
+    );
     let items = db.list_attention_items(&execution.id).unwrap();
     let item = items
         .iter()

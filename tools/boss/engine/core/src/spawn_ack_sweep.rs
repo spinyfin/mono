@@ -1374,8 +1374,10 @@ pub(crate) async fn reap_never_started_spawn(
                 shell_pid,
                 *grace_secs,
                 *silent_secs,
-                file_ingress.as_ref(),
-                &liveness_summary,
+                DriverStartEvidence {
+                    file_ingress: file_ingress.as_ref(),
+                    liveness: &liveness_summary,
+                },
             );
         }
     }
@@ -1455,6 +1457,11 @@ pub(crate) async fn reap_never_started_spawn(
 ///
 /// Best-effort — a failure here must never abort the reap, since the reap
 /// is what actually frees the slot and lease.
+struct DriverStartEvidence<'a> {
+    file_ingress: Option<&'a FileIngressState>,
+    liveness: &'a str,
+}
+
 fn raise_driver_start_attention(
     work_db: &WorkDb,
     execution: &WorkExecution,
@@ -1462,9 +1469,9 @@ fn raise_driver_start_attention(
     shell_pid: i32,
     grace_secs: i64,
     silent_secs: i64,
-    file_ingress: Option<&FileIngressState>,
-    liveness: &str,
+    evidence: DriverStartEvidence<'_>,
 ) {
+    let DriverStartEvidence { file_ingress, liveness } = evidence;
     let execution_id = execution.id.as_str();
     let reading = driver_start_reading(file_ingress);
     let pid_note = if shell_pid > 0 && file_ingress.is_some() {
@@ -1472,8 +1479,8 @@ fn raise_driver_start_attention(
     } else if shell_pid > 0 {
         format!(
             "The pane reported shell pid `{shell_pid}`, which is why every pane-level check treated \
-             this slot as healthy — a shell pid proves the pane hosts a shell, not that the driver \
-             inside it started."
+             this slot as healthy — it identifies the login shell, not the driver inside it. It does \
+             not prove the driver started."
         )
     } else {
         "No shell pid was ever reported for this pane.".to_owned()
@@ -1840,6 +1847,8 @@ mod tests {
                 file_ingress: Some(ingress),
             },
             "exec-1",
+            &TranscriptLiveness::Absent { checked: vec![] },
+            4242,
         );
         assert_eq!(stage, Stage::DriverStartTimeout);
         assert!(reason.starts_with("driver-start-timeout:"), "{reason}");
@@ -1863,6 +1872,8 @@ mod tests {
                 file_ingress: None,
             },
             "exec-2",
+            &TranscriptLiveness::Absent { checked: vec![] },
+            4242,
         );
         assert!(reason.contains("most likely never started"), "{reason}");
     }
@@ -1909,6 +1920,7 @@ mod tests {
         let cause = ReapCause::DriverStartTimeout {
             grace_secs: 300,
             silent_secs: 400,
+            file_ingress: None,
             activity: "spawning",
         };
 

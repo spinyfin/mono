@@ -22,15 +22,12 @@ use tokio::sync::{oneshot, watch};
 
 pub use crate::agent_jsonl_discovery::FileIdentity;
 use crate::agent_jsonl_discovery::{
-    Candidate, PreparedSource, RolloutProbeSource, RolloutProbeTarget, StreamHalt,
-    descriptor_is_unlinked, file_identity, named_descriptor_matches, single_link_regular,
-    validate_candidate, validated_session_meta,
+    Candidate, PreparedSource, RolloutProbeSource, RolloutProbeTarget, StreamHalt, descriptor_is_unlinked,
+    file_identity, named_descriptor_matches, single_link_regular, validate_candidate, validated_session_meta,
 };
 use crate::driver::{AgentDriver, AgentJsonlFileIngress, ProgressSessionConfig, ProgressStreamSource};
 use crate::stdout_progress::{ProgressCheckpointSink, WorkerEventSink};
 
-const DISCOVERY_POLL: Duration = Duration::from_millis(100);
-const DISCOVERY_POLL_AFTER_OVERDUE: Duration = Duration::from_secs(1);
 const FILE_POLL: Duration = Duration::from_millis(50);
 /// How long discovery may run before the run is reported as *overdue*.
 ///
@@ -48,7 +45,7 @@ const FILE_POLL: Duration = Duration::from_millis(50);
 /// ([`AgentJsonlProgressManager::stop_run`]) and merely *records* — durably,
 /// on the checkpoint, and as a dispatch event — that it is overdue.
 /// The threshold also slows scans from 100ms to one second.
-pub const DISCOVERY_OVERDUE_AFTER: Duration = Duration::from_secs(120);
+pub const DISCOVERY_OVERDUE_AFTER: Duration = crate::agent_jsonl_discovery::DISCOVERY_TIMEOUT;
 const FILE_CHUNK_BYTES: usize = 64 * 1024;
 const DUPLEX_BYTES: usize = 64 * 1024;
 
@@ -261,7 +258,7 @@ impl RolloutProbeSource for crate::work::WorkDb {
         Ok(match self.load_ingress_checkpoint(run_id)? {
             None => None,
             Some(IngressCheckpoint::NotFileIngress) => Some(RolloutProbeTarget::NotFileIngress),
-            Some(IngressCheckpoint::Armed { ingress, baseline }) => {
+            Some(IngressCheckpoint::Armed { ingress, baseline, .. }) => {
                 Some(RolloutProbeTarget::Armed { ingress, baseline })
             }
             Some(IngressCheckpoint::Attached { ingress, path, .. }) => {
@@ -968,6 +965,26 @@ async fn run_prepared<S>(
     let _ = tail.await;
 }
 
+/// Preserve the durable checkpoint schema while retaining detailed reasons
+/// in discovery logs and the checkpoint's narrative.
+fn checkpoint_rejection(reason: &crate::agent_jsonl_discovery::CandidateRejection) -> CandidateRejectReason {
+    use crate::agent_jsonl_discovery::CandidateRejection as R;
+    match reason {
+        R::InBaseline | R::NotSingleLinkRegularFile => CandidateRejectReason::UnsafeFile,
+        R::OutsideRoot => CandidateRejectReason::OutsideRoot,
+        R::IdentityChanged => CandidateRejectReason::IdentityChanged,
+        R::Empty | R::SessionMetaUnterminated { .. } => CandidateRejectReason::IncompleteSessionMeta,
+        R::SessionMetaOversized { .. } => CandidateRejectReason::OversizedSessionMeta,
+        R::NotSessionMeta { .. } | R::MissingPayload | R::MissingSessionId | R::MissingCwd => {
+            CandidateRejectReason::InvalidSessionMeta
+        }
+        R::SessionIdMismatch { .. } => CandidateRejectReason::SessionIdMismatch,
+        R::CwdNotResolvable { .. } | R::CwdMismatch { .. } => CandidateRejectReason::WorkspaceMismatch,
+        R::NameMismatch { .. } => CandidateRejectReason::FilenameMismatch,
+        R::Unreadable(_) => CandidateRejectReason::IoOrParseError,
+    }
+}
+
 /// One run's discovery: the poll loop that waits for exactly one new,
 /// workspace-correlated rollout to appear under the prepared root.
 struct Discovery<'a, S> {
@@ -992,121 +1009,70 @@ where
     /// left live workers permanently unobserved and reaped as never-started
     /// (see [`DISCOVERY_OVERDUE_AFTER`]). What ends an unattached discovery
     /// is the run's own teardown ([`StreamHalt::Cancel`]) or a failure that
-    /// polling cannot cure: the root changing identity, a scan error, or two
+    /// polling cannot cure: the root changing identity, a failed scan task, or two
     /// new rollouts both claiming this one run.
     async fn run(&self, halt: &mut watch::Receiver<StreamHalt>) -> Result<Option<(Candidate, u64)>, String> {
         let started = tokio::time::Instant::now();
-        let mut overdue_reported = false;
-        let mut rejected_candidates = 0usize;
-        let mut rejections = Vec::new();
         let mut recorded_diagnostics = None;
-        let mut recorded_live = false;
-        loop {
-            // A `Cancel` during discovery stops it: the engine is tearing the
-            // ingress down and there is nothing left to attach to.
-            if *halt.borrow() != StreamHalt::Running {
-                return Ok(None);
-            }
-            let pass = self.scan_once();
-            let waited_secs = started.elapsed().as_secs();
-            let mut matches = match pass {
-                Ok(pass) => {
-                    rejected_candidates = pass.rejected_candidates;
-                    rejections = pass.rejections;
-                    // File existence and growth are driver-originated evidence even
-                    // when the first `session_meta` line is still incomplete. Record
-                    // that independently of `diagnose_candidate`, or a Codex run whose
-                    // first line takes longer than the 30s stalled-spawn threshold to
-                    // terminate stays in `Spawning` with `driver_signal_at` unset.
-                    if !recorded_live && pass.file_progress {
-                        self.sink.record_driver_attach(self.run_id);
-                        recorded_live = true;
-                    }
-                    pass.matches
-                }
-                Err(err) => {
-                    self.record_failure(waited_secs, rejected_candidates, &rejections, &err)
-                        .await;
-                    return Err(err);
-                }
-            };
-            match matches.len() {
-                1 => {
-                    let candidate = matches.pop().expect("exactly one match");
-                    return Ok(Some((candidate, waited_secs)));
-                }
-                count if count > 1 => {
-                    let err = format!("{count} new rollout files matched one run; refusing ambiguous attachment");
-                    self.record_failure(waited_secs, rejected_candidates, &rejections, &err)
-                        .await;
-                    return Err(err);
-                }
-                _ => {}
-            }
-            let diagnostics = (rejected_candidates, rejections.clone());
-            if started.elapsed() >= self.overdue_after && recorded_diagnostics.as_ref() != Some(&diagnostics) {
-                self.record_overdue(waited_secs, rejected_candidates, &rejections).await;
-                overdue_reported = true;
+        let result = crate::agent_jsonl_discovery::discover_candidate_observed(
+            self.prepared,
+            halt,
+            self.overdue_after,
+            |rejected, reason, waited_secs, overdue| {
+                let mut rejected: Vec<_> = rejected
+                    .into_iter()
+                    .filter(|(_, reason)| {
+                        !matches!(reason, crate::agent_jsonl_discovery::CandidateRejection::InBaseline)
+                    })
+                    .collect();
+                rejected.sort_by(|a, b| a.0.cmp(&b.0));
+                let rejected_candidates = rejected.len();
+                let rejections: Vec<_> = rejected
+                    .into_iter()
+                    .take(4)
+                    .map(|(path, reason)| CandidateRejection {
+                        file_name: path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .chars()
+                            .take(256)
+                            .collect(),
+                        reason: checkpoint_rejection(&reason),
+                    })
+                    .collect();
+                let diagnostics = (overdue, rejected_candidates, rejections.clone());
+                let changed = recorded_diagnostics.as_ref() != Some(&diagnostics);
                 recorded_diagnostics = Some(diagnostics);
-            }
-            let poll = if overdue_reported {
-                DISCOVERY_POLL_AFTER_OVERDUE
-            } else {
-                DISCOVERY_POLL
-            };
-            tokio::select! {
-                _ = tokio::time::sleep(poll) => {}
-                changed = halt.changed() => {
-                    let _ = changed;
-                    return Ok(None);
-                }
-            }
-        }
-    }
-
-    fn scan_once(&self) -> Result<ScanPass, String> {
-        self.prepared.root.revalidate()?;
-        let paths = scan_matching_paths(&self.prepared.root, &self.prepared.ingress)?;
-        let file_progress = matching_file_shows_progress(self.prepared, &paths);
-        let mut new_paths = paths.difference(&self.prepared.baseline).collect::<Vec<_>>();
-        new_paths.sort();
-        let mut matches = Vec::new();
-        let mut rejections = Vec::new();
-        let mut rejected_candidates = 0;
-        for path in new_paths {
-            match diagnose_candidate(self.prepared, path).unwrap_or(Err(CandidateRejectReason::IoOrParseError)) {
-                Ok(candidate) => matches.push(candidate),
-                Err(reason) => {
-                    rejected_candidates += 1;
-                    if rejections.len() < 4 {
-                        rejections.push(CandidateRejection {
-                            file_name: path
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .chars()
-                                .take(256)
-                                .collect(),
-                            reason,
-                        });
+                async move {
+                    if overdue && changed {
+                        self.record_overdue(waited_secs, rejected_candidates, &rejections, reason)
+                            .await;
                     }
+                    false
                 }
+            },
+        )
+        .await;
+        match result {
+            Ok(candidate) => Ok(candidate.map(|candidate| (candidate, started.elapsed().as_secs()))),
+            Err(err) => {
+                let (_, count, rejections) = recorded_diagnostics.unwrap_or_default();
+                self.record_failure(started.elapsed().as_secs(), count, &rejections, &err)
+                    .await;
+                Err(err)
             }
         }
-        Ok(ScanPass {
-            rejected_candidates,
-            matches,
-            rejections,
-            file_progress,
-        })
     }
 
-    async fn record_overdue(&self, waited_secs: u64, rejected_candidates: usize, rejections: &[CandidateRejection]) {
+    async fn record_overdue(
+        &self,
+        waited_secs: u64,
+        rejected_candidates: usize,
+        rejections: &[CandidateRejection],
+        reason: String,
+    ) {
         let root = self.prepared.root.path.clone();
-        let reason = format!(
-            "no correlated rollout under {} after {waited_secs}s; still looking",
-            root.display()
-        );
         tracing::warn!(
             run_id = self.run_id,
             root = %root.display(),
@@ -1121,7 +1087,7 @@ where
             waited_secs,
             rejected_candidates,
             rejections,
-            reason,
+            format!("{reason}; still looking"),
         );
         self.sink
             .record_ingress_observation(
