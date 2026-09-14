@@ -511,6 +511,8 @@ enum WorkCardLiveStatus {
             return "Waiting — worker pool full"
         case "pending_first_attempt":
             return "Waiting for a slot"
+        case "resume_startup_pending":
+            return "Waiting — pacing startup after resume"
         default:
             return "Waiting — \(reason)"
         }

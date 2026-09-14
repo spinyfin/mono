@@ -11,7 +11,7 @@
 //! life). Two consecutive runs in the same slot reuse the slot key.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use boss_protocol::{ExecutionKind, LiveWorkerState, SessionStartSource, WorkItemBinding, WorkerActivity, WorkerEvent};
 
@@ -120,16 +120,19 @@ pub const STALLED_SPAWN_THRESHOLD_SECS: i64 = 30;
 /// hosting nothing but an idle login shell reported `shell_pid=92697`
 /// and satisfied every pane-level check forever.
 ///
-/// 300s is deliberately far above any real driver startup. A healthy
-/// driver's first hook (`SessionStart`) fires within seconds of exec.
-/// The one historically legitimate multi-minute pre-hook wait — claude's
-/// first-run folder-trust dialog, which is the entire reason
-/// [`LiveWorkerStateRegistry::mark_stalled_spawns`] exists — is
-/// *pre-suppressed* at provision time by
-/// `boss_engine_driver::claude`'s `hasTrustDialogAccepted` seeding, so
-/// no driver should ever legitimately sit pre-hook for minutes. Five
-/// minutes leaves an order of magnitude of headroom over that reality
-/// while still bounding the hold: before this, the hold was unbounded.
+/// Retain 300s after revalidation against Codex's 2026-09-13 startup:
+/// panes/shells took 4–7s, while the driver took 78–84s solo and 119–120s
+/// at six-way concurrency. Five minutes is roughly 2.5x the measured burst
+/// startup including pane setup — bounded headroom, not unlimited.
+/// Discovery, not this grace, is the binding constraint on observing a
+/// slow start: `boss_startup_policy::DiscoveryBudget` allows 120s solo
+/// and at most 240s under contention, which must stay strictly inside this
+/// grace, leaving at least 60s for pane setup and signal delivery.
+///
+/// Claude was historically validated via its prompt SessionStart hook and
+/// provisioned folder-trust acceptance. Codex is now also validated against
+/// the measured profile above. Keep the same finite grace for all drivers:
+/// a shell without driver evidence still must not hold a slot forever.
 pub const DRIVER_START_GRACE_SECS: i64 = 300;
 
 /// How long after the most recent hook a slot may keep advertising
@@ -156,6 +159,10 @@ pub struct LiveWorkerStateRegistry {
     /// per-field lifecycle, and there is no failure mode where one table
     /// keeps a stale entry a sibling table already dropped.
     inner: Mutex<HashMap<u8, SlotEntry>>,
+    /// Shared with JSONL discovery so a Claude or grok startup raises the
+    /// Codex discovery deadline. `None` in headless tests that never arm
+    /// file ingress.
+    discovery_load: Mutex<Option<Arc<boss_startup_policy::DiscoveryLoad>>>,
 }
 
 /// One slot's full record: the wire-format state the app and `bossctl`
@@ -196,9 +203,8 @@ struct SlotMeta {
     /// spawn. Consulted by `crate::stale_worker_sweep` to decide whether —
     /// and at what threshold — cadence-based staleness applies to this
     /// slot. `None` (never declared) reads as [`ProgressFidelity::Rich`]
-    /// — today's only driver (Claude) and every existing call site that
-    /// never sets this explicitly, so the default preserves current
-    /// behaviour unchanged.
+    /// — the legacy Claude default retained for callers that do not
+    /// declare a driver's fidelity explicitly.
     ///
     /// In-memory only, and not persisted or rehydrated anywhere: if the
     /// engine restarts while a worker is alive, the registry starts empty
@@ -207,16 +213,15 @@ struct SlotMeta {
     /// `Coarse`- or `Minimal`-tier driver this silently re-enables
     /// cadence-based staleness judgement for a slot the exemption was
     /// meant to protect — a live worker mid-turn with no per-tool event
-    /// can then be swept as stale. No-op today (Claude is `Rich`), but a
-    /// real gap for the first non-`Rich` driver.
+    /// can then be swept as stale. Rich drivers are unaffected; other
+    /// drivers require their fidelity declaration to be restored.
     progress_fidelity: Option<ProgressFidelity>,
     /// Does this run's driver declare `Capability::AwaitingInputSignal`?
     /// Gates whether `apply_event` trusts a `WorkerEvent::Notification` as
     /// a genuine "worker is blocked on human input" signal.
     ///
-    /// Seeded `true` by `register_spawn` (Claude is the only driver in
-    /// production today, and it provides the capability), so the ~30
-    /// existing test call sites keep working unchanged. Production spawn
+    /// Seeded `true` by the legacy `register_spawn` helper for compatibility
+    /// with Claude-oriented test registrations. Production spawn
     /// sites that resolve a real driver call
     /// `register_spawn_with_capabilities` instead, passing the resolved
     /// value directly so it can never be left at the default by a
@@ -359,6 +364,39 @@ impl LiveWorkerStateRegistry {
         Self::default()
     }
 
+    /// Share the JSONL discovery high-water mark so every in-flight startup
+    /// (not just Codex file discovery) extends pending discovery deadlines.
+    pub fn set_discovery_load(&self, load: Arc<boss_startup_policy::DiscoveryLoad>) {
+        *self.discovery_load.lock().expect("registry mutex poisoned") = Some(load);
+        self.publish_startup_contention();
+    }
+
+    /// Live slots still inside `window_secs` of spawn with no driver signal.
+    pub fn in_flight_startups(&self, now_epoch_secs: i64, window_secs: i64) -> usize {
+        let cutoff = now_epoch_secs.saturating_sub(window_secs);
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard
+            .values()
+            .filter(|entry| Self::slot_in_startup_window(entry, cutoff))
+            .count()
+    }
+
+    fn slot_in_startup_window(entry: &SlotEntry, cutoff: i64) -> bool {
+        entry.meta.driver_signal_at.is_none() && entry.meta.spawned_at > cutoff
+    }
+
+    pub(crate) fn publish_startup_contention(&self) {
+        let load = {
+            let guard = self.discovery_load.lock().expect("registry mutex poisoned");
+            guard.clone()
+        };
+        let Some(load) = load else {
+            return;
+        };
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        load.observe_in_flight(self.in_flight_startups(now, DRIVER_START_GRACE_SECS));
+    }
+
     /// Stamp the initial state for a freshly-allocated slot. Activity
     /// is `Spawning` until the first hook arrives. Any prior entry
     /// for this slot is replaced — the previous worker has been
@@ -499,6 +537,7 @@ impl LiveWorkerStateRegistry {
             registered_by = %caller,
             "live-state registry: slot entry registered; run is now visible to `bossctl agents list`",
         );
+        self.publish_startup_contention();
 
         // A slot re-registered without an intervening `release_slot` is the
         // desync `EngineToAppError::SlotBusy` exists to prevent. The prior
@@ -783,16 +822,19 @@ impl LiveWorkerStateRegistry {
         drop(guard);
 
         match removed {
-            Some(state) => tracing::info!(
-                slot_id,
-                run_id = %state.run_id,
-                activity = state.activity.as_str(),
-                last_event_at = ?state.last_event_at,
-                current_tool = ?state.current_tool,
-                shell_pid = state.shell_pid,
-                cleared_by = %caller,
-                "live-state registry: slot entry cleared; slot is now a husk candidate",
-            ),
+            Some(state) => {
+                tracing::info!(
+                    slot_id,
+                    run_id = %state.run_id,
+                    activity = state.activity.as_str(),
+                    last_event_at = ?state.last_event_at,
+                    current_tool = ?state.current_tool,
+                    shell_pid = state.shell_pid,
+                    cleared_by = %caller,
+                    "live-state registry: slot entry cleared; slot is now a husk candidate",
+                );
+                self.publish_startup_contention();
+            }
             None => tracing::debug!(
                 slot_id,
                 cleared_by = %caller,
@@ -892,13 +934,46 @@ impl LiveWorkerStateRegistry {
             signal = kind.as_str(),
             "driver-start verified: first driver-originated signal received for this run",
         );
+        self.publish_startup_contention();
         Some(slot_id)
+    }
+
+    /// Whether a live entry for `run_id` already has a driver-originated signal.
+    pub fn driver_has_signal(&self, run_id: &str) -> bool {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard
+            .values()
+            .any(|entry| entry.state.run_id == run_id && entry.meta.driver_signal_at.is_some())
     }
 
     /// Whether a driver-originated signal has been recorded for `slot_id`.
     pub fn driver_signal_at(&self, slot_id: u8) -> Option<i64> {
         let guard = self.inner.lock().expect("registry mutex poisoned");
         guard.get(&slot_id).and_then(|entry| entry.meta.driver_signal_at)
+    }
+
+    /// Startup pressure includes pool claims not registered as live yet.
+    /// A claim can outlive startup; driver proof removes it from this
+    /// count even while the execution remains productive. Unproven live
+    /// slots older than `window_secs` do not count: they are past the
+    /// driver-start grace, so they must not pin resumed admission to the
+    /// no-signal fallback. Claims without live slots use their pool claim
+    /// timestamp and expire from startup pressure at the same grace bound.
+    pub(crate) fn startup_pending(
+        &self,
+        claimed_runs: &std::collections::HashMap<String, i64>,
+        now_epoch_secs: i64,
+        window_secs: i64,
+    ) -> bool {
+        let cutoff = now_epoch_secs.saturating_sub(window_secs);
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard.values().any(|entry| Self::slot_in_startup_window(entry, cutoff))
+            || claimed_runs.iter().any(|(run_id, claimed_at)| {
+                match guard.values().find(|entry| entry.state.run_id == *run_id) {
+                    Some(entry) => Self::slot_in_startup_window(entry, cutoff),
+                    None => *claimed_at > cutoff,
+                }
+            })
     }
 
     /// Whether `slot_id`'s current registration is owed spawn-ack proof
@@ -1438,9 +1513,10 @@ impl LiveWorkerStateRegistry {
     ///   vouch for a driver that never ran.
     ///
     /// Returns the slot IDs that were changed so callers can broadcast
-    /// the updated snapshot. Normal-running workers (whose `SessionStart`
-    /// hook fires within seconds of spawn) always have `last_event_at`
-    /// set before the threshold elapses; this method ignores them.
+    /// the updated snapshot. Workers that have already supplied an event
+    /// have `last_event_at` set and are ignored. A healthy but slow Codex
+    /// startup can cross this display threshold before file progress arrives;
+    /// driver-start verification uses the separate, longer grace above.
     pub fn mark_stalled_spawns(&self, now_epoch_secs: i64, threshold_secs: i64) -> Vec<u8> {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         let cutoff = now_epoch_secs.saturating_sub(threshold_secs);

@@ -1059,6 +1059,8 @@ struct WorkerPoolInner {
 
 #[derive(Debug, Clone)]
 struct WorkerSlot {
+    /// Epoch seconds of the current claim; ignored while the slot is idle.
+    claimed_at: i64,
     worker_id: String,
     execution_id: Option<String>,
     last_workspace_id: Option<String>,
@@ -1159,6 +1161,7 @@ impl WorkerPool {
         };
         let workers = (0..clamped)
             .map(|index| WorkerSlot {
+                claimed_at: 0,
                 worker_id: format!("{}{}", prefix, index + 1),
                 execution_id: None,
                 last_workspace_id: None,
@@ -1199,6 +1202,7 @@ impl WorkerPool {
         let (chosen_idx, selection) = select_claim_index(&inner.workers, preferred_workspace_id)?;
         let worker = &mut inner.workers[chosen_idx];
         worker.execution_id = Some(execution_id.to_owned());
+        worker.claimed_at = boss_engine_utils::epoch_time::now_epoch_secs();
         let worker_id = worker.worker_id.clone();
         log_pool_claim(&worker_id, execution_id, selection);
         Some(worker_id)
@@ -1263,6 +1267,7 @@ impl WorkerPool {
             crate::dispatch_spillover::select_spill_claim_index(&views, preferred_workspace_id, WORKER_PAGE_SIZE)?;
         let worker = &mut inner.workers[chosen_idx];
         worker.execution_id = Some(execution_id.to_owned());
+        worker.claimed_at = boss_engine_utils::epoch_time::now_epoch_secs();
         let worker_id = worker.worker_id.clone();
         log_pool_claim(&worker_id, execution_id, "automation-spill");
         Some(worker_id)
@@ -1287,6 +1292,7 @@ impl WorkerPool {
         if let Some((chosen_idx, selection)) = select_claim_index(&inner.workers, preferred_workspace_id) {
             let worker = &mut inner.workers[chosen_idx];
             worker.execution_id = Some(execution_id.to_owned());
+            worker.claimed_at = boss_engine_utils::epoch_time::now_epoch_secs();
             let worker_id = worker.worker_id.clone();
             log_pool_claim(
                 &worker_id,
@@ -1307,6 +1313,7 @@ impl WorkerPool {
         }
         let new_index = inner.workers.len();
         let worker = WorkerSlot {
+            claimed_at: boss_engine_utils::epoch_time::now_epoch_secs(),
             worker_id: format!("{}{}", self.prefix, new_index + 1),
             execution_id: Some(execution_id.to_owned()),
             last_workspace_id: None,
@@ -1348,6 +1355,7 @@ impl WorkerPool {
             Some(_) => false,
             None => {
                 worker.execution_id = Some(execution_id.to_owned());
+                worker.claimed_at = boss_engine_utils::epoch_time::now_epoch_secs();
                 log_pool_claim(worker_id, execution_id, "readopt");
                 true
             }
@@ -1442,6 +1450,17 @@ impl WorkerPool {
     pub async fn has_idle_worker(&self) -> bool {
         let inner = self.inner.lock().await;
         inner.workers.iter().any(|w| w.execution_id.is_none())
+    }
+
+    /// Epoch claim times for occupied slots; idle slots are omitted.
+    pub(crate) async fn claimed_execution_times(&self) -> std::collections::HashMap<String, i64> {
+        self.inner
+            .lock()
+            .await
+            .workers
+            .iter()
+            .filter_map(|worker| worker.execution_id.as_ref().map(|id| (id.clone(), worker.claimed_at)))
+            .collect()
     }
 
     /// Return the set of execution ids currently claimed by a worker
@@ -2024,6 +2043,9 @@ pub struct ExecutionCoordinator {
     /// [`MAX_INFLIGHT_DISPATCHES`].
     #[builder(default = Arc::new(Semaphore::new(MAX_INFLIGHT_DISPATCHES)))]
     dispatch_slots: Arc<Semaphore>,
+    /// Startup pacing for the cohort that was ready when dispatch resumed.
+    #[builder(default)]
+    resume_admission: std::sync::Mutex<boss_startup_policy::ResumeAdmission>,
     /// `true` while a `run_scheduler` task is alive. `kick()` returns
     /// without spawning when this is already set; the alive scheduler
     /// is responsible for noticing the wakeup via `scheduling_pending`.

@@ -422,6 +422,10 @@ impl ExecutionCoordinator {
             self.recover_failed_dispatch(&execution, &worker_id, &err).await;
             return Err(err);
         }
+        self.resume_admission
+            .lock()
+            .unwrap()
+            .admitted(execution_id, std::time::Instant::now());
         spawn_claim.disarm();
         Ok(worker_id)
     }
@@ -815,6 +819,36 @@ impl ExecutionCoordinator {
         }
     }
 
+    async fn resume_startup_held(&self, execution_id: &str) -> bool {
+        let now = std::time::Instant::now();
+        if !self.resume_admission.lock().unwrap().holds(execution_id, true, now) {
+            return false;
+        }
+        // The production coordinator shares the live registry with ingress.
+        // Headless coordinators without it have no driver readiness lifecycle.
+        let Some(live) = &self.live_worker_states else {
+            return false;
+        };
+        // Pool claims survive the handoff from schedule_execution to the
+        // runner, including the window before live-slot registration.
+        let startup_pending = live.startup_pending(
+            &self.all_claimed_execution_times().await,
+            boss_engine_utils::epoch_time::now_epoch_secs(),
+            crate::live_worker_state::DRIVER_START_GRACE_SECS,
+        );
+        let held = self
+            .resume_admission
+            .lock()
+            .unwrap()
+            .holds(execution_id, startup_pending, now);
+        if held {
+            self.record_dispatch_wait_reason(execution_id, "resume_startup_pending");
+        }
+        // The existing scheduler heartbeat revisits ready rows every 15s,
+        // including failed/cancelled starts; no sleeps occupy the drain.
+        held
+    }
+
     /// Drain every currently-`ready` execution. Returns the reason the
     /// drain stopped so the caller can decide whether to re-enter
     /// immediately (queue empty + pending wakeup) or yield (pool
@@ -902,6 +936,13 @@ impl ExecutionCoordinator {
                 return DrainOutcome::QueueEmpty;
             }
         };
+
+        if !paused {
+            self.resume_admission
+                .lock()
+                .unwrap()
+                .observe_ready(executions.iter().map(|execution| execution.id.clone()));
+        }
 
         // Queue-level depth/oldest-wait gauges, sampled here (before the
         // pause gate and any filtering below) so they reflect the true
@@ -1029,6 +1070,9 @@ impl ExecutionCoordinator {
         };
 
         for execution in executions {
+            if !paused && self.resume_startup_held(&execution.id).await {
+                continue;
+            }
             let preferred_workspace_id = execution.preferred_workspace_id.clone();
             // Classify the target pool. Review is checked first (and excludes
             // the others) so a reviewer of an automation-produced task is
@@ -1606,6 +1650,9 @@ impl ExecutionCoordinator {
         // themselves is unchanged — they are simply all ranked below all
         // mainline work.
         for execution in spill_candidates {
+            if !paused && self.resume_startup_held(&execution.id).await {
+                continue;
+            }
             let preferred_workspace_id = execution.preferred_workspace_id.clone();
             // Re-read per candidate: each successful spill in this loop
             // raises the live-worker count, so a cap snapshotted once
@@ -2146,6 +2193,10 @@ impl ExecutionCoordinator {
         };
         let coordinator = Arc::clone(self);
         let dispatch_slots = Arc::clone(&self.dispatch_slots);
+        self.resume_admission
+            .lock()
+            .unwrap()
+            .admitted(&execution.id, std::time::Instant::now());
         let execution = execution.clone();
         let worker_id = worker_id.to_string();
         tokio::spawn(async move {

@@ -10,6 +10,7 @@ mod pause_bypass;
 mod pool;
 mod post_merge_review_dispatch;
 mod recovery;
+mod resume_pacing;
 mod review_pause;
 mod revision_gating;
 mod spawn_failures;

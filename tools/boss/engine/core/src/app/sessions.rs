@@ -729,30 +729,12 @@ pub(super) async fn handle_update_worker_shell_pid(ctx: Dispatch, req: FrontendR
         );
         return;
     }
-    // A real shell pid is proof the app's spawn path is working again — reset
-    // the spawn-capability breaker so its failure window doesn't carry stale
-    // pre-recovery failures into the next outage.
-    server_state.spawn_health.record_success();
-    // If this run was the half-open recovery probe's canary (see
-    // `maybe_admit_recovery_probe`), this is proof the breaker's trip has
-    // resolved — auto-resume dispatch. Never auto-resumes an operator pause:
-    // `resume_dispatch_after_breaker_recovery` no-ops unless the current
-    // pause is Breaker-origin.
-    if server_state.spawn_health.record_probe_success(&run_id)
-        && crate::spawn_health::resume_dispatch_after_breaker_recovery(
-            &server_state.work_db,
-            &server_state.execution_coordinator,
-            server_state.dispatch_events.as_ref(),
-            Some(&run_id),
-            "recovery probe reported a real shell pid",
-        )
-        .await
-    {
-        // The `resume_dispatch` inside `resume_dispatch_after_breaker_recovery`
-        // notified the pause-state transition; the pause-state broadcaster
-        // owns the health push from here.
-        server_state.execution_coordinator.kick();
-    }
+    // A real shell pid proves the app can create a pane. It does not prove
+    // the driver started, so it must not clear driver-start failures or
+    // auto-resume a Breaker pause — that is the 2026-07-30 idle-login-shell
+    // class. Probe success and a full breaker reset wait for a
+    // driver-originated signal (see `note_driver_start_signal`).
+    server_state.spawn_health.record_shell_ack();
     // Persist the pid to the DB FIRST, keyed by run_id (the execution id).
     // The `work_runs` row always exists by now (inserted synchronously at
     // dispatch, before the pane was spawned), so unlike the in-memory slot

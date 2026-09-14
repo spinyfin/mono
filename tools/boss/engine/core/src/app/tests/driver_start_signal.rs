@@ -73,3 +73,67 @@ async fn a_hook_at_the_ingress_records_the_driver_start_signal() {
         "having signalled, the slot must never appear as a never-started driver",
     );
 }
+
+#[tokio::test]
+async fn hooks_without_live_slots_preserve_breaker_failures() {
+    use crate::protocol::WorkerEvent;
+    let (state, _dir) = test_server_state();
+    state
+        .live_worker_states
+        .register_spawn(1, "released", "codex", 42, None);
+    state.live_worker_states.release_slot(1);
+    for (index, run) in ["unknown", "released", "unknown"].into_iter().enumerate() {
+        assert_eq!(
+            state
+                .spawn_health
+                .record_driver_start_failure(&format!("dead-{index}"), 1000),
+            (index == 2).then_some(3)
+        );
+        for _ in 0..3 {
+            let event = crate::events_socket::IncomingHookEvent::for_test(
+                WorkerEvent::PostToolUse {
+                    session_id: "late-session".into(),
+                    tool_name: "Bash".into(),
+                    tool_input: serde_json::Value::Null,
+                    tool_response: serde_json::Value::Null,
+                },
+                Some(run.into()),
+                None,
+            );
+            dispatch_live_worker_state(&state, &event).await;
+        }
+    }
+    assert_eq!(
+        state.spawn_health.record_driver_start_failure("another-dead", 1000),
+        Some(4)
+    );
+}
+
+#[tokio::test]
+async fn live_driver_start_resets_breaker_exactly_once() {
+    let (state, _dir) = test_server_state();
+    state
+        .live_worker_states
+        .register_spawn(1, "live-run", "codex", 42, None);
+    state.spawn_health.record_driver_start_failure("before-proof", 1000);
+    crate::app::worker_events::note_driver_start_signal(
+        &state,
+        "live-run",
+        crate::live_worker_state::DriverSignalKind::HookEvent,
+    )
+    .await;
+    for index in 0..3 {
+        assert_eq!(
+            state
+                .spawn_health
+                .record_driver_start_failure(&format!("dead-{index}"), 1000),
+            (index == 2).then_some(3)
+        );
+        crate::app::worker_events::note_driver_start_signal(
+            &state,
+            "live-run",
+            crate::live_worker_state::DriverSignalKind::HookEvent,
+        )
+        .await;
+    }
+}

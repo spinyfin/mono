@@ -22,6 +22,36 @@ impl ServerState {
     }
 }
 
+/// First driver-originated signal for `run_id` proves the spawn path and
+/// the driver, so it resets the spawn-capability breaker and, if this run
+/// is the half-open recovery canary, auto-resumes a Breaker pause. Later
+/// hooks are a no-op for the breaker: a healthy peer must not wipe
+/// in-window driver-start failures from dead siblings. Hooks that do not
+/// land on a live slot are also a no-op for the breaker.
+pub(super) async fn note_driver_start_signal(server_state: &ServerState, run_id: &str, kind: DriverSignalKind) {
+    let already = server_state.live_worker_states.driver_has_signal(run_id);
+    let landed = server_state
+        .live_worker_states
+        .record_driver_signal(run_id, kind)
+        .is_some();
+    if already || !landed {
+        return;
+    }
+    server_state.spawn_health.record_success();
+    if server_state.spawn_health.record_probe_success(run_id)
+        && crate::spawn_health::resume_dispatch_after_breaker_recovery(
+            &server_state.work_db,
+            &server_state.execution_coordinator,
+            server_state.dispatch_events.as_ref(),
+            Some(run_id),
+            "recovery probe received a driver-start signal",
+        )
+        .await
+    {
+        server_state.execution_coordinator.kick();
+    }
+}
+
 /// Update the per-slot LiveWorkerState for the run this hook event
 /// belongs to and push the new snapshot on the
 /// `worker.live_states` topic if anything changed. Hook events that
@@ -410,9 +440,7 @@ pub(super) async fn dispatch_live_worker_state(
     // accepted a slot and a foreground pid appeared — both true of a pane
     // hosting nothing but an idle login shell. See
     // `LiveWorkerStateRegistry::unverified_driver_starts`.
-    server_state
-        .live_worker_states
-        .record_driver_signal(run_id, DriverSignalKind::HookEvent);
+    note_driver_start_signal(server_state, run_id, DriverSignalKind::HookEvent).await;
     // Resolve any outstanding pane-injection delivery waiter for this
     // run. A `UserPromptSubmit` hook is the CLI's own confirmation
     // that it enqueued *something* as the next prompt; when a probe
@@ -482,9 +510,7 @@ pub(super) async fn dispatch_live_worker_state(
         // recorded anyway so the contract holds at every site that
         // learns a transcript path rather than depending on the two
         // staying adjacent.
-        server_state
-            .live_worker_states
-            .record_driver_signal(run_id, DriverSignalKind::TranscriptPath);
+        note_driver_start_signal(server_state, run_id, DriverSignalKind::TranscriptPath).await;
         // `run_id` here is the `_boss_run_id` from the hook payload,
         // which carries the **execution_id** (`exec_*`) — not a
         // `work_runs.id` (`run_*`). The setter joins on
@@ -664,9 +690,7 @@ pub(super) async fn dispatch_live_worker_state(
     // judged as never having started a driver. Repeating the call here —
     // idempotent and first-write-wins — makes the record land for local and
     // remote runs alike, whichever side of registration the hook fell on.
-    server_state
-        .live_worker_states
-        .record_driver_signal(run_id, DriverSignalKind::HookEvent);
+    note_driver_start_signal(server_state, run_id, DriverSignalKind::HookEvent).await;
     let prior_activity = server_state.live_worker_states.get(slot_id).map(|s| s.activity);
     let changed = server_state.live_worker_states.apply_event(slot_id, &incoming.event);
     if changed {

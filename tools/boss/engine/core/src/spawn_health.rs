@@ -69,14 +69,17 @@
 //! a [`Stage::BreakerRecoveryProbeAdmitted`] event, so it is distinguishable
 //! in `bossctl dispatch tail` from a pause that is not being honoured.
 //! `pr_review` rows are never eligible — see
-//! [`maybe_admit_recovery_probe`]. A real shell
-//! pid reported for that canary is proof the spawn path works again and
-//! auto-resumes dispatch ([`resume_dispatch_after_breaker_recovery`]); a
-//! reap of the canary (spawn-ack timeout or app NACK) backs off
+//! [`maybe_admit_recovery_probe`]. A driver-originated signal on that
+//! canary is proof both the spawn path and the driver came up, and
+//! auto-resumes dispatch ([`resume_dispatch_after_breaker_recovery`]). A
+//! shell pid alone is not enough: the 2026-07-30 / 2026-09-13 class is a
+//! live login shell hosting a never-started driver, so treating the pid as
+//! recovery would unpause into the same outage. A reap of the canary
+//! (spawn-ack timeout, driver-start timeout, or app NACK) backs off
 //! exponentially before the next attempt. Dispatch also auto-resumes on a
 //! fresh app session registering — an app relaunch is the operator's
 //! natural recovery action after e.g. waking the display, so it clears the
-//! breaker exactly like a real shell pid would. This recovery machinery is
+//! breaker the same way a proven driver start would. This recovery machinery is
 //! self-gating: it only ever activates on top of a real Breaker-origin
 //! pause, and a real pause only happens when the flag is enabled, so no
 //! separate flag check is needed inside it.
@@ -133,7 +136,7 @@ pub const SPAWN_HEALTH_PROBE_BACKOFF_MAX_SECS: i64 = 900;
 /// [`SpawnHealthTracker::try_admit_probe`] itself.
 ///
 /// Both of those normal resolution paths assume the canary either reports a
-/// shell pid or gets reaped by [`crate::spawn_ack_sweep::reap_never_started_spawn`].
+/// driver-originated signal or gets reaped by [`crate::spawn_ack_sweep::reap_never_started_spawn`].
 /// But `force_dispatch` returns as soon as scheduling completes, and the
 /// actual pane spawn happens later in a detached task — if that task's
 /// `adapter.spawn_worker` call itself errors, the execution goes straight to
@@ -142,11 +145,13 @@ pub const SPAWN_HEALTH_PROBE_BACKOFF_MAX_SECS: i64 = 900;
 /// deadline that leaves `in_flight` set forever, so `try_admit_probe` would
 /// refuse to admit a next canary and dispatch would stay Breaker-paused
 /// until a human ran `bossctl dispatch resume` — the exact latch this module
-/// exists to eliminate. Twice
-/// [`crate::spawn_ack_sweep::SPAWN_ACK_GRACE_SECS`] gives the normal reap
-/// path a full chance to resolve the probe first; this is strictly a
+/// exists to eliminate. The 600s deadline exceeds
+/// [`crate::live_worker_state::DRIVER_START_GRACE_SECS`] (300s), with room
+/// for the 60s reap sweep and scheduling slack. Driver proof, including
+/// contended JSONL discovery, or the driver-start reap must resolve first.
+/// This is strictly a
 /// last-resort backstop for the terminal-without-reap case.
-pub const SPAWN_HEALTH_PROBE_STALL_DEADLINE_SECS: i64 = 120;
+pub const SPAWN_HEALTH_PROBE_STALL_DEADLINE_SECS: i64 = 600;
 
 /// Sentinel for [`SpawnHealthTracker::last_disabled_signal_at`] meaning "no
 /// disabled-mode signal has fired yet" — distinct from a real epoch-seconds
@@ -205,13 +210,26 @@ struct FailureWindowConfig {
 /// [`SpawnHealthTracker::record_failure`] tracks for the trip-threshold
 /// decision itself, so that method's existing contract and test suite stay
 /// untouched.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct SpawnFailureEvidence {
+    pub class: FailureClass,
     pub execution_id: String,
     pub work_item_id: String,
     pub slot_id: String,
     pub shell_pid: i32,
     pub epoch_secs: i64,
+}
+
+/// Whether a never-started failure is a missing pane/shell or a missing driver.
+/// A shell ack proves the spawn path and clears only [`Self::Spawn`]; a
+/// driver-originated signal (or a fresh app session) clears both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum FailureClass {
+    /// Pane/shell never came up. Cleared by [`SpawnHealthTracker::record_shell_ack`].
+    Spawn,
+    /// Shell may be up; the driver binary never started. Survives a shell ack.
+    DriverStart,
 }
 
 /// The two parallel logs of in-window spawn failures — bundled into one
@@ -220,9 +238,9 @@ pub struct SpawnFailureEvidence {
 /// checkleft's named-field limit for structs without a builder.
 #[derive(Debug, Default)]
 struct FailureLog {
-    /// `(work_item_id, epoch_secs)` of recent spawn failures, pruned to the
-    /// window on every `record_failure`.
-    recent: Mutex<Vec<(String, i64)>>,
+    /// `(work_item_id, epoch_secs, class)` of recent spawn failures, pruned
+    /// to the window on every `record_failure`.
+    recent: Mutex<Vec<(String, i64, FailureClass)>>,
     /// Full evidence for the same in-window failures `recent` tracks by
     /// `(work_item_id, epoch_secs)` alone — see [`SpawnFailureEvidence`].
     /// Pruned to the same window on every [`SpawnHealthTracker::record_evidence`]
@@ -253,11 +271,11 @@ pub struct SpawnHealthTracker {
     /// override still takes effect there.
     breaker_enabled: bool,
     /// Epoch seconds of the last disabled-mode "would have tripped" signal
-    /// for the current outage, or `0` if none has fired yet — see
+    /// for the current outage, or `NO_DISABLED_SIGNAL_YET` if none has fired yet — see
     /// [`Self::mark_disabled_trip_signaled`]. Time-windowed (not a one-shot
     /// latch cleared by [`Self::record_success`]) because in disabled mode
     /// dispatch never pauses, so spawns keep flowing and `record_success`
-    /// fires on every real shell pid throughout the outage; a flapping spawn
+    /// fires on every proven driver start throughout the outage; a flapping spawn
     /// path would otherwise re-signal (and raise a fresh durable attention
     /// item) on every single success/failure cycle.
     last_disabled_signal_at: AtomicI64,
@@ -316,7 +334,7 @@ impl SpawnHealthTracker {
     /// Time-windowed rather than a one-shot latch cleared by
     /// [`Self::record_success`]: disabled mode never pauses dispatch, so
     /// spawns keep flowing throughout an outage and `record_success` fires
-    /// on every real shell pid reported in between failures. A flapping
+    /// on every proven driver start reported in between failures. A flapping
     /// spawn path (some spawns succeed, some don't) would otherwise clear
     /// the one-shot latch on every intervening success and raise a fresh
     /// durable attention item on every subsequent failure burst — several
@@ -345,11 +363,22 @@ impl SpawnHealthTracker {
     /// in [`trip_spawn_capability_circuit`] (which no-ops when dispatch is
     /// already paused), so the loud signal fires exactly once per outage.
     pub fn record_failure(&self, work_item_id: &str, now_epoch_secs: i64) -> Option<usize> {
+        self.record_classified_failure(work_item_id, now_epoch_secs, FailureClass::Spawn)
+    }
+
+    /// Record a never-started-driver failure. A later shell pid does not
+    /// clear these — only [`Self::record_success`] (driver signal or a
+    /// fresh app session) does.
+    pub fn record_driver_start_failure(&self, work_item_id: &str, now_epoch_secs: i64) -> Option<usize> {
+        self.record_classified_failure(work_item_id, now_epoch_secs, FailureClass::DriverStart)
+    }
+
+    fn record_classified_failure(&self, work_item_id: &str, now_epoch_secs: i64, class: FailureClass) -> Option<usize> {
         let mut recent = self.failures.recent.lock().unwrap();
         let cutoff = now_epoch_secs - self.window.window_secs;
-        recent.retain(|(_, ts)| *ts >= cutoff);
-        recent.push((work_item_id.to_owned(), now_epoch_secs));
-        let distinct: HashSet<&str> = recent.iter().map(|(w, _)| w.as_str()).collect();
+        recent.retain(|(_, ts, _)| *ts >= cutoff);
+        recent.push((work_item_id.to_owned(), now_epoch_secs, class));
+        let distinct: HashSet<&str> = recent.iter().map(|(w, _, _)| w.as_str()).collect();
         let distinct = distinct.len();
         (distinct >= self.window.threshold).then_some(distinct)
     }
@@ -380,13 +409,14 @@ impl SpawnHealthTracker {
             .collect()
     }
 
-    /// Reset the breaker. Called when a spawn provably worked (a real shell
-    /// pid was reported) or a fresh app session registered, so stale
-    /// pre-recovery failures no longer count toward a trip.
+    /// Reset the breaker. Called when a driver-originated signal arrives
+    /// (the driver binary actually started) or a fresh app session
+    /// registered, so stale pre-recovery failures no longer count toward a
+    /// trip. A shell pid is not this: see [`Self::record_shell_ack`].
     ///
     /// Deliberately does NOT clear the disabled-mode signal window
     /// ([`Self::mark_disabled_trip_signaled`]): in disabled mode dispatch
-    /// never pauses, so this fires on every real shell pid throughout an
+    /// never pauses, so this fires on every proven driver start throughout an
     /// outage, including in between bursts of a flapping spawn path. Letting
     /// a success reset the window would re-arm the signal on every flap and
     /// raise a fresh durable attention item per burst; a genuinely new
@@ -394,6 +424,24 @@ impl SpawnHealthTracker {
     pub fn record_success(&self) {
         self.failures.recent.lock().unwrap().clear();
         self.failures.evidence.lock().unwrap().clear();
+    }
+
+    /// A pane reported a real shell pid. Proves the app can create a pane,
+    /// and clears only spawn-path (no-shell) failures. Driver-start
+    /// failures stay in the window: a login shell hosting nothing is the
+    /// 2026-07-30 incident class, and treating the pid as full recovery
+    /// would wipe those failures between every paced resume admission.
+    pub fn record_shell_ack(&self) {
+        self.failures
+            .recent
+            .lock()
+            .unwrap()
+            .retain(|(_, _, class)| *class == FailureClass::DriverStart);
+        self.failures
+            .evidence
+            .lock()
+            .unwrap()
+            .retain(|evidence| evidence.class == FailureClass::DriverStart);
     }
 
     /// Window length in seconds (for the trip event's `details`).
@@ -470,11 +518,12 @@ impl SpawnHealthTracker {
         probe.next_attempt_at = now_epoch_secs + probe_backoff_secs(probe.consecutive_failures);
     }
 
-    /// The in-flight probe succeeded (a real shell pid was reported for
-    /// it): fully reset the probe state so the next outage's probing starts
-    /// fresh, with no inherited backoff. Returns `true` only when
+    /// The in-flight probe succeeded (a driver-originated signal arrived
+    /// for it): fully reset the probe state so the next outage's probing
+    /// starts fresh, with no inherited backoff. Returns `true` only when
     /// `execution_id` was in fact the in-flight probe — the caller uses
-    /// this to decide whether to auto-resume dispatch.
+    /// this to decide whether to auto-resume dispatch. A shell pid is not
+    /// success here; see [`Self::record_shell_ack`].
     pub fn record_probe_success(&self, execution_id: &str) -> bool {
         let mut probe = self.probe.lock().unwrap();
         if probe.in_flight.as_deref() != Some(execution_id) {
@@ -636,7 +685,7 @@ pub async fn maybe_admit_recovery_probe(
 
 /// Auto-resume dispatch after Breaker-origin evidence that the app's spawn
 /// path is healthy again — either the half-open recovery probe's canary
-/// reported a real shell pid, or a fresh app session registered (the
+/// reported a driver-start signal, or a fresh app session registered (the
 /// operator's natural recovery action, e.g. relaunching the app after
 /// waking the display).
 ///
@@ -856,7 +905,7 @@ pub async fn trip_spawn_capability_circuit(
              `dispatch-events/current.jsonl`).\n\n\
              **Recovery is automatic:** the engine periodically force-dispatches a single queued \
              execution as a recovery probe (backing off between attempts) and auto-resumes dispatch \
-             the moment one reports a real shell pid — see `spawn_capability_recovered` in \
+             the moment one reports a driver-start signal — see `spawn_capability_recovered` in \
              `dispatch-events/current.jsonl`. Relaunching the Boss app (e.g. after waking the display) \
              also clears the breaker immediately on reconnect. No manual action is required, but you \
              can still make sure the app is foreground with an active display and confirm new panes \
@@ -1013,6 +1062,75 @@ mod tests {
         tracker.record_success();
         // After a successful spawn the window is empty again, so it takes a
         // fresh threshold's worth of distinct failures to re-trip.
+        assert_eq!(tracker.record_failure("wi-3", 1001), None);
+        assert_eq!(tracker.record_failure("wi-4", 1001), None);
+        assert_eq!(tracker.record_failure("wi-5", 1001), Some(3));
+    }
+
+    #[test]
+    fn shell_ack_does_not_clear_driver_start_failures() {
+        let tracker = SpawnHealthTracker::with_config(3, 300);
+        tracker.record_failure("shell-failure", 1000);
+        tracker.record_evidence(
+            SpawnFailureEvidence::builder()
+                .class(FailureClass::Spawn)
+                .execution_id("shell-exec")
+                .work_item_id("shell-failure")
+                .slot_id("0")
+                .shell_pid(0)
+                .epoch_secs(1000)
+                .build(),
+        );
+        for (index, pid) in [0, 4242, 4243].into_iter().enumerate() {
+            let id = format!("driver-{index}");
+            let tripped = tracker.record_driver_start_failure(&id, 1001);
+            tracker.record_evidence(
+                SpawnFailureEvidence::builder()
+                    .class(FailureClass::DriverStart)
+                    .execution_id(format!("exec-{index}"))
+                    .work_item_id(&id)
+                    .slot_id(index.to_string())
+                    .shell_pid(pid)
+                    .epoch_secs(1001)
+                    .build(),
+            );
+            tracker.record_shell_ack();
+            assert_eq!(tripped, (index == 2).then_some(3));
+            let mut evidence_ids: Vec<_> = tracker
+                .evidence_in_window(1001)
+                .into_iter()
+                .map(|e| e.work_item_id)
+                .collect();
+            let mut failure_ids: Vec<_> = tracker
+                .failures
+                .recent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, _, _)| id.clone())
+                .collect();
+            evidence_ids.sort();
+            failure_ids.sort();
+            assert_eq!(evidence_ids, failure_ids);
+            assert_eq!(evidence_ids.len(), index + 1);
+        }
+    }
+
+    #[test]
+    fn probe_backstop_allows_driver_start_grace_and_reap_slack() {
+        let tracker = SpawnHealthTracker::new();
+        tracker.mark_probe_dispatched("slow-canary", 1000);
+        assert!(!tracker.try_admit_probe(1240));
+        assert!(!tracker.try_admit_probe(1000 + crate::live_worker_state::DRIVER_START_GRACE_SECS + 60));
+        assert!(tracker.record_probe_success("slow-canary"));
+    }
+
+    #[test]
+    fn shell_ack_clears_spawn_failures_only() {
+        let tracker = SpawnHealthTracker::with_config(3, 300);
+        tracker.record_failure("wi-1", 1000);
+        tracker.record_failure("wi-2", 1000);
+        tracker.record_shell_ack();
         assert_eq!(tracker.record_failure("wi-3", 1001), None);
         assert_eq!(tracker.record_failure("wi-4", 1001), None);
         assert_eq!(tracker.record_failure("wi-5", 1001), Some(3));
@@ -1710,20 +1828,26 @@ mod tests {
     #[test]
     fn record_evidence_prunes_outside_window_and_is_cleared_by_success() {
         let tracker = SpawnHealthTracker::with_config(3, 300);
-        tracker.record_evidence(SpawnFailureEvidence {
-            execution_id: "exec-1".to_owned(),
-            work_item_id: "wi-1".to_owned(),
-            slot_id: "0".to_owned(),
-            shell_pid: 0,
-            epoch_secs: 0,
-        });
-        tracker.record_evidence(SpawnFailureEvidence {
-            execution_id: "exec-2".to_owned(),
-            work_item_id: "wi-2".to_owned(),
-            slot_id: "1".to_owned(),
-            shell_pid: 0,
-            epoch_secs: 301,
-        });
+        tracker.record_evidence(
+            SpawnFailureEvidence::builder()
+                .class(FailureClass::Spawn)
+                .execution_id("exec-1".to_owned())
+                .work_item_id("wi-1".to_owned())
+                .slot_id("0".to_owned())
+                .shell_pid(0)
+                .epoch_secs(0)
+                .build(),
+        );
+        tracker.record_evidence(
+            SpawnFailureEvidence::builder()
+                .class(FailureClass::Spawn)
+                .execution_id("exec-2".to_owned())
+                .work_item_id("wi-2".to_owned())
+                .slot_id("1".to_owned())
+                .shell_pid(0)
+                .epoch_secs(301)
+                .build(),
+        );
         // The t=0 entry is now outside the 300s window as of t=301.
         let in_window = tracker.evidence_in_window(301);
         assert_eq!(in_window.len(), 1);
@@ -1745,13 +1869,16 @@ mod tests {
         let coordinator = make_coordinator(db.clone(), 1);
 
         let spawn_health = SpawnHealthTracker::with_config(3, 300).with_breaker_enabled(true);
-        spawn_health.record_evidence(SpawnFailureEvidence {
-            execution_id: execution.id.clone(),
-            work_item_id: work_item_id.clone(),
-            slot_id: "0".to_owned(),
-            shell_pid: 0,
-            epoch_secs: 1000,
-        });
+        spawn_health.record_evidence(
+            SpawnFailureEvidence::builder()
+                .class(FailureClass::Spawn)
+                .execution_id(execution.id.clone())
+                .work_item_id(work_item_id.clone())
+                .slot_id("0".to_owned())
+                .shell_pid(0)
+                .epoch_secs(1000)
+                .build(),
+        );
         let sink = RecordingDispatchEventSink::new();
 
         trip_spawn_capability_circuit(

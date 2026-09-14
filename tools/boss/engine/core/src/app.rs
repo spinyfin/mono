@@ -1662,6 +1662,9 @@ impl ServerState {
         // boot path rather than at runtime (design §"Risks / open
         // questions" item 6).
         crate::metrics_init::init_all(&server_state.metrics);
+        server_state
+            .live_worker_states
+            .set_discovery_load(server_state.agent_jsonl_progress_manager.discovery_load());
 
         // Seed the in-memory registry from `state.db` so monotonic
         // counter totals span engine restarts. Failures are logged
