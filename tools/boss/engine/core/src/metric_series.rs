@@ -574,6 +574,18 @@ struct BuiltBuckets {
     bucket_secs: i64,
 }
 
+/// Series-wide minima for `data_from`/`dimension_from`, computed by the
+/// caller outside the query window (typically via a dedicated, unbounded
+/// SQL aggregate) and folded into [`build_from_points`]'s own scan of the
+/// windowed `points` it is handed. Defaulting both fields leaves coverage
+/// computed purely from `points`, which is what every caller that does not
+/// have (or need) a wider source of truth — chiefly tests — gets for free.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CoverageOverride {
+    pub data_from_epoch_s: Option<i64>,
+    pub dimension_from_epoch_s: Option<i64>,
+}
+
 fn build_from_points(
     points: &[Point],
     value_kind: MetricValueKind,
@@ -581,17 +593,20 @@ fn build_from_points(
     until_epoch_s: i64,
     requested_bucket: Option<BucketWidth>,
     grouped: bool,
+    coverage_override: CoverageOverride,
 ) -> Result<BuiltBuckets, SeriesError> {
-    // Coverage (`data_from`/`dimension_from`) is computed over every point
-    // the series predicates and query filters admit, with no window lower
-    // bound: `points` may include facts from before `since_epoch_s` (the
-    // caller is expected to have projected history back to the true start,
-    // not just this query's window) so the reported capture boundary is a
-    // fact about the series, not an artifact of where the operator zoomed.
-    // Buckets and groups, in contrast, are built only from points inside
-    // the requested window.
-    let mut data_from: Option<i64> = None;
-    let mut dimension_from: Option<i64> = None;
+    // Coverage (`data_from`/`dimension_from`) starts from `coverage_override`
+    // — the series-wide minima a caller with access to unbounded history
+    // (the DB projection layer runs a dedicated SQL aggregate for this) has
+    // already computed — and is then folded with the minima of `points`
+    // itself, since `points` may also carry facts from before
+    // `since_epoch_s` (e.g. a test constructing facts directly, with no
+    // override to supply). Either source alone is enough to recover the
+    // true series start; combining them means a caller that only has one
+    // still gets the right answer. Buckets and groups, in contrast, are
+    // built only from points inside the requested window.
+    let mut data_from: Option<i64> = coverage_override.data_from_epoch_s;
+    let mut dimension_from: Option<i64> = coverage_override.dimension_from_epoch_s;
     for point in points {
         data_from = Some(data_from.map_or(point.at_epoch_s, |m| m.min(point.at_epoch_s)));
         if point.dim_present {
@@ -719,11 +734,27 @@ fn finish_report(
         .build()
 }
 
-/// Build a report from facts projected for the requested window.
+/// Build a report from facts projected for the requested window, computing
+/// coverage purely from `facts` (no series-wide override). Exists for
+/// callers — chiefly tests — that construct facts directly rather than via
+/// [`crate::work::WorkDb::metric_execution_facts`].
 pub fn build_execution_series_report(
     query: &SeriesQuery<'_>,
     facts: &[ExecutionFact],
     generated_at_epoch_s: i64,
+) -> Result<MetricSeriesReport, SeriesError> {
+    build_execution_series_report_with_coverage(query, facts, generated_at_epoch_s, CoverageOverride::default())
+}
+
+/// Build a report from facts projected for the requested window, using
+/// `coverage_override` (typically the true, unbounded series minima from
+/// SQL) as the starting point for `data_from`/`dimension_from` so those
+/// fields reflect the series' real history rather than just this window.
+pub fn build_execution_series_report_with_coverage(
+    query: &SeriesQuery<'_>,
+    facts: &[ExecutionFact],
+    generated_at_epoch_s: i64,
+    coverage_override: CoverageOverride,
 ) -> Result<MetricSeriesReport, SeriesError> {
     let spec = validate_query(query)?;
     let mut facts: Vec<ExecutionFact> = facts
@@ -767,15 +798,31 @@ pub fn build_execution_series_report(
         query.until_epoch_s,
         query.bucket,
         grouped,
+        coverage_override,
     )?;
     Ok(finish_report(spec, query, built, generated_at_epoch_s))
 }
 
-/// Build a task report from facts projected for the requested window.
+/// Build a task report from facts projected for the requested window,
+/// computing coverage purely from `facts` (no series-wide override). Exists
+/// for callers — chiefly tests — that construct facts directly rather than
+/// via [`crate::work::WorkDb::metric_task_facts`].
 pub fn build_task_series_report(
     query: &SeriesQuery<'_>,
     facts: &[TaskFact],
     generated_at_epoch_s: i64,
+) -> Result<MetricSeriesReport, SeriesError> {
+    build_task_series_report_with_coverage(query, facts, generated_at_epoch_s, CoverageOverride::default())
+}
+
+/// Build a task report using `coverage_override` (typically the true,
+/// unbounded series minima from SQL) as the starting point for
+/// `data_from`/`dimension_from`.
+pub fn build_task_series_report_with_coverage(
+    query: &SeriesQuery<'_>,
+    facts: &[TaskFact],
+    generated_at_epoch_s: i64,
+    coverage_override: CoverageOverride,
 ) -> Result<MetricSeriesReport, SeriesError> {
     let spec = validate_query(query)?;
     let grouped = query.group_by.is_some();
@@ -808,6 +855,7 @@ pub fn build_task_series_report(
         query.until_epoch_s,
         query.bucket,
         grouped,
+        coverage_override,
     )?;
     Ok(finish_report(spec, query, built, generated_at_epoch_s))
 }
