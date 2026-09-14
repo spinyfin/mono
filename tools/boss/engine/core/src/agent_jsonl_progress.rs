@@ -1128,7 +1128,6 @@ where
             // A `Cancel` during discovery stops it: the engine is tearing the
             // ingress down and there is nothing left to attach to.
             if *halt.borrow() != StreamHalt::Running {
-
                 return Ok(None);
             }
             let pass = self.scan_once();
@@ -1918,4 +1917,3 @@ mod discovery_tests;
 #[cfg(test)]
 #[path = "agent_jsonl_progress_tests/stream.rs"]
 mod tests;
-
