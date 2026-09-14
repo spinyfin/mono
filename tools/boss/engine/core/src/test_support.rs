@@ -169,6 +169,39 @@ pub fn create_ready_chore_execution(db: &WorkDb, work_item_id: impl Into<String>
     .unwrap()
 }
 
+/// Seed a product/chore/execution, start its first run, and durably record a
+/// completed tmux spawn (intent `"tok-1"` confirmed with pane pid `4242` on
+/// session `"boss-worker-1"`). Returns `(execution_id, spawn_token)`.
+///
+/// Shared by [`crate::tmux_adoption::persist`]'s and
+/// [`crate::work::tests::tmux_pane_observation_tests`]'s pane-observation
+/// tests, which both need the same "started tmux run" seeding contract —
+/// keeping one copy means a change to `start_execution_run`'s arity or to
+/// the token value only has to land once.
+pub fn start_tmux_run(db: &WorkDb) -> (String, String) {
+    let product = create_test_product(db);
+    let chore = create_test_chore(db, product.id.clone(), "Cleanup");
+    let execution = create_ready_chore_execution(db, chore.id.clone());
+    db.start_execution_run(
+        &execution.id,
+        "worker-1",
+        "mono",
+        "lease-1",
+        "mono-agent-001",
+        "/tmp/mono-agent-001",
+    )
+    .unwrap();
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(&execution.id, "boss", "boss-worker-1", "tok-1")
+            .unwrap()
+    );
+    assert!(
+        db.record_tmux_session_created_for_execution(&execution.id, "tok-1", 4242)
+            .unwrap()
+    );
+    (execution.id, "tok-1".to_owned())
+}
+
 /// Request an execution for `work_item_id`, then stamp its `started_at`
 /// to `secs_ago` seconds in the past. Returns the execution id.
 ///

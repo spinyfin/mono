@@ -48,13 +48,14 @@ async fn matched_token_signals_kills_and_clears_identity() {
     let execution_id = seed_tmux_run(db, &work_item_id, "boss-1-example", "tok-match", i64::from(pid));
     let identity = read_back_identity(db, &execution_id);
 
-    // Two `show-environment` reads are expected, not one: `reap_tmux_worker`
-    // verifies once before deciding it's safe to signal the process group,
-    // and `kill_session_verified` re-verifies on its own immediately before
-    // the actual `kill-session` — defense in depth at the one genuinely
-    // destructive call.
+    // A verified token match now also runs the narrow `#{pane_dead}` probe
+    // ([`crate::tmux_adoption::observe_pane_dead_state`]) — just
+    // `#{pane_dead}` here, since the pane is alive — before
+    // `kill_session_verified` re-verifies the token a second time and
+    // issues `kill-session`.
     let (tmux, runner) = fake_tmux([
         ok("BOSS_SPAWN_TOKEN=tok-match\n"),
+        ok("0"),
         ok("BOSS_SPAWN_TOKEN=tok-match\n"),
         ok(""),
     ]);
@@ -72,6 +73,15 @@ async fn matched_token_signals_kills_and_clears_identity() {
                 "-t",
                 "boss-1-example",
                 "BOSS_SPAWN_TOKEN"
+            ],
+            vec![
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
+                "display-message",
+                "-p",
+                "-t",
+                "boss-1-example",
+                "#{pane_dead}"
             ],
             vec![
                 "-S",
@@ -103,6 +113,86 @@ async fn matched_token_signals_kills_and_clears_identity() {
     assert!(
         db.tmux_identity_for_execution(&execution_id).unwrap().is_none(),
         "identity columns must be cleared after a successful reap",
+    );
+
+    let observation = db
+        .tmux_pane_observation_for_execution(&execution_id)
+        .unwrap()
+        .expect("the completion-path probe must persist an observation, not just the sweep's");
+    assert_eq!(observation.kind, crate::work::TmuxPaneObservationKind::Alive);
+    assert_eq!(
+        observation.pane_dead,
+        Some(false),
+        "pane was alive at probe time; teardown's own signal/kill happens after this observation",
+    );
+}
+
+#[tokio::test]
+async fn matched_token_persists_dead_pane_observation_and_logs_at_info() {
+    let buffer = crate::test_support::log_capture::install();
+    let start = buffer.lock().len();
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+
+    let mut child = spawn_group_leader_sleeper();
+    let pid = child.id() as i32;
+    let execution_id = seed_tmux_run(db, &work_item_id, "boss-1-dead", "tok-dead", i64::from(pid));
+    let identity = read_back_identity(db, &execution_id);
+    let (tmux, _runner) = fake_tmux([
+        ok("BOSS_SPAWN_TOKEN=tok-dead\n"),
+        ok("1"),
+        ok("7"),
+        ok("BOSS_SPAWN_TOKEN=tok-dead\n"),
+        ok(""),
+    ]);
+
+    assert_eq!(
+        server_state
+            .reap_tmux_worker_with(&tmux, &execution_id, &identity)
+            .await,
+        TmuxTeardownOutcome::Reaped,
+    );
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .expect("join wait task")
+        .expect("wait on child");
+    assert!(
+        !status.success(),
+        "the pane pid's process group must have been signalled"
+    );
+
+    assert!(
+        db.tmux_identity_for_execution(&execution_id).unwrap().is_none(),
+        "identity columns must still be cleared by the same reap that recorded the Dead observation",
+    );
+
+    let observation = db
+        .tmux_pane_observation_for_execution(&execution_id)
+        .unwrap()
+        .expect("the normal completion path must persist a Dead observation, surviving the identity clear above");
+    assert_eq!(observation.kind, crate::work::TmuxPaneObservationKind::Dead);
+    assert_eq!(observation.pane_dead, Some(true));
+    assert_eq!(observation.pane_dead_status.as_deref(), Some("7"));
+    assert_eq!(
+        observation.session_name, "boss-1-dead",
+        "the retained session name must be recorded",
+    );
+
+    let captured = String::from_utf8(buffer.lock()[start..].to_vec()).expect("utf8 log capture");
+    let line = captured
+        .lines()
+        .find(|line| line.contains("token-verified pane observation") && line.contains(&execution_id))
+        .unwrap_or_else(|| panic!("no pane-observation log for {execution_id}; captured:\n{captured}"));
+    assert!(line.contains("INFO"), "pane observation must be logged at INFO: {line}");
+    assert!(
+        line.contains("pane_dead=\"true\""),
+        "log must include pane_dead: {line}"
+    );
+    assert!(
+        line.contains("pane_dead_status=\"7\""),
+        "log must include pane_dead_status: {line}"
     );
 }
 
@@ -207,6 +297,13 @@ async fn absent_session_clears_identity_without_signalling() {
     let _ = tokio::task::spawn_blocking(move || child.wait()).await;
 
     assert!(db.tmux_identity_for_execution(&execution_id).unwrap().is_none());
+
+    let observation = db
+        .tmux_pane_observation_for_execution(&execution_id)
+        .unwrap()
+        .expect("an absent session must still be recorded as SessionMissing, not left blank");
+    assert_eq!(observation.kind, crate::work::TmuxPaneObservationKind::SessionMissing);
+    assert_eq!(observation.pane_dead, None);
 }
 
 /// [`ServerState::tmux_for_run`] routing: a run recorded with the literal

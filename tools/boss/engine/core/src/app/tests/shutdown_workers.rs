@@ -308,6 +308,7 @@ async fn release_worker_pane_still_reaps_a_tmux_hosted_worker() {
 
     let (tmux, runner) = fake_tmux([
         ok(&format!("BOSS_SPAWN_TOKEN={TOKEN}\n")),
+        ok("0"), // Pane-dead observation before the kill's token recheck.
         ok(&format!("BOSS_SPAWN_TOKEN={TOKEN}\n")),
         ok(""),
     ]);
@@ -315,6 +316,12 @@ async fn release_worker_pane_still_reaps_a_tmux_hosted_worker() {
 
     let outcome = server_state.release_worker_pane(&execution_id).await;
     assert_eq!(outcome, PaneReleaseOutcome::Reaped);
+    let observation = db
+        .tmux_pane_observation_for_execution(&execution_id)
+        .unwrap()
+        .expect("release must retain the observation taken before signalling the pane");
+    assert_eq!(observation.kind, crate::work::TmuxPaneObservationKind::Alive);
+    assert_eq!(observation.pane_dead, Some(false));
     assert!(
         db.tmux_identity_for_execution(&execution_id).unwrap().is_none(),
         "genuine termination must still clear tmux identity columns",

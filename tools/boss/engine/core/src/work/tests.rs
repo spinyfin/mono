@@ -690,5 +690,6 @@ mod t30;
 mod t31;
 mod t32;
 mod t33;
+mod tmux_pane_observation_tests;
 mod work_item_tags_tests;
 mod work_item_write_tests;

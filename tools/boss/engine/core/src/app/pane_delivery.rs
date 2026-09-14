@@ -74,8 +74,9 @@
 //! known observability gap, not proof of loss.
 
 use super::*;
+use crate::tmux_adoption::TmuxIdentityObservation;
 use boss_protocol::WorkerActivity;
-use boss_tmux::{DisplayField, Tmux};
+use boss_tmux::Tmux;
 
 /// Whether a pane write is permitted for a given `(activity, driver)` pair,
 /// and if so at which of the two delivery postures.
@@ -556,26 +557,56 @@ impl ServerState {
     /// `Ok(None)` means the pane is alive and a write may proceed; `Ok(Some(evidence))`
     /// means the pane is confirmed dead, with `evidence` carrying a
     /// self-describing diagnostic string (never a bare process name).
+    ///
+    /// Every token-verified classification this makes (session missing,
+    /// dead, or alive — but never a token mismatch, which is not this run's
+    /// pane at all) is routed through
+    /// [`crate::tmux_adoption::persist_observed_pane_state`], the same
+    /// durable-observation write `TmuxWorkerTerminalInspector` uses. Without
+    /// this, a driver-exit discovered here — a second, independent
+    /// dead-pane route alongside `app::tmux_teardown`'s completion path —
+    /// would terminalize the run without ever recording the observation
+    /// that motivated it.
     async fn tmux_pane_confirmed_dead(
+        work_db: &WorkDb,
+        execution_id: &str,
         tmux: &Tmux,
         session_name: &str,
         expected_spawn_token: &str,
     ) -> anyhow::Result<Option<Option<String>>> {
         let sessions = tmux.list_sessions().await?;
         if !sessions.iter().any(|session| session.name == session_name) {
+            crate::tmux_adoption::persist_observed_pane_state(
+                work_db,
+                execution_id,
+                expected_spawn_token,
+                session_name,
+                &TmuxIdentityObservation {
+                    adoption_state: boss_protocol::TmuxAdoptionState::SessionMissing,
+                    pane_dead: None,
+                    pane_dead_status: None,
+                    window_activity_epoch_secs: None,
+                    current_command: None,
+                },
+            );
             return Ok(Some(None));
         }
         let spawn_token = crate::tmux_adoption::session_spawn_token(tmux, session_name).await?;
         if spawn_token.as_deref() != Some(expected_spawn_token) {
             return Ok(Some(Some("spawn_token_mismatch".to_owned())));
         }
-        let pane_dead = tmux.display_message(session_name, DisplayField::PaneDead).await?;
-        if pane_dead == "1" {
-            let status = tmux.display_message(session_name, DisplayField::PaneDeadStatus).await?;
-            return Ok(Some(Some(if status.is_empty() {
-                "pane_dead".to_owned()
-            } else {
-                format!("pane_dead_status={status}")
+        let observation = crate::tmux_adoption::observe_pane_dead_state(tmux, session_name).await?;
+        crate::tmux_adoption::persist_observed_pane_state(
+            work_db,
+            execution_id,
+            expected_spawn_token,
+            session_name,
+            &observation,
+        );
+        if observation.pane_dead == Some(true) {
+            return Ok(Some(Some(match observation.pane_dead_status {
+                Some(status) => format!("pane_dead_status={status}"),
+                None => "pane_dead".to_owned(),
             })));
         }
         Ok(None)
@@ -635,7 +666,15 @@ impl ServerState {
                         )
                     })?
                     .spawn_token;
-                match Self::tmux_pane_confirmed_dead(&tmux, &session_name, &expected_spawn_token).await {
+                match Self::tmux_pane_confirmed_dead(
+                    self.work_db.as_ref(),
+                    run_id,
+                    &tmux,
+                    &session_name,
+                    &expected_spawn_token,
+                )
+                .await
+                {
                     Ok(Some(pane_dead_status)) => {
                         self.reconcile_driver_exit(
                             run_id,

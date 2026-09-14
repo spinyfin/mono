@@ -7,7 +7,9 @@
 //! `DriverLivenessUnavailable("no durable tmux identity recorded for run")`.
 
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
-use crate::work::WorkDb;
+use crate::work::{TmuxPaneObservationKind, TmuxPaneObservationRecord, WorkDb};
+
+use super::TmuxIdentityObservation;
 
 /// Outcome of [`persist_observed_pane_pid`]. The durable write and the
 /// in-memory adoption are deliberately allowed to disagree on one axis: a
@@ -195,5 +197,168 @@ pub(super) async fn persist_observed_pane_pid(
                 .await;
             PersistedPanePid::WriteFailed(Some(before))
         }
+    }
+}
+
+/// Persist a token-verified `#{pane_dead}` observation onto the run row.
+///
+/// Called from reconciliation (`TmuxWorkerTerminalInspector`) once
+/// [`super::observe_tmux_identity`] has classified the session. Token
+/// mismatch is skipped: the live pane is not this run's, so its
+/// `#{pane_dead}` must not be recorded as this run's exit. Best-effort —
+/// a failed write is logged and never fails the probe.
+///
+/// [`WorkDb::record_tmux_pane_observation`] refuses to let a weaker kind
+/// (`Alive`/`Unreadable`/`SessionMissing`) clobber an already-recorded
+/// `Dead` row; logging mirrors that lifecycle: INFO only for `Dead` and for
+/// the first `Unreadable`/`SessionMissing` observation on a row that had
+/// none before, DEBUG for everything else (routine `Alive` polls included)
+/// so the log does not drown lifecycle-significant events in noise.
+pub(crate) fn persist_observed_pane_state(
+    work_db: &WorkDb,
+    execution_id: &str,
+    spawn_token: &str,
+    session_name: &str,
+    observation: &TmuxIdentityObservation,
+) {
+    let Some(record) = pane_observation_record(session_name, observation) else {
+        return;
+    };
+    let pane_dead = record.pane_dead;
+    let pane_dead_status = record.pane_dead_status.clone();
+    let kind = record.kind;
+    match work_db.record_tmux_pane_observation(execution_id, spawn_token, &record) {
+        Ok(Some(outcome)) => {
+            if !outcome.written {
+                tracing::debug!(
+                    run_id = outcome.run_id,
+                    execution_id,
+                    session = session_name,
+                    observation = kind.as_str(),
+                    "tmux: weaker pane observation refused; a Dead observation is already recorded for this run",
+                );
+                return;
+            }
+            let lifecycle_significant = matches!(kind, TmuxPaneObservationKind::Dead)
+                || (matches!(
+                    kind,
+                    TmuxPaneObservationKind::Unreadable | TmuxPaneObservationKind::SessionMissing
+                ) && outcome.previous_kind.is_none());
+            let fields = (
+                outcome.run_id.as_str(),
+                match pane_dead {
+                    Some(true) => "true",
+                    Some(false) => "false",
+                    None => "none",
+                },
+                pane_dead_status.as_deref().unwrap_or(""),
+                kind.as_str(),
+            );
+            if lifecycle_significant {
+                tracing::info!(
+                    run_id = fields.0,
+                    execution_id,
+                    session = session_name,
+                    pane_dead = fields.1,
+                    pane_dead_status = fields.2,
+                    observation = fields.3,
+                    "tmux: token-verified pane observation",
+                );
+            } else {
+                tracing::debug!(
+                    run_id = fields.0,
+                    execution_id,
+                    session = session_name,
+                    pane_dead = fields.1,
+                    pane_dead_status = fields.2,
+                    observation = fields.3,
+                    "tmux: token-verified pane observation",
+                );
+            }
+        }
+        Ok(None) => {
+            tracing::debug!(
+                execution_id,
+                session = session_name,
+                "tmux: pane observation matched no durable run row; skipping persist",
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                execution_id,
+                session = session_name,
+                error = %format!("{err:#}"),
+                "tmux: failed to persist token-verified pane observation",
+            );
+        }
+    }
+}
+
+fn pane_observation_record(
+    session_name: &str,
+    observation: &TmuxIdentityObservation,
+) -> Option<TmuxPaneObservationRecord> {
+    let (kind, pane_dead, pane_dead_status) = match observation.adoption_state {
+        boss_protocol::TmuxAdoptionState::Adopted if observation.pane_dead == Some(true) => (
+            TmuxPaneObservationKind::Dead,
+            Some(true),
+            observation.pane_dead_status.clone(),
+        ),
+        boss_protocol::TmuxAdoptionState::Adopted if observation.pane_dead == Some(false) => {
+            (TmuxPaneObservationKind::Alive, Some(false), None)
+        }
+        boss_protocol::TmuxAdoptionState::Adopted => (TmuxPaneObservationKind::Unreadable, None, None),
+        boss_protocol::TmuxAdoptionState::ProbeUnavailable => (TmuxPaneObservationKind::Unreadable, None, None),
+        boss_protocol::TmuxAdoptionState::SessionMissing => (TmuxPaneObservationKind::SessionMissing, None, None),
+        boss_protocol::TmuxAdoptionState::TokenMismatch | boss_protocol::TmuxAdoptionState::NotTmuxHosted => {
+            return None;
+        }
+    };
+    Some(TmuxPaneObservationRecord {
+        kind,
+        pane_dead,
+        pane_dead_status,
+        session_name: session_name.to_owned(),
+        run_id: None,
+        observed_at: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{open_db, start_tmux_run};
+
+    /// A spawn token that changed between probe and write (e.g. a resume
+    /// minted a new one) matches no `(execution_id, tmux_spawn_token)` row.
+    /// [`WorkDb::record_tmux_pane_observation`] already asserts the
+    /// underlying `Ok(None)` shape directly; this locks in that
+    /// [`persist_observed_pane_state`] — the wrapper every call site
+    /// actually uses — treats that outcome as a silent no-op rather than a
+    /// panic or an error surfaced to the caller.
+    #[test]
+    fn stale_spawn_token_is_dropped_without_error_or_write() {
+        let (_dir, work_db) = open_db();
+        let (execution_id, _current_token) = start_tmux_run(&work_db);
+
+        persist_observed_pane_state(
+            &work_db,
+            &execution_id,
+            "stale-tok",
+            "boss-worker-1",
+            &TmuxIdentityObservation {
+                adoption_state: boss_protocol::TmuxAdoptionState::Adopted,
+                pane_dead: Some(true),
+                pane_dead_status: Some("0".to_owned()),
+                window_activity_epoch_secs: None,
+                current_command: None,
+            },
+        );
+
+        assert_eq!(
+            work_db.tmux_pane_observation_for_execution(&execution_id).unwrap(),
+            None,
+            "a stale spawn token must produce no durable observation",
+        );
     }
 }

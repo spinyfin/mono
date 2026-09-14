@@ -563,7 +563,7 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
 /// (e.g. `bazel build`) is alive and must still receive its write.
 #[tokio::test]
 async fn send_input_refuses_a_dead_tmux_pane() {
-    use crate::work::ExecutionStatus;
+    use crate::work::{ExecutionStatus, TmuxPaneObservationKind};
 
     let (server_state, _dir) = test_server_state();
     let run_id = register_idle_worker_with_driver(&server_state, 1, Some("grok"));
@@ -607,6 +607,13 @@ async fn send_input_refuses_a_dead_tmux_pane() {
         ExecutionStatus::Orphaned,
         "confirmed death terminalizes the execution instead of leaving it idle",
     );
+    let observation = server_state
+        .work_db
+        .tmux_pane_observation_for_execution(&run_id)
+        .unwrap()
+        .expect("a session-missing pane delivery check must persist its observation");
+    assert_eq!(observation.kind, TmuxPaneObservationKind::SessionMissing);
+    assert_eq!(observation.pane_dead, None);
     assert!(
         server_state.worker_registry.slot_for_run(&run_id).is_none(),
         "the terminalized execution must no longer own a pane slot",
@@ -627,7 +634,7 @@ async fn send_input_refuses_a_dead_tmux_pane() {
 /// crashed and tmux has not yet reaped the session.
 #[tokio::test]
 async fn send_input_refuses_a_tmux_pane_reported_dead() {
-    use crate::work::ExecutionStatus;
+    use crate::work::{ExecutionStatus, TmuxPaneObservationKind};
 
     let (server_state, _dir) = test_server_state();
     let run_id = register_idle_worker_with_driver(&server_state, 1, Some("grok"));
@@ -659,6 +666,14 @@ async fn send_input_refuses_a_tmux_pane_reported_dead() {
         ExecutionStatus::Orphaned,
         "confirmed death terminalizes the execution instead of leaving it idle",
     );
+    let observation = server_state
+        .work_db
+        .tmux_pane_observation_for_execution(&run_id)
+        .unwrap()
+        .expect("a pane-dead delivery check must persist its observation");
+    assert_eq!(observation.kind, TmuxPaneObservationKind::Dead);
+    assert_eq!(observation.pane_dead, Some(true));
+    assert_eq!(observation.pane_dead_status.as_deref(), Some("1"));
 }
 
 /// The failure mode that made the naive foreground-command check dangerous:

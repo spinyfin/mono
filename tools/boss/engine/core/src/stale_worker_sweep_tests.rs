@@ -2646,3 +2646,137 @@ async fn inspector_routes_legacy_labeled_run_to_the_label_server() {
         "the operator-facing prefix for a legacy-labeled run must also address -L boss",
     );
 }
+
+fn observation_log_line(captured: &str, execution_id: &str) -> String {
+    captured
+        .lines()
+        .find(|line| line.contains("token-verified pane observation") && line.contains(execution_id))
+        .unwrap_or_else(|| panic!("no pane-observation log for {execution_id}; captured:\n{captured}"))
+        .to_owned()
+}
+
+#[tokio::test]
+async fn inspector_persists_dead_pane_and_logs_at_info() {
+    let buffer = crate::test_support::log_capture::install();
+    let start = buffer.lock().len();
+
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let execution_id = create_old_execution(&db, &work_item_id);
+    stamp_tmux_run(&db, &execution_id, "boss-worker-1", "tok-1");
+
+    let (verdict, _) = inspect_with(
+        db.clone(),
+        &execution_id,
+        ScriptedTmux::new()
+            .with_session("boss-worker-1", "tok-1")
+            .with_field("boss-worker-1", "#{pane_dead}", "1")
+            .with_field("boss-worker-1", "#{pane_dead_status}", "0"),
+    )
+    .await;
+    assert_eq!(
+        verdict.unwrap(),
+        Some(TerminalLiveness::Dead {
+            session_name: "boss-worker-1".to_owned(),
+            evidence: DeadPaneEvidence::PaneExited {
+                pane_dead_status: Some("0".to_owned()),
+            },
+        })
+    );
+
+    let stored = db
+        .tmux_pane_observation_for_execution(&execution_id)
+        .unwrap()
+        .expect("normal exit must persist the token-verified pane_dead reading");
+    assert_eq!(stored.kind, crate::work::TmuxPaneObservationKind::Dead);
+    assert_eq!(stored.pane_dead, Some(true));
+    assert_eq!(stored.pane_dead_status.as_deref(), Some("0"));
+    assert_eq!(stored.session_name, "boss-worker-1");
+
+    assert!(db.clear_tmux_identity_for_execution(&execution_id, "tok-1").unwrap());
+    let after_reap = db
+        .tmux_pane_observation_for_execution(&execution_id)
+        .unwrap()
+        .expect("observation must remain queryable after identity columns are nulled");
+    assert_eq!(after_reap, stored);
+
+    let captured = String::from_utf8(buffer.lock()[start..].to_vec()).expect("utf8 log capture");
+    let line = observation_log_line(&captured, &execution_id);
+    assert!(line.contains("INFO"), "pane observation must be logged at INFO: {line}");
+    assert!(
+        line.contains("pane_dead=\"true\""),
+        "log must include pane_dead: {line}"
+    );
+    assert!(
+        line.contains("pane_dead_status=\"0\""),
+        "log must include pane_dead_status: {line}"
+    );
+    assert!(
+        line.contains("session=\"boss-worker-1\""),
+        "log must include the session name: {line}"
+    );
+    assert!(line.contains("run_id="), "log must include the run id: {line}");
+}
+
+#[tokio::test]
+async fn inspector_records_unreadable_pane_distinctly_from_dead() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let execution_id = create_old_execution(&db, &work_item_id);
+    stamp_tmux_run(&db, &execution_id, "boss-worker-1", "tok-1");
+
+    let (verdict, _) = inspect_with(
+        db.clone(),
+        &execution_id,
+        ScriptedTmux::new()
+            .with_session("boss-worker-1", "tok-1")
+            .with_failing_field("boss-worker-1", "#{pane_dead}"),
+    )
+    .await;
+    assert!(verdict.is_err(), "unreadable pane_dead remains a probe failure");
+
+    let stored = db
+        .tmux_pane_observation_for_execution(&execution_id)
+        .unwrap()
+        .expect("unreadable pane must be recorded, not left as never-observed");
+    assert_eq!(stored.kind, crate::work::TmuxPaneObservationKind::Unreadable);
+    assert_eq!(stored.pane_dead, None);
+    assert_eq!(stored.pane_dead_status, None);
+    assert_ne!(
+        stored.kind,
+        crate::work::TmuxPaneObservationKind::Dead,
+        "we could not tell must not look like we observed a clean exit",
+    );
+}
+
+#[tokio::test]
+async fn inspector_records_absent_session_distinctly_from_dead() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let execution_id = create_old_execution(&db, &work_item_id);
+    stamp_tmux_run(&db, &execution_id, "boss-worker-1", "tok-1");
+
+    let (verdict, _) = inspect_with(db.clone(), &execution_id, ScriptedTmux::new()).await;
+    assert_eq!(
+        verdict.unwrap(),
+        Some(TerminalLiveness::Dead {
+            session_name: "boss-worker-1".to_owned(),
+            evidence: DeadPaneEvidence::SessionAbsent,
+        })
+    );
+
+    let stored = db
+        .tmux_pane_observation_for_execution(&execution_id)
+        .unwrap()
+        .expect("absent pane must be recorded, not left as never-observed");
+    assert_eq!(stored.kind, crate::work::TmuxPaneObservationKind::SessionMissing);
+    assert_eq!(stored.pane_dead, None);
+    assert_ne!(
+        stored.kind,
+        crate::work::TmuxPaneObservationKind::Dead,
+        "an absent pane must not look like we observed a clean exit",
+    );
+}
