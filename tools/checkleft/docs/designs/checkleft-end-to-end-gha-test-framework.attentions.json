@@ -1,0 +1,21 @@
+[
+  {
+    "question_type": "prompt",
+    "prompt": "What should the dedicated test repository be named / who provisions it? The design assumes a persistent repo (placeholder `spinyfin/checkleft-e2e`) whose default branch holds only machine-managed scaffold. Confirm the org/name and who creates it + seeds branch protection (none).",
+    "anchor": "1-test-repo-strategy-persistent-repo-branch-per-scenario-r-c"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Which credential should drive the test repo from mono CI (open/edit/close PRs, dispatch, read check-runs, download artifacts, upload assets)? Local runs use the developer's gh token either way.",
+    "choices": [
+      "GitHub App installed on the test repo (short-lived, repo-scoped tokens; key in Buildkite secrets)",
+      "Fine-grained PAT stored in Buildkite secrets (simpler to set up, human must rotate)"
+    ],
+    "anchor": "7-auth"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "For v1, should the harness build the checkleft-under-test itself (from a sha or path, reusing the `checkleft_musl` target), rather than blocking on mono CI publishing reusable per-PR artifacts (T1310/T1313/T1314)? 'Yes' = build-in-harness now, consume per-PR artifacts later as F1.",
+    "anchor": "binary-delivery"
+  }
+]
