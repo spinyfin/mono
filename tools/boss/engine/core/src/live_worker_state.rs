@@ -93,10 +93,12 @@ impl LiveSpawnRouting {
 pub const DEFAULT_LAUNCH_MODEL: &str = "opus";
 
 /// How long a slot must be stuck in `Spawning` with no hook events before
-/// [`LiveWorkerStateRegistry::mark_stalled_spawns`] transitions it to
-/// `WaitingForInput`. 30 seconds matches the dead-PID grace period and
-/// gives a fresh-but-slow worker enough runway while being well below the
-/// typical interactive-wait tolerance.
+/// [`LiveWorkerStateRegistry::mark_stalled_spawns`] will promote it —
+/// to `WaitingForInput` when the driver declared
+/// `Capability::AwaitingInputSignal`, or to `Idle` when it did not but
+/// `driver_signal_at` is already set. 30 seconds matches the dead-PID
+/// grace period and gives a fresh-but-slow worker enough runway while
+/// being well below the typical interactive-wait tolerance.
 ///
 /// This threshold only ever promotes slots that already have a reported
 /// `shell_pid` (see the guard in `mark_stalled_spawns`) — a slot with no
@@ -231,13 +233,15 @@ struct SlotMeta {
     ///
     /// `last_event_at` is a *display* timestamp and is written by paths
     /// that are not the driver: [`LiveWorkerStateRegistry::mark_stalled_spawns`]
-    /// synthesizes one when it promotes a slot to `WaitingForInput`, and
+    /// synthesizes one when it promotes a slot out of `Spawning`, and
     /// [`LiveWorkerStateRegistry::mark_errored`] stamps one on an
     /// engine-side verdict. Treating it as proof of driver start would
     /// let the engine's own guesses vouch for a driver that never ran.
     /// This field is written by [`LiveWorkerStateRegistry::record_driver_signal`]
-    /// from exactly two call sites in the hook ingress — a real worker
-    /// hook, and receipt of a `transcript_path` — and additionally
+    /// from the hook ingress (a real worker hook, and receipt of a
+    /// `transcript_path`) and from the AgentJsonlFile ingress
+    /// (`WorkerEventSink::record_driver_attach`: discovery-time file
+    /// progress, or attach to the correlated rollout) — and additionally
     /// restored (not fabricated) by
     /// [`LiveWorkerStateRegistry::seed_semantic_progress`] from a durable
     /// checkpoint on re-adoption, carrying forward proof this same field
@@ -1428,13 +1432,15 @@ impl LiveWorkerStateRegistry {
     ///   is a *different*, capability-independent fact: a driver-originated
     ///   signal (a hook event, or a resolved `transcript_path`) has been
     ///   observed for this run. For a file-ingress driver like Codex that
-    ///   fires the moment `AgentJsonlProgressManager` attaches to the
-    ///   discovered rollout — proof the process is alive and has begun
-    ///   writing its transcript, well before the reader has parsed (let
-    ///   alone dispatched) a single complete record. Wait a full turn's
-    ///   `thinking` before the first parseable line and this sweep is the
-    ///   only thing that would otherwise notice the worker is stuck showing
-    ///   `Spawning`/unknown. When that proof exists, the honest claim is
+    ///   fires as soon as discovery sees the rollout grow — even while the
+    ///   first `session_meta` line is still incomplete — and again when
+    ///   `AgentJsonlProgressManager` attaches. Proof the process is alive
+    ///   and has begun writing its transcript, well before the reader has
+    ///   parsed (let alone dispatched) a single complete record. Wait a
+    ///   full turn's `thinking` before the first parseable line and this
+    ///   sweep is the only thing that would otherwise notice the worker is
+    ///   stuck showing `Spawning`/unknown. When that proof exists, the
+    ///   honest claim is
     ///   `Idle` — alive, no specific claim about what it is doing — never
     ///   `WaitingForInput`, which this driver class gave no basis for. When
     ///   even that proof is absent, this sweep still leaves the slot in
@@ -1494,7 +1500,7 @@ impl LiveWorkerStateRegistry {
             } else if meta.driver_signal_at.is_some() {
                 // No capability-backed basis to claim "awaits a human", but
                 // real driver-originated evidence (a hook, or — for Codex —
-                // the engine attaching to its rollout file) says the
+                // rollout file growth during discovery, or attach) says the
                 // process is alive. See the branch above for why `Idle`,
                 // not `WaitingForInput`, is the only honest claim here.
                 WorkerActivity::Idle

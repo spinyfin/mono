@@ -324,14 +324,93 @@ async fn prepared_rollout_uses_shared_reader_and_exact_run_correlation() {
     ));
     drop(events);
 
-    // Proof of life is recorded at attach — before any of the events
-    // above were dispatched — so a driver that never declares
-    // `Capability::AwaitingInputSignal` (Codex) still has evidence
-    // `mark_stalled_spawns` can promote `Spawning` on, independent of
-    // how long the first parseable record takes to appear.
-    assert_eq!(&*sink.attached_runs.lock().unwrap(), &["run-live".to_owned()]);
+    // Proof of life is recorded twice here: once when discovery sees
+    // the new file grow, and again at attach. The production sink is
+    // idempotent (`record_driver_signal` keeps the first timestamp);
+    // this test sink logs both calls so a missing producer is visible.
+    assert_eq!(
+        &*sink.attached_runs.lock().unwrap(),
+        &["run-live".to_owned(), "run-live".to_owned()],
+    );
 
     manager.stop_run("run-live");
+}
+
+/// A rollout whose first `session_meta` line is still being written
+/// (no terminating newline) must still count as driver-originated
+/// evidence. Attach waits on a parseable record; liveness must not.
+#[tokio::test]
+async fn growing_incomplete_session_meta_records_attach_before_parse() {
+    let temp = TempDir::new().unwrap();
+    let sessions = temp.path().join("sessions");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+
+    let manager = AgentJsonlProgressManager::new();
+    let sink = CaptureSink::default();
+    manager
+        .prepare_run(
+            "run-incomplete",
+            Arc::new(crate::driver::CodexDriver::default()),
+            AgentJsonlFileIngress {
+                directory: sessions.clone(),
+                filename_prefix: "rollout-".into(),
+                filename_suffix: ".jsonl".into(),
+                workspace_path: workspace.clone(),
+            },
+            sink.clone(),
+            test_store(),
+        )
+        .unwrap();
+
+    let path = sessions.join("rollout-thread-incomplete.jsonl");
+    let partial = format!(
+        r#"{{"type":"session_meta","payload":{{"id":"thread-incomplete","cwd":"{}""#,
+        workspace.display()
+    );
+    fs::write(&path, &partial).unwrap();
+    manager.activate_run("run-incomplete");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !sink.attached_runs.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(DISCOVERY_POLL).await;
+        }
+    })
+    .await
+    .expect("file growth during discovery must record attach before session_meta parses");
+
+    assert_eq!(
+        &*sink.attached_runs.lock().unwrap(),
+        &["run-incomplete".to_owned()],
+        "attach evidence must fire from file progress, not from a parsed record",
+    );
+    assert!(
+        sink.events.lock().unwrap().is_empty(),
+        "an incomplete first line is not a dispatchable record",
+    );
+
+    {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(file, r#","extra":"still-incomplete""#).unwrap();
+        file.flush().unwrap();
+    }
+    tokio::time::sleep(DISCOVERY_POLL * 2).await;
+    assert!(
+        sink.events.lock().unwrap().is_empty(),
+        "further growth without a newline must still not parse",
+    );
+    assert_eq!(
+        &*sink.attached_runs.lock().unwrap(),
+        &["run-incomplete".to_owned()],
+        "discovery records attach once, even as the incomplete line keeps growing",
+    );
+
+    manager.stop_run("run-incomplete");
 }
 
 async fn read_until_contains(reader: &mut tokio::io::DuplexStream, observed: &mut Vec<u8>, needle: &[u8]) {

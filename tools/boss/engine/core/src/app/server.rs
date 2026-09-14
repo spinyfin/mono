@@ -2430,15 +2430,17 @@ pub async fn serve_with_overrides(
                 if !stalled.is_empty() {
                     tracing::info!(
                         slots = ?stalled,
-                        "stalled-spawn sweep: transitioned slots from Spawning to WaitingForInput \
-                         (no hook event since spawn — likely blocked on initial directory-trust prompt)",
+                        "stalled-spawn sweep: transitioned slots out of Spawning \
+                         (WaitingForInput for a capability-backed directory-trust stall; \
+                          Idle for a capability-less driver with driver-originated evidence)",
                     );
-                    // This promotion happens off the hook-dispatch path, so
-                    // `awaiting_input_status::mirror_awaiting_input` never
-                    // sees it — mirror it onto the row here instead, or the
-                    // directory-trust-prompt stall leaves `status = running`
-                    // forever with no later hook to re-converge it. See
-                    // `mirror_stalled_spawn_waits`'s doc.
+                    // WaitingForInput promotions happen off the hook-dispatch
+                    // path, so `mirror_awaiting_input` never sees them —
+                    // mirror those onto the row here, or a directory-trust
+                    // stall leaves `status = running` forever. Idle
+                    // promotions stay in `stalled` so this timer still
+                    // broadcasts them; `mirror_stalled_spawn_waits` skips
+                    // them so they cannot stamp `waiting_human`.
                     crate::awaiting_input_status::mirror_stalled_spawn_waits(
                         &live_worker_states,
                         &server_clone.work_db,

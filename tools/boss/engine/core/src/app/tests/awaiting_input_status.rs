@@ -348,6 +348,80 @@ async fn a_stalled_pr_review_spawn_never_moves_the_row_off_running() {
     );
 }
 
+/// A capability-less driver (Codex) with transcript evidence is promoted
+/// to `Idle`, not `WaitingForInput`. The sweep still returns that slot so
+/// the timer can broadcast it, but the mirror must not stamp
+/// `waiting_human`: that status only clears on a transition out of
+/// `WaitingForInput`, which this slot never entered. Drive the production
+/// pair (`mark_stalled_spawns` then `mirror_stalled_spawn_waits`) and then
+/// an Idle→Working event, asserting the row stays `running` throughout.
+#[tokio::test]
+async fn a_capability_less_idle_promotion_does_not_mirror_waiting_human() {
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product = create_test_product_with_repo(db, "p", Some("git@example.com:p.git"));
+    let chore = create_test_chore_manual(db, product.id.clone(), "c");
+    let execution = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    let (_exec, run) = db
+        .start_execution_run(&execution.id, "worker-1", "repo-1", "lease-1", "ws-1", "/tmp/ws")
+        .unwrap();
+    finish_run_worker_pane_alive(db, &execution.id, &run.id, Some("Spawned worker pane in slot 1."));
+    server_state.live_worker_states.register_spawn_with_capabilities(
+        SLOT,
+        execution.id.clone(),
+        "grok-4.6",
+        4242,
+        None,
+        false,
+        LiveSpawnRouting::none(),
+    );
+    server_state.worker_registry.register_run_slot(&execution.id, SLOT);
+    server_state.live_worker_states.record_driver_signal(
+        &execution.id,
+        crate::live_worker_state::DriverSignalKind::TranscriptPath,
+    );
+
+    let now =
+        boss_engine_utils::epoch_time::now_epoch_secs() + crate::live_worker_state::STALLED_SPAWN_THRESHOLD_SECS + 1;
+    let stalled = server_state
+        .live_worker_states
+        .mark_stalled_spawns(now, crate::live_worker_state::STALLED_SPAWN_THRESHOLD_SECS);
+    assert_eq!(stalled, vec![SLOT], "transcript evidence must still promote the slot");
+    assert_eq!(
+        server_state.live_worker_states.get(SLOT).unwrap().activity,
+        WorkerActivity::Idle,
+        "a capability-less driver is promoted to Idle, not WaitingForInput",
+    );
+
+    crate::awaiting_input_status::mirror_stalled_spawn_waits(
+        &server_state.live_worker_states,
+        &server_state.work_db,
+        &server_state.publisher,
+        &stalled,
+    )
+    .await;
+
+    assert_surfaces_agree(
+        &server_state,
+        &execution.id,
+        ExecutionStatus::Running,
+        WorkerActivity::Idle,
+        "Idle promotion after attach evidence",
+    );
+
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution.id)).await;
+
+    assert_surfaces_agree(
+        &server_state,
+        &execution.id,
+        ExecutionStatus::Running,
+        WorkerActivity::Working,
+        "Idle→Working must not leave waiting_human behind",
+    );
+}
+
 /// A `pr_review` reviewer must never be mirrored out of `running`: the
 /// kanban "AI reviewing" badge queries `kind = pr_review AND status =
 /// running` with no `is_live()` widening, so moving the row to

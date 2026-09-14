@@ -61,14 +61,20 @@ pub trait WorkerEventSink: Send + Sync {
         None
     }
 
-    /// Record that a driver-originated **file** was discovered and attached
-    /// for `run_id` — proof the driver process is alive and writing its
-    /// transcript, independent of whether the JSONL reader has parsed a
-    /// single complete record from it yet.
+    /// Record that a driver-originated **file** is being written for
+    /// `run_id` — proof the driver process is alive, independent of whether
+    /// the JSONL reader has parsed a single complete record from it yet.
     ///
-    /// Called exactly once, from `agent_jsonl_progress::run_prepared`, the
-    /// moment discovery (or readoption) attaches to the correlated rollout —
-    /// before `dispatch_worker_event` has ever been reached for this run.
+    /// Called from `agent_jsonl_progress` in two places, both before
+    /// `dispatch_worker_event` has been reached for this run:
+    ///
+    /// - during discovery, the moment a matching rollout shows size or
+    ///   mtime growth against the pre-spawn baseline — even if the first
+    ///   `session_meta` line is still incomplete or oversized;
+    /// - again when discovery (or readoption) attaches to the correlated
+    ///   rollout. The production sink is idempotent (`record_driver_signal`
+    ///   keeps the first timestamp), so a second call is a no-op.
+    ///
     /// Only a [`crate::driver::ProgressIngress::AgentJsonlFile`] driver
     /// (Codex today) calls it; `HookCallback` and `StdoutJsonl` drivers have
     /// no equivalent "file discovered but not yet parsed" gap to close, and

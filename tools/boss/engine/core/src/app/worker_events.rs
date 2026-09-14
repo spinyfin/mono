@@ -61,9 +61,9 @@ impl crate::stdout_progress::WorkerEventSink for Arc<ServerState> {
         // authoritative for a hook payload's `transcript_path` (see
         // `DriverSignalKind::TranscriptPath`): proof the driver created its
         // transcript. Reused here rather than adding a new kind, because
-        // "the engine attached to the rollout it discovered on disk" is the
-        // same fact, just observed earlier — before any record in it has
-        // been parsed rather than alongside the first one.
+        // "the engine saw the rollout grow, or attached to it" is the same
+        // fact, just observed earlier — before any record in it has been
+        // parsed rather than alongside the first one.
         self.live_worker_states
             .record_driver_signal(run_id, DriverSignalKind::TranscriptPath);
     }
