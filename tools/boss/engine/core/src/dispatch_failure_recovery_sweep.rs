@@ -56,6 +56,20 @@
 //! such a row: that half exists because a slow failure loop outruns any
 //! trailing window, and a 10-minute cooldown here would un-park a row the
 //! moment it elapsed, re-creating the loop one cooldown at a time.
+//!
+//! `orphan_sweep` also parks a work item through this same representation
+//! for a *deliberate* engine park
+//! ([`crate::work::DELIBERATE_PARK_DISPATCH_FAILED_REASON`] — the worker
+//! declared itself blocked, or the auto-nudge breaker gave up). Unlike a
+//! churn park, that condition never eases on its own: it is a human decision
+//! the worker explicitly asked for, not a dispatch-health signal this sweep
+//! could plausibly re-evaluate. So a `deliberate_park` row is excluded from
+//! this sweep's candidates entirely, with no churn-style cooldown or
+//! threshold — only an explicit `bossctl work start` / kanban drag-to-Doing
+//! may resume it, exactly the contract its underlying attention item already
+//! carries. Retrying it here regardless of any churn count would silently
+//! turn "wait for a human" back into "retry automatically", undoing the
+//! whole point of the park.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,10 +79,10 @@ use boss_protocol::RequestExecutionInput;
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::work::{
-    CHURN_GUARD_DISPATCH_FAILED_REASON, DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_THRESHOLD,
-    DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_WINDOW_SECS, DISPATCH_FAILURE_RECOVERY_MIN_AGE_SECS,
-    ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD, ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD,
-    ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS, WorkDb,
+    CHURN_GUARD_DISPATCH_FAILED_REASON, DELIBERATE_PARK_DISPATCH_FAILED_REASON,
+    DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_THRESHOLD, DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_WINDOW_SECS,
+    DISPATCH_FAILURE_RECOVERY_MIN_AGE_SECS, ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD,
+    ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD, ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS, WorkDb,
 };
 
 /// Counts from one pass of the sweep; logged at `info` when non-zero.
@@ -77,11 +91,16 @@ pub struct DispatchFailureRecoverySweepOutcome {
     pub redispatched: usize,
     pub churn_skipped: usize,
     pub no_worker_skipped: usize,
+    /// Candidates excluded because they carry
+    /// `dispatch_failed_reason = DELIBERATE_PARK_DISPATCH_FAILED_REASON` —
+    /// a human decision this sweep never auto-retries, regardless of churn
+    /// count or cooldown. See the module doc.
+    pub deliberate_park_excluded: usize,
 }
 
 impl crate::sweep_loop::SweepOutcome for DispatchFailureRecoverySweepOutcome {
     fn has_activity(&self) -> bool {
-        self.redispatched > 0 || self.churn_skipped > 0
+        self.redispatched > 0 || self.churn_skipped > 0 || self.deliberate_park_excluded > 0
     }
 
     fn log(&self) {
@@ -89,6 +108,7 @@ impl crate::sweep_loop::SweepOutcome for DispatchFailureRecoverySweepOutcome {
             redispatched = self.redispatched,
             churn_skipped = self.churn_skipped,
             no_worker_skipped = self.no_worker_skipped,
+            deliberate_park_excluded = self.deliberate_park_excluded,
             "dispatch-failure recovery sweep: pass complete",
         );
     }
@@ -146,17 +166,8 @@ pub async fn run_one_pass(
     let claimed = coordinator.all_claimed_execution_ids().await;
 
     for work_item_id in candidates {
-        // A row parked by `bounce_churn_guard_parked_to_backlog` carries
-        // `dispatch_failed_reason = CHURN_GUARD_DISPATCH_FAILED_REASON`. Its
-        // guard was orphan_sweep's tighter 3-in-1h contract, not this sweep's
-        // looser 5-in-24h one — applying the looser threshold here would let
-        // this sweep re-dispatch a row twice inside ~20 minutes before the
-        // 3-in-1h guard it inherited ever gets a chance to stick. Use the
-        // orphan sweep's own threshold/window for that reason so the
-        // contract survives the churn park moving off `active` status onto
-        // this representation.
-        let is_churn_park = match work_db.get_dispatch_failed_reason(&work_item_id) {
-            Ok(reason) => reason.as_deref() == Some(CHURN_GUARD_DISPATCH_FAILED_REASON),
+        let dispatch_failed_reason = match work_db.get_dispatch_failed_reason(&work_item_id) {
+            Ok(reason) => reason,
             Err(err) => {
                 tracing::warn!(
                     work_item_id = %work_item_id,
@@ -166,6 +177,31 @@ pub async fn run_one_pass(
                 continue;
             }
         };
+
+        // A row `orphan_sweep` parked for a *deliberate* engine park (the
+        // worker declared itself blocked, or the auto-nudge breaker gave up)
+        // carries `dispatch_failed_reason = DELIBERATE_PARK_DISPATCH_FAILED_REASON`.
+        // That is a human decision, not a dispatch-health condition — unlike
+        // a churn park (handled below), no cooldown or threshold ever makes
+        // it appropriate for this sweep to touch: only an explicit `bossctl
+        // work start` / kanban drag-to-Doing may resume it. Excluded here
+        // entirely, before any churn accounting, so it is never a candidate
+        // for automatic retry regardless of how the churn count looks.
+        if dispatch_failed_reason.as_deref() == Some(DELIBERATE_PARK_DISPATCH_FAILED_REASON) {
+            outcome.deliberate_park_excluded += 1;
+            continue;
+        }
+
+        // A row parked by `bounce_churn_guard_parked_to_backlog` carries
+        // `dispatch_failed_reason = CHURN_GUARD_DISPATCH_FAILED_REASON`. Its
+        // guard was orphan_sweep's tighter 3-in-1h contract, not this sweep's
+        // looser 5-in-24h one — applying the looser threshold here would let
+        // this sweep re-dispatch a row twice inside ~20 minutes before the
+        // 3-in-1h guard it inherited ever gets a chance to stick. Use the
+        // orphan sweep's own threshold/window for that reason so the
+        // contract survives the churn park moving off `active` status onto
+        // this representation.
+        let is_churn_park = dispatch_failed_reason.as_deref() == Some(CHURN_GUARD_DISPATCH_FAILED_REASON);
         let (churn_threshold, churn_window_secs) = if is_churn_park {
             (
                 ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD,
@@ -505,6 +541,63 @@ mod tests {
         assert!(
             !task.autostart,
             "a churn-parked row must stay parked, not be re-dispatched on the looser recovery threshold"
+        );
+    }
+
+    /// Regression: a row `orphan_sweep` parked for a *deliberate* engine park
+    /// (`dispatch_failed_reason = DELIBERATE_PARK_DISPATCH_FAILED_REASON`)
+    /// must never be picked up by this sweep, no matter how old the park or
+    /// how clean its churn count — unlike a churn park, there is no
+    /// threshold at which retrying it automatically becomes correct. Only
+    /// an explicit `bossctl work start` may resume it.
+    #[tokio::test]
+    async fn deliberate_park_is_never_auto_retried() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product_id)
+                    .name("deliberately parked chore")
+                    .build(),
+            )
+            .unwrap();
+        let work_item_id = chore.id;
+
+        // Deliberately zero terminal executions: if this sweep's own churn
+        // guard were the only thing standing between this row and a retry,
+        // it would let it straight through — the exclusion must not depend
+        // on churn count at all.
+        db.bounce_deliberate_park_to_backlog(&work_item_id, "orphan_sweep", None);
+        assert_eq!(
+            get_task(&db, &work_item_id).dispatch_failed_reason.as_deref(),
+            Some(crate::work::DELIBERATE_PARK_DISPATCH_FAILED_REASON),
+            "setup must produce a deliberate-park-parked row"
+        );
+        make_failure_old(&db, &work_item_id, DISPATCH_FAILURE_RECOVERY_MIN_AGE_SECS + 60);
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref()).await;
+
+        assert_eq!(
+            outcome.deliberate_park_excluded, 1,
+            "a deliberate park must be excluded outright, not merely churn-skipped"
+        );
+        assert_eq!(outcome.churn_skipped, 0);
+        assert_eq!(outcome.redispatched, 0, "a deliberate park must never be auto-retried");
+        assert!(sink.events().await.is_empty());
+
+        let task = get_task(&db, &work_item_id);
+        assert!(
+            !task.autostart,
+            "a deliberately parked row must stay parked; only an explicit work start clears it"
+        );
+        assert_eq!(
+            task.dispatch_failed_reason.as_deref(),
+            Some(crate::work::DELIBERATE_PARK_DISPATCH_FAILED_REASON),
         );
     }
 

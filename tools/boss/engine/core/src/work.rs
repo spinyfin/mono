@@ -119,6 +119,33 @@ pub const CHURN_GUARD_PARKED_ATTENTION_KIND: &str = "churn_guard_parked";
 /// `docs/designs/dispatch-halt-state-vs-attention-items.md`.
 pub const CHURN_GUARD_DISPATCH_FAILED_REASON: &str = "churn_guard";
 
+/// `tasks.dispatch_failed_reason` value stamped by
+/// [`crate::work::WorkDb::bounce_deliberate_park_to_backlog`] when
+/// [`crate::orphan_sweep`] finds an `active` work item whose run ended in a
+/// deliberate engine park (`run_done_declared_blocked` / `nudge_breaker_tripped`
+/// — see `DELIBERATE_PARK_ATTENTION_KINDS` in that module) with its attention
+/// item still open. Before this reason existed, that open attention item was
+/// the row's *only* trace: the task stayed `active`, so the kanban card looked
+/// like ordinary Doing work forever (`docs/designs/dispatch-halt-state-vs-attention-items.md`
+/// documents attention items as a surface operators do not read). This reuses
+/// the exact `dispatch_failed_reason` / `dispatch_failed_error` / `dispatch_failed_at`
+/// / Backlog-status representation [`CHURN_GUARD_DISPATCH_FAILED_REASON`]
+/// established, under its own reason, for one deliberate purpose: a park is a
+/// human decision, not a transient dispatch failure, so
+/// [`crate::dispatch_failure_recovery_sweep`] must NEVER treat a row carrying
+/// this reason as eligible for its own automatic retry the way it does for
+/// [`CHURN_GUARD_DISPATCH_FAILED_REASON`] — only an explicit `bossctl work
+/// start` (or kanban drag-to-Doing) may clear a deliberate park, exactly the
+/// contract the attention item it is layered over already carries.
+///
+/// A row can be *both* deliberately parked and churn-tripped at once (the
+/// worker declared itself blocked after several unproductive runs). This
+/// reason wins over [`CHURN_GUARD_DISPATCH_FAILED_REASON`] in that case —
+/// see `bounce_deliberate_park_to_backlog`'s `churn_context` parameter — since
+/// the park is the stronger, human-only-clearable condition; the churn detail
+/// is folded into the body text instead so the card names both.
+pub const DELIBERATE_PARK_DISPATCH_FAILED_REASON: &str = "deliberate_park";
+
 /// `work_attention_items.kind` raised by [`crate::dispatch_stall_escalation`]
 /// when a dispatch timeline sits stuck in one stage past
 /// [`crate::dispatch_stall_escalation::PERSISTENT_STALL_THRESHOLD`]. The
