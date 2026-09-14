@@ -5,112 +5,206 @@ import XCTest
 
 @MainActor
 final class NativeSegmentedPickerTests: XCTestCase {
-    func testNeighborMovesWithoutWrapping() {
-        let values = ["Agents", "Work", "Designs"]
+    func testInstallsNSSegmentedControl() throws {
+        let host = hostedPicker(width: 440, height: 32)
+        host.layoutSubtreeIfNeeded()
+        let controls = segmentedControls(in: host)
         XCTAssertEqual(
-            NativeSegmentedPickerSelection.neighbor(of: "Agents", in: values, moving: .right),
-            "Work"
-        )
-        XCTAssertEqual(
-            NativeSegmentedPickerSelection.neighbor(of: "Work", in: values, moving: .left),
-            "Agents"
-        )
-        XCTAssertEqual(
-            NativeSegmentedPickerSelection.neighbor(of: "Agents", in: values, moving: .left),
-            "Agents"
-        )
-        XCTAssertEqual(
-            NativeSegmentedPickerSelection.neighbor(of: "Designs", in: values, moving: .right),
-            "Designs"
-        )
-        XCTAssertEqual(
-            NativeSegmentedPickerSelection.neighbor(of: "Work", in: values, moving: .up),
-            "Agents"
-        )
-        XCTAssertEqual(
-            NativeSegmentedPickerSelection.neighbor(of: "Work", in: values, moving: .down),
-            "Designs"
+            controls.count,
+            1,
+            "wrapper must host exactly one NSSegmentedControl; found \(controls.map { String(describing: type(of: $0)) })"
         )
     }
 
-    func testNeighborOfMissingSelectionIsNil() {
-        XCTAssertNil(
-            NativeSegmentedPickerSelection.neighbor(
-                of: "gone",
-                in: ["Agents", "Work"],
-                moving: .right
-            )
+    func testRepeatedLayoutStillHasOneControl() throws {
+        let host = hostedPicker(width: 440, height: 32)
+        host.layoutSubtreeIfNeeded()
+        let control = try XCTUnwrap(segmentedControls(in: host).first)
+        let distributionBefore = control.segmentDistribution
+        let segmentCountBefore = control.segmentCount
+        let labelsBefore = (0..<control.segmentCount).map { control.label(forSegment: $0) }
+
+        for _ in 0..<200 {
+            host.needsLayout = true
+            host.layoutSubtreeIfNeeded()
+        }
+
+        XCTAssertEqual(segmentedControls(in: host).count, 1)
+        XCTAssertEqual(control.segmentCount, modeTitles.count)
+        XCTAssertEqual(
+            (0..<control.segmentCount).map { control.label(forSegment: $0) },
+            modeTitles.map(\.1)
         )
+
+        // A measurement pass must not mutate the hosted control; it
+        // measures via an off-screen Coordinator control. If a future
+        // edit writes segmentDistribution or labels on the live control
+        // during sizeThatFits, this is where it shows up.
+        XCTAssertEqual(
+            control.segmentDistribution,
+            distributionBefore,
+            "repeated layout must not leave the hosted control's segment distribution changed"
+        )
+        XCTAssertEqual(
+            control.segmentDistribution,
+            .fillProportionally,
+            "hosted control must stay .fillProportionally; measurement must never mutate it"
+        )
+        XCTAssertEqual(control.segmentCount, segmentCountBefore)
+        XCTAssertEqual(
+            (0..<control.segmentCount).map { control.label(forSegment: $0) },
+            labelsBefore
+        )
+    }
+
+    func testUnconstrainedMeasureAfterStretchStaysLabelSized() throws {
+        let titles = poolTitles
+        let selection = ModeBinding(value: titles[0].0)
+        let box = SizeBox()
+        let picker = NativeSegmentedPicker(
+            "Pool",
+            selection: selection.binding,
+            options: titles.map { NativeSegmentedPicker.Option(value: $0.0, title: $0.1) }
+        )
+        func root(queryWidth: CGFloat) -> AnyView {
+            AnyView(
+                ProbeLayout(box: box, queryWidth: queryWidth) { picker }
+                    .frame(width: 800, height: 32)
+                    .background(Color(nsColor: .windowBackgroundColor))
+            )
+        }
+
+        let host = NSHostingView(rootView: root(queryWidth: 800))
+        host.appearance = NSAppearance(named: .aqua)
+        host.frame = NSRect(x: 0, y: 0, width: 800, height: 32)
+        host.layoutSubtreeIfNeeded()
+
+        let stretchedControl = try XCTUnwrap(segmentedControls(in: host).first)
+        XCTAssertEqual(stretchedControl.frame.width, 800, accuracy: 1)
+        XCTAssertEqual(stretchedControl.segmentDistribution, .fillProportionally)
+        XCTAssertEqual(box.size.width, 800, accuracy: 1)
+
+        // Same host, same control, still placed at 800pt. Probe an
+        // unbounded sizeThatFits. The ideal must stay label-sized rather
+        // than reporting back the stretched width — this is the sequential
+        // case the `.fit` / `.fillProportionally` split in
+        // `Coordinator.idealSize` exists to keep correct even when the
+        // live control is mid-stretch. A naive `nsView.fittingSize` read
+        // would report ~800 here and fail.
+        host.rootView = root(queryWidth: NativeSegmentedPickerLayout.unboundedProposal)
+        host.layoutSubtreeIfNeeded()
+
+        let sameControl = try XCTUnwrap(segmentedControls(in: host).first)
+        XCTAssertTrue(
+            sameControl === stretchedControl,
+            "reassigning rootView must keep the same NSSegmentedControl identity"
+        )
+        XCTAssertEqual(sameControl.frame.width, 800, accuracy: 1)
+        XCTAssertEqual(sameControl.segmentDistribution, .fillProportionally)
+        XCTAssertGreaterThan(box.size.width, 200)
+        XCTAssertLessThan(
+            box.size.width,
+            800,
+            "unconstrained ideal must stay label-sized, not the stretched 800pt frame"
+        )
+    }
+
+    func testLabelsAndSelectionMatchOptions() throws {
+        let host = hostedPicker(width: 440, height: 32, selection: ModeBinding(value: "work"))
+        host.layoutSubtreeIfNeeded()
+        let control = try XCTUnwrap(segmentedControls(in: host).first)
+        XCTAssertEqual(control.segmentCount, modeTitles.count)
+        XCTAssertEqual(
+            (0..<control.segmentCount).map { control.label(forSegment: $0) },
+            modeTitles.map(\.1)
+        )
+        XCTAssertEqual(control.selectedSegment, 1)
+        XCTAssertEqual(control.accessibilityLabel(), "Mode")
+        XCTAssertEqual(control.accessibilityIdentifier(), "native-segmented-picker.Mode")
+    }
+
+    func testClickUpdatesBinding() throws {
+        let selection = ModeBinding(value: "agents")
+        let host = hostedPicker(width: 440, height: 32, selection: selection)
+        host.layoutSubtreeIfNeeded()
+        let control = try XCTUnwrap(segmentedControls(in: host).first)
+        control.selectedSegment = 2
+        if let action = control.action, let target = control.target {
+            _ = target.perform(action, with: control)
+        } else {
+            XCTFail("NSSegmentedControl has no target/action")
+        }
+        XCTAssertEqual(selection.value, "designs")
+    }
+
+    func testMissingSelectionDoesNotWriteBack() throws {
+        let selection = ModeBinding(value: "gone")
+        let host = hostedPicker(width: 440, height: 32, selection: selection)
+        host.layoutSubtreeIfNeeded()
+        let control = try XCTUnwrap(segmentedControls(in: host).first)
+        XCTAssertEqual(control.selectedSegment, -1)
+        XCTAssertEqual(selection.value, "gone")
+    }
+
+    func testLiveTitlesUpdateSegmentLabels() throws {
+        let model = LiveTitlesModel(
+            selection: "bridgeCrew",
+            titles: poolTitles
+        )
+        let host = NSHostingView(rootView: LiveTitlesHarness(model: model).frame(width: 460, height: 32))
+        host.appearance = NSAppearance(named: .aqua)
+        host.frame = NSRect(x: 0, y: 0, width: 460, height: 32)
+        host.layoutSubtreeIfNeeded()
+        var control = try XCTUnwrap(segmentedControls(in: host).first)
+        XCTAssertEqual(control.label(forSegment: 0), "Bridge Crew (8)")
+
+        model.titles = [
+            ("bridgeCrew", "Bridge Crew (3)"),
+            ("lowerDecks", "Lower Decks (5)"),
+            ("automations", "Automations (1)"),
+            ("reviewers", "Reviewers (9)"),
+        ]
+        // The mutation above is delivered through `@Published` /
+        // `ObservableObject`, which schedules the SwiftUI update rather
+        // than applying it synchronously. Pump the run loop so that
+        // update actually lands before `layoutSubtreeIfNeeded` and the
+        // assertions below — otherwise this is the only coverage of the
+        // pool picker's live counts and it would be silently depending on
+        // that delivery being synchronous.
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        host.layoutSubtreeIfNeeded()
+        control = try XCTUnwrap(segmentedControls(in: host).first)
+        XCTAssertEqual(
+            (0..<control.segmentCount).map { control.label(forSegment: $0) },
+            model.titles.map(\.1)
+        )
+        XCTAssertEqual(control.selectedSegment, 0)
+        XCTAssertEqual(model.selection, "bridgeCrew")
     }
 
     func testUnconstrainedFittingSizeIsLabelSized() {
         let host = hostedPicker(width: nil, height: nil)
+        host.layoutSubtreeIfNeeded()
         let fitting = host.fittingSize
-        let expected = NativeSegmentedPickerMetrics.intrinsicSize(titles: modeTitles.map(\.1))
         XCTAssertGreaterThan(
             fitting.width, 200,
             "fittingSize must be large enough to hold the Mode labels; got \(fitting)"
         )
         XCTAssertLessThan(
-            fitting.width, NativeSegmentedPickerMetrics.unboundedProposal,
+            fitting.width, NativeSegmentedPickerLayout.unboundedProposal,
             "fittingSize must not be the NSToolbar-unbounded poisoned width; got \(fitting)"
         )
-        XCTAssertEqual(fitting.width, expected.width, accuracy: 12)
         XCTAssertGreaterThan(fitting.height, 16, "fittingSize.height=\(fitting.height)")
         XCTAssertLessThan(fitting.height, 40, "fittingSize.height=\(fitting.height)")
-        XCTAssertEqual(fitting.height, expected.height, accuracy: 8)
     }
 
     func testFramedFittingSizeMatchesFrame() {
         let host = hostedPicker(width: 440, height: nil)
+        host.layoutSubtreeIfNeeded()
         let fitting = host.fittingSize
         XCTAssertEqual(fitting.width, 440, accuracy: 1)
         XCTAssertGreaterThan(fitting.height, 16)
         XCTAssertLessThan(fitting.height, 40)
-    }
-
-    func testDoesNotInstallNSSegmentedControl() throws {
-        let host = hostedPicker(width: 440, height: 32)
-        host.layoutSubtreeIfNeeded()
-        XCTAssertTrue(
-            segmentedControls(in: host).isEmpty,
-            "NativeSegmentedPicker must not install NSSegmentedControl / NSViewRepresentable"
-        )
-    }
-
-    func testRepeatedLayoutStillDoesNotInstallNSSegmentedControl() throws {
-        let host = hostedPicker(width: 440, height: 32)
-        for _ in 0..<200 {
-            host.needsLayout = true
-            host.layoutSubtreeIfNeeded()
-        }
-        XCTAssertTrue(
-            segmentedControls(in: host).isEmpty,
-            "relayout must not re-enter the NSSegmentedControl representable path"
-        )
-    }
-
-    func testSelectedSegmentIsVisuallyDistinct() throws {
-        let agents = hostedPicker(
-            width: 440,
-            height: 32,
-            selection: ModeBinding(value: "agents")
-        )
-        let work = hostedPicker(
-            width: 440,
-            height: 32,
-            selection: ModeBinding(value: "work")
-        )
-        let agentsShot = try bitmap(of: agents)
-        let workShot = try bitmap(of: work)
-        if isUniformlyBlank(agentsShot) || isUniformlyBlank(workShot) {
-            throw XCTSkip("render came back uniformly blank; host does not support offscreen SwiftUI rendering")
-        }
-        XCTAssertNotEqual(
-            agentsShot.representation(using: .png, properties: [:]),
-            workShot.representation(using: .png, properties: [:]),
-            "the selected segment must paint differently from its neighbors"
-        )
     }
 
     func testRespectsFixedWidthAndCompressesWhenNarrow() throws {
@@ -122,35 +216,25 @@ final class NativeSegmentedPickerTests: XCTestCase {
         let narrow = hostedPicker(
             width: 200,
             height: 32,
-            titles: [
-                ("bridgeCrew", "Bridge Crew (8)"),
-                ("lowerDecks", "Lower Decks (8)"),
-                ("automations", "Automations (8)"),
-                ("reviewers", "Reviewers (16)"),
-            ]
+            titles: poolTitles
         )
         narrow.layoutSubtreeIfNeeded()
         XCTAssertEqual(narrow.bounds.width, 200)
         XCTAssertEqual(narrow.fittingSize.width, 200, accuracy: 1)
         XCTAssertLessThanOrEqual(narrow.bounds.height, 40)
-        XCTAssertLessThan(
-            narrow.fittingSize.width,
-            NativeSegmentedPickerMetrics.intrinsicSize(
-                titles: ["Bridge Crew (8)", "Lower Decks (8)", "Automations (8)", "Reviewers (16)"]
-            ).width,
-            "the 200pt frame must compress below the unconstrained label total"
-        )
+        let control = try XCTUnwrap(segmentedControls(in: narrow).first)
+        XCTAssertEqual(control.frame.width, 200, accuracy: 1)
     }
 
     func testBoundedWidthTreatsZeroAsMinimumNotUnbounded() {
-        XCTAssertEqual(NativeSegmentedPickerMetrics.boundedWidth(0), 0)
-        XCTAssertEqual(NativeSegmentedPickerMetrics.boundedWidth(200), 200)
-        XCTAssertNil(NativeSegmentedPickerMetrics.boundedWidth(nil))
-        XCTAssertNil(NativeSegmentedPickerMetrics.boundedWidth(.infinity))
-        XCTAssertNil(NativeSegmentedPickerMetrics.boundedWidth(-1))
+        XCTAssertEqual(NativeSegmentedPickerLayout.boundedWidth(0), 0)
+        XCTAssertEqual(NativeSegmentedPickerLayout.boundedWidth(200), 200)
+        XCTAssertNil(NativeSegmentedPickerLayout.boundedWidth(nil))
+        XCTAssertNil(NativeSegmentedPickerLayout.boundedWidth(.infinity))
+        XCTAssertNil(NativeSegmentedPickerLayout.boundedWidth(-1))
         XCTAssertNil(
-            NativeSegmentedPickerMetrics.boundedWidth(
-                NativeSegmentedPickerMetrics.unboundedProposal
+            NativeSegmentedPickerLayout.boundedWidth(
+                NativeSegmentedPickerLayout.unboundedProposal
             )
         )
     }
@@ -171,18 +255,13 @@ final class NativeSegmentedPickerTests: XCTestCase {
         host.frame = NSRect(x: 0, y: 0, width: 400, height: 32)
         host.layoutSubtreeIfNeeded()
 
-        let ideal = NativeSegmentedPickerMetrics.intrinsicSize(titles: titles.map(\.1))
-        XCTAssertGreaterThan(ideal.width, 50)
-        // Track padding (2pt each side) is outside SegmentDistributionLayout, so
-        // the hosted control's minimum is 4pt, not 0. That is still the
-        // compressed minimum — not the unbounded label ideal.
         XCTAssertEqual(
             box.size.width,
-            NativeSegmentedPickerMetrics.trackPadding * 2,
+            0,
             accuracy: 0.5,
-            "a 0-width proposal is the minimum-size query and must not return the ideal \(ideal.width); got \(box.size)"
+            "a 0-width proposal is the minimum-size query and must not return the label ideal; got \(box.size)"
         )
-        XCTAssertLessThan(box.size.width, ideal.width / 10)
+        XCTAssertLessThan(box.size.width, 50)
     }
 
     func testCompressesNextToSiblingWhenHStackIsNarrow() {
@@ -210,186 +289,149 @@ final class NativeSegmentedPickerTests: XCTestCase {
         host.frame = NSRect(x: 0, y: 0, width: totalWidth, height: 32)
         host.layoutSubtreeIfNeeded()
 
-        let ideal = NativeSegmentedPickerMetrics.intrinsicSize(titles: titles.map(\.1))
-        XCTAssertGreaterThan(
-            ideal.width + siblingWidth,
-            totalWidth,
-            "the fixture must be tighter than picker-ideal + sibling so compression is required"
-        )
         XCTAssertEqual(host.bounds.width, totalWidth)
         XCTAssertEqual(
             box.size.width,
             totalWidth,
             accuracy: 1,
-            "HStack proposing \(totalWidth) must fit, not overflow to the unconstrained ideal \(ideal.width); got \(box.size)"
+            "HStack proposing \(totalWidth) must fit, not overflow; got \(box.size)"
         )
-        XCTAssertLessThan(box.size.width, ideal.width)
+        XCTAssertLessThan(box.size.width, 400)
     }
 
-    func testAccessibilityIdentifiersAreInstanceScoped() {
-        let mode = hostedAXReport(label: "Mode", titles: modeTitles, selection: "agents")
-        let pool = hostedAXReport(label: "Pool", titles: poolTitles, selection: "bridgeCrew")
-        XCTAssertEqual(mode.identifier, "native-segmented-picker.Mode")
-        XCTAssertEqual(pool.identifier, "native-segmented-picker.Pool")
-        XCTAssertNotEqual(mode.identifier, pool.identifier)
-        XCTAssertEqual(mode.segments[0].identifier, "native-segmented-picker.Mode.segment.0")
-        XCTAssertEqual(pool.segments[0].identifier, "native-segmented-picker.Pool.segment.0")
-        XCTAssertNotEqual(mode.segments[0].identifier, pool.segments[0].identifier)
-        XCTAssertFalse(mode.identifier.contains("native-segmented-picker.segment"))
-        let ids = Set(mode.segments.map(\.identifier) + pool.segments.map(\.identifier) + [
-            mode.identifier,
-            pool.identifier,
-        ])
-        XCTAssertEqual(ids.count, mode.segments.count + pool.segments.count + 2)
+    func testAccessibilityIdentifiersAreInstanceScoped() throws {
+        let mode = hostedPicker(width: 440, height: 32, titles: modeTitles, label: "Mode")
+        let pool = hostedPicker(width: 460, height: 32, titles: poolTitles, label: "Pool")
+        mode.layoutSubtreeIfNeeded()
+        pool.layoutSubtreeIfNeeded()
+        let modeControl = try XCTUnwrap(segmentedControls(in: mode).first)
+        let poolControl = try XCTUnwrap(segmentedControls(in: pool).first)
+        XCTAssertEqual(modeControl.accessibilityIdentifier(), "native-segmented-picker.Mode")
+        XCTAssertEqual(poolControl.accessibilityIdentifier(), "native-segmented-picker.Pool")
+        XCTAssertNotEqual(
+            modeControl.accessibilityIdentifier(),
+            poolControl.accessibilityIdentifier()
+        )
     }
 
-    func testAccessibilityLabelValueAndSelectedState() {
-        let selection = ModeBinding(value: "work")
-        var report = hostedAXReport(
-            label: "Mode",
-            titles: modeTitles,
-            selection: selection
-        )
-        XCTAssertEqual(report.label, "Mode")
-        XCTAssertEqual(report.value, "Work")
-        XCTAssertEqual(report.segments.map(\.label), modeTitles.map(\.1))
-        XCTAssertEqual(
-            report.segments.map(\.selected),
-            [false, true, false, false, false]
-        )
-
-        selection.value = "designs"
-        report = hostedAXReport(
-            label: "Mode",
-            titles: modeTitles,
-            selection: selection
-        )
-        XCTAssertEqual(report.value, "Designs")
-        XCTAssertEqual(
-            report.segments.map(\.selected),
-            [false, false, true, false, false]
-        )
-        XCTAssertTrue(report.segments[2].selected)
-        XCTAssertFalse(report.segments[1].selected)
-    }
-
-    func testEnlargedDynamicTypeGrowsWithLongLocalizedTitle() {
-        let titles = [("automationen", "Sehr lange lokalisierte Automationen")]
+    func testControlSizeFlowsToAppKit() throws {
         let regular = hostedPicker(
             width: nil,
             height: nil,
-            titles: titles,
-            dynamicTypeSize: .large,
+            titles: [("automationen", "Sehr lange lokalisierte Automationen")],
             controlSize: .regular
         )
-        let enlarged = hostedPicker(
+        let large = hostedPicker(
             width: nil,
             height: nil,
-            titles: titles,
-            dynamicTypeSize: .accessibility3,
+            titles: [("automationen", "Sehr lange lokalisierte Automationen")],
             controlSize: .large
         )
-        let expectedRegular = NativeSegmentedPickerMetrics.intrinsicSize(
-            titles: titles.map(\.1),
-            font: NativeSegmentedPickerMetrics.font(
-                dynamicTypeSize: .large,
-                controlSize: .regular
-            )
-        )
-        let expectedEnlarged = NativeSegmentedPickerMetrics.intrinsicSize(
-            titles: titles.map(\.1),
-            font: NativeSegmentedPickerMetrics.font(
-                dynamicTypeSize: .accessibility3,
-                controlSize: .large
-            )
-        )
-        XCTAssertGreaterThan(expectedEnlarged.width, expectedRegular.width)
-        XCTAssertGreaterThan(expectedEnlarged.height, expectedRegular.height)
-        XCTAssertGreaterThan(enlarged.fittingSize.width, regular.fittingSize.width)
-        XCTAssertGreaterThan(enlarged.fittingSize.height, regular.fittingSize.height)
-        XCTAssertEqual(regular.fittingSize.width, expectedRegular.width, accuracy: 12)
-        XCTAssertEqual(enlarged.fittingSize.width, expectedEnlarged.width, accuracy: 24)
-        XCTAssertGreaterThan(
-            NativeSegmentedPickerMetrics.pointSize(
-                dynamicTypeSize: .accessibility3,
-                controlSize: .large
-            ),
-            NativeSegmentedPickerMetrics.pointSize(
-                dynamicTypeSize: .large,
-                controlSize: .regular
-            )
-        )
+        regular.layoutSubtreeIfNeeded()
+        large.layoutSubtreeIfNeeded()
+        let regularControl = try XCTUnwrap(segmentedControls(in: regular).first)
+        let largeControl = try XCTUnwrap(segmentedControls(in: large).first)
+        XCTAssertEqual(regularControl.controlSize, .regular)
+        XCTAssertEqual(largeControl.controlSize, .large)
+        XCTAssertGreaterThan(large.fittingSize.height, regular.fittingSize.height)
     }
 
-    func testRenderIsNonBlankInLightAndDark() throws {
-        let temporaryDirectory = URL(
-            fileURLWithPath: ProcessInfo.processInfo.environment["TEST_TMPDIR"] ?? NSTemporaryDirectory(),
-            isDirectory: true
-        )
-        let dest = temporaryDirectory
-            .appendingPathComponent("boss-native-segmented-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
-        addTeardownBlock {
-            try? FileManager.default.removeItem(at: dest)
-        }
-        let undeclared: URL? = ProcessInfo.processInfo.environment["TEST_UNDECLARED_OUTPUTS_DIR"].map {
-            URL(fileURLWithPath: $0, isDirectory: true)
-        }
-
-        let shots: [(name: String, appearance: NSAppearance.Name, width: CGFloat, titles: [(String, String)], system: Bool)] = [
-            ("mode-light.png", .aqua, 440, modeTitles, false),
-            ("mode-dark.png", .darkAqua, 440, modeTitles, false),
-            ("pool-light.png", .aqua, 460, poolTitles, false),
-            ("pool-dark.png", .darkAqua, 460, poolTitles, false),
-            ("pool-narrow-light.png", .aqua, 200, poolTitles, false),
-            ("mode-system-light.png", .aqua, 440, modeTitles, true),
-            ("mode-system-dark.png", .darkAqua, 440, modeTitles, true),
-            ("pool-system-light.png", .aqua, 460, poolTitles, true),
-            ("pool-system-dark.png", .darkAqua, 460, poolTitles, true),
-        ]
-
-        var paths: [String] = []
-        for shot in shots {
-            let rep = try render(
-                titles: shot.titles,
-                width: shot.width,
-                height: 36,
-                appearance: shot.appearance,
-                system: shot.system
-            )
-            guard !isUniformlyBlank(rep) else {
-                throw XCTSkip("render came back uniformly blank; host does not support offscreen SwiftUI rendering")
-            }
-            guard let data = rep.representation(using: .png, properties: [:]) else {
-                XCTFail("PNG encode failed for \(shot.name)")
-                return
-            }
-            let url = dest.appendingPathComponent(shot.name)
-            try data.write(to: url)
-            if let undeclared {
-                try data.write(to: undeclared.appendingPathComponent(shot.name))
-            }
-            paths.append(url.path)
-        }
-
-        let index = dest.appendingPathComponent("paths.txt")
-        try paths.joined(separator: "\n").write(to: index, atomically: true, encoding: .utf8)
-        print("NATIVE_SEGMENTED_PICKER_FIXTURES=\(dest.path)")
-    }
-
-    func testSystemSegmentedPickerStillUsesNSSegmentedControl() throws {
-        let selection = ModeBinding(value: "Agents")
-        let root = Picker("Mode", selection: selection.binding) {
-            ForEach(["Agents", "Work", "Designs"], id: \.self) { Text($0).tag($0) }
-        }
-        .pickerStyle(.segmented)
-        .frame(width: 440, height: 32)
-        let host = NSHostingView(rootView: root)
-        host.frame = NSRect(x: 0, y: 0, width: 440, height: 32)
+    func testDefaultDynamicTypeLeavesAppKitFont() throws {
+        let host = hostedPicker(width: 440, height: 32)
         host.layoutSubtreeIfNeeded()
-        if segmentedControls(in: host).isEmpty {
-            throw XCTSkip("system segmented Picker did not materialize NSSegmentedControl in this host")
+        let control = try XCTUnwrap(segmentedControls(in: host).first)
+        let vanilla = NSSegmentedControl()
+        vanilla.segmentStyle = .automatic
+        vanilla.trackingMode = .selectOne
+        vanilla.controlSize = .regular
+        XCTAssertNil(
+            NativeSegmentedPickerMetrics.fontIfOverridden(
+                dynamicTypeSize: .large,
+                controlSize: .regular
+            )
+        )
+        XCTAssertNotNil(
+            NativeSegmentedPickerMetrics.fontIfOverridden(
+                dynamicTypeSize: .accessibility3,
+                controlSize: .regular
+            )
+        )
+        XCTAssertEqual(control.font, vanilla.font)
+    }
+
+    func testEnlargedDynamicTypeGrowsWithLongLocalizedTitle() throws {
+        // Two independently-constructed hosts intermittently observe a
+        // stale environment on their very first layout pass under headless
+        // XCTest hosting, so this drives one host through an environment
+        // update (the pattern `testDynamicTypeChangeOnExistingControlUpdatesFontAndSize`
+        // also uses) rather than comparing two freshly-created hosts.
+        let titles = [("automationen", "Sehr lange lokalisierte Automationen")]
+        let selection = ModeBinding(value: titles[0].0)
+        func picker(dynamicTypeSize: DynamicTypeSize) -> AnyView {
+            AnyView(
+                NativeSegmentedPicker(
+                    "Mode",
+                    selection: selection.binding,
+                    options: titles.map { NativeSegmentedPicker.Option(value: $0.0, title: $0.1) }
+                )
+                .environment(\.dynamicTypeSize, dynamicTypeSize)
+            )
         }
+
+        let host = NSHostingView(rootView: picker(dynamicTypeSize: .large))
+        host.appearance = NSAppearance(named: .aqua)
+        host.layoutSubtreeIfNeeded()
+        let control = try XCTUnwrap(segmentedControls(in: host).first)
+        let fontBefore = control.font?.pointSize ?? 0
+        let widthBefore = host.fittingSize.width
+
+        host.rootView = picker(dynamicTypeSize: .accessibility3)
+        host.layoutSubtreeIfNeeded()
+        let fontAfter = control.font?.pointSize ?? 0
+        let widthAfter = host.fittingSize.width
+
+        // controlSize is held fixed; only dynamicTypeSize varies. Both the
+        // hosted control's font and its natural fitting (label-ideal) width
+        // must grow — NSSegmentedControl does not observe the SwiftUI
+        // environment value on its own, so this is on the wrapper to
+        // bridge. Height is not asserted here: AppKit's segmented control
+        // bezel height is fixed per `controlSize` and does not grow with
+        // point size the way the label width does.
+        XCTAssertGreaterThan(fontAfter, fontBefore)
+        XCTAssertGreaterThan(widthAfter, widthBefore)
+    }
+
+    func testDynamicTypeChangeOnExistingControlUpdatesFontAndSize() throws {
+        let model = LiveTitlesModel(selection: "bridgeCrew", titles: poolTitles)
+        let host = NSHostingView(
+            rootView: AnyView(
+                LiveTitlesHarness(model: model).environment(\.dynamicTypeSize, .large)
+            )
+        )
+        host.appearance = NSAppearance(named: .aqua)
+        host.layoutSubtreeIfNeeded()
+        let control = try XCTUnwrap(segmentedControls(in: host).first)
+        let fontBefore = control.font?.pointSize ?? 0
+        let widthBefore = host.fittingSize.width
+
+        host.rootView = AnyView(
+            LiveTitlesHarness(model: model).environment(\.dynamicTypeSize, .accessibility3)
+        )
+        host.layoutSubtreeIfNeeded()
+        let fontAfter = control.font?.pointSize ?? 0
+        let widthAfter = host.fittingSize.width
+
+        XCTAssertGreaterThan(fontAfter, fontBefore)
+        XCTAssertGreaterThan(widthAfter, widthBefore)
+
+        host.rootView = AnyView(
+            LiveTitlesHarness(model: model).environment(\.dynamicTypeSize, .large)
+        )
+        host.layoutSubtreeIfNeeded()
+        XCTAssertNil(
+            control.font,
+            "returning to default Dynamic Type must clear the explicit NSFont override"
+        )
     }
 
     // MARK: - Hosts
@@ -413,50 +455,14 @@ final class NativeSegmentedPickerTests: XCTestCase {
         ]
     }
 
-    private func hostedAXReport(
-        label: String,
-        titles: [(String, String)],
-        selection: String
-    ) -> NativeSegmentedPickerAXReport {
-        hostedAXReport(
-            label: label,
-            titles: titles,
-            selection: ModeBinding(value: selection)
-        )
-    }
-
-    private func hostedAXReport(
-        label: String,
-        titles: [(String, String)],
-        selection: ModeBinding
-    ) -> NativeSegmentedPickerAXReport {
-        let box = AXReportBox()
-        let picker = NativeSegmentedPicker(
-            label,
-            selection: selection.binding,
-            options: titles.map { NativeSegmentedPicker.Option(value: $0.0, title: $0.1) }
-        )
-        .onPreferenceChange(NativeSegmentedPickerAXKey.self) { box.report = $0 }
-        .frame(width: 440, height: 32)
-        let host = NSHostingView(rootView: picker)
-        host.appearance = NSAppearance(named: .aqua)
-        host.frame = NSRect(x: 0, y: 0, width: 440, height: 32)
-        host.layoutSubtreeIfNeeded()
-        XCTAssertFalse(
-            box.report.identifier.isEmpty,
-            "picker did not publish an accessibility report"
-        )
-        return box.report
-    }
-
     private func hostedPicker(
         width: CGFloat?,
         height: CGFloat?,
         titles: [(String, String)]? = nil,
         selection: ModeBinding? = nil,
         label: String = "Mode",
-        dynamicTypeSize: DynamicTypeSize = .large,
-        controlSize: ControlSize = .regular
+        controlSize: ControlSize = .regular,
+        dynamicTypeSize: DynamicTypeSize = .large
     ) -> NSHostingView<some View> {
         let titles = titles ?? modeTitles
         let selection = selection ?? ModeBinding(value: titles[0].0)
@@ -465,8 +471,8 @@ final class NativeSegmentedPickerTests: XCTestCase {
             selection: selection.binding,
             options: titles.map { NativeSegmentedPicker.Option(value: $0.0, title: $0.1) }
         )
-        .environment(\.dynamicTypeSize, dynamicTypeSize)
         .controlSize(controlSize)
+        .environment(\.dynamicTypeSize, dynamicTypeSize)
         let root: AnyView
         switch (width, height) {
         case let (w?, h?):
@@ -498,63 +504,11 @@ final class NativeSegmentedPickerTests: XCTestCase {
         return host
     }
 
-    private func bitmap(of host: NSView) throws -> NSBitmapImageRep {
-        host.layoutSubtreeIfNeeded()
-        guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else {
-            throw XCTSkip("bitmapImageRepForCachingDisplay returned nil")
-        }
-        host.cacheDisplay(in: host.bounds, to: rep)
-        return rep
-    }
-
-    private func render(
-        titles: [(String, String)],
-        width: CGFloat,
-        height: CGFloat,
-        appearance: NSAppearance.Name,
-        system: Bool = false
-    ) throws -> NSBitmapImageRep {
-        let host: NSView
-        if system {
-            host = hostedSystemPicker(width: width, height: height, titles: titles)
-        } else {
-            host = hostedPicker(width: width, height: height, titles: titles)
-        }
-        host.appearance = NSAppearance(named: appearance)
-        host.layoutSubtreeIfNeeded()
-        let bounds = host.bounds
-        guard let rep = host.bitmapImageRepForCachingDisplay(in: bounds) else {
-            throw XCTSkip("bitmapImageRepForCachingDisplay returned nil")
-        }
-        host.cacheDisplay(in: bounds, to: rep)
-        return rep
-    }
-
-    private func hostedSystemPicker(
-        width: CGFloat,
-        height: CGFloat,
-        titles: [(String, String)]
-    ) -> NSHostingView<some View> {
-        let selection = ModeBinding(value: titles[0].0)
-        let root = Picker("Mode", selection: selection.binding) {
-            ForEach(titles, id: \.0) { Text($0.1).tag($0.0) }
-        }
-        .pickerStyle(.segmented)
-        .labelsHidden()
-        .frame(width: width, height: height)
-        .background(Color(nsColor: .windowBackgroundColor))
-        let host = NSHostingView(rootView: root)
-        host.appearance = NSAppearance(named: .aqua)
-        host.frame = NSRect(x: 0, y: 0, width: width, height: height)
-        return host
-    }
-
-    private func segmentedControls(in view: NSView) -> [NSView] {
-        var found: [NSView] = []
+    private func segmentedControls(in view: NSView) -> [NSSegmentedControl] {
+        var found: [NSSegmentedControl] = []
         func walk(_ current: NSView) {
-            let name = String(describing: type(of: current))
-            if current is NSSegmentedControl || name.localizedCaseInsensitiveContains("SegmentedControl") {
-                found.append(current)
+            if let control = current as? NSSegmentedControl {
+                found.append(control)
             }
             for child in current.subviews {
                 walk(child)
@@ -564,22 +518,6 @@ final class NativeSegmentedPickerTests: XCTestCase {
         return found
     }
 
-    private func isUniformlyBlank(_ rep: NSBitmapImageRep) -> Bool {
-        guard let bytes = rep.bitmapData, rep.samplesPerPixel >= 3 else { return true }
-        var first: [UInt8]?
-        for y in stride(from: 0, to: rep.pixelsHigh, by: 4) {
-            for x in stride(from: 0, to: rep.pixelsWide, by: 4) {
-                let offset = y * rep.bytesPerRow + x * rep.samplesPerPixel
-                let pixel = [bytes[offset], bytes[offset + 1], bytes[offset + 2]]
-                if let seen = first {
-                    if pixel != seen { return false }
-                } else {
-                    first = pixel
-                }
-            }
-        }
-        return true
-    }
 }
 
 /// `Binding` cannot live in a local `var` across `NSHostingView` without a
@@ -593,12 +531,31 @@ private final class ModeBinding {
     }
 }
 
-private final class SizeBox: @unchecked Sendable {
-    var size: CGSize = .zero
+@MainActor
+private final class LiveTitlesModel: ObservableObject {
+    @Published var selection: String
+    @Published var titles: [(String, String)]
+
+    init(selection: String, titles: [(String, String)]) {
+        self.selection = selection
+        self.titles = titles
+    }
 }
 
-private final class AXReportBox: @unchecked Sendable {
-    var report = NativeSegmentedPickerAXKey.defaultValue
+private struct LiveTitlesHarness: View {
+    @ObservedObject var model: LiveTitlesModel
+
+    var body: some View {
+        NativeSegmentedPicker(
+            "Pool",
+            selection: $model.selection,
+            options: model.titles.map { NativeSegmentedPicker.Option(value: $0.0, title: $0.1) }
+        )
+    }
+}
+
+private final class SizeBox: @unchecked Sendable {
+    var size: CGSize = .zero
 }
 
 /// Asks the child for `sizeThatFits` at `queryWidth` (0 = SwiftUI minimum)
@@ -651,5 +608,3 @@ private struct ProbeSizeLayout: Layout {
         )
     }
 }
-
-

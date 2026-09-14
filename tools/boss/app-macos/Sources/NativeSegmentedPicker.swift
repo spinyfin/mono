@@ -1,226 +1,20 @@
 import AppKit
 import SwiftUI
 
-/// Keyboard / selection movement for ``NativeSegmentedPicker``. Extracted so
-/// tests can cover wrap-less arrow behaviour without hosting a view.
-enum NativeSegmentedPickerSelection {
-    /// Next value in `values` for an arrow-key move. Does not wrap: moving
-    /// off either end returns `current`. Returns `nil` when `current` is not
-    /// in `values` (the caller leaves the binding alone, matching `Picker`).
-    static func neighbor<Value: Equatable>(
-        of current: Value,
-        in values: [Value],
-        moving direction: MoveCommandDirection
-    ) -> Value? {
-        guard let index = values.firstIndex(of: current) else { return nil }
-        switch direction {
-        case .left, .up:
-            return index > 0 ? values[index - 1] : current
-        case .right, .down:
-            return index + 1 < values.count ? values[index + 1] : current
-        default:
-            return nil
-        }
-    }
-}
-
-/// Label-font metrics for ``NativeSegmentedPicker``.
+/// AppKit segmented control hosted in SwiftUI.
 ///
-/// Segment children use `frame(maxWidth: .infinity)` so they fill their slot
-/// and paint a full-width selection pill. That poisons `sizeThatFits(nil)` —
-/// each child reports a huge ideal width, which NSToolbar cannot measure.
-/// Ideal size is therefore the actual title string at the environment-resolved
-/// control font (Dynamic Type + ``ControlSize``), not the child's
-/// `sizeThatFits`. Measuring the same font the segments render keeps
-/// accessibility text size and locale working together.
-enum NativeSegmentedPickerMetrics {
-    static let horizontalTitleInset: CGFloat = 6
-    static let verticalTitleInset: CGFloat = 3
-    static let trackPadding: CGFloat = 2
-    /// Proposals at or above this are treated as unbounded (NSToolbar's
-    /// infinite / "very large" measure pass), not as a real width to fill.
-    static let unboundedProposal: CGFloat = 2_000
-
-    /// Control font matching the SwiftUI environment. `.large` / `.regular`
-    /// is the unscaled system control size; larger Dynamic Type and control
-    /// sizes scale both the rendered `Text` and this measurement font.
-    static func font(
-        dynamicTypeSize: DynamicTypeSize,
-        controlSize: ControlSize
-    ) -> NSFont {
-        NSFont.systemFont(
-            ofSize: pointSize(dynamicTypeSize: dynamicTypeSize, controlSize: controlSize)
-        )
-    }
-
-    static func pointSize(
-        dynamicTypeSize: DynamicTypeSize,
-        controlSize: ControlSize
-    ) -> CGFloat {
-        basePointSize(for: controlSize) * dynamicTypeScale(dynamicTypeSize)
-    }
-
-    static func accessibilityIdentifier(label: String) -> String {
-        "native-segmented-picker.\(label)"
-    }
-
-    static func segmentAccessibilityIdentifier(label: String, index: Int) -> String {
-        "native-segmented-picker.\(label).segment.\(index)"
-    }
-
-    static var defaultMeasurementFont: NSFont {
-        font(dynamicTypeSize: .large, controlSize: .regular)
-    }
-
-    static func segmentWidth(
-        for title: String,
-        font: NSFont = NativeSegmentedPickerMetrics.defaultMeasurementFont
-    ) -> CGFloat {
-        let text = ceil((title as NSString).size(withAttributes: [.font: font]).width)
-        return max(text + horizontalTitleInset * 2, 8)
-    }
-
-    static func segmentHeight(
-        font: NSFont = NativeSegmentedPickerMetrics.defaultMeasurementFont
-    ) -> CGFloat {
-        ceil(font.ascender - font.descender) + verticalTitleInset * 2
-    }
-
-    static func intrinsicSize(
-        titles: [String],
-        font: NSFont = NativeSegmentedPickerMetrics.defaultMeasurementFont
-    ) -> CGSize {
-        CGSize(
-            width: titles.map { segmentWidth(for: $0, font: font) }.reduce(0, +)
-                + trackPadding * 2,
-            height: segmentHeight(font: font) + trackPadding * 2
-        )
-    }
-
-    /// Finite proposals in `[0, unboundedProposal)` — including 0, SwiftUI's
-    /// minimum-size query — are real bounds. `nil`, NaN, ∞, negatives, and
-    /// NSToolbar's huge measure pass are unbounded and take the label ideal.
-    static func boundedWidth(_ value: CGFloat?) -> CGFloat? {
-        guard let value, value.isFinite, value >= 0, value < unboundedProposal else {
-            return nil
-        }
-        return value
-    }
-
-    static func basePointSize(for controlSize: ControlSize) -> CGFloat {
-        switch controlSize {
-        case .mini:
-            return NSFont.systemFontSize(for: .mini)
-        case .small:
-            return NSFont.systemFontSize(for: .small)
-        case .regular:
-            return NSFont.systemFontSize(for: .regular)
-        case .large:
-            return NSFont.systemFontSize(for: .large)
-        case .extraLarge:
-            return NSFont.systemFontSize(for: .large) + 2
-        @unknown default:
-            return NSFont.systemFontSize(for: .large) + 2
-        }
-    }
-
-    /// Body-text scale relative to `.large`, matching the HIG type ramp so
-    /// the control tracks Dynamic Type the way stock segmented `Picker` does.
-    static func dynamicTypeScale(_ size: DynamicTypeSize) -> CGFloat {
-        switch size {
-        case .xSmall: return 14.0 / 17.0
-        case .small: return 15.0 / 17.0
-        case .medium: return 16.0 / 17.0
-        case .large: return 1
-        case .xLarge: return 19.0 / 17.0
-        case .xxLarge: return 21.0 / 17.0
-        case .xxxLarge: return 23.0 / 17.0
-        case .accessibility1: return 28.0 / 17.0
-        case .accessibility2: return 33.0 / 17.0
-        case .accessibility3: return 40.0 / 17.0
-        case .accessibility4: return 47.0 / 17.0
-        case .accessibility5: return 53.0 / 17.0
-        @unknown default: return 1
-        }
-    }
-}
-
-/// Accessibility contract the picker applies to SwiftUI and publishes for
-/// hosted tests. AppKit does not expose SwiftUI's AX tree from an offscreen
-/// `NSHostingView`, so tests read this preference instead of
-/// `accessibilityChildren()`.
-struct NativeSegmentedPickerAXReport: Equatable, Sendable {
-    var identifier: String
-    var label: String
-    var value: String
-    var segments: [Segment]
-
-    struct Segment: Equatable, Sendable {
-        var identifier: String
-        var label: String
-        var selected: Bool
-    }
-
-    static func make<Value: Equatable>(
-        label: String,
-        selection: Value,
-        options: [(value: Value, title: String)]
-    ) -> NativeSegmentedPickerAXReport {
-        NativeSegmentedPickerAXReport(
-            identifier: NativeSegmentedPickerMetrics.accessibilityIdentifier(label: label),
-            label: label,
-            value: options.first(where: { $0.value == selection })?.title ?? "",
-            segments: options.enumerated().map { index, option in
-                Segment(
-                    identifier: NativeSegmentedPickerMetrics.segmentAccessibilityIdentifier(
-                        label: label,
-                        index: index
-                    ),
-                    label: option.title,
-                    selected: option.value == selection
-                )
-            }
-        )
-    }
-}
-
-enum NativeSegmentedPickerAXKey: PreferenceKey {
-    static let defaultValue = NativeSegmentedPickerAXReport(
-        identifier: "",
-        label: "",
-        value: "",
-        segments: []
-    )
-
-    static func reduce(
-        value: inout NativeSegmentedPickerAXReport,
-        nextValue: () -> NativeSegmentedPickerAXReport
-    ) {
-        let next = nextValue()
-        if !next.identifier.isEmpty {
-            value = next
-        }
-    }
-}
-
-private struct SegmentIdealWidthKey: LayoutValueKey {
-    static let defaultValue: CGFloat = 8
-}
-
-private struct SegmentIdealHeightKey: LayoutValueKey {
-    static let defaultValue: CGFloat = 22
-}
-
-/// SwiftUI-native segmented control. Replaces `Picker` + `.pickerStyle(.segmented)`,
-/// which is an `NSViewRepresentable` whose `_overrideSizeThatFits` re-enters
-/// SwiftUI with a nested ViewGraph update on every layout pass of the enclosing
-/// view.
+/// Replaces `Picker` + `.pickerStyle(.segmented)`, whose representable
+/// `_overrideSizeThatFits` re-enters SwiftUI with a nested ViewGraph update
+/// on every layout pass of the enclosing view. This wrapper talks to
+/// `NSSegmentedControl` with plain string labels (`setLabel(_:forSegment:)`)
+/// and never hosts SwiftUI content per segment, so measurement stays in
+/// AppKit.
 ///
-/// Pure SwiftUI: no `NSViewRepresentable`, no `NSSegmentedControl`. Segments
-/// size to their labels and share leftover width, with wrap-less arrow-key
-/// movement and a radio-group accessibility tree. Sizing comes from the label
-/// font plus padding so Dynamic Type and locale changes keep working.
-struct NativeSegmentedPicker<Value: Hashable>: View {
+/// Follows the same `NSViewRepresentable` + `Coordinator` idiom as
+/// `CommentTextEditor` and `ResizeDivider`. Chrome, focus-ring, and
+/// click-versus-tab focus semantics come from AppKit; this type does not
+/// draw a track, pill, divider, or focus ring.
+struct NativeSegmentedPicker<Value: Hashable>: NSViewRepresentable {
     struct Option: Hashable, Identifiable {
         var value: Value
         var title: String
@@ -230,20 +24,6 @@ struct NativeSegmentedPicker<Value: Hashable>: View {
     private let accessibilityLabel: String
     @Binding private var selection: Value
     private let options: [Option]
-
-    @Environment(\.isEnabled) private var isEnabled
-    @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
-    @Environment(\.controlSize) private var controlSize
-    @FocusState private var isFocused: Bool
-    @Namespace private var selectionNamespace
-
-    private var measurementFont: NSFont {
-        NativeSegmentedPickerMetrics.font(
-            dynamicTypeSize: dynamicTypeSize,
-            controlSize: controlSize
-        )
-    }
 
     init(
         _ accessibilityLabel: String,
@@ -271,213 +51,290 @@ struct NativeSegmentedPicker<Value: Hashable>: View {
         )
     }
 
-    var body: some View {
-        let ax = NativeSegmentedPickerAXReport.make(
-            label: accessibilityLabel,
-            selection: selection,
-            options: options.map { (value: $0.value, title: $0.title) }
-        )
-        SegmentDistributionLayout {
-            ForEach(Array(options.enumerated()), id: \.element.id) { index, option in
-                segment(option, index: index, ax: ax.segments[index])
-            }
-        }
-        .padding(NativeSegmentedPickerMetrics.trackPadding)
-        .background(track)
-        .opacity(isEnabled ? 1 : 0.5)
-        .animation(.easeInOut(duration: 0.12), value: selection)
-        // Hug height so a tall parent (the pool header, NSToolbar) cannot
-        // stretch this into a slab. Width still follows the proposal when
-        // the proposal is a real bounded width.
-        .fixedSize(horizontal: false, vertical: true)
-        .focusable(true)
-        .focused($isFocused)
-        .onMoveCommand { direction in
-            moveSelection(direction)
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel(ax.label)
-        .accessibilityValue(ax.value)
-        .accessibilityIdentifier(ax.identifier)
-        .accessibilityAdjustableAction { direction in
-            switch direction {
-            case .increment:
-                moveSelection(.right)
-            case .decrement:
-                moveSelection(.left)
-            @unknown default:
-                break
-            }
-        }
-        .preference(key: NativeSegmentedPickerAXKey.self, value: ax)
-        .allowsHitTesting(isEnabled)
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
     }
 
-    private func moveSelection(_ direction: MoveCommandDirection) {
-        let values = options.map(\.value)
-        if let next = NativeSegmentedPickerSelection.neighbor(
-            of: selection,
-            in: values,
-            moving: direction
-        ) {
-            selection = next
-        }
+    func makeNSView(context: Context) -> NSSegmentedControl {
+        let control = NSSegmentedControl()
+        control.segmentStyle = .automatic
+        control.trackingMode = .selectOne
+        control.segmentDistribution = .fillProportionally
+        control.target = context.coordinator
+        control.action = #selector(Coordinator.selectionChanged(_:))
+        // Pool header shares a row with a sibling; the control must shrink
+        // when the HStack is tighter than the label ideal. Height hugs.
+        control.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        control.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        control.setContentCompressionResistancePriority(.required, for: .vertical)
+        control.setContentHuggingPriority(.required, for: .vertical)
+        sync(control, context: context)
+        return control
     }
 
-    private var track: some View {
-        RoundedRectangle(cornerRadius: 7, style: .continuous)
-            .fill(trackFill)
+    func updateNSView(_ control: NSSegmentedControl, context: Context) {
+        context.coordinator.parent = self
+        sync(control, context: context)
     }
 
-    private var trackFill: Color {
-        Color.primary.opacity(colorScheme == .dark ? 0.12 : 0.08)
-    }
-
-    private var selectionFill: Color {
-        colorScheme == .dark ? Color.white.opacity(0.16) : Color.white
-    }
-
-    private var selectionShadow: Color {
-        Color.black.opacity(colorScheme == .dark ? 0.45 : 0.16)
-    }
-
-    private func segment(
-        _ option: Option,
-        index: Int,
-        ax: NativeSegmentedPickerAXReport.Segment
-    ) -> some View {
-        let isSelected = ax.selected
-        return Button {
-            selection = option.value
-            isFocused = true
-        } label: {
-            Text(option.title)
-                .font(.system(size: measurementFont.pointSize))
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .padding(.horizontal, NativeSegmentedPickerMetrics.horizontalTitleInset)
-                .padding(.vertical, NativeSegmentedPickerMetrics.verticalTitleInset)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(SegmentPressStyle())
-        .focusable(false)
-        .foregroundStyle(.primary)
-        .background {
-            if isSelected {
-                RoundedRectangle(cornerRadius: 5.5, style: .continuous)
-                    .fill(selectionFill)
-                    .shadow(color: selectionShadow, radius: 0.5, y: 0.5)
-                    .matchedGeometryEffect(id: "selection-pill", in: selectionNamespace)
-            }
-        }
-        .overlay(alignment: .leading) {
-            if showsDivider(before: index) {
-                Rectangle()
-                    .fill(Color(nsColor: .separatorColor).opacity(0.7))
-                    .frame(width: 1)
-                    .padding(.vertical, 5)
-            }
-        }
-        .layoutValue(
-            key: SegmentIdealWidthKey.self,
-            value: NativeSegmentedPickerMetrics.segmentWidth(
-                for: option.title,
-                font: measurementFont
-            )
-        )
-        .layoutValue(
-            key: SegmentIdealHeightKey.self,
-            value: NativeSegmentedPickerMetrics.segmentHeight(font: measurementFont)
-        )
-        .accessibilityLabel(ax.label)
-        .accessibilityAddTraits(ax.selected ? [.isButton, .isSelected] : .isButton)
-        .accessibilityIdentifier(ax.identifier)
-        .help(option.title)
-    }
-
-    /// Native `NSSegmentedControl` draws a divider only between two unselected
-    /// neighbors; the selection pill replaces the divider on either side.
-    private func showsDivider(before index: Int) -> Bool {
-        guard index > 0, index < options.count else { return false }
-        return options[index].value != selection
-            && options[index - 1].value != selection
-    }
-}
-
-/// Press feedback without AppKit button chrome. `.plain` still inherited a
-/// hover highlight from the toolbar in some macOS 26 configurations.
-private struct SegmentPressStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .opacity(configuration.isPressed ? 0.82 : 1)
-    }
-}
-
-/// Distributes the proposed width across segments by label-string size, then
-/// shares leftover space equally. Longer titles (e.g. "Automations") keep
-/// their text at the toolbar's 440pt frame instead of truncating under
-/// equal-width slots. Compresses proportionally when the proposal is tighter
-/// than the ideal total. Ideal widths come from ``NativeSegmentedPickerMetrics``
-/// (the title at the environment-resolved control font), not from
-/// `sizeThatFits(nil)` on a `maxWidth: .infinity` child.
-private struct SegmentDistributionLayout: Layout {
+    /// Toolbar measurement. NSToolbar's measure pass proposes `nil` / ∞ / a
+    /// huge width; those must report the AppKit label ideal, not a poisoned
+    /// unbounded size. Finite proposals (including 0, SwiftUI's minimum-size
+    /// query, and the Mode picker's 440pt frame) are real bounds and are
+    /// filled. Height always hugs the control — a tall parent must not stretch
+    /// this into a slab.
+    ///
+    /// This is a pure read: it never touches the hosted `NSSegmentedControl`.
+    /// The ideal size comes from `Coordinator.idealSize`, which measures an
+    /// off-screen control and caches the result, so a measurement pass after
+    /// an unchanged update is a cache lookup rather than an Auto Layout pass.
+    /// Do not call back into SwiftUI `sizeThatFits` from here: that is the
+    /// `_overrideSizeThatFits` re-entry this wrapper exists to avoid.
     func sizeThatFits(
-        proposal: ProposedViewSize,
-        subviews: Subviews,
-        cache: inout ()
-    ) -> CGSize {
-        // Height always hugs the labels. Taking the parent's proposed height
-        // made the Agents pool picker grow into a tall slab.
-        let ideals = idealSizes(subviews)
-        let height = ideals.map(\.height).max()
-            ?? NativeSegmentedPickerMetrics.segmentHeight()
-        let idealWidth = ideals.map(\.width).reduce(0, +)
-        if let proposed = NativeSegmentedPickerMetrics.boundedWidth(proposal.width) {
-            return CGSize(width: proposed, height: height)
-        }
-        return CGSize(width: idealWidth, height: height)
+        _ proposal: ProposedViewSize,
+        nsView: NSSegmentedControl,
+        context: Context
+    ) -> CGSize? {
+        let font = NativeSegmentedPickerMetrics.fontIfOverridden(
+            dynamicTypeSize: context.environment.dynamicTypeSize,
+            controlSize: context.environment.controlSize
+        )
+        let natural = context.coordinator.idealSize(
+            titles: options.map(\.title),
+            controlSize: nsControlSize(context.environment.controlSize),
+            font: font
+        )
+        let width = NativeSegmentedPickerLayout.boundedWidth(proposal.width) ?? natural.width
+        return CGSize(width: width, height: natural.height)
     }
 
-    func placeSubviews(
-        in bounds: CGRect,
-        proposal: ProposedViewSize,
-        subviews: Subviews,
-        cache: inout ()
-    ) {
-        let ideals = idealSizes(subviews)
-        let rowHeight = ideals.map(\.height).max()
-            ?? NativeSegmentedPickerMetrics.segmentHeight()
-        let idealWidth = max(ideals.map(\.width).reduce(0, +), 1)
-        let availableWidth = NativeSegmentedPickerMetrics.boundedWidth(bounds.width) ?? idealWidth
-        let count = CGFloat(max(subviews.count, 1))
-        let widths: [CGFloat]
-        if idealWidth <= availableWidth {
-            let extra = (availableWidth - idealWidth) / count
-            widths = ideals.map { $0.width + extra }
-        } else {
-            let scale = availableWidth / idealWidth
-            widths = ideals.map { $0.width * scale }
+    @MainActor
+    final class Coordinator: NSObject {
+        var parent: NativeSegmentedPicker<Value>
+
+        /// Off-screen control used only for measurement. Never installed in
+        /// a view hierarchy, so mutating it during layout carries none of
+        /// the cost or side effects of mutating the hosted control.
+        private lazy var measuringControl: NSSegmentedControl = {
+            let control = NSSegmentedControl()
+            control.segmentDistribution = .fit
+            return control
+        }()
+        private var cachedTitles: [String] = []
+        private var cachedControlSize: NSControl.ControlSize?
+        private var cachedFontKey: String?
+        private var cachedSize: CGSize?
+        /// True after `sync` assigned an explicit Dynamic Type font, so a
+        /// later return to `.large` can clear it with `font = nil`.
+        fileprivate var appliedFontOverride = false
+
+        init(_ parent: NativeSegmentedPicker<Value>) {
+            self.parent = parent
         }
-        var x = bounds.minX
-        let y = bounds.minY + max(0, (bounds.height - rowHeight) / 2)
-        for (index, subview) in subviews.enumerated() {
-            let width = widths[index]
-            subview.place(
-                at: CGPoint(x: x, y: y),
-                anchor: .topLeading,
-                proposal: ProposedViewSize(width: width, height: rowHeight)
-            )
-            x += width
+
+        @objc func selectionChanged(_ sender: NSSegmentedControl) {
+            let index = sender.selectedSegment
+            let options = parent.options
+            guard index >= 0, index < options.count else { return }
+            let value = options[index].value
+            if parent.selection != value {
+                parent.selection = value
+            }
+        }
+
+        /// Content-sized measurement on `measuringControl`, cached on
+        /// `(titles, controlSize, font)`. `font` is `nil` on the default
+        /// Dynamic Type path so this control matches the hosted one
+        /// (AppKit's own font). `.fit` is the AppKit distribution that
+        /// reports the label ideal (`.fillProportionally`, the hosted
+        /// control's live distribution, would report the current frame
+        /// after a stretch instead).
+        func idealSize(
+            titles: [String],
+            controlSize: NSControl.ControlSize,
+            font: NSFont?
+        ) -> CGSize {
+            let fontKey = font.map { "\($0.fontName)-\($0.pointSize)" }
+            if let cachedSize,
+                cachedTitles == titles,
+                cachedControlSize == controlSize,
+                cachedFontKey == fontKey {
+                return cachedSize
+            }
+            let control = measuringControl
+            if control.segmentCount != titles.count {
+                control.segmentCount = titles.count
+            }
+            for (index, title) in titles.enumerated()
+            where control.label(forSegment: index) != title {
+                control.setLabel(title, forSegment: index)
+            }
+            control.controlSize = controlSize
+            if let font {
+                control.font = font
+            } else {
+                control.font = nil
+            }
+            var size = control.fittingSize
+            if size.width <= 0 || size.height <= 0 {
+                let cellSize = control.cell?.cellSize ?? NSSize(width: 8, height: 22)
+                size = CGSize(
+                    width: max(cellSize.width, 8),
+                    height: max(cellSize.height, 16)
+                )
+            }
+            cachedTitles = titles
+            cachedControlSize = controlSize
+            cachedFontKey = fontKey
+            cachedSize = size
+            return size
         }
     }
 
-    private func idealSizes(_ subviews: Subviews) -> [CGSize] {
-        subviews.map { subview in
-            CGSize(
-                width: max(subview[SegmentIdealWidthKey.self], 1),
-                height: max(subview[SegmentIdealHeightKey.self], 1)
-            )
+    private func sync(_ control: NSSegmentedControl, context: Context) {
+        if control.segmentCount != options.count {
+            control.segmentCount = options.count
         }
+        for (index, option) in options.enumerated() {
+            if control.label(forSegment: index) != option.title {
+                control.setLabel(option.title, forSegment: index)
+            }
+            if control.toolTip(forSegment: index) != option.title {
+                control.setToolTip(option.title, forSegment: index)
+            }
+        }
+        if let index = options.firstIndex(where: { $0.value == selection }) {
+            if control.selectedSegment != index {
+                control.selectedSegment = index
+            }
+        } else if control.selectedSegment != -1 {
+            // Value is not in the option list: leave the binding alone
+            // (same as `Picker`) and show no selection.
+            control.selectedSegment = -1
+        }
+        control.isEnabled = context.environment.isEnabled
+        control.controlSize = nsControlSize(context.environment.controlSize)
+        // Default Dynamic Type (`.large`) leaves AppKit's font alone so
+        // appearance tracks `NSSegmentedControl`. Non-default sizes are
+        // the only path that assigns an explicit `NSFont`; returning to
+        // `.large` clears that override.
+        let font = NativeSegmentedPickerMetrics.fontIfOverridden(
+            dynamicTypeSize: context.environment.dynamicTypeSize,
+            controlSize: context.environment.controlSize
+        )
+        if let font {
+            if control.font != font {
+                control.font = font
+            }
+            context.coordinator.appliedFontOverride = true
+        } else if context.coordinator.appliedFontOverride {
+            control.font = nil
+            context.coordinator.appliedFontOverride = false
+        }
+        control.setAccessibilityLabel(accessibilityLabel)
+        control.setAccessibilityIdentifier(
+            "native-segmented-picker.\(accessibilityLabel)"
+        )
+    }
+
+    private func nsControlSize(_ size: ControlSize) -> NSControl.ControlSize {
+        switch size {
+        case .mini: return .mini
+        case .small: return .small
+        case .regular: return .regular
+        case .large, .extraLarge: return .large
+        @unknown default: return .regular
+        }
+    }
+}
+
+/// Dynamic Type + control-size font resolution for ``NativeSegmentedPicker``.
+/// Kept off the generic representable because Swift forbids stored statics
+/// on generic types. Used only when SwiftUI `dynamicTypeSize` is not the
+/// default (`.large`); the default path leaves `NSSegmentedControl`'s own
+/// font in place so appearance tracks AppKit.
+enum NativeSegmentedPickerMetrics {
+    /// `nil` on `.large` so callers skip the override. Non-default Dynamic
+    /// Type still needs an explicit `NSFont` because AppKit does not
+    /// observe SwiftUI's environment value on its own.
+    static func fontIfOverridden(
+        dynamicTypeSize: DynamicTypeSize,
+        controlSize: ControlSize
+    ) -> NSFont? {
+        guard dynamicTypeSize != .large else { return nil }
+        return font(dynamicTypeSize: dynamicTypeSize, controlSize: controlSize)
+    }
+
+    static func font(
+        dynamicTypeSize: DynamicTypeSize,
+        controlSize: ControlSize
+    ) -> NSFont {
+        NSFont.systemFont(
+            ofSize: pointSize(dynamicTypeSize: dynamicTypeSize, controlSize: controlSize)
+        )
+    }
+
+    static func pointSize(
+        dynamicTypeSize: DynamicTypeSize,
+        controlSize: ControlSize
+    ) -> CGFloat {
+        basePointSize(for: controlSize) * dynamicTypeScale(dynamicTypeSize)
+    }
+
+    static func basePointSize(for controlSize: ControlSize) -> CGFloat {
+        switch controlSize {
+        case .mini:
+            return NSFont.systemFontSize(for: .mini)
+        case .small:
+            return NSFont.systemFontSize(for: .small)
+        case .regular:
+            return NSFont.systemFontSize(for: .regular)
+        case .large:
+            return NSFont.systemFontSize(for: .large)
+        case .extraLarge:
+            return NSFont.systemFontSize(for: .large) + 2
+        @unknown default:
+            // Same fallback as `nsControlSize`: unknown future cases map
+            // to regular metrics so bezel and text stay matched.
+            return NSFont.systemFontSize(for: .regular)
+        }
+    }
+
+    /// Body-text scale relative to `.large`, matching the HIG type ramp so
+    /// the control tracks Dynamic Type the way stock segmented `Picker` does.
+    static func dynamicTypeScale(_ size: DynamicTypeSize) -> CGFloat {
+        switch size {
+        case .xSmall: return 14.0 / 17.0
+        case .small: return 15.0 / 17.0
+        case .medium: return 16.0 / 17.0
+        case .large: return 1
+        case .xLarge: return 19.0 / 17.0
+        case .xxLarge: return 21.0 / 17.0
+        case .xxxLarge: return 23.0 / 17.0
+        case .accessibility1: return 28.0 / 17.0
+        case .accessibility2: return 33.0 / 17.0
+        case .accessibility3: return 40.0 / 17.0
+        case .accessibility4: return 47.0 / 17.0
+        case .accessibility5: return 53.0 / 17.0
+        @unknown default: return 1
+        }
+    }
+}
+
+/// Proposal-width classification for ``NativeSegmentedPicker``. Kept off the
+/// generic representable because Swift forbids stored statics on generic types.
+enum NativeSegmentedPickerLayout {
+    /// Proposals at or above this are treated as unbounded (NSToolbar's
+    /// infinite / "very large" measure pass), not as a real width to fill.
+    static let unboundedProposal: CGFloat = 2_000
+
+    /// Finite proposals in `[0, unboundedProposal)` — including 0, SwiftUI's
+    /// minimum-size query — are real bounds. `nil`, NaN, ∞, negatives, and
+    /// NSToolbar's huge measure pass are unbounded and take the label ideal.
+    static func boundedWidth(_ value: CGFloat?) -> CGFloat? {
+        guard let value, value.isFinite, value >= 0, value < unboundedProposal else {
+            return nil
+        }
+        return value
     }
 }
