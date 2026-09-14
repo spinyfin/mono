@@ -61,10 +61,13 @@ Behaviour preserved:
 
 - Selection binds to the existing model. A value that is no longer in the
   option list is left alone (same as `Picker`).
-- Arrow keys, click-versus-tab focus, and VoiceOver increment/decrement
-  come from `NSSegmentedControl` itself. The control is one keyboard focus
-  target; a mouse click does not paint a SwiftUI focus ring around the
-  whole control.
+- Keyboard and accessibility behaviour is `NSSegmentedControl`'s own:
+  VoiceOver exposes the control as a segment group and selects segments
+  directly (there is no increment/decrement action, unlike the previous
+  SwiftUI implementation), and arrow-key movement applies when the control
+  holds first responder under Full Keyboard Access. A mouse click takes
+  AppKit's click-focus semantics and paints no focus ring around the whole
+  control.
 - Each segment's accessible label is the string passed to `setLabel`.
 - Unbounded proposals (NSToolbar's measure pass) report AppKit's label
   ideal, not a poisoned infinite width. Finite proposals, including 0,
@@ -80,11 +83,11 @@ Other `.pickerStyle(.segmented)` sites (UI Stalls "Since", Attentions,
 Settings, Ideas, Activity log, Terminal Loop, editorial sheet, work form
 sheets) were not the measured 31–45%. They can take the same control later.
 
-## Live-app sample (operator)
+## Live-app sample
 
-Isolated `--capture-to` cannot reproduce the original load (populated board,
-live workers, scrollbar drag). Agents must not launch the production
-Boss.app. A person captures the before/after pair:
+Isolated `--capture-to` is an offscreen `cacheDisplay` that exits and cannot
+reproduce the original load (populated board, live workers, scrollbar drag).
+Capture the before/after pair against a live app:
 
 ```sh
 # Boss frontmost, Agents tab, stall monitoring on, no menu or popover.

@@ -18,16 +18,88 @@ final class NativeSegmentedPickerTests: XCTestCase {
 
     func testRepeatedLayoutStillHasOneControl() throws {
         let host = hostedPicker(width: 440, height: 32)
+        host.layoutSubtreeIfNeeded()
+        let control = try XCTUnwrap(segmentedControls(in: host).first)
+        let distributionBefore = control.segmentDistribution
+        let segmentCountBefore = control.segmentCount
+        let labelsBefore = (0..<control.segmentCount).map { control.label(forSegment: $0) }
+
         for _ in 0..<200 {
             host.needsLayout = true
             host.layoutSubtreeIfNeeded()
         }
+
         XCTAssertEqual(segmentedControls(in: host).count, 1)
-        let control = try XCTUnwrap(segmentedControls(in: host).first)
         XCTAssertEqual(control.segmentCount, modeTitles.count)
         XCTAssertEqual(
             (0..<control.segmentCount).map { control.label(forSegment: $0) },
             modeTitles.map(\.1)
+        )
+
+        // A measurement pass (`sizeThatFits`) must not mutate the hosted
+        // control — it measures via an off-screen `Coordinator` control
+        // instead. If a future edit re-introduces a measure-time write to
+        // the live control, or drops the `naturalSize` distribution
+        // restore, this is where it would show up.
+        XCTAssertEqual(
+            control.segmentDistribution,
+            distributionBefore,
+            "repeated layout must not leave the hosted control's segment distribution changed"
+        )
+        XCTAssertEqual(
+            control.segmentDistribution,
+            .fillProportionally,
+            "hosted control must stay .fillProportionally; measurement must never mutate it"
+        )
+        XCTAssertEqual(control.segmentCount, segmentCountBefore)
+        XCTAssertEqual(
+            (0..<control.segmentCount).map { control.label(forSegment: $0) },
+            labelsBefore
+        )
+    }
+
+    func testUnconstrainedMeasureAfterStretchStaysLabelSized() {
+        let titles = poolTitles
+        let selection = ModeBinding(value: titles[0].0)
+        let picker = NativeSegmentedPicker(
+            "Pool",
+            selection: selection.binding,
+            options: titles.map { NativeSegmentedPicker.Option(value: $0.0, title: $0.1) }
+        )
+        let host = NSHostingView(
+            rootView: picker
+                .frame(width: 800, height: 32)
+                .background(Color(nsColor: .windowBackgroundColor))
+        )
+        host.appearance = NSAppearance(named: .aqua)
+        host.frame = NSRect(x: 0, y: 0, width: 800, height: 32)
+        host.layoutSubtreeIfNeeded()
+
+        // Stretch the control to a wide frame first, then measure
+        // unconstrained. The ideal must stay label-sized rather than
+        // reporting back the stretched width — this is the sequential case
+        // the `.fit` / `.fillProportionally` split in `Coordinator.idealSize`
+        // exists to keep correct even when the live control is mid-stretch.
+        let unconstrainedHost = NSHostingView(
+            rootView: NativeSegmentedPicker(
+                "Pool",
+                selection: selection.binding,
+                options: titles.map { NativeSegmentedPicker.Option(value: $0.0, title: $0.1) }
+            )
+            .background(Color(nsColor: .windowBackgroundColor))
+        )
+        unconstrainedHost.appearance = NSAppearance(named: .aqua)
+        unconstrainedHost.layoutSubtreeIfNeeded()
+
+        XCTAssertGreaterThan(unconstrainedHost.fittingSize.width, 200)
+        XCTAssertLessThan(
+            unconstrainedHost.fittingSize.width,
+            NativeSegmentedPickerLayout.unboundedProposal
+        )
+        XCTAssertLessThan(
+            unconstrainedHost.fittingSize.width,
+            host.fittingSize.width,
+            "unconstrained ideal must stay label-sized, not the stretched 800pt frame"
         )
     }
 
@@ -86,6 +158,14 @@ final class NativeSegmentedPickerTests: XCTestCase {
             ("automations", "Automations (1)"),
             ("reviewers", "Reviewers (9)"),
         ]
+        // The mutation above is delivered through `@Published` /
+        // `ObservableObject`, which schedules the SwiftUI update rather
+        // than applying it synchronously. Pump the run loop so that
+        // update actually lands before `layoutSubtreeIfNeeded` and the
+        // assertions below — otherwise this is the only coverage of the
+        // pool picker's live counts and it would be silently depending on
+        // that delivery being synchronous.
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
         host.layoutSubtreeIfNeeded()
         control = try XCTUnwrap(segmentedControls(in: host).first)
         XCTAssertEqual(
@@ -250,6 +330,72 @@ final class NativeSegmentedPickerTests: XCTestCase {
         XCTAssertGreaterThan(large.fittingSize.height, regular.fittingSize.height)
     }
 
+    func testEnlargedDynamicTypeGrowsWithLongLocalizedTitle() throws {
+        // Two independently-constructed hosts intermittently observe a
+        // stale environment on their very first layout pass under headless
+        // XCTest hosting, so this drives one host through an environment
+        // update (the pattern `testDynamicTypeChangeOnExistingControlUpdatesFontAndSize`
+        // also uses) rather than comparing two freshly-created hosts.
+        let titles = [("automationen", "Sehr lange lokalisierte Automationen")]
+        let selection = ModeBinding(value: titles[0].0)
+        func picker(dynamicTypeSize: DynamicTypeSize) -> AnyView {
+            AnyView(
+                NativeSegmentedPicker(
+                    "Mode",
+                    selection: selection.binding,
+                    options: titles.map { NativeSegmentedPicker.Option(value: $0.0, title: $0.1) }
+                )
+                .environment(\.dynamicTypeSize, dynamicTypeSize)
+            )
+        }
+
+        let host = NSHostingView(rootView: picker(dynamicTypeSize: .large))
+        host.appearance = NSAppearance(named: .aqua)
+        host.layoutSubtreeIfNeeded()
+        let control = try XCTUnwrap(segmentedControls(in: host).first)
+        let fontBefore = control.font?.pointSize ?? 0
+        let widthBefore = host.fittingSize.width
+
+        host.rootView = picker(dynamicTypeSize: .accessibility3)
+        host.layoutSubtreeIfNeeded()
+        let fontAfter = control.font?.pointSize ?? 0
+        let widthAfter = host.fittingSize.width
+
+        // controlSize is held fixed; only dynamicTypeSize varies. Both the
+        // hosted control's font and its natural fitting (label-ideal) width
+        // must grow — NSSegmentedControl does not observe the SwiftUI
+        // environment value on its own, so this is on the wrapper to
+        // bridge. Height is not asserted here: AppKit's segmented control
+        // bezel height is fixed per `controlSize` and does not grow with
+        // point size the way the label width does.
+        XCTAssertGreaterThan(fontAfter, fontBefore)
+        XCTAssertGreaterThan(widthAfter, widthBefore)
+    }
+
+    func testDynamicTypeChangeOnExistingControlUpdatesFontAndSize() throws {
+        let model = LiveTitlesModel(selection: "bridgeCrew", titles: poolTitles)
+        let host = NSHostingView(
+            rootView: AnyView(
+                LiveTitlesHarness(model: model).environment(\.dynamicTypeSize, .large)
+            )
+        )
+        host.appearance = NSAppearance(named: .aqua)
+        host.layoutSubtreeIfNeeded()
+        let control = try XCTUnwrap(segmentedControls(in: host).first)
+        let fontBefore = control.font?.pointSize ?? 0
+        let widthBefore = host.fittingSize.width
+
+        host.rootView = AnyView(
+            LiveTitlesHarness(model: model).environment(\.dynamicTypeSize, .accessibility3)
+        )
+        host.layoutSubtreeIfNeeded()
+        let fontAfter = control.font?.pointSize ?? 0
+        let widthAfter = host.fittingSize.width
+
+        XCTAssertGreaterThan(fontAfter, fontBefore)
+        XCTAssertGreaterThan(widthAfter, widthBefore)
+    }
+
     // MARK: - Hosts
 
     private var modeTitles: [(String, String)] {
@@ -277,7 +423,8 @@ final class NativeSegmentedPickerTests: XCTestCase {
         titles: [(String, String)]? = nil,
         selection: ModeBinding? = nil,
         label: String = "Mode",
-        controlSize: ControlSize = .regular
+        controlSize: ControlSize = .regular,
+        dynamicTypeSize: DynamicTypeSize = .large
     ) -> NSHostingView<some View> {
         let titles = titles ?? modeTitles
         let selection = selection ?? ModeBinding(value: titles[0].0)
@@ -287,6 +434,7 @@ final class NativeSegmentedPickerTests: XCTestCase {
             options: titles.map { NativeSegmentedPicker.Option(value: $0.0, title: $0.1) }
         )
         .controlSize(controlSize)
+        .environment(\.dynamicTypeSize, dynamicTypeSize)
         let root: AnyView
         switch (width, height) {
         case let (w?, h?):

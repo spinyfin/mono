@@ -274,11 +274,9 @@ struct ContentView: View {
                     options: NavigationMode.allCases,
                     title: { $0.rawValue }
                 )
-                // Same 440pt box as the previous segmented Picker. The
-                // representable's sizeThatFits reports a finite AppKit
-                // fitting size on NSToolbar's unbounded measure pass, so
-                // this frame is a width choice rather than a measurement
-                // workaround.
+                // Chosen toolbar width (440pt). sizeThatFits reports a
+                // finite AppKit fitting size on NSToolbar's unbounded
+                // measure pass.
                 .frame(width: 440)
                 .fixedSize()
             }

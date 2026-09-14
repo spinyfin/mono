@@ -84,16 +84,26 @@ struct NativeSegmentedPicker<Value: Hashable>: NSViewRepresentable {
     /// filled. Height always hugs the control — a tall parent must not stretch
     /// this into a slab.
     ///
-    /// Measurement is `NSSegmentedControl.fittingSize` / `intrinsicContentSize`
-    /// only. Do not call back into SwiftUI `sizeThatFits` from here: that is
-    /// the `_overrideSizeThatFits` re-entry this wrapper exists to avoid.
+    /// This is a pure read: it never touches the hosted `NSSegmentedControl`.
+    /// The ideal size comes from `Coordinator.idealSize`, which measures an
+    /// off-screen control and caches the result, so a measurement pass after
+    /// an unchanged update is a cache lookup rather than an Auto Layout pass.
+    /// Do not call back into SwiftUI `sizeThatFits` from here: that is the
+    /// `_overrideSizeThatFits` re-entry this wrapper exists to avoid.
     func sizeThatFits(
         _ proposal: ProposedViewSize,
         nsView: NSSegmentedControl,
         context: Context
     ) -> CGSize? {
-        sync(nsView, context: context)
-        let natural = naturalSize(of: nsView)
+        let font = NativeSegmentedPickerMetrics.font(
+            dynamicTypeSize: context.environment.dynamicTypeSize,
+            controlSize: context.environment.controlSize
+        )
+        let natural = context.coordinator.idealSize(
+            titles: options.map(\.title),
+            controlSize: nsControlSize(context.environment.controlSize),
+            font: font
+        )
         let width = NativeSegmentedPickerLayout.boundedWidth(proposal.width) ?? natural.width
         return CGSize(width: width, height: natural.height)
     }
@@ -101,6 +111,19 @@ struct NativeSegmentedPicker<Value: Hashable>: NSViewRepresentable {
     @MainActor
     final class Coordinator: NSObject {
         var parent: NativeSegmentedPicker<Value>
+
+        /// Off-screen control used only for measurement. Never installed in
+        /// a view hierarchy, so mutating it during layout carries none of
+        /// the cost or side effects of mutating the hosted control.
+        private lazy var measuringControl: NSSegmentedControl = {
+            let control = NSSegmentedControl()
+            control.segmentDistribution = .fit
+            return control
+        }()
+        private var cachedTitles: [String] = []
+        private var cachedControlSize: NSControl.ControlSize?
+        private var cachedFontKey: String = ""
+        private var cachedSize: CGSize?
 
         init(_ parent: NativeSegmentedPicker<Value>) {
             self.parent = parent
@@ -115,6 +138,48 @@ struct NativeSegmentedPicker<Value: Hashable>: NSViewRepresentable {
                 parent.selection = value
             }
         }
+
+        /// Content-sized measurement on `measuringControl`, cached on
+        /// `(titles, controlSize, font)`. `.fit` is the AppKit distribution
+        /// that reports the label ideal (`.fillProportionally`, the hosted
+        /// control's live distribution, would report the current frame
+        /// after a stretch instead).
+        func idealSize(
+            titles: [String],
+            controlSize: NSControl.ControlSize,
+            font: NSFont
+        ) -> CGSize {
+            let fontKey = "\(font.fontName)-\(font.pointSize)"
+            if let cachedSize,
+                cachedTitles == titles,
+                cachedControlSize == controlSize,
+                cachedFontKey == fontKey {
+                return cachedSize
+            }
+            let control = measuringControl
+            if control.segmentCount != titles.count {
+                control.segmentCount = titles.count
+            }
+            for (index, title) in titles.enumerated()
+            where control.label(forSegment: index) != title {
+                control.setLabel(title, forSegment: index)
+            }
+            control.controlSize = controlSize
+            control.font = font
+            var size = control.fittingSize
+            if size.width <= 0 || size.height <= 0 {
+                let cellSize = control.cell?.cellSize ?? NSSize(width: 8, height: 22)
+                size = CGSize(
+                    width: max(cellSize.width, 8),
+                    height: max(cellSize.height, 16)
+                )
+            }
+            cachedTitles = titles
+            cachedControlSize = controlSize
+            cachedFontKey = fontKey
+            cachedSize = size
+            return size
+        }
     }
 
     private func sync(_ control: NSSegmentedControl, context: Context) {
@@ -125,7 +190,9 @@ struct NativeSegmentedPicker<Value: Hashable>: NSViewRepresentable {
             if control.label(forSegment: index) != option.title {
                 control.setLabel(option.title, forSegment: index)
             }
-            control.setToolTip(option.title, forSegment: index)
+            if control.toolTip(forSegment: index) != option.title {
+                control.setToolTip(option.title, forSegment: index)
+            }
         }
         if let index = options.firstIndex(where: { $0.value == selection }) {
             if control.selectedSegment != index {
@@ -138,34 +205,17 @@ struct NativeSegmentedPicker<Value: Hashable>: NSViewRepresentable {
         }
         control.isEnabled = context.environment.isEnabled
         control.controlSize = nsControlSize(context.environment.controlSize)
+        let font = NativeSegmentedPickerMetrics.font(
+            dynamicTypeSize: context.environment.dynamicTypeSize,
+            controlSize: context.environment.controlSize
+        )
+        if control.font != font {
+            control.font = font
+        }
         control.setAccessibilityLabel(accessibilityLabel)
         control.setAccessibilityIdentifier(
             "native-segmented-picker.\(accessibilityLabel)"
         )
-    }
-
-    /// Content-sized measurement. `.fillProportionally` is the display
-    /// distribution (extra width is shared across segments) but would make
-    /// `fittingSize` report the current frame after a stretch; `.fit` asks
-    /// AppKit for the label ideal. Both calls stay on the AppKit control —
-    /// no SwiftUI `sizeThatFits` re-entry.
-    private func naturalSize(of control: NSSegmentedControl) -> CGSize {
-        let previous = control.segmentDistribution
-        if previous != .fit {
-            control.segmentDistribution = .fit
-        }
-        var size = control.fittingSize
-        if previous != .fit {
-            control.segmentDistribution = previous
-        }
-        if size.width <= 0 || size.height <= 0 {
-            let cellSize = control.cell?.cellSize ?? NSSize(width: 8, height: 22)
-            size = CGSize(
-                width: max(cellSize.width, 8),
-                height: max(cellSize.height, 16)
-            )
-        }
-        return size
     }
 
     private func nsControlSize(_ size: ControlSize) -> NSControl.ControlSize {
@@ -175,6 +225,66 @@ struct NativeSegmentedPicker<Value: Hashable>: NSViewRepresentable {
         case .regular: return .regular
         case .large, .extraLarge: return .large
         @unknown default: return .regular
+        }
+    }
+}
+
+/// Dynamic Type + control-size font resolution for ``NativeSegmentedPicker``.
+/// Kept off the generic representable because Swift forbids stored statics
+/// on generic types. `NSSegmentedControl` does not observe SwiftUI's
+/// `dynamicTypeSize` environment value on its own, so this bridges it to an
+/// explicit `NSFont` the wrapper assigns and measures with.
+enum NativeSegmentedPickerMetrics {
+    static func font(
+        dynamicTypeSize: DynamicTypeSize,
+        controlSize: ControlSize
+    ) -> NSFont {
+        NSFont.systemFont(
+            ofSize: pointSize(dynamicTypeSize: dynamicTypeSize, controlSize: controlSize)
+        )
+    }
+
+    static func pointSize(
+        dynamicTypeSize: DynamicTypeSize,
+        controlSize: ControlSize
+    ) -> CGFloat {
+        basePointSize(for: controlSize) * dynamicTypeScale(dynamicTypeSize)
+    }
+
+    static func basePointSize(for controlSize: ControlSize) -> CGFloat {
+        switch controlSize {
+        case .mini:
+            return NSFont.systemFontSize(for: .mini)
+        case .small:
+            return NSFont.systemFontSize(for: .small)
+        case .regular:
+            return NSFont.systemFontSize(for: .regular)
+        case .large:
+            return NSFont.systemFontSize(for: .large)
+        case .extraLarge:
+            return NSFont.systemFontSize(for: .large) + 2
+        @unknown default:
+            return NSFont.systemFontSize(for: .large) + 2
+        }
+    }
+
+    /// Body-text scale relative to `.large`, matching the HIG type ramp so
+    /// the control tracks Dynamic Type the way stock segmented `Picker` does.
+    static func dynamicTypeScale(_ size: DynamicTypeSize) -> CGFloat {
+        switch size {
+        case .xSmall: return 14.0 / 17.0
+        case .small: return 15.0 / 17.0
+        case .medium: return 16.0 / 17.0
+        case .large: return 1
+        case .xLarge: return 19.0 / 17.0
+        case .xxLarge: return 21.0 / 17.0
+        case .xxxLarge: return 23.0 / 17.0
+        case .accessibility1: return 28.0 / 17.0
+        case .accessibility2: return 33.0 / 17.0
+        case .accessibility3: return 40.0 / 17.0
+        case .accessibility4: return 47.0 / 17.0
+        case .accessibility5: return 53.0 / 17.0
+        @unknown default: return 1
         }
     }
 }
