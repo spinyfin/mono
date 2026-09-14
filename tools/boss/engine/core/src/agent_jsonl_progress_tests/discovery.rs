@@ -22,6 +22,47 @@ use crate::driver::AgentJsonlFileIngress;
 use crate::events_socket::IncomingHookEvent;
 use crate::stdout_progress::WorkerEventSink;
 
+#[tokio::test]
+async fn rejected_candidate_after_overdue_refreshes_diagnostics_and_can_recover() {
+    let fx = armed_run("run-diagnostic", Duration::from_millis(100));
+    fx.sink
+        .wait_for(|obs| {
+            obs.iter()
+                .any(|o| matches!(o, IngressObservation::DiscoveryOverdue { .. }))
+        })
+        .await;
+    let path = fx.sessions().join("rollout-diagnostic-thread.jsonl");
+    fs::write(&path, vec![b'x'; super::MAX_SESSION_META_BYTES as usize + 1]).unwrap();
+    fx.sink
+        .wait_for(|_| {
+            discovery_record(fx.store.get("run-diagnostic")).is_some_and(|r| {
+                r.rejections
+                    .first()
+                    .is_some_and(|r| r.reason == super::CandidateRejectReason::OversizedSessionMeta)
+            })
+        })
+        .await;
+    let oversized = discovery_record(fx.store.get("run-diagnostic")).unwrap();
+    assert_eq!(oversized.rejected_candidates, 1);
+    assert_eq!(oversized.rejections[0].file_name, "rollout-diagnostic-thread.jsonl");
+    assert!(oversized.waited_secs >= 1);
+    fs::write(&path, b"{").unwrap();
+    fx.sink
+        .wait_for(|_| {
+            discovery_record(fx.store.get("run-diagnostic")).is_some_and(|r| {
+                r.rejections
+                    .first()
+                    .is_some_and(|r| r.reason == super::CandidateRejectReason::IncompleteSessionMeta)
+            })
+        })
+        .await;
+    fs::write(&path, rollout(&fx.workspace(), "thread")).unwrap();
+    fx.sink
+        .wait_for(|obs| obs.iter().any(|o| matches!(o, IngressObservation::Attached { .. })))
+        .await;
+    fx.manager.stop_run("run-diagnostic");
+}
+
 /// Captures both the fan-out events and the ingress observations.
 #[derive(Clone, Default)]
 struct ObservingSink {
@@ -178,7 +219,7 @@ async fn rollout_appearing_after_the_overdue_threshold_still_attaches() {
     );
 
     // Now the driver finally writes its rollout — the equivalent of the
-    // incident's 123–129s startups against the old 120s give-up point.
+    // incident's 123–126s startups against the old 120s give-up point.
     let path = fx.sessions().join("rollout-late-thread-late.jsonl");
     fs::write(&path, rollout(&fx.workspace(), "thread-late")).unwrap();
 
@@ -311,6 +352,7 @@ fn armed_checkpoint_serialization_is_backward_compatible() {
             at_epoch_secs: 1_789_335_748,
             waited_secs: 120,
             rejected_candidates: 0,
+            rejections: Vec::new(),
             reason: "still looking".into(),
         }),
     };

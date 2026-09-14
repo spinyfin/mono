@@ -493,6 +493,7 @@ pub async fn run_one_pass(
             }
         }
 
+        let file_ingress = file_ingress_state(work_db, execution_id);
         tracing::error!(
             execution_id,
             work_item_id = %execution.work_item_id,
@@ -501,9 +502,9 @@ pub async fn run_one_pass(
             activity = candidate.activity.as_str(),
             silent_secs = candidate.silent_secs,
             threshold_secs = driver_start_grace_secs,
+            reading = %driver_start_reading(file_ingress.as_ref()),
             "driver-start timeout: pane spawned but NO driver-originated signal (no hook event, no \
-             transcript path) ever arrived. The reported shell pid is the login shell hosting the \
-             pane, not the driver. Reaping: releasing the worker slot and the cube workspace lease \
+             transcript path) ever arrived. Reaping: releasing the worker slot and the cube workspace lease \
              and raising an attention item.",
         );
 
@@ -516,7 +517,7 @@ pub async fn run_one_pass(
                 grace_secs: driver_start_grace_secs,
                 silent_secs: candidate.silent_secs,
                 activity: candidate.activity.as_str(),
-                file_ingress: file_ingress_state(work_db, execution_id),
+                file_ingress,
             },
             now_epoch_secs,
         )
@@ -628,9 +629,13 @@ pub(crate) fn file_ingress_state(work_db: &WorkDb, execution_id: &str) -> Option
             let summary = match record.verdict {
                 DiscoveryVerdict::Overdue => format!(
                     "the engine's file ingress never attached to a rollout: discovery was overdue at \
-                     {}s ({} rollout-shaped file(s) rejected as not this run's) and still looking, so the \
+                     {}s, recorded {}s before this reap ({} rollout-shaped file(s) that did not correlate to this run); discovery was still looking, so the \
                      driver may have started and run unobserved",
-                    record.waited_secs, record.rejected_candidates
+                    record.waited_secs,
+                    boss_engine_utils::epoch_time::now_epoch_secs()
+                        .saturating_sub(record.at_epoch_secs)
+                        .max(0),
+                    record.rejected_candidates
                 ),
                 DiscoveryVerdict::Failed => format!(
                     "the engine's file ingress never attached to a rollout: discovery failed after {}s \
@@ -826,10 +831,11 @@ pub(crate) async fn reap_never_started_spawn(
     // every reap on this path and stayed `leased` until TTL, kept warm by
     // the engine's own DB-fallback heartbeat.
     //
-    // Here we KNOW no worker occupies the workspace: no driver ever
-    // signalled, and the pane (with whatever shell it hosted) was torn
-    // down above. Holding the lease "to be safe" is the harm, not the
-    // safe option — that is what the 2026-07-30 incident was. Mirrors
+    // An overdue or failed ingress does not prove the workspace was
+    // unoccupied: a driver may have run unobserved. Release relies on the
+    // pane teardown above preventing further pane-hosted worker progress,
+    // not on missing signals. Keeping the lease after teardown would leave
+    // it warmed by DB heartbeats until TTL, as in the 2026-07-30 incident. Mirrors
     // `lost_workspace_sweep::run_one_pass`. Best-effort: a lease already
     // gone is the common benign case, so failure is `debug`, not `warn`.
     if let Some(lease_id) = execution.cube_lease_id.as_deref()
@@ -964,13 +970,25 @@ fn raise_driver_start_attention(
 ) {
     let execution_id = execution.id.as_str();
     let reading = driver_start_reading(file_ingress);
-    let pid_note = if shell_pid > 0 {
+    let pid_note = if shell_pid > 0 && file_ingress.is_some() {
+        format!("The pane reported shell pid `{shell_pid}`; this does not establish whether the driver ran.")
+    } else if shell_pid > 0 {
         format!(
             "The pane reported shell pid `{shell_pid}`, which is why every existing check treated \
              this slot as healthy — that pid is the **login shell hosting the pane**, not the driver."
         )
     } else {
         "No shell pid was ever reported for this pane.".to_owned()
+    };
+    let advice = if file_ingress.is_some() {
+        "Inspect the file-ingress checkpoint and rollout diagnostics to determine why no driver signal was observed."
+    } else {
+        "If this repeats for the same driver, the spawn command is most likely not reaching the driver binary at all — check how the command is delivered to the pane."
+    };
+    let title = if file_ingress.is_some() {
+        format!("Worker produced no driver signal on slot {slot_id}")
+    } else {
+        format!("Worker driver never started on slot {slot_id}")
     };
     let body = format!(
         "A worker pane was spawned for execution `{execution_id}` on slot {slot_id}, but no \
@@ -979,14 +997,12 @@ fn raise_driver_start_attention(
          {pid_note}\n\n\
          The engine has reaped the execution: the pane was torn down, the worker slot released, \
          and the cube workspace lease force-released. The work item is reset for redispatch.\n\n\
-         If this repeats for the same driver, the spawn command is most likely not reaching the \
-         driver binary at all — check how the command is delivered to the pane rather than \
-         whether the pane exists."
+         {advice}"
     );
     if let Err(err) = work_db.create_attention_item(CreateAttentionItemInput {
         body_markdown: body,
         kind: DRIVER_START_ATTENTION_KIND.to_owned(),
-        title: format!("Worker driver never started on slot {slot_id}"),
+        title,
         execution_id: Some(execution_id.to_owned()),
         resolved_at: None,
         status: None,
@@ -1011,6 +1027,10 @@ fn raise_driver_start_attention(
 #[cfg(test)]
 #[path = "spawn_ack_sweep_induced_failure_tests.rs"]
 mod induced_failure_tests;
+
+#[cfg(test)]
+#[path = "spawn_ack_sweep_ingress_tests.rs"]
+mod ingress_tests;
 
 #[cfg(test)]
 mod tests {
