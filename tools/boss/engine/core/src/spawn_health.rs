@@ -279,6 +279,9 @@ pub struct SpawnFailureEvidence {
 pub struct FailureComposition {
     pub no_shell: usize,
     pub shell_without_driver_signal: usize,
+    /// True when every `ShellWithoutDriverSignal` row had `shell_pid > 0`.
+    /// Vacuously true when that class is absent.
+    pub every_driver_start_had_a_shell: bool,
 }
 
 impl FailureComposition {
@@ -286,11 +289,17 @@ impl FailureComposition {
         let mut composition = Self {
             no_shell: 0,
             shell_without_driver_signal: 0,
+            every_driver_start_had_a_shell: true,
         };
         for entry in evidence {
             match entry.class {
                 SpawnFailureClass::NoShell => composition.no_shell += 1,
-                SpawnFailureClass::ShellWithoutDriverSignal => composition.shell_without_driver_signal += 1,
+                SpawnFailureClass::ShellWithoutDriverSignal => {
+                    composition.shell_without_driver_signal += 1;
+                    if entry.shell_pid <= 0 {
+                        composition.every_driver_start_had_a_shell = false;
+                    }
+                }
             }
         }
         composition
@@ -312,10 +321,15 @@ impl FailureComposition {
             ));
         }
         if self.shell_without_driver_signal > 0 {
+            let observed = if self.every_driver_start_had_a_shell {
+                SpawnFailureClass::ShellWithoutDriverSignal.observed()
+            } else {
+                "a pane came up but no driver-originated signal was observed (not every failure \
+                 reported a shell pid)"
+            };
             parts.push(format!(
                 "{} driver-start timeout(s) ({})",
-                self.shell_without_driver_signal,
-                SpawnFailureClass::ShellWithoutDriverSignal.observed()
+                self.shell_without_driver_signal, observed
             ));
         }
         if parts.is_empty() {
@@ -328,13 +342,19 @@ impl FailureComposition {
     /// Where the operator should look first, given what was observed.
     pub fn diagnosis_hint(&self) -> &'static str {
         match (self.no_shell, self.shell_without_driver_signal) {
-            (0, n) if n > 0 => {
+            (0, n) if n > 0 && self.every_driver_start_had_a_shell => {
                 "Every failure in the window had a working pane and shell, so the app's pane-spawn \
                  path is NOT implicated. Look at the driver and its progress signal: for a \
                  file-tailing driver (Codex, Grok) read the engine log for `agent JSONL progress` \
                  discovery lines naming each reaped execution — they say whether a rollout existed \
                  and why it was not attached — and check the rollout on disk before concluding the \
                  driver never ran."
+            }
+            (0, n) if n > 0 => {
+                "Every failure in the window was classed as a driver-start timeout, but not every \
+                 one reported a shell pid — do not assume the app's pane-spawn path is healthy. \
+                 Read each execution's observed text and the engine log for `agent JSONL progress` \
+                 discovery lines before concluding where to look."
             }
             (n, 0) if n > 0 => {
                 "No shell came up for any failure in the window, so the app's pane-spawn path is \
@@ -1923,6 +1943,7 @@ mod tests {
             FailureComposition {
                 no_shell: 0,
                 shell_without_driver_signal: 4,
+                every_driver_start_had_a_shell: true,
             }
         );
         let described = composition.describe();

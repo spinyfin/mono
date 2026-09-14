@@ -236,7 +236,7 @@ pub(crate) fn scan_once(prepared: &PreparedSource) -> Result<DiscoveryScan, Stri
 /// What the loop measured about its own scheduling, for the failure message
 /// and the starvation warning.
 #[derive(Debug, Clone, Copy)]
-struct ScanCadence {
+pub(crate) struct ScanCadence {
     scans: u64,
     longest_gap: Duration,
     last_scan_finished: tokio::time::Instant,
@@ -267,7 +267,8 @@ impl ScanCadence {
 /// ever existed under the root, or something did and was rejected. The
 /// second names every file seen on the final scan with its reason, and says
 /// whether the reason is one that more waiting could have changed.
-#[derive(Debug)]
+#[derive(Debug, bon::Builder)]
+#[builder(on(String, into))]
 pub(crate) struct DiscoveryFailure {
     root: PathBuf,
     /// The filename shape discovery was looking for, e.g. `rollout-*.jsonl`.
@@ -275,6 +276,10 @@ pub(crate) struct DiscoveryFailure {
     elapsed: Duration,
     cadence: ScanCadence,
     rejected: Vec<(PathBuf, CandidateRejection)>,
+    /// Last per-scan error that was retried rather than aborting the loop.
+    /// Folded into the deadline message so a window that never completed a
+    /// scan is not narrated as "no file existed".
+    last_scan_error: Option<String>,
 }
 
 impl fmt::Display for DiscoveryFailure {
@@ -283,6 +288,14 @@ impl fmt::Display for DiscoveryFailure {
         let gap_ms = self.cadence.longest_gap.as_millis();
         let secs = self.elapsed.as_secs();
         if self.rejected.is_empty() {
+            if let Some(err) = &self.last_scan_error {
+                return write!(
+                    f,
+                    "could not complete a scan of {} after {scans} scans over {secs}s \
+                     (longest gap between scans {gap_ms}ms); last error: {err}",
+                    self.root.display(),
+                );
+            }
             return write!(
                 f,
                 "no file named {} existed under {} on any of {scans} scans over {secs}s \
@@ -293,8 +306,8 @@ impl fmt::Display for DiscoveryFailure {
         }
         write!(
             f,
-            "{} rollout file(s) exist under {} but none correlates to this run after {scans} scans \
-             over {secs}s (longest gap between scans {gap_ms}ms):",
+            "{} rollout file(s) were seen under {} during the window but none correlated to this run \
+             after {scans} scans over {secs}s (longest gap between scans {gap_ms}ms):",
             self.rejected.len(),
             self.root.display(),
         )?;
@@ -305,6 +318,9 @@ impl fmt::Display for DiscoveryFailure {
                 "permanent"
             };
             write!(f, " [{kind}] {}: {rejection};", path.display())?;
+        }
+        if let Some(err) = &self.last_scan_error {
+            write!(f, " last scan error: {err}")?;
         }
         Ok(())
     }
@@ -337,6 +353,7 @@ pub(crate) async fn discover_candidate(
     // last scan must still be named in the diagnosis, not silently dropped
     // back to "nothing appeared".
     let mut ever_rejected: std::collections::HashMap<PathBuf, CandidateRejection> = std::collections::HashMap::new();
+    let mut last_scan_error: Option<String> = None;
     loop {
         // A `Cancel` during discovery stops it: the engine is tearing the
         // ingress down and there is nothing left to attach to.
@@ -344,9 +361,55 @@ pub(crate) async fn discover_candidate(
             return Ok(None);
         }
         let scan_source = Arc::clone(&prepared);
-        let scan = tokio::task::spawn_blocking(move || scan_once(&scan_source))
-            .await
-            .map_err(|err| format!("rollout discovery scan task failed: {err}"))??;
+        let scan = match tokio::task::spawn_blocking(move || scan_once(&scan_source)).await {
+            Err(err) => return Err(format!("rollout discovery scan task failed: {err}")),
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    root = %prepared.root.path.display(),
+                    error = %err,
+                    "agent JSONL progress: a discovery scan failed; retrying rather than ending \
+                     this run's progress ingress",
+                );
+                last_scan_error = Some(err);
+                let now = tokio::time::Instant::now();
+                let gap = cadence.record(now);
+                if gap > STARVED_SCAN_GAP && cadence.scans > 1 {
+                    tracing::warn!(
+                        root = %prepared.root.path.display(),
+                        gap_ms = gap.as_millis() as u64,
+                        poll_ms = DISCOVERY_POLL.as_millis() as u64,
+                        scans = cadence.scans,
+                        "agent JSONL progress: discovery poll starved — the gap between two scans was far \
+                         above the poll interval; the engine runtime was not scheduling this task",
+                    );
+                }
+                if now >= deadline {
+                    let mut rejected: Vec<(PathBuf, CandidateRejection)> = ever_rejected.into_iter().collect();
+                    rejected.sort_by(|a, b| a.0.cmp(&b.0));
+                    return Err(DiscoveryFailure {
+                        root: prepared.root.path.clone(),
+                        name_shape: format!(
+                            "{}*{}",
+                            prepared.ingress.filename_prefix, prepared.ingress.filename_suffix
+                        ),
+                        elapsed: now.saturating_duration_since(started),
+                        cadence,
+                        rejected,
+                        last_scan_error,
+                    }
+                    .to_string());
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(DISCOVERY_POLL) => {}
+                    changed = halt.changed() => {
+                        let _ = changed;
+                        return Ok(None);
+                    }
+                }
+                continue;
+            }
+            Ok(Ok(scan)) => scan,
+        };
         let now = tokio::time::Instant::now();
         let gap = cadence.record(now);
         if gap > STARVED_SCAN_GAP && cadence.scans > 1 {
@@ -399,6 +462,7 @@ pub(crate) async fn discover_candidate(
                 elapsed: now.saturating_duration_since(started),
                 cadence,
                 rejected,
+                last_scan_error,
             }
             .to_string());
         }
@@ -466,6 +530,12 @@ pub(crate) fn scan_matching_paths(
                 // vanishing from both `matched` and `rejected`.
                 if name_shaped {
                     matches.insert(path);
+                    if matches.len() > MAX_DISCOVERY_MATCHES {
+                        return Err(format!(
+                            "rollout discovery exceeded {MAX_DISCOVERY_MATCHES} matching files under {}",
+                            root.path.display()
+                        ));
+                    }
                 }
                 continue;
             }
@@ -785,8 +855,8 @@ mod tests {
             .expect_err("a rejected rollout is a failure, not an attachment");
 
         assert!(
-            err.starts_with("1 rollout file(s) exist under"),
-            "the failure must say a file existed; got: {err}"
+            err.starts_with("1 rollout file(s) were seen under"),
+            "the failure must say a file was seen; got: {err}"
         );
         assert!(err.contains("rollout-2026-09-13T21-41-42-sess-1.jsonl"), "got: {err}");
         assert!(
@@ -856,6 +926,10 @@ mod tests {
             err.contains("rollout-2026-09-13T21-41-42-sess-1.jsonl"),
             "a rejection seen earlier in the window must survive to the final message even though \
              the final scan no longer sees the file; got: {err}"
+        );
+        assert!(
+            err.contains("were seen") && !err.contains("file(s) exist under"),
+            "the union may retain a deleted path, so the message must not claim it still exists; got: {err}"
         );
         assert!(!err.starts_with("no file named"), "got: {err}");
     }
@@ -1024,6 +1098,14 @@ mod tests {
     /// A directory this process cannot read must fail the whole scan rather
     /// than silently skip it — an unreadable directory could be hiding the
     /// very rollout the reaper is asking about.
+    ///
+    /// Covers the pre-existing `read_dir` `Err` arm (`PermissionDenied` on a
+    /// `0o000` directory). The per-entry `canonicalize` arm added alongside
+    /// it is covered by `unsearchable_directory_fails_canonicalize_on_the_child`.
+    /// The `DirEntry` iterator-item and `file_type()` error arms are not
+    /// reachable from a portable test: both fail only when the directory
+    /// is mutated under the iterator, which `std::fs::read_dir` does not
+    /// expose a handle for.
     #[cfg(unix)]
     #[test]
     fn unreadable_directory_fails_the_scan_rather_than_silently_dropping_it() {
@@ -1051,6 +1133,91 @@ mod tests {
 
         let err = result.expect_err("an unreadable directory must fail the scan, not silently skip it");
         assert!(err.contains("locked") || err.contains("read"), "got: {err}");
+    }
+
+    /// `read_dir` of a readable-but-unsearchable directory succeeds and
+    /// `d_type` supplies `file_type`, but `canonicalize` on the child fails
+    /// with `EACCES` — the per-entry arm this revision made fatal.
+    #[cfg(unix)]
+    #[test]
+    fn unsearchable_directory_fails_canonicalize_on_the_child() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let fx = fixture();
+        let prepared = PreparedSource::new(fx.ingress.clone()).unwrap();
+        let noexec = fx.root.join("noexec");
+        fs::create_dir_all(&noexec).unwrap();
+        fs::write(
+            noexec.join("rollout-2026-09-13T21-41-42-sess-1.jsonl"),
+            session_meta_line("sess-1", &fx.workspace),
+        )
+        .unwrap();
+        fs::set_permissions(&noexec, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let result = scan_once(&prepared);
+
+        fs::set_permissions(&noexec, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = result.expect_err("canonicalize of a child in an unsearchable directory must fail the scan");
+        assert!(
+            err.contains("canonicalize") || err.contains("noexec") || err.contains("Permission denied"),
+            "got: {err}"
+        );
+    }
+
+    /// Name-shaped symlinks must honour the same match cap as regular files.
+    #[cfg(unix)]
+    #[test]
+    fn name_shaped_symlinks_are_capped_by_max_discovery_matches() {
+        let fx = fixture();
+        let prepared = PreparedSource::new(fx.ingress.clone()).unwrap();
+        let target = fx.root.join("target");
+        fs::write(&target, "x").unwrap();
+        for i in 0..=MAX_DISCOVERY_MATCHES {
+            let link = fx.root.join(format!("rollout-link-{i}-sess-1.jsonl"));
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+        }
+        let err = scan_matching_paths(&prepared.root, &prepared.ingress)
+            .expect_err("too many name-shaped symlinks must fail the scan rather than returning all of them");
+        assert!(
+            err.contains("exceeded") && err.contains(&MAX_DISCOVERY_MATCHES.to_string()),
+            "got: {err}"
+        );
+    }
+
+    /// A per-scan error must be retried inside the discovery window, not
+    /// abort the ingress for the rest of the run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_transient_scan_error_is_retried_and_does_not_end_discovery() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let fx = fixture();
+        let prepared = PreparedSource::new(fx.ingress.clone()).unwrap();
+        let locked = fx.root.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let rollout = fx.root.join("rollout-2026-09-13T21-41-42-sess-1.jsonl");
+        let line = session_meta_line("sess-1", &fx.workspace);
+        let locked_restore = locked.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            fs::set_permissions(&locked_restore, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::write(&rollout, line).unwrap();
+        });
+
+        let candidate = discover_candidate(&prepared, &mut running_halt(), Duration::from_secs(5))
+            .await
+            .unwrap()
+            .expect("a later scan after the transient error must still attach");
+        assert_eq!(candidate.session_id, "sess-1");
     }
 
     // ─── the liveness probe ──────────────────────────────────────────────────

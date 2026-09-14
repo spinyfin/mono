@@ -207,6 +207,15 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         "Asserts the worker's driver never started. A later run start is the direct contradiction.",
     ),
     entry(
+        crate::spawn_ack_sweep::LIVENESS_UNDETERMINABLE_ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "The spawn-ack sweep files this when liveness stays undeterminable across consecutive passes. \
+         A later Present probe, a driver-originated signal, or the execution leaving the candidate set \
+         (terminal status or a committed reap) is the producer observing that liveness is no longer \
+         unknown; the generic reconciler's run-start evidence would leave the warning up for the rest \
+         of a recovered run.",
+    ),
+    entry(
         crate::app::readoption::PROGRESS_INGRESS_UNRECOVERABLE_ATTENTION_KIND,
         ClearedBy::WorkResumed,
         "Asserts progress for a specific run could not be ingested. A later run supersedes that \
@@ -607,6 +616,7 @@ mod tests {
             crate::tmux_adoption::TMUX_ADOPTION_SCHEMA_SKEW_ATTENTION_KIND,
             crate::tmux_adoption::TMUX_LEGACY_LABEL_SERVER_ATTENTION_KIND,
             crate::spawn_ack_sweep::DRIVER_START_ATTENTION_KIND,
+            crate::spawn_ack_sweep::LIVENESS_UNDETERMINABLE_ATTENTION_KIND,
             crate::app::readoption::PROGRESS_INGRESS_UNRECOVERABLE_ATTENTION_KIND,
             crate::app::probes::PROBE_UNDELIVERED_ATTENTION_KIND,
             crate::completion::NUDGE_BREAKER_ATTENTION_KIND,

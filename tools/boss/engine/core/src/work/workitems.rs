@@ -509,6 +509,22 @@ impl WorkDb {
         Ok(rows)
     }
 
+    /// Mark every open attention item of `kind` for `execution_id` as
+    /// resolved. Returns the count resolved (`0` when none were open).
+    pub fn resolve_attention_kind_for_execution(&self, execution_id: &str, kind: &str) -> Result<usize> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let rows = conn.execute(
+            "UPDATE work_attention_items
+             SET status = 'resolved', resolved_at = ?1
+             WHERE execution_id = ?2
+               AND kind = ?3
+               AND status = 'open'",
+            params![now, execution_id, kind],
+        )?;
+        Ok(rows)
+    }
+
     /// Close an open `deferred_scope` attention item without producing a
     /// followup task — the human's conscious call that the deferred
     /// remainder needs no further tracking. Rejects any other kind (the

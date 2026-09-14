@@ -93,6 +93,11 @@ impl TranscriptLiveness {
     pub fn vetoes_reap(&self) -> bool {
         !matches!(self, TranscriptLiveness::Absent { .. })
     }
+
+    /// Whether a transcript for this execution was found on disk.
+    pub fn is_present(&self) -> bool {
+        matches!(self, TranscriptLiveness::Present { .. })
+    }
 }
 
 impl fmt::Display for TranscriptLiveness {

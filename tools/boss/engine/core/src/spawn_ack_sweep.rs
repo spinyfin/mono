@@ -196,6 +196,7 @@
 //! Runs every 60 seconds and fires once immediately on boot (same
 //! pattern as [`crate::dead_pid_sweep`] / [`crate::stale_worker_sweep`]).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -204,7 +205,9 @@ use boss_protocol::{CreateAttentionItemInput, LiveWorkerState, WorkExecution, Wo
 use crate::agent_jsonl_progress::{DiscoveryVerdict, IngressCheckpoint, IngressCheckpointStore};
 use crate::coordinator::{CubeClient, ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
-use crate::live_worker_state::{DriverSignalKind, DriverStartExpectation, LiveWorkerStateRegistry};
+use crate::live_worker_state::{
+    DriverSignalKind, DriverStartExpectation, LiveWorkerStateRegistry, NeverStartedReapCommit, NeverStartedReapKind,
+};
 use crate::spawn_health::{
     SpawnFailureClass, SpawnHealthTracker, maybe_admit_recovery_probe, trip_spawn_capability_circuit,
 };
@@ -412,6 +415,7 @@ pub async fn run_one_pass(
     driver_start_grace_secs: i64,
 ) -> SpawnAckSweepOutcome {
     let mut outcome = SpawnAckSweepOutcome::default();
+    let mut examined: HashSet<String> = HashSet::new();
     let snapshot = live_states.snapshot();
 
     let now_epoch_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
@@ -458,6 +462,7 @@ pub async fn run_one_pass(
         // that timestamp from engine-side inference, so the engine's own
         // guess could vouch for a driver that never ran.
         if live_states.driver_signal_at(state.slot_id).is_some() {
+            resolve_liveness_undeterminable_attention(work_db, &state.run_id);
             outcome.skipped.has_driver_signal += 1;
             continue;
         }
@@ -489,6 +494,7 @@ pub async fn run_one_pass(
         // Skip executions already in a terminal DB state (completion
         // path may have raced the sweep).
         if execution.status.is_terminal() {
+            resolve_liveness_undeterminable_attention(work_db, execution_id);
             continue;
         }
 
@@ -514,6 +520,7 @@ pub async fn run_one_pass(
             "spawn-ack sweep: no shell pid and no hook event since spawn; reaping execution and releasing slot",
         );
 
+        examined.insert(execution_id.to_owned());
         match reap_never_started_spawn(
             &ctx,
             &execution,
@@ -544,6 +551,9 @@ pub async fn run_one_pass(
     // specific path through it and no way to opt a driver out.
     for candidate in live_states.unverified_driver_starts(now_epoch_secs, driver_start_grace_secs) {
         let execution_id = &candidate.run_id;
+        if examined.contains(execution_id) {
+            continue;
+        }
 
         let Some(execution) = crate::sweep_loop::lookup_execution_or_warn(
             work_db,
@@ -555,6 +565,7 @@ pub async fn run_one_pass(
 
         // The completion path may have raced us to a terminal status.
         if execution.status.is_terminal() {
+            resolve_liveness_undeterminable_attention(work_db, execution_id);
             continue;
         }
 
@@ -794,13 +805,27 @@ fn driver_start_reading(file_ingress: Option<&FileIngressState>) -> String {
 impl ReapCause<'_> {
     /// Which failure shape this cause observed — the breaker composes its
     /// pause reason from these, so the wording an operator reads matches
-    /// what each reap actually saw.
-    pub(crate) fn failure_class(&self) -> SpawnFailureClass {
+    /// what each reap actually saw. Consults `shell_pid` and the probe
+    /// verdict rather than mapping purely on the variant: a pid-less
+    /// driver-start timeout is `NoShell`, and an app-reported reap whose
+    /// transcript is on disk is not.
+    pub(crate) fn failure_class(&self, shell_pid: i32, liveness: &TranscriptLiveness) -> SpawnFailureClass {
         match self {
-            ReapCause::SpawnAckTimeout { .. } | ReapCause::AppNack { .. } | ReapCause::PaneDiedBeforeStart { .. } => {
-                SpawnFailureClass::NoShell
+            ReapCause::SpawnAckTimeout { .. } => SpawnFailureClass::NoShell,
+            ReapCause::DriverStartTimeout { .. } => {
+                if shell_pid > 0 {
+                    SpawnFailureClass::ShellWithoutDriverSignal
+                } else {
+                    SpawnFailureClass::NoShell
+                }
             }
-            ReapCause::DriverStartTimeout { .. } => SpawnFailureClass::ShellWithoutDriverSignal,
+            ReapCause::AppNack { .. } | ReapCause::PaneDiedBeforeStart { .. } => {
+                if liveness.is_present() {
+                    SpawnFailureClass::ShellWithoutDriverSignal
+                } else {
+                    SpawnFailureClass::NoShell
+                }
+            }
         }
     }
 
@@ -854,21 +879,35 @@ pub(crate) enum ReapOutcome {
 /// vanished, and a cause whose reason describes the wrong event (a "death"
 /// for a pane that never came up) is indistinguishable from no explanation
 /// at all.
+fn pane_observation(shell_pid: i32) -> &'static str {
+    if shell_pid > 0 {
+        "a pane and shell came up"
+    } else {
+        "a pane was spawned but no shell pid was ever reported"
+    }
+}
+
 fn reap_narrative(
     cause: &ReapCause<'_>,
     execution_id: &str,
-    liveness: &str,
+    liveness: &TranscriptLiveness,
     shell_pid: i32,
 ) -> (String, String, Stage) {
-    let (reason, audit, stage) = reap_narrative_for_cause(cause, execution_id, shell_pid);
+    let (reason, audit, stage) = reap_narrative_for_cause(cause, execution_id, shell_pid, liveness);
+    let summary = liveness.to_string();
     (
-        format!("{reason}; liveness probe: {liveness}"),
-        format!("{audit} Liveness probe before the reap: {liveness}."),
+        format!("{reason}; liveness probe: {summary}"),
+        format!("{audit} Liveness probe before the reap: {summary}."),
         stage,
     )
 }
 
-fn reap_narrative_for_cause(cause: &ReapCause<'_>, execution_id: &str, shell_pid: i32) -> (String, String, Stage) {
+fn reap_narrative_for_cause(
+    cause: &ReapCause<'_>,
+    execution_id: &str,
+    shell_pid: i32,
+    liveness: &TranscriptLiveness,
+) -> (String, String, Stage) {
     match &cause {
         ReapCause::SpawnAckTimeout { grace_secs } => (
             format!(
@@ -879,25 +918,41 @@ fn reap_narrative_for_cause(cause: &ReapCause<'_>, execution_id: &str, shell_pid
             ),
             Stage::SpawnAckTimeout,
         ),
-        ReapCause::AppNack { reason } => (
-            format!("app reported spawn failure (no shell): {reason}"),
-            format!(
-                "app reported worker-pane spawn failure (exec {execution_id}): {reason}; chore reset to todo for redispatch."
-            ),
-            Stage::SpawnNack,
-        ),
-        ReapCause::PaneDiedBeforeStart { detail } => (
-            format!(
-                "pane-death-before-start: the app reported that {detail}, but no shell pid and no hook \
-                 event was ever observed, so no worker process ever existed"
-            ),
-            format!(
-                "app reported worker-pane death before start (exec {execution_id}): {detail}; no shell \
-                 pid or hook event was ever observed, so the pane never came up; chore reset to todo \
-                 for redispatch."
-            ),
-            Stage::PaneDeathBeforeStart,
-        ),
+        ReapCause::AppNack { reason } => {
+            let shell_note = if liveness.is_present() {
+                "after the driver had started (a transcript is on disk)"
+            } else {
+                "(no shell)"
+            };
+            (
+                format!("app reported spawn failure {shell_note}: {reason}"),
+                format!(
+                    "app reported worker-pane spawn failure (exec {execution_id}): {reason}; chore reset to todo for redispatch."
+                ),
+                Stage::SpawnNack,
+            )
+        }
+        ReapCause::PaneDiedBeforeStart { detail } => {
+            let (process_clause, audit_clause) = if liveness.is_present() {
+                (
+                    "a transcript on disk shows the driver had run, so the pane died after start rather than never coming up",
+                    "a transcript on disk shows the driver had run, so the pane died after start rather than never coming up",
+                )
+            } else {
+                (
+                    "no shell pid and no hook event was ever observed, so no worker process ever existed",
+                    "no shell pid or hook event was ever observed, so the pane never came up",
+                )
+            };
+            (
+                format!("pane-death-before-start: the app reported that {detail}, but {process_clause}"),
+                format!(
+                    "app reported worker-pane death before start (exec {execution_id}): {detail}; \
+                     {audit_clause}; chore reset to todo for redispatch."
+                ),
+                Stage::PaneDeathBeforeStart,
+            )
+        }
         ReapCause::DriverStartTimeout {
             grace_secs,
             silent_secs,
@@ -911,11 +966,7 @@ fn reap_narrative_for_cause(cause: &ReapCause<'_>, execution_id: &str, shell_pid
             // and shell came up" for that shape is the mirror-image of the
             // mislabel this PR fixes elsewhere: say what was actually
             // observed.
-            let pane_observation = if shell_pid > 0 {
-                "a pane and shell came up"
-            } else {
-                "a pane was spawned but no shell pid was ever reported"
-            };
+            let pane_observation = pane_observation(shell_pid);
             let reading = driver_start_reading(file_ingress.as_ref());
             (
                 format!(
@@ -991,6 +1042,8 @@ pub(crate) async fn reap_never_started_spawn(
         let execution_id_owned = execution_id.to_owned();
         let started_epoch = execution.started_epoch();
         match tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            probe_hold::wait_if_armed(&execution_id_owned);
             probe_transcript_liveness(&work_db, &execution_id_owned, now_epoch_secs, started_epoch)
         })
         .await
@@ -1035,7 +1088,7 @@ pub(crate) async fn reap_never_started_spawn(
                         work_item_id,
                         slot_id,
                         shell_pid,
-                        stage = cause.failure_class().as_str(),
+                        stage = cause.failure_class(shell_pid, &liveness).as_str(),
                         source = source.as_str(),
                         transcript = %path.display(),
                         age_secs,
@@ -1053,7 +1106,7 @@ pub(crate) async fn reap_never_started_spawn(
                         work_item_id,
                         slot_id,
                         shell_pid,
-                        stage = cause.failure_class().as_str(),
+                        stage = cause.failure_class(shell_pid, &liveness).as_str(),
                         source = source.as_str(),
                         transcript = %path.display(),
                         age_secs,
@@ -1066,6 +1119,7 @@ pub(crate) async fn reap_never_started_spawn(
                          re-examined on the next pass rather than reaped.",
                     ),
                 }
+                resolve_liveness_undeterminable_attention(ctx.work_db, execution_id);
                 return ReapOutcome::Vetoed;
             }
             TranscriptLiveness::Undeterminable { reasons, checked } => {
@@ -1074,7 +1128,7 @@ pub(crate) async fn reap_never_started_spawn(
                     work_item_id,
                     slot_id,
                     shell_pid,
-                    stage = cause.failure_class().as_str(),
+                    stage = cause.failure_class(shell_pid, &liveness).as_str(),
                     reasons = %reasons.join("; "),
                     checked = %checked.join("; "),
                     "NOT reaping: could not establish whether a transcript exists for this execution. An \
@@ -1110,16 +1164,73 @@ pub(crate) async fn reap_never_started_spawn(
             work_item_id,
             slot_id,
             shell_pid,
-            stage = cause.failure_class().as_str(),
+            stage = cause.failure_class(shell_pid, &liveness).as_str(),
             liveness = %liveness,
             "never-started-spawn reap: the liveness probe found something before an app-reported cause; \
              proceeding with the reap regardless, since the app's own report is positive evidence the \
              pane is gone",
         );
     }
+
+    let reap_kind = match &cause {
+        ReapCause::SpawnAckTimeout { .. } => NeverStartedReapKind::SpawnAckTimeout,
+        ReapCause::DriverStartTimeout { .. } => NeverStartedReapKind::DriverStartTimeout,
+        ReapCause::AppNack { .. } | ReapCause::PaneDiedBeforeStart { .. } => {
+            NeverStartedReapKind::AppReportedNeverStarted
+        }
+    };
+    let shell_pid = match ctx
+        .live_states
+        .confirm_never_started_reap(slot_id, execution_id, reap_kind)
+    {
+        NeverStartedReapCommit::Committed { shell_pid } => shell_pid,
+        NeverStartedReapCommit::DriverSignalled => {
+            tracing::info!(
+                execution_id,
+                work_item_id,
+                slot_id,
+                "never-started-spawn reap: a driver-originated signal arrived while the liveness probe \
+                 was in flight; abandoning the reap",
+            );
+            resolve_liveness_undeterminable_attention(ctx.work_db, execution_id);
+            return ReapOutcome::Vetoed;
+        }
+        NeverStartedReapCommit::SpawnAckNowHasPid { shell_pid } => {
+            tracing::info!(
+                execution_id,
+                work_item_id,
+                slot_id,
+                shell_pid,
+                "never-started-spawn reap: a shell pid was reported while the liveness probe was in \
+                 flight; abandoning this pass-1 reap (pass 2 owns a pid-bearing slot)",
+            );
+            return ReapOutcome::Skipped;
+        }
+        NeverStartedReapCommit::NoLongerNeverStarted => {
+            tracing::info!(
+                execution_id,
+                work_item_id,
+                slot_id,
+                "never-started-spawn reap: the app-reported never-started guard no longer holds; \
+                 abandoning the reap as stale",
+            );
+            return ReapOutcome::Skipped;
+        }
+        NeverStartedReapCommit::SlotGone => {
+            tracing::info!(
+                execution_id,
+                work_item_id,
+                slot_id,
+                "never-started-spawn reap: the live slot no longer belongs to this execution; \
+                 abandoning the reap",
+            );
+            return ReapOutcome::Skipped;
+        }
+    };
+
     let liveness_summary = liveness.to_string();
 
-    let (orphan_reason, audit_note, stage) = reap_narrative(&cause, execution_id, &liveness_summary, shell_pid);
+    let (orphan_reason, audit_note, stage) = reap_narrative(&cause, execution_id, &liveness, shell_pid);
 
     if let Err(err) = ctx.work_db.mark_execution_orphaned(execution_id, &orphan_reason) {
         tracing::warn!(
@@ -1245,7 +1356,7 @@ pub(crate) async fn reap_never_started_spawn(
             );
         }
     }
-    details["failure_class"] = serde_json::json!(cause.failure_class().as_str());
+    details["failure_class"] = serde_json::json!(cause.failure_class(shell_pid, &liveness).as_str());
     details["liveness_probe"] = serde_json::json!(liveness_summary);
     ctx.dispatch_events
         .emit(
@@ -1273,7 +1384,7 @@ pub(crate) async fn reap_never_started_spawn(
             .slot_id(slot_id.to_string())
             .shell_pid(shell_pid)
             .epoch_secs(now_epoch_secs)
-            .class(cause.failure_class())
+            .class(cause.failure_class(shell_pid, &liveness))
             .cause(stage.as_str())
             .observed(orphan_reason.as_str())
             .build(),
@@ -1298,6 +1409,8 @@ pub(crate) async fn reap_never_started_spawn(
     // `maybe_admit_recovery_probe`), the canary failed — back off before the
     // next attempt. No-op for any other execution.
     ctx.spawn_health.record_probe_failure(execution_id, now_epoch_secs);
+
+    resolve_liveness_undeterminable_attention(ctx.work_db, execution_id);
 
     ReapOutcome::Reaped
 }
@@ -1352,9 +1465,10 @@ fn raise_driver_start_attention(
     } else {
         format!("Worker driver never started on slot {slot_id}")
     };
+    let pane_observation = pane_observation(shell_pid);
     let body = format!(
-        "**Observed (driver-start timeout, sweep pass 2):** a worker pane was spawned for execution \
-         `{execution_id}` on slot {slot_id} and came up, but no driver-originated signal — no hook \
+        "**Observed (driver-start timeout, sweep pass 2):** {pane_observation} for execution \
+         `{execution_id}` on slot {slot_id}, but no driver-originated signal — no hook \
          event, no `transcript_path`, no progress-ingress event — was observed within {grace_secs}s \
          (silent for {silent_secs}s).\n\n\
          **Checked before reaping:** {liveness}.\n\n\
@@ -1441,6 +1555,19 @@ fn raise_liveness_undeterminable_attention(
     }
 }
 
+/// Resolve any open `worker_liveness_undeterminable` item for this execution.
+/// Best-effort: a failure here must never affect the reap/veto decision.
+fn resolve_liveness_undeterminable_attention(work_db: &WorkDb, execution_id: &str) {
+    if let Err(err) = work_db.resolve_attention_kind_for_execution(execution_id, LIVENESS_UNDETERMINABLE_ATTENTION_KIND)
+    {
+        tracing::warn!(
+            execution_id,
+            ?err,
+            "liveness-undeterminable: failed to resolve attention item",
+        );
+    }
+}
+
 /// End-to-end reproduction of the incident against a real OS process,
 /// asserting that all three pre-existing guards pass the slot and only
 /// driver-start verification catches it. Kept in its own file because it
@@ -1452,6 +1579,10 @@ mod induced_failure_tests;
 #[cfg(test)]
 #[path = "spawn_ack_sweep_ingress_tests.rs"]
 mod ingress_tests;
+
+#[cfg(test)]
+#[path = "spawn_ack_sweep_probe_hold.rs"]
+pub(crate) mod probe_hold;
 
 #[cfg(test)]
 mod tests {
@@ -1688,12 +1819,15 @@ mod tests {
     /// process that had never existed.
     #[test]
     fn pane_death_before_start_is_narrated_as_never_started() {
+        let absent = TranscriptLiveness::Absent {
+            checked: vec!["probe stub".to_owned()],
+        };
         let (reason, audit, stage) = reap_narrative(
             &ReapCause::PaneDiedBeforeStart {
                 detail: "surface failed to attach",
             },
             "exec-1",
-            "no transcript exists: probe stub",
+            &absent,
             0,
         );
         assert_eq!(stage, Stage::PaneDeathBeforeStart);
@@ -1723,13 +1857,16 @@ mod tests {
             activity: "spawning",
         };
 
-        let (reason, audit, _) = reap_narrative(&cause, "exec-1", "no transcript exists: probe stub", 4242);
+        let absent = TranscriptLiveness::Absent {
+            checked: vec!["probe stub".to_owned()],
+        };
+        let (reason, audit, _) = reap_narrative(&cause, "exec-1", &absent, 4242);
         assert!(
             reason.contains("a pane and shell came up") && audit.contains("a pane and shell came up"),
             "a reported pid must still be narrated as a pane and shell coming up; got: {reason} / {audit}",
         );
 
-        let (reason, audit, _) = reap_narrative(&cause, "exec-1", "no transcript exists: probe stub", 0);
+        let (reason, audit, _) = reap_narrative(&cause, "exec-1", &absent, 0);
         assert!(
             !reason.contains("a pane and shell came up") && !audit.contains("a pane and shell came up"),
             "a zero pid must not be narrated as a shell coming up; got: {reason} / {audit}",
@@ -2192,6 +2329,7 @@ mod tests {
         let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let live_states = LiveWorkerStateRegistry::new();
+        register_slot_zero_pid(&live_states, 1, &execution_id, &work_item_id);
         let ctx = SpawnReapCtx::builder()
             .work_db(db.as_ref())
             .live_states(&live_states)
@@ -2438,699 +2576,6 @@ mod tests {
         );
     }
 
-    // ─── the liveness veto (2026-09-13) ──────────────────────────────────────
-
-    /// A `session_meta` first line in the shape Codex writes, with `cwd`
-    /// pointing wherever the test wants correlation to land.
-    fn session_meta_line(session_id: &str, cwd: &std::path::Path) -> String {
-        format!(
-            "{}\n",
-            serde_json::json!({
-                "timestamp": "2026-09-13T21:41:42.000Z",
-                "type": "session_meta",
-                "payload": {
-                    "id": session_id,
-                    "timestamp": "2026-09-13T21:41:42.000Z",
-                    "cwd": cwd.display().to_string(),
-                    "originator": "codex_cli_rs",
-                    "cli_version": "0.0.0-test",
-                }
-            })
-        )
-    }
-
-    /// The durable shape a Codex spawn leaves behind: a run row and an
-    /// `Armed` ingress checkpoint pointing at `root` with the given
-    /// baseline. Returns the workspace the ingress correlates against.
-    fn arm_file_ingress(
-        db: &WorkDb,
-        execution_id: &str,
-        root: &std::path::Path,
-        workspace: &std::path::Path,
-        baseline: Vec<std::path::PathBuf>,
-    ) {
-        use crate::agent_jsonl_progress::{IngressCheckpoint, IngressCheckpointStore};
-        let checkpoint = IngressCheckpoint::Armed {
-            ingress: crate::driver::AgentJsonlFileIngress {
-                directory: root.to_path_buf(),
-                filename_prefix: "rollout-".to_owned(),
-                filename_suffix: ".jsonl".to_owned(),
-                workspace_path: workspace.to_path_buf(),
-            },
-            baseline,
-        };
-        db.store_ingress_checkpoint(execution_id, &checkpoint)
-            .expect("the run row exists, so the checkpoint can be stored");
-    }
-
-    /// The incident, reproduced: a pane with a live shell, no driver
-    /// signal for longer than the window, and a rollout on disk that the
-    /// progress ingress never attached. The reap must be refused, the
-    /// transcript recorded as the run's driver-start proof, and nothing
-    /// torn down. Run with a rollout that correlates and with one discovery
-    /// would reject (the 43-second-margin case): the driver wrote both, so
-    /// both are proof of life.
-    #[tokio::test]
-    async fn a_transcript_on_disk_vetoes_the_driver_start_reap() {
-        for correlates in [true, false] {
-            let (_dir, db) = open_db();
-            let product_id = create_product(&db);
-            let work_item_id = create_active_chore(&db, &product_id, "test chore");
-            let db = Arc::new(db);
-
-            let execution_id = create_spawned_execution(&db, &work_item_id, 92697);
-            let temp = tempfile::TempDir::new().unwrap();
-            let root = temp.path().join("sessions");
-            let workspace = temp.path().join("workspace");
-            std::fs::create_dir_all(&root).unwrap();
-            std::fs::create_dir_all(&workspace).unwrap();
-            arm_file_ingress(&db, &execution_id, &root, &workspace, Vec::new());
-            let cwd = if correlates {
-                workspace.clone()
-            } else {
-                temp.path().to_path_buf()
-            };
-            let rollout = root.join("rollout-2026-09-13T21-41-42-sess-1.jsonl");
-            std::fs::write(&rollout, session_meta_line("sess-1", &cwd)).unwrap();
-
-            let live_states = Arc::new(LiveWorkerStateRegistry::new());
-            register_slot_with_live_shell(&live_states, 1, &execution_id, &work_item_id, 92697, false);
-            let coordinator = make_coordinator(db.clone(), 1);
-            coordinator.worker_pool().claim_worker(&execution_id, None).await;
-
-            let cube = RecordingCube::default();
-            let (outcome, sink) = run_pass(&db, &live_states, &coordinator, &cube).await;
-
-            assert_eq!(
-                outcome.driver_start_reaped, 0,
-                "correlates={correlates}: a worker with a transcript on disk must not be reaped",
-            );
-            assert_eq!(outcome.vetoed, 1, "correlates={correlates}: the veto must be counted");
-            assert_ne!(
-                db.get_execution(&execution_id).unwrap().status,
-                ExecutionStatus::Orphaned,
-                "correlates={correlates}: the execution must not be orphaned",
-            );
-            assert!(
-                coordinator
-                    .worker_pool()
-                    .claimed_execution_ids()
-                    .await
-                    .contains(&execution_id),
-                "correlates={correlates}: the slot must stay claimed",
-            );
-            assert!(
-                cube.released_lease_ids().is_empty(),
-                "correlates={correlates}: the cube lease must not be released",
-            );
-            assert!(
-                sink.events().await.is_empty(),
-                "correlates={correlates}: no reap event may be emitted",
-            );
-            assert!(
-                db.list_attention_items(&execution_id).unwrap().is_empty(),
-                "correlates={correlates}: no attention item may be raised",
-            );
-            assert!(
-                live_states.driver_signal_at(1).is_some(),
-                "correlates={correlates}: the transcript must be recorded as driver-start proof",
-            );
-
-            // The proof is permanent: a second pass finds nothing to examine.
-            let (again, _) = run_pass(&db, &live_states, &coordinator, &cube).await;
-            assert_eq!(
-                again.driver_start_reaped + again.vetoed + again.liveness_undeterminable,
-                0
-            );
-        }
-    }
-
-    /// Liveness that cannot be established is not absence. A checkpoint
-    /// whose root cannot be verified must leave the slot alone and say so,
-    /// rather than reaping on an unreadable answer.
-    #[tokio::test]
-    async fn undeterminable_liveness_does_not_reap() {
-        let (_dir, db) = open_db();
-        let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id, "test chore");
-        let db = Arc::new(db);
-
-        let execution_id = create_spawned_execution(&db, &work_item_id, 4242);
-        let temp = tempfile::TempDir::new().unwrap();
-        let missing_root = temp.path().join("never-created");
-        arm_file_ingress(&db, &execution_id, &missing_root, temp.path(), Vec::new());
-
-        let live_states = Arc::new(LiveWorkerStateRegistry::new());
-        register_slot_with_live_shell(&live_states, 1, &execution_id, &work_item_id, 4242, false);
-        let coordinator = make_coordinator(db.clone(), 1);
-        coordinator.worker_pool().claim_worker(&execution_id, None).await;
-
-        let cube = RecordingCube::default();
-        let (outcome, sink) = run_pass(&db, &live_states, &coordinator, &cube).await;
-
-        assert_eq!(outcome.driver_start_reaped, 0);
-        assert_eq!(outcome.liveness_undeterminable, 1);
-        assert_ne!(
-            db.get_execution(&execution_id).unwrap().status,
-            ExecutionStatus::Orphaned
-        );
-        assert!(sink.events().await.is_empty());
-        assert!(
-            live_states.driver_signal_at(1).is_none(),
-            "an undeterminable answer is not proof either way",
-        );
-
-        // A liveness answer that stays undeterminable pass after pass must
-        // not be held silently forever: once the consecutive count crosses
-        // the threshold, a distinct attention item is raised exactly once.
-        for pass in 2..UNDETERMINABLE_LIVENESS_ATTENTION_THRESHOLD {
-            let (outcome, _) = run_pass(&db, &live_states, &coordinator, &cube).await;
-            assert_eq!(outcome.liveness_undeterminable, 1, "pass {pass}");
-            assert!(
-                db.list_attention_items(&execution_id).unwrap().is_empty(),
-                "pass {pass}: no attention item before the threshold is crossed",
-            );
-        }
-        let (outcome, _) = run_pass(&db, &live_states, &coordinator, &cube).await;
-        assert_eq!(outcome.liveness_undeterminable, 1, "the threshold-crossing pass");
-        let attentions = db.list_attention_items(&execution_id).unwrap();
-        assert_eq!(
-            attentions.len(),
-            1,
-            "exactly one attention item once the threshold is crossed"
-        );
-        assert_eq!(attentions[0].kind, LIVENESS_UNDETERMINABLE_ATTENTION_KIND);
-
-        // Further passes must not raise a second one.
-        let (outcome, _) = run_pass(&db, &live_states, &coordinator, &cube).await;
-        assert_eq!(outcome.liveness_undeterminable, 1);
-        assert_eq!(
-            db.list_attention_items(&execution_id).unwrap().len(),
-            1,
-            "the attention item must not be raised again on subsequent passes",
-        );
-    }
-
-    /// A confirmed absence still reaps — the breaker must keep firing on
-    /// genuinely dead spawns — and the record says what was checked and
-    /// which failure class fired, not that the driver "never started".
-    #[tokio::test]
-    async fn absent_transcript_reaps_and_the_record_states_what_was_checked() {
-        let (_dir, db) = open_db();
-        let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id, "test chore");
-        let db = Arc::new(db);
-
-        let execution_id = create_spawned_execution(&db, &work_item_id, 4242);
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path().join("sessions");
-        std::fs::create_dir_all(&root).unwrap();
-        // A rollout from before the spawn is baselined away and must not
-        // count as this run's transcript.
-        let stale = root.join("rollout-old-sess-0.jsonl");
-        std::fs::write(&stale, session_meta_line("sess-0", temp.path())).unwrap();
-        let stale = std::fs::canonicalize(&stale).unwrap();
-        arm_file_ingress(&db, &execution_id, &root, temp.path(), vec![stale]);
-
-        let live_states = Arc::new(LiveWorkerStateRegistry::new());
-        register_slot_with_live_shell(&live_states, 1, &execution_id, &work_item_id, 4242, false);
-        let coordinator = make_coordinator(db.clone(), 1);
-        coordinator.worker_pool().claim_worker(&execution_id, None).await;
-
-        let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
-        let sink = Arc::new(RecordingDispatchEventSink::new());
-        let spawn_health = SpawnHealthTracker::new();
-        let cube = RecordingCube::default();
-        let outcome = run_one_pass(
-            db.as_ref(),
-            &live_states,
-            coordinator.clone(),
-            sink.as_ref(),
-            reaper.as_ref(),
-            &spawn_health,
-            &cube,
-            SPAWN_ACK_GRACE_SECS,
-            DRIVER_START_GRACE_SECS,
-        )
-        .await;
-
-        assert_eq!(outcome.driver_start_reaped, 1, "a confirmed absence must still reap");
-        assert_eq!(cube.released_lease_ids(), vec!["lease-1".to_owned()]);
-        assert_eq!(outcome.vetoed, 0);
-        assert_eq!(
-            db.get_execution(&execution_id).unwrap().status,
-            ExecutionStatus::Orphaned
-        );
-
-        let attentions = db.list_attention_items(&execution_id).unwrap();
-        assert_eq!(attentions.len(), 1);
-        let body = &attentions[0].body_markdown;
-        assert!(
-            body.contains("no rollout file newer than the pre-spawn baseline"),
-            "the attention body must state the liveness probe's finding; got: {body}",
-        );
-        assert!(
-            body.contains("1 pre-existing file(s) excluded"),
-            "the probe must report the baselined file it ignored; got: {body}",
-        );
-        assert!(
-            !body.contains("The driver binary never started") && !body.contains("driver binary never ran"),
-            "the body must not assert the inference that the driver never started; got: {body}",
-        );
-        assert!(
-            body.contains("Either the driver never started, or it started and its signal never reached"),
-            "the body must name both explanations for the missing signal; got: {body}",
-        );
-        assert!(
-            attentions[0].title.contains("no driver signal was observed"),
-            "got: {}",
-            attentions[0].title,
-        );
-
-        let events = sink.events().await;
-        let reap = events
-            .iter()
-            .find(|e| e.stage == "driver_start_timeout")
-            .expect("the reap event");
-        assert_eq!(
-            reap.details["failure_class"],
-            serde_json::json!("shell_without_driver_signal")
-        );
-        assert!(
-            reap.details["liveness_probe"]
-                .as_str()
-                .unwrap()
-                .contains("no transcript exists"),
-            "got: {}",
-            reap.details["liveness_probe"],
-        );
-
-        let evidence = spawn_health.evidence_in_window(boss_engine_utils::epoch_time::now_epoch_secs());
-        assert_eq!(evidence.len(), 1);
-        assert_eq!(
-            evidence[0].class,
-            crate::spawn_health::SpawnFailureClass::ShellWithoutDriverSignal,
-            "pass 2 must feed the breaker as its own failure class",
-        );
-        assert_eq!(evidence[0].cause, "driver_start_timeout");
-        assert!(
-            evidence[0].observed.contains("liveness probe:"),
-            "got: {}",
-            evidence[0].observed
-        );
-    }
-
-    /// The liveness veto does NOT protect the app-reported causes: an
-    /// `AppNack` is the app itself positively reporting the pane failed to
-    /// spawn, which a transcript's mere existence does not contradict.
-    /// Before this fix the veto applied uniformly to every cause, leaving a
-    /// `pid<=0`/`Spawning` slot behind that no other sweep could reclaim
-    /// (see the module doc and `ReapCause::vetoable`'s doc) — the reap must
-    /// proceed here, and the transcript must NOT be recorded as a permanent
-    /// driver signal.
-    #[tokio::test]
-    async fn app_nack_is_not_vetoed_by_a_transcript_on_disk() {
-        let (_dir, db) = open_db();
-        let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id, "test chore");
-        let db = Arc::new(db);
-
-        let execution_id = create_spawned_execution(&db, &work_item_id, 0);
-        let execution = db.get_execution(&execution_id).unwrap();
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path().join("sessions");
-        let workspace = temp.path().join("workspace");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&workspace).unwrap();
-        arm_file_ingress(&db, &execution_id, &root, &workspace, Vec::new());
-        std::fs::write(
-            root.join("rollout-2026-09-13T21-41-42-sess-1.jsonl"),
-            session_meta_line("sess-1", &workspace),
-        )
-        .unwrap();
-
-        let coordinator = make_coordinator(db.clone(), 1);
-        coordinator.worker_pool().claim_worker(&execution_id, None).await;
-        let spawn_health = SpawnHealthTracker::new();
-        let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
-        let sink = Arc::new(RecordingDispatchEventSink::new());
-        let live_states = LiveWorkerStateRegistry::new();
-        register_slot_zero_pid(&live_states, 1, &execution_id, &work_item_id);
-        let cube = RecordingCube::default();
-        let ctx = SpawnReapCtx::builder()
-            .work_db(db.as_ref())
-            .live_states(&live_states)
-            .coordinator(coordinator.clone())
-            .dispatch_events(sink.as_ref())
-            .reaper(reaper.as_ref())
-            .spawn_health(&spawn_health)
-            .cube_client(&cube)
-            .build();
-        let now = boss_engine_utils::epoch_time::now_epoch_secs();
-        let outcome =
-            reap_never_started_spawn(&ctx, &execution, 1, 0, ReapCause::AppNack { reason: "late" }, now).await;
-
-        assert_eq!(
-            outcome,
-            ReapOutcome::Reaped,
-            "an app-reported NACK must reap despite a transcript on disk"
-        );
-        assert_eq!(
-            db.get_execution(&execution_id).unwrap().status,
-            ExecutionStatus::Orphaned,
-        );
-        assert_eq!(reaper.reaped().len(), 1, "the pane must still be torn down");
-        assert_eq!(sink.events().await.len(), 1);
-        assert!(
-            live_states.driver_signal_at(1).is_none(),
-            "an app-reported cause must never record a permanent driver signal from the veto probe",
-        );
-        assert!(
-            !coordinator
-                .worker_pool()
-                .claimed_execution_ids()
-                .await
-                .contains(&execution_id),
-            "the slot must be released — reachable by redispatch, not stuck the way a vetoed slot is",
-        );
-    }
-
-    /// Same as above for the other app-reported cause: a pane the app
-    /// reports as dead-before-start must be reaped even with a transcript
-    /// on disk.
-    #[tokio::test]
-    async fn pane_died_before_start_is_not_vetoed_by_a_transcript_on_disk() {
-        let (_dir, db) = open_db();
-        let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id, "test chore");
-        let db = Arc::new(db);
-
-        let execution_id = create_spawned_execution(&db, &work_item_id, 0);
-        let execution = db.get_execution(&execution_id).unwrap();
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path().join("sessions");
-        let workspace = temp.path().join("workspace");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&workspace).unwrap();
-        arm_file_ingress(&db, &execution_id, &root, &workspace, Vec::new());
-        std::fs::write(
-            root.join("rollout-2026-09-13T21-41-42-sess-1.jsonl"),
-            session_meta_line("sess-1", &workspace),
-        )
-        .unwrap();
-
-        let coordinator = make_coordinator(db.clone(), 1);
-        coordinator.worker_pool().claim_worker(&execution_id, None).await;
-        let spawn_health = SpawnHealthTracker::new();
-        let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
-        let sink = Arc::new(RecordingDispatchEventSink::new());
-        let live_states = LiveWorkerStateRegistry::new();
-        register_slot_zero_pid(&live_states, 1, &execution_id, &work_item_id);
-        let cube = RecordingCube::default();
-        let ctx = SpawnReapCtx::builder()
-            .work_db(db.as_ref())
-            .live_states(&live_states)
-            .coordinator(coordinator.clone())
-            .dispatch_events(sink.as_ref())
-            .reaper(reaper.as_ref())
-            .spawn_health(&spawn_health)
-            .cube_client(&cube)
-            .build();
-        let now = boss_engine_utils::epoch_time::now_epoch_secs();
-        let outcome = reap_never_started_spawn(
-            &ctx,
-            &execution,
-            1,
-            0,
-            ReapCause::PaneDiedBeforeStart {
-                detail: "surface failed to attach",
-            },
-            now,
-        )
-        .await;
-
-        assert_eq!(outcome, ReapOutcome::Reaped);
-        assert_eq!(
-            db.get_execution(&execution_id).unwrap().status,
-            ExecutionStatus::Orphaned,
-        );
-        assert!(live_states.driver_signal_at(1).is_none());
-    }
-
-    /// The recorded-transcript-path source must not vouch for a run that
-    /// merely reused a run row an earlier incarnation already stamped a
-    /// transcript path onto: a file last written before this execution's
-    /// `started_at` must not veto a vetoable cause.
-    #[tokio::test]
-    async fn a_transcript_path_recorded_before_this_spawn_does_not_veto() {
-        let (_dir, db) = open_db();
-        let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id, "test chore");
-        let db = Arc::new(db);
-
-        let execution_id = create_spawned_execution(&db, &work_item_id, 0);
-        let temp = tempfile::TempDir::new().unwrap();
-        let transcript = temp.path().join("earlier-incarnation.jsonl");
-        std::fs::write(&transcript, "{}\n").unwrap();
-        db.set_run_transcript_path_if_unset(&execution_id, transcript.to_str().unwrap())
-            .unwrap();
-
-        // Force `started_at` to AFTER the transcript file's mtime, simulating
-        // a later incarnation of the same execution row reusing a run whose
-        // `transcript_path` a prior, unrelated spawn already recorded.
-        let now = boss_engine_utils::epoch_time::now_epoch_secs();
-        db.force_started_at_for_test(&execution_id, now + 1000).unwrap();
-        let execution = db.get_execution(&execution_id).unwrap();
-
-        let coordinator = make_coordinator(db.clone(), 1);
-        coordinator.worker_pool().claim_worker(&execution_id, None).await;
-        let spawn_health = SpawnHealthTracker::new();
-        let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
-        let sink = Arc::new(RecordingDispatchEventSink::new());
-        let live_states = LiveWorkerStateRegistry::new();
-        register_slot_zero_pid(&live_states, 1, &execution_id, &work_item_id);
-        let cube = RecordingCube::default();
-        let ctx = SpawnReapCtx::builder()
-            .work_db(db.as_ref())
-            .live_states(&live_states)
-            .coordinator(coordinator.clone())
-            .dispatch_events(sink.as_ref())
-            .reaper(reaper.as_ref())
-            .spawn_health(&spawn_health)
-            .cube_client(&cube)
-            .build();
-        let outcome = reap_never_started_spawn(
-            &ctx,
-            &execution,
-            1,
-            0,
-            ReapCause::SpawnAckTimeout { grace_secs: 60 },
-            now + 2000,
-        )
-        .await;
-
-        assert_eq!(
-            outcome,
-            ReapOutcome::Reaped,
-            "a transcript path predating this run's spawn must not veto the reap"
-        );
-        assert!(
-            live_states.driver_signal_at(1).is_none(),
-            "a stale recorded transcript path must not be recorded as this run's driver signal",
-        );
-    }
-
-    /// No false positives: a worker whose driver DID start
-    /// is never touched, however long it then runs without further events —
-    /// the driver-start signal is first-write-wins and permanent.
-    #[tokio::test]
-    async fn a_driver_that_signalled_is_never_reaped() {
-        let (_dir, db) = open_db();
-        let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id, "test chore");
-        let db = Arc::new(db);
-
-        let execution_id = create_spawned_execution(&db, &work_item_id, 777);
-        let live_states = Arc::new(LiveWorkerStateRegistry::new());
-        register_slot_with_live_shell(&live_states, 1, &execution_id, &work_item_id, 777, false);
-
-        // The driver reported in exactly once, long ago.
-        assert_eq!(
-            live_states.record_driver_signal(&execution_id, crate::live_worker_state::DriverSignalKind::HookEvent),
-            Some(1),
-        );
-
-        let coordinator = make_coordinator(db.clone(), 1);
-        coordinator.worker_pool().claim_worker(&execution_id, None).await;
-
-        let cube = RecordingCube::default();
-        let (outcome, sink) = run_pass(&db, &live_states, &coordinator, &cube).await;
-
-        assert_eq!(outcome.driver_start_reaped, 0, "a started driver must never be reaped");
-        assert_eq!(outcome.reaped, 0);
-        assert_eq!(
-            db.get_execution(&execution_id).unwrap().status,
-            ExecutionStatus::Running,
-            "the execution must be left exactly as it was",
-        );
-        assert!(
-            coordinator
-                .worker_pool()
-                .claimed_execution_ids()
-                .await
-                .contains(&execution_id),
-            "the slot must NOT be released out from under a working worker",
-        );
-        assert!(
-            cube.released_lease_ids().is_empty(),
-            "the cube lease must NOT be released out from under a working worker",
-        );
-        assert!(db.list_attention_items(&execution_id).unwrap().is_empty());
-        assert!(sink.events().await.iter().all(|e| e.stage != "driver_start_timeout"));
-    }
-
-    /// Re-adoption then sweep: a durable driver signal from before the
-    /// engine restart must leave the worker entirely alone.
-    ///
-    /// `readopt_live_worker` restores the durable semantic-progress
-    /// checkpoint after reconstructing the slot. That checkpoint came from
-    /// a driver-originated event before restart, so it proves this run is
-    /// not a never-started driver even though this registration itself was
-    /// triggered by a shell-pid probe.
-    #[tokio::test]
-    async fn a_readopted_worker_with_durable_driver_proof_is_not_reaped() {
-        let (_dir, db) = open_db();
-        let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id, "test chore");
-        let db = Arc::new(db);
-
-        let execution_id = create_spawned_execution(&db, &work_item_id, 92697);
-        let live_states = Arc::new(LiveWorkerStateRegistry::new());
-        // Exactly what `readopt_live_worker` does when its durable-pid probe
-        // cannot produce a positive pid.
-        live_states.register_readoption(
-            1,
-            execution_id.as_str(),
-            "grok-4.6",
-            0,
-            Some(WorkItemBinding {
-                work_item_id: work_item_id.clone(),
-                work_item_name: "test chore".to_owned(),
-                execution_id: execution_id.clone(),
-            }),
-            false,
-            crate::live_worker_state::LiveSpawnRouting::none(),
-            crate::live_worker_state::ReadoptionEvidence::LiveShellPid,
-        );
-        // Age the re-registration past every window under test.
-        live_states.set_spawn_time_for_test(
-            1,
-            boss_engine_utils::epoch_time::now_epoch_secs() - (DRIVER_START_GRACE_SECS + 60),
-        );
-        live_states.seed_semantic_progress(
-            1,
-            &SemanticProgressCheckpoint {
-                progress_at: "2026-09-02T12:00:00Z".to_owned(),
-                tool_condition: SemanticToolCondition::Unknown,
-            },
-        );
-        assert!(
-            live_states.driver_signal_at(1).is_some(),
-            "a durable checkpoint restores proof that the driver signalled before restart",
-        );
-
-        let coordinator = make_coordinator(db.clone(), 1);
-        coordinator.worker_pool().claim_worker(&execution_id, None).await;
-
-        let cube = RecordingCube::default();
-        let (outcome, sink) = run_pass(&db, &live_states, &coordinator, &cube).await;
-
-        assert_eq!(
-            outcome.driver_start_reaped, 0,
-            "a re-adopted worker with durable driver proof must not be reaped",
-        );
-        assert_eq!(outcome.reaped, 0);
-        assert_eq!(
-            outcome.skipped.readopted, 1,
-            "the readopted skip must be counted, not silently dropped from the accounting",
-        );
-        assert_eq!(
-            db.get_execution(&execution_id).unwrap().status,
-            ExecutionStatus::Running,
-            "the re-adopted execution must be left exactly as re-adoption restored it",
-        );
-        assert!(
-            coordinator
-                .worker_pool()
-                .claimed_execution_ids()
-                .await
-                .contains(&execution_id),
-            "the slot must NOT be released out from under a re-adopted worker",
-        );
-        assert!(
-            cube.released_lease_ids().is_empty(),
-            "the cube lease must NOT be force-released out from under a re-adopted worker",
-        );
-        assert!(db.list_attention_items(&execution_id).unwrap().is_empty());
-        assert!(sink.events().await.iter().all(|e| e.stage != "driver_start_timeout"));
-    }
-
-    /// A driver still inside its grace window is left alone, so a merely-slow
-    /// start is never reaped.
-    #[tokio::test]
-    async fn driver_start_verification_respects_its_grace_window() {
-        let (_dir, db) = open_db();
-        let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id, "test chore");
-        let db = Arc::new(db);
-
-        let execution_id = create_spawned_execution(&db, &work_item_id, 888);
-        let live_states = Arc::new(LiveWorkerStateRegistry::new());
-        register_slot_with_live_shell(&live_states, 1, &execution_id, &work_item_id, 888, false);
-        // Spawned well inside the window: no driver signal yet, but too early
-        // to conclude anything.
-        live_states.set_spawn_time_for_test(1, boss_engine_utils::epoch_time::now_epoch_secs() - 5);
-
-        let coordinator = make_coordinator(db.clone(), 1);
-        coordinator.worker_pool().claim_worker(&execution_id, None).await;
-
-        let cube = RecordingCube::default();
-        let (outcome, _sink) = run_pass(&db, &live_states, &coordinator, &cube).await;
-
-        assert_eq!(outcome.driver_start_reaped, 0, "a fresh spawn must be given its window");
-        assert_eq!(
-            db.get_execution(&execution_id).unwrap().status,
-            ExecutionStatus::Running,
-        );
-    }
-
-    /// Pass 1's proof-of-life test is now the driver signal, not
-    /// `last_event_at`. A zero-pid slot carrying only a synthesized
-    /// `last_event_at` must still be reaped rather than skipped.
-    #[tokio::test]
-    async fn pass_one_no_longer_treats_a_synthesized_timestamp_as_proof_of_life() {
-        let (_dir, db) = open_db();
-        let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id, "test chore");
-        let db = Arc::new(db);
-
-        let execution_id = create_old_execution(&db, &work_item_id);
-        let live_states = Arc::new(LiveWorkerStateRegistry::new());
-        register_slot_zero_pid(&live_states, 1, &execution_id, &work_item_id);
-        // An engine-written timestamp with no driver behind it.
-        live_states.set_last_event_at_for_test(1, "2026-07-30T05:47:45Z");
-        assert!(live_states.driver_signal_at(1).is_none());
-
-        let coordinator = make_coordinator(db.clone(), 1);
-        coordinator.worker_pool().claim_worker(&execution_id, None).await;
-
-        let cube = RecordingCube::default();
-        let (outcome, _sink) = run_pass(&db, &live_states, &coordinator, &cube).await;
-
-        assert_eq!(
-            outcome.reaped, 1,
-            "only a driver-originated signal may suppress the spawn-ack reap",
-        );
-        assert_eq!(outcome.skipped.has_driver_signal, 0);
-    }
+    #[path = "spawn_ack_sweep_liveness_tests.rs"]
+    mod liveness_tests;
 }
