@@ -70,6 +70,17 @@ pub trait WorkerEventSink: Send + Sync {
     /// produces envelopes will still eventually apply backpressure to the
     /// reader once the queue fills.
     async fn dispatch_worker_event(&self, incoming: IncomingHookEvent);
+
+    /// Record a file-ingress lifecycle milestone for `run_id` — the rollout
+    /// was attached, or discovery is overdue / has failed. Telemetry only:
+    /// nothing downstream may change behaviour on it. The production sink
+    /// puts it on the run's dispatch timeline; a test sink may ignore it.
+    async fn record_ingress_observation(
+        &self,
+        _run_id: &str,
+        _observation: crate::agent_jsonl_progress::IngressObservation,
+    ) {
+    }
 }
 
 /// A driver slug that is not in the [`crate::driver::DriverRegistry`].

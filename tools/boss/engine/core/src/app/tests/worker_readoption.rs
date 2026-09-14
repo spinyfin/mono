@@ -630,6 +630,7 @@ async fn a_readopted_run_whose_checkpoint_is_unresolvable_files_an_attention_ite
                 workspace_path: dir.path().to_path_buf(),
             },
             baseline: Vec::new(),
+            discovery: None,
         },
     );
 
