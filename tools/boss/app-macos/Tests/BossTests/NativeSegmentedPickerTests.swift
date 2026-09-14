@@ -36,11 +36,10 @@ final class NativeSegmentedPickerTests: XCTestCase {
             modeTitles.map(\.1)
         )
 
-        // A measurement pass (`sizeThatFits`) must not mutate the hosted
-        // control — it measures via an off-screen `Coordinator` control
-        // instead. If a future edit re-introduces a measure-time write to
-        // the live control, or drops the `naturalSize` distribution
-        // restore, this is where it would show up.
+        // A measurement pass must not mutate the hosted control; it
+        // measures via an off-screen Coordinator control. If a future
+        // edit writes segmentDistribution or labels on the live control
+        // during sizeThatFits, this is where it shows up.
         XCTAssertEqual(
             control.segmentDistribution,
             distributionBefore,
@@ -58,47 +57,54 @@ final class NativeSegmentedPickerTests: XCTestCase {
         )
     }
 
-    func testUnconstrainedMeasureAfterStretchStaysLabelSized() {
+    func testUnconstrainedMeasureAfterStretchStaysLabelSized() throws {
         let titles = poolTitles
         let selection = ModeBinding(value: titles[0].0)
+        let box = SizeBox()
         let picker = NativeSegmentedPicker(
             "Pool",
             selection: selection.binding,
             options: titles.map { NativeSegmentedPicker.Option(value: $0.0, title: $0.1) }
         )
-        let host = NSHostingView(
-            rootView: picker
-                .frame(width: 800, height: 32)
-                .background(Color(nsColor: .windowBackgroundColor))
-        )
+        func root(queryWidth: CGFloat) -> AnyView {
+            AnyView(
+                ProbeLayout(box: box, queryWidth: queryWidth) { picker }
+                    .frame(width: 800, height: 32)
+                    .background(Color(nsColor: .windowBackgroundColor))
+            )
+        }
+
+        let host = NSHostingView(rootView: root(queryWidth: 800))
         host.appearance = NSAppearance(named: .aqua)
         host.frame = NSRect(x: 0, y: 0, width: 800, height: 32)
         host.layoutSubtreeIfNeeded()
 
-        // Stretch the control to a wide frame first, then measure
-        // unconstrained. The ideal must stay label-sized rather than
-        // reporting back the stretched width — this is the sequential case
-        // the `.fit` / `.fillProportionally` split in `Coordinator.idealSize`
-        // exists to keep correct even when the live control is mid-stretch.
-        let unconstrainedHost = NSHostingView(
-            rootView: NativeSegmentedPicker(
-                "Pool",
-                selection: selection.binding,
-                options: titles.map { NativeSegmentedPicker.Option(value: $0.0, title: $0.1) }
-            )
-            .background(Color(nsColor: .windowBackgroundColor))
-        )
-        unconstrainedHost.appearance = NSAppearance(named: .aqua)
-        unconstrainedHost.layoutSubtreeIfNeeded()
+        let stretchedControl = try XCTUnwrap(segmentedControls(in: host).first)
+        XCTAssertEqual(stretchedControl.frame.width, 800, accuracy: 1)
+        XCTAssertEqual(stretchedControl.segmentDistribution, .fillProportionally)
+        XCTAssertEqual(box.size.width, 800, accuracy: 1)
 
-        XCTAssertGreaterThan(unconstrainedHost.fittingSize.width, 200)
-        XCTAssertLessThan(
-            unconstrainedHost.fittingSize.width,
-            NativeSegmentedPickerLayout.unboundedProposal
+        // Same host, same control, still placed at 800pt. Probe an
+        // unbounded sizeThatFits. The ideal must stay label-sized rather
+        // than reporting back the stretched width — this is the sequential
+        // case the `.fit` / `.fillProportionally` split in
+        // `Coordinator.idealSize` exists to keep correct even when the
+        // live control is mid-stretch. A naive `nsView.fittingSize` read
+        // would report ~800 here and fail.
+        host.rootView = root(queryWidth: NativeSegmentedPickerLayout.unboundedProposal)
+        host.layoutSubtreeIfNeeded()
+
+        let sameControl = try XCTUnwrap(segmentedControls(in: host).first)
+        XCTAssertTrue(
+            sameControl === stretchedControl,
+            "reassigning rootView must keep the same NSSegmentedControl identity"
         )
+        XCTAssertEqual(sameControl.frame.width, 800, accuracy: 1)
+        XCTAssertEqual(sameControl.segmentDistribution, .fillProportionally)
+        XCTAssertGreaterThan(box.size.width, 200)
         XCTAssertLessThan(
-            unconstrainedHost.fittingSize.width,
-            host.fittingSize.width,
+            box.size.width,
+            800,
             "unconstrained ideal must stay label-sized, not the stretched 800pt frame"
         )
     }
@@ -330,6 +336,29 @@ final class NativeSegmentedPickerTests: XCTestCase {
         XCTAssertGreaterThan(large.fittingSize.height, regular.fittingSize.height)
     }
 
+    func testDefaultDynamicTypeLeavesAppKitFont() throws {
+        let host = hostedPicker(width: 440, height: 32)
+        host.layoutSubtreeIfNeeded()
+        let control = try XCTUnwrap(segmentedControls(in: host).first)
+        let vanilla = NSSegmentedControl()
+        vanilla.segmentStyle = .automatic
+        vanilla.trackingMode = .selectOne
+        vanilla.controlSize = .regular
+        XCTAssertNil(
+            NativeSegmentedPickerMetrics.fontIfOverridden(
+                dynamicTypeSize: .large,
+                controlSize: .regular
+            )
+        )
+        XCTAssertNotNil(
+            NativeSegmentedPickerMetrics.fontIfOverridden(
+                dynamicTypeSize: .accessibility3,
+                controlSize: .regular
+            )
+        )
+        XCTAssertEqual(control.font, vanilla.font)
+    }
+
     func testEnlargedDynamicTypeGrowsWithLongLocalizedTitle() throws {
         // Two independently-constructed hosts intermittently observe a
         // stale environment on their very first layout pass under headless
@@ -394,6 +423,15 @@ final class NativeSegmentedPickerTests: XCTestCase {
 
         XCTAssertGreaterThan(fontAfter, fontBefore)
         XCTAssertGreaterThan(widthAfter, widthBefore)
+
+        host.rootView = AnyView(
+            LiveTitlesHarness(model: model).environment(\.dynamicTypeSize, .large)
+        )
+        host.layoutSubtreeIfNeeded()
+        XCTAssertNil(
+            control.font,
+            "returning to default Dynamic Type must clear the explicit NSFont override"
+        )
     }
 
     // MARK: - Hosts

@@ -95,7 +95,7 @@ struct NativeSegmentedPicker<Value: Hashable>: NSViewRepresentable {
         nsView: NSSegmentedControl,
         context: Context
     ) -> CGSize? {
-        let font = NativeSegmentedPickerMetrics.font(
+        let font = NativeSegmentedPickerMetrics.fontIfOverridden(
             dynamicTypeSize: context.environment.dynamicTypeSize,
             controlSize: context.environment.controlSize
         )
@@ -122,8 +122,11 @@ struct NativeSegmentedPicker<Value: Hashable>: NSViewRepresentable {
         }()
         private var cachedTitles: [String] = []
         private var cachedControlSize: NSControl.ControlSize?
-        private var cachedFontKey: String = ""
+        private var cachedFontKey: String?
         private var cachedSize: CGSize?
+        /// True after `sync` assigned an explicit Dynamic Type font, so a
+        /// later return to `.large` can clear it with `font = nil`.
+        fileprivate var appliedFontOverride = false
 
         init(_ parent: NativeSegmentedPicker<Value>) {
             self.parent = parent
@@ -140,16 +143,18 @@ struct NativeSegmentedPicker<Value: Hashable>: NSViewRepresentable {
         }
 
         /// Content-sized measurement on `measuringControl`, cached on
-        /// `(titles, controlSize, font)`. `.fit` is the AppKit distribution
-        /// that reports the label ideal (`.fillProportionally`, the hosted
+        /// `(titles, controlSize, font)`. `font` is `nil` on the default
+        /// Dynamic Type path so this control matches the hosted one
+        /// (AppKit's own font). `.fit` is the AppKit distribution that
+        /// reports the label ideal (`.fillProportionally`, the hosted
         /// control's live distribution, would report the current frame
         /// after a stretch instead).
         func idealSize(
             titles: [String],
             controlSize: NSControl.ControlSize,
-            font: NSFont
+            font: NSFont?
         ) -> CGSize {
-            let fontKey = "\(font.fontName)-\(font.pointSize)"
+            let fontKey = font.map { "\($0.fontName)-\($0.pointSize)" }
             if let cachedSize,
                 cachedTitles == titles,
                 cachedControlSize == controlSize,
@@ -165,7 +170,11 @@ struct NativeSegmentedPicker<Value: Hashable>: NSViewRepresentable {
                 control.setLabel(title, forSegment: index)
             }
             control.controlSize = controlSize
-            control.font = font
+            if let font {
+                control.font = font
+            } else {
+                control.font = nil
+            }
             var size = control.fittingSize
             if size.width <= 0 || size.height <= 0 {
                 let cellSize = control.cell?.cellSize ?? NSSize(width: 8, height: 22)
@@ -205,12 +214,22 @@ struct NativeSegmentedPicker<Value: Hashable>: NSViewRepresentable {
         }
         control.isEnabled = context.environment.isEnabled
         control.controlSize = nsControlSize(context.environment.controlSize)
-        let font = NativeSegmentedPickerMetrics.font(
+        // Default Dynamic Type (`.large`) leaves AppKit's font alone so
+        // appearance tracks `NSSegmentedControl`. Non-default sizes are
+        // the only path that assigns an explicit `NSFont`; returning to
+        // `.large` clears that override.
+        let font = NativeSegmentedPickerMetrics.fontIfOverridden(
             dynamicTypeSize: context.environment.dynamicTypeSize,
             controlSize: context.environment.controlSize
         )
-        if control.font != font {
-            control.font = font
+        if let font {
+            if control.font != font {
+                control.font = font
+            }
+            context.coordinator.appliedFontOverride = true
+        } else if context.coordinator.appliedFontOverride {
+            control.font = nil
+            context.coordinator.appliedFontOverride = false
         }
         control.setAccessibilityLabel(accessibilityLabel)
         control.setAccessibilityIdentifier(
@@ -231,10 +250,21 @@ struct NativeSegmentedPicker<Value: Hashable>: NSViewRepresentable {
 
 /// Dynamic Type + control-size font resolution for ``NativeSegmentedPicker``.
 /// Kept off the generic representable because Swift forbids stored statics
-/// on generic types. `NSSegmentedControl` does not observe SwiftUI's
-/// `dynamicTypeSize` environment value on its own, so this bridges it to an
-/// explicit `NSFont` the wrapper assigns and measures with.
+/// on generic types. Used only when SwiftUI `dynamicTypeSize` is not the
+/// default (`.large`); the default path leaves `NSSegmentedControl`'s own
+/// font in place so appearance tracks AppKit.
 enum NativeSegmentedPickerMetrics {
+    /// `nil` on `.large` so callers skip the override. Non-default Dynamic
+    /// Type still needs an explicit `NSFont` because AppKit does not
+    /// observe SwiftUI's environment value on its own.
+    static func fontIfOverridden(
+        dynamicTypeSize: DynamicTypeSize,
+        controlSize: ControlSize
+    ) -> NSFont? {
+        guard dynamicTypeSize != .large else { return nil }
+        return font(dynamicTypeSize: dynamicTypeSize, controlSize: controlSize)
+    }
+
     static func font(
         dynamicTypeSize: DynamicTypeSize,
         controlSize: ControlSize
@@ -264,7 +294,9 @@ enum NativeSegmentedPickerMetrics {
         case .extraLarge:
             return NSFont.systemFontSize(for: .large) + 2
         @unknown default:
-            return NSFont.systemFontSize(for: .large) + 2
+            // Same fallback as `nsControlSize`: unknown future cases map
+            // to regular metrics so bezel and text stay matched.
+            return NSFont.systemFontSize(for: .regular)
         }
     }
 

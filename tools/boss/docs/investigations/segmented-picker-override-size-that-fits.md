@@ -44,8 +44,8 @@ against `.pickerStyle(.segmented)`:
 | Boss's own Swift          |                  0.1–0.2% |
 
 The Mode picker's labels are static, so this is not a "derived title"
-problem. One profile was captured while the operator was dragging a
-scrollbar; the time still went to segmented-picker measurement. The cost is
+problem. One profile was captured during a scrollbar drag; the time
+still went to segmented-picker measurement. The cost is
 per layout pass of the representable, multiplied by the enclosing view's
 invalidation rate.
 
