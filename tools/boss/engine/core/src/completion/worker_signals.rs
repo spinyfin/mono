@@ -618,6 +618,48 @@ impl WorkerCompletionHandler {
         );
     }
 
+    /// Count one legacy-ladder hit for the PR-created-declaration seam only
+    /// after a proposal-first read failed to cover a successful ladder
+    /// finalization. Sources that only act on a pre-existing binding never
+    /// reach this recorder.
+    fn record_pr_created_fallback_hit(&self, execution: &crate::work::WorkExecution, source: &str, row_existed: bool) {
+        let reason = if row_existed {
+            "a pr_created worker_proposals row existed but could not be used (see the preceding WARN for specifics); falling back to the legacy PR-detection ladder"
+        } else {
+            "no worker_proposals row found for this execution/kind"
+        };
+        self.record_proposal_fallback_hit(
+            execution,
+            &PR_CREATED_FALLBACK_HIT,
+            "pr_created_proposals_seam",
+            "pr_created",
+            source,
+            reason,
+        );
+    }
+
+    pub(super) fn record_pr_created_fallback_after_success(
+        &self,
+        execution: &crate::work::WorkExecution,
+        source: &'static str,
+        row_existed: bool,
+        outcome: &StopOutcome,
+    ) {
+        let finalized = matches!(
+            outcome,
+            StopOutcome::PrDetected { .. } | StopOutcome::PrMerged { .. } | StopOutcome::ReviewerEnqueued { .. }
+        );
+        if self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("pr_created_proposals_seam")
+            // Revision workers are intentionally not taught the declaration,
+            // so their legacy finalizations cannot measure declaration uptake.
+            && execution.kind != crate::work::ExecutionKind::RevisionImplementation
+            && finalized
+        {
+            self.record_pr_created_fallback_hit(execution, source, row_existed);
+        }
+    }
+
     /// Consume this execution's staged `proposal_channel_error` (if any —
     /// see [`crate::proposal_channel_error`]), file an attention for it, and
     /// increment `worker_proposals.channel_error`. Design §"Failure

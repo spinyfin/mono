@@ -92,6 +92,51 @@ async fn recheck_for_pr_late_binds_pr_to_active_task() {
     assert_eq!(exec.status, ExecutionStatus::Abandoned);
 }
 
+/// `recheck_for_pr_late` — the double-spawn-recovery sweep — finalizes
+/// purely through the cold `detect_pr` ladder and never reads a
+/// `pr_created` proposal first, unlike `on_stop_inner` / `recheck_for_pr`.
+/// It must still count the legacy-ladder hit: `worker_proposals.fallback_hit.pr_created`
+/// is this seam's own exit criterion for eventually deleting the ladder, and
+/// this path staying uncounted would make that criterion under-report a
+/// path still in live use (see design implementation task 12).
+#[tokio::test]
+async fn recheck_for_pr_late_counts_the_fallback_hit() {
+    let (_dir, db, _product_id, chore_id, execution_id) = abandoned_execution_fixture();
+    let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/42"));
+
+    let flags_dir = tempdir().unwrap();
+    let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        flags_dir.path().join("feature-flags.toml"),
+    ));
+    flags.load().unwrap();
+    flags.set("worker_proposals", true).unwrap();
+    flags.set("pr_created_proposals_seam", true).unwrap();
+
+    let metrics = Arc::new(Registry::new());
+    register_metrics(&metrics);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+    let handler = handler.with_feature_flags(flags).with_metrics(metrics.clone());
+
+    let candidate = crate::work::LatePrCandidate {
+        execution_id: execution_id.clone(),
+        work_item_id: chore_id.clone(),
+        repo_remote_url: "git@github.com:spinyfin/mono.git".into(),
+        branch_naming: BranchNaming::BossExecPrefix,
+        worker_branch_prefix: None,
+    };
+    let outcome = handler.recheck_for_pr_late(&candidate).await;
+
+    assert!(
+        matches!(outcome, StopOutcome::PrDetected { .. }),
+        "expected PrDetected, got {outcome:?}"
+    );
+    assert_eq!(
+        metrics.counter_value("worker_proposals.fallback_hit.pr_created"),
+        Some(1),
+        "the late-recheck sweep finalized via the legacy cold-path ladder and must count as a fallback hit",
+    );
+}
+
 #[tokio::test]
 async fn recheck_for_pr_late_returns_awaiting_input_when_no_pr() {
     let (_dir, db, _product_id, chore_id, execution_id) = abandoned_execution_fixture();

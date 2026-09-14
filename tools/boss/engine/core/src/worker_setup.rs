@@ -73,7 +73,14 @@ use boss_protocol::ExecutionKind;
 use crate::driver::{
     AgentDriver, HookWiringDestination, ProgressIngress, ProgressObservationConfig, ToolUseInterceptionConfig,
 };
+mod worker_setup_heal;
+
+use worker_setup_heal::heal_single_settings_json;
+
+#[cfg(test)]
 use crate::ssh_transport::shell_quote;
+#[cfg(test)]
+pub(crate) use worker_setup_heal::heal_hook_command;
 
 // Re-export guard command constants so the test module (which uses `use
 // super::*;`) can run the Python scripts end-to-end and verify their behaviour.
@@ -263,6 +270,19 @@ pub struct WorkerSetupInput {
     /// `is_review_supervisor`; ignored for every other worker kind.
     #[builder(default = false)]
     pub is_post_merge_reviewer: bool,
+    /// Mirrors the `pr_created_proposals_seam` feature flag (composed with
+    /// the `worker_proposals` master flag) — gates the `boss propose
+    /// pr-created` teaching alongside the "print the PR URL" line in the
+    /// standard-worker branch of [`render_claude_md`] (design
+    /// implementation task 12). Ignored for [`WorkerKind::Triage`] /
+    /// [`WorkerKind::Reviewer`] / [`WorkerKind::AnswerAgent`] workers,
+    /// which never reach that branch. The caller must pass the same value
+    /// used to render this execution's prompt
+    /// (`runner::worker_spawn::WorkerSpawnOpts::pr_created_proposals_seam_enabled`)
+    /// so the preamble and CLAUDE.md never disagree about which
+    /// PR-declaration mechanism is live.
+    #[builder(default = false)]
+    pub pr_created_proposals_seam_enabled: bool,
 }
 
 /// Render the worker-facing agent-rules file (CLAUDE.md or equivalent).
@@ -333,6 +353,27 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
     // real bazel target label the way the pre-crate-split
     // `//tools/boss/engine:engine` string did.
     let engine_bazel_run_command = env!("BOSS_ENGINE_BAZEL_RUN_COMMAND");
+    // Design implementation task 12 (PR-created-declaration seam
+    // migration): when the seam is on, the worker's terminal action after
+    // opening/updating a PR is `boss propose pr-created --url ...`, not
+    // just the printed line. The printed line stays regardless — design:
+    // "the printed URL line is kept during the soak as human-readable
+    // redundancy, then dropped."
+    let execution_can_declare_created_pr = matches!(
+        input.execution_kind.as_str(),
+        "task_implementation" | "chore_implementation" | "project_design" | "investigation_implementation"
+    );
+    let declare_pr_directive = if input.pr_created_proposals_seam_enabled && execution_can_declare_created_pr {
+        "- Your terminal action after opening or updating a PR is `boss propose pr-created --url \
+         <the PR URL>` (add `--branch <branch-name>` when useful for verification). Submission is\n\
+         synchronous and validated immediately — a malformed URL or a URL from the wrong repo fails\n\
+         right away with a typed error you can fix and retry, unlike a printed line the engine only\n\
+         reads long after you've moved on.\n\
+         - Also print the PR URL on its own line as the last thing in your final response — kept as\n\
+           human-readable redundancy alongside the `boss propose` call.\n"
+    } else {
+        "- Print the PR URL on its own line as the last thing in your final response.\n"
+    };
     format!(
         "# Boss worker rules\n\
          \n\
@@ -362,7 +403,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
            evaluates backticks and `$(...)` inside double-quoted strings, which\n\
            corrupts any body that contains inline code. Always write the body to\n\
            a file and use `--body-file` (see the recipe below).\n\
-         - Print the PR URL on its own line as the last thing in your final response.\n\
+         {declare_pr_directive}\
          - Before pushing, run `jj diff -r @`. If the diff is empty,\n\
            do NOT commit, push, or open a PR — stop and explain.\n\
          \n\
@@ -2817,32 +2858,6 @@ pub fn claude_dir_for(workspace: &Path) -> PathBuf {
     workspace.join(".claude")
 }
 
-/// Replace the boss-event shim path in a single hook command string.
-///
-/// The command format produced by [`render_settings_json`] is:
-/// `BOSS_EVENTS_SOCKET='...' BOSS_LEASE_ID='...' BOSS_RUN_ID='...' BOSS_WORKSPACE='...' '<shim_path>'`
-///
-/// This function finds the last single-quoted token that contains `boss-event`
-/// and replaces it with a shell-escaped version of `new_boss_event_path`.
-/// Returns the original string unchanged if no recognizable shim path is found.
-pub(crate) fn heal_hook_command(command: &str, new_boss_event_path: &Path) -> String {
-    let Some(shim_pos) = command.rfind("boss-event") else {
-        return command.to_owned();
-    };
-    // Walk backward from shim_pos to find the opening single quote.
-    let Some(open_pos) = command[..shim_pos].rfind('\'') else {
-        return command.to_owned();
-    };
-    // Walk forward past "boss-event" to find the closing single quote.
-    let after = shim_pos + "boss-event".len();
-    let Some(close_offset) = command[after..].find('\'') else {
-        return command.to_owned();
-    };
-    let close_pos = after + close_offset;
-    let new_escaped = shell_quote(&new_boss_event_path.display().to_string());
-    format!("{}{}{}", &command[..open_pos], new_escaped, &command[close_pos + 1..])
-}
-
 /// Walk every `*.json` file in `settings_dir` (the
 /// [`worker_settings_dir`]) and update the boss-event shim path in each
 /// to `new_boss_event_path`. A missing directory is a no-op; per-file
@@ -2940,49 +2955,6 @@ pub fn heal_worker_settings_json(settings_dir: &Path, new_boss_event_path: &Path
         total_ms = started.elapsed().as_millis() as u64,
         "healing boss-event path in worker settings files: sweep complete",
     );
-}
-
-/// Returns `Ok(true)` if any hook commands were updated, `Ok(false)` if
-/// the file was absent or unchanged.
-fn heal_single_settings_json(settings_path: &Path, new_boss_event_path: &Path) -> io::Result<bool> {
-    let content = match std::fs::read_to_string(settings_path) {
-        Ok(c) => c,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(err),
-    };
-
-    let mut parsed: serde_json::Value =
-        serde_json::from_str(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-    let mut changed = false;
-
-    if let Some(hooks) = parsed.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-        for (_name, entries) in hooks.iter_mut() {
-            if let Some(arr) = entries.as_array_mut() {
-                for entry in arr.iter_mut() {
-                    if let Some(inner_hooks) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) {
-                        for inner in inner_hooks.iter_mut() {
-                            if let Some(cmd) = inner.get("command").and_then(|c| c.as_str()).map(str::to_owned) {
-                                let healed = heal_hook_command(&cmd, new_boss_event_path);
-                                if healed != cmd {
-                                    inner["command"] = serde_json::Value::String(healed);
-                                    changed = true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if changed {
-        let new_content =
-            serde_json::to_string_pretty(&parsed).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        std::fs::write(settings_path, new_content)?;
-    }
-
-    Ok(changed)
 }
 
 #[cfg(test)]

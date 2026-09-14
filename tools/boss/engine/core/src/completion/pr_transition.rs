@@ -1184,6 +1184,175 @@ impl WorkerCompletionHandler {
                 .await;
         }
     }
+
+    /// Read `execution_id`'s `pr_created` worker-proposal row (design
+    /// implementation task 12 — the PR-created-declaration seam migration,
+    /// the last of the per-seam migrations, sequenced after
+    /// `automation_outcome_proposals_seam`). Returns the PR URL to
+    /// finalize on when an operative proposal exists, so
+    /// `on_stop_inner`/`recheck_for_pr` can short-circuit the whole
+    /// staging-cache / driver-prose / cold-reconstruction ladder and
+    /// finalize straight from a durable row that survives an engine
+    /// restart between the worker's `cube pr create`/`cube pr update` and
+    /// this Stop — unlike the in-memory `StagedPrUrlCache` the primary
+    /// path reads.
+    ///
+    /// Task 6's applier (`crate::work::proposal_apply::apply_pr_created`)
+    /// verified the URL/repo-slug synchronously at submission time. This
+    /// read independently verifies the URL still belongs to the execution's
+    /// expected branch (or the resolved chain-root PR for a revision) before
+    /// returning it, matching the legacy staged-URL path's safety boundary.
+    ///
+    /// Returns `(None, row_existed)` when no operative `pr_created`
+    /// proposal is available — the caller then runs the legacy ladder and,
+    /// if that ladder actually finalizes, records its fallback hit.
+    /// `row_existed` mirrors
+    /// [`super::finalize_passes::WorkerCompletionHandler::automation_outcome_from_proposal`]'s
+    /// discipline: `false` when no `pr_created` proposal row exists at all
+    /// (or the lookup itself errored — fail open to the legacy ladder
+    /// rather than silently dropping finalization), `true` when a row
+    /// exists but was left in a state this read cannot use (`Applied` is
+    /// the only state `apply_pr_created` — an `AutoApply` kind — ever
+    /// leaves the newest row in; `Rejected` — bad URL, wrong repo, branch
+    /// mismatch — carries no usable URL and the worker already saw the
+    /// typed error at submission time; `Proposed`/`Superseded`/`Expired`
+    /// are unexpected for a synchronously auto-applying kind).
+    ///
+    /// [`crate::work::WorkDb::list_worker_proposals_for_execution`] orders
+    /// by `created_at DESC`, so the newest row is always the operative one
+    /// — mirrors every other proposal-first read in this module.
+    pub(super) async fn pr_created_from_proposal(
+        &self,
+        execution: &crate::work::WorkExecution,
+    ) -> (Option<String>, bool) {
+        let execution_id = &execution.id;
+        let proposals = match self
+            .work_db
+            .list_worker_proposals_for_execution(execution_id, ProposalKind::PrCreated)
+        {
+            Ok(proposals) => proposals,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    ?err,
+                    "pr_created_proposals_seam: failed to look up proposals for this execution; \
+                     falling back to the legacy staging-cache / cold-reconstruction ladder",
+                );
+                return (None, false);
+            }
+        };
+        let Some(latest) = proposals.first() else {
+            return (None, false);
+        };
+
+        match latest.state {
+            ProposalState::Applied => match serde_json::from_str::<PrCreatedProposalPayload>(&latest.payload_json) {
+                Ok(payload) => {
+                    let pr_url = payload.pr_url;
+                    if self.pr_created_url_matches_execution(execution, &pr_url).await {
+                        (Some(pr_url), true)
+                    } else {
+                        (None, true)
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id,
+                        proposal_id = %latest.id,
+                        ?err,
+                        "pr_created_proposals_seam: newest pr_created proposal is Applied but its \
+                         payload_json did not deserialize; falling back to the legacy ladder",
+                    );
+                    (None, true)
+                }
+            },
+            ProposalState::Rejected => {
+                tracing::info!(
+                    execution_id,
+                    proposal_id = %latest.id,
+                    reason = latest.decision_reason.as_deref().unwrap_or("no reason recorded"),
+                    "pr_created_proposals_seam: newest pr_created proposal was rejected at submission; \
+                     falling back to the legacy ladder",
+                );
+                (None, true)
+            }
+            ProposalState::Proposed | ProposalState::Superseded | ProposalState::Expired => {
+                tracing::warn!(
+                    execution_id,
+                    proposal_id = %latest.id,
+                    state = %latest.state,
+                    "pr_created_proposals_seam: newest pr_created proposal is unexpectedly not \
+                     Applied/Rejected; falling back to the legacy ladder",
+                );
+                (None, true)
+            }
+        }
+    }
+
+    /// Apply the same execution-to-PR association rule used by the staged
+    /// URL path before trusting a durable worker declaration. A proposal is
+    /// not authority to rebind a task: it must name this execution's branch,
+    /// or, for a revision, the chain root's already-bound PR.
+    async fn pr_created_url_matches_execution(&self, execution: &crate::work::WorkExecution, pr_url: &str) -> bool {
+        if execution.kind == ExecutionKind::RevisionImplementation {
+            return match self.resolve_bound_pr_url(execution) {
+                Some(bound_url) if bound_url == pr_url => true,
+                Some(bound_url) => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        proposed_pr_url = %pr_url,
+                        bound_pr_url = %bound_url,
+                        "pr_created_proposals_seam: proposal URL does not match the revision's bound chain-root PR; falling back to the legacy ladder",
+                    );
+                    false
+                }
+                None => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        proposed_pr_url = %pr_url,
+                        "pr_created_proposals_seam: revision has no resolved bound PR; cannot verify proposal URL and will fall back to the legacy ladder",
+                    );
+                    false
+                }
+            };
+        }
+
+        let expected_branch = expected_branch_name(
+            &execution.id,
+            &execution.branch_naming,
+            execution.worker_branch_prefix.as_deref(),
+        );
+        let Ok(repo_slug) = parse_repo_slug(&execution.repo_remote_url) else {
+            tracing::warn!(execution_id = %execution.id, "pr_created_proposals_seam: cannot parse repo slug; falling back to the legacy ladder");
+            return false;
+        };
+        let Some(pr_number) = pr_number_from_url(pr_url) else {
+            tracing::warn!(execution_id = %execution.id, proposed_pr_url = %pr_url, "pr_created_proposals_seam: cannot parse PR number; falling back to the legacy ladder");
+            return false;
+        };
+        match self.branch_verifier.fetch_pr_head_ref(&repo_slug, pr_number).await {
+            Ok(head_ref) if branches_identify_same_work_item(&head_ref, &expected_branch) => true,
+            Ok(head_ref) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    proposed_pr_url = %pr_url,
+                    proposed_pr_branch = %head_ref,
+                    %expected_branch,
+                    "pr_created_proposals_seam: proposal URL's PR branch does not identify this execution; falling back to the legacy ladder",
+                );
+                false
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    proposed_pr_url = %pr_url,
+                    ?err,
+                    "pr_created_proposals_seam: branch verification failed; falling back to the legacy ladder",
+                );
+                false
+            }
+        }
+    }
 }
 
 #[cfg(test)]
