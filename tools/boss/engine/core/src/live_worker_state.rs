@@ -385,7 +385,7 @@ impl LiveWorkerStateRegistry {
         entry.meta.driver_signal_at.is_none() && entry.meta.spawned_at > cutoff
     }
 
-    fn publish_startup_contention(&self) {
+    pub(crate) fn publish_startup_contention(&self) {
         let load = {
             let guard = self.discovery_load.lock().expect("registry mutex poisoned");
             guard.clone()
@@ -957,22 +957,23 @@ impl LiveWorkerStateRegistry {
     /// count even while the execution remains productive. Unproven live
     /// slots older than `window_secs` do not count: they are past the
     /// driver-start grace, so they must not pin resumed admission to the
-    /// no-signal fallback.
+    /// no-signal fallback. Claims without live slots use their pool claim
+    /// timestamp and expire from startup pressure at the same grace bound.
     pub(crate) fn startup_pending(
         &self,
-        claimed_runs: &std::collections::HashSet<String>,
+        claimed_runs: &std::collections::HashMap<String, i64>,
         now_epoch_secs: i64,
         window_secs: i64,
     ) -> bool {
         let cutoff = now_epoch_secs.saturating_sub(window_secs);
         let guard = self.inner.lock().expect("registry mutex poisoned");
         guard.values().any(|entry| Self::slot_in_startup_window(entry, cutoff))
-            || claimed_runs.iter().any(
-                |run_id| match guard.values().find(|entry| entry.state.run_id == *run_id) {
+            || claimed_runs.iter().any(|(run_id, claimed_at)| {
+                match guard.values().find(|entry| entry.state.run_id == *run_id) {
                     Some(entry) => Self::slot_in_startup_window(entry, cutoff),
-                    None => true,
-                },
-            )
+                    None => *claimed_at > cutoff,
+                }
+            })
     }
 
     /// Whether `slot_id`'s current registration is owed spawn-ack proof

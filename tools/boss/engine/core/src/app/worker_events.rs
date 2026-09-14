@@ -26,11 +26,15 @@ impl ServerState {
 /// the driver, so it resets the spawn-capability breaker and, if this run
 /// is the half-open recovery canary, auto-resumes a Breaker pause. Later
 /// hooks are a no-op for the breaker: a healthy peer must not wipe
-/// in-window driver-start failures from dead siblings.
-async fn note_driver_start_signal(server_state: &ServerState, run_id: &str, kind: DriverSignalKind) {
+/// in-window driver-start failures from dead siblings. Hooks that do not
+/// land on a live slot are also a no-op for the breaker.
+pub(super) async fn note_driver_start_signal(server_state: &ServerState, run_id: &str, kind: DriverSignalKind) {
     let already = server_state.live_worker_states.driver_has_signal(run_id);
-    server_state.live_worker_states.record_driver_signal(run_id, kind);
-    if already {
+    let landed = server_state
+        .live_worker_states
+        .record_driver_signal(run_id, kind)
+        .is_some();
+    if already || !landed {
         return;
     }
     server_state.spawn_health.record_success();

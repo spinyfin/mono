@@ -270,6 +270,14 @@ impl ExecutionCoordinator {
         self.review_pool.clone()
     }
 
+    /// Claim times across all pools, for bounded pre-registration startup pressure.
+    pub(crate) async fn all_claimed_execution_times(&self) -> std::collections::HashMap<String, i64> {
+        let mut claimed = self.worker_pool.claimed_execution_times().await;
+        claimed.extend(self.automation_pool.claimed_execution_times().await);
+        claimed.extend(self.review_pool.claimed_execution_times().await);
+        claimed
+    }
+
     /// Return the union of execution ids currently claimed across ALL
     /// worker pools (main, automation, and review).
     ///

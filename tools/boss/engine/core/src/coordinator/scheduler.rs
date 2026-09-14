@@ -422,6 +422,10 @@ impl ExecutionCoordinator {
             self.recover_failed_dispatch(&execution, &worker_id, &err).await;
             return Err(err);
         }
+        self.resume_admission
+            .lock()
+            .unwrap()
+            .admitted(execution_id, std::time::Instant::now());
         spawn_claim.disarm();
         Ok(worker_id)
     }
@@ -828,7 +832,7 @@ impl ExecutionCoordinator {
         // Pool claims survive the handoff from schedule_execution to the
         // runner, including the window before live-slot registration.
         let startup_pending = live.startup_pending(
-            &self.all_claimed_execution_ids().await,
+            &self.all_claimed_execution_times().await,
             boss_engine_utils::epoch_time::now_epoch_secs(),
             crate::live_worker_state::DRIVER_START_GRACE_SECS,
         );

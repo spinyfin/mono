@@ -311,6 +311,7 @@ pub async fn run_one_pass(
     grace_secs: i64,
     driver_start_grace_secs: i64,
 ) -> SpawnAckSweepOutcome {
+    live_states.publish_startup_contention();
     let mut outcome = SpawnAckSweepOutcome::default();
     let snapshot = live_states.snapshot();
 
@@ -794,21 +795,25 @@ pub(crate) async fn reap_never_started_spawn(
     // item routed to it, so it belongs in the aggregate. Pass 2's own
     // per-execution attention item above is additional to this, not a
     // replacement for it — see the module doc.
-    ctx.spawn_health
-        .record_evidence(crate::spawn_health::SpawnFailureEvidence {
-            execution_id: execution_id.to_owned(),
-            work_item_id: work_item_id.to_owned(),
-            slot_id: slot_id.to_string(),
-            shell_pid,
-            epoch_secs: now_epoch_secs,
-        });
-    let distinct = match &cause {
-        ReapCause::DriverStartTimeout { .. } => ctx
+    let class = match &cause {
+        ReapCause::DriverStartTimeout { .. } => crate::spawn_health::FailureClass::DriverStart,
+        _ => crate::spawn_health::FailureClass::Spawn,
+    };
+    ctx.spawn_health.record_evidence(
+        crate::spawn_health::SpawnFailureEvidence::builder()
+            .class(class)
+            .execution_id(execution_id.to_owned())
+            .work_item_id(work_item_id.to_owned())
+            .slot_id(slot_id.to_string())
+            .shell_pid(shell_pid)
+            .epoch_secs(now_epoch_secs)
+            .build(),
+    );
+    let distinct = match class {
+        crate::spawn_health::FailureClass::DriverStart => ctx
             .spawn_health
             .record_driver_start_failure(work_item_id, now_epoch_secs),
-        ReapCause::SpawnAckTimeout { .. } | ReapCause::AppNack { .. } | ReapCause::PaneDiedBeforeStart { .. } => {
-            ctx.spawn_health.record_failure(work_item_id, now_epoch_secs)
-        }
+        crate::spawn_health::FailureClass::Spawn => ctx.spawn_health.record_failure(work_item_id, now_epoch_secs),
     };
     if let Some(distinct) = distinct {
         trip_spawn_capability_circuit(
