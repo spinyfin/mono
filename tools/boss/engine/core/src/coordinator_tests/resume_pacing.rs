@@ -13,8 +13,8 @@ async fn resume_backlog_waits_for_driver_proof_then_drains_without_waiting_for_c
         pending: true,
         ..Default::default()
     });
-    // Concurrent live workers need distinct leases; reusing the fake's
-    // default workspace trips the occupancy guard.
+    // Concurrent live workers need distinct leases, just as they do in
+    // production; reusing the fake's default workspace trips the occupancy guard.
     let cube = Arc::new(
         FakeCubeClient::default().with_workspace_id_queue((0..8).map(|index| format!("resume-pacing-{index}"))),
     );
@@ -55,6 +55,8 @@ async fn resume_backlog_waits_for_driver_proof_then_drains_without_waiting_for_c
         coordinator.drain_ready_queue_for_test().await;
         assert_eq!(runner.calls.lock().await.len(), count);
         let run_id = runner.calls.lock().await[count - 1].1.clone();
+        // Use a known-live PID so occupancy checks never depend on whether
+        // an arbitrary PID happens to exist on the test host.
         live.register_spawn(count as u8, &run_id, "codex", std::process::id() as i32, None);
         // A shell acknowledgment is still not driver readiness.
         coordinator.drain_ready_queue_for_test().await;
