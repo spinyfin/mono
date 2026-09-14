@@ -355,25 +355,28 @@ async fn initial_input_types_a_short_fixed_line_sourcing_the_workspace_script() 
         script.contains(".claude/initial-prompt.txt"),
         "expected the initial-input script to read from the prompt file, got: {script:?}",
     );
-    // The first shell line marks the pane background priority (so the
-    // worker's build/test tool calls yield to the coordinator's
-    // interactive pane under contention), then re-prepends BOSS_BIN_DIR
-    // to PATH (so the bundled `cube`/`boss` win over any `~/bin`
-    // repobin shim the login-shell init re-prepends), then the
-    // per-workspace launcher dir on top of that (so `boss` is pinned to
-    // an absolute path even in dev mode, where BOSS_BIN_DIR is unset
-    // and the clause is a no-op), then unsets the API key and invokes
-    // claude. See the comment at the construction site.
+    // The first shell line re-prepends BOSS_BIN_DIR to PATH (so the
+    // bundled `cube`/`boss` win over any `~/bin` repobin shim the
+    // login-shell init re-prepends), then the per-workspace launcher dir
+    // on top of that (so `boss` is pinned to an absolute path even in dev
+    // mode, where BOSS_BIN_DIR is unset and the clause is a no-op), then
+    // unsets the API key and invokes claude. See the comment at the
+    // construction site.
     assert!(
         script.starts_with(&format!(
-            "{}{}{}unset ANTHROPIC_API_KEY; claude",
-            worker_background_priority_clause(),
+            "{}{}unset ANTHROPIC_API_KEY; claude",
             path_prepend_clause("BOSS_BIN_DIR"),
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
         )),
-        "expected the initial-input script to mark itself background priority, re-prepend \
-             BOSS_BIN_DIR then the worker launcher dir, unset ANTHROPIC_API_KEY, and invoke \
-             claude, got: {script:?}",
+        "expected the initial-input script to re-prepend BOSS_BIN_DIR then the worker launcher \
+             dir, unset ANTHROPIC_API_KEY, and invoke claude, got: {script:?}",
+    );
+    // No Darwin background-priority clause: it starved the driver CLI it
+    // was inherited by, so the pane never reported a driver start and was
+    // reaped. See the comment at the construction site.
+    assert!(
+        !script.contains("taskpolicy"),
+        "the pane must not be placed in the Darwin background tier, got: {script:?}",
     );
 }
 
@@ -499,8 +502,7 @@ async fn untagged_row_spawn_matches_engine_default() {
     assert_eq!(
         script,
         format!(
-            "{}{}{}unset ANTHROPIC_API_KEY; claude --model {} --disallowedTools=AskUserQuestion --permission-mode auto --settings '{}' \"$(cat .claude/initial-prompt.txt)\"\n",
-            worker_background_priority_clause(),
+            "{}{}unset ANTHROPIC_API_KEY; claude --model {} --disallowedTools=AskUserQuestion --permission-mode auto --settings '{}' \"$(cat .claude/initial-prompt.txt)\"\n",
             path_prepend_clause("BOSS_BIN_DIR"),
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
             crate::driver::ClaudeDriver.descriptor().model_menu.engine_default,
