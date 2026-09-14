@@ -316,6 +316,7 @@ pub async fn run_one_pass(
     cube_client: &dyn CubeClient,
     driver_start_grace_secs: i64,
 ) -> SpawnAckSweepOutcome {
+    live_states.publish_startup_contention();
     let mut outcome = SpawnAckSweepOutcome::default();
     reconcile_liveness_undeterminable_attention(work_db, live_states);
     let snapshot = live_states.snapshot();

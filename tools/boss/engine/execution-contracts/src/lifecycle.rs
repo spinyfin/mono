@@ -215,7 +215,8 @@ pub trait LiveWorkerLiveness: Send + Sync {
     fn current_tool_for_run(&self, run_id: &str) -> Option<String>;
     /// True while any claimed run still lacks driver-start proof, including
     /// the window after a pool claim and before live-slot registration.
-    fn startup_pending(&self, claimed_runs: &std::collections::HashSet<String>) -> bool {
+    /// Values are claim timestamps in epoch seconds.
+    fn startup_pending(&self, claimed_runs: &std::collections::HashMap<String, i64>) -> bool {
         let _ = claimed_runs;
         false
     }

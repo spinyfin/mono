@@ -14,6 +14,7 @@ impl WorkerPool {
         while inner.workers.len() < size {
             let index = inner.workers.len();
             inner.workers.push(WorkerSlot {
+                claimed_at: 0,
                 worker_id: format!("{}{index}", self.prefix, index = index + 1),
                 execution_id: None,
                 last_workspace_id: None,
@@ -26,6 +27,7 @@ impl WorkerPool {
         let (index, selection) = select_claim_index(&inner.workers[..size], None)?;
         let worker = &mut inner.workers[index];
         worker.execution_id = Some(execution_id.to_owned());
+        worker.claimed_at = claim_epoch_secs();
         worker.working = false;
         log_pool_claim(&worker.worker_id, execution_id, selection);
         Some(worker.worker_id.clone())

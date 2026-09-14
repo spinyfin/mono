@@ -1065,7 +1065,7 @@ impl ExecutionCoordinator {
         };
         // Pool claims survive the handoff from schedule to the runner,
         // including the window before live-slot registration.
-        let startup_pending = live.startup_pending(&self.all_claimed_execution_ids().await);
+        let startup_pending = live.startup_pending(&self.all_claimed_execution_times().await);
         let held = self
             .resume_admission
             .lock()

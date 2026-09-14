@@ -20,7 +20,9 @@ pub const RESUME_STARTUP_INTERVAL: Duration = Duration::from_secs(84);
 #[derive(Default)]
 pub struct DiscoveryLoad {
     pending: Mutex<Vec<Weak<AtomicUsize>>>,
-    /// Live slots still inside their driver-start window with no driver
+    /// Snapshot refreshed by live-slot registration, release, driver signals,
+    /// registry attachment, and the 60s spawn-ack/driver-start sweep.
+    /// Counts live slots still inside their driver-start window with no driver
     /// signal. JSONL `begin` is often armed before the pane registers, so
     /// this count plus one is the overlapping-startup floor.
     in_flight: AtomicUsize,

@@ -468,6 +468,15 @@ impl ExecutionCoordinator {
         claimed
     }
 
+    /// Claim times across all pools, for bounded pre-registration startup pressure.
+    pub async fn all_claimed_execution_times(&self) -> std::collections::HashMap<String, i64> {
+        let mut claimed = self.worker_pool.claimed_execution_times().await;
+        claimed.extend(self.automation_pool.claimed_execution_times().await);
+        claimed.extend(self.review_pool.claimed_execution_times().await);
+        claimed.extend(self.progression_pool.claimed_execution_times().await);
+        claimed
+    }
+
     /// Re-claim `worker_id` for `execution_id` in whichever pool owns that
     /// slot — the union-of-pools counterpart to
     /// [`Self::all_claimed_execution_ids`], used by the re-adoption path.

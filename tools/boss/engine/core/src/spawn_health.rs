@@ -152,10 +152,12 @@ pub const SPAWN_HEALTH_PROBE_BACKOFF_MAX_SECS: i64 = 900;
 /// still working. A canary that never produces that signal is resolved by
 /// the driver-start reap after
 /// [`crate::live_worker_state::DRIVER_START_GRACE_SECS`], observed on the
-/// next sweep tick. The deadline is that grace plus two sweep intervals
-/// (60s each) of slack, so the reap runs first for a silent canary. This is
-/// strictly a last-resort backstop for the terminal-without-reap case.
-pub const SPAWN_HEALTH_PROBE_STALL_DEADLINE_SECS: i64 = crate::live_worker_state::DRIVER_START_GRACE_SECS + 120;
+/// next sweep tick. The 600s deadline exceeds
+/// [`crate::live_worker_state::DRIVER_START_GRACE_SECS`] (300s), with room
+/// for the 60s reap sweep and scheduling slack. Driver proof, including
+/// contended JSONL discovery, or the driver-start reap must resolve first.
+/// This is strictly a last-resort backstop for the terminal-without-reap case.
+pub const SPAWN_HEALTH_PROBE_STALL_DEADLINE_SECS: i64 = 600;
 
 /// Sentinel for [`SpawnHealthTracker::last_disabled_signal_at`] meaning "no
 /// disabled-mode signal has fired yet" — distinct from a real epoch-seconds
@@ -1419,6 +1421,15 @@ mod tests {
         assert_eq!(tracker.record_failure("wi-3", 1001), None);
         assert_eq!(tracker.record_failure("wi-4", 1001), None);
         assert_eq!(tracker.record_failure("wi-5", 1001), Some(3));
+    }
+
+    #[test]
+    fn probe_backstop_allows_driver_start_grace_and_reap_slack() {
+        let tracker = SpawnHealthTracker::new();
+        tracker.mark_probe_dispatched("slow-canary", 1000);
+        assert!(!tracker.try_admit_probe(1240));
+        assert!(!tracker.try_admit_probe(1000 + crate::live_worker_state::DRIVER_START_GRACE_SECS + 60));
+        assert!(tracker.record_probe_success("slow-canary"));
     }
 
     #[test]
