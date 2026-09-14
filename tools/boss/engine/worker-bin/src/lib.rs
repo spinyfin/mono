@@ -71,6 +71,21 @@ const CUBE_LAUNCHER_NAME: &str = "cube";
 /// [`is_build_from_source_shim`].
 const REPOBIN_NAME: &str = "repobin";
 
+/// Basename of the optional `checkleft` launcher. Written only when the
+/// workspace's `REPOBIN.toml` declares `checkleft` as a repobin tool
+/// ([`repobin_declares_tool`]); it pins the bare word to the
+/// repobin-managed copy in `<workspace>/bin/` and fails loudly when that
+/// copy is missing — never a PATH copy. See [`write_checkleft_launcher`].
+const CHECKLEFT_LAUNCHER_NAME: &str = "checkleft";
+
+/// Repo-root file repobin reads its tool declarations from.
+pub const REPOBIN_CONFIG_FILE: &str = "REPOBIN.toml";
+
+/// Directory, relative to a workspace root, that `repobin install` (or a
+/// repo's own shim installer, e.g. mono's `.cube/setup.yaml` step)
+/// populates with one entry per declared tool.
+pub const WORKSPACE_REPOBIN_BIN_SUBDIR: &str = "bin";
+
 /// Workspace-relative path of the `boss` CLI under runfiles / bazel-bin.
 const BOSS_CLI_RUNFILES_REL: &str = "tools/boss/cli/boss";
 
@@ -97,6 +112,11 @@ pub const BOSS_BIN_ENV: &str = "BOSS_BIN";
 /// Same contract as [`BOSS_BIN_ENV`]: name the binary, not a PATH entry.
 pub const CUBE_BIN_ENV: &str = "CUBE_BIN";
 
+/// Env var carrying the absolute path of this workspace's `checkleft`
+/// launcher. Same contract as [`BOSS_BIN_ENV`]: name the binary, not a PATH
+/// entry that a driver shell may reorder.
+pub const CHECKLEFT_BIN_ENV: &str = "CHECKLEFT_BIN";
+
 /// Shell token workers are taught to run instead of a PATH-resolved `boss`.
 pub const WORKER_BOSS_INVOCATION: &str = r#""$BOSS_BIN""#;
 
@@ -117,7 +137,11 @@ const CUBE_CLI_RUNFILES_REL: &str = "tools/cube/cube";
 /// Every executable name the engine may write into the launcher directory.
 /// `boss` is always present; `cube` is always present too (a thin exec of
 /// the bundled CLI, overwritten by the derived-PR compose wrapper when
-/// that worker needs it). Neither entry exposes the Boss-tier `bossctl`
+/// that worker needs it); `checkleft` is present only when the workspace's
+/// `REPOBIN.toml` declares it ([`write_checkleft_launcher`]) and then
+/// execs the repobin-managed copy in the workspace's `bin/` — a repo that
+/// does not route checkleft through repobin keeps PATH behaviour for the
+/// bare word. No entry exposes the Boss-tier `bossctl`
 /// control surface.
 ///
 /// The engine deliberately keeps `bossctl` off the worker `PATH`: it is
@@ -127,7 +151,7 @@ const CUBE_CLI_RUNFILES_REL: &str = "tools/cube/cube";
 /// distinction; a launcher dir can, and this constant is what the test
 /// suite pins it to.
 pub fn launcher_names() -> &'static [&'static str] {
-    &[BOSS_LAUNCHER_NAME, CUBE_LAUNCHER_NAME]
+    &[BOSS_LAUNCHER_NAME, CUBE_LAUNCHER_NAME, CHECKLEFT_LAUNCHER_NAME]
 }
 
 /// Path / env inputs shared by every engine-binary resolution.
@@ -343,12 +367,19 @@ pub fn resolve_boss_event_binary(
 /// excludes it, and guessing would only add a way to reject a
 /// legitimate binary.
 pub fn is_build_from_source_shim(path: &Path) -> bool {
-    if path.file_name().is_some_and(|name| name == REPOBIN_NAME) {
+    if path
+        .file_name()
+        .is_some_and(|name| name == REPOBIN_NAME || name == "repobin-shim.sh")
+    {
         return true;
     }
     std::fs::canonicalize(path)
         .ok()
-        .and_then(|target| target.file_name().map(|name| name == REPOBIN_NAME))
+        .and_then(|target| {
+            target
+                .file_name()
+                .map(|name| name == REPOBIN_NAME || name == "repobin-shim.sh")
+        })
         .unwrap_or(false)
 }
 
@@ -506,6 +537,122 @@ pub fn boss_bin_in(dir: &Path) -> PathBuf {
 /// Absolute path of the `cube` launcher inside `dir`.
 pub fn cube_bin_in(dir: &Path) -> PathBuf {
     dir.join(CUBE_LAUNCHER_NAME)
+}
+
+/// Absolute path of the `checkleft` launcher inside `dir` (present only
+/// when [`write_checkleft_launcher`] returned `Some`).
+pub fn checkleft_bin_in(dir: &Path) -> PathBuf {
+    dir.join(CHECKLEFT_LAUNCHER_NAME)
+}
+
+/// Whether `<workspace>/REPOBIN.toml` declares `tool` — as a
+/// `[tools.<tool>]` target built from the checkout or a `[pins.<tool>]`
+/// upstream pin.
+///
+/// A line scan, not a TOML parse: this crate has no dependencies by
+/// design, and the two table-header shapes are the whole contract
+/// (repobin's own `install` writes one symlink per such header). A missing
+/// or unreadable file means "not declared".
+pub fn repobin_declares_tool(workspace: &Path, tool: &str) -> bool {
+    let Ok(contents) = std::fs::read_to_string(workspace.join(REPOBIN_CONFIG_FILE)) else {
+        return false;
+    };
+    let tools_header = format!("[tools.{tool}]");
+    let pins_header = format!("[pins.{tool}]");
+    contents
+        .lines()
+        .map(str::trim)
+        .any(|line| line == tools_header || line == pins_header)
+}
+
+/// Absolute path of the repobin-managed `checkleft` entry in `workspace`.
+pub fn workspace_checkleft_path(workspace: &Path) -> PathBuf {
+    workspace
+        .join(WORKSPACE_REPOBIN_BIN_SUBDIR)
+        .join(CHECKLEFT_LAUNCHER_NAME)
+}
+
+/// Render the `/bin/sh` launcher written to `<dir>/checkleft`.
+///
+/// Unlike [`launcher_script`], the target is not resolved at spawn time:
+/// the repobin entry may legitimately appear after spawn (a repo's shim
+/// installer runs at lease; a human may run `repobin install`), so the
+/// launcher checks for it on every invocation and `exec`s it when present.
+/// When absent it prints [`CHECKLEFT_UNAVAILABLE_MESSAGE`] and exits 127 —
+/// it never searches PATH, because a PATH `checkleft` on a developer host
+/// is typically a stale `cargo install checkleft` whose verdict says
+/// nothing about the gate CI enforces.
+pub fn checkleft_launcher_script(workspace: &Path) -> String {
+    let target = workspace_checkleft_path(workspace).to_string_lossy().into_owned();
+    // `printf`, not a heredoc, for the same sandbox reason as
+    // `launcher_script`.
+    let lines: Vec<String> = CHECKLEFT_UNAVAILABLE_MESSAGE
+        .replace("{path}", &target)
+        .lines()
+        .map(sh_quote)
+        .collect();
+    format!(
+        "#!/bin/sh\n\
+         # Generated by the Boss engine for this workspace's worker session.\n\
+         # Do not edit. Pins `checkleft` to the repobin-managed copy in this\n\
+         # workspace's bin/ (its REPOBIN.toml declares checkleft), so a stale\n\
+         # PATH copy -- e.g. an old `cargo install checkleft` -- can never run\n\
+         # in its place. Missing copy => loud exit 127, never a PATH search.\n\
+         target={}\n\
+         if [ -x \"$target\" ]; then\n\
+         \x20 exec \"$target\" \"$@\"\n\
+         fi\n\
+         printf '%s\\n' {} >&2\n\
+         exit 127\n",
+        sh_quote(&target),
+        lines.join(" ")
+    )
+}
+
+/// Body of the diagnostic printed by the `checkleft` launcher when the
+/// repobin-managed entry is absent. `{path}` is the entry's absolute path.
+///
+/// Same rationale as [`UNRESOLVED_MESSAGE`]: name the failure, the reason,
+/// and what to do — the observed failure mode was a worker whose
+/// `./bin/checkleft run` failed retrying with a PATH lookup that silently
+/// ran an ancient crates.io build and reporting "checkleft passed cleanly".
+const CHECKLEFT_UNAVAILABLE_MESSAGE: &str = "\
+checkleft: refusing to run -- the repobin-managed checkleft is missing.
+
+This workspace's REPOBIN.toml declares `checkleft` as a repobin tool, so
+the only checkleft a worker may run is the one repobin installs at
+  {path}
+and that path is missing or not executable. This launcher exists so the
+fact is immediate and visible: without it a bare `checkleft` would fall
+through to whatever copy is on PATH (on a developer host, typically an
+ancient `cargo install checkleft`) -- not the program CI runs, and a
+verdict from it means nothing.
+
+Do NOT work around this by running a PATH copy, by `cargo install`ing
+one, or by skipping the check. Populate bin/ the way this repository
+documents (see its AGENTS.md; for a repobin repo that is its cube setup
+step, or `repobin install --bin-dir bin/ --no-defaults` from the
+workspace root), then retry. If that is not possible, say plainly in
+your final response that checkleft was unavailable and name the command
+you could not run.";
+
+/// Write (or remove) the per-workspace `checkleft` launcher.
+///
+/// Written only when [`repobin_declares_tool`] finds `checkleft` in the
+/// workspace's `REPOBIN.toml`; a repo that does not route checkleft
+/// through repobin keeps today's PATH behaviour. When it does not, any
+/// `checkleft` launcher left in `dir` by an earlier spawn is removed so a
+/// stale one cannot linger. Returns the launcher path when one was
+/// written. Same atomic write contract as [`write_boss_launcher`].
+pub fn write_checkleft_launcher(dir: &Path, workspace: &Path) -> io::Result<Option<PathBuf>> {
+    if !repobin_declares_tool(workspace, CHECKLEFT_LAUNCHER_NAME) {
+        return match std::fs::remove_file(checkleft_bin_in(dir)) {
+            Ok(()) => Ok(None),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err),
+        };
+    }
+    write_launcher(dir, CHECKLEFT_LAUNCHER_NAME, &checkleft_launcher_script(workspace)).map(Some)
 }
 
 /// Write the optional per-worker `cube` wrapper that composes `body_header`
@@ -911,6 +1058,11 @@ mod tests {
     }
 
     #[test]
+    fn a_path_literally_named_repobin_workspace_shim_is_a_shim() {
+        assert!(is_build_from_source_shim(Path::new("/anywhere/repobin-shim.sh")));
+    }
+
+    #[test]
     fn a_plain_missing_path_is_not_reported_as_a_shim() {
         assert!(!is_build_from_source_shim(Path::new("/nonexistent/boss")));
     }
@@ -983,7 +1135,11 @@ mod tests {
 
     #[test]
     fn scripts_are_valid_shell() {
-        for script in [launcher_script(Some(Path::new("/tmp/boss"))), launcher_script(None)] {
+        for script in [
+            launcher_script(Some(Path::new("/tmp/boss"))),
+            launcher_script(None),
+            checkleft_launcher_script(Path::new("/tmp/it's a workspace")),
+        ] {
             let mut child = std::process::Command::new("sh")
                 .arg("-n")
                 .stdin(std::process::Stdio::piped())
@@ -1020,7 +1176,7 @@ mod tests {
             .collect();
         entries.sort();
         assert_eq!(entries, vec!["boss".to_owned()]);
-        assert_eq!(launcher_names(), ["boss", "cube"]);
+        assert_eq!(launcher_names(), ["boss", "cube", "checkleft"]);
         assert!(
             !launcher_names().contains(&"bossctl"),
             "bossctl is Boss-tier and must stay off the worker PATH"
@@ -1283,5 +1439,191 @@ mod tests {
             vec!["boss".to_owned()],
             "temp siblings from atomic write must be cleaned up / renamed away"
         );
+    }
+
+    // ── checkleft launcher ──────────────────────────────────────────────────
+
+    fn write_repobin_toml(workspace: &Path, body: &str) {
+        std::fs::create_dir_all(workspace).expect("mkdir workspace");
+        std::fs::write(workspace.join(REPOBIN_CONFIG_FILE), body).expect("write REPOBIN.toml");
+    }
+
+    #[test]
+    fn repobin_declares_tool_matches_tools_and_pins_headers_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        write_repobin_toml(
+            &ws,
+            "version = 1\n\n[tools.boss]\ntarget = \"//tools/boss/cli:boss\"\n\n  [pins.checkleft]  \nrepo = \"x\"\n",
+        );
+        assert!(repobin_declares_tool(&ws, "boss"));
+        assert!(
+            repobin_declares_tool(&ws, "checkleft"),
+            "pins headers count, whitespace trimmed"
+        );
+        assert!(!repobin_declares_tool(&ws, "bos"), "must match the whole header");
+        assert!(!repobin_declares_tool(&ws, "cube"));
+        assert!(
+            !repobin_declares_tool(&tmp.path().join("no-such-workspace"), "checkleft"),
+            "no REPOBIN.toml means not declared"
+        );
+    }
+
+    #[test]
+    fn checkleft_launcher_is_written_only_when_repobin_declares_it_and_stale_ones_are_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("bin");
+        let ws = tmp.path().join("ws");
+
+        // No REPOBIN.toml at all: nothing written.
+        std::fs::create_dir_all(&ws).unwrap();
+        assert_eq!(write_checkleft_launcher(&dir, &ws).expect("write"), None);
+        assert!(!checkleft_bin_in(&dir).exists());
+
+        // Declared: written, and it names the workspace's bin/checkleft.
+        write_repobin_toml(
+            &ws,
+            "version = 1\n[tools.checkleft]\ntarget = \"//tools/checkleft:checkleft\"\n",
+        );
+        let launcher = write_checkleft_launcher(&dir, &ws)
+            .expect("write")
+            .expect("declared => launcher");
+        assert_eq!(launcher, checkleft_bin_in(&dir));
+        let body = std::fs::read_to_string(&launcher).unwrap();
+        assert!(
+            body.contains(&sh_quote(&workspace_checkleft_path(&ws).to_string_lossy())),
+            "{body}"
+        );
+
+        // No longer declared: the stale launcher must not linger.
+        write_repobin_toml(&ws, "version = 1\n[tools.boss]\ntarget = \"//tools/boss/cli:boss\"\n");
+        assert_eq!(write_checkleft_launcher(&dir, &ws).expect("write"), None);
+        assert!(
+            !checkleft_bin_in(&dir).exists(),
+            "stale checkleft launcher must be removed"
+        );
+        // And removing an absent one is not an error.
+        assert_eq!(write_checkleft_launcher(&dir, &ws).expect("write"), None);
+    }
+
+    #[test]
+    fn checkleft_launcher_never_searches_path_and_never_exits_zero_when_missing() {
+        let script = checkleft_launcher_script(Path::new("/ws"));
+        assert!(script.contains("exit 127"), "{script}");
+        let code: Vec<&str> = script
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect();
+        let code = code.join("\n");
+        assert!(
+            !code.contains("$PATH")
+                && !code.contains("${PATH")
+                && !code.contains("command -v")
+                && !code.contains("which "),
+            "must not consult PATH: {script}"
+        );
+        assert!(script.contains("'/ws/bin/checkleft'"), "{script}");
+        assert!(
+            script.contains("cargo install"),
+            "must name the failure mode it exists to prevent: {script}"
+        );
+        assert!(
+            !script.contains("repobin exec"),
+            "must not nudge the worker into dispatching through repobin by hand: {script}"
+        );
+    }
+
+    /// A fake `checkleft` in `dir` that records its argv and prints `tag`.
+    #[cfg(unix)]
+    fn fake_checkleft(dir: &Path, tag: &str, argv_log: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("checkleft");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho '{tag}'\n",
+                argv_log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkleft_launcher_execs_the_workspace_repobin_entry_not_the_path_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        write_repobin_toml(
+            &ws,
+            "version = 1\n[tools.checkleft]\ntarget = \"//tools/checkleft:checkleft\"\n",
+        );
+        let ws_log = tmp.path().join("ws-argv");
+        fake_checkleft(&ws.join("bin"), "workspace repobin checkleft", &ws_log);
+        // The decoy: an ancient cargo-installed copy, first on PATH.
+        let decoy_log = tmp.path().join("decoy-argv");
+        let decoy_dir = tmp.path().join("cargo-bin");
+        fake_checkleft(&decoy_dir, "DECOY cargo checkleft", &decoy_log);
+
+        let dir = tmp.path().join("launchers");
+        let launcher = write_checkleft_launcher(&dir, &ws).unwrap().expect("declared");
+        let out = std::process::Command::new(&launcher)
+            .args(["run", "--verbose"])
+            .env("PATH", format!("{}:/usr/bin:/bin", decoy_dir.display()))
+            .output()
+            .expect("run launcher");
+        assert!(out.status.success(), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("workspace repobin checkleft"), "{stdout}");
+        assert_eq!(
+            std::fs::read_to_string(&ws_log).unwrap(),
+            "run\n--verbose\n",
+            "arguments must pass through untouched"
+        );
+        assert!(!decoy_log.exists(), "the PATH copy must never run");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkleft_launcher_fails_loudly_with_127_when_the_repobin_entry_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        write_repobin_toml(
+            &ws,
+            "version = 1\n[tools.checkleft]\ntarget = \"//tools/checkleft:checkleft\"\n",
+        );
+        // No ws/bin at all -- the fresh-workspace-without-setup case -- but
+        // a decoy on PATH that a fallback would find.
+        let decoy_log = tmp.path().join("decoy-argv");
+        let decoy_dir = tmp.path().join("cargo-bin");
+        fake_checkleft(&decoy_dir, "DECOY cargo checkleft", &decoy_log);
+
+        let dir = tmp.path().join("launchers");
+        let launcher = write_checkleft_launcher(&dir, &ws).unwrap().expect("declared");
+        let out = std::process::Command::new(&launcher)
+            .arg("run")
+            .env("PATH", format!("{}:/usr/bin:/bin", decoy_dir.display()))
+            .output()
+            .expect("run launcher");
+        assert_eq!(out.status.code(), Some(127), "{out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let expected_path = workspace_checkleft_path(&ws);
+        assert!(stderr.contains("refusing to run"), "{stderr}");
+        assert!(
+            stderr.contains(&expected_path.to_string_lossy().into_owned()),
+            "must name what it looked for: {stderr}"
+        );
+        assert!(stderr.contains("cargo install"), "{stderr}");
+        assert!(
+            stderr.contains("final response"),
+            "must tell the worker to report it: {stderr}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "nothing checkleft-shaped may appear on stdout: {out:?}"
+        );
+        assert!(!decoy_log.exists(), "the PATH copy must never run");
     }
 }

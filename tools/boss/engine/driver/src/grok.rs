@@ -138,12 +138,10 @@ static GROK_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
 /// isn't asking anything answerable by a default, it's entered a UI whose
 /// only exit is a human pressing a key. Planning and recording a plan are
 /// still fine; blocking on approval of one is not.
-const GROK_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
+const GROK_AGENT_RULES_PREAMBLE_TEMPLATE: &str = "You are running inside a Boss-managed worker session. The engine\n\
      spawned you in a leased cube workspace and observes this session\n\
      via Grok hooks under a Boss-owned GROK_HOME.\n\
-     For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
-     `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
-     strong stated justification.\n\
+     {checkleft}\n\
      \n\
      Default to proceeding on a reasonable assumption instead of stopping to\n\
      ask the human: pick the interpretation a competent engineer would\n\
@@ -651,8 +649,8 @@ impl AgentDriver for GrokDriver {
         }
     }
 
-    fn agent_rules_preamble(&self) -> &'static str {
-        GROK_AGENT_RULES_PREAMBLE
+    fn agent_rules_preamble(&self, checkleft_pinned: bool) -> String {
+        GROK_AGENT_RULES_PREAMBLE_TEMPLATE.replace("{checkleft}", crate::checkleft_preamble_sentence(checkleft_pinned))
     }
 
     /// Route Boss worker rules to `$GROK_HOME/AGENTS.md` (global scope).
@@ -1031,7 +1029,7 @@ mod tests {
     /// reaches every Grok worker regardless of the row's classified effort.
     #[test]
     fn agent_rules_preamble_raises_the_ask_threshold() {
-        let preamble = GrokDriver::default().agent_rules_preamble();
+        let preamble = GrokDriver::default().agent_rules_preamble(true);
         assert!(
             preamble.contains("Default to proceeding on a reasonable assumption"),
             "preamble must guide Grok workers to proceed on a stated assumption: {preamble}",
@@ -1051,7 +1049,7 @@ mod tests {
     /// together in the same driver-scoped preamble.
     #[test]
     fn agent_rules_preamble_forbids_interactive_approval_gates() {
-        let preamble = GrokDriver::default().agent_rules_preamble();
+        let preamble = GrokDriver::default().agent_rules_preamble(true);
         assert!(
             preamble.contains("Never enter an interactive approval gate"),
             "preamble must forbid blocking on plan-approval / confirmation UIs: {preamble}",
@@ -1066,6 +1064,16 @@ mod tests {
         );
         // The ask-threshold paragraph must still be present alongside it.
         assert!(preamble.contains("Default to proceeding on a reasonable assumption"));
+    }
+
+    #[test]
+    fn agent_rules_preamble_unpinned_does_not_say_bin_checkleft() {
+        let preamble = GrokDriver::default().agent_rules_preamble(false);
+        assert!(
+            !preamble.contains("bin/checkleft"),
+            "a repo whose REPOBIN.toml does not declare checkleft has no bin/ dir, \
+             so the preamble must not tell workers to run bin/checkleft: {preamble}"
+        );
     }
 
     #[test]
