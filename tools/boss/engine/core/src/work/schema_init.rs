@@ -726,6 +726,11 @@ impl WorkDb {
         // `I<n>` namespace — deliberately not a `tasks` row. Additive-only
         // (`CREATE TABLE IF NOT EXISTS`); rides the current schema marker.
         step!(timer, conn, migrate_ideas_tables)?;
+        // Immutable PR comparison packets used by review-guide generation.
+        // The rollout remains disabled until the source collector and later
+        // guide execution path are enabled, but schema creation is additive
+        // and gives every reconciler one durable capture target.
+        step!(timer, conn, migrate_pr_review_guide_source_capture_tables)?;
         step!(timer, conn, Self::stamp_schema_version)?;
         timer.finish();
         Ok(())

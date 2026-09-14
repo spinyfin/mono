@@ -345,11 +345,7 @@ impl AttachmentStore {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Write-then-rename so a crash mid-write cannot leave a truncated
-        // blob sitting at a content address that claims to be complete.
-        let staging = target.with_extension(format!("{}.partial", media_type.extension()));
-        std::fs::write(&staging, bytes)?;
-        std::fs::rename(&staging, &target)?;
+        boss_engine_utils::atomic_blob::write_blob_atomic(&target, bytes)?;
         Ok(target)
     }
 

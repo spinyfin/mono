@@ -1,0 +1,15 @@
+[package]
+name = "boss-pr-review-sources"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+futures-util = "0.3"
+anyhow = { workspace = true }
+bon = { workspace = true }
+boss-github = { path = "../../github" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+

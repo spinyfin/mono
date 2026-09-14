@@ -11,9 +11,10 @@
 //! bound exists so the cache cannot grow without limit across a long-lived
 //! engine.
 
+use boss_engine_utils::atomic_blob::write_blob_atomic;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -322,22 +323,6 @@ fn persist_snapshot(dir: &Path, entries: &[(IndexEntry, String)]) -> io::Result<
         serde_json::to_vec_pretty(&index).unwrap_or_else(|_| b"{}".to_vec()),
     )?;
     fs::rename(&tmp, index_path(dir))?;
-    Ok(())
-}
-
-/// Write `bytes` to `final_path` via a sibling `*.tmp` then rename, so a
-/// crash mid-write cannot leave a truncated file at the content-addressed
-/// path (the `exists()` shortcut would then treat it as complete forever).
-fn write_blob_atomic(final_path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut tmp_name = final_path.as_os_str().to_owned();
-    tmp_name.push(".tmp");
-    let tmp_path = PathBuf::from(tmp_name);
-    {
-        let mut file = fs::File::create(&tmp_path)?;
-        file.write_all(bytes)?;
-        let _ = file.sync_all();
-    }
-    fs::rename(&tmp_path, final_path)?;
     Ok(())
 }
 

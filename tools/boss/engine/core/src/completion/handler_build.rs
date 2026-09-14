@@ -58,6 +58,7 @@ impl WorkerCompletionHandler {
             now_fn: Arc::new(std::time::Instant::now),
             review_batch_enqueuer: Arc::new(GhReviewBatchEnqueuer),
             review_pool_size: crate::coordinator::DEFAULT_REVIEW_POOL_SIZE,
+            source_packet_collector: crate::review_guide_capture::github_source_packet_collector(),
         }
     }
 
@@ -330,6 +331,64 @@ impl WorkerCompletionHandler {
     /// the escalation ladder. Default OFF (see the flag registry).
     pub fn mechanical_rebase_enabled(&self) -> bool {
         self.feature_flags.is_enabled("conflict_ladder_mechanical_rebase")
+    }
+
+    /// Queue the rollout-gated immutable source capture after a lifecycle
+    /// seam has already verified and bound a PR to this execution. The
+    /// reconciler resolves revision executions to the owning root series.
+    pub(crate) fn reconcile_review_guide_source_for_execution(
+        &self,
+        execution_id: &str,
+        pr_url: &str,
+        trigger: crate::work::PrSourceCaptureTrigger,
+    ) {
+        crate::review_guide_capture::reconcile_review_guide_source_for_execution_with_collector(
+            self.work_db.clone(),
+            self.feature_flags.clone(),
+            execution_id,
+            pr_url,
+            trigger,
+            None,
+            self.source_packet_collector.clone(),
+        );
+    }
+
+    /// Queue a source capture from the merge poller's successful, already
+    /// current probe without issuing a second endpoint observation.
+    pub(crate) fn reconcile_review_guide_source_from_probe(
+        &self,
+        root_task_id: &str,
+        pr_url: &str,
+        observed: boss_pr_review_sources::PinnedComparison,
+        observation_sequence: i64,
+    ) {
+        crate::review_guide_capture::reconcile_review_guide_source_with_collector(
+            self.work_db.clone(),
+            self.feature_flags.clone(),
+            crate::review_guide_capture::SourceCaptureRequest::builder()
+                .root_task_id(root_task_id)
+                .pr_url(pr_url)
+                .trigger(crate::work::PrSourceCaptureTrigger::Poller)
+                .observed(observed)
+                .observation_sequence(observation_sequence)
+                .build(),
+            self.source_packet_collector.clone(),
+        );
+    }
+
+    /// Inject a source-packet collector. Tests use this to spy on capture
+    /// without calling GitHub; production keeps the default GitHub collector.
+    pub(crate) fn with_source_packet_collector(
+        mut self,
+        collector: crate::review_guide_capture::SourcePacketCollector,
+    ) -> Self {
+        self.source_packet_collector = collector;
+        self
+    }
+
+    pub(crate) fn review_guide_source_capture_enabled(&self) -> bool {
+        self.feature_flags
+            .is_enabled(crate::review_guide_capture::REVIEW_GUIDE_SOURCE_CAPTURE_FLAG)
     }
 
     /// Whether each eligible PR is dispatched as a three-leaf review batch.

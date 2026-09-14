@@ -4,36 +4,33 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 exports_files(["Cargo.toml"])
 
 rust_library(
-    name = "attachments",
+    name = "pr-review-sources",
     srcs = glob(["src/**/*.rs"]),
-    crate_name = "boss_engine_attachments",
+    crate_name = "boss_pr_review_sources",
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
-        "//tools/boss/bossctl:__pkg__",
         "//tools/boss/engine/core:__pkg__",
     ],
-    deps = all_crate_deps(normal = True) + [
-        "//tools/boss/engine/utils",
-        "//tools/boss/protocol",
-    ],
+    deps = [
+        "//tools/boss/github",
+    ] + all_crate_deps(normal = True),
 )
 
 rust_test(
-    name = "attachments_test",
+    name = "pr-review-sources_test",
     size = "small",
-    crate = ":attachments",
+    crate = ":pr-review-sources",
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),
-    deps = all_crate_deps(
+    deps = [
+        "//tools/boss/github",
+    ] + all_crate_deps(
         normal = True,
         normal_dev = True,
-    ) + [
-        "//tools/boss/engine/utils",
-        "//tools/boss/protocol",
-    ],
+    ),
 )

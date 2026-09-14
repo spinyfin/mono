@@ -204,6 +204,11 @@ impl WorkerCompletionHandler {
                     return StopOutcome::DbError;
                 }
             };
+        self.reconcile_review_guide_source_for_execution(
+            &execution.id,
+            &pr_url,
+            crate::work::PrSourceCaptureTrigger::Completion,
+        );
         self.staged_pr_urls.forget(&execution.id);
         self.nudge_breaker.forget(&execution.id);
         self.build_wait_tracker.forget(&execution.id);

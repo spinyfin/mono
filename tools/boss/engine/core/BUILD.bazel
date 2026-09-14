@@ -101,6 +101,7 @@ rust_library(
         "//tools/boss/engine/metrics",
         "//tools/boss/engine/planner-validation",
         "//tools/boss/engine/pr-review",
+        "//tools/boss/engine/pr-review-sources",
         "//tools/boss/engine/pr-template",
         "//tools/boss/engine/proposal-validation",
         "//tools/boss/engine/recovery",

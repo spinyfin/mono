@@ -410,6 +410,31 @@ pub async fn run_one_pass_observed(
         .map(|candidate| candidate.pr_url.clone())
         .filter(|url| probe_url_seen.insert(url.clone()))
         .collect();
+    // Sequence source observations before beginning the probe batch. This is
+    // deliberately adjacent to the actual GitHub request rather than the
+    // later candidate walk: response timing must not determine which
+    // comparison becomes the desired one.
+    let source_observation_sequences: HashMap<String, i64> = completion_handler
+        .filter(|handler| handler.review_guide_source_capture_enabled())
+        .map(|_| {
+            probe_urls
+                .iter()
+                .filter_map(
+                    |url| match work_db.allocate_pr_review_guide_source_observation_sequence() {
+                        Ok(sequence) => Some((url.clone(), sequence)),
+                        Err(error) => {
+                            tracing::warn!(
+                                pr_url = %url,
+                                ?error,
+                                "merge poller: could not allocate review-guide source observation sequence",
+                            );
+                            None
+                        }
+                    },
+                )
+                .collect()
+        })
+        .unwrap_or_default();
     let mut snapshot = ProbeSnapshot::new(probe.probe_batch(&probe_urls).await);
     // The pass's candidate walk, materialised so a mid-pass re-probe can be
     // scoped to the part of it that has not happened yet — see
@@ -442,6 +467,7 @@ pub async fn run_one_pass_observed(
         sweep_one(
             work_db,
             &snapshot.results,
+            &source_observation_sequences,
             publisher,
             (cube_client, completion_handler, remediation),
             candidate,
@@ -738,6 +764,31 @@ pub async fn reconcile_batch(
         );
         return (outcome, pr_urls.iter().map(|url| (url.clone(), None)).collect());
     }
+    // Allocate source-capture ordering before the batched GitHub request
+    // starts. A slower, older response can therefore never outrank a newer
+    // probe merely because it arrived later. The disabled rollout pays no
+    // write cost and leaves the existing poller behavior unchanged.
+    let source_observation_sequences: HashMap<String, i64> = completion_handler
+        .filter(|handler| handler.review_guide_source_capture_enabled())
+        .map(|_| {
+            probe_urls
+                .iter()
+                .filter_map(
+                    |url| match work_db.allocate_pr_review_guide_source_observation_sequence() {
+                        Ok(sequence) => Some((url.clone(), sequence)),
+                        Err(error) => {
+                            tracing::warn!(
+                                pr_url = %url,
+                                ?error,
+                                "merge poller: could not allocate review-guide source observation sequence",
+                            );
+                            None
+                        }
+                    },
+                )
+                .collect()
+        })
+        .unwrap_or_default();
     let probe_results = probe.probe_batch(&probe_urls).await;
 
     let mut seen = std::collections::HashSet::new();
@@ -753,6 +804,7 @@ pub async fn reconcile_batch(
         sweep_one(
             work_db,
             &probe_results,
+            &source_observation_sequences,
             publisher,
             (cube_client, completion_handler, remediation),
             candidate,
@@ -1263,6 +1315,7 @@ pub(crate) async fn sweep_late_pr(
 pub(crate) async fn sweep_one(
     work_db: &WorkDb,
     probe_results: &HashMap<String, std::result::Result<PrLifecycleProbe, String>>,
+    source_observation_sequences: &HashMap<String, i64>,
     publisher: &dyn ExecutionPublisher,
     // (cube_client, completion_handler, remediation) — bundled to keep the
     // parameter count under clippy::too_many_arguments.
@@ -1344,6 +1397,19 @@ pub(crate) async fn sweep_one(
             maybe_trigger_post_merge_review(work_db, publisher, candidate, &probe_result).await;
         }
         PrLifecycleState::Open(open) => {
+            if let (Some(handler), Some(base_sha), Some(head_sha), Some(observation_sequence)) = (
+                completion_handler,
+                probe_result.base_ref_oid.clone(),
+                probe_result.head_ref_oid.clone(),
+                source_observation_sequences.get(&candidate.pr_url).copied(),
+            ) {
+                handler.reconcile_review_guide_source_from_probe(
+                    &candidate.work_item_id,
+                    &candidate.pr_url,
+                    boss_pr_review_sources::PinnedComparison { base_sha, head_sha },
+                    observation_sequence,
+                );
+            }
             known_active_queue_failure =
                 Some(reap_superseded_merge_queue_attempt(work_db, publisher, candidate, &probe_result).await);
             // Design §Q1: conflict pre-empts CI — the conflict-resolver

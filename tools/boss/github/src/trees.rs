@@ -48,6 +48,34 @@ pub struct RepoTree {
     pub truncated: bool,
 }
 
+/// One immutable Git-tree entry. Unlike [`TreeBlob`], this preserves object
+/// identity and entry kind so source collectors can distinguish ordinary
+/// files, symlinks, and submodule pointers without resolving a mutable ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedTreeEntry {
+    /// Repo-relative path at the requested commit.
+    pub path: String,
+    /// Git object id from the tree entry.
+    pub object_sha: String,
+    /// Git file mode, such as `100644`, `120000`, or `160000`.
+    pub mode: String,
+    /// GitHub tree entry type, normally `blob` or `commit` for a submodule.
+    pub object_type: String,
+    /// Blob size when GitHub supplies it. Submodule pointers have no size.
+    pub size: Option<u64>,
+}
+
+/// A selected set of entries from a tree at an immutable commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedTree {
+    pub sha: String,
+    pub entries: Vec<PinnedTreeEntry>,
+    /// A truncated recursive response cannot prove that every requested path
+    /// was seen, so source collectors must fail closed instead of treating it
+    /// as a complete manifest.
+    pub truncated: bool,
+}
+
 /// Why a GitHub tree/blob read failed, in the terms a UI needs to pick
 /// a remedy. Anything that is not recognisably one of the first three
 /// is [`Self::Unreachable`] — the catch-all for offline, DNS failure, a
@@ -169,6 +197,27 @@ pub async fn fetch_head_sha(owner: &str, repo: &str, git_ref: &str) -> TreeResul
     Ok(sha)
 }
 
+/// Shared `gh api` + JSON parse for a Git tree. `recursive` is the
+/// whole-repo listing used by document browsers; source capture walks one
+/// changed directory at a time without `recursive=1` so GitHub's 100k-entry
+/// truncation limit cannot fail a monorepo capture.
+fn tree_endpoint(owner: &str, repo: &str, sha: &str, recursive: bool) -> String {
+    if recursive {
+        format!("repos/{owner}/{repo}/git/trees/{sha}?recursive=1")
+    } else {
+        format!("repos/{owner}/{repo}/git/trees/{sha}")
+    }
+}
+
+async fn fetch_tree_body(owner: &str, repo: &str, sha: &str, recursive: bool) -> TreeResult<serde_json::Value> {
+    let endpoint = tree_endpoint(owner, repo, sha, recursive);
+    let stdout = gh_api(&["api", &endpoint]).await?;
+    serde_json::from_slice(&stdout).map_err(|e| TreeApiError {
+        kind: TreeApiErrorKind::Unreachable,
+        message: format!("could not parse the tree response from `gh api {endpoint}`: {e}"),
+    })
+}
+
 /// The full recursive tree at `sha`, keeping only blobs whose path
 /// satisfies `keep_path`.
 ///
@@ -178,13 +227,56 @@ pub async fn fetch_tree<F>(owner: &str, repo: &str, sha: &str, keep_path: F) -> 
 where
     F: Fn(&str) -> bool,
 {
-    let endpoint = format!("repos/{owner}/{repo}/git/trees/{sha}?recursive=1");
-    let stdout = gh_api(&["api", &endpoint]).await?;
-    let body: serde_json::Value = serde_json::from_slice(&stdout).map_err(|e| TreeApiError {
-        kind: TreeApiErrorKind::Unreachable,
-        message: format!("could not parse the tree response from `gh api {endpoint}`: {e}"),
-    })?;
+    let body = fetch_tree_body(owner, repo, sha, true).await?;
     Ok(parse_tree(sha, &body, keep_path))
+}
+
+/// Fetch selected entries from a tree at a full commit SHA while retaining
+/// each object's Git identity, mode, and type. This is the source-collector
+/// primitive; [`fetch_tree`] remains the compatible blobs-only convenience
+/// API for document listing callers.
+pub async fn fetch_pinned_tree<F>(owner: &str, repo: &str, sha: &str, keep_path: F) -> TreeResult<PinnedTree>
+where
+    F: Fn(&str) -> bool,
+{
+    let body = fetch_tree_body(owner, repo, sha, true).await?;
+    Ok(parse_pinned_tree(sha, &body, keep_path))
+}
+
+fn directory_tree_ref(commit_sha: &str, directory: &str) -> String {
+    if directory.is_empty() {
+        commit_sha.to_owned()
+    } else {
+        format!("{commit_sha}:{}", encode_tree_path(directory))
+    }
+}
+
+fn encode_tree_path(path: &str) -> String {
+    path.bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => (byte as char).to_string(),
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+/// Immediate children of `directory` at `commit_sha`, without walking the
+/// rest of the repository. `directory` is empty for the tree root. Entry
+/// paths in the result are GitHub's directory-relative names (the file
+/// basename), not repo-relative paths.
+pub async fn fetch_pinned_tree_directory<F>(
+    owner: &str,
+    repo: &str,
+    commit_sha: &str,
+    directory: &str,
+    keep_path: F,
+) -> TreeResult<PinnedTree>
+where
+    F: Fn(&str) -> bool,
+{
+    let tree_ref = directory_tree_ref(commit_sha, directory);
+    let body = fetch_tree_body(owner, repo, &tree_ref, false).await?;
+    Ok(parse_pinned_tree(commit_sha, &body, keep_path))
 }
 
 /// Map a `git/trees` response body into a [`RepoTree`], keeping only
@@ -221,6 +313,41 @@ where
     RepoTree {
         sha: sha.to_owned(),
         blobs,
+        truncated: body["truncated"].as_bool().unwrap_or(false),
+    }
+}
+
+/// Pure parser for the immutable tree-entry manifest used by source capture.
+fn parse_pinned_tree<F>(sha: &str, body: &serde_json::Value, keep_path: F) -> PinnedTree
+where
+    F: Fn(&str) -> bool,
+{
+    let entries = body["tree"]
+        .as_array()
+        .map(|tree| {
+            tree.iter()
+                .filter_map(|entry| {
+                    let path = entry["path"].as_str()?;
+                    if !keep_path(path) {
+                        return None;
+                    }
+                    let object_sha = entry["sha"].as_str()?;
+                    let mode = entry["mode"].as_str()?;
+                    let object_type = entry["type"].as_str()?;
+                    Some(PinnedTreeEntry {
+                        path: path.to_owned(),
+                        object_sha: object_sha.to_owned(),
+                        mode: mode.to_owned(),
+                        object_type: object_type.to_owned(),
+                        size: entry["size"].as_u64(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    PinnedTree {
+        sha: sha.to_owned(),
+        entries,
         truncated: body["truncated"].as_bool().unwrap_or(false),
     }
 }
@@ -370,12 +497,12 @@ mod tests {
             "sha": "deadbeef",
             "truncated": false,
             "tree": [
-                { "path": "docs", "type": "tree" },
-                { "path": "docs/design.md", "type": "blob", "size": 1234 },
-                { "path": "README.md", "type": "blob", "size": 42 },
-                { "path": "src/main.rs", "type": "blob", "size": 99 },
-                { "path": "vendor/lib", "type": "commit" },
-                { "path": "notes.markdown", "type": "blob" },
+                { "path": "docs", "type": "tree", "sha": "tree", "mode": "040000" },
+                { "path": "docs/design.md", "type": "blob", "sha": "design", "mode": "100644", "size": 1234 },
+                { "path": "README.md", "type": "blob", "sha": "readme", "mode": "100644", "size": 42 },
+                { "path": "src/main.rs", "type": "blob", "sha": "main", "mode": "100755", "size": 99 },
+                { "path": "vendor/lib", "type": "commit", "sha": "submodule", "mode": "160000" },
+                { "path": "notes.markdown", "type": "blob", "sha": "notes", "mode": "120000" },
             ]
         })
     }
@@ -420,6 +547,32 @@ mod tests {
     }
 
     #[test]
+    fn pinned_tree_preserves_object_metadata_for_non_blob_entries() {
+        let tree = parse_pinned_tree("abc123", &sample_tree_body(), |path| {
+            path == "vendor/lib" || path == "notes.markdown"
+        });
+        assert_eq!(
+            tree.entries,
+            vec![
+                PinnedTreeEntry {
+                    path: "vendor/lib".to_owned(),
+                    object_sha: "submodule".to_owned(),
+                    mode: "160000".to_owned(),
+                    object_type: "commit".to_owned(),
+                    size: None,
+                },
+                PinnedTreeEntry {
+                    path: "notes.markdown".to_owned(),
+                    object_sha: "notes".to_owned(),
+                    mode: "120000".to_owned(),
+                    object_type: "blob".to_owned(),
+                    size: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn parse_tree_surfaces_githubs_truncated_flag() {
         let body = serde_json::json!({ "truncated": true, "tree": [] });
         assert!(parse_tree("abc123", &body, is_markdown_path).truncated);
@@ -433,5 +586,40 @@ mod tests {
         let tree = parse_tree("abc123", &body, is_markdown_path);
         assert!(tree.blobs.is_empty());
         assert!(!tree.truncated);
+    }
+
+    #[test]
+    fn blobs_only_tree_reader_keeps_legacy_entries_without_manifest_metadata() {
+        let body = serde_json::json!({
+            "tree": [{"path": "README.md", "type": "blob", "size": 42}]
+        });
+        assert_eq!(
+            parse_tree("abc123", &body, |_| true).blobs,
+            vec![TreeBlob {
+                path: "README.md".to_owned(),
+                size: Some(42),
+            }]
+        );
+        assert!(parse_pinned_tree("abc123", &body, |_| true).entries.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod directory_endpoint_tests {
+    use super::*;
+    #[test]
+    fn directory_tree_endpoints_pin_root_nested_and_reserved_paths() {
+        assert_eq!(
+            tree_endpoint("acme", "widget", &directory_tree_ref("abc", ""), false),
+            "repos/acme/widget/git/trees/abc"
+        );
+        assert_eq!(
+            tree_endpoint("acme", "widget", &directory_tree_ref("abc", "src/nested"), false),
+            "repos/acme/widget/git/trees/abc:src/nested"
+        );
+        assert_eq!(
+            tree_endpoint("acme", "widget", &directory_tree_ref("abc", "with space/#hash"), false),
+            "repos/acme/widget/git/trees/abc:with%20space/%23hash"
+        );
     }
 }

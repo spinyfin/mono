@@ -1811,3 +1811,120 @@ mod t12;
 mod t13;
 mod t14;
 mod t15;
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::review_guide_capture::{REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, SourcePacketCollector};
+use crate::work::PrSourceCaptureTrigger;
+use boss_pr_review_sources::SourcePacket;
+
+const SOURCE_CAPTURE_PR_URL: &str = "https://github.com/spinyfin/mono/pull/25";
+
+fn source_capture_packet() -> SourcePacket {
+    SourcePacket {
+        schema_version: 2,
+        canonical_pr_url: SOURCE_CAPTURE_PR_URL.to_owned(),
+        pr_number: 25,
+        title: "Captured".to_owned(),
+        body: None,
+        base_repository: "spinyfin/mono".to_owned(),
+        head_repository: "spinyfin/mono".to_owned(),
+        observed_base_sha: "base".to_owned(),
+        merge_base_sha: "merge-base".to_owned(),
+        head_sha: "head".to_owned(),
+        files: Vec::new(),
+        omissions: Vec::new(),
+    }
+}
+
+fn counting_source_collector(calls: Arc<AtomicUsize>, packet: SourcePacket) -> SourcePacketCollector {
+    let fixture_packet = packet.clone();
+    let collect: crate::review_guide_capture::PacketCollectFn = Arc::new(move |url, _observed, _branch, _metadata| {
+        let packet = packet.clone();
+        let calls = calls.clone();
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(url, packet.canonical_pr_url);
+            Ok(packet)
+        })
+    });
+    crate::review_guide_capture::SourcePacketCollector::fixture(collect, fixture_packet)
+}
+
+async fn wait_for_source_capture(db: &WorkDb, root: &str) {
+    let started = std::time::Instant::now();
+    loop {
+        if db.get_latest_pr_review_guide_source_capture(root).unwrap().is_some() {
+            return;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(2) {
+            panic!("timed out waiting for review-guide source capture");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn finalize_pr_transition_captures_on_the_canonical_root() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    let flags_dir = tempdir().unwrap();
+    let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        flags_dir.path().join("feature-flags.toml"),
+    ));
+    flags.load().unwrap();
+    flags.set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, true).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_feature_flags(flags)
+        .with_source_packet_collector(counting_source_collector(calls.clone(), source_capture_packet()));
+
+    let outcome = handler
+        .finalize_pr_transition(
+            &execution_id,
+            SOURCE_CAPTURE_PR_URL.to_owned(),
+            WorkerPrCompletionTarget::Done,
+            "test",
+        )
+        .await;
+    assert!(
+        !matches!(outcome, StopOutcome::DbError),
+        "finalize must succeed; got {outcome:?}"
+    );
+    wait_for_source_capture(&db, &chore_id).await;
+    let capture = db
+        .get_latest_pr_review_guide_source_capture(&chore_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(capture.trigger, PrSourceCaptureTrigger::Completion.as_str());
+    assert_eq!(capture.packet.head_sha, "head");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    handler.reconcile_review_guide_source_for_execution(
+        &execution_id,
+        SOURCE_CAPTURE_PR_URL,
+        PrSourceCaptureTrigger::Completion,
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "completion must reuse the complete comparison"
+    );
+}
+
+#[tokio::test]
+async fn disabled_finalize_does_not_allocate_a_source_observation() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None)).handler;
+    let _ = handler
+        .finalize_pr_transition(
+            &execution_id,
+            SOURCE_CAPTURE_PR_URL.to_owned(),
+            WorkerPrCompletionTarget::Done,
+            "test",
+        )
+        .await;
+    assert_eq!(db.allocate_pr_review_guide_source_observation_sequence().unwrap(), 1);
+}

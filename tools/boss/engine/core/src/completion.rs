@@ -1600,6 +1600,9 @@ pub struct WorkerCompletionHandler {
     /// [`crate::coordinator::DEFAULT_REVIEW_POOL_SIZE`]; production wires
     /// `WorkConfig.review_pool_size` via [`Self::with_review_pool_size`].
     review_pool_size: usize,
+    /// GitHub source-packet collector used by review-guide capture seams.
+    /// Production uses the GitHub-backed collector; tests inject a spy.
+    source_packet_collector: crate::review_guide_capture::SourcePacketCollector,
 }
 
 /// Outcome of [`WorkerCompletionHandler::try_retire_cleared_blocking_signal`].
