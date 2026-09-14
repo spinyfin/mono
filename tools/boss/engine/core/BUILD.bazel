@@ -105,6 +105,7 @@ rust_library(
         "//tools/boss/engine/proposal-validation",
         "//tools/boss/engine/recovery",
         "//tools/boss/engine/ssh-transport",
+        "//tools/boss/engine/startup-policy",
         "//tools/boss/engine/stdout-progress",
         "//tools/boss/engine/structured-output",
         "//tools/boss/engine/timer-wheel",

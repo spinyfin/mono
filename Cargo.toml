@@ -54,6 +54,7 @@ members = [
   "tools/boss/engine/recovery",
   "tools/boss/engine/worker-bin",
   "tools/boss/engine/worker-policy",
+  "tools/boss/engine/startup-policy",
   "tools/boss/log-files",
   "tools/boss/protocol",
   "tools/boss/shell-quote",

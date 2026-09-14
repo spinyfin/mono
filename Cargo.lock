@@ -473,6 +473,7 @@ dependencies = [
  "boss-pr-template",
  "boss-protocol",
  "boss-ssh-transport",
+ "boss-startup-policy",
  "boss-timer-wheel",
  "boss-tmux",
  "boss-transcript-markdown",
@@ -979,6 +980,10 @@ dependencies = [
  "tokio",
  "tracing",
 ]
+
+[[package]]
+name = "boss-startup-policy"
+version = "0.1.0"
 
 [[package]]
 name = "boss-timer-wheel"

@@ -25,12 +25,15 @@ use crate::stdout_progress::{ProgressCheckpointSink, WorkerEventSink};
 
 const DISCOVERY_POLL: Duration = Duration::from_millis(100);
 const FILE_POLL: Duration = Duration::from_millis(50);
-const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_DISCOVERY_DIRS: usize = 512;
 const MAX_DISCOVERY_MATCHES: usize = 8;
 const MAX_SESSION_META_BYTES: u64 = 64 * 1024;
 const FILE_CHUNK_BYTES: usize = 64 * 1024;
 const DUPLEX_BYTES: usize = 64 * 1024;
+
+#[cfg(test)]
+#[path = "agent_jsonl_progress_deadline_tests.rs"]
+mod deadline_tests;
 
 /// Where a run's file ingress had got to, durably.
 ///
@@ -522,6 +525,7 @@ pub enum ResumeOutcome {
 #[derive(Default)]
 pub struct AgentJsonlProgressManager {
     runs: Mutex<HashMap<String, RunHandle>>,
+    discovery_load: boss_startup_policy::DiscoveryLoad,
 }
 
 impl AgentJsonlProgressManager {
@@ -694,11 +698,25 @@ impl AgentJsonlProgressManager {
             return Ok(());
         }
 
+        // Register only after the duplicate-run check. A duplicate prepare
+        // must not inflate every waiting discovery's contention allowance.
+        let discovery_budget = matches!(&start, IngressStart::Discover).then(|| self.discovery_load.begin());
         let (activate_tx, activate_rx) = oneshot::channel();
         let (halt_tx, halt_rx) = watch::channel(StreamHalt::Running);
         let task_run_id = run_id.to_owned();
         tokio::spawn(async move {
-            run_prepared(task_run_id, driver, prepared, sink, store, start, activate_rx, halt_rx).await;
+            run_prepared(
+                task_run_id,
+                driver,
+                prepared,
+                sink,
+                store,
+                start,
+                discovery_budget,
+                activate_rx,
+                halt_rx,
+            )
+            .await;
         });
         runs.insert(
             run_id.to_owned(),
@@ -749,6 +767,7 @@ async fn run_prepared<S>(
     sink: S,
     store: Arc<dyn IngressCheckpointStore>,
     start: IngressStart,
+    discovery_budget: Option<boss_startup_policy::DiscoveryBudget>,
     mut activate: oneshot::Receiver<()>,
     mut halt: watch::Receiver<StreamHalt>,
 ) where
@@ -768,7 +787,8 @@ async fn run_prepared<S>(
 
     let (candidate, start_offset, session_state) = match start {
         IngressStart::Discover => {
-            let candidate = match discover_candidate(&prepared, &mut halt).await {
+            let budget = discovery_budget.expect("discovery registered before activation");
+            let candidate = match discover_candidate(&prepared, &mut halt, &budget).await {
                 Ok(Some(candidate)) => candidate,
                 Ok(None) => return,
                 Err(err) => {
@@ -893,8 +913,9 @@ struct Candidate {
 async fn discover_candidate(
     prepared: &PreparedSource,
     halt: &mut watch::Receiver<StreamHalt>,
+    budget: &boss_startup_policy::DiscoveryBudget,
 ) -> Result<Option<Candidate>, String> {
-    let deadline = tokio::time::Instant::now() + DISCOVERY_TIMEOUT;
+    let started = tokio::time::Instant::now();
     loop {
         // A `Cancel` during discovery stops it: the engine is tearing the
         // ingress down and there is nothing left to attach to.
@@ -917,11 +938,11 @@ async fn discover_candidate(
             }
             _ => {}
         }
-        if tokio::time::Instant::now() >= deadline {
+        if started.elapsed() >= budget.timeout() {
             return Err(format!(
                 "no correlated rollout appeared under {} within {}s",
                 prepared.root.path.display(),
-                DISCOVERY_TIMEOUT.as_secs()
+                budget.timeout().as_secs()
             ));
         }
         tokio::select! {

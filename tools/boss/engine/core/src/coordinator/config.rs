@@ -89,6 +89,7 @@ impl ExecutionCoordinator {
             dispatch_events: Arc::new(NoopDispatchEventSink),
             inflight_dispatches: InflightDispatches::new(),
             dispatch_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_DISPATCHES)),
+            resume_admission: std::sync::Mutex::new(boss_startup_policy::ResumeAdmission::default()),
             scheduling_active: AtomicBool::new(false),
             scheduling_pending: AtomicBool::new(false),
             event_bus: Arc::new(EventBus::new()),
@@ -517,8 +518,12 @@ impl ExecutionCoordinator {
     /// The caller is responsible for persisting the new state to
     /// `state.db` — see `handle_set_dispatch_paused` in `app/engine_meta.rs`.
     pub fn resume_dispatch(&self) {
-        let was_paused = self.dispatch_pause.lock().unwrap().take().is_some();
-        if was_paused {
+        let mut pause = self.dispatch_pause.lock().unwrap();
+        if pause.is_some() {
+            // Arm before exposing the unpaused state to a concurrent drain.
+            self.resume_admission.lock().unwrap().resume(std::time::Instant::now());
+            *pause = None;
+            drop(pause);
             self.notify_pause_state_changed();
         }
     }

@@ -2024,6 +2024,9 @@ pub struct ExecutionCoordinator {
     /// [`MAX_INFLIGHT_DISPATCHES`].
     #[builder(default = Arc::new(Semaphore::new(MAX_INFLIGHT_DISPATCHES)))]
     dispatch_slots: Arc<Semaphore>,
+    /// Startup pacing for the cohort that was ready when dispatch resumed.
+    #[builder(default)]
+    resume_admission: std::sync::Mutex<boss_startup_policy::ResumeAdmission>,
     /// `true` while a `run_scheduler` task is alive. `kick()` returns
     /// without spawning when this is already set; the alive scheduler
     /// is responsible for noticing the wakeup via `scheduling_pending`.

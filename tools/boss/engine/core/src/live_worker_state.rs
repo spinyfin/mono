@@ -120,16 +120,19 @@ pub const STALLED_SPAWN_THRESHOLD_SECS: i64 = 30;
 /// hosting nothing but an idle login shell reported `shell_pid=92697`
 /// and satisfied every pane-level check forever.
 ///
-/// 300s is deliberately far above any real driver startup. A healthy
-/// driver's first hook (`SessionStart`) fires within seconds of exec.
-/// The one historically legitimate multi-minute pre-hook wait — claude's
-/// first-run folder-trust dialog, which is the entire reason
-/// [`LiveWorkerStateRegistry::mark_stalled_spawns`] exists — is
-/// *pre-suppressed* at provision time by
-/// `boss_engine_driver::claude`'s `hasTrustDialogAccepted` seeding, so
-/// no driver should ever legitimately sit pre-hook for minutes. Five
-/// minutes leaves an order of magnitude of headroom over that reality
-/// while still bounding the hold: before this, the hold was unbounded.
+/// Retain 300s after revalidation against Codex's 2026-09-13 startup:
+/// panes/shells took 4–7s, while the driver took 78–84s solo and 119–120s
+/// at six-way concurrency. Five minutes is over twice the observed burst
+/// startup, including pane startup; it is not an order of magnitude above
+/// every driver's startup. File discovery now allows 165s for that burst
+/// and at most 240s, leaving at least 60s for pane setup and signal delivery.
+/// The old 120s discovery expiry could stop observation long before this
+/// grace expired; increasing the reap grace alone would not repair that.
+///
+/// Claude was historically validated via its prompt SessionStart hook and
+/// provisioned folder-trust acceptance. Codex is now also validated against
+/// the measured profile above. Keep the same finite grace for all drivers:
+/// a shell without driver evidence still must not hold a slot forever.
 pub const DRIVER_START_GRACE_SECS: i64 = 300;
 
 /// How long after the most recent hook a slot may keep advertising
@@ -196,9 +199,8 @@ struct SlotMeta {
     /// spawn. Consulted by `crate::stale_worker_sweep` to decide whether —
     /// and at what threshold — cadence-based staleness applies to this
     /// slot. `None` (never declared) reads as [`ProgressFidelity::Rich`]
-    /// — today's only driver (Claude) and every existing call site that
-    /// never sets this explicitly, so the default preserves current
-    /// behaviour unchanged.
+    /// — the legacy Claude default retained for callers that do not
+    /// declare a driver's fidelity explicitly.
     ///
     /// In-memory only, and not persisted or rehydrated anywhere: if the
     /// engine restarts while a worker is alive, the registry starts empty
@@ -207,16 +209,15 @@ struct SlotMeta {
     /// `Coarse`- or `Minimal`-tier driver this silently re-enables
     /// cadence-based staleness judgement for a slot the exemption was
     /// meant to protect — a live worker mid-turn with no per-tool event
-    /// can then be swept as stale. No-op today (Claude is `Rich`), but a
-    /// real gap for the first non-`Rich` driver.
+    /// can then be swept as stale. Rich drivers are unaffected; other
+    /// drivers require their fidelity declaration to be restored.
     progress_fidelity: Option<ProgressFidelity>,
     /// Does this run's driver declare `Capability::AwaitingInputSignal`?
     /// Gates whether `apply_event` trusts a `WorkerEvent::Notification` as
     /// a genuine "worker is blocked on human input" signal.
     ///
-    /// Seeded `true` by `register_spawn` (Claude is the only driver in
-    /// production today, and it provides the capability), so the ~30
-    /// existing test call sites keep working unchanged. Production spawn
+    /// Seeded `true` by the legacy `register_spawn` helper for compatibility
+    /// with Claude-oriented test registrations. Production spawn
     /// sites that resolve a real driver call
     /// `register_spawn_with_capabilities` instead, passing the resolved
     /// value directly so it can never be left at the default by a
@@ -901,6 +902,19 @@ impl LiveWorkerStateRegistry {
         guard.get(&slot_id).and_then(|entry| entry.meta.driver_signal_at)
     }
 
+    /// Startup pressure includes pool claims not registered as live yet.
+    /// A claim can outlive startup; driver proof removes it from this
+    /// count even while the execution remains productive.
+    pub(crate) fn startup_pending(&self, claimed_runs: &std::collections::HashSet<String>) -> bool {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard.values().any(|entry| entry.meta.driver_signal_at.is_none())
+            || claimed_runs.iter().any(|run_id| {
+                !guard
+                    .values()
+                    .any(|entry| entry.state.run_id == *run_id && entry.meta.driver_signal_at.is_some())
+            })
+    }
+
     /// Whether `slot_id`'s current registration is owed spawn-ack proof
     /// (`EngineSpawned`) or was re-adopted (`Readopted`) — see
     /// [`DriverStartExpectation`]. Driver-start verification itself
@@ -1438,9 +1452,10 @@ impl LiveWorkerStateRegistry {
     ///   vouch for a driver that never ran.
     ///
     /// Returns the slot IDs that were changed so callers can broadcast
-    /// the updated snapshot. Normal-running workers (whose `SessionStart`
-    /// hook fires within seconds of spawn) always have `last_event_at`
-    /// set before the threshold elapses; this method ignores them.
+    /// the updated snapshot. Workers that have already supplied an event
+    /// have `last_event_at` set and are ignored. A healthy but slow Codex
+    /// startup can cross this display threshold before file progress arrives;
+    /// driver-start verification uses the separate, longer grace above.
     pub fn mark_stalled_spawns(&self, now_epoch_secs: i64, threshold_secs: i64) -> Vec<u8> {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         let cutoff = now_epoch_secs.saturating_sub(threshold_secs);
