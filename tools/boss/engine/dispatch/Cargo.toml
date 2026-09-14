@@ -19,6 +19,7 @@ boss-dispatch-events = { path = "../dispatch-events" }
 boss-engine-effort = { path = "../effort" }
 boss-engine-recovery = { path = "../recovery" }
 boss-engine-storage-values = { path = "../storage-values" }
+boss-startup-policy = { path = "../startup-policy" }
 boss-engine-utils = { path = "../utils" }
 boss-event-bus = { path = "../event-bus" }
 boss-execution-contracts = { path = "../execution-contracts" }

@@ -148,16 +148,19 @@ pub const STALLED_SPAWN_THRESHOLD_SECS: i64 = 30;
 /// on: a pane hosting nothing but an idle login shell reported
 /// `shell_pid=92697` and satisfied every pane-level check forever.
 ///
-/// 300s is deliberately far above any real driver startup. A healthy
-/// driver's first hook (`SessionStart`) fires within seconds of exec.
-/// The one historically legitimate multi-minute pre-hook wait — claude's
-/// first-run folder-trust dialog, which is the entire reason
-/// [`LiveWorkerStateRegistry::mark_stalled_spawns`] exists — is
-/// *pre-suppressed* at provision time by
-/// `boss_engine_driver::claude`'s `hasTrustDialogAccepted` seeding, so
-/// no driver should ever legitimately sit pre-hook for minutes. Five
-/// minutes leaves an order of magnitude of headroom over that reality
-/// while still bounding the hold: before this, the hold was unbounded.
+/// Retain 300s after revalidation against Codex's 2026-09-13 startup:
+/// panes/shells took 4–7s, while the driver took 78–84s solo and 119–120s
+/// at six-way concurrency. Five minutes is over twice the observed burst
+/// startup, including pane startup; it is not an order of magnitude above
+/// every driver's startup. File discovery reports overdue at 165s for that
+/// burst and at most 240s, leaving at least 60s for pane setup and signal
+/// delivery. Discovery itself keeps polling until teardown; this grace is
+/// the liveness authority for a spawn that never reports.
+///
+/// Claude was historically validated via its prompt SessionStart hook and
+/// provisioned folder-trust acceptance. Codex is now also validated against
+/// the measured profile above. Keep the same finite grace for all drivers:
+/// a shell without driver evidence still must not hold a slot forever.
 pub const DRIVER_START_GRACE_SECS: i64 = 300;
 
 /// How long after the most recent hook a slot may keep advertising
@@ -1408,6 +1411,19 @@ impl LiveWorkerStateRegistry {
         guard.get(&slot_id).and_then(|entry| entry.meta.driver_signal_at)
     }
 
+    /// Startup pressure includes pool claims not registered as live yet.
+    /// A claim can outlive startup; driver proof removes it from this
+    /// count even while the execution remains productive.
+    pub fn startup_pending(&self, claimed_runs: &std::collections::HashSet<String>) -> bool {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard.values().any(|entry| entry.meta.driver_signal_at.is_none())
+            || claimed_runs.iter().any(|run_id| {
+                !guard
+                    .values()
+                    .any(|entry| entry.state.run_id == *run_id && entry.meta.driver_signal_at.is_some())
+            })
+    }
+
     /// Whether any live slot for `run_id` has recorded a driver-originated
     /// signal. Spawn-time confirmation keys on the run rather than the slot
     /// so a hook that won the race against slot fan-out still counts.
@@ -2484,6 +2500,10 @@ impl boss_execution_contracts::LiveWorkerLiveness for LiveWorkerStateRegistry {
 
     fn current_tool_for_run(&self, run_id: &str) -> Option<String> {
         LiveWorkerStateRegistry::current_tool_for_run(self, run_id)
+    }
+
+    fn startup_pending(&self, claimed_runs: &std::collections::HashSet<String>) -> bool {
+        LiveWorkerStateRegistry::startup_pending(self, claimed_runs)
     }
 }
 

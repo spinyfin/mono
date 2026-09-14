@@ -30,6 +30,7 @@ mod progression_pool;
 mod progression_spawn;
 mod recovery;
 mod recovery_fresh_start;
+mod resume_pacing;
 mod recovery_restage;
 mod review_batch_dispatch;
 mod review_pause;

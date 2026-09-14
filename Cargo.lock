@@ -860,6 +860,7 @@ dependencies = [
  "boss-host-execution",
  "boss-metrics",
  "boss-protocol",
+ "boss-startup-policy",
  "boss-task-scope",
  "boss-work-db",
  "serde",
@@ -1149,6 +1150,7 @@ dependencies = [
  "boss-review-guide",
  "boss-spoke-hub",
  "boss-ssh-transport",
+ "boss-startup-policy",
  "boss-task-scope",
  "boss-timer-wheel",
  "boss-tmux",
@@ -1932,6 +1934,10 @@ dependencies = [
  "tokio",
  "tracing",
 ]
+
+[[package]]
+name = "boss-startup-policy"
+version = "0.1.0"
 
 [[package]]
 name = "boss-task-scope"

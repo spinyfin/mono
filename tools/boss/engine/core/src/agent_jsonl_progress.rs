@@ -29,7 +29,9 @@ use crate::driver::{AgentDriver, AgentJsonlFileIngress, ProgressSessionConfig, P
 use crate::stdout_progress::{ProgressCheckpointSink, WorkerEventSink};
 
 const FILE_POLL: Duration = Duration::from_millis(50);
-/// How long discovery may run before the run is reported as *overdue*.
+/// Solo discovery overdue threshold: 120s, matching the historical
+/// `DISCOVERY_TIMEOUT`. Overlapping startups raise it through
+/// [`boss_startup_policy::DiscoveryLoad`] (`120 + 9*(peak-1)`, cap 240s).
 ///
 /// This is a reporting threshold, not a give-up point. It used to be the
 /// latter (`DISCOVERY_TIMEOUT`): discovery returned an error after 120s and
@@ -44,7 +46,8 @@ const FILE_POLL: Duration = Duration::from_millis(50);
 /// get a shorter clock of its own. It now runs until the run is torn down
 /// ([`AgentJsonlProgressManager::stop_run`]) and merely *records* — durably,
 /// on the checkpoint, and as a dispatch event — that it is overdue.
-/// The threshold also slows scans from 100ms to one second.
+/// Later overlapping startups may extend the threshold without exceeding the
+/// 240s cap. The threshold also slows scans from 100ms to one second.
 pub const DISCOVERY_OVERDUE_AFTER: Duration = crate::agent_jsonl_discovery::DISCOVERY_TIMEOUT;
 const FILE_CHUNK_BYTES: usize = 64 * 1024;
 const DUPLEX_BYTES: usize = 64 * 1024;
@@ -519,8 +522,11 @@ pub enum ResumeOutcome {
 /// Owns at most one prepared/active file ingress per execution id.
 pub struct AgentJsonlProgressManager {
     runs: Mutex<HashMap<String, RunHandle>>,
+    discovery_load: boss_startup_policy::DiscoveryLoad,
     /// See [`DISCOVERY_OVERDUE_AFTER`]. A field so a test can drive the
-    /// overdue path in milliseconds rather than minutes.
+    /// overdue path in milliseconds rather than minutes. When this still
+    /// equals the production default, overlapping startups scale the
+    /// overdue threshold through [`Self::discovery_load`].
     discovery_overdue_after: Duration,
     /// Per-poll telemetry sink for every tail this manager spawns; a
     /// no-op unless [`Self::with_metrics`] was called.
@@ -531,6 +537,7 @@ impl Default for AgentJsonlProgressManager {
     fn default() -> Self {
         Self {
             runs: Mutex::new(HashMap::new()),
+            discovery_load: boss_startup_policy::DiscoveryLoad::default(),
             discovery_overdue_after: DISCOVERY_OVERDUE_AFTER,
             telemetry: StreamTelemetry::default(),
         }
@@ -552,11 +559,18 @@ impl AgentJsonlProgressManager {
 
     /// Report discovery as overdue after `after` instead of
     /// [`DISCOVERY_OVERDUE_AFTER`]. Reporting only: discovery keeps running
-    /// either way.
+    /// either way. A non-default value also disables load-scaled overdue
+    /// so millisecond tests stay deterministic.
     #[cfg(test)]
     fn with_discovery_overdue_after(mut self, after: Duration) -> Self {
         self.discovery_overdue_after = after;
         self
+    }
+
+    /// Shared overlapping-startup high-water mark. Tests arm extra budgets
+    /// on the same load so a first discovery observes later peers.
+    pub fn discovery_load(&self) -> &boss_startup_policy::DiscoveryLoad {
+        &self.discovery_load
     }
 
     /// Snapshot pre-existing candidates before the pane is spawned, then
@@ -728,10 +742,20 @@ impl AgentJsonlProgressManager {
             return Ok(());
         }
 
+        // Register only after the duplicate-run check. A duplicate prepare
+        // must not inflate every waiting discovery's contention allowance.
+        let discovery_budget = matches!(&start, IngressStart::Discover).then(|| self.discovery_load.begin());
         let (activate_tx, activate_rx) = oneshot::channel();
         let (halt_tx, halt_rx) = watch::channel(StreamHalt::Running);
         let task_run_id = run_id.to_owned();
-        let overdue_after = self.discovery_overdue_after;
+        let test_overdue = self.discovery_overdue_after != DISCOVERY_OVERDUE_AFTER;
+        let overdue_after = if test_overdue {
+            self.discovery_overdue_after
+        } else {
+            // Helper overdue flag at the policy cap; the observer re-reads
+            // the live budget so later contention can extend reporting.
+            Duration::from_secs(240)
+        };
         let telemetry = self.telemetry.clone();
         boss_task_scope::spawn(async move {
             run_prepared(
@@ -742,6 +766,8 @@ impl AgentJsonlProgressManager {
                     .sink(sink)
                     .store(store)
                     .overdue_after(overdue_after)
+                    .maybe_discovery_budget(discovery_budget)
+                    .scale_overdue_with_load(!test_overdue)
                     .telemetry(telemetry)
                     .build(),
                 start,
@@ -798,6 +824,8 @@ struct RunPreparedConfig<S> {
     sink: S,
     store: Arc<dyn IngressCheckpointStore>,
     overdue_after: Duration,
+    discovery_budget: Option<boss_startup_policy::DiscoveryBudget>,
+    scale_overdue_with_load: bool,
     telemetry: StreamTelemetry,
 }
 
@@ -816,6 +844,8 @@ async fn run_prepared<S>(
         sink,
         store,
         overdue_after,
+        discovery_budget,
+        scale_overdue_with_load,
         telemetry,
     } = config;
     tokio::select! {
@@ -838,6 +868,8 @@ async fn run_prepared<S>(
                 sink: &sink,
                 store: &store,
                 overdue_after,
+                budget: discovery_budget.as_ref(),
+                scale_overdue_with_load,
             };
             let (candidate, discovery_secs) = match discovery.run(&mut halt).await {
                 Ok(Some(found)) => found,
@@ -1020,6 +1052,8 @@ struct Discovery<'a, S> {
     sink: &'a S,
     store: &'a Arc<dyn IngressCheckpointStore>,
     overdue_after: Duration,
+    budget: Option<&'a boss_startup_policy::DiscoveryBudget>,
+    scale_overdue_with_load: bool,
 }
 
 impl<S> Discovery<'_, S>
@@ -1073,11 +1107,17 @@ where
                         reason: checkpoint_rejection(&reason),
                     })
                     .collect();
-                let diagnostics = (overdue, rejected_candidates, rejections.clone());
+                let overdue_now = if self.scale_overdue_with_load {
+                    self.budget
+                        .is_some_and(|budget| started.elapsed() >= budget.timeout())
+                } else {
+                    overdue
+                };
+                let diagnostics = (overdue_now, rejected_candidates, rejections.clone());
                 let changed = recorded_diagnostics.as_ref() != Some(&diagnostics);
                 recorded_diagnostics = Some(diagnostics);
                 async move {
-                    if overdue && changed {
+                    if overdue_now && changed {
                         self.record_overdue(waited_secs, rejected_candidates, &rejections, reason)
                             .await;
                     }
@@ -1558,6 +1598,10 @@ async fn wait_for_cancel(halt: &mut watch::Receiver<StreamHalt>) {
 #[cfg(test)]
 #[path = "agent_jsonl_progress_tests/discovery.rs"]
 mod discovery_tests;
+
+#[cfg(test)]
+#[path = "agent_jsonl_progress_deadline_tests.rs"]
+mod deadline_tests;
 
 #[cfg(test)]
 #[path = "agent_jsonl_progress_tests/stream.rs"]

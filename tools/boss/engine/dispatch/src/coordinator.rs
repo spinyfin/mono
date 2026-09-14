@@ -212,8 +212,8 @@ pub const MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO: usize = 2;
 pub use boss_engine_storage_values::dispatch_wait::{
     DISPATCH_WAIT_REASON_AUTOMATION_PAUSED, DISPATCH_WAIT_REASON_AWAITING_PREDECESSOR_PRESERVATION,
     DISPATCH_WAIT_REASON_DISPATCH_PAUSED, DISPATCH_WAIT_REASON_FOCUS_MODE, DISPATCH_WAIT_REASON_POOL_EXHAUSTED,
-    DISPATCH_WAIT_REASON_PROGRESSION_UNAVAILABLE, WAITING_FOR_WORKSPACE_REASON, interactive_cap_wait_reason,
-    is_capacity_wait_reason,
+    DISPATCH_WAIT_REASON_PROGRESSION_UNAVAILABLE, DISPATCH_WAIT_REASON_RESUME_STARTUP_PENDING,
+    WAITING_FOR_WORKSPACE_REASON, interactive_cap_wait_reason, is_capacity_wait_reason,
 };
 
 use boss_engine_storage_values::pool_policy::{
@@ -603,6 +603,9 @@ pub struct ExecutionCoordinator {
     /// [`MAX_INFLIGHT_DISPATCHES`].
     #[builder(default = Arc::new(Semaphore::new(MAX_INFLIGHT_DISPATCHES)))]
     dispatch_slots: Arc<Semaphore>,
+    /// Startup pacing for the cohort that was ready when dispatch resumed.
+    #[builder(default)]
+    resume_admission: std::sync::Mutex<boss_startup_policy::ResumeAdmission>,
     /// `true` while a `run_scheduler` task is alive. `kick()` returns
     /// without spawning when this is already set; the alive scheduler
     /// is responsible for noticing the wakeup via `scheduling_pending`.

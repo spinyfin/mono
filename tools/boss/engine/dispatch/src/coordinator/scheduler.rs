@@ -1048,6 +1048,37 @@ impl ExecutionCoordinator {
     /// mainline arrivals cannot cascade into wiping out every spilled
     /// automation run at once. See [`crate::dispatch_spillover`] for the
     /// policy and its rationale.
+    async fn resume_startup_held(&self, execution: &WorkExecution) -> bool {
+        let now = std::time::Instant::now();
+        if !self
+            .resume_admission
+            .lock()
+            .unwrap()
+            .holds(&execution.id, true, now)
+        {
+            return false;
+        }
+        // Headless coordinators without a live registry have no driver
+        // readiness lifecycle, so they do not pace resumed admission.
+        let Some(live) = &self.live_worker_states else {
+            return false;
+        };
+        // Pool claims survive the handoff from schedule to the runner,
+        // including the window before live-slot registration.
+        let startup_pending = live.startup_pending(&self.all_claimed_execution_ids().await);
+        let held = self
+            .resume_admission
+            .lock()
+            .unwrap()
+            .holds(&execution.id, startup_pending, now);
+        if held {
+            self.record_dispatch_wait_reason(execution, DISPATCH_WAIT_REASON_RESUME_STARTUP_PENDING, None);
+        }
+        // The existing scheduler heartbeat revisits ready rows every 15s,
+        // including failed/cancelled starts; no sleeps occupy the drain.
+        held
+    }
+
     pub(crate) async fn drain_ready_queue(self: &Arc<Self>) -> DrainOutcome {
         if let Some(reason) = self.dispatch_preflight_block_reason() {
             // A probe still in flight is the expected first seconds of every
@@ -1090,6 +1121,12 @@ impl ExecutionCoordinator {
                 return DrainOutcome::QueueEmpty;
             }
         };
+        if !paused {
+            self.resume_admission
+                .lock()
+                .unwrap()
+                .observe_ready(executions.iter().map(|execution| execution.id.clone()));
+        }
         // Rows whose work item is at the human-only `critical` priority.
         // `list_ready_executions` already sorted them first; this set is
         // what exempts them from the operator-pause gate and the
@@ -1316,6 +1353,9 @@ impl ExecutionCoordinator {
         };
 
         for execution in executions {
+            if !paused && self.resume_startup_held(&execution).await {
+                continue;
+            }
             let preferred_workspace_id = execution.preferred_workspace_id.clone();
             // Classify the target pool. Review is checked first (and excludes
             // the others) so a reviewer of an automation-produced task is
@@ -2083,6 +2123,9 @@ impl ExecutionCoordinator {
         // themselves is unchanged — they are simply all ranked below all
         // mainline work.
         for execution in spill_candidates {
+            if !paused && self.resume_startup_held(&execution).await {
+                continue;
+            }
             let preferred_workspace_id = execution.preferred_workspace_id.clone();
             let Some(lease_attempt) = self
                 .begin_repo_lease_or_wait(&execution, &mut changed_waits, None)
@@ -2736,6 +2779,10 @@ impl ExecutionCoordinator {
         };
         let coordinator = Arc::clone(self);
         let dispatch_slots = Arc::clone(&self.dispatch_slots);
+        self.resume_admission
+            .lock()
+            .unwrap()
+            .admitted(&execution.id, std::time::Instant::now());
         let execution = execution.clone();
         let worker_id = worker_id.to_string();
         boss_task_scope::spawn(async move {

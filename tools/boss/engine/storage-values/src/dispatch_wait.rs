@@ -161,6 +161,10 @@ pub const DISPATCH_WAIT_REASON_WORKSPACE_POSITIONING_REFUSED: &str =
 /// gave up and raised an attention item for a person.
 pub const DISPATCH_WAIT_REASON_RECOVERY_ATTENTION: &str = "recovery_attention";
 
+/// Resume captured this ready row and is waiting for driver-start proof
+/// (or the 84s no-signal fallback) before admitting another from that cohort.
+pub const DISPATCH_WAIT_REASON_RESUME_STARTUP_PENDING: &str = "resume_startup_pending";
+
 /// The engine could not name why the item is waiting. Never a reason in its
 /// own right: it is reported as an anomaly (logged, and raised as a
 /// `dispatch_wait_unclassified` attention item), and the card says the item is
@@ -286,6 +290,10 @@ pub const DISPATCH_WAIT_REASON_CODES: &[(&str, &str)] = &[
     (
         DISPATCH_WAIT_REASON_RECOVERY_ATTENTION,
         "worker recovery gave up; waiting for a person",
+    ),
+    (
+        DISPATCH_WAIT_REASON_RESUME_STARTUP_PENDING,
+        "pacing startup after resume",
     ),
     (
         DISPATCH_WAIT_REASON_UNCLASSIFIED,
