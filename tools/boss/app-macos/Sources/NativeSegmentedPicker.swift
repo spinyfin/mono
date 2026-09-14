@@ -11,7 +11,7 @@ import SwiftUI
 /// AppKit.
 ///
 /// Follows the same `NSViewRepresentable` + `Coordinator` idiom as
-/// `CommentTextEditor` and `ResizeDivider`. Chrome, focus-ring, and
+/// `CommentTextEditor` and `TitlebarAccessoryInstaller`. Chrome, focus-ring, and
 /// click-versus-tab focus semantics come from AppKit; this type does not
 /// draw a track, pill, divider, or focus ring.
 struct NativeSegmentedPicker<Value: Hashable>: NSViewRepresentable {
@@ -117,6 +117,8 @@ struct NativeSegmentedPicker<Value: Hashable>: NSViewRepresentable {
         /// the cost or side effects of mutating the hosted control.
         private lazy var measuringControl: NSSegmentedControl = {
             let control = NSSegmentedControl()
+            control.segmentStyle = .automatic
+            control.trackingMode = .selectOne
             control.segmentDistribution = .fit
             return control
         }()
@@ -212,8 +214,13 @@ struct NativeSegmentedPicker<Value: Hashable>: NSViewRepresentable {
             // (same as `Picker`) and show no selection.
             control.selectedSegment = -1
         }
-        control.isEnabled = context.environment.isEnabled
-        control.controlSize = nsControlSize(context.environment.controlSize)
+        if control.isEnabled != context.environment.isEnabled {
+            control.isEnabled = context.environment.isEnabled
+        }
+        let size = nsControlSize(context.environment.controlSize)
+        if control.controlSize != size {
+            control.controlSize = size
+        }
         // Default Dynamic Type (`.large`) leaves AppKit's font alone so
         // appearance tracks `NSSegmentedControl`. Non-default sizes are
         // the only path that assigns an explicit `NSFont`; returning to
@@ -231,10 +238,13 @@ struct NativeSegmentedPicker<Value: Hashable>: NSViewRepresentable {
             control.font = nil
             context.coordinator.appliedFontOverride = false
         }
-        control.setAccessibilityLabel(accessibilityLabel)
-        control.setAccessibilityIdentifier(
-            "native-segmented-picker.\(accessibilityLabel)"
-        )
+        if control.accessibilityLabel() != accessibilityLabel {
+            control.setAccessibilityLabel(accessibilityLabel)
+        }
+        let identifier = "native-segmented-picker.\(accessibilityLabel)"
+        if control.accessibilityIdentifier() != identifier {
+            control.setAccessibilityIdentifier(identifier)
+        }
     }
 
     private func nsControlSize(_ size: ControlSize) -> NSControl.ControlSize {
@@ -292,7 +302,7 @@ enum NativeSegmentedPickerMetrics {
         case .large:
             return NSFont.systemFontSize(for: .large)
         case .extraLarge:
-            return NSFont.systemFontSize(for: .large) + 2
+            return NSFont.systemFontSize(for: .large)
         @unknown default:
             // Same fallback as `nsControlSize`: unknown future cases map
             // to regular metrics so bezel and text stay matched.

@@ -164,16 +164,15 @@ final class NativeSegmentedPickerTests: XCTestCase {
             ("automations", "Automations (1)"),
             ("reviewers", "Reviewers (9)"),
         ]
-        // The mutation above is delivered through `@Published` /
-        // `ObservableObject`, which schedules the SwiftUI update rather
-        // than applying it synchronously. Pump the run loop so that
-        // update actually lands before `layoutSubtreeIfNeeded` and the
-        // assertions below — otherwise this is the only coverage of the
-        // pool picker's live counts and it would be silently depending on
-        // that delivery being synchronous.
-        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
-        host.layoutSubtreeIfNeeded()
-        control = try XCTUnwrap(segmentedControls(in: host).first)
+        // Published changes arrive asynchronously; wait for the expected
+        // labels instead of assuming a fixed SwiftUI update turnaround.
+        let deadline = Date().addingTimeInterval(2)
+        while (0..<control.segmentCount).map({ control.label(forSegment: $0) }) != model.titles.map(\.1),
+            Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+            host.layoutSubtreeIfNeeded()
+            control = try XCTUnwrap(segmentedControls(in: host).first)
+        }
         XCTAssertEqual(
             (0..<control.segmentCount).map { control.label(forSegment: $0) },
             model.titles.map(\.1)
@@ -336,6 +335,17 @@ final class NativeSegmentedPickerTests: XCTestCase {
         XCTAssertGreaterThan(large.fittingSize.height, regular.fittingSize.height)
     }
 
+    func testExtraLargeUsesLargeBezelAndFontMetrics() throws {
+        let host = hostedPicker(width: nil, height: nil, controlSize: .extraLarge)
+        host.layoutSubtreeIfNeeded()
+        let control = try XCTUnwrap(segmentedControls(in: host).first)
+        XCTAssertEqual(control.controlSize, .large)
+        XCTAssertEqual(
+            NativeSegmentedPickerMetrics.basePointSize(for: .extraLarge),
+            NSFont.systemFontSize(for: control.controlSize)
+        )
+    }
+
     func testDefaultDynamicTypeLeavesAppKitFont() throws {
         let host = hostedPicker(width: 440, height: 32)
         host.layoutSubtreeIfNeeded()
@@ -344,6 +354,10 @@ final class NativeSegmentedPickerTests: XCTestCase {
         vanilla.segmentStyle = .automatic
         vanilla.trackingMode = .selectOne
         vanilla.controlSize = .regular
+        vanilla.segmentCount = control.segmentCount
+        for index in 0..<control.segmentCount {
+            vanilla.setLabel(try XCTUnwrap(control.label(forSegment: index)), forSegment: index)
+        }
         XCTAssertNil(
             NativeSegmentedPickerMetrics.fontIfOverridden(
                 dynamicTypeSize: .large,
@@ -356,7 +370,14 @@ final class NativeSegmentedPickerTests: XCTestCase {
                 controlSize: .regular
             )
         )
-        XCTAssertEqual(control.font, vanilla.font)
+        // AppKit may materialize its default font during layout, so compare
+        // the resolved metric rather than requiring the optional to stay nil.
+        XCTAssertEqual(
+            control.font?.pointSize ?? NSFont.systemFontSize(for: control.controlSize),
+            NSFont.systemFontSize(for: .regular),
+            accuracy: 0.5
+        )
+        XCTAssertEqual(control.fittingSize.height, vanilla.fittingSize.height, accuracy: 0.5)
     }
 
     func testEnlargedDynamicTypeGrowsWithLongLocalizedTitle() throws {
@@ -382,12 +403,12 @@ final class NativeSegmentedPickerTests: XCTestCase {
         host.appearance = NSAppearance(named: .aqua)
         host.layoutSubtreeIfNeeded()
         let control = try XCTUnwrap(segmentedControls(in: host).first)
-        let fontBefore = control.font?.pointSize ?? 0
+        let fontBefore = NSFont.systemFontSize(for: control.controlSize)
         let widthBefore = host.fittingSize.width
 
         host.rootView = picker(dynamicTypeSize: .accessibility3)
         host.layoutSubtreeIfNeeded()
-        let fontAfter = control.font?.pointSize ?? 0
+        let fontAfter = try XCTUnwrap(control.font).pointSize
         let widthAfter = host.fittingSize.width
 
         // controlSize is held fixed; only dynamicTypeSize varies. Both the
@@ -397,6 +418,11 @@ final class NativeSegmentedPickerTests: XCTestCase {
         // bridge. Height is not asserted here: AppKit's segmented control
         // bezel height is fixed per `controlSize` and does not grow with
         // point size the way the label width does.
+        XCTAssertEqual(
+            fontAfter,
+            NativeSegmentedPickerMetrics.pointSize(dynamicTypeSize: .accessibility3, controlSize: .regular),
+            accuracy: 0.5
+        )
         XCTAssertGreaterThan(fontAfter, fontBefore)
         XCTAssertGreaterThan(widthAfter, widthBefore)
     }
@@ -411,16 +437,21 @@ final class NativeSegmentedPickerTests: XCTestCase {
         host.appearance = NSAppearance(named: .aqua)
         host.layoutSubtreeIfNeeded()
         let control = try XCTUnwrap(segmentedControls(in: host).first)
-        let fontBefore = control.font?.pointSize ?? 0
+        let fontBefore = NSFont.systemFontSize(for: control.controlSize)
         let widthBefore = host.fittingSize.width
 
         host.rootView = AnyView(
             LiveTitlesHarness(model: model).environment(\.dynamicTypeSize, .accessibility3)
         )
         host.layoutSubtreeIfNeeded()
-        let fontAfter = control.font?.pointSize ?? 0
+        let fontAfter = try XCTUnwrap(control.font).pointSize
         let widthAfter = host.fittingSize.width
 
+        XCTAssertEqual(
+            fontAfter,
+            NativeSegmentedPickerMetrics.pointSize(dynamicTypeSize: .accessibility3, controlSize: .regular),
+            accuracy: 0.5
+        )
         XCTAssertGreaterThan(fontAfter, fontBefore)
         XCTAssertGreaterThan(widthAfter, widthBefore)
 
