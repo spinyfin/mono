@@ -14,7 +14,10 @@ rust_library(
         "//tools/boss/bossctl:__pkg__",
         "//tools/boss/engine/core:__pkg__",
     ],
-    deps = all_crate_deps(normal = True) + ["//tools/boss/protocol"],
+    deps = all_crate_deps(normal = True) + [
+        "//tools/boss/engine/utils",
+        "//tools/boss/protocol",
+    ],
 )
 
 rust_test(
@@ -29,5 +32,8 @@ rust_test(
     deps = all_crate_deps(
         normal = True,
         normal_dev = True,
-    ) + ["//tools/boss/protocol"],
+    ) + [
+        "//tools/boss/engine/utils",
+        "//tools/boss/protocol",
+    ],
 )

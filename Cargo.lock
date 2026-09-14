@@ -509,6 +509,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bon",
+ "boss-engine-utils",
  "boss-protocol",
  "chrono",
  "sha2",
@@ -956,6 +957,7 @@ dependencies = [
  "anyhow",
  "bon",
  "boss-github",
+ "futures-util",
  "serde",
  "serde_json",
  "sha2",

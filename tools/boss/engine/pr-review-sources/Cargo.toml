@@ -5,6 +5,7 @@ edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
+futures-util = "0.3"
 anyhow = { workspace = true }
 bon = { workspace = true }
 boss-github = { path = "../../github" }

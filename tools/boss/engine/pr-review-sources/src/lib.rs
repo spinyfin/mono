@@ -6,6 +6,7 @@
 //! crate only reads pinned GitHub objects and validates references against the
 //! resulting packet.
 
+use futures_util::{StreamExt, stream};
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
@@ -390,10 +391,24 @@ pub async fn collect_pinned_source_packet_with_metadata(
         .filter(|file| ChangeKind::from_api(&file.status).has_after())
         .map(|file| file.filename.clone())
         .collect();
-    let before_entries = fetch_pinned_tree_entries(&metadata.base_repository, &merge_base_sha, &before_paths).await?;
-    let after_entries = fetch_pinned_tree_entries(&metadata.head_repository, &metadata.head_sha, &after_paths).await?;
-
+    let (before_entries, before_omissions) = fetch_pinned_tree_entries(
+        &metadata.base_repository,
+        &merge_base_sha,
+        &before_paths,
+        SourceSide::Before,
+    )
+    .await?;
+    let (after_entries, after_omissions) = fetch_pinned_tree_entries(
+        &metadata.head_repository,
+        &metadata.head_sha,
+        &after_paths,
+        SourceSide::After,
+    )
+    .await?;
+    let before_errors = omission_reasons(before_omissions);
+    let after_errors = omission_reasons(after_omissions);
     let mut omissions = Vec::new();
+
     let mut files = Vec::with_capacity(inventory.len());
     for file in inventory {
         let change_kind = ChangeKind::from_api(&file.status);
@@ -413,6 +428,7 @@ pub async fn collect_pinned_source_packet_with_metadata(
                 &merge_base_sha,
                 &before_path,
                 before_entries.get(&before_path),
+                before_errors.get(&before_path).map(String::as_str),
             )
             .await;
             record_omission(&mut omissions, &source, SourceSide::Before);
@@ -426,6 +442,7 @@ pub async fn collect_pinned_source_packet_with_metadata(
                 &metadata.head_sha,
                 &file.filename,
                 after_entries.get(&file.filename),
+                after_errors.get(&file.filename).map(String::as_str),
             )
             .await;
             record_omission(&mut omissions, &source, SourceSide::After);
@@ -487,55 +504,105 @@ pub fn require_stable_endpoints(
     Ok(())
 }
 
+fn group_paths(paths: &HashSet<String>) -> HashMap<String, HashSet<String>> {
+    let mut grouped: HashMap<String, HashSet<String>> = HashMap::new();
+    for path in paths {
+        let (directory, name) = split_repo_path(path);
+        grouped.entry(directory.to_owned()).or_default().insert(name.to_owned());
+    }
+    grouped
+}
+
+fn join_repo_path(directory: &str, name: &str) -> String {
+    if directory.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{directory}/{name}")
+    }
+}
+
 async fn fetch_pinned_tree_entries(
     repository: &str,
     sha: &str,
     paths: &HashSet<String>,
-) -> Result<HashMap<String, boss_github::trees::PinnedTreeEntry>> {
-    if paths.is_empty() {
-        return Ok(HashMap::new());
-    }
+    side: SourceSide,
+) -> Result<(
+    HashMap<String, boss_github::trees::PinnedTreeEntry>,
+    Vec<SourceOmission>,
+)> {
     let (owner, repo) = repository
         .split_once('/')
         .filter(|(owner, repo)| !owner.is_empty() && !repo.is_empty())
-        .with_context(|| format!("invalid pinned source repository identity `{repository}`"))?;
-    let mut by_directory: HashMap<String, HashSet<String>> = HashMap::new();
-    for path in paths {
-        let (directory, name) = split_repo_path(path);
-        by_directory
-            .entry(directory.to_owned())
-            .or_default()
-            .insert(name.to_owned());
-    }
-    let mut entries = HashMap::new();
-    for (directory, names) in by_directory {
-        let tree = boss_github::trees::fetch_pinned_tree_directory(owner, repo, sha, &directory, |candidate| {
+        .with_context(|| format!("invalid pinned source repository identity {repository}"))?;
+    fetch_directory_entries(repository, sha, paths, side, |directory, names| async move {
+        boss_github::trees::fetch_pinned_tree_directory(owner, repo, sha, &directory, |candidate| {
             names.contains(candidate)
         })
         .await
-        .map_err(|error| {
-            anyhow::anyhow!("could not read pinned tree {repository}@{sha} directory `{directory}`: {error}")
-        })?;
-        if tree.truncated {
-            bail!(
-                "pinned tree {repository}@{sha} directory `{directory}` was truncated; source capture cannot verify changed-file coverage"
-            );
-        }
-        for mut entry in tree.entries {
-            let full_path = if directory.is_empty() {
-                entry.path.clone()
-            } else {
-                format!("{directory}/{}", entry.path)
-            };
-            entry.path = full_path.clone();
-            entries.insert(full_path, entry);
+    })
+    .await
+}
+
+async fn fetch_directory_entries<F, Fut>(
+    repository: &str,
+    sha: &str,
+    paths: &HashSet<String>,
+    side: SourceSide,
+    fetch: F,
+) -> Result<(
+    HashMap<String, boss_github::trees::PinnedTreeEntry>,
+    Vec<SourceOmission>,
+)>
+where
+    F: Fn(String, HashSet<String>) -> Fut,
+    Fut: std::future::Future<
+            Output = std::result::Result<boss_github::trees::PinnedTree, boss_github::trees::TreeApiError>,
+        >,
+{
+    let mut pending = stream::iter(group_paths(paths))
+        .map(|(directory, names)| {
+            let result = fetch(directory.clone(), names.clone());
+            async move { (directory, names, result.await) }
+        })
+        .buffer_unordered(8);
+    let mut entries = HashMap::new();
+    let mut omissions = Vec::new();
+    while let Some((directory, names, result)) = pending.next().await {
+        match result {
+            Ok(tree) if !tree.truncated => {
+                for mut entry in tree.entries {
+                    entry.path = join_repo_path(&directory, &entry.path);
+                    entries.insert(entry.path.clone(), entry);
+                }
+            }
+            result => {
+                let cause = match result {
+                    Ok(_) => "directory response was truncated".to_owned(),
+                    Err(error) => error.to_string(),
+                };
+                for name in names {
+                    omissions.push(SourceOmission {
+                        path: Some(join_repo_path(&directory, &name)),
+                        side: Some(side),
+                        reason: format!("could not read pinned tree {repository}@{sha} directory {directory}: {cause}"),
+                    });
+                }
+            }
         }
     }
-    Ok(entries)
+    omissions.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok((entries, omissions))
 }
 
 fn split_repo_path(path: &str) -> (&str, &str) {
     path.rsplit_once('/').unwrap_or(("", path))
+}
+
+fn omission_reasons(omissions: Vec<SourceOmission>) -> HashMap<String, String> {
+    omissions
+        .into_iter()
+        .filter_map(|omission| omission.path.map(|path| (path, omission.reason)))
+        .collect()
 }
 
 async fn fetch_source(
@@ -543,7 +610,11 @@ async fn fetch_source(
     sha: &str,
     path: &str,
     entry: Option<&boss_github::trees::PinnedTreeEntry>,
+    tree_error: Option<&str>,
 ) -> PinnedSource {
+    if let Some(reason) = tree_error {
+        return PinnedSource::omitted(repository, sha, path, reason.to_owned(), None);
+    }
     let Some(entry) = entry else {
         return PinnedSource::omitted(
             repository,
@@ -644,6 +715,73 @@ fn encode_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_grouping_and_rejoining_preserve_repository_paths() {
+        let paths: HashSet<String> = ["lib.rs", "src/lib.rs", "src/main.rs", "other/lib.rs"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let grouped = group_paths(&paths);
+        assert_eq!(grouped.len(), 3);
+        assert_eq!(grouped["src"].len(), 2);
+        assert!(grouped[""].contains("lib.rs"));
+        let reconstructed: HashSet<String> = grouped
+            .into_iter()
+            .flat_map(|(directory, names)| names.into_iter().map(move |name| join_repo_path(&directory, &name)))
+            .collect();
+        assert_eq!(reconstructed, paths);
+    }
+
+    #[test]
+    fn one_directory_failure_preserves_other_sources_and_precise_omissions() {
+        use futures_util::FutureExt;
+        let paths = ["lib.rs", "broken/a.rs", "broken/b.rs"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let result = fetch_directory_entries(
+            "acme/widget",
+            "pinned",
+            &paths,
+            SourceSide::Before,
+            |directory, names| {
+                let result = if directory == "broken" {
+                    Err(boss_github::trees::TreeApiError {
+                        kind: boss_github::trees::TreeApiErrorKind::Unreachable,
+                        message: "rate limited".to_owned(),
+                    })
+                } else {
+                    let mut entry = blob_entry();
+                    entry.path = "lib.rs".to_owned();
+                    assert!(names.contains(&entry.path));
+                    Ok(boss_github::trees::PinnedTree {
+                        sha: "pinned".to_owned(),
+                        truncated: false,
+                        entries: vec![entry],
+                    })
+                };
+                std::future::ready(result)
+            },
+        )
+        .now_or_never()
+        .expect("fixture reads are ready")
+        .unwrap();
+        assert!(result.0.contains_key("lib.rs"));
+        assert_eq!(result.1.len(), 2);
+        let source = fetch_source("acme/widget", "pinned", "broken/a.rs", None, Some(&result.1[0].reason))
+            .now_or_never()
+            .expect("tree failure needs no Contents request");
+        assert_eq!(source.omission.as_deref(), Some(result.1[0].reason.as_str()));
+        assert_eq!(result.1[0].path.as_deref(), Some("broken/a.rs"));
+        assert_eq!(result.1[1].path.as_deref(), Some("broken/b.rs"));
+        assert!(
+            result
+                .1
+                .iter()
+                .all(|omission| omission.side == Some(SourceSide::Before) && omission.reason.contains("rate limited"))
+        );
+    }
 
     fn blob_entry() -> boss_github::trees::PinnedTreeEntry {
         boss_github::trees::PinnedTreeEntry {

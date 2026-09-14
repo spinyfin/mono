@@ -1838,7 +1838,8 @@ fn source_capture_packet() -> SourcePacket {
 }
 
 fn counting_source_collector(calls: Arc<AtomicUsize>, packet: SourcePacket) -> SourcePacketCollector {
-    Arc::new(move |url, _observed, _branch, _metadata| {
+    let fixture_packet = packet.clone();
+    let collect: crate::review_guide_capture::PacketCollectFn = Arc::new(move |url, _observed, _branch, _metadata| {
         let packet = packet.clone();
         let calls = calls.clone();
         Box::pin(async move {
@@ -1846,7 +1847,8 @@ fn counting_source_collector(calls: Arc<AtomicUsize>, packet: SourcePacket) -> S
             assert_eq!(url, packet.canonical_pr_url);
             Ok(packet)
         })
-    })
+    });
+    crate::review_guide_capture::SourcePacketCollector::fixture(collect, fixture_packet)
 }
 
 async fn wait_for_source_capture(db: &WorkDb, root: &str) {
@@ -1898,6 +1900,17 @@ async fn finalize_pr_transition_captures_on_the_canonical_root() {
     assert_eq!(capture.trigger, PrSourceCaptureTrigger::Completion.as_str());
     assert_eq!(capture.packet.head_sha, "head");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    handler.reconcile_review_guide_source_for_execution(
+        &execution_id,
+        SOURCE_CAPTURE_PR_URL,
+        PrSourceCaptureTrigger::Completion,
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "completion must reuse the complete comparison"
+    );
 }
 
 #[tokio::test]

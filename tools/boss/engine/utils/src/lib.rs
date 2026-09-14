@@ -12,3 +12,5 @@ pub mod iso8601;
 pub mod json_extract;
 pub mod local_time;
 pub mod string_clip;
+
+pub mod atomic_blob;

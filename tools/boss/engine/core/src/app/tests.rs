@@ -400,7 +400,8 @@ fn source_capture_packet() -> SourcePacket {
 }
 
 fn counting_source_collector(calls: Arc<AtomicUsize>, packet: SourcePacket) -> SourcePacketCollector {
-    Arc::new(move |url, _observed, _branch, _metadata| {
+    let fixture_packet = packet.clone();
+    let collect: crate::review_guide_capture::PacketCollectFn = Arc::new(move |url, _observed, _branch, _metadata| {
         let packet = packet.clone();
         let calls = calls.clone();
         Box::pin(async move {
@@ -408,7 +409,8 @@ fn counting_source_collector(calls: Arc<AtomicUsize>, packet: SourcePacket) -> S
             assert_eq!(url, packet.canonical_pr_url);
             Ok(packet)
         })
-    })
+    });
+    crate::review_guide_capture::SourcePacketCollector::fixture(collect, fixture_packet)
 }
 
 async fn wait_for_source_capture(db: &crate::work::WorkDb, root: &str) {

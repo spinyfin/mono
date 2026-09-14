@@ -201,12 +201,16 @@ pub async fn fetch_head_sha(owner: &str, repo: &str, git_ref: &str) -> TreeResul
 /// whole-repo listing used by document browsers; source capture walks one
 /// changed directory at a time without `recursive=1` so GitHub's 100k-entry
 /// truncation limit cannot fail a monorepo capture.
-async fn fetch_tree_body(owner: &str, repo: &str, sha: &str, recursive: bool) -> TreeResult<serde_json::Value> {
-    let endpoint = if recursive {
+fn tree_endpoint(owner: &str, repo: &str, sha: &str, recursive: bool) -> String {
+    if recursive {
         format!("repos/{owner}/{repo}/git/trees/{sha}?recursive=1")
     } else {
         format!("repos/{owner}/{repo}/git/trees/{sha}")
-    };
+    }
+}
+
+async fn fetch_tree_body(owner: &str, repo: &str, sha: &str, recursive: bool) -> TreeResult<serde_json::Value> {
+    let endpoint = tree_endpoint(owner, repo, sha, recursive);
     let stdout = gh_api(&["api", &endpoint]).await?;
     serde_json::from_slice(&stdout).map_err(|e| TreeApiError {
         kind: TreeApiErrorKind::Unreachable,
@@ -239,6 +243,23 @@ where
     Ok(parse_pinned_tree(sha, &body, keep_path))
 }
 
+fn directory_tree_ref(commit_sha: &str, directory: &str) -> String {
+    if directory.is_empty() {
+        commit_sha.to_owned()
+    } else {
+        format!("{commit_sha}:{}", encode_tree_path(directory))
+    }
+}
+
+fn encode_tree_path(path: &str) -> String {
+    path.bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => (byte as char).to_string(),
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
 /// Immediate children of `directory` at `commit_sha`, without walking the
 /// rest of the repository. `directory` is empty for the tree root. Entry
 /// paths in the result are GitHub's directory-relative names (the file
@@ -253,11 +274,7 @@ pub async fn fetch_pinned_tree_directory<F>(
 where
     F: Fn(&str) -> bool,
 {
-    let tree_ref = if directory.is_empty() {
-        commit_sha.to_owned()
-    } else {
-        format!("{commit_sha}:{directory}")
-    };
+    let tree_ref = directory_tree_ref(commit_sha, directory);
     let body = fetch_tree_body(owner, repo, &tree_ref, false).await?;
     Ok(parse_pinned_tree(commit_sha, &body, keep_path))
 }
@@ -584,5 +601,25 @@ mod tests {
             }]
         );
         assert!(parse_pinned_tree("abc123", &body, |_| true).entries.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod directory_endpoint_tests {
+    use super::*;
+    #[test]
+    fn directory_tree_endpoints_pin_root_nested_and_reserved_paths() {
+        assert_eq!(
+            tree_endpoint("acme", "widget", &directory_tree_ref("abc", ""), false),
+            "repos/acme/widget/git/trees/abc"
+        );
+        assert_eq!(
+            tree_endpoint("acme", "widget", &directory_tree_ref("abc", "src/nested"), false),
+            "repos/acme/widget/git/trees/abc:src/nested"
+        );
+        assert_eq!(
+            tree_endpoint("acme", "widget", &directory_tree_ref("abc", "with space/#hash"), false),
+            "repos/acme/widget/git/trees/abc:with%20space/%23hash"
+        );
     }
 }

@@ -562,7 +562,8 @@ fn counting_source_collector(
     calls: Arc<std::sync::atomic::AtomicUsize>,
     packet: boss_pr_review_sources::SourcePacket,
 ) -> crate::review_guide_capture::SourcePacketCollector {
-    Arc::new(move |url, _observed, _branch, _metadata| {
+    let fixture_packet = packet.clone();
+    let collect: crate::review_guide_capture::PacketCollectFn = Arc::new(move |url, _observed, _branch, _metadata| {
         let packet = packet.clone();
         let calls = calls.clone();
         Box::pin(async move {
@@ -570,7 +571,8 @@ fn counting_source_collector(
             assert_eq!(url, packet.canonical_pr_url);
             Ok(packet)
         })
-    })
+    });
+    crate::review_guide_capture::SourcePacketCollector::fixture(collect, fixture_packet)
 }
 
 fn source_capture_packet(pr: &str) -> boss_pr_review_sources::SourcePacket {
@@ -675,6 +677,56 @@ async fn open_probe_does_not_recollect_an_unchanged_complete_comparison() {
         .unwrap();
     assert_eq!(capture.trigger, "poller");
     assert_eq!(capture.packet.head_sha, "head-1");
+    let mut second = source_capture_packet(pr);
+    second.observed_base_sha = "base-2".to_owned();
+    second.head_sha = "head-2".to_owned();
+    let second_handler = enabled_source_capture_handler(db.clone(), counting_source_collector(calls.clone(), second));
+    probe.set_with_base_head(pr, PrLifecycleState::Open(OpenPrStatus::clean()), "base-2", "head-2");
+    run_one_pass(
+        db.as_ref(),
+        probe.as_ref(),
+        publisher.as_ref(),
+        None,
+        Some(&second_handler),
+        None,
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if db
+                .get_latest_pr_review_guide_source_capture(&chore_id)
+                .unwrap()
+                .unwrap()
+                .packet
+                .head_sha
+                == "head-2"
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    probe.set_with_base_head(pr, PrLifecycleState::Open(OpenPrStatus::clean()), "base-1", "head-1");
+    run_one_pass(
+        db.as_ref(),
+        probe.as_ref(),
+        publisher.as_ref(),
+        None,
+        Some(&handler),
+        None,
+    )
+    .await;
+    assert_eq!(
+        db.get_latest_pr_review_guide_source_capture(&chore_id)
+            .unwrap()
+            .unwrap()
+            .packet
+            .head_sha,
+        "head-1"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
