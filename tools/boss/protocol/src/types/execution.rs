@@ -513,11 +513,13 @@ pub enum DispatchAdmissionEntryPoint {
 ///
 /// - `INTERACTIVE_CONCURRENCY_CAP`, `UNMET_DEPENDENCY`, and
 ///   `INELIGIBLE_STATUS` are genuinely enforced: force never bypasses them.
-/// - `CHURN_GUARD_PARKED` and `AUTOSTART_DISABLED` are informational only
-///   (see `INFORMATIONAL_ONLY_BLOCKER_CODES` in
-///   `coordinator/dispatch_admission.rs`) — an explicit dispatch request has
-///   always cleared both, forced or not, so they are reported here purely
-///   for confirmation-dialog transparency, never as a refusal reason.
+/// - `CHURN_GUARD_PARKED`, `AUTOSTART_DISABLED`, and `DELIBERATE_PARKED`
+///   are informational only (see `INFORMATIONAL_ONLY_BLOCKER_CODES` in
+///   `coordinator/dispatch_admission.rs`) — an explicit dispatch request
+///   (`bossctl work start`, kanban drag-to-Doing) has always cleared them,
+///   forced or not, so they are reported here purely for confirmation-dialog
+///   transparency, never as a refusal reason. Automatic mint paths consult
+///   `DELIBERATE_PARKED` as a **blocking** fact.
 ///
 /// The dispatch pause itself is reported separately via
 /// [`DispatchPauseSnapshot`], not as a blocker code, since a pause is the
@@ -526,6 +528,7 @@ pub const ADMISSION_BLOCKER_INTERACTIVE_CONCURRENCY_CAP: &str = "interactive_con
 pub const ADMISSION_BLOCKER_UNMET_DEPENDENCY: &str = "unmet_dependency";
 pub const ADMISSION_BLOCKER_CHURN_GUARD_PARKED: &str = "churn_guard_parked";
 pub const ADMISSION_BLOCKER_AUTOSTART_DISABLED: &str = "autostart_disabled";
+pub const ADMISSION_BLOCKER_DELIBERATE_PARKED: &str = "deliberate_parked";
 pub const ADMISSION_BLOCKER_INELIGIBLE_STATUS: &str = "ineligible_status";
 
 /// One non-overridable reason [`DispatchAdmission`] found dispatch would

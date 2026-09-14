@@ -416,39 +416,42 @@ async fn run_one_pass_filtered(
         // (the worker declared `boss propose done --outcome blocked`) and
         // `completion::nudge`'s auto-nudge breaker both terminalize a run
         // as `abandoned` on purpose, release its slot and lease, and file
-        // an attention item as the durable "a human should look at this"
-        // surface. Redispatching such a row puts a replacement worker on
-        // exactly the work a human was asked to adjudicate, every 60
-        // seconds, forever.
+        // an attention item as the "a human should look at this" surface.
+        // Redispatching such a row puts a replacement worker on exactly
+        // the work a human was asked to adjudicate, every 60 seconds,
+        // forever.
         //
-        // The discriminator is the open park attention item, NOT the row's
-        // `autostart` flag. `autostart` is single-shot: `start_execution_run`
-        // clears it the first time a row enters `active`
-        // (`work/executions_runs.rs`, and `migrate_backfill_autostart_consumed`
-        // backfilled the same for older rows), so EVERY row this sweep can
-        // legitimately recover — every row whose worker actually ran — has
-        // `autostart = 0`. Both park paths do also clear it, but that write
-        // is already a no-op for an `active` row and it is what
-        // `rescan_active_dispatch` keys off, not this sweep. Gating this
-        // sweep on `autostart` would not honour the park; it would switch
-        // the sweep off, post-crash orphan recovery included.
+        // Consulted through `WorkDb::dispatch_admission_facts` — the
+        // engine's one reason-producing admission evaluator — rather than
+        // a private copy of the attention query. The fact keys on
+        // `work_executions.run_done_outcome = 'blocked'` (the durable
+        // signal; the column is not cleared by `ClearedBy::WorkResumed`)
+        // and on an open park attention item (the nudge-breaker park
+        // never stamps the column).
         //
-        // Self-clearing: both kinds are registered `ClearedBy::WorkResumed`
-        // in `attention_lifecycle`, so an operator's `bossctl work start`
-        // (or any fresh run) ends the park with no separate gesture — and a
-        // genuinely orphaned pane files neither kind, so recovery is
+        // The discriminator is NOT the row's `autostart` flag.
+        // `autostart` is single-shot: `start_execution_run` clears it the
+        // first time a row enters `active` (`work/executions_runs.rs`, and
+        // `migrate_backfill_autostart_consumed` backfilled the same for
+        // older rows), so EVERY row this sweep can legitimately recover —
+        // every row whose worker actually ran — has `autostart = 0`.
+        // Gating this sweep on `autostart` would not honour the park; it
+        // would switch the sweep off, post-crash orphan recovery included.
+        //
+        // Self-clearing for the attention half: both kinds are registered
+        // `ClearedBy::WorkResumed` in `attention_lifecycle`, so an
+        // operator's `bossctl work start` (or any fresh run) ends that
+        // half with no separate gesture. The column half ends because the
+        // new execution becomes latest and does not carry `blocked`. A
+        // genuinely orphaned pane stamps neither, so recovery is
         // untouched.
-        const DELIBERATE_PARK_ATTENTION_KINDS: &[&str] = &[
-            crate::completion::RUN_DONE_BLOCKED_ATTENTION_KIND,
-            crate::completion::NUDGE_BREAKER_ATTENTION_KIND,
-        ];
-        match work_db.has_open_execution_attention_of_kind(&work_item_id, DELIBERATE_PARK_ATTENTION_KINDS) {
-            Ok(false) => {}
-            Ok(true) => {
+        match work_db.dispatch_admission_facts(&work_item_id) {
+            Ok(facts) if !facts.deliberate_parked => {}
+            Ok(_) => {
                 tracing::info!(
                     work_item_id = %work_item_id,
                     "orphan sweep: skipping redispatch — this row's run ended in a deliberate park \
-                     with an open attention item (`bossctl work start` resumes it)",
+                     (`bossctl work start` resumes it)",
                 );
                 dispatch_events
                     .emit(

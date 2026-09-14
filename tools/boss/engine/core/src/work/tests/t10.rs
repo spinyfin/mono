@@ -570,3 +570,158 @@ fn migration_completed_at_is_idempotent() {
     drop(conn2);
     let _ = std::fs::remove_file(&path);
 }
+
+// ── Deliberate-park admission on automatic mint paths ──────────────────
+//
+// A blocked declaration parks the row for a human. `orphan_sweep` already
+// honoured that park; `rescan_active_dispatch`, `reconcile_active_dispatch`,
+// and `reconcile_revision_execution` did not. These tests pin each path
+// (the existing autostart assertion on
+// `record_worker_idle_abandonment_finalizes_execution_leaves_task_status_untouched`
+// is kept — it covers the idle-abandonment/autostart discriminator, which
+// is a different gate).
+
+fn stamp_blocked_declaration(db: &WorkDb, execution_id: &str) {
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions
+             SET run_done_outcome = 'blocked',
+                 run_done_declared_at = '1'
+             WHERE id = ?1",
+            rusqlite::params![execution_id],
+        )
+        .unwrap();
+}
+
+/// Active chore whose latest execution is terminal with
+/// `run_done_outcome = blocked`. `autostart` is left at 1 so a missing
+/// park gate on `rescan_active_dispatch` cannot hide behind the
+/// autostart check.
+fn parked_active_chore(db: &WorkDb, label: &str) -> (String, String) {
+    let product = create_test_product_named(db, &format!("Prod-{label}"));
+    let chore = create_test_chore(db, product.id.clone(), format!("Chore-{label}"));
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Abandoned)
+                .build(),
+        )
+        .unwrap();
+    stamp_blocked_declaration(db, &exec.id);
+    (chore.id, exec.id)
+}
+
+/// `rescan_active_dispatch` must not remint a row whose latest execution
+/// declared blocked, even when `autostart` is still 1.
+#[test]
+fn rescan_does_not_remint_a_blocked_declaration() {
+    let db = WorkDb::open(temp_db_path("park-rescan")).unwrap();
+    let (chore_id, exec_id) = parked_active_chore(&db, "rescan");
+
+    let redispatched = db.rescan_active_dispatch().unwrap();
+    assert!(
+        !redispatched.contains(&chore_id),
+        "rescan must not remint a row carrying a blocked declaration, got {redispatched:?}",
+    );
+    let executions = db.list_executions(Some(&chore_id)).unwrap();
+    assert_eq!(
+        executions.len(),
+        1,
+        "no replacement execution may be minted for a parked row"
+    );
+    assert_eq!(executions[0].id, exec_id);
+}
+
+/// Startup `reconcile_active_dispatch` ignores `autostart` so it can
+/// rehydrate rows whose worker died across a restart. It must still
+/// refuse a deliberate park — only the park signal, not the single-shot
+/// flag, holds the row.
+#[test]
+fn reconcile_active_does_not_remint_a_blocked_declaration() {
+    let db = WorkDb::open(temp_db_path("park-reconcile-active")).unwrap();
+    let (chore_id, exec_id) = parked_active_chore(&db, "reconcile-active");
+    // Production leaves `autostart = 0` on any row that has actually run.
+    // Stamp that so this test cannot pass by accidentally consulting it.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET autostart = 0 WHERE id = ?1",
+            rusqlite::params![chore_id],
+        )
+        .unwrap();
+
+    let redispatched = db.reconcile_active_dispatch(|_| true).unwrap();
+    assert!(
+        !redispatched.contains(&chore_id),
+        "startup reconcile must not remint a parked row, got {redispatched:?}",
+    );
+    let executions = db.list_executions(Some(&chore_id)).unwrap();
+    assert_eq!(executions.len(), 1);
+    assert_eq!(executions[0].id, exec_id);
+}
+
+/// Product-wide reconcile (the `publish_work_invalidation` trigger) mints
+/// `revision_implementation` rows through `reconcile_revision_execution`.
+/// A blocked declaration on the revision must hold that path too — not
+/// only the chore/orphan paths.
+#[test]
+fn reconcile_revision_does_not_remint_a_blocked_declaration() {
+    let db = WorkDb::open(temp_db_path("park-reconcile-revision")).unwrap();
+    let product_id = make_revision_product(&db, "park-rev");
+    let parent_id = make_in_review_chore(&db, &product_id, "https://github.com/spinyfin/mono/pull/55");
+    let revision_id = insert_revision_row(&db, &product_id, &parent_id);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'active', autostart = 0 WHERE id = ?1",
+            rusqlite::params![revision_id],
+        )
+        .unwrap();
+    let exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(revision_id.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Abandoned)
+                .build(),
+        )
+        .unwrap();
+    stamp_blocked_declaration(&db, &exec.id);
+
+    db.reconcile_product_executions(&product_id).unwrap();
+
+    let executions = db.list_executions(Some(&revision_id)).unwrap();
+    assert_eq!(
+        executions.len(),
+        1,
+        "reconcile_revision_execution must not remint a parked revision"
+    );
+    assert_eq!(executions[0].id, exec.id);
+}
+
+/// `bossctl work start` / kanban drag-to-Doing is the un-park gesture:
+/// `request_execution` must still mint a replacement for a parked row.
+#[test]
+fn request_execution_still_dispatches_a_blocked_declaration() {
+    let db = WorkDb::open(temp_db_path("park-explicit-start")).unwrap();
+    let (chore_id, exec_id) = parked_active_chore(&db, "explicit-start");
+
+    let minted = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore_id.clone()).build())
+        .unwrap();
+    assert_ne!(minted.id, exec_id, "explicit start must mint a fresh execution");
+    assert_eq!(minted.status, ExecutionStatus::Ready);
+    let executions = db.list_executions(Some(&chore_id)).unwrap();
+    assert_eq!(executions.len(), 2);
+}

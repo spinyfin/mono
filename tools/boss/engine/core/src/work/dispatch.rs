@@ -1,3 +1,4 @@
+use super::dispatch_admission::{has_open_execution_attention_of_kind_on, work_item_is_deliberately_parked};
 use super::*;
 
 impl WorkDb {
@@ -587,6 +588,32 @@ impl WorkDb {
             if !needs_dispatch {
                 continue;
             }
+            // Deliberate park is blocking on this automatic path.
+            // `autostart` is deliberately not consulted: it is single-shot
+            // and every legitimately recoverable row already has it
+            // cleared. Only a blocked declaration (or an open park
+            // attention item) holds the row; a worker that simply died
+            // across the restart still rehydrates.
+            match work_item_is_deliberately_parked(&tx, &work_item_id) {
+                Ok(true) => {
+                    tracing::info!(
+                        work_item_id = %work_item_id,
+                        "reconcile_active_dispatch: skipping redispatch — this row's run ended in a \
+                         deliberate park (`bossctl work start` resumes it)",
+                    );
+                    continue;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        work_item_id = %work_item_id,
+                        ?err,
+                        "reconcile_active_dispatch: skipping redispatch — could not read the row's \
+                         park state; refusing to redispatch on an unknown admission state",
+                    );
+                    continue;
+                }
+            }
             // When the predecessor was orphaned by the startup reaper
             // (worker pane died across the engine restart), default
             // the new ready row's `preferred_workspace_id` to the
@@ -680,6 +707,29 @@ impl WorkDb {
             };
             if !needs_dispatch {
                 continue;
+            }
+            // Independent of the `autostart` gate above: a blocked
+            // declaration parks the row even if `autostart` is still 1
+            // (the flag is single-shot and is not the park discriminator).
+            match work_item_is_deliberately_parked(&tx, &work_item_id) {
+                Ok(true) => {
+                    tracing::info!(
+                        work_item_id = %work_item_id,
+                        "rescan_active_dispatch: skipping redispatch — this row's run ended in a \
+                         deliberate park (`bossctl work start` resumes it)",
+                    );
+                    continue;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        work_item_id = %work_item_id,
+                        ?err,
+                        "rescan_active_dispatch: skipping redispatch — could not read the row's \
+                         park state; refusing to redispatch on an unknown admission state",
+                    );
+                    continue;
+                }
             }
             // Silently skip gated items so the rescan keeps going.
             // request_execution_in_tx_with_live_check would bail and
@@ -1078,8 +1128,9 @@ impl WorkDb {
     /// `work_item_id` NULL — see `WorkDb::create_attention_item`) are
     /// invisible to a `work_attention_items.work_item_id = t.id` predicate,
     /// so this joins through `work_executions` to ask the question at the
-    /// work-item level. Used by [`crate::orphan_sweep`] to recognise a run
-    /// that ended in a *deliberate* engine park rather than a lost pane.
+    /// work-item level. The park fact itself lives on
+    /// [`WorkDb::dispatch_admission_facts`]; this wrapper remains for
+    /// callers that need the join without the rest of the evaluator.
     ///
     /// Self-clearing by construction: every kind a caller should pass here
     /// is registered `ClearedBy::WorkResumed` in
@@ -1087,31 +1138,8 @@ impl WorkDb {
     /// run starts for the item — an operator's `bossctl work start` needs
     /// no separate un-park step.
     pub fn has_open_execution_attention_of_kind(&self, work_item_id: &str, kinds: &[&str]) -> Result<bool> {
-        if kinds.is_empty() {
-            return Ok(false);
-        }
         let conn = self.connect()?;
-        let placeholders = (2..2 + kinds.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT EXISTS(
-                 SELECT 1 FROM work_attention_items a
-                 JOIN work_executions we ON we.id = a.execution_id
-                 WHERE we.work_item_id = ?1
-                   AND a.status = 'open'
-                   AND a.kind IN ({placeholders})
-             )"
-        );
-        let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(kinds.len() + 1);
-        bound.push(&work_item_id);
-        for kind in kinds {
-            bound.push(kind);
-        }
-        conn.query_row(&sql, bound.as_slice(), |row| row.get::<_, i64>(0))
-            .map(|found| found != 0)
-            .map_err(Into::into)
+        has_open_execution_attention_of_kind_on(&conn, work_item_id, kinds)
     }
 
     /// Count recent `pr_review` attempts that did not yield a durable

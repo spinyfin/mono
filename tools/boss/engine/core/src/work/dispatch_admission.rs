@@ -49,6 +49,22 @@ pub(crate) struct DispatchAdmissionFacts {
     /// see `task_accepts_execution`'s doc comment.
     #[builder(default)]
     pub autostart_disabled: bool,
+    /// `true` when this row's latest execution ended in a *deliberate*
+    /// park rather than a lost pane: the worker declared
+    /// `run_done --outcome blocked`, or an open park attention item
+    /// (`run_done_declared_blocked` / `nudge_breaker_tripped`) is still
+    /// asking a human to adjudicate. The durable signal is
+    /// `work_executions.run_done_outcome`; the attention item is the other
+    /// representation (the nudge-breaker park never stamps the column).
+    ///
+    /// Blocking on every **automatic** mint path (`orphan_sweep`,
+    /// `rescan_active_dispatch`, `reconcile_active_dispatch`,
+    /// `reconcile_revision_execution`). Informational on this evaluator
+    /// for the same reason as `churn_guard_parked`: an explicit
+    /// `bossctl work start` / kanban drag-to-Doing is the un-park
+    /// gesture and must not be refused.
+    #[builder(default)]
+    pub deliberate_parked: bool,
     /// `true` when a fresh execution for this work item would route to
     /// the interactive main pool (i.e. neither `pr_review` nor
     /// automation-sourced) — the only pool the concurrency cap governs.
@@ -64,6 +80,75 @@ pub(crate) struct DispatchAdmissionFacts {
     pub exempt_from_operator_pause: bool,
 }
 
+/// Attention kinds that mean "a human was asked to adjudicate this run,
+/// do not auto-remint." Execution-scoped (`execution_id` set,
+/// `work_item_id` NULL), so callers must join through `work_executions`
+/// rather than filtering `work_attention_items.work_item_id`.
+const DELIBERATE_PARK_ATTENTION_KINDS: &[&str] = &[
+    crate::completion::RUN_DONE_BLOCKED_ATTENTION_KIND,
+    crate::completion::NUDGE_BREAKER_ATTENTION_KIND,
+];
+
+/// `true` when any execution of `work_item_id` carries an OPEN attention
+/// item of one of `kinds`. Shared by [`work_item_is_deliberately_parked`]
+/// and [`WorkDb::has_open_execution_attention_of_kind`] so the join
+/// through `work_executions` is not copied per caller.
+pub(crate) fn has_open_execution_attention_of_kind_on(
+    conn: &Connection,
+    work_item_id: &str,
+    kinds: &[&str],
+) -> Result<bool> {
+    if kinds.is_empty() {
+        return Ok(false);
+    }
+    let placeholders = (2..2 + kinds.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT EXISTS(
+             SELECT 1 FROM work_attention_items a
+             JOIN work_executions we ON we.id = a.execution_id
+             WHERE we.work_item_id = ?1
+               AND a.status = 'open'
+               AND a.kind IN ({placeholders})
+         )"
+    );
+    let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(kinds.len() + 1);
+    bound.push(&work_item_id);
+    for kind in kinds {
+        bound.push(kind);
+    }
+    conn.query_row(&sql, bound.as_slice(), |row| row.get::<_, i64>(0))
+        .map(|found| found != 0)
+        .map_err(Into::into)
+}
+
+/// `true` when automatic mint must not create a replacement execution for
+/// `work_item_id`. Keys on the latest execution's
+/// `run_done_outcome = 'blocked'` (the durable signal — the column is
+/// not cleared by `ClearedBy::WorkResumed`) and, additionally, on an
+/// open park attention item (the nudge-breaker park never stamps the
+/// column). Takes `&Connection` so in-transaction mint paths can consult
+/// the same fact without re-locking `WorkDb`'s mutex.
+pub(crate) fn work_item_is_deliberately_parked(conn: &Connection, work_item_id: &str) -> Result<bool> {
+    let latest_outcome: Option<String> = conn
+        .query_row(
+            "SELECT run_done_outcome FROM work_executions
+             WHERE work_item_id = ?1
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+            params![work_item_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    if latest_outcome.as_deref() == Some(boss_protocol::RunDoneOutcome::Blocked.as_str()) {
+        return Ok(true);
+    }
+    has_open_execution_attention_of_kind_on(conn, work_item_id, DELIBERATE_PARK_ATTENTION_KINDS)
+}
+
 impl WorkDb {
     pub(crate) fn dispatch_admission_facts(&self, work_item_id: &str) -> Result<DispatchAdmissionFacts> {
         // Every raw query against `conn` happens in this inner block, which
@@ -77,6 +162,7 @@ impl WorkDb {
             ineligible_reason: Option<String>,
             churn_guard_parked: bool,
             autostart_disabled: bool,
+            deliberate_parked: bool,
             kind: Option<ExecutionKind>,
         }
         let raw = {
@@ -91,6 +177,7 @@ impl WorkDb {
                     ineligible_reason: Some(format!("{resolved_work_item_id} is not a dispatchable work item")),
                     churn_guard_parked: false,
                     autostart_disabled: false,
+                    deliberate_parked: false,
                     kind: None,
                 }
             } else {
@@ -171,6 +258,7 @@ impl WorkDb {
                     |row| row.get(0),
                 )?;
                 let autostart_disabled = autostart == 0 && status == TaskStatus::Todo;
+                let deliberate_parked = work_item_is_deliberately_parked(&conn, &resolved_work_item_id)?;
                 // Mirrors the request path's own idempotency/re-dispatch
                 // guard (`request_execution_in_tx_with_live_check`'s
                 // "governing" execution): a non-terminal execution already
@@ -193,6 +281,7 @@ impl WorkDb {
                     ineligible_reason,
                     churn_guard_parked: churn_guard_parked > 0,
                     autostart_disabled,
+                    deliberate_parked,
                     kind: Some(kind),
                 }
             }
@@ -221,6 +310,7 @@ impl WorkDb {
             .unmet_dependencies(unmet_dependencies)
             .churn_guard_parked(raw.churn_guard_parked)
             .autostart_disabled(raw.autostart_disabled)
+            .deliberate_parked(raw.deliberate_parked)
             .targets_main_pool(targets_main_pool)
             .exempt_from_operator_pause(exempt_from_operator_pause)
             .build())
@@ -279,5 +369,107 @@ mod churn_guard_parked_fact_tests {
 
         let facts = db.dispatch_admission_facts(&work_item_id).unwrap();
         assert!(!facts.churn_guard_parked);
+    }
+}
+
+#[cfg(test)]
+mod deliberate_parked_fact_tests {
+    use crate::test_support::*;
+    use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus, RunDoneOutcome};
+
+    fn stamp_run_done_outcome(db: &crate::work::WorkDb, execution_id: &str, outcome: &str) {
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET run_done_outcome = ?2 WHERE id = ?1",
+                rusqlite::params![execution_id, outcome],
+            )
+            .unwrap();
+    }
+
+    fn abandoned_execution(db: &crate::work::WorkDb, work_item_id: &str) -> String {
+        db.create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(work_item_id)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Abandoned)
+                .build(),
+        )
+        .unwrap()
+        .id
+    }
+
+    /// Durable signal: the latest execution declared `blocked`.
+    #[test]
+    fn true_via_latest_run_done_outcome_blocked() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = abandoned_execution(&db, &work_item_id);
+        stamp_run_done_outcome(&db, &execution_id, RunDoneOutcome::Blocked.as_str());
+
+        let facts = db.dispatch_admission_facts(&work_item_id).unwrap();
+        assert!(facts.deliberate_parked);
+    }
+
+    /// Nudge-breaker park never stamps `run_done_outcome`; the open
+    /// attention item is the other representation of the same fact.
+    #[test]
+    fn true_via_open_park_attention_without_column() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = abandoned_execution(&db, &work_item_id);
+        db.create_attention_item(boss_protocol::CreateAttentionItemInput {
+            execution_id: Some(execution_id),
+            work_item_id: None,
+            kind: crate::completion::NUDGE_BREAKER_ATTENTION_KIND.to_owned(),
+            status: None,
+            title: "nudge breaker parked".to_owned(),
+            body_markdown: "parked".to_owned(),
+            resolved_at: None,
+        })
+        .unwrap();
+
+        let facts = db.dispatch_admission_facts(&work_item_id).unwrap();
+        assert!(facts.deliberate_parked);
+    }
+
+    /// An older blocked declaration must not park a later execution that
+    /// did not declare blocked — operator start mints a new latest row.
+    #[test]
+    fn false_when_only_an_older_execution_declared_blocked() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let older = abandoned_execution(&db, &work_item_id);
+        stamp_run_done_outcome(&db, &older, RunDoneOutcome::Blocked.as_str());
+        let _newer = abandoned_execution(&db, &work_item_id);
+
+        let facts = db.dispatch_admission_facts(&work_item_id).unwrap();
+        assert!(!facts.deliberate_parked);
+    }
+
+    #[test]
+    fn false_when_latest_declared_delivered() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = abandoned_execution(&db, &work_item_id);
+        stamp_run_done_outcome(&db, &execution_id, RunDoneOutcome::Delivered.as_str());
+
+        let facts = db.dispatch_admission_facts(&work_item_id).unwrap();
+        assert!(!facts.deliberate_parked);
+    }
+
+    #[test]
+    fn false_when_neither_column_nor_open_attention() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let _execution_id = abandoned_execution(&db, &work_item_id);
+
+        let facts = db.dispatch_admission_facts(&work_item_id).unwrap();
+        assert!(!facts.deliberate_parked);
     }
 }

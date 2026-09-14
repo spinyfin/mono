@@ -1,3 +1,4 @@
+use super::dispatch_admission::work_item_is_deliberately_parked;
 use super::*;
 
 /// Shared per-product short-id read-modify-write. Reads the current
@@ -891,6 +892,33 @@ pub(crate) fn reconcile_revision_execution(
             "reconcile_revision: item is deferred/future-scope — suppressing execution mint until explicit approval",
         );
         return Ok(());
+    }
+    // Deliberate park is blocking on this automatic path, same as
+    // `rescan_active_dispatch` / `reconcile_active_dispatch` /
+    // `orphan_sweep`. A blocked declaration leaves the row `active`
+    // by design, so `task_accepts_execution`'s todo-only `autostart`
+    // check cannot hold it — without this gate a product-wide
+    // reconcile remints a replacement onto the work a human was
+    // asked to adjudicate.
+    match work_item_is_deliberately_parked(conn, &task.id) {
+        Ok(true) => {
+            tracing::info!(
+                work_item_id = %task.id,
+                "reconcile_revision: skipping execution mint — this row's run ended in a \
+                 deliberate park (`bossctl work start` resumes it)",
+            );
+            return Ok(());
+        }
+        Ok(false) => {}
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %task.id,
+                ?err,
+                "reconcile_revision: skipping execution mint — could not read the row's park \
+                 state; refusing to remint on an unknown admission state",
+            );
+            return Ok(());
+        }
     }
 
     match query_latest_execution_for_work_item(conn, &task.id)? {

@@ -14,29 +14,33 @@ use std::collections::HashSet;
 
 use anyhow::bail;
 use boss_protocol::{
-    ADMISSION_BLOCKER_AUTOSTART_DISABLED, ADMISSION_BLOCKER_CHURN_GUARD_PARKED, ADMISSION_BLOCKER_INELIGIBLE_STATUS,
-    ADMISSION_BLOCKER_INTERACTIVE_CONCURRENCY_CAP, ADMISSION_BLOCKER_UNMET_DEPENDENCY, DispatchAdmission,
-    DispatchAdmissionBlocker, DispatchAdmissionEntryPoint, DispatchPauseSnapshot, RequestExecutionInput,
+    ADMISSION_BLOCKER_AUTOSTART_DISABLED, ADMISSION_BLOCKER_CHURN_GUARD_PARKED, ADMISSION_BLOCKER_DELIBERATE_PARKED,
+    ADMISSION_BLOCKER_INELIGIBLE_STATUS, ADMISSION_BLOCKER_INTERACTIVE_CONCURRENCY_CAP,
+    ADMISSION_BLOCKER_UNMET_DEPENDENCY, DispatchAdmission, DispatchAdmissionBlocker, DispatchAdmissionEntryPoint,
+    DispatchPauseSnapshot, RequestExecutionInput,
 };
 
 use super::*;
 use crate::work::CancelExecutionOpts;
 
-/// The two blocker codes that a plain (non-forced) `RequestExecution` has
+/// Blocker codes that a plain (non-forced) `RequestExecution` has
 /// always bypassed regardless of `force` — see
 /// `request_execution_in_tx_with_live_check`'s unconditional
-/// `resolve_attention_kind_in_tx` (churn-guard) and
+/// `resolve_attention_kind_in_tx` (churn-guard),
 /// `task_accepts_execution`'s doc comment (autostart, "explicit
-/// RequestExecution still creates a ready execution"). The design's
+/// RequestExecution still creates a ready execution"), and the
+/// deliberate-park fact on `dispatch_admission_facts` (a blocked
+/// declaration; `bossctl work start` is the un-park). The design's
 /// non-goals are explicit that a forced explicit start retains those same
 /// pre-existing behaviors rather than the new force bit newly authorizing
-/// them, so [`DispatchAdmission::blockers`] reports both for transparency
+/// them, so [`DispatchAdmission::blockers`] reports them for transparency
 /// (the confirmation UI names every constraint force does not touch) but
-/// neither ever causes [`ExecutionCoordinator::dispatch_with_pause_bypass`]
+/// none of them ever cause [`ExecutionCoordinator::dispatch_with_pause_bypass`]
 /// to refuse a request that would otherwise succeed.
 const INFORMATIONAL_ONLY_BLOCKER_CODES: &[&str] = &[
     ADMISSION_BLOCKER_CHURN_GUARD_PARKED,
     ADMISSION_BLOCKER_AUTOSTART_DISABLED,
+    ADMISSION_BLOCKER_DELIBERATE_PARKED,
 ];
 
 /// Result of [`ExecutionCoordinator::dispatch_with_pause_bypass`]: the
@@ -164,6 +168,14 @@ impl ExecutionCoordinator {
             blockers.push(DispatchAdmissionBlocker {
                 code: ADMISSION_BLOCKER_AUTOSTART_DISABLED.to_string(),
                 message: "autostart is disabled (an explicit start always bypasses this, force or not)".to_string(),
+            });
+        }
+        if facts.deliberate_parked {
+            blockers.push(DispatchAdmissionBlocker {
+                code: ADMISSION_BLOCKER_DELIBERATE_PARKED.to_string(),
+                message:
+                    "deliberately parked after a blocked declaration (an explicit start resumes this, force or not)"
+                        .to_string(),
             });
         }
         // The interactive concurrency cap only governs main-pool work, and

@@ -103,7 +103,7 @@ These use the existing dispatch-event ledger (not a task flag). Inspectable afte
 Stable blocker codes on `DispatchAdmission` (and refused force paths):
 
 - Enforced: `interactive_concurrency_cap`, `unmet_dependency`, `ineligible_status`
-- Informational only (explicit start always clears): `churn_guard_parked`, `autostart_disabled`
+- Informational only (explicit start always clears): `churn_guard_parked`, `autostart_disabled`, `deliberate_parked`
 
 The app's `hardBlockers` property filters out the informational codes when deciding whether to offer confirmation.
 
