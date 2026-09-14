@@ -14,7 +14,7 @@
 //! life). Two consecutive runs in the same slot reuse the slot key.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use boss_protocol::{
     ExecutionKind, LiveWorkerMetadata, LiveWorkerState, SessionStartSource, WorkItemBinding, WorkerActivity,
@@ -150,11 +150,13 @@ pub const STALLED_SPAWN_THRESHOLD_SECS: i64 = 30;
 ///
 /// Retain 300s after revalidation against Codex's 2026-09-13 startup:
 /// panes/shells took 4–7s, while the driver took 78–84s solo and 119–120s
-/// at six-way concurrency. Five minutes is over twice the observed burst
-/// startup, including pane startup; it is not an order of magnitude above
-/// every driver's startup. File discovery reports overdue at 165s for that
-/// burst and at most 240s, leaving at least 60s for pane setup and signal
-/// delivery. Discovery itself keeps polling until teardown; this grace is
+/// at six-way concurrency. Five minutes is roughly 2.5x the measured burst
+/// startup including pane setup — bounded headroom, not unlimited.
+/// Discovery, not this grace, is the binding constraint on observing a
+/// slow start: `boss_startup_policy::DiscoveryBudget` allows 120s solo
+/// and at most 240s under contention, which must stay strictly inside this
+/// grace, leaving at least 60s for pane setup and signal delivery.
+/// Discovery itself keeps polling until teardown; this grace is
 /// the liveness authority for a spawn that never reports.
 ///
 /// Claude was historically validated via its prompt SessionStart hook and
@@ -187,6 +189,10 @@ pub struct LiveWorkerStateRegistry {
     /// per-field lifecycle, and there is no failure mode where one table
     /// keeps a stale entry a sibling table already dropped.
     inner: Mutex<HashMap<u8, SlotEntry>>,
+    /// Shared with JSONL discovery so a Claude or grok startup raises the
+    /// Codex discovery deadline. `None` in headless tests that never arm
+    /// file ingress.
+    discovery_load: Mutex<Option<Arc<boss_startup_policy::DiscoveryLoad>>>,
     /// Serialization locks that are independent of dispatch registry reads.
     serial: SerialLocks,
     /// Driver-hook evidence for runs whose pane is launching but whose slot
@@ -579,6 +585,39 @@ impl LiveWorkerStateRegistry {
         }
     }
 
+    /// Share the JSONL discovery high-water mark so every in-flight startup
+    /// (not just Codex file discovery) extends pending discovery deadlines.
+    pub fn set_discovery_load(&self, load: Arc<boss_startup_policy::DiscoveryLoad>) {
+        *self.discovery_load.lock().expect("registry mutex poisoned") = Some(load);
+        self.publish_startup_contention();
+    }
+
+    /// Live slots still inside `window_secs` of spawn with no driver signal.
+    pub fn in_flight_startups(&self, now_epoch_secs: i64, window_secs: i64) -> usize {
+        let cutoff = now_epoch_secs.saturating_sub(window_secs);
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard
+            .values()
+            .filter(|entry| Self::slot_in_startup_window(entry, cutoff))
+            .count()
+    }
+
+    fn slot_in_startup_window(entry: &SlotEntry, cutoff: i64) -> bool {
+        entry.meta.driver_signal_at.is_none() && entry.meta.spawned_at > cutoff
+    }
+
+    fn publish_startup_contention(&self) {
+        let load = {
+            let guard = self.discovery_load.lock().expect("registry mutex poisoned");
+            guard.clone()
+        };
+        let Some(load) = load else {
+            return;
+        };
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        load.observe_in_flight(self.in_flight_startups(now, DRIVER_START_GRACE_SECS));
+    }
+
     pub fn release_persona_for_run(&self, run_id: &str) {
         let _lifecycle = self.lock_lifecycle();
         let registered = self
@@ -823,6 +862,7 @@ impl LiveWorkerStateRegistry {
             registered_by = %caller,
             "live-state registry: slot entry registered; run is now visible to `bossctl agents list`",
         );
+        self.publish_startup_contention();
 
         // A slot re-registered without an intervening `release_slot` is an
         // engine bookkeeping desync (and what `EngineToAppError::SlotBusy`
@@ -1217,16 +1257,19 @@ impl LiveWorkerStateRegistry {
         }
 
         match removed {
-            Some(state) => tracing::info!(
-                slot_id,
-                run_id = %state.run_id,
-                activity = state.activity.as_str(),
-                last_event_at = ?state.last_event_at,
-                current_tool = ?state.current_tool,
-                shell_pid = state.shell_pid,
-                cleared_by = %caller,
-                "live-state registry: slot entry cleared; slot is now a husk candidate",
-            ),
+            Some(state) => {
+                tracing::info!(
+                    slot_id,
+                    run_id = %state.run_id,
+                    activity = state.activity.as_str(),
+                    last_event_at = ?state.last_event_at,
+                    current_tool = ?state.current_tool,
+                    shell_pid = state.shell_pid,
+                    cleared_by = %caller,
+                    "live-state registry: slot entry cleared; slot is now a husk candidate",
+                );
+                self.publish_startup_contention();
+            }
             None => tracing::debug!(
                 slot_id,
                 cleared_by = %caller,
@@ -1257,6 +1300,7 @@ impl LiveWorkerStateRegistry {
         drop(guard);
         self.release_persona_locked(run_id);
         tracing::info!(slot_id, run_id, cleared_by = %std::panic::Location::caller(), "live-state registry: matching run entry cleared");
+        self.publish_startup_contention();
         Some(slot_id)
     }
 
@@ -1347,6 +1391,7 @@ impl LiveWorkerStateRegistry {
             signal = kind.as_str(),
             "driver-start verified: first driver-originated signal received for this run",
         );
+        self.publish_startup_contention();
         Some(slot_id)
     }
 
@@ -1413,15 +1458,25 @@ impl LiveWorkerStateRegistry {
 
     /// Startup pressure includes pool claims not registered as live yet.
     /// A claim can outlive startup; driver proof removes it from this
-    /// count even while the execution remains productive.
-    pub fn startup_pending(&self, claimed_runs: &std::collections::HashSet<String>) -> bool {
+    /// count even while the execution remains productive. Unproven live
+    /// slots older than `window_secs` do not count: they are past the
+    /// driver-start grace, so they must not pin resumed admission to the
+    /// no-signal fallback.
+    pub fn startup_pending(
+        &self,
+        claimed_runs: &std::collections::HashSet<String>,
+        now_epoch_secs: i64,
+        window_secs: i64,
+    ) -> bool {
+        let cutoff = now_epoch_secs.saturating_sub(window_secs);
         let guard = self.inner.lock().expect("registry mutex poisoned");
-        guard.values().any(|entry| entry.meta.driver_signal_at.is_none())
-            || claimed_runs.iter().any(|run_id| {
-                !guard
-                    .values()
-                    .any(|entry| entry.state.run_id == *run_id && entry.meta.driver_signal_at.is_some())
-            })
+        guard.values().any(|entry| Self::slot_in_startup_window(entry, cutoff))
+            || claimed_runs.iter().any(
+                |run_id| match guard.values().find(|entry| entry.state.run_id == *run_id) {
+                    Some(entry) => Self::slot_in_startup_window(entry, cutoff),
+                    None => true,
+                },
+            )
     }
 
     /// Whether any live slot for `run_id` has recorded a driver-originated
@@ -2503,7 +2558,12 @@ impl boss_execution_contracts::LiveWorkerLiveness for LiveWorkerStateRegistry {
     }
 
     fn startup_pending(&self, claimed_runs: &std::collections::HashSet<String>) -> bool {
-        LiveWorkerStateRegistry::startup_pending(self, claimed_runs)
+        LiveWorkerStateRegistry::startup_pending(
+            self,
+            claimed_runs,
+            boss_engine_utils::epoch_time::now_epoch_secs(),
+            DRIVER_START_GRACE_SECS,
+        )
     }
 }
 

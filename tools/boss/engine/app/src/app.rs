@@ -362,6 +362,10 @@ impl boss_engine_runtime::spawn_flow::WorkerSpawner for ServerState {
         Some(&self.live_worker_states)
     }
 
+    fn spawn_health(&self) -> Option<&boss_engine_runtime::spawn_health::SpawnHealthTracker> {
+        Some(&self.spawn_health)
+    }
+
     async fn publish_live_worker_states(&self) {
         self.broadcast_live_worker_states().await;
     }
@@ -1921,11 +1925,14 @@ impl ServerState {
             let execution_coordinator = Arc::new(execution_coordinator_inner);
             completion_handler.set_host_adapter_provider(execution_coordinator.host_adapter_provider());
 
+            let agent_jsonl_progress_manager = Arc::new(
+                AgentJsonlProgressManager::new().with_metrics(metrics_registry.clone()),
+            );
+            live_worker_states.set_discovery_load(agent_jsonl_progress_manager.discovery_load());
+
             ServerState::builder()
                 .work_db(work_db)
-                .agent_jsonl_progress_manager(Arc::new(
-                    AgentJsonlProgressManager::new().with_metrics(metrics_registry.clone()),
-                ))
+                .agent_jsonl_progress_manager(agent_jsonl_progress_manager)
                 .maybe_coordinator_handoff_timeout(coordinator_handoff_timeout_override)
                 .maybe_coordinator_handoff_delivery(coordinator_handoff_delivery_override)
                 .maybe_coordinator_tmux_override(coordinator_tmux_override)

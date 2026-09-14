@@ -413,9 +413,9 @@ impl FailureComposition {
 /// checkleft's named-field limit for structs without a builder.
 #[derive(Debug, Default)]
 struct FailureLog {
-    /// `(work_item_id, epoch_secs)` of recent spawn failures, pruned to the
-    /// window on every `record_failure`.
-    recent: Mutex<Vec<(String, i64)>>,
+    /// `(work_item_id, epoch_secs, class)` of recent spawn failures, pruned
+    /// to the window on every `record_failure`.
+    recent: Mutex<Vec<(String, i64, SpawnFailureClass)>>,
     /// Full evidence for the same in-window failures `recent` tracks by
     /// `(work_item_id, epoch_secs)` alone — see [`SpawnFailureEvidence`].
     /// Pruned to the same window on every [`SpawnHealthTracker::record_evidence`]
@@ -451,8 +451,8 @@ pub struct SpawnHealthTracker {
     /// [`Self::mark_disabled_trip_signaled`]. Time-windowed (not a one-shot
     /// latch cleared by [`Self::record_success`]) because in disabled mode
     /// dispatch never pauses, so spawns keep flowing and `record_success`
-    /// fires on every real shell pid throughout the outage; a flapping spawn
-    /// path would otherwise re-signal (and raise a fresh durable attention
+    /// fires on every proven driver start throughout the outage; a flapping
+    /// spawn path would otherwise re-signal (and raise a fresh durable attention
     /// item) on every single success/failure cycle.
     last_disabled_signal_at: AtomicI64,
     /// Operator pause episode for which spawn failure attention was raised.
@@ -513,7 +513,7 @@ impl SpawnHealthTracker {
     /// Time-windowed rather than a one-shot latch cleared by
     /// [`Self::record_success`]: disabled mode never pauses dispatch, so
     /// spawns keep flowing throughout an outage and `record_success` fires
-    /// on every real shell pid reported in between failures. A flapping
+    /// on every proven driver start reported in between failures. A flapping
     /// spawn path (some spawns succeed, some don't) would otherwise clear
     /// the one-shot latch on every intervening success and raise a fresh
     /// durable attention item on every subsequent failure burst — several
@@ -542,11 +542,32 @@ impl SpawnHealthTracker {
     /// in [`trip_spawn_capability_circuit`] (which no-ops when dispatch is
     /// already paused), so the loud signal fires exactly once per outage.
     pub fn record_failure(&self, work_item_id: &str, now_epoch_secs: i64) -> Option<usize> {
+        self.record_classified_failure(work_item_id, now_epoch_secs, SpawnFailureClass::NoShell)
+    }
+
+    /// Record a never-started-driver failure. A later shell pid does not
+    /// clear these — only [`Self::record_success`] (driver signal or a
+    /// fresh app session) does.
+    pub fn record_driver_start_failure(&self, work_item_id: &str, now_epoch_secs: i64) -> Option<usize> {
+        self.record_classified_failure(
+            work_item_id,
+            now_epoch_secs,
+            SpawnFailureClass::ShellWithoutDriverSignal,
+        )
+    }
+
+    /// Record one classified never-started failure into the trip window.
+    pub fn record_classified_failure(
+        &self,
+        work_item_id: &str,
+        now_epoch_secs: i64,
+        class: SpawnFailureClass,
+    ) -> Option<usize> {
         let mut recent = self.failures.recent.lock().unwrap();
         let cutoff = now_epoch_secs - self.window.window_secs;
-        recent.retain(|(_, ts)| *ts >= cutoff);
-        recent.push((work_item_id.to_owned(), now_epoch_secs));
-        let distinct: HashSet<&str> = recent.iter().map(|(w, _)| w.as_str()).collect();
+        recent.retain(|(_, ts, _)| *ts >= cutoff);
+        recent.push((work_item_id.to_owned(), now_epoch_secs, class));
+        let distinct: HashSet<&str> = recent.iter().map(|(w, _, _)| w.as_str()).collect();
         let distinct = distinct.len();
         (distinct >= self.window.threshold).then_some(distinct)
     }
@@ -577,13 +598,14 @@ impl SpawnHealthTracker {
             .collect()
     }
 
-    /// Reset the breaker. Called when a spawn provably worked (a
-    /// driver-originated signal was reported), so stale
-    /// pre-recovery failures no longer count toward a trip.
+    /// Reset the breaker. Called when a driver-originated signal arrives
+    /// (the driver binary actually started) or a fresh app session
+    /// registered, so stale pre-recovery failures no longer count toward a
+    /// trip. A shell pid is not this: see [`Self::record_shell_ack`].
     ///
     /// Deliberately does NOT clear the disabled-mode signal window
     /// ([`Self::mark_disabled_trip_signaled`]): in disabled mode dispatch
-    /// never pauses, so this fires on every real shell pid throughout an
+    /// never pauses, so this fires on every proven driver start throughout an
     /// outage, including in between bursts of a flapping spawn path. Letting
     /// a success reset the window would re-arm the signal on every flap and
     /// raise a fresh durable attention item per burst; a genuinely new
@@ -591,6 +613,24 @@ impl SpawnHealthTracker {
     pub fn record_success(&self) {
         self.failures.recent.lock().unwrap().clear();
         self.failures.evidence.lock().unwrap().clear();
+    }
+
+    /// A pane reported a real shell pid. Proves the app can create a pane,
+    /// and clears only spawn-path (no-shell) failures. Driver-start
+    /// failures stay in the window: a login shell hosting nothing is the
+    /// 2026-07-30 incident class, and treating the pid as full recovery
+    /// would wipe those failures between every paced resume admission.
+    pub fn record_shell_ack(&self) {
+        self.failures
+            .recent
+            .lock()
+            .unwrap()
+            .retain(|(_, _, class)| *class != SpawnFailureClass::NoShell);
+        self.failures
+            .evidence
+            .lock()
+            .unwrap()
+            .retain(|evidence| evidence.class != SpawnFailureClass::NoShell);
     }
 
     /// Window length in seconds (for the trip event's `details`).
@@ -670,7 +710,8 @@ impl SpawnHealthTracker {
     /// for it): fully reset the probe state so the next outage's probing
     /// starts fresh, with no inherited backoff. Returns `true` only when
     /// `execution_id` was in fact the in-flight probe — the caller uses
-    /// this to decide whether to auto-resume dispatch.
+    /// this to decide whether to auto-resume dispatch. A shell pid is not
+    /// success here; see [`Self::record_shell_ack`].
     pub fn record_probe_success(&self, execution_id: &str) -> bool {
         let mut probe = self.probe.lock().unwrap();
         if probe.in_flight.as_deref() != Some(execution_id) {
@@ -1340,6 +1381,41 @@ mod tests {
         tracker.record_success();
         // After a successful spawn the window is empty again, so it takes a
         // fresh threshold's worth of distinct failures to re-trip.
+        assert_eq!(tracker.record_failure("wi-3", 1001), None);
+        assert_eq!(tracker.record_failure("wi-4", 1001), None);
+        assert_eq!(tracker.record_failure("wi-5", 1001), Some(3));
+    }
+
+    #[test]
+    fn shell_ack_does_not_clear_driver_start_failures() {
+        let tracker = SpawnHealthTracker::with_config(3, 300);
+        assert_eq!(tracker.record_driver_start_failure("wi-1", 1000), None);
+        tracker.record_shell_ack();
+        tracker.record_evidence(test_evidence(
+            "exec-1",
+            "wi-1",
+            "0",
+            4242,
+            1000,
+            SpawnFailureClass::ShellWithoutDriverSignal,
+        ));
+        tracker.record_shell_ack();
+        assert_eq!(tracker.record_driver_start_failure("wi-2", 1001), None);
+        tracker.record_shell_ack();
+        assert_eq!(
+            tracker.record_driver_start_failure("wi-3", 1002),
+            Some(3),
+            "a shell pid must not wipe driver-start failures out of the trip window"
+        );
+        assert_eq!(tracker.evidence_in_window(1002).len(), 1);
+    }
+
+    #[test]
+    fn shell_ack_clears_spawn_failures_only() {
+        let tracker = SpawnHealthTracker::with_config(3, 300);
+        tracker.record_failure("wi-1", 1000);
+        tracker.record_failure("wi-2", 1000);
+        tracker.record_shell_ack();
         assert_eq!(tracker.record_failure("wi-3", 1001), None);
         assert_eq!(tracker.record_failure("wi-4", 1001), None);
         assert_eq!(tracker.record_failure("wi-5", 1001), Some(3));

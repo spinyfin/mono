@@ -1099,6 +1099,7 @@ pub(crate) async fn finish_reap(
     // routed to it, so it belongs in the aggregate. The per-execution
     // attention item above is additional to this, not a
     // replacement for it — see the module doc.
+    let failure_class = cause.failure_class(shell_pid);
     ctx.spawn_health.record_evidence(
         crate::spawn_health::SpawnFailureEvidence::builder()
             .execution_id(execution_id)
@@ -1106,12 +1107,21 @@ pub(crate) async fn finish_reap(
             .slot_id(slot_id.to_string())
             .shell_pid(shell_pid)
             .epoch_secs(now_epoch_secs)
-            .class(cause.failure_class(shell_pid))
+            .class(failure_class)
             .cause(stage.as_str())
             .observed(orphan_reason.as_str())
             .build(),
     );
-    if let Some(distinct) = ctx.spawn_health.record_failure(work_item_id, now_epoch_secs) {
+    let distinct = match failure_class {
+        crate::spawn_health::SpawnFailureClass::ShellWithoutDriverSignal => ctx
+            .spawn_health
+            .record_driver_start_failure(work_item_id, now_epoch_secs),
+        crate::spawn_health::SpawnFailureClass::NoShell
+        | crate::spawn_health::SpawnFailureClass::PromptNotAccepted => {
+            ctx.spawn_health.record_failure(work_item_id, now_epoch_secs)
+        }
+    };
+    if let Some(distinct) = distinct {
         trip_spawn_capability_circuit(
             ctx.work_db,
             ctx.coordinator.as_ref(),

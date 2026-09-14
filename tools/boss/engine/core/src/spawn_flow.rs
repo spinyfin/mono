@@ -523,6 +523,13 @@ pub trait WorkerSpawner: Send + Sync {
         None
     }
 
+    /// Spawn-capability tracker. A real shell pid proves the pane path
+    /// and must not reset driver-start failures. Production `ServerState`
+    /// returns `Some`; tests that never trip the breaker return `None`.
+    fn spawn_health(&self) -> Option<&crate::spawn_health::SpawnHealthTracker> {
+        None
+    }
+
     /// Hook called after `LiveWorkerStateRegistry` is updated so the
     /// caller can broadcast the snapshot on the worker live-state
     /// topic. Default no-op for tests.
@@ -841,7 +848,14 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
     )
     .await
     {
-        Ok(shell_pid) => shell_pid,
+        Ok(shell_pid) => {
+            if shell_pid > 0
+                && let Some(health) = spawner.spawn_health()
+            {
+                health.record_shell_ack();
+            }
+            shell_pid
+        }
         Err(err) => {
             spawner.stop_progress_ingress(&input.run_id);
             return Err(err);

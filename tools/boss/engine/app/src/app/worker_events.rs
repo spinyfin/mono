@@ -13,17 +13,23 @@ impl ServerState {
     /// Stamp a driver-originated signal and, if this run is the in-flight
     /// spawn-capability recovery canary, auto-resume a Breaker-origin pause.
     pub(super) async fn record_driver_signal(&self, run_id: &str, kind: DriverSignalKind) -> Option<u8> {
+        // First live-slot driver signal proves the spawn path and the
+        // driver. Repeated hooks on an already-signaled run, and hooks
+        // for unknown runs, must not wipe in-window driver-start failures.
+        let already = self.live_worker_states.has_driver_signal_for_run(run_id);
         let slot = self.live_worker_states.record_driver_signal(run_id, kind);
-        if slot.is_some() {
-            boss_engine_runtime::spawn_health::maybe_resume_after_canary_driver_signal(
-                &self.spawn_health,
-                &self.work_db,
-                &self.execution_coordinator,
-                self.dispatch_events.as_ref(),
-                run_id,
-            )
-            .await;
+        if already || slot.is_none() {
+            return slot;
         }
+        self.spawn_health.record_success();
+        boss_engine_runtime::spawn_health::maybe_resume_after_canary_driver_signal(
+            &self.spawn_health,
+            &self.work_db,
+            &self.execution_coordinator,
+            self.dispatch_events.as_ref(),
+            run_id,
+        )
+        .await;
         slot
     }
 

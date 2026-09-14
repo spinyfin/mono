@@ -12,18 +12,42 @@ use std::time::{Duration, Instant};
 pub const RESUME_STARTUP_INTERVAL: Duration = Duration::from_secs(84);
 
 /// Pending discoveries share a high-water mark of overlapping startups.
-/// Completed, cancelled and failed discoveries release their budget on drop;
-/// established sessions never count as startup contention.
+/// The mark is driver-agnostic: Claude, grok, and Codex startups all raise
+/// it, because the contention being modelled is host CPU and IO during
+/// process startup, not JSONL file discovery. Completed, cancelled and
+/// failed discoveries release their budget on drop; established sessions
+/// never count as startup contention.
 #[derive(Default)]
 pub struct DiscoveryLoad {
     pending: Mutex<Vec<Weak<AtomicUsize>>>,
+    /// Live slots still inside their driver-start window with no driver
+    /// signal. JSONL `begin` is often armed before the pane registers, so
+    /// this count plus one is the overlapping-startup floor.
+    in_flight: AtomicUsize,
 }
 
 impl DiscoveryLoad {
+    /// Raise every pending discovery's peak to at least `count` overlapping
+    /// in-flight startups. `count` is the live-registry total (every driver),
+    /// not the JSONL-only pending set.
+    pub fn observe_in_flight(&self, count: usize) {
+        self.in_flight.store(count, Ordering::Relaxed);
+        let mut pending = self.pending.lock().expect("discovery load mutex poisoned");
+        pending.retain(|entry| entry.strong_count() > 0);
+        for entry in pending.iter().filter_map(Weak::upgrade) {
+            entry.fetch_max(count, Ordering::Relaxed);
+        }
+    }
+
     pub fn begin(&self) -> DiscoveryBudget {
         let mut pending = self.pending.lock().expect("discovery load mutex poisoned");
         pending.retain(|entry| entry.strong_count() > 0);
-        let count = pending.len() + 1;
+        // `begin` usually runs before this worker is a live slot, so add one
+        // to the registry count. JSONL-only tests never call observe, so
+        // `pending.len() + 1` remains the overlapping-discovery count.
+        let from_discoveries = pending.len() + 1;
+        let from_slots = self.in_flight.load(Ordering::Relaxed).saturating_add(1);
+        let count = from_discoveries.max(from_slots);
         for entry in pending.iter().filter_map(Weak::upgrade) {
             entry.fetch_max(count, Ordering::Relaxed);
         }
@@ -45,7 +69,8 @@ impl DiscoveryBudget {
         // 2026-09-13 Codex measurements: 78–84s solo, 119–120s at six-way
         // startup. The conservative slowdown is (120 - 78) / 5 = 8.4s per
         // additional startup, rounded up to 9s. Preserve the existing 120s
-        // solo allowance: six peers get 165s, retaining >=36s of headroom.
+        // solo allowance: six overlapping discoveries get 120 + 5*9 = 165s,
+        // ~45s above the measured 119–120s six-way startup.
         // This is a contention allowance, not a throughput prediction beyond
         // the measured six. Cap at twice the measured burst (240s), leaving
         // 60s for provisioning and signal delivery inside the separate 300s
@@ -58,7 +83,7 @@ impl DiscoveryBudget {
 /// Only the ready backlog captured on resume is paced. New arrivals keep
 /// normal admission, so a dependency-held backlog row cannot permanently
 /// throttle steady-state work. The scheduler supplies time and retries;
-/// this policy never sleeps or requires an extra operator action.
+/// this policy never sleeps and needs no manual step.
 #[derive(Default)]
 pub struct ResumeAdmission {
     capture_pending: bool,

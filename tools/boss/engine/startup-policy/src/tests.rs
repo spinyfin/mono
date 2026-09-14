@@ -1,6 +1,36 @@
 use super::*;
 
 #[test]
+fn in_flight_startups_from_other_drivers_raise_jsonl_deadline() {
+    let load = DiscoveryLoad::default();
+    let first = load.begin();
+    assert_eq!(first.timeout(), Duration::from_secs(120));
+    // Three Claude/grok live slots raise this already-armed Codex discovery:
+    // peak 3 → 120 + 2*9 = 138s.
+    load.observe_in_flight(3);
+    assert_eq!(first.timeout(), Duration::from_secs(138));
+    load.observe_in_flight(5);
+    assert_eq!(first.timeout(), Duration::from_secs(156));
+    load.observe_in_flight(6);
+    assert_eq!(first.timeout(), Duration::from_secs(165));
+    load.observe_in_flight(1);
+    assert_eq!(
+        first.timeout(),
+        Duration::from_secs(165),
+        "a peer finishing cannot retract time already granted"
+    );
+}
+
+#[test]
+fn begin_sees_in_flight_slots_already_observed() {
+    let load = DiscoveryLoad::default();
+    load.observe_in_flight(5);
+    let first = load.begin();
+    // Five live slots plus this discovery that has not registered yet.
+    assert_eq!(first.timeout(), Duration::from_secs(165));
+}
+
+#[test]
 fn burst_extends_first_worker_and_retains_contention_after_peers_finish() {
     let load = DiscoveryLoad::default();
     let first = load.begin();

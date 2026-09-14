@@ -981,6 +981,7 @@ dependencies = [
  "boss-engine-utils",
  "boss-execution-contracts",
  "boss-protocol",
+ "boss-startup-policy",
  "boss-work-db",
  "serde_json",
  "tracing",

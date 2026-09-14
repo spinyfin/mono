@@ -522,7 +522,7 @@ pub enum ResumeOutcome {
 /// Owns at most one prepared/active file ingress per execution id.
 pub struct AgentJsonlProgressManager {
     runs: Mutex<HashMap<String, RunHandle>>,
-    discovery_load: boss_startup_policy::DiscoveryLoad,
+    discovery_load: Arc<boss_startup_policy::DiscoveryLoad>,
     /// See [`DISCOVERY_OVERDUE_AFTER`]. A field so a test can drive the
     /// overdue path in milliseconds rather than minutes. When this still
     /// equals the production default, overlapping startups scale the
@@ -537,7 +537,7 @@ impl Default for AgentJsonlProgressManager {
     fn default() -> Self {
         Self {
             runs: Mutex::new(HashMap::new()),
-            discovery_load: boss_startup_policy::DiscoveryLoad::default(),
+            discovery_load: Arc::new(boss_startup_policy::DiscoveryLoad::default()),
             discovery_overdue_after: DISCOVERY_OVERDUE_AFTER,
             telemetry: StreamTelemetry::default(),
         }
@@ -568,9 +568,10 @@ impl AgentJsonlProgressManager {
     }
 
     /// Shared overlapping-startup high-water mark. Tests arm extra budgets
-    /// on the same load so a first discovery observes later peers.
-    pub fn discovery_load(&self) -> &boss_startup_policy::DiscoveryLoad {
-        &self.discovery_load
+    /// on the same load so a first discovery observes later peers. The live
+    /// registry also holds this Arc so non-JSONL startups raise the same mark.
+    pub fn discovery_load(&self) -> Arc<boss_startup_policy::DiscoveryLoad> {
+        Arc::clone(&self.discovery_load)
     }
 
     /// Snapshot pre-existing candidates before the pane is spawned, then
