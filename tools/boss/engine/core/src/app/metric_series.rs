@@ -7,8 +7,8 @@
 use super::*;
 
 use crate::metric_series::{
-    CATALOG_LOOKBACK_SECS, SeriesQuery, SeriesSource, build_catalog, build_execution_series_report,
-    build_task_series_report, parse_bucket, validate_query,
+    CATALOG_LOOKBACK_SECS, CoverageOverride, SeriesQuery, SeriesSource, build_catalog,
+    build_execution_series_report_with_coverage, build_task_series_report_with_coverage, parse_bucket, validate_query,
 };
 use crate::work::MetricExecutionFactOptions;
 
@@ -85,28 +85,66 @@ pub(super) async fn handle_get_metric_series(ctx: Dispatch, req: FrontendRequest
     let report = match spec.source {
         SeriesSource::Executions {
             kinds,
+            require_duration,
             require_pr_url,
             statuses,
             unique_by_pr_url,
-            ..
-        } => match work_db.metric_execution_facts(
-            since_epoch_s,
-            until_epoch_s,
-            kinds,
-            statuses,
-            require_pr_url,
-            MetricExecutionFactOptions {
-                first_pr_only: unique_by_pr_url,
-                filters: &filters,
-            },
-        ) {
-            Ok(rows) => build_execution_series_report(&query, &rows, generated_at_epoch_s),
-            Err(err) => return send_work_error(&sink, &request_id, &err),
-        },
-        SeriesSource::Tasks => match work_db.metric_task_facts(since_epoch_s, until_epoch_s) {
-            Ok(rows) => build_task_series_report(&query, &rows, generated_at_epoch_s),
-            Err(err) => return send_work_error(&sink, &request_id, &err),
-        },
+        } => {
+            let rows = match work_db.metric_execution_facts(
+                since_epoch_s,
+                until_epoch_s,
+                kinds,
+                statuses,
+                require_pr_url,
+                MetricExecutionFactOptions {
+                    first_pr_only: unique_by_pr_url,
+                    filters: &filters,
+                },
+            ) {
+                Ok(rows) => rows,
+                Err(err) => return send_work_error(&sink, &request_id, &err),
+            };
+            let (data_from_epoch_s, dimension_from_epoch_s) = match work_db.metric_execution_coverage(
+                kinds,
+                statuses,
+                require_pr_url,
+                require_duration,
+                &filters,
+                group_by.as_deref(),
+            ) {
+                Ok(minima) => minima,
+                Err(err) => return send_work_error(&sink, &request_id, &err),
+            };
+            build_execution_series_report_with_coverage(
+                &query,
+                &rows,
+                generated_at_epoch_s,
+                CoverageOverride {
+                    data_from_epoch_s,
+                    dimension_from_epoch_s,
+                },
+            )
+        }
+        SeriesSource::Tasks => {
+            let rows = match work_db.metric_task_facts(since_epoch_s, until_epoch_s) {
+                Ok(rows) => rows,
+                Err(err) => return send_work_error(&sink, &request_id, &err),
+            };
+            let (data_from_epoch_s, dimension_from_epoch_s) =
+                match work_db.metric_task_coverage(&filters, group_by.as_deref()) {
+                    Ok(minima) => minima,
+                    Err(err) => return send_work_error(&sink, &request_id, &err),
+                };
+            build_task_series_report_with_coverage(
+                &query,
+                &rows,
+                generated_at_epoch_s,
+                CoverageOverride {
+                    data_from_epoch_s,
+                    dimension_from_epoch_s,
+                },
+            )
+        }
     };
     match report {
         Ok(report) => send_response(&sink, &request_id, FrontendEvent::MetricSeriesResult { report }),
