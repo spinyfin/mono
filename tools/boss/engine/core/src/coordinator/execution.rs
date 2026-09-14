@@ -1393,7 +1393,11 @@ impl ExecutionCoordinator {
         // above — the PR is MERGED by construction, which `--pr` refuses
         // outright). Both must happen before handing the workspace to the
         // worker. If positioning fails, abort dispatch with a diagnosable stage.
+        let recovered_blocked = self.work_db.blocked_workspace_predecessor(execution)?.is_some()
+            && lease.dirty_verified == Some(true)
+            && execution.preferred_workspace_id.as_deref() == Some(&lease.workspace_id);
         let goto_target = match (pr_for_goto, post_merge_target_sha.as_deref()) {
+            _ if recovered_blocked => None,
             (_, Some(sha)) => Some(GotoTarget::Revision(sha)),
             (Some(pr), None) => Some(GotoTarget::Pr(pr)),
             (None, None) => None,
@@ -1503,7 +1507,8 @@ impl ExecutionCoordinator {
         // create_change (there is nothing to create; the worker edits or
         // reviews the branch/commit directly). For all other executions
         // create a fresh jj change via `cube change create`.
-        let change: Option<CubeChangeHandle> = if pr_for_goto.is_some() || post_merge_target_sha.is_some() {
+        let keep_change = recovered_blocked || pr_for_goto.is_some() || post_merge_target_sha.is_some();
+        let change: Option<CubeChangeHandle> = if keep_change {
             None
         } else {
             // Normal path (pr_review without a PR URL, and all non-review/
@@ -1970,6 +1975,39 @@ impl ExecutionCoordinator {
         if !execution.allow_dirty {
             return;
         }
+        let blocked_predecessor = match self.work_db.blocked_workspace_predecessor(execution) {
+            Ok(prior) => prior,
+            Err(err) => {
+                tracing::error!(execution_id = %execution.id, error = %err,
+                    "cannot establish recovery provenance; refusing recovery patch replay");
+                return;
+            }
+        };
+        if let Some(prior) = blocked_predecessor {
+            use boss_engine_recovery::recovery_apply::{RecoveryReport, RecoverySource};
+            let in_place = lease.dirty_verified == Some(true)
+                && execution.preferred_workspace_id.as_deref() == Some(&lease.workspace_id);
+            self.record_recovery(
+                execution,
+                worker_id,
+                lease,
+                RecoveryReport {
+                    for_execution_id: execution.id.clone(),
+                    from_execution_id: prior.id,
+                    source: if in_place {
+                        RecoverySource::BlockedInPlace
+                    } else {
+                        RecoverySource::BlockedFresh
+                    },
+                    applied: None,
+                    patch_error: None,
+                },
+                None,
+            )
+            .await;
+            // A described commit is not an uncommitted recovery patch.
+            return;
+        }
         let Some((dead_execution_id, patch_path)) = self.recovery_patch_for_resume(execution) else {
             // No captured patch. Cube may still have recovered in place — say
             // so, so the worker knows not to start from `main`.
@@ -2123,6 +2161,8 @@ impl ExecutionCoordinator {
         let source = match report.source {
             boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace => "cube_in_place",
             boss_engine_recovery::recovery_apply::RecoverySource::Patch => "patch",
+            boss_engine_recovery::recovery_apply::RecoverySource::BlockedInPlace => "blocked_in_place",
+            boss_engine_recovery::recovery_apply::RecoverySource::BlockedFresh => "blocked_fresh",
         };
         let restored = report.applied.as_ref().map(|a| a.summary());
         if let Err(err) = report.write(&lease.workspace_path) {
@@ -2184,6 +2224,7 @@ impl ExecutionCoordinator {
     ) -> Result<CubeWorkspaceLease> {
         let prefer = execution.preferred_workspace_id.as_deref();
         let allow_dirty = execution.allow_dirty;
+        let blocked_predecessor = self.work_db.blocked_workspace_predecessor(execution)?;
         // Soft-prefer (OQ5): revision_implementation executions set
         // prefer_is_soft = true so a missing or leased preferred workspace
         // degrades silently to any free workspace rather than failing hard.
@@ -2204,14 +2245,14 @@ impl ExecutionCoordinator {
         // occupancy guard on a previous dispatch attempt. Passing them as
         // `--exclude` to cube breaks the livelock where cube's deterministic
         // candidate ordering keeps re-offering the same occupied workspace.
-        let refused: Vec<String> = self
+        let mut refused: Vec<String> = self
             .refused_workspaces
             .lock()
             .await
             .get(&execution.id)
             .cloned()
             .unwrap_or_default();
-        let refused_refs: Vec<&str> = refused.iter().map(|s| s.as_str()).collect();
+        let mut refused_refs: Vec<&str> = refused.iter().map(|s| s.as_str()).collect();
 
         // Stale-lease reclaim (issue #962 — UI-crash resume).
         //
@@ -2289,6 +2330,19 @@ impl ExecutionCoordinator {
             )
             .await
         {
+            Ok(lease) if blocked_predecessor.is_some() => {
+                let prior = blocked_predecessor.as_ref().expect("checked above");
+                if self.verify_blocked_workspace(prior, &lease, adapter).await {
+                    CUBE_WORKSPACE_LEASE_SUCCESS.inc(&self.metrics);
+                    return Ok(lease);
+                }
+                // Release without resetting a foreign checkout, then exclude it
+                // from the clean fallback. A successful lease is not recovery proof.
+                adapter.release_workspace(&lease.lease_id).await?;
+                refused.push(lease.workspace_id);
+                refused_refs = refused.iter().map(|s| s.as_str()).collect();
+                anyhow!("blocked predecessor workspace identity or dirty state was not verified")
+            }
             Ok(lease) => {
                 CUBE_WORKSPACE_LEASE_SUCCESS.inc(&self.metrics);
                 return Ok(lease);
@@ -2352,25 +2406,20 @@ impl ExecutionCoordinator {
         // the item terminalized to `todo` with `blocked_reason: null` — no
         // user-visible signal at all.
         //
-        // So: degrade to `any_free` when (and only when) there is a patch to
-        // replay. Without one, the hard fail is still correct.
-        let recovery_patch = self.recovery_patch_for_resume(execution);
+        // A captured patch can rescue a hard-pinned orphan resume. Blocked
+        // handoffs never use this uncommitted-diff recovery path.
+        let recovery_patch = if blocked_predecessor.is_some() {
+            None
+        } else {
+            self.recovery_patch_for_resume(execution)
+        };
         let patch_rescues_this_resume = allow_dirty && recovery_patch.is_some();
-        // Restore the original allow_dirty hard-fail (a soft prefer alone
-        // does not exempt an execution from it — only a soft prefer
-        // *without* allow_dirty does, e.g. revision_implementation's
-        // cache-warmth-only soft prefer on a fresh dispatch), and carve out
-        // ONLY the merge-cancel handoff (ExecutionKind::ChoreImplementation)
-        // from the allow_dirty clause: that mint is the sole legitimate case
-        // needing "try the known dirty workspace, then start fresh if it's
-        // gone" semantics. A resumed execution of any other kind also
-        // carries prefer_is_soft = true and allow_dirty = true via
-        // `request_resume_execution`'s forced allow_dirty, but for a resume
-        // the uncommitted work lives ONLY in the preferred workspace, so
-        // losing the race must still hard-fail and retry rather than
-        // silently discarding it by degrading to a clean workspace.
+        // Preserve hard-pin resume semantics except for the two explicit soft
+        // handoffs: merge cancellation and a durable blocked declaration.
+        // In particular, a revision with allow_dirty and prefer_is_soft alone
+        // is not evidence of a deliberate park.
         let is_merge_cancel_handoff = execution.kind == ExecutionKind::ChoreImplementation;
-        let dirty_hard_fail = allow_dirty && !is_merge_cancel_handoff;
+        let dirty_hard_fail = allow_dirty && !is_merge_cancel_handoff && blocked_predecessor.is_none();
         if prefer.is_some() && (!execution.prefer_is_soft || dirty_hard_fail) && !patch_rescues_this_resume {
             CUBE_WORKSPACE_LEASE_FAILURE.inc(&self.metrics);
             return Err(first_err);

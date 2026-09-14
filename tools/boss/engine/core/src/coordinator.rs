@@ -592,6 +592,9 @@ pub struct CubeWorkspaceStatus {
     pub lease_id: Option<String>,
     pub holder: Option<String>,
     pub task: Option<String>,
+    /// Exact task identity recorded by Cube when the previous lease ended.
+    #[serde(default)]
+    pub last_task: Option<String>,
     pub leased_at_epoch_s: Option<i64>,
     pub lease_expires_at_epoch_s: Option<i64>,
 }
@@ -2269,6 +2272,7 @@ pub struct ExecutionCoordinator {
     pause_state_changed: tokio::sync::watch::Sender<u64>,
 }
 
+mod blocked_workspace;
 mod config;
 mod dispatch_admission;
 mod execution;
@@ -2451,11 +2455,14 @@ enum DrainOutcome {
 }
 
 fn execution_task_summary(execution: &WorkExecution, work_item: &WorkItem) -> String {
-    match work_item {
+    let summary = match work_item {
         WorkItem::Product(product) => format!("{} {}", execution.kind, product.name),
         WorkItem::Project(project) => format!("{} {}", execution.kind, project.name),
         WorkItem::Task(task) | WorkItem::Chore(task) => format!("{} {}", execution.kind, task.name),
-    }
+    };
+    // Cube persists this identity as last_task on release. Names alone cannot
+    // establish that a later dirty lease still contains this execution's work.
+    format!("{} {summary}", execution.id)
 }
 
 fn execution_change_title(execution: &WorkExecution, work_item: &WorkItem) -> String {

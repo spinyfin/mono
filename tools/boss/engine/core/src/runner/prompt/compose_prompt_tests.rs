@@ -21,6 +21,39 @@ fn base_execution() -> WorkExecution {
         .build()
 }
 
+#[test]
+fn blocked_workspace_prompt_overrides_checkout_guidance_and_requires_revalidation() {
+    use boss_engine_recovery::recovery_apply::{RecoveryReport, RecoverySource};
+    let ws = tempfile::tempdir().unwrap();
+    let mut execution = base_execution();
+    execution.allow_dirty = true;
+    execution.prefer_is_soft = true;
+    execution.preferred_workspace_id = Some("prior-workspace".into());
+    for source in [RecoverySource::BlockedInPlace, RecoverySource::BlockedFresh] {
+        RecoveryReport {
+            for_execution_id: execution.id.clone(),
+            from_execution_id: "prior".into(),
+            source,
+            applied: None,
+            patch_error: None,
+        }
+        .write(ws.path())
+        .unwrap();
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&execution)
+                .work_item(&chore_without_pr())
+                .workspace_path(ws.path())
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
+        );
+        assert!(prompt.contains("BLOCKED WORKSPACE RECOVERY"));
+        assert!(prompt.contains("Re-run the required build and tests in your own leased workspace"));
+        assert!(!prompt.contains("MERGE-CANCELLED REVIEW RECOVERY"));
+        assert!(!prompt.contains("## STARTUP RECOVERY"));
+    }
+}
+
 fn chore_without_pr() -> WorkItem {
     WorkItem::Chore(
         Task::builder()

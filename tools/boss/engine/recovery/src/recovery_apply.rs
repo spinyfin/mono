@@ -78,6 +78,10 @@ pub const RECOVERY_REPORT_FILE: &str = ".boss/recovery-report.json";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoverySource {
+    /// The deliberately blocked predecessor's exact checkout was verified.
+    BlockedInPlace,
+    /// Its checkout was unavailable or unverified; dispatch started fresh.
+    BlockedFresh,
     /// Cube re-leased the dead worker's own workspace with its dirty working
     /// copy intact. The jj operation log is intact too — this is the good
     /// path.

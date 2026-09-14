@@ -970,7 +970,11 @@ pub(crate) fn reconcile_revision_execution(
                 record_repo_unresolved_attention(conn, &task.id, label)?;
                 return Ok(());
             };
-            let preferred_workspace_id = preferred_workspace_for_chain_root(conn, &chain_root_task.id)?;
+            let blocked_workspace = blocked_workspace::blocked_workspace_predecessor(conn, &task.id, "")?
+                .and_then(|prior| prior.preferred_workspace_id);
+            let recovering_blocked = blocked_workspace.is_some();
+            let preferred_workspace_id =
+                blocked_workspace.or(preferred_workspace_for_chain_root(conn, &chain_root_task.id)?);
             let created = insert_execution(
                 conn,
                 CreateExecutionInput::builder()
@@ -980,6 +984,7 @@ pub(crate) fn reconcile_revision_execution(
                     .repo_remote_url(repo_remote_url)
                     .maybe_preferred_workspace_id(preferred_workspace_id)
                     .prefer_is_soft(true)
+                    .allow_dirty(recovering_blocked)
                     .pr_url(parent_pr_url)
                     .build(),
             )?;
@@ -1501,6 +1506,13 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         None
     };
 
+    let blocked_workspace = blocked_workspace::blocked_workspace_predecessor(conn, &work_item_id, "")?
+        .and_then(|prior| prior.preferred_workspace_id);
+    // Explicit input wins; never mark an unrelated user pin as recovery.
+    let recovering_blocked = blocked_workspace.is_some()
+        && (preferred_workspace_id.is_none() || preferred_workspace_id == blocked_workspace);
+    let preferred_workspace_id = preferred_workspace_id.or(blocked_workspace);
+
     insert_execution(
         conn,
         CreateExecutionInput::builder()
@@ -1511,7 +1523,8 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
             .maybe_priority(priority)
             .maybe_preferred_workspace_id(preferred_workspace_id)
             .maybe_pr_url(revision_pr_url)
-            .allow_dirty(allow_dirty)
+            .allow_dirty(allow_dirty || recovering_blocked)
+            .prefer_is_soft(recovering_blocked)
             .build(),
     )
 }

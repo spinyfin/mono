@@ -648,6 +648,7 @@ mod t04;
 // modules below (project design-doc/audit, resolve_repo, effort/model,
 // schema migrations, short_id allocator, work-item writes, CI remediation).
 mod ai_review_state_tests;
+mod blocked_workspace_tests;
 mod ci_remediation_tests;
 mod decision_tests;
 mod design_doc_audit_tests;

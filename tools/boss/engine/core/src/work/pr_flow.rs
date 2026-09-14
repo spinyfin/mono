@@ -410,6 +410,15 @@ impl WorkDb {
             );
         }
 
+        let deliberately_blocked: bool = tx.query_row(
+            "SELECT COALESCE(run_done_outcome = 'blocked', 0) FROM work_executions WHERE id = ?1",
+            [execution_id],
+            |row| row.get(0),
+        )?;
+        if deliberately_blocked {
+            exec_tail::preserve_execution_workspace_preference(&tx, execution_id)?;
+        }
+
         let original_lease_id = execution.cube_lease_id.clone();
         let original_workspace_id = execution.cube_workspace_id.clone();
 

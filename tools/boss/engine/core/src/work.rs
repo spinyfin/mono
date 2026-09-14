@@ -512,6 +512,7 @@ mod attention_reconcile;
 mod attentions;
 mod audit_misc;
 mod automations;
+mod blocked_workspace;
 mod blocking;
 mod boothby;
 mod chain_helpers;

@@ -102,6 +102,9 @@ pub(super) struct FakeCubeClient {
     pub(super) fail_first_n_leases: usize,
     pub(super) fail_create: bool,
     pub(super) fail_goto: bool,
+    pub(super) dirty_verified: Option<bool>,
+    pub(super) recovery_status: Option<CubeWorkspaceStatus>,
+    pub(super) workspace_root: Option<PathBuf>,
     pub(super) next_workspace_id: Mutex<Option<String>>,
     /// Ordered queue of workspace IDs to return from successive
     /// `lease_workspace` calls. When non-empty, dequeues from the
@@ -216,8 +219,8 @@ crate::stub_cube_client! { FakeCubeClient {
         Ok(CubeWorkspaceLease {
             lease_id: "lease-1".to_owned(),
             workspace_id: workspace_id.clone(),
-            workspace_path: PathBuf::from(format!("/tmp/{workspace_id}")),
-            dirty_verified: None,
+            workspace_path: self.workspace_root.clone().unwrap_or_else(|| PathBuf::from("/tmp")).join(&workspace_id),
+            dirty_verified: if allow_dirty { self.dirty_verified } else { None },
         })
     }
 
@@ -268,6 +271,9 @@ crate::stub_cube_client! { FakeCubeClient {
 
     async fn workspace_status(&self, workspace_path: &std::path::Path) -> Result<CubeWorkspaceStatus> {
         self.status_calls.lock().await.push(workspace_path.to_path_buf());
+        if let Some(status) = &self.recovery_status {
+            return Ok(status.clone());
+        }
         Ok(CubeWorkspaceStatus::builder()
             .workspace_id("mono-agent-001")
             .workspace_path(workspace_path.to_path_buf())
