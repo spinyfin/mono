@@ -282,6 +282,18 @@ pub struct FailureComposition {
     /// True when every `ShellWithoutDriverSignal` row had `shell_pid > 0`.
     /// Vacuously true when that class is absent.
     pub every_driver_start_had_a_shell: bool,
+    /// Cause breakdown of the `ShellWithoutDriverSignal` rows.
+    pub with_transcript: TranscriptCauses,
+}
+
+/// How [`SpawnFailureClass::ShellWithoutDriverSignal`] rows broke down by
+/// recorded `cause`. An app NACK or pane death with a transcript is not a
+/// driver-start timeout.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TranscriptCauses {
+    pub driver_start_timeouts: usize,
+    pub spawn_nacks: usize,
+    pub pane_deaths: usize,
 }
 
 impl FailureComposition {
@@ -290,6 +302,7 @@ impl FailureComposition {
             no_shell: 0,
             shell_without_driver_signal: 0,
             every_driver_start_had_a_shell: true,
+            with_transcript: TranscriptCauses::default(),
         };
         for entry in evidence {
             match entry.class {
@@ -298,6 +311,11 @@ impl FailureComposition {
                     composition.shell_without_driver_signal += 1;
                     if entry.shell_pid <= 0 {
                         composition.every_driver_start_had_a_shell = false;
+                    }
+                    match entry.cause.as_str() {
+                        "spawn_nack" => composition.with_transcript.spawn_nacks += 1,
+                        "pane_death_before_start" => composition.with_transcript.pane_deaths += 1,
+                        _ => composition.with_transcript.driver_start_timeouts += 1,
                     }
                 }
             }
@@ -309,8 +327,10 @@ impl FailureComposition {
     /// e.g. `4 driver-start timeouts (a pane and shell came up but ...)` or
     /// `2 spawns with no shell (...) and 1 driver-start timeout (...)`.
     ///
-    /// Names both classes whenever both are present, so a mixed window is
-    /// never summarised as one of them.
+    /// Names each observed cause rather than treating every
+    /// [`SpawnFailureClass::ShellWithoutDriverSignal`] row as a driver-start
+    /// timeout: an app NACK or pane death with a transcript on disk is not
+    /// a timeout.
     pub fn describe(&self) -> String {
         let mut parts = Vec::new();
         if self.no_shell > 0 {
@@ -320,7 +340,7 @@ impl FailureComposition {
                 SpawnFailureClass::NoShell.observed()
             ));
         }
-        if self.shell_without_driver_signal > 0 {
+        if self.with_transcript.driver_start_timeouts > 0 {
             let observed = if self.every_driver_start_had_a_shell {
                 SpawnFailureClass::ShellWithoutDriverSignal.observed()
             } else {
@@ -329,7 +349,20 @@ impl FailureComposition {
             };
             parts.push(format!(
                 "{} driver-start timeout(s) ({})",
-                self.shell_without_driver_signal, observed
+                self.with_transcript.driver_start_timeouts, observed
+            ));
+        }
+        if self.with_transcript.spawn_nacks > 0 {
+            parts.push(format!(
+                "{} spawn nack(s) (app reported spawn failure; a transcript was on disk)",
+                self.with_transcript.spawn_nacks
+            ));
+        }
+        if self.with_transcript.pane_deaths > 0 {
+            parts.push(format!(
+                "{} pane-death-before-start report(s) (app reported the pane died; a transcript \
+                 was on disk)",
+                self.with_transcript.pane_deaths
             ));
         }
         if parts.is_empty() {
@@ -341,8 +374,9 @@ impl FailureComposition {
 
     /// Where the operator should look first, given what was observed.
     pub fn diagnosis_hint(&self) -> &'static str {
-        match (self.no_shell, self.shell_without_driver_signal) {
-            (0, n) if n > 0 && self.every_driver_start_had_a_shell => {
+        let app_reported = self.with_transcript.spawn_nacks + self.with_transcript.pane_deaths;
+        match (self.no_shell, self.with_transcript.driver_start_timeouts, app_reported) {
+            (0, n, 0) if n > 0 && self.every_driver_start_had_a_shell => {
                 "Every failure in the window had a working pane and shell, so the app's pane-spawn \
                  path is NOT implicated. Look at the driver and its progress signal: for a \
                  file-tailing driver (Codex, Grok) read the engine log for `agent JSONL progress` \
@@ -350,21 +384,27 @@ impl FailureComposition {
                  and why it was not attached — and check the rollout on disk before concluding the \
                  driver never ran."
             }
-            (0, n) if n > 0 => {
-                "Every failure in the window was classed as a driver-start timeout, but not every \
+            (0, n, 0) if n > 0 => {
+                "Every failure in the window was a driver-start timeout, but not every \
                  one reported a shell pid — do not assume the app's pane-spawn path is healthy. \
                  Read each execution's observed text and the engine log for `agent JSONL progress` \
                  discovery lines before concluding where to look."
             }
-            (n, 0) if n > 0 => {
+            (0, 0, n) if n > 0 => {
+                "Every failure in the window was an app-reported pane spawn failure (NACK or pane \
+                 death) with a transcript on disk. The transcript is evidence the driver had \
+                 started — look at the pane-spawn and NACK path, not at JSONL discovery or a \
+                 driver-start timeout."
+            }
+            (n, 0, 0) if n > 0 => {
                 "No shell came up for any failure in the window, so the app's pane-spawn path is \
                  the thing to look at (most often `ghostty_surface_new` returning NULL after the \
                  machine slept, i.e. no active display)."
             }
             _ => {
-                "The window mixes both classes: check the app's pane-spawn path for the no-shell \
-                 failures AND the driver's progress signal for the driver-start timeouts; one \
-                 explanation is unlikely to cover both."
+                "The window mixes causes: check the app's pane-spawn path for no-shell and \
+                 app-reported failures AND the driver's progress signal for any driver-start \
+                 timeouts; one explanation is unlikely to cover both."
             }
         }
     }
@@ -1944,6 +1984,11 @@ mod tests {
                 no_shell: 0,
                 shell_without_driver_signal: 4,
                 every_driver_start_had_a_shell: true,
+                with_transcript: TranscriptCauses {
+                    driver_start_timeouts: 4,
+                    spawn_nacks: 0,
+                    pane_deaths: 0,
+                },
             }
         );
         let described = composition.describe();
@@ -1990,9 +2035,47 @@ mod tests {
         assert!(described.contains("2 spawn(s) with no shell"), "got: {described}");
         assert!(described.contains("1 driver-start timeout(s)"), "got: {described}");
         assert!(
-            composition.diagnosis_hint().contains("mixes both classes"),
+            composition.diagnosis_hint().contains("mixes causes"),
             "got: {}",
             composition.diagnosis_hint()
+        );
+    }
+
+    /// An app NACK with a present transcript is classed
+    /// `ShellWithoutDriverSignal` but must not be announced as a
+    /// driver-start timeout in the aggregate pause text.
+    #[test]
+    fn composition_of_app_nacks_with_a_transcript_does_not_call_them_driver_start_timeouts() {
+        let mut nack = test_evidence(
+            "exec-nack",
+            "wi-nack",
+            "0",
+            0,
+            100,
+            SpawnFailureClass::ShellWithoutDriverSignal,
+        );
+        nack.cause = "spawn_nack".to_owned();
+        let evidence = vec![nack];
+        let composition = FailureComposition::of(&evidence);
+        assert_eq!(composition.with_transcript.spawn_nacks, 1);
+        assert_eq!(composition.with_transcript.driver_start_timeouts, 0);
+        let described = composition.describe();
+        assert!(
+            described.contains("spawn nack"),
+            "must name the cause that fired; got: {described}"
+        );
+        assert!(
+            !described.contains("driver-start timeout"),
+            "must not announce an app NACK as a driver-start timeout; got: {described}"
+        );
+        let hint = composition.diagnosis_hint();
+        assert!(
+            hint.contains("app-reported"),
+            "the hint must name the app-reported path; got: {hint}"
+        );
+        assert!(
+            !hint.contains("agent JSONL progress"),
+            "diagnosis must not be sent to JSONL discovery for an app NACK; got: {hint}"
         );
     }
 

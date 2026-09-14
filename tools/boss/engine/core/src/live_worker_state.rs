@@ -366,9 +366,13 @@ pub enum NeverStartedReapCommit {
     Committed { shell_pid: i32 },
     /// A driver-originated signal landed while the probe was in flight.
     DriverSignalled,
-    /// No live entry, the slot belongs to a different execution, or a
-    /// reap already committed.
+    /// No live entry, or the slot belongs to a different execution.
     SlotGone,
+    /// A never-started reap already committed for this registration.
+    /// Distinct from [`Self::SlotGone`]: the slot still belongs to this
+    /// execution, but a later driver signal must not be accepted until
+    /// the fence is released or the slot is re-registered.
+    AlreadyCommitted,
     /// Pass 1: a shell pid was reported while the probe was in flight.
     SpawnAckNowHasPid { shell_pid: i32 },
     /// An app-reported cause is now stale: the slot has shown proof of
@@ -1038,7 +1042,7 @@ impl LiveWorkerStateRegistry {
             return NeverStartedReapCommit::SlotGone;
         }
         if entry.meta.reap_committed {
-            return NeverStartedReapCommit::SlotGone;
+            return NeverStartedReapCommit::AlreadyCommitted;
         }
         if entry.meta.driver_signal_at.is_some() {
             return NeverStartedReapCommit::DriverSignalled;
@@ -1066,6 +1070,25 @@ impl LiveWorkerStateRegistry {
         NeverStartedReapCommit::Committed {
             shell_pid: entry.state.shell_pid,
         }
+    }
+
+    /// Clear [`SlotMeta::reap_committed`] for `slot_id` when it still
+    /// belongs to `execution_id`. Used when a never-started reap committed
+    /// the fence and then a later fallible step (the orphan write) failed,
+    /// so a subsequent pass can still reap and a recovering hook can still
+    /// prove the driver alive.
+    ///
+    /// No-op when the slot is gone or now belongs to a different run —
+    /// that registration's fence is not this execution's to release.
+    pub fn release_never_started_reap(&self, slot_id: u8, execution_id: &str) {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let Some(entry) = guard.get_mut(&slot_id) else {
+            return;
+        };
+        if entry.state.run_id != execution_id {
+            return;
+        }
+        entry.meta.reap_committed = false;
     }
 
     /// Whether `slot_id`'s current registration is owed spawn-ack proof

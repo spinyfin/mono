@@ -10,6 +10,7 @@ use crate::live_worker_state::DriverSignalKind;
 use crate::spawn_health::SpawnHealthTracker;
 use crate::transcript_liveness::{TranscriptLiveness, TranscriptSource};
 use crate::work::{ExecutionStatus, WorkDb};
+use boss_protocol::WorkerActivity;
 
 fn present_liveness() -> TranscriptLiveness {
     TranscriptLiveness::Present {
@@ -877,6 +878,272 @@ async fn a_pid_during_the_probe_await_skips_a_spawn_ack_reap() {
     );
 }
 
+/// App-reported never-started eligibility is the four-term predicate
+/// (not Readopted, pid<=0, no last_event_at, still Spawning). A pid that
+/// arrives during the probe must skip the reap.
+#[tokio::test]
+async fn a_pid_during_the_probe_await_skips_an_app_nack_reap() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let db = Arc::new(db);
+
+    let execution_id = create_old_execution(&db, &work_item_id);
+    let execution = db.get_execution(&execution_id).unwrap();
+    let live_states = LiveWorkerStateRegistry::new();
+    register_slot_zero_pid(&live_states, 1, &execution_id, &work_item_id);
+
+    let coordinator = make_coordinator(db.clone(), 1);
+    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+    let spawn_health = SpawnHealthTracker::new();
+    let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let cube = RecordingCube::default();
+    let ctx = SpawnReapCtx::builder()
+        .work_db(db.as_ref())
+        .live_states(&live_states)
+        .coordinator(coordinator.clone())
+        .dispatch_events(sink.as_ref())
+        .reaper(reaper.as_ref())
+        .spawn_health(&spawn_health)
+        .cube_client(&cube)
+        .build();
+
+    let hold = super::super::probe_hold::ProbeHold::new();
+    super::super::probe_hold::arm(&execution_id, Arc::clone(&hold));
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let signal_id = execution_id.clone();
+    let outcome = tokio::select! {
+        outcome = reap_never_started_spawn(
+            &ctx,
+            &execution,
+            1,
+            0,
+            ReapCause::AppNack { reason: "late" },
+            now,
+        ) => outcome,
+        _ = async {
+            tokio::task::spawn_blocking({
+                let hold = Arc::clone(&hold);
+                move || hold.wait_for_entry()
+            })
+            .await
+            .unwrap();
+            live_states.update_shell_pid(&signal_id, 4242);
+            hold.release();
+            std::future::pending::<()>().await
+        } => unreachable!(),
+    };
+    super::super::probe_hold::disarm(&execution_id);
+
+    assert_eq!(outcome, ReapOutcome::Skipped);
+    assert_ne!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Orphaned
+    );
+}
+
+/// Re-registering the slot to a different execution while the probe is
+/// held must skip the original reap as SlotGone.
+#[tokio::test]
+async fn a_reregistered_slot_during_the_probe_await_skips_the_reap() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let db = Arc::new(db);
+
+    let execution_id = create_old_execution(&db, &work_item_id);
+    let other_work_item_id = create_active_chore(&db, &product_id, "other chore");
+    let other_id = create_old_execution(&db, &other_work_item_id);
+    assert_ne!(
+        execution_id, other_id,
+        "the replacement registration must be a different execution"
+    );
+    let execution = db.get_execution(&execution_id).unwrap();
+    let live_states = LiveWorkerStateRegistry::new();
+    register_slot_zero_pid(&live_states, 1, &execution_id, &work_item_id);
+
+    let coordinator = make_coordinator(db.clone(), 1);
+    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+    let spawn_health = SpawnHealthTracker::new();
+    let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let cube = RecordingCube::default();
+    let ctx = SpawnReapCtx::builder()
+        .work_db(db.as_ref())
+        .live_states(&live_states)
+        .coordinator(coordinator.clone())
+        .dispatch_events(sink.as_ref())
+        .reaper(reaper.as_ref())
+        .spawn_health(&spawn_health)
+        .cube_client(&cube)
+        .build();
+
+    let hold = super::super::probe_hold::ProbeHold::new();
+    super::super::probe_hold::arm(&execution_id, Arc::clone(&hold));
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let other = other_id.clone();
+    let work_item = other_work_item_id.clone();
+    let outcome = tokio::select! {
+        outcome = reap_never_started_spawn(
+            &ctx,
+            &execution,
+            1,
+            0,
+            ReapCause::SpawnAckTimeout { grace_secs: 60 },
+            now,
+        ) => outcome,
+        _ = async {
+            tokio::task::spawn_blocking({
+                let hold = Arc::clone(&hold);
+                move || hold.wait_for_entry()
+            })
+            .await
+            .unwrap();
+            register_slot_zero_pid(&live_states, 1, &other, &work_item);
+            hold.release();
+            std::future::pending::<()>().await
+        } => unreachable!(),
+    };
+    super::super::probe_hold::disarm(&execution_id);
+
+    assert_eq!(outcome, ReapOutcome::Skipped);
+    assert_ne!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Orphaned
+    );
+}
+
+/// After a committed never-started reap, a later hook must not be
+/// recorded as driver proof for the registration the sweep is orphaning.
+#[tokio::test]
+async fn a_committed_reap_refuses_a_later_driver_signal() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let db = Arc::new(db);
+
+    let execution_id = create_old_execution(&db, &work_item_id);
+    let execution = db.get_execution(&execution_id).unwrap();
+    let live_states = LiveWorkerStateRegistry::new();
+    register_slot_zero_pid(&live_states, 1, &execution_id, &work_item_id);
+
+    let coordinator = make_coordinator(db.clone(), 1);
+    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+    let spawn_health = SpawnHealthTracker::new();
+    let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let cube = RecordingCube::default();
+    let ctx = SpawnReapCtx::builder()
+        .work_db(db.as_ref())
+        .live_states(&live_states)
+        .coordinator(coordinator.clone())
+        .dispatch_events(sink.as_ref())
+        .reaper(reaper.as_ref())
+        .spawn_health(&spawn_health)
+        .cube_client(&cube)
+        .build();
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let outcome = reap_never_started_spawn(
+        &ctx,
+        &execution,
+        1,
+        0,
+        ReapCause::SpawnAckTimeout { grace_secs: 60 },
+        now,
+    )
+    .await;
+    assert_eq!(outcome, ReapOutcome::Reaped);
+    assert_eq!(
+        live_states.record_driver_signal(&execution_id, DriverSignalKind::HookEvent),
+        None,
+        "a committed reap must refuse a later hook for this registration",
+    );
+}
+
+/// A failed orphan write after the fence commits must release the fence so
+/// a later pass can still reap and a recovering hook can still prove the
+/// driver alive.
+#[tokio::test]
+async fn a_failed_orphan_write_releases_the_reap_fence() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let db = Arc::new(db);
+
+    let execution_id = create_old_execution(&db, &work_item_id);
+    let execution = db.get_execution(&execution_id).unwrap();
+    let live_states = LiveWorkerStateRegistry::new();
+    register_slot_zero_pid(&live_states, 1, &execution_id, &work_item_id);
+
+    let coordinator = make_coordinator(db.clone(), 1);
+    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+    let spawn_health = SpawnHealthTracker::new();
+    let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let cube = RecordingCube::default();
+    let ctx = SpawnReapCtx::builder()
+        .work_db(db.as_ref())
+        .live_states(&live_states)
+        .coordinator(coordinator.clone())
+        .dispatch_events(sink.as_ref())
+        .reaper(reaper.as_ref())
+        .spawn_health(&spawn_health)
+        .cube_client(&cube)
+        .build();
+
+    let hold = super::super::probe_hold::ProbeHold::new();
+    super::super::probe_hold::arm(&execution_id, Arc::clone(&hold));
+    super::super::probe_hold::arm_orphan_write_failure(&execution_id);
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let outcome = tokio::select! {
+        outcome = reap_never_started_spawn(
+            &ctx,
+            &execution,
+            1,
+            0,
+            ReapCause::SpawnAckTimeout { grace_secs: 60 },
+            now,
+        ) => outcome,
+        _ = async {
+            tokio::task::spawn_blocking({
+                let hold = Arc::clone(&hold);
+                move || hold.wait_for_entry()
+            })
+            .await
+            .unwrap();
+            hold.release();
+            std::future::pending::<()>().await
+        } => unreachable!(),
+    };
+    super::super::probe_hold::disarm(&execution_id);
+
+    assert_eq!(outcome, ReapOutcome::Skipped);
+    assert_ne!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Orphaned
+    );
+    assert_eq!(
+        live_states.record_driver_signal(&execution_id, DriverSignalKind::HookEvent),
+        Some(1),
+        "the fence must be released so a recovering hook is still accepted",
+    );
+
+    // The signal above would skip a later pass-1 reap. Clear it by
+    // re-registering so the retry can actually orphan.
+    register_slot_zero_pid(&live_states, 1, &execution_id, &work_item_id);
+    let later = reap_never_started_spawn(
+        &ctx,
+        &db.get_execution(&execution_id).unwrap(),
+        1,
+        0,
+        ReapCause::SpawnAckTimeout { grace_secs: 60 },
+        now,
+    )
+    .await;
+    assert_eq!(later, ReapOutcome::Reaped);
+}
+
 #[test]
 fn failure_class_follows_observed_pid_and_probe() {
     let timeout = ReapCause::DriverStartTimeout {
@@ -1321,6 +1588,145 @@ async fn undeterminable_attention_clears_when_the_execution_goes_terminal() {
     assert_eq!(db.list_attention_items(&execution_id).unwrap()[0].status, "open");
 
     db.mark_execution_orphaned(&execution_id, "test: terminated").unwrap();
+
+    let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let spawn_health = SpawnHealthTracker::new();
+    let _ = run_one_pass(
+        db.as_ref(),
+        &live_states,
+        coordinator.clone(),
+        sink.as_ref(),
+        reaper.as_ref(),
+        &spawn_health,
+        &cube,
+        SPAWN_ACK_GRACE_SECS,
+        DRIVER_START_GRACE_SECS,
+    )
+    .await;
+
+    assert_eq!(db.list_attention_items(&execution_id).unwrap()[0].status, "resolved");
+}
+
+/// A worker that recovers into Working (driver signal + activity change)
+/// is skipped by the candidate loops; reconciliation must still clear the
+/// undeterminable item.
+#[tokio::test]
+async fn undeterminable_attention_clears_when_the_worker_recovers_into_working() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let db = Arc::new(db);
+
+    let execution_id = create_spawned_execution(&db, &work_item_id, 4242);
+    let temp = tempfile::TempDir::new().unwrap();
+    arm_file_ingress(
+        &db,
+        &execution_id,
+        &temp.path().join("never-created"),
+        temp.path(),
+        Vec::new(),
+    );
+
+    let live_states = Arc::new(LiveWorkerStateRegistry::new());
+    register_slot_with_live_shell(&live_states, 1, &execution_id, &work_item_id, 4242, false);
+    let coordinator = make_coordinator(db.clone(), 1);
+    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+    let cube = RecordingCube::default();
+
+    for _ in 0..UNDETERMINABLE_LIVENESS_ATTENTION_THRESHOLD {
+        let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let spawn_health = SpawnHealthTracker::new();
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            reaper.as_ref(),
+            &spawn_health,
+            &cube,
+            SPAWN_ACK_GRACE_SECS,
+            DRIVER_START_GRACE_SECS,
+        )
+        .await;
+        assert_eq!(outcome.liveness_undeterminable, 1);
+    }
+    assert_eq!(db.list_attention_items(&execution_id).unwrap()[0].status, "open");
+
+    assert_eq!(
+        live_states.record_driver_signal(&execution_id, DriverSignalKind::HookEvent),
+        Some(1),
+    );
+    live_states.set_activity_for_test(1, WorkerActivity::Working);
+
+    let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let spawn_health = SpawnHealthTracker::new();
+    let outcome = run_one_pass(
+        db.as_ref(),
+        &live_states,
+        coordinator.clone(),
+        sink.as_ref(),
+        reaper.as_ref(),
+        &spawn_health,
+        &cube,
+        SPAWN_ACK_GRACE_SECS,
+        DRIVER_START_GRACE_SECS,
+    )
+    .await;
+    assert_eq!(outcome.liveness_undeterminable, 0);
+    assert_eq!(outcome.skipped.not_spawning, 1);
+    assert_eq!(db.list_attention_items(&execution_id).unwrap()[0].status, "resolved");
+}
+
+/// Terminal completion followed by live-slot teardown must still clear
+/// the undeterminable item — the candidate loops no longer see the slot.
+#[tokio::test]
+async fn undeterminable_attention_clears_after_terminal_status_and_slot_removal() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let db = Arc::new(db);
+
+    let execution_id = create_spawned_execution(&db, &work_item_id, 0);
+    let temp = tempfile::TempDir::new().unwrap();
+    arm_file_ingress(
+        &db,
+        &execution_id,
+        &temp.path().join("never-created"),
+        temp.path(),
+        Vec::new(),
+    );
+
+    let live_states = Arc::new(LiveWorkerStateRegistry::new());
+    register_slot_zero_pid(&live_states, 1, &execution_id, &work_item_id);
+    let coordinator = make_coordinator(db.clone(), 1);
+    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+    let cube = RecordingCube::default();
+
+    for _ in 0..UNDETERMINABLE_LIVENESS_ATTENTION_THRESHOLD {
+        let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let spawn_health = SpawnHealthTracker::new();
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            reaper.as_ref(),
+            &spawn_health,
+            &cube,
+            SPAWN_ACK_GRACE_SECS,
+            DRIVER_START_GRACE_SECS,
+        )
+        .await;
+        assert_eq!(outcome.liveness_undeterminable, 1);
+    }
+    assert_eq!(db.list_attention_items(&execution_id).unwrap()[0].status, "open");
+
+    db.mark_execution_orphaned(&execution_id, "test: terminated").unwrap();
+    live_states.release_slot(1);
 
     let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
     let sink = Arc::new(RecordingDispatchEventSink::new());

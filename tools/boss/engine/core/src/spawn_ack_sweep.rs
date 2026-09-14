@@ -180,10 +180,9 @@
 //! reclaim (neither sweep pass, `dead_pid_sweep`, nor `stale_worker_sweep`
 //! — see this module's own doc above).
 //!
-//! **The failure class.** Pass 1 and pass 2 observe different things, and
-//! the breaker used to announce both as "failed to spawn a worker shell".
-//! Every reap now records its [`crate::spawn_health::SpawnFailureClass`]
-//! on the breaker evidence, and the pause reason and attention item are
+//! **The failure class.** Pass 1 and pass 2 observe different things.
+//! Every reap records its [`crate::spawn_health::SpawnFailureClass`] on
+//! the breaker evidence, and the pause reason and attention item are
 //! composed from the classes actually observed. Pass 2's own wording — the
 //! log line, the orphan reason, the per-execution attention item — states
 //! what was observed (a pane and shell came up; no driver-originated
@@ -416,6 +415,7 @@ pub async fn run_one_pass(
 ) -> SpawnAckSweepOutcome {
     let mut outcome = SpawnAckSweepOutcome::default();
     let mut examined: HashSet<String> = HashSet::new();
+    reconcile_liveness_undeterminable_attention(work_db, live_states);
     let snapshot = live_states.snapshot();
 
     let now_epoch_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
@@ -961,11 +961,9 @@ fn reap_narrative_for_cause(
         } => {
             // `unverified_driver_starts` is deliberately blind to
             // `shell_pid` (see the module doc), so pass 2 can reap a
-            // candidate that never reported one at all — a readopted slot,
-            // or one pass 1 skipped for another reason. Asserting "a pane
-            // and shell came up" for that shape is the mirror-image of the
-            // mislabel this PR fixes elsewhere: say what was actually
-            // observed.
+            // candidate that never reported one (a readopted slot, or one
+            // pass 1 skipped). The narrative asserts "a pane and shell came
+            // up" only when a pid was actually reported.
             let pane_observation = pane_observation(shell_pid);
             let reading = driver_start_reading(file_ingress.as_ref());
             (
@@ -1226,18 +1224,43 @@ pub(crate) async fn reap_never_started_spawn(
             );
             return ReapOutcome::Skipped;
         }
+        NeverStartedReapCommit::AlreadyCommitted => {
+            tracing::info!(
+                execution_id,
+                work_item_id,
+                slot_id,
+                "never-started-spawn reap: a never-started reap is already committed for this \
+                 registration; abandoning this pass",
+            );
+            return ReapOutcome::Skipped;
+        }
     };
 
     let liveness_summary = liveness.to_string();
 
     let (orphan_reason, audit_note, stage) = reap_narrative(&cause, execution_id, &liveness, shell_pid);
 
-    if let Err(err) = ctx.work_db.mark_execution_orphaned(execution_id, &orphan_reason) {
+    let orphan_result = {
+        #[cfg(test)]
+        {
+            if let Some(err) = probe_hold::take_orphan_write_failure(execution_id) {
+                Err(err)
+            } else {
+                ctx.work_db.mark_execution_orphaned(execution_id, &orphan_reason)
+            }
+        }
+        #[cfg(not(test))]
+        {
+            ctx.work_db.mark_execution_orphaned(execution_id, &orphan_reason)
+        }
+    };
+    if let Err(err) = orphan_result {
         tracing::warn!(
             execution_id,
             ?err,
             "reap-never-started-spawn: failed to mark execution orphaned; skipping reap",
         );
+        ctx.live_states.release_never_started_reap(slot_id, execution_id);
         return ReapOutcome::Skipped;
     }
 
@@ -1552,6 +1575,38 @@ fn raise_liveness_undeterminable_attention(
             ?err,
             "liveness-undeterminable: failed to raise attention item",
         );
+    }
+}
+
+/// Clear open `worker_liveness_undeterminable` items whose execution has
+/// live driver proof or a durable terminal status, even when the live slot
+/// is gone or the execution is no longer a reap candidate.
+fn reconcile_liveness_undeterminable_attention(work_db: &WorkDb, live_states: &LiveWorkerStateRegistry) {
+    let items = match work_db.list_open_attention_items_of_kind(LIVENESS_UNDETERMINABLE_ATTENTION_KIND) {
+        Ok(items) => items,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "liveness-undeterminable: failed to list open items for reconciliation",
+            );
+            return;
+        }
+    };
+    for item in items {
+        let Some(execution_id) = item.execution_id.as_deref() else {
+            continue;
+        };
+        let terminal = work_db
+            .get_execution(execution_id)
+            .ok()
+            .is_some_and(|execution| execution.status.is_terminal());
+        let driver_proof = live_states
+            .snapshot()
+            .iter()
+            .any(|state| state.run_id == execution_id && live_states.driver_signal_at(state.slot_id).is_some());
+        if terminal || driver_proof {
+            resolve_liveness_undeterminable_attention(work_db, execution_id);
+        }
     }
 }
 

@@ -12,15 +12,20 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{oneshot, watch};
 
-use crate::agent_jsonl_discovery::{CandidateRejection as DetailedCandidateRejection, scan_matching_paths};
+pub use crate::agent_jsonl_discovery::FileIdentity;
+use crate::agent_jsonl_discovery::{
+    Candidate, PreparedSource, RolloutProbeSource, RolloutProbeTarget, StreamHalt,
+    descriptor_is_unlinked, file_identity, named_descriptor_matches, single_link_regular,
+    validate_candidate, validated_session_meta,
+};
 use crate::driver::{AgentDriver, AgentJsonlFileIngress, ProgressSessionConfig, ProgressStreamSource};
 use crate::stdout_progress::{ProgressCheckpointSink, WorkerEventSink};
 
@@ -44,9 +49,6 @@ const FILE_POLL: Duration = Duration::from_millis(50);
 /// on the checkpoint, and as a dispatch event — that it is overdue.
 /// The threshold also slows scans from 100ms to one second.
 pub const DISCOVERY_OVERDUE_AFTER: Duration = Duration::from_secs(120);
-const MAX_DISCOVERY_DIRS: usize = 512;
-const MAX_DISCOVERY_MATCHES: usize = 8;
-pub(crate) const MAX_SESSION_META_BYTES: u64 = 64 * 1024;
 const FILE_CHUNK_BYTES: usize = 64 * 1024;
 const DUPLEX_BYTES: usize = 64 * 1024;
 
@@ -252,6 +254,21 @@ pub enum CheckpointTarget {
     /// A store-private handle resolved once at attach time. Opaque: only the
     /// store that produced it may interpret it.
     Resolved(String),
+}
+
+impl RolloutProbeSource for crate::work::WorkDb {
+    fn load_rollout_probe_target(&self, run_id: &str) -> Result<Option<RolloutProbeTarget>, String> {
+        Ok(match self.load_ingress_checkpoint(run_id)? {
+            None => None,
+            Some(IngressCheckpoint::NotFileIngress) => Some(RolloutProbeTarget::NotFileIngress),
+            Some(IngressCheckpoint::Armed { ingress, baseline }) => {
+                Some(RolloutProbeTarget::Armed { ingress, baseline })
+            }
+            Some(IngressCheckpoint::Attached { ingress, path, .. }) => {
+                Some(RolloutProbeTarget::Attached { ingress, path })
+            }
+        })
+    }
 }
 
 impl IngressCheckpointStore for crate::work::WorkDb {
@@ -475,132 +492,6 @@ impl ProgressCheckpointSink for AttachedCheckpointer {
     }
 }
 
-/// Which incarnation of a pathname a descriptor or an offset refers to.
-///
-/// Public because [`IngressCheckpoint::Attached`] persists it: a resume point
-/// is only meaningful paired with the incarnation it was measured against.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct FileIdentity {
-    device: u64,
-    inode: u64,
-}
-
-#[cfg(unix)]
-fn file_identity(metadata: &std::fs::Metadata) -> FileIdentity {
-    use std::os::unix::fs::MetadataExt;
-    FileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    }
-}
-
-#[cfg(not(unix))]
-fn file_identity(_metadata: &std::fs::Metadata) -> FileIdentity {
-    FileIdentity { device: 0, inode: 0 }
-}
-
-#[cfg(unix)]
-fn single_link_regular(metadata: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    metadata.is_file() && metadata.nlink() == 1
-}
-
-#[cfg(not(unix))]
-fn single_link_regular(metadata: &std::fs::Metadata) -> bool {
-    metadata.is_file()
-}
-
-#[cfg(unix)]
-fn descriptor_is_unlinked(metadata: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    metadata.is_file() && metadata.nlink() == 0
-}
-
-#[cfg(not(unix))]
-fn descriptor_is_unlinked(_metadata: &std::fs::Metadata) -> bool {
-    false
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct VerifiedRoot {
-    pub(crate) path: PathBuf,
-    pub(crate) canonical: PathBuf,
-    identity: FileIdentity,
-}
-
-impl VerifiedRoot {
-    fn new(path: &Path) -> Result<Self, String> {
-        let metadata = fs::symlink_metadata(path).map_err(|err| format!("stat {}: {err}", path.display()))?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(format!("{} is not a real directory", path.display()));
-        }
-        let canonical = fs::canonicalize(path).map_err(|err| format!("canonicalize {}: {err}", path.display()))?;
-        Ok(Self {
-            path: path.to_owned(),
-            canonical,
-            identity: file_identity(&metadata),
-        })
-    }
-
-    pub(crate) fn revalidate(&self) -> Result<(), String> {
-        let metadata =
-            fs::symlink_metadata(&self.path).map_err(|err| format!("stat {}: {err}", self.path.display()))?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_dir()
-            || file_identity(&metadata) != self.identity
-            || fs::canonicalize(&self.path).ok().as_ref() != Some(&self.canonical)
-        {
-            return Err(format!("JSONL root {} changed identity", self.path.display()));
-        }
-        Ok(())
-    }
-}
-
-/// Size and mtime of a matching rollout at prepare time. Discovery compares
-/// live files against this so a growing-but-unparseable first line still
-/// counts as driver-originated evidence.
-#[derive(Clone, Copy, Debug)]
-struct FileProgress {
-    len: u64,
-    mtime: Option<SystemTime>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PreparedSource {
-    pub(crate) ingress: AgentJsonlFileIngress,
-    pub(crate) root: VerifiedRoot,
-    pub(crate) canonical_workspace: PathBuf,
-    pub(crate) baseline: HashSet<PathBuf>,
-    pub(crate) baseline_progress: HashMap<PathBuf, FileProgress>,
-}
-
-impl PreparedSource {
-    pub(crate) fn new(ingress: AgentJsonlFileIngress) -> Result<Self, String> {
-        let root = VerifiedRoot::new(&ingress.directory)?;
-        let baseline = scan_matching_paths(&root, &ingress)?;
-        Self::with_baseline(ingress, baseline)
-    }
-
-    /// [`Self::new`] against a baseline that was captured earlier — the
-    /// pre-spawn snapshot read back off the run's durable checkpoint. Taking a
-    /// fresh snapshot on the readoption path would be worse than useless: the
-    /// run's own rollout already exists by then, so it would be baselined away
-    /// and discovery would wait out its timeout finding nothing.
-    pub(crate) fn with_baseline(ingress: AgentJsonlFileIngress, baseline: HashSet<PathBuf>) -> Result<Self, String> {
-        let root = VerifiedRoot::new(&ingress.directory)?;
-        let canonical_workspace = fs::canonicalize(&ingress.workspace_path)
-            .map_err(|err| format!("canonicalize workspace {}: {err}", ingress.workspace_path.display()))?;
-        let baseline_progress = snapshot_file_progress(&baseline);
-        Ok(Self {
-            ingress,
-            root,
-            canonical_workspace,
-            baseline,
-            baseline_progress,
-        })
-    }
-}
-
 /// How an ingress task gets hold of the rollout it is going to read.
 enum IngressStart {
     /// Ordinary spawn: watch for the one new correlated rollout to appear.
@@ -612,19 +503,6 @@ enum IngressStart {
         file_offset: u64,
         session_state: Option<serde_json::Value>,
     },
-}
-
-/// How an in-flight file ingress is being brought to an end.
-///
-/// [`Self::Cancel`] is teardown: the engine is releasing the pane and unread
-/// bytes are forfeit.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum StreamHalt {
-    /// Normal operation: keep tailing the growing file.
-    #[default]
-    Running,
-    /// Tear down now. Anything unread is dropped.
-    Cancel,
 }
 
 struct RunHandle {
@@ -1090,14 +968,6 @@ async fn run_prepared<S>(
     let _ = tail.await;
 }
 
-#[derive(Debug)]
-pub(crate) struct Candidate {
-    pub(crate) path: PathBuf,
-    pub(crate) session_id: String,
-    pub(crate) file: std::fs::File,
-    pub(crate) identity: FileIdentity,
-}
-
 /// One run's discovery: the poll loop that waits for exactly one new,
 /// workspace-correlated rollout to appear under the prepared root.
 struct Discovery<'a, S> {
@@ -1333,264 +1203,6 @@ struct ScanPass {
     rejected_candidates: usize,
     rejections: Vec<CandidateRejection>,
     file_progress: bool,
-}
-
-fn snapshot_file_progress(paths: &HashSet<PathBuf>) -> HashMap<PathBuf, FileProgress> {
-    let mut out = HashMap::new();
-    for path in paths {
-        let Ok(metadata) = fs::symlink_metadata(path) else {
-            continue;
-        };
-        if metadata.file_type().is_symlink() || !single_link_regular(&metadata) {
-            continue;
-        }
-        out.insert(
-            path.clone(),
-            FileProgress {
-                len: metadata.len(),
-                mtime: metadata.modified().ok(),
-            },
-        );
-    }
-    out
-}
-
-/// True when a matching rollout is new since the pre-spawn baseline (and
-/// non-empty) or an already-baselined file has grown in size or mtime.
-/// Does not require a parseable `session_meta` line.
-fn matching_file_shows_progress(prepared: &PreparedSource, paths: &HashSet<PathBuf>) -> bool {
-    for path in paths {
-        let Ok(metadata) = fs::symlink_metadata(path) else {
-            continue;
-        };
-        if metadata.file_type().is_symlink() || !single_link_regular(&metadata) {
-            continue;
-        }
-        let current = FileProgress {
-            len: metadata.len(),
-            mtime: metadata.modified().ok(),
-        };
-        match prepared.baseline_progress.get(path) {
-            Some(base) if prepared.baseline.contains(path) => {
-                if current.len > base.len {
-                    return true;
-                }
-                if let (Some(now), Some(then)) = (current.mtime, base.mtime)
-                    && now > then
-                {
-                    return true;
-                }
-            }
-            _ if current.len > 0 => return true,
-            _ => {}
-        }
-    }
-    false
-}
-
-/// [`validate_candidate_explained`] with the rejection reason dropped, for
-/// the tail's rotation and resume paths, which only need to know whether the
-/// file still correlates.
-pub(crate) fn validate_candidate(prepared: &PreparedSource, path: &Path) -> Result<Option<Candidate>, String> {
-    validate_candidate_explained(prepared, path).map(Result::ok)
-}
-
-/// Open `path` and decide whether it is this run's rollout.
-///
-/// `Ok(Err(reason))` is a file that exists but does not correlate — and says
-/// *why*, because discovery reports that reason instead of counting the file
-/// as absent. `Err` is an I/O failure on the way to a verdict.
-pub(crate) fn validate_candidate_explained(
-    prepared: &PreparedSource,
-    path: &Path,
-) -> Result<Result<Candidate, DetailedCandidateRejection>, String> {
-    prepared.root.revalidate()?;
-    let metadata = fs::symlink_metadata(path).map_err(|err| format!("stat {}: {err}", path.display()))?;
-    if metadata.file_type().is_symlink() || !single_link_regular(&metadata) {
-        return Ok(Err(DetailedCandidateRejection::NotSingleLinkRegularFile));
-    }
-    let canonical = fs::canonicalize(path).map_err(|err| format!("canonicalize {}: {err}", path.display()))?;
-    if !canonical.starts_with(&prepared.root.canonical) {
-        return Ok(Err(DetailedCandidateRejection::OutsideRoot));
-    }
-
-    let mut file = open_no_follow(&canonical)?;
-    let opened = file
-        .metadata()
-        .map_err(|err| format!("metadata {}: {err}", canonical.display()))?;
-    let identity = file_identity(&opened);
-    if !single_link_regular(&opened) || identity != file_identity(&metadata) {
-        return Ok(Err(DetailedCandidateRejection::IdentityChanged));
-    }
-    let session_id = match session_meta_verdict(prepared, &canonical, &mut file, None)? {
-        Ok(session_id) => session_id,
-        Err(rejection) => return Ok(Err(rejection)),
-    };
-    if !named_descriptor_matches(prepared, &canonical, &file, identity)? {
-        return Ok(Err(DetailedCandidateRejection::IdentityChanged));
-    }
-    Ok(Ok(Candidate {
-        path: canonical,
-        session_id,
-        file,
-        identity,
-    }))
-}
-
-fn open_no_follow(path: &Path) -> Result<std::fs::File, String> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    options
-        .open(path)
-        .map_err(|err| format!("open {}: {err}", path.display()))
-}
-
-fn tracked_path_identity(prepared: &PreparedSource, path: &Path) -> Result<Option<FileIdentity>, String> {
-    prepared.root.revalidate()?;
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(format!("stat {}: {err}", path.display())),
-    };
-    if metadata.file_type().is_symlink() || !single_link_regular(&metadata) {
-        return Ok(None);
-    }
-    let canonical = match fs::canonicalize(path) {
-        Ok(canonical) => canonical,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(format!("canonicalize {}: {err}", path.display())),
-    };
-    if canonical != path || !canonical.starts_with(&prepared.root.canonical) {
-        return Ok(None);
-    }
-    prepared.root.revalidate()?;
-    Ok(Some(file_identity(&metadata)))
-}
-
-fn named_descriptor_matches(
-    prepared: &PreparedSource,
-    path: &Path,
-    file: &std::fs::File,
-    expected_identity: FileIdentity,
-) -> Result<bool, String> {
-    let opened_before = file
-        .metadata()
-        .map_err(|err| format!("metadata {}: {err}", path.display()))?;
-    if !single_link_regular(&opened_before)
-        || file_identity(&opened_before) != expected_identity
-        || tracked_path_identity(prepared, path)? != Some(expected_identity)
-    {
-        return Ok(false);
-    }
-
-    // Re-read both sides so a path replacement during the first comparison
-    // cannot make stale path metadata authorize publication.
-    let opened_after = file
-        .metadata()
-        .map_err(|err| format!("metadata {}: {err}", path.display()))?;
-    if !single_link_regular(&opened_after)
-        || file_identity(&opened_after) != expected_identity
-        || tracked_path_identity(prepared, path)? != Some(expected_identity)
-    {
-        return Ok(false);
-    }
-    Ok(true)
-}
-
-/// [`session_meta_verdict`] with the rejection reason dropped.
-fn validated_session_meta(
-    prepared: &PreparedSource,
-    path: &Path,
-    file: &mut std::fs::File,
-    expected_session_id: Option<&str>,
-) -> Result<Option<String>, String> {
-    session_meta_verdict(prepared, path, file, expected_session_id).map(Result::ok)
-}
-
-/// Read the rollout's first line and decide whether it correlates this file
-/// to the run: a complete `session_meta` record whose `cwd` canonicalizes to
-/// the run's workspace and whose session id the filename carries.
-///
-/// `Ok(Err(_))` names the first check that failed. Every one of those was a
-/// silent `Ok(None)` before 2026-09-13, which is how a rollout that was
-/// present and inspected on every discovery scan came to be reported as
-/// never having appeared.
-fn session_meta_verdict(
-    prepared: &PreparedSource,
-    path: &Path,
-    file: &mut std::fs::File,
-    expected_session_id: Option<&str>,
-) -> Result<Result<String, DetailedCandidateRejection>, String> {
-    file.seek(SeekFrom::Start(0))
-        .map_err(|err| format!("seek session_meta {}: {err}", path.display()))?;
-    let result = (|| {
-        let mut first_line = Vec::new();
-        let mut limited = std::io::BufReader::new((&mut *file).take(MAX_SESSION_META_BYTES));
-        let bytes = limited
-            .read_until(b'\n', &mut first_line)
-            .map_err(|err| format!("read session_meta {}: {err}", path.display()))?;
-        if bytes == 0 {
-            return Ok(Err(DetailedCandidateRejection::Empty));
-        }
-        if first_line.last() != Some(&b'\n') {
-            let bytes = bytes as u64;
-            return Ok(Err(if bytes >= MAX_SESSION_META_BYTES {
-                DetailedCandidateRejection::SessionMetaOversized {
-                    cap_bytes: MAX_SESSION_META_BYTES,
-                }
-            } else {
-                DetailedCandidateRejection::SessionMetaUnterminated { bytes }
-            }));
-        }
-        let record: serde_json::Value = serde_json::from_slice(&first_line)
-            .map_err(|err| format!("parse session_meta {}: {err}", path.display()))?;
-        let record_type = record.get("type").and_then(serde_json::Value::as_str);
-        if record_type != Some("session_meta") {
-            return Ok(Err(DetailedCandidateRejection::NotSessionMeta {
-                record_type: record_type.map(str::to_owned),
-            }));
-        }
-        let Some(payload) = record.get("payload").and_then(serde_json::Value::as_object) else {
-            return Ok(Err(DetailedCandidateRejection::MissingPayload));
-        };
-        let Some(session_id) = payload.get("id").and_then(serde_json::Value::as_str) else {
-            return Ok(Err(DetailedCandidateRejection::MissingSessionId));
-        };
-        if let Some(expected) = expected_session_id
-            && expected != session_id
-        {
-            return Ok(Err(DetailedCandidateRejection::SessionIdMismatch {
-                found: session_id.to_owned(),
-                expected: expected.to_owned(),
-            }));
-        }
-        let Some(cwd) = payload.get("cwd").and_then(serde_json::Value::as_str) else {
-            return Ok(Err(DetailedCandidateRejection::MissingCwd));
-        };
-        let Ok(canonical_cwd) = fs::canonicalize(cwd) else {
-            return Ok(Err(DetailedCandidateRejection::CwdNotResolvable { cwd: cwd.to_owned() }));
-        };
-        if canonical_cwd != prepared.canonical_workspace {
-            return Ok(Err(DetailedCandidateRejection::CwdMismatch {
-                cwd: cwd.to_owned(),
-                expected: prepared.canonical_workspace.clone(),
-            }));
-        }
-        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
-        let expected_suffix = format!("-{session_id}{}", prepared.ingress.filename_suffix);
-        if !name.ends_with(&expected_suffix) {
-            return Ok(Err(DetailedCandidateRejection::NameMismatch { expected_suffix }));
-        }
-        Ok(Ok(session_id.to_owned()))
-    })();
-    file.seek(SeekFrom::Start(0))
-        .map_err(|err| format!("rewind validated rollout {}: {err}", path.display()))?;
-    result
 }
 
 fn validate_descriptor_before_publish(

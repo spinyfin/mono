@@ -73,3 +73,28 @@ pub fn wait_if_armed(execution_id: &str) {
         hold.wait();
     }
 }
+
+static ORPHAN_WRITE_FAILURES: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+/// Arm a one-shot failure for `mark_execution_orphaned` after the probe.
+pub fn arm_orphan_write_failure(execution_id: &str) {
+    ORPHAN_WRITE_FAILURES
+        .lock()
+        .unwrap()
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(execution_id.to_owned());
+}
+
+/// Consume a previously armed orphan-write failure, if any.
+pub fn take_orphan_write_failure(execution_id: &str) -> Option<anyhow::Error> {
+    let armed = ORPHAN_WRITE_FAILURES
+        .lock()
+        .unwrap()
+        .as_mut()
+        .is_some_and(|set| set.remove(execution_id));
+    if armed {
+        Some(anyhow::anyhow!("test: forced orphan write failure"))
+    } else {
+        None
+    }
+}

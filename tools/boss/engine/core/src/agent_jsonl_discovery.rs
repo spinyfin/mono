@@ -46,19 +46,16 @@
 //! so a reap decision can look at the rollout directly instead of inferring
 //! from whether the ingress ever produced an event.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::watch;
 
-use crate::agent_jsonl_progress::{
-    Candidate, IngressCheckpoint, IngressCheckpointStore, PreparedSource, StreamHalt, VerifiedRoot,
-    validate_candidate_explained,
-};
 use crate::driver::AgentJsonlFileIngress;
 
 /// How often discovery re-scans the root while waiting for the rollout.
@@ -75,6 +72,242 @@ pub(crate) const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(120);
 const STARVED_SCAN_GAP: Duration = Duration::from_secs(2);
 const MAX_DISCOVERY_DIRS: usize = 512;
 const MAX_DISCOVERY_MATCHES: usize = 8;
+/// Longest `session_meta` first line discovery will read before giving up on
+/// a file. A rollout whose first line exceeds this can never correlate; the
+/// discovery diagnostics name that case explicitly
+/// ([`CandidateRejection::SessionMetaOversized`]) rather than letting it
+/// masquerade as an absent rollout.
+pub(crate) const MAX_SESSION_META_BYTES: u64 = 64 * 1024;
+
+/// Which incarnation of a pathname a descriptor or an offset refers to.
+///
+/// Public because [`crate::agent_jsonl_progress::IngressCheckpoint::Attached`]
+/// persists it: a resume point is only meaningful paired with the
+/// incarnation it was measured against.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FileIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+}
+
+pub(crate) fn file_identity(metadata: &std::fs::Metadata) -> FileIdentity {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        FileIdentity { device: 0, inode: 0 }
+    }
+}
+
+pub(crate) fn single_link_regular(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.is_file() && metadata.nlink() == 1
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.is_file()
+    }
+}
+
+pub(crate) fn descriptor_is_unlinked(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.is_file() && metadata.nlink() == 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VerifiedRoot {
+    pub(crate) path: PathBuf,
+    pub(crate) canonical: PathBuf,
+    identity: FileIdentity,
+}
+
+impl VerifiedRoot {
+    fn new(path: &Path) -> Result<Self, String> {
+        let metadata = fs::symlink_metadata(path).map_err(|err| format!("stat {}: {err}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(format!("{} is not a real directory", path.display()));
+        }
+        let canonical = fs::canonicalize(path).map_err(|err| format!("canonicalize {}: {err}", path.display()))?;
+        Ok(Self {
+            path: path.to_owned(),
+            canonical,
+            identity: file_identity(&metadata),
+        })
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<(), String> {
+        let metadata =
+            fs::symlink_metadata(&self.path).map_err(|err| format!("stat {}: {err}", self.path.display()))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || file_identity(&metadata) != self.identity
+            || fs::canonicalize(&self.path).ok().as_ref() != Some(&self.canonical)
+        {
+            return Err(format!("JSONL root {} changed identity", self.path.display()));
+        }
+        Ok(())
+    }
+}
+
+/// Size and mtime of a matching rollout at prepare time. Discovery compares
+/// live files against this so a growing-but-unparseable first line still
+/// counts as driver-originated evidence.
+#[derive(Clone, Copy, Debug)]
+struct FileProgress {
+    len: u64,
+    mtime: Option<SystemTime>,
+}
+
+fn snapshot_file_progress(paths: &HashSet<PathBuf>) -> HashMap<PathBuf, FileProgress> {
+    let mut out = HashMap::new();
+    for path in paths {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !single_link_regular(&metadata) {
+            continue;
+        }
+        out.insert(
+            path.clone(),
+            FileProgress {
+                len: metadata.len(),
+                mtime: metadata.modified().ok(),
+            },
+        );
+    }
+    out
+}
+
+/// True when a matching rollout is new since the pre-spawn baseline (and
+/// non-empty) or an already-baselined file has grown in size or mtime.
+/// Does not require a parseable `session_meta` line.
+pub(crate) fn matching_file_shows_progress(prepared: &PreparedSource, paths: &HashSet<PathBuf>) -> bool {
+    for path in paths {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !single_link_regular(&metadata) {
+            continue;
+        }
+        let current = FileProgress {
+            len: metadata.len(),
+            mtime: metadata.modified().ok(),
+        };
+        match prepared.baseline_progress.get(path) {
+            Some(base) if prepared.baseline.contains(path) => {
+                if current.len > base.len {
+                    return true;
+                }
+                if let (Some(now), Some(then)) = (current.mtime, base.mtime)
+                    && now > then
+                {
+                    return true;
+                }
+            }
+            _ if current.len > 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedSource {
+    pub(crate) ingress: crate::driver::AgentJsonlFileIngress,
+    pub(crate) root: VerifiedRoot,
+    pub(crate) canonical_workspace: PathBuf,
+    pub(crate) baseline: HashSet<PathBuf>,
+    baseline_progress: HashMap<PathBuf, FileProgress>,
+}
+
+impl PreparedSource {
+    pub(crate) fn new(ingress: crate::driver::AgentJsonlFileIngress) -> Result<Self, String> {
+        let root = VerifiedRoot::new(&ingress.directory)?;
+        let baseline = scan_matching_paths(&root, &ingress)?;
+        Self::with_baseline(ingress, baseline)
+    }
+
+    /// [`Self::new`] against a baseline that was captured earlier — the
+    /// pre-spawn snapshot read back off the run's durable checkpoint. Taking a
+    /// fresh snapshot on the readoption path would be worse than useless: the
+    /// run's own rollout already exists by then, so it would be baselined away
+    /// and discovery would wait out its timeout finding nothing.
+    pub(crate) fn with_baseline(
+        ingress: crate::driver::AgentJsonlFileIngress,
+        baseline: HashSet<PathBuf>,
+    ) -> Result<Self, String> {
+        let root = VerifiedRoot::new(&ingress.directory)?;
+        let canonical_workspace = fs::canonicalize(&ingress.workspace_path)
+            .map_err(|err| format!("canonicalize workspace {}: {err}", ingress.workspace_path.display()))?;
+        let baseline_progress = snapshot_file_progress(&baseline);
+        Ok(Self {
+            ingress,
+            root,
+            canonical_workspace,
+            baseline,
+            baseline_progress,
+        })
+    }
+}
+
+/// How an in-flight file ingress is being brought to an end.
+///
+/// [`Self::Cancel`] is teardown: the engine is releasing the pane and unread
+/// bytes are forfeit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum StreamHalt {
+    /// Normal operation: keep tailing the growing file.
+    #[default]
+    Running,
+    /// Tear down now. Anything unread is dropped.
+    Cancel,
+}
+
+#[derive(Debug)]
+pub(crate) struct Candidate {
+    pub(crate) path: PathBuf,
+    pub(crate) session_id: String,
+    pub(crate) file: std::fs::File,
+    pub(crate) identity: FileIdentity,
+}
+
+/// What a liveness probe needs from a run's durable ingress checkpoint,
+/// without naming the checkpoint type that lives in the progress module.
+#[derive(Clone)]
+pub enum RolloutProbeTarget {
+    NotFileIngress,
+    Armed {
+        ingress: crate::driver::AgentJsonlFileIngress,
+        baseline: Vec<PathBuf>,
+    },
+    Attached {
+        ingress: crate::driver::AgentJsonlFileIngress,
+        path: PathBuf,
+    },
+}
+
+/// Loads the durable pieces the liveness probe needs. Implemented by the
+/// progress module's store so this module never imports from it.
+pub trait RolloutProbeSource {
+    fn load_rollout_probe_target(&self, run_id: &str) -> Result<Option<RolloutProbeTarget>, String>;
+}
 
 /// Why a file under the watched root, with the right name shape, was not
 /// attached as this run's rollout.
@@ -197,6 +430,201 @@ impl fmt::Display for CandidateRejection {
     }
 }
 
+/// [`validate_candidate_explained`] with the rejection reason dropped, for
+/// the tail's rotation and resume paths, which only need to know whether the
+/// file still correlates.
+pub(crate) fn validate_candidate(prepared: &PreparedSource, path: &Path) -> Result<Option<Candidate>, String> {
+    validate_candidate_explained(prepared, path).map(Result::ok)
+}
+
+/// Open `path` and decide whether it is this run's rollout.
+///
+/// `Ok(Err(reason))` is a file that exists but does not correlate — and says
+/// *why*, because discovery reports that reason instead of counting the file
+/// as absent. `Err` is an I/O failure on the way to a verdict.
+pub(crate) fn validate_candidate_explained(
+    prepared: &PreparedSource,
+    path: &Path,
+) -> Result<Result<Candidate, CandidateRejection>, String> {
+    prepared.root.revalidate()?;
+    let metadata = fs::symlink_metadata(path).map_err(|err| format!("stat {}: {err}", path.display()))?;
+    if metadata.file_type().is_symlink() || !single_link_regular(&metadata) {
+        return Ok(Err(CandidateRejection::NotSingleLinkRegularFile));
+    }
+    let canonical = fs::canonicalize(path).map_err(|err| format!("canonicalize {}: {err}", path.display()))?;
+    if !canonical.starts_with(&prepared.root.canonical) {
+        return Ok(Err(CandidateRejection::OutsideRoot));
+    }
+
+    let mut file = open_no_follow(&canonical)?;
+    let opened = file
+        .metadata()
+        .map_err(|err| format!("metadata {}: {err}", canonical.display()))?;
+    let identity = file_identity(&opened);
+    if !single_link_regular(&opened) || identity != file_identity(&metadata) {
+        return Ok(Err(CandidateRejection::IdentityChanged));
+    }
+    let session_id = match session_meta_verdict(prepared, &canonical, &mut file, None)? {
+        Ok(session_id) => session_id,
+        Err(rejection) => return Ok(Err(rejection)),
+    };
+    if !named_descriptor_matches(prepared, &canonical, &file, identity)? {
+        return Ok(Err(CandidateRejection::IdentityChanged));
+    }
+    Ok(Ok(Candidate {
+        path: canonical,
+        session_id,
+        file,
+        identity,
+    }))
+}
+
+pub(crate) fn open_no_follow(path: &Path) -> Result<std::fs::File, String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options
+        .open(path)
+        .map_err(|err| format!("open {}: {err}", path.display()))
+}
+
+pub(crate) fn tracked_path_identity(prepared: &PreparedSource, path: &Path) -> Result<Option<FileIdentity>, String> {
+    prepared.root.revalidate()?;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("stat {}: {err}", path.display())),
+    };
+    if metadata.file_type().is_symlink() || !single_link_regular(&metadata) {
+        return Ok(None);
+    }
+    let canonical = match fs::canonicalize(path) {
+        Ok(canonical) => canonical,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("canonicalize {}: {err}", path.display())),
+    };
+    if canonical != path || !canonical.starts_with(&prepared.root.canonical) {
+        return Ok(None);
+    }
+    prepared.root.revalidate()?;
+    Ok(Some(file_identity(&metadata)))
+}
+
+pub(crate) fn named_descriptor_matches(
+    prepared: &PreparedSource,
+    path: &Path,
+    file: &std::fs::File,
+    expected_identity: FileIdentity,
+) -> Result<bool, String> {
+    let opened_before = file
+        .metadata()
+        .map_err(|err| format!("metadata {}: {err}", path.display()))?;
+    if !single_link_regular(&opened_before)
+        || file_identity(&opened_before) != expected_identity
+        || tracked_path_identity(prepared, path)? != Some(expected_identity)
+    {
+        return Ok(false);
+    }
+
+    let opened_after = file
+        .metadata()
+        .map_err(|err| format!("metadata {}: {err}", path.display()))?;
+    if !single_link_regular(&opened_after)
+        || file_identity(&opened_after) != expected_identity
+        || tracked_path_identity(prepared, path)? != Some(expected_identity)
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// [`session_meta_verdict`] with the rejection reason dropped.
+pub(crate) fn validated_session_meta(
+    prepared: &PreparedSource,
+    path: &Path,
+    file: &mut std::fs::File,
+    expected_session_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    session_meta_verdict(prepared, path, file, expected_session_id).map(Result::ok)
+}
+
+fn session_meta_verdict(
+    prepared: &PreparedSource,
+    path: &Path,
+    file: &mut std::fs::File,
+    expected_session_id: Option<&str>,
+) -> Result<Result<String, CandidateRejection>, String> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|err| format!("seek session_meta {}: {err}", path.display()))?;
+    let result = (|| {
+        let mut first_line = Vec::new();
+        let mut limited = std::io::BufReader::new((&mut *file).take(MAX_SESSION_META_BYTES));
+        let bytes = limited
+            .read_until(b'\n', &mut first_line)
+            .map_err(|err| format!("read session_meta {}: {err}", path.display()))?;
+        if bytes == 0 {
+            return Ok(Err(CandidateRejection::Empty));
+        }
+        if first_line.last() != Some(&b'\n') {
+            let bytes = bytes as u64;
+            return Ok(Err(if bytes >= MAX_SESSION_META_BYTES {
+                CandidateRejection::SessionMetaOversized {
+                    cap_bytes: MAX_SESSION_META_BYTES,
+                }
+            } else {
+                CandidateRejection::SessionMetaUnterminated { bytes }
+            }));
+        }
+        let record: serde_json::Value = serde_json::from_slice(&first_line)
+            .map_err(|err| format!("parse session_meta {}: {err}", path.display()))?;
+        let record_type = record.get("type").and_then(serde_json::Value::as_str);
+        if record_type != Some("session_meta") {
+            return Ok(Err(CandidateRejection::NotSessionMeta {
+                record_type: record_type.map(str::to_owned),
+            }));
+        }
+        let Some(payload) = record.get("payload").and_then(serde_json::Value::as_object) else {
+            return Ok(Err(CandidateRejection::MissingPayload));
+        };
+        let Some(session_id) = payload.get("id").and_then(serde_json::Value::as_str) else {
+            return Ok(Err(CandidateRejection::MissingSessionId));
+        };
+        if let Some(expected) = expected_session_id
+            && expected != session_id
+        {
+            return Ok(Err(CandidateRejection::SessionIdMismatch {
+                found: session_id.to_owned(),
+                expected: expected.to_owned(),
+            }));
+        }
+        let Some(cwd) = payload.get("cwd").and_then(serde_json::Value::as_str) else {
+            return Ok(Err(CandidateRejection::MissingCwd));
+        };
+        let Ok(canonical_cwd) = fs::canonicalize(cwd) else {
+            return Ok(Err(CandidateRejection::CwdNotResolvable { cwd: cwd.to_owned() }));
+        };
+        if canonical_cwd != prepared.canonical_workspace {
+            return Ok(Err(CandidateRejection::CwdMismatch {
+                cwd: cwd.to_owned(),
+                expected: prepared.canonical_workspace.clone(),
+            }));
+        }
+        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        let expected_suffix = format!("-{session_id}{}", prepared.ingress.filename_suffix);
+        if !name.ends_with(&expected_suffix) {
+            return Ok(Err(CandidateRejection::NameMismatch { expected_suffix }));
+        }
+        Ok(Ok(session_id.to_owned()))
+    })();
+    file.seek(SeekFrom::Start(0))
+        .map_err(|err| format!("rewind validated rollout {}: {err}", path.display()))?;
+    result
+}
+
 /// One complete look at the root: every file with the rollout name shape,
 /// partitioned into the ones that correlate and the ones that do not.
 #[derive(Debug, Default)]
@@ -234,9 +662,9 @@ pub(crate) fn scan_once(prepared: &PreparedSource) -> Result<DiscoveryScan, Stri
 }
 
 /// What the loop measured about its own scheduling, for the failure message
-/// and the starvation warning.
+/// and the starvation warning. Counts only scans that inspected the root.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ScanCadence {
+struct ScanCadence {
     scans: u64,
     longest_gap: Duration,
     last_scan_finished: tokio::time::Instant,
@@ -267,42 +695,59 @@ impl ScanCadence {
 /// ever existed under the root, or something did and was rejected. The
 /// second names every file seen on the final scan with its reason, and says
 /// whether the reason is one that more waiting could have changed.
-#[derive(Debug, bon::Builder)]
-#[builder(on(String, into))]
+#[derive(Debug)]
+struct ScanOutcome {
+    cadence: ScanCadence,
+    /// Scans that errored without inspecting the root.
+    failed_scans: u64,
+    /// Last per-scan error that was retried rather than aborting the loop.
+    /// The "could not complete a scan" shape is used only when no scan
+    /// completed; a later successful scan keeps the "no file named" shape
+    /// and appends this as a footnote.
+    last_scan_error: Option<String>,
+}
+
+#[derive(Debug)]
 pub(crate) struct DiscoveryFailure {
     root: PathBuf,
     /// The filename shape discovery was looking for, e.g. `rollout-*.jsonl`.
     name_shape: String,
     elapsed: Duration,
-    cadence: ScanCadence,
     rejected: Vec<(PathBuf, CandidateRejection)>,
-    /// Last per-scan error that was retried rather than aborting the loop.
-    /// Folded into the deadline message so a window that never completed a
-    /// scan is not narrated as "no file existed".
-    last_scan_error: Option<String>,
+    scans: ScanOutcome,
 }
 
 impl fmt::Display for DiscoveryFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let scans = self.cadence.scans;
-        let gap_ms = self.cadence.longest_gap.as_millis();
+        let scans = self.scans.cadence.scans;
+        let gap_ms = self.scans.cadence.longest_gap.as_millis();
         let secs = self.elapsed.as_secs();
         if self.rejected.is_empty() {
-            if let Some(err) = &self.last_scan_error {
+            if scans == 0 {
+                let failed = self.scans.failed_scans;
+                if let Some(err) = &self.scans.last_scan_error {
+                    return write!(
+                        f,
+                        "could not complete a scan of {} after {failed} scans over {secs}s \
+                         (longest gap between scans {gap_ms}ms); last error: {err}",
+                        self.root.display(),
+                    );
+                }
                 return write!(
                     f,
-                    "could not complete a scan of {} after {scans} scans over {secs}s \
-                     (longest gap between scans {gap_ms}ms); last error: {err}",
+                    "could not complete a scan of {} after {failed} scans over {secs}s \
+                     (longest gap between scans {gap_ms}ms)",
                     self.root.display(),
                 );
             }
-            return write!(
+            write!(
                 f,
                 "no file named {} existed under {} on any of {scans} scans over {secs}s \
                  (longest gap between scans {gap_ms}ms)",
                 self.name_shape,
                 self.root.display(),
-            );
+            )?;
+            return self.write_failed_scan_footnote(f);
         }
         write!(
             f,
@@ -319,8 +764,14 @@ impl fmt::Display for DiscoveryFailure {
             };
             write!(f, " [{kind}] {}: {rejection};", path.display())?;
         }
-        if let Some(err) = &self.last_scan_error {
-            write!(f, " last scan error: {err}")?;
+        self.write_failed_scan_footnote(f)
+    }
+}
+
+impl DiscoveryFailure {
+    fn write_failed_scan_footnote(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(err) = &self.scans.last_scan_error {
+            write!(f, "; {} scan(s) failed, last error: {err}", self.scans.failed_scans)?;
         }
         Ok(())
     }
@@ -354,6 +805,7 @@ pub(crate) async fn discover_candidate(
     // back to "nothing appeared".
     let mut ever_rejected: std::collections::HashMap<PathBuf, CandidateRejection> = std::collections::HashMap::new();
     let mut last_scan_error: Option<String> = None;
+    let mut failed_scans: u64 = 0;
     loop {
         // A `Cancel` during discovery stops it: the engine is tearing the
         // ingress down and there is nothing left to attach to.
@@ -371,40 +823,21 @@ pub(crate) async fn discover_candidate(
                      this run's progress ingress",
                 );
                 last_scan_error = Some(err);
+                failed_scans += 1;
                 let now = tokio::time::Instant::now();
-                let gap = cadence.record(now);
-                if gap > STARVED_SCAN_GAP && cadence.scans > 1 {
-                    tracing::warn!(
-                        root = %prepared.root.path.display(),
-                        gap_ms = gap.as_millis() as u64,
-                        poll_ms = DISCOVERY_POLL.as_millis() as u64,
-                        scans = cadence.scans,
-                        "agent JSONL progress: discovery poll starved — the gap between two scans was far \
-                         above the poll interval; the engine runtime was not scheduling this task",
-                    );
-                }
                 if now >= deadline {
-                    let mut rejected: Vec<(PathBuf, CandidateRejection)> = ever_rejected.into_iter().collect();
-                    rejected.sort_by(|a, b| a.0.cmp(&b.0));
-                    return Err(DiscoveryFailure {
-                        root: prepared.root.path.clone(),
-                        name_shape: format!(
-                            "{}*{}",
-                            prepared.ingress.filename_prefix, prepared.ingress.filename_suffix
-                        ),
-                        elapsed: now.saturating_duration_since(started),
+                    return Err(deadline_failure(
+                        &prepared,
+                        started,
+                        now,
                         cadence,
-                        rejected,
+                        ever_rejected,
+                        failed_scans,
                         last_scan_error,
-                    }
-                    .to_string());
+                    ));
                 }
-                tokio::select! {
-                    _ = tokio::time::sleep(DISCOVERY_POLL) => {}
-                    changed = halt.changed() => {
-                        let _ = changed;
-                        return Ok(None);
-                    }
+                if wait_for_next_poll(halt).await {
+                    return Ok(None);
                 }
                 continue;
             }
@@ -412,16 +845,7 @@ pub(crate) async fn discover_candidate(
         };
         let now = tokio::time::Instant::now();
         let gap = cadence.record(now);
-        if gap > STARVED_SCAN_GAP && cadence.scans > 1 {
-            tracing::warn!(
-                root = %prepared.root.path.display(),
-                gap_ms = gap.as_millis() as u64,
-                poll_ms = DISCOVERY_POLL.as_millis() as u64,
-                scans = cadence.scans,
-                "agent JSONL progress: discovery poll starved — the gap between two scans was far \
-                 above the poll interval; the engine runtime was not scheduling this task",
-            );
-        }
+        warn_if_starved(&prepared, &cadence, gap);
         for (path, rejection) in &scan.rejected {
             // Log each distinct (path, reason) once, when it is first seen —
             // during the window, not after it. A permanent rejection at
@@ -451,27 +875,71 @@ pub(crate) async fn discover_candidate(
         // Checked after the scan, never before it: the scan that precedes
         // this test is the authoritative final look at the root.
         if now >= deadline {
-            let mut rejected: Vec<(PathBuf, CandidateRejection)> = ever_rejected.into_iter().collect();
-            rejected.sort_by(|a, b| a.0.cmp(&b.0));
-            return Err(DiscoveryFailure {
-                root: prepared.root.path.clone(),
-                name_shape: format!(
-                    "{}*{}",
-                    prepared.ingress.filename_prefix, prepared.ingress.filename_suffix
-                ),
-                elapsed: now.saturating_duration_since(started),
+            return Err(deadline_failure(
+                &prepared,
+                started,
+                now,
                 cadence,
-                rejected,
+                ever_rejected,
+                failed_scans,
                 last_scan_error,
-            }
-            .to_string());
+            ));
         }
-        tokio::select! {
-            _ = tokio::time::sleep(DISCOVERY_POLL) => {}
-            changed = halt.changed() => {
-                let _ = changed;
-                return Ok(None);
-            }
+        if wait_for_next_poll(halt).await {
+            return Ok(None);
+        }
+    }
+}
+
+fn warn_if_starved(prepared: &PreparedSource, cadence: &ScanCadence, gap: Duration) {
+    if gap > STARVED_SCAN_GAP && cadence.scans > 1 {
+        tracing::warn!(
+            root = %prepared.root.path.display(),
+            gap_ms = gap.as_millis() as u64,
+            poll_ms = DISCOVERY_POLL.as_millis() as u64,
+            scans = cadence.scans,
+            "agent JSONL progress: discovery poll starved — the gap between two scans was far \
+             above the poll interval; the engine runtime was not scheduling this task",
+        );
+    }
+}
+
+fn deadline_failure(
+    prepared: &PreparedSource,
+    started: tokio::time::Instant,
+    now: tokio::time::Instant,
+    cadence: ScanCadence,
+    ever_rejected: std::collections::HashMap<PathBuf, CandidateRejection>,
+    failed_scans: u64,
+    last_scan_error: Option<String>,
+) -> String {
+    let mut rejected: Vec<(PathBuf, CandidateRejection)> = ever_rejected.into_iter().collect();
+    rejected.sort_by(|a, b| a.0.cmp(&b.0));
+    DiscoveryFailure {
+        root: prepared.root.path.clone(),
+        name_shape: format!(
+            "{}*{}",
+            prepared.ingress.filename_prefix, prepared.ingress.filename_suffix
+        ),
+        elapsed: now.saturating_duration_since(started),
+        rejected,
+        scans: ScanOutcome {
+            cadence,
+            failed_scans,
+            last_scan_error,
+        },
+    }
+    .to_string()
+}
+
+/// Wait one discovery poll, or until the ingress is halted.
+/// Returns `true` when the caller should stop.
+async fn wait_for_next_poll(halt: &mut watch::Receiver<StreamHalt>) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(DISCOVERY_POLL) => false,
+        changed = halt.changed() => {
+            let _ = changed;
+            true
         }
     }
 }
@@ -616,17 +1084,13 @@ pub enum RolloutLiveness {
 
 /// Ask the filesystem whether `run_id`'s rollout exists.
 ///
-/// Reads the run's durable [`IngressCheckpoint`] to learn where the rollout
-/// would be and what pre-dated the spawn, then scans — the same scan
-/// discovery uses, so the two can never disagree about which files are
-/// candidates. Synchronous and blocking; the sweeps that call it already run
-/// blocking DB work inline.
-pub fn probe_correlated_rollout(
-    store: &dyn IngressCheckpointStore,
-    run_id: &str,
-    now_epoch_secs: i64,
-) -> RolloutLiveness {
-    let checkpoint = match store.load_ingress_checkpoint(run_id) {
+/// Reads the run's durable ingress checkpoint through [`RolloutProbeSource`]
+/// to learn where the rollout would be and what pre-dated the spawn, then
+/// scans — the same scan discovery uses, so the two can never disagree about
+/// which files are candidates. Synchronous and blocking; the sweeps that
+/// call it already run blocking DB work inline.
+pub fn probe_correlated_rollout(store: &dyn RolloutProbeSource, run_id: &str, now_epoch_secs: i64) -> RolloutLiveness {
+    let checkpoint = match store.load_rollout_probe_target(run_id) {
         Ok(Some(checkpoint)) => checkpoint,
         Ok(None) => return RolloutLiveness::NeverArmed,
         Err(err) => {
@@ -634,8 +1098,8 @@ pub fn probe_correlated_rollout(
         }
     };
     let (prepared, expected_path) = match checkpoint {
-        IngressCheckpoint::NotFileIngress => return RolloutLiveness::NotFileIngress,
-        IngressCheckpoint::Armed { ingress, baseline } => {
+        RolloutProbeTarget::NotFileIngress => return RolloutLiveness::NotFileIngress,
+        RolloutProbeTarget::Armed { ingress, baseline } => {
             match PreparedSource::with_baseline(ingress, baseline.into_iter().collect()) {
                 Ok(prepared) => (prepared, None),
                 Err(err) => {
@@ -645,7 +1109,7 @@ pub fn probe_correlated_rollout(
                 }
             }
         }
-        IngressCheckpoint::Attached { ingress, path, .. } => {
+        RolloutProbeTarget::Attached { ingress, path } => {
             match PreparedSource::with_baseline(ingress, HashSet::new()) {
                 Ok(prepared) => (prepared, Some(path)),
                 Err(err) => {
@@ -962,7 +1426,7 @@ mod tests {
 
         let oversized = fx.root.join("rollout-big-sess-1.jsonl");
         let mut line = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"sess-1\",\"pad\":\"".to_owned();
-        line.push_str(&"x".repeat(crate::agent_jsonl_progress::MAX_SESSION_META_BYTES as usize + 10));
+        line.push_str(&"x".repeat(MAX_SESSION_META_BYTES as usize + 10));
         line.push_str("\"}}\n");
         fs::write(&oversized, line).unwrap();
         let verdict = validate_candidate_explained(&prepared, &oversized)
@@ -1137,7 +1601,8 @@ mod tests {
 
     /// `read_dir` of a readable-but-unsearchable directory succeeds and
     /// `d_type` supplies `file_type`, but `canonicalize` on the child fails
-    /// with `EACCES` — the per-entry arm this revision made fatal.
+    /// with `EACCES` — the per-entry canonicalize arm, which fails the whole
+    /// scan rather than skipping the child.
     #[cfg(unix)]
     #[test]
     fn unsearchable_directory_fails_canonicalize_on_the_child() {
@@ -1220,24 +1685,58 @@ mod tests {
         assert_eq!(candidate.session_id, "sess-1");
     }
 
+    /// After a transient scan error clears, a window that expires against an
+    /// empty root must say no matching file existed — not that no scan
+    /// completed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_transient_scan_error_does_not_claim_no_scan_completed_after_later_success() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let fx = fixture();
+        let prepared = PreparedSource::new(fx.ingress.clone()).unwrap();
+        let locked = fx.root.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let locked_restore = locked.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            fs::set_permissions(&locked_restore, fs::Permissions::from_mode(0o755)).unwrap();
+        });
+
+        let err = discover_candidate(&prepared, &mut running_halt(), Duration::from_millis(250))
+            .await
+            .expect_err("the empty root must expire the window");
+        assert!(
+            err.starts_with("no file named"),
+            "a later successful scan must not claim no scan completed; got: {err}"
+        );
+        assert!(
+            err.contains("scan(s) failed"),
+            "the transient error must still be footnoted; got: {err}"
+        );
+    }
+
     // ─── the liveness probe ──────────────────────────────────────────────────
 
     #[derive(Default)]
     struct MapStore {
-        checkpoints: Mutex<HashMap<String, IngressCheckpoint>>,
+        checkpoints: Mutex<HashMap<String, RolloutProbeTarget>>,
         fail_loads: bool,
     }
 
-    impl IngressCheckpointStore for MapStore {
-        fn store_ingress_checkpoint(&self, run_id: &str, checkpoint: &IngressCheckpoint) -> Result<(), String> {
-            self.checkpoints
-                .lock()
-                .unwrap()
-                .insert(run_id.to_owned(), checkpoint.clone());
-            Ok(())
+    impl MapStore {
+        fn store(&self, run_id: &str, checkpoint: RolloutProbeTarget) {
+            self.checkpoints.lock().unwrap().insert(run_id.to_owned(), checkpoint);
         }
+    }
 
-        fn load_ingress_checkpoint(&self, run_id: &str) -> Result<Option<IngressCheckpoint>, String> {
+    impl RolloutProbeSource for MapStore {
+        fn load_rollout_probe_target(&self, run_id: &str) -> Result<Option<RolloutProbeTarget>, String> {
             if self.fail_loads {
                 return Err("simulated read failure".to_owned());
             }
@@ -1245,8 +1744,8 @@ mod tests {
         }
     }
 
-    fn armed(fx: &Fixture, baseline: Vec<PathBuf>) -> IngressCheckpoint {
-        IngressCheckpoint::Armed {
+    fn armed(fx: &Fixture, baseline: Vec<PathBuf>) -> RolloutProbeTarget {
+        RolloutProbeTarget::Armed {
             ingress: fx.ingress.clone(),
             baseline,
         }
@@ -1263,18 +1762,14 @@ mod tests {
             RolloutLiveness::NeverArmed
         );
 
-        store
-            .store_ingress_checkpoint("run-hooks", &IngressCheckpoint::NotFileIngress)
-            .unwrap();
+        store.store("run-hooks", RolloutProbeTarget::NotFileIngress);
         assert_eq!(
             probe_correlated_rollout(&store, "run-hooks", now),
             RolloutLiveness::NotFileIngress
         );
 
         // Armed against an empty root: absent.
-        store
-            .store_ingress_checkpoint("run-1", &armed(&fx, Vec::new()))
-            .unwrap();
+        store.store("run-1", armed(&fx, Vec::new()));
         assert!(matches!(
             probe_correlated_rollout(&store, "run-1", now),
             RolloutLiveness::Absent { baseline_files: 0, .. }
@@ -1284,7 +1779,7 @@ mod tests {
         let old = fx.root.join("rollout-old-sess-0.jsonl");
         fs::write(&old, session_meta_line("sess-0", &fx.workspace)).unwrap();
         let old = fs::canonicalize(&old).unwrap();
-        store.store_ingress_checkpoint("run-1", &armed(&fx, vec![old])).unwrap();
+        store.store("run-1", armed(&fx, vec![old]));
         assert!(matches!(
             probe_correlated_rollout(&store, "run-1", now),
             RolloutLiveness::Absent { baseline_files: 1, .. }
@@ -1324,15 +1819,13 @@ mod tests {
         // A root that cannot be verified is undeterminable.
         let mut gone = fx.ingress.clone();
         gone.directory = fx.root.join("missing");
-        store
-            .store_ingress_checkpoint(
-                "run-gone",
-                &IngressCheckpoint::Armed {
-                    ingress: gone,
-                    baseline: Vec::new(),
-                },
-            )
-            .unwrap();
+        store.store(
+            "run-gone",
+            RolloutProbeTarget::Armed {
+                ingress: gone,
+                baseline: Vec::new(),
+            },
+        );
         assert!(matches!(
             probe_correlated_rollout(&store, "run-gone", now),
             RolloutLiveness::Undeterminable(_)
