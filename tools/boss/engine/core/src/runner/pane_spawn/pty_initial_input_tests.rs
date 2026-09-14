@@ -7,7 +7,7 @@
 
 use super::{
     MAX_CANON_LINE_BYTES, check_initial_input_length, path_prepend_clause, render_env_directive,
-    worker_background_priority_clause, write_initial_input_script,
+    write_initial_input_script,
 };
 use crate::driver::{
     AgentDriver, ClaudeDriver, CodexDriver, EnvDirective, GrokDriver, PermissionInput, SpawnRequest, WorkerKind,
@@ -59,8 +59,7 @@ fn write_initial_input_script_returns_a_short_fixed_line_regardless_of_script_si
 fn assembled_initial_input(workspace_path: &std::path::Path, env: &[EnvDirective], command: &str) -> String {
     let env_prefix: String = env.iter().map(render_env_directive).collect();
     let assembled = format!(
-        "{}{}{}{env_prefix}{}",
-        worker_background_priority_clause(),
+        "{}{}{env_prefix}{}",
         path_prepend_clause("BOSS_BIN_DIR"),
         path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
         command,
@@ -224,8 +223,7 @@ fn grok_initial_input_stays_under_the_limit_with_long_workspace_path_and_full_de
 
     let env_prefix: String = plan.env.iter().map(render_env_directive).collect();
     let assembled = format!(
-        "{}{}{}{env_prefix}{}",
-        worker_background_priority_clause(),
+        "{}{}{env_prefix}{}",
         path_prepend_clause("BOSS_BIN_DIR"),
         path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
         plan.command,
