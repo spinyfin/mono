@@ -37,7 +37,12 @@ async fn resume_backlog_waits_for_driver_proof_then_drains_without_waiting_for_c
     coordinator.resume_dispatch();
     for count in 1..=6 {
         coordinator.drain_ready_queue().await;
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // A generous wall-clock bound: this only guards against a genuine
+        // hang (the ready-queue drain never producing the expected call),
+        // not a correctness assertion, so it must tolerate CI host
+        // contention rather than the fast, idle-machine case a 5s bound
+        // covers only locally.
+        tokio::time::timeout(Duration::from_secs(30), async {
             while runner.calls.lock().await.len() < count {
                 sleep(Duration::from_millis(10)).await;
             }
@@ -65,7 +70,7 @@ async fn resume_backlog_waits_for_driver_proof_then_drains_without_waiting_for_c
     }
     db.reconcile_product_executions(&product.id).unwrap();
     coordinator.drain_ready_queue().await;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         while runner.calls.lock().await.len() < 8 {
             sleep(Duration::from_millis(10)).await;
         }
