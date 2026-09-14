@@ -13,12 +13,13 @@ async fn resume_backlog_waits_for_driver_proof_then_drains_without_waiting_for_c
         pending: true,
         ..Default::default()
     });
-    let mut coordinator = ExecutionCoordinator::new(
-        db.clone(),
-        WorkerPool::new(8),
-        Arc::new(FakeCubeClient::default()),
-        runner.clone(),
-    );
+    // Concurrent live workers need distinct leases, just as they do in
+    // production; reusing the fake's default workspace trips the occupancy guard.
+    let cube = Arc::new(FakeCubeClient {
+        workspace_id_queue: Mutex::new((0..8).map(|index| format!("resume-pacing-{index}")).collect()),
+        ..Default::default()
+    });
+    let mut coordinator = ExecutionCoordinator::new(db.clone(), WorkerPool::new(8), cube, runner.clone());
     coordinator.set_live_worker_states(live.clone());
     let coordinator = Arc::new(coordinator);
     coordinator.pause_dispatch(
@@ -37,11 +38,7 @@ async fn resume_backlog_waits_for_driver_proof_then_drains_without_waiting_for_c
     coordinator.resume_dispatch();
     for count in 1..=6 {
         coordinator.drain_ready_queue().await;
-        // A generous wall-clock bound: this only guards against a genuine
-        // hang (the ready-queue drain never producing the expected call),
-        // not a correctness assertion, so it must tolerate CI host
-        // contention rather than the fast, idle-machine case a 5s bound
-        // covers only locally.
+        // Bound the wait for the detached dispatch to reach the fake runner.
         tokio::time::timeout(Duration::from_secs(30), async {
             while runner.calls.lock().await.len() < count {
                 sleep(Duration::from_millis(10)).await;
@@ -55,7 +52,9 @@ async fn resume_backlog_waits_for_driver_proof_then_drains_without_waiting_for_c
         coordinator.drain_ready_queue().await;
         assert_eq!(runner.calls.lock().await.len(), count);
         let run_id = runner.calls.lock().await[count - 1].1.clone();
-        live.register_spawn(count as u8, &run_id, "codex", 123, None);
+        // Use a known-live PID so occupancy checks never depend on whether
+        // an arbitrary PID happens to exist on the test host.
+        live.register_spawn(count as u8, &run_id, "codex", std::process::id() as i32, None);
         // A shell acknowledgment is still not driver readiness.
         coordinator.drain_ready_queue().await;
         assert_eq!(runner.calls.lock().await.len(), count);
