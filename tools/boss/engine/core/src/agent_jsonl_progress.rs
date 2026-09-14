@@ -992,6 +992,13 @@ async fn run_prepared<S>(
         },
     )
     .await;
+    // Proof of life the moment the file is found, not the moment its first
+    // record is parsed — closes the `Spawning` liveness gap for a driver
+    // whose `AwaitingInputSignal` omission leaves `mark_stalled_spawns`'s
+    // directory-trust-prompt promotion inapplicable (see that method's
+    // doc). A long-thinking first turn can otherwise leave a live, writing
+    // rollout with zero dispatched events for minutes.
+    sink.record_driver_attach(&run_id);
     let transcript_path = candidate.path.clone();
     // Resolved here, once, so the per-event write below is a single keyed
     // update. A store that cannot resolve it still gets its checkpoints — the
@@ -1831,3 +1838,4 @@ mod discovery_tests;
 #[cfg(test)]
 #[path = "agent_jsonl_progress_tests/stream.rs"]
 mod tests;
+

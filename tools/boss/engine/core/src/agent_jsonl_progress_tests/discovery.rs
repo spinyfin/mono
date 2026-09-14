@@ -73,6 +73,10 @@ struct ObservingSink {
 
 #[async_trait::async_trait]
 impl WorkerEventSink for ObservingSink {
+    fn record_driver_attach(&self, _run_id: &str) {
+        self.notify.notify_waiters();
+    }
+
     async fn dispatch_worker_event(&self, incoming: IncomingHookEvent) {
         self.events.lock().unwrap().push(incoming);
         self.notify.notify_waiters();

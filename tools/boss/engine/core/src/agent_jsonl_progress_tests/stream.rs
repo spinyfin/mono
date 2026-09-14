@@ -13,11 +13,17 @@ use crate::events_socket::IncomingHookEvent;
 #[derive(Clone, Default)]
 struct CaptureSink {
     events: Arc<Mutex<Vec<IncomingHookEvent>>>,
+    attached_runs: Arc<Mutex<Vec<String>>>,
     notify: Arc<Notify>,
 }
 
 #[async_trait::async_trait]
 impl WorkerEventSink for CaptureSink {
+    fn record_driver_attach(&self, run_id: &str) {
+        self.attached_runs.lock().unwrap().push(run_id.to_owned());
+        self.notify.notify_waiters();
+    }
+
     async fn dispatch_worker_event(&self, incoming: IncomingHookEvent) {
         self.events.lock().unwrap().push(incoming);
         self.notify.notify_waiters();
@@ -317,6 +323,13 @@ async fn prepared_rollout_uses_shared_reader_and_exact_run_correlation() {
         }
     ));
     drop(events);
+
+    // Proof of life is recorded at attach — before any of the events
+    // above were dispatched — so a driver that never declares
+    // `Capability::AwaitingInputSignal` (Codex) still has evidence
+    // `mark_stalled_spawns` can promote `Spawning` on, independent of
+    // how long the first parseable record takes to appear.
+    assert_eq!(&*sink.attached_runs.lock().unwrap(), &["run-live".to_owned()]);
 
     manager.stop_run("run-live");
 }

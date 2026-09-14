@@ -56,6 +56,18 @@ impl crate::stdout_progress::WorkerEventSink for Arc<ServerState> {
         Some(self.work_db.clone())
     }
 
+    fn record_driver_attach(&self, run_id: &str) {
+        // Same evidence class `record_driver_signal` already treats as
+        // authoritative for a hook payload's `transcript_path` (see
+        // `DriverSignalKind::TranscriptPath`): proof the driver created its
+        // transcript. Reused here rather than adding a new kind, because
+        // "the engine attached to the rollout it discovered on disk" is the
+        // same fact, just observed earlier — before any record in it has
+        // been parsed rather than alongside the first one.
+        self.live_worker_states
+            .record_driver_signal(run_id, DriverSignalKind::TranscriptPath);
+    }
+
     async fn dispatch_worker_event(&self, incoming: crate::events_socket::IncomingHookEvent) {
         dispatch_worker_event_fanout(self, &incoming).await;
     }
