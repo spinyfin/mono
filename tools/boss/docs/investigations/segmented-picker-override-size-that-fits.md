@@ -23,7 +23,7 @@ calling AppKit `fittingSize` only; it does not re-enter the ViewGraph.
 
 The slow path was not "any `NSViewRepresentable`". It was this particular
 representable hosting SwiftUI labels. The codebase already has several thin
-AppKit wrappers (`CommentTextEditor`, `ResizeDivider`, `GhosttyTerminalView`)
+AppKit wrappers (`CommentTextEditor`, `TitlebarAccessoryInstaller`, `GhosttyTerminalView`)
 that do not pay the nested-ViewGraph cost.
 
 A prior SwiftUI-only approximation (`HStack` of buttons, no AppKit control)
@@ -87,7 +87,8 @@ sheets) were not the measured 31–45%. They can take the same control later.
 
 Isolated `--capture-to` is an offscreen `cacheDisplay` that exits and cannot
 reproduce the original load (populated board, live workers, scrollbar drag).
-Capture the before/after pair against a live app:
+Do not launch the production Boss.app from an automated run — this pair must
+be captured from a live interactive session. Capture the before/after pair:
 
 ```sh
 # Boss frontmost, Agents tab, stall monitoring on, no menu or popover.
