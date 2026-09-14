@@ -79,17 +79,51 @@ async fn resume_backlog_waits_for_driver_proof_then_drains_without_waiting_for_c
 #[test]
 fn startup_pressure_releases_on_proof_failure_and_cancellation() {
     let live = LiveWorkerStateRegistry::new();
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let window = crate::live_worker_state::DRIVER_START_GRACE_SECS;
     let reserved = std::collections::HashSet::from(["reserved".to_owned()]);
-    assert!(live.startup_pending(&reserved));
-    assert!(!live.startup_pending(&std::collections::HashSet::new()));
+    assert!(live.startup_pending(&reserved, now, window));
+    assert!(!live.startup_pending(&std::collections::HashSet::new(), now, window));
     live.register_spawn(1, "reserved", "codex", 123, None);
-    assert!(live.startup_pending(&reserved));
+    assert!(live.startup_pending(&reserved, now, window));
     live.record_driver_signal("reserved", DriverSignalKind::HookEvent);
-    assert!(!live.startup_pending(&reserved));
+    assert!(!live.startup_pending(&reserved, now, window));
     live.register_spawn(2, "cancelled", "claude", 124, None);
-    assert!(live.startup_pending(&reserved));
+    assert!(live.startup_pending(&reserved, now, window));
     live.release_slot(2);
-    assert!(!live.startup_pending(&reserved));
+    assert!(!live.startup_pending(&reserved, now, window));
+}
+
+#[test]
+fn startup_pressure_ignores_unproven_slots_past_the_grace_window() {
+    let live = LiveWorkerStateRegistry::new();
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let window = crate::live_worker_state::DRIVER_START_GRACE_SECS;
+    live.register_spawn(1, "stuck", "codex", 123, None);
+    live.set_spawn_time_for_test(1, now - window - 1);
+    let claimed = std::collections::HashSet::from(["stuck".to_owned()]);
+    assert!(
+        !live.startup_pending(&claimed, now, window),
+        "a slot already past driver-start grace must not pin resumed admission"
+    );
+    assert!(!live.startup_pending(&std::collections::HashSet::new(), now, window));
+    live.register_spawn(2, "fresh", "claude", 124, None);
+    assert!(live.startup_pending(&claimed, now, window));
+}
+
+#[test]
+fn live_unproven_slots_raise_jsonl_discovery_deadline() {
+    let live = LiveWorkerStateRegistry::new();
+    let load = std::sync::Arc::new(boss_startup_policy::DiscoveryLoad::default());
+    let first = load.begin();
+    assert_eq!(first.timeout(), Duration::from_secs(120));
+    live.set_discovery_load(load);
+    live.register_spawn(1, "claude-1", "opus", 1, None);
+    live.register_spawn(2, "claude-2", "opus", 2, None);
+    live.register_spawn(3, "grok-1", "grok-4.6", 3, None);
+    // Three non-JSONL live slots raise the already-armed Codex discovery
+    // (peak 3 → 120 + 2*9).
+    assert_eq!(first.timeout(), Duration::from_secs(138));
 }
 
 #[test]
@@ -101,29 +135,40 @@ fn paced_dead_driver_backlog_still_trips_the_existing_breaker() {
     let now = std::time::Instant::now();
     let mut admission = ResumeAdmission::default();
     admission.resume(now);
-    let mut ready: std::collections::VecDeque<String> = (0..6).map(|index| format!("dead-{index}")).collect();
+    // Long enough that admissions are still flowing when the third
+    // driver-start failure lands — the six-row queue emptied before that
+    // and could not prove the property.
+    let mut ready: std::collections::VecDeque<String> = (0..20).map(|index| format!("dead-{index}")).collect();
     admission.observe_ready(ready.iter().cloned());
     let tracker = SpawnHealthTracker::new();
     let mut failures = std::collections::VecDeque::new();
+    let mut occupied = 0usize;
+    const POOL_SLOTS: usize = 8;
     let mut tripped = false;
+    let mut remaining_when_tripped = 0usize;
     // Drive the production 15s heartbeat and 60s reap cadence, including
-    // healthy shell acknowledgments (which reset the existing breaker).
+    // healthy shell acknowledgments. Shell acks must not wipe driver-start
+    // failures; reaps release pool slots so later rows keep admitting.
     // All drivers are dead; no readiness proof releases pacing early.
     for elapsed in (0..=900).step_by(15) {
         let tick = now + Duration::from_secs(elapsed as u64);
-        if let Some(id) = ready.front()
-            && !admission.holds(id, !failures.is_empty(), tick)
+        if occupied < POOL_SLOTS
+            && let Some(id) = ready.front()
+            && !admission.holds(id, occupied > 0, tick)
         {
             let id = ready.pop_front().unwrap();
             admission.admitted(&id, tick);
-            tracker.record_success();
+            tracker.record_shell_ack();
+            occupied += 1;
             failures.push_back((id, elapsed + DRIVER_START_GRACE_SECS));
         }
         if elapsed % 60 == 0 {
             while failures.front().is_some_and(|(_, due)| *due <= elapsed) {
                 let (id, _) = failures.pop_front().unwrap();
-                if tracker.record_failure(&id, elapsed).is_some() {
+                occupied = occupied.saturating_sub(1);
+                if tracker.record_driver_start_failure(&id, elapsed).is_some() {
                     tripped = true;
+                    remaining_when_tripped = ready.len();
                     break;
                 }
             }
@@ -133,4 +178,8 @@ fn paced_dead_driver_backlog_still_trips_the_existing_breaker() {
         }
     }
     assert!(tripped, "resume pacing must not hide dead drivers from the breaker");
+    assert!(
+        remaining_when_tripped > 0,
+        "the breaker must trip while the resumed backlog still has ready work, remaining={remaining_when_tripped}"
+    );
 }

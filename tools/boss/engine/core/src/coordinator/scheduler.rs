@@ -827,7 +827,11 @@ impl ExecutionCoordinator {
         };
         // Pool claims survive the handoff from schedule_execution to the
         // runner, including the window before live-slot registration.
-        let startup_pending = live.startup_pending(&self.all_claimed_execution_ids().await);
+        let startup_pending = live.startup_pending(
+            &self.all_claimed_execution_ids().await,
+            boss_engine_utils::epoch_time::now_epoch_secs(),
+            crate::live_worker_state::DRIVER_START_GRACE_SECS,
+        );
         let held = self
             .resume_admission
             .lock()

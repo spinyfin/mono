@@ -802,7 +802,15 @@ pub(crate) async fn reap_never_started_spawn(
             shell_pid,
             epoch_secs: now_epoch_secs,
         });
-    if let Some(distinct) = ctx.spawn_health.record_failure(work_item_id, now_epoch_secs) {
+    let distinct = match &cause {
+        ReapCause::DriverStartTimeout { .. } => ctx
+            .spawn_health
+            .record_driver_start_failure(work_item_id, now_epoch_secs),
+        ReapCause::SpawnAckTimeout { .. } | ReapCause::AppNack { .. } | ReapCause::PaneDiedBeforeStart { .. } => {
+            ctx.spawn_health.record_failure(work_item_id, now_epoch_secs)
+        }
+    };
+    if let Some(distinct) = distinct {
         trip_spawn_capability_circuit(
             ctx.work_db,
             ctx.coordinator.as_ref(),

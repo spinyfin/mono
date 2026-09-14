@@ -525,12 +525,16 @@ pub enum ResumeOutcome {
 #[derive(Default)]
 pub struct AgentJsonlProgressManager {
     runs: Mutex<HashMap<String, RunHandle>>,
-    discovery_load: boss_startup_policy::DiscoveryLoad,
+    discovery_load: Arc<boss_startup_policy::DiscoveryLoad>,
 }
 
 impl AgentJsonlProgressManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn discovery_load(&self) -> Arc<boss_startup_policy::DiscoveryLoad> {
+        Arc::clone(&self.discovery_load)
     }
 
     /// Snapshot pre-existing candidates before the pane is spawned, then
