@@ -603,12 +603,24 @@ pub enum Stage {
     /// either case the claimed worker is handed straight back; nothing is
     /// leased and nothing spawns.
     ///
+    /// Also emitted one step earlier, by `boss_engine::orphan_sweep`, when
+    /// the pause holds a redispatch the sweep would otherwise have minted.
+    /// That sweep creates executions through
+    /// `WorkDb::request_execution_with_live_check` directly, and creating
+    /// one is already destructive — it marks the predecessor `abandoned` —
+    /// so waiting for the spawn chokepoint to refuse it would be too late
+    /// to save the work. Those events carry
+    /// `admission = "orphan_sweep_redispatch"` and
+    /// `loop = "orphan_active_sweep"`, and name a work item rather than a
+    /// spawn-ready execution.
+    ///
     /// The `details` object carries `origin` (`"operator"` / `"breaker"`),
     /// `admission` (which entry point asked — `"queued"`,
     /// `"operator_forced"`, `"breaker_recovery_probe"`,
-    /// `"pause_bypass_override"`), `reviews_held`, `targets_review_pool`,
-    /// and the pause `reason`. Always [`Outcome::Skipped`]: a held dispatch
-    /// is the pause working, not a failure.
+    /// `"pause_bypass_override"`, `"orphan_sweep_redispatch"`),
+    /// `reviews_held`, `targets_review_pool`, and the pause `reason`.
+    /// Always [`Outcome::Skipped`]: a held dispatch is the pause working,
+    /// not a failure.
     DispatchHeldByPause,
     /// The spawn-capability breaker's half-open recovery probe admitted one
     /// canary execution through a Breaker-origin pause (see

@@ -281,6 +281,10 @@ impl WorkDb {
             recent_terminal,
             failing_execution_ids,
             counted_scope,
+            // The `pr_review_recovery` / merge-poller path only ever counts
+            // inside the trailing window; the consecutive half of the guard
+            // is `orphan_sweep`'s.
+            ChurnTrip::Window,
         );
         if let Err(err) =
             self.upsert_external_tracker_attention(work_item_id, CHURN_GUARD_PARKED_ATTENTION_KIND, &title, &body)
@@ -303,6 +307,7 @@ impl WorkDb {
         recent_terminal: i64,
         failing_execution_ids: &[String],
         counted_scope: &str,
+        trip: ChurnTrip,
     ) -> (String, String) {
         let title = format!("Parked by churn guard — {recent_terminal} recent failures");
         let ids = if failing_execution_ids.is_empty() {
@@ -311,14 +316,38 @@ impl WorkDb {
             failing_execution_ids.join(", ")
         };
         let window_hours = ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS / 3600;
+        // The two halves of the guard trip on different evidence and clear
+        // on different events, so an operator reading the card is told which
+        // one stopped the row rather than a window explanation that does not
+        // apply to a slow loop.
+        let (counted_clause, clears_clause) = match trip {
+            ChurnTrip::Window => (
+                format!(
+                    "{recent_terminal} {counted_scope} within the trailing {window_hours}h window \
+                     (threshold {ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD})"
+                ),
+                "This clears automatically once the window drains below the threshold and the next \
+                 sweep pass redispatches successfully."
+                    .to_owned(),
+            ),
+            ChurnTrip::Consecutive => (
+                format!(
+                    "{recent_terminal} consecutive {counted_scope} with no successful run in \
+                     between (threshold {ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD}) — a \
+                     cycle too slow for the trailing {window_hours}h window to catch"
+                ),
+                "This does NOT clear with the passage of time: the count is consecutive, not \
+                 windowed, so waiting will not reset it. A successful run resets it, as does an \
+                 explicit start."
+                    .to_owned(),
+            ),
+        };
         let body = format!(
             "The `{source}` sweep stopped auto-redispatching this work item: it produced \
-             {recent_terminal} {counted_scope} within the trailing {window_hours}h window \
-             (threshold {ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD}), which usually means something \
-             structural is broken (a bad host, a repo/config issue) rather than a one-off blip.\n\n\
+             {counted_clause}, which usually means something structural is broken (a bad host, a \
+             repo/config issue) rather than a one-off blip.\n\n\
              Failing executions: {ids}\n\n\
-             This clears automatically once the window drains below the threshold and the next \
-             sweep pass redispatches successfully. To bypass the guard and retry immediately, run \
+             {clears_clause} To bypass the guard and retry immediately, run \
              `bossctl work start {work_item_id}`."
         );
         (title, body)
@@ -354,6 +383,7 @@ impl WorkDb {
         recent_terminal: i64,
         failing_execution_ids: &[String],
         counted_scope: &str,
+        trip: ChurnTrip,
     ) {
         let (_, body) = Self::churn_guard_parked_text(
             work_item_id,
@@ -361,6 +391,7 @@ impl WorkDb {
             recent_terminal,
             failing_execution_ids,
             counted_scope,
+            trip,
         );
         match self.bounce_dispatch_failed_to_backlog(work_item_id, CHURN_GUARD_DISPATCH_FAILED_REASON, &body) {
             Ok(true) => {}

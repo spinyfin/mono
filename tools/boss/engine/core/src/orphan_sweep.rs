@@ -31,28 +31,46 @@
 //!    `husk_pane_sweep`, `lost_workspace_sweep`, `dead_pid_sweep`,
 //!    `spawn_ack_sweep`); this sweep picks the item up on the pass after
 //!    one of them reconciles it to `orphaned`/`abandoned`.
-//! 3. For each candidate, checks whether its latest non-terminal
+//! 3. Applies the two **admission gates** every recurring redispatcher
+//!    owes the rest of the engine, per candidate: whether the row's last
+//!    run ended in a deliberate engine park (a `boss propose done
+//!    --outcome blocked` declaration, or the auto-nudge breaker giving
+//!    up — both terminalize the run as `abandoned` and leave an open
+//!    attention item), and the global dispatch pause as
+//!    [`ExecutionCoordinator::evaluate_dispatch_admission`] reports it.
+//!    Neither gate stops the sweep from running or from evaluating: they
+//!    stop it *minting an execution*, which is the only irreversible
+//!    thing it does (`request_execution_with_live_check` marks the
+//!    predecessor `abandoned`). Both fail closed — an admission state
+//!    that cannot be established holds the row and logs, rather than
+//!    defaulting to redispatch.
+//! 4. For each candidate, checks whether its latest non-terminal
 //!    execution (if any) is claimed by a live worker slot. If it is,
 //!    the execution is genuinely live and the candidate is skipped.
 //!    As a defense-in-depth guard, any candidate whose live execution is
 //!    still in a live status at this point is also skipped unconditionally.
-//! 4. Applies the **durable-process guard**: probes the pid recorded on the
+//! 5. Applies the **durable-process guard**: probes the pid recorded on the
 //!    item's most recent local run ([`crate::durable_liveness`]) and refuses
 //!    to redispatch while that process is alive, then hands the contradiction
 //!    to [`crate::worker_readoption`] to be resolved. Every guard above this
 //!    one reads engine bookkeeping, which is exactly what is wrong in the
 //!    failure this guards — see the comment at the call site.
-//! 5. Only once both liveness guards above have passed does the sweep act on
-//!    the churn guard it evaluated earlier in the pass: if the work item has
-//!    already had [`ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD`] terminal
-//!    executions in the last [`ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS`],
-//!    it is skipped, a warning is logged, and the item is bounced to Backlog
+//! 6. Only once both liveness guards above have passed does the sweep act on
+//!    the churn guard it evaluated earlier in the pass. The guard has two
+//!    halves and either one trips it: [`ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD`]
+//!    terminal executions inside the trailing
+//!    [`ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS`] (fast churn), or
+//!    [`ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD`] *consecutive*
+//!    unproductive terminal executions with no successful run in between,
+//!    however long they took (slow churn, which no trailing window can
+//!    catch — see that constant's docs). On a trip the item is skipped, a
+//!    warning is logged, and the item is bounced to Backlog
 //!    via [`crate::work::WorkDb::bounce_churn_guard_parked_to_backlog`] (the
 //!    same `dispatch_failed_reason` surface a pre-spawn dispatch failure
 //!    uses) so the kanban board shows the park instead of the card sitting
 //!    in Doing looking idle — see
 //!    `docs/designs/dispatch-halt-state-vs-attention-items.md`. The bounce is
-//!    deliberately sequenced *after* steps 3 and 4: those are the only
+//!    deliberately sequenced *after* steps 4 and 5: those are the only
 //!    checks that can tell a churn-tripped row apart from a row whose
 //!    previous worker process is still alive (a live-but-untracked worker
 //!    tends to also produce the terminal-execution churn that trips this
@@ -61,16 +79,18 @@
 //!    workspace. Auto-clears once [`crate::dispatch_failure_recovery_sweep`]
 //!    retries it after its cooldown: that sweep recognises a
 //!    `CHURN_GUARD_DISPATCH_FAILED_REASON` row and applies *this* guard's
-//!    own threshold/window to it (not its own looser 5-in-24h one), so the
-//!    3-in-1h contract carries over unchanged rather than being weakened by
-//!    the representation change. Also clears immediately on an explicit
+//!    own thresholds to it — both halves, not its own looser 5-in-24h one —
+//!    so the contract carries over unchanged rather than being weakened by
+//!    the representation change (its 10-minute cooldown is shorter than any
+//!    window, so without the consecutive half it would un-park a slow loop
+//!    one cooldown at a time). Also clears immediately on an explicit
 //!    `bossctl work start` / kanban drag-to-Doing, either of which bypasses
 //!    the guard entirely.
-//! 6. Calls [`WorkDb::request_execution_with_live_check`] (the same
+//! 7. Calls [`WorkDb::request_execution_with_live_check`] (the same
 //!    path `bossctl work start` uses) to mark the stale execution
 //!    `abandoned` and insert a fresh `ready` execution, then kicks
 //!    the coordinator's scheduler.
-//! 7. Emits an [`Stage::OrphanActiveRedispatch`] dispatch event so
+//! 8. Emits an [`Stage::OrphanActiveRedispatch`] dispatch event so
 //!    the redispatch is visible in `bossctl dispatch tail`.
 
 use std::collections::HashSet;
@@ -82,7 +102,10 @@ use boss_protocol::{ExecutionKind, ExecutionStatus, RequestExecutionInput};
 
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
-use crate::work::{ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD, ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS, WorkDb};
+use crate::work::{
+    ChurnTrip, ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD, ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD,
+    ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS, WorkDb,
+};
 use crate::worker_readoption::LiveWorkerConvergence;
 
 /// Minimum age of `tasks.updated_at` before an active work item with
@@ -123,6 +146,25 @@ pub struct OrphanSweepOutcome {
     /// or reaped them by now. Look at the paired `live_worker_readopted` /
     /// `husk_pane_reconcile` events before assuming the guard alone is enough.
     pub live_process_skipped: usize,
+    /// Items skipped because global dispatch is paused. The sweep mints
+    /// executions through `WorkDb::request_execution_with_live_check`
+    /// directly, so nothing downstream of it re-asks the pause question on
+    /// its behalf: without this gate a pause made the sweep *more* active,
+    /// not less, because a pause stops anything consuming worker slots and
+    /// `has_idle_worker()` is then always true.
+    pub dispatch_paused_skipped: usize,
+    /// Items skipped because the row's most recent run ended in a
+    /// deliberate engine park — a `boss propose done --outcome blocked`
+    /// declaration, or the auto-nudge breaker giving up — whose attention
+    /// item is still open. Those runs end `abandoned`, which this sweep
+    /// used to read as "orphaned, redispatch".
+    pub deliberate_park_skipped: usize,
+    /// Items skipped because the pass could not *establish* whether it was
+    /// allowed to redispatch — the admission evaluation or the `autostart`
+    /// read failed. Counted separately from the gates themselves because
+    /// this is an error signal, not a policy outcome: a non-zero count
+    /// means rows are being held for a reason nobody chose.
+    pub admission_unknown_skipped: usize,
 }
 
 impl crate::sweep_loop::SweepOutcome for OrphanSweepOutcome {
@@ -132,6 +174,9 @@ impl crate::sweep_loop::SweepOutcome for OrphanSweepOutcome {
             || self.live_execution_skipped > 0
             || self.running_reviewer_skipped > 0
             || self.live_process_skipped > 0
+            || self.dispatch_paused_skipped > 0
+            || self.deliberate_park_skipped > 0
+            || self.admission_unknown_skipped > 0
     }
 
     fn log(&self) {
@@ -142,6 +187,9 @@ impl crate::sweep_loop::SweepOutcome for OrphanSweepOutcome {
             live_execution_skipped = self.live_execution_skipped,
             running_reviewer_skipped = self.running_reviewer_skipped,
             live_process_skipped = self.live_process_skipped,
+            dispatch_paused_skipped = self.dispatch_paused_skipped,
+            deliberate_park_skipped = self.deliberate_park_skipped,
+            admission_unknown_skipped = self.admission_unknown_skipped,
             "orphan sweep: pass complete",
         );
     }
@@ -359,6 +407,142 @@ async fn run_one_pass_filtered(
     let churn_cutoff = now_epoch_secs - ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS;
 
     for work_item_id in candidates {
+        // ── Admission gate 1: a deliberate engine park ────────────────
+        //
+        // This sweep redispatches any `active` row whose latest execution
+        // is terminal, and it must not: `abandoned` is a terminal status,
+        // and the engine writes it for *decisions* as well as for deaths.
+        // `completion::run_done_declaration::finalize_declared_blocked`
+        // (the worker declared `boss propose done --outcome blocked`) and
+        // `completion::nudge`'s auto-nudge breaker both terminalize a run
+        // as `abandoned` on purpose, release its slot and lease, and file
+        // an attention item as the durable "a human should look at this"
+        // surface. Redispatching such a row puts a replacement worker on
+        // exactly the work a human was asked to adjudicate, every 60
+        // seconds, forever.
+        //
+        // The discriminator is the open park attention item, NOT the row's
+        // `autostart` flag. `autostart` is single-shot: `start_execution_run`
+        // clears it the first time a row enters `active`
+        // (`work/executions_runs.rs`, and `migrate_backfill_autostart_consumed`
+        // backfilled the same for older rows), so EVERY row this sweep can
+        // legitimately recover — every row whose worker actually ran — has
+        // `autostart = 0`. Both park paths do also clear it, but that write
+        // is already a no-op for an `active` row and it is what
+        // `rescan_active_dispatch` keys off, not this sweep. Gating this
+        // sweep on `autostart` would not honour the park; it would switch
+        // the sweep off, post-crash orphan recovery included.
+        //
+        // Self-clearing: both kinds are registered `ClearedBy::WorkResumed`
+        // in `attention_lifecycle`, so an operator's `bossctl work start`
+        // (or any fresh run) ends the park with no separate gesture — and a
+        // genuinely orphaned pane files neither kind, so recovery is
+        // untouched.
+        const DELIBERATE_PARK_ATTENTION_KINDS: &[&str] = &[
+            crate::completion::RUN_DONE_BLOCKED_ATTENTION_KIND,
+            crate::completion::NUDGE_BREAKER_ATTENTION_KIND,
+        ];
+        match work_db.has_open_execution_attention_of_kind(&work_item_id, DELIBERATE_PARK_ATTENTION_KINDS) {
+            Ok(false) => {}
+            Ok(true) => {
+                tracing::info!(
+                    work_item_id = %work_item_id,
+                    "orphan sweep: skipping redispatch — this row's run ended in a deliberate park \
+                     with an open attention item (`bossctl work start` resumes it)",
+                );
+                dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::DispatchDecision, Outcome::Skipped, &work_item_id)
+                            .with_work_item(&work_item_id)
+                            .with_details(serde_json::json!({
+                                "loop": "orphan_active_sweep",
+                                "skipped_reason": "deliberate_park",
+                            })),
+                    )
+                    .await;
+                outcome.deliberate_park_skipped += 1;
+                continue;
+            }
+            Err(err) => {
+                // Fail loud and hold: an unreadable park state is not a
+                // licence to put a second worker on the row.
+                tracing::warn!(
+                    work_item_id = %work_item_id,
+                    ?err,
+                    "orphan sweep: skipping redispatch — could not read the row's park state; \
+                     refusing to redispatch on an unknown admission state",
+                );
+                outcome.admission_unknown_skipped += 1;
+                continue;
+            }
+        }
+
+        // ── Admission gate 2: the global dispatch pause ────────────────
+        //
+        // Asked through `ExecutionCoordinator::evaluate_dispatch_admission`,
+        // the engine's one reason-producing admission evaluator, rather than
+        // a second private notion of "is dispatch paused" — so this sweep
+        // agrees by construction with what `bossctl dispatch pause` means
+        // everywhere else, including the one case where a paused engine
+        // legitimately still dispatches: an operator-originated pause
+        // exempts the review pool (`drain_ready_queue` holds only
+        // `paused && !is_review`), and the evaluator reports no pause in
+        // effect for such a row. That exemption is the *only* sanctioned
+        // bypass here, and it is the evaluator's decision, not this sweep's.
+        //
+        // Deliberately reads only `admission.pause`, not `would_dispatch`:
+        // the other blockers it computes (the interactive concurrency cap
+        // above all) govern how many workers run at once, which is the
+        // `has_idle_worker` question this sweep already asks its own way.
+        // Widening the gate to every blocker would change what orphan
+        // recovery waits on, and orphan recovery must keep firing.
+        //
+        // Note what this does NOT do: it does not pause or suspend the
+        // sweep. The sweep keeps running, keeps evaluating, and keeps
+        // logging; it just does not mint an execution while dispatch is
+        // paused. Orphan recovery resumes on the first pass after the
+        // pause lifts.
+        let admission = match coordinator.evaluate_dispatch_admission(&work_item_id).await {
+            Ok(admission) => admission,
+            Err(err) => {
+                // Fail loud and hold. An admission evaluation that cannot
+                // be computed is not a licence to redispatch — that is
+                // exactly how the row would get revived through a pause.
+                tracing::warn!(
+                    work_item_id = %work_item_id,
+                    ?err,
+                    "orphan sweep: skipping redispatch — could not evaluate dispatch admission; \
+                     refusing to redispatch on an unknown pause state",
+                );
+                outcome.admission_unknown_skipped += 1;
+                continue;
+            }
+        };
+        if admission.pause.active {
+            tracing::info!(
+                work_item_id = %work_item_id,
+                pause_origin = admission.pause.origin.as_deref().unwrap_or("unknown"),
+                pause_reason = admission.pause.reason.as_deref().unwrap_or("no reason recorded"),
+                "orphan sweep: skipping redispatch — global dispatch is paused",
+            );
+            dispatch_events
+                .emit(
+                    DispatchEvent::new(Stage::DispatchHeldByPause, Outcome::Skipped, &work_item_id)
+                        .with_work_item(&work_item_id)
+                        .with_details(serde_json::json!({
+                            "loop": "orphan_active_sweep",
+                            "admission": "orphan_sweep_redispatch",
+                            "origin": admission.pause.origin,
+                            "reason": admission.pause.reason,
+                            "paused_since_epoch_s": admission.pause.paused_since_epoch_s,
+                            "overridable": admission.pause.overridable,
+                        })),
+                )
+                .await;
+            outcome.dispatch_paused_skipped += 1;
+            continue;
+        }
+
         // Churn guard: count terminal executions in the trailing window.
         // Deliberately read-only here — whether the threshold is tripped is
         // decided now (recorded in the dispatch-decision event below), but
@@ -386,7 +570,33 @@ async fn run_one_pass_filtered(
                 continue;
             }
         };
-        let churn_tripped = recent_terminal >= ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD;
+        // The trailing window alone cannot catch a loop slower than
+        // `WINDOW_SECS / THRESHOLD`: each cycle's oldest evidence ages out
+        // before the next failure lands inside the window, so the count
+        // plateaus below the threshold no matter how many workers the row
+        // burns. Observed 2026-09-13 at a 40-50 minute cycle time: at one
+        // row's redispatch only two of its terminal executions fell inside
+        // the one-hour cutoff, one short of tripping, forever. Lengthening
+        // the window does not fix that — a slower loop outruns any fixed
+        // window — so the guard has a second, time-independent half: the
+        // unbroken streak of unproductive terminal executions since the
+        // row last completed a run. Either half tripping parks the row.
+        let consecutive_terminal_ids = match work_db.list_consecutive_unproductive_terminal_execution_ids(&work_item_id)
+        {
+            Ok(ids) => ids,
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %work_item_id,
+                    ?err,
+                    "orphan sweep: failed to count consecutive terminal executions; skipping item",
+                );
+                continue;
+            }
+        };
+        let consecutive_terminal = consecutive_terminal_ids.len() as i64;
+        let window_tripped = recent_terminal >= ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD;
+        let consecutive_tripped = consecutive_terminal >= ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD;
+        let churn_tripped = window_tripped || consecutive_tripped;
 
         // Decision-point instrumentation (re-dispatch storm visibility).
         //
@@ -427,6 +637,7 @@ async fn run_one_pass_filtered(
                             "live_execution_status": live.status,
                             "live_execution_claimed": live_claimed,
                             "recent_terminal_executions": recent_terminal,
+                            "consecutive_terminal_executions": consecutive_terminal,
                         })),
                 )
                 .await;
@@ -615,22 +826,41 @@ async fn run_one_pass_filtered(
         // and no live previous-worker process for this row — only now is it
         // safe to bounce it to Backlog with a failure banner.
         if churn_tripped {
+            // The windowed half stays the reported basis when both trip:
+            // it is the tighter statement (this many failures *and* this
+            // fast), and it is the one that clears on its own.
+            let trip = if window_tripped {
+                ChurnTrip::Window
+            } else {
+                ChurnTrip::Consecutive
+            };
             tracing::warn!(
                 work_item_id = %work_item_id,
                 recent_terminal,
+                consecutive_terminal,
+                window_tripped,
+                consecutive_tripped,
                 threshold = ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD,
                 window_secs = ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS,
+                consecutive_threshold = ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD,
                 "orphan sweep: churn guard tripped; skipping redispatch — human attention required",
             );
-            let failing_ids = work_db
-                .list_recent_terminal_execution_ids(&work_item_id, churn_cutoff, None)
-                .unwrap_or_default();
+            let (counted, failing_ids) = match trip {
+                ChurnTrip::Window => (
+                    recent_terminal,
+                    work_db
+                        .list_recent_terminal_execution_ids(&work_item_id, churn_cutoff, None)
+                        .unwrap_or_default(),
+                ),
+                ChurnTrip::Consecutive => (consecutive_terminal, consecutive_terminal_ids),
+            };
             work_db.bounce_churn_guard_parked_to_backlog(
                 &work_item_id,
                 "orphan_sweep",
-                recent_terminal,
+                counted,
                 &failing_ids,
                 "terminal executions",
+                trip,
             );
             outcome.churn_skipped += 1;
             continue;
@@ -678,6 +908,7 @@ async fn run_one_pass_filtered(
                     .with_work_item(&work_item_id)
                     .with_details(serde_json::json!({
                         "recent_terminal_executions": recent_terminal,
+                        "consecutive_terminal_executions": consecutive_terminal,
                     })),
             )
             .await;
@@ -1218,6 +1449,422 @@ mod tests {
         assert_eq!(outcome.redispatched, 0);
         assert_eq!(outcome.no_worker_skipped, 1);
         assert!(sink.events().await.is_empty());
+    }
+
+    // ─── admission gates (pause / autostart) ────────────────────────────
+
+    /// **The 2026-09-13 paused-dispatch redispatch.** Global dispatch was
+    /// paused, and this sweep minted a fresh execution anyway — abandoning
+    /// the predecessor's work in the process. Its only admission gate was
+    /// `has_idle_worker()`, which is a slot-occupancy question, not an
+    /// admission question; worse, a pause stops anything *consuming* worker
+    /// slots, so pausing dispatch made this sweep strictly more likely to
+    /// fire, not less.
+    #[tokio::test]
+    async fn does_not_redispatch_while_dispatch_is_paused() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_spawned_execution(&db, &work_item_id, dead_pid());
+        db.mark_execution_orphaned(&execution_id, "worker died").unwrap();
+        make_old(&db, &work_item_id);
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let now = boss_engine_utils::epoch_time::now_epoch_secs().max(0) as u64;
+        coordinator.pause_dispatch(
+            now,
+            crate::coordinator::DispatchPauseOrigin::Operator,
+            boss_protocol::PauseReason::new("test: operator paused dispatch").unwrap(),
+        );
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.redispatched, 0,
+            "a paused dispatcher must not have work redispatched onto it behind its back",
+        );
+        assert_eq!(outcome.dispatch_paused_skipped, 1);
+
+        // The destructive half is creating the row at all: doing so marks
+        // the predecessor `abandoned` and discards its workspace.
+        let executions = db.list_executions(Some(&work_item_id)).unwrap();
+        assert_eq!(
+            executions.len(),
+            1,
+            "no fresh execution may be minted while dispatch is paused; got {executions:?}",
+        );
+
+        let events = sink.events().await;
+        let held: Vec<_> = events.iter().filter(|e| e.stage == "dispatch_held_by_pause").collect();
+        assert_eq!(held.len(), 1, "the hold must be visible in the dispatch stream");
+        assert_eq!(held[0].outcome, "skipped");
+        assert_eq!(
+            held[0].details["admission"],
+            serde_json::json!("orphan_sweep_redispatch"),
+        );
+        assert!(
+            events.iter().all(|e| e.stage != "orphan_active_redispatch"),
+            "no redispatch event may fire while dispatch is paused",
+        );
+    }
+
+    /// The pause gate holds the redispatch; it does not disable the sweep.
+    /// The same row recovers on the first pass after the pause lifts —
+    /// orphan recovery is deferred by a pause, never cancelled by one.
+    #[tokio::test]
+    async fn redispatches_once_the_pause_lifts() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_spawned_execution(&db, &work_item_id, dead_pid());
+        db.mark_execution_orphaned(&execution_id, "worker died").unwrap();
+        make_old(&db, &work_item_id);
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let now = boss_engine_utils::epoch_time::now_epoch_secs().max(0) as u64;
+        coordinator.pause_dispatch(
+            now,
+            crate::coordinator::DispatchPauseOrigin::Operator,
+            boss_protocol::PauseReason::new("test: operator paused dispatch").unwrap(),
+        );
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let held = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+        )
+        .await;
+        assert_eq!(held.redispatched, 0, "precondition: the pause held it");
+
+        coordinator.resume_dispatch();
+        let resumed = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+        )
+        .await;
+
+        assert_eq!(
+            resumed.redispatched, 1,
+            "a lifted pause must let the genuinely-orphaned row recover — the sweep is deferred \
+             by a pause, not disabled by one",
+        );
+        assert_eq!(resumed.dispatch_paused_skipped, 0);
+    }
+
+    /// A breaker-origin pause holds the redispatch exactly as an operator
+    /// one does. The sweep asks the shared admission evaluator rather than
+    /// carrying its own idea of what a pause means, so it inherits every
+    /// pause's real scope instead of re-deciding it.
+    #[tokio::test]
+    async fn a_breaker_pause_also_holds_the_redispatch() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_spawned_execution(&db, &work_item_id, dead_pid());
+        db.mark_execution_orphaned(&execution_id, "worker died").unwrap();
+        make_old(&db, &work_item_id);
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let now = boss_engine_utils::epoch_time::now_epoch_secs().max(0) as u64;
+        coordinator.pause_dispatch(
+            now,
+            crate::coordinator::DispatchPauseOrigin::Breaker,
+            boss_protocol::PauseReason::new("test: breaker tripped").unwrap(),
+        );
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+        )
+        .await;
+
+        assert_eq!(outcome.redispatched, 0);
+        assert_eq!(outcome.dispatch_paused_skipped, 1);
+        let events = sink.events().await;
+        let held: Vec<_> = events.iter().filter(|e| e.stage == "dispatch_held_by_pause").collect();
+        assert_eq!(held[0].details["origin"], serde_json::json!("breaker"));
+        assert_eq!(held[0].details["overridable"], serde_json::json!(false));
+    }
+
+    /// **The defeated park.** `finalize_declared_blocked` ends a run the
+    /// worker declared itself blocked on: the execution goes `abandoned`,
+    /// its slot and lease are released, and an open attention item asks a
+    /// human to adjudicate. `abandoned` is terminal, so this sweep read the
+    /// row as a legitimate orphan and put a replacement worker on exactly
+    /// the work that was handed to the human — every 60 seconds, forever.
+    ///
+    /// Note what the discriminator is NOT: `autostart`. That flag is
+    /// single-shot and `start_execution_run` consumes it the first time a
+    /// row goes `active`, so every row this sweep can legitimately recover
+    /// already has `autostart = 0` — see
+    /// `does_not_gate_recovery_on_the_single_shot_autostart_flag`.
+    #[tokio::test]
+    async fn does_not_revive_a_deliberately_parked_row() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_spawned_execution(&db, &work_item_id, dead_pid());
+        db.record_worker_idle_abandonment(&execution_id, "worker declared itself blocked")
+            .unwrap();
+        db.create_attention_item(boss_protocol::CreateAttentionItemInput {
+            execution_id: Some(execution_id.clone()),
+            work_item_id: None,
+            kind: crate::completion::RUN_DONE_BLOCKED_ATTENTION_KIND.to_owned(),
+            status: None,
+            title: "Run ended: worker declared itself blocked".to_owned(),
+            body_markdown: "blocked".to_owned(),
+            resolved_at: None,
+        })
+        .unwrap();
+        // Age LAST: the writes above touch `tasks.updated_at`.
+        make_old(&db, &work_item_id);
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.redispatched, 0,
+            "a row whose run was deliberately parked must not get a replacement worker",
+        );
+        assert_eq!(outcome.deliberate_park_skipped, 1);
+        let executions = db.list_executions(Some(&work_item_id)).unwrap();
+        assert_eq!(executions.len(), 1, "no replacement execution may be minted");
+        let events = sink.events().await;
+        assert!(
+            events.iter().all(|e| e.stage != "orphan_active_redispatch"),
+            "no redispatch event may fire for a parked row",
+        );
+        let skipped: Vec<_> = events
+            .iter()
+            .filter(|e| e.stage == "dispatch_decision" && e.details["skipped_reason"] == "deliberate_park")
+            .collect();
+        assert_eq!(skipped.len(), 1, "the park must be visible in the dispatch stream");
+    }
+
+    /// The park is a park, not a tombstone. Only an OPEN park item holds
+    /// the row: once it is resolved — by a human reviewing it, or
+    /// automatically by `ClearedBy::WorkResumed` when a fresh run starts —
+    /// the same row is recovered normally.
+    #[tokio::test]
+    async fn a_resolved_park_attention_does_not_hold_the_row() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_spawned_execution(&db, &work_item_id, dead_pid());
+        db.record_worker_idle_abandonment(&execution_id, "nudge breaker parked the run")
+            .unwrap();
+        db.create_attention_item(boss_protocol::CreateAttentionItemInput {
+            execution_id: Some(execution_id.clone()),
+            work_item_id: None,
+            kind: crate::completion::NUDGE_BREAKER_ATTENTION_KIND.to_owned(),
+            status: Some("resolved".to_owned()),
+            title: "Worker parked: auto-nudge loop bounded".to_owned(),
+            body_markdown: "parked".to_owned(),
+            resolved_at: Some(boss_engine_utils::iso8601::format_epoch_iso8601(
+                boss_engine_utils::epoch_time::now_epoch_secs(),
+            )),
+        })
+        .unwrap();
+        make_old(&db, &work_item_id);
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.redispatched, 1,
+            "a settled park must not keep the row out of the sweep's hands forever",
+        );
+        assert_eq!(outcome.deliberate_park_skipped, 0);
+    }
+
+    /// **The gate that would have switched the sweep off.** `autostart` is
+    /// single-shot — `start_execution_run` clears it the first time a row
+    /// enters `active` — so the flag reads `false` on *every* row this
+    /// sweep exists to recover, a genuinely orphaned pane included. This
+    /// test pins that: a row whose worker really died, with `autostart`
+    /// consumed exactly as production leaves it, must still recover.
+    #[tokio::test]
+    async fn does_not_gate_recovery_on_the_single_shot_autostart_flag() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_spawned_execution(&db, &work_item_id, dead_pid());
+        db.mark_execution_orphaned(&execution_id, "worker died").unwrap();
+        make_old(&db, &work_item_id);
+
+        assert!(
+            !get_task(&db, &work_item_id).autostart,
+            "precondition: a row that has run carries autostart = false — if this ever changes, \
+             the reasoning behind the park gate needs revisiting",
+        );
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.redispatched, 1,
+            "post-crash orphan recovery is the reason this sweep exists; a consumed autostart \
+             flag must never stop it",
+        );
+    }
+
+    /// **The churn guard a slow loop outruns.** Three unproductive terminal
+    /// executions 45 minutes apart: at every redispatch only two of them are
+    /// inside the one-hour trailing window, so the windowed count plateaus
+    /// one short of the threshold forever, however many workers the row
+    /// burns. The time-independent half must trip on the same evidence.
+    #[tokio::test]
+    async fn churn_guard_trips_on_a_slow_loop_the_window_cannot_catch() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        make_old(&db, &work_item_id);
+
+        let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
+        let cycle_secs = 45 * 60;
+        for i in 0..ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD {
+            db.insert_terminal_execution_for_test(
+                &work_item_id,
+                "chore_implementation",
+                "abandoned",
+                now_epoch - i * cycle_secs,
+            )
+            .unwrap();
+        }
+
+        // Precondition: the windowed half genuinely cannot see this. If this
+        // assertion ever fails the test has stopped exercising a slow loop.
+        let windowed = db
+            .count_recent_terminal_executions(
+                &work_item_id,
+                now_epoch - ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS,
+                None,
+            )
+            .unwrap();
+        assert!(
+            windowed < ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD,
+            "precondition: the trailing window must NOT be able to trip here (saw {windowed})",
+        );
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.churn_skipped, 1,
+            "an unbroken streak of dead runs must park the row however long it took",
+        );
+        assert_eq!(outcome.redispatched, 0);
+
+        let task = get_task(&db, &work_item_id);
+        assert_eq!(task.dispatch_failed_reason.as_deref(), Some("churn_guard"));
+        assert!(
+            task.dispatch_failed_error
+                .as_deref()
+                .is_some_and(|e| e.contains("consecutive")),
+            "the park text must name the half that actually tripped: {:?}",
+            task.dispatch_failed_error,
+        );
+    }
+
+    /// The consecutive half counts a *streak*, not a lifetime total: a run
+    /// that completed resets it. Without this the guard would park any
+    /// long-lived row that had accumulated enough failures across its whole
+    /// history, which is not churn.
+    #[tokio::test]
+    async fn a_completed_run_resets_the_consecutive_churn_count() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        make_old(&db, &work_item_id);
+
+        let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
+        let cycle_secs = 45 * 60;
+        // Old failures, then a success, then one fresh failure: the streak
+        // is 1, even though the row's lifetime failure count is over the
+        // threshold.
+        for i in 0..ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD {
+            db.insert_terminal_execution_for_test(
+                &work_item_id,
+                "chore_implementation",
+                "abandoned",
+                now_epoch - (i + 2) * cycle_secs,
+            )
+            .unwrap();
+        }
+        db.insert_terminal_execution_for_test(
+            &work_item_id,
+            "chore_implementation",
+            "completed",
+            now_epoch - cycle_secs,
+        )
+        .unwrap();
+        db.insert_terminal_execution_for_test(&work_item_id, "chore_implementation", "abandoned", now_epoch)
+            .unwrap();
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.churn_skipped, 0,
+            "a row that delivered since its failures is not churning",
+        );
+        assert_eq!(outcome.redispatched, 1);
     }
 
     /// Churn guard: item with ≥ threshold recent terminal executions is skipped.

@@ -238,7 +238,14 @@ mod churn_guard_parked_fact_tests {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
-        db.bounce_churn_guard_parked_to_backlog(&work_item_id, "orphan_sweep", 3, &[], "terminal executions");
+        db.bounce_churn_guard_parked_to_backlog(
+            &work_item_id,
+            "orphan_sweep",
+            3,
+            &[],
+            "terminal executions",
+            crate::work::ChurnTrip::Window,
+        );
 
         let facts = db.dispatch_admission_facts(&work_item_id).unwrap();
         assert!(facts.churn_guard_parked);
