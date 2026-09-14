@@ -21,11 +21,12 @@ use crate::types::{
     EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto, Idea, IdeaGraduationKind, IdeaPatch,
     LinkExternalRefInput, ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation,
     ProbeDeliveryState, ProbeInterruptOutcome, Product, Project, ProposalKind, ProposalState, ProposalSubmissionError,
-    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput,
-    ReviseDocOutcome, SelectedProductState, SetProductEditorialRulesInput, SetProductExternalTrackerInput,
-    SetProjectDesignDocInput, SetTaskDocPointerInput, Task, TaskRuntime, TranscriptSegment, WorkAttachment,
-    WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
-    WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle, WorkerProposal, WorkerTierDenial,
+    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviewGuideAttempt,
+    ReviewGuideSummary, ReviewGuideVersion, ReviseDocInput, ReviseDocOutcome, SelectedProductState,
+    SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput,
+    Task, TaskRuntime, TranscriptSegment, WorkAttachment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem,
+    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle,
+    WorkerProposal, WorkerTierDenial,
 };
 
 /// Outcome of the live `getQueue` smoke check `boss engine trunk status`
@@ -952,6 +953,24 @@ pub enum FrontendRequest {
         run_id: String,
         #[serde(default)]
         refresh: bool,
+    },
+
+    /// One immutable review-guide version's full Markdown content, by id.
+    /// Fetched only when a viewer actually opens the guide — board/task
+    /// detail replies use [`Self::GetReviewGuideSummary`] alone. Replies
+    /// with [`FrontendEvent::ReviewGuideContent`] (`content: None` when the
+    /// version id is unknown).
+    GetReviewGuideContent {
+        version_id: String,
+    },
+
+    /// Series identity and current lifecycle for a PR's review guide, keyed
+    /// by the PR's revision-chain root task id — no Markdown content (see
+    /// [`Self::GetReviewGuideContent`] for that). Replies with
+    /// [`FrontendEvent::ReviewGuideSummary`] (`summary: None` when no
+    /// comparison has been captured for this root task yet).
+    GetReviewGuideSummary {
+        root_task_id: String,
     },
 
     GetRun {
@@ -2145,6 +2164,20 @@ pub enum FrontendRequest {
     /// `blocked_attempt_id` points at the reset row. See Phase 5 #13.
     RetryConflictResolution {
         attempt_id: String,
+    },
+
+    /// Idempotently create the next generation attempt for a review-guide
+    /// series' current desired comparison. A repeated call with the same
+    /// `idempotency_token` returns the original attempt rather than
+    /// creating a second one; omitting the token always creates a fresh
+    /// attempt. Replies with [`FrontendEvent::ReviewGuideRetryQueued`], or
+    /// [`FrontendEvent::WorkError`] when no comparison has been captured
+    /// for this root task yet. See
+    /// `tools/boss/docs/designs/automatic-pr-review-guides.md`.
+    RetryReviewGuide {
+        root_task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_token: Option<String>,
     },
 
     /// Boss-tier RPC: ask the macOS app to scroll the kanban to a

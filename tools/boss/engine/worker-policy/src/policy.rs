@@ -375,6 +375,9 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::GetDispatchConcurrency
         | FrontendRequest::GetDispatchState
         | FrontendRequest::GetEngineHealth
+        | FrontendRequest::GetReviewGuideContent { .. }
+        | FrontendRequest::GetReviewGuideSummary { .. }
+        | FrontendRequest::RetryReviewGuide { .. }
         | FrontendRequest::GetSelectedProduct
         | FrontendRequest::GetSettings
         | FrontendRequest::GetTaskRuntime { .. }

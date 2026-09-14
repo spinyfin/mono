@@ -1618,6 +1618,7 @@ mod tests {
             is_revision: false,
             is_standard_worker: true,
             is_reviewer: false,
+            is_review_guide: false,
             run_id: None,
             workspace_path: None,
         }
@@ -1631,6 +1632,7 @@ mod tests {
             is_revision: false,
             is_standard_worker: true,
             is_reviewer: false,
+            is_review_guide: false,
             run_id: None,
             workspace_path: None,
         }
@@ -1742,6 +1744,7 @@ mod tests {
             is_revision: false,
             is_standard_worker: false,
             is_reviewer: true,
+            is_review_guide: false,
             run_id: None,
             workspace_path: None,
         };

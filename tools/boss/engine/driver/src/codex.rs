@@ -37,11 +37,13 @@ mod guard_python;
 pub mod guard_trace;
 mod pane_monitor;
 mod progress;
+mod review_guide_guard;
 mod reviewer_publish_guard;
 mod rollout_calls;
 mod tool_surface_guard;
 
 use guard_trace::{GUARD_TRACE_SHIM_FILENAME, GUARD_TRACE_SHIM_SCRIPT, guard_trace_path, wrapper_body};
+use review_guide_guard::codex_review_guide_guard_script;
 use reviewer_publish_guard::codex_reviewer_publish_guard_script;
 use tool_surface_guard::codex_tool_surface_guard_script;
 
@@ -493,7 +495,12 @@ pub fn codex_homes_root_and_home_for_run(run_id: &str) -> anyhow::Result<(PathBu
 /// sandbox policy (see [`build_codex_command`]).
 pub fn codex_sandbox_for_worker_kind(worker_kind: WorkerKind, sandbox_enforced: bool) -> Option<&'static str> {
     match worker_kind {
-        WorkerKind::Reviewer => None,
+        // Same no-OS-sandbox posture as `Reviewer`, for the same reason: a
+        // `--sandbox` value relocates the session's working root via `--cd`,
+        // desyncing hook `cwd` from the pane's real working directory. This
+        // kind's enforcement is `review_guide_guard` (a `PreToolUse` guard),
+        // not the OS sandbox.
+        WorkerKind::Reviewer | WorkerKind::ReviewGuide => None,
         WorkerKind::Standard | WorkerKind::Triage | WorkerKind::AnswerAgent => {
             if sandbox_enforced {
                 Some("workspace-write")
@@ -1169,7 +1176,22 @@ fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> 
         });
     }
 
-    // 6. Revision PR guard.
+    // 6. Review-guide no-tool-use guard — the entire enforced-read-only
+    // Astra mandate for this kind. Its job never needs a tool call (the
+    // source packet is already embedded in its prompt), so this blocks
+    // every `PreToolUse` call unconditionally rather than pattern-matching
+    // a publish/write shape. `.*` because it must see every tool name, not
+    // just `Bash`/`apply_patch`. See [`review_guide_guard`].
+    if config.is_review_guide {
+        planned.push(Planned {
+            name: "review_guide_guard",
+            source: GuardSource::Inline(codex_review_guide_guard_script()),
+            matcher: ".*",
+            extra_env: Vec::new(),
+        });
+    }
+
+    // 7. Revision PR guard.
     if config.is_revision {
         planned.push(Planned {
             name: "revision_pr_guard",
@@ -1678,6 +1700,7 @@ impl AgentDriver for CodexDriver {
                 || input.task_kind.as_deref() == Some("revision"),
             is_standard_worker: input.worker_kind == WorkerKind::Standard,
             is_reviewer: input.worker_kind == WorkerKind::Reviewer,
+            is_review_guide: input.worker_kind == WorkerKind::ReviewGuide,
             run_id: Some(input.run_id.clone()),
             workspace_path: Some(input.workspace_path.clone()),
         };

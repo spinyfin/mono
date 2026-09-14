@@ -503,6 +503,7 @@ impl AgentDriver for GrokDriver {
                 || input.task_kind.as_deref() == Some("revision"),
             is_standard_worker: input.worker_kind == WorkerKind::Standard,
             is_reviewer: input.worker_kind == WorkerKind::Reviewer,
+            is_review_guide: input.worker_kind == WorkerKind::ReviewGuide,
             run_id: Some(input.run_id.clone()),
             workspace_path: Some(input.workspace_path.clone()),
         };

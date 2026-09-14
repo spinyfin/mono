@@ -133,6 +133,7 @@ pub fn declaration_horizon_secs(kind: &ExecutionKind) -> i64 {
         | ExecutionKind::ConflictResolution
         | ExecutionKind::InvestigationImplementation
         | ExecutionKind::PrReview
+        | ExecutionKind::PrReviewGuide
         | ExecutionKind::ProductDesign
         | ExecutionKind::ProjectDesign
         | ExecutionKind::TaskImplementation => DEFAULT_DECLARATION_HORIZON_SECS,

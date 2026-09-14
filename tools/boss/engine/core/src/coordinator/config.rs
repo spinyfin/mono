@@ -855,7 +855,7 @@ impl ExecutionCoordinator {
     }
 
     pub(super) fn execution_targets_automation_pool(&self, execution: &WorkExecution) -> bool {
-        if execution.kind == ExecutionKind::AutomationTriage {
+        if execution.kind == ExecutionKind::AutomationTriage || execution.kind == ExecutionKind::PrReviewGuide {
             return true;
         }
         matches!(

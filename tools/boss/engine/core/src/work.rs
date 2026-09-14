@@ -562,6 +562,7 @@ mod proposals;
 mod query_ensure;
 mod review_batches;
 mod review_findings_followup;
+mod review_guide_jobs;
 mod review_guide_sources;
 mod review_verdict_apply;
 mod review_verdicts;
@@ -618,8 +619,13 @@ pub(crate) use products_design::{
     attach_task_doc_link_state, attach_task_doc_link_states, attach_task_doc_link_states_for_groups,
     parse_pr_doc_artifact_id,
 };
+pub(crate) use review_guide_jobs::{
+    PrReviewGuideAttempt, PrReviewGuideSummary, PrReviewGuideVersion, PublishReviewGuideOutcome,
+    RetryReviewGuideOutcome, migrate_pr_review_guide_job_tables,
+};
 pub(crate) use review_guide_sources::{
-    PrSourceCapturePersistOutcome, PrSourceCaptureTrigger, migrate_pr_review_guide_source_capture_tables,
+    PrReviewGuideSourceCapture, PrSourceCapturePersistOutcome, PrSourceCaptureTrigger,
+    migrate_pr_review_guide_source_capture_tables,
 };
 // Only the unit-test suite (and the resolver itself) call this directly;
 // production attach sites go through `attach_task_doc_link_state`.

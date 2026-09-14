@@ -777,6 +777,7 @@ fn materialize_guards_writes_executables() {
         is_revision: false,
         is_standard_worker: false,
         is_reviewer: false,
+        is_review_guide: false,
         run_id: Some("r".into()),
         workspace_path: Some(tmp.path().to_path_buf()),
     };
@@ -800,6 +801,7 @@ fn materialize_guards_adds_static_analysis_guard_for_reviewer() {
         is_revision: false,
         is_standard_worker: false,
         is_reviewer: true,
+        is_review_guide: false,
         run_id: Some("r".into()),
         workspace_path: Some(tmp.path().to_path_buf()),
     };
@@ -831,6 +833,7 @@ fn full_interception(tmp: &Path) -> (PathBuf, ToolUseInterceptionConfig) {
             is_revision: true,
             is_standard_worker: true,
             is_reviewer: false,
+            is_review_guide: false,
             run_id: Some("r".into()),
             workspace_path: Some(tmp.to_path_buf()),
         },

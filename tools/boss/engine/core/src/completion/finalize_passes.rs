@@ -657,6 +657,138 @@ impl WorkerCompletionHandler {
         StopOutcome::AnswerAgent { replied }
     }
 
+    /// Finalize a `pr_review_guide` execution: extract its final assistant
+    /// text (the driver never writes an artifact or calls a publish
+    /// command — its guard blocks every tool call), validate it against the
+    /// comparison it was generated from, and durably publish or fail the
+    /// bound attempt through the transactional fence in
+    /// [`crate::work::WorkDb::publish_pr_review_guide_version`].
+    pub(super) async fn finalize_review_guide(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
+        let comparison_id = execution.work_item_id.clone();
+        let attempt = match self.work_db.pr_review_guide_attempt_for_execution(&execution.id) {
+            Ok(Some(attempt)) => Some(attempt),
+            Ok(None) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    comparison_id,
+                    "review-guide finalizer: no attempt bound to this execution",
+                );
+                None
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    comparison_id,
+                    ?err,
+                    "review-guide finalizer: failed to look up the bound attempt",
+                );
+                None
+            }
+        };
+
+        let published = if let Some(attempt) = &attempt {
+            let (_driver, transcript) = self.read_final_triage_message_with_driver(&execution.id).await;
+            match transcript.into_message() {
+                None => {
+                    if let Err(err) = self
+                        .work_db
+                        .fail_pr_review_guide_attempt(&attempt.id, "the driver produced no assistant text")
+                    {
+                        tracing::warn!(execution_id = %execution.id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to record the no-text failure");
+                    }
+                    false
+                }
+                Some(raw) => match self.work_db.get_pr_review_guide_comparison_by_id(&comparison_id) {
+                    Ok(Some(capture)) => match boss_review_guide::validate_guide_output(&raw, &capture.packet) {
+                        Ok(validated) => {
+                            match self
+                                .work_db
+                                .publish_pr_review_guide_version(&attempt.id, &validated.markdown, &raw)
+                            {
+                                Ok(crate::work::PublishReviewGuideOutcome::Published(_)) => true,
+                                Ok(other) => {
+                                    tracing::info!(execution_id = %execution.id, attempt_id = %attempt.id, ?other, "review-guide finalizer: attempt finished without publishing");
+                                    false
+                                }
+                                Err(err) => {
+                                    tracing::warn!(execution_id = %execution.id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to publish");
+                                    false
+                                }
+                            }
+                        }
+                        Err(issues) => {
+                            let detail = issues
+                                .iter()
+                                .map(|issue| issue.to_string())
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            if let Err(err) = self.work_db.fail_pr_review_guide_attempt(&attempt.id, &detail) {
+                                tracing::warn!(execution_id = %execution.id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to record the validation failure");
+                            }
+                            false
+                        }
+                    },
+                    Ok(None) => {
+                        if let Err(err) = self.work_db.fail_pr_review_guide_attempt(
+                            &attempt.id,
+                            "the comparison this attempt was generated from is gone",
+                        ) {
+                            tracing::warn!(execution_id = %execution.id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to record the missing-comparison failure");
+                        }
+                        false
+                    }
+                    Err(err) => {
+                        tracing::warn!(execution_id = %execution.id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to load the comparison for validation");
+                        false
+                    }
+                },
+            }
+        } else {
+            false
+        };
+
+        let lease_id = execution.cube_lease_id.clone();
+        let workspace_path = execution.workspace_path.clone();
+        let teardown = self.begin_teardown(&execution.id);
+        match self.work_db.complete_pane_parked_execution(
+            &execution.id,
+            "completed",
+            Some(if published {
+                "review guide: published"
+            } else {
+                "review guide: not published"
+            }),
+        ) {
+            Ok(Some(_)) => {}
+            Ok(None) => tracing::debug!(
+                execution_id = %execution.id,
+                "review-guide finalise: execution already terminal; nothing to do",
+            ),
+            Err(err) => tracing::error!(
+                execution_id = %execution.id,
+                ?err,
+                "failed to finalise review-guide execution row",
+            ),
+        }
+        self.finish_worker_teardown(
+            &execution.id,
+            &execution.work_item_id,
+            lease_id.as_deref(),
+            workspace_path.as_deref().map(std::path::Path::new),
+            "review_guide",
+            teardown,
+        )
+        .await;
+
+        tracing::info!(
+            execution_id = %execution.id,
+            comparison_id,
+            published,
+            "review-guide execution finalised",
+        );
+        StopOutcome::ReviewGuide { published }
+    }
+
     /// Run [`Self::finalize_answer_agent`] for `execution_id` from outside the
     /// Stop path — the entry point [`crate::answer_agent_completion_sweep`]
     /// uses once it has positive evidence the agent's work is done but no turn

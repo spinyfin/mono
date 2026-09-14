@@ -90,6 +90,13 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         capability_id: None,
     },
     FeatureFlagSpec {
+        name: "review_guide_generation",
+        description: "Launch enforced-read-only Astra (codex/gpt-6-astra/high) pr_review_guide executions from captured source comparisons. DEFAULT OFF, and only takes effect once `review_guide_source_capture` is also enabled — generation has nothing to consume otherwise. Disable to stop new guide jobs immediately while retaining already-published versions and comments.",
+        category: "review",
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
         name: "review_batch_fanout",
         description: "Dispatch each eligible pull request to three independent Claude, Codex, and Grok leaf reviewers, with durable per-role retry state. DEFAULT OFF — retain the established single-reviewer pipeline until the new fan-out path is explicitly enabled.",
         category: "review",

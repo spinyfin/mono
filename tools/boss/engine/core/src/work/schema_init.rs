@@ -731,6 +731,13 @@ impl WorkDb {
         // guide execution path are enabled, but schema creation is additive
         // and gives every reconciler one durable capture target.
         step!(timer, conn, migrate_pr_review_guide_source_capture_tables)?;
+        // Durable attempts/versions for review-guide generation, plus the
+        // series' additive lifecycle/epoch/readable-pointer columns. Depends
+        // on `migrate_pr_review_guide_source_capture_tables` immediately
+        // above (its `pr_review_guide_source_series`/`_comparisons` tables
+        // must exist first). Rollout stays behind the source-capture flag;
+        // schema creation is additive.
+        step!(timer, conn, migrate_pr_review_guide_job_tables)?;
         step!(timer, conn, Self::stamp_schema_version)?;
         timer.finish();
         Ok(())

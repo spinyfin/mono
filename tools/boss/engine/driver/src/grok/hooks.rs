@@ -502,6 +502,7 @@ mod tests {
             is_revision: false,
             is_standard_worker: true,
             is_reviewer: false,
+            is_review_guide: false,
             run_id: Some("run-1".into()),
             workspace_path: Some(PathBuf::from("/tmp/ws")),
         };

@@ -299,6 +299,9 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::CommentsResolved { .. }
         | FrontendEvent::CommentsReviseDocResult { .. }
         | FrontendEvent::AnswerAgentRunsList { .. }
+        | FrontendEvent::ReviewGuideSummary { .. }
+        | FrontendEvent::ReviewGuideContent { .. }
+        | FrontendEvent::ReviewGuideRetryQueued { .. }
         | FrontendEvent::ReviewTerminalReady { .. }
         | FrontendEvent::LiveWorkspaceTerminalReady { .. }
         | FrontendEvent::MergeWhenReadyAccepted { .. }

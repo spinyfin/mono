@@ -126,6 +126,7 @@ pub(crate) mod proposals;
 // (crate-internal only — nothing outside the engine sees this module).
 pub(crate) mod readoption;
 mod review;
+mod review_guide;
 mod selected_product;
 mod server;
 mod sessions;
@@ -2675,6 +2676,12 @@ async fn handle_frontend_connection(
                     design_docs::handle_get_product_design_doc(ctx, r).await
                 }
                 r @ FrontendRequest::GetPrStatus { .. } => pr_status::handle_get_pr_status(ctx, r).await,
+                r @ FrontendRequest::GetReviewGuideContent { .. } => {
+                    review_guide::handle_get_review_guide_content(ctx, r).await
+                }
+                r @ FrontendRequest::GetReviewGuideSummary { .. } => {
+                    review_guide::handle_get_review_guide_summary(ctx, r).await
+                }
                 r @ FrontendRequest::GetRun { .. } => executions::handle_get_run(ctx, r).await,
                 r @ FrontendRequest::GetSelectedProduct => selected_product::handle_get_selected_product(ctx, r).await,
                 r @ FrontendRequest::GetSettings => engine_meta::handle_get_settings(ctx, r).await,
@@ -2826,6 +2833,7 @@ async fn handle_frontend_connection(
                 r @ FrontendRequest::RetryConflictResolution { .. } => {
                     conflict_resolution::handle_retry_conflict_resolution(ctx, r).await
                 }
+                r @ FrontendRequest::RetryReviewGuide { .. } => review_guide::handle_retry_review_guide(ctx, r).await,
                 r @ FrontendRequest::RevealWorkItem { .. } => work_items::handle_reveal_work_item(ctx, r).await,
                 r @ FrontendRequest::RevokeDecision { .. } => decisions::handle_revoke_decision(ctx, r).await,
                 r @ FrontendRequest::RunAutomation { .. } => automations::handle_run_automation(ctx, r).await,

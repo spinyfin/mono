@@ -509,6 +509,20 @@ impl WorkerCompletionHandler {
                 "stop event: driver reported this turn boundary as an unrecoverable error; \
                  failing the execution instead of nudging a dead process",
             );
+            // This early gate runs before `finalize_review_guide` below ever
+            // gets a chance to fail the bound attempt (a fatal driver error
+            // — e.g. an unavailable Astra/`high` configuration with no
+            // fallback — is exactly a "retryable generation failure" per the
+            // design, not a state that may leave the attempt stuck
+            // `running` forever). Best-effort and non-blocking: the generic
+            // execution-row teardown below is the authoritative outcome
+            // either way.
+            if execution.kind == ExecutionKind::PrReviewGuide
+                && let Ok(Some(attempt)) = self.work_db.pr_review_guide_attempt_for_execution(execution_id)
+                && let Err(err) = self.work_db.fail_pr_review_guide_attempt(&attempt.id, &detail)
+            {
+                tracing::warn!(execution_id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to record the driver-terminal-error failure");
+            }
             return self.finalize_driver_terminal_error(&execution, &detail).await;
         }
 
@@ -530,6 +544,14 @@ impl WorkerCompletionHandler {
         // forever.
         if execution.kind == ExecutionKind::AnswerAgent {
             return self.finalize_answer_agent(&execution).await;
+        }
+
+        // A `pr_review_guide` execution never opens a PR either. Its
+        // enforced read-only guard blocks every tool call, so its raw
+        // Markdown output only ever exists as its final assistant text —
+        // the finalizer extracts, validates, and (fenced) publishes it.
+        if execution.kind == ExecutionKind::PrReviewGuide {
+            return self.finalize_review_guide(&execution).await;
         }
 
         // A `pr_review` reviewer execution never opens a PR. It reads
