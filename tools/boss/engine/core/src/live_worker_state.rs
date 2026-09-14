@@ -238,10 +238,18 @@ struct SlotMeta {
     /// engine-side verdict. Treating it as proof of driver start would
     /// let the engine's own guesses vouch for a driver that never ran.
     /// This field is written by [`LiveWorkerStateRegistry::record_driver_signal`]
-    /// from the hook ingress (a real worker hook, and receipt of a
-    /// `transcript_path`) and from the AgentJsonlFile ingress
+    /// from two call sites in the hook ingress — a real worker hook, and
+    /// receipt of a `transcript_path` — and from the AgentJsonlFile ingress
     /// (`WorkerEventSink::record_driver_attach`: discovery-time file
-    /// progress, or attach to the correlated rollout) — and additionally
+    /// progress or attachment). There is also a non-hook-originated
+    /// writer: [`crate::spawn_ack_sweep::reap_never_started_spawn`]'s
+    /// liveness veto, which records a transcript found on disk as
+    /// [`DriverSignalKind::CorrelatedTranscript`] or
+    /// [`DriverSignalKind::CorrelatedTranscriptUnattachable`] before
+    /// refusing a vetoable reap. That write is still driver-originated in
+    /// the sense this field exists to protect — only the driver itself can
+    /// have produced the transcript the veto found — it just arrives via a
+    /// filesystem probe instead of the hook socket. It is additionally
     /// restored (not fabricated) by
     /// [`LiveWorkerStateRegistry::seed_semantic_progress`] from a durable
     /// checkpoint on re-adoption, carrying forward proof this same field
@@ -272,6 +280,21 @@ struct SlotMeta {
     /// [`SemanticToolCondition::Unknown`]; unknown is never coerced to idle.
     #[builder(default = SemanticToolCondition::Unknown)]
     semantic_tool_condition: SemanticToolCondition,
+    /// Consecutive [`crate::transcript_liveness::TranscriptLiveness::Undeterminable`]
+    /// reap outcomes recorded for this slot's current run by
+    /// [`crate::spawn_ack_sweep::reap_never_started_spawn`]. Reset only by a
+    /// fresh registration (a new spawn or readoption creates a new
+    /// [`SlotEntry`] from scratch) — there is deliberately no "clear on a
+    /// confirmed Absent/Present" path, since either of those returns before
+    /// this counter is ever consulted.
+    #[builder(default)]
+    undeterminable_liveness_passes: u32,
+    /// Whether [`crate::spawn_ack_sweep::raise_liveness_undeterminable_attention`]
+    /// has already fired for this slot's current run. Guards against raising
+    /// the same attention item again on every subsequent pass once the
+    /// threshold has been crossed.
+    #[builder(default = false)]
+    undeterminable_attention_raised: bool,
 }
 
 /// Whether the engine created this slot's current registration.
@@ -327,12 +350,21 @@ pub enum DriverSignalKind {
     TranscriptPath,
     /// A transcript for the run was found on disk by the reaper's own
     /// liveness probe ([`crate::transcript_liveness`]) — a rollout newer
-    /// than the pre-spawn baseline under the run's progress-ingress root,
-    /// or the recorded transcript path itself. Only the driver writes
-    /// either, so this is driver-start proof even when no ingress ever
-    /// delivered an event for the run (2026-09-13: four live Codex workers
-    /// reaped because discovery never attached rollouts that existed).
+    /// than the pre-spawn baseline under the run's progress-ingress root
+    /// that discovery's own correlation rules would also attach, or the
+    /// recorded transcript path itself. Only the driver writes either, so
+    /// this is driver-start proof even when no ingress ever delivered an
+    /// event for the run (2026-09-13: four live Codex workers reaped
+    /// because discovery never attached rollouts that existed).
     CorrelatedTranscript,
+    /// Same proof as [`Self::CorrelatedTranscript`] — a rollout the
+    /// liveness probe found on disk — but one discovery's own correlation
+    /// rules would NOT attach to the run (a `cwd` mismatch, an oversized
+    /// `session_meta`, etc.). Still driver-originated evidence the driver
+    /// ran, but distinguished from a clean attachment: an operator reading
+    /// this signal kind knows discovery has an unrelated bug worth fixing,
+    /// where `CorrelatedTranscript` implies discovery would have worked.
+    CorrelatedTranscriptUnattachable,
 }
 
 impl DriverSignalKind {
@@ -342,6 +374,7 @@ impl DriverSignalKind {
             DriverSignalKind::HookEvent => "hook_event",
             DriverSignalKind::TranscriptPath => "transcript_path",
             DriverSignalKind::CorrelatedTranscript => "correlated_transcript",
+            DriverSignalKind::CorrelatedTranscriptUnattachable => "correlated_transcript_unattachable",
         }
     }
 }
@@ -912,6 +945,29 @@ impl LiveWorkerStateRegistry {
     pub fn driver_signal_at(&self, slot_id: u8) -> Option<i64> {
         let guard = self.inner.lock().expect("registry mutex poisoned");
         guard.get(&slot_id).and_then(|entry| entry.meta.driver_signal_at)
+    }
+
+    /// Record one `LivenessUndeterminable` reap outcome for `run_id`'s live
+    /// slot, so [`crate::spawn_ack_sweep::reap_never_started_spawn`] can
+    /// escalate a permanently-unreadable liveness answer instead of holding
+    /// it forever behind a log line.
+    ///
+    /// Returns `Some(true)` the first time the consecutive count reaches
+    /// `threshold` — the caller should raise exactly one attention item —
+    /// `Some(false)` on every other call (including after the item has
+    /// already been raised, so it is never raised twice for the same
+    /// registration), and `None` when no live slot matches `run_id` (already
+    /// released — a benign no-op).
+    pub fn record_liveness_undeterminable(&self, run_id: &str, threshold: u32) -> Option<bool> {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let entry = guard.values_mut().find(|entry| entry.state.run_id == run_id)?;
+        entry.meta.undeterminable_liveness_passes = entry.meta.undeterminable_liveness_passes.saturating_add(1);
+        let should_raise =
+            entry.meta.undeterminable_liveness_passes == threshold && !entry.meta.undeterminable_attention_raised;
+        if should_raise {
+            entry.meta.undeterminable_attention_raised = true;
+        }
+        Some(should_raise)
     }
 
     /// Whether `slot_id`'s current registration is owed spawn-ack proof

@@ -26,6 +26,11 @@
 //! [`TranscriptLiveness::Undeterminable`], and a caller that would have
 //! reaped must not: an unreadable answer is not "absent", and a false reap
 //! destroys real work.
+//!
+//! [`probe_transcript_liveness`] is synchronous and blocking. Its caller
+//! ([`crate::spawn_ack_sweep::reap_never_started_spawn`]) runs it inside
+//! [`tokio::task::spawn_blocking`] rather than inline on the async reap
+//! path, for the same reason discovery's own scan moved off the runtime.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -60,6 +65,16 @@ pub enum TranscriptLiveness {
         path: PathBuf,
         age_secs: i64,
         bytes: u64,
+        /// Whether discovery's own correlation rules would attach this file
+        /// to the run. Always `true` for [`TranscriptSource::RecordedTranscriptPath`]
+        /// (the hook ingress already correlated it). For
+        /// [`TranscriptSource::Rollout`] this mirrors
+        /// [`crate::agent_jsonl_discovery::RolloutLiveness::Present`]'s
+        /// `correlation`: `false` means the file is the driver's but
+        /// discovery would reject it (a cwd mismatch, an oversized
+        /// `session_meta`, etc.) — proof the driver ran, but a distinct
+        /// signal from a clean attachment, worth telling apart at the reap.
+        discovery_would_attach: bool,
         /// The probe's own description of what it found, for the log.
         detail: String,
     },
@@ -103,8 +118,26 @@ impl fmt::Display for TranscriptLiveness {
 /// Consult every transcript source for `execution_id`.
 ///
 /// Synchronous and blocking (one DB read per source plus a directory scan);
-/// the sweeps that call it already do their DB work inline.
-pub fn probe_transcript_liveness(work_db: &WorkDb, execution_id: &str, now_epoch_secs: i64) -> TranscriptLiveness {
+/// call it from [`tokio::task::spawn_blocking`] rather than inline on an
+/// async task — the directory scan alone can walk up to `MAX_DISCOVERY_DIRS`
+/// directories, which is exactly the kind of unbounded-latency filesystem
+/// work this repo's discovery rework moved off the runtime for the same
+/// reason (see `crate::agent_jsonl_discovery`'s module doc).
+///
+/// `spawned_at_epoch_secs` scopes the [`TranscriptSource::RecordedTranscriptPath`]
+/// source to this run's own incarnation: a transcript path resolved through
+/// `work_db.transcript_path_for_execution` can belong to an earlier
+/// incarnation of the same execution row (the resolver actively prefers
+/// whichever run row has a non-NULL path), so a file last written before
+/// this spawn is reported in `checked`, not treated as proof. The
+/// [`TranscriptSource::Rollout`] source needs no such bound: its baseline is
+/// taken at this spawn, so anything it finds already post-dates it.
+pub fn probe_transcript_liveness(
+    work_db: &WorkDb,
+    execution_id: &str,
+    now_epoch_secs: i64,
+    spawned_at_epoch_secs: Option<i64>,
+) -> TranscriptLiveness {
     let mut checked = Vec::new();
     let mut reasons = Vec::new();
 
@@ -120,7 +153,7 @@ pub fn probe_transcript_liveness(work_db: &WorkDb, execution_id: &str, now_epoch
                 path: path.clone(),
                 age_secs,
                 bytes,
-                correlation,
+                correlation: correlation.clone(),
                 new_files,
             }
             .to_string();
@@ -129,6 +162,7 @@ pub fn probe_transcript_liveness(work_db: &WorkDb, execution_id: &str, now_epoch
                 path,
                 age_secs,
                 bytes,
+                discovery_would_attach: correlation.is_ok(),
                 detail,
             };
         }
@@ -141,15 +175,25 @@ pub fn probe_transcript_liveness(work_db: &WorkDb, execution_id: &str, now_epoch
     match work_db.transcript_path_for_execution(execution_id) {
         Ok(Some(recorded)) => match recorded_transcript(Path::new(&recorded), now_epoch_secs) {
             Ok(Some((age_secs, bytes))) => {
-                return TranscriptLiveness::Present {
-                    source: TranscriptSource::RecordedTranscriptPath,
-                    detail: format!(
-                        "recorded transcript path {recorded} exists ({bytes} bytes, last written {age_secs}s ago)"
-                    ),
-                    path: PathBuf::from(recorded),
-                    age_secs,
-                    bytes,
-                };
+                let modified_epoch = now_epoch_secs.saturating_sub(age_secs);
+                let predates_this_spawn = spawned_at_epoch_secs.is_some_and(|spawned_at| modified_epoch < spawned_at);
+                if predates_this_spawn {
+                    checked.push(format!(
+                        "recorded transcript path {recorded} exists but was last written {age_secs}s ago, \
+                         before this run's spawn — likely left by an earlier incarnation of this execution"
+                    ));
+                } else {
+                    return TranscriptLiveness::Present {
+                        source: TranscriptSource::RecordedTranscriptPath,
+                        detail: format!(
+                            "recorded transcript path {recorded} exists ({bytes} bytes, last written {age_secs}s ago)"
+                        ),
+                        path: PathBuf::from(recorded),
+                        age_secs,
+                        bytes,
+                        discovery_would_attach: true,
+                    };
+                }
             }
             Ok(None) => checked.push(format!("recorded transcript path {recorded} does not exist")),
             Err(err) => reasons.push(format!("recorded transcript path {recorded}: {err}")),

@@ -329,6 +329,14 @@ pub(crate) async fn discover_candidate(
     let prepared = Arc::new(prepared.clone());
     let mut cadence = ScanCadence::start(started);
     let mut reported: HashSet<(PathBuf, String)> = HashSet::new();
+    // Every distinct rejected path ever seen across the whole window, keyed
+    // by path so a later scan's verdict for the same path supersedes an
+    // earlier one. The failure message is built from this, not from the
+    // final scan's `rejected` alone — a file that was seen and rejected
+    // earlier in the window and then rotated, renamed, or removed before the
+    // last scan must still be named in the diagnosis, not silently dropped
+    // back to "nothing appeared".
+    let mut ever_rejected: std::collections::HashMap<PathBuf, CandidateRejection> = std::collections::HashMap::new();
     loop {
         // A `Cancel` during discovery stops it: the engine is tearing the
         // ingress down and there is nothing left to attach to.
@@ -365,8 +373,9 @@ pub(crate) async fn discover_candidate(
                      correlate to this run",
                 );
             }
+            ever_rejected.insert(path.clone(), rejection.clone());
         }
-        let DiscoveryScan { mut matched, rejected } = scan;
+        let DiscoveryScan { mut matched, .. } = scan;
         match matched.len() {
             1 => return Ok(matched.pop()),
             count if count > 1 => {
@@ -379,6 +388,8 @@ pub(crate) async fn discover_candidate(
         // Checked after the scan, never before it: the scan that precedes
         // this test is the authoritative final look at the root.
         if now >= deadline {
+            let mut rejected: Vec<(PathBuf, CandidateRejection)> = ever_rejected.into_iter().collect();
+            rejected.sort_by(|a, b| a.0.cmp(&b.0));
             return Err(DiscoveryFailure {
                 root: prepared.root.path.clone(),
                 name_shape: format!(
@@ -425,34 +436,59 @@ pub(crate) fn scan_matching_paths(
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => return Err(format!("read {}: {err}", dir.display())),
         };
-        for entry in entries.flatten() {
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(_) => continue,
-            };
+        // NOTE: every error branch below that is not `NotFound` returns
+        // `Err`, failing the whole scan, rather than `continue`-ing past the
+        // entry. A silently dropped entry never becomes a `CandidateRejection`
+        // — it appears in neither `matched` nor `rejected` — so a scan that
+        // could not fully inspect the directory would otherwise look
+        // identical to one that inspected it and found nothing, and
+        // `probe_correlated_rollout` would read that as `Absent` and
+        // authorize a reap against a rollout it never actually looked at.
+        // `scan_once`'s callers already turn a whole-scan `Err` into
+        // `Undeterminable`, which is the honest answer here.
+        for entry in entries {
+            let entry = entry.map_err(|err| format!("read a directory entry under {}: {err}", dir.display()))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|err| format!("file type of {}: {err}", entry.path().display()))?;
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let name_shaped = name.starts_with(&ingress.filename_prefix) && name.ends_with(&ingress.filename_suffix);
             if file_type.is_symlink() {
+                // Never followed, whether it points at a file or a
+                // directory (following a symlinked directory risks a
+                // traversal loop). A symlink whose name has the rollout
+                // shape is still a candidate, though: recorded as-is (not
+                // canonicalized — canonicalizing would silently resolve it
+                // to its target's identity) so `validate_candidate_explained`
+                // rejects it with `NotSingleLinkRegularFile` instead of it
+                // vanishing from both `matched` and `rejected`.
+                if name_shaped {
+                    matches.insert(path);
+                }
                 continue;
             }
-            let path = entry.path();
             if file_type.is_dir() {
-                let Ok(canonical) = fs::canonicalize(&path) else {
-                    continue;
+                let canonical = match fs::canonicalize(&path) {
+                    Ok(canonical) => canonical,
+                    // Raced away between `read_dir` and `canonicalize` —
+                    // legitimately gone, not an inspection failure.
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => return Err(format!("canonicalize {}: {err}", path.display())),
                 };
                 if canonical.starts_with(&root.canonical) {
                     stack.push(canonical);
                 }
                 continue;
             }
-            if !file_type.is_file() {
+            if !file_type.is_file() || !name_shaped {
                 continue;
             }
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !name.starts_with(&ingress.filename_prefix) || !name.ends_with(&ingress.filename_suffix) {
-                continue;
-            }
-            let Ok(canonical) = fs::canonicalize(&path) else {
-                continue;
+            let canonical = match fs::canonicalize(&path) {
+                Ok(canonical) => canonical,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(format!("canonicalize {}: {err}", path.display())),
             };
             if canonical.starts_with(&root.canonical) {
                 matches.insert(canonical);
@@ -797,6 +833,33 @@ mod tests {
         assert!(err.contains("longest gap between scans"), "got: {err}");
     }
 
+    /// A file rejected early in the window and then removed before the
+    /// deadline must still be named in the failure — the final scan alone
+    /// would see nothing and wrongly claim absence.
+    #[tokio::test]
+    async fn a_rejected_file_that_disappears_before_the_deadline_is_still_named() {
+        let fx = fixture();
+        let prepared = PreparedSource::new(fx.ingress.clone()).unwrap();
+        let rollout = fx.root.join("rollout-2026-09-13T21-41-42-sess-1.jsonl");
+        std::fs::write(&rollout, session_meta_line("sess-1", &fx.other_dir)).unwrap();
+        let to_remove = rollout.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let _ = fs::remove_file(&to_remove);
+        });
+
+        let err = discover_candidate(&prepared, &mut running_halt(), Duration::from_millis(400))
+            .await
+            .expect_err("the file vanished before it ever correlated");
+
+        assert!(
+            err.contains("rollout-2026-09-13T21-41-42-sess-1.jsonl"),
+            "a rejection seen earlier in the window must survive to the final message even though \
+             the final scan no longer sees the file; got: {err}"
+        );
+        assert!(!err.starts_with("no file named"), "got: {err}");
+    }
+
     /// A rollout that lands late in the window is attached by a later scan.
     #[tokio::test]
     async fn late_rollout_is_attached_before_the_deadline() {
@@ -928,6 +991,66 @@ mod tests {
         assert!(matches!(rejected[0].1, CandidateRejection::CwdMismatch { .. }));
         assert_eq!(rejected[1].0, "rollout-old-sess-0.jsonl");
         assert_eq!(rejected[1].1, CandidateRejection::InBaseline);
+    }
+
+    /// A symlink whose name has the rollout shape must be surfaced as a
+    /// rejection, not silently vanish from both `matched` and `rejected` —
+    /// the shape that previously let an unreadable rollout read as `Absent`.
+    #[cfg(unix)]
+    #[test]
+    fn name_shaped_symlink_is_reported_as_not_single_link_regular_file() {
+        let fx = fixture();
+        let prepared = PreparedSource::new(fx.ingress.clone()).unwrap();
+        let real = fx.root.join("rollout-real-sess-1.jsonl");
+        fs::write(&real, session_meta_line("sess-1", &fx.workspace)).unwrap();
+        let link = fx.root.join("rollout-link-sess-2.jsonl");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let scan = scan_once(&prepared).unwrap();
+        assert_eq!(scan.matched.len(), 1, "the real file still correlates");
+        let symlink_rejection = scan
+            .rejected
+            .iter()
+            .find(|(path, _)| path.file_name().unwrap().to_string_lossy() == "rollout-link-sess-2.jsonl");
+        assert!(
+            matches!(
+                symlink_rejection,
+                Some((_, CandidateRejection::NotSingleLinkRegularFile))
+            ),
+            "a name-shaped symlink must be rejected explicitly, not dropped; got: {scan:?}"
+        );
+    }
+
+    /// A directory this process cannot read must fail the whole scan rather
+    /// than silently skip it — an unreadable directory could be hiding the
+    /// very rollout the reaper is asking about.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directory_fails_the_scan_rather_than_silently_dropping_it() {
+        // Root ignores permission bits, so this guard is what keeps the test
+        // honest instead of falsely passing under a root-run sandbox.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let fx = fixture();
+        // Built BEFORE the locked directory exists: `PreparedSource::new`'s
+        // own baseline scan uses `scan_matching_paths` too, and would
+        // otherwise fail here (correctly) rather than at the `scan_once`
+        // call this test is actually about.
+        let prepared = PreparedSource::new(fx.ingress.clone()).unwrap();
+        let locked = fx.root.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = scan_once(&prepared);
+
+        // Restore permissions so the tempdir can be cleaned up.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = result.expect_err("an unreadable directory must fail the scan, not silently skip it");
+        assert!(err.contains("locked") || err.contains("read"), "got: {err}");
     }
 
     // ─── the liveness probe ──────────────────────────────────────────────────
