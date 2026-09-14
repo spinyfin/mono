@@ -783,6 +783,58 @@ mod tests {
         );
     }
 
+    /// Acceptance: a reviewer's build-command guard (shared unchanged with
+    /// Claude and Codex — see [`REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND`])
+    /// through Grok's own adapter/translation layer, the way a Grok reviewer
+    /// session would actually see it. This executes the script through the
+    /// adapter to confirm a build command is actually denied for Grok —
+    /// `reviewer_gets_the_shared_static_analysis_guard` only checks that the
+    /// guard is wired into `guard_commands`'s output and does not execute
+    /// it — the way the `pr_redirect_guard_*_via_grok_payload` tests above
+    /// do for the PR-redirect guard.
+    #[test]
+    fn reviewer_static_analysis_guard_denies_a_build_command_via_grok_payload() {
+        assert!(
+            python3_available(),
+            "python3 is required for the reviewer guard acceptance test"
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let adapter_path = write_adapter_script(tmp.path());
+
+        let payload = json!({
+            "hookEventName": "pre_tool_use",
+            "toolName": "run_terminal_command",
+            "toolInput": {"command": "cargo test --workspace"},
+        });
+
+        let (code, stdout, _stderr) =
+            run_adapter(&adapter_path, REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND, &payload, true);
+        assert_eq!(code, 0);
+        let decision: serde_json::Value = serde_json::from_str(&stdout).expect(&stdout);
+        assert_eq!(
+            decision["decision"], "deny",
+            "reviewer must not be able to run a build/test command: {stdout}"
+        );
+
+        let benign_payload = json!({
+            "hookEventName": "pre_tool_use",
+            "toolName": "run_terminal_command",
+            "toolInput": {"command": "jj diff --stat"},
+        });
+        let (code, stdout, _stderr) = run_adapter(
+            &adapter_path,
+            REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND,
+            &benign_payload,
+            true,
+        );
+        assert_eq!(code, 0);
+        let decision: serde_json::Value = serde_json::from_str(&stdout).expect(&stdout);
+        assert_eq!(
+            decision["decision"], "allow",
+            "reviewer must still be able to run a read-only command: {stdout}"
+        );
+    }
+
     /// Revision-PR guard: a revision worker attempting `gh pr create` (via
     /// the `write` tool spelling too, to prove the tool-name map is applied
     /// even off the Bash matcher) is refused.

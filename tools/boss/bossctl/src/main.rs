@@ -1340,6 +1340,12 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Review {
             action: review::ReviewAction::Show { work_item, state_root },
         } => review::review_show(cli.json, state_root, work_item),
+        Command::Review {
+            action: review::ReviewAction::Batches { work_item, state_root },
+        } => review::review_batches(cli.json, state_root, work_item),
+        Command::Review {
+            action: review::ReviewAction::LiveBatches { limit, state_root },
+        } => review::review_live_batches(cli.json, state_root, limit),
         Command::LiveStatus {
             action: LiveStatusAction::Debug,
         } => live_status_debug(&cli.socket_path, cli.json).await,
