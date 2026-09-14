@@ -27,6 +27,7 @@ mod command_types;
 mod comments;
 mod dispatch_stats;
 mod doctor;
+mod doctor_spawn;
 mod hosts;
 mod logs;
 mod pause;
