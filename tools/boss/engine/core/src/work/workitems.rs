@@ -411,6 +411,116 @@ impl WorkDb {
         }
     }
 
+    /// Bounce an `active` work item to Backlog when [`crate::orphan_sweep`]
+    /// finds its run ended in a deliberate engine park — a `boss propose done
+    /// --outcome blocked` declaration, or the auto-nudge breaker giving up —
+    /// whose attention item is still open. The board must show the halt
+    /// independently of the attention item (see
+    /// `docs/designs/dispatch-halt-state-vs-attention-items.md`). This reuses the
+    /// `dispatch_failed_reason` / `dispatch_failed_error` / `dispatch_failed_at`
+    /// / Backlog-status representation [`Self::bounce_churn_guard_parked_to_backlog`]
+    /// established, under [`DELIBERATE_PARK_DISPATCH_FAILED_REASON`] instead of
+    /// [`CHURN_GUARD_DISPATCH_FAILED_REASON`] so
+    /// [`crate::dispatch_failure_recovery_sweep`] can tell the two apart and
+    /// never auto-retries this one — a deliberate park is a human decision,
+    /// cleared only by an explicit `bossctl work start` / kanban drag-to-Doing
+    /// (which starts a fresh run and clears the stamp the same way it clears
+    /// any other `dispatch_failed_reason` — see `start_execution_run`), never
+    /// by a condition easing on its own.
+    ///
+    /// `churn_context` is `Some((trip, counted, failing_execution_ids))` when
+    /// the SAME row has also tripped `orphan_sweep`'s churn guard — a worker
+    /// can decide it is blocked only after several unproductive runs. The
+    /// reason stamped is still `deliberate_park` (the park is the stronger,
+    /// human-only-clearable condition), but the body names both conditions
+    /// rather than picking one: the row is not merely churning, it is also
+    /// waiting on a decision.
+    ///
+    /// Best-effort like its churn-guard sibling: the caller has already
+    /// logged the trip via `tracing::warn!`; a failure (or a no-op because the
+    /// row raced a status change) is logged and swallowed rather than
+    /// aborting the sweep pass.
+    ///
+    /// Returns `true` only when the write actually landed (`Ok(true)` from
+    /// [`Self::bounce_dispatch_failed_to_backlog`]), so a caller counting
+    /// bounces on an outcome struct doesn't report the halted state as
+    /// surfaced when the row raced a status change or the write failed —
+    /// the whole point of that counter is confirming a previously invisible
+    /// halt became visible.
+    pub fn bounce_deliberate_park_to_backlog(
+        &self,
+        work_item_id: &str,
+        source: &str,
+        churn_context: Option<(ChurnTrip, i64, &[String])>,
+    ) -> bool {
+        let body = Self::deliberate_park_text(work_item_id, source, churn_context);
+        match self.bounce_dispatch_failed_to_backlog(work_item_id, DELIBERATE_PARK_DISPATCH_FAILED_REASON, &body) {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::warn!(
+                    work_item_id = %work_item_id,
+                    "deliberate park: bounce to backlog was a no-op (work item is no longer todo/active)",
+                );
+                false
+            }
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %work_item_id,
+                    ?err,
+                    "deliberate park: failed to bounce work item to backlog",
+                );
+                false
+            }
+        }
+    }
+
+    /// Body text for [`Self::bounce_deliberate_park_to_backlog`]. Kept apart
+    /// from [`Self::churn_guard_parked_text`] because a park's clearing
+    /// story is different in kind: it is a human decision the worker asked
+    /// for, not a dispatch health condition that resolves itself, so the
+    /// wording must not read as a failure: the worker did its job and is
+    /// waiting on a decision.
+    fn deliberate_park_text(
+        work_item_id: &str,
+        source: &str,
+        churn_context: Option<(ChurnTrip, i64, &[String])>,
+    ) -> String {
+        let park_clause = "its worker's most recent execution ended in a deliberate park — either it declared \
+             itself blocked (`boss propose done --outcome blocked`) or the auto-nudge breaker gave up waiting \
+             for a response — and the attention item raised at the time is still open";
+        match churn_context {
+            None => format!(
+                "The `{source}` sweep is holding this work item in Backlog because {park_clause}. This is not a \
+                 failure: the worker did its job and is waiting on a decision. Review the open attention item, \
+                 then run `bossctl work start {work_item_id}` (or drag the card to Doing) to resume it."
+            ),
+            Some((trip, counted, failing_ids)) => {
+                let ids = if failing_ids.is_empty() {
+                    "(could not resolve the failing execution ids)".to_owned()
+                } else {
+                    failing_ids.join(", ")
+                };
+                let churn_clause = match trip {
+                    ChurnTrip::Window => format!(
+                        "it has ALSO produced {counted} terminal executions within the trailing \
+                         {}h window, {DELIBERATE_PARK_CHURN_COMBINED_MARKER}",
+                        ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS / 3600
+                    ),
+                    ChurnTrip::Consecutive => format!(
+                        "it has ALSO produced {counted} consecutive unproductive terminal executions with no \
+                         successful run in between, {DELIBERATE_PARK_CHURN_COMBINED_MARKER}"
+                    ),
+                };
+                format!(
+                    "The `{source}` sweep is holding this work item in Backlog because {park_clause}; and \
+                     {churn_clause}. Failing executions: {ids}. This is not a failure by itself — the worker \
+                     escalated correctly — but both conditions need a decision. Review the open attention item, \
+                     then run `bossctl work start {work_item_id}` (or drag the card to Doing) to resume it."
+                )
+            }
+        }
+    }
+
     /// File (idempotently) the operator-visible attention item raised when
     /// [`crate::dispatch_stall_escalation`] finds a dispatch timeline stuck
     /// in one stage past

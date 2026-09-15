@@ -7,26 +7,81 @@ struct WorkDispatchFailureBanner: View {
     let reason: String
     let errorText: String?
 
+    /// Mirrors `boss_engine_core::work::DELIBERATE_PARK_DISPATCH_FAILED_REASON`.
+    /// A row carrying this reason is not broken — the worker did its job and
+    /// escalated correctly (it declared itself blocked, or the auto-nudge
+    /// breaker gave up waiting for a response) — so it must not share the
+    /// red "Failed to start" treatment below, which reads as the engine
+    /// having given up on a dispatch it could not get running. Both reasons
+    /// share this one banner (same `dispatch_failed_reason` field, same
+    /// Backlog placement, same clear-on-next-run behavior) because the
+    /// underlying halted-state surface is deliberately the same; only the
+    /// framing differs: the row is not broken, so it must not read as a failure.
+    private static let deliberateParkReason = "deliberate_park"
+
+    /// Mirrors `boss_engine_core::work::DELIBERATE_PARK_CHURN_COMBINED_MARKER`.
+    /// A deliberately parked row that has ALSO tripped the churn guard
+    /// carries this exact substring in its `dispatch_failed_error` body
+    /// (`WorkDb::deliberate_park_text`). The engine unit test
+    /// `combined_park_churn_marker_matches_swift_banner` `include_str!`s
+    /// this file and asserts that constant appears here verbatim, so a
+    /// wording change on either side fails that test instead of silently
+    /// dropping the churn half of the card headline.
+    static let combinedParkChurnMarker = "tripping the churn guard on top of the park"
+
+    private var isDeliberatePark: Bool {
+        reason == Self.deliberateParkReason
+    }
+
     private var reasonLabel: String {
-        reason.replacingOccurrences(of: "_", with: " ")
+        // Combined parks retain the human-only-clearable reason. Their stored
+        // diagnostic text also names the churn guard, including older rows.
+        if isDeliberatePark, errorText?.contains(Self.combinedParkChurnMarker) == true {
+            return "deliberate park + churn guard"
+        }
+        return reason.replacingOccurrences(of: "_", with: " ")
+    }
+
+    var headline: String {
+        isDeliberatePark ? "Waiting on you — \(reasonLabel)" : "Failed to start — \(reasonLabel)"
+    }
+
+    var summary: String? {
+        isDeliberatePark ? "Review the open attention item, then drag to Doing to resume." : errorText
+    }
+
+    /// Parked cards must show the full resume instruction; dispatch-failure
+    /// cards cap the stored diagnostic at three lines. Consumed by `body`
+    /// and asserted from tests so a hard 1-line cap cannot hide behind a
+    /// structurally-unlike control view.
+    var summaryLineLimit: Int? {
+        isDeliberatePark ? nil : 3
+    }
+
+    private var tint: Color {
+        isDeliberatePark ? .blue : .red
+    }
+
+    private var iconName: String {
+        isDeliberatePark ? "person.fill.questionmark" : "exclamationmark.triangle.fill"
     }
 
     var body: some View {
         HStack(alignment: .top, spacing: 6) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.red)
+            Image(systemName: iconName)
+                .foregroundStyle(tint)
                 .font(.caption)
                 .padding(.top, 1)
             VStack(alignment: .leading, spacing: 2) {
-                Text("Failed to start — \(reasonLabel)")
+                Text(headline)
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.primary)
                     .fixedSize(horizontal: false, vertical: true)
-                if let errorText, !errorText.isEmpty {
-                    Text(errorText)
+                if let summary, !summary.isEmpty {
+                    Text(summary)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
-                        .lineLimit(3)
+                        .lineLimit(summaryLineLimit)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -36,10 +91,10 @@ struct WorkDispatchFailureBanner: View {
         .padding(.vertical, 6)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color.red.opacity(0.12))
+                .fill(tint.opacity(0.12))
                 .overlay(
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .strokeBorder(Color.red.opacity(0.4), lineWidth: 1)
+                        .strokeBorder(tint.opacity(0.4), lineWidth: 1)
                 )
         )
         .accessibilityElement(children: .combine)

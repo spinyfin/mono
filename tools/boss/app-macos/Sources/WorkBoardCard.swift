@@ -325,13 +325,18 @@ struct WorkBoardCardItem: View {
     }
 }
 
-/// Rendered directly on a kanban card whenever the engine gave up
-/// starting it (`task.dispatchFailedReason` set) — the card has been
-/// bounced to Backlog with `autostart` cleared, so it will NOT
-/// auto-retry. Distinguishes "failing to start" from "waiting for a
-/// slot": the latter never sets `dispatchFailedReason`, so this banner
-/// never appears on a card that is merely queued behind a full worker
-/// pool (see `WorkTask.boardColumn`).
+/// Rendered directly on a kanban card whenever `task.dispatchFailedReason`
+/// is set — the card has been bounced to Backlog with `autostart` cleared,
+/// so it will NOT auto-retry. Distinguishes "held, needs you" from "waiting
+/// for a slot": the latter never sets `dispatchFailedReason`, so this
+/// banner never appears on a card that is merely queued behind a full
+/// worker pool (see `WorkTask.boardColumn`). Two distinct conditions share
+/// this field and this banner: the engine genuinely gave up starting the
+/// row (a pre-spawn dispatch failure, or the churn guard), and a row whose
+/// worker finished and deliberately parked itself for a human decision
+/// (`deliberate_park` — not a failure at all). See
+/// `WorkDispatchFailureBanner` for how the two are told apart in the
+/// rendering.
 ///
 /// Read-only, and deliberately so: whether the failure is still live is
 /// the engine's call, not this view's. The engine clears
