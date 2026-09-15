@@ -46,6 +46,9 @@ pub struct PrReviewGuideSourceCapture {
     pub observation_sequence: i64,
     pub trigger: String,
     pub packet_hash: String,
+    /// Settled packet: every requested side was read or omitted for a
+    /// reason that is a property of the immutable revision. `true` does
+    /// not mean every side has `content`.
     pub complete: bool,
     pub omission_count: i64,
     pub captured_at: String,
@@ -240,6 +243,7 @@ impl WorkDb {
         if let Some(existing) = existing {
             let should_upgrade = !existing.complete && (complete || omission_count < existing.omission_count);
             if should_upgrade {
+                let superseded_path = existing.packet_path.clone();
                 let packet_path = publish_packet_artifact(&artifact_root, &packet_hash, &packet_bytes)?;
                 tx.execute(
                     "UPDATE pr_review_guide_source_comparisons
@@ -256,7 +260,11 @@ impl WorkDb {
                 )?;
                 select_comparison(&tx, &series_id, &existing.comparison_id, observation_sequence, &now)?;
                 tx.commit()?;
-                gc_unreferenced_packet_artifacts(&conn, &artifact_root)?;
+                if let Some(old_path) = superseded_path
+                    && old_path != packet_path
+                {
+                    delete_unreferenced_packet_artifact(&conn, &artifact_root, &old_path)?;
+                }
                 let mut upgraded = existing;
                 upgraded.packet_hash = packet_hash;
                 upgraded.complete = complete;
@@ -316,7 +324,6 @@ impl WorkDb {
             &capture.captured_at,
         )?;
         tx.commit()?;
-        gc_unreferenced_packet_artifacts(&conn, &artifact_root)?;
         Ok(PrSourceCapturePersistOutcome::Stored(capture))
     }
 
@@ -455,6 +462,34 @@ impl WorkDb {
                 )
             })
     }
+
+    /// Belt-and-braces sweep for packet blobs orphaned by a crash between
+    /// publish and commit. Collects the live path set under `connect()`,
+    /// then walks the store after dropping that guard so the process-wide
+    /// connection mutex is not held for a directory walk.
+    pub fn gc_unreferenced_pr_review_guide_source_artifacts(&self) -> Result<()> {
+        let artifact_root = self.artifact_root()?;
+        {
+            let conn = self.connect()?;
+            // Deleting leftover `*.tmp` files is safe only because
+            // `connect()` serialises every writer — including
+            // `write_blob_atomic`. A concurrent publisher cannot have a
+            // live staging file while this lock is held. Do not copy this
+            // pass onto a `connect_new()` path.
+            delete_orphan_tmp_packet_artifacts(&artifact_root)?;
+            drop(conn);
+        }
+        let live = {
+            let conn = self.connect()?;
+            live_packet_paths(&conn)?
+        };
+        let candidates = unreferenced_packet_blob_paths(&artifact_root, &live);
+        let conn = self.connect()?;
+        for relative in candidates {
+            delete_unreferenced_packet_artifact(&conn, &artifact_root, &relative)?;
+        }
+        Ok(())
+    }
 }
 
 fn select_comparison(
@@ -549,15 +584,36 @@ fn publish_packet_artifact(state_root: &Path, packet_hash: &str, bytes: &[u8]) -
     Ok(relative)
 }
 
-fn gc_unreferenced_packet_artifacts(conn: &Connection, artifact_root: &Path) -> Result<()> {
-    let live: std::collections::HashSet<String> = {
-        let mut stmt = conn.prepare(
-            "SELECT packet_path FROM pr_review_guide_source_comparisons
-             WHERE packet_path IS NOT NULL AND packet_path != ''",
-        )?;
-        stmt.query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<_>>()?
-    };
+fn live_packet_paths(conn: &Connection) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT packet_path FROM pr_review_guide_source_comparisons
+         WHERE packet_path IS NOT NULL AND packet_path != ''",
+    )?;
+    Ok(stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+fn delete_unreferenced_packet_artifact(conn: &Connection, artifact_root: &Path, relative: &str) -> Result<()> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pr_review_guide_source_comparisons WHERE packet_path = ?1",
+        [relative],
+        |row| row.get(0),
+    )?;
+    if count == 0 {
+        let _ = fs::remove_file(artifact_root.join(relative));
+        if let Some(shard) = artifact_root.join(relative).parent()
+            && fs::read_dir(shard)
+                .ok()
+                .is_some_and(|mut entries| entries.next().is_none())
+        {
+            let _ = fs::remove_dir(shard);
+        }
+    }
+    Ok(())
+}
+
+fn delete_orphan_tmp_packet_artifacts(artifact_root: &Path) -> Result<()> {
     let root = artifact_root.join(PACKET_ARTIFACT_DIR);
     let Ok(shards) = fs::read_dir(&root) else {
         return Ok(());
@@ -565,33 +621,52 @@ fn gc_unreferenced_packet_artifacts(conn: &Connection, artifact_root: &Path) -> 
     for shard in shards.flatten() {
         let shard_path = shard.path();
         if !shard_path.is_dir() {
-            let _ = fs::remove_file(&shard_path);
             continue;
         }
         let Ok(files) = fs::read_dir(&shard_path) else {
             continue;
         };
-        let mut empty = true;
+        for file in files.flatten() {
+            if file.file_name().to_string_lossy().ends_with(".tmp") {
+                let _ = fs::remove_file(file.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unreferenced_packet_blob_paths(artifact_root: &Path, live: &std::collections::HashSet<String>) -> Vec<String> {
+    let root = artifact_root.join(PACKET_ARTIFACT_DIR);
+    let Ok(shards) = fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    for shard in shards.flatten() {
+        let shard_path = shard.path();
+        if !shard_path.is_dir() {
+            continue;
+        }
+        let Ok(files) = fs::read_dir(&shard_path) else {
+            continue;
+        };
         for file in files.flatten() {
             let path = file.path();
             let name = file.file_name();
             let name = name.to_string_lossy();
-            let relative = path
-                .strip_prefix(artifact_root)
-                .ok()
-                .and_then(|p| p.to_str())
-                .map(str::to_owned);
-            if name.ends_with(".tmp") || relative.as_ref().is_none_or(|rel| !live.contains(rel)) {
-                let _ = fs::remove_file(&path);
-            } else {
-                empty = false;
+            if name.ends_with(".tmp") {
+                // Staging files are not candidates on this unlocked walk: a
+                // concurrent `write_blob_atomic` may hold one. `.tmp`
+                // cleanup runs only while `connect()` serialises writers.
+                continue;
+            }
+            if let Some(relative) = path.strip_prefix(artifact_root).ok().and_then(|p| p.to_str())
+                && !live.contains(relative)
+            {
+                candidates.push(relative.to_owned());
             }
         }
-        if empty {
-            let _ = fs::remove_dir(&shard_path);
-        }
     }
-    Ok(())
+    candidates
 }
 
 #[cfg(test)]
@@ -604,7 +679,7 @@ mod tests {
 
     fn packet(base: &str, head: &str) -> SourcePacket {
         SourcePacket {
-            schema_version: 2,
+            schema_version: 3,
             canonical_pr_url: "https://github.com/acme/widget/pull/11".to_owned(),
             pr_number: 11,
             title: "Capture immutable comparison".to_owned(),
@@ -612,6 +687,7 @@ mod tests {
             base_repository: "acme/widget".to_owned(),
             head_repository: "acme/widget".to_owned(),
             observed_base_sha: base.to_owned(),
+            probe_base_sha: None,
             merge_base_sha: "merge-base".to_owned(),
             head_sha: head.to_owned(),
             files: vec![SourceFile {
@@ -705,6 +781,7 @@ mod tests {
     }
 
     fn incomplete_packet(base: &str, head: &str, reason: &str) -> SourcePacket {
+        let terminal = !reason.contains("pinned source read failed");
         let mut packet = packet(base, head);
         packet.files[0].after = Some(
             PinnedSource::builder()
@@ -712,12 +789,14 @@ mod tests {
                 .sha(head)
                 .path("src/lib.rs")
                 .omission(reason)
+                .terminal(terminal)
                 .build(),
         );
         packet.omissions = vec![SourceOmission {
             path: Some("src/lib.rs".to_owned()),
             side: Some(SourceSide::After),
             reason: reason.to_owned(),
+            terminal,
         }];
         packet
     }
@@ -770,6 +849,7 @@ mod tests {
             path: Some("src/lib.rs".to_owned()),
             side: Some(SourceSide::Before),
             reason: "second hole".to_owned(),
+            terminal: true,
         });
         let reused = db
             .persist_pr_review_guide_source_capture(&root, 2, PrSourceCaptureTrigger::Poller, &worse)
@@ -1091,5 +1171,98 @@ mod tests {
                 .unwrap(),
             "a settled omission must short-circuit later poller collections"
         );
+    }
+
+    #[test]
+    fn migrate_drops_packet_json_and_adds_omission_summary_on_existing_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pr_review_guide_source_series (
+                id TEXT PRIMARY KEY,
+                root_task_id TEXT NOT NULL,
+                canonical_pr_url TEXT NOT NULL UNIQUE,
+                latest_observation_sequence INTEGER NOT NULL DEFAULT 0,
+                selected_comparison_id TEXT,
+                last_capture_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE pr_review_guide_source_comparisons (
+                id TEXT PRIMARY KEY,
+                series_id TEXT NOT NULL REFERENCES pr_review_guide_source_series(id),
+                observation_sequence INTEGER NOT NULL,
+                observed_base_sha TEXT NOT NULL,
+                merge_base_sha TEXT NOT NULL,
+                head_sha TEXT NOT NULL,
+                trigger TEXT NOT NULL,
+                packet_hash TEXT NOT NULL,
+                complete INTEGER NOT NULL CHECK (complete IN (0, 1)),
+                omission_count INTEGER NOT NULL DEFAULT 0,
+                packet_path TEXT,
+                packet_json TEXT NOT NULL,
+                captured_at TEXT NOT NULL,
+                UNIQUE(series_id, observed_base_sha, head_sha)
+            );
+            CREATE TABLE pr_review_guide_source_observation_sequence (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                last_sequence INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        let packet = packet("base", "head");
+        let bytes = serde_json::to_vec(&packet).unwrap();
+        let hash = packet.content_hash().unwrap();
+        let relative = publish_packet_artifact(dir.path(), &hash, &bytes).unwrap();
+        conn.execute(
+            "INSERT INTO pr_review_guide_source_series
+             (id, root_task_id, canonical_pr_url, latest_observation_sequence, created_at, updated_at)
+             VALUES ('prgs1', 'root', ?1, 1, 'now', 'now')",
+            [&packet.canonical_pr_url],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pr_review_guide_source_comparisons
+             (id, series_id, observation_sequence, observed_base_sha, merge_base_sha, head_sha,
+              trigger, packet_hash, complete, omission_count, packet_path, packet_json, captured_at)
+             VALUES ('prgc1', 'prgs1', 1, 'base', 'merge-base', 'head', 'creation', ?1, 1, 0, ?2, ?3, 'now')",
+            params![hash, relative, "{\"legacy\":true}"],
+        )
+        .unwrap();
+        assert!(table_has_column(&conn, "pr_review_guide_source_comparisons", "packet_json").unwrap());
+        assert!(!table_has_column(&conn, "pr_review_guide_source_comparisons", "omission_summary_json").unwrap());
+        migrate_pr_review_guide_source_capture_tables(&conn).unwrap();
+        assert!(!table_has_column(&conn, "pr_review_guide_source_comparisons", "packet_json").unwrap());
+        assert!(table_has_column(&conn, "pr_review_guide_source_comparisons", "omission_summary_json").unwrap());
+        let loaded = read_capture_by_endpoints(&conn, dir.path(), "prgs1", "base", "head")
+            .unwrap()
+            .expect("pre-existing row must survive DROP COLUMN");
+        assert_eq!(loaded.packet, packet);
+        migrate_pr_review_guide_source_capture_tables(&conn).unwrap();
+        assert!(!table_has_column(&conn, "pr_review_guide_source_comparisons", "packet_json").unwrap());
+        assert!(table_has_column(&conn, "pr_review_guide_source_comparisons", "omission_summary_json").unwrap());
+        assert!(
+            read_capture_by_endpoints(&conn, dir.path(), "prgs1", "base", "head")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn periodic_gc_deletes_orphaned_blobs_without_touching_live_ones() {
+        let (dir, db) = open_db();
+        let product = create_product(&db);
+        let root = create_active_chore(&db, &product, "periodic gc");
+        db.persist_pr_review_guide_source_capture(&root, 1, PrSourceCaptureTrigger::Creation, &packet("base", "head"))
+            .unwrap();
+        let orphan = dir.path().join("review-guide-sources/zz/orphan");
+        fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+        fs::write(&orphan, b"orphan").unwrap();
+        db.gc_unreferenced_pr_review_guide_source_artifacts().unwrap();
+        assert!(
+            !orphan.exists(),
+            "crash-orphaned blob must be collected by the periodic sweep"
+        );
+        assert_eq!(artifact_count(dir.path()), 1);
     }
 }

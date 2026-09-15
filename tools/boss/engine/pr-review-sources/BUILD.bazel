@@ -15,6 +15,7 @@ rust_library(
     ],
     deps = [
         "//tools/boss/github",
+        "@mono_crates//:tracing",
     ] + all_crate_deps(normal = True),
 )
 

@@ -13,11 +13,12 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Version 2 adds the immutable Git-tree manifest (object SHA, mode, and
-/// type) to every captured source side. Consumers can distinguish legacy
-/// packets from the stronger object-verified contract without guessing from
-/// optional fields.
-const PACKET_SCHEMA_VERSION: u32 = 2;
+/// Version 3 records REST `observed_base_sha` as the comparison identity
+/// (the base that determined `merge_base_sha`) and optional `probe_base_sha`
+/// for a GraphQL `baseRefOid` that was allowed to differ. Per-side
+/// `terminal` on omissions makes retryability data rather than a substring
+/// of `reason`.
+const PACKET_SCHEMA_VERSION: u32 = 3;
 
 /// Per-file capture budget. A single side larger than this is recorded as a
 /// [`SourceOmission`] instead of being inlined into the packet.
@@ -46,7 +47,16 @@ pub struct SourcePacket {
     pub body: Option<String>,
     pub base_repository: String,
     pub head_repository: String,
+    /// REST `pulls/{n}` `base.sha` — the identity that determined
+    /// [`Self::merge_base_sha`]. Comparison rows and in-flight capture keys
+    /// use this value, not a GraphQL `baseRefOid` that may track the live
+    /// base tip.
     pub observed_base_sha: String,
+    /// GraphQL `baseRefOid` from an independently observed lifecycle probe.
+    /// `None` when the observation was the same REST resource that supplied
+    /// [`Self::observed_base_sha`].
+    #[serde(default)]
+    pub probe_base_sha: Option<String>,
     pub merge_base_sha: String,
     pub head_sha: String,
     pub files: Vec<SourceFile>,
@@ -54,12 +64,23 @@ pub struct SourcePacket {
 }
 
 impl SourcePacket {
-    /// The packet is complete only when every requested source side was read
-    /// from an immutable revision. A missing API patch remains an omission in
-    /// the manifest but does not make the packet incomplete when its pinned
-    /// before/after sources were successfully captured.
+    /// Settled-packet predicate stored as the durable `complete` column.
+    ///
+    /// A packet is complete when no requested source side can still become
+    /// capturable: each side was read, or omitted for a reason that is a
+    /// property of the immutable revision (see [`PinnedSource::is_settled`]).
+    /// A complete packet may therefore contain sides with no `content` —
+    /// symlink, submodule, over-budget, and tree-absent omissions all settle.
+    /// A missing API patch remains a packet-level omission and does not by
+    /// itself keep the packet incomplete.
     pub fn is_complete(&self) -> bool {
         self.files.iter().all(SourceFile::is_complete)
+    }
+
+    /// Symmetric alias of [`Self::is_complete`] — the per-side predicate is
+    /// [`PinnedSource::is_settled`].
+    pub fn is_settled(&self) -> bool {
+        self.is_complete()
     }
 
     /// Stable SHA-256 over the serialized source contract, for storage and
@@ -113,6 +134,13 @@ pub struct PinnedSource {
     pub content_hash: Option<String>,
     pub byte_count: Option<u64>,
     pub omission: Option<String>,
+    /// When `omission` is set, whether this side is settled (`Some(true)`)
+    /// or should be retried (`Some(false)`). `None` only on packets
+    /// deserialized from schema v2, which lacked the field;
+    /// [`Self::is_settled`] then applies the legacy reason-string
+    /// classification so already-stored packets keep their retry behavior.
+    #[serde(default)]
+    pub terminal: Option<bool>,
 }
 
 impl PinnedSource {
@@ -136,6 +164,7 @@ impl PinnedSource {
             content_hash: Some(content_hash),
             byte_count: Some(byte_count),
             omission: None,
+            terminal: None,
         }
     }
 
@@ -145,6 +174,7 @@ impl PinnedSource {
         path: &str,
         omission: String,
         entry: Option<&boss_github::trees::PinnedTreeEntry>,
+        terminal: bool,
     ) -> Self {
         Self {
             repository: repository.to_owned(),
@@ -157,6 +187,7 @@ impl PinnedSource {
             content_hash: None,
             byte_count: entry.and_then(|entry| entry.size),
             omission: Some(omission),
+            terminal: Some(terminal),
         }
     }
 
@@ -178,6 +209,7 @@ impl PinnedSource {
             content_hash: Some(hex_digest(&bytes)),
             byte_count: Some(bytes.len() as u64),
             omission: Some(BINARY_SOURCE_OMISSION.to_owned()),
+            terminal: Some(true),
         }
     }
 
@@ -193,18 +225,38 @@ impl PinnedSource {
     /// (symlink, submodule, over-budget, absent) rather than a retryable
     /// tree/Contents request failure.
     fn is_settled(&self) -> bool {
-        self.is_captured()
-            || self
-                .omission
-                .as_ref()
-                .is_some_and(|reason| !is_retryable_omission(reason))
+        if self.is_captured() {
+            return true;
+        }
+        let Some(reason) = self.omission.as_ref() else {
+            return false;
+        };
+        match self.terminal {
+            Some(terminal) => terminal,
+            None => !legacy_retryable_omission(reason),
+        }
     }
 }
 
-fn is_retryable_omission(reason: &str) -> bool {
+/// Schema v2 packets stored retryability only as substrings of `reason`.
+/// New packets set [`PinnedSource::terminal`] at construction; this helper
+/// exists solely so already-persisted v2 rows keep the same settle/retry
+/// behavior when deserialized without the field.
+fn legacy_retryable_omission(reason: &str) -> bool {
     reason.contains("could not read pinned tree")
         || reason.contains("pinned source read failed")
         || reason.contains("directory response was truncated")
+}
+
+/// GitHub's Trees API 404 (`NotFound`) and 401/403 (`NotAuthorized`) are
+/// ambiguous for private repos — GitHub returns 404 rather than 403 when
+/// the token cannot see a private repo. `NotFound` is treated as terminal:
+/// a deleted head fork or a SHA that no longer resolves will not become
+/// capturable at this comparison. `NotAuthorized` stays retryable so
+/// restoring a token can recover the same immutable SHA, matching
+/// rate-limited and unreachable tree failures.
+fn tree_error_is_terminal(kind: boss_github::trees::TreeApiErrorKind) -> bool {
+    matches!(kind, boss_github::trees::TreeApiErrorKind::NotFound)
 }
 
 /// GitHub's changed-file classification, preserving the API value instead of
@@ -254,6 +306,11 @@ pub struct SourceOmission {
     pub path: Option<String>,
     pub side: Option<SourceSide>,
     pub reason: String,
+    /// Copied from the corresponding [`PinnedSource::terminal`] (or set
+    /// directly for packet-level omissions). Diagnostic; settling reads
+    /// the per-side field. `false` on schema v2 rows that lack the key.
+    #[serde(default)]
+    pub terminal: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -274,20 +331,46 @@ pub struct SourceReference {
 }
 
 /// Rendering adapters may use a mutable PR-diff target only after independently
-/// validating its file anchor/side/line against the captured packet. The
-/// Files-changed adapter constructs [`RenderedTarget::Validated`] from GitHub's
-/// documented `#diff-<sha256(path)>` fragment; a failed re-validation falls
-/// back to the immutable blob permalink.
+/// validating its file anchor/side/line against a captured hunk for this
+/// comparison. The Files-changed adapter constructs
+/// [`RenderedTarget::Validated`] only when the cited range sits inside a
+/// unified-diff hunk on the owning file and the packet still names the live
+/// comparison; otherwise it falls back to the immutable blob permalink.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum RenderedTarget {
-    Validated { href: String, adapter_version: String },
-    PinnedFallback { href: String, reason: String },
+    Validated {
+        href: String,
+        adapter_version: String,
+        evidence: RenderedTargetEvidence,
+    },
+    PinnedFallback {
+        href: String,
+        reason: String,
+    },
+}
+
+/// Cached proof that a Files-changed fragment corresponded to a captured
+/// hunk at adapter version [`RENDERED_TARGET_ADAPTER_VERSION`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct RenderedTargetEvidence {
+    pub head_sha: String,
+    pub merge_base_sha: String,
+    /// Inventory path whose SHA-256 is the GitHub `#diff-` hash (the current
+    /// filename, including on a rename's Before side).
+    pub file_path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub side: SourceSide,
+    /// Unified-diff hunk header that contained `[start_line, end_line]`.
+    pub hunk: String,
 }
 
 /// The Files-changed adapter version. Fragment construction is
-/// `sha256(path)` as lowercase hex, matching GitHub's PR files page.
-pub const RENDERED_TARGET_ADAPTER_VERSION: &str = "files-changed-diff-fragment-v1";
+/// `sha256(inventory path)` as lowercase hex, and Validated requires the
+/// cited range to sit inside a captured hunk for the bound comparison.
+pub const RENDERED_TARGET_ADAPTER_VERSION: &str = "files-changed-diff-fragment-v2";
 
 /// Validate a range against the captured source and build a full-SHA permalink.
 pub fn validate_pinned_reference(
@@ -337,40 +420,87 @@ pub fn validate_pinned_reference(
             "https://github.com/{}/blob/{}/{}{}",
             source.repository,
             source.sha,
-            encode_path(&source.path),
+            boss_github::trees::encode_tree_path(&source.path),
             fragment
         ),
     })
 }
 
 /// Give callers a Files-changed URL when the range still validates against
-/// the captured packet, otherwise the immutable blob permalink. The reason
-/// accompanies a fallback so a guide's navigation diagnostics stay explicit.
+/// a captured hunk for `current`, otherwise the immutable blob permalink.
+/// The reason accompanies a fallback so a guide's navigation diagnostics
+/// stay explicit.
 pub fn rendered_target_or_pinned_fallback(
     packet: &SourcePacket,
     reference: &SourceReference,
+    current: &PinnedComparison,
     reason: impl Into<String>,
 ) -> RenderedTarget {
-    match validate_pinned_reference(
+    let fallback = |why: String| RenderedTarget::PinnedFallback {
+        href: reference.href.clone(),
+        reason: format!("{why} ({RENDERED_TARGET_ADAPTER_VERSION})"),
+    };
+    if validate_pinned_reference(
         packet,
         reference.side,
         &reference.path,
         reference.start_line,
         reference.end_line,
-    ) {
-        Ok(_) => RenderedTarget::Validated {
-            href: files_changed_href(packet, reference),
-            adapter_version: RENDERED_TARGET_ADAPTER_VERSION.to_owned(),
-        },
-        Err(_) => RenderedTarget::PinnedFallback {
-            href: reference.href.clone(),
-            reason: format!("{} ({RENDERED_TARGET_ADAPTER_VERSION})", reason.into()),
+    )
+    .is_err()
+    {
+        return fallback(reason.into());
+    }
+    if current.head_sha != packet.head_sha || current.base_sha != packet.observed_base_sha {
+        return fallback(format!(
+            "packet comparison {}/{} is not the live comparison {}/{}",
+            packet.observed_base_sha, packet.head_sha, current.base_sha, current.head_sha
+        ));
+    }
+    let Some(file) = source_file_for_reference(packet, reference) else {
+        return fallback(format!(
+            "no inventory file owns {} {:?}",
+            reference.path, reference.side
+        ));
+    };
+    let Some(patch) = file.patch.as_deref() else {
+        return fallback(format!(
+            "GitHub omitted the API patch for `{}`; no rendered hunk to bind",
+            file.path
+        ));
+    };
+    let Some(hunk) = hunk_covering(patch, reference.side, reference.start_line, reference.end_line) else {
+        return fallback(format!(
+            "range {}..{} on {:?} `{}` is outside every captured diff hunk",
+            reference.start_line, reference.end_line, reference.side, file.path
+        ));
+    };
+    RenderedTarget::Validated {
+        href: files_changed_href(packet, file, reference),
+        adapter_version: RENDERED_TARGET_ADAPTER_VERSION.to_owned(),
+        evidence: RenderedTargetEvidence {
+            head_sha: packet.head_sha.clone(),
+            merge_base_sha: packet.merge_base_sha.clone(),
+            file_path: file.path.clone(),
+            start_line: reference.start_line,
+            end_line: reference.end_line,
+            side: reference.side,
+            hunk,
         },
     }
 }
 
-fn files_changed_href(packet: &SourcePacket, reference: &SourceReference) -> String {
-    let hash = hex_digest(reference.path.as_bytes());
+fn source_file_for_reference<'a>(packet: &'a SourcePacket, reference: &SourceReference) -> Option<&'a SourceFile> {
+    packet.files.iter().find(|file| match reference.side {
+        SourceSide::Before => file.before.as_ref().is_some_and(|source| source.path == reference.path),
+        SourceSide::After => file.after.as_ref().is_some_and(|source| source.path == reference.path),
+    })
+}
+
+fn files_changed_href(packet: &SourcePacket, file: &SourceFile, reference: &SourceReference) -> String {
+    // GitHub keys a rename's Files-changed entry on the current filename;
+    // L (old) and R (new) line anchors share that one `#diff-` hash.
+    let hash = hex_digest(file.path.as_bytes());
     let fragment = if reference.start_line == reference.end_line {
         match reference.side {
             SourceSide::Before => format!("L{}", reference.start_line),
@@ -383,6 +513,57 @@ fn files_changed_href(packet: &SourcePacket, reference: &SourceReference) -> Str
         }
     };
     format!("{}/files#diff-{hash}{fragment}", packet.canonical_pr_url)
+}
+
+struct DiffHunk {
+    header: String,
+    old_start: u32,
+    old_len: u32,
+    new_start: u32,
+    new_len: u32,
+}
+
+fn hunk_covering(patch: &str, side: SourceSide, start_line: u32, end_line: u32) -> Option<String> {
+    parse_diff_hunks(patch).into_iter().find_map(|hunk| {
+        let (hunk_start, hunk_len) = match side {
+            SourceSide::Before => (hunk.old_start, hunk.old_len),
+            SourceSide::After => (hunk.new_start, hunk.new_len),
+        };
+        if hunk_len == 0 {
+            return None;
+        }
+        let hunk_end = hunk_start + hunk_len - 1;
+        (start_line >= hunk_start && end_line <= hunk_end).then_some(hunk.header)
+    })
+}
+
+fn parse_diff_hunks(patch: &str) -> Vec<DiffHunk> {
+    patch.lines().filter_map(parse_hunk_header).collect()
+}
+
+fn parse_hunk_header(line: &str) -> Option<DiffHunk> {
+    let rest = line.strip_prefix("@@ ")?;
+    let header_end = rest.find(" @@")?;
+    let spec = rest[..header_end].trim();
+    let mut parts = spec.split_whitespace();
+    let old = parts.next()?.strip_prefix('-')?;
+    let new = parts.next()?.strip_prefix('+')?;
+    let (old_start, old_len) = parse_hunk_span(old)?;
+    let (new_start, new_len) = parse_hunk_span(new)?;
+    Some(DiffHunk {
+        header: format!("@@ {spec} @@"),
+        old_start,
+        old_len,
+        new_start,
+        new_len,
+    })
+}
+
+fn parse_hunk_span(span: &str) -> Option<(u32, u32)> {
+    match span.split_once(',') {
+        Some((start, len)) => Some((start.parse().ok()?, len.parse().ok()?)),
+        None => Some((span.parse().ok()?, 1)),
+    }
 }
 
 /// GitHub-backed reads used by source collection. Production uses
@@ -515,17 +696,23 @@ async fn collect_pinned_source_packet_with_transport<T: SourceTransport + Sync>(
         );
     }
     // Independently observed endpoints come from GraphQL `headRefOid` /
-    // `baseRefOid` (`gh pr view --json`). Runtime check against open PRs
-    // whose base branch has since advanced: REST `pulls/{n}` `base.sha`
-    // equals GraphQL `baseRefOid` (both are the PR's recorded base, not
-    // the live `baseRef.target.oid` tip). They are still different
-    // fields with different update paths, so a probe-shaped observation
-    // is only required to match REST on `head_sha`. REST `base.sha` is
-    // re-checked against itself across the two REST reads so a
-    // mid-collection REST move still bails. The probe's base oid is
-    // stored on the packet as provenance.
+    // `baseRefOid` (`gh pr view --json`). A probe-shaped observation is
+    // only required to match REST on `head_sha`. REST `base.sha` is the
+    // comparison identity stored as `observed_base_sha` (it determined
+    // the merge base); the probe's GraphQL oid is stored separately as
+    // `probe_base_sha`. REST `base.sha` is re-checked against itself
+    // across the two REST reads so a mid-collection REST move still
+    // bails.
     if endpoints_are_independently_observed {
         require_stable_head(observed, &metadata)?;
+        if observed.base_sha != metadata.base_sha {
+            tracing::warn!(
+                probe_base_sha = %observed.base_sha,
+                rest_base_sha = %metadata.base_sha,
+                head_sha = %observed.head_sha,
+                "review-guide source capture: GraphQL baseRefOid diverged from REST base.sha; keying the packet on REST identity"
+            );
+        }
     } else {
         require_stable_endpoints(observed, &metadata)?;
     }
@@ -606,7 +793,7 @@ async fn collect_pinned_source_packet_with_transport<T: SourceTransport + Sync>(
                 &work.sha,
                 &work.key.0,
                 work.entry.as_ref(),
-                work.tree_error.as_deref(),
+                work.tree_error.as_ref(),
             )
             .await;
             (work.key, source)
@@ -628,6 +815,7 @@ async fn collect_pinned_source_packet_with_transport<T: SourceTransport + Sync>(
                 reason: format!(
                     "unrecognised GitHub file status `{status}`; fetched both sides without asserting a modification"
                 ),
+                terminal: true,
             });
         }
         let before_path = file.previous_filename.clone().unwrap_or_else(|| file.filename.clone());
@@ -652,6 +840,7 @@ async fn collect_pinned_source_packet_with_transport<T: SourceTransport + Sync>(
                 path: Some(file.filename.clone()),
                 side: None,
                 reason: "GitHub omitted the API patch; pinned source was collected instead".to_owned(),
+                terminal: true,
             });
         }
         files.push(SourceFile {
@@ -674,7 +863,8 @@ async fn collect_pinned_source_packet_with_transport<T: SourceTransport + Sync>(
         body: metadata.body,
         base_repository: metadata.base_repository,
         head_repository: metadata.head_repository,
-        observed_base_sha: observed.base_sha.clone(),
+        observed_base_sha: metadata.base_sha.clone(),
+        probe_base_sha: endpoints_are_independently_observed.then(|| observed.base_sha.clone()),
         merge_base_sha,
         head_sha: observed.head_sha.clone(),
         files,
@@ -687,7 +877,13 @@ struct SourceFetch {
     repository: String,
     sha: String,
     entry: Option<boss_github::trees::PinnedTreeEntry>,
-    tree_error: Option<String>,
+    tree_error: Option<TreeSideError>,
+}
+
+#[derive(Clone)]
+struct TreeSideError {
+    reason: String,
+    terminal: bool,
 }
 
 /// Reject a collection whose live PR metadata no longer matches the pinned
@@ -713,11 +909,18 @@ fn require_matching_endpoints(
     compare_base: bool,
 ) -> Result<()> {
     if metadata.head_sha != observed.head_sha || (compare_base && metadata.base_sha != observed.base_sha) {
+        if compare_base {
+            bail!(
+                "PR endpoints changed while collecting sources: observed {}/{} but metadata returned {}/{}",
+                observed.base_sha,
+                observed.head_sha,
+                metadata.base_sha,
+                metadata.head_sha,
+            );
+        }
         bail!(
-            "PR endpoints changed while collecting sources: observed {}/{} but metadata returned {}/{}",
-            observed.base_sha,
+            "PR head changed while collecting sources: observed {} but metadata returned {}",
             observed.head_sha,
-            metadata.base_sha,
             metadata.head_sha,
         );
     }
@@ -796,15 +999,16 @@ where
                 }
             }
             result => {
-                let cause = match result {
-                    Ok(_) => "directory response was truncated".to_owned(),
-                    Err(error) => error.to_string(),
+                let (cause, terminal) = match result {
+                    Ok(_) => ("directory response was truncated".to_owned(), false),
+                    Err(error) => (error.to_string(), tree_error_is_terminal(error.kind)),
                 };
                 for name in names {
                     omissions.push(SourceOmission {
                         path: Some(join_repo_path(&directory, &name)),
                         side: Some(side),
                         reason: format!("could not read pinned tree {repository}@{sha} directory {directory}: {cause}"),
+                        terminal,
                     });
                 }
             }
@@ -818,10 +1022,20 @@ fn split_repo_path(path: &str) -> (&str, &str) {
     path.rsplit_once('/').unwrap_or(("", path))
 }
 
-fn omission_reasons(omissions: Vec<SourceOmission>) -> HashMap<String, String> {
+fn omission_reasons(omissions: Vec<SourceOmission>) -> HashMap<String, TreeSideError> {
     omissions
         .into_iter()
-        .filter_map(|omission| omission.path.map(|path| (path, omission.reason)))
+        .filter_map(|omission| {
+            omission.path.map(|path| {
+                (
+                    path,
+                    TreeSideError {
+                        reason: omission.reason,
+                        terminal: omission.terminal,
+                    },
+                )
+            })
+        })
         .collect()
 }
 
@@ -831,10 +1045,10 @@ async fn fetch_source<T: SourceTransport + Sync>(
     sha: &str,
     path: &str,
     entry: Option<&boss_github::trees::PinnedTreeEntry>,
-    tree_error: Option<&str>,
+    tree_error: Option<&TreeSideError>,
 ) -> PinnedSource {
-    if let Some(reason) = tree_error {
-        return PinnedSource::omitted(repository, sha, path, reason.to_owned(), None);
+    if let Some(error) = tree_error {
+        return PinnedSource::omitted(repository, sha, path, error.reason.clone(), None, error.terminal);
     }
     let Some(entry) = entry else {
         return PinnedSource::omitted(
@@ -843,10 +1057,11 @@ async fn fetch_source<T: SourceTransport + Sync>(
             path,
             "path was absent from the pinned Git tree".to_owned(),
             None,
+            true,
         );
     };
     if let Some(reason) = pinned_entry_omission(entry) {
-        return PinnedSource::omitted(repository, sha, path, reason, Some(entry));
+        return PinnedSource::omitted(repository, sha, path, reason, Some(entry), true);
     }
     let Some((owner, repo)) = repository.split_once('/') else {
         return PinnedSource::omitted(
@@ -855,6 +1070,7 @@ async fn fetch_source<T: SourceTransport + Sync>(
             path,
             "repository is not owner/repo".to_owned(),
             Some(entry),
+            true,
         );
     };
     match transport.fetch_repo_file_bytes(owner, repo, path, sha).await {
@@ -866,6 +1082,7 @@ async fn fetch_source<T: SourceTransport + Sync>(
                     path,
                     format!("pinned source exceeds the {MAX_PINNED_SOURCE_BYTES}-byte per-file capture budget"),
                     Some(entry),
+                    true,
                 );
             }
             match String::from_utf8(bytes) {
@@ -877,8 +1094,9 @@ async fn fetch_source<T: SourceTransport + Sync>(
             repository,
             sha,
             path,
-            "file was absent at the pinned revision".to_owned(),
+            "pinned source read failed: Contents returned no bytes after the pinned tree listed a blob".to_owned(),
             Some(entry),
+            false,
         ),
         Err(error) => PinnedSource::omitted(
             repository,
@@ -886,6 +1104,7 @@ async fn fetch_source<T: SourceTransport + Sync>(
             path,
             format!("pinned source read failed: {error:#}"),
             Some(entry),
+            false,
         ),
     }
 }
@@ -914,16 +1133,13 @@ fn record_omission(omissions: &mut Vec<SourceOmission>, source: &PinnedSource, s
             path: Some(source.path.clone()),
             side: Some(side),
             reason: reason.clone(),
+            terminal: source.terminal.unwrap_or(false),
         });
     }
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn encode_path(path: &str) -> String {
-    boss_github::trees::encode_tree_path(path)
 }
 
 #[cfg(test)]
@@ -989,11 +1205,15 @@ mod tests {
             "pinned",
             "broken/a.rs",
             None,
-            Some(&result.1[0].reason),
+            Some(&TreeSideError {
+                reason: result.1[0].reason.clone(),
+                terminal: result.1[0].terminal,
+            }),
         )
         .now_or_never()
         .expect("tree failure needs no Contents request");
         assert_eq!(source.omission.as_deref(), Some(result.1[0].reason.as_str()));
+        assert_eq!(source.terminal, Some(false));
         assert_eq!(result.1[0].path.as_deref(), Some("broken/a.rs"));
         assert_eq!(result.1[1].path.as_deref(), Some("broken/b.rs"));
         assert!(
@@ -1024,6 +1244,7 @@ mod tests {
             base_repository: "acme/widget".to_owned(),
             head_repository: "acme/widget".to_owned(),
             observed_base_sha: "a".repeat(40),
+            probe_base_sha: None,
             merge_base_sha: "b".repeat(40),
             head_sha: "c".repeat(40),
             files: vec![SourceFile {
@@ -1081,15 +1302,32 @@ mod tests {
         assert!(validate_pinned_reference(&packet, SourceSide::After, "src/with space.rs", 1, 1).is_err());
     }
 
+    fn live_comparison(packet: &SourcePacket) -> PinnedComparison {
+        PinnedComparison {
+            base_sha: packet.observed_base_sha.clone(),
+            head_sha: packet.head_sha.clone(),
+        }
+    }
+
     #[test]
     fn rendered_navigation_constructs_a_files_changed_target() {
         let packet = packet();
         let reference = validate_pinned_reference(&packet, SourceSide::After, "src/with space.rs", 1, 1).unwrap();
-        match rendered_target_or_pinned_fallback(&packet, &reference, "unused") {
-            RenderedTarget::Validated { href, adapter_version } => {
+        let hash = hex_digest(b"src/with space.rs");
+        match rendered_target_or_pinned_fallback(&packet, &reference, &live_comparison(&packet), "unused") {
+            RenderedTarget::Validated {
+                href,
+                adapter_version,
+                evidence,
+            } => {
                 assert_eq!(adapter_version, RENDERED_TARGET_ADAPTER_VERSION);
-                assert!(href.contains("/files#diff-"));
-                assert!(href.ends_with("R1"));
+                assert_eq!(
+                    href,
+                    format!("https://github.com/acme/widget/pull/4/files#diff-{hash}R1")
+                );
+                assert_eq!(evidence.file_path, "src/with space.rs");
+                assert_eq!(evidence.hunk, "@@ -1 +1 @@");
+                assert_eq!(evidence.head_sha, packet.head_sha);
             }
             other => panic!("expected Validated, got {other:?}"),
         }
@@ -1101,9 +1339,92 @@ mod tests {
         let mut reference = validate_pinned_reference(&packet, SourceSide::After, "src/with space.rs", 1, 1).unwrap();
         reference.end_line = 99;
         assert!(matches!(
-            rendered_target_or_pinned_fallback(&packet, &reference, "range exceeds captured source"),
+            rendered_target_or_pinned_fallback(
+                &packet,
+                &reference,
+                &live_comparison(&packet),
+                "range exceeds captured source"
+            ),
             RenderedTarget::PinnedFallback { .. }
         ));
+    }
+
+    #[test]
+    fn rendered_navigation_falls_back_for_an_out_of_hunk_line() {
+        let packet = packet();
+        let reference = validate_pinned_reference(&packet, SourceSide::After, "src/with space.rs", 2, 2).unwrap();
+        match rendered_target_or_pinned_fallback(&packet, &reference, &live_comparison(&packet), "unused") {
+            RenderedTarget::PinnedFallback { reason, .. } => {
+                assert!(reason.contains("outside every captured diff hunk"), "{reason}");
+            }
+            other => panic!("expected PinnedFallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rendered_navigation_falls_back_when_the_file_has_no_patch() {
+        let mut packet = packet();
+        packet.files[0].patch = None;
+        let reference = validate_pinned_reference(&packet, SourceSide::After, "src/with space.rs", 1, 1).unwrap();
+        match rendered_target_or_pinned_fallback(&packet, &reference, &live_comparison(&packet), "unused") {
+            RenderedTarget::PinnedFallback { reason, .. } => {
+                assert!(reason.contains("omitted the API patch"), "{reason}");
+            }
+            other => panic!("expected PinnedFallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rendered_navigation_falls_back_when_the_head_moved() {
+        let packet = packet();
+        let reference = validate_pinned_reference(&packet, SourceSide::After, "src/with space.rs", 1, 1).unwrap();
+        let mut current = live_comparison(&packet);
+        current.head_sha = "moved-head".to_owned();
+        match rendered_target_or_pinned_fallback(&packet, &reference, &current, "unused") {
+            RenderedTarget::PinnedFallback { reason, .. } => {
+                assert!(reason.contains("is not the live comparison"), "{reason}");
+            }
+            other => panic!("expected PinnedFallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rendered_navigation_hashes_the_current_filename_on_both_rename_sides() {
+        let mut packet = packet();
+        packet.files[0].path = "new.rs".to_owned();
+        packet.files[0].previous_path = Some("old.rs".to_owned());
+        packet.files[0].change_kind = ChangeKind::Renamed;
+        packet.files[0].patch = Some("@@ -1 +1 @@".to_owned());
+        packet.files[0].before.as_mut().unwrap().path = "old.rs".to_owned();
+        packet.files[0].after.as_mut().unwrap().path = "new.rs".to_owned();
+        packet.files[0].before.as_mut().unwrap().content = Some("was\n".to_owned());
+        packet.files[0].before.as_mut().unwrap().content_hash = Some(hex_digest(b"was\n"));
+        packet.files[0].after.as_mut().unwrap().content = Some("now\n".to_owned());
+        packet.files[0].after.as_mut().unwrap().content_hash = Some(hex_digest(b"now\n"));
+        let before = validate_pinned_reference(&packet, SourceSide::Before, "old.rs", 1, 1).unwrap();
+        let after = validate_pinned_reference(&packet, SourceSide::After, "new.rs", 1, 1).unwrap();
+        let hash = hex_digest(b"new.rs");
+        let current = live_comparison(&packet);
+        match rendered_target_or_pinned_fallback(&packet, &before, &current, "unused") {
+            RenderedTarget::Validated { href, evidence, .. } => {
+                assert_eq!(
+                    href,
+                    format!("https://github.com/acme/widget/pull/4/files#diff-{hash}L1")
+                );
+                assert_eq!(evidence.file_path, "new.rs");
+            }
+            other => panic!("expected Validated before-side, got {other:?}"),
+        }
+        match rendered_target_or_pinned_fallback(&packet, &after, &current, "unused") {
+            RenderedTarget::Validated { href, evidence, .. } => {
+                assert_eq!(
+                    href,
+                    format!("https://github.com/acme/widget/pull/4/files#diff-{hash}R1")
+                );
+                assert_eq!(evidence.file_path, "new.rs");
+            }
+            other => panic!("expected Validated after-side, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1115,6 +1436,7 @@ mod tests {
             "src/with space.rs",
             "pinned source read failed: timeout".to_owned(),
             None,
+            false,
         ));
         assert!(!packet.is_complete());
     }
@@ -1135,6 +1457,7 @@ mod tests {
             "link",
             SYMLINK_SOURCE_OMISSION.to_owned(),
             Some(&link),
+            true,
         );
         assert!(!source.is_captured());
         assert!(source.is_settled());
@@ -1150,6 +1473,7 @@ mod tests {
             path: Some("src/with space.rs".to_owned()),
             side: None,
             reason: "GitHub omitted the API patch; pinned source was collected instead".to_owned(),
+            terminal: true,
         });
         assert!(packet.is_complete());
     }
@@ -1180,6 +1504,7 @@ mod tests {
             path: Some("image.bin".to_owned()),
             side: Some(SourceSide::After),
             reason: BINARY_SOURCE_OMISSION.to_owned(),
+            terminal: true,
         });
         assert!(
             packet.is_complete(),
@@ -1198,7 +1523,7 @@ mod tests {
         };
         let reason = pinned_entry_omission(&link).expect("symlink must be omitted");
         assert!(reason.contains("symlink"));
-        let source = PinnedSource::omitted("acme/widget", &"c".repeat(40), "link", reason, Some(&link));
+        let source = PinnedSource::omitted("acme/widget", &"c".repeat(40), "link", reason, Some(&link), true);
         assert!(!source.is_captured());
         assert!(source.is_settled());
         assert_eq!(source.object_sha.as_deref(), Some(link.object_sha.as_str()));
@@ -1255,9 +1580,17 @@ mod tests {
     }
 
     #[test]
-    fn encode_path_leaves_tilde_unescaped_like_tree_paths() {
-        assert_eq!(encode_path("a~b/c d"), "a~b/c%20d");
-        assert_eq!(encode_path("a~b/c d"), boss_github::trees::encode_tree_path("a~b/c d"));
+    fn permalink_leaves_tilde_unescaped_like_tree_paths() {
+        let mut packet = packet();
+        packet.files[0].path = "a~b/c d".to_owned();
+        packet.files[0].after.as_mut().unwrap().path = "a~b/c d".to_owned();
+        packet.files[0].after.as_mut().unwrap().content = Some("first\n".to_owned());
+        packet.files[0].after.as_mut().unwrap().content_hash = Some(hex_digest(b"first\n"));
+        let reference = validate_pinned_reference(&packet, SourceSide::After, "a~b/c d", 1, 1).unwrap();
+        assert_eq!(
+            reference.href,
+            format!("https://github.com/acme/widget/blob/{}/a~b/c%20d#L1", "c".repeat(40))
+        );
     }
 
     fn rest_metadata(base: &str, head: &str, changed_files: u64) -> boss_github::pr_files::PrComparisonMetadata {
@@ -1424,7 +1757,8 @@ mod tests {
         .now_or_never()
         .expect("fixture collector is ready")
         .unwrap();
-        assert_eq!(packet.observed_base_sha, graphql_base);
+        assert_eq!(packet.observed_base_sha, rest_base);
+        assert_eq!(packet.probe_base_sha.as_deref(), Some(graphql_base));
         assert_eq!(packet.merge_base_sha, merge);
         assert_eq!(packet.head_sha, head);
         assert!(packet.is_complete());
@@ -1531,6 +1865,8 @@ mod tests {
                 .unwrap()
                 .contains("rate limited")
         );
+        assert_eq!(packet.files[3].after.as_ref().unwrap().terminal, Some(false));
+        assert_eq!(packet.files[4].after.as_ref().unwrap().terminal, Some(true));
         assert!(
             packet.files[4]
                 .after
@@ -1591,5 +1927,144 @@ mod tests {
         .to_string();
         assert!(err.contains("head-one"));
         assert!(err.contains("head-two"));
+    }
+
+    #[test]
+    fn poller_seam_head_mismatch_does_not_print_base_shas() {
+        let observed = PinnedComparison {
+            base_sha: "graphql-base".to_owned(),
+            head_sha: "head-one".to_owned(),
+        };
+        let moved = rest_metadata("rest-base", "head-two", 1);
+        let err = require_stable_head(&observed, &moved).unwrap_err().to_string();
+        assert!(err.contains("PR head changed while collecting sources"));
+        assert!(err.contains("head-one"));
+        assert!(err.contains("head-two"));
+        assert!(
+            !err.contains("graphql-base") && !err.contains("rest-base"),
+            "poller-seam head mismatch must not mention REST/GraphQL base SHAs: {err}"
+        );
+    }
+
+    #[test]
+    fn collector_settles_a_not_found_directory_read() {
+        use futures_util::FutureExt;
+        let rest_base = "rest-base";
+        let head = "head";
+        let merge = "merge-base";
+        let metadata = rest_metadata(rest_base, head, 1);
+        let mut trees = HashMap::new();
+        trees.insert(
+            (merge.to_owned(), String::new()),
+            tree(merge, vec![tree_blob("lib.rs", Some(4))]),
+        );
+        trees.insert(
+            (head.to_owned(), String::new()),
+            Err(boss_github::trees::TreeApiError {
+                kind: boss_github::trees::TreeApiErrorKind::NotFound,
+                message: "Not Found".to_owned(),
+            }),
+        );
+        let mut blobs = HashMap::new();
+        blobs.insert((merge.to_owned(), "lib.rs".to_owned()), b"old\n".to_vec());
+        let transport = FixtureTransport {
+            latest: metadata.clone(),
+            merge_base: merge.to_owned(),
+            inventory: vec![inventory_entry("lib.rs", None, "modified", Some("@@"))],
+            trees,
+            blobs,
+        };
+        let packet = collect_pinned_source_packet_with_transport(
+            "https://github.com/acme/widget/pull/4",
+            &PinnedComparison {
+                base_sha: rest_base.to_owned(),
+                head_sha: head.to_owned(),
+            },
+            None,
+            metadata,
+            false,
+            &transport,
+        )
+        .now_or_never()
+        .expect("fixture collector is ready")
+        .unwrap();
+        assert!(
+            packet.is_complete(),
+            "a NotFound tree read must settle rather than retry forever"
+        );
+        assert_eq!(packet.files[0].after.as_ref().unwrap().terminal, Some(true));
+    }
+
+    #[test]
+    fn contents_none_after_a_tree_blob_leaves_the_packet_incomplete() {
+        use futures_util::FutureExt;
+        let rest_base = "rest-base";
+        let head = "head";
+        let merge = "merge-base";
+        let metadata = rest_metadata(rest_base, head, 1);
+        let mut trees = HashMap::new();
+        trees.insert(
+            (merge.to_owned(), String::new()),
+            tree(merge, vec![tree_blob("lib.rs", Some(4))]),
+        );
+        trees.insert(
+            (head.to_owned(), String::new()),
+            tree(head, vec![tree_blob("lib.rs", Some(6))]),
+        );
+        let mut blobs = HashMap::new();
+        blobs.insert((merge.to_owned(), "lib.rs".to_owned()), b"old\n".to_vec());
+        let missing = FixtureTransport {
+            latest: metadata.clone(),
+            merge_base: merge.to_owned(),
+            inventory: vec![inventory_entry("lib.rs", None, "modified", Some("@@"))],
+            trees: trees.clone(),
+            blobs: blobs.clone(),
+        };
+        let first = collect_pinned_source_packet_with_transport(
+            "https://github.com/acme/widget/pull/4",
+            &PinnedComparison {
+                base_sha: rest_base.to_owned(),
+                head_sha: head.to_owned(),
+            },
+            None,
+            metadata.clone(),
+            false,
+            &missing,
+        )
+        .now_or_never()
+        .expect("fixture collector is ready")
+        .unwrap();
+        assert!(
+            !first.is_complete(),
+            "Contents Ok(None) after a tree blob must stay retryable"
+        );
+        assert_eq!(first.files[0].after.as_ref().unwrap().terminal, Some(false));
+        blobs.insert((head.to_owned(), "lib.rs".to_owned()), b"after\n".to_vec());
+        let recovered = FixtureTransport {
+            latest: metadata.clone(),
+            merge_base: merge.to_owned(),
+            inventory: vec![inventory_entry("lib.rs", None, "modified", Some("@@"))],
+            trees,
+            blobs,
+        };
+        let second = collect_pinned_source_packet_with_transport(
+            "https://github.com/acme/widget/pull/4",
+            &PinnedComparison {
+                base_sha: rest_base.to_owned(),
+                head_sha: head.to_owned(),
+            },
+            None,
+            metadata,
+            false,
+            &recovered,
+        )
+        .now_or_never()
+        .expect("fixture collector is ready")
+        .unwrap();
+        assert!(second.is_complete());
+        assert_eq!(
+            second.files[0].after.as_ref().unwrap().content.as_deref(),
+            Some("after\n")
+        );
     }
 }

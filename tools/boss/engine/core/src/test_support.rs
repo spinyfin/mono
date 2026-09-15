@@ -1145,7 +1145,7 @@ pub fn source_capture_packet(pr_url: &str, base_sha: &str, head_sha: &str) -> So
     let (owner, repo, pr_number) = boss_github::pr_url::parse_pr_url_parts(pr_url).unwrap_or(("spinyfin", "mono", 25));
     let repository = format!("{owner}/{repo}");
     SourcePacket {
-        schema_version: 2,
+        schema_version: 3,
         canonical_pr_url: pr_url.to_owned(),
         pr_number,
         title: "Captured".to_owned(),
@@ -1153,6 +1153,7 @@ pub fn source_capture_packet(pr_url: &str, base_sha: &str, head_sha: &str) -> So
         base_repository: repository.clone(),
         head_repository: repository,
         observed_base_sha: base_sha.to_owned(),
+        probe_base_sha: None,
         merge_base_sha: "merge-base".to_owned(),
         head_sha: head_sha.to_owned(),
         files: Vec::new(),
