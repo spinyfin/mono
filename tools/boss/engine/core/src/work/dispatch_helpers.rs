@@ -549,12 +549,7 @@ pub(crate) fn reconcile_work_item_execution(
         return Ok(());
     }
     let insert_fresh = |result: &mut ExecutionReconcileResult, predecessor: Option<&WorkExecution>| -> Result<()> {
-        // Conversion replaces the parked revision with new followup work.
-        // Its historical park must not prevent that new work starting.
-        let converted_followup = predecessor.is_some_and(|execution| {
-            execution.kind == ExecutionKind::RevisionImplementation && kind == ExecutionKind::ChoreImplementation
-        });
-        if !converted_followup && work_item_is_deliberately_parked(conn, work_item_id)? {
+        if work_item_is_deliberately_parked(conn, work_item_id)? {
             tracing::info!(
                 work_item_id,
                 "reconcile: skipping execution mint — this row's run ended in a deliberate park \
@@ -618,8 +613,9 @@ pub(crate) fn reconcile_work_item_execution(
                 // A work item may legitimately change execution families in
                 // place in one narrowly-defined case: a live PR-review
                 // revision becomes a followup when its parent PR merges. Its
-                // now-terminal revision_implementation row is historical
-                // evidence, not a reason to suppress the required
+                // now-terminal revision_implementation row permits conversion
+                // unless deliberately parked, as checked by `insert_fresh`.
+                // Otherwise, mint the required
                 // chore_implementation — this covers not just the ordinary
                 // cancel outcome but also the race where the worker's own
                 // completion (or a dead-PID sweep) terminalizes the row as

@@ -1955,7 +1955,7 @@ mod tests {
         let audit_path =
             audit::default_audit_log_path().expect("a test process always resolves an isolated audit path");
 
-        restart_if_dead(&spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe), 1)
+        let record = restart_if_dead(&spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe), 1)
             .await
             .unwrap()
             .expect("dead pane must be recreated");
@@ -1963,8 +1963,8 @@ mod tests {
         let last = std::fs::read_to_string(&audit_path)
             .unwrap()
             .lines()
-            .last()
-            .and_then(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|event| event["new_spawn_token"] == record.spawn_token)
             .expect("expected a coordinator_recreate audit record");
         assert_eq!(last["event"], "coordinator_recreate");
         assert_eq!(last["trigger"], "tmux_supervisor");
@@ -1990,7 +1990,7 @@ mod tests {
         let audit_path =
             audit::default_audit_log_path().expect("a test process always resolves an isolated audit path");
 
-        restart_if_dead(&spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe), 0)
+        let record = restart_if_dead(&spawn_ctx(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe), 0)
             .await
             .unwrap()
             .expect("missing session must be recreated");
@@ -1998,8 +1998,8 @@ mod tests {
         let last = std::fs::read_to_string(&audit_path)
             .unwrap()
             .lines()
-            .last()
-            .and_then(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|event| event["new_spawn_token"] == record.spawn_token)
             .expect("expected a coordinator_recreate audit record");
         assert_eq!(last["event"], "coordinator_recreate");
         assert_eq!(last["liveness_evidence"]["failed_check"], "tmux_session_exists");

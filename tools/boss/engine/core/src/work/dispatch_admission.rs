@@ -89,14 +89,9 @@ const DELIBERATE_PARK_ATTENTION_KINDS: &[&str] = &[
     crate::completion::NUDGE_BREAKER_ATTENTION_KIND,
 ];
 
-/// `true` when `execution_id` carries an OPEN attention item of one of `kinds`.
-/// The caller chooses the execution: [`work_item_is_deliberately_parked`]
-/// passes the latest so a superseded execution cannot latch the park.
-pub(crate) fn has_open_execution_attention_of_kind_on(
-    conn: &Connection,
-    execution_id: &str,
-    kinds: &[&str],
-) -> Result<bool> {
+/// Execution-scoped attention half of [`work_item_is_deliberately_parked`].
+/// Always called with the latest execution id so superseded executions cannot latch the park.
+fn has_open_execution_attention_of_kind_on(conn: &Connection, execution_id: &str, kinds: &[&str]) -> Result<bool> {
     if kinds.is_empty() {
         return Ok(false);
     }
@@ -134,7 +129,6 @@ pub(crate) fn has_open_execution_attention_of_kind_on(
 /// attention synchronously. Latest-execution scoping assumes automatic mint
 /// paths honor the park before inserting a replacement; PR-review mint paths
 /// instead require `in_review`, while a nudge-breaker park leaves work `active`.
-/// The revision-to-followup conversion deliberately replaces the parked work.
 /// Takes `&Connection` so transactional callers need not re-lock the DB.
 pub(crate) fn work_item_is_deliberately_parked(conn: &Connection, work_item_id: &str) -> Result<bool> {
     let latest: Option<(String, Option<String>)> = conn

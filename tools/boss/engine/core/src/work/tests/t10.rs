@@ -818,7 +818,7 @@ fn request_execution_still_dispatches_a_blocked_declaration() {
     assert_eq!(executions.len(), 2);
 }
 
-fn assert_converted_followup_dispatches(blocked: bool) {
+fn assert_converted_followup_dispatch(blocked: bool) {
     let db = WorkDb::open(temp_db_path("park-converted-followup")).unwrap();
     let product = create_test_product_named(&db, "Converted followup");
     let chore = create_test_chore(&db, product.id.clone(), "Continue review findings");
@@ -842,6 +842,23 @@ fn assert_converted_followup_dispatches(blocked: bool) {
         stamp_blocked_declaration(&db, &predecessor.id);
     }
     let result = db.reconcile_product_executions(&product.id).unwrap();
+    if blocked {
+        assert!(
+            result
+                .created
+                .iter()
+                .all(|execution| execution.work_item_id != chore.id)
+        );
+        let executions = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(
+            executions.len(),
+            1,
+            "a converted followup must honor the revision's park"
+        );
+        assert_eq!(executions[0].id, predecessor.id);
+        assert!(db.dispatch_admission_facts(&chore.id).unwrap().deliberate_parked);
+        return;
+    }
     let created = result
         .created
         .iter()
@@ -854,13 +871,13 @@ fn assert_converted_followup_dispatches(blocked: bool) {
 }
 
 #[test]
-fn reconcile_converted_followup_starts_after_blocked_revision() {
-    assert_converted_followup_dispatches(true);
+fn reconcile_converted_followup_does_not_remint_a_blocked_revision() {
+    assert_converted_followup_dispatch(true);
 }
 
 #[test]
 fn reconcile_converted_followup_starts_after_unblocked_revision() {
-    assert_converted_followup_dispatches(false);
+    assert_converted_followup_dispatch(false);
 }
 
 #[test]
