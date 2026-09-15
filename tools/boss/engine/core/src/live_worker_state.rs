@@ -93,10 +93,12 @@ impl LiveSpawnRouting {
 pub const DEFAULT_LAUNCH_MODEL: &str = "opus";
 
 /// How long a slot must be stuck in `Spawning` with no hook events before
-/// [`LiveWorkerStateRegistry::mark_stalled_spawns`] transitions it to
-/// `WaitingForInput`. 30 seconds matches the dead-PID grace period and
-/// gives a fresh-but-slow worker enough runway while being well below the
-/// typical interactive-wait tolerance.
+/// [`LiveWorkerStateRegistry::mark_stalled_spawns`] will promote it —
+/// to `WaitingForInput` when the driver declared
+/// `Capability::AwaitingInputSignal`, or to `Idle` when it did not but
+/// `driver_signal_at` is already set. 30 seconds matches the dead-PID
+/// grace period and gives a fresh-but-slow worker enough runway while
+/// being well below the typical interactive-wait tolerance.
 ///
 /// This threshold only ever promotes slots that already have a reported
 /// `shell_pid` (see the guard in `mark_stalled_spawns`) — a slot with no
@@ -231,13 +233,15 @@ struct SlotMeta {
     ///
     /// `last_event_at` is a *display* timestamp and is written by paths
     /// that are not the driver: [`LiveWorkerStateRegistry::mark_stalled_spawns`]
-    /// synthesizes one when it promotes a slot to `WaitingForInput`, and
+    /// synthesizes one when it promotes a slot out of `Spawning`, and
     /// [`LiveWorkerStateRegistry::mark_errored`] stamps one on an
     /// engine-side verdict. Treating it as proof of driver start would
     /// let the engine's own guesses vouch for a driver that never ran.
     /// This field is written by [`LiveWorkerStateRegistry::record_driver_signal`]
-    /// from exactly two call sites in the hook ingress — a real worker
-    /// hook, and receipt of a `transcript_path` — and additionally
+    /// from the hook ingress (a real worker hook, and receipt of a
+    /// `transcript_path`) and from the AgentJsonlFile ingress
+    /// (`WorkerEventSink::record_driver_attach`: discovery-time file
+    /// progress, or attach to the correlated rollout) — and additionally
     /// restored (not fabricated) by
     /// [`LiveWorkerStateRegistry::seed_semantic_progress`] from a durable
     /// checkpoint on re-adoption, carrying forward proof this same field
@@ -1384,8 +1388,9 @@ impl LiveWorkerStateRegistry {
     }
 
     /// Detect worker slots stuck in `Spawning` with no hook events for
-    /// longer than `threshold_secs` seconds and transition them to
-    /// `WaitingForInput`.
+    /// longer than `threshold_secs` seconds and transition them off
+    /// `Spawning`, onto whichever activity the driver's own liveness
+    /// evidence actually supports.
     ///
     /// The initial directory-trust prompt that Claude Code shows at
     /// session startup (for models that use `--permission-mode auto`)
@@ -1395,9 +1400,8 @@ impl LiveWorkerStateRegistry {
     /// prompt, so the run stalls indefinitely with no UI signal. This
     /// method is the detection path: if `last_event_at` is `None` (no
     /// hook at all) and the slot has been in `Spawning` for more than
-    /// `threshold_secs` seconds, the activity is promoted to
-    /// `WaitingForInput` so the existing kanban dot and
-    /// `WorkerWaitingIndicator` fire.
+    /// `threshold_secs` seconds, the activity is promoted so the existing
+    /// kanban dot fires instead of sitting on the `Spawning`/unknown icon.
     ///
     /// **Requires `shell_pid > 0`.** A slot that never reported a shell
     /// pid at all has produced no evidence that any process — let alone
@@ -1411,31 +1415,59 @@ impl LiveWorkerStateRegistry {
     /// `crate::spawn_ack_sweep::run_one_pass`, which terminal-fails and
     /// redispatches it after a longer grace window.
     ///
-    /// **Also gated on `awaiting_input_capable`.** A slot whose driver
-    /// doesn't declare `Capability::AwaitingInputSignal` is left in
-    /// `Spawning` here too — promoting it would be exactly the same kind
-    /// of "no events for N seconds ⇒ assume the worker awaits a human"
-    /// guess `apply_event` refuses to make for an untrusted `Notification`.
+    /// **Two liveness bases, branched on `awaiting_input_capable`.** A
+    /// driver's capability declaration decides which claim Boss is allowed
+    /// to make, not whether it may claim anything at all:
+    ///
+    /// - A driver that declares `Capability::AwaitingInputSignal` (Claude)
+    ///   gets the directory-trust-prompt promotion above: silence alone
+    ///   (`last_event_at == None`) is read as "blocked on the initial
+    ///   prompt" and promoted to `WaitingForInput`.
+    /// - A driver that omits it (Codex, Grok) never gets that promotion —
+    ///   guessing "awaits a human" from silence is exactly the kind of
+    ///   "no events for N seconds ⇒ assume blocked" leap `apply_event`
+    ///   refuses to make for an untrusted `Notification` from the same
+    ///   driver class. But the omission is a claim about the *stream*, not
+    ///   about whether Boss has any evidence at all — `meta.driver_signal_at`
+    ///   is a *different*, capability-independent fact: a driver-originated
+    ///   signal (a hook event, or a resolved `transcript_path`) has been
+    ///   observed for this run. For a file-ingress driver like Codex that
+    ///   fires as soon as discovery sees the rollout grow — even while the
+    ///   first `session_meta` line is still incomplete — and again when
+    ///   `AgentJsonlProgressManager` attaches. Proof the process is alive
+    ///   and has begun writing its transcript, well before the reader has
+    ///   parsed (let alone dispatched) a single complete record. Wait a
+    ///   full turn's `thinking` before the first parseable line and this
+    ///   sweep is the only thing that would otherwise notice the worker is
+    ///   stuck showing `Spawning`/unknown. When that proof exists, the
+    ///   honest claim is
+    ///   `Idle` — alive, no specific claim about what it is doing — never
+    ///   `WaitingForInput`, which this driver class gave no basis for. When
+    ///   even that proof is absent, this sweep still leaves the slot in
+    ///   `Spawning` rather than guess; `dead_pid_sweep`'s process-liveness
+    ///   backstop and driver-start verification (below) are the honest
+    ///   fallback for that case.
     ///
     /// ## Reconciliation with driver-start verification
     ///
-    /// Both skips above are *presentation* decisions — "may Boss claim
-    /// this worker awaits a human?" — and both remain correct as stated.
-    /// What they must never do is decide whether the slot keeps its
-    /// resources, and before driver-start verification existed they did
-    /// exactly that by omission: the `awaiting_input_capable` skip left
+    /// Both promotion decisions above are *presentation* decisions — "what
+    /// may Boss claim this worker is doing?" — and neither decides whether
+    /// the slot keeps its resources. Before driver-start verification
+    /// existed, the capability skip did exactly that by omission: it left
     /// grok's never-started spawn parked at `Spawning` forever, and the
     /// promotion in the capability-declaring case moved the slot out of
-    /// `Spawning` where `spawn_ack_sweep`'s activity filter could no
-    /// longer see it. Neither escape survives now:
+    /// `Spawning` where `spawn_ack_sweep`'s activity filter could no longer
+    /// see it. Neither escape survives now:
     ///
     /// - [`Self::unverified_driver_starts`] reads only `driver_signal_at`
     ///   and `spawned_at`, so it is blind to activity, capability and pid
-    ///   and covers both branches identically.
+    ///   and covers every branch above identically.
     /// - The `last_event_at` this method synthesizes below is explicitly
     ///   NOT a driver signal. It moves the display timestamp only;
-    ///   `driver_signal_at` is untouched, so a promotion here can never
-    ///   vouch for a driver that never ran.
+    ///   `driver_signal_at` is untouched (and, in the `Idle` branch, was
+    ///   already set by the real driver-originated signal that justified
+    ///   the promotion — this method never writes it), so a promotion here
+    ///   can never vouch for a driver that never ran.
     ///
     /// Returns the slot IDs that were changed so callers can broadcast
     /// the updated snapshot. Normal-running workers (whose `SessionStart`
@@ -1454,17 +1486,6 @@ impl LiveWorkerStateRegistry {
                 // owns this slot, not the directory-trust-prompt path.
                 continue;
             }
-            if !meta.awaiting_input_capable {
-                // This driver never declared `Capability::AwaitingInputSignal`,
-                // so — same "don't fake it" contract `apply_event` enforces on
-                // `Notification` — this sweep must not promote the slot either.
-                // Leave it in `Spawning` rather than guess, mirroring the
-                // zero-pid case just above; `dead_pid_sweep`'s process-liveness
-                // backstop is the honest fallback for this driver class (see
-                // the design doc's "ProgressObservation minimum-fidelity tier"
-                // decision).
-                continue;
-            }
             if state.last_event_at.is_some() {
                 // SessionStart (or any other hook) already fired — the
                 // worker is past the startup phase; not our concern.
@@ -1474,7 +1495,25 @@ impl LiveWorkerStateRegistry {
                 // Spawned too recently; give the worker more time.
                 continue;
             }
-            state.activity = WorkerActivity::WaitingForInput;
+            let promoted = if meta.awaiting_input_capable {
+                WorkerActivity::WaitingForInput
+            } else if meta.driver_signal_at.is_some() {
+                // No capability-backed basis to claim "awaits a human", but
+                // real driver-originated evidence (a hook, or — for Codex —
+                // rollout file growth during discovery, or attach) says the
+                // process is alive. See the branch above for why `Idle`,
+                // not `WaitingForInput`, is the only honest claim here.
+                WorkerActivity::Idle
+            } else {
+                // Neither a capability-backed guess nor driver-originated
+                // evidence exists yet. Leave it in `Spawning` rather than
+                // guess, mirroring the zero-pid case above; `dead_pid_sweep`'s
+                // backstop and driver-start verification's reap are the
+                // honest fallback for this case (see the design doc's
+                // "ProgressObservation minimum-fidelity tier" decision).
+                continue;
+            };
+            state.activity = promoted;
             // Display timestamp only — this is the engine narrating its
             // own inference, not the driver reporting in. `driver_signal_at`
             // is deliberately NOT written here: if it were, this promotion

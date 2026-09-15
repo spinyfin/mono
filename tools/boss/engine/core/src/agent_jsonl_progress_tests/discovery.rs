@@ -68,11 +68,17 @@ async fn rejected_candidate_after_overdue_refreshes_diagnostics_and_can_recover(
 struct ObservingSink {
     events: Arc<Mutex<Vec<IncomingHookEvent>>>,
     observations: Arc<Mutex<Vec<IngressObservation>>>,
+    attached_runs: Arc<Mutex<Vec<String>>>,
     notify: Arc<Notify>,
 }
 
 #[async_trait::async_trait]
 impl WorkerEventSink for ObservingSink {
+    fn record_driver_attach(&self, run_id: &str) {
+        self.attached_runs.lock().unwrap().push(run_id.to_owned());
+        self.notify.notify_waiters();
+    }
+
     async fn dispatch_worker_event(&self, incoming: IncomingHookEvent) {
         self.events.lock().unwrap().push(incoming);
         self.notify.notify_waiters();

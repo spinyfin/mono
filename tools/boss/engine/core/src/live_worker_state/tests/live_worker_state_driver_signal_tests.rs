@@ -258,6 +258,27 @@ fn mark_stalled_spawns_capability_exemption_does_not_extend_to_driver_start() {
     );
 }
 
+/// Closes the gap this exemption otherwise leaves open: a capability-less
+/// driver (Codex, Grok) with real driver-originated evidence —
+/// `driver_signal_at`, e.g. from `record_driver_attach` observing the
+/// rollout file — must still leave `Spawning`, just onto `Idle` rather than
+/// the `WaitingForInput` guess this driver class gives no basis for.
+#[test]
+fn mark_stalled_spawns_promotes_to_idle_on_driver_signal_without_capability() {
+    let reg = LiveWorkerStateRegistry::new();
+    aged_slot_with_live_shell(&reg, 1, "run-a", false);
+    assert_eq!(
+        reg.record_driver_signal("run-a", DriverSignalKind::TranscriptPath),
+        Some(1)
+    );
+
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    assert_eq!(reg.mark_stalled_spawns(now, STALLED_SPAWN_THRESHOLD_SECS), vec![1]);
+    let state = reg.get(1).unwrap();
+    assert_eq!(state.activity, WorkerActivity::Idle);
+    assert!(state.last_event_at.is_some());
+}
+
 /// The promotion path's synthesized `last_event_at` must not be mistaken
 /// for driver evidence, and leaving `Spawning` must not hide the slot.
 #[test]

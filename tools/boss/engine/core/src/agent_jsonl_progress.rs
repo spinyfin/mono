@@ -15,7 +15,7 @@ use std::fs;
 use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{oneshot, watch};
@@ -555,12 +555,22 @@ impl VerifiedRoot {
     }
 }
 
+/// Size and mtime of a matching rollout at prepare time. Discovery compares
+/// live files against this so a growing-but-unparseable first line still
+/// counts as driver-originated evidence.
+#[derive(Clone, Copy, Debug)]
+struct FileProgress {
+    len: u64,
+    mtime: Option<SystemTime>,
+}
+
 #[derive(Clone, Debug)]
 struct PreparedSource {
     ingress: AgentJsonlFileIngress,
     root: VerifiedRoot,
     canonical_workspace: PathBuf,
     baseline: HashSet<PathBuf>,
+    baseline_progress: HashMap<PathBuf, FileProgress>,
 }
 
 impl PreparedSource {
@@ -579,11 +589,13 @@ impl PreparedSource {
         let root = VerifiedRoot::new(&ingress.directory)?;
         let canonical_workspace = fs::canonicalize(&ingress.workspace_path)
             .map_err(|err| format!("canonicalize workspace {}: {err}", ingress.workspace_path.display()))?;
+        let baseline_progress = snapshot_file_progress(&baseline);
         Ok(Self {
             ingress,
             root,
             canonical_workspace,
             baseline,
+            baseline_progress,
         })
     }
 }
@@ -936,6 +948,7 @@ async fn run_prepared<S>(
             };
             let (candidate, discovery_secs) = match discovery.run(&mut halt).await {
                 Ok(Some(found)) => found,
+
                 Ok(None) => return,
                 Err(err) => {
                     tracing::error!(
@@ -992,6 +1005,13 @@ async fn run_prepared<S>(
         },
     )
     .await;
+    // Proof of life at attach, in case discovery never observed size/mtime
+    // growth (readoption of an already-complete rollout, or a file that
+    // appeared fully formed between polls). Discovery records the same
+    // signal earlier for a growing-but-unparseable first line; the sink is
+    // idempotent, so a second call here keeps the first timestamp.
+
+    sink.record_driver_attach(&run_id);
     let transcript_path = candidate.path.clone();
     // Resolved here, once, so the per-event write below is a single keyed
     // update. A store that cannot resolve it still gets its checkpoints — the
@@ -1103,6 +1123,7 @@ where
         let mut rejected_candidates = 0usize;
         let mut rejections = Vec::new();
         let mut recorded_diagnostics = None;
+        let mut recorded_live = false;
         loop {
             // A `Cancel` during discovery stops it: the engine is tearing the
             // ingress down and there is nothing left to attach to.
@@ -1115,6 +1136,15 @@ where
                 Ok(pass) => {
                     rejected_candidates = pass.rejected_candidates;
                     rejections = pass.rejections;
+                    // File existence and growth are driver-originated evidence even
+                    // when the first `session_meta` line is still incomplete. Record
+                    // that independently of `diagnose_candidate`, or a Codex run whose
+                    // first line takes longer than the 30s stalled-spawn threshold to
+                    // terminate stays in `Spawning` with `driver_signal_at` unset.
+                    if !recorded_live && pass.file_progress {
+                        self.sink.record_driver_attach(self.run_id);
+                        recorded_live = true;
+                    }
                     pass.matches
                 }
                 Err(err) => {
@@ -1160,6 +1190,7 @@ where
     fn scan_once(&self) -> Result<ScanPass, String> {
         self.prepared.root.revalidate()?;
         let paths = scan_matching_paths(&self.prepared.root, &self.prepared.ingress)?;
+        let file_progress = matching_file_shows_progress(self.prepared, &paths);
         let mut new_paths = paths.difference(&self.prepared.baseline).collect::<Vec<_>>();
         new_paths.sort();
         let mut matches = Vec::new();
@@ -1189,6 +1220,7 @@ where
             rejected_candidates,
             matches,
             rejections,
+            file_progress,
         })
     }
 
@@ -1293,6 +1325,60 @@ struct ScanPass {
     matches: Vec<Candidate>,
     rejected_candidates: usize,
     rejections: Vec<CandidateRejection>,
+    file_progress: bool,
+}
+
+fn snapshot_file_progress(paths: &HashSet<PathBuf>) -> HashMap<PathBuf, FileProgress> {
+    let mut out = HashMap::new();
+    for path in paths {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !single_link_regular(&metadata) {
+            continue;
+        }
+        out.insert(
+            path.clone(),
+            FileProgress {
+                len: metadata.len(),
+                mtime: metadata.modified().ok(),
+            },
+        );
+    }
+    out
+}
+
+/// True when a matching rollout is new since the pre-spawn baseline (and
+/// non-empty) or an already-baselined file has grown in size or mtime.
+/// Does not require a parseable `session_meta` line.
+fn matching_file_shows_progress(prepared: &PreparedSource, paths: &HashSet<PathBuf>) -> bool {
+    for path in paths {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !single_link_regular(&metadata) {
+            continue;
+        }
+        let current = FileProgress {
+            len: metadata.len(),
+            mtime: metadata.modified().ok(),
+        };
+        match prepared.baseline_progress.get(path) {
+            Some(base) if prepared.baseline.contains(path) => {
+                if current.len > base.len {
+                    return true;
+                }
+                if let (Some(now), Some(then)) = (current.mtime, base.mtime)
+                    && now > then
+                {
+                    return true;
+                }
+            }
+            _ if current.len > 0 => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn scan_matching_paths(root: &VerifiedRoot, ingress: &AgentJsonlFileIngress) -> Result<HashSet<PathBuf>, String> {

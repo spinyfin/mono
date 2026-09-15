@@ -176,11 +176,21 @@ pub async fn mirror_stalled_spawn_wait(
 /// Resolve each stalled slot to its run id and kind, and mirror the
 /// promotion onto the row via [`mirror_stalled_spawn_wait`].
 ///
+/// `mark_stalled_spawns` returns every slot it moved out of `Spawning`,
+/// including capability-less drivers promoted to [`WorkerActivity::Idle`]
+/// on attach evidence. Only [`WorkerActivity::WaitingForInput`] is a wait
+/// the row should absorb: `Idle` is "alive, no specific claim", and
+/// [`awaiting_input_transition`] only clears `waiting_human` on a
+/// transition *out of* `WaitingForInput`. Mirroring an Idle promotion
+/// would stamp `waiting_human` with nothing able to repair it. The Idle
+/// slots still belong in `stalled` so the timer can broadcast the pane
+/// update; they just must not reach the row write.
+///
 /// This is the sole call site both `app/server.rs`'s stalled-spawn timer and
-/// its tests should use — pulling the slot resolution and the `pr_review`
-/// skip out of the timer body means the two can never diverge, and a test
-/// that calls this function is actually pinning the production wiring
-/// rather than a re-typed copy of it.
+/// its tests should use — pulling the slot resolution, the activity gate,
+/// and the `pr_review` skip out of the timer body means the two can never
+/// diverge, and a test that calls this function is actually pinning the
+/// production wiring rather than a re-typed copy of it.
 pub async fn mirror_stalled_spawn_waits(
     registry: &LiveWorkerStateRegistry,
     work_db: &Arc<WorkDb>,
@@ -191,6 +201,9 @@ pub async fn mirror_stalled_spawn_waits(
         let Some(state) = registry.get(*slot_id) else {
             continue;
         };
+        if state.activity != WorkerActivity::WaitingForInput {
+            continue;
+        }
         let is_pr_review = state.kind.as_deref() == Some(ExecutionKind::PrReview.as_str());
         mirror_stalled_spawn_wait(work_db, publisher, &state.run_id, is_pr_review).await;
     }
@@ -295,6 +308,12 @@ mod tests {
         );
         assert_eq!(
             awaiting_input_transition(Some(WorkerActivity::Spawning), Some(WorkerActivity::Working)),
+            None,
+        );
+        // Capability-less Idle promotion, then a real event: must not be
+        // mistaken for leaving a wait, because the slot never entered one.
+        assert_eq!(
+            awaiting_input_transition(Some(WorkerActivity::Idle), Some(WorkerActivity::Working)),
             None,
         );
         // Re-asserting the wait (a second Notification, or a Stop that
