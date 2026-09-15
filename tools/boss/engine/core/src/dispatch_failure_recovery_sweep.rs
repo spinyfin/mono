@@ -100,7 +100,7 @@ pub struct DispatchFailureRecoverySweepOutcome {
 
 impl crate::sweep_loop::SweepOutcome for DispatchFailureRecoverySweepOutcome {
     fn has_activity(&self) -> bool {
-        self.redispatched > 0 || self.churn_skipped > 0 || self.deliberate_park_excluded > 0
+        self.redispatched > 0 || self.churn_skipped > 0
     }
 
     fn log(&self) {
@@ -324,6 +324,7 @@ mod tests {
 
     use super::*;
     use crate::dispatch_events::RecordingDispatchEventSink;
+    use crate::sweep_loop::SweepOutcome;
     use crate::test_support::*;
     use crate::work::{CreateChoreInput, ExecutionStatus, WorkDb};
 
@@ -585,6 +586,10 @@ mod tests {
         assert_eq!(
             outcome.deliberate_park_excluded, 1,
             "a deliberate park must be excluded outright, not merely churn-skipped"
+        );
+        assert!(
+            !outcome.has_activity(),
+            "excluding an unchanged park is not log-worthy activity"
         );
         assert_eq!(outcome.churn_skipped, 0);
         assert_eq!(outcome.redispatched, 0, "a deliberate park must never be auto-retried");

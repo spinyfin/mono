@@ -414,12 +414,9 @@ impl WorkDb {
     /// Bounce an `active` work item to Backlog when [`crate::orphan_sweep`]
     /// finds its run ended in a deliberate engine park — a `boss propose done
     /// --outcome blocked` declaration, or the auto-nudge breaker giving up —
-    /// whose attention item is still open. Until this existed, that open
-    /// attention item was the row's only trace: the task stayed `active` and
-    /// the kanban card looked exactly like ordinary Doing work with nothing
-    /// running behind it, indefinitely
-    /// (`docs/designs/dispatch-halt-state-vs-attention-items.md` — an
-    /// attention item is not a surface operators read). This reuses the
+    /// whose attention item is still open. The board must show the halt
+    /// independently of the attention item (see
+    /// `docs/designs/dispatch-halt-state-vs-attention-items.md`). This reuses the
     /// `dispatch_failed_reason` / `dispatch_failed_error` / `dispatch_failed_at`
     /// / Backlog-status representation [`Self::bounce_churn_guard_parked_to_backlog`]
     /// established, under [`DELIBERATE_PARK_DISPATCH_FAILED_REASON`] instead of
@@ -472,8 +469,8 @@ impl WorkDb {
     /// from [`Self::churn_guard_parked_text`] because a park's clearing
     /// story is different in kind: it is a human decision the worker asked
     /// for, not a dispatch health condition that resolves itself, so the
-    /// wording must not read as a failure — see the brief this shipped
-    /// against ("A deliberately parked row is invisible").
+    /// wording must not read as a failure: the worker did its job and is
+    /// waiting on a decision.
     fn deliberate_park_text(
         work_item_id: &str,
         source: &str,
