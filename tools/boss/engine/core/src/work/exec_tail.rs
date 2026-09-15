@@ -170,15 +170,7 @@ impl WorkDb {
     /// dirty working copy without guessing from a name.
     pub fn preserve_execution_workspace_preference(&self, execution_id: &str) -> Result<Option<String>> {
         let conn = self.connect()?;
-        let execution = query_execution(&conn, execution_id).require("execution", execution_id)?;
-        let preferred = execution.cube_workspace_id.clone().or(execution.preferred_workspace_id);
-        if let Some(workspace_id) = preferred.as_deref() {
-            conn.execute(
-                "UPDATE work_executions SET preferred_workspace_id = ?2 WHERE id = ?1",
-                params![execution_id, workspace_id],
-            )?;
-        }
-        Ok(preferred)
+        preserve_execution_workspace_preference(&conn, execution_id)
     }
 
     /// Append an `effort_escalations` row recording a worker's
@@ -641,6 +633,19 @@ impl WorkDb {
         )?;
         Ok(n > 0)
     }
+}
+
+/// Snapshot inside the caller's transaction before teardown clears the live pointer.
+pub(super) fn preserve_execution_workspace_preference(conn: &Connection, execution_id: &str) -> Result<Option<String>> {
+    let execution = query_execution(conn, execution_id).require("execution", execution_id)?;
+    let preferred = execution.cube_workspace_id.or(execution.preferred_workspace_id);
+    if let Some(workspace_id) = preferred.as_deref() {
+        conn.execute(
+            "UPDATE work_executions SET preferred_workspace_id = ?2 WHERE id = ?1",
+            params![execution_id, workspace_id],
+        )?;
+    }
+    Ok(preferred)
 }
 
 #[cfg(test)]

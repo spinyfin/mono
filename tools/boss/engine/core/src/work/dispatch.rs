@@ -594,9 +594,9 @@ impl WorkDb {
             // typically still holds in-flight commits the human wants
             // resumed — without this hint the dispatcher would lease
             // any free workspace and the fresh worker would start
-            // against `main` on an unrelated branch. Only fires for
-            // orphaned predecessors; abandoned / failed / cancelled
-            // ones are intentional throwaways and don't carry forward.
+            // against `main` on an unrelated branch. This hint covers
+            // orphaned predecessors. The shared request helper separately
+            // restores the durable preference of a deliberately blocked run.
             // When the predecessor was orphaned, carry forward both its
             // workspace and the allow_dirty flag so the recovering worker
             // reclaims the dirty workspace in place (uncommitted WIP

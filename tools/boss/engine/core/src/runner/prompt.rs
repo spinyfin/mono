@@ -16,6 +16,8 @@ use boss_protocol::{EditorialRules, ExecutionKind, TaskKind, TemplatePolicy};
 use super::work_item::{project_details, work_item_details, work_item_name, work_item_pr_url};
 
 mod block_boundary;
+mod workspace_recovery;
+use workspace_recovery::merge_cancelled_review_recovery_block;
 mod ci_monitoring;
 mod design;
 use block_boundary::block_boundary_fragment;
@@ -242,100 +244,6 @@ fn startup_recovery_block(report: &boss_engine_recovery::recovery_apply::Recover
     block
 }
 
-/// Explain the exact workspace handoff for a review revision converted to a
-/// followup because its parent PR merged mid-run. This keys primarily on the
-/// dedicated execution shape written by `reconcile_work_item_execution` — a
-/// chore-implementation followup with a soft dirty-workspace preference,
-/// which no other mint produces — not on task kind alone:
-/// `resolve_revision_on_parent_close` (work/chain_helpers.rs) falls back
-/// from `TaskKind::Followup` to plain `TaskKind::Chore` when the chain
-/// root's PR URL is missing or unparseable, and that chore-fallback
-/// conversion still inherits the same workspace/allow_dirty shape, so it
-/// needs this brief too.
-fn merge_cancelled_review_recovery_block(
-    execution: &WorkExecution,
-    work_item: &WorkItem,
-    workspace_path: &Path,
-) -> Option<String> {
-    let task = match work_item {
-        WorkItem::Task(task) | WorkItem::Chore(task) if matches!(task.kind, TaskKind::Followup | TaskKind::Chore) => {
-            task
-        }
-        _ => return None,
-    };
-    if execution.kind != ExecutionKind::ChoreImplementation || !execution.allow_dirty || !execution.prefer_is_soft {
-        return None;
-    }
-    let preferred = execution.preferred_workspace_id.as_deref()?;
-    let origin = task
-        .origin_pr_number
-        .map(|number| format!("PR #{number}"))
-        .unwrap_or_else(|| "the merged origin PR".to_owned());
-    let current = execution.cube_workspace_id.as_deref();
-
-    // `reconcile_workspace_recovery` (coordinator/execution.rs) already
-    // resolved whether the re-leased workspace's dirty state was actually
-    // confirmed — it writes this marker with `RecoverySource::CubeInPlace`
-    // only when `lease.dirty_verified == Some(true)`, before this prompt is
-    // composed. Same-workspace alone is not proof: cube can re-lease the
-    // same workspace after resetting it, or the followup can sit `ready`
-    // long enough (pool saturation, dependency gating) for an unrelated
-    // task to lease, dirty, and release that workspace first — in which
-    // case `--allow-dirty` hands this worker a foreign working copy, not
-    // its own cancelled review draft.
-    let verified_in_place = current == Some(preferred)
-        && boss_engine_recovery::recovery_apply::RecoveryReport::read_for(workspace_path, &execution.id)
-            .is_some_and(|report| report.source == boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace);
-
-    let mut block = String::from("## MERGE-CANCELLED REVIEW RECOVERY\n\n");
-    if verified_in_place {
-        block.push_str(&format!(
-            "This followup was created after {origin} merged while its review-revision worker was mid-run. \
-             The engine re-leased that worker's exact workspace (`{preferred}`) without resetting it. \
-             Its working copy remains on the merged PR's revision base and may contain partial, \
-             uncommitted edits from the cancelled turn.\n\n\
-             Inspect before changing the checkout:\n\n\
-             ```\n\
-             jj status\n\
-             jj diff --stat\n\
-             jj diff\n\
-             ```\n\n\
-             Do not trust or discard those edits. They were cut off mid-turn and were never compiled or \
-             tested. Reconcile them against this followup and current `main`, then run the required \
-             validation before opening the fresh PR.\n\n",
-        ));
-    } else if current == Some(preferred) {
-        block.push_str(&format!(
-            "This followup was created after {origin} merged while its review-revision worker was mid-run, \
-             and the engine re-leased that worker's exact workspace (`{preferred}`). However, the engine \
-             has no confirmed record of what this lease actually returned: it may have been reset (no \
-             edits present), or it may have been leased and dirtied by an unrelated task in between and \
-             then released back to the pool before landing here. Do not assume the working copy is your \
-             own cancelled review draft either way.\n\n\
-             Check before doing anything else:\n\n\
-             ```\n\
-             jj status\n\
-             jj diff --stat\n\
-             ```\n\n\
-             If it holds nothing, proceed as a fresh start from current `main`. If it holds edits, verify \
-             they actually belong to this followup's own history (check the log against {origin}'s revision \
-             base) before building on them — an edit set from an unrelated task must not be folded into \
-             this PR.\n\n",
-        ));
-    } else {
-        let current = current.unwrap_or("an unrecorded fallback workspace");
-        block.push_str(&format!(
-            "This followup was created after {origin} merged while its review-revision worker was mid-run. \
-             The engine preferred the cancelled worker's workspace (`{preferred}`), but cube could not \
-             lease it and dispatched this execution on `{current}` instead. This is a fresh-workspace \
-             fallback: no partial edits were inherited here. An unverified draft may still remain in \
-             `{preferred}` on the merged PR's base; proceed from current `main` in this workspace and do \
-             not assume that draft was validated or delivered.\n\n",
-        ));
-    }
-    Some(block)
-}
-
 /// The structured-output payload this execution's prompt is built around —
 /// the one `$BOSS_STRUCTURED_OUTPUT` names.
 ///
@@ -471,7 +379,71 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
     // directive BEFORE the execution context so it outweighs the
     // workspace-rules default of `jj git fetch && jj new main`.
     let existing_pr_url = work_item_pr_url(work_item);
-    if let Some(block) = merge_cancelled_review_recovery_block(execution, work_item, workspace_path) {
+    let recovery_report = boss_engine_recovery::recovery_apply::RecoveryReport::read_for(workspace_path, &execution.id);
+    let blocked_recovery = recovery_report.as_ref().and_then(workspace_recovery::recovery_block);
+    if let Some(block) = &blocked_recovery {
+        prompt.push_str(block);
+        // A blocked-recovery marker suppresses the generic "no PR yet" /
+        // "no marker" branches below, but it must NOT suppress the
+        // RESUME EXISTING PR guidance when the work item already has a
+        // PR — otherwise a Chore/Task with `existing_pr_url` loses its
+        // explicit "do NOT `jj new main`" override, and the acceptance-
+        // criterion block further down (which references "the ##
+        // RESUME EXISTING PR block above" whenever `existing_pr_url` is
+        // Some) points at a heading that was never rendered. For
+        // `BlockedInPlace` specifically, the inherited checkout is
+        // already the right position, so the guidance must say "stay
+        // put" rather than "run `workspace goto --pr`" — repositioning
+        // would discard the preserved commits `recovery_block` just
+        // told the worker to keep.
+        if let Some(pr_url) = existing_pr_url {
+            let pr_number = boss_github::pr_url::pr_number_from_url(pr_url)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "?".into());
+            let in_place = recovery_report
+                .as_ref()
+                .is_some_and(|r| r.source == boss_engine_recovery::recovery_apply::RecoverySource::BlockedInPlace);
+            if in_place {
+                prompt.push_str(&format!(
+                    "## RESUME EXISTING PR\n\
+                     \n\
+                     This task has an existing open PR (#{pr_number}) at {pr_url}.\n\
+                     You are already on the inherited checkout described in the recovery handoff above.\n\
+                     Do NOT run `jj new main` or `{cube} workspace goto --pr {pr_number}` — either would \
+                     discard the preserved commits. Reconcile the inherited state with this brief, then push \
+                     new commits directly to that same branch:\n\
+                     ```\n\
+                     {cube} pr update --branch <branch-name>\n\
+                     ```\n\
+                     \n\
+                     If the branch cannot be resumed (deleted upstream, etc.),\n\
+                     STOP and surface the blocker — do NOT silently open a parallel PR.\n\
+                     A merge conflict on that branch is not a resume failure: rebase, resolve, verify, and continue.\n\n",
+                ));
+            } else {
+                prompt.push_str(&format!(
+                    "## RESUME EXISTING PR\n\
+                     \n\
+                     This task has an existing open PR (#{pr_number}) at {pr_url}.\n\
+                     You MUST add commits to that branch — do NOT start from `jj new main` and do NOT open a new PR.\n\
+                     \n\
+                     After leasing your workspace:\n\
+                     ```\n\
+                     jj git fetch\n\
+                     {cube} workspace goto --pr {pr_number}   # lands you on the PR branch\n\
+                     ```\n\
+                     Then make your changes on that branch and push:\n\
+                     ```\n\
+                     {cube} pr update --branch <branch-name>\n\
+                     ```\n\
+                     \n\
+                     If the branch cannot be resumed (deleted upstream, etc.),\n\
+                     STOP and surface the blocker — do NOT silently open a parallel PR.\n\
+                     A merge conflict on that branch is not a resume failure: rebase, resolve, verify, and continue.\n\n",
+                ));
+            }
+        }
+    } else if let Some(block) = merge_cancelled_review_recovery_block(execution, work_item, workspace_path) {
         prompt.push_str(&block);
     } else if let Some(pr_url) = existing_pr_url {
         let pr_number = boss_github::pr_url::pr_number_from_url(pr_url)
@@ -506,7 +478,9 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
         // this is a fresh dispatch like any other: the ordinary "expected
         // branch name" / `jj new main` guidance further down is the correct,
         // honest instruction, so no block is rendered at all.
-        prompt.push_str(&startup_recovery_block(&report));
+        if blocked_recovery.is_none() {
+            prompt.push_str(&startup_recovery_block(&report));
+        }
     } else if execution.allow_dirty {
         // No recovery marker, but the engine recorded this as a dirty
         // re-lease (see `reconcile_workspace_recovery`): cube handed the
@@ -1774,6 +1748,19 @@ fn compose_revision_directive(
     // runs the full test suite post-push. Other revisions keep the
     // build-and-test-before-push gate.
     let is_conflict_resolution = conflict_attempt.is_some();
+    // A `BlockedInPlace` recovery already handed this revision its exact
+    // prior checkout (see `workspace_recovery::recovery_block`, pushed
+    // earlier in `compose_execution_prompt`) — the engine deliberately did
+    // NOT reposition the workspace for this run. The generic "engine
+    // pre-positioned via `workspace goto`" claim below, and its `workspace
+    // goto --pr` fallback, are both false in that case and — if followed —
+    // would fetch, force-move the bookmark, and `jj new` onto the remote PR
+    // head, discarding the preserved commits the recovery handoff just told
+    // the worker to keep. `BlockedFresh` is unaffected: the engine still
+    // positions that case normally, so the generic wording stays correct.
+    let blocked_in_place =
+        boss_engine_recovery::recovery_apply::RecoveryReport::read_for(workspace_path, &execution.id)
+            .is_some_and(|r| r.source == boss_engine_recovery::recovery_apply::RecoverySource::BlockedInPlace);
 
     let mut out = String::new();
     out.push_str("Expected outcome for this run:\n");
@@ -1806,7 +1793,15 @@ fn compose_revision_directive(
     // GitHub PR URL, which is exactly when the engine called `cube workspace goto`
     // to position the workspace at the PR head. Without a parseable URL,
     // the workspace is on main and the worker must position it manually.
-    if pr_number != "?" {
+    if blocked_in_place {
+        out.push_str(
+            "The recovery handoff above already verified and re-leased this revision's own prior, \
+             deliberately-blocked-in-place checkout. The engine did NOT run `cube workspace goto` for this \
+             run, and running it now — or `jj new main` — would discard the preserved commits. Stay at `@`: \
+             inspect `jj status`, `jj diff`, and `jj log -r '::@' -n 10` to see what the prior worker left, \
+             reconcile it with this brief and current `main`, then continue making changes directly.\n",
+        );
+    } else if pr_number != "?" {
         if is_conflict_resolution {
             out.push_str(&format!("The engine pre-positioned this workspace via `{cube} workspace goto`, so you are already on a fresh editable commit whose parent is the PR head — no branch discovery or checkout is needed. Do NOT start making changes yet: this is a conflict-resolution revision, and the ground-truth block below requires you to check GitHub's mergeable status and re-run the rebase FIRST.\n"));
         } else {
