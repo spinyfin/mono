@@ -906,9 +906,6 @@ where
             rejected,
             file_progress,
         } = scan;
-        if matched.len() == 1 {
-            return Ok(matched.pop());
-        }
         let reason = deadline_failure(
             &prepared,
             started,
@@ -922,10 +919,13 @@ where
             rejected,
             reason.clone(),
             now.duration_since(started).as_secs(),
-            now >= deadline,
+            now >= deadline && matched.is_empty(),
             file_progress,
         )
         .await;
+        if matched.len() == 1 {
+            return Ok(matched.pop());
+        }
         let count = matched.len();
         if count > 1 {
             return Err(format!(
