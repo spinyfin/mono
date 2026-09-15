@@ -65,6 +65,9 @@ pub(crate) fn migrate_work_executions_pr_head_before(conn: &Connection) -> Resul
 /// This preserves the head that the engine acted on even if a later force-push
 /// makes it impossible to reconstruct from the live PR. Idempotent.
 pub(crate) fn migrate_work_executions_pr_head_after(conn: &Connection) -> Result<()> {
+    if !work_executions_has_column(conn, "pr_head_after_capture")? {
+        conn.execute("ALTER TABLE work_executions ADD COLUMN pr_head_after_capture TEXT", [])?;
+    }
     if !work_executions_has_column(conn, "pr_head_after")? {
         conn.execute("ALTER TABLE work_executions ADD COLUMN pr_head_after TEXT", [])?;
     }

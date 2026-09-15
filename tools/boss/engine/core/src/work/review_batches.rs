@@ -1106,10 +1106,12 @@ impl WorkDb {
         if input.phase != ReviewBatchPhase::PreMerge {
             bail!("leaf reviewer dispatch only supports pre_merge batches");
         }
+        let task_id = input.legacy_task_id.as_ref().unwrap_or(&input.cycle_root_id).clone();
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(batch) = review_batch_for_target_in(&tx, &input.cycle_root_id, input.phase, &input.target_sha)? {
             let executions = batch_executions_in_tx(&tx, &batch.id)?;
+            super::completion_evidence::record_review_admission_wait_in(&tx, &task_id, false)?;
             tx.commit()?;
             return Ok(ReviewBatchDispatch::ExistingBatch { batch, executions });
         }
@@ -1129,6 +1131,7 @@ impl WorkDb {
                 )
                 .optional()?;
             if is_batch_leaf.is_none() {
+                super::completion_evidence::record_review_admission_wait_in(&tx, &task_id, false)?;
                 tx.commit()?;
                 return Ok(ReviewBatchDispatch::LegacyExecution(execution));
             }
@@ -1148,14 +1151,14 @@ impl WorkDb {
                 None => false,
             };
         if already_reviewed {
+            super::completion_evidence::record_review_admission_wait_in(&tx, &task_id, true)?;
             tx.commit()?;
             return Ok(ReviewBatchDispatch::AlreadyReviewed);
         }
         if !can_admit_review_batch_in_tx(&tx, ReviewBatchPhase::PreMerge, reservation_capacity(review_pool_size))? {
-            // Read-only so far — nothing to roll back. The caller must hold
-            // the producing task pending review rather than treat this as a
-            // legacy fallback; the deferred-admission sweep retries once an
-            // existing batch completes and frees its reservation.
+            // Persist the wait with the admission decision; an attention
+            // item is explanatory, never the source of truth for this hold.
+            super::completion_evidence::record_review_admission_wait_in(&tx, &task_id, true)?;
             tx.commit()?;
             return Ok(ReviewBatchDispatch::AdmissionDeferred);
         }
@@ -1178,6 +1181,7 @@ impl WorkDb {
             .collect::<Vec<_>>();
         let members = leaf_member_inputs(&input.classification, &execution_ids)?;
         let (batch, _) = create_review_batch_in_tx(&tx, input, &members)?;
+        super::completion_evidence::record_review_admission_wait_in(&tx, &task_id, false)?;
         tx.commit()?;
         Ok(ReviewBatchDispatch::Created { batch, executions })
     }

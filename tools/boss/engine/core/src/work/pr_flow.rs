@@ -19,6 +19,12 @@ pub struct DeferredReviewAdmissionCandidate {
     pub cycle_root_id: String,
 }
 
+enum CompletionHead<'a> {
+    Captured(&'a str),
+    Unavailable,
+    Pending,
+}
+
 impl WorkDb {
     /// Record that a worker produced a PR for `execution_id`. In a single
     /// transaction:
@@ -51,6 +57,41 @@ impl WorkDb {
         target: WorkerPrCompletionTarget,
         review_verdict: Option<ReviewVerdictInput>,
     ) -> Result<Option<WorkerPrCompletion>> {
+        self.record_worker_pr_completion_with_head(
+            execution_id,
+            pr_url,
+            pr_head_after.map_or(CompletionHead::Unavailable, CompletionHead::Captured),
+            result_summary,
+            target,
+            review_verdict,
+        )
+    }
+
+    /// Local declared completion schedules head capture after releasing the
+    /// worker. Only this entry point may record a pending network audit.
+    pub fn record_declared_worker_pr_completion(
+        &self,
+        execution_id: &str,
+        pr_url: &str,
+        target: WorkerPrCompletionTarget,
+    ) -> Result<Option<WorkerPrCompletion>> {
+        self.record_worker_pr_completion_with_head(execution_id, pr_url, CompletionHead::Pending, None, target, None)
+    }
+
+    fn record_worker_pr_completion_with_head(
+        &self,
+        execution_id: &str,
+        pr_url: &str,
+        head: CompletionHead<'_>,
+        result_summary: Option<&str>,
+        target: WorkerPrCompletionTarget,
+        review_verdict: Option<ReviewVerdictInput>,
+    ) -> Result<Option<WorkerPrCompletion>> {
+        let (pr_head_after, capture_state) = match head {
+            CompletionHead::Captured(sha) => (Some(sha), "recorded"),
+            CompletionHead::Unavailable => (None, "unavailable"),
+            CompletionHead::Pending => (None, "pending"),
+        };
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
@@ -113,6 +154,10 @@ impl WorkDb {
                  last_status_actor  = 'engine',
                  blocked_reason     = ?5,
                  blocked_attempt_id = NULL,
+                 review_required_state = CASE WHEN ?6 AND ?2 = 'active' THEN
+                     CASE WHEN review_required_state = 'automated_review' THEN review_required_state ELSE 'awaiting_admission' END
+                     WHEN review_required_state IN ('awaiting_admission', 'automated_review') THEN NULL
+                     ELSE review_required_state END,
                  completed_at       = COALESCE(completed_at, CASE WHEN ?2 IN ('done','archived') THEN ?4 END)
              WHERE id = ?1",
             params![
@@ -120,7 +165,8 @@ impl WorkDb {
                 new_status.as_str(),
                 pr_url_for_task,
                 now,
-                blocked_reason_for_task
+                blocked_reason_for_task,
+                matches!(target, WorkerPrCompletionTarget::PendingReview)
             ],
         )?;
 
@@ -151,9 +197,10 @@ impl WorkDb {
                  workspace_path = NULL,
                  finished_at = ?2,
                  pr_url = ?3,
-                 pr_head_after = ?4
+                 pr_head_after = ?4,
+                 pr_head_after_capture = CASE WHEN kind = 'pr_review' THEN NULL ELSE ?5 END
              WHERE id = ?1",
-            params![execution_id, now, pr_url, pr_head_after],
+            params![execution_id, now, pr_url, pr_head_after, capture_state],
         )?;
 
         // Update the most-recent run for this execution: if a summary is
@@ -691,8 +738,9 @@ impl WorkDb {
     /// cycle's terminal `pr_review` must not be treated as covering a new
     /// head.
     ///
-    /// A task qualifies immediately once an open
-    /// `pr_review_admission_deferred` attention item marks it as an actual
+    /// A task qualifies immediately when its review state is
+    /// `awaiting_admission`. Legacy rows also qualify when an open
+    /// `pr_review_admission_deferred` attention item marks an actual
     /// deferral (the deferral paths file exactly that marker). Absent that
     /// marker — e.g. an `AlreadyReviewed` hold, which files none — a task
     /// only qualifies once its `updated_at` is older than
@@ -753,7 +801,8 @@ impl WorkDb {
                        AND we.kind != 'pr_review'
                    )
                AND (
-                     EXISTS (
+                     t.review_required_state = 'awaiting_admission'
+                     OR EXISTS (
                        SELECT 1 FROM work_attention_items ai
                        WHERE ai.work_item_id = t.id
                          AND ai.kind = 'pr_review_admission_deferred'
@@ -835,6 +884,7 @@ impl WorkDb {
         let rows_changed = conn.execute(
             "UPDATE tasks
              SET status            = 'in_review',
+                 review_required_state = CASE WHEN review_required_state IN ('awaiting_admission', 'automated_review') THEN NULL ELSE review_required_state END,
                  updated_at        = ?2,
                  last_status_actor = 'engine'
              WHERE id = ?1
@@ -888,6 +938,7 @@ impl WorkDb {
         let sql = format!(
             "UPDATE tasks
              SET status            = 'in_review',
+                 review_required_state = CASE WHEN review_required_state IN ('awaiting_admission', 'automated_review') THEN NULL ELSE review_required_state END,
                  updated_at        = ?2,
                  last_status_actor = 'engine'
              WHERE id = ?1
@@ -935,6 +986,7 @@ impl WorkDb {
         let rows_changed = conn.execute(
             "UPDATE tasks
              SET status            = 'in_review',
+                 review_required_state = CASE WHEN review_required_state IN ('awaiting_admission', 'automated_review') THEN NULL ELSE review_required_state END,
                  pr_url            = ?2,
                  updated_at        = ?3,
                  last_status_actor = 'engine',
@@ -1063,6 +1115,7 @@ impl WorkDb {
         let rows_changed = conn.execute(
             "UPDATE tasks
              SET status            = 'in_review',
+                 review_required_state = CASE WHEN review_required_state IN ('awaiting_admission', 'automated_review') THEN NULL ELSE review_required_state END,
                  pr_url            = ?2,
                  updated_at        = ?3,
                  last_status_actor = 'engine',

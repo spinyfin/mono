@@ -86,7 +86,7 @@
 //!    one cooldown at a time). Also clears immediately on an explicit
 //!    `bossctl work start` / kanban drag-to-Doing, either of which bypasses
 //!    the guard entirely.
-//! 7. Calls [`WorkDb::request_execution_with_live_check`] (the same
+//! 7. Calls [`WorkDb::request_orphan_recovery`] (sharing the same
 //!    path `bossctl work start` uses) to mark the stale execution
 //!    `abandoned` and insert a fresh `ready` execution, then kicks
 //!    the coordinator's scheduler.
@@ -409,8 +409,8 @@ async fn run_one_pass_filtered(
     for work_item_id in candidates {
         // ── Admission gate 1: a deliberate engine park ────────────────
         //
-        // This sweep redispatches any `active` row whose latest execution
-        // is terminal, and it must not: `abandoned` is a terminal status,
+        // Only unsuccessful terminal executions can reach this point.
+        // They still need a deliberate-park guard: `abandoned` is a terminal status,
         // and the engine writes it for *decisions* as well as for deaths.
         // `completion::run_done_declaration::finalize_declared_blocked`
         // (the worker declared `boss propose done --outcome blocked`) and
@@ -872,13 +872,14 @@ async fn run_one_pass_filtered(
         // died without updating the DB — `request_execution_with_live_check`
         // will mark it `abandoned` and create a new `ready` row.
         let is_live = |exec_id: &str| claimed.contains(exec_id);
-        let new_execution = match work_db.request_execution_with_live_check(
+        let new_execution = match work_db.request_orphan_recovery(
             RequestExecutionInput::builder()
                 .work_item_id(work_item_id.clone())
                 .build(),
             is_live,
         ) {
-            Ok(exec) => exec,
+            Ok(Some(exec)) => exec,
+            Ok(None) => continue,
             Err(err) => {
                 tracing::warn!(
                     work_item_id = %work_item_id,
@@ -2409,6 +2410,35 @@ mod tests {
         .unwrap();
     }
 
+    #[tokio::test]
+    async fn completed_active_row_is_never_redispatched_but_dead_row_is_recovered() {
+        for status in ["completed", "abandoned", "orphaned"] {
+            let (_dir, db) = open_db();
+            let product_id = create_product(&db);
+            let id = create_active_chore(&db, &product_id, "recovery status regression");
+            db.insert_terminal_execution_for_test(&id, "chore_implementation", status, 1)
+                .unwrap();
+            make_old(&db, &id);
+            let db = Arc::new(db);
+            let coordinator = make_coordinator(db.clone(), 1);
+            let sink = RecordingDispatchEventSink::new();
+            let outcome = run_one_pass(db.as_ref(), coordinator, &sink, &NoopLiveWorkerConvergence).await;
+            assert_eq!(outcome.redispatched, usize::from(status != "completed"), "{status}");
+            if status == "completed" {
+                // Exercise the transaction guard as if completion raced the scan.
+                assert!(
+                    db.request_orphan_recovery(
+                        RequestExecutionInput::builder().work_item_id(id.clone()).build(),
+                        |_| false
+                    )
+                    .unwrap()
+                    .is_none()
+                );
+                assert_eq!(db.list_executions(Some(&id)).unwrap().len(), 1);
+            }
+        }
+    }
+
     /// First-PR chore: the chore is its own cycle root, `pr_head_sha` is
     /// NULL (the hold path never writes it), and a live pre_merge batch
     /// exists. This is the common production hold; a sha-keyed exclusion
@@ -2432,10 +2462,9 @@ mod tests {
         );
     }
 
-    /// Acceptance: the same task IS a candidate again once the review batch
-    /// reaches a terminal state — the hold must not become permanent immunity.
+    /// A terminal review batch cannot invalidate successful producer completion.
     #[tokio::test]
-    async fn held_task_becomes_orphan_candidate_once_review_batch_terminates() {
+    async fn completed_producer_is_not_an_orphan_after_review_batch_terminates() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
@@ -2444,10 +2473,10 @@ mod tests {
         insert_review_batch(&db, &work_item_id, "completed", "sha-current", "https://example/pr/1");
 
         assert!(
-            db.list_orphan_active_candidates(ORPHAN_MIN_AGE_SECS)
+            !db.list_orphan_active_candidates(ORPHAN_MIN_AGE_SECS)
                 .unwrap()
                 .contains(&work_item_id),
-            "a task whose review batch has already terminated must become a candidate again"
+            "successful completion remains authoritative after review ends"
         );
     }
 
@@ -2469,13 +2498,9 @@ mod tests {
         );
     }
 
-    /// Acceptance: a held task whose latest producer `pr_head_after` has
-    /// moved on from the live batch's `target_sha` is an orphan candidate
-    /// again — a stale batch must not grant immunity until the reaper
-    /// fires. Uses `pr_head_after` (written at hold time), not
-    /// `tasks.pr_head_sha`.
+    /// A stale batch target cannot invalidate successful producer completion.
     #[tokio::test]
-    async fn held_task_whose_producer_head_moved_past_batch_target_is_an_orphan_candidate() {
+    async fn completed_producer_is_not_an_orphan_when_batch_target_is_stale() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
@@ -2485,10 +2510,10 @@ mod tests {
         insert_review_batch(&db, &work_item_id, "supervising", "sha-old", "https://example/pr/1");
 
         assert!(
-            db.list_orphan_active_candidates(ORPHAN_MIN_AGE_SECS)
+            !db.list_orphan_active_candidates(ORPHAN_MIN_AGE_SECS)
                 .unwrap()
                 .contains(&work_item_id),
-            "a live pre_merge batch whose target_sha is behind the producer head must not mask the task"
+            "successful completion remains authoritative even when the batch target is stale"
         );
     }
 

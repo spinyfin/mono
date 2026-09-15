@@ -96,6 +96,9 @@ impl ReviewBatchEnqueuer for GhReviewBatchEnqueuer {
 }
 
 pub(crate) fn file_admission_deferred_attention(work_db: &crate::work::WorkDb, work_item_id: &str, pr_url: &str) {
+    if let Err(err) = work_db.record_review_admission_wait(work_item_id, true) {
+        tracing::error!(work_item_id, ?err, "failed to persist review-admission wait state");
+    }
     let title = "Automated reviewer: waiting for a review-pool slot";
     let body = format!(
         "Pre-merge review for {pr_url} was deferred because the review pool has no free \

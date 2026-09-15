@@ -931,13 +931,16 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_required_detail: Option<String>,
 
-    /// State of required-review gating at last poll. Values:
+    /// On active rows, `awaiting_admission` means the producer finished and
+    /// review awaits a pool reservation; `automated_review` means admitted.
+    /// Starting a new worker clears these states. On in_review rows this is
+    /// the state of required-review gating at last poll. Values:
     /// `"required"` (awaiting at least one required review),
     /// `"approved"` (all required reviews approved),
     /// `"changes_requested"` (at least one reviewer requested changes),
     /// `"unknown"` (review state could not be determined). `None` until the
     /// merge poller has performed at least one successful probe. Only
-    /// meaningful when `status = "in_review"` and `pr_url` is set.
+    /// meaningful as a GitHub gate when `status = "in_review"` and `pr_url` is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_required_state: Option<String>,
 
