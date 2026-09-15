@@ -59,7 +59,8 @@ pub(crate) struct DispatchAdmissionFacts {
     ///
     /// Blocking on every **automatic** mint path (`orphan_sweep`,
     /// `rescan_active_dispatch`, `reconcile_active_dispatch`,
-    /// `reconcile_revision_execution`). Informational on this evaluator
+    /// `reconcile_work_item_execution`, `reconcile_revision_execution`).
+    /// Informational on this evaluator
     /// for the same reason as `churn_guard_parked`: an explicit
     /// `bossctl work start` / kanban drag-to-Doing is the un-park
     /// gesture and must not be refused.
@@ -89,13 +90,17 @@ const DELIBERATE_PARK_ATTENTION_KINDS: &[&str] = &[
     crate::completion::NUDGE_BREAKER_ATTENTION_KIND,
 ];
 
-/// `true` when any execution of `work_item_id` carries an OPEN attention
-/// item of one of `kinds`. Shared by [`work_item_is_deliberately_parked`]
-/// and [`WorkDb::has_open_execution_attention_of_kind`] so the join
-/// through `work_executions` is not copied per caller.
+/// `true` when the *latest* execution of `work_item_id` (by
+/// `created_at DESC, id DESC`) carries an OPEN attention item of one of
+/// `kinds`. Scoped to that one execution id — not "any execution of this
+/// work item ever" — so that once `bossctl work start` mints a
+/// replacement, an open park item filed against an older, superseded
+/// execution can no longer keep [`work_item_is_deliberately_parked`]
+/// latched true forever. Shared by [`work_item_is_deliberately_parked`]
+/// so the join through `work_executions` is not copied per caller.
 pub(crate) fn has_open_execution_attention_of_kind_on(
     conn: &Connection,
-    work_item_id: &str,
+    latest_execution_id: &str,
     kinds: &[&str],
 ) -> Result<bool> {
     if kinds.is_empty() {
@@ -108,14 +113,13 @@ pub(crate) fn has_open_execution_attention_of_kind_on(
     let sql = format!(
         "SELECT EXISTS(
              SELECT 1 FROM work_attention_items a
-             JOIN work_executions we ON we.id = a.execution_id
-             WHERE we.work_item_id = ?1
+             WHERE a.execution_id = ?1
                AND a.status = 'open'
                AND a.kind IN ({placeholders})
          )"
     );
     let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(kinds.len() + 1);
-    bound.push(&work_item_id);
+    bound.push(&latest_execution_id);
     for kind in kinds {
         bound.push(kind);
     }
@@ -125,28 +129,38 @@ pub(crate) fn has_open_execution_attention_of_kind_on(
 }
 
 /// `true` when automatic mint must not create a replacement execution for
-/// `work_item_id`. Keys on the latest execution's
+/// `work_item_id`. Keys on the *latest* execution's
 /// `run_done_outcome = 'blocked'` (the durable signal — the column is
-/// not cleared by `ClearedBy::WorkResumed`) and, additionally, on an
-/// open park attention item (the nudge-breaker park never stamps the
-/// column). Takes `&Connection` so in-transaction mint paths can consult
-/// the same fact without re-locking `WorkDb`'s mutex.
+/// not cleared by `ClearedBy::WorkResumed`) and, additionally, on an open
+/// park attention item filed against that same latest execution (the
+/// nudge-breaker park never stamps the column). Both halves are scoped to
+/// the latest execution so that a fresh replacement execution — minted by
+/// an explicit `bossctl work start` — is never kept parked by a park item
+/// belonging to the row it replaced: `run_done_declared_blocked` is
+/// registered `ClearedBy::WorkResumed` in `attention_lifecycle`, which
+/// resolves the item once the new run starts, but the resolve sweep is
+/// asynchronous, so the scoping here is what makes the gate correct in the
+/// window before that sweep runs. Takes `&Connection` so in-transaction
+/// mint paths can consult the same fact without re-locking `WorkDb`'s
+/// mutex.
 pub(crate) fn work_item_is_deliberately_parked(conn: &Connection, work_item_id: &str) -> Result<bool> {
-    let latest_outcome: Option<String> = conn
+    let latest: Option<(String, Option<String>)> = conn
         .query_row(
-            "SELECT run_done_outcome FROM work_executions
+            "SELECT id, run_done_outcome FROM work_executions
              WHERE work_item_id = ?1
              ORDER BY created_at DESC, id DESC
              LIMIT 1",
             params![work_item_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .optional()?
-        .flatten();
+        .optional()?;
+    let Some((latest_execution_id, latest_outcome)) = latest else {
+        return Ok(false);
+    };
     if latest_outcome.as_deref() == Some(boss_protocol::RunDoneOutcome::Blocked.as_str()) {
         return Ok(true);
     }
-    has_open_execution_attention_of_kind_on(conn, work_item_id, DELIBERATE_PARK_ATTENTION_KINDS)
+    has_open_execution_attention_of_kind_on(conn, &latest_execution_id, DELIBERATE_PARK_ATTENTION_KINDS)
 }
 
 impl WorkDb {
@@ -437,6 +451,12 @@ mod deliberate_parked_fact_tests {
 
     /// An older blocked declaration must not park a later execution that
     /// did not declare blocked — operator start mints a new latest row.
+    /// Production always files an open `run_done_declared_blocked`
+    /// attention item alongside the column stamp, so this also pins that
+    /// the attention half of the fact is scoped to the latest execution,
+    /// not "any execution of this work item, ever": without that scoping
+    /// the open item on `older` alone would keep `deliberate_parked` true
+    /// forever, even though the column half already says otherwise.
     #[test]
     fn false_when_only_an_older_execution_declared_blocked() {
         let (_dir, db) = open_db();
@@ -444,6 +464,16 @@ mod deliberate_parked_fact_tests {
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let older = abandoned_execution(&db, &work_item_id);
         stamp_run_done_outcome(&db, &older, RunDoneOutcome::Blocked.as_str());
+        db.create_attention_item(boss_protocol::CreateAttentionItemInput {
+            execution_id: Some(older.clone()),
+            work_item_id: None,
+            kind: crate::completion::RUN_DONE_BLOCKED_ATTENTION_KIND.to_owned(),
+            status: None,
+            title: "Run ended: worker declared itself blocked".to_owned(),
+            body_markdown: "blocked".to_owned(),
+            resolved_at: None,
+        })
+        .unwrap();
         let _newer = abandoned_execution(&db, &work_item_id);
 
         let facts = db.dispatch_admission_facts(&work_item_id).unwrap();

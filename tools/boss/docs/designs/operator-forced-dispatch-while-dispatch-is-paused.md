@@ -31,16 +31,16 @@ A pause-specific override on the existing execution-request path, exposed as `bo
 
 Force overrides **only** an active, operator-originated global dispatch pause for a single request. Everything else still binds:
 
-| Constraint                                                  | Under force                                                                                   |
-| ----------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| Operator-origin global dispatch pause                       | Overridable for this request only                                                             |
-| Breaker-origin global dispatch pause                        | Never overridable                                                                             |
-| Interactive concurrency cap                                 | Enforced (hard blocker)                                                                       |
-| Unmet dependency                                            | Enforced (hard blocker)                                                                       |
-| Ineligible / blocked / terminal status                      | Enforced (hard blocker)                                                                       |
-| Human-driven classification                                 | No agent worker; drag skips admission evaluation entirely                                     |
-| Automation pause, pool routing, preflight, live-exec dedupe | Unchanged ordinary-path rules                                                                 |
-| `autostart: false`, churn-guard park                        | Informational on the admission surface; explicit start has always cleared both, forced or not |
+| Constraint                                                  | Under force                                                                                        |
+| ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| Operator-origin global dispatch pause                       | Overridable for this request only                                                                  |
+| Breaker-origin global dispatch pause                        | Never overridable                                                                                  |
+| Interactive concurrency cap                                 | Enforced (hard blocker)                                                                            |
+| Unmet dependency                                            | Enforced (hard blocker)                                                                            |
+| Ineligible / blocked / terminal status                      | Enforced (hard blocker)                                                                            |
+| Human-driven classification                                 | No agent worker; drag skips admission evaluation entirely                                          |
+| Automation pause, pool routing, preflight, live-exec dedupe | Unchanged ordinary-path rules                                                                      |
+| `autostart: false`, churn-guard park, deliberate park       | Informational on the admission surface; explicit start has always cleared all three, forced or not |
 
 The pause itself is reported on `DispatchPauseSnapshot`, not as a blocker code, because it is the one thing that _can_ be overridden.
 

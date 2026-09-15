@@ -573,13 +573,11 @@ fn migration_completed_at_is_idempotent() {
 
 // ── Deliberate-park admission on automatic mint paths ──────────────────
 //
-// A blocked declaration parks the row for a human. `orphan_sweep` already
-// honoured that park; `rescan_active_dispatch`, `reconcile_active_dispatch`,
-// and `reconcile_revision_execution` did not. These tests pin each path
-// (the existing autostart assertion on
+// A blocked declaration prevents automatic replacement on every dispatch
+// path. These tests exercise the durable park independently of the
+// idle-abandonment autostart gate, which
 // `record_worker_idle_abandonment_finalizes_execution_leaves_task_status_untouched`
-// is kept — it covers the idle-abandonment/autostart discriminator, which
-// is a different gate).
+// covers.
 
 fn stamp_blocked_declaration(db: &WorkDb, execution_id: &str) {
     db.connect()
@@ -708,6 +706,100 @@ fn reconcile_revision_does_not_remint_a_blocked_declaration() {
         "reconcile_revision_execution must not remint a parked revision"
     );
     assert_eq!(executions[0].id, exec.id);
+}
+
+/// Same fixture as [`parked_active_chore`] minus the blocked stamp — a
+/// negative control so the "nothing was minted" assertions above can't
+/// pass vacuously against an earlier, unrelated gate (`reconcile_revision_execution`
+/// alone has six other early-return points ahead of the park check).
+fn unparked_active_chore(db: &WorkDb, label: &str) -> (String, String) {
+    let product = create_test_product_named(db, &format!("Prod-{label}"));
+    let chore = create_test_chore(db, product.id.clone(), format!("Chore-{label}"));
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Abandoned)
+                .build(),
+        )
+        .unwrap();
+    (chore.id, exec.id)
+}
+
+/// Negative control for [`rescan_does_not_remint_a_blocked_declaration`]:
+/// the identical fixture minus the blocked stamp must still be redispatched.
+#[test]
+fn rescan_reminted_an_unblocked_declaration() {
+    let db = WorkDb::open(temp_db_path("park-rescan-control")).unwrap();
+    let (chore_id, _exec_id) = unparked_active_chore(&db, "rescan-control");
+
+    let redispatched = db.rescan_active_dispatch().unwrap();
+    assert!(
+        redispatched.contains(&chore_id),
+        "an unparked terminal row must still be redispatched, got {redispatched:?}",
+    );
+}
+
+/// Negative control for [`reconcile_active_does_not_remint_a_blocked_declaration`].
+#[test]
+fn reconcile_active_reminted_an_unblocked_declaration() {
+    let db = WorkDb::open(temp_db_path("park-reconcile-active-control")).unwrap();
+    let (chore_id, _exec_id) = unparked_active_chore(&db, "reconcile-active-control");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET autostart = 0 WHERE id = ?1",
+            rusqlite::params![chore_id],
+        )
+        .unwrap();
+
+    let redispatched = db.reconcile_active_dispatch(|_| true).unwrap();
+    assert!(
+        redispatched.contains(&chore_id),
+        "an unparked terminal row must still be redispatched, got {redispatched:?}",
+    );
+}
+
+/// Negative control for [`reconcile_revision_does_not_remint_a_blocked_declaration`].
+#[test]
+fn reconcile_revision_reminted_an_unblocked_declaration() {
+    let db = WorkDb::open(temp_db_path("park-reconcile-revision-control")).unwrap();
+    let product_id = make_revision_product(&db, "park-rev-control");
+    let parent_id = make_in_review_chore(&db, &product_id, "https://github.com/spinyfin/mono/pull/56");
+    let revision_id = insert_revision_row(&db, &product_id, &parent_id);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'active', autostart = 0 WHERE id = ?1",
+            rusqlite::params![revision_id],
+        )
+        .unwrap();
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(revision_id.clone())
+            .kind(ExecutionKind::RevisionImplementation)
+            .status(ExecutionStatus::Abandoned)
+            .build(),
+    )
+    .unwrap();
+
+    db.reconcile_product_executions(&product_id).unwrap();
+
+    let executions = db.list_executions(Some(&revision_id)).unwrap();
+    assert_eq!(
+        executions.len(),
+        2,
+        "an unparked terminal revision row must still get a replacement execution",
+    );
 }
 
 /// `bossctl work start` / kanban drag-to-Doing is the un-park gesture:

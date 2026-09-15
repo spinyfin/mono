@@ -1,4 +1,4 @@
-use super::dispatch_admission::{has_open_execution_attention_of_kind_on, work_item_is_deliberately_parked};
+use super::dispatch_admission::work_item_is_deliberately_parked;
 use super::*;
 
 impl WorkDb {
@@ -1119,27 +1119,6 @@ impl WorkDb {
             out.push(id);
         }
         Ok(out)
-    }
-
-    /// `true` when any execution of `work_item_id` carries an OPEN
-    /// attention item of one of `kinds`.
-    ///
-    /// Execution-scoped attention items (`execution_id` set,
-    /// `work_item_id` NULL — see `WorkDb::create_attention_item`) are
-    /// invisible to a `work_attention_items.work_item_id = t.id` predicate,
-    /// so this joins through `work_executions` to ask the question at the
-    /// work-item level. The park fact itself lives on
-    /// [`WorkDb::dispatch_admission_facts`]; this wrapper remains for
-    /// callers that need the join without the rest of the evaluator.
-    ///
-    /// Self-clearing by construction: every kind a caller should pass here
-    /// is registered `ClearedBy::WorkResumed` in
-    /// [`crate::attention_lifecycle`], so the park ends the moment a fresh
-    /// run starts for the item — an operator's `bossctl work start` needs
-    /// no separate un-park step.
-    pub fn has_open_execution_attention_of_kind(&self, work_item_id: &str, kinds: &[&str]) -> Result<bool> {
-        let conn = self.connect()?;
-        has_open_execution_attention_of_kind_on(&conn, work_item_id, kinds)
     }
 
     /// Count recent `pr_review` attempts that did not yield a durable

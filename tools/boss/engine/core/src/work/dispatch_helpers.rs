@@ -178,7 +178,7 @@ pub(crate) fn resolve_attention_kind_in_tx(conn: &Connection, work_item_id: &str
 /// (so the row commits before the caller's bail unwinds anything
 /// else) and bails with the same human-facing message
 /// `repo_unresolved_attention_body` produces. Callers MUST resolve
-/// friendly ids (`T42`) before passing `work_item_id` here.
+/// friendly short ids before passing `work_item_id` here.
 pub(crate) fn ensure_dispatch_repo_resolvable(conn: &mut Connection, work_item_id: &str) -> Result<()> {
     if resolve_repo_for_work_item(conn, work_item_id)?.is_some() {
         return Ok(());
@@ -549,6 +549,22 @@ pub(crate) fn reconcile_work_item_execution(
         return Ok(());
     }
     let insert_fresh = |result: &mut ExecutionReconcileResult, predecessor: Option<&WorkExecution>| -> Result<()> {
+        // Deliberate park is blocking on this automatic mint path, same as
+        // `rescan_active_dispatch` / `reconcile_active_dispatch` /
+        // `orphan_sweep` / `reconcile_revision_execution`. This is the path
+        // a parked PR-review revision reaches when its parent PR closes and
+        // `convert_revision_to_review_findings_followup` converts it in
+        // place to a `todo`/`autostart = 1` followup: without this check a
+        // replacement `chore_implementation` gets minted onto the exact row
+        // a human was asked to adjudicate, with no explicit start.
+        if work_item_is_deliberately_parked(conn, work_item_id)? {
+            tracing::info!(
+                work_item_id,
+                "reconcile: skipping execution mint — this row's run ended in a deliberate park \
+                 (`bossctl work start` resumes it)",
+            );
+            return Ok(());
+        }
         // Resolve through the single helper so per-row overrides beat the
         // product default (multi-repo design Q5). On a `None` we don't create
         // an execution row — instead a sticky `repo_unresolved` attention
@@ -790,9 +806,9 @@ pub(crate) fn reconcile_revision_execution(
     // the chain root's `pr_url` / `status`, neither of which reflects a
     // *resolved* conflict (or *cleared* CI) on a still-open PR — so a CLEAN,
     // already-rebased PR keeps minting fresh `revision_implementation`
-    // executions on every reconcile tick (observed on T906 / PR #970: its
-    // `conflict_resolutions` attempt was `succeeded`, yet the revision was
-    // re-dispatched indefinitely). The retire paths
+    // executions on every reconcile tick (observed in PR #970: a
+    // `conflict_resolutions` attempt that had already `succeeded` still
+    // left its revision re-dispatched indefinitely). The retire paths
     // (`conflict_watch::on_resolved`, `try_retire_cleared_blocking_signal`)
     // mark the attempt terminal and clear the *chore's* signal but never
     // settle the revision task, leaving it dispatchable here.
@@ -893,34 +909,6 @@ pub(crate) fn reconcile_revision_execution(
         );
         return Ok(());
     }
-    // Deliberate park is blocking on this automatic path, same as
-    // `rescan_active_dispatch` / `reconcile_active_dispatch` /
-    // `orphan_sweep`. A blocked declaration leaves the row `active`
-    // by design, so `task_accepts_execution`'s todo-only `autostart`
-    // check cannot hold it — without this gate a product-wide
-    // reconcile remints a replacement onto the work a human was
-    // asked to adjudicate.
-    match work_item_is_deliberately_parked(conn, &task.id) {
-        Ok(true) => {
-            tracing::info!(
-                work_item_id = %task.id,
-                "reconcile_revision: skipping execution mint — this row's run ended in a \
-                 deliberate park (`bossctl work start` resumes it)",
-            );
-            return Ok(());
-        }
-        Ok(false) => {}
-        Err(err) => {
-            tracing::warn!(
-                work_item_id = %task.id,
-                ?err,
-                "reconcile_revision: skipping execution mint — could not read the row's park \
-                 state; refusing to remint on an unknown admission state",
-            );
-            return Ok(());
-        }
-    }
-
     match query_latest_execution_for_work_item(conn, &task.id)? {
         Some(existing)
             if existing.kind == ExecutionKind::RevisionImplementation
@@ -965,6 +953,39 @@ pub(crate) fn reconcile_revision_execution(
             // abandons, shadowing the in-flight spawn.
         }
         _ => {
+            // Deliberate park is blocking on this automatic mint, same as
+            // `rescan_active_dispatch` / `reconcile_active_dispatch` /
+            // `orphan_sweep`. A blocked declaration leaves the row `active`
+            // by design, so `task_accepts_execution`'s todo-only `autostart`
+            // check cannot hold it — without this gate a product-wide
+            // reconcile remints a replacement onto the work a human was
+            // asked to adjudicate. Placed here, guarding only the mint,
+            // rather than as an early return ahead of the match: the arms
+            // above are a status refresh and a `pr_url` back-fill on an
+            // EXISTING row, not a mint, and must keep running even while a
+            // row stays parked, or a resumed row's `waiting_dependency` ->
+            // `ready` promotion and its `--resume-pr` back-fill never
+            // happen.
+            match work_item_is_deliberately_parked(conn, &task.id) {
+                Ok(true) => {
+                    tracing::info!(
+                        work_item_id = %task.id,
+                        "reconcile_revision: skipping execution mint — this row's run ended in a \
+                         deliberate park (`bossctl work start` resumes it)",
+                    );
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        work_item_id = %task.id,
+                        ?err,
+                        "reconcile_revision: skipping execution mint — could not read the row's park \
+                         state; refusing to remint on an unknown admission state",
+                    );
+                    return Ok(());
+                }
+            }
             // Cross-kind live-execution guard. The `RevisionImplementation`
             // arms above only suppress a duplicate when the task's *latest*
             // row is itself a live revision_implementation. But the latest
@@ -975,7 +996,8 @@ pub(crate) fn reconcile_revision_execution(
             // redundant-spawn guard abandons seconds later — leaving an
             // `abandoned` duplicate as the task's newest row, which then
             // shadows the genuinely-completed revision in `agents status`
-            // Defer instead: if any live execution is attached to this task, do not create a duplicate.
+            // Defer instead: if any live execution is attached to this task,
+            // do not create a duplicate.
             if let Some(live) = query_live_execution_for_work_item(conn, &task.id)? {
                 tracing::info!(
                     work_item_id = %task.id,
@@ -1666,12 +1688,12 @@ pub(crate) fn request_pr_review_in_tx(
 ///
 /// Used by [`request_pr_review_in_tx`] (operator/recovery re-review) and by
 /// [`WorkDb::create_pr_review_execution_dedup`] (the automatic
-/// reviewer-enqueue path in `finalize_pr_transition`). The latter closes
-/// T366: two independent PR-completion triggers (the Stop-hook path and the
-/// merge-poller's `pr_recheck` sweep) could each observe the producing
-/// execution as not-yet-terminal and independently enqueue a `pr_review`
-/// execution for the same unchanged head sha, minting two findings
-/// revisions from two redundant reviews. Callers MUST run this check and
+/// reviewer-enqueue path in `finalize_pr_transition`). The latter closes a
+/// race where two independent PR-completion triggers (the Stop-hook path
+/// and the merge-poller's `pr_recheck` sweep) could each observe the
+/// producing execution as not-yet-terminal and independently enqueue a
+/// `pr_review` execution for the same unchanged head sha, minting two
+/// findings revisions from two redundant reviews. Callers MUST run this check and
 /// the subsequent insert inside the same `Immediate` transaction — sqlite
 /// then serialises concurrent callers on the write lock, closing the
 /// check-then-insert race instead of merely narrowing it.
@@ -2579,13 +2601,14 @@ mod tests {
         );
     }
 
-    // ── create_pr_review_execution_dedup (T366 regression) ──────────────────
+    // ── create_pr_review_execution_dedup (concurrent-enqueue regression) ────
     //
-    // Reproduces the T366 incident: two independent PR-completion triggers
-    // (the Stop-hook path and the merge-poller's `pr_recheck` sweep) each
-    // observed the producing execution as not-yet-terminal and independently
-    // enqueued a `pr_review` execution for the same unchanged head sha,
-    // minting two near-identical findings revisions from a single push.
+    // Reproduces the incident these tests guard against: two independent
+    // PR-completion triggers (the Stop-hook path and the merge-poller's
+    // `pr_recheck` sweep) each observed the producing execution as
+    // not-yet-terminal and independently enqueued a `pr_review` execution
+    // for the same unchanged head sha, minting two near-identical findings
+    // revisions from a single push.
 
     #[test]
     fn create_pr_review_execution_dedup_creates_fresh_ready_execution() {
@@ -2605,8 +2628,9 @@ mod tests {
     #[test]
     fn create_pr_review_execution_dedup_reuses_existing_nonterminal_pr_review() {
         // Two triggers for the SAME unchanged head, back to back — the exact
-        // shape of the T366 race (Stop hook + pr_recheck sweep both racing
-        // past the enqueue check before either recorded its completion).
+        // shape of the concurrent-enqueue race (Stop hook + pr_recheck sweep
+        // both racing past the enqueue check before either recorded its
+        // completion).
         let db = open_db();
         let work_item_id = chore_with_pr(&db, "https://github.com/test/repo/pull/101", "active");
 
