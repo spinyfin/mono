@@ -947,8 +947,7 @@ pub(crate) fn reconcile_revision_execution(
             // redundant-spawn guard abandons seconds later — leaving an
             // `abandoned` duplicate as the task's newest row, which then
             // shadows the genuinely-completed revision in `agents status`
-            // (the exec_89/T500-shaped incident). Defer instead: if ANY live
-            // execution is attached to this task, do not create a duplicate.
+            // Defer instead: if any live execution is attached to this task, do not create a duplicate.
             if let Some(live) = query_live_execution_for_work_item(conn, &task.id)? {
                 tracing::info!(
                     work_item_id = %task.id,

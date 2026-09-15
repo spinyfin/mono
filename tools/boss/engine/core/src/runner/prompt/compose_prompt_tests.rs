@@ -7,6 +7,7 @@ use boss_protocol::{ExecutionStatus, TaskStatus};
 use super::*;
 use crate::work::Task;
 
+mod blocked_recovery;
 mod invocation;
 
 fn base_execution() -> WorkExecution {

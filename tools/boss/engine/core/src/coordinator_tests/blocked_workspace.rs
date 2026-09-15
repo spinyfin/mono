@@ -116,6 +116,69 @@ async fn blocked_revision_reclaims_only_verified_prior_identity_and_falls_back_s
 }
 
 #[tokio::test]
+async fn blocked_revision_retry_after_deferral_release_trusts_its_own_recovery_marker() {
+    // A post-lease deferral (e.g. the chain-sibling guard in
+    // `schedule_execution`) releases the lease it just took to hand the
+    // workspace back. `release_workspace` sets `last_task =
+    // COALESCE(task, last_task)`, and `task` was stamped at lease time with
+    // THIS execution's own id (`execution_task_summary`), not `prior.id` —
+    // so that release silently overwrites the `prior.id` marker
+    // `verify_blocked_workspace`'s `last_task` check depends on, even
+    // though the workspace itself never changed. On a retry, cube's
+    // `last_task` no longer proves the identity — but the on-disk
+    // `RecoveryReport` this same execution wrote on its first successful
+    // verification does, and must be trusted instead.
+    use boss_engine_recovery::recovery_apply::{RecoveryReport, RecoverySource};
+    let dir = tempdir().unwrap();
+    let (db, prior, next) = blocked_pair(&dir.path().join("boss.db"));
+    let workspace = dir.path().join("workspace-old");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // Simulate cube's `last_task` after a deferral release already
+    // overwrote it with this (replacement) execution's own label —
+    // the exact corruption described above.
+    let cube = Arc::new(FakeCubeClient {
+        dirty_verified: Some(true),
+        workspace_root: Some(dir.path().to_path_buf()),
+        recovery_status: Some(
+            CubeWorkspaceStatus::builder()
+                .workspace_id("workspace-old")
+                .workspace_path(workspace.clone())
+                .state("leased")
+                .lease_id("lease-1")
+                .last_task(format!("{} revision_implementation Blocked revision", next.id))
+                .build(),
+        ),
+        ..FakeCubeClient::default()
+    });
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db,
+        WorkerPool::new(1),
+        cube.clone(),
+        Arc::new(FakeExecutionRunner::default()),
+    ));
+    // This execution already verified this exact workspace on an earlier
+    // dispatch attempt and recorded it in the on-disk marker.
+    RecoveryReport {
+        for_execution_id: next.id.clone(),
+        from_execution_id: prior.id.clone(),
+        source: RecoverySource::BlockedInPlace,
+        applied: None,
+        patch_error: None,
+    }
+    .write(&workspace)
+    .unwrap();
+    let repo = CubeRepoHandle { repo_id: "mono".into() };
+    let lease = coordinator
+        .lease_workspace_with_fallback(&next, "worker", &repo, "task", &coordinator.host_adapter)
+        .await
+        .unwrap();
+    assert_eq!(lease.workspace_id, "workspace-old");
+    let calls = cube.lease_calls.lock().await;
+    assert_eq!(calls.len(), 1, "must not fall back to a fresh workspace");
+    assert!(cube.release_calls.lock().await.is_empty());
+}
+
+#[tokio::test]
 async fn blocked_recovery_report_distinguishes_fresh_checkout_without_patch_replay() {
     use boss_engine_recovery::recovery_apply::{RecoveryReport, RecoverySource};
     for recovered in [false, true] {

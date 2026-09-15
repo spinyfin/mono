@@ -383,6 +383,66 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
     let blocked_recovery = recovery_report.as_ref().and_then(workspace_recovery::recovery_block);
     if let Some(block) = &blocked_recovery {
         prompt.push_str(block);
+        // A blocked-recovery marker suppresses the generic "no PR yet" /
+        // "no marker" branches below, but it must NOT suppress the
+        // RESUME EXISTING PR guidance when the work item already has a
+        // PR — otherwise a Chore/Task with `existing_pr_url` loses its
+        // explicit "do NOT `jj new main`" override, and the acceptance-
+        // criterion block further down (which references "the ##
+        // RESUME EXISTING PR block above" whenever `existing_pr_url` is
+        // Some) points at a heading that was never rendered. For
+        // `BlockedInPlace` specifically, the inherited checkout is
+        // already the right position, so the guidance must say "stay
+        // put" rather than "run `workspace goto --pr`" — repositioning
+        // would discard the preserved commits `recovery_block` just
+        // told the worker to keep.
+        if let Some(pr_url) = existing_pr_url {
+            let pr_number = boss_github::pr_url::pr_number_from_url(pr_url)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "?".into());
+            let in_place = recovery_report
+                .as_ref()
+                .is_some_and(|r| r.source == boss_engine_recovery::recovery_apply::RecoverySource::BlockedInPlace);
+            if in_place {
+                prompt.push_str(&format!(
+                    "## RESUME EXISTING PR\n\
+                     \n\
+                     This task has an existing open PR (#{pr_number}) at {pr_url}.\n\
+                     You are already on the inherited checkout described in the recovery handoff above.\n\
+                     Do NOT run `jj new main` or `{cube} workspace goto --pr {pr_number}` — either would \
+                     discard the preserved commits. Reconcile the inherited state with this brief, then push \
+                     new commits directly to that same branch:\n\
+                     ```\n\
+                     {cube} pr update --branch <branch-name>\n\
+                     ```\n\
+                     \n\
+                     If the branch cannot be resumed (deleted upstream, etc.),\n\
+                     STOP and surface the blocker — do NOT silently open a parallel PR.\n\
+                     A merge conflict on that branch is not a resume failure: rebase, resolve, verify, and continue.\n\n",
+                ));
+            } else {
+                prompt.push_str(&format!(
+                    "## RESUME EXISTING PR\n\
+                     \n\
+                     This task has an existing open PR (#{pr_number}) at {pr_url}.\n\
+                     You MUST add commits to that branch — do NOT start from `jj new main` and do NOT open a new PR.\n\
+                     \n\
+                     After leasing your workspace:\n\
+                     ```\n\
+                     jj git fetch\n\
+                     {cube} workspace goto --pr {pr_number}   # lands you on the PR branch\n\
+                     ```\n\
+                     Then make your changes on that branch and push:\n\
+                     ```\n\
+                     {cube} pr update --branch <branch-name>\n\
+                     ```\n\
+                     \n\
+                     If the branch cannot be resumed (deleted upstream, etc.),\n\
+                     STOP and surface the blocker — do NOT silently open a parallel PR.\n\
+                     A merge conflict on that branch is not a resume failure: rebase, resolve, verify, and continue.\n\n",
+                ));
+            }
+        }
     } else if let Some(block) = merge_cancelled_review_recovery_block(execution, work_item, workspace_path) {
         prompt.push_str(&block);
     } else if let Some(pr_url) = existing_pr_url {
@@ -1688,6 +1748,19 @@ fn compose_revision_directive(
     // runs the full test suite post-push. Other revisions keep the
     // build-and-test-before-push gate.
     let is_conflict_resolution = conflict_attempt.is_some();
+    // A `BlockedInPlace` recovery already handed this revision its exact
+    // prior checkout (see `workspace_recovery::recovery_block`, pushed
+    // earlier in `compose_execution_prompt`) — the engine deliberately did
+    // NOT reposition the workspace for this run. The generic "engine
+    // pre-positioned via `workspace goto`" claim below, and its `workspace
+    // goto --pr` fallback, are both false in that case and — if followed —
+    // would fetch, force-move the bookmark, and `jj new` onto the remote PR
+    // head, discarding the preserved commits the recovery handoff just told
+    // the worker to keep. `BlockedFresh` is unaffected: the engine still
+    // positions that case normally, so the generic wording stays correct.
+    let blocked_in_place =
+        boss_engine_recovery::recovery_apply::RecoveryReport::read_for(workspace_path, &execution.id)
+            .is_some_and(|r| r.source == boss_engine_recovery::recovery_apply::RecoverySource::BlockedInPlace);
 
     let mut out = String::new();
     out.push_str("Expected outcome for this run:\n");
@@ -1720,7 +1793,15 @@ fn compose_revision_directive(
     // GitHub PR URL, which is exactly when the engine called `cube workspace goto`
     // to position the workspace at the PR head. Without a parseable URL,
     // the workspace is on main and the worker must position it manually.
-    if pr_number != "?" {
+    if blocked_in_place {
+        out.push_str(
+            "The recovery handoff above already verified and re-leased this revision's own prior, \
+             deliberately-blocked-in-place checkout. The engine did NOT run `cube workspace goto` for this \
+             run, and running it now — or `jj new main` — would discard the preserved commits. Stay at `@`: \
+             inspect `jj status`, `jj diff`, and `jj log -r '::@' -n 10` to see what the prior worker left, \
+             reconcile it with this brief and current `main`, then continue making changes directly.\n",
+        );
+    } else if pr_number != "?" {
         if is_conflict_resolution {
             out.push_str(&format!("The engine pre-positioned this workspace via `{cube} workspace goto`, so you are already on a fresh editable commit whose parent is the PR head — no branch discovery or checkout is needed. Do NOT start making changes yet: this is a conflict-resolution revision, and the ground-truth block below requires you to check GitHub's mergeable status and re-run the rebase FIRST.\n"));
         } else {

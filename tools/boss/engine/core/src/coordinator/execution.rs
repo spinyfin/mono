@@ -2332,7 +2332,10 @@ impl ExecutionCoordinator {
         {
             Ok(lease) if blocked_predecessor.is_some() => {
                 let prior = blocked_predecessor.as_ref().expect("checked above");
-                if self.verify_blocked_workspace(prior, &lease, adapter).await {
+                if self
+                    .verify_blocked_workspace(&execution.id, prior, &lease, adapter)
+                    .await
+                {
                     CUBE_WORKSPACE_LEASE_SUCCESS.inc(&self.metrics);
                     return Ok(lease);
                 }
