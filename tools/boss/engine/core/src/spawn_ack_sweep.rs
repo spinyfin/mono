@@ -1490,11 +1490,7 @@ fn raise_driver_start_attention(
     } else {
         "If this repeats for the same driver, the spawn command is most likely not reaching the driver binary at all — check how the command is delivered to the pane."
     };
-    let title = if file_ingress.is_some() {
-        format!("Worker produced no driver signal on slot {slot_id}")
-    } else {
-        format!("Worker driver never started on slot {slot_id}")
-    };
+    let title = format!("Worker spawned on slot {slot_id} but no driver signal was observed");
     let pane_observation = pane_observation(shell_pid);
     let body = format!(
         "**Observed (driver-start timeout, sweep pass 2):** {pane_observation} for execution \
@@ -1506,6 +1502,7 @@ fn raise_driver_start_attention(
          {pid_note}\n\n\
          The engine has reaped the execution: the pane was torn down, the worker slot released, \
          and the cube workspace lease force-released. The work item is reset for redispatch.\n\n\
+         Either the driver never started, or it started and its signal never reached the engine. \
          {advice}"
     );
     if let Err(err) = work_db.create_attention_item(CreateAttentionItemInput {

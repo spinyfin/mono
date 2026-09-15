@@ -195,7 +195,7 @@ fn snapshot_file_progress(paths: &HashSet<PathBuf>) -> HashMap<PathBuf, FileProg
 /// True when a matching rollout is new since the pre-spawn baseline (and
 /// non-empty) or an already-baselined file has grown in size or mtime.
 /// Does not require a parseable `session_meta` line.
-pub(crate) fn matching_file_shows_progress(prepared: &PreparedSource, paths: &HashSet<PathBuf>) -> bool {
+fn matching_file_shows_progress(prepared: &PreparedSource, paths: &HashSet<PathBuf>) -> bool {
     for path in paths {
         let Ok(metadata) = fs::symlink_metadata(path) else {
             continue;
@@ -627,6 +627,7 @@ fn session_meta_verdict(
 #[derive(Debug, Default)]
 pub(crate) struct DiscoveryScan {
     pub(crate) matched: Vec<Candidate>,
+    pub(crate) file_progress: bool,
     pub(crate) rejected: Vec<(PathBuf, CandidateRejection)>,
 }
 
@@ -639,11 +640,14 @@ pub(crate) struct DiscoveryScan {
 /// `open`, and the other files still deserve a verdict.
 pub(crate) fn scan_once(prepared: &PreparedSource) -> Result<DiscoveryScan, String> {
     prepared.root.revalidate()?;
-    let mut paths: Vec<PathBuf> = scan_matching_paths(&prepared.root, &prepared.ingress)?
-        .into_iter()
-        .collect();
+    let paths = scan_matching_paths(&prepared.root, &prepared.ingress)?;
+    let file_progress = matching_file_shows_progress(prepared, &paths);
+    let mut paths: Vec<PathBuf> = paths.into_iter().collect();
     paths.sort();
-    let mut scan = DiscoveryScan::default();
+    let mut scan = DiscoveryScan {
+        file_progress,
+        ..DiscoveryScan::default()
+    };
     for path in paths {
         if prepared.baseline.contains(&path) {
             scan.rejected.push((path, CandidateRejection::InBaseline));
@@ -789,7 +793,7 @@ pub(crate) async fn discover_candidate(
     halt: &mut watch::Receiver<StreamHalt>,
     timeout: Duration,
 ) -> Result<Option<Candidate>, String> {
-    discover_candidate_observed(prepared, halt, timeout, |_, _, _, overdue| async move { overdue }).await
+    discover_candidate_observed(prepared, halt, timeout, |_, _, _, overdue, _| async move { overdue }).await
 }
 
 /// Poll until attachment or cancellation, reporting overdue diagnostics to
@@ -802,7 +806,7 @@ pub(crate) async fn discover_candidate_observed<F, Fut>(
     mut overdue: F,
 ) -> Result<Option<Candidate>, String>
 where
-    F: FnMut(Vec<(PathBuf, CandidateRejection)>, String, u64, bool) -> Fut,
+    F: FnMut(Vec<(PathBuf, CandidateRejection)>, String, u64, bool, bool) -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
     let started = tokio::time::Instant::now();
@@ -855,6 +859,7 @@ where
                         reason.clone(),
                         now.duration_since(started).as_secs(),
                         true,
+                        false,
                     )
                     .await
                     {
@@ -896,7 +901,11 @@ where
             }
             ever_rejected.insert(path.clone(), rejection.clone());
         }
-        let DiscoveryScan { mut matched, rejected } = scan;
+        let DiscoveryScan {
+            mut matched,
+            rejected,
+            file_progress,
+        } = scan;
         if matched.len() == 1 {
             return Ok(matched.pop());
         }
@@ -914,6 +923,7 @@ where
             reason.clone(),
             now.duration_since(started).as_secs(),
             now >= deadline,
+            file_progress,
         )
         .await;
         let count = matched.len();

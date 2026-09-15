@@ -1014,11 +1014,16 @@ where
     async fn run(&self, halt: &mut watch::Receiver<StreamHalt>) -> Result<Option<(Candidate, u64)>, String> {
         let started = tokio::time::Instant::now();
         let mut recorded_diagnostics = None;
+        let mut recorded_live = false;
         let result = crate::agent_jsonl_discovery::discover_candidate_observed(
             self.prepared,
             halt,
             self.overdue_after,
-            |rejected, reason, waited_secs, overdue| {
+            |rejected, reason, waited_secs, overdue, file_progress| {
+                if file_progress && !recorded_live {
+                    self.sink.record_driver_attach(self.run_id);
+                    recorded_live = true;
+                }
                 let mut rejected: Vec<_> = rejected
                     .into_iter()
                     .filter(|(_, reason)| {
@@ -1160,15 +1165,6 @@ where
             );
         }
     }
-}
-
-/// One discovery scan: the correlated candidates, and how many new files
-/// looked like rollouts but did not correlate to this run.
-struct ScanPass {
-    matches: Vec<Candidate>,
-    rejected_candidates: usize,
-    rejections: Vec<CandidateRejection>,
-    file_progress: bool,
 }
 
 fn validate_descriptor_before_publish(

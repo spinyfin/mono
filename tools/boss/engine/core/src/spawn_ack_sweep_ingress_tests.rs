@@ -28,7 +28,10 @@ fn checkpoint_variants_drive_reap_reading_and_attention() {
         },
     );
     let old = db.list_attention_items(&execution_id).unwrap();
-    assert_eq!(old[0].title, "Worker driver never started on slot 1");
+    assert_eq!(
+        old[0].title,
+        "Worker spawned on slot 1 but no driver signal was observed"
+    );
     assert!(old[0].body_markdown.contains("not the driver"));
     assert!(old[0].body_markdown.contains("spawn command"));
     let ingress = AgentJsonlFileIngress {
@@ -132,7 +135,7 @@ fn assert_attention(db: &WorkDb, execution: &WorkExecution, state: &FileIngressS
         .iter()
         .find(|item| item.body_markdown.contains(&state.summary))
         .unwrap();
-    assert_eq!(item.title, "Worker produced no driver signal on slot 1");
+    assert_eq!(item.title, "Worker spawned on slot 1 but no driver signal was observed");
     assert!(item.body_markdown.contains("does not establish whether the driver ran"));
     assert!(item.body_markdown.contains("rollout diagnostics"));
     assert!(!item.body_markdown.contains("not the driver"));
