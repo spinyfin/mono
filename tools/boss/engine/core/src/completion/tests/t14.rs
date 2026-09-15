@@ -322,6 +322,25 @@ async fn admission_deferred_leaves_the_hold_in_place() {
             .any(|a| a.kind == crate::work::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND),
         "a deferred admission must file the deferred-admission marker; got: {attentions:?}"
     );
+    let WorkItem::Chore(task) = db.get_work_item(&chore_id).unwrap() else {
+        panic!("expected chore")
+    };
+    assert_eq!(task.review_required_state.as_deref(), Some("awaiting_admission"));
+    db.resolve_external_tracker_attention(&chore_id, crate::work::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND)
+        .unwrap();
+    assert!(
+        db.list_tasks_awaiting_pre_merge_review_admission()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.task_id == chore_id),
+        "the row's admission state survives attention resolution"
+    );
+    db.create_pr_review_execution_dedup(&chore_id, &execution.repo_remote_url)
+        .unwrap();
+    let WorkItem::Chore(task) = db.get_work_item(&chore_id).unwrap() else {
+        panic!("expected chore")
+    };
+    assert_eq!(task.review_required_state.as_deref(), Some("automated_review"));
 }
 
 /// Regression test for the recheck-vs-Stop declaration-gate asymmetry: with

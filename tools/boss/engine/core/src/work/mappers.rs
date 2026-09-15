@@ -580,6 +580,7 @@ pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
             .map(|raw| parse_text_column(28, &raw))
             .transpose()?,
         pr_head_after: row.get(29)?,
+        pr_head_after_capture: row.get(30)?,
     })
 }
 
