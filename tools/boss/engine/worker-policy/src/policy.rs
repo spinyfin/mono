@@ -499,6 +499,8 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         // coordinator diagnostic akin to `AuditProductEffort` above, not
         // something a task worker needs about its own or other work items.
         | FrontendRequest::GetCostWindowReport { .. }
+        | FrontendRequest::GetMetricCatalog
+        | FrontendRequest::GetMetricSeries { .. }
         | FrontendRequest::GetTopCostConsumers { .. }
         | FrontendRequest::GetWorkItemCostReport { .. }
         | FrontendRequest::GitHubAuthCancel

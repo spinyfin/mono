@@ -731,6 +731,10 @@ impl WorkDb {
         // guide execution path are enabled, but schema creation is additive
         // and gives every reconciler one durable capture target.
         step!(timer, conn, migrate_pr_review_guide_source_capture_tables)?;
+        // Read-time metric series: window filters on `finished_at`/`kind`
+        // and `work_runs.created_at`. Additive `CREATE INDEX IF NOT EXISTS`;
+        // rides the current schema marker.
+        step!(timer, conn, migrate_metric_series_indexes)?;
         step!(timer, conn, Self::stamp_schema_version)?;
         timer.finish();
         Ok(())
@@ -1123,6 +1127,20 @@ mod tests {
         assert!(
             work_attachments_exists,
             "expected work_attachments table from migrate_work_attachments_table"
+        );
+
+        let metric_series_indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index'
+                   AND name IN ('work_executions_finished_at_kind_idx', 'work_runs_created_at_idx')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            metric_series_indexes, 2,
+            "expected metric-series window indexes from migrate_metric_series_indexes"
         );
 
         let pr_review_verdicts_exists: bool = conn

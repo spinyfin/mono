@@ -105,6 +105,7 @@ mod ideas;
 pub mod isolation;
 mod launch_environment;
 mod live_status;
+mod metric_series;
 mod metrics;
 mod pane_delivery;
 mod pane_ops;
@@ -2670,6 +2671,8 @@ async fn handle_frontend_connection(
                 r @ FrontendRequest::GetExecution { .. } => executions::handle_get_execution(ctx, r).await,
                 r @ FrontendRequest::GetHost { .. } => hosts::handle_get_host(ctx, r).await,
                 r @ FrontendRequest::GetIdea { .. } => ideas::handle_get_idea(ctx, r).await,
+                r @ FrontendRequest::GetMetricCatalog => metric_series::handle_get_metric_catalog(ctx, r).await,
+                r @ FrontendRequest::GetMetricSeries { .. } => metric_series::handle_get_metric_series(ctx, r).await,
                 r @ FrontendRequest::GetPrBody { .. } => pr_status::handle_get_pr_body(ctx, r).await,
                 r @ FrontendRequest::GetProductDesignDoc { .. } => {
                     design_docs::handle_get_product_design_doc(ctx, r).await
