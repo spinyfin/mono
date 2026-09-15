@@ -22,10 +22,12 @@ struct WorkDispatchFailureBanner: View {
     /// Mirrors `boss_engine_core::work::DELIBERATE_PARK_CHURN_COMBINED_MARKER`.
     /// A deliberately parked row that has ALSO tripped the churn guard
     /// carries this exact substring in its `dispatch_failed_error` body
-    /// (`WorkDb::deliberate_park_text`); both sides are pinned to the same
-    /// literal via an engine unit test so a wording change on either side
-    /// cannot silently desync the contract.
-    private static let combinedParkChurnMarker = "tripping the churn guard on top of the park"
+    /// (`WorkDb::deliberate_park_text`). The engine unit test
+    /// `combined_park_churn_marker_matches_swift_banner` `include_str!`s
+    /// this file and asserts that constant appears here verbatim, so a
+    /// wording change on either side fails that test instead of silently
+    /// dropping the churn half of the card headline.
+    static let combinedParkChurnMarker = "tripping the churn guard on top of the park"
 
     private var isDeliberatePark: Bool {
         reason == Self.deliberateParkReason
@@ -46,6 +48,14 @@ struct WorkDispatchFailureBanner: View {
 
     var summary: String? {
         isDeliberatePark ? "Review the open attention item, then drag to Doing to resume." : errorText
+    }
+
+    /// Parked cards must show the full resume instruction; dispatch-failure
+    /// cards cap the stored diagnostic at three lines. Consumed by `body`
+    /// and asserted from tests so a hard 1-line cap cannot hide behind a
+    /// structurally-unlike control view.
+    var summaryLineLimit: Int? {
+        isDeliberatePark ? nil : 3
     }
 
     private var tint: Color {
@@ -71,7 +81,7 @@ struct WorkDispatchFailureBanner: View {
                     Text(summary)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
-                        .lineLimit(isDeliberatePark ? nil : 3)
+                        .lineLimit(summaryLineLimit)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }

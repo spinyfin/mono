@@ -166,13 +166,13 @@ pub struct OrphanSweepOutcome {
     /// Items actually bounced to Backlog by
     /// [`crate::work::WorkDb::bounce_deliberate_park_to_backlog`] because a
     /// deliberate park (counted above in `deliberate_park_skipped`) survived
-    /// the live-execution and durable-process guards. This is the operator-
-    /// visible halted-state surface, independent of the open attention item
-    /// (`docs/designs/dispatch-halt-state-vs-attention-items.md`). Only
-    /// incremented when the write actually landed (the bounce helper returns
-    /// `true`), so a no-op (the row raced a status change) or a DB write
-    /// failure never inflates this counter with a halt that was never made
-    /// visible on the board.
+    /// the live-execution and durable-process guards. This is the halted-
+    /// state surface the kanban card reads, independent of the open
+    /// attention item (`docs/designs/dispatch-halt-state-vs-attention-items.md`).
+    /// Only incremented when the write actually landed (the bounce helper
+    /// returns `true`), so a no-op (the row raced a status change) or a DB
+    /// write failure never inflates this counter with a halt that was never
+    /// made visible on the board.
     pub deliberate_park_bounced: usize,
     /// Items skipped because the pass could not *establish* whether it was
     /// allowed to redispatch — the admission evaluation or the `autostart`

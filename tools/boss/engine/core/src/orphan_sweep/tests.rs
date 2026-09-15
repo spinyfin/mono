@@ -924,7 +924,9 @@ async fn a_deliberately_parked_row_that_is_also_churning_names_both_conditions()
     );
     assert!(
         error_text.contains(crate::work::DELIBERATE_PARK_CHURN_COMBINED_MARKER),
-        "must ALSO name the churn condition with the exact marker WorkBoardBanners.swift matches on: {error_text:?}",
+        "must ALSO name the churn condition (proves the combined branch ran; \
+         the marker's value is pinned against WorkBoardBanners.swift by \
+         combined_park_churn_marker_matches_swift_banner): {error_text:?}",
     );
 }
 
@@ -1216,15 +1218,13 @@ async fn churn_guard_skips_repeatedly_failing_item() {
     assert!(sink.events().await.is_empty(), "no event on churn skip");
 }
 
-/// A churn-only row (no deliberate park) still gets bounced to Backlog
-/// while a global dispatch pause is in effect. Base behaviour held the
-/// pause gate ahead of the churn bounce, so a paused engine froze board
-/// state for a churn-tripped row; the combined park+churn bounce this
-/// module added now runs before the pause check for every candidate, not
-/// only parked ones, because the park half of that bounce must be able to
-/// mutate under a pause. This is an intentional widening of the
-/// pre-existing churn path, not just new behaviour for parks — pin it so
-/// a future reordering can't silently revert it.
+/// The halted-state bounce runs ahead of the dispatch-pause gate for every
+/// candidate, not only parked ones: the park half must be able to mutate a
+/// row under a pause, and splitting the two halves across the gate would
+/// leave a churn-tripped row's halt invisible for as long as the pause
+/// lasted. Surfacing a halt never mints an execution, so this does not
+/// weaken what a pause governs. Pinned here so a future reordering cannot
+/// move the bounce below the gate.
 #[tokio::test]
 async fn churn_only_row_bounces_while_dispatch_is_paused() {
     let (_dir, db) = open_db();

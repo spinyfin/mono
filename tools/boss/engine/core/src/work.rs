@@ -151,11 +151,35 @@ pub const DELIBERATE_PARK_DISPATCH_FAILED_REASON: &str = "deliberate_park";
 /// (`WorkDispatchFailureBanner.reasonLabel`) matches on this exact string to
 /// decide whether to render the combined "deliberate park + churn guard"
 /// headline instead of the plain park one — see the `/// Mirrors` comment
-/// there. Both sides are pinned to this one constant so neither a Rust
-/// wording change nor a Swift wording change can silently desync the
-/// contract; an engine unit test asserts this string appears verbatim in
-/// the combined body.
+/// there. The unit test `combined_park_churn_marker_matches_swift_banner`
+/// `include_str!`s that Swift file and asserts this constant appears in it,
+/// so a wording change on either side fails the test instead of silently
+/// dropping the churn half of the card headline. The bounce-path assertion
+/// that the generated body *contains* this constant only proves the churn
+/// branch ran; it does not pin the value.
 pub const DELIBERATE_PARK_CHURN_COMBINED_MARKER: &str = "tripping the churn guard on top of the park";
+
+#[cfg(test)]
+mod combined_park_churn_marker_pin {
+    /// Byte-identity pin: `WorkDispatchFailureBanner.combinedParkChurnMarker`
+    /// in the live Swift source must contain this crate's
+    /// [`super::DELIBERATE_PARK_CHURN_COMBINED_MARKER`] verbatim. A bounce-path
+    /// `contains(CONSTANT)` check cannot do this job — that body is produced
+    /// by interpolating the same constant, so expected and actual move
+    /// together. Reading the Swift file is the same pattern
+    /// `boss_construct_scan` uses for `CHECKS.yaml`.
+    #[test]
+    fn combined_park_churn_marker_matches_swift_banner() {
+        let swift = include_str!(env!("BOSS_WORK_BOARD_BANNERS_SWIFT"));
+        assert!(
+            swift.contains(super::DELIBERATE_PARK_CHURN_COMBINED_MARKER),
+            "WorkBoardBanners.swift must contain DELIBERATE_PARK_CHURN_COMBINED_MARKER \
+             verbatim so reasonLabel can match the engine body; changing the Rust \
+             constant without the Swift literal (or vice versa) silently drops the \
+             churn half of the card headline"
+        );
+    }
+}
 
 /// `work_attention_items.kind` raised by [`crate::dispatch_stall_escalation`]
 /// when a dispatch timeline sits stuck in one stage past

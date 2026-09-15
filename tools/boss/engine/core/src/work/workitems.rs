@@ -433,8 +433,8 @@ impl WorkDb {
     /// can decide it is blocked only after several unproductive runs. The
     /// reason stamped is still `deliberate_park` (the park is the stronger,
     /// human-only-clearable condition), but the body names both conditions
-    /// rather than picking one, so the card tells the operator the row is not
-    /// merely churning — it is also waiting on a decision.
+    /// rather than picking one: the row is not merely churning, it is also
+    /// waiting on a decision.
     ///
     /// Best-effort like its churn-guard sibling: the caller has already
     /// logged the trip via `tracing::warn!`; a failure (or a no-op because the
