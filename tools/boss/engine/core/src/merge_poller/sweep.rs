@@ -229,6 +229,42 @@ fn remaining_probe_urls<'a>(remaining: impl IntoIterator<Item = &'a PendingMerge
         .collect()
 }
 
+/// Allocate source-capture observation sequences before a batched GitHub
+/// probe starts. A slower, older response can therefore never outrank a
+/// newer probe merely because it arrived later. The disabled rollout pays
+/// no write cost and leaves the existing poller behavior unchanged.
+///
+/// Sequence allocation is deliberately adjacent to the actual GitHub
+/// request rather than the later candidate walk: response timing must not
+/// determine which comparison becomes the desired one.
+fn allocate_source_observation_sequences(
+    work_db: &WorkDb,
+    completion_handler: Option<&WorkerCompletionHandler>,
+    probe_urls: &[String],
+) -> HashMap<String, i64> {
+    completion_handler
+        .filter(|handler| handler.review_guide_source_capture_enabled())
+        .map(|_| {
+            probe_urls
+                .iter()
+                .filter_map(
+                    |url| match work_db.allocate_pr_review_guide_source_observation_sequence() {
+                        Ok(sequence) => Some((url.clone(), sequence)),
+                        Err(error) => {
+                            tracing::warn!(
+                                pr_url = %url,
+                                ?error,
+                                "merge poller: could not allocate review-guide source observation sequence",
+                            );
+                            None
+                        }
+                    },
+                )
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Run one full lifecycle sweep over every chore and project_task
 /// the poller cares about (in_review with a PR, plus rows currently
 /// blocked on merge_conflict so we can detect resolution, plus
@@ -410,31 +446,7 @@ pub async fn run_one_pass_observed(
         .map(|candidate| candidate.pr_url.clone())
         .filter(|url| probe_url_seen.insert(url.clone()))
         .collect();
-    // Sequence source observations before beginning the probe batch. This is
-    // deliberately adjacent to the actual GitHub request rather than the
-    // later candidate walk: response timing must not determine which
-    // comparison becomes the desired one.
-    let source_observation_sequences: HashMap<String, i64> = completion_handler
-        .filter(|handler| handler.review_guide_source_capture_enabled())
-        .map(|_| {
-            probe_urls
-                .iter()
-                .filter_map(
-                    |url| match work_db.allocate_pr_review_guide_source_observation_sequence() {
-                        Ok(sequence) => Some((url.clone(), sequence)),
-                        Err(error) => {
-                            tracing::warn!(
-                                pr_url = %url,
-                                ?error,
-                                "merge poller: could not allocate review-guide source observation sequence",
-                            );
-                            None
-                        }
-                    },
-                )
-                .collect()
-        })
-        .unwrap_or_default();
+    let source_observation_sequences = allocate_source_observation_sequences(work_db, completion_handler, &probe_urls);
     let mut snapshot = ProbeSnapshot::new(probe.probe_batch(&probe_urls).await);
     // The pass's candidate walk, materialised so a mid-pass re-probe can be
     // scoped to the part of it that has not happened yet — see
@@ -764,31 +776,7 @@ pub async fn reconcile_batch(
         );
         return (outcome, pr_urls.iter().map(|url| (url.clone(), None)).collect());
     }
-    // Allocate source-capture ordering before the batched GitHub request
-    // starts. A slower, older response can therefore never outrank a newer
-    // probe merely because it arrived later. The disabled rollout pays no
-    // write cost and leaves the existing poller behavior unchanged.
-    let source_observation_sequences: HashMap<String, i64> = completion_handler
-        .filter(|handler| handler.review_guide_source_capture_enabled())
-        .map(|_| {
-            probe_urls
-                .iter()
-                .filter_map(
-                    |url| match work_db.allocate_pr_review_guide_source_observation_sequence() {
-                        Ok(sequence) => Some((url.clone(), sequence)),
-                        Err(error) => {
-                            tracing::warn!(
-                                pr_url = %url,
-                                ?error,
-                                "merge poller: could not allocate review-guide source observation sequence",
-                            );
-                            None
-                        }
-                    },
-                )
-                .collect()
-        })
-        .unwrap_or_default();
+    let source_observation_sequences = allocate_source_observation_sequences(work_db, completion_handler, &probe_urls);
     let probe_results = probe.probe_batch(&probe_urls).await;
 
     let mut seen = std::collections::HashSet::new();

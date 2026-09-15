@@ -558,53 +558,6 @@ mod schedule_tests;
 mod sweep_tests;
 mod unmergeable_reaction_tests;
 
-fn counting_source_collector(
-    calls: Arc<std::sync::atomic::AtomicUsize>,
-    packet: boss_pr_review_sources::SourcePacket,
-) -> crate::review_guide_capture::SourcePacketCollector {
-    let fixture_packet = packet.clone();
-    let collect: crate::review_guide_capture::PacketCollectFn = Arc::new(move |url, _observed, _branch, _metadata| {
-        let packet = packet.clone();
-        let calls = calls.clone();
-        Box::pin(async move {
-            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            assert_eq!(url, packet.canonical_pr_url);
-            Ok(packet)
-        })
-    });
-    crate::review_guide_capture::SourcePacketCollector::fixture(collect, fixture_packet)
-}
-
-fn source_capture_packet(pr: &str) -> boss_pr_review_sources::SourcePacket {
-    boss_pr_review_sources::SourcePacket {
-        schema_version: 2,
-        canonical_pr_url: pr.to_owned(),
-        pr_number: 2,
-        title: "Captured".to_owned(),
-        body: None,
-        base_repository: "foo/bar".to_owned(),
-        head_repository: "foo/bar".to_owned(),
-        observed_base_sha: "base-1".to_owned(),
-        merge_base_sha: "merge-base".to_owned(),
-        head_sha: "head-1".to_owned(),
-        files: Vec::new(),
-        omissions: Vec::new(),
-    }
-}
-
-async fn wait_for_source_capture(db: &WorkDb, root: &str) {
-    let started = std::time::Instant::now();
-    loop {
-        if db.get_latest_pr_review_guide_source_capture(root).unwrap().is_some() {
-            return;
-        }
-        if started.elapsed() > std::time::Duration::from_secs(2) {
-            panic!("timed out waiting for review-guide source capture");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-}
-
 fn enabled_source_capture_handler(
     db: Arc<WorkDb>,
     collector: crate::review_guide_capture::SourcePacketCollector,
@@ -638,7 +591,7 @@ async fn open_probe_does_not_recollect_an_unchanged_complete_comparison() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let handler = enabled_source_capture_handler(
         db.clone(),
-        counting_source_collector(calls.clone(), source_capture_packet(pr)),
+        counting_source_collector(calls.clone(), source_capture_packet(pr, "base-1", "head-1")),
     );
     let probe = StubProbe::new();
     probe.set_with_base_head(pr, PrLifecycleState::Open(OpenPrStatus::clean()), "base-1", "head-1");
@@ -677,9 +630,7 @@ async fn open_probe_does_not_recollect_an_unchanged_complete_comparison() {
         .unwrap();
     assert_eq!(capture.trigger, "poller");
     assert_eq!(capture.packet.head_sha, "head-1");
-    let mut second = source_capture_packet(pr);
-    second.observed_base_sha = "base-2".to_owned();
-    second.head_sha = "head-2".to_owned();
+    let second = source_capture_packet(pr, "base-2", "head-2");
     let second_handler = enabled_source_capture_handler(db.clone(), counting_source_collector(calls.clone(), second));
     probe.set_with_base_head(pr, PrLifecycleState::Open(OpenPrStatus::clean()), "base-2", "head-2");
     run_one_pass(
@@ -738,7 +689,7 @@ async fn open_probe_without_head_ref_oid_persists_nothing() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let handler = enabled_source_capture_handler(
         db.clone(),
-        counting_source_collector(calls.clone(), source_capture_packet(pr)),
+        counting_source_collector(calls.clone(), source_capture_packet(pr, "base-1", "head-1")),
     );
     let probe = StubProbe::new();
     probe.set_with_base(pr, PrLifecycleState::Open(OpenPrStatus::clean()), Some("base-1"));

@@ -247,35 +247,48 @@ pub(crate) fn reconcile_review_guide_source_with_collector(
         // Own the guard before the future is polled, including cancellation.
         let guard = guard;
         boss_gh_telemetry::scope(boss_gh_telemetry::callers::REVIEW_GUIDE_SOURCE_CAPTURE, async move {
-            let metadata = if observed.is_none() {
-                match (collector.metadata)(pr_url.clone(), expected_head_branch.clone()).await {
-                    Ok(metadata) => Some(metadata),
-                    Err(error) => {
-                        record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
-                        return;
-                    }
+            let metadata = match (collector.metadata)(pr_url.clone(), expected_head_branch.clone()).await {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
+                    return;
                 }
-            } else {
-                None
             };
-            let endpoints = observed.clone().unwrap_or_else(|| {
-                let metadata = metadata.as_ref().expect("resolved metadata");
-                PinnedComparison {
-                    base_sha: metadata.base_sha.clone(),
-                    head_sha: metadata.head_sha.clone(),
-                }
-            });
+            if let Some(observed) = &observed
+                && observed.head_sha != metadata.head_sha
+            {
+                record_capture_failure(
+                    &work_db,
+                    &root_task_id,
+                    &pr_url,
+                    observation_sequence,
+                    format!(
+                        "PR head changed while collecting sources: observed {} but metadata returned {}",
+                        observed.head_sha, metadata.head_sha
+                    ),
+                );
+                return;
+            }
+            // Comparison identity is REST `base.sha` + head, not a GraphQL
+            // `baseRefOid` that may track the live base tip.
+            let rest_identity = PinnedComparison {
+                base_sha: metadata.base_sha.clone(),
+                head_sha: metadata.head_sha.clone(),
+            };
             let mut guard = match guard {
-                Some(guard) => guard,
-                None => match prepare_capture(&work_db, &root_task_id, &pr_url, &endpoints, observation_sequence) {
-                    Ok(Some(guard)) => guard,
-                    Ok(None) => return,
-                    Err(error) => {
-                        record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
-                        return;
+                Some(guard) if observed.as_ref().is_some_and(|o| o.base_sha == rest_identity.base_sha) => guard,
+                Some(_) | None => {
+                    match prepare_capture(&work_db, &root_task_id, &pr_url, &rest_identity, observation_sequence) {
+                        Ok(Some(guard)) => guard,
+                        Ok(None) => return,
+                        Err(error) => {
+                            record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
+                            return;
+                        }
                     }
-                },
+                }
             };
+            let metadata = Some(metadata);
             let result = (collector.collect)(pr_url.clone(), observed, expected_head_branch, metadata).await;
             // Coalesced observations update this sequence; hold it through persistence.
             let mut captures = in_flight_captures().lock().unwrap_or_else(|error| error.into_inner());
@@ -536,7 +549,7 @@ mod tests {
         let flags = Arc::new(FeatureFlagsStore::new(flag_directory.path().join("feature-flags.toml")));
         flags.set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, true).unwrap();
         let packet = SourcePacket {
-            schema_version: 2,
+            schema_version: 3,
             canonical_pr_url: pr_url.to_owned(),
             pr_number: 25,
             title: "Captured revision".to_owned(),
@@ -544,6 +557,7 @@ mod tests {
             base_repository: "acme/widget".to_owned(),
             head_repository: "acme/widget".to_owned(),
             observed_base_sha: "base".to_owned(),
+            probe_base_sha: None,
             merge_base_sha: "merge-base".to_owned(),
             head_sha: "head".to_owned(),
             files: Vec::new(),

@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -19,8 +20,10 @@ use crate::coordinator::{
     CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
     ExecutionCoordinator, ExecutionPublisher, WorkerPool,
 };
+use crate::review_guide_capture::SourcePacketCollector;
 use crate::runner::{ExecutionRunner, RunOutcome, RunWaitState};
 use crate::work::{CreateChoreInput, WorkDb, WorkItemPatch};
+use boss_pr_review_sources::SourcePacket;
 use boss_protocol::{
     Automation, AutomationTrigger, CreateAutomationInput, CreateExecutionInput, CreateProductInput, ExecutionKind,
     ExecutionStatus, FinishExecutionRunInput, FrontendEvent, Product, RequestExecutionInput, Task, WorkExecution,
@@ -1133,4 +1136,56 @@ pub(crate) mod log_capture {
 /// a hermetic sandbox.
 pub fn try_init_repo_with_branch(path: &Path, branch: &str) -> bool {
     boss_engine_test_git::try_init_repo_with_branch(path, branch)
+}
+
+/// Shared source-capture packet fixture. Callers pass the PR URL and the
+/// base/head SHAs so creation, completion, and poller tests assert against
+/// the same packet shape.
+pub fn source_capture_packet(pr_url: &str, base_sha: &str, head_sha: &str) -> SourcePacket {
+    let (owner, repo, pr_number) = boss_github::pr_url::parse_pr_url_parts(pr_url).unwrap_or(("spinyfin", "mono", 25));
+    let repository = format!("{owner}/{repo}");
+    SourcePacket {
+        schema_version: 3,
+        canonical_pr_url: pr_url.to_owned(),
+        pr_number,
+        title: "Captured".to_owned(),
+        body: None,
+        base_repository: repository.clone(),
+        head_repository: repository,
+        observed_base_sha: base_sha.to_owned(),
+        probe_base_sha: None,
+        merge_base_sha: "merge-base".to_owned(),
+        head_sha: head_sha.to_owned(),
+        files: Vec::new(),
+        omissions: Vec::new(),
+    }
+}
+
+/// Collector that returns `packet` and counts how many times it was invoked.
+pub fn counting_source_collector(calls: Arc<AtomicUsize>, packet: SourcePacket) -> SourcePacketCollector {
+    let fixture_packet = packet.clone();
+    let collect: crate::review_guide_capture::PacketCollectFn = Arc::new(move |url, _observed, _branch, _metadata| {
+        let packet = packet.clone();
+        let calls = calls.clone();
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(url, packet.canonical_pr_url);
+            Ok(packet)
+        })
+    });
+    SourcePacketCollector::fixture(collect, fixture_packet)
+}
+
+/// Poll until a source-capture row exists for `root`, or panic after 2s.
+pub async fn wait_for_source_capture(db: &WorkDb, root: &str) {
+    let started = std::time::Instant::now();
+    loop {
+        if db.get_latest_pr_review_guide_source_capture(root).unwrap().is_some() {
+            return;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(2) {
+            panic!("timed out waiting for review-guide source capture");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
