@@ -817,3 +817,77 @@ fn request_execution_still_dispatches_a_blocked_declaration() {
     let executions = db.list_executions(Some(&chore_id)).unwrap();
     assert_eq!(executions.len(), 2);
 }
+
+fn assert_converted_followup_dispatches(blocked: bool) {
+    let db = WorkDb::open(temp_db_path("park-converted-followup")).unwrap();
+    let product = create_test_product_named(&db, "Converted followup");
+    let chore = create_test_chore(&db, product.id.clone(), "Continue review findings");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET kind = 'followup', status = 'todo', autostart = 1, pr_url = NULL WHERE id = ?1",
+            [&chore.id],
+        )
+        .unwrap();
+    let predecessor = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Abandoned)
+                .build(),
+        )
+        .unwrap();
+    if blocked {
+        stamp_blocked_declaration(&db, &predecessor.id);
+    }
+    let result = db.reconcile_product_executions(&product.id).unwrap();
+    let created = result
+        .created
+        .iter()
+        .find(|execution| execution.work_item_id == chore.id)
+        .unwrap();
+    assert_eq!(created.kind, ExecutionKind::ChoreImplementation);
+    assert_eq!(created.status, ExecutionStatus::Ready);
+    assert_ne!(created.id, predecessor.id);
+    assert_eq!(db.list_executions(Some(&chore.id)).unwrap().len(), 2);
+}
+
+#[test]
+fn reconcile_converted_followup_starts_after_blocked_revision() {
+    assert_converted_followup_dispatches(true);
+}
+
+#[test]
+fn reconcile_converted_followup_starts_after_unblocked_revision() {
+    assert_converted_followup_dispatches(false);
+}
+
+#[test]
+fn explicit_start_resolves_execution_scoped_park_attention_synchronously() {
+    let db = WorkDb::open(temp_db_path("park-explicit-attention")).unwrap();
+    let (chore_id, execution_id) = unparked_active_chore(&db, "explicit-attention");
+    for kind in [
+        crate::completion::RUN_DONE_BLOCKED_ATTENTION_KIND,
+        crate::completion::NUDGE_BREAKER_ATTENTION_KIND,
+    ] {
+        db.create_attention_item(boss_protocol::CreateAttentionItemInput {
+            execution_id: Some(execution_id.clone()),
+            work_item_id: None,
+            kind: kind.to_owned(),
+            status: None,
+            title: "Parked".to_owned(),
+            body_markdown: "Needs a decision".to_owned(),
+            resolved_at: None,
+        })
+        .unwrap();
+    }
+    assert!(db.dispatch_admission_facts(&chore_id).unwrap().deliberate_parked);
+    db.request_execution(RequestExecutionInput::builder().work_item_id(chore_id).build())
+        .unwrap();
+    let unresolved: i64 = db.connect().unwrap().query_row(
+        "SELECT COUNT(*) FROM work_attention_items WHERE execution_id = ?1 AND (status != 'resolved' OR resolved_at IS NULL)",
+        [&execution_id], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(unresolved, 0);
+}

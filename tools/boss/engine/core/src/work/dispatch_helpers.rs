@@ -549,15 +549,12 @@ pub(crate) fn reconcile_work_item_execution(
         return Ok(());
     }
     let insert_fresh = |result: &mut ExecutionReconcileResult, predecessor: Option<&WorkExecution>| -> Result<()> {
-        // Deliberate park is blocking on this automatic mint path, same as
-        // `rescan_active_dispatch` / `reconcile_active_dispatch` /
-        // `orphan_sweep` / `reconcile_revision_execution`. This is the path
-        // a parked PR-review revision reaches when its parent PR closes and
-        // `convert_revision_to_review_findings_followup` converts it in
-        // place to a `todo`/`autostart = 1` followup: without this check a
-        // replacement `chore_implementation` gets minted onto the exact row
-        // a human was asked to adjudicate, with no explicit start.
-        if work_item_is_deliberately_parked(conn, work_item_id)? {
+        // Conversion replaces the parked revision with new followup work.
+        // Its historical park must not prevent that new work starting.
+        let converted_followup = predecessor.is_some_and(|execution| {
+            execution.kind == ExecutionKind::RevisionImplementation && kind == ExecutionKind::ChoreImplementation
+        });
+        if !converted_followup && work_item_is_deliberately_parked(conn, work_item_id)? {
             tracing::info!(
                 work_item_id,
                 "reconcile: skipping execution mint — this row's run ended in a deliberate park \
@@ -1269,6 +1266,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         // there is nothing here to bypass. If the fresh attempt fails again,
         // the next sweep pass re-files the attention.
         resolve_attention_kind_in_tx(conn, &work_item_id, CHURN_GUARD_PARKED_ATTENTION_KIND)?;
+        super::dispatch_admission::resolve_deliberate_park_attention(conn, &work_item_id)?;
 
         // Explicit dispatch is the human-approval signal for a deferred
         // (future-scope) item: clear the classification so the reconciler

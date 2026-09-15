@@ -83,24 +83,18 @@ pub(crate) struct DispatchAdmissionFacts {
 
 /// Attention kinds that mean "a human was asked to adjudicate this run,
 /// do not auto-remint." Execution-scoped (`execution_id` set,
-/// `work_item_id` NULL), so callers must join through `work_executions`
-/// rather than filtering `work_attention_items.work_item_id`.
+/// `work_item_id` NULL), matched against a specific execution id.
 const DELIBERATE_PARK_ATTENTION_KINDS: &[&str] = &[
     crate::completion::RUN_DONE_BLOCKED_ATTENTION_KIND,
     crate::completion::NUDGE_BREAKER_ATTENTION_KIND,
 ];
 
-/// `true` when the *latest* execution of `work_item_id` (by
-/// `created_at DESC, id DESC`) carries an OPEN attention item of one of
-/// `kinds`. Scoped to that one execution id — not "any execution of this
-/// work item ever" — so that once `bossctl work start` mints a
-/// replacement, an open park item filed against an older, superseded
-/// execution can no longer keep [`work_item_is_deliberately_parked`]
-/// latched true forever. Shared by [`work_item_is_deliberately_parked`]
-/// so the join through `work_executions` is not copied per caller.
+/// `true` when `execution_id` carries an OPEN attention item of one of `kinds`.
+/// The caller chooses the execution: [`work_item_is_deliberately_parked`]
+/// passes the latest so a superseded execution cannot latch the park.
 pub(crate) fn has_open_execution_attention_of_kind_on(
     conn: &Connection,
-    latest_execution_id: &str,
+    execution_id: &str,
     kinds: &[&str],
 ) -> Result<bool> {
     if kinds.is_empty() {
@@ -119,7 +113,7 @@ pub(crate) fn has_open_execution_attention_of_kind_on(
          )"
     );
     let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(kinds.len() + 1);
-    bound.push(&latest_execution_id);
+    bound.push(&execution_id);
     for kind in kinds {
         bound.push(kind);
     }
@@ -136,13 +130,12 @@ pub(crate) fn has_open_execution_attention_of_kind_on(
 /// nudge-breaker park never stamps the column). Both halves are scoped to
 /// the latest execution so that a fresh replacement execution — minted by
 /// an explicit `bossctl work start` — is never kept parked by a park item
-/// belonging to the row it replaced: `run_done_declared_blocked` is
-/// registered `ClearedBy::WorkResumed` in `attention_lifecycle`, which
-/// resolves the item once the new run starts, but the resolve sweep is
-/// asynchronous, so the scoping here is what makes the gate correct in the
-/// window before that sweep runs. Takes `&Connection` so in-transaction
-/// mint paths can consult the same fact without re-locking `WorkDb`'s
-/// mutex.
+/// belonging to the row it replaced. Explicit dispatch also resolves park
+/// attention synchronously. Latest-execution scoping assumes automatic mint
+/// paths honor the park before inserting a replacement; PR-review mint paths
+/// instead require `in_review`, while a nudge-breaker park leaves work `active`.
+/// The revision-to-followup conversion deliberately replaces the parked work.
+/// Takes `&Connection` so transactional callers need not re-lock the DB.
 pub(crate) fn work_item_is_deliberately_parked(conn: &Connection, work_item_id: &str) -> Result<bool> {
     let latest: Option<(String, Option<String>)> = conn
         .query_row(
@@ -161,6 +154,19 @@ pub(crate) fn work_item_is_deliberately_parked(conn: &Connection, work_item_id: 
         return Ok(true);
     }
     has_open_execution_attention_of_kind_on(conn, &latest_execution_id, DELIBERATE_PARK_ATTENTION_KINDS)
+}
+
+/// Explicit dispatch acknowledges parks on prior executions in the same transaction.
+pub(crate) fn resolve_deliberate_park_attention(conn: &Connection, work_item_id: &str) -> Result<()> {
+    for kind in DELIBERATE_PARK_ATTENTION_KINDS {
+        conn.execute(
+            "UPDATE work_attention_items SET status = 'resolved', resolved_at = ?1
+             WHERE status = 'open' AND kind = ?2 AND execution_id IN
+                 (SELECT id FROM work_executions WHERE work_item_id = ?3)",
+            params![super::now_string(), kind, work_item_id],
+        )?;
+    }
+    Ok(())
 }
 
 impl WorkDb {
