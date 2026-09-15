@@ -37,20 +37,23 @@ fn abandonment_preserves_only_a_durable_blocked_declaration() {
 }
 
 #[test]
-fn active_reconcile_carries_blocked_workspace_softly() {
+fn active_reconcile_preserves_park_until_explicit_resume_carries_workspace() {
     let db = WorkDb::open(temp_db_path("blocked-active-reconcile")).unwrap();
     let (_, task, id) = make_waiting_human_chore(&db, "park");
     stamp_outcome(&db, &id, Some("blocked"));
     db.record_worker_idle_abandonment(&id, "decision needed").unwrap();
-    assert!(db.reconcile_active_dispatch(|_| false).unwrap().contains(&task));
-    let next = db.latest_execution_for_work_item(&task).unwrap().unwrap();
+    assert!(!db.reconcile_active_dispatch(|_| false).unwrap().contains(&task));
+    assert_eq!(db.latest_execution_for_work_item(&task).unwrap().unwrap().id, id);
+    let next = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(task).build())
+        .unwrap();
     assert_ne!(next.id, id);
     assert!(next.preferred_workspace_id.is_some());
     assert!(next.allow_dirty && next.prefer_is_soft);
 }
 
 #[test]
-fn revision_reconcile_prefers_its_own_blocked_run_over_chain_root() {
+fn revision_reconcile_preserves_park_until_explicit_resume_prefers_its_own_workspace() {
     let db = WorkDb::open(temp_db_path("blocked-revision")).unwrap();
     let product = make_revision_product(&db, "blocked-revision");
     let pr = "https://github.com/spinyfin/mono/pull/2823";
@@ -74,7 +77,10 @@ fn revision_reconcile_prefers_its_own_blocked_run_over_chain_root() {
         .execute("UPDATE tasks SET autostart = 1 WHERE id = ?1", [&revision])
         .unwrap();
     db.reconcile_product_executions(&product).unwrap();
-    let next = db.latest_execution_for_work_item(&revision).unwrap().unwrap();
+    assert_eq!(db.latest_execution_for_work_item(&revision).unwrap().unwrap().id, id);
+    let next = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(revision).build())
+        .unwrap();
     assert_ne!(next.id, id);
     assert_eq!(next.preferred_workspace_id.as_deref(), Some("workspace-revision"));
     assert!(next.allow_dirty && next.prefer_is_soft);

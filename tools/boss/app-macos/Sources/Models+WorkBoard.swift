@@ -713,11 +713,13 @@ struct DispatchAdmissionBlocker: Codable, Hashable, Identifiable {
     var id: String { code }
 }
 
-/// The two blocker codes an explicit start (forced or not) has always
-/// bypassed — reported for transparency, never a reason to bounce a drag
-/// back. Mirrors `INFORMATIONAL_ONLY_BLOCKER_CODES` in
+/// Blocker codes an explicit start (forced or not) has always bypassed —
+/// reported for transparency, never a reason to bounce a drag back.
+/// Mirrors `INFORMATIONAL_ONLY_BLOCKER_CODES` in
 /// `coordinator/dispatch_admission.rs`.
-let dispatchAdmissionInformationalOnlyBlockerCodes: Set<String> = ["churn_guard_parked", "autostart_disabled"]
+let dispatchAdmissionInformationalOnlyBlockerCodes: Set<String> = [
+    "churn_guard_parked", "autostart_disabled", "deliberate_parked",
+]
 
 /// Snapshot of the global dispatch pause, as `EvaluateDispatchAdmission`
 /// reports it. `pausedSinceEpochS` doubles as the pause's "generation":
@@ -755,7 +757,7 @@ struct DispatchAdmission: Codable, Hashable {
     }
 
     /// Blockers that actually refuse dispatch even with force — everything
-    /// except the two informational-only codes. Mirrors
+    /// except the informational-only codes. Mirrors
     /// `pause_bypass_decision`'s own filter on the engine side.
     var hardBlockers: [DispatchAdmissionBlocker] {
         blockers.filter { !dispatchAdmissionInformationalOnlyBlockerCodes.contains($0.code) }
