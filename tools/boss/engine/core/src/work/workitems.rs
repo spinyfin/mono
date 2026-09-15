@@ -457,20 +457,28 @@ impl WorkDb {
     /// logged the trip via `tracing::warn!`; a failure (or a no-op because the
     /// row raced a status change) is logged and swallowed rather than
     /// aborting the sweep pass.
+    ///
+    /// Returns `true` only when the write actually landed (`Ok(true)` from
+    /// [`Self::bounce_dispatch_failed_to_backlog`]), so a caller counting
+    /// bounces on an outcome struct doesn't report the halted state as
+    /// surfaced when the row raced a status change or the write failed —
+    /// the whole point of that counter is confirming a previously invisible
+    /// halt became visible.
     pub fn bounce_deliberate_park_to_backlog(
         &self,
         work_item_id: &str,
         source: &str,
         churn_context: Option<(ChurnTrip, i64, &[String])>,
-    ) {
+    ) -> bool {
         let body = Self::deliberate_park_text(work_item_id, source, churn_context);
         match self.bounce_dispatch_failed_to_backlog(work_item_id, DELIBERATE_PARK_DISPATCH_FAILED_REASON, &body) {
-            Ok(true) => {}
+            Ok(true) => true,
             Ok(false) => {
                 tracing::warn!(
                     work_item_id = %work_item_id,
                     "deliberate park: bounce to backlog was a no-op (work item is no longer todo/active)",
                 );
+                false
             }
             Err(err) => {
                 tracing::warn!(
@@ -478,6 +486,7 @@ impl WorkDb {
                     ?err,
                     "deliberate park: failed to bounce work item to backlog",
                 );
+                false
             }
         }
     }
@@ -511,12 +520,12 @@ impl WorkDb {
                 let churn_clause = match trip {
                     ChurnTrip::Window => format!(
                         "it has ALSO produced {counted} terminal executions within the trailing \
-                         {}h window, tripping the churn guard on top of the park",
+                         {}h window, {DELIBERATE_PARK_CHURN_COMBINED_MARKER}",
                         ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS / 3600
                     ),
                     ChurnTrip::Consecutive => format!(
                         "it has ALSO produced {counted} consecutive unproductive terminal executions with no \
-                         successful run in between, tripping the churn guard on top of the park"
+                         successful run in between, {DELIBERATE_PARK_CHURN_COMBINED_MARKER}"
                     ),
                 };
                 format!(

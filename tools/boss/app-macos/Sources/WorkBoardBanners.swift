@@ -19,6 +19,14 @@ struct WorkDispatchFailureBanner: View {
     /// framing differs: the row is not broken, so it must not read as a failure.
     private static let deliberateParkReason = "deliberate_park"
 
+    /// Mirrors `boss_engine_core::work::DELIBERATE_PARK_CHURN_COMBINED_MARKER`.
+    /// A deliberately parked row that has ALSO tripped the churn guard
+    /// carries this exact substring in its `dispatch_failed_error` body
+    /// (`WorkDb::deliberate_park_text`); both sides are pinned to the same
+    /// literal via an engine unit test so a wording change on either side
+    /// cannot silently desync the contract.
+    private static let combinedParkChurnMarker = "tripping the churn guard on top of the park"
+
     private var isDeliberatePark: Bool {
         reason == Self.deliberateParkReason
     }
@@ -26,7 +34,7 @@ struct WorkDispatchFailureBanner: View {
     private var reasonLabel: String {
         // Combined parks retain the human-only-clearable reason. Their stored
         // diagnostic text also names the churn guard, including older rows.
-        if isDeliberatePark, errorText?.contains("churn guard") == true {
+        if isDeliberatePark, errorText?.contains(Self.combinedParkChurnMarker) == true {
             return "deliberate park + churn guard"
         }
         return reason.replacingOccurrences(of: "_", with: " ")
