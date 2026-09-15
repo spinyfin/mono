@@ -145,6 +145,18 @@ pub const CHURN_GUARD_DISPATCH_FAILED_REASON: &str = "churn_guard";
 /// is folded into the body text instead so the card names both.
 pub const DELIBERATE_PARK_DISPATCH_FAILED_REASON: &str = "deliberate_park";
 
+/// Verbatim substring [`WorkDb::deliberate_park_text`] writes into the
+/// `dispatch_failed_error` body when a deliberately parked row has ALSO
+/// tripped the churn guard. `tools/boss/app-macos/Sources/WorkBoardBanners.swift`
+/// (`WorkDispatchFailureBanner.reasonLabel`) matches on this exact string to
+/// decide whether to render the combined "deliberate park + churn guard"
+/// headline instead of the plain park one — see the `/// Mirrors` comment
+/// there. Both sides are pinned to this one constant so neither a Rust
+/// wording change nor a Swift wording change can silently desync the
+/// contract; an engine unit test asserts this string appears verbatim in
+/// the combined body.
+pub const DELIBERATE_PARK_CHURN_COMBINED_MARKER: &str = "tripping the churn guard on top of the park";
+
 /// `work_attention_items.kind` raised by [`crate::dispatch_stall_escalation`]
 /// when a dispatch timeline sits stuck in one stage past
 /// [`crate::dispatch_stall_escalation::PERSISTENT_STALL_THRESHOLD`]. The

@@ -923,8 +923,8 @@ async fn a_deliberately_parked_row_that_is_also_churning_names_both_conditions()
         "must name the park condition: {error_text:?}",
     );
     assert!(
-        error_text.to_lowercase().contains("churn") || error_text.contains("terminal executions"),
-        "must ALSO name the churn condition rather than hiding it: {error_text:?}",
+        error_text.contains(crate::work::DELIBERATE_PARK_CHURN_COMBINED_MARKER),
+        "must ALSO name the churn condition with the exact marker WorkBoardBanners.swift matches on: {error_text:?}",
     );
 }
 
@@ -1214,6 +1214,56 @@ async fn churn_guard_skips_repeatedly_failing_item() {
     assert_eq!(outcome.churn_skipped, 1, "churn guard should have fired");
     assert_eq!(outcome.redispatched, 0);
     assert!(sink.events().await.is_empty(), "no event on churn skip");
+}
+
+/// A churn-only row (no deliberate park) still gets bounced to Backlog
+/// while a global dispatch pause is in effect. Base behaviour held the
+/// pause gate ahead of the churn bounce, so a paused engine froze board
+/// state for a churn-tripped row; the combined park+churn bounce this
+/// module added now runs before the pause check for every candidate, not
+/// only parked ones, because the park half of that bounce must be able to
+/// mutate under a pause. This is an intentional widening of the
+/// pre-existing churn path, not just new behaviour for parks — pin it so
+/// a future reordering can't silently revert it.
+#[tokio::test]
+async fn churn_only_row_bounces_while_dispatch_is_paused() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    make_old(&db, &work_item_id);
+
+    let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
+    for i in 0..ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
+        db.insert_terminal_execution_for_test(&work_item_id, "chore_implementation", "orphaned", now_epoch - i)
+            .unwrap();
+    }
+
+    let db = Arc::new(db);
+    let coordinator = make_coordinator(db.clone(), 1);
+    coordinator.pause_dispatch(
+        boss_engine_utils::epoch_time::now_epoch_secs().max(0) as u64,
+        crate::coordinator::DispatchPauseOrigin::Breaker,
+        boss_protocol::PauseReason::new("test pause").unwrap(),
+    );
+
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let outcome = run_one_pass(
+        db.as_ref(),
+        coordinator.clone(),
+        sink.as_ref(),
+        &NoopLiveWorkerConvergence,
+    )
+    .await;
+
+    assert_eq!(
+        outcome.churn_skipped, 1,
+        "the churn bounce must fire under a pause exactly as it does unpaused",
+    );
+    assert_eq!(outcome.redispatched, 0);
+
+    let task = get_task(&db, &work_item_id);
+    assert_eq!(task.status.as_str(), "todo");
+    assert_eq!(task.dispatch_failed_reason.as_deref(), Some("churn_guard"));
 }
 
 /// The churn guard trip must be operator-visible on the board itself,

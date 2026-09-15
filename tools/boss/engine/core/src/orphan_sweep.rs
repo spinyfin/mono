@@ -168,7 +168,11 @@ pub struct OrphanSweepOutcome {
     /// deliberate park (counted above in `deliberate_park_skipped`) survived
     /// the live-execution and durable-process guards. This is the operator-
     /// visible halted-state surface, independent of the open attention item
-    /// (`docs/designs/dispatch-halt-state-vs-attention-items.md`).
+    /// (`docs/designs/dispatch-halt-state-vs-attention-items.md`). Only
+    /// incremented when the write actually landed (the bounce helper returns
+    /// `true`), so a no-op (the row raced a status change) or a DB write
+    /// failure never inflates this counter with a halt that was never made
+    /// visible on the board.
     pub deliberate_park_bounced: usize,
     /// Items skipped because the pass could not *establish* whether it was
     /// allowed to redispatch — the admission evaluation or the `autostart`
@@ -796,14 +800,16 @@ async fn run_one_pass_filtered(
                      Backlog so the halted state is visible on the kanban card instead of only the open \
                      attention item",
                 );
-                work_db.bounce_deliberate_park_to_backlog(
+                let bounced = work_db.bounce_deliberate_park_to_backlog(
                     &work_item_id,
                     "orphan_sweep",
                     churn_trip_info
                         .as_ref()
                         .map(|(trip, counted, ids)| (*trip, *counted, ids.as_slice())),
                 );
-                outcome.deliberate_park_bounced += 1;
+                if bounced {
+                    outcome.deliberate_park_bounced += 1;
+                }
             } else if let Some((trip, counted, failing_ids)) = churn_trip_info {
                 tracing::warn!(
                     work_item_id = %work_item_id,
@@ -895,7 +901,14 @@ async fn run_one_pass_filtered(
             continue;
         }
 
-        // Capacity governs redispatch, never the halted-state surface.
+        // Capacity governs redispatch, never the halted-state surface. This
+        // check stays below the pause-admission evaluation above rather than
+        // being hoisted back into a whole-pass fast path: a saturated pool
+        // does pay for an admission evaluation it then discards on every
+        // non-parked, non-churned candidate, but hoisting it above the pause
+        // gate would stop `DispatchEvent::DispatchHeldByPause` firing for
+        // those rows when a pause and a full pool coincide, and that event
+        // is a deliberate diagnostic this sweep must not silently drop.
         if !coordinator.worker_pool().has_idle_worker().await {
             outcome.no_worker_skipped += 1;
             continue;
