@@ -66,10 +66,9 @@ impl LiveWorkerConvergence for RecordingConvergence {
 /// item that every pre-existing guard reads as a legitimate orphan — its
 /// status is terminal so no live-execution lookup finds it, its pool claim
 /// was released so `claimed` does not contain it, and the churn window is
-/// empty. Before the durable-pid guard this redispatched, which is how one
-/// chore ended up with three concurrent workers.
+/// empty. The durable-pid guard must still prevent duplicate workers.
 ///
-/// The invariant under test is the one the brief states: a redispatch
+/// A redispatch
 /// attempt for a row whose prior process is still running must not produce
 /// a second live worker.
 #[tokio::test]
@@ -88,7 +87,7 @@ async fn does_not_redispatch_over_a_still_running_worker_process() {
 
     let db = Arc::new(db);
     // Nothing claimed: the pool released the slot when the execution was
-    // terminalized, which is precisely why the sweep used to proceed.
+    // terminalized; durable process liveness must still prevent redispatch.
     let coordinator = make_coordinator(db.clone(), 1);
     let sink = Arc::new(RecordingDispatchEventSink::new());
     let convergence = RecordingConvergence::default();
@@ -501,7 +500,7 @@ async fn skips_item_with_live_execution() {
     assert!(sink.events().await.is_empty());
 }
 
-/// All worker slots busy → sweep returns early without touching the DB.
+/// All worker slots busy → no replacement execution is minted.
 #[tokio::test]
 async fn no_redispatch_when_all_workers_busy() {
     let (_dir, db) = open_db();
@@ -678,25 +677,9 @@ async fn a_breaker_pause_also_holds_the_redispatch() {
     assert_eq!(held[0].details["overridable"], serde_json::json!(false));
 }
 
-/// **The defeated park — now visible, not just un-revived.**
-/// `finalize_declared_blocked` ends a run the worker declared itself
-/// blocked on: the execution goes `abandoned`, its slot and lease are
-/// released, and an open attention item asks a human to adjudicate.
-/// `abandoned` is terminal, so this sweep used to read the row as a
-/// legitimate orphan and put a replacement worker on exactly the work
-/// that was handed to the human — every 60 seconds, forever. Fixed by
-/// gating redispatch on the open park attention item. But that alone
-/// left the row `active` with no visible trace beyond an attention item
-/// operators do not read — this test now also pins the halted-state
-/// surface that closes that gap: the row is bounced to Backlog with
-/// `dispatch_failed_reason = "deliberate_park"`, readable as "waiting on
-/// you", not a failure.
-///
-/// Note what the discriminator is NOT: `autostart`. That flag is
-/// single-shot and `start_execution_run` consumes it the first time a
-/// row goes `active`, so every row this sweep can legitimately recover
-/// already has `autostart = 0` — see
-/// `does_not_gate_recovery_on_the_single_shot_autostart_flag`.
+/// A deliberate park moves to Backlog with a waiting-on-you banner and
+/// never mints a replacement execution. The open attention item, rather
+/// than the single-shot autostart flag, identifies the park.
 #[tokio::test]
 async fn does_not_revive_a_deliberately_parked_row() {
     let (_dir, db) = open_db();
@@ -775,9 +758,111 @@ async fn does_not_revive_a_deliberately_parked_row() {
     );
 }
 
+#[tokio::test]
+async fn parked_row_bounces_with_all_workers_busy() {
+    assert_park_bounces_under_admission_gate(false).await;
+}
+
+#[tokio::test]
+async fn parked_row_bounces_while_dispatch_is_paused() {
+    assert_park_bounces_under_admission_gate(true).await;
+}
+
+async fn assert_park_bounces_under_admission_gate(paused: bool) {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let execution_id = create_spawned_execution(&db, &work_item_id, dead_pid());
+    db.record_worker_idle_abandonment(&execution_id, "worker declared itself blocked")
+        .unwrap();
+    db.create_attention_item(boss_protocol::CreateAttentionItemInput {
+        execution_id: Some(execution_id.clone()),
+        work_item_id: None,
+        kind: crate::completion::RUN_DONE_BLOCKED_ATTENTION_KIND.to_owned(),
+        status: None,
+        title: "Run ended: worker declared itself blocked".to_owned(),
+        body_markdown: "blocked".to_owned(),
+        resolved_at: None,
+    })
+    .unwrap();
+    // Age LAST: the writes above touch `tasks.updated_at`.
+    make_old(&db, &work_item_id);
+
+    let db = Arc::new(db);
+    let coordinator = make_coordinator(db.clone(), 1);
+    if paused {
+        coordinator.pause_dispatch(
+            boss_engine_utils::epoch_time::now_epoch_secs().max(0) as u64,
+            crate::coordinator::DispatchPauseOrigin::Breaker,
+            boss_protocol::PauseReason::new("test pause").unwrap(),
+        );
+    } else {
+        coordinator
+            .worker_pool()
+            .claim_worker("busy-execution", None)
+            .await
+            .unwrap();
+        assert!(!coordinator.worker_pool().has_idle_worker().await);
+    }
+
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let outcome = run_one_pass(
+        db.as_ref(),
+        coordinator.clone(),
+        sink.as_ref(),
+        &NoopLiveWorkerConvergence,
+    )
+    .await;
+
+    assert_eq!(
+        outcome.redispatched, 0,
+        "a row whose run was deliberately parked must not get a replacement worker",
+    );
+    assert_eq!(outcome.deliberate_park_skipped, 1);
+    assert_eq!(
+        outcome.deliberate_park_bounced, 1,
+        "the park must reach the mutating halted-state bounce, not just the skip counter",
+    );
+    let executions = db.list_executions(Some(&work_item_id)).unwrap();
+    assert_eq!(executions.len(), 1, "no replacement execution may be minted");
+    let events = sink.events().await;
+    assert!(
+        events.iter().all(|e| e.stage != "orphan_active_redispatch"),
+        "no redispatch event may fire for a parked row",
+    );
+    let skipped: Vec<_> = events
+        .iter()
+        .filter(|e| e.stage == "dispatch_decision" && e.details["skipped_reason"] == "deliberate_park")
+        .collect();
+    assert_eq!(skipped.len(), 1, "the park must be visible in the dispatch stream");
+
+    let task = get_task(&db, &work_item_id);
+    assert_eq!(
+        task.status.as_str(),
+        "todo",
+        "the halted state must move the card off Doing, the same as a churn trip",
+    );
+    assert_eq!(
+        task.dispatch_failed_reason.as_deref(),
+        Some("deliberate_park"),
+        "must use its own reason, distinct from churn_guard, so the recovery sweep never auto-retries it",
+    );
+    assert!(
+        task.dispatch_failed_error
+            .as_deref()
+            .is_some_and(|e| e.contains("blocked") || e.contains("nudge")),
+        "the halted-state text must say the row is waiting on a human decision, not that it failed: {:?}",
+        task.dispatch_failed_error,
+    );
+    assert!(
+        !task.autostart,
+        "must not redispatch as a side effect of adding visibility"
+    );
+}
+
 /// A row can be BOTH deliberately parked and churn-tripped at once — a
 /// worker can decide it is blocked only after several unproductive runs.
-/// The brief requires the halted-state surface to name both conditions
+/// The halted-state surface must name both conditions
 /// rather than picking one; this pins that the `deliberate_park` reason
 /// wins (it is the stronger, human-only-clearable condition) while the
 /// body text still names the churn trip.
@@ -1206,14 +1291,8 @@ async fn churn_guard_trip_bounces_to_backlog_and_clears_on_retry() {
 }
 
 /// Regression: the churn guard must not bounce a row to Backlog while
-/// the row's previous worker process is still alive. Before the fix,
-/// the churn-guard bounce ran and mutated the row (`status = 'todo'`,
-/// `autostart = 0`, failure banner) *before* the durable-process guard
-/// ever got a chance to detect the live process, so a worker still
-/// editing the workspace would get its work item yanked out from under
-/// it. The durable-process guard must win: no bounce, status stays
-/// `active`, and the live-process path (not the churn path) is the one
-/// that fires.
+/// the row's previous worker process is still alive. The durable-process
+/// guard must win: no bounce, status stays `active`, and convergence runs.
 #[tokio::test]
 async fn churn_trip_does_not_bounce_while_prior_process_is_alive() {
     let (_dir, db) = open_db();
@@ -1298,9 +1377,7 @@ async fn no_redispatch_for_recently_activated_item() {
 /// and then exits (releasing its pool slot), so the execution is not
 /// claimed — but it is still alive and waiting for a response.
 ///
-/// Previously the sweep treated unclaimed + non-terminal as "dead worker"
-/// and double-dispatched a second worker onto the same row
-/// (exec_18b508391244f798_34 → exec_18b508565e3b6e30_39).
+/// An unclaimed non-terminal execution is not sufficient evidence of death.
 #[tokio::test]
 async fn skips_item_with_waiting_human_execution() {
     let (_dir, db) = open_db();
@@ -1380,8 +1457,7 @@ async fn skips_item_with_running_worker_execution() {
         .unwrap();
 
     let db = Arc::new(db);
-    // Deliberately unclaimed, the shape that made the pre-fix sweep
-    // treat "unclaimed + non-terminal" as a dead worker.
+    // An unclaimed running execution must still be treated as live.
     let coordinator = make_coordinator(db.clone(), 1);
 
     let sink = Arc::new(RecordingDispatchEventSink::new());
@@ -1418,21 +1494,8 @@ async fn skips_item_with_running_worker_execution() {
     );
 }
 
-/// Regression: the sweep double-dispatched a second worker onto the same
-/// row when the live worker was a review-pool `pr_review` execution.
-///
-/// A `running` `pr_review` execution is a live reviewer pane actively
-/// working (`RunWaitState::WorkerPaneAlive`). The reviewer is claimed
-/// in the REVIEW pool — not the MAIN pool. The old sweep only consulted
-/// `coordinator.worker_pool().claimed_execution_ids()` (the main pool),
-/// so a review-pool-claimed reviewer read as dead. The sweep would then
-/// abandon the live pr_review execution and re-dispatch a fresh
-/// chore_implementation on top of the already-pushed PR.
-///
-/// The fix: `all_claimed_execution_ids()` unions all three pools. This
-/// test verifies the fix by claiming the pr_review execution in the
-/// review pool only (never the main pool) and asserting the sweep does
-/// not abandon it.
+/// A running review-pool execution must stay live even when the main
+/// pool has no claim for it. The claim snapshot must union all three pools.
 #[tokio::test]
 async fn running_pr_review_in_review_pool_is_not_abandoned() {
     let (_dir, db) = open_db();
@@ -1463,13 +1526,11 @@ async fn running_pr_review_in_review_pool_is_not_abandoned() {
     let db = Arc::new(db);
     // Build a coordinator with a 1-slot main pool AND a 1-slot review pool.
     // Claim the pr_review execution in the REVIEW pool (not the main pool)
-    // to simulate the production layout: main pool has an idle slot (so
-    // the fast-path check passes), but the reviewer is live in review pool.
+    // to simulate the production layout: main pool has an idle slot,
+    // but the reviewer is live in the review pool.
     let (coordinator, review_pool) = make_coordinator_with_review_pool(db.clone(), 1, 1);
     review_pool.claim_worker(&execution.id, None).await;
-    // Main pool is idle — this is what previously triggered the bug:
-    // has_idle_worker() = true (sweep proceeds), but the main-pool
-    // claimed_execution_ids() didn't include the reviewer exec id.
+    // The idle main pool must not hide the review pool's live claim.
 
     let sink = Arc::new(RecordingDispatchEventSink::new());
     let outcome = run_one_pass(

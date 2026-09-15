@@ -16,8 +16,7 @@ struct WorkDispatchFailureBanner: View {
     /// share this one banner (same `dispatch_failed_reason` field, same
     /// Backlog placement, same clear-on-next-run behavior) because the
     /// underlying halted-state surface is deliberately the same; only the
-    /// framing differs, per the brief this shipped against ("do not make the
-    /// row look failed when it is not").
+    /// framing differs: the row is not broken, so it must not read as a failure.
     private static let deliberateParkReason = "deliberate_park"
 
     private var isDeliberatePark: Bool {
@@ -25,11 +24,20 @@ struct WorkDispatchFailureBanner: View {
     }
 
     private var reasonLabel: String {
-        reason.replacingOccurrences(of: "_", with: " ")
+        // Combined parks retain the human-only-clearable reason. Their stored
+        // diagnostic text also names the churn guard, including older rows.
+        if isDeliberatePark, errorText?.contains("churn guard") == true {
+            return "deliberate park + churn guard"
+        }
+        return reason.replacingOccurrences(of: "_", with: " ")
     }
 
-    private var headline: String {
+    var headline: String {
         isDeliberatePark ? "Waiting on you — \(reasonLabel)" : "Failed to start — \(reasonLabel)"
+    }
+
+    var summary: String? {
+        isDeliberatePark ? "Review the open attention item, then drag to Doing to resume." : errorText
     }
 
     private var tint: Color {
@@ -51,11 +59,11 @@ struct WorkDispatchFailureBanner: View {
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.primary)
                     .fixedSize(horizontal: false, vertical: true)
-                if let errorText, !errorText.isEmpty {
-                    Text(errorText)
+                if let summary, !summary.isEmpty {
+                    Text(summary)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
-                        .lineLimit(3)
+                        .lineLimit(isDeliberatePark ? nil : 3)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }

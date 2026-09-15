@@ -124,10 +124,9 @@ pub const CHURN_GUARD_DISPATCH_FAILED_REASON: &str = "churn_guard";
 /// [`crate::orphan_sweep`] finds an `active` work item whose run ended in a
 /// deliberate engine park (`run_done_declared_blocked` / `nudge_breaker_tripped`
 /// — see `DELIBERATE_PARK_ATTENTION_KINDS` in that module) with its attention
-/// item still open. Before this reason existed, that open attention item was
-/// the row's *only* trace: the task stayed `active`, so the kanban card looked
-/// like ordinary Doing work forever (`docs/designs/dispatch-halt-state-vs-attention-items.md`
-/// documents attention items as a surface operators do not read). This reuses
+/// item still open. The board reads the typed halt fields independently
+/// of the attention item, so a parked row visibly waits in Backlog (see
+/// `docs/designs/dispatch-halt-state-vs-attention-items.md`). This reuses
 /// the exact `dispatch_failed_reason` / `dispatch_failed_error` / `dispatch_failed_at`
 /// / Backlog-status representation [`CHURN_GUARD_DISPATCH_FAILED_REASON`]
 /// established, under its own reason, for one deliberate purpose: a park is a

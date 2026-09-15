@@ -345,7 +345,7 @@ impl WorkDb {
     /// (it never made it to `active`), so this also accepts that status.
     ///
     /// This closes the "failing to start" vs. "waiting for a slot"
-    /// ambiguity (T2130-adjacent incident): a dispatch that keeps losing
+    /// ambiguity: a dispatch that keeps losing
     /// the pool-claim race never reaches this method (pool exhaustion is a
     /// transient capacity wait, handled entirely by the ordinary re-scan —
     /// see `pool_exhaustion_recovers_automatically_when_slot_frees_without_manual_intervention`),

@@ -18,9 +18,7 @@
 //! as the backstop for whatever the best-effort bus drops. Each
 //! pass:
 //!
-//! 1. Checks whether the worker pool has at least one idle slot; if
-//!    not, returns early — a `ready` execution created now would just
-//!    queue behind the full pool and can wait for the next sweep.
+//! 1. Snapshots execution claims across all worker pools.
 //! 2. Queries `active` work items whose `updated_at` is older than
 //!    [`ORPHAN_MIN_AGE_SECS`] and that have no `ready`, `running` or
 //!    `waiting_human` execution. Both live statuses describe a worker the
@@ -35,20 +33,10 @@
 //!    deliberate engine park (a `boss propose done --outcome blocked`
 //!    declaration, or the auto-nudge breaker giving up — both terminalize
 //!    the run as `abandoned` and leave an open attention item), and
-//!    evaluates the churn guard (step 6) right alongside it rather than
-//!    after it — a parked row must not skip past the churn read the way it
-//!    used to, or the row can be simultaneously parked and churning with
-//!    neither ever reaching the halted-state bounce (step 6 again). Also
-//!    applies the global-dispatch-pause gate as
-//!    [`ExecutionCoordinator::evaluate_dispatch_admission`] reports it. None
-//!    of this stops the sweep from running or from evaluating the next
-//!    candidate: it stops *this* candidate from minting an execution, which
-//!    is the only irreversible thing the sweep does
-//!    (`request_execution_with_live_check` marks the predecessor
-//!    `abandoned`) — a deliberate park or a churn trip instead routes to the
-//!    mutating bounce in step 6, and an unresolvable admission state fails
-//!    closed, holding the row and logging rather than defaulting to
-//!    redispatch.
+//!    evaluates the churn guard (step 6) alongside it. Both conditions must
+//!    reach the halted-state bounce after the liveness guards, independently
+//!    of dispatch pause or worker capacity. An unreadable park state fails
+//!    closed rather than defaulting to redispatch.
 //! 4. For each candidate, checks whether its latest non-terminal
 //!    execution (if any) is claimed by a live worker slot. If it is,
 //!    the execution is genuinely live and the candidate is skipped.
@@ -77,7 +65,7 @@
 //!    reason because it is the stronger, human-only-clearable condition), and
 //!    a churn-only row keeps going through
 //!    [`crate::work::WorkDb::bounce_churn_guard_parked_to_backlog`]
-//!    (`dispatch_failed_reason = "churn_guard"`) exactly as before. Both are
+//!    (`dispatch_failed_reason = "churn_guard"`). Both are
 //!    the same `dispatch_failed_reason` surface a pre-spawn dispatch failure
 //!    uses, so the kanban board shows the halt instead of the card sitting
 //!    in Doing looking like ordinary work in progress — see
@@ -101,7 +89,7 @@
 //!    resolves on its own — only an explicit `bossctl work start` / kanban
 //!    drag-to-Doing clears it, the same gesture that already resolves the
 //!    park's own attention item.
-//! 7. Calls [`WorkDb::request_execution_with_live_check`] (the same
+//! 7. Checks dispatch pause and worker capacity, then calls [`WorkDb::request_execution_with_live_check`] (the same
 //!    path `bossctl work start` uses) to mark the stale execution
 //!    `abandoned` and insert a fresh `ready` execution, then kicks
 //!    the coordinator's scheduler.
@@ -171,8 +159,7 @@ pub struct OrphanSweepOutcome {
     /// Items whose most recent run ended in a deliberate engine park — a
     /// `boss propose done --outcome blocked` declaration, or the auto-nudge
     /// breaker giving up — whose attention item is still open. Those runs
-    /// end `abandoned`, which this sweep used to read as "orphaned,
-    /// redispatch"; it never redispatches one of these. A subset of these
+    /// end `abandoned`, but must never be redispatched. A subset of these
     /// also reach [`Self::deliberate_park_bounced`] once the liveness guards
     /// below have cleared them for the mutating halted-state bounce.
     pub deliberate_park_skipped: usize,
@@ -180,9 +167,7 @@ pub struct OrphanSweepOutcome {
     /// [`crate::work::WorkDb::bounce_deliberate_park_to_backlog`] because a
     /// deliberate park (counted above in `deliberate_park_skipped`) survived
     /// the live-execution and durable-process guards. This is the operator-
-    /// visible halted-state surface: before it existed, a deliberately
-    /// parked row's only trace was the open attention item that filed it,
-    /// which the kanban board never showed and operators do not read
+    /// visible halted-state surface, independent of the open attention item
     /// (`docs/designs/dispatch-halt-state-vs-attention-items.md`).
     pub deliberate_park_bounced: usize,
     /// Items skipped because the pass could not *establish* whether it was
@@ -401,13 +386,6 @@ async fn run_one_pass_filtered(
 ) -> OrphanSweepOutcome {
     let mut outcome = OrphanSweepOutcome::default();
 
-    // Fast-path: if no worker slot is free, newly-queued executions
-    // would just pile up in `ready`. Skip the DB scan entirely.
-    if !coordinator.worker_pool().has_idle_worker().await {
-        outcome.no_worker_skipped = 1; // sentinel so callers know why we bailed
-        return outcome;
-    }
-
     // Snapshot of which execution ids are currently claimed by a live
     // worker slot across ALL pools (main, automation, review).  Built
     // once outside the per-item loop so all items in this pass see a
@@ -503,6 +481,7 @@ async fn run_one_pass_filtered(
                 continue;
             }
         };
+
         if is_deliberately_parked {
             tracing::info!(
                 work_item_id = %work_item_id,
@@ -523,72 +502,6 @@ async fn run_one_pass_filtered(
                 .await;
             outcome.deliberate_park_skipped += 1;
 
-        }
-
-        // ── Admission gate 2: the global dispatch pause ────────────────
-        //
-        // Asked through `ExecutionCoordinator::evaluate_dispatch_admission`,
-        // the engine's one reason-producing admission evaluator, rather than
-        // a second private notion of "is dispatch paused" — so this sweep
-        // agrees by construction with what `bossctl dispatch pause` means
-        // everywhere else, including the one case where a paused engine
-        // legitimately still dispatches: an operator-originated pause
-        // exempts the review pool (`drain_ready_queue` holds only
-        // `paused && !is_review`), and the evaluator reports no pause in
-        // effect for such a row. That exemption is the *only* sanctioned
-        // bypass here, and it is the evaluator's decision, not this sweep's.
-        //
-        // Deliberately reads only `admission.pause`, not `would_dispatch`:
-        // the other blockers it computes (the interactive concurrency cap
-        // above all) govern how many workers run at once, which is the
-        // `has_idle_worker` question this sweep already asks its own way.
-        // Widening the gate to every blocker would change what orphan
-        // recovery waits on, and orphan recovery must keep firing.
-        //
-        // Note what this does NOT do: it does not pause or suspend the
-        // sweep. The sweep keeps running, keeps evaluating, and keeps
-        // logging; it just does not mint an execution while dispatch is
-        // paused. Orphan recovery resumes on the first pass after the
-        // pause lifts.
-        let admission = match coordinator.evaluate_dispatch_admission(&work_item_id).await {
-            Ok(admission) => admission,
-            Err(err) => {
-                // Fail loud and hold. An admission evaluation that cannot
-                // be computed is not a licence to redispatch — that is
-                // exactly how the row would get revived through a pause.
-                tracing::warn!(
-                    work_item_id = %work_item_id,
-                    ?err,
-                    "orphan sweep: skipping redispatch — could not evaluate dispatch admission; \
-                     refusing to redispatch on an unknown pause state",
-                );
-                outcome.admission_unknown_skipped += 1;
-                continue;
-            }
-        };
-        if admission.pause.active {
-            tracing::info!(
-                work_item_id = %work_item_id,
-                pause_origin = admission.pause.origin.as_deref().unwrap_or("unknown"),
-                pause_reason = admission.pause.reason.as_deref().unwrap_or("no reason recorded"),
-                "orphan sweep: skipping redispatch — global dispatch is paused",
-            );
-            dispatch_events
-                .emit(
-                    DispatchEvent::new(Stage::DispatchHeldByPause, Outcome::Skipped, &work_item_id)
-                        .with_work_item(&work_item_id)
-                        .with_details(serde_json::json!({
-                            "loop": "orphan_active_sweep",
-                            "admission": "orphan_sweep_redispatch",
-                            "origin": admission.pause.origin,
-                            "reason": admission.pause.reason,
-                            "paused_since_epoch_s": admission.pause.paused_since_epoch_s,
-                            "overridable": admission.pause.overridable,
-                        })),
-                )
-                .await;
-            outcome.dispatch_paused_skipped += 1;
-            continue;
         }
 
         // Churn guard: count terminal executions in the trailing window.
@@ -837,14 +750,8 @@ async fn run_one_pass_filtered(
                 continue;
             }
 
-            // The guard declined to block: instrumentation gap this closes.
-            // Before this event, the guard was silent whenever it let a
-            // redispatch through — diagnosing a wrongly-declined case (the
-            // probe said `Gone`/`Unknown` when the worker was, or should have
-            // been corroborated, alive) required cross-referencing this
-            // sweep's trace lines against a different sweep's 45ms apart.
-            // This makes the decision self-diagnosing from a single dispatch
-            // tail: pid probed, probe result, and last-hook age.
+            // Record declined blocks with the probed pid, result, and hook
+            // age so a redispatch decision can be diagnosed from its own tail.
             let last_event_at = live_states.and_then(|live| live.last_event_at_for_run(&blocking_execution_id));
             let last_event_age_secs = last_event_at
                 .as_deref()
@@ -914,10 +821,7 @@ async fn run_one_pass_filtered(
                         .map(|(trip, counted, ids)| (*trip, *counted, ids.as_slice())),
                 );
                 outcome.deliberate_park_bounced += 1;
-            } else {
-                // churn_tripped only — unchanged from before this fix.
-                let (trip, counted, failing_ids) =
-                    churn_trip_info.expect("churn_tripped is true in this branch, so churn_trip_info is Some");
+            } else if let Some((trip, counted, failing_ids)) = churn_trip_info {
                 tracing::warn!(
                     work_item_id = %work_item_id,
                     recent_terminal,
@@ -939,6 +843,78 @@ async fn run_one_pass_filtered(
                 );
                 outcome.churn_skipped += 1;
             }
+            continue;
+        }
+
+        // ── Admission gate 2: the global dispatch pause ────────────────
+        //
+        // Asked through `ExecutionCoordinator::evaluate_dispatch_admission`,
+        // the engine's one reason-producing admission evaluator, rather than
+        // a second private notion of "is dispatch paused" — so this sweep
+        // agrees by construction with what `bossctl dispatch pause` means
+        // everywhere else, including the one case where a paused engine
+        // legitimately still dispatches: an operator-originated pause
+        // exempts the review pool (`drain_ready_queue` holds only
+        // `paused && !is_review`), and the evaluator reports no pause in
+        // effect for such a row. That exemption is the *only* sanctioned
+        // bypass here, and it is the evaluator's decision, not this sweep's.
+        //
+        // Deliberately reads only `admission.pause`, not `would_dispatch`:
+        // the other blockers it computes (the interactive concurrency cap
+        // above all) govern how many workers run at once, which is the
+        // `has_idle_worker` question this sweep already asks its own way.
+        // Widening the gate to every blocker would change what orphan
+        // recovery waits on, and orphan recovery must keep firing.
+        //
+        // Note what this does NOT do: it does not pause or suspend the
+        // sweep. The sweep keeps running, keeps evaluating, and keeps
+        // logging; it just does not mint an execution while dispatch is
+        // paused. Orphan recovery resumes on the first pass after the
+        // pause lifts.
+        let admission = match coordinator.evaluate_dispatch_admission(&work_item_id).await {
+            Ok(admission) => admission,
+            Err(err) => {
+                // Fail loud and hold. An admission evaluation that cannot
+                // be computed is not a licence to redispatch — that is
+                // exactly how the row would get revived through a pause.
+                tracing::warn!(
+                    work_item_id = %work_item_id,
+                    ?err,
+                    "orphan sweep: skipping redispatch — could not evaluate dispatch admission; \
+                     refusing to redispatch on an unknown pause state",
+                );
+                outcome.admission_unknown_skipped += 1;
+                continue;
+            }
+        };
+        if admission.pause.active {
+            tracing::info!(
+                work_item_id = %work_item_id,
+                pause_origin = admission.pause.origin.as_deref().unwrap_or("unknown"),
+                pause_reason = admission.pause.reason.as_deref().unwrap_or("no reason recorded"),
+                "orphan sweep: skipping redispatch — global dispatch is paused",
+            );
+            dispatch_events
+                .emit(
+                    DispatchEvent::new(Stage::DispatchHeldByPause, Outcome::Skipped, &work_item_id)
+                        .with_work_item(&work_item_id)
+                        .with_details(serde_json::json!({
+                            "loop": "orphan_active_sweep",
+                            "admission": "orphan_sweep_redispatch",
+                            "origin": admission.pause.origin,
+                            "reason": admission.pause.reason,
+                            "paused_since_epoch_s": admission.pause.paused_since_epoch_s,
+                            "overridable": admission.pause.overridable,
+                        })),
+                )
+                .await;
+            outcome.dispatch_paused_skipped += 1;
+            continue;
+        }
+
+        // Capacity governs redispatch, never the halted-state surface.
+        if !coordinator.worker_pool().has_idle_worker().await {
+            outcome.no_worker_skipped += 1;
             continue;
         }
 
