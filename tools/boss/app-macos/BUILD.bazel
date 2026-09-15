@@ -43,6 +43,14 @@ exports_files([
     "ghosttykit.BUILD",
 ])
 
+# Live Swift source `include_str!`'d by engine_lib so the combined
+# park+churn marker cannot drift from WorkDispatchFailureBanner.
+filegroup(
+    name = "work_board_banners_swift",
+    srcs = ["Sources/WorkBoardBanners.swift"],
+    visibility = ["//tools/boss/engine/core:__pkg__"],
+)
+
 swift_library(
     name = "boss_mac_app_lib",
     # CrashWatchdog is excluded so it is only ever compiled as its own module
