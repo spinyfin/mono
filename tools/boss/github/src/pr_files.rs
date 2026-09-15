@@ -15,20 +15,6 @@ use serde_json::Value;
 use crate::gh_runner::{gh_output, run_gh};
 use crate::pr_url::parse_pr_url_parts;
 
-/// GitHub JSON Accept header shared by every compare call.
-pub const GH_COMPARE_ACCEPT: &str = "Accept: application/vnd.github+json";
-
-/// `repos/{slug}/compare/{base}...{head}` endpoint used by every engine
-/// compare fetcher.
-pub fn gh_compare_endpoint(repo_slug: &str, base: &str, head: &str) -> String {
-    format!("repos/{repo_slug}/compare/{base}...{head}")
-}
-
-/// `gh api` argv for a compare: endpoint, Accept header, jq projection.
-pub fn gh_compare_api_args<'a>(endpoint: &'a str, jq: &'a str) -> [&'a str; 6] {
-    ["api", endpoint, "-H", GH_COMPARE_ACCEPT, "--jq", jq]
-}
-
 /// Immutable endpoints and presentation fields returned by GitHub's pull
 /// request REST resource. Source collectors must use these SHAs rather than a
 /// branch name or an ambient worker checkout.
@@ -147,33 +133,6 @@ pub async fn fetch_complete_pr_file_inventory(
         );
     }
     Ok(entries)
-}
-
-/// Fetch GitHub's merge-base commit for two immutable commit identities. The
-/// comparison response's file list is deliberately ignored because that API
-/// can cap it; complete file inventory comes from
-/// [`fetch_complete_pr_file_inventory`].
-pub async fn fetch_merge_base(repository: &str, base_sha: &str, head_sha: &str) -> Result<String> {
-    let (owner, repo) = repository
-        .split_once('/')
-        .filter(|(owner, repo)| !owner.is_empty() && !repo.is_empty())
-        .with_context(|| format!("invalid comparison repository identity `{repository}`"))?;
-    let endpoint = gh_compare_endpoint(&format!("{owner}/{repo}"), base_sha, head_sha);
-    let output = gh_output(&gh_compare_api_args(&endpoint, ".merge_base_commit.sha")).await?;
-    if !output.status.success() {
-        bail!(
-            "`gh api {endpoint}` failed (exit {:?}): {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim(),
-        );
-    }
-    parse_merge_base_sha(&String::from_utf8_lossy(&output.stdout))
-        .with_context(|| format!("`gh api {endpoint}` returned no merge_base_commit.sha"))
-}
-
-fn parse_merge_base_sha(stdout: &str) -> Option<String> {
-    let sha = stdout.trim().trim_matches('"');
-    (!sha.is_empty() && sha != "null").then(|| sha.to_owned())
 }
 
 /// Strict pure parser for the PR metadata contract used by source capture.
@@ -345,30 +304,5 @@ mod tests {
     fn paginated_inventory_rejects_missing_file_keys() {
         let pages = serde_json::json!([[{"filename": "a.rs", "status": "modified", "additions": 1}]]);
         assert!(parse_paginated_pr_file_inventory(&pages).is_err());
-    }
-
-    #[test]
-    fn compare_helpers_share_endpoint_and_args() {
-        let endpoint = gh_compare_endpoint("org/repo", "abc", "def");
-        assert_eq!(endpoint, "repos/org/repo/compare/abc...def");
-        assert_eq!(
-            gh_compare_api_args(&endpoint, ".merge_base_commit.sha"),
-            [
-                "api",
-                "repos/org/repo/compare/abc...def",
-                "-H",
-                "Accept: application/vnd.github+json",
-                "--jq",
-                ".merge_base_commit.sha",
-            ],
-        );
-    }
-
-    #[test]
-    fn merge_base_sha_rejects_empty_or_json_null() {
-        assert_eq!(parse_merge_base_sha("  abcdef  ").as_deref(), Some("abcdef"));
-        assert_eq!(parse_merge_base_sha("\"abcdef\"").as_deref(), Some("abcdef"));
-        assert!(parse_merge_base_sha("").is_none());
-        assert!(parse_merge_base_sha("null").is_none());
     }
 }

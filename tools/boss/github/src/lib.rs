@@ -11,6 +11,7 @@
 //! the one-time developer setup instructions.
 
 pub mod check_runs;
+pub mod compare;
 pub mod contents;
 pub mod gh_runner;
 pub mod pr_files;

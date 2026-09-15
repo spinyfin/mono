@@ -231,18 +231,6 @@ where
     Ok(parse_tree(sha, &body, keep_path))
 }
 
-/// Fetch selected entries from a tree at a full commit SHA while retaining
-/// each object's Git identity, mode, and type. This is the source-collector
-/// primitive; [`fetch_tree`] remains the compatible blobs-only convenience
-/// API for document listing callers.
-pub async fn fetch_pinned_tree<F>(owner: &str, repo: &str, sha: &str, keep_path: F) -> TreeResult<PinnedTree>
-where
-    F: Fn(&str) -> bool,
-{
-    let body = fetch_tree_body(owner, repo, sha, true).await?;
-    Ok(parse_pinned_tree(sha, &body, keep_path))
-}
-
 fn directory_tree_ref(commit_sha: &str, directory: &str) -> String {
     if directory.is_empty() {
         commit_sha.to_owned()
@@ -251,7 +239,16 @@ fn directory_tree_ref(commit_sha: &str, directory: &str) -> String {
     }
 }
 
-fn encode_tree_path(path: &str) -> String {
+/// Percent-encode a repository path for a GitHub tree or blob URL.
+///
+/// Unreserved characters (`A-Z a-z 0-9 - . _ ~`) and `/` pass through;
+/// everything else becomes an uppercase `%XX` escape of its UTF-8 bytes.
+/// `/` is preserved so this encodes a repo-relative path, not a single
+/// path component. A sibling helper,
+/// `boss_engine_driver::grok::turn_end_recovery::percent_encode_path_component`,
+/// escapes `/` and is the right choice for opaque single segments — do
+/// not add a third encoder.
+pub fn encode_tree_path(path: &str) -> String {
     path.bytes()
         .map(|byte| match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => (byte as char).to_string(),
@@ -620,6 +617,10 @@ mod directory_endpoint_tests {
         assert_eq!(
             tree_endpoint("acme", "widget", &directory_tree_ref("abc", "with space/#hash"), false),
             "repos/acme/widget/git/trees/abc:with%20space/%23hash"
+        );
+        assert_eq!(
+            tree_endpoint("acme", "widget", &directory_tree_ref("abc", "a~b"), false),
+            "repos/acme/widget/git/trees/abc:a~b"
         );
     }
 }

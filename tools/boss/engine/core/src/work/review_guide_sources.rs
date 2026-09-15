@@ -50,6 +50,7 @@ pub struct PrReviewGuideSourceCapture {
     pub omission_count: i64,
     pub captured_at: String,
     pub packet_path: Option<String>,
+    pub omission_summary: Option<String>,
     pub packet: SourcePacket,
 }
 
@@ -90,7 +91,7 @@ pub(crate) fn migrate_pr_review_guide_source_capture_tables(conn: &Connection) -
             complete INTEGER NOT NULL CHECK (complete IN (0, 1)),
             omission_count INTEGER NOT NULL DEFAULT 0,
             packet_path TEXT,
-            packet_json TEXT NOT NULL,
+            omission_summary_json TEXT,
             captured_at TEXT NOT NULL,
             UNIQUE(series_id, observed_base_sha, head_sha)
         );
@@ -103,27 +104,20 @@ pub(crate) fn migrate_pr_review_guide_source_capture_tables(conn: &Connection) -
         INSERT OR IGNORE INTO pr_review_guide_source_observation_sequence (id, last_sequence)
             VALUES (1, 0);",
     )?;
-    if !table_has_column(conn, "pr_review_guide_source_series", "selected_comparison_id")? {
-        conn.execute(
-            "ALTER TABLE pr_review_guide_source_series ADD COLUMN selected_comparison_id TEXT",
-            [],
-        )?;
-    }
-    if !table_has_column(conn, "pr_review_guide_source_comparisons", "packet_path")? {
-        conn.execute(
-            "ALTER TABLE pr_review_guide_source_comparisons ADD COLUMN packet_path TEXT",
-            [],
-        )?;
-    }
-    if !table_has_column(conn, "pr_review_guide_source_comparisons", "omission_count")? {
-        conn.execute(
-            "ALTER TABLE pr_review_guide_source_comparisons ADD COLUMN omission_count INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-    }
+    // Databases created by the original capture PR used CREATE TABLE without
+    // `omission_summary_json` and with a write-only `packet_json` column.
+    // Fresh databases take the shape above; these two statements converge
+    // already-created tables without re-adding columns that CREATE already
+    // listed.
     if !table_has_column(conn, "pr_review_guide_source_comparisons", "omission_summary_json")? {
         conn.execute(
             "ALTER TABLE pr_review_guide_source_comparisons ADD COLUMN omission_summary_json TEXT",
+            [],
+        )?;
+    }
+    if table_has_column(conn, "pr_review_guide_source_comparisons", "packet_json")? {
+        conn.execute(
+            "ALTER TABLE pr_review_guide_source_comparisons DROP COLUMN packet_json",
             [],
         )?;
     }
@@ -186,7 +180,7 @@ impl WorkDb {
         let omission_count = packet.omissions.len() as i64;
         let omission_summary =
             serde_json::to_string(&packet.omissions).context("serialize captured PR source omission summary")?;
-        let packet_path = publish_packet_artifact(&self.artifact_root()?, &packet_hash, &packet_bytes)?;
+        let artifact_root = self.artifact_root()?;
         let now = now_string();
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -238,7 +232,7 @@ impl WorkDb {
 
         let existing = read_capture_by_endpoints(
             &tx,
-            &self.artifact_root()?,
+            &artifact_root,
             &series_id,
             &packet.observed_base_sha,
             &packet.head_sha,
@@ -246,6 +240,7 @@ impl WorkDb {
         if let Some(existing) = existing {
             let should_upgrade = !existing.complete && (complete || omission_count < existing.omission_count);
             if should_upgrade {
+                let packet_path = publish_packet_artifact(&artifact_root, &packet_hash, &packet_bytes)?;
                 tx.execute(
                     "UPDATE pr_review_guide_source_comparisons
                      SET packet_hash = ?2, complete = ?3, omission_count = ?4, packet_path = ?5, omission_summary_json = ?6
@@ -255,25 +250,28 @@ impl WorkDb {
                         packet_hash,
                         if complete { 1 } else { 0 },
                         omission_count,
-                        packet_path,
-                        omission_summary,
+                        packet_path.clone(),
+                        omission_summary.clone(),
                     ],
                 )?;
-            }
-            select_comparison(&tx, &series_id, &existing.comparison_id, observation_sequence, &now)?;
-            tx.commit()?;
-            if should_upgrade {
+                select_comparison(&tx, &series_id, &existing.comparison_id, observation_sequence, &now)?;
+                tx.commit()?;
+                gc_unreferenced_packet_artifacts(&conn, &artifact_root)?;
                 let mut upgraded = existing;
                 upgraded.packet_hash = packet_hash;
                 upgraded.complete = complete;
                 upgraded.omission_count = omission_count;
                 upgraded.packet_path = Some(packet_path);
+                upgraded.omission_summary = Some(omission_summary);
                 upgraded.packet = packet.clone();
                 return Ok(PrSourceCapturePersistOutcome::Stored(upgraded));
             }
+            select_comparison(&tx, &series_id, &existing.comparison_id, observation_sequence, &now)?;
+            tx.commit()?;
             return Ok(PrSourceCapturePersistOutcome::Existing(existing));
         }
 
+        let packet_path = publish_packet_artifact(&artifact_root, &packet_hash, &packet_bytes)?;
         let comparison_id = next_id("prgc");
         let capture = PrReviewGuideSourceCapture {
             comparison_id: comparison_id.clone(),
@@ -286,13 +284,14 @@ impl WorkDb {
             omission_count,
             captured_at: now.clone(),
             packet_path: Some(packet_path.clone()),
+            omission_summary: Some(omission_summary.clone()),
             packet: packet.clone(),
         };
         tx.execute(
             "INSERT INTO pr_review_guide_source_comparisons
              (id, series_id, observation_sequence, observed_base_sha, merge_base_sha, head_sha,
-              trigger, packet_hash, complete, omission_count, packet_path, omission_summary_json, captured_at, packet_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, '')",
+              trigger, packet_hash, complete, omission_count, packet_path, omission_summary_json, captured_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 comparison_id,
                 series_id,
@@ -317,6 +316,7 @@ impl WorkDb {
             &capture.captured_at,
         )?;
         tx.commit()?;
+        gc_unreferenced_packet_artifacts(&conn, &artifact_root)?;
         Ok(PrSourceCapturePersistOutcome::Stored(capture))
     }
 
@@ -397,35 +397,12 @@ impl WorkDb {
         let artifact_root = self.artifact_root()?;
         conn.query_row(
             "SELECT s.id, s.root_task_id, c.observation_sequence, c.trigger, c.packet_hash,
-                    c.complete, c.captured_at, c.packet_json, c.id, c.packet_path, c.omission_count
+                    c.complete, c.captured_at, c.id, c.packet_path, c.omission_count, c.omission_summary_json
              FROM pr_review_guide_source_series s
              JOIN pr_review_guide_source_comparisons c ON c.id = s.selected_comparison_id
              WHERE s.root_task_id = ?1 ORDER BY s.updated_at DESC, s.id DESC LIMIT 1",
             [root_task_id],
             |row| map_capture(row, &artifact_root),
-        )
-        .optional()
-        .map_err(Into::into)
-    }
-
-    /// Cheap indexed lookup used by the poller before spawning GitHub work.
-    /// `Some(true)` means a complete packet for these endpoints is already
-    /// stored; `Some(false)` is an incomplete packet that may still be retried;
-    /// `None` means no comparison row exists yet.
-    pub fn pr_review_guide_source_capture_complete(
-        &self,
-        canonical_pr_url: &str,
-        observed_base_sha: &str,
-        head_sha: &str,
-    ) -> Result<Option<bool>> {
-        let conn = self.connect()?;
-        conn.query_row(
-            "SELECT c.complete
-             FROM pr_review_guide_source_series s
-             JOIN pr_review_guide_source_comparisons c ON c.series_id = s.id
-             WHERE s.canonical_pr_url = ?1 AND c.observed_base_sha = ?2 AND c.head_sha = ?3",
-            params![canonical_pr_url, observed_base_sha, head_sha],
-            |row| Ok(row.get::<_, i64>(0)? != 0),
         )
         .optional()
         .map_err(Into::into)
@@ -508,7 +485,7 @@ fn read_capture_by_endpoints(
 ) -> Result<Option<PrReviewGuideSourceCapture>> {
     conn.query_row(
         "SELECT s.id, s.root_task_id, c.observation_sequence, c.trigger, c.packet_hash,
-                c.complete, c.captured_at, c.packet_json, c.id, c.packet_path, c.omission_count
+                c.complete, c.captured_at, c.id, c.packet_path, c.omission_count, c.omission_summary_json
          FROM pr_review_guide_source_series s
          JOIN pr_review_guide_source_comparisons c ON c.series_id = s.id
          WHERE c.series_id = ?1 AND c.observed_base_sha = ?2 AND c.head_sha = ?3",
@@ -521,10 +498,10 @@ fn read_capture_by_endpoints(
 
 fn map_capture(row: &Row<'_>, artifact_root: &Path) -> rusqlite::Result<PrReviewGuideSourceCapture> {
     let packet_hash: String = row.get(4)?;
-    let packet_path: Option<String> = row.get(9)?;
+    let packet_path: Option<String> = row.get(8)?;
     let packet = load_packet(artifact_root, packet_path.as_deref(), &packet_hash).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
-            7,
+            4,
             rusqlite::types::Type::Text,
             Box::new(std::io::Error::other(error.to_string())),
         )
@@ -535,11 +512,12 @@ fn map_capture(row: &Row<'_>, artifact_root: &Path) -> rusqlite::Result<PrReview
         observation_sequence: row.get(2)?,
         trigger: row.get(3)?,
         packet_hash,
-        omission_count: row.get(10)?,
+        omission_count: row.get(9)?,
         complete: row.get::<_, i64>(5)? != 0,
         captured_at: row.get(6)?,
-        comparison_id: row.get(8)?,
+        comparison_id: row.get(7)?,
         packet_path,
+        omission_summary: row.get(10)?,
         packet,
     })
 }
@@ -569,6 +547,51 @@ fn publish_packet_artifact(state_root: &Path, packet_hash: &str, bytes: &[u8]) -
         boss_engine_utils::atomic_blob::write_blob_atomic(&dest, bytes)?;
     }
     Ok(relative)
+}
+
+fn gc_unreferenced_packet_artifacts(conn: &Connection, artifact_root: &Path) -> Result<()> {
+    let live: std::collections::HashSet<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT packet_path FROM pr_review_guide_source_comparisons
+             WHERE packet_path IS NOT NULL AND packet_path != ''",
+        )?;
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    let root = artifact_root.join(PACKET_ARTIFACT_DIR);
+    let Ok(shards) = fs::read_dir(&root) else {
+        return Ok(());
+    };
+    for shard in shards.flatten() {
+        let shard_path = shard.path();
+        if !shard_path.is_dir() {
+            let _ = fs::remove_file(&shard_path);
+            continue;
+        }
+        let Ok(files) = fs::read_dir(&shard_path) else {
+            continue;
+        };
+        let mut empty = true;
+        for file in files.flatten() {
+            let path = file.path();
+            let name = file.file_name();
+            let name = name.to_string_lossy();
+            let relative = path
+                .strip_prefix(artifact_root)
+                .ok()
+                .and_then(|p| p.to_str())
+                .map(str::to_owned);
+            if name.ends_with(".tmp") || relative.as_ref().is_none_or(|rel| !live.contains(rel)) {
+                let _ = fs::remove_file(&path);
+            } else {
+                empty = false;
+            }
+        }
+        if empty {
+            let _ = fs::remove_dir(&shard_path);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -704,7 +727,7 @@ mod tests {
         let (_dir, db) = open_db();
         let product = create_product(&db);
         let root = create_active_chore(&db, &product, "upgrade incomplete packet");
-        let incomplete = incomplete_packet("base", "head", "blob is unavailable");
+        let incomplete = incomplete_packet("base", "head", "pinned source read failed: timeout");
         assert!(!incomplete.is_complete());
         let first = db
             .persist_pr_review_guide_source_capture(&root, 1, PrSourceCaptureTrigger::Creation, &incomplete)
@@ -739,7 +762,7 @@ mod tests {
         let (_dir, db) = open_db();
         let product = create_product(&db);
         let root = create_active_chore(&db, &product, "sticky incomplete packet");
-        let first_packet = incomplete_packet("base", "head", "blob is unavailable");
+        let first_packet = incomplete_packet("base", "head", "pinned source read failed: timeout");
         db.persist_pr_review_guide_source_capture(&root, 1, PrSourceCaptureTrigger::Creation, &first_packet)
             .unwrap();
         let mut worse = first_packet.clone();
@@ -979,5 +1002,94 @@ mod tests {
             )
             .unwrap();
         assert_eq!(db.review_guide_source_root_for_execution(&execution.id).unwrap(), root);
+    }
+
+    fn artifact_count(root: &Path) -> usize {
+        let dir = root.join(PACKET_ARTIFACT_DIR);
+        let Ok(shards) = fs::read_dir(dir) else {
+            return 0;
+        };
+        shards
+            .flatten()
+            .filter_map(|shard| fs::read_dir(shard.path()).ok())
+            .flat_map(|files| files.flatten())
+            .filter(|file| !file.file_name().to_string_lossy().ends_with(".tmp"))
+            .count()
+    }
+
+    #[test]
+    fn stale_observation_does_not_write_an_unreferenced_blob() {
+        let (dir, db) = open_db();
+        let product = create_product(&db);
+        let root = create_active_chore(&db, &product, "stale blob");
+        db.persist_pr_review_guide_source_capture(
+            &root,
+            7,
+            PrSourceCaptureTrigger::Creation,
+            &packet("base-a", "head-a"),
+        )
+        .unwrap();
+        assert_eq!(artifact_count(dir.path()), 1);
+        db.persist_pr_review_guide_source_capture(
+            &root,
+            6,
+            PrSourceCaptureTrigger::Poller,
+            &packet("base-b", "head-b"),
+        )
+        .unwrap();
+        assert_eq!(
+            artifact_count(dir.path()),
+            1,
+            "a rejected stale observation must not leave an unreferenced packet blob"
+        );
+    }
+
+    #[test]
+    fn upgrading_a_comparison_garbage_collects_the_superseded_blob() {
+        let (dir, db) = open_db();
+        let product = create_product(&db);
+        let root = create_active_chore(&db, &product, "gc upgraded blob");
+        let incomplete = incomplete_packet("base", "head", "pinned source read failed: timeout");
+        db.persist_pr_review_guide_source_capture(&root, 1, PrSourceCaptureTrigger::Creation, &incomplete)
+            .unwrap();
+        assert_eq!(artifact_count(dir.path()), 1);
+        db.persist_pr_review_guide_source_capture(&root, 2, PrSourceCaptureTrigger::Poller, &packet("base", "head"))
+            .unwrap();
+        assert_eq!(
+            artifact_count(dir.path()),
+            1,
+            "the superseded incomplete packet blob must be deleted"
+        );
+        let latest = db.get_latest_pr_review_guide_source_capture(&root).unwrap().unwrap();
+        assert!(latest.complete);
+        assert!(latest.omission_summary.as_deref().unwrap().contains("[]"));
+    }
+
+    #[test]
+    fn terminal_symlink_omission_is_stored_as_complete() {
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        let root = create_active_chore(&db, &product, "settled symlink");
+        let packet = incomplete_packet(
+            "base",
+            "head",
+            "pinned tree entry is a symlink; omitted so Contents API cannot follow it and mis-attribute the target's bytes",
+        );
+        assert!(
+            packet.is_complete(),
+            "a structurally impossible omission must settle the packet"
+        );
+        let stored = db
+            .persist_pr_review_guide_source_capture(&root, 1, PrSourceCaptureTrigger::Creation, &packet)
+            .unwrap();
+        let PrSourceCapturePersistOutcome::Stored(stored) = stored else {
+            panic!("settled packet must persist");
+        };
+        assert!(stored.complete);
+        assert!(
+            db.select_complete_pr_review_guide_source_capture(&root, &packet.canonical_pr_url, "base", "head", 2)
+                .unwrap(),
+            "a settled omission must short-circuit later poller collections"
+        );
     }
 }

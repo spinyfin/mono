@@ -45,7 +45,6 @@
 use std::borrow::Cow;
 use std::sync::LazyLock;
 
-use anyhow::Context;
 use regex::Regex;
 
 /// Strip the CONTENT of single- and double-quoted strings from `cmd`,
@@ -261,36 +260,10 @@ pub fn is_editorial_candidate(command: &str) -> bool {
 // the Contents helper share one copy. Re-exported here so `boss-engine` call
 // sites reach them through this crate's `gh` vocabulary alongside
 // [`gh_compare_jq`].
+pub use boss_github::compare::{
+    GH_COMPARE_ACCEPT, gh_compare_api_args, gh_compare_endpoint, gh_compare_jq, gh_compare_jq_blocking,
+};
 pub use boss_github::gh_runner::{gh_output, run_gh};
-pub use boss_github::pr_files::{GH_COMPARE_ACCEPT, gh_compare_api_args, gh_compare_endpoint};
-
-/// Shell out to `gh api repos/<repo_slug>/compare/<base>...<head>` with the
-/// GitHub JSON `Accept` header and the caller-supplied `jq` projection,
-/// returning the trimmed stdout.
-///
-/// This is the single source of truth for the `compare` endpoint + header +
-/// spawn envelope shared by every engine compare fetcher. Callers keep their
-/// own type-specific parsing of the returned string (e.g. `serde_json` into a
-/// `Vec<CompareFile>`, or a `u64` line-count parse) and their own fail-open
-/// semantics — this helper only builds the request and returns raw stdout.
-pub async fn gh_compare_jq(repo_slug: &str, base: &str, head: &str, jq: &str) -> anyhow::Result<String> {
-    let endpoint = gh_compare_endpoint(repo_slug, base, head);
-    let stdout = run_gh(&gh_compare_api_args(&endpoint, jq), &format!("gh api {endpoint}")).await?;
-    Ok(stdout.trim().to_owned())
-}
-
-/// Blocking counterpart of [`gh_compare_jq`] for call sites that already
-/// run off the tokio runtime (e.g. `spawn_blocking` review-verdict apply).
-pub fn gh_compare_jq_blocking(repo_slug: &str, base: &str, head: &str, jq: &str) -> anyhow::Result<String> {
-    let endpoint = gh_compare_endpoint(repo_slug, base, head);
-    let display = format!("gh api {endpoint}");
-    let output = boss_github::gh_runner::gh_output_blocking(&gh_compare_api_args(&endpoint, jq))
-        .with_context(|| format!("failed to spawn `{display}`"))?;
-    if !output.status.success() {
-        anyhow::bail!("`{display}` failed: {}", String::from_utf8_lossy(&output.stderr).trim());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
 
 #[cfg(test)]
 mod tests {

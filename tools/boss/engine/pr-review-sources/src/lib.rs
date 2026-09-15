@@ -89,8 +89,8 @@ pub struct SourceFile {
 
 impl SourceFile {
     fn is_complete(&self) -> bool {
-        self.before.as_ref().is_none_or(PinnedSource::is_captured)
-            && self.after.as_ref().is_none_or(PinnedSource::is_captured)
+        self.before.as_ref().is_none_or(PinnedSource::is_settled)
+            && self.after.as_ref().is_none_or(PinnedSource::is_settled)
     }
 }
 
@@ -187,6 +187,24 @@ impl PinnedSource {
             && self.byte_count.is_some()
             && (self.content.is_some() || self.omission.as_deref() == Some(BINARY_SOURCE_OMISSION))
     }
+
+    /// True when this side will not become capturable later: it was read
+    /// successfully, or the omission is a property of the immutable revision
+    /// (symlink, submodule, over-budget, absent) rather than a retryable
+    /// tree/Contents request failure.
+    fn is_settled(&self) -> bool {
+        self.is_captured()
+            || self
+                .omission
+                .as_ref()
+                .is_some_and(|reason| !is_retryable_omission(reason))
+    }
+}
+
+fn is_retryable_omission(reason: &str) -> bool {
+    reason.contains("could not read pinned tree")
+        || reason.contains("pinned source read failed")
+        || reason.contains("directory response was truncated")
 }
 
 /// GitHub's changed-file classification, preserving the API value instead of
@@ -238,7 +256,7 @@ pub struct SourceOmission {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceSide {
     Before,
@@ -256,8 +274,10 @@ pub struct SourceReference {
 }
 
 /// Rendering adapters may use a mutable PR-diff target only after independently
-/// validating its file anchor/side/line against GitHub's rendered page. Until
-/// that adapter exists, this explicit outcome produces a pinned fallback.
+/// validating its file anchor/side/line against the captured packet. The
+/// Files-changed adapter constructs [`RenderedTarget::Validated`] from GitHub's
+/// documented `#diff-<sha256(path)>` fragment; a failed re-validation falls
+/// back to the immutable blob permalink.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum RenderedTarget {
@@ -265,10 +285,9 @@ pub enum RenderedTarget {
     PinnedFallback { href: String, reason: String },
 }
 
-/// The source/reference contract's current adapter version. It intentionally
-/// has no PR-diff renderer implementation yet, so callers get a truthfully
-/// labeled immutable source link rather than an invented `#diff-*` fragment.
-pub const RENDERED_TARGET_ADAPTER_VERSION: &str = "pinned-source-fallback-v1";
+/// The Files-changed adapter version. Fragment construction is
+/// `sha256(path)` as lowercase hex, matching GitHub's PR files page.
+pub const RENDERED_TARGET_ADAPTER_VERSION: &str = "files-changed-diff-fragment-v1";
 
 /// Validate a range against the captured source and build a full-SHA permalink.
 pub fn validate_pinned_reference(
@@ -324,13 +343,123 @@ pub fn validate_pinned_reference(
     })
 }
 
-/// Give callers a safe output target while the rendered-diff adapter cannot
-/// prove a mutable PR Files-changed fragment. The reason is durable packet
-/// context and must accompany a guide's navigation diagnostics.
-pub fn rendered_target_or_pinned_fallback(reference: &SourceReference, reason: impl Into<String>) -> RenderedTarget {
-    RenderedTarget::PinnedFallback {
-        href: reference.href.clone(),
-        reason: format!("{} ({RENDERED_TARGET_ADAPTER_VERSION})", reason.into()),
+/// Give callers a Files-changed URL when the range still validates against
+/// the captured packet, otherwise the immutable blob permalink. The reason
+/// accompanies a fallback so a guide's navigation diagnostics stay explicit.
+pub fn rendered_target_or_pinned_fallback(
+    packet: &SourcePacket,
+    reference: &SourceReference,
+    reason: impl Into<String>,
+) -> RenderedTarget {
+    match validate_pinned_reference(
+        packet,
+        reference.side,
+        &reference.path,
+        reference.start_line,
+        reference.end_line,
+    ) {
+        Ok(_) => RenderedTarget::Validated {
+            href: files_changed_href(packet, reference),
+            adapter_version: RENDERED_TARGET_ADAPTER_VERSION.to_owned(),
+        },
+        Err(_) => RenderedTarget::PinnedFallback {
+            href: reference.href.clone(),
+            reason: format!("{} ({RENDERED_TARGET_ADAPTER_VERSION})", reason.into()),
+        },
+    }
+}
+
+fn files_changed_href(packet: &SourcePacket, reference: &SourceReference) -> String {
+    let hash = hex_digest(reference.path.as_bytes());
+    let fragment = if reference.start_line == reference.end_line {
+        match reference.side {
+            SourceSide::Before => format!("L{}", reference.start_line),
+            SourceSide::After => format!("R{}", reference.start_line),
+        }
+    } else {
+        match reference.side {
+            SourceSide::Before => format!("L{}-L{}", reference.start_line, reference.end_line),
+            SourceSide::After => format!("R{}-R{}", reference.start_line, reference.end_line),
+        }
+    };
+    format!("{}/files#diff-{hash}{fragment}", packet.canonical_pr_url)
+}
+
+/// GitHub-backed reads used by source collection. Production uses
+/// [`LiveSourceTransport`]; tests inject a fixture so the composition
+/// function can be driven without spawning `gh`.
+trait SourceTransport {
+    fn fetch_pr_comparison_metadata(
+        &self,
+        pr_url: &str,
+    ) -> impl std::future::Future<Output = Result<boss_github::pr_files::PrComparisonMetadata>> + Send;
+    fn fetch_merge_base(
+        &self,
+        repository: &str,
+        base_sha: &str,
+        head_sha: &str,
+    ) -> impl std::future::Future<Output = Result<String>> + Send;
+    fn fetch_complete_pr_file_inventory(
+        &self,
+        repository: &str,
+        number: u64,
+        expected_changed_files: u64,
+    ) -> impl std::future::Future<Output = Result<Vec<boss_github::pr_files::PrFileInventoryEntry>>> + Send;
+    fn fetch_pinned_tree_directory(
+        &self,
+        owner: &str,
+        repo: &str,
+        commit_sha: &str,
+        directory: &str,
+        names: &HashSet<String>,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<boss_github::trees::PinnedTree, boss_github::trees::TreeApiError>,
+    > + Send;
+    fn fetch_repo_file_bytes(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        sha: &str,
+    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>>> + Send;
+}
+
+struct LiveSourceTransport;
+
+impl SourceTransport for LiveSourceTransport {
+    async fn fetch_pr_comparison_metadata(&self, pr_url: &str) -> Result<boss_github::pr_files::PrComparisonMetadata> {
+        boss_github::pr_files::fetch_pr_comparison_metadata(pr_url).await
+    }
+
+    async fn fetch_merge_base(&self, repository: &str, base_sha: &str, head_sha: &str) -> Result<String> {
+        boss_github::compare::fetch_merge_base(repository, base_sha, head_sha).await
+    }
+
+    async fn fetch_complete_pr_file_inventory(
+        &self,
+        repository: &str,
+        number: u64,
+        expected_changed_files: u64,
+    ) -> Result<Vec<boss_github::pr_files::PrFileInventoryEntry>> {
+        boss_github::pr_files::fetch_complete_pr_file_inventory(repository, number, expected_changed_files).await
+    }
+
+    async fn fetch_pinned_tree_directory(
+        &self,
+        owner: &str,
+        repo: &str,
+        commit_sha: &str,
+        directory: &str,
+        names: &HashSet<String>,
+    ) -> std::result::Result<boss_github::trees::PinnedTree, boss_github::trees::TreeApiError> {
+        boss_github::trees::fetch_pinned_tree_directory(owner, repo, commit_sha, directory, |candidate| {
+            names.contains(candidate)
+        })
+        .await
+    }
+
+    async fn fetch_repo_file_bytes(&self, owner: &str, repo: &str, path: &str, sha: &str) -> Result<Option<Vec<u8>>> {
+        boss_github::contents::fetch_repo_file_bytes(owner, repo, path, sha).await
     }
 }
 
@@ -358,6 +487,25 @@ pub async fn collect_pinned_source_packet_with_metadata(
     metadata: boss_github::pr_files::PrComparisonMetadata,
     endpoints_are_independently_observed: bool,
 ) -> Result<SourcePacket> {
+    collect_pinned_source_packet_with_transport(
+        pr_url,
+        observed,
+        expected_head_branch,
+        metadata,
+        endpoints_are_independently_observed,
+        &LiveSourceTransport,
+    )
+    .await
+}
+
+async fn collect_pinned_source_packet_with_transport<T: SourceTransport + Sync>(
+    pr_url: &str,
+    observed: &PinnedComparison,
+    expected_head_branch: Option<&str>,
+    metadata: boss_github::pr_files::PrComparisonMetadata,
+    endpoints_are_independently_observed: bool,
+    transport: &T,
+) -> Result<SourcePacket> {
     if let Some(expected_head_branch) = expected_head_branch
         && metadata.head_ref_name != expected_head_branch
     {
@@ -366,20 +514,36 @@ pub async fn collect_pinned_source_packet_with_metadata(
             metadata.head_ref_name,
         );
     }
+    // Independently observed endpoints come from GraphQL `headRefOid` /
+    // `baseRefOid` (`gh pr view --json`). Runtime check against open PRs
+    // whose base branch has since advanced: REST `pulls/{n}` `base.sha`
+    // equals GraphQL `baseRefOid` (both are the PR's recorded base, not
+    // the live `baseRef.target.oid` tip). They are still different
+    // fields with different update paths, so a probe-shaped observation
+    // is only required to match REST on `head_sha`. REST `base.sha` is
+    // re-checked against itself across the two REST reads so a
+    // mid-collection REST move still bails. The probe's base oid is
+    // stored on the packet as provenance.
     if endpoints_are_independently_observed {
+        require_stable_head(observed, &metadata)?;
+    } else {
         require_stable_endpoints(observed, &metadata)?;
     }
-    let merge_base_sha =
-        boss_github::pr_files::fetch_merge_base(&metadata.base_repository, &metadata.base_sha, &metadata.head_sha)
-            .await?;
-    let inventory = boss_github::pr_files::fetch_complete_pr_file_inventory(
-        &metadata.base_repository,
-        metadata.number,
-        metadata.changed_files,
-    )
-    .await?;
-    let latest = boss_github::pr_files::fetch_pr_comparison_metadata(pr_url).await?;
-    require_stable_endpoints(observed, &latest)?;
+    let merge_base_sha = transport
+        .fetch_merge_base(&metadata.base_repository, &metadata.base_sha, &metadata.head_sha)
+        .await?;
+    let inventory = transport
+        .fetch_complete_pr_file_inventory(&metadata.base_repository, metadata.number, metadata.changed_files)
+        .await?;
+    let latest = transport.fetch_pr_comparison_metadata(pr_url).await?;
+    let rest_identity = PinnedComparison {
+        base_sha: metadata.base_sha.clone(),
+        head_sha: metadata.head_sha.clone(),
+    };
+    require_stable_endpoints(&rest_identity, &latest)?;
+    if endpoints_are_independently_observed {
+        require_stable_head(observed, &latest)?;
+    }
 
     let before_paths: HashSet<String> = inventory
         .iter()
@@ -392,6 +556,7 @@ pub async fn collect_pinned_source_packet_with_metadata(
         .map(|file| file.filename.clone())
         .collect();
     let (before_entries, before_omissions) = fetch_pinned_tree_entries(
+        transport,
         &metadata.base_repository,
         &merge_base_sha,
         &before_paths,
@@ -399,6 +564,7 @@ pub async fn collect_pinned_source_packet_with_metadata(
     )
     .await?;
     let (after_entries, after_omissions) = fetch_pinned_tree_entries(
+        transport,
         &metadata.head_repository,
         &metadata.head_sha,
         &after_paths,
@@ -407,8 +573,51 @@ pub async fn collect_pinned_source_packet_with_metadata(
     .await?;
     let before_errors = omission_reasons(before_omissions);
     let after_errors = omission_reasons(after_omissions);
-    let mut omissions = Vec::new();
 
+    let mut source_work = Vec::new();
+    for file in &inventory {
+        let change_kind = ChangeKind::from_api(&file.status);
+        if change_kind.has_before() {
+            let before_path = file.previous_filename.clone().unwrap_or_else(|| file.filename.clone());
+            source_work.push(SourceFetch {
+                key: (before_path.clone(), SourceSide::Before),
+                repository: metadata.base_repository.clone(),
+                sha: merge_base_sha.clone(),
+                entry: before_entries.get(&before_path).cloned(),
+                tree_error: before_errors.get(&before_path).cloned(),
+            });
+        }
+        if change_kind.has_after() {
+            source_work.push(SourceFetch {
+                key: (file.filename.clone(), SourceSide::After),
+                repository: metadata.head_repository.clone(),
+                sha: metadata.head_sha.clone(),
+                entry: after_entries.get(&file.filename).cloned(),
+                tree_error: after_errors.get(&file.filename).cloned(),
+            });
+        }
+    }
+
+    let mut pending = stream::iter(source_work)
+        .map(|work| async move {
+            let source = fetch_source(
+                transport,
+                &work.repository,
+                &work.sha,
+                &work.key.0,
+                work.entry.as_ref(),
+                work.tree_error.as_deref(),
+            )
+            .await;
+            (work.key, source)
+        })
+        .buffer_unordered(8);
+    let mut fetched = HashMap::new();
+    while let Some((key, source)) = pending.next().await {
+        fetched.insert(key, source);
+    }
+
+    let mut omissions = Vec::new();
     let mut files = Vec::with_capacity(inventory.len());
     for file in inventory {
         let change_kind = ChangeKind::from_api(&file.status);
@@ -423,33 +632,21 @@ pub async fn collect_pinned_source_packet_with_metadata(
         }
         let before_path = file.previous_filename.clone().unwrap_or_else(|| file.filename.clone());
         let before = if change_kind.has_before() {
-            let source = fetch_source(
-                &metadata.base_repository,
-                &merge_base_sha,
-                &before_path,
-                before_entries.get(&before_path),
-                before_errors.get(&before_path).map(String::as_str),
-            )
-            .await;
-            record_omission(&mut omissions, &source, SourceSide::Before);
-            Some(source)
+            fetched.remove(&(before_path, SourceSide::Before))
         } else {
             None
         };
         let after = if change_kind.has_after() {
-            let source = fetch_source(
-                &metadata.head_repository,
-                &metadata.head_sha,
-                &file.filename,
-                after_entries.get(&file.filename),
-                after_errors.get(&file.filename).map(String::as_str),
-            )
-            .await;
-            record_omission(&mut omissions, &source, SourceSide::After);
-            Some(source)
+            fetched.remove(&(file.filename.clone(), SourceSide::After))
         } else {
             None
         };
+        if let Some(source) = &before {
+            record_omission(&mut omissions, source, SourceSide::Before);
+        }
+        if let Some(source) = &after {
+            record_omission(&mut omissions, source, SourceSide::After);
+        }
         if file.patch.is_none() {
             omissions.push(SourceOmission {
                 path: Some(file.filename.clone()),
@@ -485,6 +682,14 @@ pub async fn collect_pinned_source_packet_with_metadata(
     })
 }
 
+struct SourceFetch {
+    key: (String, SourceSide),
+    repository: String,
+    sha: String,
+    entry: Option<boss_github::trees::PinnedTreeEntry>,
+    tree_error: Option<String>,
+}
+
 /// Reject a collection whose live PR metadata no longer matches the pinned
 /// comparison identity. Path/count equality is not enough: a same-count
 /// force-push would otherwise mix a new inventory into an old packet.
@@ -492,7 +697,22 @@ pub fn require_stable_endpoints(
     observed: &PinnedComparison,
     metadata: &boss_github::pr_files::PrComparisonMetadata,
 ) -> Result<()> {
-    if metadata.base_sha != observed.base_sha || metadata.head_sha != observed.head_sha {
+    require_matching_endpoints(observed, metadata, true)
+}
+
+fn require_stable_head(
+    observed: &PinnedComparison,
+    metadata: &boss_github::pr_files::PrComparisonMetadata,
+) -> Result<()> {
+    require_matching_endpoints(observed, metadata, false)
+}
+
+fn require_matching_endpoints(
+    observed: &PinnedComparison,
+    metadata: &boss_github::pr_files::PrComparisonMetadata,
+    compare_base: bool,
+) -> Result<()> {
+    if metadata.head_sha != observed.head_sha || (compare_base && metadata.base_sha != observed.base_sha) {
         bail!(
             "PR endpoints changed while collecting sources: observed {}/{} but metadata returned {}/{}",
             observed.base_sha,
@@ -521,7 +741,8 @@ fn join_repo_path(directory: &str, name: &str) -> String {
     }
 }
 
-async fn fetch_pinned_tree_entries(
+async fn fetch_pinned_tree_entries<T: SourceTransport + Sync>(
+    transport: &T,
     repository: &str,
     sha: &str,
     paths: &HashSet<String>,
@@ -535,10 +756,9 @@ async fn fetch_pinned_tree_entries(
         .filter(|(owner, repo)| !owner.is_empty() && !repo.is_empty())
         .with_context(|| format!("invalid pinned source repository identity {repository}"))?;
     fetch_directory_entries(repository, sha, paths, side, |directory, names| async move {
-        boss_github::trees::fetch_pinned_tree_directory(owner, repo, sha, &directory, |candidate| {
-            names.contains(candidate)
-        })
-        .await
+        transport
+            .fetch_pinned_tree_directory(owner, repo, sha, &directory, &names)
+            .await
     })
     .await
 }
@@ -605,7 +825,8 @@ fn omission_reasons(omissions: Vec<SourceOmission>) -> HashMap<String, String> {
         .collect()
 }
 
-async fn fetch_source(
+async fn fetch_source<T: SourceTransport + Sync>(
+    transport: &T,
     repository: &str,
     sha: &str,
     path: &str,
@@ -636,7 +857,7 @@ async fn fetch_source(
             Some(entry),
         );
     };
-    match boss_github::contents::fetch_repo_file_bytes(owner, repo, path, sha).await {
+    match transport.fetch_repo_file_bytes(owner, repo, path, sha).await {
         Ok(Some(bytes)) => {
             if bytes.len() as u64 > MAX_PINNED_SOURCE_BYTES {
                 return PinnedSource::omitted(
@@ -702,14 +923,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 fn encode_path(path: &str) -> String {
-    path.bytes()
-        .flat_map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'/' => {
-                vec![byte as char].into_iter().collect::<Vec<_>>()
-            }
-            _ => format!("%{byte:02X}").chars().collect(),
-        })
-        .collect()
+    boss_github::trees::encode_tree_path(path)
 }
 
 #[cfg(test)]
@@ -769,9 +983,16 @@ mod tests {
         .unwrap();
         assert!(result.0.contains_key("lib.rs"));
         assert_eq!(result.1.len(), 2);
-        let source = fetch_source("acme/widget", "pinned", "broken/a.rs", None, Some(&result.1[0].reason))
-            .now_or_never()
-            .expect("tree failure needs no Contents request");
+        let source = fetch_source(
+            &LiveSourceTransport,
+            "acme/widget",
+            "pinned",
+            "broken/a.rs",
+            None,
+            Some(&result.1[0].reason),
+        )
+        .now_or_never()
+        .expect("tree failure needs no Contents request");
         assert_eq!(source.omission.as_deref(), Some(result.1[0].reason.as_str()));
         assert_eq!(result.1[0].path.as_deref(), Some("broken/a.rs"));
         assert_eq!(result.1[1].path.as_deref(), Some("broken/b.rs"));
@@ -861,10 +1082,26 @@ mod tests {
     }
 
     #[test]
-    fn rendered_navigation_defaults_to_an_explicit_pinned_fallback() {
-        let reference = validate_pinned_reference(&packet(), SourceSide::After, "src/with space.rs", 1, 1).unwrap();
+    fn rendered_navigation_constructs_a_files_changed_target() {
+        let packet = packet();
+        let reference = validate_pinned_reference(&packet, SourceSide::After, "src/with space.rs", 1, 1).unwrap();
+        match rendered_target_or_pinned_fallback(&packet, &reference, "unused") {
+            RenderedTarget::Validated { href, adapter_version } => {
+                assert_eq!(adapter_version, RENDERED_TARGET_ADAPTER_VERSION);
+                assert!(href.contains("/files#diff-"));
+                assert!(href.ends_with("R1"));
+            }
+            other => panic!("expected Validated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rendered_navigation_falls_back_when_the_range_no_longer_validates() {
+        let packet = packet();
+        let mut reference = validate_pinned_reference(&packet, SourceSide::After, "src/with space.rs", 1, 1).unwrap();
+        reference.end_line = 99;
         assert!(matches!(
-            rendered_target_or_pinned_fallback(&reference, "rendered fragment was not validated"),
+            rendered_target_or_pinned_fallback(&packet, &reference, "range exceeds captured source"),
             RenderedTarget::PinnedFallback { .. }
         ));
     }
@@ -876,10 +1113,33 @@ mod tests {
             "acme/widget",
             &"c".repeat(40),
             "src/with space.rs",
-            "blob is unavailable".to_owned(),
+            "pinned source read failed: timeout".to_owned(),
             None,
         ));
         assert!(!packet.is_complete());
+    }
+
+    #[test]
+    fn terminal_symlink_omission_settles_the_packet() {
+        let mut packet = packet();
+        let link = boss_github::trees::PinnedTreeEntry {
+            path: "link".to_owned(),
+            object_sha: "e".repeat(40),
+            mode: "120000".to_owned(),
+            object_type: "blob".to_owned(),
+            size: Some(11),
+        };
+        let source = PinnedSource::omitted(
+            "acme/widget",
+            &"c".repeat(40),
+            "link",
+            SYMLINK_SOURCE_OMISSION.to_owned(),
+            Some(&link),
+        );
+        assert!(!source.is_captured());
+        assert!(source.is_settled());
+        packet.files[0].after = Some(source);
+        assert!(packet.is_complete());
     }
 
     #[test]
@@ -940,6 +1200,7 @@ mod tests {
         assert!(reason.contains("symlink"));
         let source = PinnedSource::omitted("acme/widget", &"c".repeat(40), "link", reason, Some(&link));
         assert!(!source.is_captured());
+        assert!(source.is_settled());
         assert_eq!(source.object_sha.as_deref(), Some(link.object_sha.as_str()));
         assert_eq!(source.mode.as_deref(), Some("120000"));
     }
@@ -991,5 +1252,344 @@ mod tests {
                 .unwrap()
                 .contains("per-file capture budget")
         );
+    }
+
+    #[test]
+    fn encode_path_leaves_tilde_unescaped_like_tree_paths() {
+        assert_eq!(encode_path("a~b/c d"), "a~b/c%20d");
+        assert_eq!(encode_path("a~b/c d"), boss_github::trees::encode_tree_path("a~b/c d"));
+    }
+
+    fn rest_metadata(base: &str, head: &str, changed_files: u64) -> boss_github::pr_files::PrComparisonMetadata {
+        boss_github::pr_files::PrComparisonMetadata {
+            number: 4,
+            title: "Capture source".to_owned(),
+            body: None,
+            base_repository: "acme/widget".to_owned(),
+            head_repository: "acme/widget".to_owned(),
+            head_ref_name: "feature".to_owned(),
+            base_sha: base.to_owned(),
+            head_sha: head.to_owned(),
+            changed_files,
+        }
+    }
+
+    fn tree_blob(path: &str, size: Option<u64>) -> boss_github::trees::PinnedTreeEntry {
+        boss_github::trees::PinnedTreeEntry {
+            path: path.to_owned(),
+            object_sha: format!("obj-{path}"),
+            mode: "100644".to_owned(),
+            object_type: "blob".to_owned(),
+            size,
+        }
+    }
+
+    fn inventory_entry(
+        filename: &str,
+        previous: Option<&str>,
+        status: &str,
+        patch: Option<&str>,
+    ) -> boss_github::pr_files::PrFileInventoryEntry {
+        boss_github::pr_files::PrFileInventoryEntry {
+            filename: filename.to_owned(),
+            previous_filename: previous.map(str::to_owned),
+            status: status.to_owned(),
+            additions: 1,
+            deletions: 1,
+            patch: patch.map(str::to_owned),
+        }
+    }
+
+    #[derive(Clone)]
+    struct FixtureTransport {
+        latest: boss_github::pr_files::PrComparisonMetadata,
+        merge_base: String,
+        inventory: Vec<boss_github::pr_files::PrFileInventoryEntry>,
+        trees: HashMap<
+            (String, String),
+            std::result::Result<boss_github::trees::PinnedTree, boss_github::trees::TreeApiError>,
+        >,
+        blobs: HashMap<(String, String), Vec<u8>>,
+    }
+
+    impl SourceTransport for FixtureTransport {
+        async fn fetch_pr_comparison_metadata(
+            &self,
+            _pr_url: &str,
+        ) -> Result<boss_github::pr_files::PrComparisonMetadata> {
+            Ok(self.latest.clone())
+        }
+
+        async fn fetch_merge_base(&self, _repository: &str, _base_sha: &str, _head_sha: &str) -> Result<String> {
+            Ok(self.merge_base.clone())
+        }
+
+        async fn fetch_complete_pr_file_inventory(
+            &self,
+            _repository: &str,
+            _number: u64,
+            expected_changed_files: u64,
+        ) -> Result<Vec<boss_github::pr_files::PrFileInventoryEntry>> {
+            anyhow::ensure!(
+                self.inventory.len() as u64 == expected_changed_files,
+                "fixture inventory count mismatch"
+            );
+            Ok(self.inventory.clone())
+        }
+
+        async fn fetch_pinned_tree_directory(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            commit_sha: &str,
+            directory: &str,
+            names: &HashSet<String>,
+        ) -> std::result::Result<boss_github::trees::PinnedTree, boss_github::trees::TreeApiError> {
+            match self.trees.get(&(commit_sha.to_owned(), directory.to_owned())) {
+                Some(Ok(tree)) => {
+                    let mut tree = tree.clone();
+                    tree.entries.retain(|entry| names.contains(&entry.path));
+                    Ok(tree)
+                }
+                Some(Err(error)) => Err(error.clone()),
+                None => Ok(boss_github::trees::PinnedTree {
+                    sha: commit_sha.to_owned(),
+                    entries: Vec::new(),
+                    truncated: false,
+                }),
+            }
+        }
+
+        async fn fetch_repo_file_bytes(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            path: &str,
+            sha: &str,
+        ) -> Result<Option<Vec<u8>>> {
+            Ok(self.blobs.get(&(sha.to_owned(), path.to_owned())).cloned())
+        }
+    }
+
+    fn tree(
+        sha: &str,
+        entries: Vec<boss_github::trees::PinnedTreeEntry>,
+    ) -> std::result::Result<boss_github::trees::PinnedTree, boss_github::trees::TreeApiError> {
+        Ok(boss_github::trees::PinnedTree {
+            sha: sha.to_owned(),
+            entries,
+            truncated: false,
+        })
+    }
+
+    #[test]
+    fn collector_accepts_a_probe_shaped_base_that_differs_from_rest() {
+        use futures_util::FutureExt;
+        let rest_base = "rest-base";
+        let graphql_base = "graphql-live-tip";
+        let head = "head";
+        let merge = "merge-base";
+        let metadata = rest_metadata(rest_base, head, 1);
+        let mut trees = HashMap::new();
+        trees.insert(
+            (merge.to_owned(), String::new()),
+            tree(merge, vec![tree_blob("lib.rs", Some(4))]),
+        );
+        trees.insert(
+            (head.to_owned(), String::new()),
+            tree(head, vec![tree_blob("lib.rs", Some(6))]),
+        );
+        let mut blobs = HashMap::new();
+        blobs.insert((merge.to_owned(), "lib.rs".to_owned()), b"old\n".to_vec());
+        blobs.insert((head.to_owned(), "lib.rs".to_owned()), b"after\n".to_vec());
+        let transport = FixtureTransport {
+            latest: metadata.clone(),
+            merge_base: merge.to_owned(),
+            inventory: vec![inventory_entry("lib.rs", None, "modified", Some("@@"))],
+            trees,
+            blobs,
+        };
+        let observed = PinnedComparison {
+            base_sha: graphql_base.to_owned(),
+            head_sha: head.to_owned(),
+        };
+        let packet = collect_pinned_source_packet_with_transport(
+            "https://github.com/acme/widget/pull/4",
+            &observed,
+            Some("feature"),
+            metadata,
+            true,
+            &transport,
+        )
+        .now_or_never()
+        .expect("fixture collector is ready")
+        .unwrap();
+        assert_eq!(packet.observed_base_sha, graphql_base);
+        assert_eq!(packet.merge_base_sha, merge);
+        assert_eq!(packet.head_sha, head);
+        assert!(packet.is_complete());
+        assert_eq!(
+            packet.files[0].before.as_ref().unwrap().content.as_deref(),
+            Some("old\n")
+        );
+        assert_eq!(
+            packet.files[0].after.as_ref().unwrap().content.as_deref(),
+            Some("after\n")
+        );
+    }
+
+    #[test]
+    fn collector_covers_add_delete_rename_tree_failure_and_oversize() {
+        use futures_util::FutureExt;
+        let rest_base = "rest-base";
+        let head = "head";
+        let merge = "merge-base";
+        let metadata = rest_metadata(rest_base, head, 5);
+        let mut trees = HashMap::new();
+        trees.insert(
+            (merge.to_owned(), String::new()),
+            tree(merge, vec![tree_blob("gone.rs", Some(3)), tree_blob("old.rs", Some(3))]),
+        );
+        trees.insert(
+            (head.to_owned(), String::new()),
+            tree(
+                head,
+                vec![
+                    tree_blob("added.rs", Some(4)),
+                    tree_blob("new.rs", Some(3)),
+                    boss_github::trees::PinnedTreeEntry {
+                        path: "huge.bin".to_owned(),
+                        object_sha: "huge".to_owned(),
+                        mode: "100644".to_owned(),
+                        object_type: "blob".to_owned(),
+                        size: Some(MAX_PINNED_SOURCE_BYTES + 1),
+                    },
+                ],
+            ),
+        );
+        trees.insert(
+            (head.to_owned(), "broken".to_owned()),
+            Err(boss_github::trees::TreeApiError {
+                kind: boss_github::trees::TreeApiErrorKind::Unreachable,
+                message: "rate limited".to_owned(),
+            }),
+        );
+        let mut blobs = HashMap::new();
+        blobs.insert((merge.to_owned(), "gone.rs".to_owned()), b"old\n".to_vec());
+        blobs.insert((merge.to_owned(), "old.rs".to_owned()), b"was\n".to_vec());
+        blobs.insert((head.to_owned(), "added.rs".to_owned()), b"new\n".to_vec());
+        blobs.insert((head.to_owned(), "new.rs".to_owned()), b"now\n".to_vec());
+        let transport = FixtureTransport {
+            latest: metadata.clone(),
+            merge_base: merge.to_owned(),
+            inventory: vec![
+                inventory_entry("added.rs", None, "added", Some("@@")),
+                inventory_entry("gone.rs", None, "deleted", Some("@@")),
+                inventory_entry("new.rs", Some("old.rs"), "renamed", None),
+                inventory_entry("broken/a.rs", None, "modified", Some("@@")),
+                inventory_entry("huge.bin", None, "added", None),
+            ],
+            trees,
+            blobs,
+        };
+        let observed = PinnedComparison {
+            base_sha: rest_base.to_owned(),
+            head_sha: head.to_owned(),
+        };
+        let packet = collect_pinned_source_packet_with_transport(
+            "https://github.com/acme/widget/pull/4",
+            &observed,
+            None,
+            metadata,
+            false,
+            &transport,
+        )
+        .now_or_never()
+        .expect("fixture collector is ready")
+        .unwrap();
+        assert_eq!(packet.files.len(), 5);
+        assert!(packet.files[0].before.is_none());
+        assert_eq!(
+            packet.files[0].after.as_ref().unwrap().content.as_deref(),
+            Some("new\n")
+        );
+        assert_eq!(
+            packet.files[1].before.as_ref().unwrap().content.as_deref(),
+            Some("old\n")
+        );
+        assert!(packet.files[1].after.is_none());
+        assert_eq!(packet.files[2].previous_path.as_deref(), Some("old.rs"));
+        assert_eq!(packet.files[2].before.as_ref().unwrap().path, "old.rs");
+        assert_eq!(packet.files[2].after.as_ref().unwrap().path, "new.rs");
+        assert!(
+            packet.files[3]
+                .after
+                .as_ref()
+                .unwrap()
+                .omission
+                .as_deref()
+                .unwrap()
+                .contains("rate limited")
+        );
+        assert!(
+            packet.files[4]
+                .after
+                .as_ref()
+                .unwrap()
+                .omission
+                .as_deref()
+                .unwrap()
+                .contains("per-file capture budget")
+        );
+        assert!(
+            !packet.is_complete(),
+            "a retryable tree failure must keep the packet incomplete"
+        );
+        let reasons: Vec<_> = packet
+            .omissions
+            .iter()
+            .map(|o| (o.path.clone(), o.side, o.reason.clone()))
+            .collect();
+        assert!(
+            reasons.iter().any(|(path, side, reason)| {
+                path.as_deref() == Some("broken/a.rs")
+                    && *side == Some(SourceSide::After)
+                    && reason.contains("rate limited")
+            }),
+            "omission order must record the tree failure during assembly: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn collector_bails_when_rest_head_moves_mid_collection() {
+        use futures_util::FutureExt;
+        let metadata = rest_metadata("base", "head-one", 1);
+        let mut latest = metadata.clone();
+        latest.head_sha = "head-two".to_owned();
+        let transport = FixtureTransport {
+            latest,
+            merge_base: "merge-base".to_owned(),
+            inventory: vec![inventory_entry("lib.rs", None, "modified", Some("@@"))],
+            trees: HashMap::new(),
+            blobs: HashMap::new(),
+        };
+        let observed = PinnedComparison {
+            base_sha: "base".to_owned(),
+            head_sha: "head-one".to_owned(),
+        };
+        let err = collect_pinned_source_packet_with_transport(
+            "https://github.com/acme/widget/pull/4",
+            &observed,
+            None,
+            metadata,
+            true,
+            &transport,
+        )
+        .now_or_never()
+        .expect("fixture collector is ready")
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("head-one"));
+        assert!(err.contains("head-two"));
     }
 }
