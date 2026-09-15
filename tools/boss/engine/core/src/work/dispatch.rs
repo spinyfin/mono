@@ -574,6 +574,9 @@ impl WorkDb {
         let mut redispatched = Vec::new();
         let mut pending = PendingEvents::new();
         for work_item_id in candidate_ids {
+            if crate::local_worker_quarantine::work_item_is_quarantined_in(&tx, &work_item_id)? {
+                continue;
+            }
             // Decide whether this work item needs a fresh ready
             // execution. The candidate cases are:
             //   - no execution at all → yes,
@@ -701,6 +704,9 @@ impl WorkDb {
         let mut redispatched = Vec::new();
         let mut pending = PendingEvents::new();
         for (work_item_id, autostart) in candidates {
+            if crate::local_worker_quarantine::work_item_is_quarantined_in(&tx, &work_item_id)? {
+                continue;
+            }
             if !autostart {
                 continue;
             }

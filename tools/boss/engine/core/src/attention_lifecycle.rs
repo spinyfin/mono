@@ -283,6 +283,11 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     ),
     // ── The producer owns resolution ────────────────────────────────────
     entry(
+        crate::local_worker_quarantine::ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "Startup re-probes historical local workers after rollback/drain and resolves this attention only when their quarantine clears.",
+    ),
+    entry(
         crate::stale_worker_sweep::STALE_WORKER_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
         "The stale-worker sweep rechecks tmux evidence every pass and resolves this attention when the \
@@ -660,6 +665,7 @@ mod tests {
             crate::completion::MID_TURN_REAP_ATTENTION_KIND,
             crate::coordinator::PANE_SPAWN_FAILED_ATTENTION_KIND,
             crate::coordinator::ANSWER_AGENT_READY_AGE_ATTENTION_KIND,
+            crate::local_worker_quarantine::ATTENTION_KIND,
             crate::stale_worker_sweep::STALE_WORKER_ATTENTION_KIND,
             crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND,
             crate::work::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,

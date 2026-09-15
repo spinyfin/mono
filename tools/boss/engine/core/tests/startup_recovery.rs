@@ -8,9 +8,100 @@ use boss_client::wait_for_socket;
 use boss_engine::app::serve;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_engine::work::{ClaimPlannerRunInput, PLANNER_RUN_ENGINE_RESTART_SUMMARY, WorkDb};
-use boss_protocol::{CreateProductInput, CreateProjectInput, CreateTaskInput, PLANNER_OUTCOME_PLANNER_FAILED};
+use boss_protocol::{
+    CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput, ExecutionStatus,
+    PLANNER_OUTCOME_PLANNER_FAILED, RequestExecutionInput,
+};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[tokio::test]
+async fn serve_quarantines_historical_local_workers_before_recovery() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let socket_path = temp.path().join("engine.sock");
+    let db_path = temp.path().join("state.db");
+    let db = WorkDb::open(db_path.clone())?;
+    let product = db.create_product(
+        CreateProductInput::builder()
+            .name("Historical local workers")
+            .repo_remote_url("https://example.invalid/historical.git")
+            .build(),
+    )?;
+    let mut executions = Vec::new();
+    for (name, pid) in [
+        ("live", Some(i64::from(std::process::id()))),
+        ("unknown", None),
+        ("dead", Some(i64::from(i32::MAX))),
+    ] {
+        let chore = db.create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name(name)
+                .build(),
+        )?;
+        let execution = db.request_execution(RequestExecutionInput::builder().work_item_id(chore.id).build())?;
+        db.start_execution_run(
+            &execution.id,
+            "worker-1",
+            "historical-repo",
+            "expired-lease",
+            "historical-workspace",
+            temp.path().to_str().unwrap(),
+        )?;
+        if let Some(pid) = pid {
+            db.set_run_shell_pid_for_execution(&execution.id, pid)?;
+        }
+        executions.push(execution);
+    }
+    let work = WorkConfig::builder()
+        .cwd(temp.path().to_path_buf())
+        .db_path(db_path)
+        .build();
+    let cfg = Arc::new(RuntimeConfig::from_parts(work, None));
+    let bound_socket = socket_path.clone();
+    let join = tokio::spawn(async move { serve(cfg, bound_socket, None, None, None, None).await });
+    let bound = wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await;
+    // The socket binds before post-bind orphan recovery. Wait for the dead
+    // worker's durable outcome rather than aborting startup in that gap.
+    let recovered = async {
+        if !bound {
+            return Err(anyhow!("engine never bound its isolated frontend socket"));
+        }
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        while db.get_execution(&executions[2].id)?.status != ExecutionStatus::Orphaned {
+            if Instant::now() >= deadline {
+                return Err(anyhow!("startup did not orphan the proven-dead historical worker"));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok(())
+    }
+    .await;
+    // Stop the isolated engine before assertions, including on failure.
+    join.abort();
+    let _ = join.await;
+    recovered?;
+
+    for execution in &executions[..2] {
+        assert_eq!(db.get_execution(&execution.id)?.status, ExecutionStatus::Running);
+        assert!(db.mark_execution_orphaned(&execution.id, "expired lease").is_err());
+        assert!(
+            db.request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(execution.work_item_id.clone())
+                    .build()
+            )
+            .is_err()
+        );
+        assert!(
+            db.list_attention_items_for_work_item(&execution.work_item_id)?
+                .iter()
+                .any(|item| item.kind == "local_worker_startup_quarantine" && item.status == "open")
+        );
+    }
+    assert_eq!(db.get_execution(&executions[2].id)?.status, ExecutionStatus::Orphaned);
+    Ok(())
+}
 
 /// Engine startup moves local capability discovery out of schema init so the
 /// frontend can bind first, but it must still replace the cleared auto rows.

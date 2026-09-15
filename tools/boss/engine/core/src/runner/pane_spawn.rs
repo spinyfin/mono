@@ -1,4 +1,4 @@
-//! [`PaneSpawnRunner`]: the libghostty-pane [`ExecutionRunner`], plus the
+//! [`PaneSpawnRunner`]: the tmux worker [`ExecutionRunner`], plus the
 //! boss-event shim install/resolve helpers it relies on.
 
 use std::io;
@@ -230,13 +230,12 @@ mod apply_permission_extra_args_tests {
 #[cfg(test)]
 mod pty_initial_input_tests;
 
-/// `ExecutionRunner` that drives the libghostty pane RPC: writes the
-/// per-lease worker config files, asks the macOS app to host a
-/// worker pane, and registers the returned shell pid against the
-/// run id so events-socket hook deliveries can correlate.
+/// `ExecutionRunner` that writes per-lease configuration, starts a detached
+/// tmux worker, and registers its pid for hook-event correlation. The macOS
+/// app may attach a viewer after the worker starts.
 ///
 /// Returns `WorkerPaneAlive` immediately on a successful spawn — the
-/// pane stays alive in the app with its agent working, and the
+/// tmux session stays alive with its agent working, and the
 /// workspace lease is retained until a follow-up flow concludes the
 /// run. Real lifecycle (the pane signaling "Stop" → run completes)
 /// lands once the events-socket consumer drives state transitions.
@@ -256,7 +255,14 @@ pub struct PaneSpawnRunner {
     /// Test-injection override for the boss-event binary path. When set,
     /// `boss_event_binary()` returns this directly without consulting the
     /// environment — so tests don't depend on host PATH/filesystem layout.
-    boss_event_path_override: std::sync::OnceLock<PathBuf>,
+    overrides: PaneSpawnOverrides,
+}
+
+#[derive(Default)]
+struct PaneSpawnOverrides {
+    boss_event_path: std::sync::OnceLock<PathBuf>,
+    #[cfg(test)]
+    tmux_host: std::sync::OnceLock<TmuxWorkerHost>,
 }
 
 impl PaneSpawnRunner {
@@ -270,7 +276,7 @@ impl PaneSpawnRunner {
             work_db,
             feature_flags,
             server_state: std::sync::OnceLock::new(),
-            boss_event_path_override: std::sync::OnceLock::new(),
+            overrides: PaneSpawnOverrides::default(),
         }
     }
 
@@ -282,7 +288,7 @@ impl PaneSpawnRunner {
     /// depend on the host filesystem or `BOSS_EVENT_BIN` env var.
     #[cfg(test)]
     pub(crate) fn set_boss_event_path(&self, path: PathBuf) {
-        let _ = self.boss_event_path_override.set(path);
+        let _ = self.overrides.boss_event_path.set(path);
     }
 
     fn events_socket_path(&self) -> PathBuf {
@@ -290,7 +296,7 @@ impl PaneSpawnRunner {
     }
 
     fn boss_event_binary(&self) -> PathBuf {
-        if let Some(injected) = self.boss_event_path_override.get() {
+        if let Some(injected) = self.overrides.boss_event_path.get() {
             return injected.clone();
         }
         let engine_path = std::env::current_exe().unwrap_or_default();
@@ -317,6 +323,10 @@ impl PaneSpawnRunner {
     }
 
     fn tmux_worker_host(&self, slot_id: u8, execution_id: &str) -> Result<TmuxWorkerHost> {
+        #[cfg(test)]
+        if let Some(host) = self.overrides.tmux_host.get() {
+            return Ok(host.clone());
+        }
         let short_execution_id: String = execution_id
             .strip_prefix("exec_")
             .unwrap_or(execution_id)
@@ -381,9 +391,8 @@ const MAX_CANON_LINE_BYTES: usize = 1024;
 /// Workspace-relative path of the script holding the full assembled pane
 /// spawn command. Kept relative — never embedded as an absolute path in the
 /// typed line — so the *typed* line's length never grows with the
-/// workspace path. The pane's cwd is always the workspace root (see
-/// `SpawnWorkerPaneInput::workspace_path` / `GhosttyTerminalView`'s
-/// `config.working_directory`), so a relative reference resolves correctly.
+/// workspace path. The tmux session's working directory is always the
+/// workspace root, so a relative reference resolves correctly.
 const INITIAL_INPUT_SCRIPT_REL_PATH: &str = ".boss/initial-input.sh";
 
 /// Write the full assembled pane-spawn shell script (`PATH` prepends,
@@ -574,13 +583,6 @@ pub(crate) fn install_boss_event_to_stable_bin(source_shim: &Path, stable_bin_di
 
 #[async_trait]
 impl ExecutionRunner for PaneSpawnRunner {
-    fn tmux_hosting_enabled_for(&self, pool: &str) -> bool {
-        self.server_state
-            .get()
-            .and_then(Weak::upgrade)
-            .is_some_and(|state| state.tmux_hosting_enabled_for(pool))
-    }
-
     async fn run_execution(
         &self,
         worker_id: &str,
@@ -939,7 +941,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         let worker_bin_dir = ensure_worker_bin_dir(&settings_dir, workspace_path);
         let env_prefix: String = spawn_plan.env.iter().map(render_env_directive).collect();
         // All local pools, including review and automation, share this
-        // assembly for both tmux and app-hosted panes. Read state.db at each
+        // tmux worker assembly. Read state.db at each
         // spawn so changes take effect without restarting the engine.
         let priority_clause = worker_background_priority_clause(&self.work_db)?;
         let assembled_command = format!(
@@ -1004,10 +1006,12 @@ impl ExecutionRunner for PaneSpawnRunner {
             Ok(Some(_))
         );
         let pool = crate::live_worker_state::attributed_pool_label(execution.kind.clone(), has_source_automation);
-        let tmux_host = spawner
-            .tmux_hosting_enabled_for(pool)
-            .then(|| self.tmux_worker_host(slot_id, &execution.id))
-            .transpose()?;
+        if let Some(reason) = self.work_db.local_dispatch_quarantine_reason()? {
+            return Err(anyhow!(reason));
+        }
+        let tmux_host = self
+            .tmux_worker_host(slot_id, &execution.id)
+            .context("local dispatch requires a tmux worker host")?;
 
         let started = start_worker(
             spawner.as_ref(),
@@ -1048,7 +1052,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 // Same Arc resolved above for provision/spawn — settings
                 // wiring and live-state capability flags use it too.
                 .driver(driver.clone())
-                .maybe_tmux_host(tmux_host)
+                .tmux_host(tmux_host)
                 .automation_outcome_proposals_seam_enabled(automation_outcome_proposals_seam_enabled)
                 .is_review_supervisor(is_review_supervisor)
                 .is_post_merge_reviewer(is_post_merge_reviewer)
@@ -1069,55 +1073,12 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .unwrap_or("none"),
             effort_value = spawn_config.effort_value.unwrap_or("default"),
             model = %spawn_config.model,
-            ack_timed_out = started.ack_timed_out,
             "pane spawned for execution",
         );
 
-        // Provisional spawn: the `SpawnWorkerPane` ack timed out, so the
-        // app may or may not have hosted the pane. We deliberately do NOT
-        // treat this as a failure (which would release the lease under a
-        // possibly-live pane and duplicate-dispatch the work item — a
-        // prior incident). The execution stays tracked in `waiting_human`
-        // with the slot registered; the spawn-ack sweep confirms liveness
-        // (a hook/pid arrives) or reaps on total silence past the grace
-        // window. Surface it loudly so the provisional state is visible in
-        // the engine log and the run's result summary.
-        if started.ack_timed_out {
-            tracing::warn!(
-                worker_id,
-                execution_id = %execution.id,
-                slot_id = started.slot_id,
-                "spawn ack timed out; worker registered provisionally (shell_pid 0). \
-                 Deferring to the spawn-ack sweep to confirm liveness or reap — the \
-                 execution stays tracked and the workspace lease is retained.",
-            );
-        } else if started.shell_pid == 0 {
-            // A SUCCESSFUL ack that reports shell_pid 0 (the app hosted the
-            // pane but its surface hasn't published the shell pid yet; the
-            // real pid arrives shortly via `update_worker_shell_pid`). This
-            // is the exact `shell_pid: 0, ack_timed_out: false` state seen in
-            // the field, and until the pid lands the slot looks identical to
-            // an ack-timeout provisional spawn (activity=Spawning, pid 0) to
-            // the sweeps. It was previously silent — only the ack-timeout
-            // branch warned — so the window did not appear in the trace.
-            // Surface it explicitly so a run that misbehaves during this
-            // window is diagnosable. This is instrumentation only: the pid is
-            // reconciled by `update_worker_shell_pid`, and the sweeps already
-            // protect a hooking/pid-reporting worker.
-            tracing::warn!(
-                worker_id,
-                execution_id = %execution.id,
-                slot_id = started.slot_id,
-                "pane spawned on a successful ack but with shell_pid 0 — provisional \
-                 liveness window: awaiting update_worker_shell_pid from the app before \
-                 the pid→run mapping is registered. The execution stays tracked and the \
-                 slot is registered; no reap is warranted while it hooks or reports a pid.",
-            );
-        }
-
         // Mid-spawn cancel reconciliation. A cancel / force-stop
-        // can land while we were awaiting the `SpawnWorkerPane`
-        // round-trip: it marks the execution row `cancelled` but, with
+        // can land while we were awaiting tmux worker creation and viewer
+        // attachment: it marks the execution row `cancelled` but, with
         // no pid yet materialized, cannot reap the worker and
         // deliberately leaves the cube lease held (see
         // `WorkerCompletionHandler::force_release`). Now that the spawn
@@ -1173,20 +1134,10 @@ impl ExecutionRunner for PaneSpawnRunner {
         // when the worker resumes. See `RunWaitState::WorkerPaneAlive` and
         // `tools/boss/docs/worker-liveness-contract.md`.
         let wait_state = RunWaitState::WorkerPaneAlive;
-        let result_summary = if started.ack_timed_out {
-            format!(
-                "Spawned worker pane in slot {} PROVISIONALLY — the SpawnWorkerPane ack timed out, \
-                 so the pane's liveness is unconfirmed (shell pid {}). The slot is registered and \
-                 the spawn-ack sweep will confirm it via the first hook event or reap it on total \
-                 silence. Hook events from this run will surface on the engine events socket.",
-                started.slot_id, started.shell_pid,
-            )
-        } else {
-            format!(
-                "Spawned worker pane in slot {} (shell pid {}). Hook events from this run will surface on the engine events socket.",
-                started.slot_id, started.shell_pid,
-            )
-        };
+        let result_summary = format!(
+            "Spawned tmux worker in slot {} (shell pid {}). Hook events from this run will surface on the engine events socket.",
+            started.slot_id, started.shell_pid,
+        );
         Ok(RunOutcome {
             wait_state,
             result_summary: Some(result_summary),

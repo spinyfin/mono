@@ -463,19 +463,21 @@ impl ServerState {
     /// the app RPC rather than assume this path carries it.
     async fn send_interrupt_key(&self, run_id: &str, slot_id: u8, key: &str) -> Result<u8, InterruptPaneError> {
         match self.worker_registry.pane_for_run(run_id) {
-            Some(pane) if pane.tmux_session_name.is_some() || pane.tmux_hosted => match pane.tmux_session_name {
-                Some(session_name) => match self.tmux_for_pane_delivery(run_id) {
-                    Ok(tmux) => tmux
-                        .send_key(&session_name, key)
-                        .await
-                        .map(|_| slot_id)
-                        .map_err(InterruptPaneError::Tmux),
-                    Err(err) => Err(InterruptPaneError::Tmux(err)),
-                },
-                None => Err(InterruptPaneError::Tmux(anyhow::anyhow!(
-                    "tmux-hosted pane has no session name"
-                ))),
-            },
+            Some(pane) if pane.tmux_session_name.is_some() => {
+                match pane.tmux_session_name.filter(|name| !name.is_empty()) {
+                    Some(session_name) => match self.tmux_for_pane_delivery(run_id) {
+                        Ok(tmux) => tmux
+                            .send_key(&session_name, key)
+                            .await
+                            .map(|_| slot_id)
+                            .map_err(InterruptPaneError::Tmux),
+                        Err(err) => Err(InterruptPaneError::Tmux(err)),
+                    },
+                    None => Err(InterruptPaneError::Tmux(anyhow::anyhow!(
+                        "tmux-hosted pane has no session name"
+                    ))),
+                }
+            }
             _ => {
                 if key != "Escape" {
                     tracing::warn!(

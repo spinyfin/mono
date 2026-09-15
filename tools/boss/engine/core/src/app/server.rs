@@ -637,6 +637,9 @@ pub async fn serve_with_overrides(
     //    selection then reports `DriverProbeNotRun` loudly instead of
     //    silently matching.
     server_state.execution_coordinator.set_startup_recovery_pending(true);
+    let local_quarantine = crate::local_worker_quarantine::quarantine_historical_local_workers(&server_state.work_db)
+        .context("establishing historical local worker quarantine before startup recovery")?;
+
     server_state
         .execution_coordinator
         .set_local_capability_discovery_pending(true);
@@ -1355,7 +1358,7 @@ pub async fn serve_with_overrides(
             Vec::new()
         }
     };
-    let probe_report = if in_flight.is_empty() {
+    let mut probe_report = if in_flight.is_empty() {
         tracing::debug!("no persisted in-flight executions to probe at startup");
         crate::run_reconcile::RunReconcileReport::default()
     } else {
@@ -1378,6 +1381,18 @@ pub async fn serve_with_overrides(
         }
         report
     };
+    // A cube lease cannot prove a historical app-hosted worker dead.
+    // Only the durable process probe may authorize orphaning these rows.
+    for id in &local_quarantine.protected_execution_ids {
+        probe_report
+            .verdicts
+            .insert(id.clone(), crate::run_reconcile::RunReconcileVerdict::Unknown);
+    }
+    for id in &local_quarantine.dead_execution_ids {
+        probe_report
+            .verdicts
+            .insert(id.clone(), crate::run_reconcile::RunReconcileVerdict::Dead);
+    }
     post_bind.mark("in_flight_cube_probe");
 
     // Union, not just the probe's own verdicts: a tmux-adopted execution was
@@ -1418,8 +1433,7 @@ pub async fn serve_with_overrides(
     // in-flight commits the next worker should resume against.
     //
     // See docs/post-crash-recovery.md for the full flow.
-    let orphan_reason =
-        "engine startup: cube probe verdict Dead — worker lease no longer matches recorded state across restart";
+    let orphan_reason = "engine startup: recovery probe proved worker dead across restart";
     for (execution_id, verdict) in &probe_report.verdicts {
         if !matches!(verdict, crate::run_reconcile::RunReconcileVerdict::Dead) {
             continue;
@@ -1482,10 +1496,9 @@ pub async fn serve_with_overrides(
 
     post_bind.mark("unspawned_pane_reconcile");
 
-    match server_state
-        .work_db
-        .reconcile_active_dispatch(|execution_id| skip_dispatch_ids.contains(execution_id))
-    {
+    match server_state.work_db.reconcile_active_dispatch(|execution_id| {
+        skip_dispatch_ids.contains(execution_id) || local_quarantine.scan_failed
+    }) {
         Ok(redispatched) if !redispatched.is_empty() => {
             tracing::info!(
                 count = redispatched.len(),
@@ -2559,7 +2572,7 @@ pub async fn serve_with_overrides(
                 crate::audit::record_shutdown(format!("signal:{signal}"));
                 crate::ladder_lease_registry::release_all_on_shutdown(server_state.cube_client.as_ref()).await;
                 server_state
-                    .shutdown_workers(Duration::from_secs(5), Duration::from_secs(1))
+                    .shutdown_workers()
                     .await;
                 // One final metrics flush so the 0–30s window of
                 // increments between the last periodic flush and the
@@ -2580,7 +2593,7 @@ pub async fn serve_with_overrides(
                 crate::audit::record_shutdown("rpc");
                 crate::ladder_lease_registry::release_all_on_shutdown(server_state.cube_client.as_ref()).await;
                 server_state
-                    .shutdown_workers(Duration::from_secs(5), Duration::from_secs(1))
+                    .shutdown_workers()
                     .await;
                 if let Err(err) = crate::metrics::flush_all(
                     &server_state.metrics,

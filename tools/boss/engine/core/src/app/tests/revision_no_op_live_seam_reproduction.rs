@@ -202,6 +202,7 @@ async fn revision_no_op_survives_unavailable_seam_through_the_real_dispatch_path
     let pr = "https://github.com/spinyfin/mono/pull/1613";
     let slot_id = 5;
     let execution_id = seed_parked_revision(&server_state, pr, slot_id);
+    super::tmux_stub::install_teardown(&server_state, &execution_id, 4_194_303);
     write_no_changes_needed_transcript(&server_state.work_db, &std::env::temp_dir(), &execution_id);
 
     // Before: the row says live and the pool says claimed.

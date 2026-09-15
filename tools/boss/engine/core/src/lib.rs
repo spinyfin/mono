@@ -167,6 +167,7 @@ pub mod spawn_health;
 pub mod speculative_conflict;
 pub mod ssh_spawn;
 pub use boss_ssh_transport as ssh_transport;
+mod local_worker_quarantine;
 pub mod stacked_pr_structuring;
 pub mod stale_worker_sweep;
 pub mod startup_pane_reconcile;

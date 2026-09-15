@@ -7,9 +7,7 @@
 //!    self-excluding `.gitignore`) plus the worker settings file —
 //!    which lives *outside* the workspace tree — from the templates in
 //!    [`crate::worker_setup`].
-//! 2. Send `SpawnWorkerPane` (legacy) or `AttachWorkerPane` (tmux-hosted)
-//!    to the registered app session via the engine→app dispatch on
-//!    `ServerState`.
+//! 2. Create a detached tmux worker and attach an optional app viewer.
 //! 3. Register the returned shell pid in the
 //!    [`crate::worker_registry::WorkerRegistry`] so subsequent hook
 //!    events from the boss-event shim can be correlated back to the
@@ -34,10 +32,7 @@ use std::sync::Arc;
 
 use crate::driver::{AgentDriver, Capability, ProgressFidelity, ProgressIngress, ProgressObservationConfig};
 use crate::live_worker_state::LiveWorkerStateRegistry;
-use crate::protocol::{
-    AttachWorkerPaneInput, EngineToAppError, EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput,
-    SpawnWorkerPaneResult,
-};
+use crate::protocol::{AttachWorkerPaneInput, EngineToAppRequest, EngineToAppResponse, EnvVar};
 use crate::work::WorkDb;
 use crate::worker_registry::WorkerRegistry;
 use crate::worker_setup::{WorkerKind, WorkerSetupInput, WrittenFiles, write_workspace_files};
@@ -308,9 +303,7 @@ impl TmuxSpawnStore for WorkDb {
     }
 }
 
-/// The collaborators for the tmux-hosted branch of a single worker spawn.
-/// `None` on [`StartWorkerInput::tmux_host`] leaves the legacy app RPC
-/// entirely unchanged.
+/// Required collaborators for a local worker spawn.
 #[derive(Clone)]
 pub struct TmuxWorkerHost {
     tmux: Tmux,
@@ -475,9 +468,8 @@ pub struct StartWorkerInput {
     pub lease_id: String,
     /// Slot the engine has already claimed for this worker (1-indexed,
     /// matches the app's WorkersWorkspaceModel slot numbering). The
-    /// engine is the source of truth for slot allocation; the app's
-    /// job is to host the pane in this exact slot or fail with
-    /// `EngineToAppError::SlotBusy`.
+    /// engine is the source of truth for slot allocation; an optional app
+    /// viewer attaches to the tmux worker in this slot.
     pub slot_id: u8,
     pub workspace_path: PathBuf,
     pub events_socket_path: PathBuf,
@@ -551,9 +543,8 @@ pub struct StartWorkerInput {
     /// method on the run goes through one object. Tests may pass any
     /// registered (or stub) driver.
     pub driver: Arc<dyn AgentDriver>,
-    /// Enables the direct tmux-hosted branch for this run. `None` preserves
-    /// the app-hosted `SpawnWorkerPane` flow byte-for-byte.
-    pub tmux_host: Option<TmuxWorkerHost>,
+    /// Required tmux owner for this local worker.
+    pub tmux_host: TmuxWorkerHost,
     /// Forwarded to `WorkerSetupInput` — see that field's doc. Ignored
     /// unless `worker_kind` is [`WorkerKind::Triage`].
     #[builder(default)]
@@ -573,30 +564,12 @@ pub struct StartedWorker {
     pub slot_id: u8,
     pub shell_pid: i32,
     pub written_files: WrittenFiles,
-    /// `true` when the `SpawnWorkerPane` RPC never acked within the
-    /// spawn window and the worker was registered *provisionally*: the
-    /// app may or may not have hosted the pane, so the slot is tracked
-    /// with `shell_pid = 0` and the spawn-ack sweep is left to confirm
-    /// liveness (a hook/pid arrives) or reap it (total silence past the
-    /// grace window). Callers use this only to log/annotate — the
-    /// tracked-vs-failure decision has already been made here. See the
-    /// ack-timeout branch in [`start_worker`].
-    pub ack_timed_out: bool,
 }
 
 #[derive(Debug, Error)]
 pub enum StartWorkerError {
     #[error("writing worker config: {0}")]
     WriteFiles(std::io::Error),
-    #[error("sending SpawnWorkerPane to app: {0}")]
-    Send(#[from] crate::app::SendToAppError),
-    // Use Display (not Debug) so SlotBusy's "desync, not capacity"
-    // wording reaches dispatch.jsonl / attention bodies rather than the
-    // opaque `SlotBusy { occupying_run_id: ... }` debug dump.
-    #[error("app reported spawn error: {0}")]
-    AppError(EngineToAppError),
-    #[error("app responded with unexpected response variant")]
-    ResponseKindMismatch,
     #[error("preparing progress ingress: {0}")]
     ProgressIngress(String),
     #[error("tmux-hosted worker spawn: {0:#}")]
@@ -673,15 +646,7 @@ pub trait WorkerSpawner: Send + Sync {
         false
     }
 
-    /// Whether the attributed pool should create this worker in a detached
-    /// tmux session. Defaults off so existing test spawners and production
-    /// installations retain the app-hosted path until an operator enables a
-    /// pool explicitly.
-    fn tmux_hosting_enabled_for(&self, _pool: &str) -> bool {
-        false
-    }
-
-    /// Tear down the libghostty pane and reap the OS process tree for
+    /// Verify and tear down the tmux session and its process tree for
     /// `run_id` (the execution id). Used by the spawn flow to reap a
     /// worker that was cancelled *during* its spawn window: at cancel
     /// time the pid had not yet materialized, so the cancel path could
@@ -694,7 +659,7 @@ pub trait WorkerSpawner: Send + Sync {
     async fn reap_worker_pane(&self, _run_id: &str) {}
 }
 
-/// Render the worker-config files, ask the app to spawn a pane,
+/// Render the worker-config files, start a detached tmux worker,
 /// register the resulting shell pid for hook-event correlation, and
 /// return the slot id + pid for the caller to record.
 pub async fn start_worker<S: WorkerSpawner + ?Sized>(
@@ -742,7 +707,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         .prepare_progress_ingress(&input.run_id, input.driver.clone(), progress_ingress)
         .map_err(StartWorkerError::ProgressIngress)?;
 
-    // 2. Build the SpawnWorkerPane request. Workers get a strict env
+    // 2. Build the tmux worker environment. Workers get a strict env
     //    allowlist (per `v2-design-risks.md` R3): a sanitized PATH
     //    (no `bossctl`), the engine-injected `BOSS_EVENTS_SOCKET`,
     //    `BOSS_SOCKET_PATH` (the bound frontend socket, so `boss`
@@ -907,201 +872,88 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         );
     }
 
-    let claimed_slot = input.slot_id;
-    let (slot_id, shell_pid, ack_timed_out) = if let Some(tmux_host) = input.tmux_host.as_ref() {
-        let shell_pid = match start_tmux_worker(
-            tmux_host,
-            &pane_launch,
-            &input.run_id,
-            &input.workspace_path,
-            &input.initial_input,
-            &env,
-            input.driver.descriptor().name,
-        )
-        .await
-        {
-            Ok(shell_pid) => shell_pid,
-            Err(err) => {
-                spawner.stop_progress_ingress(&input.run_id);
-                return Err(err);
-            }
-        };
-        // The detached tmux session is now the worker's owner. Attaching a
-        // Ghostty surface is best-effort presentation only: an app restart or
-        // a missing app session must not turn a successfully-created worker
-        // into a failed spawn.
-        let tmux_socket_path = tmux_host
-            .socket_path()
-            .ok_or_else(|| {
-                StartWorkerError::Tmux(anyhow!(
-                    "tmux host for {} has no socket path; cannot attach a viewer",
-                    input.run_id
-                ))
-            })?
-            .display()
-            .to_string();
-        match spawner
-            .send_to_app_request(
-                EngineToAppRequest::AttachWorkerPane(AttachWorkerPaneInput {
-                    run_id: input.run_id.clone(),
-                    slot_id: claimed_slot,
-                    session_name: tmux_host.session_name().to_owned(),
-                    tmux_socket_path,
-                    summary: input.title_summary.clone(),
-                    task_title: input.task_title.clone(),
-                }),
-                spawn_timeout,
-            )
-            .await
-        {
-            Ok(EngineToAppResponse::AttachWorkerPane { result: Ok(_) }) => {
-                tracing::info!(
-                    run_id = %input.run_id,
-                    slot_id = claimed_slot,
-                    session_name = tmux_host.session_name(),
-                    "attached tmux-hosted worker pane",
-                );
-            }
-            Ok(response) => {
-                tracing::warn!(
-                    run_id = %input.run_id,
-                    slot_id = claimed_slot,
-                    ?response,
-                    "tmux worker started but app did not attach its viewer surface",
-                );
-            }
-            Err(err) => {
-                tracing::debug!(
-                    run_id = %input.run_id,
-                    slot_id = claimed_slot,
-                    ?err,
-                    "tmux worker started without an app viewer surface",
-                );
-            }
-        }
-        // Unlike the app RPC, `tmux new-session -d` returns a definite local
-        // outcome and the synchronous `#{pane_pid}` read is already the
-        // worker's real process identity. No provisional-ack state exists.
-        (claimed_slot, shell_pid, false)
-    } else {
-        let send_outcome = spawner
-            .send_to_app_request(
-                EngineToAppRequest::SpawnWorkerPane(SpawnWorkerPaneInput {
-                    run_id: input.run_id.clone(),
-                    workspace_path: input.workspace_path.display().to_string(),
-                    slot_id: claimed_slot,
-                    initial_input: input.initial_input,
-                    env,
-                    summary: input.title_summary,
-                    task_title: input.task_title,
-                    // Driver-supplied screen-scrape markers for the app's
-                    // pre-hook fallback status pill. None keeps Claude
-                    // literals on the app side (older drivers / stubs).
-                    // Boxed so the optional payload does not bloat the
-                    // EngineToAppRequest enum when absent.
-                    pane_monitor: input.driver.pane_monitor_spec().map(Box::new),
-                }),
-                Duration::from_secs(spawn_timeout.as_secs()),
-            )
-            .await;
-
-        // Resolve the app-hosted spawn outcome into
-        // `(slot_id, shell_pid, ack_timed_out)`. The timeout branch is
-        // deliberately legacy-only: a tmux creation is synchronous and
-        // therefore never has an unknown app-RPC outcome.
-        match send_outcome {
-            Ok(EngineToAppResponse::SpawnWorkerPane { result }) => match result {
-                Ok(SpawnWorkerPaneResult { slot_id, shell_pid }) => (slot_id, shell_pid, false),
-                Err(err) => {
-                    spawner.stop_progress_ingress(&input.run_id);
-                    return Err(StartWorkerError::AppError(err));
-                }
-            },
-            Ok(
-                EngineToAppResponse::ReleaseWorkerPane { .. }
-                | EngineToAppResponse::AttachWorkerPane { .. }
-                | EngineToAppResponse::AttachCoordinatorPane { .. }
-                | EngineToAppResponse::DetachWorkerPane { .. }
-                | EngineToAppResponse::SendToPane { .. }
-                | EngineToAppResponse::FocusWorkerPane { .. }
-                | EngineToAppResponse::InterruptWorkerPane { .. }
-                | EngineToAppResponse::RevealWorkItem { .. }
-                | EngineToAppResponse::OpenDocument { .. }
-                | EngineToAppResponse::ListHostedPanes { .. },
-            ) => {
-                spawner.stop_progress_ingress(&input.run_id);
-                return Err(StartWorkerError::ResponseKindMismatch);
-            }
-            Err(crate::app::SendToAppError::Timeout) => {
-                tracing::warn!(
-                    run_id = %input.run_id,
-                    slot_id = claimed_slot,
-                    timeout_secs = spawn_timeout.as_secs(),
-                    "spawn_flow: SpawnWorkerPane ack timed out — outcome is UNKNOWN (the app may have \
-                     hosted the pane anyway, e.g. a slow post-sleep RPC drain). Registering the slot \
-                     provisionally with shell_pid 0 and leaving the spawn-ack sweep to confirm liveness \
-                     (a hook/pid arrives) or reap on total silence. NOT failing the execution or \
-                     releasing the workspace lease, which would strand a live pane and duplicate dispatch.",
-                );
-                (claimed_slot, 0, true)
-            }
-            Err(err) => {
-                spawner.stop_progress_ingress(&input.run_id);
-                return Err(StartWorkerError::Send(err));
-            }
+    let slot_id = input.slot_id;
+    let tmux_host = &input.tmux_host;
+    let tmux_socket_path = tmux_host
+        .socket_path()
+        .ok_or_else(|| {
+            StartWorkerError::Tmux(anyhow!(
+                "tmux host for {} has no socket path; cannot attach a viewer",
+                input.run_id
+            ))
+        })?
+        .display()
+        .to_string();
+    let shell_pid = match start_tmux_worker(
+        tmux_host,
+        &pane_launch,
+        &input.run_id,
+        &input.workspace_path,
+        &input.initial_input,
+        &env,
+        input.driver.descriptor().name,
+    )
+    .await
+    {
+        Ok(shell_pid) => shell_pid,
+        Err(err) => {
+            spawner.stop_progress_ingress(&input.run_id);
+            return Err(err);
         }
     };
-
-    // The engine dictates the slot; the app's response slot is just a
-    // confirmation echo. A mismatch means the app picked a different
-    // slot than we asked for, which would re-introduce the dual
-    // allocator the engine-owns-slots refactor exists to remove. On an
-    // ack timeout there is no echo, so `slot_id` is the engine-claimed
-    // slot by construction and this holds trivially.
-    debug_assert_eq!(
-        slot_id, claimed_slot,
-        "app honored a different slot ({slot_id}) than the engine claimed ({claimed_slot})"
-    );
-
-    // 3. Register the shell pid against the run id so the events
-    //    socket can correlate hook events from descendants of the
-    //    spawned shell back to this run, and remember the slot id so
-    //    follow-up `SendToPane` requests (e.g., probe injection) can
-    //    route by run id.
-    if let Some(tmux_host) = input.tmux_host.as_ref() {
-        spawner
-            .worker_registry()
-            .register_tmux_run_slot(input.run_id.clone(), slot_id, tmux_host.session_name());
-    } else {
-        spawner
-            .worker_registry()
-            .register_run_slot(input.run_id.clone(), slot_id);
+    // The detached tmux session is now the worker's owner. Attaching a
+    // Ghostty surface is best-effort presentation only: an app restart or
+    // a missing app session must not turn a successfully-created worker
+    // into a failed spawn.
+    match spawner
+        .send_to_app_request(
+            EngineToAppRequest::AttachWorkerPane(AttachWorkerPaneInput {
+                run_id: input.run_id.clone(),
+                slot_id,
+                session_name: tmux_host.session_name().to_owned(),
+                tmux_socket_path,
+                summary: input.title_summary.clone(),
+                task_title: input.task_title.clone(),
+            }),
+            spawn_timeout,
+        )
+        .await
+    {
+        Ok(EngineToAppResponse::AttachWorkerPane { result: Ok(_) }) => {
+            tracing::info!(
+                run_id = %input.run_id,
+                slot_id = slot_id,
+                session_name = tmux_host.session_name(),
+                "attached tmux-hosted worker pane",
+            );
+        }
+        Ok(response) => {
+            tracing::warn!(
+                run_id = %input.run_id,
+                slot_id = slot_id,
+                ?response,
+                "tmux worker started but app did not attach its viewer surface",
+            );
+        }
+        Err(err) => {
+            tracing::debug!(
+                run_id = %input.run_id,
+                slot_id = slot_id,
+                ?err,
+                "tmux worker started without an app viewer surface",
+            );
+        }
     }
-    if shell_pid > 0 {
-        spawner.worker_registry().register(shell_pid, input.run_id.clone());
-    } else {
-        tracing::info!(
-            slot_id,
-            run_id = %input.run_id,
-            "spawn returned shell_pid 0; awaiting update_worker_shell_pid from app once surface initializes",
-        );
-    }
+
+    spawner
+        .worker_registry()
+        .register_tmux_run_slot(input.run_id.clone(), slot_id, tmux_host.session_name());
+    spawner.worker_registry().register(shell_pid, input.run_id.clone());
 
     // 4. Stamp the initial LiveWorkerState so bossctl/UI immediately
     //    see "Spawning" with the launch-default model — no more
     //    "Claude Unknown" while we wait for SessionStart to fire.
     if let Some(live_states) = spawner.live_worker_state_registry() {
-        // Resolved before `input.pool`/`input.model` are moved below —
-        // `input.tmux_host` is the spawn decision itself (set iff this
-        // spawn actually went onto the tmux-hosting path), the same
-        // per-execution fact `dispatch_hosting_stamp` documents as only
-        // being free to read right here. Stamping it onto the
-        // `LiveWorkerState` at spawn time — rather than having a later
-        // reader re-derive it from the current `workers.tmux_hosting`
-        // setting — is what lets the quit-confirmation dialog (and any
-        // other consumer) describe what a running worker actually is,
-        // independent of the setting having since been toggled.
-        let tmux_hosted = input.tmux_host.is_some();
         // Ask the resolved driver, rather than assume: this derives the
         // capability from the actual driver's declared capabilities and
         // passes it straight into registration, so there is no window
@@ -1118,7 +970,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             // non-empty snake_case kind, tests that leave the field at a
             // placeholder still surface it on the wire. Pool may be
             // `None` for tests that never set `StartWorkerInput.pool`.
-            crate::live_worker_state::LiveSpawnRouting::new_with_hosting(input.pool, input.execution_kind, tmux_hosted),
+            crate::live_worker_state::LiveSpawnRouting::new_with_hosting(input.pool, input.execution_kind, true),
         );
         // Declare this slot's driver-reported progress fidelity so
         // `stale_worker_sweep` judges cadence-based staleness against the
@@ -1137,7 +989,6 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         slot_id,
         shell_pid,
         written_files: written,
-        ack_timed_out,
     })
 }
 
@@ -1146,6 +997,7 @@ mod tests {
     use super::*;
     use crate::app::SendToAppError;
     use crate::driver::test_support::{codex_homes_override, transcript_store_override};
+    use crate::protocol::{AttachWorkerPaneResult, EngineToAppError};
     use boss_tmux::{CommandOutput, CommandRunner};
     use std::ffi::OsString;
     use std::path::Path;
@@ -1155,6 +1007,7 @@ mod tests {
 
     struct StubSpawner {
         registry: WorkerRegistry,
+        tmux_runner: Arc<RecordingTmuxRunner>,
         spawn_calls: Arc<AtomicUsize>,
         canned_response: Result<EngineToAppResponse, SendToAppError>,
         last_request: std::sync::Mutex<Option<EngineToAppRequest>>,
@@ -1185,18 +1038,23 @@ mod tests {
 
     impl StubSpawner {
         fn last_spawn_env(&self) -> Vec<(String, String)> {
-            match self.last_request.lock().unwrap().clone() {
-                Some(EngineToAppRequest::SpawnWorkerPane(input)) => input
-                    .env
-                    .into_iter()
-                    .map(|EnvVar { key, value }| (key, value))
-                    .collect(),
-                _ => panic!("last request was not SpawnWorkerPane"),
-            }
+            let calls = self.tmux_runner.calls();
+            let create = calls
+                .iter()
+                .find(|args| args.get(2).map(String::as_str) == Some("new-session"))
+                .unwrap();
+            create
+                .windows(2)
+                .filter(|pair| pair[0] == "-e")
+                .map(|pair| {
+                    let (key, value) = pair[1].split_once('=').unwrap();
+                    (key.to_owned(), value.to_owned())
+                })
+                .collect()
         }
     }
 
-    fn sample_input(workspace: &TempDir) -> StartWorkerInput {
+    fn sample_input(workspace: &TempDir, runner: Arc<RecordingTmuxRunner>) -> StartWorkerInput {
         StartWorkerInput {
             run_id: "run-test".into(),
             lease_id: "lease-test".into(),
@@ -1220,7 +1078,11 @@ mod tests {
             driver: crate::driver::DriverRegistry::default()
                 .require(crate::effort::ENGINE_DEFAULT_DRIVER)
                 .expect("engine default driver is always registered"),
-            tmux_host: None,
+            tmux_host: TmuxWorkerHost::new(
+                Tmux::with_runner_and_socket("/fake/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap(),
+                runner.steps.clone(),
+                "boss-3-run-test".into(),
+            ),
             automation_outcome_proposals_seam_enabled: false,
             is_review_supervisor: false,
             is_post_merge_reviewer: false,
@@ -1264,11 +1126,18 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct TmuxResponseOverrides {
+        fail_command: Option<String>,
+        pane_pid_stdout: String,
+    }
+
+    #[derive(Default)]
     struct RecordingTmuxRunner {
         calls: std::sync::Mutex<Vec<Vec<String>>>,
         stdin: std::sync::Mutex<Vec<Vec<u8>>>,
         steps: Arc<RecordingTmuxStore>,
         tmux_version_stdout: String,
+        response: TmuxResponseOverrides,
     }
 
     impl RecordingTmuxRunner {
@@ -1278,6 +1147,10 @@ mod tests {
                 stdin: std::sync::Mutex::new(Vec::new()),
                 steps,
                 tmux_version_stdout: "tmux 3.6a\n".to_owned(),
+                response: TmuxResponseOverrides {
+                    fail_command: None,
+                    pane_pid_stdout: "4242\n".into(),
+                },
             }
         }
 
@@ -1305,6 +1178,15 @@ mod tests {
                 .iter()
                 .map(|argument| argument.to_string_lossy().into_owned())
                 .collect::<Vec<_>>();
+            if self.response.fail_command.as_deref() == args.get(2).map(String::as_str) {
+                self.calls.lock().unwrap().push(args);
+                return Ok(CommandOutput {
+                    success: false,
+                    code: Some(1),
+                    stdout: String::new(),
+                    stderr: "injected tmux failure".into(),
+                });
+            }
             let (step, stdout) = match args.get(2).map(String::as_str) {
                 Some("start-server") => ("server-bootstrap", ""),
                 Some("-V") => ("version", self.tmux_version_stdout.as_str()),
@@ -1329,7 +1211,7 @@ mod tests {
                     Some("@boss_spawn_token") => ("label", ""),
                     other => panic!("unexpected tmux set-option: {other:?}, args={args:?}"),
                 },
-                Some("display-message") => ("pane-pid", "4242\n"),
+                Some("display-message") => ("pane-pid", self.response.pane_pid_stdout.as_str()),
                 other => panic!("unexpected tmux command: {other:?}, args={args:?}"),
             };
             self.steps.steps.lock().unwrap().push(step);
@@ -1378,6 +1260,7 @@ mod tests {
         let spawner = StubSpawner {
             registry: registry.clone(),
             spawn_calls: Arc::new(AtomicUsize::new(0)),
+            tmux_runner: Arc::new(RecordingTmuxRunner::new(Arc::default())),
             last_request: std::sync::Mutex::new(None),
             canned_response: Err(SendToAppError::NotRegistered),
         };
@@ -1385,13 +1268,12 @@ mod tests {
         let runner = Arc::new(RecordingTmuxRunner::new(store.clone()));
         let tmux = Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH)
             .unwrap();
-        let mut input = sample_input(&workspace);
-        input.tmux_host = Some(TmuxWorkerHost::new(tmux, store.clone(), "boss-3-run-test".to_owned()));
+        let mut input = sample_input(&workspace, spawner.tmux_runner.clone());
+        input.tmux_host = TmuxWorkerHost::new(tmux, store.clone(), "boss-3-run-test".to_owned());
 
         let started = start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
 
         assert_eq!(started.shell_pid, 4242);
-        assert!(!started.ack_timed_out);
         assert_eq!(registry.lookup(4242).as_deref(), Some("run-test"));
         assert_eq!(
             spawner.spawn_calls.load(Ordering::SeqCst),
@@ -1568,6 +1450,7 @@ mod tests {
         let spawner = StubSpawner {
             registry: WorkerRegistry::new(),
             spawn_calls: Arc::new(AtomicUsize::new(0)),
+            tmux_runner: Arc::new(RecordingTmuxRunner::new(Arc::default())),
             last_request: std::sync::Mutex::new(None),
             canned_response: Err(SendToAppError::NotRegistered),
         };
@@ -1575,12 +1458,8 @@ mod tests {
         let runner = Arc::new(RecordingTmuxRunner::new(store.clone()));
         let tmux = Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH)
             .unwrap();
-        let mut input = codex_input(&workspace, "run-codex-tmux", 1);
-        input.tmux_host = Some(TmuxWorkerHost::new(
-            tmux,
-            store.clone(),
-            "boss-1-run-codex-tmux".to_owned(),
-        ));
+        let mut input = codex_input(&workspace, "run-codex-tmux", 1, spawner.tmux_runner.clone());
+        input.tmux_host = TmuxWorkerHost::new(tmux, store.clone(), "boss-1-run-codex-tmux".to_owned());
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1646,6 +1525,7 @@ mod tests {
         let spawner = StubSpawner {
             registry: WorkerRegistry::new(),
             spawn_calls: Arc::new(AtomicUsize::new(0)),
+            tmux_runner: Arc::new(RecordingTmuxRunner::new(Arc::default())),
             last_request: std::sync::Mutex::new(None),
             canned_response: Err(SendToAppError::NotRegistered),
         };
@@ -1653,12 +1533,8 @@ mod tests {
         let runner = Arc::new(RecordingTmuxRunner::new(store.clone()).with_tmux_version("tmux 3.3a\n"));
         let tmux = Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH)
             .unwrap();
-        let mut input = codex_input(&workspace, "run-codex-tmux-old", 1);
-        input.tmux_host = Some(TmuxWorkerHost::new(
-            tmux,
-            store.clone(),
-            "boss-1-run-codex-tmux-old".to_owned(),
-        ));
+        let mut input = codex_input(&workspace, "run-codex-tmux-old", 1, spawner.tmux_runner.clone());
+        input.tmux_host = TmuxWorkerHost::new(tmux, store.clone(), "boss-1-run-codex-tmux-old".to_owned());
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1690,25 +1566,27 @@ mod tests {
         let spawner = StubSpawner {
             registry: registry.clone(),
             spawn_calls: Arc::new(AtomicUsize::new(0)),
+            tmux_runner: Arc::new(RecordingTmuxRunner::new(Arc::default())),
             last_request: std::sync::Mutex::new(None),
-            canned_response: Ok(EngineToAppResponse::SpawnWorkerPane {
-                result: Ok(SpawnWorkerPaneResult {
-                    slot_id: 3,
-                    shell_pid: 42_111,
-                }),
+            canned_response: Ok(EngineToAppResponse::AttachWorkerPane {
+                result: Ok(AttachWorkerPaneResult {}),
             }),
         };
 
-        let started = start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1))
-            .await
-            .unwrap();
+        let started = start_worker(
+            &spawner,
+            sample_input(&workspace, spawner.tmux_runner.clone()),
+            StdDuration::from_secs(1),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(started.slot_id, 3);
-        assert_eq!(started.shell_pid, 42_111);
+        assert_eq!(started.shell_pid, 4242);
         assert!(started.written_files.claude_md_path.exists());
         assert!(started.written_files.settings_path.exists());
         assert!(started.written_files.gitignore_path.exists());
-        assert_eq!(registry.lookup(42_111).as_deref(), Some("run-test"));
+        assert_eq!(registry.lookup(4242).as_deref(), Some("run-test"));
     }
 
     /// Call-site cutover acceptance: `start_worker` must use the driver Arc
@@ -1723,12 +1601,10 @@ mod tests {
         let spawner = StubSpawner {
             registry: WorkerRegistry::new(),
             spawn_calls: Arc::new(AtomicUsize::new(0)),
+            tmux_runner: Arc::new(RecordingTmuxRunner::new(Arc::default())),
             last_request: std::sync::Mutex::new(None),
-            canned_response: Ok(EngineToAppResponse::SpawnWorkerPane {
-                result: Ok(SpawnWorkerPaneResult {
-                    slot_id: 3,
-                    shell_pid: 99,
-                }),
+            canned_response: Ok(EngineToAppResponse::AttachWorkerPane {
+                result: Ok(AttachWorkerPaneResult {}),
             }),
         };
 
@@ -1736,7 +1612,7 @@ mod tests {
         descriptor.name = "stub-codex";
         descriptor.config_dir = ".stub";
         descriptor.agent_rules_filename = "AGENTS.md";
-        let mut input = sample_input(&workspace);
+        let mut input = sample_input(&workspace, spawner.tmux_runner.clone());
         input.driver = Arc::new(
             StubDriver::new(descriptor, CapabilitySet::new([Capability::Spawn]))
                 .with_progress_fidelity(ProgressFidelity::Rich),
@@ -1768,11 +1644,12 @@ mod tests {
         let spawner = StubSpawner {
             registry: registry.clone(),
             spawn_calls: Arc::new(AtomicUsize::new(0)),
+            tmux_runner: Arc::new(RecordingTmuxRunner::new(Arc::default())),
             last_request: std::sync::Mutex::new(None),
             canned_response: Err(SendToAppError::NotRegistered),
         };
 
-        let mut input = sample_input(&workspace);
+        let mut input = sample_input(&workspace, spawner.tmux_runner.clone());
         input.driver = Arc::new(StubDriver::new(
             stub_descriptor(),
             CapabilitySet::new([Capability::Spawn]),
@@ -1802,53 +1679,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_pid_zero_skips_registration_with_warning() {
+    async fn viewer_error_does_not_fail_the_worker() {
         let workspace = TempDir::new().unwrap();
-        let registry = WorkerRegistry::new();
-        let spawner = StubSpawner {
-            registry: registry.clone(),
-            spawn_calls: Arc::new(AtomicUsize::new(0)),
-            last_request: std::sync::Mutex::new(None),
-            canned_response: Ok(EngineToAppResponse::SpawnWorkerPane {
-                result: Ok(SpawnWorkerPaneResult {
-                    slot_id: 3,
-                    shell_pid: 0,
-                }),
-            }),
-        };
-
-        let started = start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1))
-            .await
-            .unwrap();
-
-        assert_eq!(started.shell_pid, 0);
-        assert!(registry.is_empty());
-    }
-
-    #[tokio::test]
-    async fn app_error_propagates() {
-        let workspace = TempDir::new().unwrap();
-        let registry = WorkerRegistry::new();
-        let spawner = StubSpawner {
-            registry: registry.clone(),
-            spawn_calls: Arc::new(AtomicUsize::new(0)),
-            last_request: std::sync::Mutex::new(None),
-            canned_response: Ok(EngineToAppResponse::SpawnWorkerPane {
-                result: Err(EngineToAppError::NoAvailableSlot),
-            }),
-        };
-
-        let result = start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1)).await;
-        assert!(matches!(
-            result,
-            Err(StartWorkerError::AppError(EngineToAppError::NoAvailableSlot))
-        ));
-        assert!(registry.is_empty());
+        let mut spawner = ok_spawner_capturing();
+        spawner.canned_response = Ok(EngineToAppResponse::AttachWorkerPane {
+            result: Err(EngineToAppError::NoAvailableSlot),
+        });
+        let started = start_worker(
+            &spawner,
+            sample_input(&workspace, spawner.tmux_runner.clone()),
+            StdDuration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(started.shell_pid, 4242);
+        assert_eq!(spawner.registry.lookup(4242).as_deref(), Some("run-test"));
     }
 
     /// Engine-owns-slots invariant: the slot the runner claimed for
     /// this worker (set on `StartWorkerInput.slot_id`) must reach
-    /// the app verbatim on `SpawnWorkerPaneInput.slot_id`. A drop
+    /// the app verbatim on `AttachWorkerPaneInput.slot_id`. A drop
     /// here would re-allow the app's old firstIndex(where:) heuristic
     /// to silently override the engine's pick.
     #[tokio::test]
@@ -1857,62 +1707,44 @@ mod tests {
         let spawner = StubSpawner {
             registry: WorkerRegistry::new(),
             spawn_calls: Arc::new(AtomicUsize::new(0)),
+            tmux_runner: Arc::new(RecordingTmuxRunner::new(Arc::default())),
             last_request: std::sync::Mutex::new(None),
-            canned_response: Ok(EngineToAppResponse::SpawnWorkerPane {
-                result: Ok(SpawnWorkerPaneResult {
-                    slot_id: 7,
-                    shell_pid: 99,
-                }),
+            canned_response: Ok(EngineToAppResponse::AttachWorkerPane {
+                result: Ok(AttachWorkerPaneResult {}),
             }),
         };
-        let mut input = sample_input(&workspace);
+        let mut input = sample_input(&workspace, spawner.tmux_runner.clone());
         input.slot_id = 7;
 
         start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
 
         let last = spawner.last_request.lock().unwrap().clone().unwrap();
         match last {
-            EngineToAppRequest::SpawnWorkerPane(req) => {
+            EngineToAppRequest::AttachWorkerPane(req) => {
                 assert_eq!(req.slot_id, 7);
             }
-            other => panic!("expected SpawnWorkerPane request, got {other:?}"),
+            other => panic!("expected AttachWorkerPane request, got {other:?}"),
         }
     }
 
-    /// If the app and the engine disagree about which slot is free
-    /// (engine asks for slot N; app already hosts a session there),
-    /// the app returns `SlotBusy` and the spawn flow surfaces it as
-    /// `StartWorkerError::AppError(SlotBusy)` without registering a
-    /// pid for the run. The coordinator can then handle the
-    /// disagreement explicitly instead of the app silently picking a
-    /// different slot.
     #[tokio::test]
-    async fn slot_busy_error_propagates_without_registering_pid() {
+    async fn busy_viewer_does_not_lose_the_tmux_worker() {
         let workspace = TempDir::new().unwrap();
-        let registry = WorkerRegistry::new();
-        let spawner = StubSpawner {
-            registry: registry.clone(),
-            spawn_calls: Arc::new(AtomicUsize::new(0)),
-            last_request: std::sync::Mutex::new(None),
-            canned_response: Ok(EngineToAppResponse::SpawnWorkerPane {
-                result: Err(EngineToAppError::SlotBusy {
-                    occupying_run_id: Some("run-husk".into()),
-                }),
+        let mut spawner = ok_spawner_capturing();
+        spawner.canned_response = Ok(EngineToAppResponse::AttachWorkerPane {
+            result: Err(EngineToAppError::SlotBusy {
+                occupying_run_id: Some("run-husk".into()),
             }),
-        };
-
-        let result = start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1)).await;
-        assert!(
-            matches!(
-                result,
-                Err(StartWorkerError::AppError(EngineToAppError::SlotBusy { .. }))
-            ),
-            "expected SlotBusy app error, got {result:?}",
-        );
-        assert!(
-            registry.is_empty(),
-            "registry must be empty when the app rejects the spawn — no pid to track",
-        );
+        });
+        let started = start_worker(
+            &spawner,
+            sample_input(&workspace, spawner.tmux_runner.clone()),
+            StdDuration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(started.shell_pid, 4242);
+        assert_eq!(spawner.registry.slot_for_run("run-test"), Some(3));
     }
 
     #[tokio::test]
@@ -1923,12 +1755,10 @@ mod tests {
         let spawner = StubSpawner {
             registry,
             spawn_calls: spawn_calls.clone(),
+            tmux_runner: Arc::new(RecordingTmuxRunner::new(Arc::default())),
             last_request: std::sync::Mutex::new(None),
-            canned_response: Ok(EngineToAppResponse::SpawnWorkerPane {
-                result: Ok(SpawnWorkerPaneResult {
-                    slot_id: 1,
-                    shell_pid: 1,
-                }),
+            canned_response: Ok(EngineToAppResponse::AttachWorkerPane {
+                result: Ok(AttachWorkerPaneResult {}),
             }),
         };
 
@@ -1936,7 +1766,7 @@ mod tests {
         // create_dir_all fails inside write_workspace_files.
         let blocked = workspace.path().join("blocked");
         std::fs::write(&blocked, b"i am a file").unwrap();
-        let mut input = sample_input(&workspace);
+        let mut input = sample_input(&workspace, spawner.tmux_runner.clone());
         input.workspace_path = blocked;
 
         let result = start_worker(&spawner, input, StdDuration::from_secs(1)).await;
@@ -1991,7 +1821,7 @@ mod tests {
         /// `prepare_progress_ingress`, tagged with the `ProgressIngress`
         /// variant the resolved driver returned.
         Prepared(&'static str),
-        /// The `SpawnWorkerPane` request to the app.
+        /// The viewer attachment request after tmux worker creation.
         PaneRequested,
         /// `activate_progress_ingress`, tagged with whether the slot's
         /// live-state entry was already registered when it fired.
@@ -2010,22 +1840,22 @@ mod tests {
     /// ordering that matters.
     struct LiveStateSpawner {
         registry: WorkerRegistry,
+        tmux_runner: Arc<RecordingTmuxRunner>,
         live_states: LiveWorkerStateRegistry,
         jsonl: crate::agent_jsonl_progress::AgentJsonlProgressManager,
         slot_id: u8,
-        shell_pid: i32,
         spawn_calls: Arc<AtomicUsize>,
         steps: std::sync::Mutex<Vec<SpawnStep>>,
     }
 
     impl LiveStateSpawner {
-        fn new(slot_id: u8, shell_pid: i32) -> Self {
+        fn new(slot_id: u8) -> Self {
             Self {
                 registry: WorkerRegistry::new(),
+                tmux_runner: Arc::new(RecordingTmuxRunner::new(Arc::default())),
                 live_states: LiveWorkerStateRegistry::new(),
                 jsonl: crate::agent_jsonl_progress::AgentJsonlProgressManager::new(),
                 slot_id,
-                shell_pid,
                 spawn_calls: Arc::new(AtomicUsize::new(0)),
                 steps: std::sync::Mutex::new(Vec::new()),
             }
@@ -2050,11 +1880,8 @@ mod tests {
         ) -> Result<EngineToAppResponse, SendToAppError> {
             self.spawn_calls.fetch_add(1, Ordering::SeqCst);
             self.record(SpawnStep::PaneRequested);
-            Ok(EngineToAppResponse::SpawnWorkerPane {
-                result: Ok(SpawnWorkerPaneResult {
-                    slot_id: self.slot_id,
-                    shell_pid: self.shell_pid,
-                }),
+            Ok(EngineToAppResponse::AttachWorkerPane {
+                result: Ok(AttachWorkerPaneResult {}),
             })
         }
 
@@ -2119,11 +1946,16 @@ mod tests {
     /// (as this fixture used to) would hide exactly the writer/checker
     /// mismatch this test exists to catch, so it drives the real
     /// `provision_durable_sessions` writer instead.
-    fn codex_input(workspace: &TempDir, run_id: &str, slot_id: u8) -> StartWorkerInput {
+    fn codex_input(
+        workspace: &TempDir,
+        run_id: &str,
+        slot_id: u8,
+        runner: Arc<RecordingTmuxRunner>,
+    ) -> StartWorkerInput {
         let codex_home = crate::driver::codex::codex_home_for_run(run_id).unwrap();
         std::fs::create_dir_all(&codex_home).unwrap();
         crate::driver::transcript_store::provision_durable_sessions(&codex_home, "codex", run_id).unwrap();
-        let mut input = sample_input(workspace);
+        let mut input = sample_input(workspace, runner);
         input.run_id = run_id.to_owned();
         input.slot_id = slot_id;
         input.model = "gpt-6-astra".into();
@@ -2147,7 +1979,7 @@ mod tests {
     ///
     /// Codex is the first driver whose progress arrives over a byte stream
     /// (`ProgressIngress::AgentJsonlFile`) rather than the hook socket, and
-    /// that ingress is prepared *before* `SpawnWorkerPane` — an unhappy
+    /// that ingress is prepared *before* tmux worker creation — an unhappy
     /// preparation short-circuits `start_worker` before it ever reaches the
     /// registration below. This pins that a Codex spawn lands in the same
     /// registry, with the same routing stamps, as a Claude spawn.
@@ -2175,8 +2007,8 @@ mod tests {
         let _transcripts_env = transcript_store_override(transcripts.path());
 
         let workspace = TempDir::new().unwrap();
-        let spawner = LiveStateSpawner::new(4, 4242);
-        let input = codex_input(&workspace, "exec-codex-1", 4);
+        let spawner = LiveStateSpawner::new(4);
+        let input = codex_input(&workspace, "exec-codex-1", 4, spawner.tmux_runner.clone());
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2227,11 +2059,15 @@ mod tests {
     #[tokio::test]
     async fn claude_spawn_registers_live_worker_state() {
         let workspace = TempDir::new().unwrap();
-        let spawner = LiveStateSpawner::new(3, 77);
+        let spawner = LiveStateSpawner::new(3);
 
-        start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1))
-            .await
-            .unwrap();
+        start_worker(
+            &spawner,
+            sample_input(&workspace, spawner.tmux_runner.clone()),
+            StdDuration::from_secs(1),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             spawner.steps(),
@@ -2254,15 +2090,13 @@ mod tests {
         StubSpawner {
             registry: WorkerRegistry::new(),
             spawn_calls: Arc::new(AtomicUsize::new(0)),
+            tmux_runner: Arc::new(RecordingTmuxRunner::new(Arc::default())),
             last_request: std::sync::Mutex::new(None),
             // Echo whatever sample_input claims (slot 3) so the
             // engine-side debug_assert that the app honored the
             // claimed slot doesn't fire in tests.
-            canned_response: Ok(EngineToAppResponse::SpawnWorkerPane {
-                result: Ok(SpawnWorkerPaneResult {
-                    slot_id: 3,
-                    shell_pid: 1,
-                }),
+            canned_response: Ok(EngineToAppResponse::AttachWorkerPane {
+                result: Ok(AttachWorkerPaneResult {}),
             }),
         }
     }
@@ -2272,9 +2106,13 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         let spawner = ok_spawner_capturing();
 
-        start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1))
-            .await
-            .unwrap();
+        start_worker(
+            &spawner,
+            sample_input(&workspace, spawner.tmux_runner.clone()),
+            StdDuration::from_secs(1),
+        )
+        .await
+        .unwrap();
 
         let env = spawner.last_spawn_env();
         let path = env
@@ -2320,7 +2158,7 @@ mod tests {
     async fn omitted_frontend_socket_is_not_exported() {
         let workspace = TempDir::new().unwrap();
         let spawner = ok_spawner_capturing();
-        let mut input = sample_input(&workspace);
+        let mut input = sample_input(&workspace, spawner.tmux_runner.clone());
         input.frontend_socket_path = None;
         start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
         let env = spawner.last_spawn_env();
@@ -2338,7 +2176,7 @@ mod tests {
     async fn omitted_control_token_is_not_exported() {
         let workspace = TempDir::new().unwrap();
         let spawner = ok_spawner_capturing();
-        let mut input = sample_input(&workspace);
+        let mut input = sample_input(&workspace, spawner.tmux_runner.clone());
         input.control_token_path = None;
         start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
         let env = spawner.last_spawn_env();
@@ -2362,7 +2200,7 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         let spawner = ok_spawner_capturing();
 
-        let mut input = sample_input(&workspace);
+        let mut input = sample_input(&workspace, spawner.tmux_runner.clone());
         input.extra_env = vec![(
             boss_engine_worker_bin::WORKER_BIN_DIR_ENV.into(),
             "/tmp/boss-worker-settings/bin".into(),
@@ -2421,9 +2259,13 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         let spawner = ok_spawner_capturing();
 
-        start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1))
-            .await
-            .unwrap();
+        start_worker(
+            &spawner,
+            sample_input(&workspace, spawner.tmux_runner.clone()),
+            StdDuration::from_secs(1),
+        )
+        .await
+        .unwrap();
 
         let env = spawner.last_spawn_env();
         let path = env
@@ -2536,9 +2378,13 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         let spawner = ok_spawner_capturing();
 
-        start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1))
-            .await
-            .unwrap();
+        start_worker(
+            &spawner,
+            sample_input(&workspace, spawner.tmux_runner.clone()),
+            StdDuration::from_secs(1),
+        )
+        .await
+        .unwrap();
 
         let env = spawner.last_spawn_env();
         // Every editor-resolution env that git/jj/$EDITOR-aware tools
@@ -2574,9 +2420,13 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         let spawner = ok_spawner_capturing();
 
-        start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1))
-            .await
-            .unwrap();
+        start_worker(
+            &spawner,
+            sample_input(&workspace, spawner.tmux_runner.clone()),
+            StdDuration::from_secs(1),
+        )
+        .await
+        .unwrap();
 
         let env = spawner.last_spawn_env();
         assert_eq!(
@@ -2593,7 +2443,7 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         let spawner = ok_spawner_capturing();
 
-        let mut input = sample_input(&workspace);
+        let mut input = sample_input(&workspace, spawner.tmux_runner.clone());
         input.extra_env = vec![("XAI_API_KEY".into(), "xai-real-looking-key".into())];
 
         start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
@@ -2616,7 +2466,7 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         let spawner = ok_spawner_capturing();
 
-        let mut input = sample_input(&workspace);
+        let mut input = sample_input(&workspace, spawner.tmux_runner.clone());
         input.extra_env = vec![
             ("BOSS_TASK_ID".into(), "T-42".into()),
             ("CUBE_LEASE_ID".into(), "lease-cube".into()),
@@ -2645,16 +2495,16 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         let spawner = ok_spawner_capturing();
 
-        let mut input = sample_input(&workspace);
+        let mut input = sample_input(&workspace, spawner.tmux_runner.clone());
         input.title_summary = Some("Pane Titlebar Summary".to_owned());
 
         start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
 
         match spawner.last_request.lock().unwrap().clone() {
-            Some(EngineToAppRequest::SpawnWorkerPane(input)) => {
+            Some(EngineToAppRequest::AttachWorkerPane(input)) => {
                 assert_eq!(input.summary.as_deref(), Some("Pane Titlebar Summary"));
             }
-            other => panic!("expected SpawnWorkerPane, got {other:?}"),
+            other => panic!("expected AttachWorkerPane, got {other:?}"),
         }
     }
 
@@ -2663,15 +2513,19 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         let spawner = ok_spawner_capturing();
 
-        start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1))
-            .await
-            .unwrap();
+        start_worker(
+            &spawner,
+            sample_input(&workspace, spawner.tmux_runner.clone()),
+            StdDuration::from_secs(1),
+        )
+        .await
+        .unwrap();
 
         match spawner.last_request.lock().unwrap().clone() {
-            Some(EngineToAppRequest::SpawnWorkerPane(input)) => {
+            Some(EngineToAppRequest::AttachWorkerPane(input)) => {
                 assert!(input.summary.is_none());
             }
-            other => panic!("expected SpawnWorkerPane, got {other:?}"),
+            other => panic!("expected AttachWorkerPane, got {other:?}"),
         }
     }
 
@@ -2680,7 +2534,7 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         let spawner = ok_spawner_capturing();
 
-        let mut input = sample_input(&workspace);
+        let mut input = sample_input(&workspace, spawner.tmux_runner.clone());
         // Mix of clearly-dangerous keys and a fake one to confirm
         // both get filtered. `BOSS_CONTROL_SOCKET` is the canonical
         // example: even if some upstream caller tried to set it, the
@@ -2703,72 +2557,60 @@ mod tests {
         assert!(keys.contains(&"BOSS_TASK_ID"));
     }
 
-    /// Regression test: a `SpawnWorkerPane` ack timeout must NOT surface
-    /// as a spawn failure. The app may have hosted the pane anyway (seen
-    /// previously: a slow post-sleep RPC drain made the ack time out while
-    /// the `claude` process had already started). `start_worker` returns
-    /// `Ok` with `ack_timed_out` set, `shell_pid = 0`, and the
-    /// engine-claimed slot — and it registers the run→slot mapping so the
-    /// (possibly-live) pane's hook events correlate back to this run and
-    /// the spawn-ack sweep can confirm liveness or reap. Because it is
-    /// `Ok`, the coordinator never takes the failure path that releases
-    /// the lease and duplicate-dispatches the work item.
     #[tokio::test]
-    async fn ack_timeout_registers_provisional_worker_instead_of_failing() {
-        let workspace = TempDir::new().unwrap();
-        let registry = WorkerRegistry::new();
-        let spawner = StubSpawner {
-            registry: registry.clone(),
-            spawn_calls: Arc::new(AtomicUsize::new(0)),
-            last_request: std::sync::Mutex::new(None),
-            canned_response: Err(SendToAppError::Timeout),
-        };
-
-        let started = start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1))
+    async fn absent_or_unresponsive_viewer_keeps_the_worker_registered() {
+        for response in [SendToAppError::Timeout, SendToAppError::NotRegistered] {
+            let workspace = TempDir::new().unwrap();
+            let mut spawner = ok_spawner_capturing();
+            spawner.canned_response = Err(response);
+            let started = start_worker(
+                &spawner,
+                sample_input(&workspace, spawner.tmux_runner.clone()),
+                StdDuration::from_secs(1),
+            )
             .await
-            .expect("ack timeout must be a provisional success, not an error");
-
-        assert!(started.ack_timed_out, "ack timeout must be flagged as provisional");
-        assert_eq!(started.shell_pid, 0, "a provisional spawn has no reported shell pid");
+            .unwrap();
+            assert_eq!(started.shell_pid, 4242);
+            assert_eq!(spawner.registry.lookup(4242).as_deref(), Some("run-test"));
+            assert_eq!(spawner.registry.slot_for_run("run-test"), Some(3));
+        }
+    }
+    #[tokio::test]
+    async fn tmux_failure_is_an_explicit_local_failure_without_app_fallback() {
+        let workspace = TempDir::new().unwrap();
+        let mut spawner = ok_spawner_capturing();
+        Arc::get_mut(&mut spawner.tmux_runner).unwrap().response.fail_command = Some("new-session".into());
+        let result = start_worker(
+            &spawner,
+            sample_input(&workspace, spawner.tmux_runner.clone()),
+            StdDuration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(result, Err(StartWorkerError::Tmux(_))), "{result:?}");
         assert_eq!(
-            started.slot_id, 3,
-            "a provisional spawn tracks the engine-claimed slot (no app echo on timeout)",
+            spawner.spawn_calls.load(Ordering::SeqCst),
+            0,
+            "tmux failure must never call the app"
         );
-        // The run→slot mapping is the correlation key: without it,
-        // dispatch_live_worker_state would drop every hook the live pane
-        // emits, and the spawn-ack sweep would never see the slot.
-        assert_eq!(
-            registry.slot_for_run("run-test"),
-            Some(3),
-            "provisional spawn must register the run→slot mapping so hooks correlate",
-        );
+        assert!(spawner.registry.slot_for_run("run-test").is_none());
+        let steps = spawner.tmux_runner.steps.steps();
+        assert_eq!(steps.first(), Some(&"intent"));
+        assert!(!steps.contains(&"created"));
     }
 
-    /// Only an ambiguous ack *timeout* is treated as provisional. A
-    /// `NotRegistered` send error means the request was never delivered
-    /// (no app session) — the pane definitively did not spawn — so it
-    /// stays a hard failure and registers nothing. The coordinator's
-    /// failure path (release lease + mark failed) is correct for this
-    /// case.
     #[tokio::test]
-    async fn not_registered_send_error_stays_a_hard_failure() {
+    async fn invalid_tmux_pid_is_a_failure_instead_of_provisional_registration() {
         let workspace = TempDir::new().unwrap();
-        let registry = WorkerRegistry::new();
-        let spawner = StubSpawner {
-            registry: registry.clone(),
-            spawn_calls: Arc::new(AtomicUsize::new(0)),
-            last_request: std::sync::Mutex::new(None),
-            canned_response: Err(SendToAppError::NotRegistered),
-        };
-
-        let result = start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1)).await;
-        assert!(
-            matches!(result, Err(StartWorkerError::Send(SendToAppError::NotRegistered))),
-            "a never-delivered spawn must remain a hard failure; got {result:?}",
-        );
-        assert!(
-            registry.slot_for_run("run-test").is_none(),
-            "a hard-failure spawn must not register a run→slot mapping",
-        );
+        let mut spawner = ok_spawner_capturing();
+        Arc::get_mut(&mut spawner.tmux_runner).unwrap().response.pane_pid_stdout = "0".into();
+        let result = start_worker(
+            &spawner,
+            sample_input(&workspace, spawner.tmux_runner.clone()),
+            StdDuration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(result, Err(StartWorkerError::Tmux(_))), "{result:?}");
+        assert_eq!(spawner.spawn_calls.load(Ordering::SeqCst), 0);
+        assert!(spawner.registry.slot_for_run("run-test").is_none());
     }
 }

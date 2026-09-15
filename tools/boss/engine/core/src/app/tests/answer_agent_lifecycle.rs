@@ -70,6 +70,7 @@ fn seed_parked_answer_agent(server_state: &Arc<ServerState>, slot_id: u8) -> (St
         .unwrap();
     crate::test_support::finish_run_worker_pane_alive(work_db, &execution.id, &spawn_run.id, Some("spawned"));
     register_working_worker(server_state, &execution.id, slot_id);
+    super::tmux_stub::install_teardown(server_state, &execution.id, 4_194_303);
     (comment.id, run.id, execution.id)
 }
 

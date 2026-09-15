@@ -353,16 +353,6 @@ impl SettingsStore {
         })
     }
 
-    /// Whether the given attributed pool should use the tmux-hosted spawn
-    /// path. Unknown pool labels intentionally remain on the legacy path.
-    pub fn tmux_hosting_enabled_for(&self, pool: &str) -> bool {
-        self.state
-            .lock()
-            .expect("settings lock poisoned")
-            .tmux_hosting
-            .contains_attributed_pool(pool)
-    }
-
     /// Snapshot of the operator-facing tmux-hosting boolean, for
     /// `GetSettings`. `enabled` is true only when every known pool is
     /// currently configured for tmux hosting — a partially-migrated set
@@ -518,9 +508,30 @@ mod tests {
         let store = make_store(&tmp);
         store.load().unwrap();
 
-        assert!(store.tmux_hosting_enabled_for("review"));
-        assert!(store.tmux_hosting_enabled_for("automation"));
-        assert!(store.tmux_hosting_enabled_for("main"));
+        assert!(
+            store
+                .state
+                .lock()
+                .unwrap()
+                .tmux_hosting
+                .contains_attributed_pool("review")
+        );
+        assert!(
+            store
+                .state
+                .lock()
+                .unwrap()
+                .tmux_hosting
+                .contains_attributed_pool("automation")
+        );
+        assert!(
+            store
+                .state
+                .lock()
+                .unwrap()
+                .tmux_hosting
+                .contains_attributed_pool("main")
+        );
     }
 
     #[test]
@@ -536,9 +547,30 @@ mod tests {
 
         let restored = make_store(&tmp);
         restored.load().unwrap();
-        assert!(restored.tmux_hosting_enabled_for("review"));
-        assert!(restored.tmux_hosting_enabled_for("main"));
-        assert!(!restored.tmux_hosting_enabled_for("automation"));
+        assert!(
+            restored
+                .state
+                .lock()
+                .unwrap()
+                .tmux_hosting
+                .contains_attributed_pool("review")
+        );
+        assert!(
+            restored
+                .state
+                .lock()
+                .unwrap()
+                .tmux_hosting
+                .contains_attributed_pool("main")
+        );
+        assert!(
+            !restored
+                .state
+                .lock()
+                .unwrap()
+                .tmux_hosting
+                .contains_attributed_pool("automation")
+        );
     }
 
     #[test]

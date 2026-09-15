@@ -14,20 +14,29 @@ use super::*;
 use crate::app::SendToAppError;
 use crate::driver::AgentDriver;
 use crate::live_worker_state::LiveWorkerStateRegistry;
-use crate::protocol::{EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput, SpawnWorkerPaneResult};
+use crate::protocol::{AttachWorkerPaneResult, EngineToAppRequest, EngineToAppResponse, EnvVar};
 use crate::test_support::*;
 use crate::work::{CreateChoreInput, CreateProjectInput, CreateTaskInput, EffortLevel, Task, WorkExecution, WorkItem};
 use crate::worker_registry::WorkerRegistry;
 use boss_protocol::{ExecutionKind, ExecutionStatus, TaskKind, TaskStatus};
+use boss_tmux::{CommandOutput, CommandRunner, Tmux};
+use std::ffi::OsString;
 use std::sync::Mutex as StdMutex;
 use tempfile::TempDir;
+
+#[derive(Clone)]
+struct CapturedSpawn {
+    slot_id: u8,
+    initial_input: String,
+    env: Vec<EnvVar>,
+}
 
 /// Records the spawn request the runner sent so tests can assert
 /// on env, initial_input, etc.
 struct CapturingSpawner {
     registry: WorkerRegistry,
     live_states: LiveWorkerStateRegistry,
-    last: StdMutex<Option<SpawnWorkerPaneInput>>,
+    last: StdMutex<Option<CapturedSpawn>>,
     /// Run ids passed to `reap_worker_pane` — lets the mid-spawn
     /// cancel test assert the runner reaped the just-spawned pane.
     reaped: StdMutex<Vec<String>>,
@@ -43,12 +52,12 @@ impl CapturingSpawner {
         }
     }
 
-    fn spawn_input(&self) -> SpawnWorkerPaneInput {
+    fn spawn_input(&self) -> CapturedSpawn {
         self.last
             .lock()
             .unwrap()
             .clone()
-            .expect("expected SpawnWorkerPane to be sent")
+            .expect("expected tmux new-session to be sent")
     }
 
     fn reaped_run_ids(&self) -> Vec<String> {
@@ -64,15 +73,15 @@ impl crate::spawn_flow::WorkerSpawner for CapturingSpawner {
         _timeout: tokio::time::Duration,
     ) -> Result<EngineToAppResponse, SendToAppError> {
         match request {
-            EngineToAppRequest::SpawnWorkerPane(input) => {
-                // Echo the slot the engine claimed; the
-                // engine-owns-slots refactor makes the response
-                // slot a confirmation echo rather than an
-                // independent allocator pick.
-                let slot_id = input.slot_id;
-                *self.last.lock().unwrap() = Some(input);
-                Ok(EngineToAppResponse::SpawnWorkerPane {
-                    result: Ok(SpawnWorkerPaneResult { slot_id, shell_pid: 0 }),
+            EngineToAppRequest::AttachWorkerPane(input) => {
+                self.last
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .expect("tmux worker must start before viewer attachment")
+                    .slot_id = input.slot_id;
+                Ok(EngineToAppResponse::AttachWorkerPane {
+                    result: Ok(AttachWorkerPaneResult {}),
                 })
             }
             other => panic!("unexpected request kind: {other:?}"),
@@ -93,6 +102,72 @@ impl crate::spawn_flow::WorkerSpawner for CapturingSpawner {
     fn live_worker_state_registry(&self) -> Option<&LiveWorkerStateRegistry> {
         Some(&self.live_states)
     }
+}
+
+#[async_trait]
+impl CommandRunner for CapturingSpawner {
+    async fn run(&self, _program: &Path, args: &[OsString], _cwd: Option<&Path>) -> std::io::Result<CommandOutput> {
+        let args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let stdout = match args.get(2).map(String::as_str) {
+            Some("new-session") => {
+                let env = args
+                    .windows(2)
+                    .filter(|pair| pair[0] == "-e")
+                    .map(|pair| {
+                        let (key, value) = pair[1].split_once('=').unwrap();
+                        EnvVar {
+                            key: key.into(),
+                            value: value.into(),
+                        }
+                    })
+                    .collect();
+                *self.last.lock().unwrap() = Some(CapturedSpawn {
+                    slot_id: 0,
+                    env,
+                    initial_input: args.last().unwrap().clone(),
+                });
+                ""
+            }
+            Some("display-message") => "4242",
+            Some("-V") => "tmux 3.3",
+            Some("start-server" | "set-option" | "show-options") => "",
+            other => panic!("unexpected tmux command {other:?}: {args:?}"),
+        };
+        Ok(CommandOutput {
+            success: true,
+            code: Some(0),
+            stdout: stdout.into(),
+            stderr: String::new(),
+        })
+    }
+}
+
+impl crate::spawn_flow::TmuxSpawnStore for CapturingSpawner {
+    fn record_tmux_spawn_intent(&self, _: &str, _: &str, _: &str, _: &str) -> Result<bool> {
+        Ok(true)
+    }
+    fn record_tmux_session_created(&self, _: &str, _: &str, _: i64, _: &str, _: &str) -> Result<bool> {
+        Ok(true)
+    }
+}
+
+fn bind_runner(
+    runner: &PaneSpawnRunner,
+    weak: Weak<dyn crate::spawn_flow::WorkerSpawner>,
+    spawner: &Arc<CapturingSpawner>,
+) {
+    runner.set_server_state(weak);
+    let tmux = Tmux::with_runner_and_socket("/fake/tmux", spawner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap();
+    assert!(
+        runner
+            .overrides
+            .tmux_host
+            .set(TmuxWorkerHost::new(tmux, spawner.clone(), "boss-test-worker".into()))
+            .is_ok()
+    );
 }
 
 fn sample_execution(workspace_path: &Path) -> WorkExecution {
@@ -210,7 +285,7 @@ async fn run_once(workspace: &TempDir, boss_event_path: Option<&Path>) -> Result
         workspace.path().join("feature-flags.toml"),
     ));
     let runner = PaneSpawnRunner::new(cfg, work_db, flags);
-    runner.set_server_state(weak);
+    bind_runner(&runner, weak, &spawner);
     if let Some(path) = boss_event_path {
         runner.set_boss_event_path(path.to_path_buf());
     }
@@ -302,32 +377,23 @@ async fn implementation_prompt_dictates_engine_supplied_branch_name() {
 }
 
 #[tokio::test]
-async fn spawn_request_carries_claude_pane_monitor_spec() {
-    // Claude is the default driver for these fixtures; the app's
-    // pre-hook status pill must receive Claude's historical markers
-    // on the wire rather than relying only on the app-side default.
+async fn spawn_attaches_a_viewer_after_launching_tmux() {
     let workspace = TempDir::new().unwrap();
     let spawner = run_once(&workspace, None).await.unwrap();
-    let input = spawner.spawn_input();
-    let spec = input.pane_monitor.expect("Claude spawn must populate pane_monitor");
-    assert_eq!(spec.agent_markers, vec!["Claude Code", "auto mode on", "/effort"]);
-    assert_eq!(spec.busy_markers, vec!["esc to interrupt"]);
+    assert_eq!(spawner.spawn_input().slot_id, 1);
     assert_eq!(
-        spec.starting_markers,
-        vec!["Accessing workspace:", "Quick safety check:"]
+        spawner
+            .registry
+            .pane_for_run("exec-test-1")
+            .unwrap()
+            .tmux_session_name
+            .as_deref(),
+        Some("boss-test-worker")
     );
-    assert_eq!(spec.prompt_prefixes, vec!["❯"]);
-    assert_eq!(spec.idle_debounce_polls, 2);
 }
 
-/// Read back the full assembled command `initial_input` now sources —
-/// see `write_initial_input_script`. Tests that assert on the composed
-/// command (model/effort/permission flags, prompt-file read, PATH
-/// prepends) read this instead of `SpawnWorkerPaneInput::initial_input`,
-/// which after the MAX_CANON fix is always a short fixed line.
 fn initial_input_script(workspace: &Path) -> String {
-    std::fs::read_to_string(workspace.join(".boss").join("initial-input.sh"))
-        .expect("initial-input script must exist in the workspace after a successful spawn")
+    std::fs::read_to_string(workspace.join(".boss").join("initial-input.sh")).unwrap()
 }
 
 #[tokio::test]
@@ -343,7 +409,10 @@ async fn initial_input_types_a_short_fixed_line_sourcing_the_workspace_script() 
     // its entirety (not truncated), so the previous behaviour of typing
     // the whole command meant a long enough combination of the above
     // meant the worker never started, with nothing surfaced anywhere.
-    assert_eq!(input.initial_input, ". .boss/initial-input.sh\n");
+    assert_eq!(
+        input.initial_input,
+        crate::spawn_flow::WorkerPaneLaunch::from_environment().tmux_command(". .boss/initial-input.sh\n")
+    );
 
     let script = initial_input_script(workspace.path());
     // The pane needs a `claude` invocation that picks up the rendered
@@ -386,12 +455,12 @@ async fn throttle_changes_apply_to_next_spawn_in_every_local_pool() {
         ("review-1", ExecutionKind::PrReview),
     ] {
         let workspace = TempDir::new().unwrap();
-        let (_spawner, weak, cfg, db) = spawn_test_env(&workspace);
+        let (spawner, weak, cfg, db) = spawn_test_env(&workspace);
         let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
             workspace.path().join("feature-flags.toml"),
         ));
         let runner = PaneSpawnRunner::new(cfg, db.clone(), flags);
-        runner.set_server_state(weak);
+        bind_runner(&runner, weak, &spawner);
         let mut execution = sample_execution(workspace.path());
         execution.kind = kind;
         for enabled in [false, true, false] {
@@ -490,7 +559,7 @@ async fn run_once_with_chore_inner(
         workspace.path().join("feature-flags.toml"),
     ));
     let runner = PaneSpawnRunner::new(cfg, work_db, flags);
-    runner.set_server_state(weak);
+    bind_runner(&runner, weak, &spawner);
 
     let mut execution = sample_execution(workspace.path());
     execution.work_item_id = chore.id.clone();
@@ -823,7 +892,7 @@ async fn product_default_model_fills_in_when_row_is_untagged() {
 #[tokio::test]
 async fn run_outcome_carries_resolved_spawn_config() {
     let workspace = TempDir::new().unwrap();
-    let (_spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
 
     let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
     let chore = work_db
@@ -840,7 +909,7 @@ async fn run_outcome_carries_resolved_spawn_config() {
         workspace.path().join("feature-flags.toml"),
     ));
     let runner = PaneSpawnRunner::new(cfg, work_db, flags);
-    runner.set_server_state(weak);
+    bind_runner(&runner, weak, &spawner);
 
     let mut execution = sample_execution(workspace.path());
     execution.work_item_id = chore.id.clone();
@@ -878,7 +947,7 @@ async fn run_outcome_carries_resolved_spawn_config() {
 #[tokio::test]
 async fn every_execution_kind_yields_worker_pane_alive() {
     let workspace = TempDir::new().unwrap();
-    let (_spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
 
     let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
     let chore = create_test_chore_manual(&work_db, product.id.clone(), "Some chore being reviewed");
@@ -887,7 +956,7 @@ async fn every_execution_kind_yields_worker_pane_alive() {
         workspace.path().join("feature-flags.toml"),
     ));
     let runner = PaneSpawnRunner::new(cfg.clone(), work_db.clone(), flags.clone());
-    runner.set_server_state(weak.clone());
+    bind_runner(&runner, weak.clone(), &spawner);
 
     // Build a PrReview execution; no pr_url on the chore is fine —
     // the runner falls back to the generic prompt, which is irrelevant
@@ -917,7 +986,7 @@ async fn every_execution_kind_yields_worker_pane_alive() {
     // A non-review worker kind must yield the SAME state: its agent is
     // just as alive, and just as much not waiting for a human.
     let runner2 = PaneSpawnRunner::new(cfg, work_db, flags);
-    runner2.set_server_state(weak);
+    bind_runner(&runner2, weak, &spawner);
     let mut chore_exec = sample_execution(workspace.path());
     chore_exec.kind = ExecutionKind::ChoreImplementation;
     chore_exec.work_item_id = chore.id.clone();
@@ -1060,7 +1129,7 @@ async fn spawn_env_uses_the_bound_socket_from_config_not_the_environment() {
         workspace.path().join("feature-flags.toml"),
     ));
     let runner = PaneSpawnRunner::new(cfg, work_db, flags);
-    runner.set_server_state(weak);
+    bind_runner(&runner, weak, &spawner);
     runner
         .run_execution(
             "worker-1",
@@ -1112,7 +1181,7 @@ async fn spawn_env_exports_the_bound_frontend_socket_as_boss_socket_path() {
         workspace.path().join("feature-flags.toml"),
     ));
     let runner = PaneSpawnRunner::new(cfg, work_db, flags);
-    runner.set_server_state(weak);
+    bind_runner(&runner, weak, &spawner);
     runner
         .run_execution(
             "worker-1",
@@ -1216,7 +1285,7 @@ fn bound_events_socket_path_falls_back_when_nothing_was_bound() {
 /// The engine is now the source of truth for which slot a
 /// worker lands in. The runner derives the slot from the
 /// `worker-{N}` id the coordinator passes in and forwards it on
-/// `SpawnWorkerPaneInput.slot_id`. The app honors that slot
+/// `CapturedSpawn.slot_id`. The app honors that slot
 /// rather than running its own allocator. This test pins down
 /// that wiring so a regression that drops the slot from the
 /// request (or computes it wrong) doesn't silently re-introduce
@@ -1240,7 +1309,7 @@ async fn spawn_request_includes_engine_claimed_slot() {
         workspace.path().join("feature-flags.toml"),
     ));
     let runner = PaneSpawnRunner::new(cfg, work_db, flags);
-    runner.set_server_state(weak);
+    bind_runner(&runner, weak, &spawner);
 
     // Engine claimed slot 6 (i.e. handed `worker-6` to the
     // runner). The spawn request must carry slot 6 — not 1, not
@@ -1305,7 +1374,7 @@ async fn run_execution_stamps_work_item_binding_on_live_state() {
 }
 
 /// Regression — the mid-spawn cancel reconciliation. When the
-/// execution row is cancelled while the `SpawnWorkerPane` round-trip
+/// execution row is cancelled while worker creation and viewer attachment
 /// is in flight, `run_execution` must, on return, (i) reap the
 /// just-spawned pane (the pid is now known, so the reap is no longer
 /// a no-op) and (ii) report `CancelledDuringSpawn` so the coordinator
@@ -1341,7 +1410,7 @@ async fn run_execution_reaps_and_signals_when_cancelled_mid_spawn() {
         workspace.path().join("feature-flags.toml"),
     ));
     let runner = PaneSpawnRunner::new(cfg, work_db.clone(), flags);
-    runner.set_server_state(weak);
+    bind_runner(&runner, weak, &spawner);
 
     let chore_item = work_db.get_work_item(&chore.id).unwrap();
     let outcome = runner
@@ -1376,7 +1445,7 @@ async fn run_execution_reaps_and_signals_when_cancelled_mid_spawn() {
 #[tokio::test]
 async fn spawn_prompt_for_project_scoped_task_includes_parent_project_context() {
     let workspace = TempDir::new().unwrap();
-    let (_spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
 
     // Stand up a real product → project → task chain so the
     // runner's `get_project` lookup hits a row with the
@@ -1409,7 +1478,7 @@ async fn spawn_prompt_for_project_scoped_task_includes_parent_project_context() 
         workspace.path().join("feature-flags.toml"),
     ));
     let runner = PaneSpawnRunner::new(cfg, work_db, flags);
-    runner.set_server_state(weak);
+    bind_runner(&runner, weak, &spawner);
 
     let mut execution = sample_execution(workspace.path());
     execution.kind = ExecutionKind::TaskImplementation;
@@ -1451,7 +1520,7 @@ async fn spawn_prompt_for_project_scoped_task_includes_parent_project_context() 
 #[tokio::test]
 async fn spawn_prompt_for_auto_design_task_states_design_only_directive() {
     let workspace = TempDir::new().unwrap();
-    let (_spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
 
     let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
     let project = work_db
@@ -1479,7 +1548,7 @@ async fn spawn_prompt_for_auto_design_task_states_design_only_directive() {
         workspace.path().join("feature-flags.toml"),
     ));
     let runner = PaneSpawnRunner::new(cfg, work_db, flags);
-    runner.set_server_state(weak);
+    bind_runner(&runner, weak, &spawner);
 
     let mut execution = sample_execution(workspace.path());
     execution.kind = ExecutionKind::ProjectDesign;
@@ -1582,7 +1651,7 @@ async fn spawn_prompt_for_design_task_uses_explicit_design_doc_path() {
     use crate::work::SetProjectDesignDocInput;
 
     let workspace = TempDir::new().unwrap();
-    let (_spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
 
     let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
     let project = work_db
@@ -1618,7 +1687,7 @@ async fn spawn_prompt_for_design_task_uses_explicit_design_doc_path() {
         workspace.path().join("feature-flags.toml"),
     ));
     let runner = PaneSpawnRunner::new(cfg, work_db, flags);
-    runner.set_server_state(weak);
+    bind_runner(&runner, weak, &spawner);
 
     let mut execution = sample_execution(workspace.path());
     execution.kind = ExecutionKind::ProjectDesign;

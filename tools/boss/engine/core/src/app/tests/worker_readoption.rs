@@ -167,6 +167,7 @@ async fn durable_state_scan_reclaims_a_live_pane_after_its_work_closes() {
 
     let mut child = crate::test_support::spawn_group_leader_sleeper();
     let execution_id = create_spawned_execution(db, &work_item_id, i64::from(child.id()));
+    super::tmux_stub::install_teardown(&server_state, &execution_id, i64::from(child.id()));
     db.mark_execution_orphaned(&execution_id, "app reported a pane death")
         .unwrap();
     db.update_work_item(
@@ -238,7 +239,7 @@ async fn durable_state_scan_reclaims_a_live_pane_after_its_work_closes() {
             assert!(
                 matches!(
                     request,
-                    EngineToAppRequest::ReleaseWorkerPane(ReleaseWorkerPaneInput { slot_id: 1, .. })
+                    EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id: 1, .. })
                 ),
                 "expected ReleaseWorkerPane for slot 1, got {request:?}",
             );
@@ -250,8 +251,8 @@ async fn durable_state_scan_reclaims_a_live_pane_after_its_work_closes() {
         .deliver_app_response(
             "session-app",
             &release_id,
-            EngineToAppResponse::ReleaseWorkerPane {
-                result: Ok(crate::protocol::ReleaseWorkerPaneResult {}),
+            EngineToAppResponse::DetachWorkerPane {
+                result: Ok(crate::protocol::DetachWorkerPaneResult {}),
             },
         )
         .await;

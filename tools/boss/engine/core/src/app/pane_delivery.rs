@@ -622,13 +622,11 @@ impl ServerState {
     pub(super) fn pane_write_transport_ready(&self, run_id: &str) -> Result<(), String> {
         let pane = self.worker_registry.pane_for_run(run_id);
         match pane {
-            Some(pane) if pane.tmux_session_name.is_some() || pane.tmux_hosted => {
-                match self.work_db.tmux_identity_for_execution(run_id) {
-                    Ok(Some(_)) => Ok(()),
-                    Ok(None) => Err("no durable tmux identity recorded for run".to_owned()),
-                    Err(err) => Err(format!("tmux identity lookup failed: {err:#}")),
-                }
-            }
+            Some(pane) if pane.tmux_session_name.is_some() => match self.work_db.tmux_identity_for_execution(run_id) {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => Err("no durable tmux identity recorded for run".to_owned()),
+                Err(err) => Err(format!("tmux identity lookup failed: {err:#}")),
+            },
             _ => Ok(()),
         }
     }
@@ -647,8 +645,8 @@ impl ServerState {
         let expected_driver_binary = self.expected_driver_binary(run_id)?;
         let pane = self.worker_registry.pane_for_run(run_id);
         match pane {
-            Some(pane) if pane.tmux_session_name.is_some() || pane.tmux_hosted => {
-                let Some(session_name) = pane.tmux_session_name else {
+            Some(pane) if pane.tmux_session_name.is_some() => {
+                let Some(session_name) = pane.tmux_session_name.filter(|name| !name.is_empty()) else {
                     return Err(PaneSendFailure::Tmux(anyhow::anyhow!(
                         "tmux-hosted pane has no session name"
                     )));

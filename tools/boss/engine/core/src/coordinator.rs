@@ -26,7 +26,6 @@ use crate::host_registry::Host;
 use crate::host_scheduling::{self, ChoreRequirements, HostSlot};
 use crate::metrics::Registry;
 use crate::runner::{ExecutionRunner, RunOutcome, RunWaitState};
-use crate::spawn_flow::StartWorkerError;
 use crate::work::{
     CreateAttentionItemInput, DispatchClaimOutcome, DispatchClass, FinishExecutionRunInput, PreStartFailureOutcome,
     WorkDb, WorkExecution, WorkItem, WorkRun,
@@ -1720,14 +1719,12 @@ pub fn worker_page_label(slot_id: u8) -> Option<String> {
 /// rejection.
 ///
 /// `err` arrives `.with_context(...)`-wrapped by the spawn flow, so
-/// the concrete `StartWorkerError` is not the outermost type — this
+/// the concrete `EngineToAppError` is not the outermost type — this
 /// walks the anyhow source chain rather than downcasting `err`
 /// directly, which would only ever match the context wrapper.
 fn slot_busy_occupant(err: &anyhow::Error) -> Option<Option<String>> {
-    match err.chain().find_map(|cause| cause.downcast_ref::<StartWorkerError>()) {
-        Some(StartWorkerError::AppError(EngineToAppError::SlotBusy { occupying_run_id })) => {
-            Some(occupying_run_id.clone())
-        }
+    match err.chain().find_map(|cause| cause.downcast_ref::<EngineToAppError>()) {
+        Some(EngineToAppError::SlotBusy { occupying_run_id }) => Some(occupying_run_id.clone()),
         _ => None,
     }
 }

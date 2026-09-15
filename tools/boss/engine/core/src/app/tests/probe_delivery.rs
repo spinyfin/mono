@@ -765,6 +765,7 @@ async fn a_probe_outliving_its_run_is_abandoned_not_left_queued() {
     // The run ends: its pane is torn down and its slot freed. No app session
     // is registered, which is the same shape as a teardown the app cannot be
     // reached for.
+    super::tmux_stub::install_teardown(&server_state, &run_id, 4_194_303);
     server_state.release_worker_pane(&run_id).await;
 
     let state = server_state
@@ -802,13 +803,15 @@ async fn a_probe_outliving_its_run_is_abandoned_not_left_queued() {
 #[tokio::test]
 async fn a_probe_queued_before_a_slot_existed_is_still_settled_when_the_run_dies() {
     let (server_state, _dir) = test_server_state();
-    let probe_id = server_state.queue_probe("run-that-never-spawned".into(), "hello?".into(), false);
+    let run_id = super::tmux_stub::seed_teardown(&server_state);
+    assert!(server_state.worker_registry.slot_for_run(&run_id).is_none());
+    let probe_id = server_state.queue_probe(run_id.clone(), "hello?".into(), false);
 
-    let outcome = server_state.release_worker_pane("run-that-never-spawned").await;
+    let outcome = server_state.release_worker_pane(&run_id).await;
     assert_eq!(
         outcome,
-        PaneReleaseOutcome::NoLiveWorker,
-        "fixture precondition: this run never mapped a slot",
+        PaneReleaseOutcome::Reaped,
+        "tmux teardown proves death even though the run never mapped a slot",
     );
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
@@ -1387,6 +1390,7 @@ async fn a_probe_queued_at_a_turn_boundary_is_delivered_before_teardown_can_aban
     // Now the run ends, as it would have milliseconds later. The probe is
     // past the queue, so teardown has nothing to abandon — it settles the
     // delivered-but-unanswered probe honestly instead.
+    super::tmux_stub::install_teardown(&server_state, &run_id, 4_194_303);
     server_state.release_worker_pane(&run_id).await;
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
@@ -1410,6 +1414,7 @@ async fn a_delivered_but_unanswered_probe_is_orphaned_when_its_run_ends() {
     assert_eq!(claimed.probe_id, probe_id);
     server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Consumed);
 
+    super::tmux_stub::install_teardown(&server_state, &run_id, 4_194_303);
     server_state.release_worker_pane(&run_id).await;
 
     let record = server_state
@@ -1447,6 +1452,7 @@ async fn teardown_leaves_an_already_replied_probe_alone() {
     assert_eq!(claimed.probe_id, probe_id);
     server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Replied);
 
+    super::tmux_stub::install_teardown(&server_state, &run_id, 4_194_303);
     server_state.release_worker_pane(&run_id).await;
 
     assert_eq!(
@@ -1477,6 +1483,7 @@ async fn an_abandoned_probe_is_surfaced_actively_not_only_on_query() {
         .await;
 
     let probe_id = server_state.queue_probe(run_id.clone(), "do not open the PR yet".into(), false);
+    super::tmux_stub::install_teardown(&server_state, &run_id, 4_194_303);
     server_state.release_worker_pane(&run_id).await;
 
     assert_eq!(
@@ -1541,6 +1548,7 @@ async fn the_same_probe_is_abandoned_when_teardown_reaches_the_boundary_first() 
     let probe_id = server_state.queue_probe(run_id.clone(), "do not open the PR yet".into(), false);
 
     // Teardown wins the boundary.
+    super::tmux_stub::install_teardown(&server_state, &run_id, 4_194_303);
     server_state.release_worker_pane(&run_id).await;
     let outcome = dispatch_probe_on_stop(&server_state, &stop_event(&run_id)).await;
 

@@ -6,7 +6,6 @@
 
 pub(super) use super::super::*;
 
-pub(super) use crate::spawn_flow::StartWorkerError;
 pub(super) use crate::test_support::*;
 pub(super) use std::future::pending;
 pub(super) use std::path::PathBuf;
@@ -419,9 +418,9 @@ impl ExecutionRunner for FakeExecutionRunner {
             pending::<()>().await;
         }
         if self.slot_busy {
-            let root = StartWorkerError::AppError(EngineToAppError::SlotBusy {
+            let root = EngineToAppError::SlotBusy {
                 occupying_run_id: Some("exec_other_occupant".to_owned()),
-            });
+            };
             return Err(anyhow::Error::new(root).context("failed to spawn worker pane"));
         }
         if self.fail {

@@ -74,6 +74,7 @@ async fn seed_stalled_worker(error_line: &str, register_session: bool) -> Seeded
         .expect("test pool has a free slot");
     assert_eq!(claimed, "worker-1");
     register_idle_worker(&server, &execution.id, 1);
+    super::tmux_stub::install_teardown(&server, &execution.id, 4_194_303);
 
     let sink = make_session_sink();
     if register_session {
@@ -134,15 +135,15 @@ async fn confirm_next_pane_release(server: Arc<ServerState>, sink: Arc<SessionSi
         panic!("expected an EngineRequest for the pane release, got {:?}", env.payload);
     };
     assert!(
-        matches!(request, EngineToAppRequest::ReleaseWorkerPane(_)),
+        matches!(request, EngineToAppRequest::DetachWorkerPane(_)),
         "transient-recovery must ask the app to tear the pane down, got {request:?}",
     );
     server
         .deliver_app_response(
             "session-app",
             &request_id,
-            EngineToAppResponse::ReleaseWorkerPane {
-                result: Ok(crate::protocol::ReleaseWorkerPaneResult {}),
+            EngineToAppResponse::DetachWorkerPane {
+                result: Ok(crate::protocol::DetachWorkerPaneResult {}),
             },
         )
         .await;
@@ -263,6 +264,7 @@ async fn untracked_reaped_without_hosted_pane_drops_the_orphaned_live_state_entr
     let seeded = seed_stalled_worker_without_slot_mapping(SOCKET_ERROR_LINE).await;
     let mut child = spawn_group_leader_sleeper();
     let pid = i64::from(child.id());
+    super::tmux_stub::install_teardown(&seeded.server, &seeded.exec_id, pid);
     assert!(
         seeded
             .server

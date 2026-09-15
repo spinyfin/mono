@@ -185,15 +185,15 @@ fn automation_pool_slots_are_disjoint_from_regular_pool() {
 
 #[test]
 fn slot_busy_occupant_walks_the_with_context_wrapped_chain() {
-    // The spawn flow always wraps `StartWorkerError` with
+    // The spawn flow always wraps `EngineToAppError` with
     // `.with_context(...)` before it reaches the coordinator (see
     // `runner.rs`'s `spawning worker pane for run {}` wrapper), so
-    // a naive `err.downcast_ref::<StartWorkerError>()` on the
+    // a naive `err.downcast_ref::<EngineToAppError>()` on the
     // outermost error would never match. This pins the chain-walk
     // that makes extraction work anyway.
-    let root = StartWorkerError::AppError(EngineToAppError::SlotBusy {
+    let root = EngineToAppError::SlotBusy {
         occupying_run_id: Some("run-husk".to_owned()),
-    });
+    };
     let wrapped: anyhow::Error = anyhow::Error::new(root).context("spawning worker pane for run exec-1");
     assert_eq!(slot_busy_occupant(&wrapped), Some(Some("run-husk".to_owned())));
 }
@@ -204,14 +204,14 @@ fn slot_busy_occupant_handles_missing_occupying_run_id() {
     // payload — must decode as `Some(None)` (the error IS
     // SlotBusy, but the occupant is unknown), not `None`
     // (not-a-SlotBusy-error at all).
-    let root = StartWorkerError::AppError(EngineToAppError::SlotBusy { occupying_run_id: None });
+    let root = EngineToAppError::SlotBusy { occupying_run_id: None };
     let wrapped: anyhow::Error = anyhow::Error::new(root).context("spawning worker pane for run exec-2");
     assert_eq!(slot_busy_occupant(&wrapped), Some(None));
 }
 
 #[test]
 fn slot_busy_occupant_is_none_for_other_start_worker_errors() {
-    let root = StartWorkerError::AppError(EngineToAppError::NoAvailableSlot);
+    let root = EngineToAppError::NoAvailableSlot;
     let wrapped: anyhow::Error = anyhow::Error::new(root).context("spawning worker pane for run exec-3");
     assert_eq!(slot_busy_occupant(&wrapped), None);
 }

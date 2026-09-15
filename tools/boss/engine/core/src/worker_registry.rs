@@ -65,16 +65,12 @@ struct RegistryInner {
     run_to_slot: HashMap<String, RegisteredWorkerPane>,
 }
 
-/// The app surface attached to a worker run. `tmux_hosted` selects the
-/// non-owning detach RPC during normal cleanup. A tmux session identity
-/// independently selects direct tmux input delivery, including for adopted
-/// sessions that retain legacy process-tree reaping.
+/// A worker's presentation slot and optional local tmux identity.
+/// Remote virtual slots have no local tmux session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegisteredWorkerPane {
     pub slot_id: u8,
-    pub tmux_hosted: bool,
-    /// The tmux-owned worker's durable session identity. `None` is valid
-    /// only for an app-owned pane not backed by a tmux session.
+    /// Missing identity is valid for remote slots; local operations fail closed.
     pub tmux_session_name: Option<String>,
 }
 
@@ -113,7 +109,6 @@ impl WorkerRegistry {
                 run_id.into(),
                 RegisteredWorkerPane {
                     slot_id,
-                    tmux_hosted: false,
                     tmux_session_name: None,
                 },
             );
@@ -131,48 +126,7 @@ impl WorkerRegistry {
                 run_id.into(),
                 RegisteredWorkerPane {
                     slot_id,
-                    tmux_hosted: true,
                     tmux_session_name: Some(session_name.into()),
-                },
-            );
-            self.sleep_assertion
-                .set_live_worker_panes(local_live_pane_count(&inner));
-        }
-    }
-
-    /// Record an adopted tmux session while preserving legacy teardown and
-    /// process-tree reaping until tmux session teardown owns that responsibility.
-    pub fn register_adopted_tmux_run_slot(
-        &self,
-        run_id: impl Into<String>,
-        slot_id: u8,
-        session_name: impl Into<String>,
-    ) {
-        {
-            let mut inner = self.inner.lock().expect("registry poisoned");
-            inner.run_to_slot.insert(
-                run_id.into(),
-                RegisteredWorkerPane {
-                    slot_id,
-                    tmux_hosted: false,
-                    tmux_session_name: Some(session_name.into()),
-                },
-            );
-            self.sleep_assertion
-                .set_live_worker_panes(local_live_pane_count(&inner));
-        }
-    }
-
-    #[cfg(test)]
-    pub fn register_tmux_run_slot_without_session_for_test(&self, run_id: impl Into<String>, slot_id: u8) {
-        {
-            let mut inner = self.inner.lock().expect("registry poisoned");
-            inner.run_to_slot.insert(
-                run_id.into(),
-                RegisteredWorkerPane {
-                    slot_id,
-                    tmux_hosted: true,
-                    tmux_session_name: None,
                 },
             );
             self.sleep_assertion
@@ -235,7 +189,6 @@ impl WorkerRegistry {
             run_id.to_owned(),
             RegisteredWorkerPane {
                 slot_id: slot,
-                tmux_hosted: false,
                 tmux_session_name: None,
             },
         );
@@ -447,7 +400,6 @@ mod tests {
             reg.take_worker_pane_for_run("run-tmux"),
             Some(RegisteredWorkerPane {
                 slot_id: 4,
-                tmux_hosted: true,
                 tmux_session_name: Some("boss-4-worker".to_owned()),
             })
         );

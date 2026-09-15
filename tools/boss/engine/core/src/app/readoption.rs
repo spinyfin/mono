@@ -100,6 +100,9 @@ impl ServerState {
     ///
     /// Returns the verdict's stable string for the caller's trace line.
     pub(super) async fn converge_terminal_execution(&self, execution: &WorkExecution, trigger: &str) -> &'static str {
+        if self.work_db.is_execution_quarantined(&execution.id).unwrap_or(true) {
+            return "historical_worker_quarantined";
+        }
         if !self.begin_terminal_convergence(&execution.id) {
             tracing::debug!(
                 run_id = %execution.id,

@@ -53,6 +53,7 @@ async fn release_worker_pane_reaps_an_untracked_worker_from_its_durable_pid() {
     let mut child = spawn_group_leader_sleeper();
     let pid = child.id() as i32;
     let execution_id = create_spawned_execution(db, &work_item_id, i64::from(pid));
+    super::tmux_stub::install_teardown(&server_state, &execution_id, i64::from(pid));
     db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
 
     // No slot mapping — exactly what the terminal path leaves behind.
@@ -157,8 +158,8 @@ async fn release_worker_pane_still_reaps_a_tmux_session_for_a_dead_recorded_pid(
 
     assert_eq!(
         server_state.release_worker_pane(&execution_id).await,
-        PaneReleaseOutcome::NoLiveWorker,
-        "no live OS pid, so the lease contract is unchanged by the tmux reap",
+        PaneReleaseOutcome::Reaped,
+        "verified tmux teardown proves the workspace is no longer occupied",
     );
 
     assert!(

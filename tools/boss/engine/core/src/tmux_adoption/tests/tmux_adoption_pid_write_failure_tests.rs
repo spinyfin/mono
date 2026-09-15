@@ -57,7 +57,6 @@ async fn write_failed_pid_snapshot_does_not_block_in_memory_adoption() {
         spawner.registry.pane_for_run(&execution_id),
         Some(crate::worker_registry::RegisteredWorkerPane {
             slot_id: 1,
-            tmux_hosted: false,
             tmux_session_name: Some("boss-worker-1".to_owned()),
         }),
     );
