@@ -7,7 +7,9 @@ use std::path::Path;
 use anyhow::Context as _;
 use boss_engine_gh_invocation::gh_output;
 use boss_gh_telemetry::{callers, scope as gh_scope};
+use boss_github::gh_runner::GhRunner;
 
+use crate::completion::{expected_branch_name, parse_repo_slug};
 use crate::coordinator::pool_dispatch_policy_for_worker_id;
 use crate::effort::{SpawnConfig, SpawnResolutionInput, resolve_spawn_config_in};
 use crate::structured_output::StructuredOutputKind;
@@ -20,8 +22,8 @@ use boss_protocol::{
 };
 
 use super::prompt::{
-    ExecutionPromptParams, compose_answer_agent_prompt, compose_execution_prompt, designated_output_kind,
-    render_merge_order_preservation_lines,
+    ExecutionPromptParams, PriorBranchProbe, compose_answer_agent_prompt, compose_execution_prompt,
+    designated_output_kind, render_merge_order_preservation_lines,
 };
 use super::work_item::{work_item_created_via, work_item_name, work_item_pr_url, work_item_task_kind_enum};
 
@@ -450,6 +452,84 @@ fn prompt_addendum_to_prepend(kind: &ExecutionKind, addendum: Option<&'static st
     }
 }
 
+/// Probe whether the crash-recovered predecessor named in this workspace's
+/// [`RecoveryReport`](boss_engine_recovery::recovery_apply::RecoveryReport)
+/// actually pushed its branch to the remote, so the prompt can either tell
+/// the worker to resume it (`jj edit ...@origin`) or explicitly say it is
+/// absent — never guess. Makes one `gh` REST call (via `gh`, the injected
+/// [`GhRunner`]) against the predecessor's own frozen branch name; returns
+/// `None` when there is no recovery report, the remote URL / predecessor
+/// row can't be resolved, or the probe itself is inconclusive (any
+/// non-404 error). On success, returns the exact branch string this probe
+/// queried alongside the bool — callers must render THAT string, never
+/// recompute one from the successor's own (possibly diverged) naming
+/// settings.
+async fn prior_recovery_branch_exists(
+    work_db: &WorkDb,
+    execution: &WorkExecution,
+    workspace_path: &Path,
+    gh: &dyn GhRunner,
+) -> Option<PriorBranchProbe> {
+    let report = boss_engine_recovery::recovery_apply::RecoveryReport::read_for(workspace_path, &execution.id)?;
+    if report.from_execution_id.is_empty() {
+        return None;
+    }
+    let remote_url = execution.repo_remote_url.trim();
+    if remote_url.is_empty() {
+        return None;
+    }
+    let repo_slug = match parse_repo_slug(remote_url) {
+        Ok(slug) => slug,
+        Err(err) => {
+            tracing::warn!(
+                execution_id = %execution.id,
+                remote_url,
+                error = %format!("{err:#}"),
+                "recovery prompt could not parse repository remote; omitting prior-branch resume guidance",
+            );
+            return None;
+        }
+    };
+    // `branch_naming`/`worker_branch_prefix` are frozen per execution at
+    // creation time (see `expected_branch_name`'s doc comment) — the
+    // predecessor's branch was named from ITS OWN snapshot of those
+    // settings, not the successor's. Reusing `execution`'s (the
+    // newly-spawned successor's) config here would query the wrong ref
+    // whenever the product's naming strategy or prefix changed between the
+    // two executions, misreporting a genuinely pushed branch as absent.
+    let predecessor = match work_db.get_execution(&report.from_execution_id) {
+        Ok(exec) => exec,
+        Err(err) => {
+            tracing::warn!(
+                execution_id = %execution.id,
+                prior_execution_id = %report.from_execution_id,
+                error = ?err,
+                "recovery prompt could not load prior execution's frozen branch naming; omitting \
+                 branch-resume guidance",
+            );
+            return None;
+        }
+    };
+    let branch = expected_branch_name(
+        &report.from_execution_id,
+        &predecessor.branch_naming,
+        predecessor.worker_branch_prefix.as_deref(),
+    );
+    match boss_github::gh_runner::branch_ref_exists(gh, &repo_slug, &branch).await {
+        Ok(exists) => Some(PriorBranchProbe { exists, branch }),
+        Err(err) => {
+            tracing::warn!(
+                execution_id = %execution.id,
+                prior_execution_id = %report.from_execution_id,
+                branch,
+                error = ?err,
+                "recovery prompt could not verify prior branch; omitting branch-resume guidance",
+            );
+            None
+        }
+    }
+}
+
 /// Per-execution prompt + spawn-config composition shared by every
 /// worker transport.
 ///
@@ -465,7 +545,13 @@ fn prompt_addendum_to_prepend(kind: &ExecutionKind, addendum: Option<&'static st
 ///
 /// Transport-agnostic: it reads only from `work_db` (and, for `pr_review`
 /// executions, calls `gh pr view` to pre-fetch the PR metadata for the
-/// reviewer's initial prompt).
+/// reviewer's initial prompt, and one more `gh` call for the crash-recovery
+/// branch-resume probe when applicable).
+// `gh` is a testability seam for a live GitHub dependency, not an
+// editorial/proposal flag — it does not belong in `WorkerSpawnOpts`
+// (which is documented as exactly that bundle), so it stays a separate
+// argument even though that pushes the count past clippy's default.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn compose_worker_spawn(
     work_db: &WorkDb,
     worker_id: &str,
@@ -473,6 +559,11 @@ pub(crate) async fn compose_worker_spawn(
     work_item: &WorkItem,
     workspace_path: &Path,
     cube_change_id: Option<&str>,
+    // Injected so a test can prove the PR-URL skip-probe short-circuit
+    // below actually short-circuits — a fake that panics on any call
+    // catches a regression that would otherwise only surface as a live
+    // network call in production. Every real caller passes `&CommandGhRunner`.
+    gh: &dyn GhRunner,
     // Bundled (rather than a run of positional bools) to keep the parameter
     // count under clippy::too_many_arguments AND so call sites name what
     // they set instead of relying on positional order — a transposed pair
@@ -489,6 +580,17 @@ pub(crate) async fn compose_worker_spawn(
         review_batch_fanout_enabled,
         run_done_proposals_seam_enabled,
     } = editorial_opts;
+    // `compose_execution_prompt` (see `## RESUME EXISTING PR` in
+    // prompt.rs) checks an existing PR URL before it ever consults
+    // `prior_branch` — when the work item already has one, the
+    // recovery-report branch that would use this probe's result never
+    // runs. Skip the GitHub call in that case rather than computing and
+    // silently discarding it.
+    let prior_branch = if work_item_pr_url(work_item).is_some() {
+        None
+    } else {
+        prior_recovery_branch_exists(work_db, execution, workspace_path, gh).await
+    };
     // For any project-scoped task (the synthetic `kind = 'design'`
     // task and ordinary `project_task` rows alike), the richer
     // brief — what the project is for, what its goal is — lives
@@ -716,6 +818,7 @@ pub(crate) async fn compose_worker_spawn(
                         .maybe_editorial_rules(product_editorial_rules.as_ref())
                         .maybe_design_guidance(product_design_guidance.as_deref())
                         .pr_template_set(&pr_template_set)
+                        .maybe_prior_branch(prior_branch)
                         .editorial_enabled(editorial_enabled)
                         .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
                         .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
@@ -752,6 +855,7 @@ pub(crate) async fn compose_worker_spawn(
                     .maybe_editorial_rules(product_editorial_rules.as_ref())
                     .maybe_design_guidance(product_design_guidance.as_deref())
                     .pr_template_set(&pr_template_set)
+                    .maybe_prior_branch(prior_branch)
                     .editorial_enabled(editorial_enabled)
                     .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
                     .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
@@ -957,6 +1061,7 @@ pub(crate) async fn compose_worker_spawn(
                 .maybe_editorial_rules(product_editorial_rules.as_ref())
                 .maybe_design_guidance(product_design_guidance.as_deref())
                 .pr_template_set(&pr_template_set)
+                .maybe_prior_branch(prior_branch)
                 .editorial_enabled(editorial_enabled)
                 .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
                 .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
@@ -1342,6 +1447,7 @@ mod compose_worker_spawn_tests {
     //! prompt rendered when the PR metadata fetch fails.
     use super::*;
     use crate::work::Task;
+    use boss_github::gh_runner::CommandGhRunner;
     use boss_protocol::{EffortLevel, ExecutionKind, ExecutionStatus, TaskKind, TaskStatus};
     use tempfile::TempDir;
 
@@ -1443,6 +1549,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
+            &CommandGhRunner,
             WorkerSpawnOpts::default(),
         )
         .await
@@ -1459,6 +1566,98 @@ mod compose_worker_spawn_tests {
             composed.prompt_text,
         );
         assert_eq!(composed.embedded_output_path, None);
+    }
+
+    /// A [`GhRunner`] that panics on any call — proves the PR-URL
+    /// skip-probe short-circuit in `compose_worker_spawn` actually skips
+    /// the GitHub call, rather than merely computing and discarding it.
+    /// A regression that removes or inverts the `work_item_pr_url(...).is_some()`
+    /// check would make this test panic instead of silently passing.
+    struct PanicGhRunner;
+
+    #[async_trait::async_trait]
+    impl GhRunner for PanicGhRunner {
+        async fn graphql(
+            &self,
+            _query: &str,
+            _vars: &[(&str, &str)],
+            _token: Option<&str>,
+        ) -> std::result::Result<serde_json::Value, boss_github::gh_runner::GhRunnerError> {
+            panic!("compose_worker_spawn must skip the GitHub probe when the work item already has a pr_url");
+        }
+
+        async fn rest_get(
+            &self,
+            _path: &str,
+            _token: Option<&str>,
+        ) -> std::result::Result<boss_github::gh_runner::GhResponse, boss_github::gh_runner::GhRunnerError> {
+            panic!("compose_worker_spawn must skip the GitHub probe when the work item already has a pr_url");
+        }
+
+        async fn rest_patch(
+            &self,
+            _path: &str,
+            _fields: &[(&str, &str)],
+            _token: Option<&str>,
+        ) -> std::result::Result<boss_github::gh_runner::GhResponse, boss_github::gh_runner::GhRunnerError> {
+            panic!("compose_worker_spawn must skip the GitHub probe when the work item already has a pr_url");
+        }
+
+        async fn rest_post(
+            &self,
+            _path: &str,
+            _body: &serde_json::Value,
+            _token: Option<&str>,
+        ) -> std::result::Result<boss_github::gh_runner::GhResponse, boss_github::gh_runner::GhRunnerError> {
+            panic!("compose_worker_spawn must skip the GitHub probe when the work item already has a pr_url");
+        }
+    }
+
+    /// When the work item already has a `pr_url` AND a recovery-report
+    /// marker is present (the crash-recovery-mid-PR scenario), the
+    /// `## RESUME EXISTING PR` path takes precedence and
+    /// `prior_recovery_branch_exists`'s GitHub probe must never run — see
+    /// the `work_item_pr_url(work_item).is_some()` short-circuit in
+    /// `compose_worker_spawn`. Exercised at this level (not just the lower
+    /// `prior_recovery_branch_exists` unit tests) because `CommandGhRunner`
+    /// is hard-coded at every production call site; this test injects a
+    /// `GhRunner` that panics on any call so a future inversion or removal
+    /// of the short-circuit fails loudly here instead of firing a live
+    /// network call in production.
+    #[tokio::test]
+    async fn pr_url_set_skips_the_recovery_branch_probe_entirely() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let execution = chore_execution();
+        let work_item = task_with_pr("task-chore-1", "https://github.com/org/repo/pull/42");
+        boss_engine_recovery::recovery_apply::RecoveryReport {
+            for_execution_id: execution.id.clone(),
+            from_execution_id: "exec_prior_dead_01".to_owned(),
+            source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
+            applied: None,
+            patch_error: None,
+        }
+        .write(workspace.path())
+        .unwrap();
+
+        let composed = compose_worker_spawn(
+            &db,
+            "worker-1",
+            &execution,
+            &work_item,
+            workspace.path(),
+            None,
+            &PanicGhRunner,
+            WorkerSpawnOpts::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            composed.prompt_text.contains("## RESUME EXISTING PR"),
+            "existing-PR resume block should still be present:\n{}",
+            composed.prompt_text,
+        );
     }
 
     /// A missing automation row degrades an automation-triage execution to
@@ -1484,6 +1683,7 @@ mod compose_worker_spawn_tests {
             &task_without_pr("task-triage-1"),
             workspace.path(),
             None,
+            &CommandGhRunner,
             WorkerSpawnOpts::default(),
         )
         .await
@@ -1514,6 +1714,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
+            &CommandGhRunner,
             WorkerSpawnOpts::default(),
         )
         .await
@@ -1557,6 +1758,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
+            &CommandGhRunner,
             WorkerSpawnOpts::default(),
         )
         .await
@@ -1596,6 +1798,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
+            &CommandGhRunner,
             WorkerSpawnOpts::default(),
         )
         .await
@@ -1670,6 +1873,7 @@ mod compose_worker_spawn_tests {
                 &work_item,
                 workspace.path(),
                 None,
+                &CommandGhRunner,
                 WorkerSpawnOpts::default(),
             )
             .await
@@ -1732,6 +1936,7 @@ mod compose_worker_spawn_tests {
                 &work_item,
                 workspace.path(),
                 None,
+                &CommandGhRunner,
                 WorkerSpawnOpts::default(),
             )
             .await
@@ -1789,6 +1994,7 @@ mod compose_worker_spawn_tests {
                 &work_item,
                 workspace.path(),
                 None,
+                &CommandGhRunner,
                 WorkerSpawnOpts::default(),
             )
             .await
@@ -1848,6 +2054,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
+            &CommandGhRunner,
             WorkerSpawnOpts::default(),
         )
         .await
@@ -1947,6 +2154,7 @@ mod compose_worker_spawn_tests {
             &design_with_product("task-design-grok", &product.id),
             workspace.path(),
             None,
+            &CommandGhRunner,
             WorkerSpawnOpts::default(),
         )
         .await
@@ -1971,6 +2179,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
+            &CommandGhRunner,
             WorkerSpawnOpts::default(),
         )
         .await
@@ -2013,6 +2222,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
+            &CommandGhRunner,
             WorkerSpawnOpts::default(),
         )
         .await
@@ -2048,6 +2258,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
+            &CommandGhRunner,
             WorkerSpawnOpts::default(),
         )
         .await
@@ -2081,5 +2292,219 @@ mod compose_worker_spawn_tests {
         // Task pin is present, so product pin is left as-is for the resolver
         // (which will not consult it).
         assert_eq!(product, Some("grok"));
+    }
+}
+
+#[cfg(test)]
+mod prior_recovery_branch_exists_tests {
+    //! Exercises `prior_recovery_branch_exists`'s own Ok/404/other-error
+    //! branches directly, via an injected fake `GhRunner` — the seam the
+    //! trait exists for. Also covers the frozen-predecessor-identity fix:
+    //! the probed branch must be derived from the PREDECESSOR execution's
+    //! own `branch_naming`/`worker_branch_prefix`, not the successor's.
+    use std::collections::VecDeque;
+    use std::sync::Mutex as StdMutex;
+
+    use async_trait::async_trait;
+    use boss_github::gh_runner::{GhResponse, GhRunnerError};
+    use boss_protocol::{BranchNaming, ExecutionStatus};
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::test_support::{create_active_chore, create_old_execution, create_product, open_db};
+
+    /// Fake [`GhRunner`] driven by a fixed queue of GET responses, mirroring
+    /// the one `abandoned_branch_pr_sweep`'s tests use for the sibling
+    /// `branch_ref_exists` helper.
+    struct FakeGhRunner {
+        gets: StdMutex<VecDeque<std::result::Result<GhResponse, GhRunnerError>>>,
+        requested_paths: StdMutex<Vec<String>>,
+    }
+
+    impl FakeGhRunner {
+        fn new(gets: Vec<std::result::Result<GhResponse, GhRunnerError>>) -> Self {
+            Self {
+                gets: StdMutex::new(gets.into_iter().collect()),
+                requested_paths: StdMutex::new(Vec::new()),
+            }
+        }
+
+        /// The `_path` argument of every `rest_get` call made against this
+        /// fake, in order — lets a test assert which ref was actually
+        /// queried, not just what the queued response happened to say.
+        fn requested_paths(&self) -> Vec<String> {
+            self.requested_paths.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl GhRunner for FakeGhRunner {
+        async fn graphql(
+            &self,
+            _query: &str,
+            _vars: &[(&str, &str)],
+            _token: Option<&str>,
+        ) -> std::result::Result<serde_json::Value, GhRunnerError> {
+            unimplemented!("prior_recovery_branch_exists never calls graphql")
+        }
+
+        async fn rest_get(&self, path: &str, _token: Option<&str>) -> std::result::Result<GhResponse, GhRunnerError> {
+            self.requested_paths.lock().unwrap().push(path.to_owned());
+            self.gets
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("no more queued GET responses")
+        }
+
+        async fn rest_patch(
+            &self,
+            _path: &str,
+            _fields: &[(&str, &str)],
+            _token: Option<&str>,
+        ) -> std::result::Result<GhResponse, GhRunnerError> {
+            unimplemented!("prior_recovery_branch_exists never calls rest_patch")
+        }
+
+        async fn rest_post(
+            &self,
+            _path: &str,
+            _body: &serde_json::Value,
+            _token: Option<&str>,
+        ) -> std::result::Result<GhResponse, GhRunnerError> {
+            unimplemented!("prior_recovery_branch_exists never calls rest_post")
+        }
+    }
+
+    /// Build a predecessor execution with a NON-default branch naming
+    /// (`CustomPrefix`) and a successor execution with the default
+    /// (`BossExecPrefix`), then write a recovery-report marker linking the
+    /// successor back to the predecessor. Returns (db, predecessor_id,
+    /// successor_execution, workspace TempDir).
+    fn recovery_fixture() -> (WorkDb, String, WorkExecution, TempDir) {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let predecessor_id = create_old_execution(&db, &work_item_id);
+        let predecessor_naming = BranchNaming::CustomPrefix {
+            prefix: "custom".to_owned(),
+        };
+        db.force_branch_naming_for_test(&predecessor_id, &predecessor_naming)
+            .unwrap();
+
+        let successor = WorkExecution::builder()
+            .id("exec_successor_01")
+            .work_item_id(work_item_id)
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::Running)
+            .repo_remote_url("git@github.com:org/repo.git")
+            .created_at("2026-05-15T00:00:00Z")
+            .build();
+
+        let workspace = TempDir::new().unwrap();
+        boss_engine_recovery::recovery_apply::RecoveryReport {
+            for_execution_id: successor.id.clone(),
+            from_execution_id: predecessor_id.clone(),
+            source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
+            applied: None,
+            patch_error: None,
+        }
+        .write(workspace.path())
+        .unwrap();
+
+        (db, predecessor_id, successor, workspace)
+    }
+
+    #[tokio::test]
+    async fn uses_predecessors_own_frozen_branch_naming_not_the_successors() {
+        let (db, predecessor_id, successor, workspace) = recovery_fixture();
+        // The successor's own naming (whatever `create_old_execution`
+        // defaults to) would compute `boss/<predecessor_id>` — a different
+        // ref than the predecessor's actual `CustomPrefix { "custom" }`
+        // naming computes. Pin that difference so the assertion below is
+        // meaningful, not incidental.
+        let successor_derived_branch = expected_branch_name(&predecessor_id, &BranchNaming::BossExecPrefix, None);
+        let predecessor_derived_branch = expected_branch_name(
+            &predecessor_id,
+            &BranchNaming::CustomPrefix {
+                prefix: "custom".to_owned(),
+            },
+            None,
+        );
+        assert_ne!(successor_derived_branch, predecessor_derived_branch);
+        let gh = FakeGhRunner::new(vec![Ok(GhResponse {
+            body: serde_json::json!({}),
+        })]);
+
+        let result = prior_recovery_branch_exists(&db, &successor, workspace.path(), &gh).await;
+
+        assert_eq!(
+            result,
+            Some(PriorBranchProbe {
+                exists: true,
+                branch: predecessor_derived_branch.clone(),
+            }),
+            "the fake only has one queued response — a second (wrong-branch) call would panic \
+             on an empty queue, so reaching this result proves exactly one call was made against \
+             the predecessor-derived branch",
+        );
+        // Pin exactly which ref was queried, not just the boolean outcome —
+        // a regression to the successor's naming would still satisfy a
+        // path-blind fake with the same queued response.
+        let requested = gh.requested_paths();
+        assert_eq!(requested.len(), 1);
+        assert!(
+            requested[0].ends_with(&format!("heads/{predecessor_derived_branch}")),
+            "expected the predecessor-derived branch in the requested path, got {:?}",
+            requested[0],
+        );
+        assert!(
+            !requested[0].ends_with(&format!("heads/{successor_derived_branch}")),
+            "must not have queried the successor-derived branch, got {:?}",
+            requested[0],
+        );
+    }
+
+    #[tokio::test]
+    async fn a_404_reports_explicit_absence() {
+        let (db, predecessor_id, successor, workspace) = recovery_fixture();
+        let gh = FakeGhRunner::new(vec![Err(GhRunnerError::with_status(404, "Not Found"))]);
+
+        let result = prior_recovery_branch_exists(&db, &successor, workspace.path(), &gh).await;
+
+        assert_eq!(
+            result,
+            Some(PriorBranchProbe {
+                exists: false,
+                branch: expected_branch_name(
+                    &predecessor_id,
+                    &BranchNaming::CustomPrefix {
+                        prefix: "custom".to_owned(),
+                    },
+                    None,
+                ),
+            }),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_404_error_is_inconclusive() {
+        let (db, _predecessor_id, successor, workspace) = recovery_fixture();
+        let gh = FakeGhRunner::new(vec![Err(GhRunnerError::transient("connection reset"))]);
+
+        let result = prior_recovery_branch_exists(&db, &successor, workspace.path(), &gh).await;
+
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn no_recovery_report_yields_none_without_calling_gh() {
+        let (db, _predecessor_id, successor, _report_workspace) = recovery_fixture();
+        let empty_workspace = TempDir::new().unwrap();
+        let gh = FakeGhRunner::new(vec![]);
+
+        let result = prior_recovery_branch_exists(&db, &successor, empty_workspace.path(), &gh).await;
+
+        assert_eq!(result, None, "no marker means no GitHub call and no claim either way");
     }
 }
