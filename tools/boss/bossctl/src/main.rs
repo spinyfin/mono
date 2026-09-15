@@ -1076,11 +1076,13 @@ enum ExecutionsAction {
         #[arg(long)]
         reason: Option<String>,
     },
-    /// Delete terminal (`abandoned` / `failed` / `orphaned` / `cancelled`)
-    /// `work_executions` rows past the retention bound. `completed`
-    /// executions are never touched. Always keeps the most recent
-    /// `--keep-per-work-item` eligible rows per work item regardless of
-    /// age, so recent diagnostics survive.
+    /// Delete never-started terminal (`abandoned` / `failed` / `orphaned` /
+    /// `cancelled`) `work_executions` rows past the retention bound.
+    /// `completed` executions are never touched, and neither is any
+    /// execution that actually started (`started_at IS NOT NULL`) — once a
+    /// worker spawned, its terminal row is kept indefinitely regardless of
+    /// age. Always keeps the most recent `--keep-per-work-item` eligible
+    /// rows per work item regardless of age, so recent diagnostics survive.
     ///
     /// Does **not** cancel live or queued work — only deletes rows that
     /// are already terminal. Use `executions cancel` for moot ready rows.
