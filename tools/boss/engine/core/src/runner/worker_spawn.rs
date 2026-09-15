@@ -23,7 +23,10 @@ use super::prompt::{
     ExecutionPromptParams, compose_answer_agent_prompt, compose_execution_prompt, designated_output_kind,
     render_merge_order_preservation_lines,
 };
-use super::work_item::{work_item_created_via, work_item_name, work_item_pr_url, work_item_task_kind_enum};
+use super::work_item::{
+    followup_pr_backlink_for_work_item, work_item_created_via, work_item_name, work_item_pr_url,
+    work_item_task_kind_enum,
+};
 
 /// Composed worker prompt + resolved effort/model config, the output of
 /// [`compose_worker_spawn`].
@@ -479,6 +482,9 @@ pub(crate) async fn compose_worker_spawn(
     // of seam flags here would compile silently and mis-gate a prompt.
     editorial_opts: WorkerSpawnOpts,
 ) -> anyhow::Result<ComposedWorkerSpawn> {
+    // Validate provenance before dispatch and give it directly to the worker.
+    // Both local and remote spawns use this prompt; cube stays a plain launcher.
+    let origin_pr_backlink = followup_pr_backlink_for_work_item(work_item, &execution.repo_remote_url)?;
     let WorkerSpawnOpts {
         editorial_enabled,
         max_embed_diff_lines,
@@ -966,6 +972,15 @@ pub(crate) async fn compose_worker_spawn(
                 .build(),
         )
     };
+    let prompt_text = match origin_pr_backlink {
+        Some(backlink) => format!(
+            "{prompt_text}\n\n## Origin PR backlink\n\n\
+             When writing this run's PR body, include the following backlink to the origin PR. \
+             Compose it together with your summary and validation in the body file you pass to cube:\n\n\
+             ```markdown\n{backlink}\n```\n"
+        ),
+        None => prompt_text,
+    };
     let work_item_kind = work_item_task_kind_enum(work_item);
     let registry = crate::driver::DriverRegistry::default();
     let batch_member = if execution.kind == ExecutionKind::PrReview {
@@ -1424,6 +1439,80 @@ mod compose_worker_spawn_tests {
 
     fn open_memory_db() -> WorkDb {
         WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn derived_worker_receives_origin_backlink_and_body_composition_instruction() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let execution = chore_execution();
+        for origin in [None, Some(2685)] {
+            let WorkItem::Chore(mut task) = task_without_pr("task-chore-1") else {
+                unreachable!();
+            };
+            if origin.is_some() {
+                task.kind = TaskKind::Followup;
+                task.created_via = "pr_review:exec_source".into();
+                task.origin_pr_number = origin;
+            }
+            let composed = compose_worker_spawn(
+                &db,
+                "worker-1",
+                &execution,
+                &WorkItem::Chore(task),
+                workspace.path(),
+                None,
+                WorkerSpawnOpts::default(),
+            )
+            .await
+            .unwrap();
+            let prompt = composed.prompt_text;
+            assert_eq!(prompt.contains("## Origin PR backlink"), origin.is_some(), "{prompt}");
+            if origin.is_some() {
+                assert!(
+                    prompt.contains("When writing this run's PR body, include the following backlink"),
+                    "{prompt}"
+                );
+                assert!(prompt.contains("body file you pass to cube"), "{prompt}");
+                assert!(prompt.contains("This `review findings` follow-up derives from [the origin PR](https://github.com/org/repo/pull/2685)."), "{prompt}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn derived_worker_still_refuses_missing_or_invalid_origin_provenance() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        for (origin, remote, expected) in [
+            (None, "git@github.com:org/repo.git", "has no origin PR number"),
+            (Some(0), "git@github.com:org/repo.git", "invalid origin PR number"),
+            (
+                Some(42),
+                "git@example.com:org/repo.git",
+                "could not resolve origin PR URL",
+            ),
+        ] {
+            let mut execution = chore_execution();
+            execution.repo_remote_url = remote.into();
+            let WorkItem::Chore(mut task) = task_without_pr("task-chore-1") else {
+                unreachable!();
+            };
+            task.kind = TaskKind::Followup;
+            task.origin_pr_number = origin;
+            let error = compose_worker_spawn(
+                &db,
+                "worker-1",
+                &execution,
+                &WorkItem::Chore(task),
+                workspace.path(),
+                None,
+                WorkerSpawnOpts::default(),
+            )
+            .await
+            .err()
+            .expect("invalid provenance must refuse dispatch");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     /// When a `pr_review` execution's producing task has no `pr_url`, the

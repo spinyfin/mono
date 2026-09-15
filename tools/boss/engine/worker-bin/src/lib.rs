@@ -39,8 +39,8 @@
 //!   prepending `$BOSS_BIN_DIR` (a bundle directory that also contains
 //!   `bossctl`, `cube` and the engine), a dedicated dir cannot leak
 //!   Boss-tier tooling into a worker session. `bossctl` is Boss-tier and
-//!   stays off the worker's `PATH`. A derived-PR worker also gets a `cube`
-//!   wrapper that passes an engine-owned opaque prefix to `cube pr create`.
+//!   stays off the worker's `PATH`. The `cube` launcher likewise pins the
+//!   engine-owned binary; workers compose their own PR descriptions.
 //! * **An unresolvable `boss` fails loudly and instantly.** When
 //!   resolution comes up empty the launcher is still written, but it
 //!   prints a specific diagnostic and exits 127 immediately. It never
@@ -60,10 +60,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Basename of the launcher the engine writes for workers.
 const BOSS_LAUNCHER_NAME: &str = "boss";
 
-/// Basename of the optional wrapper that composes an engine-owned PR body
-/// (origin header + worker body) for PR-creating cube calls in one worker
-/// session. Cube itself gains no provenance awareness — the wrapper hands it
-/// an ordinary `--body-file`.
+/// Basename of the launcher that pins `cube` to the engine-owned binary.
 const CUBE_LAUNCHER_NAME: &str = "cube";
 
 /// Basename of the repobin multiplexer. A candidate that resolves to
@@ -115,9 +112,8 @@ pub const CUBE_CLI_BIN_ENV: &str = "CUBE_CLI_BIN";
 const CUBE_CLI_RUNFILES_REL: &str = "tools/cube/cube";
 
 /// Every executable name the engine may write into the launcher directory.
-/// `boss` is always present; `cube` is always present too (a thin exec of
-/// the bundled CLI, overwritten by the derived-PR compose wrapper when
-/// that worker needs it). Neither entry exposes the Boss-tier `bossctl`
+/// `boss` and `cube` are always thin execs of the bundled CLIs.
+/// Neither entry exposes the Boss-tier `bossctl`
 /// control surface.
 ///
 /// The engine deliberately keeps `bossctl` off the worker `PATH`: it is
@@ -480,9 +476,8 @@ sibling directory, and found none of them. Build it
 /// never observes a truncated file.
 ///
 /// Does not touch a co-located `cube` launcher: [`write_cube_launcher`]
-/// (or the derived-PR compose wrapper) owns that file. A non-derived
-/// spawn must still call [`write_cube_launcher`] so a stale compose
-/// wrapper from a previous worker in this workspace cannot linger.
+/// owns that file. Every spawn must call [`write_cube_launcher`] so a stale
+/// launcher from a previous worker in this workspace cannot linger.
 pub fn write_boss_launcher(dir: &Path, resolved: Option<&Path>) -> io::Result<PathBuf> {
     write_launcher(dir, BOSS_LAUNCHER_NAME, &launcher_script(resolved))
 }
@@ -492,8 +487,8 @@ pub fn write_boss_launcher(dir: &Path, resolved: Option<&Path>) -> io::Result<Pa
 ///
 /// `resolved` is the output of [`resolve_cube_cli`]. `Some` produces a
 /// one-line `exec` of that absolute path; `None` produces a loudly-failing
-/// launcher, same contract as [`write_boss_launcher`]. A derived-PR spawn
-/// overwrites this afterwards with [`write_cube_pr_body_compose_launcher`].
+/// launcher, same contract as [`write_boss_launcher`]. Every spawn writes it,
+/// including when replacing a compose wrapper left by an older engine.
 pub fn write_cube_launcher(dir: &Path, resolved: Option<&Path>) -> io::Result<PathBuf> {
     write_launcher(dir, CUBE_LAUNCHER_NAME, &launcher_script(resolved))
 }
@@ -506,19 +501,6 @@ pub fn boss_bin_in(dir: &Path) -> PathBuf {
 /// Absolute path of the `cube` launcher inside `dir`.
 pub fn cube_bin_in(dir: &Path) -> PathBuf {
     dir.join(CUBE_LAUNCHER_NAME)
-}
-
-/// Write the optional per-worker `cube` wrapper that composes `body_header`
-/// with the worker's ordinary `--body` / `--body-file` into a single temp
-/// body file, then invokes real `cube pr create` / `ensure` with only
-/// `--body-file` (no cube feature flags). The wrapper removes its own
-/// directory from `PATH` before delegating so it cannot recurse into itself.
-pub fn write_cube_pr_body_compose_launcher(dir: &Path, body_header: &str) -> io::Result<PathBuf> {
-    write_launcher(
-        dir,
-        CUBE_LAUNCHER_NAME,
-        &cube_pr_body_compose_launcher_script(body_header),
-    )
 }
 
 fn write_launcher(dir: &Path, launcher_name: &str, script: &str) -> io::Result<PathBuf> {
@@ -566,118 +548,8 @@ fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// Shell script that rewrites `cube pr create|ensure` so the engine-owned
-/// header is part of the ordinary body cube already accepts.
-///
-/// Composition happens entirely outside cube: the wrapper strips any worker
-/// `--body` / `--body-file`, writes `header` (+ optional worker body) to a
-/// temp file, and re-invokes real cube with only `--body-file`. Cube never
-/// learns about provenance, prefixes, or Boss.
-fn cube_pr_body_compose_launcher_script(body_header: &str) -> String {
-    // Embedded header is single-quoted via sh_quote so `$`, backticks, and
-    // quotes in the header cannot be shell-evaluated when the script runs.
-    format!(
-        r##"#!/bin/sh
-if [ -n "${{{env}:-}}" ]; then
-    PATH="${{PATH#"${{{env}}}:"}}"
-    export PATH
-fi
-if [ "$1" = "pr" ]; then
-    case "$2" in
-        create|ensure)
-            subcommand="$2"
-            shift 2
-            header={header}
-            worker_body=""
-            worker_body_file=""
-            has_body=0
-            has_body_file=0
-            # Rebuild non-body args with shell-safe quoting so `eval set --`
-            # restores them exactly for the real cube invocation.
-            kept=""
-            q() {{
-                # POSIX single-quote escape: foo'bar → 'foo'\''bar'
-                printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\''/g")"
-            }}
-            add_kept() {{
-                kept="$kept $(q "$1")"
-            }}
-            while [ "$#" -gt 0 ]; do
-                case "$1" in
-                    --body)
-                        if [ "$has_body" -eq 1 ] || [ "$has_body_file" -eq 1 ]; then
-                            printf '%s\n' "cube wrapper: --body specified more than once or with --body-file" >&2
-                            exit 2
-                        fi
-                        if [ "$#" -lt 2 ]; then
-                            printf '%s\n' "cube wrapper: --body requires a value" >&2
-                            exit 2
-                        fi
-                        has_body=1
-                        worker_body="$2"
-                        shift 2
-                        ;;
-                    --body=*)
-                        if [ "$has_body" -eq 1 ] || [ "$has_body_file" -eq 1 ]; then
-                            printf '%s\n' "cube wrapper: --body specified more than once or with --body-file" >&2
-                            exit 2
-                        fi
-                        has_body=1
-                        worker_body="${{1#--body=}}"
-                        shift
-                        ;;
-                    --body-file)
-                        if [ "$has_body" -eq 1 ] || [ "$has_body_file" -eq 1 ]; then
-                            printf '%s\n' "cube wrapper: --body-file specified more than once or with --body" >&2
-                            exit 2
-                        fi
-                        if [ "$#" -lt 2 ]; then
-                            printf '%s\n' "cube wrapper: --body-file requires a value" >&2
-                            exit 2
-                        fi
-                        has_body_file=1
-                        worker_body_file="$2"
-                        shift 2
-                        ;;
-                    --body-file=*)
-                        if [ "$has_body" -eq 1 ] || [ "$has_body_file" -eq 1 ]; then
-                            printf '%s\n' "cube wrapper: --body-file specified more than once or with --body" >&2
-                            exit 2
-                        fi
-                        has_body_file=1
-                        worker_body_file="${{1#--body-file=}}"
-                        shift
-                        ;;
-                    *)
-                        add_kept "$1"
-                        shift
-                        ;;
-                esac
-            done
-            body_tmp=$(mktemp "${{TMPDIR:-/tmp}}/boss-pr-body.XXXXXX") || exit 1
-            if [ "$has_body_file" -eq 1 ]; then
-                {{
-                    printf '%s\n\n' "$header"
-                    cat -- "$worker_body_file"
-                }} > "$body_tmp" || exit 1
-            elif [ "$has_body" -eq 1 ]; then
-                printf '%s\n\n%s' "$header" "$worker_body" > "$body_tmp" || exit 1
-            else
-                # Header-only body: a derived PR must still carry its origin
-                # link even when the worker supplied no description.
-                printf '%s' "$header" > "$body_tmp" || exit 1
-            fi
-            eval "set -- $kept"
-            exec cube pr "$subcommand" --body-file "$body_tmp" "$@"
-            ;;
-    esac
-fi
-exec cube "$@"
-"##,
-        env = WORKER_BIN_DIR_ENV,
-        header = sh_quote(body_header),
-    )
-}
+#[cfg(test)]
+mod launcher_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1024,143 +896,6 @@ mod tests {
         assert!(
             !launcher_names().contains(&"bossctl"),
             "bossctl is Boss-tier and must stay off the worker PATH"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cube_compose_launcher_passes_full_body_via_body_file_when_worker_supplies_none() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let wrapper_dir = tmp.path().join("worker-bin");
-        let real_bin = tmp.path().join("real-bin");
-        let captured = tmp.path().join("captured-args");
-        let captured_body = tmp.path().join("captured-body");
-        let real_cube = real_bin.join("cube");
-        std::fs::create_dir_all(&real_bin).expect("mkdir real bin");
-        // Fake cube records argv and the contents of any --body-file so the
-        // test can prove composition happened outside cube (ordinary flag).
-        std::fs::write(
-            &real_cube,
-            "#!/bin/sh\n\
-             : > \"$CUBE_CAPTURED_ARGS\"\n\
-             prev=\n\
-             for arg in \"$@\"; do\n\
-               printf '%s\\n' \"$arg\" >> \"$CUBE_CAPTURED_ARGS\"\n\
-               if [ \"$prev\" = \"--body-file\" ]; then\n\
-                 cp -- \"$arg\" \"$CUBE_CAPTURED_BODY\"\n\
-               fi\n\
-               prev=$arg\n\
-             done\n",
-        )
-        .expect("write fake cube");
-        std::fs::set_permissions(&real_cube, std::fs::Permissions::from_mode(0o755)).expect("chmod fake cube");
-
-        let header = "## Boss follow-up\n\nKeep `$(this text)` literal.";
-        let launcher = write_cube_pr_body_compose_launcher(&wrapper_dir, header).expect("write wrapper");
-        let path = format!("{}:{}:/usr/bin:/bin", wrapper_dir.display(), real_bin.display());
-        let status = std::process::Command::new(&launcher)
-            .args(["pr", "create", "--title", "Example"])
-            .env(WORKER_BIN_DIR_ENV, &wrapper_dir)
-            .env("PATH", path)
-            .env("CUBE_CAPTURED_ARGS", &captured)
-            .env("CUBE_CAPTURED_BODY", &captured_body)
-            .status()
-            .expect("run wrapper");
-        assert!(status.success());
-
-        let args = std::fs::read_to_string(&captured).expect("read captured args");
-        assert!(
-            args.starts_with("pr\ncreate\n--body-file\n"),
-            "wrapper must pass ordinary --body-file, not a cube prefix flag; got:\n{args}"
-        );
-        assert!(
-            args.contains("\n--title\nExample\n"),
-            "other flags must be preserved; got:\n{args}"
-        );
-        assert!(
-            !args.contains("body-prefix"),
-            "cube must not receive a body-prefix feature flag; got:\n{args}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&captured_body).expect("read captured body"),
-            header,
-            "header-only create must submit the engine header as the full body"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cube_compose_launcher_prepends_header_to_worker_body_file() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let wrapper_dir = tmp.path().join("worker-bin");
-        let real_bin = tmp.path().join("real-bin");
-        let captured_body = tmp.path().join("captured-body");
-        let worker_body = tmp.path().join("worker-body.md");
-        std::fs::write(&worker_body, "## Summary\n\nDo the thing.\n").expect("write worker body");
-        let real_cube = real_bin.join("cube");
-        std::fs::create_dir_all(&real_bin).expect("mkdir real bin");
-        std::fs::write(
-            &real_cube,
-            "#!/bin/sh\n\
-             prev=\n\
-             for arg in \"$@\"; do\n\
-               if [ \"$prev\" = \"--body-file\" ]; then\n\
-                 cp -- \"$arg\" \"$CUBE_CAPTURED_BODY\"\n\
-               fi\n\
-               prev=$arg\n\
-             done\n",
-        )
-        .expect("write fake cube");
-        std::fs::set_permissions(&real_cube, std::fs::Permissions::from_mode(0o755)).expect("chmod fake cube");
-
-        let header = "## Boss follow-up\n\nOrigin link.";
-        let launcher = write_cube_pr_body_compose_launcher(&wrapper_dir, header).expect("write wrapper");
-        let path = format!("{}:{}:/usr/bin:/bin", wrapper_dir.display(), real_bin.display());
-        let status = std::process::Command::new(&launcher)
-            .args([
-                "pr",
-                "create",
-                "--title",
-                "Example",
-                "--body-file",
-                worker_body.to_str().unwrap(),
-            ])
-            .env(WORKER_BIN_DIR_ENV, &wrapper_dir)
-            .env("PATH", path)
-            .env("CUBE_CAPTURED_BODY", &captured_body)
-            .status()
-            .expect("run wrapper");
-        assert!(status.success());
-
-        assert_eq!(
-            std::fs::read_to_string(&captured_body).expect("read captured body"),
-            format!("{header}\n\n## Summary\n\nDo the thing.\n"),
-        );
-    }
-
-    #[test]
-    fn writing_the_cube_launcher_replaces_a_stale_body_compose_wrapper() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("bin");
-        write_cube_pr_body_compose_launcher(&dir, "## Stale").expect("write compose wrapper");
-        write_boss_launcher(&dir, Some(Path::new("/opt/boss/bin/boss"))).expect("refresh boss launcher");
-        // A non-derived spawn must still replace the compose wrapper; writing
-        // only `boss` would leave the previous worker's header in place.
-        write_cube_launcher(&dir, Some(Path::new("/opt/boss/bin/cube"))).expect("refresh cube launcher");
-
-        assert!(dir.join(BOSS_LAUNCHER_NAME).exists());
-        let cube = std::fs::read_to_string(dir.join(CUBE_LAUNCHER_NAME)).expect("read cube launcher");
-        assert!(
-            cube.contains("exec '/opt/boss/bin/cube'"),
-            "stale compose wrapper must be replaced with a thin exec: {cube}"
-        );
-        assert!(
-            !cube.contains("## Stale"),
-            "a non-derived worker must not inherit a prior worker's body-compose wrapper"
         );
     }
 

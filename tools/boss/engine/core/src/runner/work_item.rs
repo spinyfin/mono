@@ -7,7 +7,7 @@ use crate::work::{Project, Task, WorkItem};
 use boss_protocol::{CREATED_VIA_ATTENTION, CREATED_VIA_PR_REVIEW_PREFIX, TaskKind};
 
 /// Render a human-meaningful follow-up kind label from a task's
-/// `created_via` provenance, for the engine-composed header on a derived PR.
+/// `created_via` provenance, for the backlink a worker writes on a derived PR.
 /// `task_kind.as_str()` (e.g. `"followup"`) is not this label: it is
 /// the DB-level kind enum, not something a reader would recognize, so it is
 /// only used as the generic fallback for a `created_via` shape this function
@@ -57,7 +57,7 @@ pub(crate) fn work_item_task_kind_enum(work_item: &WorkItem) -> Option<&TaskKind
     }
 }
 
-/// Resolve an engine-owned prefix for a PR that is derived from another PR.
+/// Resolve the backlink to include in the worker prompt for a derived PR.
 /// This intentionally keys on durable origin provenance, not on execution
 /// kind: any future task kind that carries an origin PR gets the same
 /// behaviour without a new dispatch branch.
@@ -67,7 +67,7 @@ pub(crate) fn work_item_task_kind_enum(work_item: &WorkItem) -> Option<&TaskKind
 /// a reason to publish an unlinked PR. Other kinds that merely record an
 /// origin PR number (plain chores) lose only the provenance header when the
 /// remote is not a github.com URL — they stay dispatchable.
-pub(crate) fn followup_pr_body_prefix(
+pub(crate) fn followup_pr_backlink(
     task_kind: &TaskKind,
     created_via: &str,
     origin_pr_number: Option<i64>,
@@ -101,13 +101,13 @@ pub(crate) fn followup_pr_body_prefix(
     )))
 }
 
-pub(crate) fn followup_pr_body_prefix_for_work_item(
+pub(crate) fn followup_pr_backlink_for_work_item(
     work_item: &WorkItem,
     repo_remote_url: &str,
 ) -> Result<Option<String>> {
     match work_item {
         WorkItem::Task(task) | WorkItem::Chore(task) => {
-            followup_pr_body_prefix(&task.kind, &task.created_via, task.origin_pr_number, repo_remote_url)
+            followup_pr_backlink(&task.kind, &task.created_via, task.origin_pr_number, repo_remote_url)
         }
         WorkItem::Product(_) | WorkItem::Project(_) => Ok(None),
     }
@@ -267,13 +267,13 @@ fn task_details(task: &Task) -> Option<String> {
 }
 
 #[cfg(test)]
-mod followup_pr_body_prefix_tests {
-    use super::{followup_kind_label, followup_pr_body_prefix};
+mod followup_pr_backlink_tests {
+    use super::{followup_kind_label, followup_pr_backlink};
     use boss_protocol::TaskKind;
 
     #[test]
     fn review_findings_followup_gets_a_full_origin_pr_url_and_a_human_kind() {
-        let prefix = followup_pr_body_prefix(
+        let prefix = followup_pr_backlink(
             &TaskKind::Followup,
             "pr_review:exec_test",
             Some(2685),
@@ -289,7 +289,7 @@ mod followup_pr_body_prefix_tests {
 
     #[test]
     fn deferred_scope_followup_gets_a_human_kind() {
-        let prefix = followup_pr_body_prefix(
+        let prefix = followup_pr_backlink(
             &TaskKind::Followup,
             "attention",
             Some(2710),
@@ -303,12 +303,12 @@ mod followup_pr_body_prefix_tests {
 
     #[test]
     fn unenumerated_created_via_falls_back_to_the_engine_task_kind_string() {
-        // This pins the value cube can actually receive for a `created_via`
+        // This pins the label the worker receives for a `created_via`
         // this function does not special-case: `TaskKind::as_str()`, not a
         // human phrase. If the header ever reads "This `followup` follow-up
         // derives from ..." that degenerate case is intentional and covered
         // here, not silently untested.
-        let prefix = followup_pr_body_prefix(
+        let prefix = followup_pr_backlink(
             &TaskKind::Followup,
             "engine_auto",
             Some(2710),
@@ -322,7 +322,7 @@ mod followup_pr_body_prefix_tests {
 
     #[test]
     fn followup_without_an_origin_fails_loudly() {
-        let error = followup_pr_body_prefix(
+        let error = followup_pr_backlink(
             &TaskKind::Followup,
             "pr_review:exec_test",
             None,
@@ -334,7 +334,7 @@ mod followup_pr_body_prefix_tests {
 
     #[test]
     fn followup_with_non_github_remote_fails_loudly() {
-        let error = followup_pr_body_prefix(
+        let error = followup_pr_backlink(
             &TaskKind::Followup,
             "pr_review:exec_test",
             Some(42),
@@ -350,7 +350,7 @@ mod followup_pr_body_prefix_tests {
         // non-github product remote lose only the provenance header —
         // they stay dispatchable instead of hard-failing at spawn.
         let prefix =
-            followup_pr_body_prefix(&TaskKind::Chore, "engine_auto", Some(42), "git@example.com:foo.git").unwrap();
+            followup_pr_backlink(&TaskKind::Chore, "engine_auto", Some(42), "git@example.com:foo.git").unwrap();
         assert!(prefix.is_none());
     }
 }

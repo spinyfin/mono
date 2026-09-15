@@ -40,7 +40,7 @@ pub(crate) fn plan_review_findings_followup(
 ) -> Result<ReviewFindingsFollowupPlan> {
     // Emit a `followup` with provenance when the chain root still has a
     // parseable origin PR. Only tag `Followup` when that number is
-    // present — `followup_pr_body_prefix` treats the kind as a hard
+    // present — `followup_pr_backlink` treats the kind as a hard
     // origin-PR contract and bails at dispatch otherwise, so minting a
     // Followup with `origin_pr_number = None` (missing/soft-deleted root
     // or unparseable `pr_url`) would permanently wedge the task. Fall

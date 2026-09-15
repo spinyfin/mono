@@ -116,7 +116,7 @@ fn pr_review_revision_creates_followup_with_correct_kind_and_provenance() {
         "followup must carry the revision's pr_review: created_via; got {:?}",
         followup.created_via,
     );
-    let prefix = crate::runner::work_item::followup_pr_body_prefix(
+    let prefix = crate::runner::work_item::followup_pr_backlink(
         &followup.kind,
         &followup.created_via,
         followup.origin_pr_number,
