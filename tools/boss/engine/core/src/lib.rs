@@ -1,6 +1,7 @@
 pub use boss_transcript_markdown as transcript_markdown;
 
 pub mod abandoned_branch_pr_sweep;
+pub mod agent_jsonl_discovery;
 pub mod agent_jsonl_progress;
 pub mod answer_agent;
 pub mod answer_agent_completion_sweep;
@@ -185,6 +186,7 @@ pub use boss_transcript_tail as transcript_tail;
 pub mod trace_rotation;
 pub use boss_engine_transient_error as transient_error;
 pub mod tmux_preflight;
+pub mod transcript_liveness;
 pub mod transient_recovery;
 pub mod trunk_merge;
 pub mod trunk_queue_adopt;

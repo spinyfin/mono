@@ -955,6 +955,7 @@ async fn resolve_reported_pane_death(
 fn spawn_reap_ctx(server_state: &Arc<ServerState>) -> crate::spawn_ack_sweep::SpawnReapCtx<'_> {
     crate::spawn_ack_sweep::SpawnReapCtx::builder()
         .work_db(server_state.work_db.as_ref())
+        .live_states(server_state.live_worker_states.as_ref())
         .coordinator(server_state.execution_coordinator.clone())
         .dispatch_events(server_state.dispatch_events.as_ref())
         .reaper(server_state.as_ref())

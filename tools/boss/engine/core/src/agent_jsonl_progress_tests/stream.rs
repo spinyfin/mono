@@ -8,6 +8,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
 
 use super::*;
+use crate::agent_jsonl_discovery::DISCOVERY_POLL;
 use crate::events_socket::IncomingHookEvent;
 
 #[derive(Clone, Default)]
