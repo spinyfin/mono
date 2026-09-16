@@ -29,6 +29,23 @@ use boss_protocol::{
     ExecutionStatus, FinishExecutionRunInput, FrontendEvent, Product, RequestExecutionInput, Task, WorkExecution,
 };
 
+/// Direct-DB fixtures must model the bookmark that dispatch creates before spawn.
+/// Retain the returned directory for the duration of the test.
+pub async fn seed_empty_execution_bookmark(db: &WorkDb, execution_id: &str) -> TempDir {
+    let root = tempfile::tempdir().unwrap();
+    let repo = boss_engine_test_git::jj::JjRepo::new(root.path());
+    let record = boss_engine_recovery::execution_bookmark::create(
+        &boss_engine_recovery::execution_bookmark::LocalJj,
+        &repo.worker,
+        execution_id,
+        "local",
+    )
+    .await
+    .unwrap();
+    db.record_execution_bookmark(&record).unwrap();
+    root
+}
+
 /// The mono repo remote used by the overwhelming majority of tests.
 pub const TEST_REPO_REMOTE_URL: &str = "git@github.com:spinyfin/mono.git";
 
@@ -716,6 +733,20 @@ macro_rules! stub_cube_client {
         #[::async_trait::async_trait]
         impl $crate::coordinator::CubeClient for $ty {
             $($acc)*
+            async fn create_execution_bookmark(&self, workspace: &::std::path::Path, execution_id: &str, _predecessor: Option<&::boss_engine_recovery::execution_bookmark::ExecutionBookmark>) -> ::anyhow::Result<::boss_engine_recovery::execution_bookmark::ExecutionBookmark> {
+                Ok(::boss_engine_recovery::execution_bookmark::ExecutionBookmark {
+                    execution_id: execution_id.to_owned(),
+                    repo_path: workspace.to_path_buf(),
+                    host_id: "local".to_owned(),
+                })
+            }
+        }
+    };
+    (@munch $ty:ty [$($acc:tt)*] @done async fn create_execution_bookmark $a:tt -> $r:ty $b:block) => {
+        #[::async_trait::async_trait]
+        impl $crate::coordinator::CubeClient for $ty {
+            $($acc)*
+            async fn create_execution_bookmark $a -> $r $b
         }
     };
 }
@@ -1128,14 +1159,6 @@ pub(crate) mod log_capture {
             })
             .clone()
     }
-}
-
-/// Initialize a git repo at `path` whose `HEAD` names `branch`.
-///
-/// Returns false when git is missing so callers can skip rather than fail in
-/// a hermetic sandbox.
-pub fn try_init_repo_with_branch(path: &Path, branch: &str) -> bool {
-    boss_engine_test_git::try_init_repo_with_branch(path, branch)
 }
 
 /// Shared source-capture packet fixture. Callers pass the PR URL and the

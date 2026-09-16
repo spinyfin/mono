@@ -234,6 +234,7 @@ async fn absent_transcript_reaps_and_the_record_states_what_was_checked() {
     let db = Arc::new(db);
 
     let execution_id = create_spawned_execution(&db, &work_item_id, 4242);
+    let _bookmark_store = crate::test_support::seed_empty_execution_bookmark(&db, &execution_id).await;
     let temp = tempfile::TempDir::new().unwrap();
     let root = temp.path().join("sessions");
     std::fs::create_dir_all(&root).unwrap();
@@ -1354,6 +1355,7 @@ async fn zero_pid_driver_start_timeout_is_classed_no_shell() {
     let db = Arc::new(db);
 
     let execution_id = create_spawned_execution(&db, &work_item_id, 0);
+    let _bookmark_store = crate::test_support::seed_empty_execution_bookmark(&db, &execution_id).await;
     let live_states = Arc::new(LiveWorkerStateRegistry::new());
     // Pass 1 skips re-adopted slots; pass 2 still verifies driver start and
     // can reap a pid-less registration. `mark_stalled_spawns` will not

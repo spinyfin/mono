@@ -22,39 +22,6 @@ fn base_execution() -> WorkExecution {
         .build()
 }
 
-#[test]
-fn blocked_workspace_prompt_overrides_checkout_guidance_and_requires_revalidation() {
-    use boss_engine_recovery::recovery_apply::{RecoveryReport, RecoverySource};
-    let ws = tempfile::tempdir().unwrap();
-    let mut execution = base_execution();
-    execution.allow_dirty = true;
-    execution.prefer_is_soft = true;
-    execution.preferred_workspace_id = Some("prior-workspace".into());
-    for source in [RecoverySource::BlockedInPlace, RecoverySource::BlockedFresh] {
-        RecoveryReport {
-            for_execution_id: execution.id.clone(),
-            from_execution_id: "prior".into(),
-            source,
-            applied: None,
-            patch_error: None,
-        }
-        .write(ws.path())
-        .unwrap();
-        let prompt = compose_execution_prompt(
-            ExecutionPromptParams::builder()
-                .execution(&execution)
-                .work_item(&chore_without_pr())
-                .workspace_path(ws.path())
-                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
-                .build(),
-        );
-        assert!(prompt.contains("BLOCKED WORKSPACE RECOVERY"));
-        assert!(prompt.contains("Re-run the required build and tests in your own leased workspace"));
-        assert!(!prompt.contains("MERGE-CANCELLED REVIEW RECOVERY"));
-        assert!(!prompt.contains("## STARTUP RECOVERY"));
-    }
-}
-
 fn chore_without_pr() -> WorkItem {
     WorkItem::Chore(
         Task::builder()
@@ -353,413 +320,12 @@ fn acceptance_criterion_uses_fresh_branch_when_no_pr_url() {
             .build(),
     );
     assert!(
-        prompt.contains("jj bookmark create"),
+        prompt.contains("jj bookmark set"),
         "acceptance criterion should guide fresh branch creation:\n{prompt}",
     );
     assert!(
         prompt.contains("gh pr create") || prompt.contains("cube pr create") || prompt.contains("$CUBE_BIN"),
         "acceptance criterion should guide opening a new PR:\n{prompt}",
-    );
-}
-
-/// No `.boss/recovery-report.json` marker in the workspace means the engine
-/// holds no durable pointer for this run: no block at all, and critically no
-/// speculative `jj edit ...@origin` line naming a branch nobody confirmed
-/// was ever pushed — that line failed with `Revision doesn't exist` whenever
-/// the prior worker died before pushing.
-#[test]
-fn no_recovery_block_when_no_recovery_report() {
-    let ws = tempfile::TempDir::new().unwrap();
-    let prompt = compose_execution_prompt(
-        ExecutionPromptParams::builder()
-            .execution(&base_execution())
-            .work_item(&chore_without_pr())
-            .workspace_path(ws.path())
-            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
-            .build(),
-    );
-    assert!(
-        !prompt.contains("STARTUP RECOVERY"),
-        "no recovery block expected when no recovery-report marker is present:\n{prompt}",
-    );
-    assert!(
-        !prompt.contains("@origin"),
-        "no speculative branch-resume instruction expected without a durable pointer:\n{prompt}",
-    );
-    assert!(
-        !prompt.contains("may also have pushed"),
-        "no speculative 'may have pushed' language expected without a durable pointer:\n{prompt}",
-    );
-}
-
-/// `reconcile_workspace_recovery` can re-lease a workspace dirty
-/// (`execution.allow_dirty`) without ever writing a recovery-report marker —
-/// e.g. `dirty_verified` came back `None`, or writing the marker itself
-/// failed. In that case `@` may still hold a prior worker's uncommitted
-/// edits, so the prompt must not go silent the way `no_recovery_block_when_no_recovery_report`
-/// pins for the ordinary fresh-dispatch case above.
-#[test]
-fn dirty_reset_warning_when_allow_dirty_and_no_recovery_report() {
-    let ws = tempfile::TempDir::new().unwrap();
-    let execution = WorkExecution::builder()
-        .id("exec_abc123_01")
-        .work_item_id("task-1")
-        .kind(ExecutionKind::ChoreImplementation)
-        .status(ExecutionStatus::Running)
-        .repo_remote_url("git@github.com:org/repo.git")
-        .workspace_path("/tmp/workspace")
-        .created_at("2026-05-15T00:00:00Z")
-        .allow_dirty(true)
-        .build();
-    let prompt = compose_execution_prompt(
-        ExecutionPromptParams::builder()
-            .execution(&execution)
-            .work_item(&chore_without_pr())
-            .workspace_path(ws.path())
-            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
-            .build(),
-    );
-    assert!(
-        !prompt.contains("STARTUP RECOVERY"),
-        "no recovery report marker was written, so no STARTUP RECOVERY block is expected:\n{prompt}",
-    );
-    assert!(
-        prompt.contains("re-leased without a reset"),
-        "an allow_dirty respawn with no marker must still warn before `jj new main` can discard state:\n{prompt}",
-    );
-    assert!(
-        prompt.contains("jj status"),
-        "the warning must tell the worker how to check before resetting:\n{prompt}",
-    );
-}
-
-#[test]
-fn merge_cancelled_review_followup_warns_about_reclaimed_partial_work() {
-    let ws = tempfile::TempDir::new().unwrap();
-    let execution = WorkExecution::builder()
-        .id("exec_followup")
-        .work_item_id("task-1")
-        .kind(ExecutionKind::ChoreImplementation)
-        .status(ExecutionStatus::Running)
-        .repo_remote_url("git@github.com:org/repo.git")
-        .workspace_path(ws.path().display().to_string())
-        .cube_workspace_id("mono-agent-001")
-        .preferred_workspace_id("mono-agent-001")
-        .allow_dirty(true)
-        .prefer_is_soft(true)
-        .created_at("2026-09-02T00:00:00Z")
-        .build();
-    // Confident "edits are present" wording requires a verified recovery
-    // marker — `reconcile_workspace_recovery` writes this with
-    // `RecoverySource::CubeInPlace` only when the lease's dirty state was
-    // actually confirmed, before the prompt is composed.
-    boss_engine_recovery::recovery_apply::RecoveryReport {
-        for_execution_id: execution.id.clone(),
-        from_execution_id: String::new(),
-        source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
-        applied: None,
-        patch_error: None,
-    }
-    .write(ws.path())
-    .unwrap();
-    let prompt = compose_execution_prompt(
-        ExecutionPromptParams::builder()
-            .execution(&execution)
-            .work_item(&review_followup())
-            .workspace_path(ws.path())
-            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
-            .build(),
-    );
-    assert!(prompt.contains("MERGE-CANCELLED REVIEW RECOVERY"));
-    assert!(prompt.contains("PR #1501"));
-    assert!(prompt.contains("exact workspace (`mono-agent-001`)"));
-    assert!(prompt.contains("partial, uncommitted edits"));
-    assert!(prompt.contains("never compiled or tested"));
-    assert!(prompt.contains("jj diff"));
-}
-
-#[test]
-fn merge_cancelled_review_followup_hedges_without_a_verified_recovery_marker() {
-    let ws = tempfile::TempDir::new().unwrap();
-    let execution = WorkExecution::builder()
-        .id("exec_followup_unverified")
-        .work_item_id("task-1")
-        .kind(ExecutionKind::ChoreImplementation)
-        .status(ExecutionStatus::Running)
-        .repo_remote_url("git@github.com:org/repo.git")
-        .workspace_path(ws.path().display().to_string())
-        .cube_workspace_id("mono-agent-001")
-        .preferred_workspace_id("mono-agent-001")
-        .allow_dirty(true)
-        .prefer_is_soft(true)
-        .created_at("2026-09-02T00:00:00Z")
-        .build();
-    // No recovery marker written: same workspace as preferred, but the
-    // engine never confirmed what the lease actually returned (could be a
-    // reset workspace, or one dirtied by an unrelated task in between).
-    let prompt = compose_execution_prompt(
-        ExecutionPromptParams::builder()
-            .execution(&execution)
-            .work_item(&review_followup())
-            .workspace_path(ws.path())
-            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
-            .build(),
-    );
-    assert!(prompt.contains("MERGE-CANCELLED REVIEW RECOVERY"));
-    assert!(prompt.contains("no confirmed record"));
-    assert!(!prompt.contains("partial, uncommitted edits"));
-}
-
-#[test]
-fn merge_cancelled_review_followup_explains_fresh_workspace_fallback() {
-    let ws = tempfile::TempDir::new().unwrap();
-    let execution = WorkExecution::builder()
-        .id("exec_followup_fallback")
-        .work_item_id("task-1")
-        .kind(ExecutionKind::ChoreImplementation)
-        .status(ExecutionStatus::Running)
-        .repo_remote_url("git@github.com:org/repo.git")
-        .workspace_path(ws.path().display().to_string())
-        .cube_workspace_id("mono-agent-004")
-        .preferred_workspace_id("mono-agent-001")
-        .allow_dirty(true)
-        .prefer_is_soft(true)
-        .created_at("2026-09-02T00:00:00Z")
-        .build();
-    let prompt = compose_execution_prompt(
-        ExecutionPromptParams::builder()
-            .execution(&execution)
-            .work_item(&review_followup())
-            .workspace_path(ws.path())
-            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
-            .build(),
-    );
-    assert!(prompt.contains("preferred the cancelled worker's workspace (`mono-agent-001`)"));
-    assert!(prompt.contains("dispatched this execution on `mono-agent-004` instead"));
-    assert!(prompt.contains("fresh-workspace fallback"));
-    assert!(prompt.contains("no partial edits were inherited here"));
-}
-
-/// A recorded recovery marker IS a durable pointer the engine wrote itself —
-/// the block must still fire, and must cite the concrete pointer (the dead
-/// execution's id) rather than a guessed branch name.
-#[test]
-fn recovery_block_injected_when_recovery_report_present() {
-    let ws = tempfile::TempDir::new().unwrap();
-    boss_engine_recovery::recovery_apply::RecoveryReport {
-        for_execution_id: "exec_abc123_01".to_owned(),
-        from_execution_id: "exec_prior123_09".to_owned(),
-        source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
-        applied: None,
-        patch_error: None,
-    }
-    .write(ws.path())
-    .expect("write recovery report");
-    let prompt = compose_execution_prompt(
-        ExecutionPromptParams::builder()
-            .execution(&base_execution())
-            .work_item(&chore_without_pr())
-            .workspace_path(ws.path())
-            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
-            .build(),
-    );
-    assert!(
-        prompt.contains("## STARTUP RECOVERY"),
-        "recovery block should be present when a recovery report is recorded:\n{prompt}",
-    );
-    assert!(
-        prompt.contains("exec_prior123_09"),
-        "recovery block should name the concrete dead execution it recovered from:\n{prompt}",
-    );
-}
-
-// ── STARTUP RECOVERY: recovered working state ──────────────────────────
-//
-// The block used to talk about a *pushed branch* nobody ever confirmed was
-// pushed, and told the worker to fall back to `jj new main@origin` — which
-// moves `@` off any recovered uncommitted state. It now fires only on a
-// durable pointer the engine wrote itself (the recovery-report marker); no
-// marker means no block, and the marker's contents are what it cites,
-// never a guessed branch name. These tests pin the fix.
-
-fn apply_report(
-    paths: &[&str],
-    insertions: usize,
-    deletions: usize,
-) -> boss_engine_recovery::recovery_apply::ApplyReport {
-    boss_engine_recovery::recovery_apply::ApplyReport {
-        paths: paths.iter().map(|p| (*p).to_owned()).collect(),
-        insertions,
-        deletions,
-        filtered_paths: vec![".boss/events-pending.jsonl".to_owned()],
-    }
-}
-
-/// Cube recovered the tree in place: say so, say the jj history came with
-/// it, tell the worker to look before it leaps, and never suggest resetting
-/// it.
-#[test]
-fn recovery_block_reports_in_place_recovery() {
-    let report = boss_engine_recovery::recovery_apply::RecoveryReport {
-        for_execution_id: "exec_new".to_owned(),
-        from_execution_id: "exec_dead".to_owned(),
-        source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
-        applied: None,
-        patch_error: None,
-    };
-    let block = startup_recovery_block(&report);
-    assert!(
-        block.contains("exec_dead"),
-        "block should cite the concrete recovered-from execution:\n{block}"
-    );
-    assert!(block.contains("State recovered IN PLACE"), "{block}");
-    assert!(
-        block.contains("operation log is intact") || block.contains("operation log"),
-        "{block}"
-    );
-    assert!(block.contains("Do not reset it."), "{block}");
-    assert!(
-        block.contains("jj diff --stat"),
-        "the worker must be told how to inspect before building on it:\n{block}",
-    );
-    assert!(
-        !block.contains("@origin"),
-        "no speculative branch-resume instruction; the recovery report is the only pointer cited:\n{block}",
-    );
-}
-
-/// The coordinator writes `from_execution_id: String::new()` on the
-/// cube-in-place-with-no-patch path (a crash before any patch capture, with
-/// cube reclaiming the workspace in place). The block must not interpolate
-/// that empty string into a backticked id — it must fall back to prose that
-/// names no execution at all.
-#[test]
-fn recovery_block_handles_empty_from_execution_id() {
-    let report = boss_engine_recovery::recovery_apply::RecoveryReport {
-        for_execution_id: "exec_new".to_owned(),
-        from_execution_id: String::new(),
-        source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
-        applied: None,
-        patch_error: None,
-    };
-    let block = startup_recovery_block(&report);
-    assert!(
-        !block.contains("execution ``"),
-        "must not render an empty backticked execution id:\n{block}",
-    );
-    assert!(
-        block.contains("the previous worker session was interrupted"),
-        "should fall back to prose naming no specific execution:\n{block}",
-    );
-}
-
-/// Patch recovery: name the files and the line counts, and be explicit
-/// that only uncommitted edits came across.
-#[test]
-fn recovery_block_reports_patch_recovery_in_human_terms() {
-    let report = boss_engine_recovery::recovery_apply::RecoveryReport {
-        for_execution_id: "exec_new".to_owned(),
-        from_execution_id: "exec_dead".to_owned(),
-        source: boss_engine_recovery::recovery_apply::RecoverySource::Patch,
-        applied: Some(apply_report(&["tools/cube/src/app.rs", "docs/x.md"], 120, 14)),
-        patch_error: None,
-    };
-    let block = startup_recovery_block(&report);
-    assert!(block.contains("State recovered FROM A PATCH"), "{block}");
-    assert!(block.contains("2 file(s), +120/-14"), "{block}");
-    assert!(block.contains("`tools/cube/src/app.rs`"), "{block}");
-    assert!(block.contains("`docs/x.md`"), "{block}");
-    assert!(
-        block.contains("uncommitted edits only"),
-        "the worker must know the jj history did NOT come with the patch:\n{block}",
-    );
-    assert!(block.contains("Do not reset the working copy."), "{block}");
-}
-
-/// A failed apply must be surfaced to the worker, not silently omitted.
-/// Silence would leave it believing it was resuming.
-#[test]
-fn recovery_block_says_so_loudly_when_the_patch_did_not_apply() {
-    let report = boss_engine_recovery::recovery_apply::RecoveryReport {
-        for_execution_id: "exec_new".to_owned(),
-        from_execution_id: "exec_dead".to_owned(),
-        source: boss_engine_recovery::recovery_apply::RecoverySource::Patch,
-        applied: None,
-        patch_error: Some("error: patch does not apply".to_owned()),
-    };
-    let block = startup_recovery_block(&report);
-    assert!(block.contains("Recovery FAILED"), "{block}");
-    assert!(block.contains("error: patch does not apply"), "{block}");
-    assert!(
-        block.contains("Do NOT assume any of the prior work is present."),
-        "the worker must not believe it is resuming:\n{block}",
-    );
-    assert!(
-        !block.contains("State recovered"),
-        "a failed recovery must never read as a successful one:\n{block}",
-    );
-}
-
-#[test]
-fn recovery_block_suppressed_when_pr_url_set() {
-    // When the work item already has a PR URL, the existing RESUME
-    // EXISTING PR path takes precedence; the recovery block must not
-    // also appear (that would be contradictory), even if a recovery
-    // report happens to be present in the workspace.
-    let ws = tempfile::TempDir::new().unwrap();
-    boss_engine_recovery::recovery_apply::RecoveryReport {
-        for_execution_id: "exec_abc123_01".to_owned(),
-        from_execution_id: "exec_prior123_09".to_owned(),
-        source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
-        applied: None,
-        patch_error: None,
-    }
-    .write(ws.path())
-    .expect("write recovery report");
-    let chore = chore_with_pr("https://github.com/org/repo/pull/42");
-    let prompt = compose_execution_prompt(
-        ExecutionPromptParams::builder()
-            .execution(&base_execution())
-            .work_item(&chore)
-            .workspace_path(ws.path())
-            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
-            .build(),
-    );
-    assert!(
-        !prompt.contains("STARTUP RECOVERY"),
-        "recovery block must not appear when existing PR URL takes precedence:\n{prompt}",
-    );
-    assert!(
-        prompt.contains("## RESUME EXISTING PR"),
-        "RESUME EXISTING PR block should still be present:\n{prompt}",
-    );
-}
-
-#[test]
-fn recovery_block_appears_before_execution_context() {
-    let ws = tempfile::TempDir::new().unwrap();
-    boss_engine_recovery::recovery_apply::RecoveryReport {
-        for_execution_id: "exec_abc123_01".to_owned(),
-        from_execution_id: "exec_prior123_09".to_owned(),
-        source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
-        applied: None,
-        patch_error: None,
-    }
-    .write(ws.path())
-    .expect("write recovery report");
-    let prompt = compose_execution_prompt(
-        ExecutionPromptParams::builder()
-            .execution(&base_execution())
-            .work_item(&chore_without_pr())
-            .workspace_path(ws.path())
-            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
-            .build(),
-    );
-    let recovery_pos = prompt.find("## STARTUP RECOVERY").expect("missing recovery block");
-    let exec_pos = prompt.find("Execution context:").expect("missing execution context");
-    assert!(
-        recovery_pos < exec_pos,
-        "recovery block must appear before execution context:\n{prompt}",
     );
 }
 
@@ -1280,7 +846,7 @@ fn revision_prompt_omits_expected_branch_line() {
     // The revision directive remains the only — and now uncontradicted —
     // word on branching.
     assert!(
-        prompt.contains("Do NOT create a `boss/exec_*` bookmark"),
+        prompt.contains("The engine owns your `boss-recovery/exec_*` recovery bookmark; keep it advanced locally"),
         "revision directive must still forbid creating a boss/exec_* bookmark:\n{prompt}",
     );
 }
@@ -1458,7 +1024,7 @@ fn revision_directive_with_conflict_provenance_injects_conflict_fragment() {
     );
     // Must still contain the base revision directive spine.
     assert!(
-        prompt.contains("Do NOT create a `boss/exec_*` bookmark"),
+        prompt.contains("The engine owns your `boss-recovery/exec_*` recovery bookmark; keep it advanced locally"),
         "base revision directive must still be present:\n{prompt}",
     );
     // incident-002: the preservation rule must be present so a
@@ -1874,7 +1440,7 @@ fn revision_directive_with_ci_fix_provenance_injects_ci_fragment() {
     );
     // Must still contain the base revision directive spine.
     assert!(
-        prompt.contains("Do NOT create a `boss/exec_*` bookmark"),
+        prompt.contains("The engine owns your `boss-recovery/exec_*` recovery bookmark; keep it advanced locally"),
         "base revision directive must still be present:\n{prompt}",
     );
 }
@@ -2065,7 +1631,7 @@ fn revision_directive_without_provenance_has_no_fragment() {
         "no CI fragment for operator revision:\n{prompt}",
     );
     assert!(
-        prompt.contains("Do NOT create a `boss/exec_*` bookmark"),
+        prompt.contains("The engine owns your `boss-recovery/exec_*` recovery bookmark; keep it advanced locally"),
         "base revision directive must still be present:\n{prompt}",
     );
 }

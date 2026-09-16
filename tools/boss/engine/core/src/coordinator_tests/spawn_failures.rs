@@ -1699,7 +1699,7 @@ async fn pre_start_failure_retries_and_succeeds_on_second_attempt() {
 /// workspace). The dispatch must fail so the scheduler can retry with
 /// the correct workspace later.
 #[tokio::test]
-async fn lease_with_prefer_set_does_not_fall_back_when_refused() {
+async fn lease_failure_retries_clean_scratch_even_with_old_preference() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let product = create_test_product(&db);
@@ -1714,7 +1714,7 @@ async fn lease_with_prefer_set_does_not_fall_back_when_refused() {
     .unwrap();
 
     let cube = Arc::new(FakeCubeClient {
-        fail_lease_when_prefer_set: true,
+        fail_lease: true,
         ..FakeCubeClient::default()
     });
     let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
@@ -1739,11 +1739,11 @@ async fn lease_with_prefer_set_does_not_fall_back_when_refused() {
     let calls = cube.lease_calls.lock().await;
     assert_eq!(
         calls.len(),
-        1,
-        "engine must not retry when prefer is set; got {:?}",
+        2,
+        "engine retries clean scratch independently of old preference; got {:?}",
         calls
     );
-    assert_eq!(calls[0].2.as_deref(), Some("mono-agent-003"));
+    assert!(calls.iter().all(|call| call.2.is_none() && !call.3));
     drop(calls);
 
     let events = recording.events_for(&execution_id).await;
@@ -1755,23 +1755,23 @@ async fn lease_with_prefer_set_does_not_fall_back_when_refused() {
         .collect();
     assert_eq!(
         attempt_events.len(),
-        1,
-        "expected exactly one lease_attempted event; got stages {stages:?}"
+        2,
+        "expected two clean lease attempts; got stages {stages:?}"
     );
     assert_eq!(
         attempt_events[0]
             .details
             .get("prefer_workspace_id")
             .and_then(|v| v.as_str()),
-        Some("mono-agent-003"),
+        None,
     );
     assert_eq!(
         attempt_events[0]
             .details
             .get("fallback_policy")
             .and_then(|v| v.as_str()),
-        Some("none"),
-        "policy must be none when prefer is set — no silent workspace swap",
+        Some("any_free"),
+        "workspace identity must not gate recovery",
     );
 
     // Execution must fail, not succeed on a different workspace.

@@ -26,16 +26,3 @@ pub(super) fn blocked_workspace_predecessor(
         blocked && e.status.is_terminal() && e.preferred_workspace_id.as_deref().is_some_and(|id| !id.is_empty())
     }))
 }
-
-impl WorkDb {
-    pub(crate) fn blocked_workspace_predecessor(&self, execution: &WorkExecution) -> Result<Option<WorkExecution>> {
-        if !execution.allow_dirty || !execution.prefer_is_soft {
-            return Ok(None);
-        }
-        let conn = self.connect()?;
-        Ok(
-            blocked_workspace_predecessor(&conn, &execution.work_item_id, &execution.id)?
-                .filter(|prior| prior.preferred_workspace_id == execution.preferred_workspace_id),
-        )
-    }
-}

@@ -1435,10 +1435,9 @@ pub async fn serve_with_overrides(
                     crate::driver_teardown::TeardownReason::AppCrashReconcile,
                 )
                 .await;
-                // Snapshot any uncommitted in-flight work to a durable
-                // patch before the workspace can be re-leased/reset.
-                // Best-effort and self-logging; never blocks the reaper.
-                boss_engine_recovery::recovery_backup::backup_dead_execution(&execution);
+                // Export shared-store evidence without reading the old workspace.
+                // Recovery inspection failures raise attention and retain the ref.
+                crate::execution_bookmark_recovery::backup_dead_execution(&server_state.work_db, &execution).await;
             }
             Err(err) => {
                 // Already-terminal rows are benign here — a parallel
@@ -2080,6 +2079,7 @@ pub async fn serve_with_overrides(
     // incident writeup and retry/backoff rationale.
     let _abandoned_branch_pr_sweep_handle = crate::abandoned_branch_pr_sweep::spawn_loop(
         server_state.work_db.clone(),
+        server_state.execution_coordinator.clone(),
         server_state.dispatch_events.clone(),
         crate::abandoned_branch_pr_sweep::DEFAULT_INTERVAL,
     );

@@ -1,57 +1,63 @@
 use super::*;
 
 impl ExecutionCoordinator {
-    /// Validate after acquiring the lease, when no other lessee can replace the
-    /// checkout. Missing identity (including legacy name-only labels) fails closed.
-    ///
-    /// `execution_id` is the replacement execution attempting this lease (not
-    /// `prior`, the blocked predecessor it is trying to recover). It is used
-    /// to consult the on-disk recovery marker as a second identity proof —
-    /// see the comment below for why cube's own `last_task` label is not
-    /// sufficient on a retry.
-    pub(super) async fn verify_blocked_workspace(
+    /// Restore the predecessor's engine-created reference into the new lease.
+    /// No read of its old workspace or lease history occurs.
+    pub(super) async fn recover_execution_bookmark(
         &self,
-        execution_id: &str,
-        prior: &WorkExecution,
+        execution: &WorkExecution,
         lease: &CubeWorkspaceLease,
         adapter: &Arc<dyn HostAdapter>,
-    ) -> bool {
-        if prior.preferred_workspace_id.as_deref() != Some(&lease.workspace_id) || lease.dirty_verified != Some(true) {
-            return false;
+    ) -> Result<Option<(String, bool)>> {
+        if let Some(record) = self.work_db.execution_bookmark_optional(&execution.id)? {
+            // A dispatch retry already owns this reference. Validate and reuse
+            // it instead of recreating refs or overwriting its provenance.
+            let has_work = adapter
+                .restore_execution_bookmark(&record, &lease.workspace_path)
+                .await?;
+            return Ok(Some((execution.id.clone(), has_work)));
         }
-        // A prior dispatch attempt by this SAME replacement execution may
-        // already have verified this exact workspace and recorded that via
-        // the on-disk recovery marker (`RecoveryReport`, keyed by this
-        // execution's own id — written by `reconcile_workspace_recovery`
-        // right after a successful verified lease). That marker lives under
-        // `.boss/` in the workspace itself and survives a later
-        // deferral-release, unlike cube's own `last_task` label: releasing a
-        // lease sets `last_task = COALESCE(task, last_task)`, and `task` was
-        // stamped at lease time with THIS execution's own id (not
-        // `prior.id`) — see `execution_task_summary`. So a deferral-release
-        // between two dispatch attempts for the same execution silently
-        // overwrites the `prior.id` marker the `last_task` check below
-        // depends on, even though the workspace itself never changed. Trust
-        // the on-disk marker first so that case does not force a spurious
-        // fresh-workspace fallback.
-        if boss_engine_recovery::recovery_apply::RecoveryReport::read_for(&lease.workspace_path, execution_id)
-            .is_some_and(|report| report.from_execution_id == prior.id)
-        {
-            return true;
-        }
-        let status = match adapter.workspace_status(&lease.workspace_path).await {
-            Ok(status) => status,
-            Err(err) => {
-                tracing::warn!(error = %err, "cannot verify blocked workspace ownership");
-                return false;
-            }
+        let Some(prior) = self.work_db.recovery_predecessor(execution)? else {
+            return Ok(None);
         };
-        status.workspace_id == lease.workspace_id
-            && status.lease_id.as_deref() == Some(&lease.lease_id)
-            && status
-                .last_task
-                .as_deref()
-                .and_then(|task| task.split_once(' '))
-                .is_some_and(|(id, _)| id == prior.id)
+        let record = self.work_db.execution_bookmark(&prior.id)?;
+        anyhow::ensure!(
+            record.host_id == adapter.host_id(),
+            "execution {} recovery store is on host {}; dispatch selected {}",
+            prior.id,
+            record.host_id,
+            adapter.host_id()
+        );
+        let has_work = adapter
+            .restore_execution_bookmark(&record, &lease.workspace_path)
+            .await?;
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::WorkspaceRecovery, DispatchOutcome::Ok, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_details(serde_json::json!({
+                        "source": "execution_bookmark",
+                        "predecessor": prior.id,
+                        "bookmark": record.head(),
+                        "has_work": has_work,
+                    })),
+            )
+            .await;
+        Ok(Some((prior.id, has_work)))
+    }
+
+    pub(crate) async fn inspect_execution_bookmark(
+        &self,
+        record: &boss_engine_recovery::execution_bookmark::ExecutionBookmark,
+    ) -> Result<String> {
+        let host = self
+            .work_db
+            .get_host(&record.host_id)?
+            .ok_or_else(|| anyhow!("recovery host {} is unavailable", record.host_id))?;
+        self.host_adapter_provider
+            .adapter_for(&host)
+            .await?
+            .execution_bookmark_diff(record)
+            .await
     }
 }

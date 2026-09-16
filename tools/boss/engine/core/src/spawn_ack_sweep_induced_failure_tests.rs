@@ -237,6 +237,8 @@ async fn assert_incident_detected_and_released(fixture: &IncidentFixture, expect
         "precondition: the worker slot is held",
     );
 
+    let _bookmark_store = crate::test_support::seed_empty_execution_bookmark(db, execution_id).await;
+
     // ── Gate 1: dead_pid_sweep. `kill(pid, 0)` finds the shell alive. ────
     let sink = Arc::new(RecordingDispatchEventSink::new());
     let dead_pid_outcome = crate::dead_pid_sweep::run_one_pass(
