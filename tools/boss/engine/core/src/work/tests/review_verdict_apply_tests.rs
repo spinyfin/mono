@@ -150,10 +150,23 @@ fn findings_verdict_payload(batch_id: &str, target_sha: &str) -> String {
 
 #[test]
 fn clean_verdict_advances_the_origin_to_review_without_a_revision() {
+    for state in ["awaiting_admission", "automated_review", "required"] {
+        assert_clean_verdict_advances_to_review(state);
+    }
+}
+
+fn assert_clean_verdict_advances_to_review(state: &str) {
     let db = WorkDb::open(temp_db_path("verdict-apply-clean")).unwrap();
     let product = create_test_product(&db);
     let cycle_root = create_test_chore_manual(&db, product.id, "review target");
     bind_open_pr(&db, &cycle_root.id);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'active', review_required_state = ?2 WHERE id = ?1",
+            rusqlite::params![cycle_root.id, state],
+        )
+        .unwrap();
     let supervisor = db
         .create_execution(
             CreateExecutionInput::builder()
@@ -192,6 +205,10 @@ fn clean_verdict_advances_the_origin_to_review_without_a_revision() {
 
     let after = query_task(&db.connect().unwrap(), &cycle_root.id).unwrap().unwrap();
     assert_eq!(after.status, TaskStatus::InReview);
+    assert_eq!(
+        after.review_required_state.as_deref(),
+        (state == "required").then_some(state)
+    );
     let (cycle, sha) = db.get_task_review_cycle_state(&cycle_root.id).unwrap();
     assert_eq!(cycle, 1);
     assert_eq!(sha.as_deref(), Some("head-sha"));

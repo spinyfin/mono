@@ -722,6 +722,12 @@ fn insert_conflict_revision_row(db: &WorkDb, product_id: &str, parent_task_id: &
 /// the revision to `in_review`; no new execution is created.
 #[test]
 fn merge_conflict_revision_stops_dispatch_after_attempt_succeeds() {
+    for state in ["awaiting_admission", "automated_review", "required"] {
+        assert_conflict_revision_stops_dispatch(state);
+    }
+}
+
+fn assert_conflict_revision_stops_dispatch(state: &str) {
     let db = WorkDb::open(temp_db_path("crz-revision-stop-dispatch")).unwrap();
     let product_id = make_revision_product(&db, "crz-stop");
     let pr_url = "https://github.com/spinyfin/mono/pull/970";
@@ -759,6 +765,13 @@ fn merge_conflict_revision_stops_dispatch_after_attempt_succeeds() {
     // `ready` execution from above is still queued (the exact race that
     // makes a manual move-to-Review pointless).
     db.mark_conflict_resolution_succeeded(&crz.id, None).unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET review_required_state = ?2 WHERE id = ?1",
+            rusqlite::params![revision_id, state],
+        )
+        .unwrap();
 
     // Second reconcile: the fix must NOT mint another execution.
     db.reconcile_product_executions(&product_id).unwrap();
@@ -777,6 +790,12 @@ fn merge_conflict_revision_stops_dispatch_after_attempt_succeeds() {
         task_status(&db, &revision_id),
         "in_review",
         "the revision must be settled to in_review once its fix vehicle is spent",
+    );
+
+    let after = query_task(&db.connect().unwrap(), &revision_id).unwrap().unwrap();
+    assert_eq!(
+        after.review_required_state.as_deref(),
+        (state == "required").then_some(state)
     );
 
     // Third reconcile: idempotent — the in_review revision is no longer
