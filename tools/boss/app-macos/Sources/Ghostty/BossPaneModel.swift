@@ -761,6 +761,8 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
 
     Reach for this whenever the operator's intent is "amend the work that produced this open PR" rather than "start something new". Do not use it if the parent has no PR yet, or if the PR is already merged or closed — in those cases a normal `boss task create` (a fresh chore) is correct, and `create-revision` will refuse with a gate error pointing you there.
 
+    That refusal applies at creation time: if an operator-filed revision already exists when its parent PR merges, the engine preserves unfinished work as a standalone chore for a follow-up PR against `main`, archiving the original revision. Active revisions restart automatically as chores; queued revisions become non-autostart chores in the backlog. The work is not stranded or pushed to the merged branch; revisions already in review are marked done because their commits merged with the parent.
+
     **Revisions auto-start, and the engine sequences them per PR.** Do not pass `--no-autostart` on `boss task create-revision` to avoid concurrent writers on one branch — the engine already holds a new revision as `blocked` while another writer is live on the same PR and dispatches it when that writer finishes. A revision showing `blocked` is waiting its turn, not parked. Reserve `--no-autostart` for the rare case where the operator explicitly wants a revision filed but not run.
 
     ## Parity and port tasks
