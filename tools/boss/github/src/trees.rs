@@ -235,7 +235,7 @@ fn directory_tree_ref(commit_sha: &str, directory: &str) -> String {
     if directory.is_empty() {
         commit_sha.to_owned()
     } else {
-        format!("{commit_sha}:{}", encode_tree_path(directory))
+        format!("{commit_sha}:{}", encode_repo_path(directory))
     }
 }
 
@@ -249,6 +249,11 @@ fn directory_tree_ref(commit_sha: &str, directory: &str) -> String {
 /// escapes `/` and is the right choice for opaque single segments — do
 /// not add a third encoder.
 pub fn encode_tree_path(path: &str) -> String {
+    encode_repo_path(path)
+}
+
+/// Encode a repository path for GitHub URLs, preserving directory separators.
+pub fn encode_repo_path(path: &str) -> String {
     path.bytes()
         .map(|byte| match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => (byte as char).to_string(),

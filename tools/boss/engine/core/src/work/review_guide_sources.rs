@@ -136,9 +136,12 @@ pub(crate) fn migrate_pr_review_guide_source_capture_tables(conn: &Connection) -
         }
     }
     if table_has_column(conn, "pr_review_guide_source_comparisons", "packet_json")? {
-        conn.execute(
-            "ALTER TABLE pr_review_guide_source_comparisons DROP COLUMN packet_json",
-            [],
+        conn.execute_batch(
+            "UPDATE pr_review_guide_source_series SET selected_comparison_id = NULL
+             WHERE selected_comparison_id IN
+               (SELECT id FROM pr_review_guide_source_comparisons WHERE packet_path IS NULL);
+             DELETE FROM pr_review_guide_source_comparisons WHERE packet_path IS NULL;
+             ALTER TABLE pr_review_guide_source_comparisons DROP COLUMN packet_json;",
         )?;
     }
     Ok(())
@@ -212,6 +215,19 @@ impl WorkDb {
         publish: impl FnOnce(&Path, &str, &[u8]) -> Result<String>,
     ) -> Result<PrSourceCapturePersistOutcome> {
         let mut publish = Some(publish);
+        let conn = self.connect()?;
+        let latest: Option<i64> = conn
+            .query_row(
+                "SELECT latest_observation_sequence FROM pr_review_guide_source_series
+             WHERE canonical_pr_url = ?1 AND root_task_id = ?2",
+                params![packet.canonical_pr_url, root_task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if latest.is_some_and(|latest| observation_sequence < latest) {
+            return Ok(PrSourceCapturePersistOutcome::IgnoredStaleObservation);
+        }
+        drop(conn);
         let packet_bytes = serde_json::to_vec(packet).context("serialize captured PR source packet")?;
         let packet_hash = packet.content_hash()?;
         let complete = packet.is_complete();
@@ -463,7 +479,7 @@ impl WorkDb {
                     c.complete, c.captured_at, c.id, c.packet_path, c.omission_count, c.omission_summary_json, c.attempt_count
              FROM pr_review_guide_source_series s
              JOIN pr_review_guide_source_comparisons c ON c.id = s.selected_comparison_id
-             WHERE s.root_task_id = ?1 ORDER BY s.updated_at DESC, s.id DESC LIMIT 1",
+             WHERE s.root_task_id = ?1 ORDER BY s.latest_observation_sequence DESC, s.id DESC LIMIT 1",
             [root_task_id],
             |row| map_capture(row, &artifact_root),
         )
@@ -506,9 +522,9 @@ impl WorkDb {
     ) -> Result<bool> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing: Option<(String, String, String, i64)> = tx
+        let existing: Option<(String, String, String, i64, String, Option<String>)> = tx
             .query_row(
-                "SELECT s.id, c.id, s.root_task_id, s.latest_observation_sequence
+                "SELECT s.id, c.id, s.root_task_id, s.latest_observation_sequence, c.packet_hash, c.packet_path
              FROM pr_review_guide_source_series s
              JOIN pr_review_guide_source_comparisons c ON c.series_id = s.id
              WHERE s.canonical_pr_url = ?1 AND c.head_sha = ?3
@@ -516,16 +532,50 @@ impl WorkDb {
              AND (c.complete = 1 OR c.attempt_count >= ?5)
              ORDER BY c.observation_sequence DESC LIMIT 1",
                 params![pr_url, base_sha, head_sha, probe, MAX_CAPTURE_ATTEMPTS],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((series, comparison, root, latest)) = existing else {
+        let Some((series, comparison, root, latest, hash, path)) = existing else {
             return Ok(false);
         };
         anyhow::ensure!(
             root == root_task_id,
             "canonical PR is already associated with another root task"
         );
+        if let Err(error) = load_packet(&self.artifact_root()?, path.as_deref(), &hash) {
+            if let Some(path) = &path {
+                match fs::remove_file(self.artifact_root()?.join(path)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            // Forget the unusable comparison so the next collection can replace it.
+            tx.execute(
+                "DELETE FROM pr_review_guide_source_comparisons WHERE id = ?1",
+                [&comparison],
+            )?;
+            tx.execute(
+                "UPDATE pr_review_guide_source_series
+                 SET selected_comparison_id = CASE WHEN selected_comparison_id = ?2 THEN NULL ELSE selected_comparison_id END,
+                     last_capture_error = CASE WHEN selected_comparison_id = ?2 OR latest_observation_sequence <= ?4
+                         THEN ?3 ELSE last_capture_error END
+                 WHERE id = ?1",
+                params![series, comparison, error.to_string(), sequence],
+            )?;
+            tx.commit()?;
+            tracing::warn!(%error, pr_url, "invalid source artifact; recollecting comparison");
+            return Ok(false);
+        }
         if sequence >= latest {
             select_comparison(&tx, &series, &comparison, sequence, &now_string())?;
         }
@@ -795,4 +845,7 @@ fn unreferenced_packet_blob_paths(artifact_root: &Path, live: &std::collections:
 
 #[cfg(test)]
 #[path = "review_guide_sources_tests.rs"]
+mod upstream_tests;
+
+#[cfg(test)]
 mod tests;

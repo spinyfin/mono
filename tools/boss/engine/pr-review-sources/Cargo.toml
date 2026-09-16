@@ -5,9 +5,10 @@ edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
-futures-util = "0.3"
+tokio = { workspace = true, features = ["rt", "macros"] }
 anyhow = { workspace = true }
 bon = { workspace = true }
+boss-gh-telemetry = { path = "../../gh_telemetry" }
 boss-github = { path = "../../github" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
