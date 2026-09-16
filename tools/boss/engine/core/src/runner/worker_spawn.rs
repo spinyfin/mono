@@ -23,7 +23,10 @@ use super::prompt::{
     ExecutionPromptParams, compose_answer_agent_prompt, compose_execution_prompt, designated_output_kind,
     render_merge_order_preservation_lines,
 };
-use super::work_item::{work_item_created_via, work_item_name, work_item_pr_url, work_item_task_kind_enum};
+use super::work_item::{
+    followup_pr_backlink_for_work_item, work_item_created_via, work_item_name, work_item_pr_url,
+    work_item_task_kind_enum,
+};
 
 /// Composed worker prompt + resolved effort/model config, the output of
 /// [`compose_worker_spawn`].
@@ -479,6 +482,31 @@ pub(crate) async fn compose_worker_spawn(
     // of seam flags here would compile silently and mis-gate a prompt.
     editorial_opts: WorkerSpawnOpts,
 ) -> anyhow::Result<ComposedWorkerSpawn> {
+    // Validate provenance before dispatch and give it directly to the worker.
+    // Both local and remote spawns use this prompt; cube stays a plain launcher.
+    //
+    // The provenance check inside `followup_pr_backlink_for_work_item` must
+    // run unconditionally for every execution kind: it is where the hard-fail
+    // lives for a `TaskKind::Followup` work item with a missing origin PR
+    // number, a non-positive number, or a remote URL that doesn't parse as a
+    // github.com slug (see `work_item.rs`'s doc comment — the contract keys
+    // on durable origin provenance, not on execution kind). Only whether the
+    // resulting backlink text is appended to the prompt is gated on worker
+    // kind: a Standard-kind worker (this includes CiRemediation, which maps
+    // to `WorkerKind::Standard` and can push branches/open PRs like any
+    // other implementing worker) is the one that actually runs `cube pr
+    // create`/`pr update --body-file`, while PrReview, AnswerAgent, and
+    // AutomationTriage executions never write a PR body, so appending the
+    // backlink there would contradict that worker's read-only/decision-only
+    // mandate. This mirrors the `prompt_addendum_to_prepend` kind-gate
+    // above.
+    let origin_pr_backlink = followup_pr_backlink_for_work_item(work_item, &execution.repo_remote_url)?;
+    let origin_pr_backlink = match crate::worker_setup::worker_kind_for_execution(&execution.kind) {
+        crate::worker_setup::WorkerKind::Standard => origin_pr_backlink,
+        crate::worker_setup::WorkerKind::Reviewer
+        | crate::worker_setup::WorkerKind::Triage
+        | crate::worker_setup::WorkerKind::AnswerAgent => None,
+    };
     let WorkerSpawnOpts {
         editorial_enabled,
         max_embed_diff_lines,
@@ -966,6 +994,15 @@ pub(crate) async fn compose_worker_spawn(
                 .build(),
         )
     };
+    let prompt_text = match origin_pr_backlink {
+        Some(backlink) => format!(
+            "{prompt_text}\n\n## Origin PR backlink\n\n\
+             When writing this run's PR body, include the following backlink to the origin PR. \
+             Compose it together with your summary and validation in the body file you pass to cube:\n\n\
+             ```markdown\n{backlink}\n```\n"
+        ),
+        None => prompt_text,
+    };
     let work_item_kind = work_item_task_kind_enum(work_item);
     let registry = crate::driver::DriverRegistry::default();
     let batch_member = if execution.kind == ExecutionKind::PrReview {
@@ -1424,6 +1461,163 @@ mod compose_worker_spawn_tests {
 
     fn open_memory_db() -> WorkDb {
         WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn derived_worker_receives_origin_backlink_and_body_composition_instruction() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let execution = chore_execution();
+        for origin in [None, Some(2685)] {
+            let WorkItem::Chore(mut task) = task_without_pr("task-chore-1") else {
+                unreachable!();
+            };
+            if origin.is_some() {
+                task.kind = TaskKind::Followup;
+                task.created_via = "pr_review:exec_source".into();
+                task.origin_pr_number = origin;
+            }
+            let composed = compose_worker_spawn(
+                &db,
+                "worker-1",
+                &execution,
+                &WorkItem::Chore(task),
+                workspace.path(),
+                None,
+                WorkerSpawnOpts::default(),
+            )
+            .await
+            .unwrap();
+            let prompt = composed.prompt_text;
+            assert_eq!(prompt.contains("## Origin PR backlink"), origin.is_some(), "{prompt}");
+            if origin.is_some() {
+                assert!(
+                    prompt.contains("When writing this run's PR body, include the following backlink"),
+                    "{prompt}"
+                );
+                assert!(prompt.contains("body file you pass to cube"), "{prompt}");
+                assert!(prompt.contains("This `review findings` follow-up derives from [the origin PR](https://github.com/org/repo/pull/2685)."), "{prompt}");
+            }
+        }
+    }
+
+    /// A restricted-kind execution (here `PrReview`) never writes a PR body,
+    /// so the origin-PR backlink instruction must not be appended even when
+    /// the work item's static provenance (a `Followup` task with
+    /// `origin_pr_number` set) would otherwise produce one for a Standard
+    /// worker. This guards the `worker_kind_for_execution` gate on
+    /// `origin_pr_backlink` in `compose_worker_spawn`.
+    #[tokio::test]
+    async fn restricted_kind_execution_never_receives_origin_backlink() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let mut execution = pr_review_execution();
+        execution.repo_remote_url = "git@github.com:org/repo.git".into();
+        let WorkItem::Chore(mut task) = task_with_pr("task-pr-1", "https://github.com/org/repo/pull/99") else {
+            unreachable!();
+        };
+        task.kind = TaskKind::Followup;
+        task.created_via = "pr_review:exec_source".into();
+        task.origin_pr_number = Some(2685);
+
+        let composed = compose_worker_spawn(
+            &db,
+            "review-1",
+            &execution,
+            &WorkItem::Chore(task),
+            workspace.path(),
+            None,
+            WorkerSpawnOpts::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !composed.prompt_text.contains("## Origin PR backlink"),
+            "restricted-kind execution must not receive the origin PR backlink instruction:\n{}",
+            composed.prompt_text,
+        );
+    }
+
+    #[tokio::test]
+    async fn derived_worker_still_refuses_missing_or_invalid_origin_provenance() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        for (origin, remote, expected) in [
+            (None, "git@github.com:org/repo.git", "has no origin PR number"),
+            (Some(0), "git@github.com:org/repo.git", "invalid origin PR number"),
+            (
+                Some(42),
+                "git@example.com:org/repo.git",
+                "could not resolve origin PR URL",
+            ),
+        ] {
+            let mut execution = chore_execution();
+            execution.repo_remote_url = remote.into();
+            let WorkItem::Chore(mut task) = task_without_pr("task-chore-1") else {
+                unreachable!();
+            };
+            task.kind = TaskKind::Followup;
+            task.origin_pr_number = origin;
+            let error = compose_worker_spawn(
+                &db,
+                "worker-1",
+                &execution,
+                &WorkItem::Chore(task),
+                workspace.path(),
+                None,
+                WorkerSpawnOpts::default(),
+            )
+            .await
+            .err()
+            .expect("invalid provenance must refuse dispatch");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    /// The provenance hard-fail in `followup_pr_backlink_for_work_item` must
+    /// run for every execution kind, not just `WorkerKind::Standard`: a
+    /// `Followup` work item with missing or invalid origin provenance is a
+    /// dispatch error regardless of which kind of worker it is dispatched
+    /// as. This guards against re-introducing the regression where gating
+    /// the whole `followup_pr_backlink_for_work_item` call on worker kind
+    /// (rather than gating only whether its result is appended to the
+    /// prompt) let a restricted-kind execution (`PrReview` here) dispatch
+    /// successfully against a `Followup` work item with no origin PR number.
+    #[tokio::test]
+    async fn restricted_kind_execution_still_refuses_missing_or_invalid_origin_provenance() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        for (origin, remote, expected) in [
+            (None, "git@github.com:org/repo.git", "has no origin PR number"),
+            (Some(0), "git@github.com:org/repo.git", "invalid origin PR number"),
+            (
+                Some(42),
+                "git@example.com:org/repo.git",
+                "could not resolve origin PR URL",
+            ),
+        ] {
+            let mut execution = pr_review_execution();
+            execution.repo_remote_url = remote.into();
+            let WorkItem::Chore(mut task) = task_with_pr("task-pr-1", "https://github.com/org/repo/pull/99") else {
+                unreachable!();
+            };
+            task.kind = TaskKind::Followup;
+            task.origin_pr_number = origin;
+            let error = compose_worker_spawn(
+                &db,
+                "review-1",
+                &execution,
+                &WorkItem::Chore(task),
+                workspace.path(),
+                None,
+                WorkerSpawnOpts::default(),
+            )
+            .await
+            .err()
+            .expect("invalid provenance must refuse dispatch even for a restricted-kind execution");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     /// When a `pr_review` execution's producing task has no `pr_url`, the

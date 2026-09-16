@@ -1804,8 +1804,12 @@ fn ensure_worker_bin_dir_clears_a_stale_compose_wrapper() {
     let workspace = dir.path().join("workspaces/mono-agent-008");
     std::fs::create_dir_all(&workspace).unwrap();
     let bin_dir = dir.path().join("bin").join("mono-agent-008");
-    boss_engine_worker_bin::write_cube_pr_body_compose_launcher(&bin_dir, "## Prior worker PR body header\n")
-        .expect("seed a stale compose wrapper");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::write(
+        bin_dir.join("cube"),
+        "#!/bin/sh\n# Prior worker PR body header\nexec cube \"$@\"\n",
+    )
+    .expect("seed a stale compose wrapper");
     let stale = std::fs::read_to_string(bin_dir.join("cube")).unwrap();
     assert!(
         stale.contains("Prior worker PR body header"),

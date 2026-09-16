@@ -231,8 +231,15 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let direct_claude_pid = std::fs::read_to_string(claude_pid)
-            .unwrap()
+        let direct_claude_pid = std::fs::read_to_string(&claude_pid)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "driver PID marker {}: {error}; wrapper stderr: {}; worker log: {}",
+                    claude_pid.display(),
+                    String::from_utf8_lossy(&output.stderr),
+                    std::fs::read_to_string(workspace.join(".boss/worker.log")).unwrap_or_default(),
+                )
+            })
             .trim()
             .parse::<i64>()
             .unwrap();
