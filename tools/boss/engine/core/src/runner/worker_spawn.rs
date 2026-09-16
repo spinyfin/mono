@@ -1024,9 +1024,8 @@ pub(crate) async fn compose_worker_spawn(
     // (non-terminal) pre_merge batch already exists for the work item, so a
     // memberless `pr_review` execution here is a genuine race (a leaf whose
     // member-row write raced this read) rather than one of the other
-    // legacy-dispatch paths. `pr_transition.rs` gates only its own dispatch
-    // on `review_batch_fanout` — `WorkDb::request_pr_review`
-    // (`bossctl review start`), the merge poller's reviewer-fallback re-fire,
+    // legacy-dispatch paths. Although automatic starts and `bossctl review
+    // start` honor `review_batch_fanout`, the merge poller's reviewer-fallback re-fire,
     // pr_review_recovery's legacy loop, and pr_transition's own
     // batch-metadata-failure fallback all still mint memberless legacy
     // `pr_review` executions with the flag on, matching

@@ -128,6 +128,7 @@ pub(crate) mod proposals;
 // (crate-internal only — nothing outside the engine sees this module).
 pub(crate) mod readoption;
 mod review;
+mod review_start;
 mod selected_product;
 mod server;
 mod sessions;
@@ -2894,7 +2895,7 @@ async fn handle_frontend_connection(
                 Box::pin(external_tracker::handle_sync_product_external_tracker(ctx, r))
             }
             r @ FrontendRequest::TailRunTranscript { .. } => Box::pin(executions::handle_tail_run_transcript(ctx, r)),
-            r @ FrontendRequest::TriggerPrReview { .. } => Box::pin(review::handle_trigger_pr_review(ctx, r)),
+            r @ FrontendRequest::TriggerPrReview { .. } => Box::pin(review_start::handle_trigger_pr_review(ctx, r)),
             r @ FrontendRequest::TrunkSetToken { .. } => Box::pin(trunk_auth::handle_trunk_set_token(ctx, r)),
             r @ FrontendRequest::TrunkStatus => Box::pin(trunk_auth::handle_trunk_status(ctx, r)),
             r @ FrontendRequest::UnlinkWorkItemExternalRef { .. } => {

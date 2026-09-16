@@ -90,20 +90,24 @@ Host sleep currently consumed 38% of measured review wall time, and 95% of gaps 
 
 ## Chosen approach
 
-### Persist one immutable review batch per target
+### Persist immutable review batches with explicit generations
 
 Introduce a review-batch model rather than encoding roles in `created_via` or inferring siblings from timestamps.
 
 A batch records:
 
-- identity: batch id, cycle-root work item, PR URL and number;
+- identity: batch id, cycle-root work item, PR URL and number, generation (starting at one);
 - phase: `pre_merge` or `post_merge`;
 - immutable target: base SHA, reviewed head SHA, and merge SHA when applicable;
 - the complete classification input and selected profile;
 - lifecycle: collecting, supervising, applying, completed, or failed;
 - timestamps and the final verdict/proposal id.
 
-Batch members record batch id, role, execution id, requested driver, resolved model, provider effort, attempt number, and terminal/report state. Pre-merge roles are `claude_reviewer`, `codex_reviewer`, `grok_reviewer`, and `supervisor`; post-merge uses `post_merge_reviewer`. The unique key `(batch_id, role, attempt)` makes retries explicit, while `(cycle_root_id, phase, target_sha)` prevents two batches for the same immutable target.
+Batch members record batch id, role, execution id, requested driver, resolved model, provider effort, attempt number, and terminal/report state. Pre-merge roles are `claude_reviewer`, `codex_reviewer`, `grok_reviewer`, and `supervisor`; post-merge uses `post_merge_reviewer`. The unique key `(batch_id, role, attempt)` makes recovery retries explicit, while `(cycle_root_id, phase, target_sha, generation)` identifies each separate batch. Existing rows migrate to generation one. Post-merge batches stay at generation one and retain their existing deduplication behavior.
+
+Immutability is a property of a batch, not of a target SHA. With `review_batch_fanout` enabled, `bossctl review start --pr <n>` creates all three heterogeneous leaf members atomically using the automatic path's classification and admission logic; the existing quorum lifecycle dispatches the supervisor after the leaves settle. An explicit request at a head whose latest batch is completed or failed creates the next generation, leaving every prior batch, member, and execution untouched. A request while that head's batch is active reuses it. Explicit re-review never grows an admitted batch or adds reviewer attempts to it.
+
+Only explicit operator starts advance generations. Automatic post-push admission reuses the latest existing batch at a head, including a completed batch, and never creates an automatic re-review generation. Explicit starts override pure-rebase, no-op, already-reviewed-head, and maximum-cycle redundancy skips, but still require the four-unit reservation. Capacity exhaustion, unavailable PR metadata, or an unavailable reviewer driver returns an error without a single-reviewer fallback. An active legacy reviewer also returns an error, keeping the two finalizers from competing. With the flag off, the operator command retains its legacy single-reviewer behavior; the feature flag is the only mode switch.
 
 Resolved model and effort belong to the member, not the task. The scheduler reads the member policy at spawn, so review configuration cannot inherit `tasks.driver`, `tasks.model_override`, `tasks.reasoning`, or `tasks.effort_level`. The batch preserves both classifier inputs and the resolved model names, making a later menu or threshold change unable to rewrite history.
 
@@ -152,7 +156,7 @@ Every leaf receives provider effort `medium`. Model capability varies with the P
 
 The batch reconciler atomically inserts one member and one `pr_review` execution per driver, then kicks the scheduler. Each execution gets its own provider process, lease, transcript, proposal attribution, retry state, and review-pool slot.
 
-The per-PR chain guard gains one narrow exception: read-only leaf members in the same batch may run concurrently with one another. They still block every writer, a reviewer from another batch for the same target cannot exist because of the batch unique key, and the existing conflict-resolution preemption remains unchanged. The exception is keyed on persisted batch membership and leaf role, never merely on `kind = pr_review`.
+The per-PR chain guard gains one narrow exception: read-only leaf members in the same batch may run concurrently with one another. They still block every writer and reviewers from other batches. Explicit generations at the same target follow terminal batches, while the existing conflict-resolution preemption remains unchanged. The exception is keyed on persisted batch membership and leaf role, never merely on `kind = pr_review`.
 
 The current review-pool fixed-Claude policy becomes review-member-aware. Automation keeps its existing Claude/strong policy. Review executions without valid member metadata fail before spawn rather than falling back to Claude and accidentally collapsing diversity.
 

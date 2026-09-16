@@ -234,6 +234,7 @@ fn parse_classification(row: &Row<'_>, index: usize) -> rusqlite::Result<ReviewC
 fn map_review_batch(row: &Row<'_>) -> rusqlite::Result<ReviewBatch> {
     Ok(ReviewBatch {
         id: row.get(0)?,
+        generation: row.get(14)?,
         cycle_root_id: row.get(1)?,
         base_sha: row.get(2)?,
         classification: parse_classification(row, 3)?,
@@ -426,6 +427,7 @@ fn create_review_batch_in_tx(
     tx: &rusqlite::Transaction<'_>,
     input: ReviewBatchCreateInput,
     member_inputs: &[ReviewBatchMemberCreateInput],
+    generation: i64,
 ) -> Result<(ReviewBatch, Vec<ReviewBatchMember>)> {
     validate_batch_input(&input, member_inputs)?;
     let classification_json = serde_json::to_string(&input.classification)?;
@@ -435,8 +437,8 @@ fn create_review_batch_in_tx(
         "INSERT INTO pr_review_batches (
             id, cycle_root_id, base_sha, classification_json, created_at,
             phase, pr_number, pr_url, status, target_sha, updated_at,
-            completed_at, final_verdict_proposal_id, merge_sha
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'collecting', ?9, ?5, NULL, NULL, ?10)",
+            completed_at, final_verdict_proposal_id, merge_sha, generation
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'collecting', ?9, ?5, NULL, NULL, ?10, ?11)",
         params![
             batch_id,
             input.cycle_root_id,
@@ -448,6 +450,7 @@ fn create_review_batch_in_tx(
             input.pr_url,
             input.target_sha,
             input.merge_sha,
+            generation,
         ],
     )?;
 
@@ -459,6 +462,7 @@ fn create_review_batch_in_tx(
     Ok((
         ReviewBatch::builder()
             .id(batch_id)
+            .generation(generation)
             .cycle_root_id(input.cycle_root_id)
             .base_sha(input.base_sha)
             .classification(input.classification)
@@ -520,10 +524,10 @@ fn insert_batch_member_in_tx(
         .build())
 }
 
-/// Look up the only batch allowed for an immutable target, against any
+/// Look up the latest generation for an immutable target, against any
 /// open connection or transaction. Shared by the public
 /// [`WorkDb::review_batch_for_target`] and the in-transaction lookup in
-/// [`WorkDb::create_pre_merge_review_batch`] so the fourteen-column SELECT
+/// [`WorkDb::create_pre_merge_review_batch`] so the SELECT
 /// and `map_review_batch` stay in one place.
 fn review_batch_for_target_in(
     conn: &rusqlite::Connection,
@@ -534,8 +538,9 @@ fn review_batch_for_target_in(
     conn.query_row(
         "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
                 phase, pr_number, pr_url, status, target_sha, updated_at,
-                completed_at, final_verdict_proposal_id, merge_sha
-         FROM pr_review_batches WHERE cycle_root_id = ?1 AND phase = ?2 AND target_sha = ?3",
+                completed_at, final_verdict_proposal_id, merge_sha, generation
+         FROM pr_review_batches WHERE cycle_root_id = ?1 AND phase = ?2 AND target_sha = ?3
+         ORDER BY generation DESC LIMIT 1",
         params![cycle_root_id, phase.as_str(), target_sha],
         map_review_batch,
     )
@@ -568,7 +573,7 @@ fn review_batch_by_id_in(conn: &rusqlite::Connection, batch_id: &str) -> Result<
     conn.query_row(
         "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
                 phase, pr_number, pr_url, status, target_sha, updated_at,
-                completed_at, final_verdict_proposal_id, merge_sha
+                completed_at, final_verdict_proposal_id, merge_sha, generation
          FROM pr_review_batches WHERE id = ?1",
         params![batch_id],
         map_review_batch,
@@ -1036,7 +1041,7 @@ impl WorkDb {
     ) -> Result<(ReviewBatch, Vec<ReviewBatchMember>)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let created = create_review_batch_in_tx(&tx, input, member_inputs)?;
+        let created = create_review_batch_in_tx(&tx, input, member_inputs, 1)?;
         tx.commit()?;
         Ok(created)
     }
@@ -1103,15 +1108,58 @@ impl WorkDb {
         repo_remote_url: &str,
         review_pool_size: usize,
     ) -> Result<ReviewBatchDispatch> {
+        self.dispatch_pre_merge_review_batch(input, Some(repo_remote_url), review_pool_size, false)
+    }
+
+    /// An operator request can start a new generation after a terminal batch,
+    /// irrespective of automatic redundancy gates. Capacity remains mandatory.
+    pub(crate) fn request_pre_merge_review_batch_for_pool(
+        &self,
+        input: ReviewBatchCreateInput,
+        review_pool_size: usize,
+    ) -> Result<ReviewBatchDispatch> {
+        self.dispatch_pre_merge_review_batch(input, None, review_pool_size, true)
+    }
+
+    fn dispatch_pre_merge_review_batch(
+        &self,
+        input: ReviewBatchCreateInput,
+        repo_remote_url: Option<&str>,
+        review_pool_size: usize,
+        explicit: bool,
+    ) -> Result<ReviewBatchDispatch> {
         if input.phase != ReviewBatchPhase::PreMerge {
             bail!("leaf reviewer dispatch only supports pre_merge batches");
         }
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if explicit {
+            let task = super::query_task(&tx, &input.cycle_root_id)?
+                .filter(|task| task.deleted_at.is_none())
+                .ok_or_else(|| anyhow::anyhow!("unknown task: {}", input.cycle_root_id))?;
+            if task.status.is_terminal() {
+                bail!("cannot review {}: task is `{}`", task.id, task.status);
+            }
+            if task.pr_url.as_deref() != Some(input.pr_url.as_str()) {
+                bail!("cannot review {}: task PR changed while fetching metadata", task.id);
+            }
+        }
+        let mut generation = 1;
         if let Some(batch) = review_batch_for_target_in(&tx, &input.cycle_root_id, input.phase, &input.target_sha)? {
-            let executions = batch_executions_in_tx(&tx, &batch.id)?;
-            tx.commit()?;
-            return Ok(ReviewBatchDispatch::ExistingBatch { batch, executions });
+            if !explicit || !matches!(batch.status, ReviewBatchStatus::Completed | ReviewBatchStatus::Failed) {
+                let executions = batch_executions_in_tx(&tx, &batch.id)?;
+                tx.commit()?;
+                return Ok(ReviewBatchDispatch::ExistingBatch { batch, executions });
+            }
+            generation = batch.generation + 1;
+        }
+        if explicit && let Some(live) = super::query_live_execution_for_work_item(&tx, &input.cycle_root_id)? {
+            bail!(
+                "cannot review {}: execution {} ({}) is already live",
+                input.cycle_root_id,
+                live.id,
+                live.kind
+            );
         }
         if let Some(execution) = existing_nonterminal_pr_review_execution(&tx, &input.cycle_root_id)? {
             // `existing_nonterminal_pr_review_execution` cannot itself tell a
@@ -1129,6 +1177,12 @@ impl WorkDb {
                 )
                 .optional()?;
             if is_batch_leaf.is_none() {
+                if explicit {
+                    bail!(
+                        "cannot start review batch: legacy reviewer {} is still active",
+                        execution.id
+                    );
+                }
                 tx.commit()?;
                 return Ok(ReviewBatchDispatch::LegacyExecution(execution));
             }
@@ -1142,16 +1196,20 @@ impl WorkDb {
         // as AlreadyReviewed ("this head is settled") while quorum is still
         // outstanding. Checked inside this transaction so it sees the same
         // snapshot the ExistingBatch/LegacyExecution reads above did.
-        let already_reviewed = WorkDb::already_reviewed_at_head_in_tx(&tx, &input.cycle_root_id, &input.target_sha)?
-            || match &input.legacy_task_id {
-                Some(task_id) => WorkDb::already_reviewed_at_head_in_tx(&tx, task_id, &input.target_sha)?,
-                None => false,
-            };
+        let already_reviewed = !explicit
+            && (WorkDb::already_reviewed_at_head_in_tx(&tx, &input.cycle_root_id, &input.target_sha)?
+                || match &input.legacy_task_id {
+                    Some(task_id) => WorkDb::already_reviewed_at_head_in_tx(&tx, task_id, &input.target_sha)?,
+                    None => false,
+                });
         if already_reviewed {
             tx.commit()?;
             return Ok(ReviewBatchDispatch::AlreadyReviewed);
         }
         if !can_admit_review_batch_in_tx(&tx, ReviewBatchPhase::PreMerge, reservation_capacity(review_pool_size))? {
+            if explicit {
+                bail!("cannot start review batch: review-pool reservation capacity exhausted (requires 4 units)");
+            }
             // Read-only so far — nothing to roll back. The caller must hold
             // the producing task pending review rather than treat this as a
             // legacy fallback; the deferred-admission sweep retries once an
@@ -1159,7 +1217,12 @@ impl WorkDb {
             tx.commit()?;
             return Ok(ReviewBatchDispatch::AdmissionDeferred);
         }
-        let executions = (0..3)
+        let repo_remote_url = match repo_remote_url {
+            Some(repo) => repo.to_owned(),
+            None => super::resolve_repo_for_work_item(&tx, &input.cycle_root_id)?
+                .ok_or_else(|| anyhow::anyhow!("cannot start review batch: repository is unresolved"))?,
+        };
+        let mut executions = (0..3)
             .map(|_| {
                 insert_execution(
                     &tx,
@@ -1167,7 +1230,7 @@ impl WorkDb {
                         .work_item_id(input.cycle_root_id.clone())
                         .kind(ExecutionKind::PrReview)
                         .status(ExecutionStatus::Ready)
-                        .repo_remote_url(repo_remote_url)
+                        .repo_remote_url(repo_remote_url.clone())
                         .build(),
                 )
             })
@@ -1177,7 +1240,18 @@ impl WorkDb {
             .map(|execution| execution.id.clone())
             .collect::<Vec<_>>();
         let members = leaf_member_inputs(&input.classification, &execution_ids)?;
-        let (batch, _) = create_review_batch_in_tx(&tx, input, &members)?;
+        let (batch, _) = create_review_batch_in_tx(&tx, input, &members, generation)?;
+        // Freeze one timestamp even if insertion crosses a clock tick.
+        for execution in &mut executions {
+            tx.execute(
+                "UPDATE work_executions SET created_at = ?1 WHERE id = ?2",
+                params![batch.created_at, execution.id],
+            )?;
+            execution.created_at = batch.created_at.clone();
+        }
+        if explicit {
+            super::resolve_attention_kind_in_tx(&tx, &batch.cycle_root_id, super::CHURN_GUARD_PARKED_ATTENTION_KIND)?;
+        }
         tx.commit()?;
         Ok(ReviewBatchDispatch::Created { batch, executions })
     }
@@ -1226,7 +1300,7 @@ impl WorkDb {
         )?;
         let registry = crate::driver::DriverRegistry::default();
         let member = post_merge_member_input(&registry, &input.classification, execution.id.clone())?;
-        let (batch, _) = create_review_batch_in_tx(&tx, input, std::slice::from_ref(&member))?;
+        let (batch, _) = create_review_batch_in_tx(&tx, input, std::slice::from_ref(&member), 1)?;
         tx.commit()?;
         Ok(ReviewBatchDispatch::Created {
             batch,
@@ -1240,7 +1314,7 @@ impl WorkDb {
         review_batch_by_id_in(&conn, batch_id)
     }
 
-    /// Look up the only batch allowed for an immutable target.
+    /// Look up the latest generation for an immutable target.
     pub fn review_batch_for_target(
         &self,
         cycle_root_id: &str,
@@ -1274,10 +1348,10 @@ impl WorkDb {
         let mut statement = conn.prepare(
             "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
                     phase, pr_number, pr_url, status, target_sha, updated_at,
-                    completed_at, final_verdict_proposal_id, merge_sha
+                    completed_at, final_verdict_proposal_id, merge_sha, generation
              FROM pr_review_batches
              WHERE cycle_root_id = ?1
-             ORDER BY created_at DESC, id DESC",
+             ORDER BY created_at DESC, generation DESC, id DESC",
         )?;
         Ok(statement
             .query_map(params![cycle_root_id], map_review_batch)?

@@ -31,6 +31,17 @@ pub(crate) async fn enqueue_review_batch(
 ) -> anyhow::Result<crate::work::ReviewBatchDispatch> {
     let root =
         boss_github::pr_files::fetch_pr_view_json(pr_url, "baseRefOid,headRefOid,files,additions,deletions").await?;
+    let input = review_batch_input_from_metadata(work_db, work_item_id, pr_url, root)?;
+    work_db.create_pre_merge_review_batch_for_pool(input, repo_remote_url, review_pool_size)
+}
+
+/// Shared classification and immutable target validation for automatic and explicit starts.
+pub(crate) fn review_batch_input_from_metadata(
+    work_db: &crate::work::WorkDb,
+    work_item_id: &str,
+    pr_url: &str,
+    root: serde_json::Value,
+) -> anyhow::Result<crate::work::ReviewBatchCreateInput> {
     let view: BatchReviewPrView = serde_json::from_value(root.clone())?;
     if view.base_sha.is_empty() || view.target_sha.is_empty() {
         anyhow::bail!("GitHub PR metadata omitted immutable base or head SHA");
@@ -61,7 +72,7 @@ pub(crate) async fn enqueue_review_batch(
         .target_sha(view.target_sha)
         .maybe_legacy_task_id(legacy_task_id)
         .build();
-    work_db.create_pre_merge_review_batch_for_pool(input, repo_remote_url, review_pool_size)
+    Ok(input)
 }
 
 /// Production or test strategy for creating a pre-merge review batch from
