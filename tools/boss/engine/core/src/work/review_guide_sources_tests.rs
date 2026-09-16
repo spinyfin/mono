@@ -459,11 +459,20 @@ fn valid_json_with_modified_metadata_fails_integrity_validation() {
             .to_string()
             .contains("integrity failure")
     );
-    assert!(
-        db.persist_pr_review_guide_source_capture("root", 2, PrSourceCaptureTrigger::Poller, &original)
-            .unwrap_err()
-            .to_string()
-            .contains("integrity failure")
+    let recovered = db
+        .persist_pr_review_guide_source_capture("root", 2, PrSourceCaptureTrigger::Poller, &original)
+        .unwrap();
+    let PrSourceCapturePersistOutcome::Stored(recovered) = recovered else {
+        panic!("fresh evidence must replace the corrupt artifact");
+    };
+    assert_eq!(recovered.packet, original);
+    assert_eq!(recovered.packet_hash, original.content_hash().unwrap());
+    assert_eq!(
+        db.get_latest_pr_review_guide_source_capture("root")
+            .unwrap()
+            .unwrap()
+            .packet,
+        original
     );
 }
 
