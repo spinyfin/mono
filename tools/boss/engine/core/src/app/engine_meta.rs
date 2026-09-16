@@ -347,6 +347,13 @@ pub(super) async fn handle_get_settings(ctx: Dispatch, req: FrontendRequest) {
         // registry-backed boolean — see `SettingsStore::tmux_hosting_snapshot`.
         let mut snapshots = server_state.settings.snapshot_all();
         snapshots.push(server_state.settings.tmux_hosting_snapshot());
+        let throttle = match crate::worker_throttle::snapshot(&server_state.work_db) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                send_work_error(&sink, &request_id, err.to_string());
+                return;
+            }
+        };
         let settings = snapshots
             .into_iter()
             .map(|snap| boss_protocol::SettingSnapshot {
@@ -355,6 +362,7 @@ pub(super) async fn handle_get_settings(ctx: Dispatch, req: FrontendRequest) {
                 default_enabled: snap.default_enabled,
                 enabled: snap.enabled,
             })
+            .chain(std::iter::once(throttle))
             .collect();
         send_response(&sink, &request_id, FrontendEvent::SettingsList { settings });
     }
@@ -375,7 +383,9 @@ pub(super) async fn handle_set_setting(ctx: Dispatch, req: FrontendRequest) {
         // registry boolean, so it routes through the dedicated setter
         // rather than `SettingsStore::set` (which would reject it as
         // unknown) — see `SettingsStore::set_tmux_hosting_enabled`.
-        let result = if key == crate::settings::TMUX_HOSTING_SETTING {
+        let result = if key == crate::worker_throttle::SETTING_KEY {
+            crate::worker_throttle::set(&server_state.work_db, enabled)
+        } else if key == crate::settings::TMUX_HOSTING_SETTING {
             server_state.settings.set_tmux_hosting_enabled(enabled)
         } else {
             server_state.settings.set(&key, enabled)

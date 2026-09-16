@@ -406,6 +406,15 @@ private struct WorkerSettingsPane: View {
                         Text("Workers")
                     }
                 }
+                if let setting = chatModel.engineSettings.first(where: { $0.key == "workers.background_throttle" }) {
+                    Section {
+                        WorkerThrottlePickerRow(setting: setting) { enabled in
+                            chatModel.setEngineSetting(key: setting.key, enabled: enabled)
+                        }
+                    } header: {
+                        Text("Worker Priority")
+                    }
+                }
                 if let setting = tmuxHostingSetting {
                     Section {
                         SettingToggleRow(setting: setting) { enabled in

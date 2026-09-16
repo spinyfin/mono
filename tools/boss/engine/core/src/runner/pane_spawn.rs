@@ -937,23 +937,12 @@ impl ExecutionRunner for PaneSpawnRunner {
         // repobin shim was winning.
         let worker_bin_dir = ensure_worker_bin_dir(&settings_dir, workspace_path);
         let env_prefix: String = spawn_plan.env.iter().map(render_env_directive).collect();
-        // No Darwin background-priority (`PRIO_DARWIN_BG`, `taskpolicy -b`)
-        // clause is emitted here, deliberately. Worker de-prioritisation
-        // used to lead this command; it was removed, not lost. The clause
-        // was inherited by everything the pane's login shell forked or
-        // exec'd — the driver CLI included — and starved it: a freshly
-        // spawned pane's driver process sat at 0.0% CPU at `PRI 4` for
-        // minutes, and clearing the tier on that same process with
-        // `taskpolicy -B` took it to 10.8% CPU within seconds. A starved
-        // driver never emits its start signal, so the engine reaped the
-        // pane at the driver-start deadline and re-dispatched into another
-        // throttled pane, discarding completed work each time. The policy
-        // also outlived the pane: a workspace's `bazel` server kept the
-        // background tier for the rest of its life. An operator-facing
-        // throttle setting (defaulting to unthrottled) is being added
-        // separately; do not reintroduce an unconditional clause here.
+        // All local pools, including review and automation, share this
+        // assembly for both tmux and app-hosted panes. Read state.db at each
+        // spawn so changes take effect without restarting the engine.
+        let priority_clause = worker_background_priority_clause(&self.work_db)?;
         let assembled_command = format!(
-            "{}{}{env_prefix}{}",
+            "{priority_clause}{}{}{env_prefix}{}",
             path_prepend_clause("BOSS_BIN_DIR"),
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
             spawn_plan.command,
@@ -1205,6 +1194,16 @@ impl ExecutionRunner for PaneSpawnRunner {
             spawn_config: Some(spawn_config),
         })
     }
+}
+
+/// The shell's background tier is inherited by drivers and build tools,
+/// including Bazel servers that can outlive the pane. Off emits no command.
+fn worker_background_priority_clause(db: &WorkDb) -> Result<&'static str> {
+    let enabled = crate::worker_throttle::enabled(db)?;
+    Ok(crate::worker_throttle::priority_clause(
+        enabled,
+        cfg!(target_os = "macos"),
+    ))
 }
 
 #[cfg(test)]
