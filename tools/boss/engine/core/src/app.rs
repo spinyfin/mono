@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -2552,371 +2554,374 @@ async fn handle_frontend_connection(
             .recv_instant(recv_instant)
             .decode_ms(decode_ms)
             .build();
-        // Heap-allocate the dispatch future. The match is one state machine
-        // over every `FrontendRequest` arm; putting it on the stack overflowed
-        // Linux CI's sandbox thread once Ideas added more variants
-        // (`control_verbs_test` aborted with `has overflowed its stack`).
-        Box::pin(async move {
-            match request {
-                r @ FrontendRequest::AbandonCiRemediation { .. } => {
-                    ci_remediation::handle_abandon_ci_remediation(ctx, r).await
-                }
-                r @ FrontendRequest::AbandonConflictResolution { .. } => {
-                    conflict_resolution::handle_abandon_conflict_resolution(ctx, r).await
-                }
-                r @ FrontendRequest::AcceptDeferredScopeAttention { .. } => {
-                    attentions::handle_accept_deferred_scope_attention(ctx, r).await
-                }
-                r @ FrontendRequest::ActionAttentionGroup { .. } => {
-                    attentions::handle_action_attention_group(ctx, r).await
-                }
-                r @ FrontendRequest::AddDependency { .. } => dependencies::handle_add_dependency(ctx, r).await,
-                r @ FrontendRequest::AddHost { .. } => hosts::handle_add_host(ctx, r).await,
-                r @ FrontendRequest::AddHostTag { .. } => hosts::handle_add_host_tag(ctx, r).await,
-                r @ FrontendRequest::AnswerAttention { .. } => attentions::handle_answer_attention(ctx, r).await,
-                r @ FrontendRequest::AuditProductEffort { .. } => effort::handle_audit_product_effort(ctx, r).await,
-                r @ FrontendRequest::CancelExecution { .. } => executions::handle_cancel_execution(ctx, r).await,
-                r @ FrontendRequest::ClassifyCiRemediation { .. } => {
-                    ci_remediation::handle_classify_ci_remediation(ctx, r).await
-                }
-                r @ FrontendRequest::CommentsBannerState { .. } => comments::handle_comments_banner_state(ctx, r).await,
-                r @ FrontendRequest::CommentsCreate { .. } => comments::handle_comments_create(ctx, r).await,
-                r @ FrontendRequest::CommentsDismiss { .. } => comments::handle_comments_dismiss(ctx, r).await,
-                r @ FrontendRequest::CommentsGet { .. } => comments::handle_comments_get(ctx, r).await,
-                r @ FrontendRequest::CommentsList { .. } => comments::handle_comments_list(ctx, r).await,
-                r @ FrontendRequest::CommentsPostAnswer { .. } => comments::handle_comments_post_answer(ctx, r).await,
-                r @ FrontendRequest::CommentsPostFollowup { .. } => {
-                    comments::handle_comments_post_followup(ctx, r).await
-                }
-                r @ FrontendRequest::CommentsResolve { .. } => comments::handle_comments_resolve(ctx, r).await,
-                r @ FrontendRequest::CommentsReviseDoc { .. } => comments::handle_comments_revise_doc(ctx, r).await,
-                r @ FrontendRequest::CommentsSetIntent { .. } => comments::handle_comments_set_intent(ctx, r).await,
-                r @ FrontendRequest::CommentsSetStatus { .. } => comments::handle_comments_set_status(ctx, r).await,
-                r @ FrontendRequest::CommentsUpdateAnchor { .. } => {
-                    comments::handle_comments_update_anchor(ctx, r).await
-                }
-                r @ FrontendRequest::CreateAttention { .. } => attentions::handle_create_attention(ctx, r).await,
-                r @ FrontendRequest::CreateAttentionItem { .. } => {
-                    attentions::handle_create_attention_item(ctx, r).await
-                }
-                r @ FrontendRequest::CreateAutomation { .. } => automations::handle_create_automation(ctx, r).await,
-                r @ FrontendRequest::CreateAutomationTask { .. } => {
-                    automations::handle_create_automation_task(ctx, r).await
-                }
-                r @ FrontendRequest::CreateChore { .. } => work_items::handle_create_chore(ctx, r).await,
-                r @ FrontendRequest::CreateDecision { .. } => decisions::handle_create_decision(ctx, r).await,
-                r @ FrontendRequest::CreateExecution { .. } => executions::handle_create_execution(ctx, r).await,
-                r @ FrontendRequest::CreateIdea { .. } => ideas::handle_create_idea(ctx, r).await,
-                r @ FrontendRequest::CreateInvestigation { .. } => {
-                    work_items::handle_create_investigation(ctx, r).await
-                }
-                r @ FrontendRequest::CreateManyChores { .. } => work_items::handle_create_many_chores(ctx, r).await,
-                r @ FrontendRequest::CreateManyTasks { .. } => work_items::handle_create_many_tasks(ctx, r).await,
-                r @ FrontendRequest::CreateProduct { .. } => products::handle_create_product(ctx, r).await,
-                r @ FrontendRequest::CreateProject { .. } => projects::handle_create_project(ctx, r).await,
-                r @ FrontendRequest::CreateRevision { .. } => work_items::handle_create_revision(ctx, r).await,
-                r @ FrontendRequest::CreateRun { .. } => executions::handle_create_run(ctx, r).await,
-                r @ FrontendRequest::CreateTask { .. } => work_items::handle_create_task(ctx, r).await,
-                r @ FrontendRequest::CreateTaskFromDeferredScopeAttention { .. } => {
-                    attentions::handle_create_task_from_deferred_scope_attention(ctx, r).await
-                }
-                r @ FrontendRequest::DebugLiveStatusPipeline => {
-                    live_status::handle_debug_live_status_pipeline(ctx, r).await
-                }
-                r @ FrontendRequest::DeleteAutomation { .. } => automations::handle_delete_automation(ctx, r).await,
-                r @ FrontendRequest::DeleteIdea { .. } => ideas::handle_delete_idea(ctx, r).await,
-                r @ FrontendRequest::DeleteWorkItem { .. } => work_items::handle_delete_work_item(ctx, r).await,
-                r @ FrontendRequest::DisableAutomation { .. } => automations::handle_disable_automation(ctx, r).await,
-                r @ FrontendRequest::DismissAttention { .. } => attentions::handle_dismiss_attention(ctx, r).await,
-                r @ FrontendRequest::EnableAutomation { .. } => automations::handle_enable_automation(ctx, r).await,
-                r @ FrontendRequest::EngineResponse { .. } => sessions::handle_engine_response(ctx, r).await,
-                r @ FrontendRequest::ExecutionTranscript { .. } => {
-                    executions::handle_execution_transcript(ctx, r).await
-                }
-                r @ FrontendRequest::FindWorkItemsByPr { .. } => work_items::handle_find_work_items_by_pr(ctx, r).await,
-                r @ FrontendRequest::FocusWorkerPane { .. } => panes::handle_focus_worker_pane(ctx, r).await,
-                r @ FrontendRequest::GetAttentionGroup { .. } => attentions::handle_get_attention_group(ctx, r).await,
-                r @ FrontendRequest::GetAttentionItem { .. } => attentions::handle_get_attention_item(ctx, r).await,
-                r @ FrontendRequest::GetAutomation { .. } => automations::handle_get_automation(ctx, r).await,
-                r @ FrontendRequest::GetAutomationOpenTaskCount { .. } => {
-                    automations::handle_get_automation_open_task_count(ctx, r).await
-                }
-                r @ FrontendRequest::GetAutomationState => engine_meta::handle_get_automation_state(ctx, r).await,
-                r @ FrontendRequest::GetCiBudget { .. } => ci_remediation::handle_get_ci_budget(ctx, r).await,
-                r @ FrontendRequest::GetDriverQuotaUsage { .. } => {
-                    engine_meta::handle_get_driver_quota_usage(ctx, r).await
-                }
-                r @ FrontendRequest::GetDriverTrafficSplit => {
-                    engine_meta::handle_get_driver_traffic_split(ctx, r).await
-                }
-                r @ FrontendRequest::GetCiRemediation { .. } => ci_remediation::handle_get_ci_remediation(ctx, r).await,
-                r @ FrontendRequest::GetConflictHotspots { .. } => {
-                    conflict_resolution::handle_get_conflict_hotspots(ctx, r).await
-                }
-                r @ FrontendRequest::GetConflictResolution { .. } => {
-                    conflict_resolution::handle_get_conflict_resolution(ctx, r).await
-                }
-                r @ FrontendRequest::GetCoordinatorHandoff => {
-                    coordinator_handoff::handle_get_coordinator_handoff(ctx, r).await
-                }
-                r @ FrontendRequest::GetCostWindowReport { .. } => cost::handle_get_cost_window_report(ctx, r).await,
-                r @ FrontendRequest::GetDecision { .. } => decisions::handle_get_decision(ctx, r).await,
-                r @ FrontendRequest::GetDispatchConcurrency => {
-                    engine_meta::handle_get_dispatch_concurrency(ctx, r).await
-                }
-                r @ FrontendRequest::GetDispatchState => engine_meta::handle_get_dispatch_state(ctx, r).await,
-                r @ FrontendRequest::GetEngineHealth => engine_meta::handle_get_engine_health(ctx, r).await,
-                r @ FrontendRequest::GetEngineVersion => engine_meta::handle_get_engine_version(ctx, r).await,
-                r @ FrontendRequest::GetExecution { .. } => executions::handle_get_execution(ctx, r).await,
-                r @ FrontendRequest::GetHost { .. } => hosts::handle_get_host(ctx, r).await,
-                r @ FrontendRequest::GetIdea { .. } => ideas::handle_get_idea(ctx, r).await,
-                r @ FrontendRequest::GetPrBody { .. } => pr_status::handle_get_pr_body(ctx, r).await,
-                r @ FrontendRequest::GetProductDesignDoc { .. } => {
-                    design_docs::handle_get_product_design_doc(ctx, r).await
-                }
-                r @ FrontendRequest::GetPrStatus { .. } => pr_status::handle_get_pr_status(ctx, r).await,
-                r @ FrontendRequest::GetRun { .. } => executions::handle_get_run(ctx, r).await,
-                r @ FrontendRequest::GetSelectedProduct => selected_product::handle_get_selected_product(ctx, r).await,
-                r @ FrontendRequest::GetSettings => engine_meta::handle_get_settings(ctx, r).await,
-                r @ FrontendRequest::GetTaskRuntime { .. } => executions::handle_get_task_runtime(ctx, r).await,
-                r @ FrontendRequest::GetTopCostConsumers { .. } => cost::handle_get_top_cost_consumers(ctx, r).await,
-                r @ FrontendRequest::GetWorkerContext { .. } => context::handle_get_worker_context(ctx, r).await,
-                r @ FrontendRequest::GetWorkItem { .. } => work_items::handle_get_work_item(ctx, r).await,
-                r @ FrontendRequest::GetWorkItemByShortId { .. } => {
-                    work_items::handle_get_work_item_by_short_id(ctx, r).await
-                }
-                r @ FrontendRequest::GetWorkItemCostReport { .. } => {
-                    cost::handle_get_work_item_cost_report(ctx, r).await
-                }
-                r @ FrontendRequest::GetWorkTree { .. } => work_items::handle_get_work_tree(ctx, r).await,
-                r @ FrontendRequest::GitHubAuthCancel => github_auth::handle_git_hub_auth_cancel(ctx, r).await,
-                r @ FrontendRequest::GitHubAuthDisconnect => github_auth::handle_git_hub_auth_disconnect(ctx, r).await,
-                r @ FrontendRequest::GitHubAuthStart => github_auth::handle_git_hub_auth_start(ctx, r).await,
-                r @ FrontendRequest::GitHubAuthStatus => github_auth::handle_git_hub_auth_status(ctx, r).await,
-                r @ FrontendRequest::GraduateIdea { .. } => ideas::handle_graduate_idea(ctx, r).await,
-                r @ FrontendRequest::HoldRun { .. } => executions::handle_hold_run(ctx, r).await,
-                r @ FrontendRequest::InterruptWorkerPane { .. } => panes::handle_interrupt_worker_pane(ctx, r).await,
-                r @ FrontendRequest::KickPrReconcilers => engine_meta::handle_kick_pr_reconcilers(ctx, r).await,
-                r @ FrontendRequest::LinkWorkItemExternalRef { .. } => {
-                    external_tracker::handle_link_work_item_external_ref(ctx, r).await
-                }
-                r @ FrontendRequest::ListAnswerAgentRuns { .. } => {
-                    comments::handle_list_answer_agent_runs(ctx, r).await
-                }
-                r @ FrontendRequest::ListAttentionGroups { .. } => {
-                    attentions::handle_list_attention_groups(ctx, r).await
-                }
-                r @ FrontendRequest::ListAttentionItems { .. } => attentions::handle_list_attention_items(ctx, r).await,
-                r @ FrontendRequest::ListAttentionItemsForWorkItem { .. } => {
-                    attentions::handle_list_attention_items_for_work_item(ctx, r).await
-                }
-                r @ FrontendRequest::ListAttentionMerges { .. } => {
-                    attentions::handle_list_attention_merges(ctx, r).await
-                }
-                r @ FrontendRequest::ListAutomationDedupSuppressions { .. } => {
-                    automations::handle_list_automation_dedup_suppressions(ctx, r).await
-                }
-                r @ FrontendRequest::ListAutomationRuns { .. } => {
-                    automations::handle_list_automation_runs(ctx, r).await
-                }
-                r @ FrontendRequest::ListAutomations { .. } => automations::handle_list_automations(ctx, r).await,
-                r @ FrontendRequest::ListAutomationTasks { .. } => {
-                    automations::handle_list_automation_tasks(ctx, r).await
-                }
-                r @ FrontendRequest::ListChores { .. } => work_items::handle_list_chores(ctx, r).await,
-                r @ FrontendRequest::ListCiRemediations { .. } => {
-                    ci_remediation::handle_list_ci_remediations(ctx, r).await
-                }
-                r @ FrontendRequest::ListConflictResolutions { .. } => {
-                    conflict_resolution::handle_list_conflict_resolutions(ctx, r).await
-                }
-                r @ FrontendRequest::ListDecisions { .. } => decisions::handle_list_decisions(ctx, r).await,
-                r @ FrontendRequest::ListDeferredScopeAttentions { .. } => {
-                    attentions::handle_list_deferred_scope_attentions(ctx, r).await
-                }
-                r @ FrontendRequest::ListDependencies { .. } => dependencies::handle_list_dependencies(ctx, r).await,
-                r @ FrontendRequest::ListDependenciesDetailed { .. } => {
-                    dependencies::handle_list_dependencies_detailed(ctx, r).await
-                }
-                r @ FrontendRequest::ListEditorialActions { .. } => {
-                    automations::handle_list_editorial_actions(ctx, r).await
-                }
-                r @ FrontendRequest::ListEngineAttempts { .. } => executions::handle_list_engine_attempts(ctx, r).await,
-                r @ FrontendRequest::ListExecutions { .. } => executions::handle_list_executions(ctx, r).await,
-                r @ FrontendRequest::ListFeatureFlags => engine_meta::handle_list_feature_flags(ctx, r).await,
-                r @ FrontendRequest::ListHosts => hosts::handle_list_hosts(ctx, r).await,
-                r @ FrontendRequest::ListHostedPaneStatuses => panes::handle_list_hosted_pane_statuses(ctx, r).await,
-                r @ FrontendRequest::ListIdeas { .. } => ideas::handle_list_ideas(ctx, r).await,
-                r @ FrontendRequest::ListLiveStatusDisabledSlots => {
-                    live_status::handle_list_live_status_disabled_slots(ctx, r).await
-                }
-                r @ FrontendRequest::ListPlannerRuns { .. } => planner_ops::handle_list_planner_runs(ctx, r).await,
-                r @ FrontendRequest::ListProductDesignDocs { .. } => {
-                    design_docs::handle_list_product_design_docs(ctx, r).await
-                }
-                r @ FrontendRequest::ListProducts => products::handle_list_products(ctx, r).await,
-                r @ FrontendRequest::ListProjects { .. } => projects::handle_list_projects(ctx, r).await,
-                r @ FrontendRequest::ListAttachments { .. } => attachments::handle_list_attachments(ctx, r).await,
-                r @ FrontendRequest::ListAttachmentsForWorkItem { .. } => {
-                    attachments::handle_list_attachments_for_work_item(ctx, r).await
-                }
-                r @ FrontendRequest::ListProposals { .. } => proposals::handle_list_proposals(ctx, r).await,
-                r @ FrontendRequest::ListRuns { .. } => executions::handle_list_runs(ctx, r).await,
-                r @ FrontendRequest::ListTasks { .. } => work_items::handle_list_tasks(ctx, r).await,
-                r @ FrontendRequest::ListRevisions { .. } => work_items::handle_list_revisions(ctx, r).await,
-                r @ FrontendRequest::ListWorkerLiveStates => panes::handle_list_worker_live_states(ctx, r).await,
-                r @ FrontendRequest::ListTmuxWorkerStatuses => panes::handle_list_tmux_worker_statuses(ctx, r).await,
-                r @ FrontendRequest::MarkCiRemediationFailed { .. } => {
-                    ci_remediation::handle_mark_ci_remediation_failed(ctx, r).await
-                }
-                r @ FrontendRequest::MarkCiRemediationNoop { .. } => {
-                    ci_remediation::handle_mark_ci_remediation_noop(ctx, r).await
-                }
-                r @ FrontendRequest::MarkCiRemediationRetriggered { .. } => {
-                    ci_remediation::handle_mark_ci_remediation_retriggered(ctx, r).await
-                }
-                r @ FrontendRequest::MarkCiRemediationSucceededViaRebase { .. } => {
-                    ci_remediation::handle_mark_ci_remediation_succeeded_via_rebase(ctx, r).await
-                }
-                r @ FrontendRequest::MarkConflictResolutionFailed { .. } => {
-                    conflict_resolution::handle_mark_conflict_resolution_failed(ctx, r).await
-                }
-                r @ FrontendRequest::MergeWhenReady { .. } => review::handle_merge_when_ready(ctx, r).await,
-                r @ FrontendRequest::MetricsListLive => metrics::handle_metrics_list_live(ctx, r).await,
-                r @ FrontendRequest::MetricsReset { .. } => metrics::handle_metrics_reset(ctx, r).await,
-                r @ FrontendRequest::MetricsShowLive { .. } => metrics::handle_metrics_show_live(ctx, r).await,
-                r @ FrontendRequest::OpenDocument { .. } => panes::handle_open_document(ctx, r).await,
-                r @ FrontendRequest::OpenLiveWorkspaceTerminal { .. } => {
-                    review::handle_open_live_workspace_terminal(ctx, r).await
-                }
-                r @ FrontendRequest::OpenReviewTerminal { .. } => review::handle_open_review_terminal(ctx, r).await,
-                r @ FrontendRequest::PlanProject { .. } => planner_ops::handle_plan_project(ctx, r).await,
-                r @ FrontendRequest::ProbeRun { .. } => executions::handle_probe_run(ctx, r).await,
-                r @ FrontendRequest::ProbeStatus { .. } => executions::handle_probe_status(ctx, r).await,
-                r @ FrontendRequest::ReapRun { .. } => executions::handle_reap_run(ctx, r).await,
-                r @ FrontendRequest::RecordEffortEscalation { .. } => {
-                    effort::handle_record_effort_escalation(ctx, r).await
-                }
-                r @ FrontendRequest::RecordProducerSideConflict { .. } => {
-                    conflict_resolution::handle_record_producer_side_conflict(ctx, r).await
-                }
-                r @ FrontendRequest::RecreateCoordinator { .. } => sessions::handle_recreate_coordinator(ctx, r).await,
-                r @ FrontendRequest::RegisterAppSession => sessions::handle_register_app_session(ctx, r).await,
-                r @ FrontendRequest::RegisterCapabilities { .. } => {
-                    engine_meta::handle_register_capabilities(ctx, r).await
-                }
-                r @ FrontendRequest::ReleaseHoldRun { .. } => executions::handle_release_hold_run(ctx, r).await,
-                r @ FrontendRequest::ReleaseProject { .. } => planner_ops::handle_release_project(ctx, r).await,
-                r @ FrontendRequest::ReleaseReviewTerminal { .. } => {
-                    review::handle_release_review_terminal(ctx, r).await
-                }
-                r @ FrontendRequest::RemoveDependency { .. } => dependencies::handle_remove_dependency(ctx, r).await,
-                r @ FrontendRequest::RemoveHost { .. } => hosts::handle_remove_host(ctx, r).await,
-                r @ FrontendRequest::RemoveHostTag { .. } => hosts::handle_remove_host_tag(ctx, r).await,
-                r @ FrontendRequest::ReorderProjectTasks { .. } => projects::handle_reorder_project_tasks(ctx, r).await,
-                r @ FrontendRequest::RequestExecution { .. } => executions::handle_request_execution(ctx, r).await,
-                r @ FrontendRequest::ResolveProjectDesignDoc { .. } => {
-                    projects::handle_resolve_project_design_doc(ctx, r).await
-                }
-                r @ FrontendRequest::RestoreWorkItem { .. } => work_items::handle_restore_work_item(ctx, r).await,
-                r @ FrontendRequest::RetirePane { .. } => panes::handle_retire_pane(ctx, r).await,
-                r @ FrontendRequest::RetryCiRemediation { .. } => {
-                    ci_remediation::handle_retry_ci_remediation(ctx, r).await
-                }
-                r @ FrontendRequest::RetryConflictResolution { .. } => {
-                    conflict_resolution::handle_retry_conflict_resolution(ctx, r).await
-                }
-                r @ FrontendRequest::RevealWorkItem { .. } => work_items::handle_reveal_work_item(ctx, r).await,
-                r @ FrontendRequest::RevokeDecision { .. } => decisions::handle_revoke_decision(ctx, r).await,
-                r @ FrontendRequest::RunAutomation { .. } => automations::handle_run_automation(ctx, r).await,
-                r @ FrontendRequest::SendInputToWorker { .. } => panes::handle_send_input_to_worker(ctx, r).await,
-                r @ FrontendRequest::SetAutomationPaused { .. } => {
-                    engine_meta::handle_set_automation_paused(ctx, r).await
-                }
-                r @ FrontendRequest::SetCiBudget { .. } => ci_remediation::handle_set_ci_budget(ctx, r).await,
-                r @ FrontendRequest::SetDriverTrafficSplit { .. } => {
-                    engine_meta::handle_set_driver_traffic_split(ctx, r).await
-                }
-                r @ FrontendRequest::SetDispatchConcurrency { .. } => {
-                    engine_meta::handle_set_dispatch_concurrency(ctx, r).await
-                }
-                r @ FrontendRequest::SetDispatchPaused { .. } => engine_meta::handle_set_dispatch_paused(ctx, r).await,
-                r @ FrontendRequest::SetFeatureFlag { .. } => engine_meta::handle_set_feature_flag(ctx, r).await,
-                r @ FrontendRequest::SetHostEnabled { .. } => hosts::handle_set_host_enabled(ctx, r).await,
-                r @ FrontendRequest::SetLiveStatusEnabled { .. } => {
-                    live_status::handle_set_live_status_enabled(ctx, r).await
-                }
-                r @ FrontendRequest::SetProductDefaultModel { .. } => {
-                    products::handle_set_product_default_model(ctx, r).await
-                }
-                r @ FrontendRequest::SetProductDefaultDriver { .. } => {
-                    products::handle_set_product_default_driver(ctx, r).await
-                }
-                r @ FrontendRequest::SetProductMergeMechanism { .. } => {
-                    products::handle_set_product_merge_mechanism(ctx, r).await
-                }
-                r @ FrontendRequest::SetProductEditorialRules { .. } => {
-                    products::handle_set_product_editorial_rules(ctx, r).await
-                }
-                r @ FrontendRequest::EvaluateEditorialRules { .. } => {
-                    products::handle_evaluate_editorial_rules(ctx, r).await
-                }
-                r @ FrontendRequest::EvaluateDispatchAdmission { .. } => {
-                    executions::handle_evaluate_dispatch_admission(ctx, r).await
-                }
-                r @ FrontendRequest::SetProductExternalTracker { .. } => {
-                    external_tracker::handle_set_product_external_tracker(ctx, r).await
-                }
-                r @ FrontendRequest::SetCoordinatorHandoff { .. } => {
-                    coordinator_handoff::handle_set_coordinator_handoff(ctx, r).await
-                }
-                r @ FrontendRequest::SetProjectDesignDoc { .. } => {
-                    projects::handle_set_project_design_doc(ctx, r).await
-                }
-                r @ FrontendRequest::SetSetting { .. } => engine_meta::handle_set_setting(ctx, r).await,
-                r @ FrontendRequest::SetTaskDocPointer { .. } => work_items::handle_set_task_doc_pointer(ctx, r).await,
-                r @ FrontendRequest::Shutdown { .. } => sessions::handle_shutdown(ctx, r).await,
-                r @ FrontendRequest::SpawnCapabilityRestored => {
-                    sessions::handle_spawn_capability_restored(ctx, r).await
-                }
-                r @ FrontendRequest::StopRun { .. } => executions::handle_stop_run(ctx, r).await,
-                r @ FrontendRequest::SubmitAttachment { .. } => attachments::handle_submit_attachment(ctx, r).await,
-                r @ FrontendRequest::SubmitProposal { .. } => proposals::handle_submit_proposal(ctx, r).await,
-                r @ FrontendRequest::Subscribe { .. } => subscriptions::handle_subscribe(ctx, r).await,
-                r @ FrontendRequest::SupersedeDecision { .. } => decisions::handle_supersede_decision(ctx, r).await,
-                r @ FrontendRequest::SyncProductExternalTracker { .. } => {
-                    external_tracker::handle_sync_product_external_tracker(ctx, r).await
-                }
-                r @ FrontendRequest::TailRunTranscript { .. } => executions::handle_tail_run_transcript(ctx, r).await,
-                r @ FrontendRequest::TriggerPrReview { .. } => review::handle_trigger_pr_review(ctx, r).await,
-                r @ FrontendRequest::TrunkSetToken { .. } => trunk_auth::handle_trunk_set_token(ctx, r).await,
-                r @ FrontendRequest::TrunkStatus => trunk_auth::handle_trunk_status(ctx, r).await,
-                r @ FrontendRequest::UnlinkWorkItemExternalRef { .. } => {
-                    external_tracker::handle_unlink_work_item_external_ref(ctx, r).await
-                }
-                r @ FrontendRequest::UnpopulateProject { .. } => planner_ops::handle_unpopulate_project(ctx, r).await,
-                r @ FrontendRequest::Unsubscribe { .. } => subscriptions::handle_unsubscribe(ctx, r).await,
-                r @ FrontendRequest::UpdateAutomation { .. } => automations::handle_update_automation(ctx, r).await,
-                r @ FrontendRequest::UpdateIdea { .. } => ideas::handle_update_idea(ctx, r).await,
-                r @ FrontendRequest::MoveWorkItemOnBoard { .. } => {
-                    work_items::handle_move_work_item_on_board(ctx, r).await
-                }
-                r @ FrontendRequest::UpdateWorkItem { .. } => work_items::handle_update_work_item(ctx, r).await,
-                r @ FrontendRequest::ReportSelectedProduct { .. } => {
-                    selected_product::handle_report_selected_product(ctx, r).await
-                }
-                r @ FrontendRequest::ReportWorkerSpawnFailed { .. } => {
-                    sessions::handle_report_worker_spawn_failed(ctx, r).await
-                }
-                r @ FrontendRequest::UpdateWorkerShellPid { .. } => {
-                    sessions::handle_update_worker_shell_pid(ctx, r).await
-                }
-                r @ FrontendRequest::WorkerPaneDied { .. } => sessions::handle_worker_pane_died(ctx, r).await,
-                r @ FrontendRequest::WorkerPoolSummary => engine_meta::handle_worker_pool_summary(ctx, r).await,
-                r @ FrontendRequest::WorkspacePoolSummary => engine_meta::handle_workspace_pool_summary(ctx, r).await,
+        // Box each arm's future individually so the outer match holds a
+        // single pointer rather than a generator sized to the sum of every
+        // arm. Boxing only the whole `match` as one `async move` block (the
+        // prior mitigation here) still materializes the summed state machine
+        // as a stack temporary before moving it to the heap; the stack
+        // requirement grows with every new `FrontendRequest` variant and
+        // previously overflowed Linux CI's sandbox thread once Ideas added
+        // more variants (`control_verbs_test` aborted with `has overflowed
+        // its stack`).
+        let dispatch_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match request {
+            r @ FrontendRequest::AbandonCiRemediation { .. } => {
+                Box::pin(ci_remediation::handle_abandon_ci_remediation(ctx, r))
             }
-        })
-        .await;
+            r @ FrontendRequest::AbandonConflictResolution { .. } => {
+                Box::pin(conflict_resolution::handle_abandon_conflict_resolution(ctx, r))
+            }
+            r @ FrontendRequest::AcceptDeferredScopeAttention { .. } => {
+                Box::pin(attentions::handle_accept_deferred_scope_attention(ctx, r))
+            }
+            r @ FrontendRequest::ActionAttentionGroup { .. } => {
+                Box::pin(attentions::handle_action_attention_group(ctx, r))
+            }
+            r @ FrontendRequest::AddDependency { .. } => Box::pin(dependencies::handle_add_dependency(ctx, r)),
+            r @ FrontendRequest::AddHost { .. } => Box::pin(hosts::handle_add_host(ctx, r)),
+            r @ FrontendRequest::AddHostTag { .. } => Box::pin(hosts::handle_add_host_tag(ctx, r)),
+            r @ FrontendRequest::AnswerAttention { .. } => Box::pin(attentions::handle_answer_attention(ctx, r)),
+            r @ FrontendRequest::AuditProductEffort { .. } => Box::pin(effort::handle_audit_product_effort(ctx, r)),
+            r @ FrontendRequest::CancelExecution { .. } => Box::pin(executions::handle_cancel_execution(ctx, r)),
+            r @ FrontendRequest::ClassifyCiRemediation { .. } => {
+                Box::pin(ci_remediation::handle_classify_ci_remediation(ctx, r))
+            }
+            r @ FrontendRequest::CommentsBannerState { .. } => Box::pin(comments::handle_comments_banner_state(ctx, r)),
+            r @ FrontendRequest::CommentsCreate { .. } => Box::pin(comments::handle_comments_create(ctx, r)),
+            r @ FrontendRequest::CommentsDismiss { .. } => Box::pin(comments::handle_comments_dismiss(ctx, r)),
+            r @ FrontendRequest::CommentsGet { .. } => Box::pin(comments::handle_comments_get(ctx, r)),
+            r @ FrontendRequest::CommentsList { .. } => Box::pin(comments::handle_comments_list(ctx, r)),
+            r @ FrontendRequest::CommentsPostAnswer { .. } => Box::pin(comments::handle_comments_post_answer(ctx, r)),
+            r @ FrontendRequest::CommentsPostFollowup { .. } => {
+                Box::pin(comments::handle_comments_post_followup(ctx, r))
+            }
+            r @ FrontendRequest::CommentsResolve { .. } => Box::pin(comments::handle_comments_resolve(ctx, r)),
+            r @ FrontendRequest::CommentsReviseDoc { .. } => Box::pin(comments::handle_comments_revise_doc(ctx, r)),
+            r @ FrontendRequest::CommentsSetIntent { .. } => Box::pin(comments::handle_comments_set_intent(ctx, r)),
+            r @ FrontendRequest::CommentsSetStatus { .. } => Box::pin(comments::handle_comments_set_status(ctx, r)),
+            r @ FrontendRequest::CommentsUpdateAnchor { .. } => {
+                Box::pin(comments::handle_comments_update_anchor(ctx, r))
+            }
+            r @ FrontendRequest::CreateAttention { .. } => Box::pin(attentions::handle_create_attention(ctx, r)),
+            r @ FrontendRequest::CreateAttentionItem { .. } => {
+                Box::pin(attentions::handle_create_attention_item(ctx, r))
+            }
+            r @ FrontendRequest::CreateAutomation { .. } => Box::pin(automations::handle_create_automation(ctx, r)),
+            r @ FrontendRequest::CreateAutomationTask { .. } => {
+                Box::pin(automations::handle_create_automation_task(ctx, r))
+            }
+            r @ FrontendRequest::CreateChore { .. } => Box::pin(work_items::handle_create_chore(ctx, r)),
+            r @ FrontendRequest::CreateDecision { .. } => Box::pin(decisions::handle_create_decision(ctx, r)),
+            r @ FrontendRequest::CreateExecution { .. } => Box::pin(executions::handle_create_execution(ctx, r)),
+            r @ FrontendRequest::CreateIdea { .. } => Box::pin(ideas::handle_create_idea(ctx, r)),
+            r @ FrontendRequest::CreateInvestigation { .. } => {
+                Box::pin(work_items::handle_create_investigation(ctx, r))
+            }
+            r @ FrontendRequest::CreateManyChores { .. } => Box::pin(work_items::handle_create_many_chores(ctx, r)),
+            r @ FrontendRequest::CreateManyTasks { .. } => Box::pin(work_items::handle_create_many_tasks(ctx, r)),
+            r @ FrontendRequest::CreateProduct { .. } => Box::pin(products::handle_create_product(ctx, r)),
+            r @ FrontendRequest::CreateProject { .. } => Box::pin(projects::handle_create_project(ctx, r)),
+            r @ FrontendRequest::CreateRevision { .. } => Box::pin(work_items::handle_create_revision(ctx, r)),
+            r @ FrontendRequest::CreateRun { .. } => Box::pin(executions::handle_create_run(ctx, r)),
+            r @ FrontendRequest::CreateTask { .. } => Box::pin(work_items::handle_create_task(ctx, r)),
+            r @ FrontendRequest::CreateTaskFromDeferredScopeAttention { .. } => {
+                Box::pin(attentions::handle_create_task_from_deferred_scope_attention(ctx, r))
+            }
+            r @ FrontendRequest::DebugLiveStatusPipeline => {
+                Box::pin(live_status::handle_debug_live_status_pipeline(ctx, r))
+            }
+            r @ FrontendRequest::DeleteAutomation { .. } => Box::pin(automations::handle_delete_automation(ctx, r)),
+            r @ FrontendRequest::DeleteIdea { .. } => Box::pin(ideas::handle_delete_idea(ctx, r)),
+            r @ FrontendRequest::DeleteWorkItem { .. } => Box::pin(work_items::handle_delete_work_item(ctx, r)),
+            r @ FrontendRequest::DisableAutomation { .. } => Box::pin(automations::handle_disable_automation(ctx, r)),
+            r @ FrontendRequest::DismissAttention { .. } => Box::pin(attentions::handle_dismiss_attention(ctx, r)),
+            r @ FrontendRequest::EnableAutomation { .. } => Box::pin(automations::handle_enable_automation(ctx, r)),
+            r @ FrontendRequest::EngineResponse { .. } => Box::pin(sessions::handle_engine_response(ctx, r)),
+            r @ FrontendRequest::ExecutionTranscript { .. } => {
+                Box::pin(executions::handle_execution_transcript(ctx, r))
+            }
+            r @ FrontendRequest::FindWorkItemsByPr { .. } => Box::pin(work_items::handle_find_work_items_by_pr(ctx, r)),
+            r @ FrontendRequest::FocusWorkerPane { .. } => Box::pin(panes::handle_focus_worker_pane(ctx, r)),
+            r @ FrontendRequest::GetAttentionGroup { .. } => Box::pin(attentions::handle_get_attention_group(ctx, r)),
+            r @ FrontendRequest::GetAttentionItem { .. } => Box::pin(attentions::handle_get_attention_item(ctx, r)),
+            r @ FrontendRequest::GetAutomation { .. } => Box::pin(automations::handle_get_automation(ctx, r)),
+            r @ FrontendRequest::GetAutomationOpenTaskCount { .. } => {
+                Box::pin(automations::handle_get_automation_open_task_count(ctx, r))
+            }
+            r @ FrontendRequest::GetAutomationState => Box::pin(engine_meta::handle_get_automation_state(ctx, r)),
+            r @ FrontendRequest::GetCiBudget { .. } => Box::pin(ci_remediation::handle_get_ci_budget(ctx, r)),
+            r @ FrontendRequest::GetDriverQuotaUsage { .. } => {
+                Box::pin(engine_meta::handle_get_driver_quota_usage(ctx, r))
+            }
+            r @ FrontendRequest::GetDriverTrafficSplit => {
+                Box::pin(engine_meta::handle_get_driver_traffic_split(ctx, r))
+            }
+            r @ FrontendRequest::GetCiRemediation { .. } => Box::pin(ci_remediation::handle_get_ci_remediation(ctx, r)),
+            r @ FrontendRequest::GetConflictHotspots { .. } => {
+                Box::pin(conflict_resolution::handle_get_conflict_hotspots(ctx, r))
+            }
+            r @ FrontendRequest::GetConflictResolution { .. } => {
+                Box::pin(conflict_resolution::handle_get_conflict_resolution(ctx, r))
+            }
+            r @ FrontendRequest::GetCoordinatorHandoff => {
+                Box::pin(coordinator_handoff::handle_get_coordinator_handoff(ctx, r))
+            }
+            r @ FrontendRequest::GetCostWindowReport { .. } => Box::pin(cost::handle_get_cost_window_report(ctx, r)),
+            r @ FrontendRequest::GetDecision { .. } => Box::pin(decisions::handle_get_decision(ctx, r)),
+            r @ FrontendRequest::GetDispatchConcurrency => {
+                Box::pin(engine_meta::handle_get_dispatch_concurrency(ctx, r))
+            }
+            r @ FrontendRequest::GetDispatchState => Box::pin(engine_meta::handle_get_dispatch_state(ctx, r)),
+            r @ FrontendRequest::GetEngineHealth => Box::pin(engine_meta::handle_get_engine_health(ctx, r)),
+            r @ FrontendRequest::GetEngineVersion => Box::pin(engine_meta::handle_get_engine_version(ctx, r)),
+            r @ FrontendRequest::GetExecution { .. } => Box::pin(executions::handle_get_execution(ctx, r)),
+            r @ FrontendRequest::GetHost { .. } => Box::pin(hosts::handle_get_host(ctx, r)),
+            r @ FrontendRequest::GetIdea { .. } => Box::pin(ideas::handle_get_idea(ctx, r)),
+            r @ FrontendRequest::GetPrBody { .. } => Box::pin(pr_status::handle_get_pr_body(ctx, r)),
+            r @ FrontendRequest::GetProductDesignDoc { .. } => {
+                Box::pin(design_docs::handle_get_product_design_doc(ctx, r))
+            }
+            r @ FrontendRequest::GetPrStatus { .. } => Box::pin(pr_status::handle_get_pr_status(ctx, r)),
+            r @ FrontendRequest::GetRun { .. } => Box::pin(executions::handle_get_run(ctx, r)),
+            r @ FrontendRequest::GetSelectedProduct => Box::pin(selected_product::handle_get_selected_product(ctx, r)),
+            r @ FrontendRequest::GetSettings => Box::pin(engine_meta::handle_get_settings(ctx, r)),
+            r @ FrontendRequest::GetTaskRuntime { .. } => Box::pin(executions::handle_get_task_runtime(ctx, r)),
+            r @ FrontendRequest::GetTopCostConsumers { .. } => Box::pin(cost::handle_get_top_cost_consumers(ctx, r)),
+            r @ FrontendRequest::GetWorkerContext { .. } => Box::pin(context::handle_get_worker_context(ctx, r)),
+            r @ FrontendRequest::GetWorkItem { .. } => Box::pin(work_items::handle_get_work_item(ctx, r)),
+            r @ FrontendRequest::GetWorkItemByShortId { .. } => {
+                Box::pin(work_items::handle_get_work_item_by_short_id(ctx, r))
+            }
+            r @ FrontendRequest::GetWorkItemCostReport { .. } => {
+                Box::pin(cost::handle_get_work_item_cost_report(ctx, r))
+            }
+            r @ FrontendRequest::GetWorkTree { .. } => Box::pin(work_items::handle_get_work_tree(ctx, r)),
+            r @ FrontendRequest::GitHubAuthCancel => Box::pin(github_auth::handle_git_hub_auth_cancel(ctx, r)),
+            r @ FrontendRequest::GitHubAuthDisconnect => Box::pin(github_auth::handle_git_hub_auth_disconnect(ctx, r)),
+            r @ FrontendRequest::GitHubAuthStart => Box::pin(github_auth::handle_git_hub_auth_start(ctx, r)),
+            r @ FrontendRequest::GitHubAuthStatus => Box::pin(github_auth::handle_git_hub_auth_status(ctx, r)),
+            r @ FrontendRequest::GraduateIdea { .. } => Box::pin(ideas::handle_graduate_idea(ctx, r)),
+            r @ FrontendRequest::HoldRun { .. } => Box::pin(executions::handle_hold_run(ctx, r)),
+            r @ FrontendRequest::InterruptWorkerPane { .. } => Box::pin(panes::handle_interrupt_worker_pane(ctx, r)),
+            r @ FrontendRequest::KickPrReconcilers => Box::pin(engine_meta::handle_kick_pr_reconcilers(ctx, r)),
+            r @ FrontendRequest::LinkWorkItemExternalRef { .. } => {
+                Box::pin(external_tracker::handle_link_work_item_external_ref(ctx, r))
+            }
+            r @ FrontendRequest::ListAnswerAgentRuns { .. } => {
+                Box::pin(comments::handle_list_answer_agent_runs(ctx, r))
+            }
+            r @ FrontendRequest::ListAttentionGroups { .. } => {
+                Box::pin(attentions::handle_list_attention_groups(ctx, r))
+            }
+            r @ FrontendRequest::ListAttentionItems { .. } => Box::pin(attentions::handle_list_attention_items(ctx, r)),
+            r @ FrontendRequest::ListAttentionItemsForWorkItem { .. } => {
+                Box::pin(attentions::handle_list_attention_items_for_work_item(ctx, r))
+            }
+            r @ FrontendRequest::ListAttentionMerges { .. } => {
+                Box::pin(attentions::handle_list_attention_merges(ctx, r))
+            }
+            r @ FrontendRequest::ListAutomationDedupSuppressions { .. } => {
+                Box::pin(automations::handle_list_automation_dedup_suppressions(ctx, r))
+            }
+            r @ FrontendRequest::ListAutomationRuns { .. } => {
+                Box::pin(automations::handle_list_automation_runs(ctx, r))
+            }
+            r @ FrontendRequest::ListAutomations { .. } => Box::pin(automations::handle_list_automations(ctx, r)),
+            r @ FrontendRequest::ListAutomationTasks { .. } => {
+                Box::pin(automations::handle_list_automation_tasks(ctx, r))
+            }
+            r @ FrontendRequest::ListChores { .. } => Box::pin(work_items::handle_list_chores(ctx, r)),
+            r @ FrontendRequest::ListCiRemediations { .. } => {
+                Box::pin(ci_remediation::handle_list_ci_remediations(ctx, r))
+            }
+            r @ FrontendRequest::ListConflictResolutions { .. } => {
+                Box::pin(conflict_resolution::handle_list_conflict_resolutions(ctx, r))
+            }
+            r @ FrontendRequest::ListDecisions { .. } => Box::pin(decisions::handle_list_decisions(ctx, r)),
+            r @ FrontendRequest::ListDeferredScopeAttentions { .. } => {
+                Box::pin(attentions::handle_list_deferred_scope_attentions(ctx, r))
+            }
+            r @ FrontendRequest::ListDependencies { .. } => Box::pin(dependencies::handle_list_dependencies(ctx, r)),
+            r @ FrontendRequest::ListDependenciesDetailed { .. } => {
+                Box::pin(dependencies::handle_list_dependencies_detailed(ctx, r))
+            }
+            r @ FrontendRequest::ListEditorialActions { .. } => {
+                Box::pin(automations::handle_list_editorial_actions(ctx, r))
+            }
+            r @ FrontendRequest::ListEngineAttempts { .. } => Box::pin(executions::handle_list_engine_attempts(ctx, r)),
+            r @ FrontendRequest::ListExecutions { .. } => Box::pin(executions::handle_list_executions(ctx, r)),
+            r @ FrontendRequest::ListFeatureFlags => Box::pin(engine_meta::handle_list_feature_flags(ctx, r)),
+            r @ FrontendRequest::ListHosts => Box::pin(hosts::handle_list_hosts(ctx, r)),
+            r @ FrontendRequest::ListHostedPaneStatuses => Box::pin(panes::handle_list_hosted_pane_statuses(ctx, r)),
+            r @ FrontendRequest::ListIdeas { .. } => Box::pin(ideas::handle_list_ideas(ctx, r)),
+            r @ FrontendRequest::ListLiveStatusDisabledSlots => {
+                Box::pin(live_status::handle_list_live_status_disabled_slots(ctx, r))
+            }
+            r @ FrontendRequest::ListPlannerRuns { .. } => Box::pin(planner_ops::handle_list_planner_runs(ctx, r)),
+            r @ FrontendRequest::ListProductDesignDocs { .. } => {
+                Box::pin(design_docs::handle_list_product_design_docs(ctx, r))
+            }
+            r @ FrontendRequest::ListProducts => Box::pin(products::handle_list_products(ctx, r)),
+            r @ FrontendRequest::ListProjects { .. } => Box::pin(projects::handle_list_projects(ctx, r)),
+            r @ FrontendRequest::ListAttachments { .. } => Box::pin(attachments::handle_list_attachments(ctx, r)),
+            r @ FrontendRequest::ListAttachmentsForWorkItem { .. } => {
+                Box::pin(attachments::handle_list_attachments_for_work_item(ctx, r))
+            }
+            r @ FrontendRequest::ListProposals { .. } => Box::pin(proposals::handle_list_proposals(ctx, r)),
+            r @ FrontendRequest::ListRuns { .. } => Box::pin(executions::handle_list_runs(ctx, r)),
+            r @ FrontendRequest::ListTasks { .. } => Box::pin(work_items::handle_list_tasks(ctx, r)),
+            r @ FrontendRequest::ListRevisions { .. } => Box::pin(work_items::handle_list_revisions(ctx, r)),
+            r @ FrontendRequest::ListWorkerLiveStates => Box::pin(panes::handle_list_worker_live_states(ctx, r)),
+            r @ FrontendRequest::ListTmuxWorkerStatuses => Box::pin(panes::handle_list_tmux_worker_statuses(ctx, r)),
+            r @ FrontendRequest::MarkCiRemediationFailed { .. } => {
+                Box::pin(ci_remediation::handle_mark_ci_remediation_failed(ctx, r))
+            }
+            r @ FrontendRequest::MarkCiRemediationNoop { .. } => {
+                Box::pin(ci_remediation::handle_mark_ci_remediation_noop(ctx, r))
+            }
+            r @ FrontendRequest::MarkCiRemediationRetriggered { .. } => {
+                Box::pin(ci_remediation::handle_mark_ci_remediation_retriggered(ctx, r))
+            }
+            r @ FrontendRequest::MarkCiRemediationSucceededViaRebase { .. } => {
+                Box::pin(ci_remediation::handle_mark_ci_remediation_succeeded_via_rebase(ctx, r))
+            }
+            r @ FrontendRequest::MarkConflictResolutionFailed { .. } => {
+                Box::pin(conflict_resolution::handle_mark_conflict_resolution_failed(ctx, r))
+            }
+            r @ FrontendRequest::MergeWhenReady { .. } => Box::pin(review::handle_merge_when_ready(ctx, r)),
+            r @ FrontendRequest::MetricsListLive => Box::pin(metrics::handle_metrics_list_live(ctx, r)),
+            r @ FrontendRequest::MetricsReset { .. } => Box::pin(metrics::handle_metrics_reset(ctx, r)),
+            r @ FrontendRequest::MetricsShowLive { .. } => Box::pin(metrics::handle_metrics_show_live(ctx, r)),
+            r @ FrontendRequest::OpenDocument { .. } => Box::pin(panes::handle_open_document(ctx, r)),
+            r @ FrontendRequest::OpenLiveWorkspaceTerminal { .. } => {
+                Box::pin(review::handle_open_live_workspace_terminal(ctx, r))
+            }
+            r @ FrontendRequest::OpenReviewTerminal { .. } => Box::pin(review::handle_open_review_terminal(ctx, r)),
+            r @ FrontendRequest::PlanProject { .. } => Box::pin(planner_ops::handle_plan_project(ctx, r)),
+            r @ FrontendRequest::ProbeRun { .. } => Box::pin(executions::handle_probe_run(ctx, r)),
+            r @ FrontendRequest::ProbeStatus { .. } => Box::pin(executions::handle_probe_status(ctx, r)),
+            r @ FrontendRequest::ReapRun { .. } => Box::pin(executions::handle_reap_run(ctx, r)),
+            r @ FrontendRequest::RecordEffortEscalation { .. } => {
+                Box::pin(effort::handle_record_effort_escalation(ctx, r))
+            }
+            r @ FrontendRequest::RecordProducerSideConflict { .. } => {
+                Box::pin(conflict_resolution::handle_record_producer_side_conflict(ctx, r))
+            }
+            r @ FrontendRequest::RecreateCoordinator { .. } => Box::pin(sessions::handle_recreate_coordinator(ctx, r)),
+            r @ FrontendRequest::RegisterAppSession => Box::pin(sessions::handle_register_app_session(ctx, r)),
+            r @ FrontendRequest::RegisterCapabilities { .. } => {
+                Box::pin(engine_meta::handle_register_capabilities(ctx, r))
+            }
+            r @ FrontendRequest::ReleaseHoldRun { .. } => Box::pin(executions::handle_release_hold_run(ctx, r)),
+            r @ FrontendRequest::ReleaseProject { .. } => Box::pin(planner_ops::handle_release_project(ctx, r)),
+            r @ FrontendRequest::ReleaseReviewTerminal { .. } => {
+                Box::pin(review::handle_release_review_terminal(ctx, r))
+            }
+            r @ FrontendRequest::RemoveDependency { .. } => Box::pin(dependencies::handle_remove_dependency(ctx, r)),
+            r @ FrontendRequest::RemoveHost { .. } => Box::pin(hosts::handle_remove_host(ctx, r)),
+            r @ FrontendRequest::RemoveHostTag { .. } => Box::pin(hosts::handle_remove_host_tag(ctx, r)),
+            r @ FrontendRequest::ReorderProjectTasks { .. } => Box::pin(projects::handle_reorder_project_tasks(ctx, r)),
+            r @ FrontendRequest::RequestExecution { .. } => Box::pin(executions::handle_request_execution(ctx, r)),
+            r @ FrontendRequest::ResolveProjectDesignDoc { .. } => {
+                Box::pin(projects::handle_resolve_project_design_doc(ctx, r))
+            }
+            r @ FrontendRequest::RestoreWorkItem { .. } => Box::pin(work_items::handle_restore_work_item(ctx, r)),
+            r @ FrontendRequest::RetirePane { .. } => Box::pin(panes::handle_retire_pane(ctx, r)),
+            r @ FrontendRequest::RetryCiRemediation { .. } => {
+                Box::pin(ci_remediation::handle_retry_ci_remediation(ctx, r))
+            }
+            r @ FrontendRequest::RetryConflictResolution { .. } => {
+                Box::pin(conflict_resolution::handle_retry_conflict_resolution(ctx, r))
+            }
+            r @ FrontendRequest::RevealWorkItem { .. } => Box::pin(work_items::handle_reveal_work_item(ctx, r)),
+            r @ FrontendRequest::RevokeDecision { .. } => Box::pin(decisions::handle_revoke_decision(ctx, r)),
+            r @ FrontendRequest::RunAutomation { .. } => Box::pin(automations::handle_run_automation(ctx, r)),
+            r @ FrontendRequest::SendInputToWorker { .. } => Box::pin(panes::handle_send_input_to_worker(ctx, r)),
+            r @ FrontendRequest::SetAutomationPaused { .. } => {
+                Box::pin(engine_meta::handle_set_automation_paused(ctx, r))
+            }
+            r @ FrontendRequest::SetCiBudget { .. } => Box::pin(ci_remediation::handle_set_ci_budget(ctx, r)),
+            r @ FrontendRequest::SetDriverTrafficSplit { .. } => {
+                Box::pin(engine_meta::handle_set_driver_traffic_split(ctx, r))
+            }
+            r @ FrontendRequest::SetDispatchConcurrency { .. } => {
+                Box::pin(engine_meta::handle_set_dispatch_concurrency(ctx, r))
+            }
+            r @ FrontendRequest::SetDispatchPaused { .. } => Box::pin(engine_meta::handle_set_dispatch_paused(ctx, r)),
+            r @ FrontendRequest::SetFeatureFlag { .. } => Box::pin(engine_meta::handle_set_feature_flag(ctx, r)),
+            r @ FrontendRequest::SetHostEnabled { .. } => Box::pin(hosts::handle_set_host_enabled(ctx, r)),
+            r @ FrontendRequest::SetLiveStatusEnabled { .. } => {
+                Box::pin(live_status::handle_set_live_status_enabled(ctx, r))
+            }
+            r @ FrontendRequest::SetProductDefaultModel { .. } => {
+                Box::pin(products::handle_set_product_default_model(ctx, r))
+            }
+            r @ FrontendRequest::SetProductDefaultDriver { .. } => {
+                Box::pin(products::handle_set_product_default_driver(ctx, r))
+            }
+            r @ FrontendRequest::SetProductMergeMechanism { .. } => {
+                Box::pin(products::handle_set_product_merge_mechanism(ctx, r))
+            }
+            r @ FrontendRequest::SetProductEditorialRules { .. } => {
+                Box::pin(products::handle_set_product_editorial_rules(ctx, r))
+            }
+            r @ FrontendRequest::EvaluateEditorialRules { .. } => {
+                Box::pin(products::handle_evaluate_editorial_rules(ctx, r))
+            }
+            r @ FrontendRequest::EvaluateDispatchAdmission { .. } => {
+                Box::pin(executions::handle_evaluate_dispatch_admission(ctx, r))
+            }
+            r @ FrontendRequest::SetProductExternalTracker { .. } => {
+                Box::pin(external_tracker::handle_set_product_external_tracker(ctx, r))
+            }
+            r @ FrontendRequest::SetCoordinatorHandoff { .. } => {
+                Box::pin(coordinator_handoff::handle_set_coordinator_handoff(ctx, r))
+            }
+            r @ FrontendRequest::SetProjectDesignDoc { .. } => {
+                Box::pin(projects::handle_set_project_design_doc(ctx, r))
+            }
+            r @ FrontendRequest::SetSetting { .. } => Box::pin(engine_meta::handle_set_setting(ctx, r)),
+            r @ FrontendRequest::SetTaskDocPointer { .. } => Box::pin(work_items::handle_set_task_doc_pointer(ctx, r)),
+            r @ FrontendRequest::Shutdown { .. } => Box::pin(sessions::handle_shutdown(ctx, r)),
+            r @ FrontendRequest::SpawnCapabilityRestored => {
+                Box::pin(sessions::handle_spawn_capability_restored(ctx, r))
+            }
+            r @ FrontendRequest::StopRun { .. } => Box::pin(executions::handle_stop_run(ctx, r)),
+            r @ FrontendRequest::SubmitAttachment { .. } => Box::pin(attachments::handle_submit_attachment(ctx, r)),
+            r @ FrontendRequest::SubmitProposal { .. } => Box::pin(proposals::handle_submit_proposal(ctx, r)),
+            r @ FrontendRequest::Subscribe { .. } => Box::pin(subscriptions::handle_subscribe(ctx, r)),
+            r @ FrontendRequest::SupersedeDecision { .. } => Box::pin(decisions::handle_supersede_decision(ctx, r)),
+            r @ FrontendRequest::SyncProductExternalTracker { .. } => {
+                Box::pin(external_tracker::handle_sync_product_external_tracker(ctx, r))
+            }
+            r @ FrontendRequest::TailRunTranscript { .. } => Box::pin(executions::handle_tail_run_transcript(ctx, r)),
+            r @ FrontendRequest::TriggerPrReview { .. } => Box::pin(review::handle_trigger_pr_review(ctx, r)),
+            r @ FrontendRequest::TrunkSetToken { .. } => Box::pin(trunk_auth::handle_trunk_set_token(ctx, r)),
+            r @ FrontendRequest::TrunkStatus => Box::pin(trunk_auth::handle_trunk_status(ctx, r)),
+            r @ FrontendRequest::UnlinkWorkItemExternalRef { .. } => {
+                Box::pin(external_tracker::handle_unlink_work_item_external_ref(ctx, r))
+            }
+            r @ FrontendRequest::UnpopulateProject { .. } => Box::pin(planner_ops::handle_unpopulate_project(ctx, r)),
+            r @ FrontendRequest::Unsubscribe { .. } => Box::pin(subscriptions::handle_unsubscribe(ctx, r)),
+            r @ FrontendRequest::UpdateAutomation { .. } => Box::pin(automations::handle_update_automation(ctx, r)),
+            r @ FrontendRequest::UpdateIdea { .. } => Box::pin(ideas::handle_update_idea(ctx, r)),
+            r @ FrontendRequest::MoveWorkItemOnBoard { .. } => {
+                Box::pin(work_items::handle_move_work_item_on_board(ctx, r))
+            }
+            r @ FrontendRequest::UpdateWorkItem { .. } => Box::pin(work_items::handle_update_work_item(ctx, r)),
+            r @ FrontendRequest::ReportSelectedProduct { .. } => {
+                Box::pin(selected_product::handle_report_selected_product(ctx, r))
+            }
+            r @ FrontendRequest::ReportWorkerSpawnFailed { .. } => {
+                Box::pin(sessions::handle_report_worker_spawn_failed(ctx, r))
+            }
+            r @ FrontendRequest::UpdateWorkerShellPid { .. } => {
+                Box::pin(sessions::handle_update_worker_shell_pid(ctx, r))
+            }
+            r @ FrontendRequest::WorkerPaneDied { .. } => Box::pin(sessions::handle_worker_pane_died(ctx, r)),
+            r @ FrontendRequest::WorkerPoolSummary => Box::pin(engine_meta::handle_worker_pool_summary(ctx, r)),
+            r @ FrontendRequest::WorkspacePoolSummary => Box::pin(engine_meta::handle_workspace_pool_summary(ctx, r)),
+        };
+        dispatch_fut.await;
     }
 
     tracing::info!(session_id = %session_id, "frontend connection reader loop exited; tearing down session");
