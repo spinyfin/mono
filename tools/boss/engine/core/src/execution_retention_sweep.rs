@@ -71,6 +71,13 @@ pub async fn run_one_pass(work_db: &WorkDb) -> ExecutionRetentionSweepOutcome {
 
     let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
 
+    if let Err(err) = work_db.gc_unreferenced_pr_review_guide_source_artifacts() {
+        tracing::warn!(
+            ?err,
+            "execution-retention sweep: review-guide source artifact gc failed; continuing"
+        );
+    }
+
     match work_db.prune_terminal_executions(ExecutionRetentionPolicy::default(), now_epoch, false) {
         Ok(outcome) => ExecutionRetentionSweepOutcome {
             deleted: outcome.deleted,

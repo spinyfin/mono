@@ -1814,55 +1814,10 @@ mod t15;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::review_guide_capture::{REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, SourcePacketCollector};
+use crate::review_guide_capture::REVIEW_GUIDE_SOURCE_CAPTURE_FLAG;
 use crate::work::PrSourceCaptureTrigger;
-use boss_pr_review_sources::SourcePacket;
 
 const SOURCE_CAPTURE_PR_URL: &str = "https://github.com/spinyfin/mono/pull/25";
-
-fn source_capture_packet() -> SourcePacket {
-    SourcePacket {
-        schema_version: 2,
-        canonical_pr_url: SOURCE_CAPTURE_PR_URL.to_owned(),
-        pr_number: 25,
-        title: "Captured".to_owned(),
-        body: None,
-        base_repository: "spinyfin/mono".to_owned(),
-        head_repository: "spinyfin/mono".to_owned(),
-        observed_base_sha: "base".to_owned(),
-        merge_base_sha: "merge-base".to_owned(),
-        head_sha: "head".to_owned(),
-        files: Vec::new(),
-        omissions: Vec::new(),
-    }
-}
-
-fn counting_source_collector(calls: Arc<AtomicUsize>, packet: SourcePacket) -> SourcePacketCollector {
-    let fixture_packet = packet.clone();
-    let collect: crate::review_guide_capture::PacketCollectFn = Arc::new(move |url, _observed, _branch, _metadata| {
-        let packet = packet.clone();
-        let calls = calls.clone();
-        Box::pin(async move {
-            calls.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(url, packet.canonical_pr_url);
-            Ok(packet)
-        })
-    });
-    crate::review_guide_capture::SourcePacketCollector::fixture(collect, fixture_packet)
-}
-
-async fn wait_for_source_capture(db: &WorkDb, root: &str) {
-    let started = std::time::Instant::now();
-    loop {
-        if db.get_latest_pr_review_guide_source_capture(root).unwrap().is_some() {
-            return;
-        }
-        if started.elapsed() > std::time::Duration::from_secs(2) {
-            panic!("timed out waiting for review-guide source capture");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-}
 
 #[tokio::test]
 async fn finalize_pr_transition_captures_on_the_canonical_root() {
@@ -1878,7 +1833,10 @@ async fn finalize_pr_transition_captures_on_the_canonical_root() {
     let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
         .handler
         .with_feature_flags(flags)
-        .with_source_packet_collector(counting_source_collector(calls.clone(), source_capture_packet()));
+        .with_source_packet_collector(counting_source_collector(
+            calls.clone(),
+            source_capture_packet(SOURCE_CAPTURE_PR_URL, "base", "head"),
+        ));
 
     let outcome = handler
         .finalize_pr_transition(
