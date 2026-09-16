@@ -804,6 +804,44 @@ mod tests {
     }
 
     #[test]
+    fn comparison_lookup_keeps_its_packet_after_selection_moves() {
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        let root = create_active_chore(&db, &product, "look up bound comparison");
+        let PrSourceCapturePersistOutcome::Stored(first) = db
+            .persist_pr_review_guide_source_capture(&root, 1, PrSourceCaptureTrigger::Creation, &packet("base", "head"))
+            .unwrap()
+        else {
+            panic!("first capture must persist")
+        };
+        db.persist_pr_review_guide_source_capture(
+            &root,
+            2,
+            PrSourceCaptureTrigger::Poller,
+            &packet("base", "new-head"),
+        )
+        .unwrap();
+        let bound = db
+            .get_pr_review_guide_comparison_by_id(&first.comparison_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.comparison_id, first.comparison_id);
+        assert_eq!(bound.packet_hash, first.packet_hash);
+        assert_eq!(bound.packet.head_sha, "head");
+        assert_eq!(bound.packet_path, first.packet_path);
+        assert_eq!(bound.omission_summary, first.omission_summary);
+        assert!(db.get_pr_review_guide_comparison_by_id("missing").unwrap().is_none());
+        assert_eq!(
+            db.get_latest_pr_review_guide_source_capture(&root)
+                .unwrap()
+                .unwrap()
+                .packet
+                .head_sha,
+            "new-head"
+        );
+    }
+
+    #[test]
     fn duplicate_endpoints_reuse_the_immutable_packet() {
         let (_dir, db) = open_db();
         let product = create_product(&db);

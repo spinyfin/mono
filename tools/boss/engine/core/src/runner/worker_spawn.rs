@@ -541,7 +541,7 @@ pub(crate) async fn compose_worker_spawn(
     // kind: a Standard-kind worker (this includes CiRemediation, which maps
     // to `WorkerKind::Standard` and can push branches/open PRs like any
     // other implementing worker) is the one that actually runs `cube pr
-    // create`/`pr update --body-file`, while PrReview, AnswerAgent, and
+    // create`/`pr update --body-file`, while PrReview, PrReviewGuide, AnswerAgent, and
     // AutomationTriage executions never write a PR body, so appending the
     // backlink there would contradict that worker's read-only/decision-only
     // mandate. This mirrors the `prompt_addendum_to_prepend` kind-gate
@@ -550,6 +550,7 @@ pub(crate) async fn compose_worker_spawn(
     let origin_pr_backlink = match crate::worker_setup::worker_kind_for_execution(&execution.kind) {
         crate::worker_setup::WorkerKind::Standard => origin_pr_backlink,
         crate::worker_setup::WorkerKind::Reviewer
+        | crate::worker_setup::WorkerKind::ReviewGuide
         | crate::worker_setup::WorkerKind::Triage
         | crate::worker_setup::WorkerKind::AnswerAgent => None,
     };

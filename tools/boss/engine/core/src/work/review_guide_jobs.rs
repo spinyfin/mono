@@ -646,6 +646,7 @@ mod tests {
             base_repository: "acme/widget".to_owned(),
             head_repository: "acme/widget".to_owned(),
             observed_base_sha: base.to_owned(),
+            probe_base_sha: None,
             merge_base_sha: base.to_owned(),
             head_sha: head.to_owned(),
             files: Vec::new(),

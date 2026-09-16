@@ -394,6 +394,7 @@ mod tests {
             base_repository: "acme/widget".to_owned(),
             head_repository: "acme/widget".to_owned(),
             observed_base_sha: "a".repeat(40),
+            probe_base_sha: None,
             merge_base_sha: "b".repeat(40),
             head_sha: "c".repeat(40),
             files: vec![SourceFile {
