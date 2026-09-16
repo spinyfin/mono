@@ -500,6 +500,31 @@ fn diagnostic_read_selects_the_latest_pr_series() {
 }
 
 #[test]
+fn diagnostic_read_orders_by_observation_sequence_not_completion_order() {
+    // `first`'s series carries the higher observation sequence but is
+    // persisted (and so gets the earlier `updated_at`) before `second`'s
+    // series, which completes later with a lower sequence. A wall-clock
+    // read would wrongly prefer `second` because it finished last; the
+    // series' own `latest_observation_sequence` must decide instead.
+    let (_dir, db) = open_db();
+    let first = packet("base", "first");
+    let mut second = packet("base", "second");
+    second.canonical_pr_url = "https://github.com/acme/widget/pull/13".to_owned();
+    second.pr_number = 13;
+    db.persist_pr_review_guide_source_capture("root", 2, PrSourceCaptureTrigger::Creation, &first)
+        .unwrap();
+    db.persist_pr_review_guide_source_capture("root", 1, PrSourceCaptureTrigger::Creation, &second)
+        .unwrap();
+    assert_eq!(
+        db.get_latest_pr_review_guide_source_capture("root")
+            .unwrap()
+            .unwrap()
+            .packet,
+        first
+    );
+}
+
+#[test]
 fn concurrent_same_digest_publications_are_complete() {
     let directory = tempfile::tempdir().unwrap();
     let packet = packet("base", "head");

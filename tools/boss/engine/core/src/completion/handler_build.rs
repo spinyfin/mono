@@ -336,6 +336,9 @@ impl WorkerCompletionHandler {
     /// Queue the rollout-gated immutable source capture after a lifecycle
     /// seam has already verified and bound a PR to this execution. The
     /// reconciler resolves revision executions to the owning root series.
+    /// Returns the spawned capture task, if one was spawned, so a caller
+    /// that needs to know the outcome (tests) can await it deterministically
+    /// instead of guessing how long collection takes.
     pub(crate) fn reconcile_review_guide_source_for_execution(
         &self,
         execution_id: &str,
