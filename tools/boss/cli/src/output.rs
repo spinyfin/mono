@@ -1022,7 +1022,7 @@ pub(crate) fn print_task_details(title: &str, task: &Task, parent_product: Optio
         }
     }
     if let Some(reason) = task.dispatch_failed_reason.as_deref() {
-        println!("Dispatch failed: {reason}");
+        println!("{}", boss_engine::work::dispatch_halt_headline(reason));
         if let Some(error) = task.dispatch_failed_error.as_deref() {
             println!("  {error}");
         }

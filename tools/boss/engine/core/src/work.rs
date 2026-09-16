@@ -145,6 +145,21 @@ pub const CHURN_GUARD_DISPATCH_FAILED_REASON: &str = "churn_guard";
 /// is folded into the body text instead so the card names both.
 pub const DELIBERATE_PARK_DISPATCH_FAILED_REASON: &str = "deliberate_park";
 
+/// One-line CLI headline for a `tasks.dispatch_failed_reason` value.
+/// A deliberate park is a wait, not a failure, so it must not share the
+/// "Dispatch failed" prefix every other reason uses. `print_task_details`
+/// (`cli/src/output.rs`) and `bossctl agents status` (`bossctl/src/agents.rs`)
+/// both print this, so a third reason added later cannot regress the same
+/// "failed" mislabel. Mirrors `WorkDispatchFailureBanner.headline` on the
+/// kanban card (colon here, em dash there).
+pub fn dispatch_halt_headline(reason: &str) -> String {
+    if reason == DELIBERATE_PARK_DISPATCH_FAILED_REASON {
+        "Waiting on you: deliberate park".to_owned()
+    } else {
+        format!("Dispatch failed: {reason}")
+    }
+}
+
 /// Verbatim substring [`WorkDb::deliberate_park_text`] writes into the
 /// `dispatch_failed_error` body when a deliberately parked row has ALSO
 /// tripped the churn guard. `tools/boss/app-macos/Sources/WorkBoardBanners.swift`
@@ -177,6 +192,25 @@ mod combined_park_churn_marker_pin {
              verbatim so reasonLabel can match the engine body; changing the Rust \
              constant without the Swift literal (or vice versa) silently drops the \
              churn half of the card headline"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dispatch_halt_headline_tests {
+    #[test]
+    fn does_not_label_a_park_as_failed() {
+        assert_eq!(
+            super::dispatch_halt_headline(super::DELIBERATE_PARK_DISPATCH_FAILED_REASON),
+            "Waiting on you: deliberate park",
+        );
+        assert_eq!(
+            super::dispatch_halt_headline(super::CHURN_GUARD_DISPATCH_FAILED_REASON),
+            "Dispatch failed: churn_guard",
+        );
+        assert_eq!(
+            super::dispatch_halt_headline("spawn_timeout"),
+            "Dispatch failed: spawn_timeout",
         );
     }
 }

@@ -455,18 +455,14 @@ async fn run_one_pass_filtered(
         // new execution becomes latest and does not carry `blocked`. A
         // genuinely orphaned pane stamps neither, so recovery is
         // untouched.
-        // Deliberately does NOT `continue` on a positive park read the way
-        // this used to: that early exit is exactly what made a parked row
-        // invisible — it skipped past the churn read below before that
-        // code ever ran, so a row that was BOTH parked and churning never
-        // reached the mutating bounce that would have surfaced either
-        // condition. Instead this carries `is_deliberately_parked` forward
-        // through the churn read, the pause gate, and the two liveness
-        // guards, and only the combined decision after those guards
-        // (below) decides whether to bounce. `Err` still fails closed
-        // exactly as before: an unreadable park state is not a licence to
-        // put a second worker on the row, and there is nothing useful to
-        // combine it with.
+        // No `continue` on a positive park read: the churn read below and
+        // both liveness guards must all run before anything mutates the
+        // row, so the bounce decision is made once, after them.
+        // Short-circuiting here would leave a parked row sitting in Doing
+        // with no board-visible halt, and a row that is both parked and
+        // churning would surface neither condition. `Err` still fails
+        // closed — an unreadable park state is not a licence to put a
+        // second worker on the row.
         let is_deliberately_parked = match work_db.dispatch_admission_facts(&work_item_id) {
             Ok(facts) => facts.deliberate_parked,
             Err(err) => {

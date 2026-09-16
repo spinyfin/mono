@@ -677,98 +677,35 @@ async fn a_breaker_pause_also_holds_the_redispatch() {
     assert_eq!(held[0].details["overridable"], serde_json::json!(false));
 }
 
+/// Admission constraint under which a park bounce must still fire.
+/// `Unconstrained` is the ordinary sweep pass; the other two pin that
+/// pause and a full worker pool cannot skip the mutating bounce.
+enum ParkBounceAdmission {
+    Unconstrained,
+    DispatchPaused,
+    AllWorkersBusy,
+}
+
 /// A deliberate park moves to Backlog with a waiting-on-you banner and
 /// never mints a replacement execution. The open attention item, rather
-/// than the single-shot autostart flag, identifies the park.
+/// than the single-shot autostart flag, identifies the park. Work start
+/// then clears the halt and mints a fresh ready execution.
 #[tokio::test]
 async fn does_not_revive_a_deliberately_parked_row() {
-    let (_dir, db) = open_db();
-    let product_id = create_product(&db);
-    let work_item_id = create_active_chore(&db, &product_id, "test chore");
-    let execution_id = create_spawned_execution(&db, &work_item_id, dead_pid());
-    db.record_worker_idle_abandonment(&execution_id, "worker declared itself blocked")
-        .unwrap();
-    db.create_attention_item(boss_protocol::CreateAttentionItemInput {
-        execution_id: Some(execution_id.clone()),
-        work_item_id: None,
-        kind: crate::completion::RUN_DONE_BLOCKED_ATTENTION_KIND.to_owned(),
-        status: None,
-        title: "Run ended: worker declared itself blocked".to_owned(),
-        body_markdown: "blocked".to_owned(),
-        resolved_at: None,
-    })
-    .unwrap();
-    // Age LAST: the writes above touch `tasks.updated_at`.
-    make_old(&db, &work_item_id);
-
-    let db = Arc::new(db);
-    let coordinator = make_coordinator(db.clone(), 1);
-    let sink = Arc::new(RecordingDispatchEventSink::new());
-    let outcome = run_one_pass(
-        db.as_ref(),
-        coordinator.clone(),
-        sink.as_ref(),
-        &NoopLiveWorkerConvergence,
-    )
-    .await;
-
-    assert_eq!(
-        outcome.redispatched, 0,
-        "a row whose run was deliberately parked must not get a replacement worker",
-    );
-    assert_eq!(outcome.deliberate_park_skipped, 1);
-    assert_eq!(
-        outcome.deliberate_park_bounced, 1,
-        "the park must reach the mutating halted-state bounce, not just the skip counter",
-    );
-    let executions = db.list_executions(Some(&work_item_id)).unwrap();
-    assert_eq!(executions.len(), 1, "no replacement execution may be minted");
-    let events = sink.events().await;
-    assert!(
-        events.iter().all(|e| e.stage != "orphan_active_redispatch"),
-        "no redispatch event may fire for a parked row",
-    );
-    let skipped: Vec<_> = events
-        .iter()
-        .filter(|e| e.stage == "dispatch_decision" && e.details["skipped_reason"] == "deliberate_park")
-        .collect();
-    assert_eq!(skipped.len(), 1, "the park must be visible in the dispatch stream");
-
-    let task = get_task(&db, &work_item_id);
-    assert_eq!(
-        task.status.as_str(),
-        "todo",
-        "the halted state must move the card off Doing, the same as a churn trip",
-    );
-    assert_eq!(
-        task.dispatch_failed_reason.as_deref(),
-        Some("deliberate_park"),
-        "must use its own reason, distinct from churn_guard, so the recovery sweep never auto-retries it",
-    );
-    assert!(
-        task.dispatch_failed_error
-            .as_deref()
-            .is_some_and(|e| e.contains("blocked") || e.contains("nudge")),
-        "the halted-state text must say the row is waiting on a human decision, not that it failed: {:?}",
-        task.dispatch_failed_error,
-    );
-    assert!(
-        !task.autostart,
-        "must not redispatch as a side effect of adding visibility"
-    );
+    assert_park_bounces_under_admission_gate(ParkBounceAdmission::Unconstrained).await;
 }
 
 #[tokio::test]
 async fn parked_row_bounces_with_all_workers_busy() {
-    assert_park_bounces_under_admission_gate(false).await;
+    assert_park_bounces_under_admission_gate(ParkBounceAdmission::AllWorkersBusy).await;
 }
 
 #[tokio::test]
 async fn parked_row_bounces_while_dispatch_is_paused() {
-    assert_park_bounces_under_admission_gate(true).await;
+    assert_park_bounces_under_admission_gate(ParkBounceAdmission::DispatchPaused).await;
 }
 
-async fn assert_park_bounces_under_admission_gate(paused: bool) {
+async fn assert_park_bounces_under_admission_gate(admission: ParkBounceAdmission) {
     let (_dir, db) = open_db();
     let product_id = create_product(&db);
     let work_item_id = create_active_chore(&db, &product_id, "test chore");
@@ -790,19 +727,23 @@ async fn assert_park_bounces_under_admission_gate(paused: bool) {
 
     let db = Arc::new(db);
     let coordinator = make_coordinator(db.clone(), 1);
-    if paused {
-        coordinator.pause_dispatch(
-            boss_engine_utils::epoch_time::now_epoch_secs().max(0) as u64,
-            crate::coordinator::DispatchPauseOrigin::Breaker,
-            boss_protocol::PauseReason::new("test pause").unwrap(),
-        );
-    } else {
-        coordinator
-            .worker_pool()
-            .claim_worker("busy-execution", None)
-            .await
-            .unwrap();
-        assert!(!coordinator.worker_pool().has_idle_worker().await);
+    match admission {
+        ParkBounceAdmission::Unconstrained => {}
+        ParkBounceAdmission::DispatchPaused => {
+            coordinator.pause_dispatch(
+                boss_engine_utils::epoch_time::now_epoch_secs().max(0) as u64,
+                crate::coordinator::DispatchPauseOrigin::Breaker,
+                boss_protocol::PauseReason::new("test pause").unwrap(),
+            );
+        }
+        ParkBounceAdmission::AllWorkersBusy => {
+            coordinator
+                .worker_pool()
+                .claim_worker("busy-execution", None)
+                .await
+                .unwrap();
+            assert!(!coordinator.worker_pool().has_idle_worker().await);
+        }
     }
 
     let sink = Arc::new(RecordingDispatchEventSink::new());
@@ -857,6 +798,31 @@ async fn assert_park_bounces_under_admission_gate(paused: bool) {
     assert!(
         !task.autostart,
         "must not redispatch as a side effect of adding visibility"
+    );
+
+    if !matches!(admission, ParkBounceAdmission::Unconstrained) {
+        return;
+    }
+
+    // `bossctl work start` / drag-to-Doing must un-park the row: clear
+    // the halt stamp and mint a fresh ready execution. The recovery
+    // sweep will not do this for `deliberate_park`.
+    db.request_execution_with_live_check(
+        RequestExecutionInput::builder()
+            .work_item_id(work_item_id.clone())
+            .build(),
+        |_| false,
+    )
+    .unwrap();
+    let task_after = get_task(&db, &work_item_id);
+    assert!(
+        task_after.dispatch_failed_reason.is_none(),
+        "work start must clear the deliberate_park halt, the same as a churn bounce"
+    );
+    let executions_after = db.list_executions(Some(&work_item_id)).unwrap();
+    assert!(
+        executions_after.iter().any(|e| e.status == ExecutionStatus::Ready),
+        "work start must mint a fresh ready execution; got: {executions_after:?}"
     );
 }
 
