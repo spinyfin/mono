@@ -371,13 +371,52 @@ async fn initial_input_types_a_short_fixed_line_sourcing_the_workspace_script() 
         "expected the initial-input script to re-prepend BOSS_BIN_DIR then the worker launcher \
              dir, unset ANTHROPIC_API_KEY, and invoke claude, got: {script:?}",
     );
-    // No Darwin background-priority clause: it starved the driver CLI it
-    // was inherited by, so the pane never reported a driver start and was
-    // reaped. See the comment at the construction site.
+    // A fresh install must never lower worker priority implicitly.
     assert!(
         !script.contains("taskpolicy"),
         "the pane must not be placed in the Darwin background tier, got: {script:?}",
     );
+}
+
+#[tokio::test]
+async fn throttle_changes_apply_to_next_spawn_in_every_local_pool() {
+    for (worker_id, kind) in [
+        ("worker-1", ExecutionKind::ChoreImplementation),
+        ("auto-worker-1", ExecutionKind::AutomationTriage),
+        ("review-1", ExecutionKind::PrReview),
+    ] {
+        let workspace = TempDir::new().unwrap();
+        let (_spawner, weak, cfg, db) = spawn_test_env(&workspace);
+        let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            workspace.path().join("feature-flags.toml"),
+        ));
+        let runner = PaneSpawnRunner::new(cfg, db.clone(), flags);
+        runner.set_server_state(weak);
+        let mut execution = sample_execution(workspace.path());
+        execution.kind = kind;
+        for enabled in [false, true, false] {
+            crate::worker_throttle::set(&db, enabled).unwrap();
+            runner
+                .run_execution(
+                    worker_id,
+                    &execution,
+                    &sample_chore(),
+                    workspace.path(),
+                    Some("change-1"),
+                )
+                .await
+                .unwrap();
+            let script = initial_input_script(workspace.path());
+            assert_eq!(
+                script.contains("/usr/sbin/taskpolicy -b -p $$"),
+                enabled && cfg!(target_os = "macos"),
+                "pool {worker_id}, enabled {enabled}: {script}"
+            );
+            if !enabled {
+                assert!(!script.contains("taskpolicy"));
+            }
+        }
+    }
 }
 
 /// Build a runner driven against a real product + chore row so

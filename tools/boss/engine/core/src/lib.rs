@@ -197,4 +197,5 @@ pub mod worker_readoption;
 pub mod worker_registry;
 pub mod worker_sandbox_audit;
 pub mod worker_setup;
+mod worker_throttle;
 pub mod wrapper_distribution;
