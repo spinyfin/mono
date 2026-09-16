@@ -2,7 +2,7 @@
 //! concurrency. The existing boolean Settings RPC represents Off/Background.
 
 use crate::work::WorkDb;
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 pub(crate) const SETTING_KEY: &str = "workers.background_throttle";
 
@@ -10,7 +10,10 @@ pub(crate) fn enabled(db: &WorkDb) -> Result<bool> {
     match db.get_metadata(SETTING_KEY)?.as_deref() {
         None | Some("off") => Ok(false),
         Some("background") => Ok(true),
-        Some(value) => bail!("invalid worker throttle level: {value}"),
+        Some(value) => {
+            tracing::warn!("unrecognized worker throttle level {value:?}; defaulting to off");
+            Ok(false)
+        }
     }
 }
 
@@ -59,15 +62,11 @@ mod tests {
     }
 
     #[test]
-    fn unknown_stored_level_is_an_error() {
+    fn unknown_stored_level_defaults_off() {
         let db = WorkDb::open_in_memory().unwrap();
         db.set_metadata(SETTING_KEY, "unknown").unwrap();
-        assert!(
-            enabled(&db)
-                .unwrap_err()
-                .to_string()
-                .contains("invalid worker throttle level")
-        );
+        assert!(!enabled(&db).unwrap());
+        assert!(!snapshot(&db).unwrap().enabled);
     }
 
     #[test]
