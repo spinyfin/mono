@@ -341,7 +341,7 @@ impl WorkerCompletionHandler {
         execution_id: &str,
         pr_url: &str,
         trigger: crate::work::PrSourceCaptureTrigger,
-    ) {
+    ) -> Option<tokio::task::JoinHandle<()>> {
         crate::review_guide_capture::reconcile_review_guide_source_for_execution_with_collector(
             self.work_db.clone(),
             self.feature_flags.clone(),
@@ -350,7 +350,7 @@ impl WorkerCompletionHandler {
             trigger,
             None,
             self.source_packet_collector.clone(),
-        );
+        )
     }
 
     /// Queue a source capture from the merge poller's successful, already

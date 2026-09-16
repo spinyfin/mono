@@ -27,7 +27,7 @@ use crate::gh_runner::{gh_output, parse_http_status_from_stderr};
 /// names like `boss/exec_*` correctly) live in exactly one place; each
 /// caller applies its own error classification to the result.
 pub(crate) fn raw_content_args(owner: &str, repo: &str, path: &str, git_ref: &str) -> (String, Vec<String>) {
-    let path = crate::trees::encode_tree_path(path);
+    let path = crate::trees::encode_repo_path(path);
     let endpoint = format!("repos/{owner}/{repo}/contents/{path}");
     let args = vec![
         "api".to_owned(),
@@ -301,6 +301,14 @@ fn header_value(headers: &str, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contents_args_encode_reserved_path_bytes() {
+        let (endpoint, args) = raw_content_args("o", "r", "with space/#name?~.rs", "sha");
+        assert_eq!(endpoint, "repos/o/r/contents/with%20space/%23name%3F~.rs");
+        assert_eq!(args[1], endpoint);
+        assert_eq!(args[5], "ref=sha");
+    }
 
     #[test]
     fn success_returns_decoded_body() {
