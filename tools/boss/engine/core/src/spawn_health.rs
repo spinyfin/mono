@@ -309,13 +309,15 @@ impl FailureComposition {
                 SpawnFailureClass::NoShell => composition.no_shell += 1,
                 SpawnFailureClass::ShellWithoutDriverSignal => {
                     composition.shell_without_driver_signal += 1;
-                    if entry.shell_pid <= 0 {
-                        composition.every_driver_start_had_a_shell = false;
-                    }
                     match entry.cause.as_str() {
                         "spawn_nack" => composition.with_transcript.spawn_nacks += 1,
                         "pane_death_before_start" => composition.with_transcript.pane_deaths += 1,
-                        _ => composition.with_transcript.driver_start_timeouts += 1,
+                        _ => {
+                            composition.with_transcript.driver_start_timeouts += 1;
+                            if entry.shell_pid <= 0 {
+                                composition.every_driver_start_had_a_shell = false;
+                            }
+                        }
                     }
                 }
             }
@@ -2076,6 +2078,46 @@ mod tests {
         assert!(
             !hint.contains("agent JSONL progress"),
             "diagnosis must not be sent to JSONL discovery for an app NACK; got: {hint}"
+        );
+    }
+
+    /// A window mixing a real driver-start timeout (shell_pid > 0) with an
+    /// app NACK that never got a shell (shell_pid <= 0) must not let the
+    /// NACK's missing shell pid falsify `every_driver_start_had_a_shell` for
+    /// the timeout that did report one.
+    #[test]
+    fn composition_of_mixed_timeout_and_app_nack_keeps_timeout_shell_flag_true() {
+        let timeout = test_evidence(
+            "exec-timeout",
+            "wi-timeout",
+            "0",
+            4242,
+            100,
+            SpawnFailureClass::ShellWithoutDriverSignal,
+        );
+        let mut nack = test_evidence(
+            "exec-nack",
+            "wi-nack",
+            "1",
+            0,
+            100,
+            SpawnFailureClass::ShellWithoutDriverSignal,
+        );
+        nack.cause = "spawn_nack".to_owned();
+        let evidence = vec![timeout, nack];
+        let composition = FailureComposition::of(&evidence);
+        assert_eq!(composition.with_transcript.driver_start_timeouts, 1);
+        assert_eq!(composition.with_transcript.spawn_nacks, 1);
+        assert!(
+            composition.every_driver_start_had_a_shell,
+            "the app NACK's missing shell pid must not taint the driver-start timeout, \
+             which did report one"
+        );
+        let described = composition.describe();
+        assert!(
+            !described.contains("not every failure reported a shell pid"),
+            "must not qualify the driver-start timeout with the app-reported row's \
+             missing shell pid; got: {described}"
         );
     }
 

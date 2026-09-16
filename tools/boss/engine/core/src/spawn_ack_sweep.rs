@@ -753,13 +753,13 @@ pub(crate) fn file_ingress_state(work_db: &WorkDb, execution_id: &str) -> Option
             let summary = match record.verdict {
                 DiscoveryVerdict::Overdue => format!(
                     "the engine's file ingress never attached to a rollout: discovery was overdue at \
-                     {}s, recorded {}s before this reap ({} rollout-shaped file(s) that did not correlate to this run); discovery was still looking, so the \
-                     driver may have started and run unobserved",
+                     {}s, recorded {}s before this reap ({}), so the driver may have started and run \
+                     unobserved",
                     record.waited_secs,
                     boss_engine_utils::epoch_time::now_epoch_secs()
                         .saturating_sub(record.at_epoch_secs)
                         .max(0),
-                    record.rejected_candidates
+                    record.reason,
                 ),
                 DiscoveryVerdict::Failed => format!(
                     "the engine's file ingress never attached to a rollout: discovery failed after {}s \
@@ -1440,6 +1440,12 @@ pub(crate) async fn reap_never_started_spawn(
     ReapOutcome::Reaped
 }
 
+/// What the reap observed, bundled for [`raise_driver_start_attention`].
+struct DriverStartEvidence<'a> {
+    file_ingress: Option<&'a FileIngressState>,
+    liveness: &'a str,
+}
+
 /// Raise the per-execution attention item for a driver-start timeout.
 ///
 /// The 2026-07-30 incident's defining property was silence: the merge
@@ -1457,11 +1463,6 @@ pub(crate) async fn reap_never_started_spawn(
 ///
 /// Best-effort — a failure here must never abort the reap, since the reap
 /// is what actually frees the slot and lease.
-struct DriverStartEvidence<'a> {
-    file_ingress: Option<&'a FileIngressState>,
-    liveness: &'a str,
-}
-
 fn raise_driver_start_attention(
     work_db: &WorkDb,
     execution: &WorkExecution,
