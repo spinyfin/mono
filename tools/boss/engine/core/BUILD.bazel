@@ -31,6 +31,10 @@ rust_library(
         # expectations cannot drift from the source of truth.
         "//tools/boss/docs:operator_forced_dispatch_design_doc",
         "//tools/boss/docs:engine_app_rpc_design_doc",
+        # Read by work.rs's combined-park+churn marker pin so the Swift
+        # banner's match string stays byte-identical to
+        # DELIBERATE_PARK_CHURN_COMBINED_MARKER.
+        "//tools/boss/app-macos:work_board_banners_swift",
     ],
     crate_name = "boss_engine",
     crate_root = "src/lib.rs",
@@ -56,6 +60,10 @@ rust_library(
         # Absolute path to a live design doc with bold-bullet breakdown
         # entries, read by the planner parser regression test.
         "BOSS_ENGINE_APP_RPC_DESIGN_DOC": "$(execpath //tools/boss/docs:engine_app_rpc_design_doc)",
+        # Absolute path to WorkBoardBanners.swift, read by the combined
+        # park+churn marker pin via include_str!(env!(...)) — same
+        # cross-package-boundary reason as BOSS_CHECKS_YAML above.
+        "BOSS_WORK_BOARD_BANNERS_SWIFT": "$(execpath //tools/boss/app-macos:work_board_banners_swift)",
         # Canonical `bazel run` command for the engine target, so worker-facing
         # guidance (worker_setup.rs, agent_launch_guard.rs) can't drift from
         # the real target label the way the pre-split `//tools/boss/engine:engine`

@@ -119,6 +119,68 @@ pub const CHURN_GUARD_PARKED_ATTENTION_KIND: &str = "churn_guard_parked";
 /// `docs/designs/dispatch-halt-state-vs-attention-items.md`.
 pub const CHURN_GUARD_DISPATCH_FAILED_REASON: &str = "churn_guard";
 
+/// `tasks.dispatch_failed_reason` value stamped by
+/// [`crate::work::WorkDb::bounce_deliberate_park_to_backlog`] when
+/// [`crate::orphan_sweep`] finds an `active` work item whose run ended in a
+/// deliberate engine park (`run_done_declared_blocked` / `nudge_breaker_tripped`
+/// — see `DELIBERATE_PARK_ATTENTION_KINDS` in that module) with its attention
+/// item still open. The board reads the typed halt fields independently
+/// of the attention item, so a parked row visibly waits in Backlog (see
+/// `docs/designs/dispatch-halt-state-vs-attention-items.md`). This reuses
+/// the exact `dispatch_failed_reason` / `dispatch_failed_error` / `dispatch_failed_at`
+/// / Backlog-status representation [`CHURN_GUARD_DISPATCH_FAILED_REASON`]
+/// established, under its own reason, for one deliberate purpose: a park is a
+/// human decision, not a transient dispatch failure, so
+/// [`crate::dispatch_failure_recovery_sweep`] must NEVER treat a row carrying
+/// this reason as eligible for its own automatic retry the way it does for
+/// [`CHURN_GUARD_DISPATCH_FAILED_REASON`] — only an explicit `bossctl work
+/// start` (or kanban drag-to-Doing) may clear a deliberate park, exactly the
+/// contract the attention item it is layered over already carries.
+///
+/// A row can be *both* deliberately parked and churn-tripped at once (the
+/// worker declared itself blocked after several unproductive runs). This
+/// reason wins over [`CHURN_GUARD_DISPATCH_FAILED_REASON`] in that case —
+/// see `bounce_deliberate_park_to_backlog`'s `churn_context` parameter — since
+/// the park is the stronger, human-only-clearable condition; the churn detail
+/// is folded into the body text instead so the card names both.
+pub const DELIBERATE_PARK_DISPATCH_FAILED_REASON: &str = "deliberate_park";
+
+/// Verbatim substring [`WorkDb::deliberate_park_text`] writes into the
+/// `dispatch_failed_error` body when a deliberately parked row has ALSO
+/// tripped the churn guard. `tools/boss/app-macos/Sources/WorkBoardBanners.swift`
+/// (`WorkDispatchFailureBanner.reasonLabel`) matches on this exact string to
+/// decide whether to render the combined "deliberate park + churn guard"
+/// headline instead of the plain park one — see the `/// Mirrors` comment
+/// there. The unit test `combined_park_churn_marker_matches_swift_banner`
+/// `include_str!`s that Swift file and asserts this constant appears in it,
+/// so a wording change on either side fails the test instead of silently
+/// dropping the churn half of the card headline. The bounce-path assertion
+/// that the generated body *contains* this constant only proves the churn
+/// branch ran; it does not pin the value.
+pub const DELIBERATE_PARK_CHURN_COMBINED_MARKER: &str = "tripping the churn guard on top of the park";
+
+#[cfg(test)]
+mod combined_park_churn_marker_pin {
+    /// Byte-identity pin: `WorkDispatchFailureBanner.combinedParkChurnMarker`
+    /// in the live Swift source must contain this crate's
+    /// [`super::DELIBERATE_PARK_CHURN_COMBINED_MARKER`] verbatim. A bounce-path
+    /// `contains(CONSTANT)` check cannot do this job — that body is produced
+    /// by interpolating the same constant, so expected and actual move
+    /// together. Reading the Swift file is the same pattern
+    /// `boss_construct_scan` uses for `CHECKS.yaml`.
+    #[test]
+    fn combined_park_churn_marker_matches_swift_banner() {
+        let swift = include_str!(env!("BOSS_WORK_BOARD_BANNERS_SWIFT"));
+        assert!(
+            swift.contains(super::DELIBERATE_PARK_CHURN_COMBINED_MARKER),
+            "WorkBoardBanners.swift must contain DELIBERATE_PARK_CHURN_COMBINED_MARKER \
+             verbatim so reasonLabel can match the engine body; changing the Rust \
+             constant without the Swift literal (or vice versa) silently drops the \
+             churn half of the card headline"
+        );
+    }
+}
+
 /// `work_attention_items.kind` raised by [`crate::dispatch_stall_escalation`]
 /// when a dispatch timeline sits stuck in one stage past
 /// [`crate::dispatch_stall_escalation::PERSISTENT_STALL_THRESHOLD`]. The
