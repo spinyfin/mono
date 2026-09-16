@@ -32,7 +32,11 @@ async fn rejected_candidate_after_overdue_refreshes_diagnostics_and_can_recover(
         })
         .await;
     let path = fx.sessions().join("rollout-diagnostic-thread.jsonl");
-    fs::write(&path, vec![b'x'; super::MAX_SESSION_META_BYTES as usize + 1]).unwrap();
+    fs::write(
+        &path,
+        vec![b'x'; crate::agent_jsonl_discovery::MAX_SESSION_META_BYTES as usize + 1],
+    )
+    .unwrap();
     fx.sink
         .wait_for(|_| {
             discovery_record(fx.store.get("run-diagnostic")).is_some_and(|r| {
@@ -56,6 +60,17 @@ async fn rejected_candidate_after_overdue_refreshes_diagnostics_and_can_recover(
             })
         })
         .await;
+    fs::remove_file(&path).unwrap();
+    fx.sink
+        .wait_for(|_| {
+            discovery_record(fx.store.get("run-diagnostic")).is_some_and(|record| {
+                record.rejected_candidates == 0 && record.reason.contains("rollout-diagnostic-thread.jsonl")
+            })
+        })
+        .await;
+    let removed = discovery_record(fx.store.get("run-diagnostic")).unwrap();
+    assert!(removed.rejections.is_empty());
+    assert!(removed.reason.contains("were seen"), "{}", removed.reason);
     fs::write(&path, rollout(&fx.workspace(), "thread")).unwrap();
     fx.sink
         .wait_for(|obs| obs.iter().any(|o| matches!(o, IngressObservation::Attached { .. })))

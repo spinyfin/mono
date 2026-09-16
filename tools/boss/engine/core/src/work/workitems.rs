@@ -127,6 +127,23 @@ impl WorkDb {
         Ok(item)
     }
 
+    /// Open attention items of `kind` across every execution. Used by
+    /// producers that reconcile [`ClearedBy::ProducerReconciles`] kinds
+    /// independently of a candidate set that may no longer include the
+    /// execution.
+    pub fn list_open_attention_items_of_kind(&self, kind: &str) -> Result<Vec<WorkAttentionItem>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at, converted_task_id
+             FROM work_attention_items
+             WHERE kind = ?1
+               AND status = 'open'
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([kind], map_attention_item)?;
+        collect_rows(rows)
+    }
+
     pub fn list_attention_items(&self, execution_id: &str) -> Result<Vec<WorkAttentionItem>> {
         let conn = self.connect()?;
         ensure_execution_exists(&conn, execution_id)?;
@@ -505,6 +522,22 @@ impl WorkDb {
                 crate::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND,
                 crate::worker_escalation::WORKER_BLOCKED_ATTENTION_KIND,
             ],
+        )?;
+        Ok(rows)
+    }
+
+    /// Mark every open attention item of `kind` for `execution_id` as
+    /// resolved. Returns the count resolved (`0` when none were open).
+    pub fn resolve_attention_kind_for_execution(&self, execution_id: &str, kind: &str) -> Result<usize> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let rows = conn.execute(
+            "UPDATE work_attention_items
+             SET status = 'resolved', resolved_at = ?1
+             WHERE execution_id = ?2
+               AND kind = ?3
+               AND status = 'open'",
+            params![now, execution_id, kind],
         )?;
         Ok(rows)
     }
