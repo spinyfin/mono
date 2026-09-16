@@ -9,6 +9,7 @@ bon = { workspace = true }
 boss-build-info = { path = "../build-info" }
 boss-client = { path = "../client" }
 boss-editorial = { path = "../engine/editorial" }
+boss-engine = { path = "../engine/core" }
 boss-engine-utils = { path = "../engine/utils" }
 boss-github = { path = "../github" }
 boss-protocol = { path = "../protocol" }
@@ -22,6 +23,5 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 
 [dev-dependencies]
-boss-engine = { path = "../engine/core" }
 tempfile = { workspace = true }
 wiremock = { workspace = true }

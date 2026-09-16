@@ -13,6 +13,8 @@
 
 use super::*;
 
+use boss_engine::work::dispatch_halt_headline;
+
 /// Resolve a positional `agent` argument to a live worker entry.
 ///
 /// Tries, in order: (a) exact match on `run_id`, (b) exact match on
@@ -514,7 +516,7 @@ async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work
     if let WorkItem::Task(t) | WorkItem::Chore(t) = work_item
         && let Some(reason) = t.dispatch_failed_reason.as_deref()
     {
-        println!("  dispatch_failed_reason: {reason}");
+        println!("  {}", dispatch_halt_headline(reason));
         if let Some(error) = t.dispatch_failed_error.as_deref() {
             println!("    {error}");
         }
