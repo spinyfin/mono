@@ -2195,3 +2195,47 @@ async fn spawn_event_subscriber_redispatches_on_execution_terminal() {
     .await
     .expect("event-driven redispatch did not happen before the timeout");
 }
+
+/// **The actual dead-pid-reap redispatch path.** `dead_pid_sweep`'s reap
+/// handler marks the execution `orphaned` and releases the slot directly —
+/// it never touches `tasks.autostart` or calls `release_worker_and_kick`,
+/// so this sweep's periodic pass (not `rescan_active_dispatch`) is what
+/// mints the successor. The successor must inherit the dead worker's
+/// workspace and `allow_dirty`, exactly like the other two redispatch
+/// paths, or a reaped item's recovery patch is never replayed.
+#[tokio::test]
+async fn redispatch_inherits_dirty_workspace_from_orphaned_predecessor() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    // `create_spawned_execution` starts the run against workspace "ws-1" —
+    // mirrors what `start_execution_run` records before a real reap.
+    let execution_id = create_spawned_execution(&db, &work_item_id, dead_pid());
+    db.mark_execution_orphaned(&execution_id, "dead-pid reconcile: worker process gone")
+        .unwrap();
+    make_old(&db, &work_item_id);
+
+    let db = Arc::new(db);
+    let coordinator = make_coordinator(db.clone(), 1);
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let convergence = RecordingConvergence::default();
+
+    let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), &convergence).await;
+    assert_eq!(outcome.redispatched, 1);
+
+    let successor = db
+        .list_executions(Some(&work_item_id))
+        .unwrap()
+        .into_iter()
+        .find(|e| e.status == ExecutionStatus::Ready)
+        .expect("redispatch must have created a fresh ready execution");
+    assert_eq!(
+        successor.preferred_workspace_id.as_deref(),
+        Some("ws-1"),
+        "successor must inherit the reaped execution's workspace so cube can re-lease it dirty",
+    );
+    assert!(
+        successor.allow_dirty,
+        "successor must carry allow_dirty so cube does not reset the recovered workspace",
+    );
+}

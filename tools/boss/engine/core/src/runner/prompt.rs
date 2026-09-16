@@ -20,9 +20,12 @@ mod workspace_recovery;
 use workspace_recovery::merge_cancelled_review_recovery_block;
 mod ci_monitoring;
 mod design;
+mod recovery_branch;
 use block_boundary::block_boundary_fragment;
 use ci_monitoring::ci_monitoring_directive;
 use design::{compose_design_directive, compose_design_postmortem_directive};
+pub(super) use recovery_branch::PriorBranchProbe;
+use recovery_branch::{prior_branch_block, startup_recovery_block};
 
 #[derive(bon::Builder)]
 pub(super) struct ExecutionPromptParams<'a> {
@@ -43,6 +46,7 @@ pub(super) struct ExecutionPromptParams<'a> {
     /// entirely — see `worker_spawn.rs`).
     design_guidance: Option<&'a str>,
     pr_template_set: &'a crate::pr_template::PrTemplateSet,
+    prior_branch: Option<PriorBranchProbe>,
     #[builder(default)]
     editorial_enabled: bool,
     /// Whether `worker_signal_proposals_seam` is on — gates the worker-facing
@@ -106,142 +110,6 @@ pub(super) struct ExecutionPromptParams<'a> {
     /// for conflict revisions with no merged overlap partner.
     #[builder(default)]
     merge_order_preservation: &'a [String],
-}
-
-/// Render the `## STARTUP RECOVERY` block for a worker respawned after its
-/// predecessor was interrupted.
-///
-/// ## Why this only fires on a durable pointer
-///
-/// The engine's operating rule for recovery is that it fires only on an
-/// unambiguous durable pointer the system itself wrote — restart fresh on
-/// doubt. The old block violated that: alongside genuinely recovered state it
-/// also told the worker "the prior worker **may** have pushed commits to
-/// `boss/exec_<prior-id>`" and handed it a `jj edit <branch>@origin` line to
-/// try. That branch name is *derived*, not *recorded* — the engine has no
-/// column anywhere that confirms a push actually happened for an orphaned
-/// execution (`pr_url` is only ever stamped atomically with the transition to
-/// `completed`, which an orphaned execution never reaches). So the line was a
-/// name-match heuristic dressed up as a resume instruction, and it fails
-/// loudly and pointlessly whenever the prior worker died before pushing —
-/// which is the common case, not the exception.
-///
-/// The only thing the engine *does* durably record is [recovered workspace
-/// state](boss_engine_recovery::recovery_apply): a marker
-/// (`.boss/recovery-report.json`) it writes itself when it actually recovers
-/// something, in place or from a saved patch. This function is now called
-/// only when that marker exists for this execution — see
-/// [`compose_execution_prompt`]. When it doesn't, [`compose_execution_prompt`]
-/// renders no block at all: the ordinary "expected branch name" / `jj new
-/// main` guidance already in the prompt is the correct, honest instruction
-/// for a fresh start, and no extra text is needed to say so.
-///
-/// ## What the block says
-///
-/// 1. whether state was recovered, and how — in place by cube (jj history
-///    intact) or replayed from a patch (uncommitted edits only);
-/// 2. what exactly was restored, in files and line counts, so the worker can
-///    check rather than guess;
-/// 3. to **inspect before building on it** — recovered work is a crashed
-///    worker's mid-thought, not a reviewed baseline, and must not be reset.
-///
-/// A `patch_error` on the report means recovery FAILED. That case gets its
-/// own paragraph telling the worker not to assume anything was resumed —
-/// silence there would leave it guessing, which is how a "recovered" worker
-/// quietly redoes everything or, worse, half-redoes it.
-fn startup_recovery_block(report: &boss_engine_recovery::recovery_apply::RecoveryReport) -> String {
-    use boss_engine_recovery::recovery_apply::RecoverySource;
-
-    let mut block = String::from("## STARTUP RECOVERY\n\n");
-    if report.from_execution_id.is_empty() {
-        block.push_str(
-            "This execution was respawned after the previous worker session was interrupted \
-             (engine or UI crash). The engine recovered its state into this workspace — treat \
-             what follows as a recovered mid-thought, not as a reviewed starting point.\n\n",
-        );
-    } else {
-        block.push_str(&format!(
-            "This execution was respawned after execution `{}` was interrupted (engine or UI \
-             crash). The engine recovered its state into this workspace — treat what follows as \
-             a recovered mid-thought, not as a reviewed starting point.\n\n",
-            report.from_execution_id,
-        ));
-    }
-
-    if let Some(err) = report.patch_error.as_deref() {
-        block.push_str(&format!(
-            "### Recovery FAILED\n\
-             \n\
-             The engine had a saved patch of the prior worker's uncommitted work but it \
-             did NOT apply:\n\
-             \n\
-             ```\n{err}\n```\n\
-             \n\
-             **Do NOT assume any of the prior work is present.** Your working copy holds \
-             whatever the workspace already had — most likely nothing. Verify with \
-             `jj status` and `jj diff --stat` before you plan, and expect to redo the \
-             prior work from the task description. The patch was deliberately left on \
-             disk so a human can salvage it; say so in your summary if the redo is \
-             substantial.\n\n",
-        ));
-    } else if report.source == RecoverySource::CubeInPlace {
-        block.push_str(
-            "### State recovered IN PLACE\n\
-             \n\
-             You are running in the *same* cube workspace the interrupted worker was \
-             using, and its uncommitted working copy is intact — including its jj \
-             operation log. **Do not reset it.** Start by looking at what is already \
-             there:\n\
-             \n\
-             ```\n\
-             jj status\n\
-             jj diff --stat\n\
-             jj log -r '::@' -n 10\n\
-             ```\n\
-             \n\
-             Read the recovered changes before adding to them. They are a crashed \
-             worker's in-progress edits: they may be half-finished, may not compile, and \
-             may not match the current task description. Reconcile them against the \
-             brief first, then continue.\n\n",
-        );
-    } else {
-        // RecoverySource::Patch, applied successfully.
-        let summary = report
-            .applied
-            .as_ref()
-            .map(|a| a.summary())
-            .unwrap_or_else(|| "nothing".to_string());
-        let files = report
-            .applied
-            .as_ref()
-            .map(|a| a.paths.iter().map(|p| format!("  - `{p}`\n")).collect::<String>())
-            .unwrap_or_default();
-        block.push_str(&format!(
-            "### State recovered FROM A PATCH\n\
-             \n\
-             The interrupted worker's cube workspace could not be reclaimed, so the \
-             engine replayed its saved patch into THIS workspace. Restored: \
-             {summary}.\n\
-             \n\
-             Files restored:\n{files}\
-             \n\
-             These are **uncommitted edits only** — the prior worker's jj history and \
-             operation log did not come with them, and Boss's own bookkeeping files were \
-             filtered out. **Do not reset the working copy.** Inspect before building on \
-             it:\n\
-             \n\
-             ```\n\
-             jj status\n\
-             jj diff --stat\n\
-             ```\n\
-             \n\
-             A three-way apply can leave edits that do not compile or that reference \
-             things that have since changed on `main`. Verify the restored state builds \
-             and matches the task description before adding to it.\n\n",
-        ));
-    }
-
-    block
 }
 
 /// The structured-output payload this execution's prompt is built around —
@@ -331,6 +199,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
         editorial_rules,
         design_guidance,
         pr_template_set,
+        prior_branch,
         editorial_enabled,
         worker_signal_proposals_seam_enabled,
         deferred_scope_proposals_seam_enabled,
@@ -480,6 +349,9 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
         // honest instruction, so no block is rendered at all.
         if blocked_recovery.is_none() {
             prompt.push_str(&startup_recovery_block(&report));
+        }
+        if let Some(prior_branch_block) = prior_branch_block(&report, prior_branch.as_ref()) {
+            prompt.push_str(&prior_branch_block);
         }
     } else if execution.allow_dirty {
         // No recovery marker, but the engine recorded this as a dirty
