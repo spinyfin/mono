@@ -8,7 +8,7 @@
 //! Because [`crate::sweep_loop::spawn_sweep_loop`] fires immediately on
 //! spawn, the first pass after this ships also performs the one-time
 //! cleanup of whatever backlog had already accumulated (e.g. the
-//! T2168/T2215 `redundant_spawn` storm) — there is no separate migration
+//! accumulated `redundant_spawn` pre-spawn aborts) — there is no separate migration
 //! step. Every subsequent pass just keeps the stock bounded going forward.
 //!
 //! ## Ordering vs Codex home reclaim

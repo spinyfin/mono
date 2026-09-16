@@ -27,6 +27,7 @@ use crate::gh_runner::{gh_output, parse_http_status_from_stderr};
 /// names like `boss/exec_*` correctly) live in exactly one place; each
 /// caller applies its own error classification to the result.
 pub(crate) fn raw_content_args(owner: &str, repo: &str, path: &str, git_ref: &str) -> (String, Vec<String>) {
+    let path = crate::trees::encode_tree_path(path);
     let endpoint = format!("repos/{owner}/{repo}/contents/{path}");
     let args = vec![
         "api".to_owned(),
@@ -39,6 +40,14 @@ pub(crate) fn raw_content_args(owner: &str, repo: &str, path: &str, git_ref: &st
         "Accept: application/vnd.github.raw".to_owned(),
     ];
     (endpoint, args)
+}
+
+#[test]
+fn contents_endpoint_encodes_reserved_characters_without_encoding_slashes() {
+    let (endpoint, args) = raw_content_args("o", "r", "dir/a#b?c %é.rs", "sha");
+    assert_eq!(endpoint, "repos/o/r/contents/dir/a%23b%3Fc%20%25%C3%A9.rs");
+    assert_eq!(args[1], endpoint);
+    assert!(args.contains(&"ref=sha".to_owned()));
 }
 
 /// Like [`raw_content_args`], plus `--include` so response headers

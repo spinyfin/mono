@@ -40,10 +40,21 @@ pub struct SourcePacketCollector {
 impl SourcePacketCollector {
     #[cfg(test)]
     pub(crate) fn fixture(collect: PacketCollectFn, packet: SourcePacket) -> Self {
+        let metadata_base = packet.observed_base_sha.clone();
+        Self::fixture_with_metadata_base(collect, packet, metadata_base)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_with_metadata_base(
+        collect: PacketCollectFn,
+        packet: SourcePacket,
+        metadata_base: String,
+    ) -> Self {
         Self {
             collect,
             metadata: Arc::new(move |_, _| {
                 let packet = packet.clone();
+                let metadata_base = metadata_base.clone();
                 Box::pin(async move {
                     Ok(PrComparisonMetadata {
                         number: packet.pr_number,
@@ -52,7 +63,7 @@ impl SourcePacketCollector {
                         base_repository: packet.base_repository,
                         head_repository: packet.head_repository,
                         head_ref_name: "fixture".to_owned(),
-                        base_sha: packet.observed_base_sha,
+                        base_sha: metadata_base,
                         head_sha: packet.head_sha,
                         changed_files: packet.files.len() as u64,
                     })
@@ -232,7 +243,7 @@ pub(crate) fn reconcile_review_guide_source_with_collector(
         },
     };
     let guard = if let Some(endpoints) = &observed {
-        match prepare_capture(&work_db, &root_task_id, &pr_url, endpoints, observation_sequence) {
+        match prepare_capture(&work_db, &root_task_id, &pr_url, endpoints, observation_sequence, true) {
             Ok(Some(guard)) => Some(guard),
             Ok(None) => return None,
             Err(error) => {
@@ -278,9 +289,28 @@ pub(crate) fn reconcile_review_guide_source_with_collector(
             let mut guard = match guard {
                 Some(guard) if observed.as_ref().is_some_and(|o| o.base_sha == rest_identity.base_sha) => guard,
                 Some(_) | None => {
-                    match prepare_capture(&work_db, &root_task_id, &pr_url, &rest_identity, observation_sequence) {
+                    match prepare_capture(
+                        &work_db,
+                        &root_task_id,
+                        &pr_url,
+                        &rest_identity,
+                        observation_sequence,
+                        false,
+                    ) {
                         Ok(Some(guard)) => guard,
-                        Ok(None) => return,
+                        Ok(None) => {
+                            if let Some(probe) = &observed
+                                && let Err(error) = work_db.remember_pr_review_guide_probe(
+                                    &pr_url,
+                                    &rest_identity,
+                                    &probe.base_sha,
+                                    observation_sequence,
+                                )
+                            {
+                                record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
+                            }
+                            return;
+                        }
                         Err(error) => {
                             record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
                             return;
@@ -330,7 +360,13 @@ pub(crate) fn reconcile_review_guide_source_with_collector(
                         "review-guide source capture: could not persist packet",
                     ),
                 },
-                Err(error) => record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error),
+                Err(error) => {
+                    if let Err(count_error) = work_db.record_pr_review_guide_source_retry_error(&pr_url, &rest_identity)
+                    {
+                        tracing::warn!(?count_error, "could not count failed source retry");
+                    }
+                    record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
+                }
             }
             captures.remove(&guard.key);
             guard.active = false;
@@ -345,24 +381,18 @@ fn prepare_capture(
     url: &str,
     endpoints: &PinnedComparison,
     sequence: i64,
+    probe: bool,
 ) -> Result<Option<InFlightGuard>> {
-    if db.select_complete_pr_review_guide_source_capture(
-        root,
-        url,
-        &endpoints.base_sha,
-        &endpoints.head_sha,
-        sequence,
-    )? {
+    let select = if probe {
+        WorkDb::select_probe_pr_review_guide_source_capture
+    } else {
+        WorkDb::select_complete_pr_review_guide_source_capture
+    };
+    if select(db, root, url, &endpoints.base_sha, &endpoints.head_sha, sequence)? {
         return Ok(None);
     }
     let mut captures = in_flight_captures().lock().unwrap_or_else(|error| error.into_inner());
-    if db.select_complete_pr_review_guide_source_capture(
-        root,
-        url,
-        &endpoints.base_sha,
-        &endpoints.head_sha,
-        sequence,
-    )? {
+    if select(db, root, url, &endpoints.base_sha, &endpoints.head_sha, sequence)? {
         return Ok(None);
     }
     Ok(InFlightGuard::acquire_locked(
@@ -454,152 +484,5 @@ fn record_capture_failure(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::feature_flags::FeatureFlagsStore;
-    use crate::test_support::{create_active_chore, create_product, open_db};
-    use crate::work::{FakePrStateChecker, PrOpenState};
-    use boss_protocol::{CreateExecutionInput, CreateRevisionInput, ExecutionKind, ExecutionStatus, WorkItemPatch};
-
-    #[test]
-    fn unpolled_future_releases_its_claim_and_coalesces_sequences() {
-        let key = ("cancel-test".to_owned(), "base".to_owned(), "head".to_owned());
-        let guard = InFlightGuard::acquire(key.clone(), 1).unwrap();
-        assert!(InFlightGuard::acquire(key.clone(), 4).is_none());
-        assert_eq!(*guard.sequence.lock().unwrap(), 4);
-        let future = async move {
-            let _guard = guard;
-        };
-        drop(future);
-        assert!(InFlightGuard::acquire(key, 5).is_some());
-    }
-
-    #[test]
-    fn automatic_capture_defaults_off_and_respects_the_rollout_flag() {
-        let directory = tempfile::tempdir().unwrap();
-        let flags = FeatureFlagsStore::new(directory.path().join("feature-flags.toml"));
-        flags.load().unwrap();
-        assert!(!source_capture_enabled(&flags));
-        flags.set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, true).unwrap();
-        assert!(source_capture_enabled(&flags));
-    }
-
-    #[test]
-    fn disabled_reconciler_does_not_allocate_or_spawn_collection() {
-        let (_directory, work_db) = open_db();
-        let work_db = Arc::new(work_db);
-        let flag_directory = tempfile::tempdir().unwrap();
-        let flags = Arc::new(FeatureFlagsStore::new(flag_directory.path().join("feature-flags.toml")));
-        reconcile_review_guide_source_with_collector(
-            work_db.clone(),
-            flags,
-            SourceCaptureRequest::builder()
-                .root_task_id("unreachable-root")
-                .pr_url("https://github.com/acme/widget/pull/25")
-                .trigger(PrSourceCaptureTrigger::Creation)
-                .observed(PinnedComparison {
-                    base_sha: "base".to_owned(),
-                    head_sha: "head".to_owned(),
-                })
-                .build(),
-            github_source_packet_collector(),
-        );
-        assert_eq!(
-            work_db.allocate_pr_review_guide_source_observation_sequence().unwrap(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn execution_reconciler_persists_a_revision_capture_on_its_canonical_root() {
-        let (_directory, work_db) = open_db();
-        let work_db = Arc::new(work_db);
-        let product = create_product(&work_db);
-        let root = create_active_chore(&work_db, &product, "root source capture");
-        let pr_url = "https://github.com/acme/widget/pull/25";
-        work_db
-            .update_work_item(
-                &root,
-                WorkItemPatch {
-                    status: Some("in_review".to_owned()),
-                    pr_url: Some(pr_url.to_owned()),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        let revision = work_db
-            .create_revision(
-                CreateRevisionInput::builder()
-                    .parent_task_id(root.clone())
-                    .description("refresh the implementation")
-                    .build(),
-                &FakePrStateChecker::always(PrOpenState::Open),
-            )
-            .unwrap();
-        let execution = work_db
-            .create_execution(
-                CreateExecutionInput::builder()
-                    .work_item_id(revision.id)
-                    .kind(ExecutionKind::RevisionImplementation)
-                    .status(ExecutionStatus::Ready)
-                    .build(),
-            )
-            .unwrap();
-        let flag_directory = tempfile::tempdir().unwrap();
-        let flags = Arc::new(FeatureFlagsStore::new(flag_directory.path().join("feature-flags.toml")));
-        flags.set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, true).unwrap();
-        let packet = SourcePacket {
-            schema_version: 3,
-            canonical_pr_url: pr_url.to_owned(),
-            pr_number: 25,
-            title: "Captured revision".to_owned(),
-            body: None,
-            base_repository: "acme/widget".to_owned(),
-            head_repository: "acme/widget".to_owned(),
-            observed_base_sha: "base".to_owned(),
-            probe_base_sha: None,
-            merge_base_sha: "merge-base".to_owned(),
-            head_sha: "head".to_owned(),
-            files: Vec::new(),
-            omissions: Vec::new(),
-        };
-        let fixture_packet = packet.clone();
-        let collect: PacketCollectFn = Arc::new(move |url, observed, expected_head_branch, _metadata| {
-            let packet = packet.clone();
-            Box::pin(async move {
-                let Some(observed) = observed else {
-                    anyhow::bail!("execution reconciler supplied unexpected comparison identity");
-                };
-                if url != packet.canonical_pr_url || observed.base_sha != "base" || observed.head_sha != "head" {
-                    anyhow::bail!("execution reconciler supplied unexpected comparison identity");
-                }
-                if expected_head_branch.is_some() {
-                    anyhow::bail!("revision capture must not require an implementation branch name");
-                }
-                Ok(packet)
-            })
-        });
-        let collector = SourcePacketCollector::fixture(collect, fixture_packet);
-        let handle = reconcile_review_guide_source_for_execution_with_collector(
-            work_db.clone(),
-            flags,
-            &execution.id,
-            pr_url,
-            PrSourceCaptureTrigger::Completion,
-            Some(PinnedComparison {
-                base_sha: "base".to_owned(),
-                head_sha: "head".to_owned(),
-            }),
-            collector,
-        )
-        .expect("enabled execution reconciliation must start collection");
-        handle.await.unwrap();
-
-        let capture = work_db
-            .get_latest_pr_review_guide_source_capture(&root)
-            .unwrap()
-            .expect("capture persisted on canonical root");
-        assert_eq!(capture.trigger, "completion");
-        assert_eq!(capture.packet.head_sha, "head");
-    }
-}
+#[path = "review_guide_capture_tests.rs"]
+mod tests;
