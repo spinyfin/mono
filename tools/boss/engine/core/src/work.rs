@@ -718,6 +718,7 @@ mod chain_helpers;
 mod ci_failure_identity;
 mod comment_thread_entries;
 mod comments;
+mod completion_evidence;
 mod conflict_res;
 mod coordinator_guidance_cache;
 mod coordinator_tmux;
