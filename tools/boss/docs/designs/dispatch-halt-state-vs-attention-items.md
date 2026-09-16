@@ -1,8 +1,8 @@
 # Boss: dispatch/execution halt state does not belong in attention items
 
-- **Status:** shipped (churn-guard park only) — see PR mono#2742.
+- **Status:** shipped for active-task churn and deliberate parks — see PRs mono#2742 and mono#2964.
 - **Prompted by:** a churn-guard park being invisible on the kanban board — the card sits in Doing looking normal while nothing runs, and the only way to find it was the CLI. Rendering attention items on cards was considered and rejected: it would have made the wrong representation load-bearing rather than fixing it.
-- **Code:** `tools/boss/engine/core/src/attention_lifecycle.rs` (the kind registry this doc classifies), `tools/boss/engine/core/src/orphan_sweep.rs`, `tools/boss/engine/core/src/work/dispatch.rs` (`bounce_dispatch_failed_to_backlog`), `tools/boss/app-macos/Sources/WorkBoardCard.swift` (`WorkDispatchFailureBanner`).
+- **Code:** `tools/boss/engine/core/src/attention_lifecycle.rs` (the kind registry this doc classifies), `tools/boss/engine/core/src/orphan_sweep.rs`, `tools/boss/engine/core/src/work/dispatch.rs` (`bounce_dispatch_failed_to_backlog`), `tools/boss/app-macos/Sources/WorkBoardBanners.swift` (`WorkDispatchFailureBanner`).
 
 ## The rule
 
@@ -14,38 +14,52 @@ The test to apply to a candidate kind: _if every open instance of this kind vani
 
 Attention items remain the right mechanism whenever the honest answer to "what closes this?" is `ClearedBy::HumanDecision` or `ClearedBy::ProducerReconciles` _and_ the thing being decided is about the work or an engine action needing sign-off, not about whether the dispatcher is currently able to run something.
 
-## What this PR fixes
+## Shipped halt surfaces
 
 `churn_guard_parked` (filed by `orphan_sweep` when an `active` work item accumulates too many terminal executions in the trailing window) moves off `work_attention_items` entirely. It now goes through the same mechanism a pre-spawn dispatch failure already uses: `WorkDb::bounce_dispatch_failed_to_backlog(work_item_id, "churn_guard", body)`. See the code comment on that call site in `orphan_sweep.rs` for the exact tradeoffs (status change, retry cadence).
 
-`pr_review_recovery`'s use of the _same_ `churn_guard_parked` kind is explicitly **not** touched by this PR — the deferral is recorded on the PR that ships this doc. It guards a `pr_review` execution for a task under active review, where "Backlog" is not a meaningful destination (the task has an open PR under active review); it needs its own board-surfacing design, not a copy-paste of the active-task fix.
+`pr_review_recovery` retains the _same_ `churn_guard_parked` attention kind. It guards a `pr_review` execution for a task under active review, where "Backlog" is not a meaningful destination (the task has an open PR under active review); it needs its own board-surfacing design, not a copy-paste of the active-task fix.
+
+### Deliberate parks and attention coexistence
+
+For `run_done_declared_blocked` and `nudge_breaker_tripped`, the sweep retains the open attention item as the decision record and separately moves the task to Backlog with `dispatch_failed_reason = deliberate_park`. Both liveness guards run before this write, even when dispatch is paused or all worker slots are busy. This write never mints an execution. The blue Waiting on you banner names deliberate park and, when present, churn guard; its visible summary tells the user to review the attention item and drag to Doing to resume. Detailed execution diagnostics remain available on hover.
+
+Unlike a churn-only halt, a deliberate park is excluded from automatic dispatch-failure recovery. An explicit work start or drag to Doing starts a fresh run, clears the halt stamp, and resolves the attention through `ClearedBy::WorkResumed`. The two surfaces coexist because the attention records the decision needed while the typed field makes the stopped state visible on the board. A combined park and churn trip retains the deliberate-park reason and its explicit-resume requirement.
 
 ## Classification of every kind in `ATTENTION_LIFECYCLES` (as of this audit)
 
 Confidence is "high" only where the kind's own doc comment/rationale in `attention_lifecycle.rs` states its meaning explicitly; "medium" where classified from the constant's producer module without reading every call site.
 
-### Bucket A — dispatch/execution mechanics, should eventually move off attention items (same defect shape as `churn_guard_parked`)
+### Bucket A — dispatch/execution mechanics requiring board-native state
 
 | kind                                                                                                                                                                     | why it's mechanics, not judgment                                                                                                                                                                                              | confidence |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| `churn_guard_parked`                                                                                                                                                     | fixed by this PR (active-task case only)                                                                                                                                                                                      | high       |
+| `churn_guard_parked`                                                                                                                                                     | fixed in mono#2742 (active-task case only)                                                                                                                                                                                    | high       |
 | `worker_recovery_permanent_error`, `worker_recovery_exhausted`                                                                                                           | its own rationale in the registry says outright: _"This is a dispatch gate, not a report"_ — the clearest sibling of `churn_guard_parked` in the whole table                                                                  | high       |
 | `dispatch_stage_stalled`                                                                                                                                                 | "asserts an execution is wedged before dispatch"                                                                                                                                                                              | high       |
 | `chain_serialized_stall`                                                                                                                                                 | "the item is queued behind a chain sibling"                                                                                                                                                                                   | high       |
 | `husk_breaker`                                                                                                                                                           | its own rationale: _"About pane retirement, not about this work item"_                                                                                                                                                        | high       |
-| `pane_death`, `tmux_adoption_schema_skew`, `driver_start`, `progress_ingress_unrecoverable`, `nudge_breaker`, `driver_terminal_error`, `pane_spawn_failed`               | worker-pane/driver lifecycle bookkeeping                                                                                                                                                                                      | medium     |
+| `pane_death`, `tmux_adoption_schema_skew`, `driver_start`, `progress_ingress_unrecoverable`, `driver_terminal_error`, `pane_spawn_failed`                                | worker-pane/driver lifecycle bookkeeping                                                                                                                                                                                      | medium     |
 | `spawn_capability`                                                                                                                                                       | its own rationale: _"Host-level spawn capability, not per-item state"_                                                                                                                                                        | high       |
 | `repo_unresolved`                                                                                                                                                        | config-resolution gate, not a judgment about the work's content                                                                                                                                                               | medium     |
 | `proposal_channel_error`                                                                                                                                                 | describes an engine parse/delivery failure, not a decision about the work (the lost proposal content is a side effect)                                                                                                        | medium     |
 | `trunk_queue_unreachable`, `trunk_token_rejected`, `trunk_queue_not_running`, `trunk_queue_entry_cancelled`, `trunk_queue_merge_failure`, `trunk_queue_resubmit_stalled` | merge-queue integration/infra state; Task already has a precedent for board-native PR-lifecycle fields (`ciRequiredState`, `reviewRequiredState`, `mergeQueueState`) that these could migrate onto instead of attention items | medium     |
 
-None of the above are touched by this PR beyond `churn_guard_parked`. They are candidates for the same fix, one at a time, each needing its own board-placement design (as pr_review_recovery's churn park does) — they are not free rewrites of this PR's pattern.
+The remaining mechanics kinds need their own board-placement design; the active-task Backlog placement does not apply automatically to every lifecycle.
 
 ### Bucket B — genuinely human-judgment-about-the-work (correctly attention items; no change needed)
 
 `question`, `followup`, `deferred_scope`, `deletion_signoff` (`merge_parent_deletion`), `review_result_giveup`, `revision_no_op`, `mid_turn_reap`, `worker_escalation`, `worker_blocked`, `abandoned_branch_no_pr`, `revision_archived`, `ci_remediation_exhausted`, `answer_agent_stranded`, `unobserved_command` (+ `_overflow`), `external_tracker_removed_upstream`, `external_tracker_permission_denied`, `push_restriction`, `envelope_overrun`, `probe_undelivered`, `answer_agent_ready_age`, `external_tracker_auth_failed`, `external_tracker_token_revoked`, `external_tracker_transient_errors`.
 
 Of particular note, since a sibling chore ("worker_blocked and worker_escalation attention items are unreachable from every read surface") depends on this classification: **`worker_escalation` and `worker_blocked` are correctly classified.** They are the `[effort-escalation]` / `[blocked]` Stop-boundary markers (`worker_escalation.rs`) — a worker explicitly asking a human/coordinator for a decision it cannot make alone. That is exactly the shape an attention item is for. The fix for that sibling chore should be "make the existing attention item reachable" (a genuine read-surface gap), not a representation change like this PR made for `churn_guard_parked`.
+
+### Bucket C — attention item is the decision record; board reads a typed halt
+
+These kinds stay on `work_attention_items` because the honest answer to "what closes this?" is a human decision about the work (`ClearedBy::WorkResumed`). They also need board-native state so the card does not sit in Doing looking healthy. Both halves shipped together in mono#2964: the sweep retains the open attention item and stamps `dispatch_failed_reason = deliberate_park`. One predicate (`DELIBERATE_PARK_ATTENTION_KINDS` / `work_item_is_deliberately_parked`) covers both kinds; they must not be split across buckets.
+
+| kind                                                 | why both surfaces                                                                                       | confidence |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------- | ---------- |
+| `run_done_declared_blocked`, `nudge_breaker_tripped` | typed halt coexists with the decision attention item; the board names the wait, the attention names why | high       |
 
 ## Migration for pre-existing open `churn_guard_parked` items
 

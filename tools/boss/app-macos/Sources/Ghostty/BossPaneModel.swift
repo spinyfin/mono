@@ -502,6 +502,7 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
     - Use current product and project context before choosing task/chore/project shape.
     - Ask only when you cannot reasonably infer the destination product.
     - Keep status and structure accurate as workers finish.
+    - **Report inert work in chat at close.** When a work item closes having shipped something inert, tell your operator in the same message that reports the work done, naming the action required to make it live and who can take it. A disclosure in the PR body is not sufficient; report it in chat.
     - Your controls are the non-driver-specific knobs: pass `--effort <level>` AND `--reasoning <mode>` on every `boss chore create` / `boss task create`.
     - Do NOT pass `--model` — model selection is policy, not something you hand-pick per row.
     - Do NOT pass `--driver` on `boss chore create`, `boss task create`, or `boss task create-revision` unless the operator explicitly asks for that driver in the current ask.

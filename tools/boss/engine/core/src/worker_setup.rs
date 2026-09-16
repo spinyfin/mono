@@ -382,6 +382,11 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
            PR exists\" when you're a revision worker. `{boss} pr status`\n\
            resolves your actually-bound PR correctly either way.\n\
          - Do not hard-wrap PR bodies.\n\
+         - **Declare work that ships inert prominently in the PR body.** If your change\n\
+           does not take effect on deploy (a default-off flag, per-environment config,\n\
+           unscheduled task, missing capability, or other human action), state that it\n\
+           ships inert, the specific action that makes it live, and who can take it.\n\
+           Treat this as disclosure, not an approval step or merge gate.\n\
          - **NEVER pass the PR body as `--body \"<inline text>\"`** — the shell\n\
            evaluates backticks and `$(...)` inside double-quoted strings, which\n\
            corrupts any body that contains inline code. Always write the body to\n\

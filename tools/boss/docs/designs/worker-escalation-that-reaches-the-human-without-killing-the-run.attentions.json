@@ -1,0 +1,23 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "Denial reaps the worker immediately (your stated shape). Should the worker instead get one bounded wind-down turn (e.g. 3 minutes) to record its own final summary before the engine reaps it? The blocked explanation and the head-commit pointer survive either way; the wind-down only adds the worker's own words.",
+    "anchor": "denial-atomic-blocked-transition-then-reap"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Which pool should the escalation supervisor run on? The doc recommends the review pool (pinned strong model, exempt from dispatch pause, cannot deadlock behind the escalating worker's interactive slot).",
+    "choices": ["review pool (recommended)", "automation pool", "a new dedicated escalation pool"],
+    "anchor": "the-supervisor"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "v1 approval is instructional only: the human's words reach the worker as a prompt, and no mechanical capability (e.g. a gate bypass token) is granted. Is it acceptable to ship v1 that way and treat approval-scoped capability grants as deferred follow-on work?",
+    "anchor": "risks--open-questions"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "The doc keeps the worker alive, holding its interactive slot and cube lease, for as long as the human takes to decide, with no expiry. Is unbounded slot occupancy acceptable for v1 (the loud slot-release park is deferred)?",
+    "anchor": "risks--open-questions"
+  }
+]

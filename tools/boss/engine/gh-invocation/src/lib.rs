@@ -494,8 +494,8 @@ mod tests {
 
     #[test]
     fn cube_pr_create_not_matched_inside_double_quoted_commit_message() {
-        // Reproduces the T1031 bug: the phrase appears inside -m "..."
-        // but the command is `jj describe`, not `cube pr create`.
+        // A `pr create` phrase inside an -m "..." body must not be classified as an invocation.
+        // The command here is `jj describe`.
         assert!(
             !is_cube_pr_create(
                 r#"jj describe -m "fix(boss-engine): extend editorial hook to intercept cube pr create""#,
