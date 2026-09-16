@@ -129,7 +129,7 @@ Use `jj` for all VCS. Do not invoke `git` directly except via `gh`.
 - `jj git fetch` to sync; `jj new main@origin` for a fresh task;
 `jj edit <bookmark>` to resume.
 - `jj describe -m '...'` to set commit messages;
-`jj bookmark create <name> -r @` to name a commit.
+`jj bookmark set <name> -r @` to create or advance a bookmark.
 - **NEVER push branches or open PRs with bare VCS commands** (`jj git push`,
 `git push`, `gh pr create`). A PreToolUse hook blocks these. Use:
 - `"$CUBE_BIN" pr create --branch <name>` — new PR (pushes branch + opens PR, jj-aware, no GIT_DIR needed)
@@ -163,7 +163,7 @@ line. This protects backticks, `$(...)`, and `${VAR}` from shell evaluation.
 
 ```sh
 jj describe -m "your commit message"
-jj bookmark create my-feature -r @
+jj bookmark set my-feature -r @
 body=$(mktemp)
 cat > "$body" << 'PRBODY'
 ## Summary

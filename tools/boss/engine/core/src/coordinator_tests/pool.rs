@@ -596,7 +596,7 @@ async fn running_worker_is_never_preempted_by_a_higher_dispatch_class_arrival() 
 }
 
 #[tokio::test]
-async fn scheduler_passes_preferred_workspace_to_lease_and_records_affinity() {
+async fn scheduler_records_actual_lease_affinity_without_pinning_the_workspace() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     seed_local_claude_driver(&db);
@@ -626,7 +626,7 @@ async fn scheduler_passes_preferred_workspace_to_lease_and_records_affinity() {
 
     let calls = cube.lease_calls.lock().await;
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].2.as_deref(), Some("mono-agent-007"));
+    assert!(calls[0].2.is_none(), "the pool must be free to supply any workspace");
     drop(calls);
 
     let execution = db.get_execution(&execution.id).unwrap();

@@ -781,11 +781,9 @@ async fn reap_dead_execution(
     )
     .await;
 
-    // Snapshot the dead worker's uncommitted workspace work to a
-    // durable patch before the slot is released and the workspace
-    // becomes eligible for re-lease/reset. Best-effort: a failed or
-    // empty capture returns None and never blocks the reap.
-    let recovery_patch = boss_engine_recovery::recovery_backup::backup_dead_execution(execution);
+    // Export supplementary patch evidence from the recorded shared-store ref.
+    // Inspection failures raise attention; they never read the old workspace.
+    let recovery_patch = crate::execution_bookmark_recovery::backup_dead_execution(work_db, execution).await;
 
     // Append [engine-reconcile] audit line to the task description
     // so a human inspecting the chore can see why it was reset (and

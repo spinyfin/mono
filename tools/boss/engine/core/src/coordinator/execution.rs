@@ -260,7 +260,7 @@ impl ExecutionCoordinator {
         work_item: &WorkItem,
         worker_id: &str,
     ) -> Result<Host> {
-        let pinned = self
+        let mut pinned = self
             .work_db
             .execution_pinned_host(&execution.id)
             .context("host-selection: execution pinned host")?;
@@ -270,6 +270,25 @@ impl ExecutionCoordinator {
         // there. `schedule_execution` clears it explicitly on success or
         // on a terminal cancel — never here.
         let requested = self.requested_host_for(&execution.id);
+        let recovery_record = match self.work_db.execution_bookmark_optional(&execution.id)? {
+            Some(record) => Some(record),
+            None => match self.work_db.recovery_predecessor(execution)? {
+                Some(prior) => self.work_db.execution_bookmark_optional(&prior.id)?,
+                None => None,
+            },
+        };
+        if let Some(record) = recovery_record {
+            for constraint in [pinned.as_deref(), requested.as_deref()].into_iter().flatten() {
+                anyhow::ensure!(
+                    constraint == record.host_id,
+                    "recovery store is on host {}, conflicting with requested host {constraint}",
+                    record.host_id
+                );
+            }
+            // The repository store is host-local. This constrains the host,
+            // never a cube workspace or its lease lifetime.
+            pinned = Some(record.host_id);
+        }
         // Resolved driver is a hard requirement. Prefer the claimed
         // worker's pool policy (review/automation) so placement matches
         // the driver spawn will actually launch; otherwise use the same
@@ -1170,11 +1189,6 @@ impl ExecutionCoordinator {
             }
         }
 
-        // Recovery, cube-first (see `reconcile_workspace_recovery`). Runs
-        // before the run starts so the worker's prompt can read the marker
-        // this drops. A no-op for every non-resume dispatch.
-        self.reconcile_workspace_recovery(execution, worker_id, &lease).await;
-
         // Lease-time occupancy guard (defect 3). Cube should never hand us
         // a workspace that is still the cwd of a live worker — but the
         // duplicate-dispatch incident proved it can when an upstream bug
@@ -1357,7 +1371,7 @@ impl ExecutionCoordinator {
             }
         }
         {
-            let mut lease_args = vec![
+            let lease_args = vec![
                 "--json",
                 "workspace",
                 "lease",
@@ -1369,9 +1383,6 @@ impl ExecutionCoordinator {
                 // reproduces exactly what ran.
                 "--release-on-setup-failure",
             ];
-            if let Some(p) = execution.preferred_workspace_id.as_deref() {
-                lease_args.extend_from_slice(&["--prefer", p]);
-            }
             self.dispatch_events
                 .emit(
                     DispatchEvent::new(Stage::CubeWorkspaceLeased, DispatchOutcome::Ok, &execution.id)
@@ -1393,9 +1404,27 @@ impl ExecutionCoordinator {
         // above — the PR is MERGED by construction, which `--pr` refuses
         // outright). Both must happen before handing the workspace to the
         // worker. If positioning fails, abort dispatch with a diagnosable stage.
-        let recovered_blocked = self.work_db.blocked_workspace_predecessor(execution)?.is_some()
-            && lease.dirty_verified == Some(true)
-            && execution.preferred_workspace_id.as_deref() == Some(&lease.workspace_id);
+        let recovered = match self.recover_execution_bookmark(execution, &lease, &adapter).await {
+            Ok(recovered) => recovered,
+            Err(err) => {
+                if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
+                    tracing::error!(?release_err, "failed to release lease after bookmark recovery failure");
+                }
+                self.record_start_failure(
+                    Arc::clone(self),
+                    execution,
+                    worker_id,
+                    Some(&repo.repo_id),
+                    (
+                        crate::execution_bookmark_recovery::RECOVERY_FAILED,
+                        "Execution bookmark recovery failed",
+                    ),
+                    &err,
+                )?;
+                return Err(err);
+            }
+        };
+        let recovered_blocked = recovered.as_ref().is_some_and(|(_, has_work)| *has_work);
         let goto_target = match (pr_for_goto, post_merge_target_sha.as_deref()) {
             _ if recovered_blocked => None,
             (_, Some(sha)) => Some(GotoTarget::Revision(sha)),
@@ -1579,6 +1608,45 @@ impl ExecutionCoordinator {
                 }
             }
         };
+
+        let bookmark_result = async {
+            if self.work_db.execution_bookmark_optional(&execution.id)?.is_none() {
+                let predecessor = recovered
+                    .as_ref()
+                    .filter(|(_, has_work)| *has_work)
+                    .map(|(id, _)| self.work_db.execution_bookmark(id))
+                    .transpose()?;
+                let record = adapter
+                    .create_execution_bookmark(&lease.workspace_path, &execution.id, predecessor.as_ref())
+                    .await?;
+                self.work_db.record_execution_bookmark(&record)?;
+            }
+            if let Some((predecessor, has_work)) = &recovered
+                && predecessor != &execution.id
+            {
+                self.work_db
+                    .record_bookmark_recovery(&execution.id, predecessor, *has_work)?;
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(err) = bookmark_result {
+            if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
+                tracing::error!(?release_err, "failed to release lease after bookmark creation failure");
+            }
+            self.record_start_failure(
+                Arc::clone(self),
+                execution,
+                worker_id,
+                Some(&repo.repo_id),
+                (
+                    crate::execution_bookmark_recovery::CREATE_FAILED,
+                    "Execution bookmark creation failed",
+                ),
+                &err,
+            )?;
+            return Err(err);
+        }
 
         let attributed_pool = self.attributed_pool_label(execution);
         let tmux_hosted = selected_host.id == "local" && adapter.tmux_hosting_enabled_for(attributed_pool);
@@ -1815,405 +1883,6 @@ impl ExecutionCoordinator {
         }
     }
 
-    /// Reclaim a stale cube lease still held against `workspace_id` by a
-    /// dead (now-terminal) execution, so a hard-prefer resume can
-    /// re-lease that exact workspace and recover the in-flight jj
-    /// checkout. See [`crate::work::WorkDb::stale_lease_to_reclaim_for_workspace`]
-    /// and issue #962 for the full rationale.
-    ///
-    /// Best-effort: probes cube's live view (`list_workspaces`) for the
-    /// lease currently bound to `workspace_id`, cross-checks it against
-    /// the engine's own record (only a lease whose owning execution is
-    /// terminal and unclaimed is eligible), and force-releases it. Every
-    /// failure mode is logged and swallowed — the caller proceeds to the
-    /// normal lease attempt regardless, so a flaky cube probe never
-    /// blocks a resume.
-    async fn reclaim_stale_lease_for_resume(
-        &self,
-        execution: &WorkExecution,
-        worker_id: &str,
-        workspace_id: &str,
-        adapter: &Arc<dyn HostAdapter>,
-    ) {
-        let snapshot = match adapter.list_workspaces().await {
-            Ok(rows) => rows,
-            Err(err) => {
-                tracing::warn!(
-                    execution_id = %execution.id,
-                    workspace_id,
-                    error = format!("{err:#}"),
-                    "stale-lease reclaim: cube workspace list failed; proceeding to lease without reclaim",
-                );
-                return;
-            }
-        };
-        let Some(workspace) = snapshot.iter().find(|w| w.workspace_id == workspace_id) else {
-            // Cube doesn't list the workspace, or it's already free —
-            // nothing to reclaim, the lease attempt can proceed.
-            return;
-        };
-        if workspace.state != "leased" {
-            return;
-        }
-        let Some(current_lease_id) = workspace.lease_id.as_deref() else {
-            return;
-        };
-
-        // Only reclaim a lease the engine can prove belongs to a dead
-        // (terminal, unclaimed) execution for this workspace.
-        let stale_lease_id = match self
-            .work_db
-            .stale_lease_to_reclaim_for_workspace(workspace_id, current_lease_id)
-        {
-            Ok(Some(id)) => id,
-            Ok(None) => return,
-            Err(err) => {
-                tracing::warn!(
-                    execution_id = %execution.id,
-                    workspace_id,
-                    current_lease_id,
-                    ?err,
-                    "stale-lease reclaim: DB lookup failed; proceeding to lease without reclaim",
-                );
-                return;
-            }
-        };
-
-        let reason = format!(
-            "boss engine: reclaiming stale lease for UI-crash resume of execution {} (workspace {workspace_id})",
-            execution.id,
-        );
-        match adapter
-            .force_release_lease(&stale_lease_id, Some(reason.as_str()))
-            .await
-        {
-            Ok(()) => {
-                tracing::warn!(
-                    execution_id = %execution.id,
-                    worker_id,
-                    workspace_id,
-                    reclaimed_lease_id = %stale_lease_id,
-                    "stale-lease reclaim: force-released dead worker's lease so resume can re-lease its workspace",
-                );
-                self.dispatch_events
-                    .emit(
-                        DispatchEvent::new(Stage::CubeWorkspaceLeaseAttempted, DispatchOutcome::Ok, &execution.id)
-                            .with_work_item(&execution.work_item_id)
-                            .with_worker(worker_id)
-                            .with_details(serde_json::json!({
-                                "step": "stale_lease_reclaim",
-                                "workspace_id": workspace_id,
-                                "reclaimed_lease_id": stale_lease_id.as_str(),
-                            })),
-                    )
-                    .await;
-            }
-            Err(err) => {
-                tracing::warn!(
-                    execution_id = %execution.id,
-                    worker_id,
-                    workspace_id,
-                    stale_lease_id = %stale_lease_id,
-                    error = format!("{err:#}"),
-                    "stale-lease reclaim: force-release failed; proceeding to lease attempt anyway",
-                );
-            }
-        }
-    }
-
-    /// Locate the recovery patch belonging to the execution that
-    /// `execution` is resuming, if the engine captured one.
-    ///
-    /// Returns `(dead_execution_id, patch_path)`. The dead execution is found
-    /// via `get_prior_orphaned_execution`, the same lookup
-    /// [`reconcile_workspace_recovery`] uses to populate the recovery report
-    /// this resume's STARTUP RECOVERY prompt block reads back.
-    ///
-    /// Every failure mode (no recovery dir, no prior orphan, no patch on
-    /// disk, a DB error) yields `None`: recovery is a precaution layered on
-    /// top of dispatch and must never be able to break it.
-    fn recovery_patch_for_resume(&self, execution: &WorkExecution) -> Option<(String, PathBuf)> {
-        let recovery_dir = boss_engine_recovery::recovery_backup::default_recovery_dir()?;
-        let prior = self
-            .work_db
-            .get_prior_orphaned_execution(&execution.work_item_id, &execution.id)
-            .ok()
-            .flatten()?;
-        let patch = boss_engine_recovery::recovery_apply::find_patch(&recovery_dir, &prior.id)?;
-        Some((prior.id, patch))
-    }
-
-    /// Resolve, and record, how a resume dispatch got its predecessor's work
-    /// back — cube first, patch only as fallback.
-    ///
-    /// Called once per dispatch immediately after the lease. Does nothing for
-    /// a non-resume execution (`allow_dirty` is the resume flag; the
-    /// reconcilers set it on every respawn that pins a workspace).
-    ///
-    /// The order is the operator's:
-    ///
-    /// 1. **Cube recovered in place.** `lease.dirty_verified == Some(true)`
-    ///    means cube handed back a working copy that still held work existing
-    ///    on no remote. The work is live, in place, with jj history intact.
-    ///    We must NOT apply the patch on top of it — the hunks are already
-    ///    there and a second application either duplicates them or conflicts.
-    /// 2. **Cube could not recover.** The lease failed and we degraded to a
-    ///    free workspace, or it succeeded with `dirty_verified == Some(false)`
-    ///    because the tree had already been reset. Now, and only now, replay
-    ///    the patch.
-    ///
-    /// A failed apply is loud: an `outcome=error` dispatch event, an
-    /// `ERROR`-level log, and a recovery report carrying `patch_error` so the
-    /// worker's prompt tells it recovery FAILED rather than letting it build
-    /// on a tree it believes was restored.
-    pub(super) async fn reconcile_workspace_recovery(
-        &self,
-        execution: &WorkExecution,
-        worker_id: &str,
-        lease: &CubeWorkspaceLease,
-    ) {
-        if !execution.allow_dirty {
-            return;
-        }
-        let blocked_predecessor = match self.work_db.blocked_workspace_predecessor(execution) {
-            Ok(prior) => prior,
-            Err(err) => {
-                tracing::error!(execution_id = %execution.id, error = %err,
-                    "cannot establish recovery provenance; refusing recovery patch replay");
-                return;
-            }
-        };
-        if let Some(prior) = blocked_predecessor {
-            use boss_engine_recovery::recovery_apply::{RecoveryReport, RecoverySource};
-            let in_place = lease.dirty_verified == Some(true)
-                && execution.preferred_workspace_id.as_deref() == Some(&lease.workspace_id);
-            self.record_recovery(
-                execution,
-                worker_id,
-                lease,
-                RecoveryReport {
-                    for_execution_id: execution.id.clone(),
-                    from_execution_id: prior.id,
-                    source: if in_place {
-                        RecoverySource::BlockedInPlace
-                    } else {
-                        RecoverySource::BlockedFresh
-                    },
-                    applied: None,
-                    patch_error: None,
-                },
-                None,
-            )
-            .await;
-            // A described commit is not an uncommitted recovery patch.
-            return;
-        }
-        let Some((dead_execution_id, patch_path)) = self.recovery_patch_for_resume(execution) else {
-            // No captured patch. Cube may still have recovered in place — say
-            // so, so the worker knows not to start from `main`.
-            if lease.dirty_verified == Some(true) {
-                self.record_recovery(
-                    execution,
-                    worker_id,
-                    lease,
-                    boss_engine_recovery::recovery_apply::RecoveryReport {
-                        for_execution_id: execution.id.clone(),
-                        from_execution_id: String::new(),
-                        source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
-                        applied: None,
-                        patch_error: None,
-                    },
-                    None,
-                )
-                .await;
-            }
-            return;
-        };
-
-        // ── 1. cube-first ────────────────────────────────────────────────
-        if lease.dirty_verified == Some(true) {
-            self.record_recovery(
-                execution,
-                worker_id,
-                lease,
-                boss_engine_recovery::recovery_apply::RecoveryReport {
-                    for_execution_id: execution.id.clone(),
-                    from_execution_id: dead_execution_id,
-                    source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
-                    applied: None,
-                    patch_error: None,
-                },
-                Some(&patch_path),
-            )
-            .await;
-            return;
-        }
-
-        // ── 2. patch fallback ────────────────────────────────────────────
-        match boss_engine_recovery::recovery_apply::apply_recovery_patch(&lease.workspace_path, &patch_path) {
-            Ok(Some(applied)) => {
-                tracing::info!(
-                    execution_id = %execution.id,
-                    dead_execution_id = %dead_execution_id,
-                    workspace_id = %lease.workspace_id,
-                    restored = %applied.summary(),
-                    "workspace recovery: replayed the dead execution's patch into the resuming workspace",
-                );
-                self.record_recovery(
-                    execution,
-                    worker_id,
-                    lease,
-                    boss_engine_recovery::recovery_apply::RecoveryReport {
-                        for_execution_id: execution.id.clone(),
-                        from_execution_id: dead_execution_id,
-                        source: boss_engine_recovery::recovery_apply::RecoverySource::Patch,
-                        applied: Some(applied),
-                        patch_error: None,
-                    },
-                    Some(&patch_path),
-                )
-                .await;
-            }
-            Ok(None) => {
-                // The capture held nothing but Boss's own bookkeeping. Not a
-                // failure, but not a recovery either — say nothing to the
-                // worker rather than claim a restoration that did not happen.
-                tracing::info!(
-                    execution_id = %execution.id,
-                    dead_execution_id = %dead_execution_id,
-                    patch = %patch_path.display(),
-                    "workspace recovery: patch held only Boss bookkeeping; nothing restored",
-                );
-                self.dispatch_events
-                    .emit(
-                        DispatchEvent::new(Stage::WorkspaceRecovery, DispatchOutcome::Ok, &execution.id)
-                            .with_work_item(&execution.work_item_id)
-                            .with_worker(worker_id)
-                            .with_details(serde_json::json!({
-                                "source": "patch",
-                                "restored": false,
-                                "reason": "bookkeeping_only",
-                                "dead_execution_id": dead_execution_id,
-                            })),
-                    )
-                    .await;
-                boss_engine_recovery::recovery_apply::mark_patch_consumed(&patch_path);
-            }
-            Err(err) => {
-                let message = format!("{err:#}");
-                tracing::error!(
-                    execution_id = %execution.id,
-                    dead_execution_id = %dead_execution_id,
-                    workspace_id = %lease.workspace_id,
-                    patch = %patch_path.display(),
-                    error = %message,
-                    "workspace recovery FAILED: the dead execution's patch did not apply; \
-                     the worker will be told NOT to assume its state was recovered",
-                );
-                self.dispatch_events
-                    .emit(
-                        DispatchEvent::new(Stage::WorkspaceRecovery, DispatchOutcome::Error, &execution.id)
-                            .with_work_item(&execution.work_item_id)
-                            .with_worker(worker_id)
-                            .with_details(serde_json::json!({
-                                "source": "patch",
-                                "restored": false,
-                                "reason": "apply_failed",
-                                "dead_execution_id": dead_execution_id,
-                                "recovery_patch": patch_path.display().to_string(),
-                                "error": message,
-                            })),
-                    )
-                    .await;
-                // Deliberately NOT marked consumed: the patch is the only
-                // copy of the work and a human may still salvage it by hand.
-                let report = boss_engine_recovery::recovery_apply::RecoveryReport {
-                    for_execution_id: execution.id.clone(),
-                    from_execution_id: dead_execution_id,
-                    source: boss_engine_recovery::recovery_apply::RecoverySource::Patch,
-                    applied: None,
-                    patch_error: Some(message),
-                };
-                if let Err(write_err) = report.write(&lease.workspace_path) {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        error = %format!("{write_err:#}"),
-                        "workspace recovery: could not write the failure marker; \
-                         the worker's prompt will not mention the failed recovery",
-                    );
-                }
-            }
-        }
-    }
-
-    /// Persist a successful recovery: drop the marker the worker's prompt
-    /// reads, emit the dispatch event, and retire the patch so a later
-    /// restart does not replay it over the work it already restored (case: a
-    /// restart racing a just-completed recovery).
-    async fn record_recovery(
-        &self,
-        execution: &WorkExecution,
-        worker_id: &str,
-        lease: &CubeWorkspaceLease,
-        report: boss_engine_recovery::recovery_apply::RecoveryReport,
-        consume_patch: Option<&Path>,
-    ) {
-        let source = match report.source {
-            boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace => "cube_in_place",
-            boss_engine_recovery::recovery_apply::RecoverySource::Patch => "patch",
-            boss_engine_recovery::recovery_apply::RecoverySource::BlockedInPlace => "blocked_in_place",
-            boss_engine_recovery::recovery_apply::RecoverySource::BlockedFresh => "blocked_fresh",
-        };
-        let restored = report.applied.as_ref().map(|a| a.summary());
-        if let Err(err) = report.write(&lease.workspace_path) {
-            tracing::warn!(
-                execution_id = %execution.id,
-                error = %format!("{err:#}"),
-                "workspace recovery: could not write the recovery marker; the worker's \
-                 prompt will not know its state was recovered",
-            );
-        }
-        self.dispatch_events
-            .emit(
-                DispatchEvent::new(Stage::WorkspaceRecovery, DispatchOutcome::Ok, &execution.id)
-                    .with_work_item(&execution.work_item_id)
-                    .with_worker(worker_id)
-                    .with_details(serde_json::json!({
-                        "source": source,
-                        "restored": true,
-                        "workspace_id": lease.workspace_id,
-                        "dead_execution_id": report.from_execution_id,
-                        "summary": restored,
-                    })),
-            )
-            .await;
-        if let Some(patch) = consume_patch {
-            boss_engine_recovery::recovery_apply::mark_patch_consumed(patch);
-        }
-    }
-
-    /// Lease a cube workspace for `execution`, emitting a structured
-    /// attempt/failure event for every try and falling back to "any
-    /// free workspace" when an unprefixed lease fails.
-    ///
-    /// Behaviour matrix:
-    ///
-    /// | preferred set? | first attempt      | on first failure                          |
-    /// |----------------|--------------------|-------------------------------------------|
-    /// | no             | without `--prefer` | retry once without `--prefer` (`any_free`) |
-    /// | yes            | with `--prefer`    | terminal failure (preserves continuity)   |
-    ///
-    /// When `preferred_workspace_id` is set the caller needs a specific
-    /// workspace (e.g. resuming a prior run). Silently landing elsewhere
-    /// would lose state continuity, so we fail fast and let the scheduler
-    /// retry the dispatch later. When no preference is set any free
-    /// workspace is acceptable, so a single bad workspace cannot block
-    /// the entire dispatch.
-    ///
-    /// Each subprocess invocation is bounded by [`CUBE_LEASE_TIMEOUT`]
-    /// so the engine cannot wedge indefinitely waiting on cube — the
-    /// motivating incident sat in `worker_claimed/ok` for ~46s with
-    /// no event because the cube call never returned.
     pub(super) async fn lease_workspace_with_fallback(
         &self,
         execution: &WorkExecution,
@@ -2222,57 +1891,24 @@ impl ExecutionCoordinator {
         task: &str,
         adapter: &Arc<dyn HostAdapter>,
     ) -> Result<CubeWorkspaceLease> {
-        let prefer = execution.preferred_workspace_id.as_deref();
-        let allow_dirty = execution.allow_dirty;
-        let blocked_predecessor = self.work_db.blocked_workspace_predecessor(execution)?;
-        // Soft-prefer (OQ5): revision_implementation executions set
-        // prefer_is_soft = true so a missing or leased preferred workspace
-        // degrades silently to any free workspace rather than failing hard.
-        // Orphan-resume executions use the hard "none" policy (prefer_is_soft
-        // = false) because their state lives only in that specific workspace.
-        // allow_dirty additionally suppresses the cube-side reset so the
-        // recovering worker lands on the dirty tree. A hard preference still
-        // fails rather than losing continuity; the merge-cancelled-review
-        // handoff deliberately combines allow_dirty with a soft preference,
-        // because its contract explicitly permits a fresh-workspace fallback.
-        let fallback_policy = if prefer.is_none() || execution.prefer_is_soft {
-            "any_free"
-        } else {
-            "none"
-        };
+        // Lease clean scratch space. Recovery follows the engine-created
+        // reference in the shared store, never the old workspace's identity.
+        let prefer: Option<&str> = None;
+        let allow_dirty = false;
+        let fallback_policy = "any_free";
 
         // Look up any workspaces that were refused for this execution by the
         // occupancy guard on a previous dispatch attempt. Passing them as
         // `--exclude` to cube breaks the livelock where cube's deterministic
         // candidate ordering keeps re-offering the same occupied workspace.
-        let mut refused: Vec<String> = self
+        let refused: Vec<String> = self
             .refused_workspaces
             .lock()
             .await
             .get(&execution.id)
             .cloned()
             .unwrap_or_default();
-        let mut refused_refs: Vec<&str> = refused.iter().map(|s| s.as_str()).collect();
-
-        // Stale-lease reclaim (issue #962 — UI-crash resume).
-        //
-        // A hard-prefer resume targets the exact workspace the dead
-        // worker was leased into, because the in-flight jj checkout the
-        // human wants recovered lives only there. But after a UI crash
-        // the dead execution's cube lease is intentionally left intact
-        // (the startup reaper preserves it), so cube still reports that
-        // workspace as `leased` and will refuse a fresh
-        // `--prefer <workspace>` lease — failing the resume outright and
-        // stranding the local work. Before attempting the prefer lease,
-        // reclaim the dead lease if (and only if) the engine can prove
-        // it belongs to a now-terminal execution and no live execution
-        // claims the workspace. Best-effort: any probe/reclaim error is
-        // logged and we fall through to the normal lease attempt rather
-        // than blocking the resume.
-        if let Some(workspace_id) = prefer.filter(|_| !execution.prefer_is_soft) {
-            self.reclaim_stale_lease_for_resume(execution, worker_id, workspace_id, adapter)
-                .await;
-        }
+        let refused_refs: Vec<&str> = refused.iter().map(|s| s.as_str()).collect();
 
         // Build the lease args for attempt 1 so we can attach the
         // exact command to both the attempted and failed events.
@@ -2285,21 +1921,13 @@ impl ExecutionCoordinator {
             task,
             "--release-on-setup-failure",
         ];
-        if let Some(p) = prefer {
-            attempt1_args.extend_from_slice(&["--prefer", p]);
-        }
-        if allow_dirty {
-            attempt1_args.push("--allow-dirty");
-        }
         for excluded in &refused_refs {
             attempt1_args.extend_from_slice(&["--exclude", excluded]);
         }
         let attempt1_repr = adapter.command_repr(&attempt1_args);
 
-        // First attempt: use the preferred workspace if the caller
-        // pinned one. Emit `cube_workspace_lease_attempted` *before*
-        // the subprocess so the timeline shows what we tried even
-        // when cube hangs and never returns.
+        // Emit the attempt before leasing clean scratch so the timeline
+        // retains the invocation even if cube fails to return.
         self.dispatch_events
             .emit(
                 DispatchEvent::new(Stage::CubeWorkspaceLeaseAttempted, DispatchOutcome::Ok, &execution.id)
@@ -2319,7 +1947,7 @@ impl ExecutionCoordinator {
             .await;
 
         CUBE_WORKSPACE_LEASE_ATTEMPTS.inc(&self.metrics);
-        let first_err = match self
+        match self
             .invoke_lease(
                 repo,
                 task,
@@ -2330,22 +1958,6 @@ impl ExecutionCoordinator {
             )
             .await
         {
-            Ok(lease) if blocked_predecessor.is_some() => {
-                let prior = blocked_predecessor.as_ref().expect("checked above");
-                if self
-                    .verify_blocked_workspace(&execution.id, prior, &lease, adapter)
-                    .await
-                {
-                    CUBE_WORKSPACE_LEASE_SUCCESS.inc(&self.metrics);
-                    return Ok(lease);
-                }
-                // Release without resetting a foreign checkout, then exclude it
-                // from the clean fallback. A successful lease is not recovery proof.
-                adapter.release_workspace(&lease.lease_id).await?;
-                refused.push(lease.workspace_id);
-                refused_refs = refused.iter().map(|s| s.as_str()).collect();
-                anyhow!("blocked predecessor workspace identity or dirty state was not verified")
-            }
             Ok(lease) => {
                 CUBE_WORKSPACE_LEASE_SUCCESS.inc(&self.metrics);
                 return Ok(lease);
@@ -2382,77 +1994,8 @@ impl ExecutionCoordinator {
                             .with_details(details),
                     )
                     .await;
-                err
             }
         };
-
-        // Fallback only kicks in when the first attempt had no workspace
-        // preference, OR when prefer_is_soft is true (revision_implementation
-        // uses a soft prefer for cache warmth only — losing the preferred
-        // workspace is a non-event, not a continuity failure).
-        // With a hard prefer (prefer set + prefer_is_soft = false), the
-        // caller needs that specific workspace (orphan-resume); silently
-        // landing elsewhere would lose local commit state.
-        // A hard preference still implies hard-fail: the uncommitted patch
-        // lives only in the named workspace, so landing elsewhere is
-        // meaningless unless a recovery patch exists. A soft preference is
-        // the merge-cancelled-review exception: try the known dirty workspace
-        // first, then start fresh while making that fallback explicit in the
-        // worker prompt.
-        // Case: a resume that loses the workspace race is not automatically
-        // doomed. The hard pin exists because the uncommitted work lived ONLY
-        // in that workspace; once the engine has captured a recovery patch
-        // for the dead execution, that premise is false and the work is
-        // reproducible anywhere. Observed failure mode: a fresh dispatch
-        // grabbed the pinned workspace seven seconds before the resume, the
-        // resume burned its retries against a guaranteed-failing lease, and
-        // the item terminalized to `todo` with `blocked_reason: null` — no
-        // user-visible signal at all.
-        //
-        // A captured patch can rescue a hard-pinned orphan resume. Blocked
-        // handoffs never use this uncommitted-diff recovery path.
-        let recovery_patch = if blocked_predecessor.is_some() {
-            None
-        } else {
-            self.recovery_patch_for_resume(execution)
-        };
-        let patch_rescues_this_resume = allow_dirty && recovery_patch.is_some();
-        // Preserve hard-pin resume semantics except for the two explicit soft
-        // handoffs: merge cancellation and a durable blocked declaration.
-        // In particular, a revision with allow_dirty and prefer_is_soft alone
-        // is not evidence of a deliberate park.
-        let is_merge_cancel_handoff = execution.kind == ExecutionKind::ChoreImplementation;
-        let dirty_hard_fail = allow_dirty && !is_merge_cancel_handoff && blocked_predecessor.is_none();
-        if prefer.is_some() && (!execution.prefer_is_soft || dirty_hard_fail) && !patch_rescues_this_resume {
-            CUBE_WORKSPACE_LEASE_FAILURE.inc(&self.metrics);
-            return Err(first_err);
-        }
-        if patch_rescues_this_resume {
-            let (dead_execution_id, patch_path) = recovery_patch.as_ref().expect("checked above");
-            tracing::warn!(
-                execution_id = %execution.id,
-                work_item_id = %execution.work_item_id,
-                worker_id,
-                prefer = ?prefer,
-                dead_execution_id = %dead_execution_id,
-                patch = %patch_path.display(),
-                "resume lost its pinned workspace, but a recovery patch exists; \
-                 degrading to any free workspace and replaying the patch there",
-            );
-            self.dispatch_events
-                .emit(
-                    DispatchEvent::new(Stage::WorkspaceRecovery, DispatchOutcome::Ok, &execution.id)
-                        .with_work_item(&execution.work_item_id)
-                        .with_worker(worker_id)
-                        .with_details(serde_json::json!({
-                            "step": "prefer_degraded_to_any_free",
-                            "prefer_workspace_id": prefer,
-                            "dead_execution_id": dead_execution_id,
-                            "recovery_patch": patch_path.display().to_string(),
-                        })),
-                )
-                .await;
-        }
 
         let mut attempt2_args = vec![
             "--json",

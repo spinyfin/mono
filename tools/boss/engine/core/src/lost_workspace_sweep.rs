@@ -396,11 +396,9 @@ async fn reconcile_if_execution_dead_at(
         "execution-liveness reconcile: {pane_clause} (prior status `{prior_status}`, age {age_in_status_secs:?}s)"
     );
 
-    // The workspace dir exists (signal 1 didn't fire) and may hold
-    // uncommitted work from a prior run on a resumed execution — snapshot it
-    // before the row becomes eligible for resume/reset, mirroring
-    // `dead_pane_sweep::reconcile_if_pane_dead`'s backup-before-orphan.
-    let recovery_patch = boss_engine_recovery::recovery_backup::backup_dead_execution(execution);
+    // Recovery evidence comes from the shared store even when the workspace
+    // is gone. Export its recorded reference; report failures as attention.
+    let recovery_patch = crate::execution_bookmark_recovery::backup_dead_execution(work_db, execution).await;
 
     let reconciled = crate::execution_liveness::finalize_gone_execution(
         work_db,

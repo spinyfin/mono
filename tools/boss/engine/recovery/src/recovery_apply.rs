@@ -3,7 +3,7 @@
 //! ## Why this module exists
 //!
 //! Before it, the recovery pipeline was write-only. Six sweep sites called
-//! [`crate::recovery_backup::backup_dead_execution`], 86 patches accumulated
+//! [`crate::recovery_backup::backup_execution_patch`], 86 patches accumulated
 //! on disk going back to 2026-06-03, `boothby.md` even scheduled a GC pass
 //! for them — and nothing anywhere read one. A crashed worker's uncommitted
 //! work was captured to a file that no code path ever opened.

@@ -618,6 +618,15 @@ pub struct CubeRepoSummary {
 
 #[async_trait]
 pub trait CubeClient: Send + Sync {
+    async fn create_execution_bookmark(
+        &self,
+        workspace: &Path,
+        execution_id: &str,
+        predecessor: Option<&boss_engine_recovery::execution_bookmark::ExecutionBookmark>,
+    ) -> Result<boss_engine_recovery::execution_bookmark::ExecutionBookmark> {
+        let _ = (workspace, execution_id, predecessor);
+        anyhow::bail!("execution bookmarks are not supported by this CubeClient")
+    }
     async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle>;
     async fn lease_workspace(
         &self,
@@ -878,6 +887,21 @@ impl crate::cube_commands::CubeJsonTransport for CommandCubeClient {
 
 #[async_trait]
 impl CubeClient for CommandCubeClient {
+    async fn create_execution_bookmark(
+        &self,
+        workspace: &Path,
+        execution_id: &str,
+        predecessor: Option<&boss_engine_recovery::execution_bookmark::ExecutionBookmark>,
+    ) -> Result<boss_engine_recovery::execution_bookmark::ExecutionBookmark> {
+        boss_engine_recovery::execution_bookmark::create_from(
+            &boss_engine_recovery::execution_bookmark::LocalJj,
+            workspace,
+            execution_id,
+            "local",
+            predecessor,
+        )
+        .await
+    }
     async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle> {
         crate::cube_commands::ensure_repo(self, origin).await
     }

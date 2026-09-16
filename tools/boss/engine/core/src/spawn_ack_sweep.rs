@@ -1278,10 +1278,9 @@ pub(crate) async fn reap_never_started_spawn(
     )
     .await;
 
-    // Snapshot any uncommitted workspace work to a durable patch before the
-    // slot is released and the workspace becomes eligible for re-lease/reset.
-    // Best-effort: a false-live spawn typically has nothing to back up.
-    let recovery_patch = boss_engine_recovery::recovery_backup::backup_dead_execution(execution);
+    // Export the dispatch-created reference. An empty run yields no patch;
+    // a missing or unreadable reference raises recovery attention.
+    let recovery_patch = crate::execution_bookmark_recovery::backup_dead_execution(ctx.work_db, execution).await;
 
     // Append an [engine-reconcile] audit line to the work item's description
     // so a human inspecting the chore can see why it was reset.
@@ -2493,6 +2492,7 @@ mod tests {
         coordinator.worker_pool().claim_worker(&execution_id, None).await;
 
         let cube = RecordingCube::default();
+        let _bookmark_store = crate::test_support::seed_empty_execution_bookmark(&db, &execution_id).await;
         let (outcome, sink) = run_pass(&db, &live_states, &coordinator, &cube).await;
 
         assert_eq!(

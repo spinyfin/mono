@@ -147,6 +147,21 @@ const fn entry(kind: &'static str, cleared_by: ClearedBy, rationale: &'static st
 /// `insert_attention_item_row`, and the two bespoke raw-INSERT helpers.
 /// `every_registered_kind_is_declared_once` below pins the table itself.
 pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
+    entry(
+        crate::execution_bookmark_recovery::CREATE_FAILED,
+        ClearedBy::WorkResumed,
+        "Dispatch creates the execution recovery bookmark before starting a worker; a subsequent start proves creation succeeded.",
+    ),
+    entry(
+        crate::execution_bookmark_recovery::RECOVERY_FAILED,
+        ClearedBy::WorkResumed,
+        "A successful recovery/start clears dispatch failures. The bookmark sweep also resolves this signal after inspecting the recorded reference successfully.",
+    ),
+    entry(
+        crate::abandoned_execution_bookmarks::RECOVERABLE_WORK,
+        ClearedBy::ProducerReconciles,
+        "The bookmark sweep resolves this signal when the execution has no remaining unpublished work.",
+    ),
     // ── Cleared by work resuming ────────────────────────────────────────
     entry(
         crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND,
@@ -645,6 +660,9 @@ mod tests {
             crate::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND,
             crate::worker_escalation::WORKER_BLOCKED_ATTENTION_KIND,
             crate::abandoned_branch_pr_sweep::ATTENTION_KIND_ABANDONED_BRANCH_NO_PR,
+            crate::execution_bookmark_recovery::CREATE_FAILED,
+            crate::execution_bookmark_recovery::RECOVERY_FAILED,
+            crate::abandoned_execution_bookmarks::RECOVERABLE_WORK,
             crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND,
             crate::merge_parent_deletion::SIGNOFF_ATTENTION_KIND,
             crate::work::REVIEW_VERDICT_BATCH_NOT_APPLYING_ATTENTION_KIND,

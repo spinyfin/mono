@@ -15,7 +15,6 @@ rust_library(
     ],
     deps = [
         "//tools/boss/log-files",
-        "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
 )
 
@@ -23,7 +22,9 @@ rust_test(
     name = "recovery_test",
     size = "small",
     crate = ":recovery",
+    data = ["@jj_test_tools//:jj"],
     edition = "2024",
+    env = {"BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)"},
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
@@ -31,7 +32,6 @@ rust_test(
     deps = [
         "//tools/boss/engine/test-git",
         "//tools/boss/log-files",
-        "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,

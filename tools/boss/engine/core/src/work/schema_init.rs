@@ -731,6 +731,7 @@ impl WorkDb {
         // guide execution path are enabled, but schema creation is additive
         // and gives every reconciler one durable capture target.
         step!(timer, conn, migrate_pr_review_guide_source_capture_tables)?;
+        step!(timer, conn, execution_bookmarks::migrate_execution_bookmarks)?;
         step!(timer, conn, Self::stamp_schema_version)?;
         timer.finish();
         Ok(())

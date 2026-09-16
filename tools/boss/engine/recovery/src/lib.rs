@@ -1,14 +1,13 @@
-//! Crash-recovery patch flow for dead executions.
+//! Execution recovery through engine-created references in the shared jj store.
 //!
-//! When the engine detects that an execution has died with uncommitted work
-//! in its leased cube workspace, [`recovery_backup`] captures that work to a
-//! durable patch file keyed by execution id, and [`recovery_apply`] later
-//! locates, filters, and replays that patch into the resuming worker's
-//! workspace. The two halves share the patch naming and bookkeeping filter so
-//! a patch the backup path writes is exactly the one the apply path reads.
+//! [`execution_bookmark`] creates, validates, and restores execution references.
+//! [`recovery_backup`] exports those references as supplementary patch evidence,
+//! without reading the originating workspace. [`recovery_apply`] retains the
+//! patch filtering and replay utilities for saved artifacts.
 //!
 //! This crate has a single one-way consumer edge: `boss-engine` (engine/core)
 //! depends on it, never the reverse.
 
+pub mod execution_bookmark;
 pub mod recovery_apply;
 pub mod recovery_backup;

@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use boss_engine_recovery::execution_bookmark::{self, ExecutionBookmark, Jj, LocalJj};
 use boss_protocol::ExecutionKind;
 use tokio::sync::Mutex;
 
@@ -58,6 +59,36 @@ const REMOTE_SETTINGS_DIR: &str = ".boss-remote/settings";
 /// resolves it by name rather than an engine-local absolute path.
 const REMOTE_BOSS_EVENT_BIN: &str = "boss-event";
 
+#[async_trait]
+impl Jj for SshHostAdapter {
+    async fn run(&self, repo: &Path, args: &[&str]) -> Result<String> {
+        let path = repo.to_str().context("shared repo path is not UTF-8")?;
+        let mut command = vec!["jj", "--no-pager", "-R", path];
+        command.extend_from_slice(args);
+        let output = self.transport.run_within(&command, Duration::from_secs(60)).await?;
+        anyhow::ensure!(
+            output.success(),
+            "remote jj recovery failed on {}: {}",
+            self.transport.host_id,
+            output.stderr
+        );
+        Ok(output.stdout)
+    }
+
+    async fn shared_repo(&self, workspace: &Path) -> Result<PathBuf> {
+        let pointer = workspace.join(".jj/repo");
+        let pointer = pointer.to_str().context("workspace path is not UTF-8")?;
+        let output = self.transport.run(&["cat", pointer]).await?;
+        anyhow::ensure!(
+            output.success(),
+            "cannot read shared jj store pointer on {}: {}",
+            self.transport.host_id,
+            output.stderr
+        );
+        execution_bookmark::shared_repo_from_pointer(&output.stdout)
+    }
+}
+
 /// Paths for engine-owned files in a remote driver's workspace config
 /// directory. Keeping the prompt and ignore file together prevents the
 /// prompt from appearing in the worker's change.
@@ -80,6 +111,25 @@ fn remote_driver_config_paths(
 /// remote (Phase 3+).
 #[async_trait]
 pub trait HostAdapter: Send + Sync {
+    async fn create_execution_bookmark(
+        &self,
+        workspace: &Path,
+        execution_id: &str,
+        predecessor: Option<&ExecutionBookmark>,
+    ) -> Result<ExecutionBookmark> {
+        let _ = (workspace, execution_id, predecessor);
+        bail!("execution bookmarks are not supported by this host adapter")
+    }
+
+    async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {
+        let _ = record;
+        bail!("execution bookmark inspection is not supported by this host adapter")
+    }
+
+    async fn restore_execution_bookmark(&self, record: &ExecutionBookmark, workspace: &Path) -> Result<bool> {
+        let _ = (record, workspace);
+        bail!("execution bookmark recovery is not supported by this host adapter")
+    }
     /// Stable host identifier (e.g. `"local"`, `"zakalwe"`).
     fn host_id(&self) -> &str;
 
@@ -313,6 +363,34 @@ impl LocalHostAdapter {
 
 #[async_trait]
 impl HostAdapter for LocalHostAdapter {
+    async fn create_execution_bookmark(
+        &self,
+        workspace: &Path,
+        execution_id: &str,
+        predecessor: Option<&ExecutionBookmark>,
+    ) -> Result<ExecutionBookmark> {
+        self.cube_client
+            .create_execution_bookmark(workspace, execution_id, predecessor)
+            .await
+    }
+
+    async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {
+        anyhow::ensure!(
+            record.host_id == "local",
+            "recovery bookmark belongs to host {}",
+            record.host_id
+        );
+        execution_bookmark::unpublished_diff(&LocalJj, record).await
+    }
+
+    async fn restore_execution_bookmark(&self, record: &ExecutionBookmark, workspace: &Path) -> Result<bool> {
+        anyhow::ensure!(
+            record.host_id == "local",
+            "recovery bookmark belongs to host {}",
+            record.host_id
+        );
+        execution_bookmark::restore(&LocalJj, record, workspace).await
+    }
     fn host_id(&self) -> &str {
         "local"
     }
@@ -692,6 +770,32 @@ impl crate::cube_commands::CubeJsonTransport for SshHostAdapter {
 
 #[async_trait]
 impl HostAdapter for SshHostAdapter {
+    async fn create_execution_bookmark(
+        &self,
+        workspace: &Path,
+        execution_id: &str,
+        predecessor: Option<&ExecutionBookmark>,
+    ) -> Result<ExecutionBookmark> {
+        execution_bookmark::create_from(self, workspace, execution_id, self.host_id(), predecessor).await
+    }
+
+    async fn execution_bookmark_diff(&self, record: &ExecutionBookmark) -> Result<String> {
+        anyhow::ensure!(
+            record.host_id == self.host_id(),
+            "recovery bookmark belongs to host {}",
+            record.host_id
+        );
+        execution_bookmark::unpublished_diff(self, record).await
+    }
+
+    async fn restore_execution_bookmark(&self, record: &ExecutionBookmark, workspace: &Path) -> Result<bool> {
+        anyhow::ensure!(
+            record.host_id == self.host_id(),
+            "recovery bookmark belongs to host {}",
+            record.host_id
+        );
+        execution_bookmark::restore(self, record, workspace).await
+    }
     fn host_id(&self) -> &str {
         &self.transport.host_id
     }
