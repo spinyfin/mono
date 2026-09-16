@@ -433,9 +433,14 @@ async fn initial_input_types_a_short_fixed_line_sourcing_the_workspace_script() 
     // construction site.
     assert!(
         script.starts_with(&format!(
-            "{}{}unset ANTHROPIC_API_KEY; claude",
+            "{}{}unset ANTHROPIC_API_KEY; {}claude",
             path_prepend_clause("BOSS_BIN_DIR"),
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
+            boss_engine_worker_bin::environment::shell_environment_clause(
+                &crate::worker_setup::worker_settings_dir()
+                    .join("bin")
+                    .join(workspace.path().file_name().unwrap()),
+            ),
         )),
         "expected the initial-input script to re-prepend BOSS_BIN_DIR then the worker launcher \
              dir, unset ANTHROPIC_API_KEY, and invoke claude, got: {script:?}",
@@ -610,9 +615,14 @@ async fn untagged_row_spawn_matches_engine_default() {
     assert_eq!(
         script,
         format!(
-            "{}{}unset ANTHROPIC_API_KEY; claude --model {} --disallowedTools=AskUserQuestion --permission-mode auto --settings '{}' \"$(cat .claude/initial-prompt.txt)\"\n",
+            "{}{}unset ANTHROPIC_API_KEY; {}claude --model {} --disallowedTools=AskUserQuestion --permission-mode auto --settings '{}' \"$(cat .claude/initial-prompt.txt)\"\n",
             path_prepend_clause("BOSS_BIN_DIR"),
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
+            boss_engine_worker_bin::environment::shell_environment_clause(
+                &crate::worker_setup::worker_settings_dir()
+                    .join("bin")
+                    .join(workspace.path().file_name().unwrap()),
+            ),
             crate::driver::ClaudeDriver.descriptor().model_menu.engine_default,
             settings_path.display(),
         ),
@@ -1896,9 +1906,38 @@ fn ensure_worker_bin_dir_writes_boss_and_cube_never_bossctl() {
     entries.sort();
     assert_eq!(
         entries,
-        vec!["boss".to_owned(), "cube".to_owned()],
+        vec!["boss".to_owned(), "checkleft".to_owned(), "cube".to_owned()],
         "workers get `boss` and `cube` launchers; `bossctl` is Boss-tier",
     );
+}
+
+/// Export the actual spawn-path launchers as Bazel artifacts so an operator can
+/// exercise them in a leased checkout without starting an agent or leasing a
+/// second workspace. Repository builds must run outside the test sandbox.
+#[test]
+fn worker_environment_probe_artifacts_use_the_bundled_dispatcher() {
+    let output = PathBuf::from(std::env::var_os("TEST_UNDECLARED_OUTPUTS_DIR").unwrap());
+    let workspace = output.join("probe-workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // rules_rust attaches data runfiles to the test wrapper, not the inner
+    // sharded executable. Inject that entrypoint into the production resolver.
+    let mut entrypoint = std::fs::canonicalize(std::env::current_exe().unwrap())
+        .unwrap()
+        .into_os_string();
+    entrypoint.push("_test_wrapper.sh");
+    let bin = ensure_worker_bin_dir_for_engine(&output, &workspace, Path::new(&entrypoint)).unwrap();
+    let launcher = std::fs::read_to_string(bin.join("checkleft")).unwrap();
+    assert!(
+        launcher.contains("exec '"),
+        "repobin must resolve from test runfiles beside {entrypoint:?}: {launcher}"
+    );
+    assert!(launcher.contains(" exec 'checkleft'"), "{launcher}");
+    let activate = format!(
+        "export PATH={}:\"$PATH\"; {}\n",
+        crate::ssh_transport::shell_quote(&bin.display().to_string()),
+        boss_engine_worker_bin::environment::shell_environment_clause(&bin),
+    );
+    std::fs::write(output.join("activate-worker-environment.sh"), activate).unwrap();
 }
 
 /// A non-derived spawn must still call `write_cube_launcher` so a stale

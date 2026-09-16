@@ -157,6 +157,7 @@ rust_binary(
     data = [
         "//tools/boss/cli:boss",
         "//tools/boss/event-shim:boss-event",
+        "//tools/repobin",
     ],
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
@@ -204,7 +205,10 @@ rust_test(
     size = "small",
     timeout = "moderate",
     crate = ":engine_lib",
-    data = ["@jj_test_tools//:jj"],
+    data = [
+        "//tools/repobin",
+        "@jj_test_tools//:jj",
+    ],
     edition = "2024",
     env = {
         "BOSS_EVENT_BIN": "/opt/boss/bin/boss-event",

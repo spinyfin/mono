@@ -718,17 +718,6 @@ fn render_config_toml(workspace: &Path, sandbox_workspace_write: String) -> Stri
     let config = format!(
         "# Boss-owned per-run Codex config. Do not hand-edit; regenerated every dispatch.\n\
          \n\
-         # Suppress the external-agent (Claude Code) config-migration notice\n\
-         # for this home and project, and pin the memory-import feature off.\n\
-         # Boss workspaces routinely contain a co-located `.claude/` from the\n\
-         # Claude driver path; see render_base_config_toml's doc comment for\n\
-         # why this is belt-and-suspenders rather than the actual gate.\n\
-         [notice.external_config_migration_prompts]\n\
-         home = true\n\
-         \n\
-         [notice.external_config_migration_prompts.projects]\n\
-         {workspace_key} = true\n\
-         \n\
          # Force non-login shells for tool commands and reject explicit\n\
          # login-shell requests. The pane already ran a login shell before\n\
          # exec'ing Codex; a second login at tool-run time is what rebuilds\n\
@@ -739,6 +728,17 @@ fn render_config_toml(workspace: &Path, sandbox_workspace_write: String) -> Stri
          # would silently make it features.allow_login_shell, which Codex\n\
          # never reads.\n\
          allow_login_shell = false\n\
+         \n\
+         # Suppress the external-agent (Claude Code) config-migration notice\n\
+         # for this home and project, and pin the memory-import feature off.\n\
+         # Boss workspaces routinely contain a co-located `.claude/` from the\n\
+         # Claude driver path; see render_base_config_toml's doc comment for\n\
+         # why this is belt-and-suspenders rather than the actual gate.\n\
+         [notice.external_config_migration_prompts]\n\
+         home = true\n\
+         \n\
+         [notice.external_config_migration_prompts.projects]\n\
+         {workspace_key} = true\n\
          \n\
          [features]\n\
          external_agent_memory_import = false\n\

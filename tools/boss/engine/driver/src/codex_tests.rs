@@ -445,19 +445,15 @@ async fn provision_workspace_creates_owned_home_and_snapshots_auth_body(
             && config.contains("experimental_use_profile = false"),
         "must pin Codex snapshot/login-shell off so PATH is not rebuilt on top of the pane: {config}"
     );
-    // `allow_login_shell` is a top-level `ConfigToml` key, not a member of
-    // the `[features]` flag set (that's where `shell_snapshot` lives) — a
-    // blank line does not close a TOML table, so the key must be emitted
-    // strictly before the `[features]` header or it silently becomes
-    // `features.allow_login_shell`, which Codex never reads. `.contains`
-    // alone can't tell those apart; assert the ordering directly.
+    // A TOML key after any table header belongs to that table. Check the
+    // first header, not just [features]: notice tables also precede features.
     let login_shell_pos = config
         .find("allow_login_shell = false")
         .expect("allow_login_shell must be present");
-    let features_pos = config.find("[features]").expect("[features] must be present");
+    let first_table_pos = config.find('[').expect("config tables must be present");
     assert!(
-        login_shell_pos < features_pos,
-        "allow_login_shell must be a top-level key rendered BEFORE [features], not nested inside it: {config}"
+        login_shell_pos < first_table_pos,
+        "allow_login_shell must be a top-level key rendered BEFORE every table, not nested inside it: {config}"
     );
     assert!(
         config.contains("trust_level = \"trusted\""),

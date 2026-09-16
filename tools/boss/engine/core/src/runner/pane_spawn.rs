@@ -465,17 +465,20 @@ fn check_initial_input_length(line: &str, driver_name: &str) -> Result<()> {
 /// `bossctl` is deliberately absent: this directory is prepended to the
 /// worker's `PATH`, and the Boss-tier control surface stays Boss-tier.
 ///
-/// Returns `None` if the directory could not be written at all. That is
-/// logged, not fatal — the worker simply keeps today's `PATH` behaviour
-/// rather than losing its spawn over a temp-dir failure.
+/// Returns `None` if the directory or shell environment could not be written.
+/// The caller aborts spawn rather than falling back to host tool resolution.
 fn ensure_worker_bin_dir(settings_dir: &Path, workspace_path: &Path) -> Option<PathBuf> {
     let engine_path = std::env::current_exe().unwrap_or_default();
+    ensure_worker_bin_dir_for_engine(settings_dir, workspace_path, &engine_path)
+}
+
+fn ensure_worker_bin_dir_for_engine(settings_dir: &Path, workspace_path: &Path, engine_path: &Path) -> Option<PathBuf> {
     let workspace_dir = std::env::var_os("BUILD_WORKSPACE_DIRECTORY").map(PathBuf::from);
     let env_override = std::env::var_os(boss_engine_worker_bin::BOSS_CLI_BIN_ENV).map(PathBuf::from);
     let boss_bin_dir = std::env::var_os("BOSS_BIN_DIR").map(PathBuf::from);
 
     let resolved = boss_engine_worker_bin::resolve_boss_cli(
-        &engine_path,
+        engine_path,
         workspace_dir.as_deref(),
         env_override.as_deref(),
         boss_bin_dir.as_deref(),
@@ -517,7 +520,7 @@ fn ensure_worker_bin_dir(settings_dir: &Path, workspace_path: &Path) -> Option<P
 
     let cube_override = std::env::var_os(boss_engine_worker_bin::CUBE_CLI_BIN_ENV).map(PathBuf::from);
     let cube_resolved = boss_engine_worker_bin::resolve_cube_cli(
-        &engine_path,
+        engine_path,
         workspace_dir.as_deref(),
         cube_override.as_deref(),
         boss_bin_dir.as_deref(),
@@ -551,6 +554,25 @@ fn ensure_worker_bin_dir(settings_dir: &Path, workspace_path: &Path) -> Option<P
             );
             return None;
         }
+    }
+    let repobin = boss_engine_worker_bin::resolve_engine_binary(
+        "repobin",
+        "tools/repobin/repobin",
+        boss_engine_worker_bin::ResolvePaths {
+            engine_path,
+            workspace_dir: workspace_dir.as_deref(),
+            env_override: None,
+            boss_bin_dir: boss_bin_dir.as_deref(),
+            stable_bin_dir: None,
+        },
+        false,
+    );
+    let environment =
+        boss_engine_worker_bin::environment::write_repo_tool_launcher(&dir, "checkleft", repobin.as_deref())
+            .and_then(|_| boss_engine_worker_bin::environment::write_shell_environment(&dir));
+    if let Err(err) = environment {
+        tracing::error!(?err, "could not materialize the worker tool environment");
+        return None;
     }
     Some(dir)
 }
@@ -987,14 +1009,16 @@ impl ExecutionRunner for PaneSpawnRunner {
         // shell rebuilding PATH; BOSS_BIN_DIR's own prepend is a bare
         // directory and is a no-op in dev mode, where the user's `~/bin`
         // repobin shim was winning.
-        let worker_bin_dir = ensure_worker_bin_dir(&settings_dir, workspace_path);
+        let worker_bin_dir = ensure_worker_bin_dir(&settings_dir, workspace_path)
+            .context("materializing the worker tool environment")?;
+        let environment_clause = boss_engine_worker_bin::environment::shell_environment_clause(&worker_bin_dir);
         let env_prefix: String = spawn_plan.env.iter().map(render_env_directive).collect();
         // All local pools, including review and automation, share this
         // tmux worker assembly. Read state.db at each
         // spawn so changes take effect without restarting the engine.
         let priority_clause = worker_background_priority_clause(&self.work_db)?;
         let assembled_command = format!(
-            "{priority_clause}{}{}{env_prefix}{}",
+            "{priority_clause}{}{}{env_prefix}{environment_clause}{}",
             path_prepend_clause("BOSS_BIN_DIR"),
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
             spawn_plan.command,
@@ -1080,12 +1104,10 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .initial_input(initial_input)
                 .extra_env({
                     let mut env = structured_output_env;
-                    if let Some(dir) = worker_bin_dir.as_ref() {
-                        env.push((
-                            boss_engine_worker_bin::WORKER_BIN_DIR_ENV.to_owned(),
-                            dir.display().to_string(),
-                        ));
-                    }
+                    env.push((
+                        boss_engine_worker_bin::WORKER_BIN_DIR_ENV.to_owned(),
+                        worker_bin_dir.display().to_string(),
+                    ));
                     env
                 })
                 .maybe_title_summary(title_summary)

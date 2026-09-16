@@ -13,3 +13,14 @@ if [[ ! -f "$engine_path" ]]; then
   echo "but it is not a regular file (bundle layout drifted from engine_binary.bzl?)" >&2
   exit 1
 fi
+
+repobin_path="$(dirname "$engine_path")/repobin"
+# Inspect the packaged mode bits, not access(X_OK): seatbelt denies execution
+# of binaries inside a declared directory artifact even when their mode is
+# 0555. `find -perm -111` is in the hermetic test runtime's curated tool set
+# (`stat` is not) and matches only a regular file with every execute bit set.
+if [[ ! -f "$repobin_path" ]] \
+  || [[ -z "$(find "$repobin_path" -maxdepth 0 -type f -perm -111)" ]]; then
+  echo "expected executable worker tool dispatcher at: $repobin_path" >&2
+  exit 1
+fi

@@ -195,8 +195,8 @@ if [[ -d "$BIN_DIR" ]]; then
     --entitlements "$ENGINE_ENTITLEMENTS" \
     -s "$APP_IDENTITY" "${BIN_DIR}/${ENGINE_BINARY_NAME}"
 
-  # boss, bossctl, boss-event are plain Rust CLIs with no special entitlements.
-  for bin in boss bossctl boss-event; do
+  # These are plain Rust CLIs with no special entitlements.
+  for bin in boss bossctl boss-event repobin; do
     [[ -f "${BIN_DIR}/${bin}" ]] && \
       run codesign --force --options runtime \
         -s "$APP_IDENTITY" "${BIN_DIR}/${bin}"

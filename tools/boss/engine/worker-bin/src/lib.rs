@@ -31,7 +31,8 @@
 //! crate resolves that binary by absolute path — deliberately **without
 //! ever searching `PATH`**, since a `PATH` search is precisely how the
 //! repobin shim wins — and materializes a tiny per-workspace launcher
-//! directory containing exactly one executable, `boss`, that `exec`s it.
+//! directory containing pinned `boss` and `cube` launchers, plus a repository
+//! `checkleft` launcher (see [`environment`]).
 //!
 //! Two properties are load-bearing:
 //!
@@ -56,6 +57,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub mod environment;
 
 /// Basename of the launcher the engine writes for workers.
 const BOSS_LAUNCHER_NAME: &str = "boss";
@@ -113,8 +116,8 @@ const CUBE_CLI_RUNFILES_REL: &str = "tools/cube/cube";
 
 /// Every executable name the engine may write into the launcher directory.
 /// `boss` and `cube` are always thin execs of the bundled CLIs.
-/// Neither entry exposes the Boss-tier `bossctl`
-/// control surface.
+/// `checkleft` dispatches through the engine-owned repobin.
+/// No entry exposes the Boss-tier `bossctl` control surface.
 ///
 /// The engine deliberately keeps `bossctl` off the worker `PATH`: it is
 /// the Boss-tier control surface (host registry, agent fleet, engine
@@ -123,7 +126,7 @@ const CUBE_CLI_RUNFILES_REL: &str = "tools/cube/cube";
 /// distinction; a launcher dir can, and this constant is what the test
 /// suite pins it to.
 pub fn launcher_names() -> &'static [&'static str] {
-    &[BOSS_LAUNCHER_NAME, CUBE_LAUNCHER_NAME]
+    &[BOSS_LAUNCHER_NAME, CUBE_LAUNCHER_NAME, "checkleft"]
 }
 
 /// Path / env inputs shared by every engine-binary resolution.
@@ -892,7 +895,7 @@ mod tests {
             .collect();
         entries.sort();
         assert_eq!(entries, vec!["boss".to_owned()]);
-        assert_eq!(launcher_names(), ["boss", "cube"]);
+        assert_eq!(launcher_names(), ["boss", "cube", "checkleft"]);
         assert!(
             !launcher_names().contains(&"bossctl"),
             "bossctl is Boss-tier and must stay off the worker PATH"
