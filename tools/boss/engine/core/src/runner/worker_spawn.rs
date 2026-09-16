@@ -1590,6 +1590,7 @@ mod compose_worker_spawn_tests {
                 &WorkItem::Chore(task),
                 workspace.path(),
                 None,
+                &PanicGhRunner,
                 WorkerSpawnOpts::default(),
             )
             .await
@@ -1633,6 +1634,7 @@ mod compose_worker_spawn_tests {
             &WorkItem::Chore(task),
             workspace.path(),
             None,
+            &PanicGhRunner,
             WorkerSpawnOpts::default(),
         )
         .await
@@ -1672,6 +1674,7 @@ mod compose_worker_spawn_tests {
                 &WorkItem::Chore(task),
                 workspace.path(),
                 None,
+                &PanicGhRunner,
                 WorkerSpawnOpts::default(),
             )
             .await
@@ -1717,6 +1720,7 @@ mod compose_worker_spawn_tests {
                 &WorkItem::Chore(task),
                 workspace.path(),
                 None,
+                &PanicGhRunner,
                 WorkerSpawnOpts::default(),
             )
             .await
