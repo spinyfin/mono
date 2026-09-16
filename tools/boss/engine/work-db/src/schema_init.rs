@@ -793,6 +793,10 @@ mod floor_tests {
         type ExpectedStep = (&'static str, Box<dyn FnOnce(&Connection)>);
         let mut steps: Vec<ExpectedStep> = vec![
             (
+                "20261028_1900_pr_head_after_capture",
+                Box::new(|c| c.execute_batch("ALTER TABLE work_executions ADD COLUMN pr_head_after_capture TEXT").unwrap()),
+            ),
+            (
                 "00000000_0000_v033_postmortem_signals",
                 Box::new(|c| project_postmortem::migrate_project_postmortem_signals(c).unwrap()),
             ),
@@ -1297,6 +1301,10 @@ mod floor_tests {
             }
             if version >= 60 {
                 conn.execute_batch(EXECUTION_BOOKMARK_PRUNE_COLUMNS_60).unwrap();
+            }
+            if version >= 61 {
+                conn.execute_batch("ALTER TABLE work_executions ADD COLUMN pr_head_after_capture TEXT")
+                    .unwrap();
             }
             conn.execute(
                 "INSERT INTO metadata VALUES ('schema_version', ?1)",
