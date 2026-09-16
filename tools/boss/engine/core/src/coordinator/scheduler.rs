@@ -398,7 +398,7 @@ impl ExecutionCoordinator {
         // than a check-then-reserve pair: a concurrent `drain_ready_queue`
         // could otherwise slip in during the `claim_worker_force` await, and
         // both paths would believe they own the dispatch.
-        let Some(_reservation) = self.inflight_dispatches.try_reserve(&execution) else {
+        let Some(_reservation) = self.inflight_dispatches.try_reserve(&execution, &self.work_db) else {
             return Err(anyhow!(
                 "execution {execution_id} (or another execution for its work item) is already \
                  being dispatched — cannot force-dispatch"
@@ -930,7 +930,8 @@ impl ExecutionCoordinator {
             crate::dispatch_metrics::record_queue_snapshot(&self.metrics, snapshot);
         }
 
-        // Drop rows whose work item a previous drain already handed off. A
+        // Drop rows blocked by a previous drain's reservation, except for
+        // compatible members of the same persisted review batch. A
         // dispatched row is CAS'd to `claimed` at pickup so
         // `list_ready_executions` no longer returns it, but overlapping drains
         // can still see a snapshot taken before that write — and the 15s
@@ -947,7 +948,7 @@ impl ExecutionCoordinator {
         // candidates" the surviving rows report.
         let executions: Vec<WorkExecution> = executions
             .into_iter()
-            .filter(|e| !self.inflight_dispatches.is_work_item_dispatching(&e.work_item_id))
+            .filter(|e| !self.inflight_dispatches.blocks_execution(e, &self.work_db))
             .collect();
 
         if executions.is_empty() {
@@ -1203,6 +1204,8 @@ impl ExecutionCoordinator {
             // for). The pre-loop filter above cannot catch it — that snapshot
             // predates the reservation an earlier iteration just took — so it
             // is re-checked per row.
+            // Compatible same-batch members must pass both filters so all
+            // three can be handed off without waiting for another heartbeat.
             //
             // Skipped before `request_recorded` so the row emits no dispatch
             // timeline at all: it is not a dispatch attempt, and a second
@@ -1210,10 +1213,7 @@ impl ExecutionCoordinator {
             // corrupt the per-execution event stream. Left `ready`; once the
             // winner is `running`, `schedule_execution`'s DB double-spawn
             // guard resolves this row as redundant on a later pass.
-            if self
-                .inflight_dispatches
-                .is_work_item_dispatching(&execution.work_item_id)
-            {
+            if self.inflight_dispatches.blocks_execution(&execution, &self.work_db) {
                 tracing::debug!(
                     execution_id = %execution.id,
                     work_item_id = %execution.work_item_id,
@@ -2131,7 +2131,7 @@ impl ExecutionCoordinator {
         // above. `try_reserve` is atomic, so exactly one of the two wins;
         // the loser hands its slot back rather than dispatching a second
         // worker for the same work item.
-        let Some(reservation) = self.inflight_dispatches.try_reserve(execution) else {
+        let Some(reservation) = self.inflight_dispatches.try_reserve(execution, &self.work_db) else {
             tracing::info!(
                 execution_id = %execution.id,
                 work_item_id = %execution.work_item_id,
