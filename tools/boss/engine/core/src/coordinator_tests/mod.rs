@@ -5,6 +5,7 @@ mod automation;
 mod blocked_workspace;
 mod claimed_dispatch;
 mod dispatch;
+mod execution_bookmarks;
 mod helpers;
 mod pause_admission;
 mod pause_bypass;

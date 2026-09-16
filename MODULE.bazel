@@ -59,6 +59,10 @@ host_tmux_repository = use_repo_rule(
 
 host_tmux_repository(name = "host_tmux")
 
+jj_test_repository = use_repo_rule("//tools/boss/engine/recovery:jj_repository.bzl", "jj_test_repository")
+
+jj_test_repository(name = "jj_test_tools")
+
 # Zig-based hermetic CC toolchain used for musl cross-compilation.
 # Provides @zig_sdk//libc_aware/toolchain:linux_amd64_musl (and arm64 variant)
 # which cross-compile C/C++ code from any host to a fully-static musl binary.

@@ -1,20 +1,10 @@
-//! Workspace recovery and lease fallback on resume: cube in-place recovery,
-//! recovery-patch replay, stale-lease reclaim, and fallback exhaustion.
+//! Shared-store recovery and clean scratch leasing, including lease failures.
 //!
 //! Shared fixtures live in [`super::helpers`].
 
 use super::helpers::*;
 
-/// `BOSS_RECOVERY_DIR` is process-global, so the recovery tests
-/// serialise on this lock rather than racing each other's tempdirs.
-fn recovery_env_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-}
-
-/// Seed a chore with a dead predecessor execution (orphaned, so
-/// `get_prior_orphaned_execution` finds it) plus a live resume execution
-/// carrying `allow_dirty`. Returns `(dead_execution_id, resume_execution)`.
+/// Seed an orphaned predecessor and a resume of the same work item.
 fn seed_resume_pair(db: &Arc<WorkDb>) -> (String, WorkExecution) {
     let product = create_test_product(db);
     let chore = create_test_chore_manual(db, product.id.clone(), "Recover me");
@@ -54,7 +44,7 @@ fn recovery_coordinator(db: Arc<WorkDb>) -> Arc<ExecutionCoordinator> {
 }
 
 #[tokio::test]
-async fn merge_cancel_workspace_preference_falls_back_without_dirty_reuse() {
+async fn merge_cancel_workspace_preference_is_ignored_without_dirty_reuse() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let product = create_test_product(&db);
@@ -99,22 +89,14 @@ async fn merge_cancel_workspace_preference_falls_back_without_dirty_reuse() {
 
     assert_eq!(lease.workspace_id, "mono-agent-004");
     let calls = cube.lease_calls.lock().await;
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].2.as_deref(), Some("mono-agent-003"));
-    assert!(calls[0].3, "the preferred workspace must preserve partial edits");
-    assert!(calls[1].2.is_none());
-    assert!(!calls[1].3, "a fallback workspace must start from a clean checkout");
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].2.is_none(), "recovery must not prefer the previous workspace");
+    assert!(!calls[0].3, "the lease must start clean");
 }
 
-/// A resumed `revision_implementation` also carries `prefer_is_soft = true`
-/// (`request_resume_execution` forces `allow_dirty = true` and carries
-/// `prefer_is_soft` forward from the dead row) — but unlike the merge-cancel
-/// handoff above, its uncommitted work lives ONLY in the preferred
-/// workspace. Losing the lease race must still hard-fail (so the scheduler
-/// retries) rather than silently degrading to a clean workspace, which
-/// would discard that work whenever no recovery patch was captured.
+/// A revision resumes into clean scratch even when its prior workspace is held.
 #[tokio::test]
-async fn revision_resume_with_allow_dirty_and_soft_prefer_still_hard_fails() {
+async fn revision_resume_uses_fresh_scratch_without_workspace_pinning() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let product = create_test_product(&db);
@@ -157,320 +139,157 @@ async fn revision_resume_with_allow_dirty_and_soft_prefer_still_hard_fails() {
         .await;
 
     assert!(
-        result.is_err(),
-        "a revision resume with no recovery patch must hard-fail rather than degrade to a clean workspace"
+        result.is_ok(),
+        "a revision resume leases clean scratch and resolves recovery separately"
     );
     let calls = cube.lease_calls.lock().await;
-    assert_eq!(
-        calls.len(),
-        1,
-        "only the preferred-workspace attempt should run, no fallback attempt"
-    );
+    assert_eq!(calls.len(), 1, "one clean lease request should run");
 }
 
-/// A git repo with one committed file, so `git apply --3way` has a blob
-/// to three-way against.
-fn init_recovery_workspace(path: &std::path::Path) -> bool {
-    let run = |args: &[&str]| {
-        std::process::Command::new("git")
-            .args(args)
-            .current_dir(path)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    };
-    if !crate::test_support::try_init_repo_with_branch(path, "main") {
-        return false;
-    }
-    let _ = run(&["config", "user.email", "t@example.com"]);
-    let _ = run(&["config", "user.name", "T"]);
-    std::fs::write(path.join("hello.txt"), "original\n").unwrap();
-    run(&["add", "."]) && run(&["commit", "-m", "seed"])
+async fn record_recovery_work(db: &WorkDb, id: &str, workspace: &std::path::Path) {
+    use boss_engine_recovery::execution_bookmark::{LocalJj, create};
+    let record = create(&LocalJj, workspace, id, "local").await.unwrap();
+    db.record_execution_bookmark(&record).unwrap();
 }
 
 fn lease_for(workspace_path: &std::path::Path, dirty_verified: Option<bool>) -> CubeWorkspaceLease {
     CubeWorkspaceLease {
-        lease_id: "lease-resume".to_owned(),
-        workspace_id: "mono-agent-003".to_owned(),
+        lease_id: "lease-resume".into(),
+        workspace_id: "replacement".into(),
         workspace_path: workspace_path.to_path_buf(),
         dirty_verified,
     }
 }
 
-const RECOVERY_PATCH: &str = "diff --git a/hello.txt b/hello.txt\n\
-                                  index 0000000..1111111 100644\n\
-                                  --- a/hello.txt\n\
-                                  +++ b/hello.txt\n\
-                                  @@ -1 +1 @@\n\
-                                  -original\n\
-                                  +recovered work\n";
-
-/// Cube recovered the tree in place. The patch must NOT be applied on top
-/// — the hunks are already there, and a second application either
-/// duplicates them or conflicts. The worker is still told it is resuming.
-// The env guard is a std Mutex held across awaits. clippy flags that
-// shape because it can block an executor thread, but here it is the
-// point: `BOSS_RECOVERY_DIR` is process-global, each `#[tokio::test]`
-// gets its own current-thread runtime, and serialising these tests on
-// one thread is exactly the intended behaviour.
-#[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn recovery_prefers_cube_in_place_and_does_not_replay_the_patch() {
-    let _guard = recovery_env_lock().lock().unwrap();
+async fn recovery_uses_bookmark_without_replaying_a_legacy_patch() {
+    use boss_engine_test_git::jj::JjRepo;
     let dir = tempdir().unwrap();
-    let ws = dir.path().join("ws");
-    std::fs::create_dir_all(&ws).unwrap();
-    // The "recovered in place" content cube handed back.
-    std::fs::write(ws.join("hello.txt"), "recovered work\n").unwrap();
-    let recovery_dir = dir.path().join("recovery");
-    std::fs::create_dir_all(&recovery_dir).unwrap();
-    unsafe { std::env::set_var(boss_engine_recovery::recovery_backup::RECOVERY_DIR_ENV, &recovery_dir) };
-
+    let repo = JjRepo::new(dir.path());
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let (dead_id, resume) = seed_resume_pair(&db);
-    let patch = recovery_dir.join(format!("{dead_id}.patch"));
-    std::fs::write(&patch, RECOVERY_PATCH).unwrap();
-
+    record_recovery_work(&db, &dead_id, &repo.worker).await;
+    std::fs::write(repo.worker.join("hello.txt"), "recovered work\n").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    let patch = dir.path().join(format!("{dead_id}.patch"));
+    std::fs::write(&patch, "obsolete patch, must never replay").unwrap();
     let coordinator = recovery_coordinator(db);
-    coordinator
-        .reconcile_workspace_recovery(&resume, "worker-1", &lease_for(&ws, Some(true)))
-        .await;
-
-    let report = boss_engine_recovery::recovery_apply::RecoveryReport::read_for(&ws, &resume.id)
-        .expect("an in-place recovery must still be reported to the worker");
+    let restored = coordinator
+        .recover_execution_bookmark(
+            &resume,
+            &lease_for(&repo.replacement, Some(true)),
+            &coordinator.host_adapter,
+        )
+        .await
+        .unwrap();
+    assert_eq!(restored, Some((dead_id, true)));
     assert_eq!(
-        report.source,
-        boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace
-    );
-    assert_eq!(report.from_execution_id, dead_id);
-    assert!(report.applied.is_none(), "nothing was replayed");
-    assert!(report.patch_error.is_none());
-    // The file is untouched — the patch would have failed to apply here
-    // anyway (its pre-image is `original`), so a silent apply attempt
-    // would have surfaced as an error report.
-    assert_eq!(
-        std::fs::read_to_string(ws.join("hello.txt")).unwrap(),
+        std::fs::read_to_string(repo.replacement.join("hello.txt")).unwrap(),
         "recovered work\n"
     );
-    // The recovery patch is consumed, so a later restart does not replay it.
-    assert!(!patch.exists());
-    assert!(recovery_dir.join(format!("{dead_id}.patch.applied")).exists());
-
-    unsafe { std::env::remove_var(boss_engine_recovery::recovery_backup::RECOVERY_DIR_ENV) };
-}
-
-/// Cube could NOT recover (`dirty_verified: false` — the tree had already
-/// been reset). Now, and only now, the patch is replayed.
-// The env guard is a std Mutex held across awaits. clippy flags that
-// shape because it can block an executor thread, but here it is the
-// point: `BOSS_RECOVERY_DIR` is process-global, each `#[tokio::test]`
-// gets its own current-thread runtime, and serialising these tests on
-// one thread is exactly the intended behaviour.
-#[allow(clippy::await_holding_lock)]
-#[tokio::test]
-async fn recovery_falls_back_to_the_patch_when_cube_recovered_nothing() {
-    let _guard = recovery_env_lock().lock().unwrap();
-    let dir = tempdir().unwrap();
-    let ws = dir.path().join("ws");
-    std::fs::create_dir_all(&ws).unwrap();
-    if !init_recovery_workspace(&ws) {
-        eprintln!("skipping: git unavailable in sandbox");
-        return;
-    }
-    let recovery_dir = dir.path().join("recovery");
-    std::fs::create_dir_all(&recovery_dir).unwrap();
-    unsafe { std::env::set_var(boss_engine_recovery::recovery_backup::RECOVERY_DIR_ENV, &recovery_dir) };
-
-    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-    let (dead_id, resume) = seed_resume_pair(&db);
-    let patch = recovery_dir.join(format!("{dead_id}.patch"));
-    std::fs::write(&patch, RECOVERY_PATCH).unwrap();
-
-    let coordinator = recovery_coordinator(db);
-    coordinator
-        .reconcile_workspace_recovery(&resume, "worker-1", &lease_for(&ws, Some(false)))
-        .await;
-
-    assert_eq!(
-        std::fs::read_to_string(ws.join("hello.txt")).unwrap(),
-        "recovered work\n",
-        "the patch must actually restore the work into the workspace",
-    );
-    let report = boss_engine_recovery::recovery_apply::RecoveryReport::read_for(&ws, &resume.id).expect("report");
-    assert_eq!(
-        report.source,
-        boss_engine_recovery::recovery_apply::RecoverySource::Patch
-    );
-    let applied = report.applied.expect("a patch recovery must report what it restored");
-    assert_eq!(applied.paths, ["hello.txt"]);
-    assert_eq!((applied.insertions, applied.deletions), (1, 1));
-    assert!(
-        !patch.exists(),
-        "a consumed patch must not be replayed on a later restart"
-    );
-
-    unsafe { std::env::remove_var(boss_engine_recovery::recovery_backup::RECOVERY_DIR_ENV) };
-}
-
-/// A patch that does not apply must be loud: the worker is told recovery
-/// FAILED, and the patch is deliberately NOT consumed because it is the
-/// only remaining copy of that work.
-// The env guard is a std Mutex held across awaits. clippy flags that
-// shape because it can block an executor thread, but here it is the
-// point: `BOSS_RECOVERY_DIR` is process-global, each `#[tokio::test]`
-// gets its own current-thread runtime, and serialising these tests on
-// one thread is exactly the intended behaviour.
-#[allow(clippy::await_holding_lock)]
-#[tokio::test]
-async fn a_failed_patch_apply_is_reported_and_the_patch_is_kept() {
-    let _guard = recovery_env_lock().lock().unwrap();
-    let dir = tempdir().unwrap();
-    let ws = dir.path().join("ws");
-    std::fs::create_dir_all(&ws).unwrap();
-    if !init_recovery_workspace(&ws) {
-        eprintln!("skipping: git unavailable in sandbox");
-        return;
-    }
-    let recovery_dir = dir.path().join("recovery");
-    std::fs::create_dir_all(&recovery_dir).unwrap();
-    unsafe { std::env::set_var(boss_engine_recovery::recovery_backup::RECOVERY_DIR_ENV, &recovery_dir) };
-
-    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-    let (dead_id, resume) = seed_resume_pair(&db);
-    let patch = recovery_dir.join(format!("{dead_id}.patch"));
-    // Pre-image that exists nowhere, and a blob id git cannot resolve, so
-    // neither the direct apply nor the 3-way fallback can succeed.
-    std::fs::write(
-        &patch,
-        "diff --git a/absent.txt b/absent.txt\n\
-             index deadbee..cafebab 100644\n\
-             --- a/absent.txt\n\
-             +++ b/absent.txt\n\
-             @@ -1 +1 @@\n\
-             -never here\n\
-             +replacement\n",
-    )
-    .unwrap();
-
-    let coordinator = recovery_coordinator(db);
-    coordinator
-        .reconcile_workspace_recovery(&resume, "worker-1", &lease_for(&ws, Some(false)))
-        .await;
-
-    let report = boss_engine_recovery::recovery_apply::RecoveryReport::read_for(&ws, &resume.id)
-        .expect("a failed recovery must still be reported — silence would let the worker assume success");
-    assert!(report.applied.is_none());
-    let err = report.patch_error.expect("the failure must be carried to the worker");
-    assert!(err.contains("git apply --3way"), "error should name the command: {err}");
     assert!(
         patch.exists(),
-        "the only copy of the work must survive a failed apply for manual salvage",
+        "legacy evidence is retained, never replayed or consumed"
     );
-    assert!(!recovery_dir.join(format!("{dead_id}.patch.applied")).exists());
-    let _ = dead_id;
-
-    unsafe { std::env::remove_var(boss_engine_recovery::recovery_backup::RECOVERY_DIR_ENV) };
 }
 
-/// A patch of nothing but Boss's own hook spool restores nothing, and
-/// must not be reported to the worker as a recovery.
-// The env guard is a std Mutex held across awaits. clippy flags that
-// shape because it can block an executor thread, but here it is the
-// point: `BOSS_RECOVERY_DIR` is process-global, each `#[tokio::test]`
-// gets its own current-thread runtime, and serialising these tests on
-// one thread is exactly the intended behaviour.
-#[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn a_bookkeeping_only_patch_is_not_reported_as_a_recovery() {
-    let _guard = recovery_env_lock().lock().unwrap();
+async fn recovery_uses_shared_store_when_cube_recovered_nothing() {
+    use boss_engine_test_git::jj::JjRepo;
     let dir = tempdir().unwrap();
-    let ws = dir.path().join("ws");
-    std::fs::create_dir_all(&ws).unwrap();
-    let recovery_dir = dir.path().join("recovery");
-    std::fs::create_dir_all(&recovery_dir).unwrap();
-    unsafe { std::env::set_var(boss_engine_recovery::recovery_backup::RECOVERY_DIR_ENV, &recovery_dir) };
-
+    let repo = JjRepo::new(dir.path());
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let (dead_id, resume) = seed_resume_pair(&db);
-    let patch = recovery_dir.join(format!("{dead_id}.patch"));
-    std::fs::write(
-        &patch,
-        "diff --git a/.boss/events-pending.jsonl b/.boss/events-pending.jsonl\n\
-             --- a/.boss/events-pending.jsonl\n\
-             +++ b/.boss/events-pending.jsonl\n\
-             @@ -0,0 +1 @@\n\
-             +{\"event\":\"Stop\"}\n",
-    )
-    .unwrap();
-
+    record_recovery_work(&db, &dead_id, &repo.worker).await;
+    std::fs::write(repo.worker.join("hello.txt"), "recovered work\n").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    JjRepo::run(&repo.worker, &["new", "root()", "-m", "Unrelated lease"]);
+    std::fs::write(repo.worker.join("foreign.txt"), "foreign work").unwrap();
     let coordinator = recovery_coordinator(db);
-    coordinator
-        .reconcile_workspace_recovery(&resume, "worker-1", &lease_for(&ws, Some(false)))
-        .await;
-
-    assert!(
-        boss_engine_recovery::recovery_apply::RecoveryReport::read_for(&ws, &resume.id).is_none(),
-        "a bookkeeping-only patch restores nothing and must not claim a recovery",
+    let restored = coordinator
+        .recover_execution_bookmark(
+            &resume,
+            &lease_for(&repo.replacement, Some(false)),
+            &coordinator.host_adapter,
+        )
+        .await
+        .unwrap();
+    assert_eq!(restored, Some((dead_id, true)));
+    assert_eq!(
+        std::fs::read_to_string(repo.replacement.join("hello.txt")).unwrap(),
+        "recovered work\n"
     );
-    assert!(!patch.exists(), "the spent patch is still retired");
-
-    unsafe { std::env::remove_var(boss_engine_recovery::recovery_backup::RECOVERY_DIR_ENV) };
+    assert!(!repo.replacement.join("foreign.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(repo.worker.join("foreign.txt")).unwrap(),
+        "foreign work"
+    );
 }
 
-/// A normal (non-resume) dispatch must not touch the recovery machinery
-/// at all — no marker, no consumed patch.
-// The env guard is a std Mutex held across awaits. clippy flags that
-// shape because it can block an executor thread, but here it is the
-// point: `BOSS_RECOVERY_DIR` is process-global, each `#[tokio::test]`
-// gets its own current-thread runtime, and serialising these tests on
-// one thread is exactly the intended behaviour.
-#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn a_failed_bookmark_recovery_is_loud_and_legacy_evidence_is_kept() {
+    use boss_engine_test_git::jj::JjRepo;
+    let dir = tempdir().unwrap();
+    let repo = JjRepo::new(dir.path());
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let (dead_id, resume) = seed_resume_pair(&db);
+    record_recovery_work(&db, &dead_id, &repo.worker).await;
+    JjRepo::run(&repo.repo, &["bookmark", "delete", &format!("boss-recovery/{dead_id}")]);
+    let patch = dir.path().join(format!("{dead_id}.patch"));
+    std::fs::write(&patch, "legacy evidence").unwrap();
+    let coordinator = recovery_coordinator(db);
+    let error = coordinator
+        .recover_execution_bookmark(&resume, &lease_for(&repo.replacement, None), &coordinator.host_adapter)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("exactly one"), "{error:#}");
+    assert!(patch.exists());
+    assert!(!repo.replacement.join("hello.txt").exists());
+}
+
+#[tokio::test]
+async fn bookkeeping_only_work_is_not_reported_as_a_recovery() {
+    use boss_engine_test_git::jj::JjRepo;
+    let dir = tempdir().unwrap();
+    let repo = JjRepo::new(dir.path());
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let (dead_id, resume) = seed_resume_pair(&db);
+    record_recovery_work(&db, &dead_id, &repo.worker).await;
+    std::fs::create_dir(repo.worker.join(".boss")).unwrap();
+    std::fs::write(repo.worker.join(".boss/events-pending.jsonl"), "bookkeeping").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    let coordinator = recovery_coordinator(db);
+    let restored = coordinator
+        .recover_execution_bookmark(&resume, &lease_for(&repo.replacement, None), &coordinator.host_adapter)
+        .await
+        .unwrap();
+    assert_eq!(restored, Some((dead_id, false)));
+}
+
 #[tokio::test]
 async fn recovery_is_a_no_op_for_a_non_resume_dispatch() {
-    let _guard = recovery_env_lock().lock().unwrap();
     let dir = tempdir().unwrap();
-    let ws = dir.path().join("ws");
-    std::fs::create_dir_all(&ws).unwrap();
-    let recovery_dir = dir.path().join("recovery");
-    std::fs::create_dir_all(&recovery_dir).unwrap();
-    unsafe { std::env::set_var(boss_engine_recovery::recovery_backup::RECOVERY_DIR_ENV, &recovery_dir) };
-
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-    let (dead_id, _resume) = seed_resume_pair(&db);
-    let patch = recovery_dir.join(format!("{dead_id}.patch"));
-    std::fs::write(&patch, RECOVERY_PATCH).unwrap();
-
+    let (dead_id, _) = seed_resume_pair(&db);
+    let patch = dir.path().join(format!("{dead_id}.patch"));
+    std::fs::write(&patch, "unrelated evidence").unwrap();
     let product = create_test_product(&db);
-    let chore = create_test_chore_manual(&db, product.id.clone(), "Fresh work");
-    db.reconcile_product_executions(&product.id).unwrap();
+    let chore = create_test_chore_manual(&db, product.id, "Fresh work");
     let fresh = db
-        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id).build())
         .unwrap();
-    assert!(!fresh.allow_dirty, "a fresh dispatch is not a resume");
-
     let coordinator = recovery_coordinator(db);
-    coordinator
-        .reconcile_workspace_recovery(&fresh, "worker-1", &lease_for(&ws, None))
-        .await;
-
-    assert!(boss_engine_recovery::recovery_apply::RecoveryReport::read_for(&ws, &fresh.id).is_none());
-    assert!(patch.exists(), "an unrelated execution's patch must be left alone");
-
-    unsafe { std::env::remove_var(boss_engine_recovery::recovery_backup::RECOVERY_DIR_ENV) };
+    let restored = coordinator
+        .recover_execution_bookmark(&fresh, &lease_for(dir.path(), None), &coordinator.host_adapter)
+        .await
+        .unwrap();
+    assert!(restored.is_none());
+    assert!(patch.exists());
 }
 
-/// Issue #962 -- the UI-crash resume reclaims a stale lease.
-///
-/// A prior worker (the dead execution) was leased into
-/// `mono-agent-003` and then orphaned by the startup reaper, which
-/// preserved its `cube_lease_id` / `cube_workspace_id`. Cube still
-/// reports that workspace `leased` to the dead `lease-dead`. When the
-/// hard-prefer resume dispatches, the coordinator must force-release
-/// the dead lease first so the `--prefer` re-lease can succeed and
-/// recover the in-flight checkout -- instead of failing the resume
-/// and stranding the local work.
+/// A stale lease no longer needs to be reclaimed to recover the execution.
 #[tokio::test]
-async fn hard_prefer_resume_reclaims_stale_lease_then_leases() {
+async fn resume_does_not_reclaim_stale_lease_for_recovery() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let product = create_test_product(&db);
@@ -495,7 +314,7 @@ async fn hard_prefer_resume_reclaims_stale_lease_then_leases() {
     .unwrap();
     db.mark_execution_orphaned(&dead_id, "ui crash").unwrap();
 
-    // Resume execution: hard prefer back onto mono-agent-003.
+    // Legacy workspace affinity must not influence the recovery lease.
     let resume = db
         .request_execution(
             RequestExecutionInput::builder()
@@ -532,23 +351,18 @@ async fn hard_prefer_resume_reclaims_stale_lease_then_leases() {
         .await;
     assert!(result.is_ok(), "resume lease should succeed after reclaim");
 
-    // The dead lease was force-released exactly once.
+    // Recovery leaves the previous lease alone.
     let releases = cube.force_release_calls.lock().await;
-    assert_eq!(releases.len(), 1, "stale lease must be reclaimed once");
-    assert_eq!(releases[0].0, "lease-dead");
+    assert!(releases.is_empty(), "recovery must not reclaim the old lease");
     drop(releases);
 
-    // The prefer lease was then issued for the same workspace.
+    // Request ordinary clean scratch without a workspace preference.
     let calls = cube.lease_calls.lock().await;
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].2.as_deref(), Some("mono-agent-003"));
+    assert!(calls[0].2.is_none(), "no workspace preference is sent");
 }
 
-/// Safety: a hard-prefer resume must NOT force-release a lease that
-/// cube reports holding a workspace the engine has no terminal
-/// record for (e.g. a genuinely live worker in another slot). The
-/// reclaim probe runs but finds nothing eligible, so the lease
-/// attempt proceeds without any force-release.
+/// A foreign lease is never queried or force-released for work recovery.
 #[tokio::test]
 async fn hard_prefer_resume_does_not_reclaim_unowned_lease() {
     let dir = tempdir().unwrap();
@@ -900,10 +714,23 @@ async fn resume_pane_spawn_reenters_the_runner_for_a_running_leased_execution() 
         runner.clone(),
     ));
 
+    let err = coordinator
+        .resume_pane_spawn_for_running_execution(&exec)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("no engine-created recovery bookmark"));
+    assert!(runner.calls.lock().await.is_empty());
+    assert!(
+        db.list_attention_items(&exec.id)
+            .unwrap()
+            .iter()
+            .any(|a| a.kind == crate::execution_bookmark_recovery::RECOVERY_FAILED)
+    );
+    let _bookmark_store = crate::test_support::seed_empty_execution_bookmark(&db, &exec.id).await;
     coordinator
         .resume_pane_spawn_for_running_execution(&exec)
         .await
-        .expect("resume must accept a running leased execution");
+        .expect("resume must accept a running leased execution with its recorded bookmark");
 
     let mut saw_call = false;
     for _ in 0..100 {

@@ -397,10 +397,9 @@ pub async fn reconcile_if_pane_dead(
 
     let prior_status = execution.status.as_str();
 
-    // Snapshot any uncommitted workspace work to a durable patch before the
-    // workspace becomes eligible for resume/reset. Best-effort: a no-op-safe
-    // call mirroring the other reap paths.
-    let recovery_patch = boss_engine_recovery::recovery_backup::backup_dead_execution(execution);
+    // Export the recorded shared-store reference, independently of the lease.
+    // A failed inspection raises recovery attention while the reap continues.
+    let recovery_patch = crate::execution_bookmark_recovery::backup_dead_execution(work_db, execution).await;
 
     // State only what was observed. This previously asserted "pane died with
     // its host app", which is a hardcoded causal claim this code never

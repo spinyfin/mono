@@ -1,5 +1,9 @@
-//! Periodic reconciler for terminated executions that pushed a branch but
-//! never got a PR opened for it.
+//! Periodic reconciler for work left by terminated executions.
+//!
+//! Each pass first checks engine-recorded references in the shared jj store,
+//! including unpushed revision work, through [`crate::abandoned_execution_bookmarks`].
+//! That local pass reports recoverable work and inspection errors. The remote
+//! pass below recovers PRs for branches workers already published.
 //!
 //! ## The incident this closes (2026-07-24)
 //!
@@ -59,8 +63,8 @@
 //!    same race.
 //! 3. A branch that was never pushed, or was pushed with no commits ahead
 //!    of the repo's default branch, has nothing to open a PR for — that is
-//!    not this bug (the worker genuinely never got that far) and is skipped
-//!    quietly. GitHub's own validation on the create call (404 / 422 "No
+//!    handled by the local bookmark pass rather than this remote PR creator.
+//!    GitHub's own validation on the create call (404 / 422 "No
 //!    commits between…") is the source of truth for this, not a separate
 //!    compare call.
 //!
@@ -423,6 +427,7 @@ impl BindAction {
 /// the lock, so there is no real contention.
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
+    coordinator: Arc<crate::coordinator::ExecutionCoordinator>,
     dispatch_events: Arc<dyn DispatchEventSink>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
@@ -431,11 +436,15 @@ pub fn spawn_loop(
     let failure_counts: Arc<AsyncMutex<HashMap<String, u32>>> = Arc::new(AsyncMutex::new(HashMap::new()));
     spawn_sweep_loop(interval, move || {
         let work_db = Arc::clone(&work_db);
+        let coordinator = Arc::clone(&coordinator);
         let pr_detector = Arc::clone(&pr_detector);
         let pr_creator = Arc::clone(&pr_creator);
         let dispatch_events = Arc::clone(&dispatch_events);
         let failure_counts = Arc::clone(&failure_counts);
         async move {
+            if let Err(err) = crate::abandoned_execution_bookmarks::run_one_pass(&work_db, &coordinator).await {
+                tracing::error!(error = %err, "abandoned execution bookmark sweep failed");
+            }
             let mut failure_counts = failure_counts.lock().await;
             boss_gh_telemetry::scope(
                 boss_gh_telemetry::callers::ABANDONED_BRANCH_SWEEP,

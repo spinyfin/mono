@@ -1461,9 +1461,8 @@ async fn execute_auto_reap(
         "stale-worker sweep: two-hour token-verified auto-reap firing",
     );
 
-    // 1. Recovery backup — capture uncommitted workspace work before any
-    //    teardown makes the workspace eligible for re-lease/reset.
-    let recovery_patch = boss_engine_recovery::recovery_backup::backup_dead_execution(execution);
+    // 1. Export the engine-created execution reference from the shared store.
+    let recovery_patch = crate::execution_bookmark_recovery::backup_dead_execution(work_db, execution).await;
 
     // 2. Orphan + audit.
     let reason = format!(
@@ -1700,11 +1699,9 @@ async fn run_cadence_fallback(
     )
     .await;
 
-    // Snapshot the wedged worker's uncommitted workspace work to a
-    // durable patch before the slot is released and the workspace
-    // becomes eligible for re-lease/reset. Best-effort: a failed or
-    // empty capture returns None and never blocks the reap.
-    let recovery_patch = boss_engine_recovery::recovery_backup::backup_dead_execution(execution);
+    // Export the wedged worker's recorded shared-store reference.
+    // Missing or unreadable references raise recovery attention.
+    let recovery_patch = crate::execution_bookmark_recovery::backup_dead_execution(work_db, execution).await;
 
     // Append [engine-reconcile] audit line to the task description so
     // a human inspecting the chore can see why it was reset (and

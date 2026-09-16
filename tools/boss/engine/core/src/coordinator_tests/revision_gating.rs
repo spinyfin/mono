@@ -208,11 +208,10 @@ async fn revision_lease_failure_records_start_failure() {
     );
 }
 
-/// The soft-prefer fallback must succeed when the preferred workspace is held,
-/// and workspace positioning must use `goto_workspace` (not `create_change`)
-/// when a `pr_url` is present.
+/// A new revision uses clean scratch regardless of legacy affinity and is
+/// positioned on its PR when there is no predecessor work to recover.
 #[tokio::test]
-async fn revision_soft_prefer_fallback_positions_via_goto() {
+async fn revision_clean_lease_positions_via_goto() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
 
@@ -266,19 +265,13 @@ async fn revision_soft_prefer_fallback_positions_via_goto() {
     );
 
     let calls = cube.lease_calls.lock().await;
-    assert_eq!(
-        calls.len(),
-        2,
-        "two lease attempts expected: prefer failed then fallback succeeded"
-    );
+    assert_eq!(calls.len(), 1, "revision dispatch requests clean scratch directly");
 
-    // Attempt 1 targeted the preferred workspace; attempt 2 did not.
-    assert_eq!(
-        calls[0].2,
-        Some("mono-agent-001".to_owned()),
-        "attempt 1 must pass the preferred workspace"
+    assert!(
+        calls[0].2.is_none(),
+        "the previous workspace is not the recovery handle"
     );
-    assert_eq!(calls[1].2, None, "attempt 2 must not specify a preferred workspace");
+    assert!(!calls[0].3, "the new lease starts clean");
     drop(calls);
 
     // Positioning happens via goto_workspace (not create_change) when pr_url is set.

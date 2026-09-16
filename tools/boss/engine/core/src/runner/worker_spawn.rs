@@ -721,6 +721,7 @@ pub(crate) async fn compose_worker_spawn(
     // need an override.
     let mut embedded_output_path = designated_output_kind(execution, work_item)
         .map(|kind| crate::structured_output::default_path_string(&execution.id, kind));
+    let bookmark_recovery = work_db.bookmark_recovery(&execution.id)?;
     let prompt_text = if execution.kind == ExecutionKind::AutomationTriage {
         match work_db.get_automation(&execution.work_item_id) {
             Ok(Some(automation)) => {
@@ -784,6 +785,7 @@ pub(crate) async fn compose_worker_spawn(
                         .execution(execution)
                         .work_item(work_item)
                         .workspace_path(workspace_path)
+                        .maybe_bookmark_recovery(bookmark_recovery.as_ref())
                         .maybe_parent_project(parent_project.as_ref())
                         .maybe_cube_change_id(cube_change_id)
                         .maybe_conflict_attempt(conflict_attempt.as_ref())
@@ -820,6 +822,7 @@ pub(crate) async fn compose_worker_spawn(
                     .execution(execution)
                     .work_item(work_item)
                     .workspace_path(workspace_path)
+                    .maybe_bookmark_recovery(bookmark_recovery.as_ref())
                     .maybe_parent_project(parent_project.as_ref())
                     .maybe_cube_change_id(cube_change_id)
                     .maybe_conflict_attempt(conflict_attempt.as_ref())
@@ -1031,6 +1034,7 @@ pub(crate) async fn compose_worker_spawn(
                 .execution(execution)
                 .work_item(work_item)
                 .workspace_path(workspace_path)
+                .maybe_bookmark_recovery(bookmark_recovery.as_ref())
                 .maybe_parent_project(parent_project.as_ref())
                 .maybe_cube_change_id(cube_change_id)
                 .maybe_conflict_attempt(conflict_attempt.as_ref())
@@ -1047,6 +1051,9 @@ pub(crate) async fn compose_worker_spawn(
                 .build(),
         )
     };
+    let bookmark_instructions = crate::execution_bookmark_recovery::worker_instructions(execution);
+    let (opening, rest) = prompt_text.split_once('\n').unwrap_or((&prompt_text, ""));
+    let prompt_text = format!("{opening}\n\n{bookmark_instructions}{rest}");
     let prompt_text = match origin_pr_backlink {
         Some(backlink) => format!(
             "{prompt_text}\n\n## Origin PR backlink\n\n\

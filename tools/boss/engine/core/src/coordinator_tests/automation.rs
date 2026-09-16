@@ -867,7 +867,14 @@ async fn preempted_automation_work_redispatches_once_capacity_frees() {
 
     let pool = WorkerPool::new(MAIN_POOL);
     let preemptor = Arc::new(FakePreemptor::new(pool.clone(), PreemptOutcome::Released));
-    let cube = Arc::new(FakeCubeClient::default());
+    let repo = boss_engine_test_git::jj::JjRepo::new(dir.path());
+    let cube = Arc::new(
+        FakeCubeClient {
+            workspace_root: Some(dir.path().to_path_buf()),
+            ..FakeCubeClient::default()
+        }
+        .with_next_workspace_id("worker"),
+    );
     let mut coord = ExecutionCoordinator::new(
         db.clone(),
         pool.clone(),
@@ -893,6 +900,25 @@ async fn preempted_automation_work_redispatches_once_capacity_frees() {
         .expect("test precondition: automation must hold the Lower Decks slot")
         .execution_id;
     let spilled_work_item = db.get_execution(&spilled_execution_id).unwrap().work_item_id;
+
+    // Only the preempted execution crosses the real recovery boundary in
+    // this scheduler test. Give that fake dispatch a real empty reference;
+    // unrelated slot allocation must not wait on concurrent jj processes.
+    let record = boss_engine_recovery::execution_bookmark::create(
+        &boss_engine_recovery::execution_bookmark::LocalJj,
+        &repo.worker,
+        &spilled_execution_id,
+        "local",
+    )
+    .await
+    .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE execution_bookmarks SET repo_path = ?2 WHERE execution_id = ?1",
+            rusqlite::params![spilled_execution_id, record.repo_path.to_str().unwrap()],
+        )
+        .unwrap();
 
     let late = create_test_chore(&db, product.id.clone(), "Late mainline chore");
     db.request_execution(

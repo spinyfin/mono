@@ -1,6 +1,7 @@
 pub use boss_transcript_markdown as transcript_markdown;
 
 pub mod abandoned_branch_pr_sweep;
+mod abandoned_execution_bookmarks;
 pub mod agent_jsonl_discovery;
 pub mod agent_jsonl_progress;
 pub mod answer_agent;
@@ -85,6 +86,7 @@ pub mod execution_liveness;
 pub mod execution_retention_sweep;
 pub mod external_tracker;
 pub use boss_feature_flags as feature_flags;
+mod execution_bookmark_recovery;
 pub mod github_api_usage;
 pub mod hold_registry;
 pub mod host_adapter;

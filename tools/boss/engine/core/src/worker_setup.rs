@@ -466,7 +466,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          - `jj git fetch` to sync; `jj new main@origin` for a fresh task;\n\
            `jj edit <bookmark>` to resume.\n\
          - `jj describe -m '...'` to set commit messages;\n\
-           `jj bookmark create <name> -r @` to name a commit.\n\
+           `jj bookmark set <name> -r @` to create or advance a bookmark.\n\
          - **NEVER push branches or open PRs with bare VCS commands** (`jj git push`,\n\
            `git push`, `gh pr create`). A PreToolUse hook blocks these. Use:\n\
            - `{cube} pr create --branch <name>` — new PR (pushes branch + opens PR, jj-aware, no GIT_DIR needed)\n\
@@ -500,7 +500,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          \n\
          ```sh\n\
          jj describe -m \"your commit message\"\n\
-         jj bookmark create my-feature -r @\n\
+         jj bookmark set my-feature -r @\n\
          body=$(mktemp)\n\
          cat > \"$body\" << 'PRBODY'\n\
          ## Summary\n\

@@ -204,9 +204,11 @@ rust_test(
     size = "small",
     timeout = "moderate",
     crate = ":engine_lib",
+    data = ["@jj_test_tools//:jj"],
     edition = "2024",
     env = {
         "BOSS_EVENT_BIN": "/opt/boss/bin/boss-event",
+        "BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)",
         "HOME": "/tmp",
     },
     experimental_enable_sharding = True,

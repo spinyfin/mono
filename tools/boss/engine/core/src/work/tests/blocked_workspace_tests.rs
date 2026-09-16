@@ -85,7 +85,7 @@ fn revision_reconcile_preserves_park_until_explicit_resume_prefers_its_own_works
     assert_eq!(next.preferred_workspace_id.as_deref(), Some("workspace-revision"));
     assert!(next.allow_dirty && next.prefer_is_soft);
     assert_eq!(next.pr_url.as_deref(), Some(pr));
-    assert_eq!(db.blocked_workspace_predecessor(&next).unwrap().unwrap().id, id);
+    assert_eq!(db.recovery_predecessor(&next).unwrap().unwrap().id, id);
 }
 
 #[test]

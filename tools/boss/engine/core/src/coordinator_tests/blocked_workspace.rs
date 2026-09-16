@@ -48,7 +48,7 @@ fn blocked_pair(path: &std::path::Path) -> (Arc<WorkDb>, WorkExecution, WorkExec
 }
 
 #[tokio::test]
-async fn blocked_revision_reclaims_only_verified_prior_identity_and_falls_back_softly() {
+async fn blocked_revision_leases_clean_scratch_regardless_of_prior_lease_identity() {
     for scenario in [
         "valid",
         "leased",
@@ -96,38 +96,24 @@ async fn blocked_revision_reclaims_only_verified_prior_identity_and_falls_back_s
             .await
             .unwrap();
         let calls = cube.lease_calls.lock().await;
-        assert_eq!(calls[0].2.as_deref(), Some("workspace-old"), "{scenario}");
-        assert!(calls[0].3);
-        if scenario == "valid" {
-            assert_eq!(lease.workspace_id, "workspace-old");
-            assert_eq!(calls.len(), 1);
-            assert!(cube.release_calls.lock().await.is_empty());
-        } else {
-            assert_ne!(lease.workspace_id, "workspace-old", "{scenario}");
-            assert_eq!(calls.len(), 2, "{scenario}");
-            assert!(calls[1].2.is_none());
-            assert!(!calls[1].3);
-            if scenario != "leased" {
-                assert!(calls[1].4.contains(&"workspace-old".to_owned()));
-                assert_eq!(cube.release_calls.lock().await.len(), 1);
-            }
-        }
+        assert!(
+            calls[0].2.is_none(),
+            "{scenario}: recovery must not request the old workspace"
+        );
+        assert!(!calls[0].3);
+        assert_ne!(lease.workspace_id, "workspace-old", "{scenario}");
+        assert_eq!(calls.len(), 1, "{scenario}");
+        assert!(
+            cube.status_calls.lock().await.is_empty(),
+            "lease history is not recovery provenance"
+        );
+        assert!(cube.release_calls.lock().await.is_empty());
     }
 }
 
 #[tokio::test]
-async fn blocked_revision_retry_after_deferral_release_trusts_its_own_recovery_marker() {
-    // A post-lease deferral (e.g. the chain-sibling guard in
-    // `schedule_execution`) releases the lease it just took to hand the
-    // workspace back. `release_workspace` sets `last_task =
-    // COALESCE(task, last_task)`, and `task` was stamped at lease time with
-    // THIS execution's own id (`execution_task_summary`), not `prior.id` —
-    // so that release silently overwrites the `prior.id` marker
-    // `verify_blocked_workspace`'s `last_task` check depends on, even
-    // though the workspace itself never changed. On a retry, cube's
-    // `last_task` no longer proves the identity — but the on-disk
-    // `RecoveryReport` this same execution wrote on its first successful
-    // verification does, and must be trusted instead.
+async fn blocked_revision_retry_ignores_old_workspace_markers() {
+    // Legacy markers cannot establish shared-store provenance or pin a lease.
     use boss_engine_recovery::recovery_apply::{RecoveryReport, RecoverySource};
     let dir = tempdir().unwrap();
     let (db, prior, next) = blocked_pair(&dir.path().join("boss.db"));
@@ -156,8 +142,7 @@ async fn blocked_revision_retry_after_deferral_release_trusts_its_own_recovery_m
         cube.clone(),
         Arc::new(FakeExecutionRunner::default()),
     ));
-    // This execution already verified this exact workspace on an earlier
-    // dispatch attempt and recorded it in the on-disk marker.
+    // Even an execution-matching legacy marker must not affect scratch selection.
     RecoveryReport {
         for_execution_id: next.id.clone(),
         from_execution_id: prior.id.clone(),
@@ -172,16 +157,15 @@ async fn blocked_revision_retry_after_deferral_release_trusts_its_own_recovery_m
         .lease_workspace_with_fallback(&next, "worker", &repo, "task", &coordinator.host_adapter)
         .await
         .unwrap();
-    assert_eq!(lease.workspace_id, "workspace-old");
+    assert_ne!(lease.workspace_id, "workspace-old");
     let calls = cube.lease_calls.lock().await;
-    assert_eq!(calls.len(), 1, "must not fall back to a fresh workspace");
+    assert_eq!(calls.len(), 1, "must directly request clean scratch");
     assert!(cube.release_calls.lock().await.is_empty());
 }
 
 #[tokio::test]
-async fn blocked_recovery_report_distinguishes_fresh_checkout_without_patch_replay() {
-    use boss_engine_recovery::recovery_apply::{RecoveryReport, RecoverySource};
-    for recovered in [false, true] {
+async fn blocked_recovery_missing_bookmark_fails_even_when_cube_claims_recovery() {
+    for dirty_verified in [None, Some(false), Some(true)] {
         let dir = tempdir().unwrap();
         let (db, prior, next) = blocked_pair(&dir.path().join("boss.db"));
         let coordinator = Arc::new(ExecutionCoordinator::new(
@@ -192,27 +176,24 @@ async fn blocked_recovery_report_distinguishes_fresh_checkout_without_patch_repl
         ));
         let lease = CubeWorkspaceLease {
             lease_id: "lease-new".into(),
-            workspace_id: if recovered { "workspace-old" } else { "fresh" }.into(),
+            workspace_id: "workspace-old".into(),
             workspace_path: dir.path().to_path_buf(),
-            dirty_verified: recovered.then_some(true),
+            dirty_verified,
         };
-        coordinator.reconcile_workspace_recovery(&next, "worker", &lease).await;
-        let report = RecoveryReport::read_for(dir.path(), &next.id).unwrap();
-        assert_eq!(report.from_execution_id, prior.id);
-        assert_eq!(
-            report.source,
-            if recovered {
-                RecoverySource::BlockedInPlace
-            } else {
-                RecoverySource::BlockedFresh
-            }
+        let err = coordinator
+            .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(&prior.id), "{err:#}");
+        assert!(
+            err.to_string().contains("no engine-created recovery bookmark"),
+            "{err:#}"
         );
-        assert!(report.applied.is_none());
     }
 }
 
 #[tokio::test]
-async fn blocked_revision_dispatch_keeps_verified_checkout_and_positions_fresh_fallback() {
+async fn blocked_revision_dispatch_restores_bookmark_with_or_without_original_workspace() {
     for recovered in [false, true] {
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
@@ -226,28 +207,32 @@ async fn blocked_revision_dispatch_keeps_verified_checkout_and_positions_fresh_f
             )
             .unwrap();
         let next = db.get_execution(&next.id).unwrap();
-        let workspace = dir.path().join("workspace-old");
-        std::fs::create_dir_all(&workspace).unwrap();
+        use boss_engine_recovery::execution_bookmark::{LocalJj, create};
+        use boss_engine_test_git::jj::JjRepo;
+        let repo = JjRepo::new(dir.path());
+        let record = create(&LocalJj, &repo.worker, &prior.id, "local").await.unwrap();
+        db.record_execution_bookmark(&record).unwrap();
+        std::fs::write(repo.worker.join("revision.txt"), "unpushed revision").unwrap();
+        JjRepo::run(&repo.worker, &["status"]);
+        if !recovered {
+            std::fs::remove_dir_all(&repo.worker).unwrap();
+        }
         let cube = Arc::new(FakeCubeClient {
-            fail_lease_when_prefer_set: !recovered,
-            dirty_verified: Some(true),
             workspace_root: Some(dir.path().to_path_buf()),
-            recovery_status: Some(
-                CubeWorkspaceStatus::builder()
-                    .workspace_id("workspace-old")
-                    .workspace_path(workspace)
-                    .state("leased")
-                    .lease_id("lease-1")
-                    .last_task(format!("{} revision_implementation Blocked revision", prior.id))
-                    .build(),
-            ),
+            next_workspace_id: Mutex::new(Some("replacement".into())),
+            real_bookmarks: true,
             ..FakeCubeClient::default()
         });
         let runner = Arc::new(FakeExecutionRunner {
             pending: true,
             ..FakeExecutionRunner::default()
         });
-        let coordinator = Arc::new(ExecutionCoordinator::new(db, WorkerPool::new(1), cube.clone(), runner));
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner,
+        ));
         let worker = coordinator
             .pool_for_execution(&next)
             .claim_worker(&next.id, None)
@@ -257,7 +242,25 @@ async fn blocked_revision_dispatch_keeps_verified_checkout_and_positions_fresh_f
             .schedule_execution(&next, &worker, DispatchAdmission::Queued)
             .await
             .unwrap();
-        assert_eq!(cube.goto_calls.lock().await.len(), usize::from(!recovered));
+        assert!(
+            cube.goto_calls.lock().await.is_empty(),
+            "PR positioning must not overwrite recovered work"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.replacement.join("revision.txt")).unwrap(),
+            "unpushed revision"
+        );
+        assert_eq!(db.bookmark_recovery(&next.id).unwrap(), Some((prior.id, true)));
+        assert_eq!(
+            db.execution_bookmark(&next.id).unwrap().head(),
+            format!("boss-recovery/{}", next.id)
+        );
+        assert!(
+            boss_engine_recovery::execution_bookmark::diff(&LocalJj, &db.execution_bookmark(&next.id).unwrap())
+                .await
+                .unwrap()
+                .contains("revision.txt")
+        );
         assert!(cube.create_calls.lock().await.is_empty());
         assert!(cube.lease_calls.lock().await[0].1.starts_with(&format!("{} ", next.id)));
     }

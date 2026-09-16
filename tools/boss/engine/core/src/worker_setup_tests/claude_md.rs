@@ -239,8 +239,8 @@ fn claude_md_has_cube_pr_create_section() {
     );
     assert!(rendered.contains("--branch"), "expected --branch flag guidance",);
     assert!(
-        rendered.contains("jj bookmark create"),
-        "expected canonical bookmark creation command",
+        rendered.contains("jj bookmark set"),
+        "expected canonical bookmark advancement command",
     );
 }
 

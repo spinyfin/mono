@@ -733,12 +733,13 @@ name = "boss-engine-recovery"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "boss-engine-test-git",
  "boss-log-files",
- "boss-protocol",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "tracing",
 ]
 
