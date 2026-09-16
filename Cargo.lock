@@ -957,11 +957,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bon",
+ "boss-gh-telemetry",
  "boss-github",
- "futures-util",
  "serde",
  "serde_json",
  "sha2",
+ "tokio",
  "tracing",
 ]
 

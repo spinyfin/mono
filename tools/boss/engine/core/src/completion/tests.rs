@@ -1858,12 +1858,15 @@ async fn finalize_pr_transition_captures_on_the_canonical_root() {
     assert_eq!(capture.trigger, PrSourceCaptureTrigger::Completion.as_str());
     assert_eq!(capture.packet.head_sha, "head");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    handler.reconcile_review_guide_source_for_execution(
-        &execution_id,
-        SOURCE_CAPTURE_PR_URL,
-        PrSourceCaptureTrigger::Completion,
-    );
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    handler
+        .reconcile_review_guide_source_for_execution(
+            &execution_id,
+            SOURCE_CAPTURE_PR_URL,
+            PrSourceCaptureTrigger::Completion,
+        )
+        .expect("metadata resolution is asynchronous")
+        .await
+        .unwrap();
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,

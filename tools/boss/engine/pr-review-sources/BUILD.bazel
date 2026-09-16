@@ -15,6 +15,7 @@ rust_library(
         "//tools/boss/engine/review-guide:__pkg__",
     ],
     deps = [
+        "//tools/boss/gh_telemetry",
         "//tools/boss/github",
         "@mono_crates//:tracing",
     ] + all_crate_deps(normal = True),
@@ -30,6 +31,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//tools/boss/gh_telemetry",
         "//tools/boss/github",
     ] + all_crate_deps(
         normal = True,

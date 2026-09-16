@@ -110,21 +110,7 @@ pub(crate) fn github_source_packet_collector() -> SourcePacketCollector {
                 (Some(observed), None) => {
                     collect_pinned_source_packet(&pr_url, &observed, expected_head_branch.as_deref()).await
                 }
-                (None, None) => {
-                    let metadata = boss_github::pr_files::fetch_pr_comparison_metadata(&pr_url).await?;
-                    let observed = PinnedComparison {
-                        base_sha: metadata.base_sha.clone(),
-                        head_sha: metadata.head_sha.clone(),
-                    };
-                    collect_pinned_source_packet_with_metadata(
-                        &pr_url,
-                        &observed,
-                        expected_head_branch.as_deref(),
-                        metadata,
-                        false,
-                    )
-                    .await
-                }
+                (None, None) => anyhow::bail!("collector requires resolved metadata when no endpoints were observed"),
             }
         })
     });
@@ -326,59 +312,61 @@ pub(crate) fn reconcile_review_guide_source_with_collector(
             };
             let metadata = Some(metadata);
             let result = (collector.collect)(pr_url.clone(), observed, expected_head_branch, metadata).await;
-            // Coalesced observations update this sequence; hold it through persistence.
-            let mut captures = in_flight_captures().lock().unwrap_or_else(|error| error.into_inner());
-            let sequence = guard.sequence.lock().unwrap_or_else(|error| error.into_inner());
-            let observation_sequence = *sequence;
-            match result {
-                Ok(packet) => match work_db.persist_pr_review_guide_source_capture(
-                    &root_task_id,
-                    observation_sequence,
-                    trigger,
-                    &packet,
-                ) {
-                    Ok(PrSourceCapturePersistOutcome::Stored(capture)) => {
-                        tracing::info!(
+            for pass in 0..2 {
+                let observation_sequence = *guard.sequence.lock().unwrap_or_else(|error| error.into_inner());
+                match &result {
+                    Ok(packet) => match work_db.persist_pr_review_guide_source_capture(
+                        &root_task_id,
+                        observation_sequence,
+                        trigger,
+                        packet,
+                    ) {
+                        Ok(PrSourceCapturePersistOutcome::Stored(capture)) => {
+                            tracing::info!(
+                                root_task_id,
+                                pr_url,
+                                observation_sequence,
+                                packet_hash = %capture.packet_hash,
+                                complete = capture.complete,
+                                "review-guide source capture: stored immutable comparison packet",
+                            );
+                            enqueue_review_guide_generation(&work_db, &feature_flags, &capture);
+                        }
+                        Ok(PrSourceCapturePersistOutcome::Existing(capture)) => tracing::debug!(
                             root_task_id,
                             pr_url,
                             observation_sequence,
-                            packet_hash = %capture.packet_hash,
-                            complete = capture.complete,
-                            "review-guide source capture: stored immutable comparison packet",
-                        );
-                        enqueue_review_guide_generation(&work_db, &feature_flags, &capture);
+                            existing_sequence = capture.observation_sequence,
+                            "review-guide source capture: comparison packet already present",
+                        ),
+                        Ok(PrSourceCapturePersistOutcome::IgnoredStaleObservation) => tracing::debug!(
+                            root_task_id,
+                            pr_url,
+                            observation_sequence,
+                            "review-guide source capture: ignored delayed observation",
+                        ),
+                        Err(error) => record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error),
+                    },
+                    Err(error) => {
+                        if let Err(count_error) = work_db.record_pr_review_guide_source_retry_error(&pr_url, &rest_identity) {
+                            tracing::warn!(?count_error, "could not count failed source retry");
+                        }
+                        record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
                     }
-                    Ok(PrSourceCapturePersistOutcome::Existing(capture)) => tracing::debug!(
-                        root_task_id,
-                        pr_url,
-                        observation_sequence,
-                        existing_sequence = capture.observation_sequence,
-                        "review-guide source capture: comparison packet already present",
-                    ),
-                    Ok(PrSourceCapturePersistOutcome::IgnoredStaleObservation) => tracing::debug!(
-                        root_task_id,
-                        pr_url,
-                        observation_sequence,
-                        "review-guide source capture: ignored delayed observation",
-                    ),
-                    Err(error) => tracing::warn!(
-                        root_task_id,
-                        pr_url,
-                        observation_sequence,
-                        ?error,
-                        "review-guide source capture: could not persist packet",
-                    ),
-                },
-                Err(error) => {
-                    if let Err(count_error) = work_db.record_pr_review_guide_source_retry_error(&pr_url, &rest_identity)
-                    {
-                        tracing::warn!(?count_error, "could not count failed source retry");
+                }
+                let mut captures = in_flight_captures().lock().unwrap_or_else(|error| error.into_inner());
+                let latest_sequence = *guard.sequence.lock().unwrap_or_else(|error| error.into_inner());
+                if latest_sequence == observation_sequence || pass == 1 {
+                    if latest_sequence != observation_sequence {
+                        tracing::warn!(root_task_id, pr_url, observation_sequence, latest_sequence,
+                            "review-guide source capture: coalescing retry limit reached; next observation will reconcile");
                     }
-                    record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
+                    captures.remove(&guard.key);
+                    guard.active = false;
+                    break;
                 }
             }
-            captures.remove(&guard.key);
-            guard.active = false;
+            drop(guard);
         })
         .await;
     }))
@@ -483,7 +471,7 @@ fn enqueue_review_guide_generation(
     );
 }
 
-fn prepare_capture(
+pub(crate) fn prepare_capture(
     db: &WorkDb,
     root: &str,
     url: &str,
@@ -500,9 +488,6 @@ fn prepare_capture(
         return Ok(None);
     }
     let mut captures = in_flight_captures().lock().unwrap_or_else(|error| error.into_inner());
-    if select(db, root, url, &endpoints.base_sha, &endpoints.head_sha, sequence)? {
-        return Ok(None);
-    }
     Ok(InFlightGuard::acquire_locked(
         &mut captures,
         (
@@ -514,7 +499,7 @@ fn prepare_capture(
     ))
 }
 
-struct InFlightGuard {
+pub(crate) struct InFlightGuard {
     key: CaptureKey,
     active: bool,
     sequence: Arc<Mutex<i64>>,
