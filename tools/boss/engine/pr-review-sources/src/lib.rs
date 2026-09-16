@@ -1000,7 +1000,7 @@ where
             }
             result => {
                 let (cause, terminal) = match result {
-                    Ok(_) => ("directory response was truncated".to_owned(), false),
+                    Ok(_) => ("directory response was truncated".to_owned(), true),
                     Err(error) => (error.to_string(), tree_error_is_terminal(error.kind)),
                 };
                 for name in names {
@@ -1643,6 +1643,48 @@ mod tests {
             std::result::Result<boss_github::trees::PinnedTree, boss_github::trees::TreeApiError>,
         >,
         blobs: HashMap<(String, String), Vec<u8>>,
+    }
+
+    #[test]
+    fn truncated_immutable_directory_settles_the_packet() {
+        use futures_util::FutureExt;
+        let metadata = rest_metadata("base", "head", 1);
+        let transport = FixtureTransport {
+            latest: metadata.clone(),
+            merge_base: "merge".to_owned(),
+            inventory: vec![inventory_entry("a.rs", None, "added", Some("@@"))],
+            trees: HashMap::from([(
+                ("head".to_owned(), String::new()),
+                Ok(boss_github::trees::PinnedTree {
+                    sha: "head".to_owned(),
+                    entries: Vec::new(),
+                    truncated: true,
+                }),
+            )]),
+            blobs: HashMap::new(),
+        };
+        let packet = collect_pinned_source_packet_with_transport(
+            "https://github.com/acme/widget/pull/4",
+            &PinnedComparison {
+                base_sha: "base".to_owned(),
+                head_sha: "head".to_owned(),
+            },
+            None,
+            metadata,
+            false,
+            &transport,
+        )
+        .now_or_never()
+        .unwrap()
+        .unwrap();
+        assert!(packet.is_complete());
+        assert_eq!(packet.files[0].after.as_ref().unwrap().terminal, Some(true));
+        assert!(
+            packet
+                .omissions
+                .iter()
+                .any(|o| o.reason.contains("directory response was truncated"))
+        );
     }
 
     impl SourceTransport for FixtureTransport {
