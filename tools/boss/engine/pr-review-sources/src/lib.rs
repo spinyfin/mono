@@ -313,7 +313,7 @@ pub struct SourceOmission {
     pub terminal: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceSide {
     Before,
@@ -1167,17 +1167,6 @@ fn record_omission(omissions: &mut Vec<SourceOmission>, source: &PinnedSource, s
 
 fn hex_digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn encode_path(path: &str) -> String {
-    path.bytes()
-        .flat_map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'/' => {
-                vec![byte as char].into_iter().collect::<Vec<_>>()
-            }
-            _ => format!("%{byte:02X}").chars().collect(),
-        })
-        .collect()
 }
 
 #[cfg(test)]

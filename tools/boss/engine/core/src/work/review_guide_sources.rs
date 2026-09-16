@@ -320,6 +320,7 @@ impl WorkDb {
                 existing.attempt_count += 1;
                 let should_upgrade = !existing.complete && (complete || omission_count < existing.omission_count);
                 if should_upgrade {
+                    let superseded_path = existing.packet_path.clone();
                     let packet_path = published.take().expect("packet published outside transaction");
                     tx.execute(
                     "UPDATE pr_review_guide_source_comparisons
@@ -336,6 +337,15 @@ impl WorkDb {
                 )?;
                     select_comparison(&tx, &series_id, &existing.comparison_id, observation_sequence, &now)?;
                     tx.commit()?;
+                    drop(conn);
+                    drop(_publication);
+                    if let Some(old_path) = superseded_path
+                        && old_path != packet_path
+                        && let Some(_gc) = packet_store_lock(&artifact_root, true)?
+                    {
+                        let conn = self.connect()?;
+                        delete_unreferenced_packet_artifact(&conn, &artifact_root, &old_path)?;
+                    }
                     let mut upgraded = existing;
                     upgraded.packet_hash = packet_hash;
                     upgraded.complete = complete;

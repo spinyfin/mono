@@ -483,8 +483,7 @@ async fn truncated_immutable_directory_settles_the_packet() {
         false,
         &transport,
     )
-    .now_or_never()
-    .unwrap()
+    .await
     .unwrap();
     assert!(packet.is_complete());
     assert_eq!(packet.files[0].after.as_ref().unwrap().terminal, Some(true));

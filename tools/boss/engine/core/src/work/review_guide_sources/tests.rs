@@ -251,7 +251,7 @@ fn assert_recollects(db: &WorkDb, root: &str, packet: &SourcePacket) {
         base_sha: packet.observed_base_sha.clone(),
         head_sha: packet.head_sha.clone(),
     };
-    let claim = crate::review_guide_capture::prepare_capture(db, root, &packet.canonical_pr_url, &endpoints, 3)
+    let claim = crate::review_guide_capture::prepare_capture(db, root, &packet.canonical_pr_url, &endpoints, 3, false)
         .unwrap()
         .expect("invalid artifact must permit recollection");
     let error: Option<String> = db
@@ -268,7 +268,7 @@ fn assert_recollects(db: &WorkDb, root: &str, packet: &SourcePacket) {
         .unwrap();
     drop(claim);
     assert!(
-        crate::review_guide_capture::prepare_capture(db, root, &packet.canonical_pr_url, &endpoints, 4)
+        crate::review_guide_capture::prepare_capture(db, root, &packet.canonical_pr_url, &endpoints, 4, false)
             .unwrap()
             .is_none()
     );
@@ -544,6 +544,7 @@ fn blocked_artifact_validation_allows_unrelated_claim_and_database_write() {
                     head_sha: "head".into(),
                 },
                 2,
+                false,
             )
             .unwrap()
         });
@@ -559,6 +560,7 @@ fn blocked_artifact_validation_allows_unrelated_claim_and_database_write() {
                     head_sha: "other-head".into(),
                 },
                 sequence,
+                false,
             )
             .unwrap();
             claimed_tx.send(claim.is_some()).unwrap();
