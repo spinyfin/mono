@@ -72,8 +72,9 @@ pub enum PrSourceCapturePersistOutcome {
 }
 
 /// Additive persistence for the source-capture foundation. A series identifies
-/// a canonical PR and its root task; comparisons are separately immutable so
-/// a force-push, base advance, or later poll cannot erase historical evidence.
+/// a canonical PR and its root task. A force-push, base advance, or later poll
+/// preserves earlier comparisons; incomplete packets may be upgraded in place.
+/// Rows are removed only when their referenced artifacts are unreadable.
 pub(crate) fn migrate_pr_review_guide_source_capture_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS pr_review_guide_source_series (
@@ -86,8 +87,9 @@ pub(crate) fn migrate_pr_review_guide_source_capture_tables(conn: &Connection) -
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS pr_review_guide_source_series_root_idx
-            ON pr_review_guide_source_series(root_task_id, updated_at DESC);
+        DROP INDEX IF EXISTS pr_review_guide_source_series_root_idx;
+        CREATE INDEX IF NOT EXISTS pr_review_guide_source_series_observation_idx
+            ON pr_review_guide_source_series(root_task_id, latest_observation_sequence DESC, id DESC);
         CREATE TABLE IF NOT EXISTS pr_review_guide_source_comparisons (
             id TEXT PRIMARY KEY,
             series_id TEXT NOT NULL REFERENCES pr_review_guide_source_series(id),
@@ -520,9 +522,8 @@ impl WorkDb {
         sequence: i64,
         probe: bool,
     ) -> Result<bool> {
-        let mut conn = self.connect()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing: Option<(String, String, String, i64, String, Option<String>)> = tx
+        let conn = self.connect()?;
+        let existing: Option<(String, String, String, i64, String, Option<String>)> = conn
             .query_row(
                 "SELECT s.id, c.id, s.root_task_id, s.latest_observation_sequence, c.packet_hash, c.packet_path
              FROM pr_review_guide_source_series s
@@ -544,14 +545,30 @@ impl WorkDb {
                 },
             )
             .optional()?;
-        let Some((series, comparison, root, latest, hash, path)) = existing else {
+        let Some((series, comparison, root, _, hash, path)) = existing else {
             return Ok(false);
         };
         anyhow::ensure!(
             root == root_task_id,
             "canonical PR is already associated with another root task"
         );
-        if let Err(error) = load_packet(&self.artifact_root()?, path.as_deref(), &hash) {
+        drop(conn);
+        let validation = load_packet(&self.artifact_root()?, path.as_deref(), &hash);
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let latest: Option<i64> = tx
+            .query_row(
+                "SELECT s.latest_observation_sequence FROM pr_review_guide_source_series s
+             JOIN pr_review_guide_source_comparisons c ON c.series_id = s.id
+             WHERE s.id = ?1 AND c.id = ?2 AND c.packet_hash = ?3 AND c.packet_path IS ?4 AND (c.complete = 1 OR c.attempt_count >= ?5)",
+                params![series, comparison, hash, path, MAX_CAPTURE_ATTEMPTS],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(latest) = latest else {
+            return Ok(false);
+        };
+        if let Err(error) = validation {
             if let Some(path) = &path {
                 match fs::remove_file(self.artifact_root()?.join(path)) {
                     Ok(()) => {}
@@ -679,47 +696,120 @@ fn read_capture_by_endpoints(
     base_sha: &str,
     head_sha: &str,
 ) -> Result<Option<PrReviewGuideSourceCapture>> {
-    conn.query_row(
-        "SELECT s.id, s.root_task_id, c.observation_sequence, c.trigger, c.packet_hash,
+    let metadata = conn
+        .query_row(
+            "SELECT s.id, s.root_task_id, c.observation_sequence, c.trigger, c.packet_hash,
                 c.complete, c.captured_at, c.id, c.packet_path, c.omission_count, c.omission_summary_json, c.attempt_count
          FROM pr_review_guide_source_series s
          JOIN pr_review_guide_source_comparisons c ON c.series_id = s.id
          WHERE c.series_id = ?1 AND c.observed_base_sha = ?2 AND c.head_sha = ?3",
-        params![series_id, base_sha, head_sha],
-        |row| map_capture(row, artifact_root),
-    )
-    .optional()
-    .map_err(Into::into)
+            params![series_id, base_sha, head_sha],
+            CaptureMetadata::from_row,
+        )
+        .optional()?;
+    let Some(metadata) = metadata else {
+        return Ok(None);
+    };
+    match load_packet(artifact_root, metadata.packet_path.as_deref(), &metadata.packet_hash) {
+        Ok(packet) => Ok(Some(metadata.with_packet(packet))),
+        Err(error) => {
+            if let Some(path) = &metadata.packet_path {
+                match fs::remove_file(artifact_root.join(path)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            conn.execute("UPDATE pr_review_guide_source_series SET selected_comparison_id = NULL WHERE id = ?1 AND selected_comparison_id = ?2", params![series_id, metadata.comparison_id])?;
+            conn.execute(
+                "DELETE FROM pr_review_guide_source_comparisons WHERE id = ?1",
+                [&metadata.comparison_id],
+            )?;
+            tracing::warn!(%error, comparison_id = metadata.comparison_id, "invalid source artifact; replacing comparison");
+            Ok(None)
+        }
+    }
+}
+
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+struct CaptureMetadata {
+    series_id: String,
+    root_task_id: String,
+    observation_sequence: i64,
+    trigger: String,
+    packet_hash: String,
+    complete: bool,
+    captured_at: String,
+    comparison_id: String,
+    packet_path: Option<String>,
+    omission_count: i64,
+    attempt_count: i64,
+    omission_summary: Option<String>,
+}
+
+impl CaptureMetadata {
+    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            series_id: row.get(0)?,
+            root_task_id: row.get(1)?,
+            observation_sequence: row.get(2)?,
+            trigger: row.get(3)?,
+            packet_hash: row.get(4)?,
+            complete: row.get::<_, i64>(5)? != 0,
+            captured_at: row.get(6)?,
+            comparison_id: row.get(7)?,
+            packet_path: row.get(8)?,
+            omission_count: row.get(9)?,
+            attempt_count: row.get(11)?,
+            omission_summary: row.get(10)?,
+        })
+    }
+
+    fn with_packet(self, packet: SourcePacket) -> PrReviewGuideSourceCapture {
+        PrReviewGuideSourceCapture {
+            series_id: self.series_id,
+            root_task_id: self.root_task_id,
+            observation_sequence: self.observation_sequence,
+            trigger: self.trigger,
+            packet_hash: self.packet_hash,
+            complete: self.complete,
+            captured_at: self.captured_at,
+            comparison_id: self.comparison_id,
+            packet_path: self.packet_path,
+            omission_count: self.omission_count,
+            attempt_count: self.attempt_count,
+            omission_summary: self.omission_summary,
+            packet,
+        }
+    }
 }
 
 fn map_capture(row: &Row<'_>, artifact_root: &Path) -> rusqlite::Result<PrReviewGuideSourceCapture> {
-    let packet_hash: String = row.get(4)?;
-    let packet_path: Option<String> = row.get(8)?;
-    let packet = load_packet(artifact_root, packet_path.as_deref(), &packet_hash).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(
-            4,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::other(error.to_string())),
-        )
-    })?;
-    Ok(PrReviewGuideSourceCapture {
-        series_id: row.get(0)?,
-        root_task_id: row.get(1)?,
-        observation_sequence: row.get(2)?,
-        trigger: row.get(3)?,
-        packet_hash,
-        omission_count: row.get(9)?,
-        attempt_count: row.get(11)?,
-        complete: row.get::<_, i64>(5)? != 0,
-        captured_at: row.get(6)?,
-        comparison_id: row.get(7)?,
-        packet_path,
-        omission_summary: row.get(10)?,
-        packet,
-    })
+    let metadata = CaptureMetadata::from_row(row)?;
+    let packet =
+        load_packet(artifact_root, metadata.packet_path.as_deref(), &metadata.packet_hash).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::other(error.to_string())),
+            )
+        })?;
+    Ok(metadata.with_packet(packet))
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_PACKET_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn load_packet(artifact_root: &Path, packet_path: Option<&str>, expected_hash: &str) -> Result<SourcePacket> {
+    #[cfg(test)]
+    BEFORE_PACKET_READ.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
     let packet_path = packet_path
         .filter(|path| !path.is_empty())
         .context("missing referenced source packet blob: no artifact path")?;
@@ -738,9 +828,7 @@ fn publish_packet_artifact(state_root: &Path, packet_hash: &str, bytes: &[u8]) -
     anyhow::ensure!(packet_hash.len() >= 2, "source packet hash is too short to address");
     let relative = format!("{PACKET_ARTIFACT_DIR}/{}/{}", &packet_hash[..2], packet_hash);
     let dest = state_root.join(&relative);
-    if dest.exists() {
-        load_packet(state_root, Some(&relative), packet_hash)?;
-    } else {
+    if !dest.exists() || load_packet(state_root, Some(&relative), packet_hash).is_err() {
         boss_engine_utils::atomic_blob::write_blob_atomic(&dest, bytes)?;
     }
     Ok(relative)
@@ -844,8 +932,11 @@ fn unreferenced_packet_blob_paths(artifact_root: &Path, live: &std::collections:
 }
 
 #[cfg(test)]
-#[path = "review_guide_sources_tests.rs"]
-mod upstream_tests;
+mod tests;
 
 #[cfg(test)]
-mod tests;
+mod artifact_tests;
+
+#[cfg(test)]
+#[path = "review_guide_sources_tests.rs"]
+mod upstream_tests;

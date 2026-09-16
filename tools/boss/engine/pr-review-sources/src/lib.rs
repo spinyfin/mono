@@ -313,7 +313,7 @@ pub struct SourceOmission {
     pub terminal: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceSide {
     Before,
@@ -680,7 +680,7 @@ pub async fn collect_pinned_source_packet_with_metadata(
     .await
 }
 
-async fn collect_pinned_source_packet_with_transport<T: SourceTransport + Clone + Send + Sync + 'static>(
+async fn collect_pinned_source_packet_with_transport<T: SourceTransport + Sync + Send + Clone + 'static>(
     pr_url: &str,
     observed: &PinnedComparison,
     expected_head_branch: Option<&str>,
@@ -786,7 +786,7 @@ async fn collect_pinned_source_packet_with_transport<T: SourceTransport + Clone 
         }
     }
 
-    let pending = source_work.into_iter().map(|work| {
+    let requests = source_work.into_iter().map(|work| {
         let transport = transport.clone();
         async move {
             let source = fetch_source(
@@ -801,7 +801,7 @@ async fn collect_pinned_source_packet_with_transport<T: SourceTransport + Clone 
             (work.key, source)
         }
     });
-    let mut fetched: HashMap<_, _> = resolve_bounded(pending).await?.into_iter().collect();
+    let mut fetched: HashMap<_, _> = resolve_bounded(requests).await?.into_iter().collect();
 
     let mut omissions = Vec::new();
     let mut files = Vec::with_capacity(inventory.len());
@@ -943,7 +943,7 @@ fn join_repo_path(directory: &str, name: &str) -> String {
     }
 }
 
-async fn fetch_pinned_tree_entries<T: SourceTransport + Clone + Send + Sync + 'static>(
+async fn fetch_pinned_tree_entries<T: SourceTransport + Sync + Send + Clone + 'static>(
     transport: &T,
     repository: &str,
     sha: &str,
@@ -964,7 +964,9 @@ async fn fetch_pinned_tree_entries<T: SourceTransport + Clone + Send + Sync + 's
         let (owner, repo, sha) = (owner.clone(), repo.clone(), pinned_sha.clone());
         let transport = transport.clone();
         async move {
-            transport.fetch_pinned_tree_directory(&owner, &repo, &sha, &directory, &names).await
+            transport
+                .fetch_pinned_tree_directory(&owner, &repo, &sha, &directory, &names)
+                .await
         }
     })
     .await
@@ -1167,8 +1169,19 @@ fn hex_digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-#[cfg(test)]
-mod upstream_tests;
+fn encode_path(path: &str) -> String {
+    path.bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'/' => {
+                vec![byte as char].into_iter().collect::<Vec<_>>()
+            }
+            _ => format!("%{byte:02X}").chars().collect(),
+        })
+        .collect()
+}
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod transport_tests;

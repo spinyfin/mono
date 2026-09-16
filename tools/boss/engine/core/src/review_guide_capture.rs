@@ -306,7 +306,7 @@ pub(crate) fn reconcile_review_guide_source_with_collector(
             };
             let metadata = Some(metadata);
             let result = (collector.collect)(pr_url.clone(), observed, expected_head_branch, metadata).await;
-            loop {
+            for pass in 0..2 {
                 let observation_sequence = *guard.sequence.lock().unwrap_or_else(|error| error.into_inner());
                 match &result {
                     Ok(packet) => match work_db.persist_pr_review_guide_source_capture(
@@ -336,13 +336,7 @@ pub(crate) fn reconcile_review_guide_source_with_collector(
                             observation_sequence,
                             "review-guide source capture: ignored delayed observation",
                         ),
-                        Err(error) => tracing::warn!(
-                            root_task_id,
-                            pr_url,
-                            observation_sequence,
-                            ?error,
-                            "review-guide source capture: could not persist packet",
-                        ),
+                        Err(error) => record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error),
                     },
                     Err(error) => {
                         if let Err(count_error) = work_db.record_pr_review_guide_source_retry_error(&pr_url, &rest_identity) {
@@ -352,7 +346,12 @@ pub(crate) fn reconcile_review_guide_source_with_collector(
                     }
                 }
                 let mut captures = in_flight_captures().lock().unwrap_or_else(|error| error.into_inner());
-                if *guard.sequence.lock().unwrap_or_else(|error| error.into_inner()) == observation_sequence {
+                let latest_sequence = *guard.sequence.lock().unwrap_or_else(|error| error.into_inner());
+                if latest_sequence == observation_sequence || pass == 1 {
+                    if latest_sequence != observation_sequence {
+                        tracing::warn!(root_task_id, pr_url, observation_sequence, latest_sequence,
+                            "review-guide source capture: coalescing retry limit reached; next observation will reconcile");
+                    }
                     captures.remove(&guard.key);
                     guard.active = false;
                     break;
@@ -381,9 +380,6 @@ pub(crate) fn prepare_capture(
         return Ok(None);
     }
     let mut captures = in_flight_captures().lock().unwrap_or_else(|error| error.into_inner());
-    if select(db, root, url, &endpoints.base_sha, &endpoints.head_sha, sequence)? {
-        return Ok(None);
-    }
     Ok(InFlightGuard::acquire_locked(
         &mut captures,
         (

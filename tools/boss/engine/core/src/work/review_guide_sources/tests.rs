@@ -4,9 +4,9 @@ use crate::work::{FakePrStateChecker, PrOpenState};
 use boss_pr_review_sources::{ChangeKind, PinnedSource, SourceFile, SourceOmission, SourceSide};
 use boss_protocol::{CreateExecutionInput, CreateRevisionInput, ExecutionKind, ExecutionStatus, WorkItemPatch};
 
-fn packet(base: &str, head: &str) -> SourcePacket {
+pub(super) fn packet(base: &str, head: &str) -> SourcePacket {
     SourcePacket {
-        schema_version: 2,
+        schema_version: 3,
         canonical_pr_url: "https://github.com/acme/widget/pull/11".to_owned(),
         pr_number: 11,
         title: "Capture immutable comparison".to_owned(),
@@ -14,6 +14,7 @@ fn packet(base: &str, head: &str) -> SourcePacket {
         base_repository: "acme/widget".to_owned(),
         head_repository: "acme/widget".to_owned(),
         observed_base_sha: base.to_owned(),
+        probe_base_sha: None,
         merge_base_sha: "merge-base".to_owned(),
         head_sha: head.to_owned(),
         files: vec![SourceFile {
@@ -96,7 +97,8 @@ fn duplicate_endpoints_reuse_the_immutable_packet() {
     assert_eq!(second.observation_sequence, 1);
 }
 
-fn incomplete_packet(base: &str, head: &str, reason: &str) -> SourcePacket {
+pub(super) fn incomplete_packet(base: &str, head: &str, reason: &str) -> SourcePacket {
+    let terminal = reason.contains("symlink");
     let mut packet = packet(base, head);
     packet.files[0].after = Some(
         PinnedSource::builder()
@@ -104,12 +106,14 @@ fn incomplete_packet(base: &str, head: &str, reason: &str) -> SourcePacket {
             .sha(head)
             .path("src/lib.rs")
             .omission(reason)
+            .terminal(terminal)
             .build(),
     );
     packet.omissions = vec![SourceOmission {
         path: Some("src/lib.rs".to_owned()),
         side: Some(SourceSide::After),
         reason: reason.to_owned(),
+        terminal,
     }];
     packet
 }
@@ -162,6 +166,7 @@ fn incomplete_packet_stays_sticky_when_a_retry_is_not_better() {
         path: Some("src/lib.rs".to_owned()),
         side: Some(SourceSide::Before),
         reason: "second hole".to_owned(),
+        terminal: true,
     });
     let reused = db
         .persist_pr_review_guide_source_capture(&root, 2, PrSourceCaptureTrigger::Poller, &worse)
@@ -234,12 +239,6 @@ fn valid_json_with_modified_metadata_fails_integrity_validation() {
     .unwrap();
     assert!(
         db.get_latest_pr_review_guide_source_capture("root")
-            .unwrap_err()
-            .to_string()
-            .contains("integrity failure")
-    );
-    assert!(
-        db.persist_pr_review_guide_source_capture("root", 2, PrSourceCaptureTrigger::Poller, &original)
             .unwrap_err()
             .to_string()
             .contains("integrity failure")
@@ -484,4 +483,114 @@ fn stale_invalid_comparison_does_not_replace_current_diagnostics() {
             .packet,
         new
     );
+}
+
+#[test]
+fn incomplete_artifacts_recover_for_missing_corrupt_and_identical_replacements() {
+    for corrupt in [false, true] {
+        for identical in [false, true] {
+            let (dir, db) = open_db();
+            let original = incomplete_packet("base", "head", "unavailable blob");
+            db.persist_pr_review_guide_source_capture("root", 1, PrSourceCaptureTrigger::Creation, &original)
+                .unwrap();
+            let capture = db.get_latest_pr_review_guide_source_capture("root").unwrap().unwrap();
+            let path = dir.path().join(capture.packet_path.unwrap());
+            if corrupt {
+                fs::write(&path, b"truncated").unwrap();
+            } else {
+                fs::remove_file(&path).unwrap();
+            }
+            let replacement = if identical {
+                original
+            } else {
+                incomplete_packet("base", "head", "new omission")
+            };
+            db.persist_pr_review_guide_source_capture("root", 2, PrSourceCaptureTrigger::Poller, &replacement)
+                .unwrap();
+            assert_eq!(
+                db.get_latest_pr_review_guide_source_capture("root")
+                    .unwrap()
+                    .unwrap()
+                    .packet,
+                replacement
+            );
+        }
+    }
+}
+
+#[test]
+fn blocked_artifact_validation_allows_unrelated_claim_and_database_write() {
+    let (_dir, db) = open_db();
+    let original = packet("base", "head");
+    db.persist_pr_review_guide_source_capture("root", 1, PrSourceCaptureTrigger::Creation, &original)
+        .unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            BEFORE_PACKET_READ.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }))
+            });
+            crate::review_guide_capture::prepare_capture(
+                &db,
+                "root",
+                &original.canonical_pr_url,
+                &boss_pr_review_sources::PinnedComparison {
+                    base_sha: "base".into(),
+                    head_sha: "head".into(),
+                },
+                2,
+            )
+            .unwrap()
+        });
+        entered_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        scope.spawn(|| {
+            let sequence = db.allocate_pr_review_guide_source_observation_sequence().unwrap();
+            let claim = crate::review_guide_capture::prepare_capture(
+                &db,
+                "other-root",
+                "https://github.com/acme/other/pull/1",
+                &boss_pr_review_sources::PinnedComparison {
+                    base_sha: "other-base".into(),
+                    head_sha: "other-head".into(),
+                },
+                sequence,
+            )
+            .unwrap();
+            claimed_tx.send(claim.is_some()).unwrap();
+        });
+        let claimed = claimed_rx.recv_timeout(std::time::Duration::from_secs(10));
+        release_tx.send(()).unwrap();
+        assert!(reader.join().unwrap().is_none());
+        assert!(claimed.unwrap());
+    });
+}
+
+#[test]
+fn migration_replaces_the_legacy_series_index() {
+    let (_dir, db) = open_db();
+    let conn = db.connect().unwrap();
+    conn.execute_batch("DROP INDEX pr_review_guide_source_series_observation_idx;
+        CREATE INDEX pr_review_guide_source_series_root_idx ON pr_review_guide_source_series(root_task_id, updated_at DESC);").unwrap();
+    migrate_pr_review_guide_source_capture_tables(&conn).unwrap();
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = ?1",
+            ["pr_review_guide_source_series_observation_idx"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(sql.contains("latest_observation_sequence DESC, id DESC"));
+    let old_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = ?1",
+            ["pr_review_guide_source_series_root_idx"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_count, 0);
 }
