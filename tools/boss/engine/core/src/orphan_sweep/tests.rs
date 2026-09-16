@@ -1030,6 +1030,60 @@ async fn a_resolved_park_attention_does_not_hold_the_row() {
     assert_eq!(outcome.deliberate_park_skipped, 0);
 }
 
+/// Regression for the latch this park gate must not have:
+/// `work_item_is_deliberately_parked` (`work/dispatch_admission.rs`)
+/// scopes both halves of the fact to the *latest* execution. An OPEN
+/// `run_done_declared_blocked` item filed against an OLDER, superseded
+/// execution (the sweep that resolves it via `ClearedBy::WorkResumed`
+/// is asynchronous, so it need not have run yet) must not keep a
+/// resumed row parked forever — the row's own latest execution, here a
+/// genuinely dead pane, must be judged on its own merits.
+#[tokio::test]
+async fn a_resumed_row_is_not_held_by_a_park_on_the_superseded_execution() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+
+    let first_execution_id = create_spawned_execution(&db, &work_item_id, dead_pid());
+    db.record_worker_idle_abandonment(&first_execution_id, "worker declared itself blocked")
+        .unwrap();
+    db.create_attention_item(boss_protocol::CreateAttentionItemInput {
+        execution_id: Some(first_execution_id.clone()),
+        work_item_id: None,
+        kind: crate::completion::RUN_DONE_BLOCKED_ATTENTION_KIND.to_owned(),
+        status: None,
+        title: "Run ended: worker declared itself blocked".to_owned(),
+        body_markdown: "blocked".to_owned(),
+        resolved_at: None,
+    })
+    .unwrap();
+
+    // An operator resumes the row (`bossctl work start` mints a fresh
+    // latest execution) and that replacement's own pane later dies —
+    // a genuine orphan on the row the sweep must still be free to act on.
+    let second_execution_id = create_spawned_execution(&db, &work_item_id, dead_pid());
+    db.mark_execution_orphaned(&second_execution_id, "worker died").unwrap();
+    make_old(&db, &work_item_id);
+
+    let db = Arc::new(db);
+    let coordinator = make_coordinator(db.clone(), 1);
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let outcome = run_one_pass(
+        db.as_ref(),
+        coordinator.clone(),
+        sink.as_ref(),
+        &NoopLiveWorkerConvergence,
+    )
+    .await;
+
+    assert_eq!(
+        outcome.redispatched, 1,
+        "an open park item on a superseded execution must not hold a resumed row forever, \
+         got {outcome:?}",
+    );
+    assert_eq!(outcome.deliberate_park_skipped, 0);
+}
+
 /// **The gate that would have switched the sweep off.** `autostart` is
 /// single-shot — `start_execution_run` clears it the first time a row
 /// enters `active` — so the flag reads `false` on *every* row this

@@ -467,11 +467,6 @@ async fn run_one_pass_filtered(
         // exactly as before: an unreadable park state is not a licence to
         // put a second worker on the row, and there is nothing useful to
         // combine it with.
-        //
-        // Consulted through `WorkDb::dispatch_admission_facts` so this
-        // sweep agrees with the rest of dispatch admission (latest-
-        // execution scoped park, including `run_done_outcome = 'blocked'`
-        // and open park attention).
         let is_deliberately_parked = match work_db.dispatch_admission_facts(&work_item_id) {
             Ok(facts) => facts.deliberate_parked,
             Err(err) => {
@@ -505,7 +500,6 @@ async fn run_one_pass_filtered(
                 )
                 .await;
             outcome.deliberate_park_skipped += 1;
-
         }
 
         // Churn guard: count terminal executions in the trailing window.
@@ -987,4 +981,3 @@ async fn run_one_pass_filtered(
 
 #[cfg(test)]
 mod tests;
-
