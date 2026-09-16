@@ -228,6 +228,16 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          run with a fresh breaker; the old park is no longer the item's state.",
     ),
     entry(
+        crate::completion::RUN_DONE_BLOCKED_ATTENTION_KIND,
+        ClearedBy::WorkResumed,
+        "Asserts a run declared `run_done --outcome blocked`, asking a human to adjudicate. A later \
+         run start for the same work item — a fresh execution minted by an explicit `bossctl work \
+         start` — is the operator's un-park gesture; `work_item_is_deliberately_parked` \
+         (`work/dispatch_admission.rs`) additionally scopes its own read of this kind to the \
+         latest execution, so the gate itself doesn't wait on this sweep to stop refusing the \
+         replacement.",
+    ),
+    entry(
         crate::completion::DRIVER_TERMINAL_ERROR_ATTENTION_KIND,
         ClearedBy::WorkResumed,
         "Asserts the provider itself failed a run. A later run start is the provider working again \
@@ -620,6 +630,7 @@ mod tests {
             crate::app::readoption::PROGRESS_INGRESS_UNRECOVERABLE_ATTENTION_KIND,
             crate::app::probes::PROBE_UNDELIVERED_ATTENTION_KIND,
             crate::completion::NUDGE_BREAKER_ATTENTION_KIND,
+            crate::completion::RUN_DONE_BLOCKED_ATTENTION_KIND,
             crate::completion::REVIEW_RESULT_GIVEUP_ATTENTION_KIND,
             crate::completion::DRIVER_TERMINAL_ERROR_ATTENTION_KIND,
             crate::completion::REVISION_NO_OP_ATTENTION_KIND,

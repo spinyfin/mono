@@ -570,3 +570,341 @@ fn migration_completed_at_is_idempotent() {
     drop(conn2);
     let _ = std::fs::remove_file(&path);
 }
+
+// ── Deliberate-park admission on automatic mint paths ──────────────────
+//
+// A blocked declaration prevents automatic replacement on every dispatch
+// path. These tests exercise the durable park independently of the
+// idle-abandonment autostart gate, which
+// `record_worker_idle_abandonment_finalizes_execution_leaves_task_status_untouched`
+// covers.
+
+fn stamp_blocked_declaration(db: &WorkDb, execution_id: &str) {
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions
+             SET run_done_outcome = 'blocked',
+                 run_done_declared_at = '1'
+             WHERE id = ?1",
+            rusqlite::params![execution_id],
+        )
+        .unwrap();
+}
+
+/// Active chore whose latest execution is terminal with
+/// `run_done_outcome = blocked`. `autostart` is left at 1 so a missing
+/// park gate on `rescan_active_dispatch` cannot hide behind the
+/// autostart check.
+fn parked_active_chore(db: &WorkDb, label: &str) -> (String, String) {
+    let product = create_test_product_named(db, &format!("Prod-{label}"));
+    let chore = create_test_chore(db, product.id.clone(), format!("Chore-{label}"));
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Abandoned)
+                .build(),
+        )
+        .unwrap();
+    stamp_blocked_declaration(db, &exec.id);
+    (chore.id, exec.id)
+}
+
+/// `rescan_active_dispatch` must not remint a row whose latest execution
+/// declared blocked, even when `autostart` is still 1.
+#[test]
+fn rescan_does_not_remint_a_blocked_declaration() {
+    let db = WorkDb::open(temp_db_path("park-rescan")).unwrap();
+    let (chore_id, exec_id) = parked_active_chore(&db, "rescan");
+
+    let redispatched = db.rescan_active_dispatch().unwrap();
+    assert!(
+        !redispatched.contains(&chore_id),
+        "rescan must not remint a row carrying a blocked declaration, got {redispatched:?}",
+    );
+    let executions = db.list_executions(Some(&chore_id)).unwrap();
+    assert_eq!(
+        executions.len(),
+        1,
+        "no replacement execution may be minted for a parked row"
+    );
+    assert_eq!(executions[0].id, exec_id);
+}
+
+/// Startup `reconcile_active_dispatch` ignores `autostart` so it can
+/// rehydrate rows whose worker died across a restart. It must still
+/// refuse a deliberate park — only the park signal, not the single-shot
+/// flag, holds the row.
+#[test]
+fn reconcile_active_does_not_remint_a_blocked_declaration() {
+    let db = WorkDb::open(temp_db_path("park-reconcile-active")).unwrap();
+    let (chore_id, exec_id) = parked_active_chore(&db, "reconcile-active");
+    // Production leaves `autostart = 0` on any row that has actually run.
+    // Stamp that so this test cannot pass by accidentally consulting it.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET autostart = 0 WHERE id = ?1",
+            rusqlite::params![chore_id],
+        )
+        .unwrap();
+
+    let redispatched = db.reconcile_active_dispatch(|_| true).unwrap();
+    assert!(
+        !redispatched.contains(&chore_id),
+        "startup reconcile must not remint a parked row, got {redispatched:?}",
+    );
+    let executions = db.list_executions(Some(&chore_id)).unwrap();
+    assert_eq!(executions.len(), 1);
+    assert_eq!(executions[0].id, exec_id);
+}
+
+/// Product-wide reconcile (the `publish_work_invalidation` trigger) mints
+/// `revision_implementation` rows through `reconcile_revision_execution`.
+/// A blocked declaration on the revision must hold that path too — not
+/// only the chore/orphan paths.
+#[test]
+fn reconcile_revision_does_not_remint_a_blocked_declaration() {
+    let db = WorkDb::open(temp_db_path("park-reconcile-revision")).unwrap();
+    let product_id = make_revision_product(&db, "park-rev");
+    let parent_id = make_in_review_chore(&db, &product_id, "https://github.com/spinyfin/mono/pull/55");
+    let revision_id = insert_revision_row(&db, &product_id, &parent_id);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'active', autostart = 0 WHERE id = ?1",
+            rusqlite::params![revision_id],
+        )
+        .unwrap();
+    let exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(revision_id.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Abandoned)
+                .build(),
+        )
+        .unwrap();
+    stamp_blocked_declaration(&db, &exec.id);
+
+    db.reconcile_product_executions(&product_id).unwrap();
+
+    let executions = db.list_executions(Some(&revision_id)).unwrap();
+    assert_eq!(
+        executions.len(),
+        1,
+        "reconcile_revision_execution must not remint a parked revision"
+    );
+    assert_eq!(executions[0].id, exec.id);
+}
+
+/// Same fixture as [`parked_active_chore`] minus the blocked stamp — a
+/// negative control so the "nothing was minted" assertions above can't
+/// pass vacuously against an earlier, unrelated gate (`reconcile_revision_execution`
+/// alone has six other early-return points ahead of the park check).
+fn unparked_active_chore(db: &WorkDb, label: &str) -> (String, String) {
+    let product = create_test_product_named(db, &format!("Prod-{label}"));
+    let chore = create_test_chore(db, product.id.clone(), format!("Chore-{label}"));
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Abandoned)
+                .build(),
+        )
+        .unwrap();
+    (chore.id, exec.id)
+}
+
+/// Negative control for [`rescan_does_not_remint_a_blocked_declaration`]:
+/// the identical fixture minus the blocked stamp must still be redispatched.
+#[test]
+fn rescan_reminted_an_unblocked_declaration() {
+    let db = WorkDb::open(temp_db_path("park-rescan-control")).unwrap();
+    let (chore_id, _exec_id) = unparked_active_chore(&db, "rescan-control");
+
+    let redispatched = db.rescan_active_dispatch().unwrap();
+    assert!(
+        redispatched.contains(&chore_id),
+        "an unparked terminal row must still be redispatched, got {redispatched:?}",
+    );
+}
+
+/// Negative control for [`reconcile_active_does_not_remint_a_blocked_declaration`].
+#[test]
+fn reconcile_active_reminted_an_unblocked_declaration() {
+    let db = WorkDb::open(temp_db_path("park-reconcile-active-control")).unwrap();
+    let (chore_id, _exec_id) = unparked_active_chore(&db, "reconcile-active-control");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET autostart = 0 WHERE id = ?1",
+            rusqlite::params![chore_id],
+        )
+        .unwrap();
+
+    let redispatched = db.reconcile_active_dispatch(|_| true).unwrap();
+    assert!(
+        redispatched.contains(&chore_id),
+        "an unparked terminal row must still be redispatched, got {redispatched:?}",
+    );
+}
+
+/// Negative control for [`reconcile_revision_does_not_remint_a_blocked_declaration`].
+#[test]
+fn reconcile_revision_reminted_an_unblocked_declaration() {
+    let db = WorkDb::open(temp_db_path("park-reconcile-revision-control")).unwrap();
+    let product_id = make_revision_product(&db, "park-rev-control");
+    let parent_id = make_in_review_chore(&db, &product_id, "https://github.com/spinyfin/mono/pull/56");
+    let revision_id = insert_revision_row(&db, &product_id, &parent_id);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'active', autostart = 0 WHERE id = ?1",
+            rusqlite::params![revision_id],
+        )
+        .unwrap();
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(revision_id.clone())
+            .kind(ExecutionKind::RevisionImplementation)
+            .status(ExecutionStatus::Abandoned)
+            .build(),
+    )
+    .unwrap();
+
+    db.reconcile_product_executions(&product_id).unwrap();
+
+    let executions = db.list_executions(Some(&revision_id)).unwrap();
+    assert_eq!(
+        executions.len(),
+        2,
+        "an unparked terminal revision row must still get a replacement execution",
+    );
+}
+
+/// `bossctl work start` / kanban drag-to-Doing is the un-park gesture:
+/// `request_execution` must still mint a replacement for a parked row.
+#[test]
+fn request_execution_still_dispatches_a_blocked_declaration() {
+    let db = WorkDb::open(temp_db_path("park-explicit-start")).unwrap();
+    let (chore_id, exec_id) = parked_active_chore(&db, "explicit-start");
+
+    let minted = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore_id.clone()).build())
+        .unwrap();
+    assert_ne!(minted.id, exec_id, "explicit start must mint a fresh execution");
+    assert_eq!(minted.status, ExecutionStatus::Ready);
+    let executions = db.list_executions(Some(&chore_id)).unwrap();
+    assert_eq!(executions.len(), 2);
+}
+
+fn assert_converted_followup_dispatch(blocked: bool) {
+    let db = WorkDb::open(temp_db_path("park-converted-followup")).unwrap();
+    let product = create_test_product_named(&db, "Converted followup");
+    let chore = create_test_chore(&db, product.id.clone(), "Continue review findings");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET kind = 'followup', status = 'todo', autostart = 1, pr_url = NULL WHERE id = ?1",
+            [&chore.id],
+        )
+        .unwrap();
+    let predecessor = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Abandoned)
+                .build(),
+        )
+        .unwrap();
+    if blocked {
+        stamp_blocked_declaration(&db, &predecessor.id);
+    }
+    let result = db.reconcile_product_executions(&product.id).unwrap();
+    if blocked {
+        assert!(
+            result
+                .created
+                .iter()
+                .all(|execution| execution.work_item_id != chore.id)
+        );
+        let executions = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(
+            executions.len(),
+            1,
+            "a converted followup must honor the revision's park"
+        );
+        assert_eq!(executions[0].id, predecessor.id);
+        assert!(db.dispatch_admission_facts(&chore.id).unwrap().deliberate_parked);
+        return;
+    }
+    let created = result
+        .created
+        .iter()
+        .find(|execution| execution.work_item_id == chore.id)
+        .unwrap();
+    assert_eq!(created.kind, ExecutionKind::ChoreImplementation);
+    assert_eq!(created.status, ExecutionStatus::Ready);
+    assert_ne!(created.id, predecessor.id);
+    assert_eq!(db.list_executions(Some(&chore.id)).unwrap().len(), 2);
+}
+
+#[test]
+fn reconcile_converted_followup_does_not_remint_a_blocked_revision() {
+    assert_converted_followup_dispatch(true);
+}
+
+#[test]
+fn reconcile_converted_followup_starts_after_unblocked_revision() {
+    assert_converted_followup_dispatch(false);
+}
+
+#[test]
+fn explicit_start_resolves_execution_scoped_park_attention_synchronously() {
+    let db = WorkDb::open(temp_db_path("park-explicit-attention")).unwrap();
+    let (chore_id, execution_id) = unparked_active_chore(&db, "explicit-attention");
+    for kind in [
+        crate::completion::RUN_DONE_BLOCKED_ATTENTION_KIND,
+        crate::completion::NUDGE_BREAKER_ATTENTION_KIND,
+    ] {
+        db.create_attention_item(boss_protocol::CreateAttentionItemInput {
+            execution_id: Some(execution_id.clone()),
+            work_item_id: None,
+            kind: kind.to_owned(),
+            status: None,
+            title: "Parked".to_owned(),
+            body_markdown: "Needs a decision".to_owned(),
+            resolved_at: None,
+        })
+        .unwrap();
+    }
+    assert!(db.dispatch_admission_facts(&chore_id).unwrap().deliberate_parked);
+    db.request_execution(RequestExecutionInput::builder().work_item_id(chore_id).build())
+        .unwrap();
+    let unresolved: i64 = db.connect().unwrap().query_row(
+        "SELECT COUNT(*) FROM work_attention_items WHERE execution_id = ?1 AND (status != 'resolved' OR resolved_at IS NULL)",
+        [&execution_id], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(unresolved, 0);
+}
