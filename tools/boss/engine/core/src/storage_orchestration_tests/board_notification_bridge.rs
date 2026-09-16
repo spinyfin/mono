@@ -83,6 +83,12 @@ fn member(
 
 #[tokio::test]
 async fn clean_verdict_advances_the_origin_to_review_without_a_revision() {
+    for state in ["awaiting_admission", "automated_review", "required"] {
+        assert_clean_verdict_advances_to_review(state).await;
+    }
+}
+
+async fn assert_clean_verdict_advances_to_review(state: &str) {
     let (_dir, db) = open_db();
     let product = create_test_product(&db);
     let product_id = product.id.clone();
@@ -91,6 +97,10 @@ async fn clean_verdict_advances_the_origin_to_review_without_a_revision() {
     let publisher = std::sync::Arc::new(crate::test_support::RecordingPublisher::default());
     let notifications =
         crate::board_notification_bridge::spawn_notifications(db.event_bus().clone(), publisher.clone());
+    raw(&db).execute(
+        "UPDATE tasks SET status = 'active', review_required_state = ?2 WHERE id = ?1",
+        rusqlite::params![cycle_root.id, state],
+    ).unwrap();
     let supervisor = db
         .create_execution(
             CreateExecutionInput::builder()
@@ -184,6 +194,7 @@ async fn clean_verdict_advances_the_origin_to_review_without_a_revision() {
 
     let after = task_from_item(db.get_work_item(&cycle_root.id).unwrap());
     assert_eq!(after.status, TaskStatus::InReview);
+    assert_eq!(after.review_required_state.as_deref(), (state == "required").then_some(state));
     let (cycle, sha) = db.get_task_review_cycle_state(&cycle_root.id).unwrap();
     assert_eq!(cycle, 1);
     assert_eq!(sha.as_deref(), Some("head-sha"));
