@@ -30,7 +30,8 @@
 //! liveness with the reservations held here, restoring the invariant the serial
 //! loop used to provide for free.
 //!
-//! Reservations are unique per work item and claimed atomically
+//! Reservations are unique per execution and claimed atomically. Work items
+//! remain exclusive except for admissible members of one persisted review batch
 //! ([`InflightDispatches::try_reserve`]) — see that method for why both
 //! properties are load-bearing rather than incidental.
 //!
@@ -55,6 +56,8 @@ use std::sync::{Arc, Mutex};
 
 use boss_protocol::WorkExecution;
 
+use crate::work::WorkDb;
+
 /// Shared reservation table, keyed by execution id.
 type Table = Arc<Mutex<HashMap<String, WorkExecution>>>;
 
@@ -72,28 +75,15 @@ impl InflightDispatches {
     }
 
     /// Claim the right to dispatch `execution`, or `None` if its work item is
-    /// already being dispatched.
+    /// already being dispatched by an incompatible execution.
     ///
-    /// Reservations are unique **per work item**, not per execution id, and
-    /// the check-and-insert is atomic under one lock. Both properties are
-    /// load-bearing:
-    ///
-    /// * *Atomic* — a `contains`-then-`reserve` pair is a TOCTOU. Two callers
-    ///   (a drain pass and a concurrent `force_dispatch`) could both observe
-    ///   "not in flight" and both insert; keyed by execution id that collapses
-    ///   to ONE map entry with TWO guards, so the first `Drop` de-registers a
-    ///   dispatch that is still running. A chain sibling in the next drain pass
-    ///   would then see a clear chain and co-dispatch a second writer — the
-    ///   T1577/T1815 hazard, reintroduced by the very thing meant to prevent
-    ///   it.
-    /// * *Per work item* — only one execution per work item may ever be live;
-    ///   that is precisely what `schedule_execution`'s double-spawn guard
-    ///   enforces against the DB. Enforcing it here too means two duplicate
-    ///   `ready` rows (the orphan-sweep race) can never BOTH be handed off, so
-    ///   they can never both look at each other mid-dispatch and mutually
-    ///   abandon — leaving the work item with no live execution at all. The
-    ///   loser simply stays `ready` and is resolved by the DB guard on a later
-    ///   pass, once the winner is actually `running`.
+    /// Check-and-insert stays atomic under one lock, including the persisted
+    /// batch check. The same execution can never own two guards: otherwise
+    /// dropping either would remove the other's reservation. Ordinary work
+    /// items remain exclusive, including duplicate ready rows from the orphan
+    /// sweep. Only the DB double-spawn guard's same-batch exception is shared.
+    /// A failed membership lookup blocks dispatch rather than admitting a
+    /// possible second writer.
     ///
     /// Callers MUST hold the returned guard for the whole dispatch — move it
     /// into the handed-off task, or keep it alive across the inline
@@ -101,11 +91,9 @@ impl InflightDispatches {
     /// window this registry exists to close.
     #[must_use = "dropping the reservation immediately de-registers the dispatch, \
                   reopening the two-writer window it exists to close"]
-    pub fn try_reserve(&self, execution: &WorkExecution) -> Option<DispatchReservation> {
+    pub fn try_reserve(&self, execution: &WorkExecution, db: &WorkDb) -> Option<DispatchReservation> {
         let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
-        // Subsumes an execution-id collision: the same execution necessarily
-        // carries the same work item.
-        if table.values().any(|e| e.work_item_id == execution.work_item_id) {
+        if Self::conflicts(&table, execution, db) {
             return None;
         }
         table.insert(execution.id.clone(), execution.clone());
@@ -123,19 +111,37 @@ impl InflightDispatches {
         self.table.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
-    /// `true` when a dispatch for `work_item_id` is in flight.
-    ///
-    /// Callers selecting rows to dispatch MUST skip these. A handed-off
-    /// execution stays `ready` in the DB until its run starts, so
-    /// `WorkDb::list_ready_executions` keeps returning it and a re-drain (a
-    /// kick landing mid-pass, or the scheduler heartbeat) would dispatch it a
-    /// second time. The chain and double-spawn guards cannot catch that: both
-    /// exclude the execution's own id by design, so a row racing *itself*
-    /// looks clear to them.
-    ///
-    /// Keyed by work item rather than execution id so it also skips a
-    /// *duplicate* `ready` row for a work item already dispatching — that row
-    /// must not burn a slot or emit a dispatch timeline either.
+    /// Pre-filter for drain rows. Rechecked atomically by `try_reserve`.
+    /// Rejects a repeated execution and incompatible same-work-item rows,
+    /// while allowing persisted same-batch members through to dispatch.
+    pub fn blocks_execution(&self, execution: &WorkExecution, db: &WorkDb) -> bool {
+        let table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        Self::conflicts(&table, execution, db)
+    }
+
+    fn conflicts(table: &HashMap<String, WorkExecution>, execution: &WorkExecution, db: &WorkDb) -> bool {
+        // The batch helper recognizes roles, not reservation ownership. In
+        // particular, a leaf compared with itself is an admissible DB pair.
+        if table.contains_key(&execution.id) {
+            return true;
+        }
+        table
+            .values()
+            .filter(|e| e.work_item_id == execution.work_item_id)
+            .any(
+                |other| match db.are_admissible_same_review_batch_pair(&execution.id, &other.id) {
+                    Ok(admissible) => !admissible,
+                    Err(err) => {
+                        tracing::warn!(execution_id = %execution.id, other_execution_id = %other.id,
+                        ?err, "cannot verify review batch compatibility; holding dispatch");
+                        true
+                    }
+                },
+            )
+    }
+
+    /// Whether any dispatch for this work item is in flight, including review
+    /// members. Used for work-item-level admission, not individual drain rows.
     pub fn is_work_item_dispatching(&self, work_item_id: &str) -> bool {
         self.table
             .lock()
@@ -152,8 +158,8 @@ impl InflightDispatches {
     /// [`crate::work::WorkDb::live_executions_elsewhere_in_chain`], which skips
     /// the caller's own work item because same-work-item duplicates are the
     /// double-spawn guard's job, not the chain guard's. Here they are
-    /// additionally impossible: [`Self::try_reserve`] admits one dispatch per
-    /// work item.
+    /// additionally impossible: [`Self::try_reserve`] excludes incompatible
+    /// same-work-item dispatches.
     pub fn chain_siblings(
         &self,
         member_ids: &[String],
@@ -209,13 +215,15 @@ mod tests {
 
     #[test]
     fn reservation_is_visible_to_the_chain_guard_while_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let inflight = InflightDispatches::new();
         let members = vec!["T1".to_string(), "T2".to_string()];
 
         assert!(inflight.is_empty());
 
         let _reservation = inflight
-            .try_reserve(&execution("exec_a", "T1"))
+            .try_reserve(&execution("exec_a", "T1"), &db)
             .expect("first reservation");
 
         assert!(!inflight.is_empty());
@@ -230,12 +238,14 @@ mod tests {
 
     #[test]
     fn reservation_is_released_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let inflight = InflightDispatches::new();
         let members = vec!["T1".to_string(), "T2".to_string()];
 
         {
             let _reservation = inflight
-                .try_reserve(&execution("exec_a", "T1"))
+                .try_reserve(&execution("exec_a", "T1"), &db)
                 .expect("first reservation");
             assert!(!inflight.chain_siblings(&members, "T2", "exec_b").is_empty());
         }
@@ -249,11 +259,13 @@ mod tests {
 
     #[test]
     fn chain_siblings_excludes_the_caller_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let inflight = InflightDispatches::new();
         let members = vec!["T1".to_string(), "T2".to_string()];
 
         let _reservation = inflight
-            .try_reserve(&execution("exec_a", "T1"))
+            .try_reserve(&execution("exec_a", "T1"), &db)
             .expect("first reservation");
 
         // `exec_a` resolving its own chain hold must not see its own
@@ -268,10 +280,12 @@ mod tests {
 
     #[test]
     fn chain_siblings_ignores_work_items_outside_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let inflight = InflightDispatches::new();
 
         let _reservation = inflight
-            .try_reserve(&execution("exec_a", "T9"))
+            .try_reserve(&execution("exec_a", "T9"), &db)
             .expect("first reservation");
 
         assert!(
@@ -288,14 +302,16 @@ mod tests {
     /// no live execution at all.
     #[test]
     fn a_second_row_for_the_same_work_item_cannot_reserve() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let inflight = InflightDispatches::new();
 
         let _first = inflight
-            .try_reserve(&execution("exec_a", "T1"))
+            .try_reserve(&execution("exec_a", "T1"), &db)
             .expect("first reservation");
 
         assert!(
-            inflight.try_reserve(&execution("exec_b", "T1")).is_none(),
+            inflight.try_reserve(&execution("exec_b", "T1"), &db).is_none(),
             "a duplicate row for a work item already dispatching must not get a reservation",
         );
         assert!(inflight.is_work_item_dispatching("T1"));
@@ -307,14 +323,16 @@ mod tests {
     /// would de-register a dispatch that is still running.
     #[test]
     fn a_rejected_reservation_does_not_disturb_the_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let inflight = InflightDispatches::new();
         let members = vec!["T1".to_string(), "T2".to_string()];
 
         let _first = inflight
-            .try_reserve(&execution("exec_a", "T1"))
+            .try_reserve(&execution("exec_a", "T1"), &db)
             .expect("first reservation");
         // A racing `force_dispatch` for the same row is refused...
-        assert!(inflight.try_reserve(&execution("exec_a", "T1")).is_none());
+        assert!(inflight.try_reserve(&execution("exec_a", "T1"), &db).is_none());
         // ...and, crucially, refusing it left the live reservation intact
         // rather than overwriting it with a second, separately-dropped entry.
         let siblings = inflight.chain_siblings(&members, "T2", "exec_b");
@@ -326,30 +344,34 @@ mod tests {
     /// otherwise a failed dispatch would wedge its work item forever.
     #[test]
     fn a_work_item_is_reservable_again_after_its_dispatch_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let inflight = InflightDispatches::new();
 
         drop(
             inflight
-                .try_reserve(&execution("exec_a", "T1"))
+                .try_reserve(&execution("exec_a", "T1"), &db)
                 .expect("first reservation"),
         );
 
         assert!(
-            inflight.try_reserve(&execution("exec_b", "T1")).is_some(),
+            inflight.try_reserve(&execution("exec_b", "T1"), &db).is_some(),
             "a retry of a finished dispatch must be able to reserve its work item",
         );
     }
 
     #[test]
     fn reservations_are_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let inflight = InflightDispatches::new();
         let members = vec!["T1".to_string(), "T2".to_string()];
 
         let first = inflight
-            .try_reserve(&execution("exec_a", "T1"))
+            .try_reserve(&execution("exec_a", "T1"), &db)
             .expect("first reservation");
         let _second = inflight
-            .try_reserve(&execution("exec_b", "T2"))
+            .try_reserve(&execution("exec_b", "T2"), &db)
             .expect("distinct work item");
 
         drop(first);
