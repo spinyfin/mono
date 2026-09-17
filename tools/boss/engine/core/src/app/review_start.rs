@@ -116,14 +116,15 @@ async fn handle_trigger_pr_review_with<F, Fut>(
         match result {
             Ok(outcome) => {
                 let execution = outcome.execution();
+                let (batch_id, batch_generation, batch_execution_ids, already_active) = outcome.batch_fields();
                 tracing::info!(
                     work_item_id = %owner.id,
                     execution_id = %execution.id,
                     pr_number,
-                    "review start: re-enqueued pr_review execution",
+                    already_active,
+                    "review start: dispatched pr_review",
                 );
                 server_state.execution_coordinator.kick();
-                let (batch_id, batch_generation, batch_execution_ids, already_active) = outcome.batch_fields();
                 send_response(
                     &sink,
                     &request_id,
