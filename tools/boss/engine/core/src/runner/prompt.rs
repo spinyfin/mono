@@ -657,9 +657,9 @@ fn bazel_conflict_resolution_gate_block(workspace_path: &Path, seam_enabled: boo
 /// and [`bazel_prepush_gate_text`] for what `seam_enabled` selects.
 pub(crate) fn bazel_conflict_resolution_gate_text(seam_enabled: bool) -> String {
     let failure_sentence = if seam_enabled {
-        "If `bazel build` fails (the merge does not compile) and you cannot make it compile, do NOT push. Deciding on your own that the run has gone on long enough is not a build failure, and is never a reason to stop short of a clean build. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; call `\"$BOSS_BIN\" propose blocked --reason \"...\"` naming the failure and stop.\n"
+        "If `bazel build` fails or times out, do NOT push. A successful build is required before delivery. Deciding on your own that the run has gone on long enough is not a build failure, and is never a reason to stop short of a clean build. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; call `\"$BOSS_BIN\" propose blocked --reason \"...\"` naming the failure and stop.\n"
     } else {
-        "If `bazel build` fails (the merge does not compile) and you cannot make it compile, do NOT push. Deciding on your own that the run has gone on long enough is not a build failure, and is never a reason to stop short of a clean build. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; emit a `[blocked] reason=\"...\"` marker naming the failure and stop.\n"
+        "If `bazel build` fails or times out, do NOT push. A successful build is required before delivery. Deciding on your own that the run has gone on long enough is not a build failure, and is never a reason to stop short of a clean build. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; emit a `[blocked] reason=\"...\"` marker naming the failure and stop.\n"
     };
     format!(
         "\n## Pre-push gate for conflict resolution (Bazel workspace) — merge correctness first, then push\n\
@@ -1028,10 +1028,10 @@ pub(crate) fn run_done_directive(
     };
     let gate_exception = if conflict_resolution {
         "The merge-correctness pre-push gate is not covered by any unattributable-failure exception. \
-         If `bazel build` fails (the merge does not compile), do NOT push: the merged code MUST COMPILE. \
+         If `bazel build` fails or times out, do NOT push: the merged code MUST COMPILE. \
          A still-red compile is a reason to stop without delivery, not a reason to push, even if the \
-         failure looks pre-existing or environmental. Timeouts and the full test suite are not a \
-         precondition for this push — the conflict-resolution gate already defers those to CI. Bazel \
+         failure looks pre-existing or environmental. Only the full test suite is deferred to CI; \
+         a successful `bazel build` is a precondition for this push. Bazel \
          remains the source of truth: do not bypass or weaken checks, and still stop for required \
          approval to relax a check, missing credentials or authorization, genuine instruction \
          conflicts or contradictory briefs."

@@ -335,7 +335,7 @@ fn conflict_revision_keeps_absolute_compile_stop_when_run_done_seam_on() {
     );
     assert!(
         gate.contains(
-            "If `bazel build` fails (the merge does not compile) and you cannot make it compile, do NOT push."
+            "If `bazel build` fails or times out, do NOT push. A successful build is required before delivery."
         ),
         "run_done seam on: conflict gate's absolute do-NOT-push wording must be preserved verbatim:\n{gate}",
     );
@@ -358,5 +358,18 @@ fn conflict_revision_keeps_absolute_compile_stop_when_run_done_seam_on() {
     assert!(
         prompt.contains("the merged code MUST COMPILE"),
         "run_done seam on: conflict run_done text must restate MUST COMPILE:\n{prompt}",
+    );
+    let run_done = prompt.split("## Declaring your run finished").nth(1).unwrap();
+    assert!(
+        run_done.contains("If `bazel build` fails or times out, do NOT push"),
+        "conflict run_done text must prohibit pushing failed or timed-out builds:\n{run_done}",
+    );
+    assert!(
+        run_done.contains("Only the full test suite is deferred to CI"),
+        "conflict run_done text must limit CI deferral to tests:\n{run_done}",
+    );
+    assert!(
+        !prompt.contains("Timeouts and the full test suite are not a precondition"),
+        "conflict prompt must not exempt build timeouts from the compile gate:\n{prompt}",
     );
 }
