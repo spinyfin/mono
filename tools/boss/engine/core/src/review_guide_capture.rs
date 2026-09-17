@@ -18,10 +18,16 @@ use boss_pr_review_sources::{
 };
 
 use crate::feature_flags::FeatureFlagsStore;
-use crate::work::{PrSourceCapturePersistOutcome, PrSourceCaptureTrigger, WorkDb};
+use crate::work::{PrReviewGuideSourceCapture, PrSourceCapturePersistOutcome, PrSourceCaptureTrigger, WorkDb};
 
 /// Operator-controlled rollout gate for automatic source capture.
 pub const REVIEW_GUIDE_SOURCE_CAPTURE_FLAG: &str = "review_guide_source_capture";
+
+/// Operator-controlled rollout gate for launching generation jobs from
+/// captured comparisons. Independent of [`REVIEW_GUIDE_SOURCE_CAPTURE_FLAG`]
+/// so capture and generation can be staged separately — generation simply
+/// has nothing to consume while capture alone is enabled.
+pub const REVIEW_GUIDE_GENERATION_FLAG: &str = "review_guide_generation";
 
 type SourcePacketFuture = Pin<Box<dyn Future<Output = Result<SourcePacket>> + Send>>;
 pub(crate) type PacketCollectFn = Arc<
@@ -315,14 +321,17 @@ pub(crate) fn reconcile_review_guide_source_with_collector(
                         trigger,
                         packet,
                     ) {
-                        Ok(PrSourceCapturePersistOutcome::Stored(capture)) => tracing::info!(
-                            root_task_id,
-                            pr_url,
-                            observation_sequence,
-                            packet_hash = %capture.packet_hash,
-                            complete = capture.complete,
-                            "review-guide source capture: stored immutable comparison packet",
-                        ),
+                        Ok(PrSourceCapturePersistOutcome::Stored(capture)) => {
+                            tracing::info!(
+                                root_task_id,
+                                pr_url,
+                                observation_sequence,
+                                packet_hash = %capture.packet_hash,
+                                complete = capture.complete,
+                                "review-guide source capture: stored immutable comparison packet",
+                            );
+                            enqueue_review_guide_generation(&work_db, &feature_flags, &capture);
+                        }
                         Ok(PrSourceCapturePersistOutcome::Existing(capture)) => tracing::debug!(
                             root_task_id,
                             pr_url,
@@ -361,6 +370,105 @@ pub(crate) fn reconcile_review_guide_source_with_collector(
         })
         .await;
     }))
+}
+
+/// Enqueue one durable `pr_review_guide` generation attempt for a freshly
+/// stored/upgraded comparison — the connection point between task 1's
+/// immutable source capture and this task's execution machinery. Gated
+/// independently by [`REVIEW_GUIDE_GENERATION_FLAG`]. Best-effort: any
+/// failure here is logged and dropped rather than propagated, matching every
+/// other outcome in this reconciler — a missed enqueue is recoverable (the
+/// next observation, or an explicit retry, tries again), while losing the
+/// packet that was just durably captured would not be.
+fn enqueue_review_guide_generation(
+    work_db: &WorkDb,
+    feature_flags: &FeatureFlagsStore,
+    capture: &PrReviewGuideSourceCapture,
+) {
+    if !feature_flags.is_enabled(REVIEW_GUIDE_GENERATION_FLAG) {
+        return;
+    }
+    match work_db.live_or_queued_pr_review_guide_execution_for_comparison(&capture.comparison_id) {
+        Ok(Some(_)) => {
+            tracing::debug!(
+                comparison_id = %capture.comparison_id,
+                "review-guide generation: a job for this exact comparison is already in flight; not enqueuing another",
+            );
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                comparison_id = %capture.comparison_id,
+                ?error,
+                "review-guide generation: could not check for a live execution; skipping enqueue",
+            );
+            return;
+        }
+    }
+    let repo_remote_url = match work_db.get_work_item(&capture.root_task_id) {
+        Ok(item) => match item {
+            crate::work::WorkItem::Task(task) | crate::work::WorkItem::Chore(task) => task.repo_remote_url,
+            _ => None,
+        },
+        Err(error) => {
+            tracing::warn!(
+                root_task_id = %capture.root_task_id,
+                ?error,
+                "review-guide generation: could not resolve the root task's repository; skipping enqueue",
+            );
+            return;
+        }
+    };
+    let Some(repo_remote_url) = repo_remote_url else {
+        tracing::warn!(
+            root_task_id = %capture.root_task_id,
+            "review-guide generation: root task has no repository; skipping enqueue",
+        );
+        return;
+    };
+    let attempt = match work_db.create_pr_review_guide_attempt(
+        &capture.series_id,
+        &capture.comparison_id,
+        boss_review_guide::PROMPT_VERSION,
+    ) {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            tracing::warn!(
+                comparison_id = %capture.comparison_id,
+                ?error,
+                "review-guide generation: could not create a durable attempt",
+            );
+            return;
+        }
+    };
+    let execution = match work_db.create_pr_review_guide_execution(&capture.comparison_id, &repo_remote_url) {
+        Ok(execution) => execution,
+        Err(error) => {
+            tracing::warn!(
+                comparison_id = %capture.comparison_id,
+                attempt_id = %attempt.id,
+                ?error,
+                "review-guide generation: could not create the execution row",
+            );
+            return;
+        }
+    };
+    if let Err(error) = work_db.bind_pr_review_guide_attempt_execution(&attempt.id, &execution.id) {
+        tracing::warn!(
+            attempt_id = %attempt.id,
+            execution_id = %execution.id,
+            ?error,
+            "review-guide generation: could not bind the attempt to its execution",
+        );
+        return;
+    }
+    tracing::info!(
+        comparison_id = %capture.comparison_id,
+        attempt_id = %attempt.id,
+        execution_id = %execution.id,
+        "review-guide generation: enqueued a durable generation attempt",
+    );
 }
 
 pub(crate) fn prepare_capture(

@@ -906,6 +906,13 @@ pub(crate) async fn run_by_exec(client: &mut BossClient, ctx: &RunContext, args:
                 execution.id, execution.work_item_id, execution.work_item_id
             )));
         }
+        ExecutionKind::PrReviewGuide => {
+            return Err(CliError::application(format!(
+                "execution {} is a review-guide run bound to source comparison {} (not a task/chore) — there is no \
+                 CLI inspection verb for it yet",
+                execution.id, execution.work_item_id
+            )));
+        }
         _ => {}
     }
     let item = get_work_item(client, &execution.work_item_id).await?;

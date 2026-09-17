@@ -19,10 +19,11 @@ use boss_protocol::{
     ReviewBatchMemberStatus, ReviewBatchPhase, ReviewBatchStatus, ReviewReportProposalPayload, TaskKind,
 };
 
+use super::answer_agent_prompt::compose_answer_agent_prompt;
 use super::prompt::{
-    ExecutionPromptParams, compose_answer_agent_prompt, compose_execution_prompt, designated_output_kind,
-    render_merge_order_preservation_lines,
+    ExecutionPromptParams, compose_execution_prompt, designated_output_kind, render_merge_order_preservation_lines,
 };
+use super::review_guide_prompt::compose_review_guide_prompt;
 use super::work_item::{
     followup_pr_backlink_for_work_item, work_item_created_via, work_item_name, work_item_pr_url,
     work_item_task_kind_enum,
@@ -430,6 +431,50 @@ fn resolve_batch_reviewer_spawn(
         .map_err(|error| anyhow::anyhow!("review batch effort/model resolution: {error}"))
 }
 
+/// The enforced-fixed Astra profile for every `pr_review_guide` execution:
+/// driver `codex`, model `gpt-6-astra`, `EffortLevel::Medium` (which
+/// `codex_effort_value_for_level` maps to provider `"high"`). Bypasses task/
+/// product driver and model defaults entirely — unlike every other kind,
+/// this one's model policy is not configurable per task or product. Verifies
+/// the resolved configuration is EXACTLY what was requested before letting
+/// the worker spawn: a missing driver, an unsupported effort value, an
+/// unavailable model, or any other silent fallback from the requested
+/// configuration must fail the spawn (a retryable pre-start failure through
+/// the normal execution retry path) rather than quietly run at a different
+/// model/effort. See design "Generation and read-only enforcement".
+fn resolve_review_guide_spawn_config(registry: &crate::driver::DriverRegistry) -> anyhow::Result<SpawnConfig> {
+    const REVIEW_GUIDE_DRIVER: &str = "codex";
+    const REVIEW_GUIDE_MODEL: &str = "gpt-6-astra";
+    const REVIEW_GUIDE_EFFORT: EffortLevel = EffortLevel::Medium;
+    const REVIEW_GUIDE_EFFORT_VALUE: &str = "high";
+
+    let input = SpawnResolutionInput::builder()
+        .effort_level(REVIEW_GUIDE_EFFORT)
+        .model_override(REVIEW_GUIDE_MODEL)
+        .task_driver(REVIEW_GUIDE_DRIVER)
+        .build();
+    let config = resolve_spawn_config_in(registry, &input)
+        .map_err(|error| anyhow::anyhow!("review-guide Astra profile resolution: {error}"))?;
+    anyhow::ensure!(
+        config.driver == REVIEW_GUIDE_DRIVER,
+        "review-guide Astra profile refused: resolved driver `{}`, expected `{REVIEW_GUIDE_DRIVER}` \
+         (no fallback to another driver is permitted for this execution kind)",
+        config.driver,
+    );
+    anyhow::ensure!(
+        config.model == REVIEW_GUIDE_MODEL,
+        "review-guide Astra profile refused: resolved model `{}`, expected `{REVIEW_GUIDE_MODEL}` \
+         (no fallback to another model is permitted for this execution kind)",
+        config.model,
+    );
+    anyhow::ensure!(
+        config.effort_value == Some(REVIEW_GUIDE_EFFORT_VALUE),
+        "review-guide Astra profile refused: resolved effort value {:?}, expected exactly {REVIEW_GUIDE_EFFORT_VALUE:?}",
+        config.effort_value,
+    );
+    Ok(config)
+}
+
 /// Effort-level prompt addenda tell the worker to plan files it will
 /// touch and start editing. That framing is implementation-only.
 ///
@@ -449,7 +494,8 @@ fn prompt_addendum_to_prepend(kind: &ExecutionKind, addendum: Option<&'static st
         crate::worker_setup::WorkerKind::Standard => addendum,
         crate::worker_setup::WorkerKind::Reviewer
         | crate::worker_setup::WorkerKind::Triage
-        | crate::worker_setup::WorkerKind::AnswerAgent => None,
+        | crate::worker_setup::WorkerKind::AnswerAgent
+        | crate::worker_setup::WorkerKind::ReviewGuide => None,
     }
 }
 
@@ -495,7 +541,7 @@ pub(crate) async fn compose_worker_spawn(
     // kind: a Standard-kind worker (this includes CiRemediation, which maps
     // to `WorkerKind::Standard` and can push branches/open PRs like any
     // other implementing worker) is the one that actually runs `cube pr
-    // create`/`pr update --body-file`, while PrReview, AnswerAgent, and
+    // create`/`pr update --body-file`, while PrReview, PrReviewGuide, AnswerAgent, and
     // AutomationTriage executions never write a PR body, so appending the
     // backlink there would contradict that worker's read-only/decision-only
     // mandate. This mirrors the `prompt_addendum_to_prepend` kind-gate
@@ -504,6 +550,7 @@ pub(crate) async fn compose_worker_spawn(
     let origin_pr_backlink = match crate::worker_setup::worker_kind_for_execution(&execution.kind) {
         crate::worker_setup::WorkerKind::Standard => origin_pr_backlink,
         crate::worker_setup::WorkerKind::Reviewer
+        | crate::worker_setup::WorkerKind::ReviewGuide
         | crate::worker_setup::WorkerKind::Triage
         | crate::worker_setup::WorkerKind::AnswerAgent => None,
     };
@@ -975,6 +1022,12 @@ pub(crate) async fn compose_worker_spawn(
         // of the ordinary implementer prompt. Its `work_item_id` is the
         // comment id (see `WorkDb::create_answer_agent_execution`).
         compose_answer_agent_prompt(work_db, execution).await
+    } else if execution.kind == ExecutionKind::PrReviewGuide {
+        // A `pr_review_guide` execution renders the review-guide prompt
+        // (exact versioned template + embedded source packet) instead of
+        // the ordinary implementer prompt. Its `work_item_id` is the
+        // comparison id (see `WorkDb::create_pr_review_guide_execution`).
+        compose_review_guide_prompt(work_db, execution)
     } else {
         compose_execution_prompt(
             ExecutionPromptParams::builder()
@@ -1075,34 +1128,54 @@ pub(crate) async fn compose_worker_spawn(
             product_default_driver.as_deref(),
         )
     };
-    let spawn_config = match batch_member.as_ref() {
-        Some(member) => resolve_batch_reviewer_spawn(&registry, member, work_item_kind)?,
-        None => {
-            let spawn_input = SpawnResolutionInput::builder()
-                // Effort always comes from the owning row, for pool and main-pool workers alike.
-                // For review/automation pools this is deliberate: capability comes from the pool's
-                // strong model tier below, while effort stays proportional to the likely material to
-                // inspect instead of raising every small review's spend. The automated-reviewer
-                // design §5 defines that override; §10 keeps production effort/model selection unchanged.
-                // `resolve_spawn_config` documents their independent precedence, and
-                // `pool_override_does_not_change_effort_or_addendum` pins the separation.
-                // For PR reviews this is only a size proxy, not a claim that small
-                // diffs are low risk: the rubric applies the same correctness bar at
-                // every level.
-                .maybe_effort_level(row_effort)
-                .maybe_model_override(row_model_override.as_deref())
-                .maybe_pool_model_override(pool_policy.map(|p| p.model_tier))
-                .maybe_product_default_model(product_default_model.as_deref())
-                .maybe_task_driver(effective_task_driver)
-                .maybe_product_default_driver(effective_product_default_driver)
-                .maybe_pool_policy_driver(pool_policy.map(|policy| policy.driver))
-                .maybe_allocated_driver(allocated_driver.as_deref())
-                .maybe_kind(work_item_kind)
-                .maybe_reasoning(row_reasoning)
-                .design_reasoning_effort_xhigh(row_design_reasoning_effort_xhigh)
-                .build();
-            resolve_spawn_config_in(&registry, &spawn_input)
-                .map_err(|error| anyhow::anyhow!("effort/model resolution: {error}"))?
+    let spawn_config = if execution.kind == ExecutionKind::PrReviewGuide {
+        let config = resolve_review_guide_spawn_config(&registry)?;
+        if let Ok(Some(attempt)) = work_db.pr_review_guide_attempt_for_execution(&execution.id)
+            && let Err(error) = work_db.record_pr_review_guide_attempt_spawn_config(
+                &attempt.id,
+                &config.driver,
+                &config.model,
+                config.effort_value.unwrap_or_default(),
+            )
+        {
+            tracing::warn!(
+                execution_id = %execution.id,
+                attempt_id = %attempt.id,
+                ?error,
+                "review_guide execution: could not record the resolved spawn config on its attempt",
+            );
+        }
+        config
+    } else {
+        match batch_member.as_ref() {
+            Some(member) => resolve_batch_reviewer_spawn(&registry, member, work_item_kind)?,
+            None => {
+                let spawn_input = SpawnResolutionInput::builder()
+                    // Effort always comes from the owning row, for pool and main-pool workers alike.
+                    // For review/automation pools this is deliberate: capability comes from the pool's
+                    // strong model tier below, while effort stays proportional to the likely material to
+                    // inspect instead of raising every small review's spend. The automated-reviewer
+                    // design §5 defines that override; §10 keeps production effort/model selection unchanged.
+                    // `resolve_spawn_config` documents their independent precedence, and
+                    // `pool_override_does_not_change_effort_or_addendum` pins the separation.
+                    // For PR reviews this is only a size proxy, not a claim that small
+                    // diffs are low risk: the rubric applies the same correctness bar at
+                    // every level.
+                    .maybe_effort_level(row_effort)
+                    .maybe_model_override(row_model_override.as_deref())
+                    .maybe_pool_model_override(pool_policy.map(|p| p.model_tier))
+                    .maybe_product_default_model(product_default_model.as_deref())
+                    .maybe_task_driver(effective_task_driver)
+                    .maybe_product_default_driver(effective_product_default_driver)
+                    .maybe_pool_policy_driver(pool_policy.map(|policy| policy.driver))
+                    .maybe_allocated_driver(allocated_driver.as_deref())
+                    .maybe_kind(work_item_kind)
+                    .maybe_reasoning(row_reasoning)
+                    .design_reasoning_effort_xhigh(row_design_reasoning_effort_xhigh)
+                    .build();
+                resolve_spawn_config_in(&registry, &spawn_input)
+                    .map_err(|error| anyhow::anyhow!("effort/model resolution: {error}"))?
+            }
         }
     };
 

@@ -66,6 +66,10 @@ pub enum WorkerKind {
     /// Read-only "mini-coordinator" answer agent, enforced via allowlist
     /// rather than blocklist.
     AnswerAgent,
+    /// Read-only PR review-guide generator: no shell, no file edits, no
+    /// allowlisted mutating command at all. Runs exclusively on the Codex
+    /// driver's fixed `gpt-6-astra`/`high` profile.
+    ReviewGuide,
 }
 
 /// All inputs Boss provides to a driver for its [`Capability::PermissionPolicy`]:
@@ -1454,6 +1458,11 @@ pub struct ToolUseInterceptionConfig {
     /// command guard for these sessions, preventing builds, tests, formatters,
     /// generators, and execution of checked-out code.
     pub is_reviewer: bool,
+    /// Whether this is a review-guide generation worker. Its guard blocks
+    /// every `PreToolUse` call unconditionally — it never needs a tool call
+    /// at all — rather than the reviewer's publish/write pattern-match.
+    #[builder(default)]
+    pub is_review_guide: bool,
     /// Execution / run id — used by Codex to locate the Boss-owned per-run
     /// `CODEX_HOME` when arming hooks. Claude ignores this.
     pub run_id: Option<String>,

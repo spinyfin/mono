@@ -2270,6 +2270,15 @@ pub enum StopOutcome {
     /// the comment doesn't sit in `answering` forever). The execution is
     /// finalised (`completed`) and its pane/workspace released either way.
     AnswerAgent { replied: bool },
+    /// A `pr_review_guide` execution finished. `published` is `true` when its
+    /// raw output passed validation and was durably published as the
+    /// series' new readable version (subject to the publication fence — a
+    /// stale comparison still finalizes the execution but does not advance
+    /// the pointer), `false` when validation failed or the driver produced
+    /// no usable text (the attempt is recorded `failed`/`superseded` either
+    /// way). The execution is finalised (`completed`) and its pane/
+    /// workspace released regardless.
+    ReviewGuide { published: bool },
     /// A primary-implementation worker's PR was detected and
     /// an independent reviewer pass has been enqueued. The producing task
     /// remains in `active` (Doing column) until the reviewer resolves.

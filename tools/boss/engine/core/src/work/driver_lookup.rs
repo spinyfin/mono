@@ -239,6 +239,11 @@ impl WorkDb {
         };
         match kind {
             ExecutionKind::AnswerAgent => Ok(Some(self.answer_agent_driver_slug(&work_item_id))),
+            // Fixed driver pin, never resolved per-comment/per-product like
+            // `AnswerAgent` above: a `pr_review_guide` execution always
+            // dispatches on `codex` (the enforced Astra profile) or does not
+            // dispatch at all — see `resolve_review_guide_spawn_config`.
+            ExecutionKind::PrReviewGuide => Ok(Some("codex".to_owned())),
             // A triage execution has no task row to supply a pin/allocation
             // ladder. If it spilled into an ordinary worker, its frozen
             // launch configuration is the only truthful driver source; do

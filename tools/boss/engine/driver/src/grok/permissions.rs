@@ -43,7 +43,11 @@ pub fn grok_sandbox_disabled(is_remote: bool) -> bool {
 /// workspace.
 fn sandbox_base_profile(worker_kind: WorkerKind) -> &'static str {
     match worker_kind {
-        WorkerKind::Reviewer => "read-only",
+        // Grok never actually dispatches a review-guide job (it is pinned to
+        // Codex's `gpt-6-astra`), but this match must stay total. Read-only
+        // is the closest existing posture — strictly narrower than the empty
+        // Codex allowlist would allow, never wider.
+        WorkerKind::Reviewer | WorkerKind::ReviewGuide => "read-only",
         WorkerKind::Standard | WorkerKind::Triage | WorkerKind::AnswerAgent => "workspace",
     }
 }
@@ -52,7 +56,7 @@ fn sandbox_base_profile(worker_kind: WorkerKind) -> &'static str {
 /// base profile so the two postures never collide in the same file.
 fn boss_sandbox_profile_name(worker_kind: WorkerKind) -> &'static str {
     match worker_kind {
-        WorkerKind::Reviewer => "boss-read-only",
+        WorkerKind::Reviewer | WorkerKind::ReviewGuide => "boss-read-only",
         WorkerKind::Standard | WorkerKind::Triage | WorkerKind::AnswerAgent => "boss-workspace",
     }
 }
@@ -200,7 +204,7 @@ pub fn structural_deny_rules(
 /// value alongside it is an interaction the investigation never exercised.
 pub fn permission_mode_for_worker_kind(worker_kind: WorkerKind) -> Option<&'static str> {
     match worker_kind {
-        WorkerKind::AnswerAgent => Some("dontAsk"),
+        WorkerKind::AnswerAgent | WorkerKind::ReviewGuide => Some("dontAsk"),
         WorkerKind::Standard | WorkerKind::Reviewer | WorkerKind::Triage => None,
     }
 }

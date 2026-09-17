@@ -466,6 +466,7 @@ fn create_review_batch_in_tx(
         ReviewBatch::builder()
             .id(batch_id)
             .generation(generation)
+            .explicit(explicit)
             .cycle_root_id(input.cycle_root_id)
             .base_sha(input.base_sha)
             .classification(input.classification)
@@ -1155,24 +1156,17 @@ impl WorkDb {
                 tx.commit()?;
                 return Ok(ReviewBatchDispatch::ExistingBatch { batch, executions });
             }
-            // Defence in depth: every present path that terminalizes a batch
-            // (the pre-merge Collecting arm's quorum settlement, the
-            // stale/dead-root reaper, and the moved-head/closed-PR failure
-            // paths) also abandons every non-terminal member execution in
-            // the same transaction, so a `Completed`/`Failed` batch should
-            // never still own a schedulable leaf. Assert that invariant
-            // explicitly rather than relying on it implicitly: minting a new
-            // generation over a superseded batch that still has a live or
-            // schedulable execution would let the coordinator's double-spawn
-            // guard (which joins strictly on `batch_id`) mistake the two
-            // generations' leaves for a redundant duplicate pair.
+            // Batch completion can precede reviewer teardown. Wait for all
+            // member executions to settle before admitting another generation:
+            // the coordinator's double-spawn guard joins on batch_id and would
+            // treat overlapping generations as redundant reviewers.
             let unsettled = batch_executions_in_tx(&tx, &batch.id)?
                 .into_iter()
                 .find(|execution| !execution.status.is_terminal());
             if let Some(execution) = unsettled {
                 bail!(
                     "cannot mint generation {} for {}: superseded batch {} still owns \
-                     unsettled execution {} ({})",
+                     unsettled execution {} ({}); the prior batch's reviewer is still tearing down; retry once it settles",
                     batch.generation + 1,
                     input.cycle_root_id,
                     batch.id,

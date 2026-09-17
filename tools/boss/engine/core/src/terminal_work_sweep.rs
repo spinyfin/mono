@@ -302,15 +302,19 @@ pub async fn run_one_pass(
 
         let execution_terminal = execution.status.is_terminal();
 
-        // `AutomationTriage`'s `work_item_id` is an automation id — not a
-        // product/project/task/comment — so bound-item closedness cannot be
-        // established. Answer-agent executions bind a real comment id, but
-        // their completion sweep owns comment-terminal recovery so it can
-        // finalize through the answer-agent path and file its lost-signal
-        // attention item. Skip both here and fall back to execution status.
+        // `AutomationTriage`'s `work_item_id` is an automation id, and
+        // `PrReviewGuide`'s is a source-comparison id — neither is a
+        // product/project/task/comment, so bound-item closedness cannot be
+        // established for either. Answer-agent executions bind a real
+        // comment id, but their completion sweep owns comment-terminal
+        // recovery so it can finalize through the answer-agent path and
+        // file its lost-signal attention item. Skip all three here and fall
+        // back to execution status.
         let never_bound_work_item = matches!(
             execution.kind,
-            boss_protocol::ExecutionKind::AutomationTriage | boss_protocol::ExecutionKind::AnswerAgent
+            boss_protocol::ExecutionKind::AutomationTriage
+                | boss_protocol::ExecutionKind::AnswerAgent
+                | boss_protocol::ExecutionKind::PrReviewGuide
         );
 
         // The O'Brien signal: the bound work item is terminal (done /

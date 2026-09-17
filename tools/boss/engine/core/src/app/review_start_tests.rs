@@ -82,6 +82,34 @@ fn triggered(event: FrontendEvent) -> WorkExecution {
     }
 }
 
+fn triggered_with_batch(
+    event: FrontendEvent,
+    expected_batch: Option<&ReviewBatch>,
+    expected_execution_ids: &[String],
+    expected_active: bool,
+) -> WorkExecution {
+    let FrontendEvent::PrReviewTriggered {
+        execution,
+        batch_id,
+        batch_generation,
+        batch_execution_ids,
+        already_active,
+        ..
+    } = event
+    else {
+        panic!("expected successful review start, got {event:?}");
+    };
+    assert_eq!(batch_id.as_deref(), expected_batch.map(|batch| batch.id.as_str()));
+    assert_eq!(batch_generation, expected_batch.map(|batch| batch.generation));
+    let mut actual = batch_execution_ids;
+    let mut expected = expected_execution_ids.to_vec();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+    assert_eq!(already_active, expected_active);
+    execution
+}
+
 fn rejected(event: FrontendEvent, reason: &str) {
     match event {
         FrontendEvent::WorkError { message } => assert!(message.contains(reason), "{message}"),
@@ -133,12 +161,22 @@ fn record_review(state: &ServerState, id: &str, head: &str) {
 async fn flag_on_creates_atomic_heterogeneous_batch_and_supervisor() {
     let (state, _dir) = state(true);
     let id = seed(&state, "example/repo", 42);
-    let execution = triggered(request(&state, 42, None, Ok(metadata("head"))).await);
+    let event = request(&state, 42, None, Ok(metadata("head"))).await;
     let batch = batch(&state, &id, "head");
     assert_eq!(batch.generation, 1);
     let db = &state.work_db;
     let members = db.review_batch_members(&batch.id).unwrap();
     assert_eq!(members.len(), 3);
+    let execution_ids: Vec<_> = members.iter().map(|m| m.execution_id.clone().unwrap()).collect();
+    let execution = triggered_with_batch(event, Some(&batch), &execution_ids, false);
+    let reused = triggered_with_batch(
+        request(&state, 42, None, Ok(metadata("head"))).await,
+        Some(&batch),
+        &execution_ids,
+        true,
+    );
+    assert_eq!(reused.id, execution.id);
+
     assert_eq!(
         members.iter().map(|m| m.requested_driver.as_str()).collect::<Vec<_>>(),
         ["claude", "codex", "grok"]
@@ -411,12 +449,8 @@ async fn completed_head_gets_new_generation_but_automatic_and_live_replays_do_no
     assert_eq!(db.review_batches_for_cycle_root(&id).unwrap().len(), 2);
 }
 
-/// The `Failed` half of `dispatch_pre_merge_review_batch`'s terminal-batch
-/// predicate (`Completed | Failed`) had no coverage: every other generation
-/// test in this module drives the prior batch to `completed` only. A
-/// regression that dropped `Failed` from that match (so an explicit retry
-/// after a failed batch silently returned `ExistingBatch` and started
-/// nothing) would not have been caught.
+/// An explicit retry after a failed batch creates the next generation while
+/// leaving the prior batch and its members intact.
 #[tokio::test]
 async fn failed_head_also_gets_a_new_generation_on_explicit_retry() {
     let (state, _dir) = state(true);
@@ -431,11 +465,7 @@ async fn failed_head_also_gets_a_new_generation_on_explicit_retry() {
             [&first.id],
         )
         .unwrap();
-    // A quorum failure (e.g. the supervisor exhausting its retry without a
-    // verdict) leaves every leaf execution terminal — quorum only dispatches
-    // the supervisor once two of three leaves have reported. Model that
-    // real shape rather than leaving the leaves `ready`, which the
-    // superseded-batch liveness assertion below correctly rejects.
+    // Model a failed batch whose member executions have finished tearing down.
     db.connect()
         .unwrap()
         .execute(
@@ -518,7 +548,12 @@ async fn missing_metadata_and_closed_pr_never_fall_back() {
 async fn flag_off_keeps_legacy_row_and_does_not_fetch_batch_metadata() {
     let (state, _dir) = state(false);
     let id = seed(&state, "example/repo", 42);
-    let execution = triggered(request(&state, 42, None, Err(anyhow::anyhow!("must not fetch"))).await);
+    let execution = triggered_with_batch(
+        request(&state, 42, None, Err(anyhow::anyhow!("must not fetch"))).await,
+        None,
+        &[],
+        false,
+    );
     assert_eq!(
         serde_json::to_value(&execution).unwrap(),
         serde_json::to_value(state.work_db.request_pr_review(&id, &OpenPr).unwrap()).unwrap()
@@ -552,4 +587,63 @@ async fn repo_substring_disambiguates_identical_pr_numbers() {
     assert_eq!(execution.work_item_id, second);
     assert!(state.work_db.review_batches_for_cycle_root(&first).unwrap().is_empty());
     assert_eq!(state.work_db.review_batches_for_cycle_root(&second).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn terminal_batch_with_unsettled_member_rejects_next_generation() {
+    for status in ["completed", "failed"] {
+        let (state, _dir) = state(true);
+        let id = seed(&state, "example/repo", 42);
+        let execution = triggered(request(&state, 42, None, Ok(metadata("head"))).await);
+        let first = batch(&state, &id, "head");
+        let db = &state.work_db;
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET status = 'completed' WHERE work_item_id = ?1",
+                [&id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE work_executions SET status = 'ready' WHERE id = ?1",
+                [&execution.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE pr_review_batches SET status = ?1 WHERE id = ?2",
+                [status, &first.id],
+            )
+            .unwrap();
+        }
+        rejected(
+            request(&state, 42, None, Ok(metadata("head"))).await,
+            &format!(
+                "still owns unsettled execution {} (ready); the prior batch's reviewer is still tearing down; retry once it settles",
+                execution.id
+            ),
+        );
+        assert_eq!(db.review_batches_for_cycle_root(&id).unwrap().len(), 1);
+        assert_eq!(db.review_batch_members(&first.id).unwrap().len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn explicit_admission_returns_the_persisted_batch() {
+    let (state, _dir) = state(true);
+    let id = seed(&state, "example/repo", 42);
+    let db = &state.work_db;
+    let input = crate::completion::review_batch_input_from_metadata(
+        db,
+        &id,
+        "https://github.com/example/repo/pull/42",
+        metadata("head"),
+    )
+    .unwrap();
+    let crate::work::ReviewBatchDispatch::Created { batch, .. } =
+        db.request_pre_merge_review_batch_for_pool(input, 16).unwrap()
+    else {
+        panic!("explicit admission must create a batch");
+    };
+    assert!(batch.explicit);
+    assert_eq!(batch, db.review_batch(&batch.id).unwrap().unwrap());
 }

@@ -113,6 +113,7 @@ rust_library(
         "//tools/boss/engine/pr-template",
         "//tools/boss/engine/proposal-validation",
         "//tools/boss/engine/recovery",
+        "//tools/boss/engine/review-guide",
         "//tools/boss/engine/ssh-transport",
         "//tools/boss/engine/stdout-progress",
         "//tools/boss/engine/structured-output",
