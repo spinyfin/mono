@@ -967,6 +967,22 @@ pub(crate) fn run_done_directive(seam_enabled: bool) -> String {
      credential, or decision needed in the summary. File `{boss} propose blocked --reason \"...\"` \
      alongside it (before this call) so the blocker itself is recorded, not just the fact that you \
      stopped.\n\n\
+     For validation failures, this is a narrow exception to the earlier gate/stop rules: a failing \
+     gate warrants stopping without delivery only when it is reproducible AND attributable to \
+     your change — fix it; if attribution remains unresolved, the failure still stands. A timeout, \
+     a full-suite failure that passes in isolation, or a failure in untouched code is not by itself \
+     a reason to stop: retry the specific Bazel target (two or three attempts maximum), and if it \
+     keeps failing, check whether it reproduces on an unmodified base revision. Proceed with \
+     delivery only with evidence that the failure is pre-existing or environmental (a base \
+     reproduction, a passing rerun/isolation run, or a concrete code-path argument showing why \
+     your change cannot cause it), recording the target, failure, attempts and evidence in the \
+     PR body; merely calling it flaky is not evidence. Bazel remains the source of truth: do not \
+     bypass or weaken checks, and still stop for required approval to relax a check, missing \
+     credentials or authorization, genuine instruction conflicts or contradictory briefs.\n\n\
+     To flag a concern while continuing, `{boss} propose blocked --reason \"...\"` alone records \
+     the blocker and pauses the nudge loop; it does NOT end the run. Only \
+     `{boss} propose done --outcome blocked` ends the run, releases the slot and lease, and parks \
+     the row for a human.\n\n\
      If you simply stop without declaring, you are not left alone: the engine holds the run open \
      while it can see you working, then asks you once whether you are finished, then fails the attempt \
      with a visible diagnostic. That is worse for you and for the human than \
