@@ -2138,9 +2138,13 @@ pub enum StopOutcome {
     /// queued via `nudge_or_park`) instead of dogging a worker that already
     /// declared itself stuck awaiting coordinator direction (incident
     /// 2026-07-02, exec_18b5243e65ff188_2d). `reason` names the
-    /// pending signal kind(s). The execution stays `waiting_human`; no
-    /// probe is sent. Resolving the attention item (coordinator ack)
-    /// resumes normal nudging on the next Stop.
+    /// pending signal kind(s). The execution stays `waiting_human` with its
+    /// lease and pane attached; no probe is sent. There is no time bound —
+    /// this is the AGENTS.md mandated-stop channel (`boss propose blocked`
+    /// without a terminal `done`). The coordinator-visible attention item
+    /// is the release valve (`bossctl probe`), not the nudge breaker.
+    /// Resolving the attention item (coordinator ack) resumes normal
+    /// nudging on the next Stop.
     EscalationPending { reason: String },
     /// The worker's Stop-boundary text matched the [`crate::build_wait`]
     /// heuristic — it is narrating that it is legitimately waiting on a
@@ -2341,9 +2345,11 @@ pub enum StopOutcome {
     /// The execution is finalised synchronously at submit time, not at a
     /// later Stop boundary that may never arrive. Fired for `blocked` (the
     /// run is over without delivering) or `delivered` with no PR the engine
-    /// could resolve — both terminalize without a positive task-status
-    /// change. Both fail the execution and record an attributable task blocker
-    /// before releasing the lease and pane; neither creates a deliberate park.
+    /// could resolve. Both fail the execution and, for a task still in
+    /// `active`/`todo`, record `blocked:worker_failed` before releasing the
+    /// lease and pane; neither creates a deliberate park. A parent already
+    /// in `in_review` or a domain-owned blocked reason is left in that
+    /// recovery state — see [`crate::work::WorkDb::record_worker_failure`].
     /// `delivered` with a resolvable PR instead reaches [`Self::PrDetected`],
     /// and `no_changes_needed` reaches [`Self::NoChangesNeeded`] — both
     /// existing variants, reused because their semantics already fit.

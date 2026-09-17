@@ -344,11 +344,17 @@ impl WorkDb {
         }))
     }
 
-    /// Fail an unsuccessful worker and move its task out of automatic dispatch
-    /// in the same transaction, before publishing ExecutionTerminal. The task's
-    /// blocked detail is the durable board/CLI diagnostic; attention delivery is
-    /// not required for correctness. Resources are released even for a deleted task.
-    /// A repeated call is a no-op. Explicit retries retain workspace recovery.
+    /// Fail an unsuccessful worker and, when the linked task is still in a
+    /// status this path owns (`active` / `todo`), move it out of automatic
+    /// dispatch in the same transaction, before publishing ExecutionTerminal.
+    /// Helper executions (`ci_remediation`, `conflict_resolution`,
+    /// `revision_implementation`) share the parent task's `work_item_id`; a
+    /// parent already in `in_review` or a domain-owned blocked reason
+    /// (`ci_failure`, `merge_conflict`, …) is left in that recovery state so
+    /// the merge poller and CI/conflict sweeps still see it. The failure
+    /// diagnostic is folded into `blocked_detail` when a blocked reason
+    /// already exists. Resources are released even for a deleted task. A
+    /// repeated call is a no-op. Explicit retries retain workspace recovery.
     pub fn record_worker_failure(&self, execution_id: &str, detail: &str) -> Result<Option<WorkerFailureCompletion>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -407,14 +413,39 @@ impl WorkDb {
             params![execution_id, now],
         )?;
 
-        // Status excludes failed work from orphan recovery and automatic minting.
-        tx.execute(
-            "UPDATE tasks
-             SET status = 'blocked', blocked_reason = 'worker_failed', blocked_detail = ?2,
-                 autostart = 0, last_status_actor = 'engine', updated_at = ?3
-             WHERE id = ?1 AND deleted_at IS NULL AND status IN ('active', 'todo', 'in_review', 'blocked')",
-            params![work_item_id, trimmed, now],
-        )?;
+        // Terminal-failure takeover applies only to rows this path owns
+        // (`active` / `todo`). Helper executions share the parent
+        // `work_item_id`; stomping `in_review` or a domain-owned
+        // `blocked_reason` drops the parent out of the merge poller and
+        // CI/conflict recovery sweeps. Those rows keep status/reason/pr_url;
+        // the diagnostic is folded into `blocked_detail` when a reason
+        // already exists (blocked_detail cannot outlive blocked_reason).
+        match query_task(&tx, &work_item_id)? {
+            Some(task) if matches!(task.status, TaskStatus::Active | TaskStatus::Todo) => {
+                tx.execute(
+                    "UPDATE tasks
+                     SET status = 'blocked', blocked_reason = 'worker_failed', blocked_detail = ?2,
+                         autostart = 0, last_status_actor = 'engine', updated_at = ?3
+                     WHERE id = ?1 AND deleted_at IS NULL AND status IN ('active', 'todo')",
+                    params![work_item_id, trimmed, now],
+                )?;
+            }
+            Some(task)
+                if task.status == TaskStatus::Blocked && task.blocked_reason.is_some() && !trimmed.is_empty() =>
+            {
+                let folded = match task.blocked_detail.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(existing) => format!("{existing}\n\n{trimmed}"),
+                    None => trimmed.to_owned(),
+                };
+                tx.execute(
+                    "UPDATE tasks
+                     SET blocked_detail = ?2, updated_at = ?3
+                     WHERE id = ?1 AND deleted_at IS NULL AND status = 'blocked' AND blocked_reason IS NOT NULL",
+                    params![work_item_id, folded, now],
+                )?;
+            }
+            _ => {}
+        }
 
         // Preserve the attributable failure in the latest run history.
         if !trimmed.is_empty() {

@@ -64,12 +64,18 @@ impl WorkerCompletionHandler {
                 .await;
             return StopOutcome::Held { reason: record.reason };
         }
+        // Unresolved `propose blocked` / `[effort-escalation]` holds the
+        // slot: lease, pane, and `waiting_human` stay attached until a
+        // coordinator resolves the attention item. No time bound, and the
+        // circuit breaker is not consulted — that is the AGENTS.md
+        // mandated-stop keep-alive. A vague blocker can occupy the slot
+        // indefinitely; the attention item is the operator surface.
         if let Some(reason) = self.unresolved_worker_signal_reason(execution) {
             tracing::info!(
                 execution_id = %execution.id,
                 %reason,
                 "auto-nudge: suppressed — worker has an unresolved escalation/blocker awaiting \
-                 coordinator action",
+                 coordinator action; execution keeps its lease and pane until that item is resolved",
             );
             self.publisher
                 .publish(
