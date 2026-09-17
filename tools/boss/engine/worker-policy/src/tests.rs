@@ -508,6 +508,10 @@ fn execution_rows_carry_no_runtime_half_fields() {
             execution: execution(),
             work_item_id: "chore_1".into(),
             pr_url: "https://github.com/o/r/pull/1".into(),
+            batch_id: None,
+            batch_generation: None,
+            batch_execution_ids: Vec::new(),
+            already_active: false,
         },
     ] {
         assert_nothing_leaked(&sanitize_event_for_worker(event));

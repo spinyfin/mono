@@ -131,7 +131,7 @@ pub const REVIEW_BATCH_REPORTED_MEMBER_GRACE_SECS: u64 = 120;
 /// later batch's leaves can never occupy the slot this batch's own
 /// supervisor will eventually need. See docs/designs/multi-agent-code-review.md,
 /// "Expand the static review pool to 16 slots".
-const PRE_MERGE_BATCH_RESERVATION_UNITS: i64 = 4;
+pub const PRE_MERGE_BATCH_RESERVATION_UNITS: i64 = 4;
 
 /// Reservation weight of one non-terminal post-merge batch: a single
 /// safety-net reviewer against the already-landed tree.
@@ -248,6 +248,7 @@ fn map_review_batch(row: &Row<'_>) -> rusqlite::Result<ReviewBatch> {
         completed_at: row.get(11)?,
         final_verdict_proposal_id: row.get(12)?,
         merge_sha: row.get(13)?,
+        explicit: row.get(15)?,
     })
 }
 
@@ -428,6 +429,7 @@ fn create_review_batch_in_tx(
     input: ReviewBatchCreateInput,
     member_inputs: &[ReviewBatchMemberCreateInput],
     generation: i64,
+    explicit: bool,
 ) -> Result<(ReviewBatch, Vec<ReviewBatchMember>)> {
     validate_batch_input(&input, member_inputs)?;
     let classification_json = serde_json::to_string(&input.classification)?;
@@ -437,8 +439,8 @@ fn create_review_batch_in_tx(
         "INSERT INTO pr_review_batches (
             id, cycle_root_id, base_sha, classification_json, created_at,
             phase, pr_number, pr_url, status, target_sha, updated_at,
-            completed_at, final_verdict_proposal_id, merge_sha, generation
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'collecting', ?9, ?5, NULL, NULL, ?10, ?11)",
+            completed_at, final_verdict_proposal_id, merge_sha, generation, explicit
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'collecting', ?9, ?5, NULL, NULL, ?10, ?11, ?12)",
         params![
             batch_id,
             input.cycle_root_id,
@@ -451,6 +453,7 @@ fn create_review_batch_in_tx(
             input.target_sha,
             input.merge_sha,
             generation,
+            explicit,
         ],
     )?;
 
@@ -538,7 +541,7 @@ fn review_batch_for_target_in(
     conn.query_row(
         "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
                 phase, pr_number, pr_url, status, target_sha, updated_at,
-                completed_at, final_verdict_proposal_id, merge_sha, generation
+                completed_at, final_verdict_proposal_id, merge_sha, generation, explicit
          FROM pr_review_batches WHERE cycle_root_id = ?1 AND phase = ?2 AND target_sha = ?3
          ORDER BY generation DESC LIMIT 1",
         params![cycle_root_id, phase.as_str(), target_sha],
@@ -573,7 +576,7 @@ fn review_batch_by_id_in(conn: &rusqlite::Connection, batch_id: &str) -> Result<
     conn.query_row(
         "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
                 phase, pr_number, pr_url, status, target_sha, updated_at,
-                completed_at, final_verdict_proposal_id, merge_sha, generation
+                completed_at, final_verdict_proposal_id, merge_sha, generation, explicit
          FROM pr_review_batches WHERE id = ?1",
         params![batch_id],
         map_review_batch,
@@ -1041,7 +1044,7 @@ impl WorkDb {
     ) -> Result<(ReviewBatch, Vec<ReviewBatchMember>)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let created = create_review_batch_in_tx(&tx, input, member_inputs, 1)?;
+        let created = create_review_batch_in_tx(&tx, input, member_inputs, 1, false)?;
         tx.commit()?;
         Ok(created)
     }
@@ -1111,8 +1114,9 @@ impl WorkDb {
         self.dispatch_pre_merge_review_batch(input, Some(repo_remote_url), review_pool_size, false)
     }
 
-    /// An operator request can start a new generation after a terminal batch,
-    /// irrespective of automatic redundancy gates. Capacity remains mandatory.
+    /// An explicit review start can mint a new generation after a terminal
+    /// batch, irrespective of automatic redundancy gates. Capacity remains
+    /// mandatory.
     pub(crate) fn request_pre_merge_review_batch_for_pool(
         &self,
         input: ReviewBatchCreateInput,
@@ -1150,6 +1154,31 @@ impl WorkDb {
                 let executions = batch_executions_in_tx(&tx, &batch.id)?;
                 tx.commit()?;
                 return Ok(ReviewBatchDispatch::ExistingBatch { batch, executions });
+            }
+            // Defence in depth: every present path that terminalizes a batch
+            // (the pre-merge Collecting arm's quorum settlement, the
+            // stale/dead-root reaper, and the moved-head/closed-PR failure
+            // paths) also abandons every non-terminal member execution in
+            // the same transaction, so a `Completed`/`Failed` batch should
+            // never still own a schedulable leaf. Assert that invariant
+            // explicitly rather than relying on it implicitly: minting a new
+            // generation over a superseded batch that still has a live or
+            // schedulable execution would let the coordinator's double-spawn
+            // guard (which joins strictly on `batch_id`) mistake the two
+            // generations' leaves for a redundant duplicate pair.
+            let unsettled = batch_executions_in_tx(&tx, &batch.id)?
+                .into_iter()
+                .find(|execution| !execution.status.is_terminal());
+            if let Some(execution) = unsettled {
+                bail!(
+                    "cannot mint generation {} for {}: superseded batch {} still owns \
+                     unsettled execution {} ({})",
+                    batch.generation + 1,
+                    input.cycle_root_id,
+                    batch.id,
+                    execution.id,
+                    execution.status,
+                );
             }
             generation = batch.generation + 1;
         }
@@ -1208,7 +1237,10 @@ impl WorkDb {
         }
         if !can_admit_review_batch_in_tx(&tx, ReviewBatchPhase::PreMerge, reservation_capacity(review_pool_size))? {
             if explicit {
-                bail!("cannot start review batch: review-pool reservation capacity exhausted (requires 4 units)");
+                bail!(
+                    "cannot start review batch: review-pool reservation capacity exhausted \
+                     (requires {PRE_MERGE_BATCH_RESERVATION_UNITS} units)"
+                );
             }
             // Read-only so far — nothing to roll back. The caller must hold
             // the producing task pending review rather than treat this as a
@@ -1240,7 +1272,7 @@ impl WorkDb {
             .map(|execution| execution.id.clone())
             .collect::<Vec<_>>();
         let members = leaf_member_inputs(&input.classification, &execution_ids)?;
-        let (batch, _) = create_review_batch_in_tx(&tx, input, &members, generation)?;
+        let (batch, _) = create_review_batch_in_tx(&tx, input, &members, generation, explicit)?;
         // Freeze one timestamp even if insertion crosses a clock tick.
         for execution in &mut executions {
             tx.execute(
@@ -1300,7 +1332,7 @@ impl WorkDb {
         )?;
         let registry = crate::driver::DriverRegistry::default();
         let member = post_merge_member_input(&registry, &input.classification, execution.id.clone())?;
-        let (batch, _) = create_review_batch_in_tx(&tx, input, std::slice::from_ref(&member), 1)?;
+        let (batch, _) = create_review_batch_in_tx(&tx, input, std::slice::from_ref(&member), 1, false)?;
         tx.commit()?;
         Ok(ReviewBatchDispatch::Created {
             batch,
@@ -1348,7 +1380,7 @@ impl WorkDb {
         let mut statement = conn.prepare(
             "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
                     phase, pr_number, pr_url, status, target_sha, updated_at,
-                    completed_at, final_verdict_proposal_id, merge_sha, generation
+                    completed_at, final_verdict_proposal_id, merge_sha, generation, explicit
              FROM pr_review_batches
              WHERE cycle_root_id = ?1
              ORDER BY created_at DESC, generation DESC, id DESC",

@@ -1,4 +1,4 @@
-//! Explicit operator review admission and PR-number disambiguation.
+//! Explicit review-start admission and PR-number disambiguation.
 
 use super::*;
 
@@ -96,19 +96,26 @@ async fn handle_trigger_pr_review_with<F, Fut>(
                 }
                 let input = crate::completion::review_batch_input_from_metadata(&work_db, &owner.id, pr_url, metadata)?;
                 match work_db.request_pre_merge_review_batch_for_pool(input, usize::from(server_state.review_pool_size))? {
-                    crate::work::ReviewBatchDispatch::Created { batch, executions }
-                    | crate::work::ReviewBatchDispatch::ExistingBatch { batch, executions } => {
+                    crate::work::ReviewBatchDispatch::Created { batch, executions } => {
                         tracing::info!(batch_id = %batch.id, generation = batch.generation, "review start: admitted review batch");
-                        executions.into_iter().next().ok_or_else(|| anyhow::anyhow!("review batch has no executions"))
+                        BatchOutcome::new(batch, executions, false)
+                    }
+                    crate::work::ReviewBatchDispatch::ExistingBatch { batch, executions } => {
+                        tracing::info!(batch_id = %batch.id, generation = batch.generation, "review start: reused active review batch");
+                        BatchOutcome::new(batch, executions, true)
                     }
                     other => anyhow::bail!("cannot start review batch: unexpected admission outcome {other:?}"),
                 }
             }.await
+            .map(ReviewStartOutcome::Batch)
         } else {
-            work_db.request_pr_review(&owner.id, pr_checker)
+            work_db
+                .request_pr_review(&owner.id, pr_checker)
+                .map(ReviewStartOutcome::Legacy)
         };
         match result {
-            Ok(execution) => {
+            Ok(outcome) => {
+                let execution = outcome.execution();
                 tracing::info!(
                     work_item_id = %owner.id,
                     execution_id = %execution.id,
@@ -116,6 +123,7 @@ async fn handle_trigger_pr_review_with<F, Fut>(
                     "review start: re-enqueued pr_review execution",
                 );
                 server_state.execution_coordinator.kick();
+                let (batch_id, batch_generation, batch_execution_ids, already_active) = outcome.batch_fields();
                 send_response(
                     &sink,
                     &request_id,
@@ -123,6 +131,10 @@ async fn handle_trigger_pr_review_with<F, Fut>(
                         execution,
                         work_item_id: owner.id,
                         pr_url: owner.pr_url.unwrap_or_default(),
+                        batch_id,
+                        batch_generation,
+                        batch_execution_ids,
+                        already_active,
                     },
                 );
             }
@@ -135,6 +147,69 @@ async fn handle_trigger_pr_review_with<F, Fut>(
                     },
                 );
             }
+        }
+    }
+}
+
+/// One admitted batch and whether it was freshly created or reused, carrying
+/// enough to report both the arbitrary leaf `execution` (legacy shape) and
+/// the full membership (fanout-aware shape).
+struct BatchOutcome {
+    batch: crate::work::ReviewBatch,
+    executions: Vec<crate::work::WorkExecution>,
+    already_active: bool,
+}
+
+impl BatchOutcome {
+    fn new(
+        batch: crate::work::ReviewBatch,
+        executions: Vec<crate::work::WorkExecution>,
+        already_active: bool,
+    ) -> Result<Self, anyhow::Error> {
+        if executions.is_empty() {
+            anyhow::bail!("review batch has no executions");
+        }
+        Ok(Self {
+            batch,
+            executions,
+            already_active,
+        })
+    }
+}
+
+/// The two shapes `handle_trigger_pr_review_with` can report: a batch
+/// admission (`review_batch_fanout` on) or the unchanged legacy single
+/// execution (flag off).
+enum ReviewStartOutcome {
+    Batch(BatchOutcome),
+    Legacy(crate::work::WorkExecution),
+}
+
+impl ReviewStartOutcome {
+    /// The single execution reported in the legacy-shaped `execution` field:
+    /// the whole result for `Legacy`, or an arbitrary (first) leaf for
+    /// `Batch` — kept for callers that only care whether *something* is
+    /// running, not full fan-out membership.
+    fn execution(&self) -> crate::work::WorkExecution {
+        match self {
+            Self::Batch(outcome) => outcome.executions[0].clone(),
+            Self::Legacy(execution) => execution.clone(),
+        }
+    }
+
+    fn batch_fields(&self) -> (Option<String>, Option<i64>, Vec<String>, bool) {
+        match self {
+            Self::Batch(outcome) => (
+                Some(outcome.batch.id.clone()),
+                Some(outcome.batch.generation),
+                outcome
+                    .executions
+                    .iter()
+                    .map(|execution| execution.id.clone())
+                    .collect(),
+                outcome.already_active,
+            ),
+            Self::Legacy(_) => (None, None, Vec::new(), false),
         }
     }
 }

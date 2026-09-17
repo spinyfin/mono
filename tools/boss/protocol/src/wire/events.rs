@@ -118,10 +118,27 @@ pub enum FrontendEvent {
     /// Reply for [`FrontendRequest::TriggerPrReview`]. Carries the
     /// freshly-enqueued (or reused, if one was already queued) `pr_review`
     /// execution, the work item it targets, and the PR URL under review.
+    ///
+    /// `execution` is always populated (one arbitrary leaf when a batch was
+    /// admitted, for backward compatibility with the legacy single-reviewer
+    /// shape). When `review_batch_fanout` admission ran, `batch_id` and
+    /// `batch_generation` carry the admitted batch's identity,
+    /// `batch_execution_ids` carries every member execution (not just the
+    /// one leaf `execution` holds), and `already_active` is `true` when an
+    /// active batch already covered this head and nothing new was started.
+    /// All four are absent/empty for the flag-off legacy path.
     PrReviewTriggered {
         execution: WorkExecution,
         work_item_id: String,
         pr_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch_generation: Option<i64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        batch_execution_ids: Vec<String>,
+        #[serde(default)]
+        already_active: bool,
     },
     RunsList {
         execution_id: String,

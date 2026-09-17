@@ -114,6 +114,22 @@ pub(crate) fn migrate_pr_review_batch_generations(conn: &Connection) -> Result<(
     Ok(())
 }
 
+/// Add the `explicit` provenance flag distinguishing a `bossctl review
+/// start` admission from an automatic pre-merge/post-merge one. A plain
+/// `ALTER TABLE ... ADD COLUMN` suffices here (unlike `generation`, which
+/// needed a full rebuild for its `CHECK`/`UNIQUE` changes): `explicit` has
+/// no such constraint, and defaulting existing rows to `0` correctly marks
+/// every batch that predates this column as non-explicit.
+pub(crate) fn migrate_pr_review_batch_explicit(conn: &Connection) -> Result<()> {
+    if !super::table_has_column(conn, "pr_review_batches", "explicit")? {
+        conn.execute(
+            "ALTER TABLE pr_review_batches ADD COLUMN explicit INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// Stamp a batch verdict onto `pr_review_verdicts` with the proposal id as
 /// the materialisation idempotency key. Legacy single-reviewer rows leave
 /// both columns NULL; the unique indexes are partial so they do not

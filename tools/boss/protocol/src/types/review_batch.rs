@@ -307,6 +307,15 @@ pub struct ReviewBatch {
     pub final_verdict_proposal_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_sha: Option<String>,
+    /// Set when this batch was minted by an explicit `bossctl review start`
+    /// admission rather than the automatic pre-merge/post-merge path. An
+    /// explicit admission is a deliberate request to re-review a specific
+    /// head and must never be suppressed as a same-SHA duplicate by the
+    /// verdict applier's replay guard, even when an earlier (automatic or
+    /// legacy) pass already reviewed that exact SHA.
+    #[serde(default)]
+    #[builder(default = false)]
+    pub explicit: bool,
 }
 
 fn first_generation() -> i64 {

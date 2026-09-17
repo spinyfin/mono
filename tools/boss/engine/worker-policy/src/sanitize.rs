@@ -102,10 +102,18 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
             execution,
             work_item_id,
             pr_url,
+            batch_id,
+            batch_generation,
+            batch_execution_ids,
+            already_active,
         } => FrontendEvent::PrReviewTriggered {
             execution: sanitize_execution(execution),
             work_item_id,
             pr_url,
+            batch_id,
+            batch_generation,
+            batch_execution_ids,
+            already_active,
         },
         FrontendEvent::RunReaped { run_id, execution } => FrontendEvent::RunReaped {
             run_id,
