@@ -1125,13 +1125,16 @@ fn assert_started_execution_keeps_base_in_review(db: &WorkDb, base_id: &str) {
     assert_eq!(task_status(db, base_id), "in_review", "precondition");
 
     // Simulate the stray re-dispatch: a `ready` execution bound to the
-    // base, then a worker claiming it.
+    // base, then a worker claiming it. Construct historical state directly:
+    // normal admission now refuses to create this duplicate.
+    let kind = execution_kind_for_work_item(&db.connect().unwrap(), base_id).unwrap();
     let exec = db
-        .request_execution_with_live_check(
-            RequestExecutionInput::builder()
+        .create_execution(
+            CreateExecutionInput::builder()
                 .work_item_id(base_id.to_owned())
+                .kind(kind)
+                .status(ExecutionStatus::Ready)
                 .build(),
-            |_| false,
         )
         .unwrap();
     assert_eq!(exec.status, ExecutionStatus::Ready);
@@ -1356,16 +1359,9 @@ fn redispatching_in_review_revision_with_legacy_nested_child_stays_in_review() {
     );
 }
 
-/// Unlike a revision task, a non-revision base (chore/project_task/task)
-/// must stay parked in Review even when re-dispatched directly and with no
-/// revision ever filed against it — the automated reviewer pass relies on
-/// exactly this: it re-dispatches a fresh
-/// `chore_implementation` (and later `pr_review`) execution straight
-/// against the base while it is `in_review`, and `record_worker_pr_completion`'s
-/// `PendingReview` target only "holds" the row's current status correctly
-/// because that status never visibly flipped to `active` mid-flight. Kind
-/// is therefore the deciding factor here, not whether a revision child
-/// exists.
+/// A delivered base refuses fresh implementation admission even without a
+/// revision child. Historical queued duplicates must also preserve Review
+/// when they start; automated reviews use their dedicated admission path.
 #[test]
 fn redispatching_in_review_base_with_no_revision_stays_in_review() {
     let db = WorkDb::open(temp_db_path("base-no-rev-in-review-active")).unwrap();
@@ -1373,10 +1369,23 @@ fn redispatching_in_review_base_with_no_revision_stays_in_review() {
     let pr_url = "https://github.com/spinyfin/mono/pull/3043";
     let base_id = make_in_review_chore(&db, &product_id, pr_url);
 
-    let exec = db
+    let error = db
         .request_execution_with_live_check(
             RequestExecutionInput::builder().work_item_id(base_id.clone()).build(),
             |_| false,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("bound PR"));
+    assert!(db.list_executions(Some(&base_id)).unwrap().is_empty());
+    // A historical queued duplicate must also leave the base in review
+    // if it reaches the worker-start path after admission has been fixed.
+    let exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(base_id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
         )
         .unwrap();
     assert_eq!(exec.status, ExecutionStatus::Ready);

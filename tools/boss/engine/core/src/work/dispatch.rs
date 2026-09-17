@@ -1,4 +1,4 @@
-use super::dispatch_admission::work_item_is_deliberately_parked;
+use super::dispatch_admission::{primary_pr_awaits_review, work_item_is_deliberately_parked};
 use super::*;
 
 impl WorkDb {
@@ -580,6 +580,9 @@ impl WorkDb {
             //   - latest execution terminal → yes,
             //   - latest execution non-terminal but `is_live`
             //     reports the slot is gone → yes (stale row).
+            if primary_pr_awaits_review(&tx, &work_item_id)? {
+                continue;
+            }
             let existing = query_latest_execution_for_work_item(&tx, &work_item_id)?;
             let needs_dispatch = match &existing {
                 Some(existing) => existing.status.is_terminal() || !is_live(&existing.id),
@@ -699,6 +702,9 @@ impl WorkDb {
         let mut pending = PendingEvents::new();
         for (work_item_id, autostart) in candidates {
             if !autostart {
+                continue;
+            }
+            if primary_pr_awaits_review(&tx, &work_item_id)? {
                 continue;
             }
             let needs_dispatch = match query_latest_execution_for_work_item(&tx, &work_item_id)? {
@@ -931,7 +937,12 @@ impl WorkDb {
         let rows = stmt.query_map([cutoff], |row| row.get::<_, String>(0))?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?);
+            let id = row?;
+            // A completed producer waiting for review admission is not
+            // an orphan. Review recovery owns it, even without a batch.
+            if !primary_pr_awaits_review(&conn, &id)? {
+                out.push(id);
+            }
         }
         Ok(out)
     }

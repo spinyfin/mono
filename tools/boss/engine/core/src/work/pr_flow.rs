@@ -267,8 +267,32 @@ impl WorkDb {
         // terminal (done / archived), leave the status alone.
         // `pr_url` is left untouched — a no-op produced none, and the
         // worker correctly refused to fabricate one.
+        // Finishing a run without new changes is not evidence that its
+        // existing PR merged. Keep the owner visible and report the
+        // contradiction in the same transaction as the run's completion.
+        let contradiction = task
+            .pr_url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+            .filter(|_| !task.status.is_terminal());
+        let attention = if let Some(pr_url) = contradiction {
+            Some(CreateAttentionItemInput {
+                kind: "completion_with_bound_pr".into(),
+                title: "Completion refused: work still has a bound PR".into(),
+                body_markdown: format!(
+                    "The worker declared no changes needed, but this work item owns {pr_url}. \
+                     This completion has no merge evidence. The run has ended, but the work item \
+                     remains in review. Inspect the PR before closing the work item."
+                ),
+                ..Default::default()
+            })
+        } else {
+            attention
+        };
         let new_status = if task.status.is_terminal() {
             task.status.clone()
+        } else if contradiction.is_some() {
+            TaskStatus::InReview
         } else {
             TaskStatus::Done
         };
@@ -302,6 +326,11 @@ impl WorkDb {
 
         // Capture the no-op explanation as the run summary if the run
         // hasn't already recorded one.
+        let detail = if contradiction.is_some() {
+            "No-op completion refused: the work item has a bound PR without merge evidence; retained in review with attention."
+        } else {
+            detail
+        };
         let trimmed = detail.trim();
         if !trimmed.is_empty() {
             tx.execute(
@@ -709,7 +738,12 @@ impl WorkDb {
         // previous inlined copy used `depth < 64`, which could emit depth 64
         // and overshoot [`super::chain_root`].
         let walk = super::cycle_root_walk_cte(
-            "t.status = 'active'
+            "(t.status = 'active' OR (t.status = 'in_review' AND EXISTS (
+                 SELECT 1 FROM work_attention_items ai
+                 WHERE ai.work_item_id = t.id
+                   AND ai.kind = 'pr_review_admission_deferred'
+                   AND ai.status = 'open'
+             )))
                  AND t.pr_url IS NOT NULL
                  AND t.pr_url != ''
                  AND t.deleted_at IS NULL",

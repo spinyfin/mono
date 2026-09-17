@@ -58,6 +58,7 @@ impl PrFixture {
 
         let product = crate::test_support::create_test_product(db);
         let task = crate::test_support::create_test_chore(db, product.id.clone(), "Ship it");
+        let execution = crate::test_support::create_execution_started_now(db, &task.id);
         let pr_url = "https://github.com/example/repo/pull/42".to_owned();
         db.connect()
             .unwrap()
@@ -67,7 +68,6 @@ impl PrFixture {
             )
             .unwrap();
 
-        let execution = crate::test_support::create_execution_started_now(db, &task.id);
         server_state.worker_registry.register(self_pid(), execution.clone());
 
         Self {
@@ -322,6 +322,7 @@ async fn status_refresh_is_throttled_once_the_budget_is_exhausted() {
     // that many distinct callers, each bound to the same PR.
     for i in 0..pr_status::PrStatusRefreshBudget::MAX_PER_WINDOW {
         let task = crate::test_support::create_test_chore(db, product.id.clone(), format!("Chore {i}"));
+        let execution = crate::test_support::create_execution_started_now(db, &task.id);
         db.connect()
             .unwrap()
             .execute(
@@ -329,7 +330,6 @@ async fn status_refresh_is_throttled_once_the_budget_is_exhausted() {
                 rusqlite::params![fx.pr_url, task.id],
             )
             .unwrap();
-        let execution = crate::test_support::create_execution_started_now(db, &task.id);
         fx.server_state.worker_registry.register(self_pid(), execution.clone());
         let status = status_view(call_status(&fx.server_state, Some(self_pid()), &execution, true).await);
         assert!(status.refreshed);
@@ -342,6 +342,7 @@ async fn status_refresh_is_throttled_once_the_budget_is_exhausted() {
     // A fresh, never-before-seen execution is still throttled — the global
     // window itself is exhausted, independent of the per-execution cooldown.
     let overflow_task = crate::test_support::create_test_chore(db, product.id.clone(), "Chore overflow");
+    let overflow_execution = crate::test_support::create_execution_started_now(db, &overflow_task.id);
     db.connect()
         .unwrap()
         .execute(
@@ -349,7 +350,6 @@ async fn status_refresh_is_throttled_once_the_budget_is_exhausted() {
             rusqlite::params![fx.pr_url, overflow_task.id],
         )
         .unwrap();
-    let overflow_execution = crate::test_support::create_execution_started_now(db, &overflow_task.id);
     fx.server_state
         .worker_registry
         .register(self_pid(), overflow_execution.clone());

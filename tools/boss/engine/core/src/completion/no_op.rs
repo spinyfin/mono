@@ -136,6 +136,14 @@ impl WorkerCompletionHandler {
         .await;
         let work_item_id = completion.execution.work_item_id.clone();
         let product_id = completion.work_item.product_id().to_string();
+        let retained_in_review = matches!(&completion.work_item,
+            WorkItem::Task(task) | WorkItem::Chore(task)
+                if task.status == boss_protocol::TaskStatus::InReview);
+        let event = if retained_in_review {
+            "worker_completion_refused"
+        } else {
+            "worker_no_op_completed"
+        };
         if let Some(item) = completion.filed_attention_item.clone() {
             self.publisher
                 .publish_frontend_event_on_product(&product_id, FrontendEvent::AttentionItemCreated { item })
@@ -146,12 +154,21 @@ impl WorkerCompletionHandler {
                 &completion.execution.id,
                 &work_item_id,
                 completion.execution.status.as_str(),
-                "worker_no_op_completed",
+                event,
             )
             .await;
         self.publisher
-            .publish_work_item_changed(&product_id, &work_item_id, "worker_no_op_completed")
+            .publish_work_item_changed(&product_id, &work_item_id, event)
             .await;
+        if let WorkItem::Task(task) | WorkItem::Chore(task) = &completion.work_item
+            && task.status == boss_protocol::TaskStatus::InReview
+        {
+            tracing::error!(execution_id = %execution.id, work_item_id = %work_item_id,
+                "no-op completion contradicted by a bound PR; retained in review with attention");
+            return StopOutcome::PrDetected {
+                pr_url: task.pr_url.clone().unwrap_or_default(),
+            };
+        }
         tracing::info!(
             execution_id = %execution.id,
             work_item_id = %work_item_id,

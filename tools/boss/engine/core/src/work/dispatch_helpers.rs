@@ -1,4 +1,4 @@
-use super::dispatch_admission::work_item_is_deliberately_parked;
+use super::dispatch_admission::{primary_pr_awaits_review, work_item_is_deliberately_parked};
 use super::*;
 
 /// Shared per-product short-id read-modify-write. Reads the current
@@ -549,6 +549,9 @@ pub(crate) fn reconcile_work_item_execution(
         return Ok(());
     }
     let insert_fresh = |result: &mut ExecutionReconcileResult, predecessor: Option<&WorkExecution>| -> Result<()> {
+        if primary_pr_awaits_review(conn, work_item_id)? {
+            return Ok(());
+        }
         if work_item_is_deliberately_parked(conn, work_item_id)? {
             tracing::info!(
                 work_item_id,
@@ -1529,6 +1532,11 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         );
     }
 
+    // Existing live work, queued reviews and CI-remediation retries above
+    // remain reusable. Only minting a fresh primary implementation is wrong.
+    if primary_pr_awaits_review(conn, &work_item_id)? {
+        bail!("Work already has a bound PR; use a revision to change it");
+    }
     let _ = product_id_for_work_item(conn, &work_item_id)?;
 
     // For revision tasks, look up the chain root's PR URL so the worker
