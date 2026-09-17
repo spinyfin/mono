@@ -344,59 +344,12 @@ impl WorkDb {
         }))
     }
 
-    /// Record that the engine gave up nudging a live worker: the auto-nudge
-    /// circuit breaker tripped ([`crate::completion::WorkerCompletionHandler::park_for_unproductive_nudges`])
-    /// because repeated Stops produced no state change — no new commit, no
-    /// PR, no bound-PR anomaly resolved. Unlike
-    /// [`Self::record_worker_no_op_completion`], there is no positive
-    /// evidence the assigned work is done — only that further automated
-    /// nudging is unproductive — so, unlike that sibling, this does **not**
-    /// touch the task/chore's `status` or `pr_url` at all. Requiring the
-    /// [`crate::no_op_signal`] marker for a `done` close (and never
-    /// fabricating one here) is what distinguishes "verified already done"
-    /// from "gave up without trying"; conflating them would be exactly the
-    /// dishonest auto-close this module's own no-op gate was built to avoid.
-    ///
-    /// What this closes: without it, a live worker the breaker parks holds
-    /// its cube lease and worker pane/slot forever — the operator has to
-    /// notice and reap it by hand (incident `exec_18b932df99d17658_475`: a
-    /// worker concluded a CI failure had already resolved itself, never
-    /// produced a PR, and sat parked indefinitely holding its slot). In one
-    /// transaction:
-    ///   - the execution moves to `abandoned`, cube lease/workspace columns
-    ///     cleared, `finished_at` stamped — freeing the slot/lease is the
-    ///     whole point;
-    ///   - the most-recent run captures `detail` (the breaker's park reason)
-    ///     as its result summary if it does not already have one;
-    ///   - the task/chore's `autostart` flag is cleared (mirroring
-    ///     [`Self::bounce_dispatch_failed_to_backlog`]'s single-shot
-    ///     convention) so [`Self::rescan_active_dispatch`] does not
-    ///     immediately re-dispatch a fresh worker onto the same task the
-    ///     moment this one's slot frees up — without this, a task whose
-    ///     worker keeps concluding "nothing to do" without emitting the
-    ///     no-op marker would loop abandon → rescan-redispatch → abandon
-    ///     forever, churning a cube lease and worker slot with no human in
-    ///     the loop. `status`/`pr_url` are otherwise left untouched, so the
-    ///     merge poller's late-PR sweep and the dispatcher's redundant-spawn
-    ///     guard continue to see it exactly as they did before — a human
-    ///     reviewing the attention item this call's caller files can
-    ///     explicitly re-arm `autostart` (or dispatch a fresh execution
-    ///     directly) once they've decided the task is worth another try.
-    ///
-    /// Tolerates the task/chore row having been hard-deleted while the
-    /// execution was live: the lease/pane are the resource this method
-    /// exists to free, and that must happen unconditionally rather than
-    /// bailing out because a best-effort metadata lookup came up empty —
-    /// `work_item` is `None` in the returned completion in that case.
-    ///
-    /// Returns `Ok(None)` if the execution has already been finalised
-    /// (terminal status), making this safe to call from a hook handler that
-    /// may fire repeatedly.
-    pub fn record_worker_idle_abandonment(
-        &self,
-        execution_id: &str,
-        detail: &str,
-    ) -> Result<Option<IdleAbandonmentCompletion>> {
+    /// Fail an unsuccessful worker and move its task out of automatic dispatch
+    /// in the same transaction, before publishing ExecutionTerminal. The task's
+    /// blocked detail is the durable board/CLI diagnostic; attention delivery is
+    /// not required for correctness. Resources are released even for a deleted task.
+    /// A repeated call is a no-op. Explicit retries retain workspace recovery.
+    pub fn record_worker_failure(&self, execution_id: &str, detail: &str) -> Result<Option<WorkerFailureCompletion>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
@@ -405,7 +358,7 @@ impl WorkDb {
         }
         if !execution.status.is_live() {
             bail!(
-                "execution {execution_id} cannot be idle-abandoned from status `{}`",
+                "execution {execution_id} cannot fail from status `{}`",
                 execution.status
             );
         }
@@ -423,13 +376,29 @@ impl WorkDb {
         let original_workspace_id = execution.cube_workspace_id.clone();
 
         let work_item_id = execution.work_item_id.clone();
-        let task = query_task(&tx, &work_item_id)?;
 
         let now = now_string();
-        let trimmed = detail.trim();
+        let mut diagnostic = detail.trim().to_owned();
+        // Include the declaration and companion blocker in the readable failure.
+        let mut stmt = tx.prepare(
+            "SELECT payload_json FROM worker_proposals
+             WHERE execution_id = ?1 AND kind IN ('run_done', 'blocked') AND state = 'applied'
+             ORDER BY created_at, id",
+        )?;
+        for payload in stmt.query_map([execution_id], |row| row.get::<_, String>(0))? {
+            let payload: serde_json::Value = serde_json::from_str(&payload?)?;
+            for field in ["summary", "reason"] {
+                if let Some(text) = payload.get(field).and_then(|value| value.as_str()) {
+                    diagnostic.push_str("\n\n");
+                    diagnostic.push_str(text);
+                }
+            }
+        }
+        drop(stmt);
+        let trimmed = diagnostic.trim();
         tx.execute(
             "UPDATE work_executions
-             SET status = 'abandoned',
+             SET status = 'failed',
                  cube_lease_id = NULL,
                  cube_workspace_id = NULL,
                  workspace_path = NULL,
@@ -438,40 +407,20 @@ impl WorkDb {
             params![execution_id, now],
         )?;
 
-        // Stop the automated re-dispatch loop: clear `autostart` so the
-        // on-free rescan (`rescan_active_dispatch`) leaves this task parked
-        // in `active` instead of immediately spawning a replacement worker
-        // that may just abandon again the same way. Deliberately does NOT
-        // stamp `dispatch_failed_reason` / `dispatch_failed_error` /
-        // `dispatch_failed_at`: those three columns are the *only* source of
-        // the kanban card's red "Failed to start" banner
-        // (`WorkDispatchFailureBanner` in the macOS app), whose documented
-        // contract is "the engine gave up starting it" — the opposite of
-        // what happened here, where the worker started, ran, and was torn
-        // down mid-flight. Stamping them also enrolled the row in
-        // `dispatch_failure_recovery_sweep`'s candidate set, which only
-        // guards re-enabling `autostart` with the loose 5-in-24h default —
-        // far looser than the loop this park exists to stop. Leaving them
-        // unset means the item stays parked (`autostart = 0`, no banner)
-        // until a human reviews the attention item filed by this call's
-        // caller and explicitly re-arms `autostart` or dispatches a fresh
-        // execution directly — exactly the surface this method's docs
-        // already promise. Best-effort — if the task row is gone there's
-        // nothing to clear.
+        // Status excludes failed work from orphan recovery and automatic minting.
         tx.execute(
             "UPDATE tasks
-             SET autostart = 0
-             WHERE id = ?1 AND deleted_at IS NULL",
-            params![work_item_id],
+             SET status = 'blocked', blocked_reason = 'worker_failed', blocked_detail = ?2,
+                 autostart = 0, last_status_actor = 'engine', updated_at = ?3
+             WHERE id = ?1 AND deleted_at IS NULL AND status IN ('active', 'todo', 'in_review', 'blocked')",
+            params![work_item_id, trimmed, now],
         )?;
 
-        // Capture the park reason as the run summary if the run hasn't
-        // already recorded one — the durable "why was this abandoned" note
-        // an operator finds on the row.
+        // Preserve the attributable failure in the latest run history.
         if !trimmed.is_empty() {
             tx.execute(
                 "UPDATE work_runs
-                 SET result_summary = COALESCE(NULLIF(result_summary, ''), ?2)
+                 SET status = 'failed', error_text = ?2, result_summary = ?2, finished_at = COALESCE(finished_at, ?3)
                  WHERE execution_id = ?1
                    AND id = (
                        SELECT id FROM work_runs
@@ -479,15 +428,16 @@ impl WorkDb {
                        ORDER BY created_at DESC, id DESC
                        LIMIT 1
                    )",
-                params![execution_id, trimmed],
+                params![execution_id, trimmed, now],
             )?;
         }
 
+        let task = query_task(&tx, &work_item_id)?;
         let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let mut pending = PendingEvents::new();
         stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
         commit_and_publish(tx, pending, &self.event_bus)?;
-        Ok(Some(IdleAbandonmentCompletion {
+        Ok(Some(WorkerFailureCompletion {
             execution: updated_execution,
             work_item: task.map(task_to_item),
             released_lease_id: original_lease_id,

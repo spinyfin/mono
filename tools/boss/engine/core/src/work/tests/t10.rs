@@ -417,27 +417,18 @@ fn record_worker_no_op_completion_coalesce_stability() {
     );
 }
 
-/// record_worker_idle_abandonment (the auto-nudge-breaker-gave-up path) must
-/// finalize the EXECUTION — freeing its cube lease/workspace so it stops
-/// holding a slot forever — but must NOT touch the task/chore's `status` or
-/// `pr_url`: no status write, no `pr_url`, no `completed_at`. Unlike
-/// record_worker_no_op_completion, there is no positive evidence the work is
-/// done here, only that further nudging is unproductive. It DOES clear
-/// `autostart`, though — otherwise `rescan_active_dispatch` immediately
-/// re-dispatches a fresh worker onto the same task the moment this
-/// abandonment frees its slot, turning one stuck slot into an unbounded
-/// abandon/re-dispatch churn loop.
+/// Failure releases resources and records a task failure atomically.
 #[test]
-fn record_worker_idle_abandonment_finalizes_execution_leaves_task_status_untouched() {
+fn record_worker_failure_finalizes_execution_and_records_task_failure() {
     let db = WorkDb::open(temp_db_path("rwia-finalize")).unwrap();
     let (_product_id, chore_id, exec_id) = make_waiting_human_chore(&db, "rwia");
 
     let completion = db
-        .record_worker_idle_abandonment(&exec_id, "breaker tripped: no PR after 3 nudges")
+        .record_worker_failure(&exec_id, "breaker tripped: no PR after 3 nudges")
         .unwrap()
         .expect("a live execution must be finalized");
 
-    assert_eq!(completion.execution.status, ExecutionStatus::Abandoned);
+    assert_eq!(completion.execution.status, ExecutionStatus::Failed);
     assert!(completion.execution.cube_lease_id.is_none());
     assert!(completion.execution.cube_workspace_id.is_none());
     assert!(completion.execution.finished_at.is_some());
@@ -447,18 +438,18 @@ fn record_worker_idle_abandonment_finalizes_execution_leaves_task_status_untouch
         WorkItem::Chore(t) => {
             assert_eq!(
                 t.status,
-                TaskStatus::Active,
-                "idle abandonment must not touch task status"
+                TaskStatus::Blocked,
+                "worker failure must exclude the task from automatic orphan recovery"
             );
             assert!(t.pr_url.is_none());
             assert!(
                 !t.autostart,
-                "idle abandonment must clear autostart so the rescan doesn't immediately \
+                "worker failure must clear autostart so the rescan doesn't immediately \
                  re-dispatch the same task",
             );
             assert!(
                 t.dispatch_failed_reason.is_none(),
-                "idle abandonment must not stamp dispatch_failed_reason — those columns are the \
+                "worker failure must not stamp dispatch_failed_reason — those columns are the \
                  sole source of the kanban card's 'Failed to start' banner, and this worker did \
                  start; leave the row to a human's explicit re-arm instead of the loose \
                  dispatch-failure recovery sweep",
@@ -475,16 +466,16 @@ fn record_worker_idle_abandonment_finalizes_execution_leaves_task_status_untouch
     let redispatched = db.rescan_active_dispatch().unwrap();
     assert!(
         !redispatched.contains(&chore_id),
-        "rescan must not re-dispatch a task whose autostart was cleared by idle abandonment",
+        "rescan must not re-dispatch a task whose autostart was cleared by worker failure",
     );
 }
 
-/// If the task/chore row is gone by the time the breaker parks (e.g. hard
+/// If the task/chore row is gone by the time the breaker fails the attempt (e.g. hard
 /// deleted while the execution was still live), the lease/pane must still
 /// be freed — that is the entire point of this method. It must not bail
 /// out just because a best-effort work-item lookup came up empty.
 #[test]
-fn record_worker_idle_abandonment_frees_execution_even_if_task_row_missing() {
+fn record_worker_failure_frees_execution_even_if_task_row_missing() {
     let db = WorkDb::open(temp_db_path("rwia-no-task")).unwrap();
     let (_product_id, chore_id, exec_id) = make_waiting_human_chore(&db, "rwia-no-task");
 
@@ -495,11 +486,11 @@ fn record_worker_idle_abandonment_frees_execution_even_if_task_row_missing() {
     }
 
     let completion = db
-        .record_worker_idle_abandonment(&exec_id, "breaker tripped: task row missing")
+        .record_worker_failure(&exec_id, "breaker tripped: task row missing")
         .unwrap()
         .expect("a live execution must still be finalized when its task row is missing");
 
-    assert_eq!(completion.execution.status, ExecutionStatus::Abandoned);
+    assert_eq!(completion.execution.status, ExecutionStatus::Failed);
     assert!(completion.execution.cube_lease_id.is_none());
     assert!(completion.execution.cube_workspace_id.is_none());
     assert_eq!(completion.released_lease_id.as_deref(), Some("lease-1"));
@@ -509,21 +500,19 @@ fn record_worker_idle_abandonment_frees_execution_even_if_task_row_missing() {
     );
 }
 
-/// A second record_worker_idle_abandonment call on an already-abandoned
+/// A second record_worker_failure call on an already-failed
 /// execution must be a no-op (Ok(None)) — idempotent against a repeated
 /// Stop-hook fire, mirroring record_worker_no_op_completion's contract.
 #[test]
-fn record_worker_idle_abandonment_is_idempotent() {
+fn record_worker_failure_is_idempotent() {
     let db = WorkDb::open(temp_db_path("rwia-idempotent")).unwrap();
     let (_product_id, _chore_id, exec_id) = make_waiting_human_chore(&db, "rwia-idem");
 
-    db.record_worker_idle_abandonment(&exec_id, "breaker tripped").unwrap();
-    let second = db
-        .record_worker_idle_abandonment(&exec_id, "breaker tripped again")
-        .unwrap();
+    db.record_worker_failure(&exec_id, "breaker tripped").unwrap();
+    let second = db.record_worker_failure(&exec_id, "breaker tripped again").unwrap();
     assert!(
         second.is_none(),
-        "a second call on an already-abandoned execution must be Ok(None)"
+        "a second call on an already-failed execution must be Ok(None)"
     );
 }
 
@@ -576,7 +565,7 @@ fn migration_completed_at_is_idempotent() {
 // A blocked declaration prevents automatic replacement on every dispatch
 // path. These tests exercise the durable park independently of the
 // idle-abandonment autostart gate, which
-// `record_worker_idle_abandonment_finalizes_execution_leaves_task_status_untouched`
+// `record_worker_failure_finalizes_execution_and_records_task_failure`
 // covers.
 
 fn stamp_blocked_declaration(db: &WorkDb, execution_id: &str) {

@@ -710,8 +710,7 @@ async fn assert_park_bounces_under_admission_gate(admission: ParkBounceAdmission
     let product_id = create_product(&db);
     let work_item_id = create_active_chore(&db, &product_id, "test chore");
     let execution_id = create_spawned_execution(&db, &work_item_id, dead_pid());
-    db.record_worker_idle_abandonment(&execution_id, "worker declared itself blocked")
-        .unwrap();
+    seed_legacy_abandonment(&db, &execution_id);
     db.create_attention_item(boss_protocol::CreateAttentionItemInput {
         execution_id: Some(execution_id.clone()),
         work_item_id: None,
@@ -845,8 +844,7 @@ async fn a_deliberately_parked_row_that_is_also_churning_names_both_conditions()
     }
 
     let execution_id = create_spawned_execution(&db, &work_item_id, dead_pid());
-    db.record_worker_idle_abandonment(&execution_id, "worker declared itself blocked")
-        .unwrap();
+    seed_legacy_abandonment(&db, &execution_id);
     db.create_attention_item(boss_protocol::CreateAttentionItemInput {
         execution_id: Some(execution_id.clone()),
         work_item_id: None,
@@ -909,8 +907,7 @@ async fn deliberate_park_does_not_bounce_while_prior_process_is_alive() {
 
     // Our own pid stands in for a still-running worker shell.
     let execution_id = create_spawned_execution(&db, &work_item_id, i64::from(std::process::id()));
-    db.record_worker_idle_abandonment(&execution_id, "worker declared itself blocked")
-        .unwrap();
+    seed_legacy_abandonment(&db, &execution_id);
     db.create_attention_item(boss_protocol::CreateAttentionItemInput {
         execution_id: Some(execution_id.clone()),
         work_item_id: None,
@@ -962,8 +959,7 @@ async fn a_resolved_park_attention_does_not_hold_the_row() {
     let product_id = create_product(&db);
     let work_item_id = create_active_chore(&db, &product_id, "test chore");
     let execution_id = create_spawned_execution(&db, &work_item_id, dead_pid());
-    db.record_worker_idle_abandonment(&execution_id, "nudge breaker parked the run")
-        .unwrap();
+    seed_legacy_abandonment(&db, &execution_id);
     db.create_attention_item(boss_protocol::CreateAttentionItemInput {
         execution_id: Some(execution_id.clone()),
         work_item_id: None,
@@ -1011,8 +1007,7 @@ async fn a_resumed_row_is_not_held_by_a_park_on_the_superseded_execution() {
     let work_item_id = create_active_chore(&db, &product_id, "test chore");
 
     let first_execution_id = create_spawned_execution(&db, &work_item_id, dead_pid());
-    db.record_worker_idle_abandonment(&first_execution_id, "worker declared itself blocked")
-        .unwrap();
+    seed_legacy_abandonment(&db, &first_execution_id);
     db.create_attention_item(boss_protocol::CreateAttentionItemInput {
         execution_id: Some(first_execution_id.clone()),
         work_item_id: None,
@@ -2194,4 +2189,52 @@ async fn spawn_event_subscriber_redispatches_on_execution_terminal() {
     })
     .await
     .expect("event-driven redispatch did not happen before the timeout");
+}
+
+// Compatibility fixture: persisted by engines before visible worker failures.
+// Do not use the new failure writer here: its task is atomically non-active.
+fn seed_legacy_abandonment(db: &WorkDb, execution_id: &str) {
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE work_executions SET status = 'abandoned', cube_lease_id = NULL,
+         cube_workspace_id = NULL, workspace_path = NULL, finished_at = '1' WHERE id = ?1",
+        [execution_id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE tasks SET autostart = 0 WHERE id =
+         (SELECT work_item_id FROM work_executions WHERE id = ?1)",
+        [execution_id],
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn worker_failure_never_cycles_replacement_workers() {
+    let (_dir, db) = open_db();
+    let product = create_product(&db);
+    let item = create_active_chore(&db, &product, "failed attempt");
+    let execution = create_spawned_execution(&db, &item, dead_pid());
+    db.record_worker_failure(&execution, "Required credential unavailable")
+        .unwrap();
+    make_old(&db, &item);
+    let db = Arc::new(db);
+    let coordinator = make_coordinator(db.clone(), 1);
+    let sink = RecordingDispatchEventSink::new();
+    for _ in 0..5 {
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), &sink, &NoopLiveWorkerConvergence).await;
+        assert_eq!(outcome.redispatched, 0);
+        assert_eq!(outcome.churn_skipped, 0, "failure must not consume the churn allowance");
+        assert_eq!(outcome.deliberate_park_skipped, 0, "new failures are not legacy parks");
+        assert!(!db.rescan_active_dispatch().unwrap().contains(&item));
+        assert!(!db.reconcile_active_dispatch(|_| false).unwrap().contains(&item));
+        db.reconcile_product_executions(&product).unwrap();
+        assert_eq!(db.list_executions(Some(&item)).unwrap().len(), 1);
+    }
+    let boss_protocol::WorkItem::Chore(task) = db.get_work_item(&item).unwrap() else {
+        panic!("expected chore")
+    };
+    assert_eq!(task.status, boss_protocol::TaskStatus::Blocked);
+    assert_eq!(task.blocked_reason.as_deref(), Some("worker_failed"));
+    assert!(task.blocked_detail.unwrap().contains("Required credential unavailable"));
 }

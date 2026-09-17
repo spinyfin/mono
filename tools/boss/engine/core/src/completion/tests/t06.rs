@@ -5,7 +5,7 @@
 //! One `#[tokio::test]` per Stop-hook finalizer that terminalizes a
 //! parked-live execution and therefore owns driver teardown —
 //! `finalize_pr_transition`, `finalize_pr_review_pass`,
-//! `finalize_no_op_completion`, and `finalize_idle_park` — following the
+//! `finalize_no_op_completion`, and `finalize_worker_failure` — following the
 //! established one-test-per-call-site convention already used for
 //! `force_release` (`t01::force_release_tears_down_driver_workspace`),
 //! `finalize_gone_execution` (`execution_liveness.rs`), and
@@ -137,7 +137,7 @@ async fn finalize_no_op_completion_tears_down_driver_workspace() {
 }
 
 #[tokio::test]
-async fn finalize_idle_park_tears_down_driver_workspace() {
+async fn finalize_worker_failure_tears_down_driver_workspace() {
     crate::driver_teardown::test_hooks::reset();
 
     let workspace = tempdir().unwrap();
@@ -148,7 +148,7 @@ async fn finalize_idle_park_tears_down_driver_workspace() {
     let handler = handler.with_max_unproductive_nudges(2);
 
     // The legitimate produce-a-PR nudge fires up to the cap, then the third
-    // Stop trips the breaker and finalizes via `finalize_idle_park`.
+    // Stop trips the breaker and finalizes via `finalize_worker_failure`.
     let _o1 = handler.on_stop(&execution_id).await;
     let _o2 = handler.on_stop(&execution_id).await;
     let o3 = handler.on_stop(&execution_id).await;
@@ -159,7 +159,7 @@ async fn finalize_idle_park_tears_down_driver_workspace() {
     assert_eq!(
         crate::driver_teardown::test_hooks::count(),
         1,
-        "finalize_idle_park must invoke driver teardown exactly once",
+        "finalize_worker_failure must invoke driver teardown exactly once",
     );
 
     // Idempotency: a further Stop on the now-abandoned execution must not

@@ -17,7 +17,7 @@ fn abandonment_preserves_only_a_durable_blocked_declaration() {
         let (_, task, id) = make_waiting_human_chore(&db, "park");
         let workspace = db.get_execution(&id).unwrap().cube_workspace_id;
         stamp_outcome(&db, &id, outcome);
-        db.record_worker_idle_abandonment(&id, "worker stopped").unwrap();
+        db.record_worker_failure(&id, "worker stopped").unwrap();
         let prior = db.get_execution(&id).unwrap();
         assert!(prior.cube_workspace_id.is_none());
         assert!(prior.cube_lease_id.is_none());
@@ -26,7 +26,7 @@ fn abandonment_preserves_only_a_durable_blocked_declaration() {
             prior.preferred_workspace_id,
             if outcome == Some("blocked") { workspace } else { None }
         );
-        assert!(db.record_worker_idle_abandonment(&id, "duplicate").unwrap().is_none());
+        assert!(db.record_worker_failure(&id, "duplicate").unwrap().is_none());
         let next = db
             .request_execution(RequestExecutionInput::builder().work_item_id(task).build())
             .unwrap();
@@ -41,7 +41,7 @@ fn active_reconcile_preserves_park_until_explicit_resume_carries_workspace() {
     let db = WorkDb::open(temp_db_path("blocked-active-reconcile")).unwrap();
     let (_, task, id) = make_waiting_human_chore(&db, "park");
     stamp_outcome(&db, &id, Some("blocked"));
-    db.record_worker_idle_abandonment(&id, "decision needed").unwrap();
+    db.record_worker_failure(&id, "decision needed").unwrap();
     assert!(!db.reconcile_active_dispatch(|_| false).unwrap().contains(&task));
     assert_eq!(db.latest_execution_for_work_item(&task).unwrap().unwrap().id, id);
     let next = db
@@ -50,6 +50,11 @@ fn active_reconcile_preserves_park_until_explicit_resume_carries_workspace() {
     assert_ne!(next.id, id);
     assert!(next.preferred_workspace_id.is_some());
     assert!(next.allow_dirty && next.prefer_is_soft);
+    let WorkItem::Chore(retried) = db.get_work_item(&next.work_item_id).unwrap() else {
+        panic!("expected chore");
+    };
+    assert!(retried.blocked_reason.is_none());
+    assert!(retried.blocked_detail.is_none());
 }
 
 #[test]
@@ -71,7 +76,7 @@ fn revision_reconcile_preserves_park_until_explicit_resume_prefers_its_own_works
     )
     .unwrap();
     stamp_outcome(&db, &id, Some("blocked"));
-    db.record_worker_idle_abandonment(&id, "decision needed").unwrap();
+    db.record_worker_failure(&id, "decision needed").unwrap();
     db.connect()
         .unwrap()
         .execute("UPDATE tasks SET autostart = 1 WHERE id = ?1", [&revision])
@@ -93,7 +98,7 @@ fn recovery_does_not_search_past_a_newer_failed_attempt_or_override_explicit_pin
     let db = WorkDb::open(temp_db_path("blocked-latest-only")).unwrap();
     let (_, task, id) = make_waiting_human_chore(&db, "park");
     stamp_outcome(&db, &id, Some("blocked"));
-    db.record_worker_idle_abandonment(&id, "decision needed").unwrap();
+    db.record_worker_failure(&id, "decision needed").unwrap();
     let next = db
         .request_execution(
             RequestExecutionInput::builder()

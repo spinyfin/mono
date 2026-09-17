@@ -2124,10 +2124,9 @@ pub enum StopOutcome {
     EmptyDiffPr { pr_url: String },
     /// The auto-nudge circuit breaker tripped: the worker was nudged
     /// `max_unproductive_nudges` consecutive times with no new commit,
-    /// PR, or state transition. The execution is parked (an attention
-    /// item is filed and an `AttentionItemCreated` event published)
-    /// instead of being nudged again. `reason` is the human-readable
-    /// explanation recorded on the attention item.
+    /// PR, or state transition. The execution fails and releases its resources;
+    /// the task records the failure reason and is excluded from automatic retry.
+    /// The variant name is retained for existing consumers; no park is created.
     NudgeBreakerParked { reason: String },
     /// The nudge breaker rejected an otherwise valid probe because the same
     /// fingerprint was queued too recently. No probe was delivered; a
@@ -2343,10 +2342,8 @@ pub enum StopOutcome {
     /// later Stop boundary that may never arrive. Fired for `blocked` (the
     /// run is over without delivering) or `delivered` with no PR the engine
     /// could resolve — both terminalize without a positive task-status
-    /// change (mirrors [`Self::NudgeBreakerParked`]'s idle-park mechanics:
-    /// `abandoned`, lease/pane released, `autostart` cleared) and file a
-    /// [`RUN_DONE_AUDIT_FLAGGED_ATTENTION_KIND`] or
-    /// [`RUN_DONE_BLOCKED_ATTENTION_KIND`] attention so a human sees why.
+    /// change. Both fail the execution and record an attributable task blocker
+    /// before releasing the lease and pane; neither creates a deliberate park.
     /// `delivered` with a resolvable PR instead reaches [`Self::PrDetected`],
     /// and `no_changes_needed` reaches [`Self::NoChangesNeeded`] — both
     /// existing variants, reused because their semantics already fit.

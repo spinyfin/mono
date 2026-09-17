@@ -224,6 +224,11 @@ pub(crate) fn update_execution_status(
 }
 
 pub(crate) fn task_accepts_execution(task: &Task) -> bool {
+    // A worker failure is not a dependency wait: only an explicit retry may
+    // start another attempt. Ordinary blocked dependency work still reconciles.
+    if task.blocked_reason.as_deref() == Some("worker_failed") {
+        return false;
+    }
     if task.deleted_at.is_some() {
         return false;
     }

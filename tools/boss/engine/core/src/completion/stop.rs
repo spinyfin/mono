@@ -1370,7 +1370,7 @@ impl WorkerCompletionHandler {
                         "stop event: ci_remediation execution has no resolvable bound PR — parking instead of nudging to create one"
                     );
                     return self
-                        .park_for_unproductive_nudges(
+                        .fail_for_unproductive_nudges(
                             &execution,
                             0,
                             None,
@@ -1392,7 +1392,7 @@ asked to open one",
                         "stop event: revision_implementation execution has no resolvable bound PR — parking instead of nudging to create one"
                     );
                     return self
-                        .park_for_unproductive_nudges(
+                        .fail_for_unproductive_nudges(
                             &execution,
                             0,
                             None,

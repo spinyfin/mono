@@ -517,6 +517,10 @@ pub(crate) fn reconcile_work_item_execution(
     // `waiting_dependency` regardless of what the caller asked for.
     // This keeps gated dependents out of `ready` and therefore out
     // of the dispatcher's pickup pool.
+    // Dependency cascades can enter here without task_accepts_execution.
+    if query_task(conn, work_item_id)?.is_some_and(|task| task.blocked_reason.as_deref() == Some("worker_failed")) {
+        return Ok(());
+    }
     let gated = !deps::gating_prereqs_for(conn, work_item_id)?.is_empty();
     let effective_status = if gated && desired_status == ExecutionStatus::Ready {
         ExecutionStatus::WaitingDependency
@@ -1263,6 +1267,16 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         // the next sweep pass re-files the attention.
         resolve_attention_kind_in_tx(conn, &work_item_id, CHURN_GUARD_PARKED_ATTENTION_KIND)?;
         super::dispatch_admission::resolve_deliberate_park_attention(conn, &work_item_id)?;
+
+        // An explicit retry acknowledges the failed attempt. Its run history
+        // retains the explanation, while the new attempt starts without a stale
+        // failure blocker. Automatic reconciliation cannot reach this clear.
+        conn.execute(
+            "UPDATE tasks SET status = 'todo', blocked_reason = NULL, blocked_detail = NULL,
+                 last_status_actor = 'engine', updated_at = ?2
+             WHERE id = ?1 AND status = 'blocked' AND blocked_reason = 'worker_failed'",
+            params![work_item_id, now],
+        )?;
 
         // Explicit dispatch is the human-approval signal for a deferred
         // (future-scope) item: clear the classification so the reconciler

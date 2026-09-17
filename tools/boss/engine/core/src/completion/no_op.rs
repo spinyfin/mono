@@ -405,7 +405,7 @@ impl WorkerCompletionHandler {
     /// File a human-visible attention item recording that a reviewer worker
     /// exhausted its re-prompts without ever producing a readable
     /// `ReviewResult`, so its task stays in Doing pending recovery. Unlike
-    /// [`Self::park_for_unproductive_nudges`], this does NOT change the
+    /// [`Self::fail_for_unproductive_nudges`], this does NOT change the
     /// execution's terminal handling — the caller still finalises the reviewer
     /// pass — it only surfaces the give-up to the human. Best-effort: a filing
     /// failure is logged and swallowed.

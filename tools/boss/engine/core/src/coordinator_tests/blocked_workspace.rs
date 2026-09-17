@@ -29,8 +29,7 @@ fn blocked_pair(path: &std::path::Path) -> (Arc<WorkDb>, WorkExecution, WorkExec
             [&prior.id],
         )
         .unwrap();
-    db.record_worker_idle_abandonment(&prior.id, "needs a decision")
-        .unwrap();
+    db.record_worker_failure(&prior.id, "needs a decision").unwrap();
     let prior = db.get_execution(&prior.id).unwrap();
     let next = db
         .create_execution(

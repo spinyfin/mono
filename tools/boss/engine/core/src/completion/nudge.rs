@@ -21,7 +21,7 @@ impl WorkerCompletionHandler {
     ///
     /// - queues `probe_text`, publishes the awaiting-PR signal, and
     ///   returns `proceed_outcome` (the nudge fired); or
-    /// - parks the execution via [`Self::park_for_unproductive_nudges`]
+    /// - fails the execution via [`Self::fail_for_unproductive_nudges`]
     ///   and returns [`StopOutcome::NudgeBreakerParked`] (the breaker
     ///   tripped — `max_unproductive_nudges` consecutive nudges fired
     ///   with no state change).
@@ -267,7 +267,7 @@ impl WorkerCompletionHandler {
                 StopOutcome::NudgeDebounced
             }
             NudgeDecision::Trip { count } => {
-                self.park_for_unproductive_nudges(execution, count, bound_pr_url, "no new commit, PR, or state change")
+                self.fail_for_unproductive_nudges(execution, count, bound_pr_url, "no new commit, PR, or state change")
                     .await
             }
         };
@@ -551,15 +551,9 @@ impl WorkerCompletionHandler {
         Some(outcome)
     }
 
-    /// Park `execution` because the auto-nudge circuit breaker tripped
-    /// (or because nudging it is structurally wrong, e.g. a
-    /// `ci_remediation` exec with no bound PR). Files a (deduplicated)
-    /// attention item with a human-readable reason and publishes
-    /// `AttentionItemCreated` so the coordinator/UI surfaces it, then
-    /// publishes a distinct live-state reason. The execution stays in
-    /// `waiting_human` — that *is* the parked-for-human state — but the
-    /// engine stops nudging it.
-    pub(super) async fn park_for_unproductive_nudges(
+    /// Fail an unproductive attempt, releasing its slot and recording a visible
+    /// task failure before any terminal event can trigger orphan recovery.
+    pub(super) async fn fail_for_unproductive_nudges(
         &self,
         execution: &crate::work::WorkExecution,
         nudge_count: u32,
@@ -570,31 +564,14 @@ impl WorkerCompletionHandler {
             Some(url) => format!("A PR already exists for this work: {url}."),
             None => "No PR was produced.".to_owned(),
         };
-        // Legibility (2026-07-14 log-volume incident): the parked/yellow
-        // state — active, no live execution, autostart cleared — carries no
-        // surfaced reason of its own; an operator staring at the row has no
-        // way to tell it apart from an ordinary backlog item without opening
-        // this attention item. Stamp the explicit wall-clock time the park
-        // happened so at least "why is this yellow, and since when" is
-        // answerable at a glance.
-        let parked_at =
-            boss_engine_utils::iso8601::format_epoch_iso8601(boss_engine_utils::epoch_time::now_epoch_secs());
-        let reason = if nudge_count > 0 {
-            format!(
-                "Auto-nudge circuit breaker tripped: nudged {nudge_count} times with {detail}. \
-{pr_clause} Parked for human review at {parked_at}. The execution's cube lease and worker slot \
-have been released; `autostart` has been cleared so the automated rescan will not immediately \
-re-dispatch a replacement worker onto this task/chore — status is otherwise left unchanged for \
-re-dispatch or manual review."
-            )
-        } else {
-            format!(
-                "Worker parked without nudging: {detail}. {pr_clause} Parked at {parked_at}. The \
-execution's cube lease and worker slot have been released; `autostart` has been cleared so the \
-automated rescan will not immediately re-dispatch a replacement worker onto this task/chore — \
-status is otherwise left unchanged for re-dispatch or manual review."
-            )
-        };
+        let reason = format!(
+            "Execution `{}` failed: auto-nudge circuit breaker stopped the attempt after \
+             {nudge_count} nudges: {detail}. {pr_clause} No automatic replacement will be started.",
+            execution.id
+        );
+        if !self.finalize_worker_failure(execution, &reason).await {
+            return StopOutcome::DbError;
+        }
 
         // Deduplicate: only one open attention item of this kind per
         // execution, so repeated Stops after the breaker trips don't
@@ -613,7 +590,7 @@ status is otherwise left unchanged for re-dispatch or manual review."
                 .file_execution_attention(
                     execution,
                     NUDGE_BREAKER_ATTENTION_KIND,
-                    "Worker parked: auto-nudge loop bounded",
+                    "Worker failed: auto-nudge loop bounded",
                     reason.clone(),
                 )
                 .await
@@ -621,75 +598,33 @@ status is otherwise left unchanged for re-dispatch or manual review."
             tracing::warn!(
                 execution_id = %execution.id,
                 ?err,
-                "nudge breaker: failed to file attention item; parking without UI surface"
+                "nudge breaker: failed to file attention item; task failure remains visible"
             );
         }
 
-        self.publisher
-            .publish(
-                &execution.id,
-                &execution.work_item_id,
-                execution.status.as_str(),
-                "worker_nudge_breaker_parked",
-            )
-            .await;
-        tracing::warn!(
-            execution_id = %execution.id,
-            work_item_id = %execution.work_item_id,
-            kind = %execution.kind,
-            nudge_count,
-            %reason,
-            "auto-nudge circuit breaker tripped — parked execution, no further nudges"
-        );
-        // Release the slot/lease this execution would otherwise hold
-        // forever — the `exec_18b932df99d17658_475` incident this closes:
-        // a worker concluded there was nothing left to do, the breaker
-        // parked it, and it sat holding its cube lease and worker pane
-        // indefinitely until an operator noticed and reaped it by hand.
-        // The attention item filed above is the durable human-facing
-        // surface; this is what actually frees the resources.
-        self.finalize_idle_park(execution, &reason).await;
         StopOutcome::NudgeBreakerParked { reason }
     }
 
-    /// Finalize an execution the auto-nudge circuit breaker gave up on:
-    /// release its cube lease and worker pane so it stops holding a slot
-    /// forever. Mirrors [`Self::finalize_no_op_completion`]'s teardown
-    /// mechanics, but deliberately does NOT touch the task/chore status —
-    /// there is no positive evidence the work is done here, only that
-    /// further automated nudging is unproductive (see
-    /// [`crate::work::WorkDb::record_worker_idle_abandonment`] for why that
-    /// distinction matters, including why it clears `autostart` to stop an
-    /// automated abandon/re-dispatch churn loop). The attention item
-    /// [`Self::park_for_unproductive_nudges`] already filed is the durable
-    /// surface for a human to review or re-dispatch the work item.
-    ///
-    /// Best-effort and idempotent: a DB write against an already-terminal
-    /// execution is a silent no-op (the row was already finalized by a
-    /// concurrent path), and a lease-release failure is logged, never
-    /// propagated — this must never block the Stop-boundary response. The
-    /// lease/pane release also proceeds even if the task/chore row itself
-    /// was hard-deleted out from under the execution — `record_worker_idle_abandonment`
-    /// returns `work_item: None` in that case rather than erroring the
-    /// whole finalize, so the work-item-changed publish is simply skipped.
-    pub(super) async fn finalize_idle_park(&self, execution: &crate::work::WorkExecution, detail: &str) {
-        // Captured before `record_worker_idle_abandonment` below nulls
+    /// Commit the durable failure before resource teardown and publication.
+    /// A database error must not be reported to the caller as successful completion.
+    pub(super) async fn finalize_worker_failure(&self, execution: &crate::work::WorkExecution, detail: &str) -> bool {
+        // Captured before `record_worker_failure` below nulls
         // `workspace_path` in the same transaction that terminalizes the
-        // execution — this path terminalizes a parked-live execution, so it
+        // execution — this path terminalizes a live execution, so it
         // owns driver teardown.
         let workspace_path = execution.workspace_path.clone();
         // Marked before the terminalizing write — see `super::teardown`.
         let teardown = self.begin_teardown(&execution.id);
-        let completion = match self.work_db.record_worker_idle_abandonment(&execution.id, detail) {
+        let completion = match self.work_db.record_worker_failure(&execution.id, detail) {
             Ok(Some(completion)) => completion,
-            Ok(None) => return,
+            Ok(None) => return true,
             Err(err) => {
                 tracing::error!(
                     execution_id = %execution.id,
                     ?err,
-                    "idle-park finalize: failed to record",
+                    "worker failure finalize: failed to record",
                 );
-                return;
+                return false;
             }
         };
         self.staged_pr_urls.forget(&execution.id);
@@ -702,7 +637,7 @@ status is otherwise left unchanged for re-dispatch or manual review."
             &completion.execution.work_item_id,
             completion.released_lease_id.as_deref(),
             workspace_path.as_deref().map(std::path::Path::new),
-            "idle_park",
+            "worker_failure",
             teardown,
         )
         .await;
@@ -712,29 +647,30 @@ status is otherwise left unchanged for re-dispatch or manual review."
                 &completion.execution.id,
                 &work_item_id,
                 completion.execution.status.as_str(),
-                "worker_idle_park_finalized",
+                "worker_failure_finalized",
             )
             .await;
         match completion.work_item.as_ref() {
             Some(work_item) => {
                 let product_id = work_item.product_id().to_string();
                 self.publisher
-                    .publish_work_item_changed(&product_id, &work_item_id, "worker_idle_park_finalized")
+                    .publish_work_item_changed(&product_id, &work_item_id, "worker_failure_finalized")
                     .await;
             }
             None => {
                 tracing::warn!(
                     execution_id = %execution.id,
                     work_item_id = %work_item_id,
-                    "idle-park finalize: task/chore row missing, skipping work-item-changed publish",
+                    "worker failure finalize: task/chore row missing, skipping work-item-changed publish",
                 );
             }
         }
         tracing::warn!(
             execution_id = %execution.id,
             work_item_id = %work_item_id,
-            "idle-park finalize: cube lease and worker slot released; execution abandoned; \
-             autostart cleared so the automated rescan won't immediately re-dispatch it",
+            "worker failure finalize: cube lease and worker slot released; execution failed; \
+             task failure committed before terminal publication",
         );
+        true
     }
 }
