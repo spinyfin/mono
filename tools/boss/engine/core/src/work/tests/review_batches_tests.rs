@@ -2030,6 +2030,13 @@ fn create_pre_merge_review_batch_defers_when_the_pool_is_at_capacity() {
     }
 
     let deferred_cycle_root = create_test_chore_manual(&db, product.id, "another review target");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'active', pr_url = 'https://github.com/example/repo/pull/42' WHERE id = ?1",
+            [&deferred_cycle_root.id],
+        )
+        .unwrap();
     match db
         .create_pre_merge_review_batch(
             batch_input(
@@ -2050,6 +2057,32 @@ fn create_pre_merge_review_batch_defers_when_the_pool_is_at_capacity() {
             .is_none(),
         "a deferred admission must not create a batch row"
     );
+    let WorkItem::Chore(task) = db.get_work_item(&deferred_cycle_root.id).unwrap() else {
+        panic!("expected chore");
+    };
+    assert_eq!(task.review_required_state.as_deref(), Some("awaiting_admission"));
+    assert!(db.list_attention_items_for_work_item(&task.id).unwrap().is_empty());
+    assert!(
+        db.list_tasks_awaiting_pre_merge_review_admission()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.task_id == task.id)
+    );
+    db.connect()
+        .unwrap()
+        .execute("UPDATE pr_review_batches SET status = 'completed'", [])
+        .unwrap();
+    let admitted = db
+        .create_pre_merge_review_batch(
+            batch_input(task.id.clone(), "new-head-sha", ReviewBatchPhase::PreMerge),
+            "https://github.com/example/repo",
+        )
+        .unwrap();
+    assert!(matches!(admitted, ReviewBatchDispatch::Created { .. }));
+    let WorkItem::Chore(task) = db.get_work_item(&task.id).unwrap() else {
+        panic!("expected chore")
+    };
+    assert_eq!(task.review_required_state.as_deref(), Some("automated_review"));
 }
 
 /// Admission capacity tracks the configured review-pool size, not the

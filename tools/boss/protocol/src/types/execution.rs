@@ -807,8 +807,8 @@ pub struct WorkExecution {
     #[serde(default)]
     pub pr_head_before: Option<String>,
 
-    /// SHA of the PR head observed immediately before this execution's
-    /// successful PR-completion terminalization. Unlike [`Self::pr_head_before`],
+    /// SHA of the PR head observed at successful PR completion. Declared
+    /// completion captures it asynchronously after local teardown. Unlike [`Self::pr_head_before`],
     /// this is a teardown-time forensic snapshot rather than a run-start
     /// contribution baseline. `None` when the fresh REST read failed or was
     /// unparseable, on executions that did not complete through a producing
@@ -817,6 +817,15 @@ pub struct WorkExecution {
     /// mid-turn), or on rows that predate this column.
     #[serde(default)]
     pub pr_head_after: Option<String>,
+
+    /// Head snapshot provenance: `pending` when declared completion schedules
+    /// its network audit, `recorded` after a successful read,
+    /// or `unavailable` when the read could not be made. None means no capture
+    /// was scheduled (including legacy rows and reviewer completions).
+    /// `pending` is not a durable in-flight guarantee: the audit is in memory,
+    /// so an engine restart can leave it pending indefinitely without retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_head_after_capture: Option<String>,
 
     /// The PR URL captured at the end of this execution's run, if any.
     /// Set when the worker successfully opens a PR and the engine

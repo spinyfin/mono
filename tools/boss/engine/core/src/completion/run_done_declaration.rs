@@ -188,22 +188,21 @@ impl WorkerCompletionHandler {
         } else {
             WorkerPrCompletionTarget::InReview
         };
-        let completion =
-            match self
-                .work_db
-                .record_worker_pr_completion(&execution.id, &pr_url, None, None, target, None)
-            {
-                Ok(Some(completion)) => completion,
-                Ok(None) => return StopOutcome::AlreadyTerminal,
-                Err(err) => {
-                    tracing::error!(
-                        execution_id = %execution.id,
-                        ?err,
-                        "run_done finalize (delivered): failed to record PR completion",
-                    );
-                    return StopOutcome::DbError;
-                }
-            };
+        let completion = match self
+            .work_db
+            .record_declared_worker_pr_completion(&execution.id, &pr_url, target)
+        {
+            Ok(Some(completion)) => completion,
+            Ok(None) => return StopOutcome::AlreadyTerminal,
+            Err(err) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "run_done finalize (delivered): failed to record PR completion",
+                );
+                return StopOutcome::DbError;
+            }
+        };
         self.reconcile_review_guide_source_for_execution(
             &execution.id,
             &pr_url,
@@ -344,16 +343,14 @@ impl WorkerCompletionHandler {
     /// released, by the time this task ever polls anything), so a slow or
     /// failing GitHub call can delay a flagged attention item, never a slot
     /// release. Best-effort and fire-and-forget: this handler doesn't even
-    /// observe whether the spawned task finished.
+    /// observe whether the spawned task finished. An engine restart loses this
+    /// task and can leave `pr_head_after_capture` at `pending` indefinitely;
+    /// that value records scheduling, not durable in-flight work.
     ///
-    /// No-ops when this execution has no `pr_head_before` dispatch-time
-    /// snapshot to compare against — there is nothing to audit against, and
-    /// silently accepting the declaration is correct (refusing would only
-    /// punish executions that predate reliable snapshotting).
+    /// Captures the head even for first-PR runs without a dispatch baseline.
+    /// Only the unchanged-head comparison requires `pr_head_before`.
     fn spawn_declared_delivery_audit(&self, execution: &crate::work::WorkExecution, work_item_id: &str, pr_url: &str) {
-        let Some(pr_head_before) = execution.pr_head_before.clone().filter(|s| !s.is_empty()) else {
-            return;
-        };
+        let pr_head_before = execution.pr_head_before.clone().unwrap_or_default();
         let branch_verifier = self.branch_verifier.clone();
         let work_db = self.work_db.clone();
         let publisher = self.publisher.clone();
@@ -459,6 +456,9 @@ pub(super) async fn audit_declared_delivery(
                 ?err,
                 "run_done audit: cannot parse repo slug; skipping audit"
             );
+            if let Err(error) = work_db.record_completion_head(execution_id, None) {
+                tracing::error!(execution_id, ?error, "failed to persist unavailable completion head");
+            }
             return;
         }
     };
@@ -468,9 +468,12 @@ pub(super) async fn audit_declared_delivery(
             pr_url,
             "run_done audit: cannot parse PR number; skipping audit"
         );
+        if let Err(error) = work_db.record_completion_head(execution_id, None) {
+            tracing::error!(execution_id, ?error, "failed to persist unavailable completion head");
+        }
         return;
     };
-    let head_now = match branch_verifier.fetch_pr_head_oid(&repo_slug, pr_number).await {
+    let head_now = match branch_verifier.fetch_pr_head_oid_fresh(&repo_slug, pr_number).await {
         Ok(oid) => oid,
         Err(err) => {
             tracing::debug!(
@@ -478,10 +481,16 @@ pub(super) async fn audit_declared_delivery(
                 ?err,
                 "run_done audit: head fetch failed; skipping audit for this declaration",
             );
+            if let Err(error) = work_db.record_completion_head(execution_id, None) {
+                tracing::error!(execution_id, ?error, "failed to persist unavailable completion head");
+            }
             return;
         }
     };
-    if head_now != pr_head_before {
+    if let Err(error) = work_db.record_completion_head(execution_id, Some(&head_now)) {
+        tracing::error!(execution_id, ?error, "failed to persist completion head");
+    }
+    if pr_head_before.is_empty() || head_now != pr_head_before {
         return;
     }
     tracing::warn!(

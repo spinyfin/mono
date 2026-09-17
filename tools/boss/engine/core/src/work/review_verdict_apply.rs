@@ -697,7 +697,10 @@ fn advance_cycle_root_to_in_review_in_tx(
              updated_at        = ?2,
              last_status_actor = 'engine',
              blocked_reason    = NULL,
-             blocked_attempt_id = NULL
+             blocked_attempt_id = NULL,
+             review_required_state = CASE
+                 WHEN review_required_state IN ('awaiting_admission', 'automated_review') THEN NULL
+                 ELSE review_required_state END
          WHERE id = ?1
            AND deleted_at IS NULL
            AND status NOT IN ('done', 'archived', 'in_review')

@@ -89,10 +89,11 @@
 //!    resolves on its own — only an explicit `bossctl work start` / kanban
 //!    drag-to-Doing clears it, the same gesture that already resolves the
 //!    park's own attention item.
-//! 7. Checks dispatch pause and worker capacity, then calls [`WorkDb::request_execution_with_live_check`] (the same
-//!    path `bossctl work start` uses) to mark the stale execution
-//!    `abandoned` and insert a fresh `ready` execution, then kicks
-//!    the coordinator's scheduler.
+//! 7. Checks dispatch pause and worker capacity, then calls
+//!    [`WorkDb::request_orphan_recovery`] to recheck completed-execution
+//!    evidence transactionally before marking the stale execution `abandoned`
+//!    and inserting a fresh `ready` execution, then kicks the scheduler.
+//!    Explicit dispatch requests use [`WorkDb::request_execution`] separately.
 //! 8. Emits an [`Stage::OrphanActiveRedispatch`] dispatch event so
 //!    the redispatch is visible in `bossctl dispatch tail`.
 
@@ -419,8 +420,8 @@ async fn run_one_pass_filtered(
     for work_item_id in candidates {
         // ── Admission gate 1: a deliberate engine park ────────────────
         //
-        // This sweep redispatches any `active` row whose latest execution
-        // is terminal, and it must not: `abandoned` is a terminal status,
+        // Only unsuccessful terminal executions can reach this point.
+        // They still need a deliberate-park guard: `abandoned` is a terminal status,
         // and the engine writes it for *decisions* as well as for deaths.
         // `completion::run_done_declaration::finalize_declared_blocked`
         // (the worker declared `boss propose done --outcome blocked`) and
@@ -927,13 +928,30 @@ async fn run_one_pass_filtered(
         // died without updating the DB — `request_execution_with_live_check`
         // will mark it `abandoned` and create a new `ready` row.
         let is_live = |exec_id: &str| claimed.contains(exec_id);
-        let new_execution = match work_db.request_execution_with_live_check(
+        let new_execution = match work_db.request_orphan_recovery(
             RequestExecutionInput::builder()
                 .work_item_id(work_item_id.clone())
                 .build(),
             is_live,
         ) {
-            Ok(exec) => exec,
+            Ok(Some(exec)) => exec,
+            Ok(None) => {
+                tracing::info!(
+                    work_item_id = %work_item_id,
+                    "orphan sweep: skipping redispatch — newest execution completed since listing",
+                );
+                dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::DispatchDecision, Outcome::Skipped, &work_item_id)
+                            .with_work_item(&work_item_id)
+                            .with_details(serde_json::json!({
+                                "loop": "orphan_active_sweep",
+                                "skipped_reason": "completed_since_listed",
+                            })),
+                    )
+                    .await;
+                continue;
+            }
             Err(err) => {
                 tracing::warn!(
                     work_item_id = %work_item_id,

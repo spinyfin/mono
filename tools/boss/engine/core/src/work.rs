@@ -615,6 +615,7 @@ mod boothby;
 mod chain_helpers;
 mod comment_thread_entries;
 mod comments;
+mod completion_evidence;
 mod conflict_res;
 mod coordinator_tmux;
 mod cost_report_db;
