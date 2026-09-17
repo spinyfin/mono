@@ -16,7 +16,7 @@ const PACKET_ARTIFACT_DIR: &str = "review-guide-sources";
 const MAX_CAPTURE_ATTEMPTS: i64 = 3;
 #[path = "review_guide_source_retention.rs"]
 mod retention;
-use retention::{SourceRetentionPolicy, packet_store_lock};
+use retention::{SourceRetentionPolicy, packet_store_lock, packet_store_lock_for_gc};
 
 /// The lifecycle seam that requested a source capture. Kept with the durable
 /// comparison row so diagnostics can tell an initial create observation from a
@@ -339,6 +339,12 @@ impl WorkDb {
                     tx.commit()?;
                     drop(conn);
                     drop(_publication);
+                    // Best-effort immediate cleanup, not the source of truth: the DB row
+                    // above already points at the new packet, so `old_path` is genuinely
+                    // unreferenced from here regardless of what happens next. If the
+                    // exclusive lock is busy, skipping is correct (unlike the GC sweep's
+                    // former bug) because the periodic GC pass (packet_store_lock_for_gc)
+                    // will independently find and collect this same unreferenced blob.
                     if let Some(old_path) = superseded_path
                         && old_path != packet_path
                         && let Some(_gc) = packet_store_lock(&artifact_root, true)?
@@ -658,13 +664,17 @@ impl WorkDb {
     /// publish and commit. Collects the live path set under `connect()`,
     /// then walks the store after dropping that guard so the process-wide
     /// connection mutex is not held for a directory walk.
+    ///
+    /// Returns `Err` if the exclusive store lock stays contended past the
+    /// retry budget (see `packet_store_lock_for_gc`): callers must treat that
+    /// as "this pass did not run", never as a completed no-op collection.
     pub fn gc_unreferenced_pr_review_guide_source_artifacts(&self) -> Result<()> {
         let artifact_root = self.artifact_root()?;
         // connect() is process-local. The store lock also excludes publishers
-        // in other processes; skip this pass if a publisher is active.
-        let Some(_gc) = packet_store_lock(&artifact_root, true)? else {
-            return Ok(());
-        };
+        // in other processes; retry briefly on contention and surface an
+        // error rather than silently skipping the pass (see
+        // packet_store_lock_for_gc for why this must not be a silent no-op).
+        let _gc = packet_store_lock_for_gc(&artifact_root)?;
         self.prune_pr_review_guide_sources(SourceRetentionPolicy::default())?;
         delete_orphan_tmp_packet_artifacts(&artifact_root)?;
         let live = {
