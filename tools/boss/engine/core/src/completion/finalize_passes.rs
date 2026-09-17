@@ -12,12 +12,17 @@ enum AssistantTurnRead {
     NoAssistantText { event_count: usize },
 }
 
-/// Published Markdown is the last assistant turn; `raw_output` keeps the
+/// Published Markdown is the last assistant turn containing a guide heading; `raw_output` keeps the
 /// full joined transcript so a preamble or post-guard narration is retained
 /// for diagnostics without becoming the readable guide.
 fn review_guide_publish_texts(turns: &[String]) -> Option<(String, String)> {
-    let last = turns.last()?.clone();
-    Some((last, turns.join("\n")))
+    turns.first()?;
+    let raw = turns.join("\n");
+    let guide = turns
+        .iter()
+        .rev()
+        .find(|turn| turn.lines().any(|line| line.starts_with("# ")));
+    Some((guide.cloned().unwrap_or_else(|| raw.clone()), raw))
 }
 
 /// Result of [`WorkerCompletionHandler::check_pure_rebase_skip`].
@@ -2438,6 +2443,20 @@ mod review_guide_publish_texts_tests {
         .unwrap();
         assert_eq!(markdown, "# Guide\n\n## Problem\n");
         assert_eq!(raw, "preamble about the model\n# Guide\n\n## Problem\n");
+    }
+
+    #[test]
+    fn trailing_narration_does_not_discard_the_guide() {
+        let turns = vec![
+            "preamble".to_owned(),
+            "# Guide\n## Problem".to_owned(),
+            "I could not verify X".to_owned(),
+        ];
+        let (markdown, raw) = review_guide_publish_texts(&turns).unwrap();
+        assert_eq!(markdown, turns[1]);
+        assert_eq!(raw, turns.join("\n"));
+        let narration = vec!["first".to_owned(), "last".to_owned()];
+        assert_eq!(review_guide_publish_texts(&narration).unwrap().0, "first\nlast");
     }
 
     #[test]

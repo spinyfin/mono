@@ -1,6 +1,5 @@
-//! Prompt composition for `answer_agent` executions. Split out of
-//! `runner::prompt` (which sits at the repo's file-size limit) to keep the
-//! module boundary reviewable. See `comment-triggered-document-revisions.md`.
+//! Prompt composition for `answer_agent` executions from document content and
+//! comment-thread context. See `comment-triggered-document-revisions.md`.
 
 use crate::work::{WorkDb, WorkExecution, parse_pr_doc_artifact_id};
 

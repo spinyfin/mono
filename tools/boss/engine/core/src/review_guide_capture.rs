@@ -376,10 +376,8 @@ pub(crate) fn reconcile_review_guide_source_with_collector(
 /// attempt plus its execution row. Gated independently by
 /// [`REVIEW_GUIDE_GENERATION_FLAG`]. Best-effort: any failure here is logged
 /// and dropped rather than propagated, matching every other outcome in this
-/// reconciler — a missed enqueue is recoverable (the next observation, an
-/// explicit retry, or [`WorkDb::reconcile_pr_review_guide_attempts`], tries
-/// again), while losing the packet that was just durably captured would not
-/// be.
+/// reconciler. An explicit retry can recover a missed enqueue;
+/// reconcile recovers only attempts that were durably created.
 ///
 /// Admission is series-scoped: at most one non-terminal attempt is allowed
 /// per series. A duplicate observation of the same comparison is a no-op;
@@ -393,37 +391,11 @@ fn enqueue_review_guide_generation(
     if !feature_flags.is_enabled(REVIEW_GUIDE_GENERATION_FLAG) {
         return;
     }
-    match work_db.live_pr_review_guide_attempts_for_series(&capture.series_id) {
-        Ok(live)
-            if live
-                .iter()
-                .any(|attempt| attempt.comparison_id == capture.comparison_id) =>
-        {
-            tracing::debug!(
-                comparison_id = %capture.comparison_id,
-                "review-guide generation: a job for this exact comparison is already in flight; not enqueuing another",
-            );
-            return;
-        }
-        Ok(live) if !live.is_empty() => {
-            if let Err(error) = work_db
-                .cancel_live_pr_review_guide_attempts_for_series(&capture.series_id, "superseded by a newer comparison")
-            {
-                tracing::warn!(
-                    series_id = %capture.series_id,
-                    ?error,
-                    "review-guide generation: could not cancel the obsolete attempt; skipping enqueue",
-                );
-                return;
-            }
-        }
-        Ok(_) => {}
+    match work_db.repo_remote_url_for_root(&capture.root_task_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return,
         Err(error) => {
-            tracing::warn!(
-                series_id = %capture.series_id,
-                ?error,
-                "review-guide generation: could not check for a live attempt; skipping enqueue",
-            );
+            tracing::warn!(?error, "review-guide generation: could not resolve repository");
             return;
         }
     }

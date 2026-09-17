@@ -292,3 +292,36 @@ fn enqueue_is_series_scoped_and_cancels_an_obsolete_attempt() {
     let exec = db.get_execution(&first_exec).unwrap();
     assert_eq!(exec.status, ExecutionStatus::Cancelled);
 }
+
+#[test]
+fn enqueue_without_repository_does_not_create_an_attempt() {
+    let (_dir, db) = open_db();
+    let product = create_product(&db);
+    let root = create_active_chore(&db, &product, "repository missing");
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET repo_remote_url = NULL WHERE id = ?1", [&root])
+        .unwrap();
+    let packet = crate::test_support::source_capture_packet("https://github.com/acme/widget/pull/9", "base", "head");
+    let PrSourceCapturePersistOutcome::Stored(capture) = db
+        .persist_pr_review_guide_source_capture(&root, 1, PrSourceCaptureTrigger::Creation, &packet)
+        .unwrap()
+    else {
+        panic!("capture must persist")
+    };
+    let flags_dir = tempfile::tempdir().unwrap();
+    let flags = FeatureFlagsStore::new(flags_dir.path().join("flags.toml"));
+    flags.load().unwrap();
+    flags.set(REVIEW_GUIDE_GENERATION_FLAG, true).unwrap();
+    enqueue_review_guide_generation(&db, &flags, &capture);
+    let count: i64 = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM pr_review_guide_attempts WHERE series_id = ?1",
+            [&capture.series_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+}

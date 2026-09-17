@@ -15,7 +15,7 @@ use std::fmt;
 use boss_pr_review_sources::{SourcePacket, SourceSide, validate_pinned_reference};
 
 /// The prompt contract version this crate implements. A change to
-/// [`PROMPT_TEMPLATE_V1`] (or its substitution behavior) must land as a new
+/// [`PROMPT_TEMPLATE`] (or its substitution behavior) must land as a new
 /// version constant and prompt id — the desired-comparison key an attempt
 /// binds to includes the prompt version, so a prompt change never silently
 /// reinterprets an already-captured comparison's existing readable version.
@@ -27,10 +27,10 @@ pub const PROMPT_VERSION: &str = "review-guide-v2";
 /// packet/broker context is supplied separately (see [`render_source_context`]).
 ///
 /// Do not hand-edit this string without also updating
-/// [`PROMPT_TEMPLATE_V1_SHA256`] and bumping [`PROMPT_VERSION`] — the
-/// `prompt_template_v1_hash_is_pinned` test fails loudly on any byte drift so
+/// [`PROMPT_TEMPLATE_SHA256`] and bumping [`PROMPT_VERSION`] — the
+/// `prompt_template_hash_is_pinned` test fails loudly on any byte drift so
 /// a prompt change is always a visible, deliberate, versioned decision.
-pub const PROMPT_TEMPLATE_V1: &str = "I want you to provide me a guided summary of the changes in {{PR_URL}}. The summary should break down as:
+pub const PROMPT_TEMPLATE: &str = "I want you to provide me a guided summary of the changes in {{PR_URL}}. The summary should break down as:
 
 1. a general overview of the problem being solved.
 2. a general overview of the core fix / implementation.
@@ -60,13 +60,13 @@ Use the complete revised PR comparison if this is a regenerated guide. Do not de
 
 Return only the finished Markdown guide, with a descriptive title and the four requested main sections. Put the worked example within the implementation walkthrough. Keep the guide as concise as the explanation permits while preserving useful reasoning and evidence. Do not include a chat preamble, model details, internal tool logs, a merge recommendation, or an unsupported declaration that the PR is safe to merge. If essential context cannot be obtained, state the specific limitation rather than inventing behavior.";
 
-/// SHA-256 of [`PROMPT_TEMPLATE_V1`] (UTF-8, excluding any fence/terminal
+/// SHA-256 of [`PROMPT_TEMPLATE`] (UTF-8, excluding any fence/terminal
 /// newline) — matches the value recorded in the design doc, computed
 /// independently from the doc's own fenced block as a second source of
-/// truth. See `prompt_template_v1_hash_is_pinned`.
-pub const PROMPT_TEMPLATE_V1_SHA256: &str = "aeef2e1a0754d96a3680541daa1cddb62bb1f7bc56f45b13a316156a53527d80";
+/// truth. See `prompt_template_hash_is_pinned`.
+pub const PROMPT_TEMPLATE_SHA256: &str = "aeef2e1a0754d96a3680541daa1cddb62bb1f7bc56f45b13a316156a53527d80";
 
-/// The metadata substituted into [`PROMPT_TEMPLATE_V1`] for one comparison.
+/// The metadata substituted into [`PROMPT_TEMPLATE`] for one comparison.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptMetadata<'a> {
     pub pr_url: &'a str,
@@ -76,12 +76,12 @@ pub struct PromptMetadata<'a> {
     pub head_sha: &'a str,
 }
 
-/// Substitute only the five metadata placeholders into [`PROMPT_TEMPLATE_V1`].
+/// Substitute only the five metadata placeholders into [`PROMPT_TEMPLATE`].
 /// Packet/broker context is not part of this string — callers append
 /// [`render_source_context`] separately, keeping "the guide task" and "the
 /// source material" visibly distinct in the rendered prompt.
 pub fn render_prompt(metadata: &PromptMetadata<'_>) -> String {
-    PROMPT_TEMPLATE_V1
+    PROMPT_TEMPLATE
         .replace("{{PR_URL}}", metadata.pr_url)
         .replace("{{REPOSITORY}}", metadata.repository)
         .replace("{{PR_TITLE}}", metadata.pr_title)
@@ -447,14 +447,14 @@ mod tests {
     }
 
     #[test]
-    fn prompt_template_v1_hash_is_pinned() {
-        let digest: String = Sha256::digest(PROMPT_TEMPLATE_V1.as_bytes())
+    fn prompt_template_hash_is_pinned() {
+        let digest: String = Sha256::digest(PROMPT_TEMPLATE.as_bytes())
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(
-            digest, PROMPT_TEMPLATE_V1_SHA256,
-            "PROMPT_TEMPLATE_V1 changed without updating PROMPT_TEMPLATE_V1_SHA256 / PROMPT_VERSION",
+            digest, PROMPT_TEMPLATE_SHA256,
+            "PROMPT_TEMPLATE changed without updating PROMPT_TEMPLATE_SHA256 / PROMPT_VERSION",
         );
     }
 
