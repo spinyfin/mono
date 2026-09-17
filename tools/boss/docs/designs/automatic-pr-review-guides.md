@@ -117,7 +117,7 @@ Enforce this at tool dispatch and filesystem/process capability boundaries, incl
 
 ### Source acquisition at pinned revisions
 
-The packet identifies both the observed base tip and the merge base. GitHub PR diffs normally describe the merge-base-to-head change; comparing the current base tree directly to the head can add unrelated base-branch changes. Compute the merge base from immutable commit identities and record the comparison mode. The worked example's “before” files come from the merge base, and “after” files from the head; relevant current-base context is separately labeled. Supply `BASE_SHA` as the observed base tip and name the actual diff-base SHA in the accompanying packet.
+The packet identifies both the observed base tip and the merge base. GitHub PR diffs normally describe the merge-base-to-head change; comparing the current base tree directly to the head can add unrelated base-branch changes. Compute the merge base from immutable commit identities and record the comparison mode. The worked example's “before” files come from the merge base, and “after” files from the head; relevant current-base context is separately labeled. Supply `BASE_SHA` as the merge-base SHA (the before-side of the comparison) and name the observed base tip separately in the accompanying packet.
 
 Reuse `boss_github::pr_url`, `pr_files`, `contents`, `trees`, and shared `gh` telemetry. Extend these for paginated comparison metadata and immutable tree/blob reads. Verify changed-file coverage against the pinned trees; a missing `files` key is an error here, even though the existing paths-only helper returns an empty list. Account for renames, deletions, added files, modes, binaries, submodules, generated files, and inaccessible blobs. Never treat an omitted API patch as an empty diff. GitHub's API caps must be detected; fall back to complete pinned object/tree acquisition through the existing repository tooling and compute the comparison from those objects, or report collection incomplete. The existing [post-merge reviewer](../../engine/pr-review/src/post_merge_render.rs) already uses explicit-revision `jj file show`; reuse that immutable-object reading pattern in the engine-owned collector, with explicit from/to SHAs for diffs. Do not silently reduce the comparison to the files that fit.
 
@@ -206,7 +206,7 @@ If the PR merges/closes before feedback submission or dispatch, keep the comment
 
 ### Prompt contract
 
-Use the following exact template as `review-guide-v1`, stored in the implementation crate with a content hash. Substitute only the metadata placeholders; supply packet/broker context separately. The evaluated baseline is exactly the initial four-section request through “Check every step against the actual code.” The remainder is the brief's unevaluated production addition, which the rollout validates. Revision-agent instructions above are a separate template.
+Use the following exact template as `review-guide-v2`, stored in the implementation crate with a content hash. Substitute only the metadata placeholders; supply packet/broker context separately. The evaluated baseline is exactly the initial four-section request through “Check every step against the actual code.” The remainder is the brief's unevaluated production addition, which the rollout validates. Revision-agent instructions above are a separate template.
 
 ```text
 I want you to provide me a guided summary of the changes in {{PR_URL}}. The summary should break down as:
@@ -223,7 +223,7 @@ Make the core fix concrete with one worked example. Give the input and relevant 
 Review context:
 - Repository: {{REPOSITORY}}
 - PR title: {{PR_TITLE}}
-- Base revision: {{BASE_SHA}}
+- Merge-base revision: {{BASE_SHA}}
 - Head revision: {{HEAD_SHA}}
 - The accompanying source context and available read tools provide the PR description, diff, before/after files, related source and tests, and validated GitHub link targets.
 
@@ -240,7 +240,7 @@ Use the complete revised PR comparison if this is a regenerated guide. Do not de
 Return only the finished Markdown guide, with a descriptive title and the four requested main sections. Put the worked example within the implementation walkthrough. Keep the guide as concise as the explanation permits while preserving useful reasoning and evidence. Do not include a chat preamble, model details, internal tool logs, a merge recommendation, or an unsupported declaration that the PR is safe to merge. If essential context cannot be obtained, state the specific limitation rather than inventing behavior.
 ```
 
-Template SHA-256 (UTF-8, excluding the fence and terminal newline): `77d3ff117a07898771b4802b7d1f0c195b4fb4112cf1f58d6fb57fdb6639c543`.
+Template SHA-256 (UTF-8, excluding the fence and terminal newline): `aeef2e1a0754d96a3680541daa1cddb62bb1f7bc56f45b13a316156a53527d80`.
 
 ### Diagnostics
 

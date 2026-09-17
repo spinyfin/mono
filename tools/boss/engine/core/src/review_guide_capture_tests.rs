@@ -226,3 +226,69 @@ async fn execution_reconciler_persists_a_revision_capture_on_its_canonical_root(
     assert_eq!(capture.trigger, "completion");
     assert_eq!(capture.packet.head_sha, "head");
 }
+
+#[test]
+fn enqueue_is_series_scoped_and_cancels_an_obsolete_attempt() {
+    let (_dir, db) = open_db();
+    let product = create_product(&db);
+    let root = create_active_chore(&db, &product, "enqueue series");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET repo_remote_url = ?1 WHERE id = ?2",
+            ["https://github.com/acme/widget.git", root.as_str()],
+        )
+        .unwrap();
+    let packet = crate::test_support::source_capture_packet("https://github.com/acme/widget/pull/9", "base", "head");
+    let stored = db
+        .persist_pr_review_guide_source_capture(&root, 1, PrSourceCaptureTrigger::Creation, &packet)
+        .unwrap();
+    let PrSourceCapturePersistOutcome::Stored(capture) = stored else {
+        panic!("capture must persist")
+    };
+    let flags_dir = tempfile::tempdir().unwrap();
+    let flags = FeatureFlagsStore::new(flags_dir.path().join("flags.toml"));
+    flags.load().unwrap();
+    flags.set(REVIEW_GUIDE_GENERATION_FLAG, true).unwrap();
+
+    enqueue_review_guide_generation(&db, &flags, &capture);
+    let live = db.live_pr_review_guide_attempts_for_series(&capture.series_id).unwrap();
+    assert_eq!(live.len(), 1);
+    let first_id = live[0].id.clone();
+    let first_exec = live[0].execution_id.clone().expect("enqueue must bind an execution");
+
+    enqueue_review_guide_generation(&db, &flags, &capture);
+    let live = db.live_pr_review_guide_attempts_for_series(&capture.series_id).unwrap();
+    assert_eq!(
+        live.len(),
+        1,
+        "duplicate observation of the same comparison must not start a second job"
+    );
+    assert_eq!(live[0].id, first_id);
+
+    let packet2 = crate::test_support::source_capture_packet("https://github.com/acme/widget/pull/9", "base", "head2");
+    let stored2 = db
+        .persist_pr_review_guide_source_capture(&root, 2, PrSourceCaptureTrigger::Poller, &packet2)
+        .unwrap();
+    let PrSourceCapturePersistOutcome::Stored(capture2) = stored2 else {
+        panic!("second capture must persist")
+    };
+    enqueue_review_guide_generation(&db, &flags, &capture2);
+    let live = db.live_pr_review_guide_attempts_for_series(&capture.series_id).unwrap();
+    assert_eq!(live.len(), 1);
+    assert_ne!(live[0].id, first_id);
+    assert_eq!(live[0].comparison_id, capture2.comparison_id);
+
+    let old_status: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status FROM pr_review_guide_attempts WHERE id = ?1",
+            [&first_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_status, "superseded");
+    let exec = db.get_execution(&first_exec).unwrap();
+    assert_eq!(exec.status, ExecutionStatus::Cancelled);
+}

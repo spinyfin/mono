@@ -19,7 +19,7 @@ use boss_pr_review_sources::{SourcePacket, SourceSide, validate_pinned_reference
 /// version constant and prompt id — the desired-comparison key an attempt
 /// binds to includes the prompt version, so a prompt change never silently
 /// reinterprets an already-captured comparison's existing readable version.
-pub const PROMPT_VERSION: &str = "review-guide-v1";
+pub const PROMPT_VERSION: &str = "review-guide-v2";
 
 /// The exact production prompt template, byte-identical to the fenced block
 /// in `automatic-pr-review-guides.md`'s "Prompt contract" section. Only the
@@ -44,7 +44,7 @@ Make the core fix concrete with one worked example. Give the input and relevant 
 Review context:
 - Repository: {{REPOSITORY}}
 - PR title: {{PR_TITLE}}
-- Base revision: {{BASE_SHA}}
+- Merge-base revision: {{BASE_SHA}}
 - Head revision: {{HEAD_SHA}}
 - The accompanying source context and available read tools provide the PR description, diff, before/after files, related source and tests, and validated GitHub link targets.
 
@@ -64,7 +64,7 @@ Return only the finished Markdown guide, with a descriptive title and the four r
 /// newline) — matches the value recorded in the design doc, computed
 /// independently from the doc's own fenced block as a second source of
 /// truth. See `prompt_template_v1_hash_is_pinned`.
-pub const PROMPT_TEMPLATE_V1_SHA256: &str = "77d3ff117a07898771b4802b7d1f0c195b4fb4112cf1f58d6fb57fdb6639c543";
+pub const PROMPT_TEMPLATE_V1_SHA256: &str = "aeef2e1a0754d96a3680541daa1cddb62bb1f7bc56f45b13a316156a53527d80";
 
 /// The metadata substituted into [`PROMPT_TEMPLATE_V1`] for one comparison.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -469,7 +469,7 @@ mod tests {
         });
         assert!(rendered.contains("https://github.com/acme/widget/pull/4"));
         assert!(rendered.contains("Repository: acme/widget"));
-        assert!(rendered.contains(&format!("Base revision: {}", "a".repeat(40))));
+        assert!(rendered.contains(&format!("Merge-base revision: {}", "a".repeat(40))));
         assert!(rendered.contains(&format!("Head revision: {}", "c".repeat(40))));
         assert!(!rendered.contains("{{"));
         assert!(rendered.starts_with("I want you to provide me a guided summary"));

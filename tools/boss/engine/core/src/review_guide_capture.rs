@@ -372,14 +372,19 @@ pub(crate) fn reconcile_review_guide_source_with_collector(
     }))
 }
 
-/// Enqueue one durable `pr_review_guide` generation attempt for a freshly
-/// stored/upgraded comparison — the connection point between task 1's
-/// immutable source capture and this task's execution machinery. Gated
-/// independently by [`REVIEW_GUIDE_GENERATION_FLAG`]. Best-effort: any
-/// failure here is logged and dropped rather than propagated, matching every
-/// other outcome in this reconciler — a missed enqueue is recoverable (the
-/// next observation, or an explicit retry, tries again), while losing the
-/// packet that was just durably captured would not be.
+/// Bridges a freshly stored or upgraded comparison to a durable generation
+/// attempt plus its execution row. Gated independently by
+/// [`REVIEW_GUIDE_GENERATION_FLAG`]. Best-effort: any failure here is logged
+/// and dropped rather than propagated, matching every other outcome in this
+/// reconciler — a missed enqueue is recoverable (the next observation, an
+/// explicit retry, or [`WorkDb::reconcile_pr_review_guide_attempts`], tries
+/// again), while losing the packet that was just durably captured would not
+/// be.
+///
+/// Admission is series-scoped: at most one non-terminal attempt is allowed
+/// per series. A duplicate observation of the same comparison is a no-op;
+/// a newer comparison cancels the obsolete attempt (and its execution)
+/// before the replacement is created.
 fn enqueue_review_guide_generation(
     work_db: &WorkDb,
     feature_flags: &FeatureFlagsStore,
@@ -388,45 +393,40 @@ fn enqueue_review_guide_generation(
     if !feature_flags.is_enabled(REVIEW_GUIDE_GENERATION_FLAG) {
         return;
     }
-    match work_db.live_or_queued_pr_review_guide_execution_for_comparison(&capture.comparison_id) {
-        Ok(Some(_)) => {
+    match work_db.live_pr_review_guide_attempts_for_series(&capture.series_id) {
+        Ok(live)
+            if live
+                .iter()
+                .any(|attempt| attempt.comparison_id == capture.comparison_id) =>
+        {
             tracing::debug!(
                 comparison_id = %capture.comparison_id,
                 "review-guide generation: a job for this exact comparison is already in flight; not enqueuing another",
             );
             return;
         }
-        Ok(None) => {}
+        Ok(live) if !live.is_empty() => {
+            if let Err(error) = work_db
+                .cancel_live_pr_review_guide_attempts_for_series(&capture.series_id, "superseded by a newer comparison")
+            {
+                tracing::warn!(
+                    series_id = %capture.series_id,
+                    ?error,
+                    "review-guide generation: could not cancel the obsolete attempt; skipping enqueue",
+                );
+                return;
+            }
+        }
+        Ok(_) => {}
         Err(error) => {
             tracing::warn!(
-                comparison_id = %capture.comparison_id,
+                series_id = %capture.series_id,
                 ?error,
-                "review-guide generation: could not check for a live execution; skipping enqueue",
+                "review-guide generation: could not check for a live attempt; skipping enqueue",
             );
             return;
         }
     }
-    let repo_remote_url = match work_db.get_work_item(&capture.root_task_id) {
-        Ok(item) => match item {
-            crate::work::WorkItem::Task(task) | crate::work::WorkItem::Chore(task) => task.repo_remote_url,
-            _ => None,
-        },
-        Err(error) => {
-            tracing::warn!(
-                root_task_id = %capture.root_task_id,
-                ?error,
-                "review-guide generation: could not resolve the root task's repository; skipping enqueue",
-            );
-            return;
-        }
-    };
-    let Some(repo_remote_url) = repo_remote_url else {
-        tracing::warn!(
-            root_task_id = %capture.root_task_id,
-            "review-guide generation: root task has no repository; skipping enqueue",
-        );
-        return;
-    };
     let attempt = match work_db.create_pr_review_guide_attempt(
         &capture.series_id,
         &capture.comparison_id,
@@ -442,33 +442,20 @@ fn enqueue_review_guide_generation(
             return;
         }
     };
-    let execution = match work_db.create_pr_review_guide_execution(&capture.comparison_id, &repo_remote_url) {
-        Ok(execution) => execution,
-        Err(error) => {
-            tracing::warn!(
-                comparison_id = %capture.comparison_id,
-                attempt_id = %attempt.id,
-                ?error,
-                "review-guide generation: could not create the execution row",
-            );
-            return;
-        }
-    };
-    if let Err(error) = work_db.bind_pr_review_guide_attempt_execution(&attempt.id, &execution.id) {
-        tracing::warn!(
+    match work_db.dispatch_pr_review_guide_attempt(&attempt.id, &capture.root_task_id) {
+        Ok(bound) => tracing::info!(
+            comparison_id = %capture.comparison_id,
+            attempt_id = %bound.id,
+            execution_id = ?bound.execution_id,
+            "review-guide generation: enqueued a durable generation attempt",
+        ),
+        Err(error) => tracing::warn!(
+            comparison_id = %capture.comparison_id,
             attempt_id = %attempt.id,
-            execution_id = %execution.id,
             ?error,
-            "review-guide generation: could not bind the attempt to its execution",
-        );
-        return;
+            "review-guide generation: created a durable attempt but could not dispatch its execution; reconcile will retry",
+        ),
     }
-    tracing::info!(
-        comparison_id = %capture.comparison_id,
-        attempt_id = %attempt.id,
-        execution_id = %execution.id,
-        "review-guide generation: enqueued a durable generation attempt",
-    );
 }
 
 pub(crate) fn prepare_capture(

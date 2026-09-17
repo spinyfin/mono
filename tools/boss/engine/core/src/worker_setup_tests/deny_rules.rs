@@ -353,3 +353,8 @@ fn hook_entry_runs_path_guard_matches_only_the_gate_script_entry() {
     })));
     assert!(!hook_entry_runs_path_guard(&serde_json::json!({"matcher": "Bash"})));
 }
+
+#[test]
+fn review_guide_and_answer_agent_share_the_read_only_deny_body() {
+    assert_eq!(review_guide_deny_rules(), answer_agent_deny_rules());
+}

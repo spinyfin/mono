@@ -313,41 +313,35 @@ impl WorkDb {
         query_execution(&conn, &id)?.with_context(|| format!("missing review-guide execution after insert: {id}"))
     }
 
-    /// Any non-terminal `pr_review_guide` execution already bound to this
-    /// exact immutable comparison (`work_item_id = comparison_id`). Used to
-    /// dedup enqueueing: a queued/running job for this comparison already
-    /// existing means "no new attempt or document" (design: duplicate
-    /// observation). Broader than [`Self::get_live_execution_for_work_item`]
-    /// (which only counts `running`/`waiting_human`) — a merely `ready`
-    /// review-guide execution still waiting for a worker slot must also
-    /// suppress a second enqueue.
-    pub(crate) fn live_or_queued_pr_review_guide_execution_for_comparison(
+    /// Non-terminal generation attempts for this series, newest epoch first.
+    /// Used to enforce "at most one active attempt per series": a duplicate
+    /// observation of the same comparison is a no-op, and a newer comparison
+    /// must cancel these before admitting a replacement.
+    pub(crate) fn live_pr_review_guide_attempts_for_series(
         &self,
-        comparison_id: &str,
-    ) -> Result<Option<WorkExecution>> {
+        series_id: &str,
+    ) -> Result<Vec<PrReviewGuideAttempt>> {
         let conn = self.connect()?;
-        conn.query_row(
-            "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
-                    cube_workspace_id, workspace_path, priority, preferred_workspace_id,
-                    created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after
-             FROM work_executions
-             WHERE work_item_id = ?1
-               AND status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
-             ORDER BY created_at DESC, id DESC
-             LIMIT 1",
-            [comparison_id],
-            map_execution,
-        )
-        .optional()
-        .map_err(Into::into)
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PR_REVIEW_GUIDE_ATTEMPT_COLUMNS} FROM pr_review_guide_attempts
+             WHERE series_id = ?1
+               AND status NOT IN ('succeeded', 'failed', 'cancelled', 'superseded')
+             ORDER BY request_epoch DESC, created_at DESC, id DESC"
+        ))?;
+        let rows = stmt.query_map([series_id], map_pr_review_guide_attempt)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
-    /// Bind an attempt to the execution generating it, and mark it running.
+    /// Bind an attempt to the execution generating it, mark it running, and
+    /// advance the series to `generating` when this attempt is still the
+    /// current desired comparison. A stale bind (series already moved on)
+    /// still records the execution on the attempt but leaves card lifecycle
+    /// untouched.
     pub(crate) fn bind_pr_review_guide_attempt_execution(&self, attempt_id: &str, execution_id: &str) -> Result<()> {
-        let conn = self.connect()?;
         let now = now_string();
-        conn.execute(
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             "UPDATE pr_review_guide_attempts
              SET execution_id = ?2, status = ?3, started_at = ?4
              WHERE id = ?1 AND status = ?5",
@@ -359,6 +353,16 @@ impl WorkDb {
                 PrReviewGuideAttemptStatus::Queued.as_str(),
             ],
         )?;
+        tx.execute(
+            "UPDATE pr_review_guide_source_series
+             SET guide_lifecycle = 'generating', updated_at = ?2
+             WHERE id = (SELECT series_id FROM pr_review_guide_attempts WHERE id = ?1)
+               AND selected_comparison_id = (
+                   SELECT comparison_id FROM pr_review_guide_attempts WHERE id = ?1
+               )",
+            params![attempt_id, now],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -475,7 +479,30 @@ impl WorkDb {
     /// readable pointer — a failed refresh leaves any prior readable version
     /// exactly as it was (design: "Failed refresh ... Record failure without
     /// changing readable version").
+    ///
+    /// A stale attempt (its comparison is no longer the series'
+    /// `selected_comparison_id`) is recorded `superseded` and does **not**
+    /// flip `guide_lifecycle` to `failed` — a newer published guide must
+    /// not be downgraded by late output from an obsolete run.
     pub fn fail_pr_review_guide_attempt(&self, attempt_id: &str, error: &str) -> Result<()> {
+        self.terminate_pr_review_guide_attempt(attempt_id, PrReviewGuideAttemptStatus::Failed, Some(error), true)
+    }
+
+    /// Record that generation was cancelled (operator cancel, a newer
+    /// comparison admitted, or an explicit retry replacing this attempt).
+    /// Same selected-comparison fence as [`Self::fail_pr_review_guide_attempt`]:
+    /// a stale cancel leaves card lifecycle untouched.
+    pub fn cancel_pr_review_guide_attempt(&self, attempt_id: &str, reason: &str) -> Result<()> {
+        self.terminate_pr_review_guide_attempt(attempt_id, PrReviewGuideAttemptStatus::Cancelled, Some(reason), false)
+    }
+
+    fn terminate_pr_review_guide_attempt(
+        &self,
+        attempt_id: &str,
+        status: PrReviewGuideAttemptStatus,
+        error: Option<&str>,
+        increment_retries: bool,
+    ) -> Result<()> {
         let now = now_string();
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -484,18 +511,227 @@ impl WorkDb {
             tx.commit()?;
             return Ok(());
         }
-        tx.execute(
-            "UPDATE pr_review_guide_attempts
-             SET status = ?2, error = ?3, retries = retries + 1, finished_at = ?4
-             WHERE id = ?1",
-            params![attempt_id, PrReviewGuideAttemptStatus::Failed.as_str(), error, now],
+        let selected: Option<String> = tx.query_row(
+            "SELECT selected_comparison_id FROM pr_review_guide_source_series WHERE id = ?1",
+            [&attempt.series_id],
+            |row| row.get(0),
         )?;
-        tx.execute(
-            "UPDATE pr_review_guide_source_series SET guide_lifecycle = 'failed', updated_at = ?2 WHERE id = ?1",
-            params![attempt.series_id, now],
-        )?;
+        let stale = selected.as_deref() != Some(attempt.comparison_id.as_str());
+        let final_status = if stale {
+            PrReviewGuideAttemptStatus::Superseded
+        } else {
+            status
+        };
+        if increment_retries && !stale {
+            tx.execute(
+                "UPDATE pr_review_guide_attempts
+                 SET status = ?2, error = ?3, retries = retries + 1, finished_at = ?4
+                 WHERE id = ?1",
+                params![attempt_id, final_status.as_str(), error, now],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE pr_review_guide_attempts
+                 SET status = ?2, error = ?3, finished_at = ?4
+                 WHERE id = ?1",
+                params![attempt_id, final_status.as_str(), error, now],
+            )?;
+        }
+        if !stale
+            && matches!(
+                final_status,
+                PrReviewGuideAttemptStatus::Failed | PrReviewGuideAttemptStatus::Cancelled
+            )
+        {
+            tx.execute(
+                "UPDATE pr_review_guide_source_series
+                 SET guide_lifecycle = 'failed', updated_at = ?2
+                 WHERE id = ?1",
+                params![attempt.series_id, now],
+            )?;
+        }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Create the `work_executions` row for a queued attempt and bind it.
+    /// Idempotent: an already-bound or already-terminal attempt is returned
+    /// unchanged. The root task must have a `repo_remote_url`.
+    pub(crate) fn dispatch_pr_review_guide_attempt(
+        &self,
+        attempt_id: &str,
+        root_task_id: &str,
+    ) -> Result<PrReviewGuideAttempt> {
+        let conn = self.connect()?;
+        let attempt =
+            query_pr_review_guide_attempt(&conn, attempt_id).require("pr_review_guide_attempt", attempt_id)?;
+        drop(conn);
+        if PrReviewGuideAttemptStatus::from_str(&attempt.status)?.is_terminal() || attempt.execution_id.is_some() {
+            return Ok(attempt);
+        }
+        let repo = self.repo_remote_url_for_root(root_task_id)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "root task {root_task_id} has no repository; cannot dispatch review-guide attempt {attempt_id}"
+            )
+        })?;
+        let execution = self.create_pr_review_guide_execution(&attempt.comparison_id, &repo)?;
+        self.bind_pr_review_guide_attempt_execution(&attempt.id, &execution.id)?;
+        let conn = self.connect()?;
+        query_pr_review_guide_attempt(&conn, attempt_id).require("pr_review_guide_attempt", attempt_id)
+    }
+
+    fn repo_remote_url_for_root(&self, root_task_id: &str) -> Result<Option<String>> {
+        match self.get_work_item(root_task_id)? {
+            WorkItem::Task(task) | WorkItem::Chore(task) => Ok(task.repo_remote_url),
+            _ => Ok(None),
+        }
+    }
+
+    /// Cancel every non-terminal attempt for `series_id` (and its bound
+    /// execution, if any). Used before admitting a newer comparison or an
+    /// explicit retry so two Astra-high jobs cannot run for one PR at once.
+    pub(crate) fn cancel_live_pr_review_guide_attempts_for_series(
+        &self,
+        series_id: &str,
+        reason: &str,
+    ) -> Result<Vec<PrReviewGuideAttempt>> {
+        let live = self.live_pr_review_guide_attempts_for_series(series_id)?;
+        for attempt in &live {
+            if let Err(err) = self.cancel_pr_review_guide_attempt(&attempt.id, reason) {
+                tracing::warn!(
+                    attempt_id = %attempt.id,
+                    series_id,
+                    ?err,
+                    "review-guide: failed to cancel an obsolete attempt",
+                );
+            }
+            if let Some(execution_id) = &attempt.execution_id
+                && let Err(err) = self.cancel_execution(execution_id)
+            {
+                tracing::debug!(
+                    attempt_id = %attempt.id,
+                    execution_id,
+                    ?err,
+                    "review-guide: obsolete execution already terminal or unknown",
+                );
+            }
+        }
+        Ok(live)
+    }
+
+    /// Finish a non-terminal attempt whose bound execution has reached a
+    /// terminal status. `cancelled` executions write `Cancelled`; every other
+    /// terminal status writes `Failed` with `reason`. The selected-comparison
+    /// fence in [`Self::terminate_pr_review_guide_attempt`] still applies.
+    pub(crate) fn finish_pr_review_guide_attempt_for_terminal_execution(
+        &self,
+        execution_id: &str,
+        execution_status: ExecutionStatus,
+        reason: &str,
+    ) -> Result<()> {
+        let Some(attempt) = self.pr_review_guide_attempt_for_execution(execution_id)? else {
+            return Ok(());
+        };
+        if execution_status == ExecutionStatus::Cancelled {
+            self.cancel_pr_review_guide_attempt(&attempt.id, reason)
+        } else {
+            self.fail_pr_review_guide_attempt(&attempt.id, reason)
+        }
+    }
+
+    /// Startup / sweep pass: every non-terminal attempt whose bound
+    /// execution is already terminal is finished with a classified reason;
+    /// every queued attempt with no execution is dispatched. Returns the
+    /// number of attempts that were finished or dispatched.
+    pub(crate) fn reconcile_pr_review_guide_attempts(&self) -> Result<usize> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PR_REVIEW_GUIDE_ATTEMPT_COLUMNS} FROM pr_review_guide_attempts
+             WHERE status NOT IN ('succeeded', 'failed', 'cancelled', 'superseded')"
+        ))?;
+        let attempts = stmt
+            .query_map([], map_pr_review_guide_attempt)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        drop(conn);
+
+        let mut acted = 0usize;
+        for attempt in attempts {
+            if let Some(execution_id) = &attempt.execution_id {
+                match self.get_execution(execution_id) {
+                    Ok(execution) if execution.status.is_terminal() => {
+                        let reason = classified_review_guide_terminal_reason(&execution.status);
+                        if let Err(err) = self.finish_pr_review_guide_attempt_for_terminal_execution(
+                            execution_id,
+                            execution.status,
+                            &reason,
+                        ) {
+                            tracing::warn!(
+                                attempt_id = %attempt.id,
+                                execution_id,
+                                ?err,
+                                "review-guide reconcile: failed to finish a stranded attempt",
+                            );
+                        } else {
+                            acted += 1;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            attempt_id = %attempt.id,
+                            execution_id,
+                            ?err,
+                            "review-guide reconcile: bound execution is gone; failing the attempt",
+                        );
+                        if let Err(fail_err) = self.fail_pr_review_guide_attempt(&attempt.id, "bound execution is gone")
+                        {
+                            tracing::warn!(
+                                attempt_id = %attempt.id,
+                                ?fail_err,
+                                "review-guide reconcile: failed to record a vanished-execution failure",
+                            );
+                        } else {
+                            acted += 1;
+                        }
+                    }
+                }
+            } else if attempt.status == PrReviewGuideAttemptStatus::Queued.as_str() {
+                match self.root_task_id_for_series(&attempt.series_id) {
+                    Ok(Some(root)) => match self.dispatch_pr_review_guide_attempt(&attempt.id, &root) {
+                        Ok(_) => acted += 1,
+                        Err(err) => tracing::warn!(
+                            attempt_id = %attempt.id,
+                            ?err,
+                            "review-guide reconcile: could not dispatch a queued unbound attempt",
+                        ),
+                    },
+                    Ok(None) => tracing::warn!(
+                        attempt_id = %attempt.id,
+                        series_id = %attempt.series_id,
+                        "review-guide reconcile: series has no root task; leaving the attempt queued",
+                    ),
+                    Err(err) => tracing::warn!(
+                        attempt_id = %attempt.id,
+                        series_id = %attempt.series_id,
+                        ?err,
+                        "review-guide reconcile: failed to resolve the series root task",
+                    ),
+                }
+            }
+        }
+        Ok(acted)
+    }
+
+    fn root_task_id_for_series(&self, series_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT root_task_id FROM pr_review_guide_source_series WHERE id = ?1",
+            [series_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     /// Series/comparison identity plus lifecycle for the `GetReviewGuide`
@@ -543,6 +779,11 @@ impl WorkDb {
     /// comparison — the `RetryReviewGuide` RPC. A repeated call with the same
     /// `idempotency_token` returns the original attempt rather than creating
     /// a second one; omitting the token always creates a fresh attempt.
+    ///
+    /// A newly created attempt is dispatched immediately (execution row +
+    /// bind). A repeated token whose original attempt was never bound is
+    /// dispatched on this call so a crash between create and bind is
+    /// recoverable.
     pub fn retry_pr_review_guide(
         &self,
         root_task_id: &str,
@@ -568,16 +809,53 @@ impl WorkDb {
                 )
                 .optional()?;
             if let Some(existing) = existing {
+                let existing = self.dispatch_if_unbound(existing, root_task_id);
                 return Ok(RetryReviewGuideOutcome::AlreadyRequested(existing));
             }
         }
+        let _ =
+            self.cancel_live_pr_review_guide_attempts_for_series(&summary.series_id, "replaced by an explicit retry");
         let attempt = self.create_pr_review_guide_attempt_with_token(
             &summary.series_id,
             &comparison_id,
             prompt_version,
             idempotency_token,
         )?;
+        let attempt = self.dispatch_if_unbound(attempt, root_task_id);
         Ok(RetryReviewGuideOutcome::Created(attempt))
+    }
+
+    fn dispatch_if_unbound(&self, attempt: PrReviewGuideAttempt, root_task_id: &str) -> PrReviewGuideAttempt {
+        if attempt.execution_id.is_some()
+            || PrReviewGuideAttemptStatus::from_str(&attempt.status)
+                .map(|status| status.is_terminal())
+                .unwrap_or(true)
+        {
+            return attempt;
+        }
+        match self.dispatch_pr_review_guide_attempt(&attempt.id, root_task_id) {
+            Ok(bound) => bound,
+            Err(err) => {
+                tracing::warn!(
+                    attempt_id = %attempt.id,
+                    root_task_id,
+                    ?err,
+                    "review-guide: created a durable attempt but could not dispatch its execution; reconcile will retry",
+                );
+                attempt
+            }
+        }
+    }
+}
+
+fn classified_review_guide_terminal_reason(status: &ExecutionStatus) -> String {
+    match status {
+        ExecutionStatus::Cancelled => "execution cancelled".to_owned(),
+        ExecutionStatus::Orphaned => "execution orphaned".to_owned(),
+        ExecutionStatus::Abandoned => "execution abandoned".to_owned(),
+        ExecutionStatus::Failed => "execution failed".to_owned(),
+        ExecutionStatus::Completed => "execution completed without publishing a guide".to_owned(),
+        other => format!("execution reached terminal status `{}`", other.as_str()),
     }
 }
 
@@ -657,6 +935,13 @@ mod tests {
     fn seeded_series(db: &WorkDb) -> (String, String, String) {
         let product = create_product(db);
         let root = create_active_chore(db, &product, "review guide job test");
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET repo_remote_url = ?1 WHERE id = ?2",
+                params!["https://github.com/acme/widget.git", root],
+            )
+            .unwrap();
         let stored = db
             .persist_pr_review_guide_source_capture(&root, 1, PrSourceCaptureTrigger::Creation, &packet("base", "head"))
             .unwrap();
@@ -689,6 +974,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(bound.status, "running");
+        let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+        assert_eq!(summary.lifecycle, "generating");
 
         let outcome = db
             .publish_pr_review_guide_version(&attempt.id, "# Guide\n\n## Problem\n", "raw")
@@ -794,6 +1081,12 @@ mod tests {
             panic!("repeat token must not create a second attempt")
         };
         assert_eq!(first_attempt.id, second_attempt.id);
+        assert!(
+            first_attempt.execution_id.is_some(),
+            "retry must create and bind a work_executions row, not leave the attempt queued forever"
+        );
+        assert_eq!(first_attempt.execution_id, second_attempt.execution_id);
+        assert_eq!(first_attempt.status, "running");
     }
 
     #[test]
@@ -805,5 +1098,151 @@ mod tests {
             db.retry_pr_review_guide(&root, None, "review-guide-v1").unwrap(),
             RetryReviewGuideOutcome::NoComparison
         );
+    }
+
+    fn attempt_status(db: &WorkDb, attempt_id: &str) -> String {
+        db.connect()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM pr_review_guide_attempts WHERE id = ?1",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn failing_a_stale_attempt_does_not_downgrade_a_newer_ready_series() {
+        let (_dir, db) = open_db();
+        let (root, series_id, first_comparison) = seeded_series(&db);
+        let first = db
+            .create_pr_review_guide_attempt(&series_id, &first_comparison, "review-guide-v1")
+            .unwrap();
+
+        db.persist_pr_review_guide_source_capture(&root, 2, PrSourceCaptureTrigger::Poller, &packet("base2", "head2"))
+            .unwrap();
+        let second_comparison = db
+            .get_pr_review_guide_summary_for_root(&root)
+            .unwrap()
+            .unwrap()
+            .selected_comparison_id
+            .unwrap();
+        let second = db
+            .create_pr_review_guide_attempt(&series_id, &second_comparison, "review-guide-v1")
+            .unwrap();
+        db.publish_pr_review_guide_version(&second.id, "# Current\n\n## A\n## B\n## C\n## D\n", "raw")
+            .unwrap();
+
+        db.fail_pr_review_guide_attempt(&first.id, "late invalid output")
+            .unwrap();
+
+        assert_eq!(attempt_status(&db, &first.id), "superseded");
+        let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+        assert_eq!(summary.lifecycle, "ready");
+    }
+
+    #[test]
+    fn reconcile_finishes_a_running_attempt_whose_execution_is_already_terminal() {
+        let (_dir, db) = open_db();
+        let (root, series_id, comparison_id) = seeded_series(&db);
+        let attempt = db
+            .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
+            .unwrap();
+        let execution = db
+            .create_pr_review_guide_execution(&comparison_id, "https://github.com/acme/widget.git")
+            .unwrap();
+        db.bind_pr_review_guide_attempt_execution(&attempt.id, &execution.id)
+            .unwrap();
+        // Terminalize the execution row without going through cancel_execution,
+        // which is the stranded shape the sweep has to recover: orphan reap,
+        // abandon, or a restart that lost the run.
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET status = 'orphaned', finished_at = datetime('now') WHERE id = ?1",
+                [&execution.id],
+            )
+            .unwrap();
+
+        let acted = db.reconcile_pr_review_guide_attempts().unwrap();
+        assert_eq!(acted, 1);
+        assert_eq!(attempt_status(&db, &attempt.id), "failed");
+        let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+        assert_eq!(summary.lifecycle, "failed");
+    }
+
+    #[test]
+    fn cancel_live_attempts_enforces_one_active_attempt_per_series() {
+        let (_dir, db) = open_db();
+        let (root, series_id, _first_comparison) = seeded_series(&db);
+        let first = db.retry_pr_review_guide(&root, None, "review-guide-v1").unwrap();
+        let RetryReviewGuideOutcome::Created(first) = first else {
+            panic!("must create")
+        };
+        assert_eq!(first.status, "running");
+
+        db.persist_pr_review_guide_source_capture(&root, 2, PrSourceCaptureTrigger::Poller, &packet("base2", "head2"))
+            .unwrap();
+        let cancelled = db
+            .cancel_live_pr_review_guide_attempts_for_series(&series_id, "superseded by a newer comparison")
+            .unwrap();
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].id, first.id);
+
+        let status: String = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM pr_review_guide_attempts WHERE id = ?1",
+                [&first.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "superseded",
+            "the first comparison is no longer selected, so cancel records superseded not failed"
+        );
+        let exec = db.get_execution(first.execution_id.as_deref().unwrap()).unwrap();
+        assert_eq!(exec.status, ExecutionStatus::Cancelled);
+    }
+
+    #[test]
+    fn cancel_execution_writes_cancelled_on_the_bound_attempt() {
+        let (_dir, db) = open_db();
+        let (root, ..) = seeded_series(&db);
+        let RetryReviewGuideOutcome::Created(attempt) =
+            db.retry_pr_review_guide(&root, None, "review-guide-v1").unwrap()
+        else {
+            panic!("must create")
+        };
+        db.cancel_execution(attempt.execution_id.as_deref().unwrap()).unwrap();
+        assert_eq!(attempt_status(&db, &attempt.id), "cancelled");
+        let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+        assert_eq!(summary.lifecycle, "failed");
+    }
+
+    #[test]
+    fn reconcile_dispatches_a_queued_attempt_with_no_execution() {
+        let (_dir, db) = open_db();
+        let (root, series_id, comparison_id) = seeded_series(&db);
+        let attempt = db
+            .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
+            .unwrap();
+        assert!(attempt.execution_id.is_none());
+
+        let acted = db.reconcile_pr_review_guide_attempts().unwrap();
+        assert_eq!(acted, 1);
+        let bound = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT execution_id, status FROM pr_review_guide_attempts WHERE id = ?1",
+                [&attempt.id],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert!(bound.0.is_some());
+        assert_eq!(bound.1, "running");
+        let _ = root;
     }
 }

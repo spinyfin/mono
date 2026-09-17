@@ -125,6 +125,22 @@ impl WorkDb {
         let mut pending = PendingEvents::new();
         stage_execution_terminal(&mut pending, &tx, execution_id, &updated.work_item_id)?;
         commit_and_publish(tx, pending, &self.event_bus)?;
+        // `connect()` is a process-wide mutex; drop it before the review-guide
+        // follow-up, which needs its own connection.
+        drop(conn);
+        if existing.kind == ExecutionKind::PrReviewGuide
+            && let Err(err) = self.finish_pr_review_guide_attempt_for_terminal_execution(
+                execution_id,
+                ExecutionStatus::Cancelled,
+                &reason,
+            )
+        {
+            tracing::warn!(
+                execution_id = %execution_id,
+                ?err,
+                "review-guide: cancelled the execution but failed to cancel the bound attempt",
+            );
+        }
         Ok(updated)
     }
 
@@ -225,6 +241,20 @@ impl WorkDb {
         let mut pending = PendingEvents::new();
         stage_execution_terminal(&mut pending, &tx, execution_id, &updated.work_item_id)?;
         commit_and_publish(tx, pending, &self.event_bus)?;
+        drop(conn);
+        if existing.kind == ExecutionKind::PrReviewGuide
+            && let Err(err) = self.finish_pr_review_guide_attempt_for_terminal_execution(
+                execution_id,
+                ExecutionStatus::Orphaned,
+                reason,
+            )
+        {
+            tracing::warn!(
+                execution_id = %execution_id,
+                ?err,
+                "review-guide: orphaned the execution but failed to fail the bound attempt",
+            );
+        }
         Ok(updated)
     }
 
