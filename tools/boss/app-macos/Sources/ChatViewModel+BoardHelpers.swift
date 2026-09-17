@@ -493,7 +493,12 @@ extension ChatViewModel {
             }
             return liveState != nil
         }()
-        let showsMergeWhenReady = task.isMergeWhenReadyEligible
+        // `column` is the effective board column (optimistic drag override
+        // included). `isMergeWhenReadyEligible` reads the raw
+        // `task.boardColumn`, which still reports `.review` until the engine
+        // confirms a move, so a card dragged out of Review would keep a live
+        // Merge When Ready button without this extra gate.
+        let showsMergeWhenReady = column == .review && task.isMergeWhenReadyEligible
         let terminalTooltip = (column == .review || column == .done)
             ? "Open terminal on PR branch"
             : "Open terminal in workspace"

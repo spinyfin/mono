@@ -101,20 +101,10 @@ extension ChatViewModel {
             // that task for the rest of the session.
             retryingReviewGuideRootTaskIDs.removeAll()
             // A `get_review_guide_content` request in flight when the link
-            // dropped can never complete either — leave the viewer in
-            // `.loading` forever rather than a retryable failure.
-            if pendingReviewGuideVersionId != nil, case .loading = asyncMarkdownViewerVM.state {
-                asyncMarkdownViewerVM.state = .failed(
-                    title: "Review guide",
-                    message: "Connection lost while loading this guide."
-                )
-                asyncMarkdownViewerVM.canRetry = true
-                asyncMarkdownViewerVM.onRetry = { [weak self] in
-                    guard let self, let rootTaskId = self.pendingReviewGuideRootTaskId,
-                          let task = self.task(withID: rootTaskId) else { return }
-                    self.openReviewGuide(for: task)
-                }
-            }
+            // drops can never complete; without this the viewer stays
+            // `.loading` for the rest of the session, so fail it with a
+            // retry that re-opens the pending guide.
+            failLoadingReviewGuideViewer(message: "Connection lost while loading this guide.")
             // Same reasoning for a drag-to-Doing admission check in
             // flight: the socket drop means no `dispatch_admission_evaluated`
             // reply is ever coming, so nothing else would clear
@@ -249,6 +239,10 @@ extension ChatViewModel {
                 mergeErrorNoticesByTaskID[taskId] = message
             }
             mergingWhenReadyIDs.removeAll()
+            // Mirror the disconnect path: a `get_review_guide_content`
+            // WorkError (the engine's actual reply when the version lookup
+            // fails) must not leave the shared markdown window spinning.
+            failLoadingReviewGuideViewer(message: message)
             retryingReviewGuideRootTaskIDs.removeAll()
             plannerActionInFlightProjectIDs.removeAll()
             deferredScopeActionInFlightIDs.removeAll()
@@ -596,6 +590,7 @@ extension ChatViewModel {
             // WorkItemUpdated event carrying the new merge-queue / merged
             // state will arrive shortly.
             mergingWhenReadyIDs.remove(workItemID)
+            mergeErrorNoticesByTaskID.removeValue(forKey: workItemID)
             mergeFeedbackNotice = MergeFeedbackNotice(
                 taskID: workItemID,
                 message: Self.mergeWhenReadyFeedbackText(for: action)
@@ -854,7 +849,30 @@ extension ChatViewModel {
         if !pendingMoveOriginByTaskID.isEmpty { return true }
         if pendingDragAdmissionCheck != nil { return true }
         if engineAttemptDetailRequestID != nil { return true }
+        // `pendingReviewGuideVersionId` is retained after a successful load
+        // (it is the displayed version), so pair it with `.loading`.
+        if pendingReviewGuideVersionId != nil, case .loading = asyncMarkdownViewerVM.state {
+            return true
+        }
         return false
+    }
+
+    /// Fail a review-guide content fetch that can no longer complete (socket
+    /// drop or `WorkError`). Retry re-opens the pending version — a re-fetch,
+    /// not `retryReviewGuide`, which would enqueue a new generation.
+    private func failLoadingReviewGuideViewer(message: String) {
+        if pendingReviewGuideVersionId != nil, case .loading = asyncMarkdownViewerVM.state {
+            asyncMarkdownViewerVM.state = .failed(
+                title: "Review guide",
+                message: message
+            )
+            asyncMarkdownViewerVM.canRetry = true
+            asyncMarkdownViewerVM.onRetry = { [weak self] in
+                guard let self, let rootTaskId = self.pendingReviewGuideRootTaskId,
+                      let task = self.task(withID: rootTaskId) else { return }
+                self.openReviewGuide(for: task)
+            }
+        }
     }
 
     /// Whether an `.error` message is a transport-level signal from

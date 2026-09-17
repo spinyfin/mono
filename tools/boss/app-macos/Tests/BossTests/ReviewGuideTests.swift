@@ -181,6 +181,83 @@ final class ReviewGuideTests: XCTestCase {
         XCTAssertTrue(model.asyncMarkdownViewerVM.canRetry)
     }
 
+    /// A `WorkError` while the async viewer is `.loading` a guide's content
+    /// is the engine's actual reply when the version lookup fails — the
+    /// viewer must fail with a retry that re-opens (re-fetches) the guide,
+    /// not stay spinning, and not count as an untracked request that
+    /// paints the raw message onto an unrelated attachments viewer.
+    func testWorkErrorFailsAViewerStuckLoadingGuideContent() {
+        let model = makeModel()
+        let task = Self.makeTask(id: "task_1", readableVersionId: "prgv_1")
+        model.taskIndexByID = [task.id: task]
+        model.openReviewGuide(for: task)
+        guard case .loading = model.asyncMarkdownViewerVM.state else {
+            return XCTFail("expected .loading immediately after open")
+        }
+        model.attachmentsInFlightTaskIDs.insert("task_2")
+
+        model.applyEventForTest(.workError(message: "no such version", requestId: nil))
+
+        guard case .failed(title: _, message: let message) = model.asyncMarkdownViewerVM.state else {
+            return XCTFail("a content-fetch WorkError must fail the loading viewer")
+        }
+        XCTAssertEqual(message, "no such version")
+        XCTAssertTrue(model.asyncMarkdownViewerVM.canRetry)
+        XCTAssertEqual(
+            model.attachmentsLoadFailureByTaskID["task_2"], "Loading failed. Retry?",
+            "an in-flight guide fetch must count as another tracked request"
+        )
+    }
+
+    /// Keep version A open; version B publishes for a newer comparison;
+    /// a retry on B's comparison then fails. The task-level stale flag
+    /// is false (B matches the series' selected comparison) and lifecycle
+    /// is `"failed"`, but the viewer is still showing A — it must offer
+    /// the published B and still describe A as covering an older revision.
+    func testViewerCurrentnessWhenOpenVersionLagsPublishedThenRetryFails() {
+        let currentness = ReviewGuideViewerCurrentness.from(
+            lifecycle: "failed",
+            readableVersionId: "prgv_B",
+            selectedComparisonId: "prgc_2",
+            displayedVersionId: "prgv_A",
+            displayedComparisonId: "prgc_1"
+        )
+        XCTAssertTrue(
+            currentness.showsOpenUpdatedGuide,
+            "a different readable version must be offered even when the latest attempt failed"
+        )
+        guard case .refreshFailed(let displayedStaleSource) = currentness.status else {
+            return XCTFail("latest attempt failed, so the viewer still surfaces that failure")
+        }
+        XCTAssertTrue(
+            displayedStaleSource,
+            "displayed version A's comparison is not the series' current comparison"
+        )
+    }
+
+    func testApplyReviewGuideContentRetainsDisplayedComparisonIdentity() {
+        let model = makeModel()
+        model.taskIndexByID = ["task_1": Self.makeTask(id: "task_1", readableVersionId: "prgv_1")]
+        model.openReviewGuide(for: model.taskIndexByID!["task_1"]!)
+        XCTAssertNil(model.asyncMarkdownViewerVM.reviewGuideComparisonId)
+
+        model.applyReviewGuideContent(
+            versionId: "prgv_1",
+            content: ReviewGuideVersionContent(
+                id: "prgv_1",
+                seriesId: "prgs_1",
+                comparisonId: "prgc_1",
+                attemptId: "prga_1",
+                markdown: "# The guide",
+                contentHash: "hash-1",
+                promptVersion: "review-guide-v1",
+                generatedAt: "2026-09-16T00:00:00Z"
+            )
+        )
+
+        XCTAssertEqual(model.asyncMarkdownViewerVM.reviewGuideComparisonId, "prgc_1")
+    }
+
     /// `hasOtherTrackedAppRequestInFlight` exists precisely so an ambiguous
     /// `WorkError` is not painted onto the transcript/attachment viewers —
     /// a review-guide retry in flight must count as "some other tracked

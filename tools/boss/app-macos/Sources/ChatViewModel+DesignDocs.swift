@@ -86,6 +86,7 @@ extension ChatViewModel {
         pendingReviewGuideRootTaskId = nil
         asyncMarkdownViewerVM.reviewGuideRootTaskId = nil
         asyncMarkdownViewerVM.reviewGuideGeneratedAt = nil
+        asyncMarkdownViewerVM.reviewGuideComparisonId = nil
         asyncMarkdownViewerVM.clickStartTime = Date()
         asyncMarkdownViewerVM.collapsedByDefaultHeadings = []
         if let existing = designDocContentByRef[ref] {
@@ -323,6 +324,7 @@ extension ChatViewModel {
         pendingAsyncViewerArtifact = nil
         asyncMarkdownViewerVM.reviewGuideRootTaskId = nil
         asyncMarkdownViewerVM.reviewGuideGeneratedAt = nil
+        asyncMarkdownViewerVM.reviewGuideComparisonId = nil
         asyncMarkdownViewerVM.pendingRenderProjectShortID = nil
         asyncMarkdownViewerVM.renderStartTime = nil
         asyncMarkdownViewerVM.clickStartTime = nil

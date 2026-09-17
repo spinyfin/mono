@@ -298,6 +298,7 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // Derived; populated after mapping by attach_review_guide_state.
         review_guide_lifecycle: None,
         review_guide_readable_version_id: None,
+        review_guide_selected_comparison_id: None,
         review_guide_stale_source: None,
         // Followup provenance; populated by map_task_with_parent_and_provenance
         // and map_task_with_external_ref_parent_source_and_provenance when the

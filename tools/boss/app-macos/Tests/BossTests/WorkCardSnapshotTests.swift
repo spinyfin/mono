@@ -88,6 +88,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         "parentTaskId",
         "readyForReview",
         "docLinkState",
+        "reviewGuideSelectedComparisonId",
         "originTaskShortId",
         "originPrNumber",
         "completedAt",
@@ -237,6 +238,9 @@ final class WorkCardSnapshotTests: XCTestCase {
             ("readyForReview", { t in var t = t; t.readyForReview = true; return t }),
             ("docLinkState", { t in
                 var t = t; t.docLinkState = .notSet; return t
+            }),
+            ("reviewGuideSelectedComparisonId", { t in
+                var t = t; t.reviewGuideSelectedComparisonId = "prgc_1"; return t
             }),
             ("originTaskShortId", { t in var t = t; t.originTaskShortId = 9; return t }),
             ("originPrNumber", { t in var t = t; t.originPrNumber = 88; return t }),
@@ -1052,6 +1056,38 @@ final class WorkCardSnapshotTests: XCTestCase {
         var alreadyQueued = Self.makeTask(status: "in_review", prURL: "https://github.com/x/y/pull/3")
         alreadyQueued.mergeQueueState = "queued"
         XCTAssertFalse(alreadyQueued.isMergeWhenReadyEligible)
+    }
+
+    /// `workCardSnapshot` gates Merge When Ready on the *effective* column
+    /// (optimistic drag included), not only `task.boardColumn`. An
+    /// `in_review` task still reports `.review` on the model while a drag
+    /// to Doing is in flight; the snapshot built for `.doing` must hide
+    /// the control so confirming it cannot fire `merge_when_ready`.
+    func testWorkCardSnapshotHidesMergeWhenReadyWhenEffectiveColumnIsNotReview() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        let task = Self.makeTask(status: "in_review", prURL: "https://github.com/x/y/pull/3")
+        XCTAssertTrue(task.isMergeWhenReadyEligible)
+        XCTAssertEqual(task.boardColumn, .review)
+
+        let dragged = model.workCardSnapshot(
+            for: task,
+            column: .doing,
+            isSelected: false,
+            isFrontierHighlighted: false,
+            boardStyle: .productDefault,
+            liveState: nil
+        )
+        XCTAssertFalse(dragged.showsMergeWhenReady)
+
+        let review = model.workCardSnapshot(
+            for: task,
+            column: .review,
+            isSelected: false,
+            isFrontierHighlighted: false,
+            boardStyle: .productDefault,
+            liveState: nil
+        )
+        XCTAssertTrue(review.showsMergeWhenReady)
     }
 
     /// The design requires distinguishing source staleness (the PR's head

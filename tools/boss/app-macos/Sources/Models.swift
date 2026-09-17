@@ -228,6 +228,12 @@ struct WorkTask: Identifiable, Hashable {
     /// `"failed"`: an older version stays open/readable while a refresh
     /// is in flight or has failed.
     var reviewGuideReadableVersionId: String? = nil
+    /// The series' current source comparison. The viewer pins whatever
+    /// version the user opened, so displayed staleness is this id compared
+    /// against that version's own `comparisonId`, not
+    /// `reviewGuideStaleSource` (which describes only the current readable
+    /// version). Mirrors `Task.review_guide_selected_comparison_id`.
+    var reviewGuideSelectedComparisonId: String? = nil
     /// `true` when `reviewGuideReadableVersionId` was generated against a
     /// source comparison that is no longer current — the PR's head actually
     /// moved since that version was produced, not merely a same-comparison

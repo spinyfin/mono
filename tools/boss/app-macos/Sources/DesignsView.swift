@@ -701,6 +701,10 @@ final class AsyncMarkdownViewerViewModel: ObservableObject {
     /// The open review-guide version's generation timestamp (RFC 3339).
     /// `nil` alongside `reviewGuideRootTaskId == nil`.
     var reviewGuideGeneratedAt: String? = nil
+    /// The open review-guide version's source comparison id. Used by the
+    /// header to derive displayed-guide staleness against the series'
+    /// current comparison. `nil` until content arrives.
+    var reviewGuideComparisonId: String? = nil
 }
 
 /// Content view for the `"async-markdown-viewer"` Window scene. Shows a

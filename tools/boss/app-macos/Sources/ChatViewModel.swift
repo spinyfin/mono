@@ -1206,7 +1206,8 @@ final class ChatViewModel: ObservableObject {
     /// same limitation `mergeFeedbackNotice`'s doc comment describes for
     /// success). Read by the review-guide viewer header, which — unlike the
     /// board card — has no other surface for `workErrorMessage`'s modal
-    /// alert. Cleared explicitly via `clearMergeError(for:)`.
+    /// alert. Cleared on a fresh `mergeWhenReady(for:)` attempt, on
+    /// `.mergeWhenReadyAccepted`, and via `clearMergeError(for:)`.
     @Published var mergeErrorNoticesByTaskID: [String: String] = [:]
 
     /// Dismiss a per-task merge failure notice set via

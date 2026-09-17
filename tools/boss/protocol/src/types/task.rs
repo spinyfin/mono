@@ -949,6 +949,15 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_guide_readable_version_id: Option<String>,
 
+    /// The series' current `selected_comparison_id`. The long-lived viewer
+    /// pins whatever version the user opened, which may lag the readable
+    /// pointer; comparing that version's own `comparison_id` against this
+    /// field is how the viewer derives *displayed* source-staleness (the
+    /// `review_guide_stale_source` flag is computed only for the current
+    /// readable version). `None` until a series exists for this root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_guide_selected_comparison_id: Option<String>,
+
     /// `true` when `review_guide_readable_version_id` was generated against
     /// a source comparison that is no longer the series' current one — i.e.
     /// the PR's head genuinely moved since that version was produced, not

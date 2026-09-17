@@ -152,3 +152,51 @@ struct ReviewGuideCardPresentation: Equatable {
         }
     }
 }
+
+/// Currentness of the version currently on screen in the long-lived
+/// review-guide viewer. Distinct from `ReviewGuideCardPresentation`:
+/// the card describes the series' *current* readable version, while
+/// the viewer may still be pinned on an older one. Displayed
+/// source-staleness is `displayedComparisonId != selectedComparisonId`,
+/// not `WorkTask.reviewGuideStaleSource` (that flag is about the
+/// current readable version). Offering a different readable version
+/// does not depend on the latest attempt's lifecycle being `"ready"`.
+struct ReviewGuideViewerCurrentness: Equatable {
+    enum Status: Equatable {
+        case none
+        case refreshing
+        case refreshFailed(displayedStaleSource: Bool)
+    }
+
+    var showsOpenUpdatedGuide: Bool
+    var status: Status
+
+    static func from(
+        lifecycle: String?,
+        readableVersionId: String?,
+        selectedComparisonId: String?,
+        displayedVersionId: String?,
+        displayedComparisonId: String?
+    ) -> ReviewGuideViewerCurrentness {
+        let showsOpenUpdatedGuide = readableVersionId != nil
+            && readableVersionId != displayedVersionId
+        let displayedStaleSource = displayedComparisonId != nil
+            && selectedComparisonId != nil
+            && displayedComparisonId != selectedComparisonId
+        let status: Status
+        switch lifecycle {
+        case "queued":
+            status = readableVersionId != nil ? .refreshing : .none
+        case "failed":
+            status = readableVersionId != nil
+                ? .refreshFailed(displayedStaleSource: displayedStaleSource)
+                : .none
+        default:
+            status = .none
+        }
+        return ReviewGuideViewerCurrentness(
+            showsOpenUpdatedGuide: showsOpenUpdatedGuide,
+            status: status
+        )
+    }
+}

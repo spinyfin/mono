@@ -26,6 +26,7 @@ extension ChatViewModel {
         asyncMarkdownViewerVM.collapsedByDefaultHeadings = []
         asyncMarkdownViewerVM.reviewGuideRootTaskId = task.id
         asyncMarkdownViewerVM.reviewGuideGeneratedAt = nil
+        asyncMarkdownViewerVM.reviewGuideComparisonId = nil
         asyncMarkdownViewerVM.state = .loading
         asyncMarkdownViewerVM.staleReason = nil
         asyncMarkdownViewerVM.canRetry = false
@@ -60,6 +61,7 @@ extension ChatViewModel {
         asyncMarkdownViewerVM.staleReason = nil
         asyncMarkdownViewerVM.canRetry = false
         asyncMarkdownViewerVM.reviewGuideGeneratedAt = content.generatedAt
+        asyncMarkdownViewerVM.reviewGuideComparisonId = content.comparisonId
         asyncMarkdownViewerVM.state = .loaded(title: title, markdown: content.markdown, artifact: nil)
     }
 

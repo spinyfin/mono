@@ -96,13 +96,18 @@ struct ReviewGuideViewerHeader: View {
 
     @ViewBuilder
     private func currentnessBanner(for task: WorkTask) -> some View {
-        // A refresh that completed WHILE this version stayed open: the card
-        // already points at the new version, but "an already-open viewer
-        // stays pinned until the user switches" (design) — offer, don't
-        // force, the update.
-        if task.reviewGuideLifecycle == "ready",
-           let newerVersionId = task.reviewGuideReadableVersionId,
-           newerVersionId != chatModel.pendingReviewGuideVersionId {
+        // Derive currentness from the version on screen, not from the
+        // series' current readable version. The viewer stays pinned until
+        // the user switches, so `task.reviewGuideStaleSource` (computed for
+        // the readable pointer) can disagree with what this window shows.
+        let currentness = ReviewGuideViewerCurrentness.from(
+            lifecycle: task.reviewGuideLifecycle,
+            readableVersionId: task.reviewGuideReadableVersionId,
+            selectedComparisonId: task.reviewGuideSelectedComparisonId,
+            displayedVersionId: chatModel.pendingReviewGuideVersionId,
+            displayedComparisonId: chatModel.asyncMarkdownViewerVM.reviewGuideComparisonId
+        )
+        if currentness.showsOpenUpdatedGuide {
             HStack(spacing: 8) {
                 Text("A newer explanation is available.")
                     .font(.caption)
@@ -110,37 +115,31 @@ struct ReviewGuideViewerHeader: View {
                 Button("Open updated guide") { chatModel.openReviewGuide(for: task) }
                     .controlSize(.small)
             }
-        } else {
-            let presentation = ReviewGuideCardPresentation.from(
-                lifecycle: task.reviewGuideLifecycle,
-                readableVersionId: task.reviewGuideReadableVersionId,
-                staleSource: task.reviewGuideStaleSource ?? false
-            )
-            switch presentation?.kind {
-            case .refreshing:
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
-                    Text("Updating explanation\u{2026}")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            case .refreshFailed:
-                HStack(spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle")
-                        .foregroundStyle(.orange)
-                    Text(
-                        (task.reviewGuideStaleSource ?? false)
-                            ? "Explanation refresh failed \u{2014} this guide covers an older revision."
-                            : "Explanation refresh failed."
-                    )
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Button("Retry") { chatModel.retryReviewGuide(for: task) }
-                        .controlSize(.small)
-                }
-            default:
-                EmptyView()
+        }
+        switch currentness.status {
+        case .refreshing:
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Updating explanation\u{2026}")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
+        case .refreshFailed(let displayedStaleSource):
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+                Text(
+                    displayedStaleSource
+                        ? "Explanation refresh failed \u{2014} this guide covers an older revision."
+                        : "Explanation refresh failed."
+                )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("Retry") { chatModel.retryReviewGuide(for: task) }
+                    .controlSize(.small)
+            }
+        case .none:
+            EmptyView()
         }
     }
 }

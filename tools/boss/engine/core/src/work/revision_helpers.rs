@@ -971,6 +971,7 @@ pub(crate) fn attach_review_guide_state(conn: &Connection, tasks: &mut [Task], c
         if let Some(state) = states.get(&task.id) {
             task.review_guide_lifecycle = Some(state.lifecycle.clone());
             task.review_guide_readable_version_id = state.readable_version_id.clone();
+            task.review_guide_selected_comparison_id = state.selected_comparison_id.clone();
             task.review_guide_stale_source = state.stale_source;
         }
     }
@@ -982,6 +983,11 @@ pub(crate) fn attach_review_guide_state(conn: &Connection, tasks: &mut [Task], c
 struct ReviewGuideCardState {
     lifecycle: String,
     readable_version_id: Option<String>,
+    /// Series' current comparison — the viewer's displayed version may lag
+    /// the readable pointer, so the client needs this to derive *displayed*
+    /// staleness rather than reusing `stale_source` (which is about the
+    /// current readable version only).
+    selected_comparison_id: Option<String>,
     /// `true` when the readable version's own `comparison_id` no longer
     /// matches the series' current `selected_comparison_id` — i.e. the PR's
     /// source has actually moved since that version was generated, as
@@ -1041,6 +1047,7 @@ fn query_review_guide_card_states(
             ReviewGuideCardState {
                 lifecycle,
                 readable_version_id,
+                selected_comparison_id,
                 stale_source,
             },
         );
@@ -1108,6 +1115,7 @@ fn copy_derived_projection_fields(dst: &mut Task, src: &Task) {
     dst.ready_for_review = src.ready_for_review;
     dst.review_guide_lifecycle = src.review_guide_lifecycle.clone();
     dst.review_guide_readable_version_id = src.review_guide_readable_version_id.clone();
+    dst.review_guide_selected_comparison_id = src.review_guide_selected_comparison_id.clone();
     dst.review_guide_stale_source = src.review_guide_stale_source;
 }
 

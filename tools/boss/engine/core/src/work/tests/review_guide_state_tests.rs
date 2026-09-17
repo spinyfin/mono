@@ -7,45 +7,14 @@
 //! silently absent with every other test green.
 
 use super::*;
-use boss_pr_review_sources::SourcePacket;
-
-fn packet(base: &str, head: &str) -> SourcePacket {
-    SourcePacket {
-        schema_version: 2,
-        canonical_pr_url: "https://github.com/acme/widget/pull/9".to_owned(),
-        pr_number: 9,
-        title: "Fix retry".to_owned(),
-        body: None,
-        base_repository: "acme/widget".to_owned(),
-        head_repository: "acme/widget".to_owned(),
-        observed_base_sha: base.to_owned(),
-        probe_base_sha: None,
-        merge_base_sha: base.to_owned(),
-        head_sha: head.to_owned(),
-        files: Vec::new(),
-        omissions: Vec::new(),
-    }
-}
-
-/// Mirrors `review_guide_jobs::tests::seeded_series` (private to that
-/// module) so this file can seed an equivalent series without duplicating
-/// production code.
-fn seeded_series(db: &WorkDb, root: &str) -> (String, String) {
-    let stored = db
-        .persist_pr_review_guide_source_capture(root, 1, PrSourceCaptureTrigger::Creation, &packet("base", "head"))
-        .unwrap();
-    let PrSourceCapturePersistOutcome::Stored(capture) = stored else {
-        panic!("capture must persist")
-    };
-    (capture.series_id, capture.comparison_id)
-}
+use crate::test_support::{review_guide_source_packet, seed_review_guide_series};
 
 #[test]
 fn root_task_id_for_review_guide_series_resolves_the_seeded_root() {
     let (_dir, db) = open_db();
     let product_id = create_product(&db);
     let root = create_active_chore(&db, &product_id, "review guide state test");
-    let (series_id, _comparison_id) = seeded_series(&db, &root);
+    let (series_id, _comparison_id) = seed_review_guide_series(&db, &root);
 
     assert_eq!(db.root_task_id_for_review_guide_series(&series_id).unwrap(), Some(root));
 }
@@ -66,7 +35,7 @@ fn attach_review_guide_state_sets_ready_lifecycle_on_the_root_only() {
     let (_dir, db) = open_db();
     let product_id = create_product(&db);
     let root = create_active_chore(&db, &product_id, "review guide state test");
-    let (series_id, comparison_id) = seeded_series(&db, &root);
+    let (series_id, comparison_id) = seed_review_guide_series(&db, &root);
 
     let attempt = db
         .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
@@ -109,6 +78,36 @@ fn attach_review_guide_state_sets_ready_lifecycle_on_the_root_only() {
         Some(version.id.as_str())
     );
     assert_eq!(root_task.review_guide_stale_source, Some(false));
+    assert_eq!(
+        root_task.review_guide_selected_comparison_id.as_deref(),
+        Some(comparison_id.as_str())
+    );
+
+    // A later capture with a different head SHA advances
+    // `selected_comparison_id` while `readable_version_id` stays on the
+    // published version — the true branch of `stale_source`.
+    db.persist_pr_review_guide_source_capture(
+        &root,
+        2,
+        PrSourceCaptureTrigger::Poller,
+        &review_guide_source_packet("base2", "head2"),
+    )
+    .unwrap();
+    {
+        let conn = db.connect().unwrap();
+        attach_review_guide_state(&conn, &mut tasks, &mut chores).unwrap();
+    }
+    let root_task = tasks.iter().find(|t| t.id == root).unwrap();
+    assert_eq!(root_task.review_guide_stale_source, Some(true));
+    assert_eq!(
+        root_task.review_guide_readable_version_id.as_deref(),
+        Some(version.id.as_str()),
+        "a later capture must not clear the already-published readable version"
+    );
+    assert_ne!(
+        root_task.review_guide_selected_comparison_id.as_deref(),
+        Some(comparison_id.as_str())
+    );
 
     let non_pr_task = tasks.iter().find(|t| t.id == "task_no_pr").unwrap();
     assert_eq!(
