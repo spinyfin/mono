@@ -122,6 +122,7 @@ struct WorkCardPopoverView: View {
                 }
                 metadataPRRow(prURL: task.prURL)
                 docRow
+                reviewGuideRow
                 if task.kind == "followup" {
                     let originParts = [
                         task.originTaskShortId.map { "T\($0)" },
@@ -462,6 +463,56 @@ struct WorkCardPopoverView: View {
                 .buttonStyle(.plain)
                 .help(presentation.tooltip)
                 .accessibilityLabel(presentation.accessibilityLabel)
+            }
+        }
+    }
+
+    /// Review-guide row, independent of board column — unlike the card's
+    /// badge-strip affordance (Review-column only), the popover is where
+    /// the design's "keep history access in task detail/popover" access
+    /// lives once the card leaves Review. Reads `task.reviewGuideLifecycle`
+    /// / `reviewGuideReadableVersionId` directly rather than through a
+    /// `WorkCardSnapshot`, since the popover already takes the live task.
+    @ViewBuilder
+    private var reviewGuideRow: some View {
+        if let presentation = ReviewGuideCardPresentation.from(
+            lifecycle: task.reviewGuideLifecycle,
+            readableVersionId: task.reviewGuideReadableVersionId
+        ) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Review guide")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    if presentation.showsDocumentButton {
+                        Button {
+                            model.openReviewGuide(for: task)
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "doc.text.magnifyingglass")
+                                    .foregroundStyle(presentation.kind == .refreshFailed ? Color.orange : Color.accentColor)
+                                Text(presentation.kind == .ready ? "Open guide" : "Open older guide")
+                                    .font(.body)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    } else if presentation.showsProgress {
+                        ProgressView().controlSize(.small)
+                    }
+                    if presentation.showsProgress {
+                        Text("Generating\u{2026}")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if presentation.showsRetry {
+                        Button("Retry") {
+                            model.retryReviewGuide(for: task)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.orange)
+                    }
+                }
+                .help(presentation.tooltip)
             }
         }
     }

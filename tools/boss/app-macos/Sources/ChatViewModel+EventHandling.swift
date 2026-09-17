@@ -225,6 +225,7 @@ extension ChatViewModel {
             openingReviewTerminalIDs.removeAll()
             openingLiveWorkspaceTerminalIDs.removeAll()
             mergingWhenReadyIDs.removeAll()
+            retryingReviewGuideRootTaskIDs.removeAll()
             plannerActionInFlightProjectIDs.removeAll()
             deferredScopeActionInFlightIDs.removeAll()
             if case .loading = reviewTerminalVM.state {
@@ -359,6 +360,10 @@ extension ChatViewModel {
             applyProductDesignDocsList(productID: productID, state: state)
         case .productDesignDocContent(let ref, let content):
             applyProductDesignDocContent(ref: ref, content: content)
+        case .reviewGuideContent(let versionId, let content):
+            applyReviewGuideContent(versionId: versionId, content: content)
+        case .reviewGuideRetryQueued(let rootTaskId, _, _):
+            applyReviewGuideRetryQueued(rootTaskId: rootTaskId)
         case .conflictResolutionsList(let attempts):
             conflictResolutions = attempts
         case .conflictResolutionStarted(_, _, _, let prURL):

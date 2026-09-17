@@ -794,6 +794,43 @@ impl WorkerCompletionHandler {
             false
         };
 
+        // Refresh the owning card the moment this attempt reaches a
+        // terminal outcome — published, failed, or superseded by a newer
+        // request. `WorkExecution::work_item_id` is the comparison id for
+        // this execution kind, not a task id (see
+        // `root_task_id_for_review_guide_series`'s doc comment), so the
+        // series is the only path back to the board card. Best-effort: a
+        // missed push only costs the card an unrelated refresh's worth of
+        // latency (see `notify_review_guide_changed`), never correctness.
+        if let Some(attempt) = &attempt {
+            match self.work_db.root_task_id_for_review_guide_series(&attempt.series_id) {
+                Ok(Some(root_task_id)) => {
+                    crate::work::notify_review_guide_changed(
+                        &self.work_db,
+                        &self.publisher,
+                        &root_task_id,
+                        if published {
+                            "review_guide_ready"
+                        } else {
+                            "review_guide_failed"
+                        },
+                    )
+                    .await;
+                }
+                Ok(None) => tracing::warn!(
+                    execution_id = %execution.id,
+                    attempt_id = %attempt.id,
+                    "review-guide finalizer: series has no root task; skipping card refresh",
+                ),
+                Err(err) => tracing::warn!(
+                    execution_id = %execution.id,
+                    attempt_id = %attempt.id,
+                    ?err,
+                    "review-guide finalizer: failed to resolve root task for card refresh",
+                ),
+            }
+        }
+
         let lease_id = execution.cube_lease_id.clone();
         let workspace_path = execution.workspace_path.clone();
         let teardown = self.begin_teardown(&execution.id);

@@ -62,6 +62,8 @@ final class WorkCardSnapshotTests: XCTestCase {
         "mergeQueueState",
         "mergeQueueDetail",
         "prMergeableState",
+        "reviewGuideLifecycle",
+        "reviewGuideReadableVersionId",
     ]
 
     /// `WorkTask` fields the snapshot intentionally ignores. Changing any of
@@ -604,6 +606,39 @@ final class WorkCardSnapshotTests: XCTestCase {
                 }
             ),
             Case(
+                name: "reviewGuideLifecycle",
+                context: review,
+                base: {
+                    var t = Self.makeTask(
+                        id: "task_1",
+                        status: "in_review",
+                        prURL: "https://github.com/x/y/pull/3"
+                    )
+                    t.reviewGuideLifecycle = "queued"
+                    return t
+                },
+                mutate: {
+                    var t = $0; t.reviewGuideLifecycle = "ready"; return t
+                }
+            ),
+            Case(
+                name: "reviewGuideReadableVersionId",
+                context: review,
+                base: {
+                    var t = Self.makeTask(
+                        id: "task_1",
+                        status: "in_review",
+                        prURL: "https://github.com/x/y/pull/3"
+                    )
+                    t.reviewGuideLifecycle = "ready"
+                    t.reviewGuideReadableVersionId = nil
+                    return t
+                },
+                mutate: {
+                    var t = $0; t.reviewGuideReadableVersionId = "prgv_1"; return t
+                }
+            ),
+            Case(
                 name: "mergeQueueState",
                 context: done,
                 base: {
@@ -949,6 +984,61 @@ final class WorkCardSnapshotTests: XCTestCase {
         XCTAssertFalse(backlog.hasReviewRow)
         // prMergeableState is unconditional (mono#2366).
         XCTAssertEqual(backlog.prMergeableState, "mergeable")
+    }
+
+    /// Mirrors `testCIAndReviewStateGatedToReviewLane`: the review-guide
+    /// badge is Review-lane only on the card (design: "It appears in
+    /// Review for cards with a bound PR"); task detail/popover reads the
+    /// raw `WorkTask` fields directly instead of through the snapshot, so
+    /// the affordance stays reachable once the card leaves Review.
+    func testReviewGuidePresentationGatedToReviewLane() {
+        var task = Self.makeTask(status: "in_review", prURL: "https://github.com/x/y/pull/3")
+        task.reviewGuideLifecycle = "ready"
+        task.reviewGuideReadableVersionId = "prgv_1"
+
+        let review = WorkCardSnapshot.build(task: task, context: WorkCardSnapshotContext(column: .review))
+        XCTAssertEqual(review.reviewGuidePresentation?.kind, .ready)
+
+        let done = WorkCardSnapshot.build(task: task, context: WorkCardSnapshotContext(column: .done))
+        XCTAssertNil(done.reviewGuidePresentation)
+    }
+
+    /// The five brief states from the design's "Review card and viewer"
+    /// table, all mechanically derivable from `reviewGuideLifecycle` +
+    /// whether a readable version already exists.
+    func testReviewGuideCardPresentationStates() {
+        XCTAssertNil(ReviewGuideCardPresentation.from(lifecycle: nil, readableVersionId: nil))
+        XCTAssertNil(ReviewGuideCardPresentation.from(lifecycle: "idle", readableVersionId: nil))
+
+        let generating = ReviewGuideCardPresentation.from(lifecycle: "queued", readableVersionId: nil)
+        XCTAssertEqual(generating?.kind, .generating)
+        XCTAssertFalse(generating?.showsDocumentButton ?? true)
+        XCTAssertTrue(generating?.showsProgress ?? false)
+        XCTAssertFalse(generating?.showsRetry ?? true)
+
+        let refreshing = ReviewGuideCardPresentation.from(lifecycle: "queued", readableVersionId: "prgv_1")
+        XCTAssertEqual(refreshing?.kind, .refreshing)
+        XCTAssertTrue(refreshing?.showsDocumentButton ?? false)
+        XCTAssertTrue(refreshing?.showsProgress ?? false)
+        XCTAssertFalse(refreshing?.showsRetry ?? true)
+
+        let ready = ReviewGuideCardPresentation.from(lifecycle: "ready", readableVersionId: "prgv_1")
+        XCTAssertEqual(ready?.kind, .ready)
+        XCTAssertTrue(ready?.showsDocumentButton ?? false)
+        XCTAssertFalse(ready?.showsProgress ?? true)
+        XCTAssertFalse(ready?.showsRetry ?? true)
+
+        let failed = ReviewGuideCardPresentation.from(lifecycle: "failed", readableVersionId: nil)
+        XCTAssertEqual(failed?.kind, .failed)
+        XCTAssertFalse(failed?.showsDocumentButton ?? true)
+        XCTAssertFalse(failed?.showsProgress ?? true)
+        XCTAssertTrue(failed?.showsRetry ?? false)
+
+        let refreshFailed = ReviewGuideCardPresentation.from(lifecycle: "failed", readableVersionId: "prgv_1")
+        XCTAssertEqual(refreshFailed?.kind, .refreshFailed)
+        XCTAssertTrue(refreshFailed?.showsDocumentButton ?? false)
+        XCTAssertFalse(refreshFailed?.showsProgress ?? true)
+        XCTAssertTrue(refreshFailed?.showsRetry ?? false)
     }
 
     /// Pre-snapshot gate was `task.prURL != nil` (not non-empty). Empty

@@ -667,6 +667,23 @@ final class ChatViewModel: ObservableObject {
     var pendingAsyncViewerTitle: String = ""
     var pendingAsyncViewerArtifact: CommentArtifactRef?
 
+    /// In-flight engine fetch for the async markdown viewer (review-guide
+    /// affordance). `applyReviewGuideContent` updates the window only when
+    /// the reply's version id matches this — the response-identity guard
+    /// for a late reply racing a since-abandoned open. `nil` whenever the
+    /// window is showing something else (a design doc, a task description).
+    var pendingReviewGuideVersionId: String?
+    /// The root task id the pending/open review-guide viewer belongs to —
+    /// carried alongside `pendingReviewGuideVersionId` so the merge control
+    /// and header metadata can resolve the live task without threading it
+    /// through the loaded-content payload.
+    var pendingReviewGuideRootTaskId: String?
+
+    /// Root task ids for which `retry_review_guide` has been sent but
+    /// `review_guide_retry_queued` (or `work_error`) has not yet arrived.
+    /// Guards against a duplicate tap on the card's Retry affordance.
+    var retryingReviewGuideRootTaskIDs: Set<String> = []
+
     /// Indirection for opening the review-terminal window. Installed by
     /// [[ContentView]] using `@Environment(\.openWindow)`. Called on
     /// click (before the engine responds) so the window opens immediately

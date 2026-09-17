@@ -295,6 +295,9 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // every read path that returns a Task; None here because the
         // standard SELECT omits those columns.
         doc_link_state: None,
+        // Derived; populated after mapping by attach_review_guide_state.
+        review_guide_lifecycle: None,
+        review_guide_readable_version_id: None,
         // Followup provenance; populated by map_task_with_parent_and_provenance
         // and map_task_with_external_ref_parent_source_and_provenance when the
         // SELECT includes those columns. None in all standard query paths.

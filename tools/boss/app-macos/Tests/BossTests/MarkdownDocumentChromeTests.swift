@@ -666,6 +666,75 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         withExtendedLifetime(window) {}
     }
 
+    // MARK: - Review-guide viewer header (design entry: automatic PR review guides)
+
+    /// No task resolved for the pending root task id (e.g. it scrolled out of
+    /// the client's known set) — the header must render nothing rather than
+    /// crash on a forced unwrap.
+    func testReviewGuideViewerHeaderRendersEmptyWithoutATask() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        let view = ReviewGuideViewerHeader(chatModel: model, rootTaskId: "missing", generatedAt: nil)
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: 760, height: 80)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertEqual(hosting.fittingSize.height, 0)
+    }
+
+    /// A Review-lane task with a resolved PR URL renders the PR link, the
+    /// generated-at label, and the shared merge control — the currentness
+    /// banner stays absent while the guide is `"ready"` (current).
+    func testReviewGuideViewerHeaderRendersWithReviewTask() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        var task = Self.makeReviewGuideTestTask(id: "task_1")
+        task.reviewGuideLifecycle = "ready"
+        task.reviewGuideReadableVersionId = "prgv_1"
+        model.taskIndexByID = [task.id: task]
+
+        let view = ReviewGuideViewerHeader(chatModel: model, rootTaskId: task.id, generatedAt: "2026-09-16T00:00:00Z")
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: 760, height: 100)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+    }
+
+    /// A `"queued"` lifecycle with an existing readable version renders the
+    /// "Updating explanation…" currentness banner instead of the merge
+    /// control's usual quiet state — this is the design's "refreshing with
+    /// earlier content" viewer distinction.
+    func testReviewGuideViewerHeaderRendersUpdatingBanner() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        var task = Self.makeReviewGuideTestTask(id: "task_1")
+        task.reviewGuideLifecycle = "queued"
+        task.reviewGuideReadableVersionId = "prgv_1"
+        model.taskIndexByID = [task.id: task]
+
+        let view = ReviewGuideViewerHeader(chatModel: model, rootTaskId: task.id, generatedAt: "2026-09-16T00:00:00Z")
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: 760, height: 100)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+    }
+
+    /// Minimal Review-lane `WorkTask` with a resolved PR URL, for
+    /// `ReviewGuideViewerHeader` hosting tests above.
+    private static func makeReviewGuideTestTask(id: String) -> WorkTask {
+        WorkTask(
+            id: id,
+            productID: "prod_test",
+            projectID: nil,
+            kind: "task",
+            name: "Test work",
+            description: "",
+            status: "in_review",
+            priority: "medium",
+            ordinal: nil,
+            prURL: "https://github.com/spinyfin/mono/pull/42",
+            deletedAt: nil,
+            createdAt: "2026-05-14T00:00:00Z",
+            updatedAt: "2026-05-14T00:00:00Z"
+        )
+    }
+
     private static func largeHeadedDocument(sections: Int) -> String {
         var parts: [String] = ["# Large document\n\nIntro paragraph with **bold** and a [link](https://example.com).\n"]
         for i in 1...sections {

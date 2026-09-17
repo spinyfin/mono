@@ -141,6 +141,12 @@ struct WorkCardSnapshot: Equatable {
     let mergeQueueDetail: String?
     let prMergeableState: String?
     let externalRefLink: ExternalRefLinkPresentation?
+    /// Review-card guide affordance, derived from `task.reviewGuideLifecycle`
+    /// / `reviewGuideReadableVersionId`. Only rendered in Review (matching
+    /// `ciRequiredState`'s gating) — task detail/popover reads the two raw
+    /// `WorkTask` fields directly instead, so the affordance stays reachable
+    /// once the card leaves Review.
+    let reviewGuidePresentation: ReviewGuideCardPresentation?
     let ambiguousRepoNames: Set<String>
     let inReviewRevisions: [WorkCardRevisionRollup]
     let parentShortID: Int?
@@ -261,6 +267,12 @@ struct WorkCardSnapshot: Equatable {
         let ciRequiredDetail: String? = (column == .review || inMerging) ? task.ciRequiredDetail : nil
         let reviewRequiredState: String? = column == .review ? task.reviewRequiredState : nil
         let reviewRequiredDetail: String? = column == .review ? task.reviewRequiredDetail : nil
+        let reviewGuidePresentation: ReviewGuideCardPresentation? = column == .review
+            ? ReviewGuideCardPresentation.from(
+                lifecycle: task.reviewGuideLifecycle,
+                readableVersionId: task.reviewGuideReadableVersionId
+            )
+            : nil
         let mergeQueueState: String? = inMerging ? task.mergeQueueState : nil
         let mergeQueueDetail: String? = inMerging ? task.mergeQueueDetail : nil
 
@@ -365,6 +377,7 @@ struct WorkCardSnapshot: Equatable {
             mergeQueueDetail: mergeQueueDetail,
             prMergeableState: task.prMergeableState,
             externalRefLink: context.externalRefLink,
+            reviewGuidePresentation: reviewGuidePresentation,
             ambiguousRepoNames: context.ambiguousRepoNames,
             inReviewRevisions: context.inReviewRevisions,
             parentShortID: context.parentShortID,

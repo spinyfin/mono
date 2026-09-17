@@ -211,6 +211,23 @@ struct WorkTask: Identifiable, Hashable {
     /// card feeds this into the doc-link affordance. `nil` when the item
     /// has no per-task pointer (hides the affordance).
     var docLinkState: ProjectDesignDocState? = nil
+    /// Current lifecycle of this task's PR review-guide series: one of
+    /// `"idle"`, `"queued"`, `"ready"`, `"failed"`, or `nil` when no series
+    /// has been captured yet for this task's PR (including every non-root
+    /// row — a series is always keyed by the chain-root task id). Mirrors
+    /// `Task.review_guide_lifecycle` on the wire. Independent of
+    /// `ciRequiredState` / `reviewRequiredState` / merge readiness — this
+    /// says nothing about whether the PR is approved or mergeable, only
+    /// whether an explanation is available. `"queued"` covers both
+    /// "not yet started" and "actively generating".
+    var reviewGuideLifecycle: String? = nil
+    /// The review-guide series' currently readable version id, if any —
+    /// pass to `GetReviewGuideContent` to fetch its Markdown. Mirrors
+    /// `Task.review_guide_readable_version_id` on the wire. Can be
+    /// non-nil even while `reviewGuideLifecycle` is `"queued"` or
+    /// `"failed"`: an older version stays open/readable while a refresh
+    /// is in flight or has failed.
+    var reviewGuideReadableVersionId: String? = nil
 
     /// Short id of the reviewed task that produced this follow-up.
     /// `nil` for every task whose `kind` is not `"followup"`.

@@ -1108,6 +1108,28 @@ extension EngineClient {
         ])
     }
 
+    /// Fetch one immutable review-guide version's full Markdown. Engine
+    /// replies with `review_guide_content` carrying a
+    /// `ReviewGuideVersionContent` (`content: nil` when the version id is
+    /// unknown).
+    func sendGetReviewGuideContent(versionID: String) {
+        sendLine([
+            "type": "get_review_guide_content",
+            "version_id": versionID,
+        ])
+    }
+
+    /// Idempotently request another generation attempt for a PR's current
+    /// review-guide series. Engine replies with `review_guide_retry_queued`
+    /// carrying a `ReviewGuideAttempt`.
+    func sendRetryReviewGuide(rootTaskID: String, idempotencyToken: String) {
+        sendLine([
+            "type": "retry_review_guide",
+            "root_task_id": rootTaskID,
+            "idempotency_token": idempotencyToken,
+        ])
+    }
+
     /// Ask the engine for the markdown files at HEAD of `productID`'s
     /// configured repo. Engine replies with `product_design_docs_list`
     /// carrying a `DesignDocTreeState`. Read-only; nothing on this

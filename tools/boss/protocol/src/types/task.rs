@@ -925,6 +925,30 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_remote_url: Option<String>,
 
+    /// Current lifecycle of this task's PR review-guide series, one of
+    /// `"idle"` / `"queued"` / `"ready"` / `"failed"` — see
+    /// `tools/boss/docs/designs/automatic-pr-review-guides.md`. `None` when
+    /// no series has been captured for this task's PR yet (including every
+    /// non-root/non-PR row: a series is always keyed by the chain-root
+    /// task id). Independent of `ci_required_state` / `review_required_state`
+    /// / merge readiness (design invariant #6) — this says nothing about
+    /// whether the PR is approved or mergeable, only whether an explanation
+    /// is available. `"queued"` covers both "not yet started" and "a
+    /// generation attempt is actively running": the series has no separate
+    /// "generating" state, so the card renders both as one indeterminate
+    /// state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_guide_lifecycle: Option<String>,
+
+    /// The series' currently readable guide version id, if any — pass to
+    /// `GetReviewGuideContent` to fetch its Markdown. `Some` even while
+    /// `review_guide_lifecycle == "queued"` or `"failed"`: an older
+    /// version can remain open/readable while a refresh is in flight or
+    /// has failed (design's "Job state and concurrency" table). `None`
+    /// until the first guide for this PR has ever published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_guide_readable_version_id: Option<String>,
+
     /// Reviewer names for the review indicator tooltip. JSON-encoded list of
     /// login strings. For `"approved"`: the approving reviewers. For
     /// `"changes_requested"`: the requesting reviewers. `None` otherwise.

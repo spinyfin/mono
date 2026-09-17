@@ -1808,6 +1808,7 @@ fn tag_cases() -> Vec<TagCase> {
         TagCase {
             label: "ReviewGuideContent",
             event: FrontendEvent::ReviewGuideContent {
+                version_id: "prgv_1".to_owned(),
                 content: Some(
                     ReviewGuideVersion::builder()
                         .id("prgv_1")
@@ -1826,6 +1827,7 @@ fn tag_cases() -> Vec<TagCase> {
         TagCase {
             label: "ReviewGuideRetryQueued",
             event: FrontendEvent::ReviewGuideRetryQueued {
+                root_task_id: "task_1".to_owned(),
                 attempt: ReviewGuideAttempt::builder()
                     .id("prga_1")
                     .series_id("prgs_1")

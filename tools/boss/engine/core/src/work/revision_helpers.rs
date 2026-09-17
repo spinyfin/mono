@@ -946,6 +946,78 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
     Ok(())
 }
 
+/// Resolve [`Task::review_guide_lifecycle`] / [`Task::review_guide_readable_version_id`]
+/// for every task/chore that carries a `pr_url` — only a PR-bearing row can
+/// own a `pr_review_guide_source_series`, keyed by chain-root task id (see
+/// `tools/boss/docs/designs/automatic-pr-review-guides.md`, "Ownership and
+/// invariants"). A revision row's own id is never a series key (the series
+/// belongs to the chain root), so this leaves a revision's fields `None`
+/// even when its root has a guide — matching the design's card placement
+/// (the affordance lives on the root's card, not a revision's). One batched
+/// `IN (...)` query, same shape as [`attach_ai_review_state`]'s verdict
+/// lookup.
+pub(crate) fn attach_review_guide_state(conn: &Connection, tasks: &mut [Task], chores: &mut [Task]) -> Result<()> {
+    let root_task_ids: Vec<String> = tasks
+        .iter()
+        .chain(chores.iter())
+        .filter(|task| task.pr_url.is_some())
+        .map(|task| task.id.clone())
+        .collect();
+    if root_task_ids.is_empty() {
+        return Ok(());
+    }
+    let states = query_review_guide_card_states(conn, &root_task_ids)?;
+    for task in tasks.iter_mut().chain(chores.iter_mut()) {
+        if let Some((lifecycle, readable_version_id)) = states.get(&task.id) {
+            task.review_guide_lifecycle = Some(lifecycle.clone());
+            task.review_guide_readable_version_id = readable_version_id.clone();
+        }
+    }
+    Ok(())
+}
+
+/// Batched `root_task_id -> (guide_lifecycle, readable_version_id)` lookup
+/// for [`attach_review_guide_state`]. A free function (not a `WorkDb`
+/// method) so a board/work-tree read can call it on its own already-open
+/// connection rather than opening a second one — matches
+/// `query_latest_informative_review_verdicts`.
+fn query_review_guide_card_states(
+    conn: &Connection,
+    root_task_ids: &[String],
+) -> Result<std::collections::HashMap<String, (String, Option<String>)>> {
+    let placeholders = root_task_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT root_task_id, guide_lifecycle, readable_version_id
+         FROM pr_review_guide_source_series
+         WHERE root_task_id IN ({placeholders})
+         ORDER BY updated_at ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> = root_task_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    // One series per canonical repository/PR (design invariant), so this is
+    // never actually contested — ascending order + insert-overwrite is
+    // defensive "most recent wins", matching how
+    // `query_latest_informative_review_verdicts` treats duplicates.
+    let mut result = std::collections::HashMap::new();
+    for row in rows {
+        let (root_task_id, lifecycle, readable_version_id) = row?;
+        result.insert(root_task_id, (lifecycle, readable_version_id));
+    }
+    Ok(result)
+}
+
 /// Populate engine-derived `Task` projection fields for a single row so
 /// `WorkItemUpdated` payloads are complete rather than carrying mapper
 /// defaults. Mirrors the attach_* pipeline `get_work_tree` runs over the
@@ -982,6 +1054,13 @@ pub(crate) fn attach_task_derived_projections(conn: &Connection, task: &mut Task
             "attach_task_derived_projections: has_attachments failed; ignoring"
         );
     }
+    if let Err(err) = attach_review_guide_state(conn, &mut tasks, &mut chores) {
+        tracing::warn!(
+            ?err,
+            task_id = %task.id,
+            "attach_task_derived_projections: review_guide_state failed; ignoring"
+        );
+    }
     if let Some(projected) = tasks.iter().chain(chores.iter()).find(|t| t.id == task.id) {
         copy_derived_projection_fields(task, projected);
     }
@@ -997,6 +1076,8 @@ fn copy_derived_projection_fields(dst: &mut Task, src: &Task) {
     dst.ai_review_state = src.ai_review_state.clone();
     dst.ai_review_findings_revision_id = src.ai_review_findings_revision_id.clone();
     dst.ready_for_review = src.ready_for_review;
+    dst.review_guide_lifecycle = src.review_guide_lifecycle.clone();
+    dst.review_guide_readable_version_id = src.review_guide_readable_version_id.clone();
 }
 
 fn push_projection_row(task: Task, tasks: &mut Vec<Task>, chores: &mut Vec<Task>) {

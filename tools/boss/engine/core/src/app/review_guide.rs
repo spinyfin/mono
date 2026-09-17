@@ -21,7 +21,7 @@ pub(super) async fn handle_get_review_guide_summary(ctx: Dispatch, req: Frontend
             &sink,
             &request_id,
             FrontendEvent::ReviewGuideSummary {
-                summary: summary.map(wire_summary),
+                summary: summary.map(crate::work::to_wire_review_guide_summary),
             },
         ),
         Err(err) => send_work_error(&sink, &request_id, &err),
@@ -43,6 +43,7 @@ pub(super) async fn handle_get_review_guide_content(ctx: Dispatch, req: Frontend
             &sink,
             &request_id,
             FrontendEvent::ReviewGuideContent {
+                version_id,
                 content: version.map(wire_version),
             },
         ),
@@ -53,6 +54,7 @@ pub(super) async fn handle_get_review_guide_content(ctx: Dispatch, req: Frontend
 pub(super) async fn handle_retry_review_guide(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         work_db,
+        server_state,
         sink,
         request_id,
         ..
@@ -69,18 +71,29 @@ pub(super) async fn handle_retry_review_guide(ctx: Dispatch, req: FrontendReques
         idempotency_token.as_deref(),
         boss_review_guide::PROMPT_VERSION,
     ) {
-        Ok(crate::work::RetryReviewGuideOutcome::Created(attempt)) => send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::ReviewGuideRetryQueued {
-                attempt: wire_attempt(attempt),
-                already_requested: false,
-            },
-        ),
+        Ok(crate::work::RetryReviewGuideOutcome::Created(attempt)) => {
+            crate::work::notify_review_guide_changed(
+                &work_db,
+                &server_state.publisher,
+                &root_task_id,
+                "review_guide_retry_queued",
+            )
+            .await;
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::ReviewGuideRetryQueued {
+                    root_task_id: root_task_id.clone(),
+                    attempt: wire_attempt(attempt),
+                    already_requested: false,
+                },
+            )
+        }
         Ok(crate::work::RetryReviewGuideOutcome::AlreadyRequested(attempt)) => send_response(
             &sink,
             &request_id,
             FrontendEvent::ReviewGuideRetryQueued {
+                root_task_id: root_task_id.clone(),
                 attempt: wire_attempt(attempt),
                 already_requested: true,
             },
@@ -92,18 +105,6 @@ pub(super) async fn handle_retry_review_guide(ctx: Dispatch, req: FrontendReques
         ),
         Err(err) => send_work_error(&sink, &request_id, &err),
     }
-}
-
-fn wire_summary(summary: crate::work::PrReviewGuideSummary) -> boss_protocol::ReviewGuideSummary {
-    boss_protocol::ReviewGuideSummary::builder()
-        .series_id(summary.series_id)
-        .root_task_id(summary.root_task_id)
-        .canonical_pr_url(summary.canonical_pr_url)
-        .lifecycle(summary.lifecycle)
-        .request_epoch(summary.request_epoch)
-        .maybe_selected_comparison_id(summary.selected_comparison_id)
-        .maybe_readable_version_id(summary.readable_version_id)
-        .build()
 }
 
 fn wire_version(version: crate::work::PrReviewGuideVersion) -> boss_protocol::ReviewGuideVersion {

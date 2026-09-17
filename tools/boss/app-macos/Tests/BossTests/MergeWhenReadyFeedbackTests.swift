@@ -1,3 +1,5 @@
+import AppKit
+import SwiftUI
 import XCTest
 @testable import Boss
 
@@ -69,6 +71,26 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
 
         XCTAssertEqual(model.mergeFeedbackNotice?.taskID, "task_2")
         XCTAssertEqual(model.mergeFeedbackNotice?.message, "Merge requested")
+    }
+
+    // MARK: - Shared control (card + review-guide viewer)
+
+    /// The extracted `MergeWhenReadyControl` (design: "Extract the current
+    /// card merge control and confirmation into one reusable
+    /// presentation/action component, used by both card and viewer") hosts
+    /// and lays out on its own, independent of a `WorkCardSnapshot`. The
+    /// card and the review-guide viewer header both mount it with only an
+    /// `onConfirm` closure that calls `mergeWhenReady(for:)` — this test
+    /// pins that the shared view itself renders without needing snapshot
+    /// or task context.
+    @MainActor
+    func testMergeWhenReadyControlHostsAndRenders() {
+        let view = MergeWhenReadyControl(onConfirm: {})
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: 60, height: 30)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(hosting.fittingSize.width, 0)
+        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
     }
 
     // MARK: - Helpers

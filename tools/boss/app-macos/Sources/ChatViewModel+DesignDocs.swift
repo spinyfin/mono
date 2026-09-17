@@ -82,6 +82,10 @@ extension ChatViewModel {
         pendingAsyncViewerRef = ref
         pendingAsyncViewerTitle = title
         pendingAsyncViewerArtifact = artifact
+        pendingReviewGuideVersionId = nil
+        pendingReviewGuideRootTaskId = nil
+        asyncMarkdownViewerVM.reviewGuideRootTaskId = nil
+        asyncMarkdownViewerVM.reviewGuideGeneratedAt = nil
         asyncMarkdownViewerVM.clickStartTime = Date()
         asyncMarkdownViewerVM.collapsedByDefaultHeadings = []
         if let existing = designDocContentByRef[ref] {
@@ -306,6 +310,10 @@ extension ChatViewModel {
     /// scoped to the design-doc click-to-first-paint journey.
     @MainActor
     func openTaskDescription(_ task: WorkTask) {
+        pendingReviewGuideVersionId = nil
+        pendingReviewGuideRootTaskId = nil
+        asyncMarkdownViewerVM.reviewGuideRootTaskId = nil
+        asyncMarkdownViewerVM.reviewGuideGeneratedAt = nil
         asyncMarkdownViewerVM.pendingRenderProjectShortID = nil
         asyncMarkdownViewerVM.renderStartTime = nil
         asyncMarkdownViewerVM.clickStartTime = nil

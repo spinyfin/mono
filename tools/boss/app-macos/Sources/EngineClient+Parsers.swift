@@ -254,6 +254,8 @@ extension EngineClient {
             aiReviewFindingsRevisionId: payload["ai_review_findings_revision_id"] as? String,
             readyForReview: (payload["ready_for_review"] as? Bool) ?? false,
             docLinkState: parseDocLinkState(payload["doc_link_state"]),
+            reviewGuideLifecycle: payload["review_guide_lifecycle"] as? String,
+            reviewGuideReadableVersionId: payload["review_guide_readable_version_id"] as? String,
             originTaskShortId: (payload["origin_task_short_id"] as? NSNumber)?.intValue,
             originPrNumber: (payload["origin_pr_number"] as? NSNumber)?.intValue,
             completedAt: payload["completed_at"] as? String,
