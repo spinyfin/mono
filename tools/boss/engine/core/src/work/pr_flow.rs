@@ -204,10 +204,9 @@ impl WorkDb {
     /// diff is empty, and there is genuinely nothing to commit, push, or
     /// open a PR for. This is the sanctioned no-op terminal (see
     /// [`crate::no_op_signal`]). In a single transaction:
-    ///   - the linked task/chore moves to `done` (with **no** `pr_url` —
-    ///     there is no PR), unless it is already terminal (`done` /
-    ///     `archived`), in which case its status is left
-    ///     alone;
+    ///   - the linked task/chore moves to `done`, unless already terminal.
+    ///     A nonterminal PR owner instead stays in `in_review` with a
+    ///     contradiction attention; revisions do not own their stamped PR;
     ///   - the execution transitions from `waiting_human` (or `running`)
     ///     to `completed`, the cube workspace lease columns are cleared,
     ///     and `finished_at` is stamped;
@@ -216,9 +215,8 @@ impl WorkDb {
     ///
     /// Mirrors [`Self::record_worker_pr_completion`] — including the
     /// dependent-cascade on a real status change and the returned
-    /// lease/workspace ids for out-of-band cube release — but stamps NO
-    /// `pr_url`: fabricating one would be exactly the empty PR the worker
-    /// correctly refused to push.
+    /// lease/workspace ids for out-of-band cube release — but preserves any existing
+    /// `pr_url` without fabricating a new one.
     ///
     /// Returns `Ok(None)` if the execution has already been finalised
     /// (terminal status), making this safe to call from a hook handler
@@ -274,10 +272,10 @@ impl WorkDb {
             .pr_url
             .as_deref()
             .filter(|url| !url.trim().is_empty())
-            .filter(|_| !task.status.is_terminal());
+            .filter(|_| task.kind != TaskKind::Revision && !task.status.is_terminal());
         let attention = if let Some(pr_url) = contradiction {
             Some(CreateAttentionItemInput {
-                kind: "completion_with_bound_pr".into(),
+                kind: crate::attention_lifecycle::COMPLETION_WITH_BOUND_PR_ATTENTION_KIND.into(),
                 title: "Completion refused: work still has a bound PR".into(),
                 body_markdown: format!(
                     "The worker declared no changes needed, but this work item owns {pr_url}. \

@@ -25,6 +25,36 @@
 use super::*;
 
 #[test]
+fn revision_no_op_preserves_specific_attention_with_stamped_pr() {
+    let db = WorkDb::open(temp_db_path("revision-stamped-noop")).unwrap();
+    let (_, task_id, exec_id) = make_waiting_human_chore(&db, "revision-stamped-noop");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET kind = 'revision', pr_url = 'https://github.com/spinyfin/mono/pull/4042' WHERE id = ?1",
+            [&task_id],
+        )
+        .unwrap();
+    let completion = db
+        .record_worker_no_op_completion(
+            &exec_id,
+            "finding declined",
+            Some(CreateAttentionItemInput {
+                kind: crate::completion::REVISION_NO_OP_ATTENTION_KIND.into(),
+                title: "Finding declined".into(),
+                body_markdown: "The finding was declined rather than fixed.".into(),
+                ..Default::default()
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(task_status(&db, &task_id), "done");
+    let attention = completion.filed_attention_item.unwrap();
+    assert_eq!(attention.kind, crate::completion::REVISION_NO_OP_ATTENTION_KIND);
+    assert_eq!(attention.body_markdown, "The finding was declined rather than fixed.");
+}
+
+#[test]
 fn delivered_chore_waiting_for_review_cannot_receive_another_implementation() {
     let db = WorkDb::open(temp_db_path("delivered-dispatch")).unwrap();
     let (_, chore_id, exec_id) = make_waiting_human_chore(&db, "delivered-dispatch");

@@ -392,6 +392,12 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          first sweep, every time.",
     ),
     entry(
+        COMPLETION_WITH_BOUND_PR_ATTENTION_KIND,
+        ClearedBy::HumanDecision,
+        "Records a completion claim contradicted by an owned PR without merge evidence.
+         A human must inspect the PR and decide whether the completion claim was justified.",
+    ),
+    entry(
         crate::completion::REVISION_NO_OP_ATTENTION_KIND,
         ClearedBy::HumanDecision,
         "Records that a worker declined a reviewer's finding. Whether that judgement stands is the \
@@ -557,6 +563,8 @@ pub const REVISION_ARCHIVED_ATTENTION_KIND: &str = "revision_archived";
 pub const FOLLOWUP_ATTENTION_KIND: &str = "followup";
 /// Attention-group kind for a question posed to the operator.
 pub const QUESTION_ATTENTION_KIND: &str = "question";
+/// A no-op completion contradicted by a PR still owned by the work item.
+pub const COMPLETION_WITH_BOUND_PR_ATTENTION_KIND: &str = "completion_with_bound_pr";
 /// Product-scoped external-tracker fetch failures, resolved by the
 /// reconcile loop on the next successful fetch. The reconcile loop
 /// (`external_tracker::reconcile::logic`) both raises and resolves against
@@ -685,6 +693,7 @@ mod tests {
             REVISION_ARCHIVED_ATTENTION_KIND,
             FOLLOWUP_ATTENTION_KIND,
             QUESTION_ATTENTION_KIND,
+            COMPLETION_WITH_BOUND_PR_ATTENTION_KIND,
             EXTERNAL_TRACKER_AUTH_FAILED_ATTENTION_KIND,
             EXTERNAL_TRACKER_TOKEN_REVOKED_ATTENTION_KIND,
             EXTERNAL_TRACKER_TRANSIENT_ERRORS_ATTENTION_KIND,

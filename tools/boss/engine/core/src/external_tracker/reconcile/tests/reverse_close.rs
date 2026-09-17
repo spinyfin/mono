@@ -7,7 +7,7 @@ fn seed_done_chore(db: &WorkDb, product_id: &str, canonical_id: &str, issue_num:
     let chore = create_test_chore_manual(db, product_id, format!("Done chore {canonical_id}"));
     db.set_external_ref(&chore.id, "spy", canonical_id, &json!({ "issue_number": issue_num }))
         .expect("set_external_ref");
-    db.reconciler_close_work_item(&chore.id).expect("close work item");
+    db.reconciler_close_work_item(&chore.id, &[]).expect("close work item");
     db.find_by_external_ref("spy", canonical_id)
         .expect("query ok")
         .expect("chore exists")
@@ -133,7 +133,7 @@ async fn reverse_close_fires_for_reconciler_imported_chore() {
     assert_eq!(chore.status, TaskStatus::Todo);
 
     // Simulate the chore being completed (e.g. PR merged → boss dragged to done).
-    db.reconciler_close_work_item(&chore.id).expect("close work item");
+    db.reconciler_close_work_item(&chore.id, &[]).expect("close work item");
     let closed = db
         .find_by_external_ref("spy", "spy#30")
         .expect("query ok")

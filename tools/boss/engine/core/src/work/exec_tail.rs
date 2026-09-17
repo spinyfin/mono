@@ -490,16 +490,25 @@ impl WorkDb {
     }
 
     /// Move `work_item_id` to `status = 'done'`, clearing any block reason.
-    /// No-op (returns `false`) when the row is already done/archived or soft-deleted.
+    /// No-op (returns `false`) when already terminal/deleted, or an owned PR
+    /// lacks matching merge evidence in `merged_pr_urls`.
     /// Used by the external-tracker reconciler for close-mirror (Behavior 2) and
     /// PR-merge-close (Behavior 5). Cascades the dep-unblock sweep after commit.
-    pub fn reconciler_close_work_item(&self, work_item_id: &str) -> Result<bool> {
+    pub fn reconciler_close_work_item(&self, work_item_id: &str, merged_pr_urls: &[&str]) -> Result<bool> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let Some(task) = query_task(&tx, work_item_id)? else {
             return Ok(false);
         };
         if task.deleted_at.is_some() || task.status == TaskStatus::Done || task.status == TaskStatus::Archived {
+            return Ok(false);
+        }
+        // Read the binding inside the closing transaction: tracker associations
+        // may refer to another PR, or a PR attached earlier in this same pass.
+        if task.kind != TaskKind::Revision
+            && let Some(pr_url) = task.pr_url.as_deref().filter(|url| !url.trim().is_empty())
+            && !merged_pr_urls.contains(&pr_url)
+        {
             return Ok(false);
         }
         let now = now_string();

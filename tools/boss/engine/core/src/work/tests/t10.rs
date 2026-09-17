@@ -128,7 +128,7 @@ fn reconciler_close_work_item_sets_completed_at() {
         "completed_at must be NULL before close",
     );
 
-    let closed = db.reconciler_close_work_item(&chore_id).unwrap();
+    let closed = db.reconciler_close_work_item(&chore_id, &[pr_url]).unwrap();
     assert!(
         closed,
         "reconciler_close_work_item must return true for an in_review row"
@@ -161,7 +161,7 @@ fn reconciler_close_work_item_clears_merge_queue_state() {
         )
         .unwrap();
 
-    let closed = db.reconciler_close_work_item(&chore_id).unwrap();
+    let closed = db.reconciler_close_work_item(&chore_id, &[pr_url]).unwrap();
     assert!(
         closed,
         "reconciler_close_work_item must return true for an in_review row"
