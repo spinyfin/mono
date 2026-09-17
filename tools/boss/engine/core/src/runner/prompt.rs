@@ -518,6 +518,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
     prompt.push_str(&run_done_directive(
         run_done_proposals_seam_enabled,
         worker_signal_proposals_seam_enabled,
+        conflict_attempt.is_some(),
     ));
     prompt.push_str("\nRespond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
@@ -990,7 +991,22 @@ pub(crate) fn worker_escalation_protocol_directive(seam_enabled: bool) -> String
 /// is on — the two flags are independently defaulted off, and a worker
 /// must never be taught a verb the engine won't yet read proposals-first
 /// for. The `propose done` verb itself remains gated only on `seam_enabled`.
-pub(crate) fn run_done_directive(seam_enabled: bool, worker_signal_seam_enabled: bool) -> String {
+///
+/// `conflict_resolution` is true when this prompt also carries
+/// [`bazel_conflict_resolution_gate_text`]. That gate is an absolute
+/// compile-or-do-not-push stop and never receives the unattributable-failure
+/// exception; the closing paragraph here must not read as overriding it.
+/// The marker fallback (`worker_signal_seam_enabled` off) must also not
+/// claim a `[blocked]` marker records synchronously: that parser runs only
+/// at the Stop boundary (`completion::stop`), never from
+/// `finalize_declared_run_done`, so a marker emitted immediately before
+/// this terminal call is lost. The mixed-flag path therefore stores the
+/// blocker in `--summary` instead.
+pub(crate) fn run_done_directive(
+    seam_enabled: bool,
+    worker_signal_seam_enabled: bool,
+    conflict_resolution: bool,
+) -> String {
     if !seam_enabled {
         return String::new();
     }
@@ -1002,9 +1018,39 @@ pub(crate) fn run_done_directive(seam_enabled: bool, worker_signal_seam_enabled:
         )
     } else {
         (
-            "Emit a `[blocked] reason=\"...\"` marker alongside it (before this call)".to_string(),
-            "a `[blocked] reason=\"...\"` marker alone records".to_string(),
+            "Put the blocker reason in this call's `--summary` (a `[blocked] reason=\"...\"` marker \
+             emitted immediately before this call is never parsed — the marker is Stop-boundary-only)"
+                .to_string(),
+            "a `[blocked] reason=\"...\"` marker is parsed only at the Stop boundary (when the turn \
+             ends without a terminal `propose done`) and records"
+                .to_string(),
         )
+    };
+    let gate_exception = if conflict_resolution {
+        "The merge-correctness pre-push gate is not covered by any unattributable-failure exception. \
+         If `bazel build` fails (the merge does not compile), do NOT push: the merged code MUST COMPILE. \
+         A still-red compile is a reason to stop without delivery, not a reason to push, even if the \
+         failure looks pre-existing or environmental. Timeouts and the full test suite are not a \
+         precondition for this push — the conflict-resolution gate already defers those to CI. Bazel \
+         remains the source of truth: do not bypass or weaken checks, and still stop for required \
+         approval to relax a check, missing credentials or authorization, genuine instruction \
+         conflicts or contradictory briefs."
+            .to_string()
+    } else {
+        "For validation failures, this is a narrow exception to the earlier gate/stop rules, including \
+         the pre-push Bazel gate: a failing gate warrants stopping without delivery only when it is \
+         reproducible AND attributable to your change — fix it; if attribution remains unresolved, \
+         the failure still stands. A timeout, a full-suite failure that passes in isolation, or a \
+         failure in untouched code is not by itself a reason to stop or to refuse the push: retry the \
+         specific Bazel target (two or three attempts maximum), and if it keeps failing, check whether \
+         it reproduces on an unmodified base revision. You MAY push despite a still-red target, and \
+         declare `delivered`, only with evidence that the failure is pre-existing or environmental (a \
+         base reproduction, a passing rerun/isolation run, or a concrete code-path argument showing why \
+         your change cannot cause it), recording the target, failure, attempts and evidence in the \
+         PR body; merely calling it flaky is not evidence. Bazel remains the source of truth: do not \
+         bypass or weaken checks, and still stop for required approval to relax a check, missing \
+         credentials or authorization, genuine instruction conflicts or contradictory briefs."
+            .to_string()
     };
     format!(
         "\n## Declaring your run finished\n\n\
@@ -1030,19 +1076,7 @@ pub(crate) fn run_done_directive(seam_enabled: bool, worker_signal_seam_enabled:
      Never relax a repository check without approval. Include the exact failed command, missing \
      credential, or decision needed in the summary. {blocked_file} so the blocker itself is \
      recorded, not just the fact that you stopped.\n\n\
-     For validation failures, this is a narrow exception to the earlier gate/stop rules, including \
-     the pre-push Bazel gate: a failing gate warrants stopping without delivery only when it is \
-     reproducible AND attributable to your change — fix it; if attribution remains unresolved, \
-     the failure still stands. A timeout, a full-suite failure that passes in isolation, or a \
-     failure in untouched code is not by itself a reason to stop or to refuse the push: retry the \
-     specific Bazel target (two or three attempts maximum), and if it keeps failing, check whether \
-     it reproduces on an unmodified base revision. You MAY push despite a still-red target, and \
-     declare `delivered`, only with evidence that the failure is pre-existing or environmental (a \
-     base reproduction, a passing rerun/isolation run, or a concrete code-path argument showing why \
-     your change cannot cause it), recording the target, failure, attempts and evidence in the \
-     PR body; merely calling it flaky is not evidence. Bazel remains the source of truth: do not \
-     bypass or weaken checks, and still stop for required approval to relax a check, missing \
-     credentials or authorization, genuine instruction conflicts or contradictory briefs.\n\n\
+     {gate_exception}\n\n\
      To flag a concern while continuing, {blocked_while_continuing} the blocker and pauses the \
      nudge loop; it does NOT end the run. Only `{boss} propose done --outcome blocked` ends the \
      run, releases the slot and lease, and parks the row for a human.\n\n\
