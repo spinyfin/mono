@@ -90,6 +90,11 @@ impl ExecutionCoordinator {
         {
             return Ok(item);
         }
+        if execution.kind == ExecutionKind::PrReviewGuide
+            && let Some(item) = self.synthetic_review_guide_work_item(execution)
+        {
+            return Ok(item);
+        }
         self.work_db.get_work_item(&execution.work_item_id)
     }
 
@@ -151,6 +156,40 @@ impl ExecutionCoordinator {
             .repo_remote_url(execution.repo_remote_url.clone())
             .created_at(comment.created_at.clone())
             .updated_at(comment.updated_at.clone())
+            .build();
+        Some(WorkItem::Chore(task))
+    }
+
+    /// Build the synthetic `Chore` work item for a `pr_review_guide`
+    /// execution from its bound immutable comparison (`work_item_id` is a
+    /// `pr_review_guide_source_comparisons.id`, per
+    /// [`crate::work::WorkDb::create_pr_review_guide_execution`]). `None`
+    /// when the comparison is gone (same engine-raced-under-us tolerance as
+    /// the other synthetic builders). `product_id` is the owning root task's
+    /// real product, needed for host capability resolution; `name`/
+    /// `description` only feed cube's task label / change title — the
+    /// runner composes the real review-guide prompt (with the embedded
+    /// source packet) separately, and the completion handler branches on
+    /// `kind` to run publication fencing instead of PR detection.
+    fn synthetic_review_guide_work_item(&self, execution: &WorkExecution) -> Option<WorkItem> {
+        let capture = self
+            .work_db
+            .get_pr_review_guide_comparison_by_id(&execution.work_item_id)
+            .ok()??;
+        let root_item = self.work_db.get_work_item(&capture.root_task_id).ok()?;
+        let task = boss_protocol::Task::builder()
+            .id(capture.comparison_id.clone())
+            .product_id(root_item.product_id().to_string())
+            .kind(TaskKind::Chore)
+            .name(format!("Review guide: {}", capture.packet.title))
+            .description(format!(
+                "Generate a review guide for {}",
+                capture.packet.canonical_pr_url
+            ))
+            .status(TaskStatus::Active)
+            .repo_remote_url(execution.repo_remote_url.clone())
+            .created_at(capture.captured_at.clone())
+            .updated_at(capture.captured_at.clone())
             .build();
         Some(WorkItem::Chore(task))
     }

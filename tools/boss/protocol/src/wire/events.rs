@@ -1438,6 +1438,25 @@ pub enum FrontendEvent {
         workspace_path: String,
         lease_id: String,
     },
+    /// Response to [`FrontendRequest::GetReviewGuideSummary`]. `None` when
+    /// no comparison has been captured for this root task yet — distinct
+    /// from an unknown/deleted root task, which replies `WorkError`.
+    ReviewGuideSummary {
+        summary: Option<ReviewGuideSummary>,
+    },
+    /// Response to [`FrontendRequest::GetReviewGuideContent`]. `None` when
+    /// `version_id` does not resolve to a stored version.
+    ReviewGuideContent {
+        content: Option<ReviewGuideVersion>,
+    },
+    /// Response to [`FrontendRequest::RetryReviewGuide`]. `already_requested`
+    /// is `true` when the supplied idempotency token matched an existing
+    /// attempt rather than creating a new one — mirrors
+    /// [`Self::ProposalSubmitted`]'s `already_submitted`.
+    ReviewGuideRetryQueued {
+        attempt: ReviewGuideAttempt,
+        already_requested: bool,
+    },
     /// Response to [`FrontendRequest::OpenLiveWorkspaceTerminal`]: the
     /// work item has a live execution with an already-leased cube
     /// workspace at `workspace_path`. The app should open a Ghostty

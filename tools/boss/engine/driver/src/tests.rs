@@ -341,6 +341,7 @@ fn tool_use_interception_config_fields_are_accessible() {
         is_revision: true,
         is_standard_worker: true,
         is_reviewer: false,
+        is_review_guide: false,
         run_id: Some("run-1".into()),
         workspace_path: Some(PathBuf::from("/ws")),
     };

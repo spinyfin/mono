@@ -58,6 +58,16 @@ pub enum ExecutionKind {
     ConflictResolution,
     InvestigationImplementation,
     PrReview,
+    /// Generates one immutable, source-grounded explanation ("review guide")
+    /// of a captured PR comparison, via the enforced read-only Astra
+    /// (`codex`/`gpt-6-astra`/`high`) profile. Like [`Self::AnswerAgent`],
+    /// this kind has no `tasks` row: `work_executions.work_item_id` is a
+    /// `pr_review_guide_source_comparisons.id`, giving free per-comparison
+    /// concurrency dedup via `get_live_execution_for_work_item`. Its job can
+    /// only read the engine-collected immutable source packet and return
+    /// Markdown; it never edits, pushes, comments, or merges. See
+    /// `tools/boss/docs/designs/automatic-pr-review-guides.md`.
+    PrReviewGuide,
     ProductDesign,
     ProjectDesign,
     RevisionImplementation,
@@ -74,6 +84,7 @@ impl ExecutionKind {
             Self::ConflictResolution => "conflict_resolution",
             Self::InvestigationImplementation => "investigation_implementation",
             Self::PrReview => "pr_review",
+            Self::PrReviewGuide => "pr_review_guide",
             Self::ProductDesign => "product_design",
             Self::ProjectDesign => "project_design",
             Self::RevisionImplementation => "revision_implementation",
@@ -99,6 +110,7 @@ impl std::str::FromStr for ExecutionKind {
             "conflict_resolution" => Ok(Self::ConflictResolution),
             "investigation_implementation" => Ok(Self::InvestigationImplementation),
             "pr_review" => Ok(Self::PrReview),
+            "pr_review_guide" => Ok(Self::PrReviewGuide),
             "product_design" => Ok(Self::ProductDesign),
             "project_design" => Ok(Self::ProjectDesign),
             "revision_implementation" => Ok(Self::RevisionImplementation),
@@ -106,7 +118,7 @@ impl std::str::FromStr for ExecutionKind {
             other => Err(format!(
                 "unknown execution kind: `{other}`; expected one of: \
                  answer_agent, automation_triage, chore_implementation, ci_remediation, \
-                 conflict_resolution, investigation_implementation, pr_review, \
+                 conflict_resolution, investigation_implementation, pr_review, pr_review_guide, \
                  product_design, project_design, revision_implementation, task_implementation"
             )),
         }

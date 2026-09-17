@@ -24,8 +24,10 @@ use crate::effort::SpawnConfig;
 use crate::work::{WorkExecution, WorkItem};
 use boss_protocol::ExecutionStatus;
 
+mod answer_agent_prompt;
 pub(crate) mod pane_spawn;
 mod prompt;
+mod review_guide_prompt;
 pub(crate) mod work_item;
 mod worker_spawn;
 

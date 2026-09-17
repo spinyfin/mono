@@ -879,6 +879,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 crate::worker_setup::WorkerKind::Reviewer => crate::driver::WorkerKind::Reviewer,
                 crate::worker_setup::WorkerKind::Triage => crate::driver::WorkerKind::Triage,
                 crate::worker_setup::WorkerKind::AnswerAgent => crate::driver::WorkerKind::AnswerAgent,
+                crate::worker_setup::WorkerKind::ReviewGuide => crate::driver::WorkerKind::ReviewGuide,
             },
             workspace_path: workspace_path.to_path_buf(),
             events_socket_path: self.events_socket_path(),

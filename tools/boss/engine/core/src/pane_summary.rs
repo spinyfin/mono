@@ -284,6 +284,14 @@ pub fn answer_agent_summary() -> Option<String> {
     Some("answering a doc comment".to_owned())
 }
 
+/// Fixed phrase for [`ExecutionKind::PrReviewGuide`], mirroring
+/// [`answer_agent_summary`]: this kind's synthetic row is keyed by a source
+/// comparison id, not a real task, so there is no `work_item_id` cache slot
+/// worth sharing and no model call worth spending on a titlebar phrase.
+pub fn review_guide_summary() -> Option<String> {
+    Some("generating a review guide".to_owned())
+}
+
 /// Route an execution kind to a *derived* pane-titlebar phrase, bypassing
 /// [`get_or_generate`] entirely — or `None` to say "fall through to the
 /// cached/LLM path".
@@ -308,6 +316,7 @@ pub fn derived_title_summary(kind: &ExecutionKind, task_name: &str) -> Option<Op
         ExecutionKind::ConflictResolution => Some(conflict_resolution_summary(task_name)),
         ExecutionKind::PrReview => Some(pr_review_summary(task_name)),
         ExecutionKind::AnswerAgent => Some(answer_agent_summary()),
+        ExecutionKind::PrReviewGuide => Some(review_guide_summary()),
         ExecutionKind::AutomationTriage
         | ExecutionKind::ChoreImplementation
         | ExecutionKind::InvestigationImplementation

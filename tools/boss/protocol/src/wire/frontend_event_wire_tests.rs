@@ -1787,6 +1787,53 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "live_workspace_terminal_ready",
         },
         TagCase {
+            label: "ReviewGuideSummary",
+            event: FrontendEvent::ReviewGuideSummary {
+                summary: Some(
+                    ReviewGuideSummary::builder()
+                        .series_id("prgs_1")
+                        .root_task_id("task_1")
+                        .canonical_pr_url("https://github.com/acme/widget/pull/4")
+                        .lifecycle("ready")
+                        .request_epoch(1)
+                        .build(),
+                ),
+            },
+            expected_tag: "review_guide_summary",
+        },
+        TagCase {
+            label: "ReviewGuideContent",
+            event: FrontendEvent::ReviewGuideContent {
+                content: Some(
+                    ReviewGuideVersion::builder()
+                        .id("prgv_1")
+                        .series_id("prgs_1")
+                        .comparison_id("prgc_1")
+                        .attempt_id("prga_1")
+                        .markdown("# Guide\n")
+                        .content_hash("deadbeef")
+                        .prompt_version("review-guide-v1")
+                        .generated_at("2026-01-01T00:00:00Z")
+                        .build(),
+                ),
+            },
+            expected_tag: "review_guide_content",
+        },
+        TagCase {
+            label: "ReviewGuideRetryQueued",
+            event: FrontendEvent::ReviewGuideRetryQueued {
+                attempt: ReviewGuideAttempt::builder()
+                    .id("prga_1")
+                    .series_id("prgs_1")
+                    .comparison_id("prgc_1")
+                    .request_epoch(2)
+                    .status("queued")
+                    .build(),
+                already_requested: false,
+            },
+            expected_tag: "review_guide_retry_queued",
+        },
+        TagCase {
             label: "MergeWhenReadyAccepted",
             event: FrontendEvent::MergeWhenReadyAccepted {
                 work_item_id: "task_1".into(),
@@ -2177,6 +2224,9 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::CommentsResolved { .. }
         | FrontendEvent::CommentsReviseDocResult { .. }
         | FrontendEvent::AnswerAgentRunsList { .. }
+        | FrontendEvent::ReviewGuideSummary { .. }
+        | FrontendEvent::ReviewGuideContent { .. }
+        | FrontendEvent::ReviewGuideRetryQueued { .. }
         | FrontendEvent::ReviewTerminalReady { .. }
         | FrontendEvent::LiveWorkspaceTerminalReady { .. }
         | FrontendEvent::MergeWhenReadyAccepted { .. }

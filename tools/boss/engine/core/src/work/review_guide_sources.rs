@@ -499,6 +499,55 @@ impl WorkDb {
         .map_err(Into::into)
     }
 
+    /// Look up one immutable comparison by its own id — the review-guide job
+    /// path's entry point (synthetic work-item resolution, spawn-time packet
+    /// load). Unlike [`Self::get_latest_pr_review_guide_source_capture`],
+    /// this does not require the comparison to be the series' currently
+    /// selected one: a bound attempt always reads its own exact comparison,
+    /// even after the series has moved on to a newer one (publication
+    /// fencing happens separately, at publish time).
+    pub fn get_pr_review_guide_comparison_by_id(
+        &self,
+        comparison_id: &str,
+    ) -> Result<Option<PrReviewGuideSourceCapture>> {
+        let conn = self.connect()?;
+        let artifact_root = self.artifact_root()?;
+        conn.query_row(
+            "SELECT s.id, s.root_task_id, c.observation_sequence, c.trigger, c.packet_hash,
+                    c.complete, c.captured_at, c.id, c.packet_path, c.omission_count, c.omission_summary_json, c.attempt_count
+             FROM pr_review_guide_source_series s
+             JOIN pr_review_guide_source_comparisons c ON c.series_id = s.id
+             WHERE c.id = ?1",
+            [comparison_id],
+            |row| map_capture(row, &artifact_root),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Cheap indexed lookup used by the poller before spawning GitHub work.
+    /// `Some(true)` means a complete packet for these endpoints is already
+    /// stored; `Some(false)` is an incomplete packet that may still be retried;
+    /// `None` means no comparison row exists yet.
+    pub fn pr_review_guide_source_capture_complete(
+        &self,
+        canonical_pr_url: &str,
+        observed_base_sha: &str,
+        head_sha: &str,
+    ) -> Result<Option<bool>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT c.complete
+             FROM pr_review_guide_source_series s
+             JOIN pr_review_guide_source_comparisons c ON c.series_id = s.id
+             WHERE s.canonical_pr_url = ?1 AND c.observed_base_sha = ?2 AND c.head_sha = ?3",
+            params![canonical_pr_url, observed_base_sha, head_sha],
+            |row| Ok(row.get::<_, i64>(0)? != 0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// Select a settled or retry-exhausted REST comparison.
     pub(crate) fn select_complete_pr_review_guide_source_capture(
         &self,

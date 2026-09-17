@@ -472,6 +472,7 @@ dependencies = [
  "boss-pr-review",
  "boss-pr-template",
  "boss-protocol",
+ "boss-review-guide",
  "boss-ssh-transport",
  "boss-timer-wheel",
  "boss-tmux",
@@ -981,6 +982,15 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "boss-review-guide"
+version = "0.1.0"
+dependencies = [
+ "boss-pr-review-sources",
+ "regex",
+ "sha2",
 ]
 
 [[package]]

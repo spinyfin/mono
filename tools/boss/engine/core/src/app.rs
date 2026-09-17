@@ -128,6 +128,7 @@ pub(crate) mod proposals;
 // (crate-internal only — nothing outside the engine sees this module).
 pub(crate) mod readoption;
 mod review;
+mod review_guide;
 mod selected_product;
 mod server;
 mod sessions;
@@ -2681,6 +2682,12 @@ async fn handle_frontend_connection(
                 Box::pin(design_docs::handle_get_product_design_doc(ctx, r))
             }
             r @ FrontendRequest::GetPrStatus { .. } => Box::pin(pr_status::handle_get_pr_status(ctx, r)),
+            r @ FrontendRequest::GetReviewGuideContent { .. } => {
+                Box::pin(review_guide::handle_get_review_guide_content(ctx, r))
+            }
+            r @ FrontendRequest::GetReviewGuideSummary { .. } => {
+                Box::pin(review_guide::handle_get_review_guide_summary(ctx, r))
+            }
             r @ FrontendRequest::GetRun { .. } => Box::pin(executions::handle_get_run(ctx, r)),
             r @ FrontendRequest::GetSelectedProduct => Box::pin(selected_product::handle_get_selected_product(ctx, r)),
             r @ FrontendRequest::GetSettings => Box::pin(engine_meta::handle_get_settings(ctx, r)),
@@ -2832,6 +2839,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::RetryConflictResolution { .. } => {
                 Box::pin(conflict_resolution::handle_retry_conflict_resolution(ctx, r))
             }
+            r @ FrontendRequest::RetryReviewGuide { .. } => Box::pin(review_guide::handle_retry_review_guide(ctx, r)),
             r @ FrontendRequest::RevealWorkItem { .. } => Box::pin(work_items::handle_reveal_work_item(ctx, r)),
             r @ FrontendRequest::RevokeDecision { .. } => Box::pin(decisions::handle_revoke_decision(ctx, r)),
             r @ FrontendRequest::RunAutomation { .. } => Box::pin(automations::handle_run_automation(ctx, r)),

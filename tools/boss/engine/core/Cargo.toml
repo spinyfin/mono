@@ -47,6 +47,7 @@ boss-metrics = { path = "../metrics" }
 boss-engine-planner-validation = { path = "../planner-validation" }
 boss-pr-review = { path = "../pr-review" }
 boss-pr-template = { path = "../pr-template" }
+boss-review-guide = { path = "../review-guide" }
 boss-engine-proposal-validation = { path = "../proposal-validation" }
 boss-engine-recovery = { path = "../recovery" }
 boss-protocol = { path = "../../protocol" }

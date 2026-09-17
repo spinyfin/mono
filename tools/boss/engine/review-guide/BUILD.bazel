@@ -4,35 +4,31 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 exports_files(["Cargo.toml"])
 
 rust_library(
-    name = "pr-review-sources",
+    name = "review-guide",
     srcs = glob(["src/**/*.rs"]),
-    crate_name = "boss_pr_review_sources",
+    crate_name = "boss_review_guide",
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/engine/core:__pkg__",
-        "//tools/boss/engine/review-guide:__pkg__",
     ],
     deps = [
-        "//tools/boss/gh_telemetry",
-        "//tools/boss/github",
-        "@mono_crates//:tracing",
+        "//tools/boss/engine/pr-review-sources",
     ] + all_crate_deps(normal = True),
 )
 
 rust_test(
-    name = "pr-review-sources_test",
+    name = "review-guide_test",
     size = "small",
-    crate = ":pr-review-sources",
+    crate = ":review-guide",
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),
     deps = [
-        "//tools/boss/gh_telemetry",
-        "//tools/boss/github",
+        "//tools/boss/engine/pr-review-sources",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,

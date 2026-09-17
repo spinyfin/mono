@@ -1154,6 +1154,10 @@ pub(crate) async fn sweep_pending_pr(
         // P3b: an answer_agent outcome only comes from the on-Stop
         // finalizer, never from a PR-detection recheck.
         | StopOutcome::AnswerAgent { .. }
+        // A review-guide outcome only comes from the on-Stop finalizer,
+        // never from a PR-detection recheck (review-guide executions never
+        // produce a PR at all).
+        | StopOutcome::ReviewGuide { .. }
         // ReviewerEnqueued is handled in its own arm above.
         // ReviewPassCompleted/ReviewPassRevisionCreated/ReviewPassAwaitingResult
         // only come from on-Stop (reviewer finalisation).
@@ -1263,6 +1267,10 @@ pub(crate) async fn sweep_late_pr(
         // P3b: an answer_agent outcome only comes from the on-Stop
         // finalizer, never from a late-PR recheck.
         | StopOutcome::AnswerAgent { .. }
+        // A review-guide outcome only comes from the on-Stop finalizer,
+        // never from a late-PR recheck (review-guide executions never
+        // produce a PR at all).
+        | StopOutcome::ReviewGuide { .. }
         // reviewer-related outcomes are handled on the on-Stop
         // path; covered here for exhaustiveness.
         | StopOutcome::ReviewerEnqueued { .. }
