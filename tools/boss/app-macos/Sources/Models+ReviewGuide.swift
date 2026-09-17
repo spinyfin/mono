@@ -88,6 +88,12 @@ struct ReviewGuideCardPresentation: Equatable {
     /// The version to open, when a document button should be shown at all
     /// (`ready`, `refreshing`, `refreshFailed`).
     let readableVersionId: String?
+    /// Mirrors `WorkTask.reviewGuideStaleSource` — only meaningful for
+    /// `.refreshFailed`, where it distinguishes genuine source staleness
+    /// (the PR's head moved) from a same-comparison prompt/prose retry
+    /// failure. Defaulted `false` for callers that only need the other four
+    /// states, which never consult it.
+    var staleSource: Bool = false
 
     var showsDocumentButton: Bool { readableVersionId != nil }
     var showsProgress: Bool { kind == .generating || kind == .refreshing }
@@ -109,7 +115,10 @@ struct ReviewGuideCardPresentation: Equatable {
         case .refreshing: return "Open older review guide; updating\u{2026}"
         case .ready: return "Open review guide"
         case .failed: return "Review guide failed to generate. Retry?"
-        case .refreshFailed: return "Guide covers an older revision \u{2014} refresh failed. Retry?"
+        case .refreshFailed:
+            return staleSource
+                ? "Guide covers an older revision \u{2014} refresh failed. Retry?"
+                : "Explanation refresh failed. Retry?"
         }
     }
 
@@ -117,7 +126,11 @@ struct ReviewGuideCardPresentation: Equatable {
     /// been captured for this PR yet (including every non-root row, since a
     /// series is always keyed by the chain-root task id), so the card
     /// renders no affordance at all.
-    static func from(lifecycle: String?, readableVersionId: String?) -> ReviewGuideCardPresentation? {
+    static func from(
+        lifecycle: String?,
+        readableVersionId: String?,
+        staleSource: Bool = false
+    ) -> ReviewGuideCardPresentation? {
         guard let lifecycle else { return nil }
         let hasContent = readableVersionId != nil
         switch lifecycle {
@@ -131,7 +144,8 @@ struct ReviewGuideCardPresentation: Equatable {
         case "failed":
             return ReviewGuideCardPresentation(
                 kind: hasContent ? .refreshFailed : .failed,
-                readableVersionId: readableVersionId
+                readableVersionId: readableVersionId,
+                staleSource: staleSource
             )
         default:
             return nil

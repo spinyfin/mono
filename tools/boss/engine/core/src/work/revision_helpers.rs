@@ -968,23 +968,39 @@ pub(crate) fn attach_review_guide_state(conn: &Connection, tasks: &mut [Task], c
     }
     let states = query_review_guide_card_states(conn, &root_task_ids)?;
     for task in tasks.iter_mut().chain(chores.iter_mut()) {
-        if let Some((lifecycle, readable_version_id)) = states.get(&task.id) {
-            task.review_guide_lifecycle = Some(lifecycle.clone());
-            task.review_guide_readable_version_id = readable_version_id.clone();
+        if let Some(state) = states.get(&task.id) {
+            task.review_guide_lifecycle = Some(state.lifecycle.clone());
+            task.review_guide_readable_version_id = state.readable_version_id.clone();
+            task.review_guide_stale_source = state.stale_source;
         }
     }
     Ok(())
 }
 
-/// Batched `root_task_id -> (guide_lifecycle, readable_version_id)` lookup
-/// for [`attach_review_guide_state`]. A free function (not a `WorkDb`
-/// method) so a board/work-tree read can call it on its own already-open
-/// connection rather than opening a second one — matches
-/// `query_latest_informative_review_verdicts`.
+/// One series' derived card state, as returned by
+/// [`query_review_guide_card_states`].
+struct ReviewGuideCardState {
+    lifecycle: String,
+    readable_version_id: Option<String>,
+    /// `true` when the readable version's own `comparison_id` no longer
+    /// matches the series' current `selected_comparison_id` — i.e. the PR's
+    /// source has actually moved since that version was generated, as
+    /// opposed to a same-comparison retry failure. `None` when there is no
+    /// readable version to compare.
+    stale_source: Option<bool>,
+}
+
+/// Batched `root_task_id -> ReviewGuideCardState` lookup for
+/// [`attach_review_guide_state`]. A free function (not a `WorkDb` method)
+/// so a board/work-tree read can call it on its own already-open connection
+/// rather than opening a second one — matches
+/// `query_latest_informative_review_verdicts`. The `LEFT JOIN` against
+/// `pr_review_guide_versions` resolves the readable version's own
+/// `comparison_id` so staleness can be derived without a second round trip.
 fn query_review_guide_card_states(
     conn: &Connection,
     root_task_ids: &[String],
-) -> Result<std::collections::HashMap<String, (String, Option<String>)>> {
+) -> Result<std::collections::HashMap<String, ReviewGuideCardState>> {
     let placeholders = root_task_ids
         .iter()
         .enumerate()
@@ -992,10 +1008,12 @@ fn query_review_guide_card_states(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT root_task_id, guide_lifecycle, readable_version_id
-         FROM pr_review_guide_source_series
-         WHERE root_task_id IN ({placeholders})
-         ORDER BY updated_at ASC, id ASC"
+        "SELECT s.root_task_id, s.guide_lifecycle, s.readable_version_id,
+                s.selected_comparison_id, v.comparison_id
+         FROM pr_review_guide_source_series s
+         LEFT JOIN pr_review_guide_versions v ON v.id = s.readable_version_id
+         WHERE s.root_task_id IN ({placeholders})
+         ORDER BY s.updated_at ASC, s.id ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
     let params: Vec<&dyn rusqlite::ToSql> = root_task_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
@@ -1004,6 +1022,8 @@ fn query_review_guide_card_states(
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
         ))
     })?;
     // One series per canonical repository/PR (design invariant), so this is
@@ -1012,8 +1032,18 @@ fn query_review_guide_card_states(
     // `query_latest_informative_review_verdicts` treats duplicates.
     let mut result = std::collections::HashMap::new();
     for row in rows {
-        let (root_task_id, lifecycle, readable_version_id) = row?;
-        result.insert(root_task_id, (lifecycle, readable_version_id));
+        let (root_task_id, lifecycle, readable_version_id, selected_comparison_id, version_comparison_id) = row?;
+        let stale_source = readable_version_id
+            .is_some()
+            .then(|| selected_comparison_id != version_comparison_id);
+        result.insert(
+            root_task_id,
+            ReviewGuideCardState {
+                lifecycle,
+                readable_version_id,
+                stale_source,
+            },
+        );
     }
     Ok(result)
 }
@@ -1078,6 +1108,7 @@ fn copy_derived_projection_fields(dst: &mut Task, src: &Task) {
     dst.ready_for_review = src.ready_for_review;
     dst.review_guide_lifecycle = src.review_guide_lifecycle.clone();
     dst.review_guide_readable_version_id = src.review_guide_readable_version_id.clone();
+    dst.review_guide_stale_source = src.review_guide_stale_source;
 }
 
 fn push_projection_row(task: Task, tasks: &mut Vec<Task>, chores: &mut Vec<Task>) {

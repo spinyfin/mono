@@ -949,6 +949,18 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_guide_readable_version_id: Option<String>,
 
+    /// `true` when `review_guide_readable_version_id` was generated against
+    /// a source comparison that is no longer the series' current one — i.e.
+    /// the PR's head genuinely moved since that version was produced, not
+    /// merely a same-comparison prompt/prose retry. Distinguishes "this
+    /// guide covers an older revision" (source staleness) from "Explanation
+    /// refresh failed" (a retry of the same source failed) per the design's
+    /// "Review card and viewer" section — lifecycle plus the presence of a
+    /// readable version id cannot tell those apart on their own. `None`
+    /// until a readable version exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_guide_stale_source: Option<bool>,
+
     /// Reviewer names for the review indicator tooltip. JSON-encoded list of
     /// login strings. For `"approved"`: the approving reviewers. For
     /// `"changes_requested"`: the requesting reviewers. `None` otherwise.

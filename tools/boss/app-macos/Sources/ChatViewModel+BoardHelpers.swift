@@ -493,10 +493,7 @@ extension ChatViewModel {
             }
             return liveState != nil
         }()
-        let showsMergeWhenReady = column == .review
-            && task.status == "in_review"
-            && task.prURL.map { !$0.isEmpty } == true
-            && task.mergeQueueState == nil
+        let showsMergeWhenReady = task.isMergeWhenReadyEligible
         let terminalTooltip = (column == .review || column == .done)
             ? "Open terminal on PR branch"
             : "Open terminal in workspace"

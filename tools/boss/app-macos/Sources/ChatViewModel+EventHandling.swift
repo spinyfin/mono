@@ -94,6 +94,27 @@ extension ChatViewModel {
             // without this, a disconnect mid-request leaves the row
             // permanently disabled since no work_error will ever arrive.
             deferredScopeActionInFlightIDs.removeAll()
+            // Same reasoning for a review-guide retry in flight: no
+            // `review_guide_retry_queued` or `work_error` reply is ever
+            // coming for a request the disconnect killed in transit, so
+            // without this the Retry button stays a permanent no-op for
+            // that task for the rest of the session.
+            retryingReviewGuideRootTaskIDs.removeAll()
+            // A `get_review_guide_content` request in flight when the link
+            // dropped can never complete either — leave the viewer in
+            // `.loading` forever rather than a retryable failure.
+            if pendingReviewGuideVersionId != nil, case .loading = asyncMarkdownViewerVM.state {
+                asyncMarkdownViewerVM.state = .failed(
+                    title: "Review guide",
+                    message: "Connection lost while loading this guide."
+                )
+                asyncMarkdownViewerVM.canRetry = true
+                asyncMarkdownViewerVM.onRetry = { [weak self] in
+                    guard let self, let rootTaskId = self.pendingReviewGuideRootTaskId,
+                          let task = self.task(withID: rootTaskId) else { return }
+                    self.openReviewGuide(for: task)
+                }
+            }
             // Same reasoning for a drag-to-Doing admission check in
             // flight: the socket drop means no `dispatch_admission_evaluated`
             // reply is ever coming, so nothing else would clear
@@ -224,6 +245,9 @@ extension ChatViewModel {
             }
             openingReviewTerminalIDs.removeAll()
             openingLiveWorkspaceTerminalIDs.removeAll()
+            for taskId in mergingWhenReadyIDs {
+                mergeErrorNoticesByTaskID[taskId] = message
+            }
             mergingWhenReadyIDs.removeAll()
             retryingReviewGuideRootTaskIDs.removeAll()
             plannerActionInFlightProjectIDs.removeAll()
@@ -824,6 +848,7 @@ extension ChatViewModel {
         if !openingReviewTerminalIDs.isEmpty { return true }
         if !openingLiveWorkspaceTerminalIDs.isEmpty { return true }
         if !mergingWhenReadyIDs.isEmpty { return true }
+        if !retryingReviewGuideRootTaskIDs.isEmpty { return true }
         if !plannerActionInFlightProjectIDs.isEmpty { return true }
         if !deferredScopeActionInFlightIDs.isEmpty { return true }
         if !pendingMoveOriginByTaskID.isEmpty { return true }

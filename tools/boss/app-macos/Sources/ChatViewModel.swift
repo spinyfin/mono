@@ -1199,6 +1199,22 @@ final class ChatViewModel: ObservableObject {
     /// expanded. Set and auto-dismissed from `ChatViewModel+EventHandling`.
     @Published var mergeFeedbackNotice: MergeFeedbackNotice?
 
+    /// Per-task Merge When Ready failure message, keyed by work item id.
+    /// Populated from the `.workError` arm for every task whose
+    /// `merge_when_ready` request was in flight when the failure arrived
+    /// (the generic reply carries no request id to disambiguate further —
+    /// same limitation `mergeFeedbackNotice`'s doc comment describes for
+    /// success). Read by the review-guide viewer header, which — unlike the
+    /// board card — has no other surface for `workErrorMessage`'s modal
+    /// alert. Cleared explicitly via `clearMergeError(for:)`.
+    @Published var mergeErrorNoticesByTaskID: [String: String] = [:]
+
+    /// Dismiss a per-task merge failure notice set via
+    /// `mergeErrorNoticesByTaskID`.
+    func clearMergeError(for taskID: String) {
+        mergeErrorNoticesByTaskID.removeValue(forKey: taskID)
+    }
+
     // MARK: - Optimistic kanban moves
 
     /// Optimistic column override for a card whose drop has been accepted

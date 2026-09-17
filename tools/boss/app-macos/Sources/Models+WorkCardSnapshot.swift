@@ -270,7 +270,8 @@ struct WorkCardSnapshot: Equatable {
         let reviewGuidePresentation: ReviewGuideCardPresentation? = column == .review
             ? ReviewGuideCardPresentation.from(
                 lifecycle: task.reviewGuideLifecycle,
-                readableVersionId: task.reviewGuideReadableVersionId
+                readableVersionId: task.reviewGuideReadableVersionId,
+                staleSource: task.reviewGuideStaleSource ?? false
             )
             : nil
         let mergeQueueState: String? = inMerging ? task.mergeQueueState : nil

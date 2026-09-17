@@ -64,6 +64,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         "prMergeableState",
         "reviewGuideLifecycle",
         "reviewGuideReadableVersionId",
+        "reviewGuideStaleSource",
     ]
 
     /// `WorkTask` fields the snapshot intentionally ignores. Changing any of
@@ -639,6 +640,24 @@ final class WorkCardSnapshotTests: XCTestCase {
                 }
             ),
             Case(
+                name: "reviewGuideStaleSource",
+                context: review,
+                base: {
+                    var t = Self.makeTask(
+                        id: "task_1",
+                        status: "in_review",
+                        prURL: "https://github.com/x/y/pull/3"
+                    )
+                    t.reviewGuideLifecycle = "failed"
+                    t.reviewGuideReadableVersionId = "prgv_1"
+                    t.reviewGuideStaleSource = false
+                    return t
+                },
+                mutate: {
+                    var t = $0; t.reviewGuideStaleSource = true; return t
+                }
+            ),
+            Case(
                 name: "mergeQueueState",
                 context: done,
                 base: {
@@ -1001,6 +1020,59 @@ final class WorkCardSnapshotTests: XCTestCase {
 
         let done = WorkCardSnapshot.build(task: task, context: WorkCardSnapshotContext(column: .done))
         XCTAssertNil(done.reviewGuidePresentation)
+    }
+
+    /// `WorkTask.isMergeWhenReadyEligible` is the single shared predicate
+    /// both the card's snapshot builder (`showsMergeWhenReady`) and
+    /// `ReviewGuideViewerHeader` gate the Merge When Ready control on. A
+    /// task only routed into the Review column because it is `blocked` on a
+    /// review-phase reason (`isReviewPhaseBlocked`) must never be eligible,
+    /// even though its `boardColumn` is `.review` — the card deliberately
+    /// hides the control for exactly this case.
+    func testIsMergeWhenReadyEligibleMatchesCardGate() {
+        let eligible = Self.makeTask(status: "in_review", prURL: "https://github.com/x/y/pull/3")
+        XCTAssertEqual(eligible.boardColumn, .review)
+        XCTAssertTrue(eligible.isMergeWhenReadyEligible)
+
+        var blockedOnCIFailure = Self.makeTask(status: "blocked", prURL: "https://github.com/x/y/pull/3")
+        blockedOnCIFailure.blockedReason = "ci_failure"
+        XCTAssertEqual(blockedOnCIFailure.boardColumn, .review, "blocked-for-review-reason routes into Review")
+        XCTAssertFalse(
+            blockedOnCIFailure.isMergeWhenReadyEligible,
+            "a task the card refuses to offer merge for must not be eligible in the viewer either"
+        )
+
+        var blockedOnMergeConflict = Self.makeTask(status: "blocked", prURL: "https://github.com/x/y/pull/3")
+        blockedOnMergeConflict.blockedReason = "merge_conflict"
+        XCTAssertFalse(blockedOnMergeConflict.isMergeWhenReadyEligible)
+
+        let noPRURL = Self.makeTask(status: "in_review", prURL: nil)
+        XCTAssertFalse(noPRURL.isMergeWhenReadyEligible)
+
+        var alreadyQueued = Self.makeTask(status: "in_review", prURL: "https://github.com/x/y/pull/3")
+        alreadyQueued.mergeQueueState = "queued"
+        XCTAssertFalse(alreadyQueued.isMergeWhenReadyEligible)
+    }
+
+    /// The design requires distinguishing source staleness (the PR's head
+    /// actually moved) from a same-comparison prompt/prose retry failure —
+    /// only the former earns "covers an older revision" wording.
+    func testReviewGuideCardPresentationDistinguishesStaleSourceOnRefreshFailed() {
+        let sameComparisonRetryFailure = ReviewGuideCardPresentation.from(
+            lifecycle: "failed",
+            readableVersionId: "prgv_1",
+            staleSource: false
+        )
+        XCTAssertEqual(sameComparisonRetryFailure?.kind, .refreshFailed)
+        XCTAssertEqual(sameComparisonRetryFailure?.tooltip, "Explanation refresh failed. Retry?")
+
+        let staleSourceFailure = ReviewGuideCardPresentation.from(
+            lifecycle: "failed",
+            readableVersionId: "prgv_1",
+            staleSource: true
+        )
+        XCTAssertEqual(staleSourceFailure?.kind, .refreshFailed)
+        XCTAssertTrue(staleSourceFailure?.tooltip.contains("older revision") ?? false)
     }
 
     /// The five brief states from the design's "Review card and viewer"

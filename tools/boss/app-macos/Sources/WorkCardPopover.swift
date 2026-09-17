@@ -477,7 +477,8 @@ struct WorkCardPopoverView: View {
     private var reviewGuideRow: some View {
         if let presentation = ReviewGuideCardPresentation.from(
             lifecycle: task.reviewGuideLifecycle,
-            readableVersionId: task.reviewGuideReadableVersionId
+            readableVersionId: task.reviewGuideReadableVersionId,
+            staleSource: task.reviewGuideStaleSource ?? false
         ) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Review guide")
@@ -496,11 +497,10 @@ struct WorkCardPopoverView: View {
                             }
                         }
                         .buttonStyle(.plain)
-                    } else if presentation.showsProgress {
-                        ProgressView().controlSize(.small)
                     }
                     if presentation.showsProgress {
-                        Text("Generating\u{2026}")
+                        ProgressView().controlSize(.small)
+                        Text(presentation.kind == .refreshing ? "Updating\u{2026}" : "Generating\u{2026}")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }

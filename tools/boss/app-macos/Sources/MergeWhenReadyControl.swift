@@ -5,9 +5,10 @@ import SwiftUI
 /// owns only the button/dialog presentation, never eligibility: the caller
 /// decides whether to mount it at all (the card gates on its precomputed
 /// `WorkCardSnapshot.showsMergeWhenReady`; the review-guide viewer
-/// recomputes live from `WorkTask.boardColumn == .review` on every render,
-/// since a long-lived viewer must reflect the PR's current state, not a
-/// snapshot captured when it opened). `onConfirm` is the only action —
+/// recomputes live from `WorkTask.isMergeWhenReadyEligible` on every
+/// render, since a long-lived viewer must reflect the PR's current state,
+/// not a snapshot captured when it opened — both call sites share that one
+/// computed property so they cannot drift). `onConfirm` is the only action —
 /// callers wire it to `ChatViewModel.mergeWhenReady(for:)`, the single
 /// source of truth for the actual merge request and its eligibility/error
 /// handling.

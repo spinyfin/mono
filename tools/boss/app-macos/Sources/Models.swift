@@ -228,6 +228,12 @@ struct WorkTask: Identifiable, Hashable {
     /// `"failed"`: an older version stays open/readable while a refresh
     /// is in flight or has failed.
     var reviewGuideReadableVersionId: String? = nil
+    /// `true` when `reviewGuideReadableVersionId` was generated against a
+    /// source comparison that is no longer current — the PR's head actually
+    /// moved since that version was produced, not merely a same-comparison
+    /// prompt/prose retry. Mirrors `Task.review_guide_stale_source` on the
+    /// wire. `nil` until a readable version exists.
+    var reviewGuideStaleSource: Bool? = nil
 
     /// Short id of the reviewed task that produced this follow-up.
     /// `nil` for every task whose `kind` is not `"followup"`.
@@ -525,6 +531,24 @@ extension WorkTask {
     /// buckets.
     var isInMergingSection: Bool {
         status == "in_review" && mergeQueueState != nil
+    }
+
+    /// `true` when the Merge When Ready control should be offered for this
+    /// task: it is sitting in the Review column, its status is genuinely
+    /// `"in_review"` (not merely review-phase-blocked), it has a non-empty
+    /// PR URL, and it is not already in the merge queue
+    /// (`mergeQueueState == nil`). This is the single source of truth for
+    /// that eligibility — both the board card's snapshot builder
+    /// (`ChatViewModel+BoardHelpers.swift`) and the review-guide viewer
+    /// header (`ReviewGuideViewerHeader.swift`) call this so they cannot
+    /// drift: a task that is only in Review because it is `blocked` with a
+    /// review-phase reason (`isReviewPhaseBlocked`) must never show the
+    /// control.
+    var isMergeWhenReadyEligible: Bool {
+        boardColumn == .review
+            && status == "in_review"
+            && prURL.map { !$0.isEmpty } == true
+            && mergeQueueState == nil
     }
 
 }

@@ -312,12 +312,24 @@ extension ChatViewModel {
     func openTaskDescription(_ task: WorkTask) {
         pendingReviewGuideVersionId = nil
         pendingReviewGuideRootTaskId = nil
+        // Clear the design-doc identity guard too — this is the sibling
+        // identity-guard site to `openReviewGuide`'s clearing of
+        // `pendingAsyncViewerRef`, and without it a late
+        // `product_design_doc_content` reply for a previously-opened design
+        // doc still matches `pendingAsyncViewerRef` and overwrites this task
+        // description in the shared singleton window.
+        pendingAsyncViewerRef = nil
+        pendingAsyncViewerTitle = ""
+        pendingAsyncViewerArtifact = nil
         asyncMarkdownViewerVM.reviewGuideRootTaskId = nil
         asyncMarkdownViewerVM.reviewGuideGeneratedAt = nil
         asyncMarkdownViewerVM.pendingRenderProjectShortID = nil
         asyncMarkdownViewerVM.renderStartTime = nil
         asyncMarkdownViewerVM.clickStartTime = nil
         asyncMarkdownViewerVM.renderContentID = UUID()
+        asyncMarkdownViewerVM.staleReason = nil
+        asyncMarkdownViewerVM.canRetry = false
+        asyncMarkdownViewerVM.onRetry = nil
         // Engine-minted revision briefs (`kind == "revision"`) always carry
         // the standing "HARD RULE: no punting" boilerplate ahead of their
         // findings (`render_revision_instructions` in

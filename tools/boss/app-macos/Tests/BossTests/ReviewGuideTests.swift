@@ -148,6 +148,56 @@ final class ReviewGuideTests: XCTestCase {
         XCTAssertTrue(model.retryingReviewGuideRootTaskIDs.contains("task_2"), "unrelated in-flight guards must survive")
     }
 
+    /// A disconnect while a retry request is in flight can never receive
+    /// `review_guide_retry_queued` or `work_error` — without clearing the
+    /// guard here, Retry becomes a permanent no-op for that task for the
+    /// rest of the session.
+    func testDisconnectClearsRetryInFlightGuard() {
+        let model = makeModel()
+        model.retryingReviewGuideRootTaskIDs.insert("task_1")
+
+        model.applyEventForTest(.disconnected)
+
+        XCTAssertTrue(model.retryingReviewGuideRootTaskIDs.isEmpty)
+    }
+
+    /// A disconnect while the async viewer is `.loading` a guide's content
+    /// can equally never receive a reply — the viewer must fail with a
+    /// retry action rather than spin forever.
+    func testDisconnectFailsAViewerStuckLoadingGuideContent() {
+        let model = makeModel()
+        let task = Self.makeTask(id: "task_1", readableVersionId: "prgv_1")
+        model.taskIndexByID = [task.id: task]
+        model.openReviewGuide(for: task)
+        guard case .loading = model.asyncMarkdownViewerVM.state else {
+            return XCTFail("expected .loading immediately after open")
+        }
+
+        model.applyEventForTest(.disconnected)
+
+        guard case .failed = model.asyncMarkdownViewerVM.state else {
+            return XCTFail("a request that can never complete must fail, not stay loading forever")
+        }
+        XCTAssertTrue(model.asyncMarkdownViewerVM.canRetry)
+    }
+
+    /// `hasOtherTrackedAppRequestInFlight` exists precisely so an ambiguous
+    /// `WorkError` is not painted onto the transcript/attachment viewers —
+    /// a review-guide retry in flight must count as "some other tracked
+    /// request", the same as every sibling in-flight set.
+    func testWorkErrorWhileRetryInFlightIsNotAttributedToAttachmentsViewer() {
+        let model = makeModel()
+        model.retryingReviewGuideRootTaskIDs.insert("task_1")
+        model.attachmentsInFlightTaskIDs.insert("task_2")
+
+        model.applyEventForTest(.workError(message: "some ambiguous failure", requestId: nil))
+
+        XCTAssertEqual(
+            model.attachmentsLoadFailureByTaskID["task_2"], "Loading failed. Retry?",
+            "the retry in flight should make the failure ambiguous, not attributed to the attachments viewer"
+        )
+    }
+
     // MARK: - Card badge: isolated renders across the five brief states
 
     func testCardBadgeHostsAndRendersEveryState() {
@@ -163,9 +213,9 @@ final class ReviewGuideTests: XCTestCase {
             let hosting = NSHostingView(rootView: view)
             hosting.frame = NSRect(x: 0, y: 0, width: 120, height: 30)
             hosting.layoutSubtreeIfNeeded()
-            XCTAssertGreaterThanOrEqual(
+            XCTAssertGreaterThan(
                 hosting.fittingSize.width, 0,
-                "kind \(presentation.kind) must host without crashing"
+                "kind \(presentation.kind) must render at least one control"
             )
         }
     }

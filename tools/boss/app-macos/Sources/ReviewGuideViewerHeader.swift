@@ -6,6 +6,11 @@ import SwiftUI
 /// currentness banner always reflect the PR's current state — design:
 /// "It derives availability from the live root task and the same board
 /// eligibility projection, not a snapshot captured when the guide opened."
+/// That projection is `WorkTask.isMergeWhenReadyEligible` (Models.swift),
+/// the same one `ChatViewModel+BoardHelpers.swift` uses to gate the card's
+/// control — a task merely routed into the Review column while `blocked`
+/// (conflict/CI-failure resolution in progress, `isReviewPhaseBlocked`)
+/// must not show the button here either.
 ///
 /// Deliberately quiet: a guide is "a generated explanation", never an
 /// approval. No checkmark, no green success wording, no merge gate tied to
@@ -26,17 +31,17 @@ struct ReviewGuideViewerHeader: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer(minLength: 8)
-                    if task.boardColumn == .review {
+                    if task.isMergeWhenReadyEligible {
                         MergeWhenReadyControl(onConfirm: { chatModel.mergeWhenReady(for: task) })
                     }
                 }
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    if let (owner, repo, number) = Self.parsePR(task.prURL) {
+                    if let (org, repo, number) = parseGitHubPRURL(task.prURL ?? "") {
                         if let url = task.prURL.flatMap(URL.init(string:)) {
-                            Link("\(owner)/\(repo) #\(number)", destination: url)
+                            Link("\(org)/\(repo) #\(number)", destination: url)
                                 .font(.caption)
                         } else {
-                            Text("\(owner)/\(repo) #\(number)")
+                            Text("\(org)/\(repo) #\(number)")
                                 .font(.caption)
                         }
                     }
@@ -47,11 +52,45 @@ struct ReviewGuideViewerHeader: View {
                     }
                 }
                 currentnessBanner(for: task)
+                mergeFeedbackRow(for: task)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
             .background(Color.secondary.opacity(0.06))
             Divider()
+        }
+    }
+
+    /// Surfaces the same accept/error feedback the board card shows for a
+    /// merge action, scoped to this viewer's root task — the merge action
+    /// fired from here has otherwise been invisible to a reader who is not
+    /// also watching the board window (`mergeFeedbackNotice` renders only on
+    /// `WorkBoardCard`, and merge failures land only in `ContentView`'s
+    /// modal alert, which is never presented over this separate viewer
+    /// window).
+    @ViewBuilder
+    private func mergeFeedbackRow(for task: WorkTask) -> some View {
+        if let notice = chatModel.mergeFeedbackNotice, notice.taskID == task.id {
+            WorkMergeFeedbackBanner(message: notice.message) {
+                chatModel.clearMergeFeedback()
+            }
+        } else if let errorMessage = chatModel.mergeErrorNoticesByTaskID[task.id] {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+                Text(errorMessage)
+                    .font(.caption)
+                    .foregroundStyle(.primary)
+                Spacer(minLength: 4)
+                Button(action: { chatModel.clearMergeError(for: task.id) }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                        .font(.caption)
+                }
+                .buttonStyle(.plain)
+                .help("Dismiss")
+                .accessibilityLabel("Dismiss merge error")
+            }
         }
     }
 
@@ -74,7 +113,8 @@ struct ReviewGuideViewerHeader: View {
         } else {
             let presentation = ReviewGuideCardPresentation.from(
                 lifecycle: task.reviewGuideLifecycle,
-                readableVersionId: task.reviewGuideReadableVersionId
+                readableVersionId: task.reviewGuideReadableVersionId,
+                staleSource: task.reviewGuideStaleSource ?? false
             )
             switch presentation?.kind {
             case .refreshing:
@@ -88,7 +128,11 @@ struct ReviewGuideViewerHeader: View {
                 HStack(spacing: 8) {
                     Image(systemName: "exclamationmark.triangle")
                         .foregroundStyle(.orange)
-                    Text("Explanation refresh failed \u{2014} this guide covers an older revision.")
+                    Text(
+                        (task.reviewGuideStaleSource ?? false)
+                            ? "Explanation refresh failed \u{2014} this guide covers an older revision."
+                            : "Explanation refresh failed."
+                    )
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Button("Retry") { chatModel.retryReviewGuide(for: task) }
@@ -98,15 +142,5 @@ struct ReviewGuideViewerHeader: View {
                 EmptyView()
             }
         }
-    }
-
-    /// Parse `https://github.com/{owner}/{repo}/pull/{number}` into its
-    /// three components. Returns `nil` for any other shape (non-GitHub
-    /// remote, malformed URL) rather than guessing.
-    private static func parsePR(_ prURL: String?) -> (owner: String, repo: String, number: String)? {
-        guard let prURL, let url = URL(string: prURL) else { return nil }
-        let parts = url.pathComponents.filter { $0 != "/" }
-        guard parts.count >= 4, parts[2] == "pull" else { return nil }
-        return (owner: parts[0], repo: parts[1], number: parts[3])
     }
 }

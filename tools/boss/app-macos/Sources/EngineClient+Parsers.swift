@@ -256,6 +256,7 @@ extension EngineClient {
             docLinkState: parseDocLinkState(payload["doc_link_state"]),
             reviewGuideLifecycle: payload["review_guide_lifecycle"] as? String,
             reviewGuideReadableVersionId: payload["review_guide_readable_version_id"] as? String,
+            reviewGuideStaleSource: payload["review_guide_stale_source"] as? Bool,
             originTaskShortId: (payload["origin_task_short_id"] as? NSNumber)?.intValue,
             originPrNumber: (payload["origin_pr_number"] as? NSNumber)?.intValue,
             completedAt: payload["completed_at"] as? String,
