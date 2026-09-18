@@ -56,12 +56,10 @@ impl WorkerCompletionHandler {
         )
     }
 
-    /// Finalize a sanctioned no-op completion: the worker verified its work
-    /// is already done (empty diff, no PR produced and none bound), so the
-    /// task is closed cleanly as `done` WITHOUT a PR and the execution is
-    /// finalised. No nudge is sent. Mirrors [`Self::finalize_pr_transition`]'s
-    /// lease/pane release and event publishing, but never stamps a `pr_url`
-    /// (there is none — fabricating one is the empty-PR the worker refused).
+    /// Finalize a sanctioned no-op by ending the execution and releasing its
+    /// lease/pane. Work without an owned PR closes as done; an owner with a
+    /// bound PR stays in review with contradiction attention instead. Revision
+    /// no-ops retain their dedicated attention. Existing PR URLs are preserved.
     ///
     /// Idempotent against an already-finalized execution: the DB write
     /// returns `None` for a non-live row, which maps to `AlreadyTerminal`.
@@ -136,6 +134,17 @@ impl WorkerCompletionHandler {
         .await;
         let work_item_id = completion.execution.work_item_id.clone();
         let product_id = completion.work_item.product_id().to_string();
+        let retained_in_review = match &completion.work_item {
+            WorkItem::Task(task) | WorkItem::Chore(task) if task.status == boss_protocol::TaskStatus::InReview => {
+                Some(task)
+            }
+            _ => None,
+        };
+        let event = if retained_in_review.is_some() {
+            "worker_completion_refused"
+        } else {
+            "worker_no_op_completed"
+        };
         if let Some(item) = completion.filed_attention_item.clone() {
             self.publisher
                 .publish_frontend_event_on_product(&product_id, FrontendEvent::AttentionItemCreated { item })
@@ -146,12 +155,19 @@ impl WorkerCompletionHandler {
                 &completion.execution.id,
                 &work_item_id,
                 completion.execution.status.as_str(),
-                "worker_no_op_completed",
+                event,
             )
             .await;
         self.publisher
-            .publish_work_item_changed(&product_id, &work_item_id, "worker_no_op_completed")
+            .publish_work_item_changed(&product_id, &work_item_id, event)
             .await;
+        if let Some(task) = retained_in_review {
+            tracing::error!(execution_id = %execution.id, work_item_id = %work_item_id,
+                "no-op completion contradicted by a bound PR; retained in review with attention");
+            return StopOutcome::PrDetected {
+                pr_url: task.pr_url.clone().unwrap_or_default(),
+            };
+        }
         tracing::info!(
             execution_id = %execution.id,
             work_item_id = %work_item_id,

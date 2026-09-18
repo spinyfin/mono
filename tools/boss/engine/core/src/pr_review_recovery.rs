@@ -607,8 +607,8 @@ mod tests {
     use std::sync::Arc;
 
     use boss_protocol::{
-        ExecutionKind, RequestExecutionInput, ReviewBatchMemberRole, ReviewBatchMemberStatus, ReviewBatchPhase,
-        ReviewBatchStatus, ReviewClassification, ReviewLanguageBucket, ReviewProfile,
+        ExecutionKind, ReviewBatchMemberRole, ReviewBatchMemberStatus, ReviewBatchPhase, ReviewBatchStatus,
+        ReviewClassification, ReviewLanguageBucket, ReviewProfile,
     };
 
     use super::*;
@@ -645,16 +645,14 @@ mod tests {
         .unwrap();
 
         let execution = db
-            .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
-            .unwrap();
-        {
-            let conn = db.connect().unwrap();
-            conn.execute(
-                "UPDATE work_executions SET kind = 'pr_review', status = 'orphaned' WHERE id = ?1",
-                rusqlite::params![execution.id],
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Orphaned)
+                    .build(),
             )
             .unwrap();
-        }
         (chore.id, execution.id)
     }
 
@@ -752,14 +750,9 @@ mod tests {
             "expected an open churn_guard_parked attention item; got: {attentions:?}"
         );
 
-        // Bypassing the guard (`bossctl work start`) resolves it immediately.
-        db.request_execution_with_live_check(
-            RequestExecutionInput::builder()
-                .work_item_id(work_item_id.clone())
-                .build(),
-            |_| false,
-        )
-        .unwrap();
+        // An explicit review retry resolves the park without starting a
+        // fresh implementation on the already-delivered PR.
+        db.request_pr_review(&work_item_id, &checker).unwrap();
         let attentions_after = db.list_attention_items_for_work_item(&work_item_id).unwrap();
         assert!(
             attentions_after

@@ -59,6 +59,34 @@ impl LiveWorkerConvergence for RecordingConvergence {
 
 // ─── tests ──────────────────────────────────────────────────────────────
 
+#[tokio::test]
+async fn deferred_review_admission_is_not_an_orphaned_implementation() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let work_item_id = create_active_chore(&db, &product_id, "delivered chore");
+    let execution_id = create_spawned_execution(&db, &work_item_id, dead_pid());
+    let pr_url = "https://github.com/spinyfin/mono/pull/4044";
+    db.record_worker_pr_completion(
+        &execution_id,
+        pr_url,
+        None,
+        None,
+        crate::work::WorkerPrCompletionTarget::PendingReview,
+        None,
+    )
+    .unwrap();
+    crate::completion::file_admission_deferred_attention(&db, &work_item_id, pr_url);
+    make_old(&db, &work_item_id);
+    let before = db.list_executions(Some(&work_item_id)).unwrap().len();
+    let db = Arc::new(db);
+    let coordinator = make_coordinator(db.clone(), 1);
+    let sink = RecordingDispatchEventSink::new();
+    let outcome = run_one_pass(db.as_ref(), coordinator, &sink, &NoopLiveWorkerConvergence).await;
+    assert_eq!(outcome.redispatched, 0);
+    assert_eq!(db.list_executions(Some(&work_item_id)).unwrap().len(), before);
+    assert!(db.list_orphan_active_candidates(0).unwrap().is_empty());
+}
+
 /// **The 2026-07-28 duplicate-dispatch regression.**
 ///
 /// Reproduces the exact production shape: an execution the engine
@@ -1738,9 +1766,10 @@ fn insert_review_batch(db: &WorkDb, cycle_root_id: &str, status: &str, target_sh
 /// single-connection pool.
 fn hold_with_completed_producer(db: &WorkDb, work_item_id: &str) {
     let execution = db
-        .request_execution(
-            RequestExecutionInput::builder()
+        .create_execution(
+            crate::work::CreateExecutionInput::builder()
                 .work_item_id(work_item_id.to_owned())
+                .kind(boss_protocol::ExecutionKind::ChoreImplementation)
                 .build(),
         )
         .unwrap();

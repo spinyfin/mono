@@ -542,11 +542,17 @@ async fn reconcile_existing(
         }
     }
 
+    let merged_pr_urls: Vec<&str> = upstream
+        .pr_associations
+        .iter()
+        .filter(|pr| pr.merged)
+        .map(|pr| pr.pr_url.as_str())
+        .collect();
     match &upstream.status {
         UpstreamStatus::Closed { .. } => {
-            // Behavior 2: close-mirror — upstream is done, boss must follow.
+            // Behavior 2: mirror closure only with merge evidence for any owned PR.
             if task.status != TaskStatus::Done && task.status != TaskStatus::Archived {
-                match work_db.reconciler_close_work_item(work_item_id) {
+                match work_db.reconciler_close_work_item(work_item_id, &merged_pr_urls) {
                     Ok(true) => {
                         CLOSED.inc(metrics);
                         outcome.items_closed += 1;
@@ -564,13 +570,18 @@ async fn reconcile_existing(
         }
         UpstreamStatus::Open => {
             // Behavior 5: close-on-merge.
-            let has_merged_pr = upstream.pr_associations.iter().any(|p| p.merged);
+            let bound_pr = task
+                .pr_url
+                .as_deref()
+                .filter(|url| !url.trim().is_empty())
+                .or_else(|| pick_best_pr(&upstream.pr_associations).map(|pr| pr.pr_url.as_str()));
+            let has_merged_pr = bound_pr.is_some_and(|url| merged_pr_urls.contains(&url));
             let boss_is_done = task.status == TaskStatus::Done || task.status == TaskStatus::Archived;
             let boss_has_pr = !task.pr_url.as_deref().unwrap_or("").is_empty();
 
             if has_merged_pr && !boss_is_done {
                 // Merged PR detected upstream but boss row not yet done → flip it.
-                match work_db.reconciler_close_work_item(work_item_id) {
+                match work_db.reconciler_close_work_item(work_item_id, &merged_pr_urls) {
                     Ok(true) => {
                         outcome.items_closed += 1;
                         info!(work_item_id, "Behavior 5: merged PR detected → boss row → done");
@@ -586,11 +597,11 @@ async fn reconcile_existing(
             }
 
             // Queue close_issue for Behavior 5 if:
-            //   (a) merged PR detected in upstream associations, OR
+            //   (a) the bound PR is merged in upstream associations, OR
             //   (b) boss is already done with a pr_url (retry from prior failed close)
             if has_merged_pr || (boss_is_done && boss_has_pr) {
                 let pr_url = if has_merged_pr {
-                    pick_best_pr(&upstream.pr_associations).map(|p| p.pr_url.clone())
+                    bound_pr.map(str::to_owned)
                 } else {
                     task.pr_url.clone()
                 };

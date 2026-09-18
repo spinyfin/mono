@@ -163,6 +163,15 @@ pub(crate) fn resolve_deliberate_park_attention(conn: &Connection, work_item_id:
     Ok(())
 }
 
+/// A delivered primary PR belongs to review/merge handling, even while
+/// deferred review admission leaves its owner in `active`.
+/// Revisions intentionally resume their parent's PR and are not owners.
+pub(crate) fn primary_pr_awaits_review(conn: &Connection, work_item_id: &str) -> Result<bool> {
+    Ok(query_task(conn, work_item_id)?.is_some_and(|task| {
+        task.kind != TaskKind::Revision && task.pr_url.as_deref().is_some_and(|url| !url.trim().is_empty())
+    }))
+}
+
 impl WorkDb {
     pub(crate) fn dispatch_admission_facts(&self, work_item_id: &str) -> Result<DispatchAdmissionFacts> {
         // Every raw query against `conn` happens in this inner block, which
@@ -230,6 +239,12 @@ impl WorkDb {
                             )
                         }
                     })
+                } else if primary_pr_awaits_review(&conn, &resolved_work_item_id)?
+                    && query_live_execution_for_work_item(&conn, &resolved_work_item_id)?.is_none()
+                    && query_latest_execution_for_work_item(&conn, &resolved_work_item_id)?
+                        .is_none_or(|execution| execution.status.is_terminal())
+                {
+                    Some("Work already has a bound PR; use a revision to change it".into())
                 } else if work_item_is_human_driven(&conn, &resolved_work_item_id)? {
                     Some(format!(
                         "{resolved_work_item_id} is human-driven — no agent worker will run"

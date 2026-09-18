@@ -331,3 +331,40 @@ async fn chore_run_done_no_changes_needed_does_not_file_revision_declined_record
     );
     assert_eq!(publisher.attention_items_created().await, 0);
 }
+
+#[tokio::test]
+async fn declared_no_changes_cannot_close_a_chore_with_a_bound_open_pr() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, chore_id, execution_id) = fixture(workspace.path());
+    let pr_url = "https://github.com/spinyfin/mono/pull/4042";
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![chore_id, pr_url],
+        )
+        .unwrap();
+    let TestHarness {
+        handler,
+        cube,
+        publisher,
+        ..
+    } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let outcome = handler
+        .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::NoChangesNeeded)
+        .await;
+    assert!(matches!(outcome, StopOutcome::PrDetected { .. }), "{outcome:?}");
+    let WorkItem::Chore(task) = db.get_work_item(&chore_id).unwrap() else {
+        panic!("expected chore")
+    };
+    assert_eq!(task.status, boss_protocol::TaskStatus::InReview);
+    assert!(task.completed_at.is_none());
+    let items = db.list_attention_items(&execution_id).unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|item| item.kind == "completion_with_bound_pr" && item.body_markdown.contains(pr_url))
+    );
+    assert_eq!(publisher.attention_items_created().await, 1);
+    assert!(cube.release_calls.lock().await.as_slice() == ["lease-1"]);
+}

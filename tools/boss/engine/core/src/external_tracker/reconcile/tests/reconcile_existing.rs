@@ -1,6 +1,64 @@
 use super::*;
 
 #[tokio::test]
+async fn tracker_completion_requires_the_bound_pr_to_merge() {
+    for closed in [false, true] {
+        for matching_merge in [false, true] {
+            for attach_during_pass in [false, true] {
+                let db = in_memory_db();
+                let product = setup_product_with_tracker(&db);
+                let chore = create_test_chore_manual(&db, product.id.clone(), "Bound PR owner");
+                db.set_external_ref(&chore.id, "spy", "spy#3", &json!({ "issue_number": 3 }))
+                    .unwrap();
+                let bound = "https://github.com/example/repo/pull/99";
+                if !attach_during_pass {
+                    db.reconciler_attach_pr_url(&chore.id, bound).unwrap();
+                }
+                let mut item = if closed {
+                    closed_item(3)
+                } else {
+                    open_item(3, "Bound PR")
+                };
+                item.pr_associations.push(UpstreamPrAssociation {
+                    pr_url: bound.into(),
+                    merged: matching_merge,
+                    merged_at: matching_merge.then_some(1),
+                });
+                // A different merged PR must not close an already-bound owner.
+                if !attach_during_pass {
+                    item.pr_associations.push(UpstreamPrAssociation {
+                        pr_url: "https://github.com/example/repo/pull/100".into(),
+                        merged: true,
+                        merged_at: Some(2),
+                    });
+                }
+                let tracker = SpyTracker::new(vec![item]);
+                tracker.push_ok();
+                let registry = spy_registry(tracker.clone());
+                let metrics = Registry::new();
+                register_metrics(&metrics);
+                let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
+                let updated = db.find_by_external_ref("spy", "spy#3").unwrap().unwrap();
+                assert_eq!(updated.status == TaskStatus::Done, matching_merge);
+                let completed_at: Option<String> = db
+                    .connect()
+                    .unwrap()
+                    .query_row("SELECT completed_at FROM tasks WHERE id = ?1", [&chore.id], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(completed_at.is_some(), matching_merge);
+                assert_eq!(outcome.items_closed, usize::from(matching_merge));
+                assert_eq!(updated.pr_url.as_deref(), Some(bound));
+                if !matching_merge {
+                    assert!(tracker.close_calls().is_empty());
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn reconcile_retries_tracked_label_when_missing_on_existing_item() {
     // Behavior 7 retry: an already-imported item whose upstream fetch shows
     // no `tracked` label must trigger add_label on each reconcile pass until
