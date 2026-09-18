@@ -1485,89 +1485,29 @@ fn current_parent_pid_only_trusts_env_var() {
     }
 }
 
-/// Graceful shutdown must walk every live worker the engine knows
-/// about and ask the app to release its pane. This is the
-/// regression test for `engine kills its claude workers on
-/// shutdown` — without it, a clean engine exit leaves the worker
-/// shells reparented to launchd and `claude` keeps burning tokens.
+/// Shutdown preserves local ownership for adoption or rollback/drain.
 #[tokio::test]
-async fn shutdown_workers_releases_each_live_worker_via_release_worker_pane() {
+async fn shutdown_workers_preserves_every_registered_worker() {
     let (server_state, _dir) = test_server_state();
-
-    // Two workers, both registered against slot ids and the
-    // live-state registry — exactly the shape `release_worker_pane`
-    // walks (worker_registry → take_slot_for_run; live_states →
-    // release_slot).
-    server_state.worker_registry.register_run_slot("run-a", 1);
-    server_state.worker_registry.register_run_slot("run-b", 2);
+    for (run_id, slot_id) in [("run-a", 1), ("run-b", 2)] {
+        server_state.worker_registry.register_run_slot(run_id, slot_id);
+        server_state
+            .live_worker_states
+            .register_spawn(slot_id, run_id, "claude-opus-4-7", 0, None);
+    }
+    let sink = make_session_sink();
     server_state
-        .live_worker_states
-        .register_spawn(1, "run-a", "claude-opus-4-7", 0, None);
-    server_state
-        .live_worker_states
-        .register_spawn(2, "run-b", "claude-opus-4-7", 0, None);
-
-    // Stand up a fake app session and a responder task: the
-    // engine sends `ReleaseWorkerPane` requests onto its sink, the
-    // responder pulls them off, and we assert on the slot ids
-    // emitted. Without an ack the engine logs and moves on — but
-    // `shutdown_workers` would hit its 5s budget on a real run, so
-    // we ack each one to keep the test fast and to verify the
-    // engine round-trips correctly.
-    let app_sink = make_session_sink();
-    server_state
-        .register_app_session("session-app".into(), app_sink.clone())
+        .register_app_session("session-app".into(), sink.clone())
         .await;
-
-    let server_for_app = server_state.clone();
-    let observed_slots: Arc<StdMutex<Vec<u8>>> = Arc::new(StdMutex::new(Vec::new()));
-    let observed_for_task = observed_slots.clone();
-    let app_responder = tokio::spawn(async move {
-        // Two workers => two ReleaseWorkerPane requests.
-        for _ in 0..2 {
-            let envelope = app_sink
-                .next()
-                .await
-                .expect("ReleaseWorkerPane EngineRequest should be enqueued");
-            let (request_id, slot_id) = match &envelope.payload {
-                FrontendEvent::EngineRequest { request_id, request } => match request {
-                    EngineToAppRequest::ReleaseWorkerPane(input) => (request_id.clone(), input.slot_id),
-                    other => panic!("expected ReleaseWorkerPane, got {other:?}"),
-                },
-                other => panic!("expected EngineRequest, got {other:?}"),
-            };
-            observed_for_task.lock().unwrap().push(slot_id);
-            server_for_app
-                .deliver_app_response(
-                    "session-app",
-                    &request_id,
-                    EngineToAppResponse::ReleaseWorkerPane {
-                        result: Ok(crate::protocol::ReleaseWorkerPaneResult {}),
-                    },
-                )
-                .await;
-        }
-    });
-
-    server_state
-        .shutdown_workers(Duration::from_secs(2), Duration::from_millis(0))
-        .await;
-
-    app_responder.await.expect("app responder task panicked");
-
-    let mut slots = observed_slots.lock().unwrap().clone();
-    slots.sort();
-    assert_eq!(
-        slots,
-        vec![1, 2],
-        "shutdown_workers must dispatch ReleaseWorkerPane for every registered slot",
+    server_state.shutdown_workers().await;
+    assert_eq!(server_state.worker_registry.slot_for_run("run-a"), Some(1));
+    assert_eq!(server_state.worker_registry.slot_for_run("run-b"), Some(2));
+    assert_eq!(server_state.live_worker_states.snapshot().len(), 2);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), sink.next())
+            .await
+            .is_err()
     );
-
-    // Slot mappings and live-state entries must be drained — a
-    // future re-spawn into the same slot id has to start clean.
-    assert_eq!(server_state.worker_registry.slot_for_run("run-a"), None);
-    assert_eq!(server_state.worker_registry.slot_for_run("run-b"), None);
-    assert!(server_state.live_worker_states.snapshot().is_empty());
 }
 
 /// Empty registry → no-op. Guards against `shutdown_workers`
@@ -1577,9 +1517,7 @@ async fn shutdown_workers_releases_each_live_worker_via_release_worker_pane() {
 async fn shutdown_workers_is_noop_when_no_workers_registered() {
     let (server_state, _dir) = test_server_state();
     // No app session, no slot registrations — must still return.
-    server_state
-        .shutdown_workers(Duration::from_millis(50), Duration::from_millis(0))
-        .await;
+    server_state.shutdown_workers().await;
 }
 
 // --- resolve_status_actor regression suite ---

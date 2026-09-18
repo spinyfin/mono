@@ -356,7 +356,7 @@ async fn tmux_for_run_refuses_legacy_label_with_the_real_runner() {
 /// even attempt to resolve a real `Tmux`, so this test needs no tmux
 /// binary on the host.
 #[tokio::test]
-async fn no_recorded_identity_is_not_tmux_hosted() {
+async fn no_recorded_identity_refuses_local_teardown() {
     let (server_state, _dir) = test_server_state();
     let db = server_state.work_db.as_ref();
     let product_id = create_product(db);
@@ -365,6 +365,21 @@ async fn no_recorded_identity_is_not_tmux_hosted() {
 
     assert_eq!(
         server_state.reap_tmux_worker(&execution_id).await,
-        TmuxTeardownOutcome::NotTmuxHosted,
+        TmuxTeardownOutcome::Refused,
+    );
+    server_state.worker_registry.register_run_slot(&execution_id, 1);
+    server_state
+        .live_worker_states
+        .register_spawn(1, &execution_id, "test", 0, None);
+    let probe_id = server_state.queue_probe(execution_id.clone(), "still working?".into(), false);
+    assert_eq!(
+        server_state.release_worker_pane(&execution_id).await,
+        PaneReleaseOutcome::NoLiveWorker
+    );
+    assert_eq!(server_state.worker_registry.slot_for_run(&execution_id), Some(1));
+    assert!(server_state.live_worker_states.get(1).is_some());
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Queued)
     );
 }

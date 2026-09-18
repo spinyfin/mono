@@ -218,6 +218,27 @@ Deletion proceeds from process ownership outward:
 
 Historical local rows with null tmux columns are migration input, not a supported mode. On startup, a provably dead row is orphaned with an audit reason and redispatched through tmux. A row with a live pid or indeterminate evidence is quarantined: local dispatch pauses, an attention explains that an older app-hosted worker may still exist, and the operator rolls back to the prior release to stop/drain it before retrying the tmux-only upgrade. The new build never reattaches it, reaps it on ambiguous pid identity, or redispatches over it, and no code can spawn a new null-identity local run.
 
+### Local engine spawn and teardown implementation
+
+[PR #2993](https://github.com/spinyfin/mono/pull/2993) implements the first deletion step: the engine's local spawn and teardown boundary requires tmux. `StartWorkerInput` requires `TmuxWorkerHost`, and `PaneSpawnRunner` constructs it without consulting a pool hosting setting. A tmux creation failure returns an explicit local dispatch error. The app can attach a viewer after creation; failure to attach that viewer does not fail or replace the worker.
+
+`WorkerRegistry` records the presentation slot and session name without a hosting-mode bit. Local teardown detaches the viewer and requires durable tmux identity plus token verification before signalling the worker or destroying its session. Missing identity or an unreadable probe refuses teardown. Engine shutdown preserves workers for adoption after restart.
+
+Startup establishes the historical-worker quarantine before ordinary recovery runs. It selects nonterminal executions whose latest run is local and lacks any part of the durable tmux identity: server label, session name, or spawn token. The existing `durable_liveness` process probe supplies the evidence; neither a lost workspace lease nor missing app inventory proves death.
+
+| Evidence                                             | Startup behavior                                                                           |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Recorded process is gone                             | Permit orphan recovery and redispatch through tmux.                                        |
+| Recorded process is alive                            | Preserve the execution, raise attention, and pause local dispatch.                         |
+| Process evidence is unknown, including a missing pid | Apply the same quarantine as a live process.                                               |
+| Historical inventory cannot be read                  | Fail closed: pause dispatch and prevent recovery from treating unknown executions as dead. |
+
+The quarantine is persisted in database metadata and checked at host selection, local spawn, orphaning, and dispatch reconciliation. A quarantined work item cannot evade the hold by dispatching remotely; unrelated remote work remains eligible when the inventory scan succeeds. A later terminal status does not clear an established hold. On restart, the engine re-probes held executions and clears each hold and its attention only after proving process death.
+
+This boundary takes effect on deploy without an enablement flag. For a live or unknown historical worker, the operator must stop or drain it using the prior release and restart the tmux-only engine. Missing evidence remains a hold; the upgrade does not infer death from elapsed time or a status change.
+
+Regression coverage exercises tmux creation failure without app fallback, viewer attachment failure, token-verified teardown, live/dead/unknown historical rows, partial identity, persistence across restart and terminalization, remote placement, and recovery through an isolated engine. The local gate builds and tests `//...`, including the macOS app and installer, then runs `checkleft run` serially.
+
 ### Setting removal behavior
 
 The setting has two explicit stages:

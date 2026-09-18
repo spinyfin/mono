@@ -60,19 +60,9 @@ use crate::worker_registry::WorkerRegistry;
 use async_trait::async_trait;
 use tokio::time::{Duration, timeout};
 
-/// Grace the app is asked to give a worker's process tree between the
-/// polite signal and `SIGKILL` when tearing a pane down.
-const PANE_RELEASE_KILL_GRACE: Duration = Duration::from_secs(5);
-
-/// How long the engine waits for the app to acknowledge a pane teardown.
-///
-/// Strictly greater than [`PANE_RELEASE_KILL_GRACE`], and deliberately so:
-/// the two were both 5s, which meant any worker that used its full kill
-/// grace made the engine's own deadline expire at the moment the app was
-/// still doing exactly what it had been asked to do. An unacknowledged
-/// teardown no longer fabricates a "slot free" signal (see
-/// `ServerState::release_worker_pane`), but it does cost a slot for a
-/// sweep cycle, so the common case must not time out.
+/// How long the engine waits for the app to acknowledge detaching a viewer.
+/// An unacknowledged detach retains a terminal execution's pool claim until
+/// the claim sweep can reconcile it.
 const PANE_RELEASE_ACK_TIMEOUT: Duration = Duration::from_secs(20);
 
 mod agent_launch_guard;
@@ -306,17 +296,10 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
         request: EngineToAppRequest,
         timeout: Duration,
     ) -> Result<EngineToAppResponse, SendToAppError> {
-        // Serialize SpawnWorkerPane round-trips. Concurrent bursts of
-        // surface_new on the macOS side crashed the app
-        // (slot 4 spawned, then 3 follow-ups timed out into a dead
-        // process). The app reasonably allocates panes one at a time,
-        // and there's no benefit to dispatching parallel spawns —
-        // gating the engine side keeps libghostty from being asked to
-        // stand up multiple surfaces inside a single runloop tick.
-        // ReleaseWorkerPane / SendToPane don't share this hazard, so
-        // they go through unsynchronized.
-        if matches!(request, EngineToAppRequest::SpawnWorkerPane(_)) {
-            let _guard = self.spawn_pane_lock.lock().await;
+        // Ghostty surface allocation must stay serialized even though the
+        // worker processes are already running independently in tmux.
+        if matches!(request, EngineToAppRequest::AttachWorkerPane(_)) {
+            let _guard = self.attach_pane_lock.lock().await;
             return self.send_to_app(request, timeout).await;
         }
         self.send_to_app(request, timeout).await
@@ -408,10 +391,6 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
     fn non_opus_auto_mode(&self) -> bool {
         self.settings.is_enabled("workers.non_opus_permission_mode")
     }
-
-    fn tmux_hosting_enabled_for(&self, pool: &str) -> bool {
-        self.settings.tmux_hosting_enabled_for(pool)
-    }
 }
 
 #[async_trait]
@@ -451,24 +430,12 @@ impl crate::transient_recovery::TransientRecoveryReaper for ServerState {
     /// app to tear the pane down, so the next dispatch claimed a slot
     /// the app still hosted and died `SlotBusy`.
     async fn reap_worker(&self, execution_id: &str) {
-        let _ = ServerState::release_worker_pane(self, execution_id).await;
-        // `release_worker_pane` drops live-state itself when it has a
-        // run→slot mapping (`release_slot(slot_id)`). The untracked
-        // path (`reap_untracked_worker_process`) does not: neither the
-        // no-alive-pid `NoLiveWorker` arm nor the alive-pid + no hosted
-        // pane `Reaped` arm touches `live_worker_states` or the pool
-        // claim. The caller (`transient_recovery::release_slot`) has
-        // already called `work_db.request_resume_execution` /
-        // `mark_execution_orphaned`, so the execution is terminal by the
-        // time this returns. Left alone, that is worse than the SlotBusy
-        // this reaper exists to prevent: `pool_claim_sweep` step 1
-        // explicitly skips a claim still backed by a live-state entry for
-        // the same run, so the claim would be held forever and the slot
-        // would keep showing a phantom live worker. Drop the orphaned
-        // live-state entry so the slot lands in the terminal +
-        // claimed + no-live-entry shape `pool_claim_sweep` reconciles at
-        // `LEAK_GRACE_SECS`. A no-op when the slot-mapped path (or the
-        // hosted-pane arm of the untracked path) already dropped it.
+        if ServerState::release_worker_pane(self, execution_id).await != PaneReleaseOutcome::Reaped {
+            return;
+        }
+        // A successfully reaped worker may have lost its run-to-slot mapping
+        // before teardown. Clear any remaining live-state entry so the pool
+        // sweep can hand back its terminal claim.
         if let Some(slot_id) = self.live_worker_states.release_slot_for_run(execution_id) {
             tracing::warn!(
                 execution_id,
@@ -715,7 +682,7 @@ struct ServerState {
     /// Test-only override for the [`boss_tmux::Tmux`] handle
     /// [`Self::reap_tmux_worker`] resolves. Production leaves this `None`
     /// and always resolves a real handle via `Tmux::resolve(socket_path)`. Exists so
-    /// `release_worker_pane` / `reap_untracked_worker_process`'s wiring
+    /// `release_worker_pane` / `detach_untracked_worker_viewer`'s wiring
     /// into the tmux reap can be exercised end-to-end against a stubbed
     /// `Tmux` (mirroring `reap_tmux_worker_with`'s injected-runner tests)
     /// without a real tmux binary on the test host.
@@ -860,7 +827,7 @@ struct ServerState {
     /// The relaunched app has a new pid, so the trust root must be
     /// re-pinned to it on re-registration; otherwise the stale pid
     /// rejects every `RegisterAppSession` and engine→app RPCs
-    /// (`SpawnWorkerPane`, reveal) die. See `register_app_session`'s
+    /// (`AttachWorkerPane`, reveal) die. See `register_app_session`'s
     /// caller and `current_app_pid`/`set_app_pid`.
     app_pid: StdMutex<Option<libc::pid_t>>,
     /// Pid of the engine-owned coordinator tmux pane. Used as the second
@@ -965,10 +932,8 @@ struct ServerState {
     /// per-call `Send(Timeout)` WARNs. See [`AppChannelHealth`].
     #[builder(default)]
     app_channel_health: Arc<AppChannelHealth>,
-    /// Serializes outbound `SpawnWorkerPane` round-trips so the app
-    /// only ever sees one pane allocation in flight at a time. See the
-    /// `WorkerSpawner` impl for the why.
-    spawn_pane_lock: Arc<Mutex<()>>,
+    /// Serialize app viewer allocation independently of tmux worker creation.
+    attach_pane_lock: Arc<Mutex<()>>,
     /// Append-only JSONL log of every engine↔app IPC exchange. Each
     /// `send_to_app` call appends an `engine→app` record; each
     /// `deliver_app_response` call appends an `app→engine` record.
@@ -1648,7 +1613,7 @@ impl ServerState {
                 .in_flight_probes(StdMutex::new(HashMap::new()))
                 .next_probe_id(AtomicU64::new(1))
                 .app_session(Arc::new(Mutex::new(None)))
-                .spawn_pane_lock(Arc::new(Mutex::new(())))
+                .attach_pane_lock(Arc::new(Mutex::new(())))
                 .ipc_logger(ipc_logger)
                 .self_weak(weak_self.clone())
                 .feature_flags(feature_flags_for_state)
@@ -1821,7 +1786,7 @@ impl ServerState {
         }
     }
 
-    /// Tear down the libghostty pane allocated for `run_id`.
+    /// Reap the tmux worker allocated for `run_id` and detach its viewer.
     /// Safe to call repeatedly: `take_slot_for_run` returns `None` after the
     /// first call so duplicate releases (completion-detection followed by a
     /// chore-done update or `bossctl agents stop`) don't error out.
@@ -1829,26 +1794,14 @@ impl ServerState {
     /// mapping has already been removed, so a future release can't
     /// retry without a fresh registration.
     ///
-    /// A second call is **not** a guaranteed no-op, and callers must not rely
-    /// on one: with no slot mapping this falls through to
-    /// [`ServerState::reap_untracked_worker_process`], which reaps from the
-    /// run's durable `work_runs.shell_pid` when that pid is alive and its row
-    /// is inside [`REDISPATCH_PID_TRUST_SECS`]. That is the point — the
-    /// terminal path clears the mapping, so a worker the engine lost track of
-    /// has no mapping *by construction* and used to be unreachable by the
-    /// operator's own stop verb. What still holds is the property callers
-    /// actually need: the pid is scoped to `run_id`'s own latest run row, so
-    /// this never reaches a worker belonging to a different execution, however
-    /// the slot was since recycled.
-    ///
-    /// Also drops the matching `LiveWorkerStateRegistry` entry and
-    /// broadcasts the snapshot so subscribers (the kanban Doing dot,
-    /// the pane titlebar pill) stop showing the worker as attached
-    /// to its work item. Without this step a chore-done update would
-    /// release the libghostty pane but leave the live state stuck on
-    /// `WaitingForInput`, making the UI think the worker was still
-    /// running.
+    /// Durable tmux identity and verified teardown are required before removing
+    /// the registry entry or returning the workspace lease. Missing identity
+    /// or unavailable tmux evidence preserves the worker for rollback/drain.
+    /// A verified teardown also clears live-state and detaches its app viewer.
     pub async fn release_worker_pane(&self, run_id: &str) -> PaneReleaseOutcome {
+        if self.reap_tmux_worker(run_id).await != tmux_teardown::TmuxTeardownOutcome::Reaped {
+            return PaneReleaseOutcome::NoLiveWorker;
+        }
         // A slot leaving the live-state registry can never be visited by
         // the stale-worker sweep again, so resolve any open stale_worker
         // attention here — completion and explicit-stop teardown share this
@@ -1886,22 +1839,8 @@ impl ServerState {
             .await;
         }
         let Some(pane) = self.worker_registry.take_worker_pane_for_run(run_id) else {
-            // No slot mapping does not imply no process. The registry is
-            // in-memory and is cleared unconditionally at the end of this very
-            // function ("successfully or not"), while the durable
-            // `work_runs.shell_pid` the app reported survives — so a worker
-            // whose execution was wrongly terminalized loses its slot mapping
-            // while its process keeps running. Consult the DB before giving
-            // up; that is what makes `bossctl agents stop` able to reach
-            // exactly the workers the engine has lost track of (2026-07-28).
-            //
-            // Only a pid that a probe says is ALIVE, from a run row recent
-            // enough to still vouch for it, justifies proceeding: a genuinely
-            // mid-spawn worker has no recorded pid at all and must still
-            // report `NoLiveWorker`, because that verdict is what stops the
-            // caller releasing a cube lease out from under a workspace the
-            // worker is about to occupy.
-            return self.reap_untracked_worker_process(run_id).await;
+            // The tmux worker was reaped even if this engine never adopted its slot.
+            return self.detach_untracked_worker_viewer(run_id).await;
         };
         let slot_id = pane.slot_id;
         // Between the drain above and `take_worker_pane_for_run` just now, the slot
@@ -1921,44 +1860,14 @@ impl ServerState {
              being taken, against a run that was already going away",
         )
         .await;
-        // Snapshot the worker's recorded shell pid *before* we drop the
-        // live-state entry further down — the engine-side reap backstop
-        // below needs it. `0` means "pid not reported by the app yet",
-        // which the reaper treats as a no-op.
-        let shell_pid = self
-            .live_worker_states
-            .get(slot_id)
-            .map(|state| state.shell_pid)
-            .unwrap_or(0);
-        let request = if pane.tmux_hosted {
-            EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id })
-        } else {
-            EngineToAppRequest::ReleaseWorkerPane(ReleaseWorkerPaneInput {
-                slot_id,
-                kill_grace_seconds: PANE_RELEASE_KILL_GRACE.as_secs() as u32,
-            })
-        };
+        let request = EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id });
         // Whether the app has actually told us the slot no longer hosts a
         // pane. This is what gates the WorkerPool handback below — see
         // `PANE_RELEASE_ACK_TIMEOUT` and the release site for why an
         // unconfirmed teardown must not be reported to the pool as "free".
         let pane_confirmed_released = match self.send_to_app(request, PANE_RELEASE_ACK_TIMEOUT).await {
-            Ok(EngineToAppResponse::ReleaseWorkerPane { result: Ok(_) }) => {
-                tracing::info!(run_id, slot_id, "released worker pane");
-                true
-            }
             Ok(EngineToAppResponse::DetachWorkerPane { result: Ok(_) }) => {
                 tracing::info!(run_id, slot_id, "detached tmux-hosted worker pane");
-                true
-            }
-            Ok(EngineToAppResponse::ReleaseWorkerPane {
-                result: Err(EngineToAppError::UnknownSlot),
-            }) => {
-                tracing::debug!(
-                    run_id,
-                    slot_id,
-                    "release_worker_pane: app reports unknown slot — already released",
-                );
                 true
             }
             Ok(EngineToAppResponse::DetachWorkerPane {
@@ -1980,22 +1889,7 @@ impl ServerState {
                 );
                 false
             }
-            // NOT a confirmed teardown. `pane` was taken from the worker
-            // registry just above, so by construction some app session did
-            // host it — `register_run_slot` / `register_tmux_run_slot` are
-            // only ever called from the spawn flow's `SpawnWorkerPane`
-            // response handler, which requires a registered session to have
-            // answered. `NotRegistered` here therefore always means "the
-            // session that hosted this pane went away", never "no app has
-            // ever hosted this pane": `drop_app_session_if_matches`
-            // (app_session.rs) clears the registration on every websocket
-            // disconnect, but does nothing to the app's own hosted-pane
-            // inventory — the app process (and the pane) can still be very
-            // much alive. Treating this as confirmed would let the pool
-            // claim be handed back while the app is still hosting the pane,
-            // reproducing the exact fabricated "slot free" signal this
-            // function exists to prevent. Fall through to the same
-            // unconfirmed handling as a timeout or an unexpected response.
+            // A disconnected app may still display its viewer until it reconnects.
             Err(SendToAppError::NotRegistered) => {
                 tracing::warn!(
                     run_id,
@@ -2010,76 +1904,10 @@ impl ServerState {
                 false
             }
         };
-        // Engine-side reap backstop. The app's pane teardown above is
-        // the primary reaper, but it cannot act when no app session is
-        // registered, when the app is unresponsive, or when a wedged
-        // surface reports no foreground pid — exactly the `bossctl
-        // agents stop` leak from #975, where the engine slot and the
-        // cube lease were freed but the worker's `claude` process kept
-        // running (orphaned, still holding bazel/swiftc locks). Signal
-        // the recorded shell pid's process group directly so the OS
-        // process tree goes down even when the app path can't reach it.
-        // Idempotent with the app's reap: a process already gone just
-        // yields `ESRCH`. The grace mirrors the app's `kill_grace_seconds`.
-        // tmux-hosted panes outlive the app viewer (#2647): detach rather
-        // than kill from the app path, and skip the shell-pid process-group
-        // reap here. The token-verified tmux teardown below owns killing
-        // that tree (and the session) when identity columns are present.
-        if !pane.tmux_hosted {
-            reap_worker_process_tree(shell_pid, PANE_RELEASE_KILL_GRACE);
-        }
-        // tmux-hosted counterpart of the two steps above: a cheap no-op
-        // past one DB read for every run that isn't tmux-hosted (every run
-        // today). See `tmux_teardown` for the token-verified sequence.
-        self.reap_tmux_worker(run_id).await;
-        // The engine's WorkerPool slot was held for the lifetime of
-        // the libghostty pane (the coordinator deferred its release
-        // when `run_execution` returned with `slot_id = Some(N)`).
-        // Hand it back and kick the scheduler — but ONLY once the app
-        // has actually confirmed the pane is gone.
-        //
-        // This used to release unconditionally, on the reasoning that the
-        // pane had been torn down "successfully or not". It has not: a
-        // teardown the app never acknowledged (RPC deadline, transport
-        // error, unexpected response) leaves the app still hosting the
-        // pane while the engine advertises slot N as free. The very next
-        // dispatch claims N, `SpawnWorkerPane` is rejected `SlotBusy`, and
-        // the coordinator terminalizes that execution `failed` seconds
-        // after start with `work_executions.driver` still NULL — the
-        // launch config is only stamped on the successful-spawn arm. That
-        // is a fabricated free signal, not a spawn problem, and it fires
-        // exactly when another execution is finishing, which is where the
-        // reported cluster came from.
-        //
-        // When the teardown is unconfirmed the claim therefore STAYS with
-        // this execution and `crate::pool_claim_sweep` reconciles it: a
-        // terminal execution with no live-state entry (dropped just below)
-        // past `LEAK_GRACE_SECS` is exactly the leaked-claim shape it
-        // exists to release, and it compare-and-releases so it cannot yank
-        // a slot a live execution has since re-claimed. The sweep only
-        // considers terminal executions, so a non-terminal one (or a run
-        // with no execution row at all — test and legacy paths) still
-        // releases inline rather than leaking the slot forever.
-        //
-        // KNOWN GAP: nothing re-attempts the pane teardown before the sweep
-        // hands the claim back at `LEAK_GRACE_SECS`. Against an app that is
-        // slow-but-alive this converges fine — the delayed ack lands well
-        // inside the grace window. Against an app that is genuinely wedged
-        // (never reconnects, never answers), the sweep frees the claim on
-        // schedule, the next dispatch immediately collides `SlotBusy`
-        // again, and that repeats indefinitely: one fabricated-free/re-leak
-        // cycle roughly every `LEAK_GRACE_SECS` + one sweep interval,
-        // forever, until an operator intervenes. There is no automatic
-        // reclaimer for this app-hosted (non-tmux) pane shape today —
-        // `husk_pane_sweep` only enumerates the private tmux server; the
-        // app-hosted side stays the manual `bossctl agents retire-pane`
-        // break-glass path. Closing this fully needs the sweep itself to
-        // re-issue (or confirm) the teardown before releasing, which is
-        // deferred out of this change.
-        //
-        // `WorkerPool::release_worker` is a find-or-skip no-op for
-        // already-idle slots, so the inline release is safe even if the
-        // pane was a non-pool spawn (e.g. legacy or test path).
+        // Preserve the existing viewer-slot acknowledgement contract: terminal
+        // claims with an unconfirmed detach are handed back by pool_claim_sweep.
+        // Nonterminal claims must be released here because that sweep only
+        // considers terminal rows. The tmux process has already been reaped.
         let worker_id = crate::coordinator::worker_id_for_slot(slot_id);
         let sweep_owns_handback = !pane_confirmed_released && self.execution_is_terminal(run_id);
         if sweep_owns_handback {
@@ -2117,140 +1945,23 @@ impl ServerState {
         PaneReleaseOutcome::Reaped
     }
 
-    /// Last-resort teardown for a run the engine has no slot mapping for,
-    /// driven entirely by durable state.
-    ///
-    /// This is the path that makes "`bossctl` must be able to stop a worker it
-    /// can see in a pane" true. `bossctl agents stop` funnels through
-    /// `force_stop_execution` → `force_release` → `release_worker_pane`, and
-    /// every one of those steps used to dead-end at the in-memory
-    /// `WorkerRegistry` slot lookup. A worker whose execution was wrongly
-    /// terminalized has no slot mapping *by construction* — the terminal path
-    /// cleared it — so the operator's reap verb was blind to exactly the
-    /// workers that needed reaping, and the six live panes on 2026-07-28 had
-    /// to be killed by hand with `kill <pid>`.
-    ///
-    /// Two independent teardowns, because either can be the one that works:
-    ///
-    /// 1. **The app's pane**, if it still hosts one for this run. Found by
-    ///    asking the app what it hosts rather than by consulting engine
-    ///    bookkeeping — the bookkeeping being wrong is the premise here. This
-    ///    is also what clears the pane from the operator's screen.
-    /// 2. **The OS process tree**, from `work_runs.shell_pid`. Reaches the
-    ///    worker even when no app session is registered, the app is wedged, or
-    ///    the pane was already torn down while the process survived.
-    ///
-    /// Returns `Reaped` when either teardown had something real to act on, and
-    /// `NoLiveWorker` otherwise. Preserving `NoLiveWorker` for the "no durable
-    /// pid at all" case matters: that is the mid-spawn shape, and its contract
-    /// is that the caller must NOT release the cube lease (the worker is about
-    /// to occupy that workspace).
-    ///
-    /// **Age-bounded, unlike the read-only probes.** The pid is read through
-    /// [`crate::durable_liveness::probe_execution_worker_within`] with the same
-    /// [`REDISPATCH_PID_TRUST_SECS`] window the re-dispatch guard uses, and an
-    /// older row yields `NoLiveWorker` without signalling anything. A recorded
-    /// pid is a durable number, not a durable handle: macOS wraps pids at
-    /// ~99999, `reap_worker_process_tree` signals the process *group*, and this
-    /// entry point is reachable from operator input — `bossctl agents stop`
-    /// forwards any unresolvable `exec_…` selector straight through
-    /// `force_stop_execution` → `force_release` → `release_worker_pane` with no
-    /// status or age gate of its own. Without the bound, `agents stop` on a
-    /// days-old execution id would signal whatever process group inherited that
-    /// number.
-    async fn reap_untracked_worker_process(&self, run_id: &str) -> PaneReleaseOutcome {
-        let process = crate::durable_liveness::probe_execution_worker_within(
-            &self.work_db,
-            run_id,
-            crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
-            boss_engine_utils::epoch_time::now_epoch_secs(),
-        );
-        let Some(shell_pid) = process.alive_pid() else {
-            // INFO, not DEBUG: this is the line that says a `release_pane`
-            // arrived after its slot was already gone — i.e. somebody else
-            // (a sweep, an operator stop) got to the pane first. The
-            // 2026-07-30 post-mortem could only infer that from the absence
-            // of other lines, because the retained log keeps INFO and above
-            // and this was DEBUG. A completion path reaching this arm is
-            // rare and always worth seeing.
-            tracing::info!(
-                run_id,
-                verdict = process.reason(),
-                trust_window_secs = crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
-                "release_worker_pane: no slot mapped and no live durable pid within the trust \
-                 window; treating as mid-spawn, already released, or too old to vouch for",
-            );
-            // The tmux reap does not depend on pid trust at all — it
-            // re-verifies BOSS_SPAWN_TOKEN against the durably recorded
-            // token before touching anything, so it is safe (and necessary)
-            // to run even when the OS-pid probe above found nothing to
-            // vouch for. Without this, a tmux-hosted session whose pane
-            // process already died, or whose run aged past the trust
-            // window, would never be torn down.
-            self.reap_tmux_worker(run_id).await;
-            return PaneReleaseOutcome::NoLiveWorker;
-        };
-        tracing::warn!(
-            run_id,
-            shell_pid,
-            "release_worker_pane: no slot mapped but the run's recorded process is ALIVE — the \
-             engine lost track of a running worker. Reaping it from durable state so the operator's \
-             stop verb is not blind to exactly the workers that need stopping.",
-        );
-        // Ask the app what it actually hosts. Engine bookkeeping is what is
-        // wrong here, so it cannot be the source for the slot id.
-        match self.hosted_pane_slot_for_run(run_id).await {
-            Some(slot_id) => {
-                let request = EngineToAppRequest::ReleaseWorkerPane(ReleaseWorkerPaneInput {
-                    slot_id,
-                    kill_grace_seconds: 5,
-                });
-                match self.send_to_app(request, Duration::from_secs(5)).await {
-                    Ok(EngineToAppResponse::ReleaseWorkerPane { result: Ok(_) }) => {
-                        tracing::info!(run_id, slot_id, "release_worker_pane: released untracked pane");
-                    }
-                    Ok(EngineToAppResponse::ReleaseWorkerPane {
-                        result: Err(EngineToAppError::UnknownSlot),
-                    }) => {
-                        tracing::debug!(run_id, slot_id, "release_worker_pane: app reports unknown slot");
-                    }
-                    other => {
-                        tracing::warn!(
-                            run_id,
-                            slot_id,
-                            ?other,
-                            "release_worker_pane: untracked pane release did not succeed; \
-                             falling through to the process-tree reap",
-                        );
-                    }
-                }
-                // The slot the app was really using may still hold a stale
-                // pool claim and live-state entry from before the engine lost
-                // track. Clear both so the slot is genuinely reusable.
-                let worker_id = crate::coordinator::worker_id_for_slot(slot_id);
-                self.execution_coordinator
-                    .release_worker_and_kick(&worker_id, None)
-                    .await;
-                self.live_worker_states.release_slot(slot_id);
-                self.live_status_manager.stop_slot(slot_id);
-                self.broadcast_live_worker_states().await;
+    /// Detach presentation for a worker whose tmux teardown was already verified.
+    async fn detach_untracked_worker_viewer(&self, run_id: &str) -> PaneReleaseOutcome {
+        if let Some(slot_id) = self.hosted_pane_slot_for_run(run_id).await {
+            let request = EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id });
+            if let Err(err) = self.send_to_app(request, PANE_RELEASE_ACK_TIMEOUT).await {
+                tracing::warn!(run_id, slot_id, ?err, "failed to detach untracked tmux viewer");
             }
-            None => {
-                tracing::debug!(
-                    run_id,
-                    "release_worker_pane: app hosts no pane for this run; process-tree reap only",
-                );
-            }
+            let worker_id = crate::coordinator::worker_id_for_slot(slot_id);
+            self.execution_coordinator
+                .release_worker_and_kick(&worker_id, None)
+                .await;
+            self.live_worker_states.release_slot(slot_id);
+            self.live_status_manager.stop_slot(slot_id);
+            self.broadcast_live_worker_states().await;
         }
-        reap_worker_process_tree(shell_pid, PANE_RELEASE_KILL_GRACE);
-        // tmux-hosted counterpart, same as `release_worker_pane`'s slot-mapped
-        // path — reaches a tmux-hosted worker the engine lost track of just
-        // as the process-tree signal above does.
-        self.reap_tmux_worker(run_id).await;
         self.transcript_path_cache.forget(run_id);
         self.run_cost_capture.forget(run_id);
-        // A live process was signalled, so this IS a reap: the caller may free
-        // the workspace lease.
         PaneReleaseOutcome::Reaped
     }
 

@@ -852,7 +852,7 @@ async fn adopt_one<S>(
 
     spawner
         .worker_registry()
-        .register_adopted_tmux_run_slot(execution_id.to_owned(), slot_id, session_name);
+        .register_tmux_run_slot(execution_id.to_owned(), slot_id, session_name);
     spawner.worker_registry().register(shell_pid, execution_id.to_owned());
 
     if !coordinator.reclaim_slot(&handle.agent_id, execution_id).await {
@@ -1905,10 +1905,9 @@ mod tests {
             spawner.registry.pane_for_run(&execution_id),
             Some(crate::worker_registry::RegisteredWorkerPane {
                 slot_id: 1,
-                tmux_hosted: false,
                 tmux_session_name: Some("boss-worker-1".to_owned()),
             }),
-            "adopted sessions route input through tmux but retain legacy teardown and process reaping",
+            "adopted sessions route input and token-verified teardown through tmux",
         );
         let live_state = spawner.live_states.get(1).expect("slot 1 must be registered");
         assert_eq!(live_state.run_id, execution_id);
@@ -2033,10 +2032,9 @@ mod tests {
             spawner.registry.pane_for_run(&execution_id),
             Some(crate::worker_registry::RegisteredWorkerPane {
                 slot_id: 1,
-                tmux_hosted: false,
                 tmux_session_name: Some("boss-worker-1".to_owned()),
             }),
-            "adopted sessions route input through tmux but retain legacy teardown and process reaping",
+            "adopted sessions route input and token-verified teardown through tmux",
         );
         let live_state = spawner.live_states.get(1).expect("slot 1 must be registered");
         assert_eq!(live_state.run_id, execution_id);

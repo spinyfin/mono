@@ -108,6 +108,9 @@ impl WorkDb {
     /// Errors when the execution is unknown or already terminal —
     /// callers shouldn't try to reap a row that's already done.
     pub fn mark_execution_orphaned(&self, execution_id: &str, reason: &str) -> Result<WorkExecution> {
+        if self.is_execution_quarantined(execution_id)? {
+            bail!("historical local worker is quarantined; rollback/drain and restart required before orphan recovery");
+        }
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;

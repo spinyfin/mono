@@ -3,8 +3,8 @@ use super::*;
 use crate::test_support::*;
 
 #[tokio::test]
-async fn spawn_worker_pane_requests_are_serialized() {
-    // Two concurrent SpawnWorkerPane calls go through
+async fn attach_worker_pane_requests_are_serialized() {
+    // Two concurrent AttachWorkerPane calls go through
     // `WorkerSpawner::send_to_app_request`. The mutex inside that
     // path should ensure only one is enqueued on the sink before
     // the first response is delivered. The second request must
@@ -18,15 +18,13 @@ async fn spawn_worker_pane_requests_are_serialized() {
         .await;
 
     let make_request = |run: &str| {
-        EngineToAppRequest::SpawnWorkerPane(crate::protocol::SpawnWorkerPaneInput {
+        EngineToAppRequest::AttachWorkerPane(crate::protocol::AttachWorkerPaneInput {
             run_id: run.to_owned(),
-            workspace_path: "/tmp".into(),
             slot_id: 1,
-            initial_input: "claude\n".into(),
-            env: vec![],
+            session_name: format!("boss-{run}"),
+            tmux_socket_path: boss_tmux::TEST_SOCKET_PATH.into(),
             summary: None,
             task_title: None,
-            pane_monitor: None,
         })
     };
 
@@ -44,7 +42,7 @@ async fn spawn_worker_pane_requests_are_serialized() {
     });
 
     // The first request must be on the sink; the second must be
-    // gated behind the spawn_pane_lock until the first resolves.
+    // gated behind the attach_pane_lock until the first resolves.
     let first = sink.next().await.expect("first EngineRequest enqueued");
     let first_request_id = match &first.payload {
         FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
@@ -58,7 +56,7 @@ async fn spawn_worker_pane_requests_are_serialized() {
     let peek = tokio::time::timeout(Duration::from_millis(100), sink.next()).await;
     assert!(
         peek.is_err(),
-        "second SpawnWorkerPane should not be in flight while the first is pending; got {:?}",
+        "second AttachWorkerPane should not be in flight while the first is pending; got {:?}",
         peek.ok().flatten().map(|env| env.payload),
     );
 
@@ -68,11 +66,8 @@ async fn spawn_worker_pane_requests_are_serialized() {
         .deliver_app_response(
             "session-app",
             &first_request_id,
-            EngineToAppResponse::SpawnWorkerPane {
-                result: Ok(crate::protocol::SpawnWorkerPaneResult {
-                    slot_id: 1,
-                    shell_pid: 0,
-                }),
+            EngineToAppResponse::AttachWorkerPane {
+                result: Ok(crate::protocol::AttachWorkerPaneResult {}),
             },
         )
         .await;
@@ -87,11 +82,8 @@ async fn spawn_worker_pane_requests_are_serialized() {
         .deliver_app_response(
             "session-app",
             &second_request_id,
-            EngineToAppResponse::SpawnWorkerPane {
-                result: Ok(crate::protocol::SpawnWorkerPaneResult {
-                    slot_id: 2,
-                    shell_pid: 0,
-                }),
+            EngineToAppResponse::AttachWorkerPane {
+                result: Ok(crate::protocol::AttachWorkerPaneResult {}),
             },
         )
         .await;
@@ -107,10 +99,11 @@ async fn release_worker_pane_drops_live_worker_state() {
     // pinned at the worker's last activity (e.g. WaitingForInput)
     // even after the libghostty pane was torn down.
     let (server_state, _dir) = test_server_state();
-    server_state.worker_registry.register_run_slot("run-x", 1);
+    let run_id = super::tmux_stub::seed_teardown(&server_state);
+    server_state.worker_registry.register_run_slot(&run_id, 1);
     server_state
         .live_worker_states
-        .register_spawn(1, "run-x", "claude-opus-4-7", 0, None);
+        .register_spawn(1, &run_id, "claude-opus-4-7", 0, None);
     assert!(
         server_state.live_worker_states.get(1).is_some(),
         "precondition: live state for slot 1 should be registered",
@@ -119,21 +112,21 @@ async fn release_worker_pane_drops_live_worker_state() {
     // No app session is registered, so the SendToApp call in
     // release_worker_pane returns NotRegistered. The cleanup must
     // run regardless.
-    server_state.release_worker_pane("run-x").await;
+    server_state.release_worker_pane(&run_id).await;
 
     assert!(
         server_state.live_worker_states.get(1).is_none(),
         "release_worker_pane must drop the live-state entry alongside the libghostty pane",
     );
     assert_eq!(
-        server_state.worker_registry.slot_for_run("run-x"),
+        server_state.worker_registry.slot_for_run(&run_id),
         None,
         "release_worker_pane must drop the worker_registry slot mapping",
     );
 
     // Idempotent: a second call (e.g. completion-detection then
     // chore-done firing for the same run) is a no-op.
-    server_state.release_worker_pane("run-x").await;
+    server_state.release_worker_pane(&run_id).await;
     assert!(server_state.live_worker_states.get(1).is_none());
 }
 
@@ -143,6 +136,7 @@ async fn release_worker_pane_resolves_open_stale_worker_attention() {
     let product_id = create_product(&server_state.work_db);
     let work_item_id = create_active_chore(&server_state.work_db, &product_id, "test chore");
     let execution_id = create_old_execution(&server_state.work_db, &work_item_id);
+    super::tmux_stub::install_teardown(&server_state, &execution_id, 4_194_303);
     server_state
         .work_db
         .upsert_external_tracker_attention(
@@ -275,6 +269,7 @@ async fn release_worker_pane_releases_matching_worker_pool_slot() {
     // engine and the app drift apart and the next
     // SpawnWorkerPane gets rejected as SlotBusy.
     let (server_state, _dir) = test_server_state();
+    let run_id = super::tmux_stub::seed_teardown(&server_state);
     let pool = server_state.execution_coordinator.worker_pool();
 
     // Pre-claim slot 1 the way the coordinator would, then wire
@@ -286,12 +281,12 @@ async fn release_worker_pane_releases_matching_worker_pool_slot() {
         .expect("worker pool starts with one free slot");
     assert_eq!(claimed, "worker-1");
     assert_eq!(pool.idle_count().await, 0);
-    server_state.worker_registry.register_run_slot("run-1", 1);
+    server_state.worker_registry.register_run_slot(&run_id, 1);
 
     // No app session is registered, so the SendToApp call inside
     // release_worker_pane bails on NotRegistered — the pool
     // release must still happen.
-    server_state.release_worker_pane("run-1").await;
+    server_state.release_worker_pane(&run_id).await;
 
     assert_eq!(
         pool.idle_count().await,
@@ -312,12 +307,13 @@ async fn release_worker_pane_pool_release_is_idempotent() {
     // racy double-release must not zero out an unrelated execution
     // that has already re-claimed the slot.
     let (server_state, _dir) = test_server_state();
+    let run_id = super::tmux_stub::seed_teardown(&server_state);
     let pool = server_state.execution_coordinator.worker_pool();
 
     let _claimed = pool.claim_worker("exec-1", None).await.unwrap();
-    server_state.worker_registry.register_run_slot("run-1", 1);
+    server_state.worker_registry.register_run_slot(&run_id, 1);
 
-    server_state.release_worker_pane("run-1").await;
+    server_state.release_worker_pane(&run_id).await;
     assert_eq!(pool.idle_count().await, 1);
 
     // Re-claim the slot for a new execution.
@@ -327,7 +323,7 @@ async fn release_worker_pane_pool_release_is_idempotent() {
 
     // A duplicate release for the original run must not steal the
     // slot back from exec-2.
-    server_state.release_worker_pane("run-1").await;
+    server_state.release_worker_pane(&run_id).await;
     assert_eq!(
         pool.idle_count().await,
         0,
@@ -372,6 +368,7 @@ async fn reap_run_releases_worker_pool_claim_and_live_state() {
         .await
         .expect("pool starts with a free slot");
     assert_eq!(claimed, "worker-1");
+    super::tmux_stub::install_teardown(&server_state, &execution.id, 4_194_303);
     server_state.worker_registry.register_run_slot(&execution.id, 1);
     server_state
         .live_worker_states
@@ -440,8 +437,8 @@ async fn reap_run_releases_worker_pool_claim_and_live_state() {
         .deliver_app_response(
             "session-app",
             &request_id,
-            EngineToAppResponse::ReleaseWorkerPane {
-                result: Ok(crate::protocol::ReleaseWorkerPaneResult {}),
+            EngineToAppResponse::DetachWorkerPane {
+                result: Ok(crate::protocol::DetachWorkerPaneResult {}),
             },
         )
         .await;
@@ -483,21 +480,49 @@ async fn claim_slot_one_for(server_state: &Arc<ServerState>, execution_id: &str)
         .await
         .expect("worker pool starts with one free slot");
     assert_eq!(claimed, "worker-1");
+    super::tmux_stub::install_teardown(server_state, execution_id, 4_194_303);
     server_state.worker_registry.register_run_slot(execution_id, 1);
 }
 
-/// The engine must not tell the app how long to wait for a worker to die
-/// and then give up on the answer at exactly that moment. The two being
-/// equal (both 5s) is what made every full-grace teardown time out, and a
-/// timed-out teardown is the unconfirmed case the test below covers.
-#[test]
-fn pane_release_ack_timeout_outlasts_the_kill_grace_it_asks_for() {
+/// The app's acknowledgement deadline starts only after tmux has reaped the
+/// worker; a process kill grace can no longer consume the viewer's deadline.
+#[tokio::test]
+async fn tmux_teardown_finishes_before_waiting_for_the_viewer_ack() {
+    let (server, _dir) = test_server_state();
+    let execution_id = super::tmux_stub::seed_teardown(&server);
+    server
+        .worker_registry
+        .register_tmux_run_slot(&execution_id, 1, "boss-test-worker");
+    let sink = make_session_sink();
+    server.register_app_session("session-app".into(), sink.clone()).await;
+    let releasing_server = server.clone();
+    let releasing_id = execution_id.clone();
+    let release = tokio::spawn(async move { releasing_server.release_worker_pane(&releasing_id).await });
+    let envelope = tokio::time::timeout(Duration::from_secs(5), sink.next())
+        .await
+        .unwrap()
+        .unwrap();
+    let FrontendEvent::EngineRequest { request_id, request } = envelope.payload else {
+        panic!("expected viewer detach");
+    };
+    assert!(matches!(request, EngineToAppRequest::DetachWorkerPane(_)));
     assert!(
-        crate::app::PANE_RELEASE_ACK_TIMEOUT > crate::app::PANE_RELEASE_KILL_GRACE,
-        "the ack deadline ({:?}) must exceed the kill grace the app is asked to honour ({:?})",
-        crate::app::PANE_RELEASE_ACK_TIMEOUT,
-        crate::app::PANE_RELEASE_KILL_GRACE,
+        server
+            .work_db
+            .tmux_identity_for_execution(&execution_id)
+            .unwrap()
+            .is_none()
     );
+    server
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::DetachWorkerPane {
+                result: Ok(crate::protocol::DetachWorkerPaneResult {}),
+            },
+        )
+        .await;
+    assert_eq!(release.await.unwrap(), PaneReleaseOutcome::Reaped);
 }
 
 #[tokio::test(start_paused = true)]

@@ -242,7 +242,12 @@ impl ExecutionCoordinator {
             required_capabilities.insert(crate::host_capability_probe::driver_capability(driver));
         }
 
-        let hosts = self.work_db.list_hosts().context("host-selection: list hosts")?;
+        self.work_db.ensure_work_item_not_quarantined(work_item.primary_id())?;
+        let quarantine_reason = self.work_db.local_dispatch_quarantine_reason()?;
+        let mut hosts = self.work_db.list_hosts().context("host-selection: list hosts")?;
+        if quarantine_reason.is_some() {
+            hosts.retain(|host| host.id != "local");
+        }
         let active = self
             .work_db
             .active_runs_per_host()
@@ -286,9 +291,12 @@ impl ExecutionCoordinator {
                 .find(|h| h.id == host_id)
                 .ok_or_else(|| anyhow!("selected host '{host_id}' is missing from the registry")),
             None => Err(anyhow!(
-                "no eligible host for work item {}: {}",
+                "no eligible host for work item {}: {}{}",
                 work_item.primary_id(),
                 summarize_ineligibility(&report, required_driver.as_deref()),
+                quarantine_reason
+                    .map(|reason| format!("; {reason}"))
+                    .unwrap_or_default(),
             )),
         }
     }
@@ -1687,8 +1695,7 @@ impl ExecutionCoordinator {
             return Err(err);
         }
 
-        let attributed_pool = self.attributed_pool_label(execution);
-        let tmux_hosted = selected_host.id == "local" && adapter.tmux_hosting_enabled_for(attributed_pool);
+        let tmux_hosted = selected_host.id == "local";
         match self.work_db.start_execution_run_on_host_with_tmux_hosting(
             &execution.id,
             worker_id,

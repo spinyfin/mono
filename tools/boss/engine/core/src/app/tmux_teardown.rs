@@ -1,17 +1,8 @@
-//! Token-verified tmux session teardown — the tmux-hosted counterpart of
-//! the SIGTERM→SIGKILL ladder [`reap_worker_process_tree`] already runs
-//! against every released worker's pane pid.
+//! Token-verified teardown for local tmux workers.
 //!
-//! Every terminal path that calls [`ServerState::release_worker_pane`]
-//! (completion, cancel, orphan reconcile, husk retire, stale escalation,
-//! `bossctl agents stop`) ends up here too, via
-//! [`ServerState::reap_tmux_worker`]: read back the durably-recorded tmux
-//! session identity for the run, refuse to touch anything unless the
-//! session's *live* token matches exactly, signal the pane pid's process
-//! group, destroy the session, and clear the identity columns. Safe (and a
-//! cheap no-op past the first DB read) to call for a run that was never
-//! tmux-hosted at all — which is every run today, since `workers.tmux_hosting`
-//! defaults off.
+//! Session identity must be present and verified before signalling a worker.
+//! Missing identity and unreadable state fail closed, including historical
+//! app-hosted rows held for rollback or drain.
 //!
 //! There is no lower-level "kill by session name" reachable from here, or
 //! from anywhere else in this crate: [`boss_tmux::Tmux::kill_session_verified`]
@@ -39,10 +30,6 @@ const TMUX_SPAWN_TOKEN_ENV: &str = "BOSS_SPAWN_TOKEN";
 /// What [`ServerState::reap_tmux_worker`] did for one execution's teardown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TmuxTeardownOutcome {
-    /// No tmux session identity is durably recorded for this execution's
-    /// current run — not a tmux-hosted worker, or an earlier teardown call
-    /// already cleared the columns. Nothing to do.
-    NotTmuxHosted,
     /// The session's live token matched (or the session was already gone),
     /// the process group was signalled when applicable, the session was
     /// destroyed, and the identity columns were cleared.
@@ -55,21 +42,22 @@ pub(super) enum TmuxTeardownOutcome {
 }
 
 impl ServerState {
-    /// tmux-hosted counterpart of the process-tree signal
-    /// [`Self::release_worker_pane`] / [`Self::reap_untracked_worker_process`]
-    /// already send to `shell_pid`. See the module doc for the full
-    /// sequence and why a bare kill-by-name is unreachable from here.
+    /// Verify local process ownership before signalling the worker and
+    /// destroying its session. Missing identity always refuses teardown.
     pub(super) async fn reap_tmux_worker(&self, execution_id: &str) -> TmuxTeardownOutcome {
         let identity = match self.work_db.tmux_identity_for_execution(execution_id) {
             Ok(Some(identity)) => identity,
-            Ok(None) => return TmuxTeardownOutcome::NotTmuxHosted,
+            Ok(None) => {
+                tracing::warn!(execution_id, "local teardown refused: no durable tmux identity");
+                return TmuxTeardownOutcome::Refused;
+            }
             Err(err) => {
                 tracing::warn!(
                     execution_id,
                     error = %format!("{err:#}"),
-                    "reap_tmux_worker: failed reading tmux identity; treating as not tmux-hosted",
+                    "reap_tmux_worker: failed reading tmux identity; refusing local teardown",
                 );
-                return TmuxTeardownOutcome::NotTmuxHosted;
+                return TmuxTeardownOutcome::Refused;
             }
         };
         #[cfg(test)]
@@ -112,7 +100,7 @@ impl ServerState {
     /// Test-only: install a stubbed [`Tmux`] that [`Self::reap_tmux_worker`]
     /// uses instead of resolving a real tmux binary. Lets a test exercise
     /// the caller-side wiring (`release_worker_pane`,
-    /// `reap_untracked_worker_process`) end-to-end against a scripted
+    /// `detach_untracked_worker_viewer`) end-to-end against a scripted
     /// `CommandRunner`, the same way [`Self::reap_tmux_worker_with`]'s own
     /// direct-call tests do.
     #[cfg(test)]
@@ -234,10 +222,8 @@ impl ServerState {
         );
 
         // Verified match: safe to signal the recorded pane pid's process
-        // group. This is the same ladder every app-hosted release already
-        // runs (`reap_worker_process_tree`) — it stays because the reason
-        // it exists stays: node-based agents commonly ignore the SIGHUP a
-        // pty teardown delivers.
+        // group. Node-based agents commonly ignore the SIGHUP a pty
+        // teardown delivers, so retain the TERM/KILL escalation ladder.
         if let Some(pane_pid) = identity
             .pane_pid
             .and_then(|pid| i32::try_from(pid).ok())

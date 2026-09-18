@@ -576,6 +576,7 @@ async fn retire_pane_reaps_an_untracked_slot_whose_durable_process_is_alive() {
     let mut child = spawn_group_leader_sleeper();
     let pid = child.id() as i32;
     let execution_id = create_spawned_execution(db, &work_item_id, i64::from(pid));
+    super::tmux_stub::install_teardown(&server_state, &execution_id, i64::from(child.id()));
     db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
 
     let sink = make_session_sink();
@@ -644,7 +645,7 @@ async fn retire_pane_reaps_an_untracked_slot_whose_durable_process_is_alive() {
             assert!(
                 matches!(
                     request,
-                    EngineToAppRequest::ReleaseWorkerPane(ReleaseWorkerPaneInput { slot_id: 4, .. })
+                    EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id: 4, .. })
                 ),
                 "expected ReleaseWorkerPane for slot 4, got {request:?}"
             );
@@ -652,8 +653,8 @@ async fn retire_pane_reaps_an_untracked_slot_whose_durable_process_is_alive() {
                 .deliver_app_response(
                     "session-app",
                     &request_id,
-                    EngineToAppResponse::ReleaseWorkerPane {
-                        result: Ok(crate::protocol::ReleaseWorkerPaneResult {}),
+                    EngineToAppResponse::DetachWorkerPane {
+                        result: Ok(crate::protocol::DetachWorkerPaneResult {}),
                     },
                 )
                 .await;

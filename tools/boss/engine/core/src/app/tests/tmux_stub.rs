@@ -75,3 +75,38 @@ pub(crate) fn fake_tmux(replies: impl IntoIterator<Item = CommandOutput>) -> (Tm
         runner,
     )
 }
+
+/// Give a teardown fixture the same durable identity a successful spawn writes.
+/// The scripted server verifies the token twice before the real process reap.
+pub(super) fn install_teardown(server: &super::ServerState, execution_id: &str, pane_pid: i64) {
+    let db = &server.work_db;
+    if db.list_runs(execution_id).unwrap().is_empty() {
+        db.create_run(
+            boss_protocol::CreateRunInput::builder()
+                .execution_id(execution_id)
+                .agent_id("worker-1")
+                .build(),
+        )
+        .unwrap();
+    }
+    let token = format!("token-{execution_id}");
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(execution_id, boss_tmux::SERVER_LABEL, "boss-test-worker", &token)
+            .unwrap()
+    );
+    assert!(
+        db.record_tmux_session_created_for_execution(execution_id, &token, pane_pid)
+            .unwrap()
+    );
+    let env = format!("BOSS_SPAWN_TOKEN={token}\n");
+    let (tmux, _) = fake_tmux([ok(&env), ok("0"), ok(&env), ok("")]);
+    server.set_tmux_override_for_test(tmux);
+}
+
+pub(super) fn seed_teardown(server: &super::ServerState) -> String {
+    let product = crate::test_support::create_product(&server.work_db);
+    let item = crate::test_support::create_active_chore(&server.work_db, &product, "tmux worker");
+    let execution = crate::test_support::create_old_execution(&server.work_db, &item);
+    install_teardown(server, &execution, 4_194_303);
+    execution
+}

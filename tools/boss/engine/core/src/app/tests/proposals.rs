@@ -530,6 +530,7 @@ async fn accepted_review_report_reaps_a_real_worker_process() {
 
     let mut child = crate::test_support::spawn_group_leader_sleeper();
     let pid = child.id() as i64;
+    super::tmux_stub::install_teardown(&server_state, &execution_id, pid);
     assert!(
         server_state
             .work_db
@@ -827,6 +828,7 @@ async fn accepted_run_done_delivered_reaps_a_real_worker_process_without_network
 
     let mut child = crate::test_support::spawn_group_leader_sleeper();
     let pid = child.id() as i64;
+    super::tmux_stub::install_teardown(&server_state, &execution_id, pid);
     assert!(
         server_state
             .work_db

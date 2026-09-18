@@ -81,12 +81,9 @@ pub struct StartupPaneReconcileOutcome {
 ///
 /// `hosted_run_ids` is the result of one `ListHostedPanes` round-trip:
 /// `Ok` even when empty (the app answered), `Err` when the app could not
-/// be asked. Whether a run was tmux-hosted is read from the newest run's
-/// durable hosting-mode snapshot ([`WorkDb::latest_run_tmux_hosting_for_execution`]),
-/// never from the current pool setting — that setting only decides how the
-/// *next* spawn is issued. A tmux-intended run does not need the app oracle:
-/// boot-time tmux adoption plus the live-state registry are sufficient,
-/// including before its spawn identity has been written.
+/// be asked. Local tmux identity comes from the latest durable run. Missing
+/// identity is never evidence of death, even if the previous run intended
+/// to use tmux; startup quarantine owns recovery of those historical rows.
 pub struct EnginePaneOracle {
     pub work_db: WorkDb,
     pub live_states: Option<Arc<LiveWorkerStateRegistry>>,
@@ -107,22 +104,25 @@ impl PanePresenceOracle for EnginePaneOracle {
         {
             return PanePresence::Present;
         }
-        match self.work_db.latest_run_tmux_hosting_for_execution(execution_id) {
-            Ok(Some(true)) => {
+        match self.work_db.tmux_identity_for_execution(execution_id) {
+            Ok(Some(_)) => {
                 // Boot-time tmux inventory already ran. Not adopted and not
                 // in live-state means the intended session was never created.
                 return PanePresence::Absent;
             }
-            Ok(Some(false) | None) => {}
+            Ok(None) => {}
             Err(err) => {
                 return PanePresence::Undetermined {
-                    reason: format!("durable tmux hosting mode unreadable: {err:#}"),
+                    reason: format!("durable tmux identity unreadable: {err:#}"),
                 };
             }
         }
         match &self.hosted_run_ids {
             Ok(ids) if ids.contains(execution_id) => PanePresence::Present,
-            Ok(_) => PanePresence::Absent,
+            Ok(_) => PanePresence::Undetermined {
+                reason: "historical local worker lacks tmux identity; process death must be proven before recovery"
+                    .into(),
+            },
             Err(reason) => PanePresence::Undetermined { reason: reason.clone() },
         }
     }
@@ -192,6 +192,9 @@ async fn consider_one(
     resumer: &dyn UnspawnedRunResumer,
     dispatch_events: &dyn DispatchEventSink,
 ) -> OneOutcome {
+    if work_db.is_execution_quarantined(&execution.id).unwrap_or(true) {
+        return OneOutcome::NotCandidate;
+    }
     if execution.status != ExecutionStatus::Running {
         return OneOutcome::NotCandidate;
     }
@@ -645,7 +648,10 @@ mod tests {
             Ok(["exec-hosted".to_owned()].into_iter().collect()),
         );
         assert_eq!(oracle.pane_presence("exec-hosted").await, PanePresence::Present);
-        assert_eq!(oracle.pane_presence("exec-missing").await, PanePresence::Absent);
+        assert!(matches!(
+            oracle.pane_presence("exec-missing").await,
+            PanePresence::Undetermined { .. }
+        ));
     }
 
     #[tokio::test]
@@ -793,10 +799,10 @@ mod tests {
     }
 
     /// A tmux-intended run can die after its row is committed but before the
-    /// spawn flow writes a tmux identity. Boot-time tmux inventory has already
-    /// ruled out a session, so an unavailable app cannot delay recovery.
+    /// spawn flow writes a tmux identity. Missing identity cannot prove death,
+    /// even when the run was intended to use tmux.
     #[tokio::test]
-    async fn tmux_intended_run_without_spawn_identity_respawns_when_app_is_unavailable() {
+    async fn tmux_intended_run_without_spawn_identity_requires_death_evidence() {
         let (_dir, db) = open_db();
         let exec = seed_running_leased_with_tmux_hosting(&db, true);
         assert!(
@@ -815,9 +821,9 @@ mod tests {
             &sink,
         )
         .await;
-        assert_eq!(outcome.respawned, 1);
-        assert_eq!(outcome.undetermined, 0);
-        assert_eq!(*resumer.calls.lock().unwrap(), vec![exec.id.clone()]);
+        assert_eq!(outcome.respawned, 0);
+        assert_eq!(outcome.undetermined, 1);
+        assert!(resumer.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

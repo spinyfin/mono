@@ -579,6 +579,9 @@ async fn send_input_refuses_a_dead_tmux_pane() {
     *server_state.pane_delivery_tmux_override.write().unwrap() =
         Some(Tmux::with_runner_and_socket("/usr/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap());
 
+    let (teardown, _) = super::tmux_stub::fake_tmux([super::tmux_stub::failure("session not found")]);
+    server_state.set_tmux_override_for_test(teardown);
+
     let err = server_state
         .send_input_to_worker(&run_id, "do not write this to a dead pane".into())
         .await
@@ -799,9 +802,7 @@ async fn send_input_refuses_a_tmux_pane_whose_spawn_token_no_longer_matches() {
 async fn tmux_pane_without_session_name_surfaces_typed_errors() {
     let (server_state, _dir) = test_server_state();
     let run_id = register_idle_worker_with_driver(&server_state, 8, None);
-    server_state
-        .worker_registry
-        .register_tmux_run_slot_without_session_for_test(&run_id, 8);
+    server_state.worker_registry.register_tmux_run_slot(&run_id, 8, "");
 
     assert!(matches!(
         server_state.send_input_to_worker(&run_id, "hello".into()).await,
@@ -1173,6 +1174,7 @@ async fn send_input_to_worker_terminalizes_when_the_app_reports_the_driver_exite
 
     let (server_state, _dir) = test_server_state();
     let run_id = register_idle_worker_with_driver(&server_state, 1, Some("grok"));
+    super::tmux_stub::install_teardown(&server_state, &run_id, 4_194_303);
     let pool = server_state.execution_coordinator.worker_pool();
     pool.claim_worker(&run_id, None)
         .await
@@ -1221,14 +1223,14 @@ async fn send_input_to_worker_terminalizes_when_the_app_reports_the_driver_exite
     };
     assert!(matches!(
         release_request,
-        EngineToAppRequest::ReleaseWorkerPane(ref input) if input.slot_id == 1
+        EngineToAppRequest::DetachWorkerPane(ref input) if input.slot_id == 1
     ));
     server_state
         .deliver_app_response(
             "session-app",
             &release_request_id,
-            EngineToAppResponse::ReleaseWorkerPane {
-                result: Ok(crate::protocol::ReleaseWorkerPaneResult {}),
+            EngineToAppResponse::DetachWorkerPane {
+                result: Ok(crate::protocol::DetachWorkerPaneResult {}),
             },
         )
         .await;
