@@ -27,25 +27,46 @@ pub struct SettingSpec {
     pub default_enabled: bool,
 }
 
-/// Removed when tmux became the only local pane host. Presence in
-/// `settings.toml` is a hard error so a stale empty list cannot silently
-/// select a hosting mode that no longer exists.
+/// Presence in `settings.toml` is a hard error so a stale empty list cannot
+/// silently select a hosting mode that no longer exists.
 const TMUX_HOSTING_SETTING: &str = "workers.tmux_hosting";
 
-/// Remediation text when [`TMUX_HOSTING_SETTING`] is still present.
-pub const TMUX_HOSTING_REMOVED_MESSAGE: &str = "remove `workers.tmux_hosting`; local workers are always tmux-hosted";
+/// Remediation text for [`RemovedTmuxHostingKey`].
+const TMUX_HOSTING_REMOVED_MESSAGE: &str = "remove `workers.tmux_hosting`; local workers are always tmux-hosted";
+
+/// Typed marker for the stale-`workers.tmux_hosting` refusal, so callers can
+/// identify it by type instead of matching remediation prose.
+#[derive(Debug)]
+struct RemovedTmuxHostingKey;
+
+impl std::fmt::Display for RemovedTmuxHostingKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{TMUX_HOSTING_REMOVED_MESSAGE}")
+    }
+}
+
+impl std::error::Error for RemovedTmuxHostingKey {}
 
 /// True when `err` (or a cause) is the stale-`workers.tmux_hosting` refusal.
 pub fn is_removed_tmux_hosting_error(err: &anyhow::Error) -> bool {
     err.chain()
-        .any(|cause| cause.to_string().contains(TMUX_HOSTING_REMOVED_MESSAGE))
+        .any(|cause| cause.downcast_ref::<RemovedTmuxHostingKey>().is_some())
 }
 
-fn reject_removed_tmux_hosting_key(key: &str, value: &toml::Value) -> Result<()> {
-    let present = key == TMUX_HOSTING_SETTING
-        || (key == "workers" && value.as_table().is_some_and(|table| table.contains_key("tmux_hosting")));
-    if present {
-        anyhow::bail!("{TMUX_HOSTING_REMOVED_MESSAGE}");
+fn is_removed_tmux_hosting_key(key: &str, value: &toml::Value) -> bool {
+    key == TMUX_HOSTING_SETTING
+        || (key == "workers" && value.as_table().is_some_and(|table| table.contains_key("tmux_hosting")))
+}
+
+/// Scans every entry for the removed key before any fallible value
+/// validation runs, so the refusal fires regardless of `HashMap` iteration
+/// order over sibling keys.
+fn reject_removed_tmux_hosting_key(settings: &HashMap<String, toml::Value>) -> Result<()> {
+    if settings
+        .iter()
+        .any(|(key, value)| is_removed_tmux_hosting_key(key, value))
+    {
+        return Err(RemovedTmuxHostingKey.into());
     }
     Ok(())
 }
@@ -141,9 +162,9 @@ impl SettingsStore {
         };
         let parsed: FileShape =
             toml::from_str(&contents).with_context(|| format!("parse settings file: {}", self.path.display()))?;
+        reject_removed_tmux_hosting_key(&parsed.settings)?;
         let mut next = SettingsState::default();
         for (key, value) in parsed.settings {
-            reject_removed_tmux_hosting_key(&key, &value)?;
             // `workers.always_use_opus` was replaced by
             // `workers.non_opus_permission_mode`. If the old key is still in the
             // file it is a no-op; log once so it can be cleaned up.
@@ -361,6 +382,45 @@ mod tests {
             !store.is_enabled("default_pr_draft_mode"),
             "a refused load must not apply sibling keys"
         );
+    }
+
+    #[test]
+    fn tmux_hosting_key_wins_over_sibling_validation_error_regardless_of_order() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.toml");
+        // A wrong-typed registered value alongside the removed key: if the
+        // removed-key scan didn't run as its own pass before validation, a
+        // HashMap iteration visiting this entry first would surface the
+        // ordinary boolean-type error instead, and app.rs would boot on
+        // defaults with the forbidden key still in the file.
+        std::fs::write(
+            &path,
+            "\"workers.tmux_hosting\" = []\ndefault_pr_draft_mode = \"yes\"\n",
+        )
+        .unwrap();
+
+        let error = SettingsStore::new(path).load().unwrap_err();
+        assert_tmux_hosting_removed(&error);
+    }
+
+    #[test]
+    fn invalid_toml_is_not_mistaken_for_removed_tmux_hosting_key() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(&path, "not valid toml {{{\n").unwrap();
+
+        let error = SettingsStore::new(path).load().unwrap_err();
+        assert!(!is_removed_tmux_hosting_error(&error));
+    }
+
+    #[test]
+    fn wrong_typed_registered_value_is_not_mistaken_for_removed_tmux_hosting_key() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(&path, "default_pr_draft_mode = \"yes\"\n").unwrap();
+
+        let error = SettingsStore::new(path).load().unwrap_err();
+        assert!(!is_removed_tmux_hosting_error(&error));
     }
 
     #[test]

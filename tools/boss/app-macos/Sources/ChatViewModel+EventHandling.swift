@@ -50,7 +50,7 @@ extension ChatViewModel {
             engine.sendGetEngineHealth()
             // Pull the current per-installation settings snapshot so
             // Settings reflects the engine immediately after connecting
-            // rather than waiting on the operator to open the pane.
+            // rather than waiting until Settings is opened.
             engine.sendGetSettings()
             // Pull the current GitHub OAuth auth state so the "GitHub
             // account" settings subsection reflects a token persisted by a

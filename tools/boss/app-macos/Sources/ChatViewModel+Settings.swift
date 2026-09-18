@@ -19,8 +19,8 @@ extension ChatViewModel {
     /// Ask the engine for the current per-installation settings
     /// snapshot. Called by the Settings window on appear, and on every
     /// (re)connect (see the `.connected` arm of `handle`) so the pane
-    /// reflects the engine's file without waiting for the operator to
-    /// open Settings first.
+    /// reflects the engine's file without waiting for Settings to be
+    /// opened first.
     func refreshSettings() {
         engine.sendGetSettings()
     }

@@ -530,8 +530,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Builds the quit confirmation for the current worker count and
-    /// hosting mode without presenting it. `applicationShouldTerminate`
+    /// Builds the quit confirmation for the current worker count
+    /// without presenting it. `applicationShouldTerminate`
     /// presents the result; tests inspect the same `NSAlert`.
     func makeQuitConfirmationAlert() -> NSAlert? {
         QuitConfirmation.alert(agentCount: liveWorkerStates?.activeAgentCount ?? 0)

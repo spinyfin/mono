@@ -1284,10 +1284,9 @@ impl ServerState {
         // Load per-installation settings. A missing or unreadable file
         // falls back to registry defaults; ordinary parse failures are
         // logged but don't block startup. A leftover
-        // `workers.tmux_hosting` key is the exception: it used to
-        // select app-hosted local panes, so accepting it as a no-op
-        // would start workers under a different ownership model than
-        // the file claims.
+        // `workers.tmux_hosting` key is the exception: accepting it as
+        // a no-op would start workers under a different ownership
+        // model than the file claims.
         let settings = Arc::new(crate::settings::SettingsStore::new(
             crate::settings::SettingsStore::default_path(&state_root),
         ));
