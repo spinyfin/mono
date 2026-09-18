@@ -158,7 +158,7 @@ fn record_review(state: &ServerState, id: &str, head: &str) {
 }
 
 #[tokio::test]
-async fn flag_on_creates_atomic_heterogeneous_batch_and_supervisor() {
+async fn flag_on_creates_heterogeneous_batch_and_supervisor() {
     let (state, _dir) = state(true);
     let id = seed(&state, "example/repo", 42);
     let event = request(&state, 42, None, Ok(metadata("head"))).await;
@@ -186,7 +186,6 @@ async fn flag_on_creates_atomic_heterogeneous_batch_and_supervisor() {
         assert_eq!(member.created_at, batch.created_at);
         let execution_id = member.execution_id.as_deref().unwrap();
         let leaf = db.get_execution(execution_id).unwrap();
-        assert_eq!(leaf.created_at, batch.created_at);
         assert_eq!(leaf.kind, ExecutionKind::PrReview);
         assert_eq!(leaf.status, ExecutionStatus::Ready);
         let payload = serde_json::json!({
@@ -249,7 +248,7 @@ async fn explicit_start_ignores_prior_head_noop_and_cycle_limit() {
 /// its quorum to `supervising`, then stage and return a high-severity
 /// `ReviewVerdict` proposal id from the resulting supervisor member — the
 /// same leaf-report-then-supervisor-verdict sequence
-/// `flag_on_creates_atomic_heterogeneous_batch_and_supervisor` exercises,
+/// `flag_on_creates_heterogeneous_batch_and_supervisor` exercises,
 /// factored out so a same-head explicit re-review can be driven all the way
 /// through verdict application rather than stopping at batch creation.
 fn stage_high_severity_supervisor_verdict(db: &WorkDb, id: &str, batch: &ReviewBatch, target_sha: &str) -> String {
@@ -646,4 +645,46 @@ async fn explicit_admission_returns_the_persisted_batch() {
     };
     assert!(batch.explicit);
     assert_eq!(batch, db.review_batch(&batch.id).unwrap().unwrap());
+}
+
+#[tokio::test]
+async fn member_insert_failure_rolls_back_batch_and_all_executions() {
+    let (state, _dir) = state(true);
+    let id = seed(&state, "example/repo", 42);
+    // Fail the second member insert, after all three executions, the batch,
+    // and its first member have been inserted into the transaction.
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_codex_review_member BEFORE INSERT ON pr_review_batch_members
+         WHEN NEW.requested_driver = 'codex'
+         BEGIN SELECT RAISE(ABORT, 'injected member insert failure'); END;",
+        )
+        .unwrap();
+    rejected(
+        request(&state, 42, None, Ok(metadata("head"))).await,
+        "injected member insert failure",
+    );
+    assert!(state.work_db.list_executions(Some(&id)).unwrap().is_empty());
+    assert!(state.work_db.review_batches_for_cycle_root(&id).unwrap().is_empty());
+    let members: i64 = state
+        .work_db
+        .connect()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM pr_review_batch_members", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(members, 0);
+    assert_eq!(state.work_db.review_pool_reserved_units().unwrap().0, 0);
+
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_codex_review_member")
+        .unwrap();
+    triggered(request(&state, 42, None, Ok(metadata("head"))).await);
+    assert_eq!(batch(&state, &id, "head").generation, 1);
+    assert_eq!(state.work_db.list_executions(Some(&id)).unwrap().len(), 3);
 }
