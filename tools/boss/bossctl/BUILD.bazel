@@ -66,3 +66,19 @@ rust_test(
         normal_dev = True,
     ),
 )
+
+rust_test(
+    name = "review_start_test",
+    size = "small",
+    srcs = ["tests/review_start.rs"],
+    data = [":bossctl"],
+    edition = "2024",
+    env = {"BOSSCTL_TEST_BINARY": "$(rootpath :bossctl)"},
+    deps = [
+        "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

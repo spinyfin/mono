@@ -149,8 +149,21 @@ impl WorkDb {
         // worse than never triggering the pass at all. Exempt PostMerge so
         // its findings always materialise a follow-up when the severity gate
         // warrants one.
+        //
+        // It also has no meaning for an explicit batch (`batch.explicit`,
+        // minted by `bossctl review start`): an explicit admission is a
+        // deliberate request to re-review one exact head, potentially the
+        // very same SHA a prior automatic or legacy pass already reviewed
+        // (that is the whole point of minting a new `generation` at that
+        // SHA). Applying the SHA-only comparison to it would silently drop
+        // its findings as `dropped_duplicate_head`, burning the reviewers
+        // and supervisor it consumed for nothing. Exempt explicit batches so
+        // their verdicts always materialise when the severity gate warrants
+        // it; the SHA-only comparison still guards the automatic/legacy
+        // paths it was built for.
         let mut duplicate_head = false;
         if batch.phase != boss_protocol::ReviewBatchPhase::PostMerge
+            && !batch.explicit
             && let Ok((_, prior_sha)) = self.get_task_review_cycle_state(&batch.cycle_root_id)
         {
             duplicate_head = prior_sha.as_deref() == Some(verdict.target_sha.as_str());

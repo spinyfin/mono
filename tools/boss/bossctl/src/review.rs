@@ -255,6 +255,10 @@ pub(crate) async fn review_start(
             execution,
             work_item_id,
             pr_url,
+            batch_id,
+            batch_generation,
+            batch_execution_ids,
+            already_active,
         } => {
             if json {
                 println!(
@@ -263,9 +267,30 @@ pub(crate) async fn review_start(
                         "execution": &execution,
                         "work_item_id": &work_item_id,
                         "pr_url": &pr_url,
+                        "batch_id": &batch_id,
+                        "batch_generation": &batch_generation,
+                        "batch_execution_ids": &batch_execution_ids,
+                        "already_active": already_active,
                     }))
                     .expect("response serializes")
                 );
+            } else if let (Some(batch_id), Some(batch_generation)) = (batch_id, batch_generation) {
+                if already_active {
+                    println!(
+                        "an active review batch already covers this head (batch {batch_id}, generation \
+                         {batch_generation}); nothing started"
+                    );
+                } else {
+                    println!(
+                        "admitted review batch {batch_id} (generation {batch_generation}) - {} reviewers",
+                        batch_execution_ids.len()
+                    );
+                }
+                println!("  work item: {work_item_id}");
+                println!("  pr url:    {pr_url}");
+                for execution_id in &batch_execution_ids {
+                    println!("  execution: {execution_id}");
+                }
             } else {
                 println!("re-enqueued review for PR #{pr_number}");
                 println!("  work item: {work_item_id}");

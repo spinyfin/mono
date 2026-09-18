@@ -287,6 +287,10 @@ impl std::str::FromStr for ReviewBatchMemberStatus {
 #[builder(on(String, into))]
 pub struct ReviewBatch {
     pub id: String,
+    /// Explicit pre-merge re-reviews advance this; automatic starts reuse it.
+    #[serde(default = "first_generation")]
+    #[builder(default = 1)]
+    pub generation: i64,
     pub cycle_root_id: String,
     pub base_sha: String,
     pub classification: ReviewClassification,
@@ -303,6 +307,19 @@ pub struct ReviewBatch {
     pub final_verdict_proposal_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_sha: Option<String>,
+    /// Set when this batch was minted by an explicit `bossctl review start`
+    /// admission rather than the automatic pre-merge/post-merge path. An
+    /// explicit admission is a deliberate request to re-review a specific
+    /// head and must never be suppressed as a same-SHA duplicate by the
+    /// verdict applier's replay guard, even when an earlier (automatic or
+    /// legacy) pass already reviewed that exact SHA.
+    #[serde(default)]
+    #[builder(default = false)]
+    pub explicit: bool,
+}
+
+fn first_generation() -> i64 {
+    1
 }
 
 /// One persisted reviewer or supervisor attempt within a batch.

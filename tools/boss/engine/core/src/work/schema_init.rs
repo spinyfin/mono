@@ -652,6 +652,8 @@ impl WorkDb {
         // persistence-only at this stage; dispatch still uses legacy review
         // orchestration until the batch reconciler lands.
         step!(timer, conn, migrate_pr_review_batches_tables)?;
+        step!(timer, conn, migrate_pr_review_batch_generations)?;
+        step!(timer, conn, migrate_pr_review_batch_explicit)?;
         // Batch-verdict applier: one `pr_review_verdicts` row per batch,
         // keyed on the review-verdict proposal id so reapply is a no-op.
         step!(timer, conn, migrate_pr_review_verdicts_batch_columns)?;
