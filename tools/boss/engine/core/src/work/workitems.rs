@@ -2025,15 +2025,16 @@ impl WorkDb {
     }
 
     /// Recovery sweep: find `todo, autostart=true` tasks whose latest execution
-    /// is `waiting_dependency` (or absent) and whose gating prereqs are all
-    /// satisfied, then promote those executions to `ready`. Returns the ids of
+    /// is `waiting_dependency`, terminal, or absent and whose gating prereqs
+    /// are all satisfied, then reconcile them to `ready`. Returns the ids of
     /// tasks that were recovered.
     ///
     /// This handles tasks that got stuck after an auto-unblock (Part B
     /// recovery): the auto-unblock transitions `blocked` → `todo` and creates a
     /// `ready` execution atomically, but tasks unblocked before that fix landed
     /// may still have a stale `waiting_dependency` execution with no one to
-    /// promote it.
+    /// promote it. It also recovers revisions converted in place to followups
+    /// whose old execution is terminal; ordinary admission guards still apply.
     pub fn promote_todo_autostart_stuck_executions(&self) -> Result<Vec<String>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -2052,7 +2053,7 @@ impl WorkDb {
                 continue;
             }
             let needs_promotion = match query_latest_execution_for_work_item(&tx, &work_item_id)? {
-                Some(exec) => exec.status == ExecutionStatus::WaitingDependency,
+                Some(exec) => exec.status == ExecutionStatus::WaitingDependency || exec.status.is_terminal(),
                 None => true,
             };
             if !needs_promotion {

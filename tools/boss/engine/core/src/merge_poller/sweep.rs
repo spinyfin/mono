@@ -954,48 +954,40 @@ pub(crate) async fn stop_active_revision_executions(
                 );
             }
         }
+    }
 
-        // The task may just have changed execution families in place
-        // (revision -> followup). Reconcile after the old revision
-        // execution is terminal — whether *this* call made it terminal via
-        // a successful cancel, or it was already terminal (a concurrent
-        // completion or a prior sweep raced us here) — so the ordinary
-        // single-in-flight guard can safely mint the new
-        // chore_implementation row regardless of which path terminalized
-        // it. The subsequent kick makes that ready row visible to the
-        // dispatcher immediately. Run this unconditionally on cancel
-        // outcome: gating it on `Ok(cancelled)` alone reproduces the exact
-        // defect this sweep fixes whenever the cancel races a terminal
-        // status and bails.
-        match work_db.get_work_item(&execution.work_item_id) {
-            Ok(work_item) => {
-                let product_id = work_item.product_id().to_owned();
-                match work_db.reconcile_product_executions(&product_id) {
-                    Ok(result) => {
-                        tracing::info!(
-                            execution_id = %execution.id,
-                            work_item_id = %execution.work_item_id,
-                            created = result.created.len(),
-                            updated = result.updated.len(),
-                            "merge poller: reconciled execution after revision cancellation",
-                        );
-                        publisher.kick_scheduler();
-                    }
-                    Err(err) => tracing::warn!(
-                        execution_id = %execution.id,
-                        work_item_id = %execution.work_item_id,
-                        ?err,
-                        "merge poller: failed to reconcile followup after revision cancellation",
-                    ),
+    // Reconcile once for the chain root's product after lease cleanup,
+    // including when there were no leased executions. A pre-run review
+    // revision is abandoned during conversion and never appears in the
+    // lease query. Terminal executions (including cancellation races) can
+    // now receive a fresh followup execution through ordinary admission.
+    match work_db.get_work_item(chain_root_id) {
+        Ok(work_item) => {
+            let product_id = work_item.product_id().to_owned();
+            match work_db.reconcile_product_executions(&product_id) {
+                Ok(result) => {
+                    tracing::info!(
+                        chain_root_id,
+                        product_id,
+                        created = result.created.len(),
+                        updated = result.updated.len(),
+                        "merge poller: reconciled executions after parent PR merge",
+                    );
+                    publisher.kick_scheduler();
                 }
+                Err(err) => tracing::warn!(
+                    chain_root_id,
+                    product_id,
+                    ?err,
+                    "merge poller: failed to reconcile followups after parent PR merge",
+                ),
             }
-            Err(err) => tracing::warn!(
-                execution_id = %execution.id,
-                work_item_id = %execution.work_item_id,
-                ?err,
-                "merge poller: failed to resolve converted revision after cancellation",
-            ),
         }
+        Err(err) => tracing::warn!(
+            chain_root_id,
+            ?err,
+            "merge poller: failed to resolve chain root after parent PR merge",
+        ),
     }
 }
 
