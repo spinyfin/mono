@@ -113,18 +113,39 @@ fn quarantine_with_probe(db: &WorkDb, probe: impl Fn(&str) -> WorkerProcess) -> 
         }
     }
     db.set_metadata(METADATA_KEY, &serde_json::to_string(&quarantine)?)?;
+    // The hold above is what dispatch admission reads; the attention items
+    // below are the operator-facing explanation. Filing them is best-effort:
+    // a held execution can belong to a work item that was soft-deleted after
+    // the worker spawned, and `upsert_external_tracker_attention` refuses a
+    // tombstoned task. That refusal must not take the engine down at startup
+    // (the hold is already durable), so it is logged and the sweep continues.
     for work_item_id in previous.executions.values().collect::<HashSet<_>>() {
-        if quarantine.scan_error.is_none() && !quarantine.executions.values().any(|id| id == work_item_id) {
-            db.resolve_external_tracker_attention(work_item_id, ATTENTION_KIND)?;
+        let still_held = quarantine.scan_error.is_some() || quarantine.executions.values().any(|id| id == work_item_id);
+        if still_held {
+            continue;
+        }
+        if let Err(err) = db.resolve_external_tracker_attention(work_item_id, ATTENTION_KIND) {
+            tracing::error!(
+                work_item_id,
+                error = %format!("{err:#}"),
+                "failed to resolve the historical local worker attention item; the hold itself is already lifted"
+            );
         }
     }
     for (execution_id, work_item_id) in &quarantine.executions {
-        db.upsert_external_tracker_attention(
+        if let Err(err) = db.upsert_external_tracker_attention(
             work_item_id,
             ATTENTION_KIND,
             "Local dispatch paused for a historical worker",
             &format!("Execution `{execution_id}` has no complete tmux identity and its process is live or unknown. An older app-hosted worker may still exist. Local dispatch is paused to prevent duplicate workers. Roll back to the prior release to stop or drain the worker, then restart the tmux-only engine. Missing app inventory or an expired workspace lease does not prove death."),
-        )?;
+        ) {
+            tracing::error!(
+                execution_id,
+                work_item_id,
+                error = %format!("{err:#}"),
+                "failed to file the historical local worker attention item; the hold itself is already durable"
+            );
+        }
     }
     Ok(report)
 }
@@ -317,5 +338,26 @@ mod tests {
         assert!(db.local_dispatch_quarantine_reason().unwrap().is_some());
         assert!(db.is_execution_quarantined("unknown-execution").unwrap());
         assert!(db.ensure_work_item_not_quarantined("unknown-item").is_err());
+    }
+
+    #[test]
+    fn tombstoned_work_item_keeps_its_hold_without_aborting_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("work.db")).unwrap();
+        let (execution, item) = seed(&db, "deleted after spawn");
+        db.delete_work_item(&item).unwrap();
+        // Filing attention against a tombstoned task is refused; the hold
+        // must still land and the sweep must still return `Ok`.
+        let report = quarantine_with_probe(&db, |_| WorkerProcess::Unknown).unwrap();
+        assert!(report.protected_execution_ids.contains(&execution));
+        assert!(db.is_execution_quarantined(&execution).unwrap());
+        assert!(db.ensure_work_item_not_quarantined(&item).is_err());
+        assert!(db.local_dispatch_quarantine_reason().unwrap().is_some());
+        // ...and proven death still lifts it, again without an attention error
+        // surfacing as a startup failure.
+        let drained = quarantine_with_probe(&db, |_| WorkerProcess::Gone { shell_pid: 42 }).unwrap();
+        assert!(drained.dead_execution_ids.contains(&execution));
+        assert!(!db.is_execution_quarantined(&execution).unwrap());
+        assert!(db.local_dispatch_quarantine_reason().unwrap().is_none());
     }
 }
