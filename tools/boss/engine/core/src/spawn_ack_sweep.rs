@@ -753,7 +753,7 @@ impl ReapCause {
     /// pause reason from these, so the wording an operator reads matches
     /// what each reap actually saw. Consults `shell_pid` rather than mapping
     /// purely on the variant: a pid-less driver-start timeout is `NoShell`.
-    pub(crate) fn failure_class(&self, shell_pid: i32, _liveness: &TranscriptLiveness) -> SpawnFailureClass {
+    pub(crate) fn failure_class(&self, shell_pid: i32) -> SpawnFailureClass {
         match self {
             ReapCause::SpawnAckTimeout { .. } => SpawnFailureClass::NoShell,
             ReapCause::DriverStartTimeout { .. } => {
@@ -953,7 +953,7 @@ pub(crate) async fn reap_never_started_spawn(
                     work_item_id,
                     slot_id,
                     shell_pid,
-                    stage = cause.failure_class(shell_pid, &liveness).as_str(),
+                    stage = cause.failure_class(shell_pid).as_str(),
                     source = source.as_str(),
                     transcript = %path.display(),
                     age_secs,
@@ -971,7 +971,7 @@ pub(crate) async fn reap_never_started_spawn(
                     work_item_id,
                     slot_id,
                     shell_pid,
-                    stage = cause.failure_class(shell_pid, &liveness).as_str(),
+                    stage = cause.failure_class(shell_pid).as_str(),
                     source = source.as_str(),
                     transcript = %path.display(),
                     age_secs,
@@ -993,7 +993,7 @@ pub(crate) async fn reap_never_started_spawn(
                 work_item_id,
                 slot_id,
                 shell_pid,
-                stage = cause.failure_class(shell_pid, &liveness).as_str(),
+                stage = cause.failure_class(shell_pid).as_str(),
                 reasons = %reasons.join("; "),
                 checked = %checked.join("; "),
                 "NOT reaping: could not establish whether a transcript exists for this execution. An \
@@ -1040,16 +1040,6 @@ pub(crate) async fn reap_never_started_spawn(
                 shell_pid,
                 "never-started-spawn reap: a shell pid was reported while the liveness probe was in \
                  flight; abandoning this pass-1 reap (pass 2 owns a pid-bearing slot)",
-            );
-            return ReapOutcome::Skipped;
-        }
-        NeverStartedReapCommit::NoLongerNeverStarted => {
-            tracing::info!(
-                execution_id,
-                work_item_id,
-                slot_id,
-                "never-started-spawn reap: the app-reported never-started guard no longer holds; \
-                 abandoning the reap as stale",
             );
             return ReapOutcome::Skipped;
         }
@@ -1213,7 +1203,7 @@ pub(crate) async fn reap_never_started_spawn(
             );
         }
     }
-    details["failure_class"] = serde_json::json!(cause.failure_class(shell_pid, &liveness).as_str());
+    details["failure_class"] = serde_json::json!(cause.failure_class(shell_pid).as_str());
     details["liveness_probe"] = serde_json::json!(liveness_summary);
     ctx.dispatch_events
         .emit(
@@ -1240,7 +1230,7 @@ pub(crate) async fn reap_never_started_spawn(
             .slot_id(slot_id.to_string())
             .shell_pid(shell_pid)
             .epoch_secs(now_epoch_secs)
-            .class(cause.failure_class(shell_pid, &liveness))
+            .class(cause.failure_class(shell_pid))
             .cause(stage.as_str())
             .observed(orphan_reason.as_str())
             .build(),

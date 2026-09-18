@@ -58,7 +58,7 @@ checks:
   # Durable guard against reintroducing the NSException-raising legacy
   # `NSFileHandle` convenience APIs into the diagnostic writers under
   # `app-macos/Sources` (`TerminalLoopLog`, `StallLog`,
-  # `PopulationTimingLog`, `IpcLog`, `SpawnDiagnosticsLog`). All three —
+  # `PopulationTimingLog`, `IpcLog`). All three —
   # `FileHandle.write(_:)`, `closeFile`, and `seekToEndOfFile` — raise an
   # uncatchable-from-Swift `NSFileHandleOperationException` on a failing
   # syscall (e.g. `ENOSPC`/`EIO` on a full disk) instead of throwing, which

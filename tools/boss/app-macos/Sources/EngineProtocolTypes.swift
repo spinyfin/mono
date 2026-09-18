@@ -1,9 +1,7 @@
 import Foundation
 
-/// The launch parameters `WorkersWorkspaceModel.hostAttachedPane` needs to
-/// stand up a pane's libghostty surface. Built internally by
-/// `attachWorkerPane` from an `EngineAttachRequest` — there is no longer a
-/// standalone spawn RPC that constructs this directly.
+/// Internal launch parameters for a worker-viewer libghostty surface.
+/// `attachWorkerPane` builds this from an `EngineAttachRequest`.
 struct EngineSpawnRequest: Sendable {
     let runId: String
     let workspacePath: String
@@ -32,9 +30,7 @@ struct EngineSpawnRequest: Sendable {
     let paneMonitor: PaneMonitorSpec?
 }
 
-/// Failure returned from an `AttachWorkerPane` / `AttachCoordinatorPane`
-/// request. Named for its original spawn-RPC use; retained under this name
-/// since it remains the shared failure type for both attach paths.
+/// Shared failure type for `AttachWorkerPane` and `AttachCoordinatorPane`.
 enum EngineSpawnError: Sendable {
     case noAvailableSlot
     /// Engine asked us to host the pane in a slot that already has a

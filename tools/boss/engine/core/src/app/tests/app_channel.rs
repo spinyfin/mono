@@ -92,15 +92,11 @@ async fn send_to_app_resolves_app_disconnected_on_session_drop() {
     // Simulate the app session disconnecting.
     server_state.drop_app_session_if_matches("session-app").await;
 
-    let response = send.await.expect("send task panicked").expect("ok");
-    match response {
-        // The cleanup path uses the AttachWorkerPane variant uniformly for
-        // every pending request kind, regardless of what was actually sent.
-        EngineToAppResponse::AttachWorkerPane {
-            result: Err(EngineToAppError::AppDisconnected),
-        } => {}
-        other => panic!("expected AppDisconnected, got {other:?}"),
-    }
+    let response = send.await.expect("send task panicked");
+    assert!(
+        matches!(response, Err(SendToAppError::AppDisconnected)),
+        "expected transport AppDisconnected, got {response:?}",
+    );
 }
 
 #[tokio::test]
@@ -322,11 +318,9 @@ async fn second_register_invalidates_first() {
     let second_sink = make_session_sink();
     server_state.register_app_session("session-2".into(), second_sink).await;
 
-    let response = in_flight.await.expect("send task").expect("ok");
-    match response {
-        EngineToAppResponse::AttachWorkerPane {
-            result: Err(EngineToAppError::AppDisconnected),
-        } => {}
-        other => panic!("expected AppDisconnected, got {other:?}"),
-    }
+    let response = in_flight.await.expect("send task");
+    assert!(
+        matches!(response, Err(SendToAppError::AppDisconnected)),
+        "expected transport AppDisconnected, got {response:?}",
+    );
 }

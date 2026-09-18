@@ -252,11 +252,9 @@ impl ServerState {
             None => tracing::info!(session_id = %session_id, "app session registered"),
         }
         if let Some(prior) = prior {
-            for (_, tx) in prior.pending {
-                let _ = tx.send(EngineToAppResponse::AttachWorkerPane {
-                    result: Err(EngineToAppError::AppDisconnected),
-                });
-            }
+            // Closing every reply channel makes send_to_app return AppDisconnected
+            // independently of the pending request's response kind.
+            drop(prior.pending);
         }
     }
 
@@ -284,11 +282,9 @@ impl ServerState {
                 "app session dropped — frontend connection closed (reader-loop exit); \
                  engine→app RPCs will report NotRegistered until the app reconnects",
             );
-            for (_, tx) in prior.pending {
-                let _ = tx.send(EngineToAppResponse::AttachWorkerPane {
-                    result: Err(EngineToAppError::AppDisconnected),
-                });
-            }
+            // Closing every reply channel makes send_to_app return AppDisconnected
+            // independently of the pending request's response kind.
+            drop(prior.pending);
         }
     }
 

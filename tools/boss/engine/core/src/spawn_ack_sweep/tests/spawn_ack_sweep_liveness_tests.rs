@@ -8,15 +8,8 @@ use super::*;
 use crate::dispatch_events::RecordingDispatchEventSink;
 use crate::live_worker_state::DriverSignalKind;
 use crate::spawn_health::SpawnHealthTracker;
-use crate::transcript_liveness::TranscriptLiveness;
 use crate::work::{ExecutionStatus, WorkDb};
 use boss_protocol::WorkerActivity;
-
-fn absent_liveness() -> TranscriptLiveness {
-    TranscriptLiveness::Absent {
-        checked: vec!["probe stub".to_owned()],
-    }
-}
 
 // ─── the liveness veto (2026-09-13) ──────────────────────────────────────
 
@@ -935,20 +928,19 @@ async fn a_failed_orphan_write_releases_the_reap_fence() {
 }
 
 #[test]
-fn failure_class_follows_observed_pid_and_probe() {
+fn failure_class_follows_observed_pid() {
     let timeout = ReapCause::DriverStartTimeout {
         grace_secs: 300,
         silent_secs: 400,
         file_ingress: None,
         activity: "spawning",
     };
-    let absent = absent_liveness();
     assert_eq!(
-        timeout.failure_class(0, &absent),
+        timeout.failure_class(0),
         crate::spawn_health::SpawnFailureClass::NoShell
     );
     assert_eq!(
-        timeout.failure_class(4242, &absent),
+        timeout.failure_class(4242),
         crate::spawn_health::SpawnFailureClass::ShellWithoutDriverSignal
     );
 }

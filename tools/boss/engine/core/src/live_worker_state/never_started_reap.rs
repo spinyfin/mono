@@ -1,6 +1,6 @@
 //! Atomic eligibility checks and reversible fences for never-started reaps.
 
-use super::{DriverStartExpectation, LiveWorkerStateRegistry, WorkerActivity};
+use super::LiveWorkerStateRegistry;
 
 /// Which never-started reap is asking the registry to re-assert eligibility
 /// after the liveness probe. Each variant restates the cause-specific
@@ -11,13 +11,6 @@ pub enum NeverStartedReapKind {
     SpawnAckTimeout,
     /// Pass 2: still this execution, no driver signal (a pid may exist).
     DriverStartTimeout,
-    /// Historical: an app self-report NACK / pane-death-before-start —
-    /// wire paths that no longer exist now that tmux is the sole local
-    /// worker-hosting mechanism. Nothing constructs this variant any more;
-    /// it survives only so the match in
-    /// [`LiveWorkerStateRegistry::confirm_never_started_reap`] stays
-    /// exhaustive.
-    AppReportedNeverStarted,
 }
 
 /// Outcome of [`LiveWorkerStateRegistry::confirm_never_started_reap`].
@@ -37,9 +30,6 @@ pub enum NeverStartedReapCommit {
     AlreadyCommitted,
     /// Pass 1: a shell pid was reported while the probe was in flight.
     SpawnAckNowHasPid { shell_pid: i32 },
-    /// An app-reported cause is now stale: the slot has shown proof of
-    /// life or left `Spawning`.
-    NoLongerNeverStarted,
 }
 
 impl LiveWorkerStateRegistry {
@@ -80,15 +70,6 @@ impl LiveWorkerStateRegistry {
                 }
             }
             NeverStartedReapKind::DriverStartTimeout => {}
-            NeverStartedReapKind::AppReportedNeverStarted => {
-                let still_never_started = entry.meta.driver_start_expectation != DriverStartExpectation::Readopted
-                    && entry.state.shell_pid <= 0
-                    && entry.state.last_event_at.is_none()
-                    && entry.state.activity == WorkerActivity::Spawning;
-                if !still_never_started {
-                    return NeverStartedReapCommit::NoLongerNeverStarted;
-                }
-            }
         }
         entry.meta.reap_committed = true;
         NeverStartedReapCommit::Committed {
