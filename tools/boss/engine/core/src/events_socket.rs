@@ -1495,11 +1495,19 @@ mod tests {
 
         let (stream, _) = listener.accept().await.unwrap();
         let mut stream = stream;
+        // Match handle_connection: consume the request before replying. Closing
+        // with unread bytes resets the Unix socket on Linux instead of sending EOF.
+        let mut request = Vec::new();
+        stream.read_to_end(&mut request).await.unwrap();
+        assert_eq!(request, b"anything");
         let err = SocketError::DriverSlugLookupTransient {
             run_id: "run-1".to_owned(),
             error: "database is locked".to_owned(),
         };
         retry_connection(&mut stream, &err).await;
+        // Production drops the connection after its best-effort notice. Close
+        // this fixture's owned socket too before the peer waits for EOF.
+        drop(stream);
         let response = client.await.unwrap();
 
         let response = String::from_utf8(response).unwrap();

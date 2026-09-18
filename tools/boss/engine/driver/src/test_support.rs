@@ -16,6 +16,34 @@ use super::{
     ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass, WorkerProcessLifetime,
 };
 
+thread_local! {
+    pub(crate) static CLAUDE_CONFIG_PATH: std::cell::RefCell<Option<std::path::PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Overrides Claude's trust store on this thread without changing HOME.
+/// Use synchronous work or a current-thread runtime; spawned threads do not
+/// inherit this override. The guard cannot move between threads.
+pub struct ClaudeConfigOverride {
+    prior: Option<std::path::PathBuf>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+pub fn claude_config_override(path: &Path) -> ClaudeConfigOverride {
+    let prior = CLAUDE_CONFIG_PATH.with(|slot| slot.replace(Some(path.to_owned())));
+    ClaudeConfigOverride {
+        prior,
+        _thread: std::marker::PhantomData,
+    }
+}
+
+impl Drop for ClaudeConfigOverride {
+    fn drop(&mut self) {
+        CLAUDE_CONFIG_PATH.with(|slot| slot.replace(self.prior.take()));
+    }
+}
+
 /// RAII override of [`crate::codex::CODEX_HOMES_ROOT_ENV`], obtained
 /// from [`codex_homes_override`].
 ///

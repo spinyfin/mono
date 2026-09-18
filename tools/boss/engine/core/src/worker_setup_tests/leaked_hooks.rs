@@ -222,7 +222,7 @@ fn strip_leaked_hooks_returns_false_when_no_hooks_key() {
 #[test]
 fn write_workspace_files_purges_leaked_in_tree_settings() {
     let _shared = lock_shared_settings_dir();
-    let _home = HomeGuard::new();
+    let _home = ClaudeConfigGuard::new();
     let dir = TempDir::new().unwrap();
     let claude_dir = dir.path().join(".claude");
     std::fs::create_dir_all(&claude_dir).unwrap();

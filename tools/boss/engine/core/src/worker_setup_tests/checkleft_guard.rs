@@ -105,7 +105,7 @@ fn checkleft_push_guard_script_has_the_load_bearing_logic() {
 #[test]
 fn write_workspace_files_writes_checkleft_push_guard_script_outside_workspace() {
     let _shared = lock_shared_settings_dir();
-    let _home = HomeGuard::new();
+    let _home = ClaudeConfigGuard::new();
     let dir = TempDir::new().unwrap();
     let input = WorkerSetupInput {
         run_id: "run-clguard".into(),

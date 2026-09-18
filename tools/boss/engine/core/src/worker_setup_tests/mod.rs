@@ -1,7 +1,7 @@
 //! Test suite for `worker_setup`, split into behavior-area modules to keep
 //! each file well under the repo's file-size cap.
 //!
-//! Shared fixtures (`sample_input`, `claude_md_for`, `HomeGuard`,
+//! Shared fixtures (`sample_input`, `claude_md_for`, `ClaudeConfigGuard`,
 //! `lock_shared_settings_dir`, …) live in [`helpers`]; each sibling module
 //! pulls them in with `use super::helpers::*;` and reaches the items under
 //! test with `use super::super::*;`.

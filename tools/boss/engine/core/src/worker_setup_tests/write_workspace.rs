@@ -2,9 +2,39 @@ use super::super::*;
 use super::helpers::*;
 
 #[test]
+fn claude_trust_override_is_thread_local_and_restores_nested_paths() {
+    use crate::driver::claude::{claude_global_config_path, pre_trust_workspace};
+
+    let original = claude_global_config_path();
+    let home = std::env::var_os("HOME");
+    let guard = ClaudeConfigGuard::new();
+    let private = claude_global_config_path().unwrap();
+    std::thread::spawn(move || {
+        // A concurrent caller without an override still resolves the original
+        // destination, never the parent test's private assertion path.
+        assert_eq!(claude_global_config_path(), original);
+        let _other = ClaudeConfigGuard::new();
+        let workspace = TempDir::new().unwrap();
+        pre_trust_workspace(workspace.path());
+        assert!(claude_global_config_path().unwrap().exists());
+    })
+    .join()
+    .unwrap();
+    assert!(!private.exists());
+    {
+        let _nested = ClaudeConfigGuard::new();
+        assert_ne!(claude_global_config_path().unwrap(), private);
+    }
+    assert_eq!(claude_global_config_path().unwrap(), private);
+    assert_eq!(std::env::var_os("HOME"), home);
+    drop(guard);
+    assert_ne!(claude_global_config_path(), Some(private));
+}
+
+#[test]
 fn write_workspace_files_creates_claude_dir_and_writes_all_files() {
     let _shared = lock_shared_settings_dir();
-    let _home = HomeGuard::new();
+    let _home = ClaudeConfigGuard::new();
     let dir = TempDir::new().unwrap();
     let input = WorkerSetupInput {
         run_id: "run-1".into(),
@@ -61,7 +91,7 @@ fn write_workspace_files_creates_claude_dir_and_writes_all_files() {
 #[test]
 fn write_workspace_files_pre_trusts_workspace_in_claude_json() {
     let _shared = lock_shared_settings_dir();
-    let _home = HomeGuard::new();
+    let _home = ClaudeConfigGuard::new();
     let dir = TempDir::new().unwrap();
     let input = WorkerSetupInput {
         run_id: "run-trust".into(),
@@ -74,10 +104,10 @@ fn write_workspace_files_pre_trusts_workspace_in_claude_json() {
 
     write_workspace_files(&input, &ClaudeDriver).unwrap();
 
-    // The redirected HOME now has a ~/.claude.json marking this
+    // The private trust store now has a .claude.json marking this
     // workspace as trusted, so the worker's claude session skips the
-    // folder-trust dialog. Resolved via the driver's own accessor (HomeGuard
-    // above redirects HOME), so this stays correct if the driver ever moves
+    // folder-trust dialog. Resolved via the driver's own accessor (ClaudeConfigGuard
+    // above redirects this thread's config), so this stays correct if the driver ever moves
     // where it seeds trust.
     let config_path = crate::driver::claude::claude_global_config_path().unwrap();
     let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -91,7 +121,7 @@ fn write_workspace_files_pre_trusts_workspace_in_claude_json() {
 #[test]
 fn write_workspace_files_overwrites_existing_files() {
     let _shared = lock_shared_settings_dir();
-    let _home = HomeGuard::new();
+    let _home = ClaudeConfigGuard::new();
     let dir = TempDir::new().unwrap();
     let claude_dir = dir.path().join(".claude");
     std::fs::create_dir_all(&claude_dir).unwrap();
@@ -129,7 +159,7 @@ fn write_workspace_files_uses_resolved_non_claude_driver() {
     use crate::driver::{Capability, CapabilitySet};
 
     let _shared = lock_shared_settings_dir();
-    let _home = HomeGuard::new();
+    let _home = ClaudeConfigGuard::new();
     let dir = TempDir::new().unwrap();
     let input = WorkerSetupInput {
         run_id: "run-stub".into(),

@@ -1250,7 +1250,9 @@ pub const CLAUDE_DIR_GITIGNORE: &str = "*\n";
 /// `boss_engine::worker_setup`'s tests) resolve the config through this
 /// single source of truth rather than re-deriving `$HOME/.claude.json`.
 pub fn claude_global_config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude.json"))
+    crate::test_support::CLAUDE_CONFIG_PATH
+        .with(|slot| slot.borrow().clone())
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude.json")))
 }
 
 /// Pre-accept Claude Code's first-run folder-trust dialog for
@@ -1364,7 +1366,7 @@ fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::Capability;
-    use crate::test_support::home_override;
+    use crate::test_support::claude_config_override;
     use boss_protocol::ReviewModelTier;
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -1988,11 +1990,10 @@ mod tests {
 
     #[tokio::test]
     async fn provision_workspace_writes_prompt_gitignore_and_pretrust() {
-        // HOME must be redirected so pre_trust_workspace doesn't write to the
-        // developer's real ~/.claude.json.
+        // Redirect this thread's trust store without changing process HOME.
         let workspace = TempDir::new().unwrap();
         let fake_home = TempDir::new().unwrap();
-        let _home = home_override(fake_home.path());
+        let _config = claude_config_override(&fake_home.path().join(".claude.json"));
 
         let driver = ClaudeDriver;
         let runtime_state = driver
