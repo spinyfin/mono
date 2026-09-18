@@ -70,6 +70,13 @@ final class SpawnDiagnosticsLogTests: XCTestCase {
         let contents = try String(contentsOfFile: (dir.path as NSString).appendingPathComponent(files[0]), encoding: .utf8)
         let lines = contents.split(separator: "\n").map(String.init)
         XCTAssertEqual(lines.count, 3, "request, failure, and recovery must be recorded")
+        for line in lines {
+            let record = try XCTUnwrap(
+                try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+            )
+            XCTAssertEqual(record["run_id"] as? String, "exec-99",
+                           "every viewer event must be discoverable by execution id")
+        }
         XCTAssertTrue(lines[0].contains("\"event\":\"spawn_requested\""))
         XCTAssertTrue(lines[0].contains("\"run_id\":\"exec-99\""))
         XCTAssertTrue(lines[1].contains("\"event\":\"surface_failed\""))
