@@ -166,7 +166,6 @@ _SHARD1_SRCS = [
     "Tests/BossTests/RevisionKanbanTests.swift",
     "Tests/BossTests/WorkBlockedBadgeTests.swift",
     "Tests/BossTests/WorkCreateRepoFieldTests.swift",
-    "Tests/BossTests/WorkerProcessKillerTests.swift",
     "Tests/BossTests/WorkersWorkspaceModelTests.swift",
 ]
 

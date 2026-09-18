@@ -418,44 +418,6 @@ final class EngineClient: @unchecked Sendable {
                     body: request
                 )
                 switch kind {
-                case "spawn_worker_pane":
-                    let runId = request["run_id"] as? String ?? ""
-                    let workspacePath = request["workspace_path"] as? String ?? ""
-                    let slotId = (request["slot_id"] as? NSNumber)?.intValue ?? 0
-                    let initialInput = request["initial_input"] as? String ?? ""
-                    let env = (request["env"] as? [[String: Any]] ?? []).compactMap {
-                        item -> (String, String)? in
-                        guard let k = item["key"] as? String, let v = item["value"] as? String else {
-                            return nil
-                        }
-                        return (k, v)
-                    }
-                    let summary = request["summary"] as? String
-                    let taskTitle = request["task_title"] as? String
-                    let paneMonitorDict = request["pane_monitor"] as? [String: Any]
-                    // Parse only when the engine actually sent a dict;
-                    // absent/null keeps the app-side Claude default.
-                    let paneMonitor: PaneMonitorSpec? = paneMonitorDict.map {
-                        PaneMonitorSpec.fromWire($0)
-                    }
-                    let spawn = EngineSpawnRequest(
-                        runId: runId,
-                        workspacePath: workspacePath,
-                        slotId: slotId,
-                        initialInput: initialInput,
-                        env: env,
-                        summary: summary,
-                        taskTitle: taskTitle,
-                        paneMonitor: paneMonitor
-                    )
-                    emit(.engineRequest(requestId: requestId, request: .spawnWorkerPane(spawn)))
-                case "release_worker_pane":
-                    let slotId = (request["slot_id"] as? NSNumber)?.intValue ?? 0
-                    let killGrace = (request["kill_grace_seconds"] as? NSNumber)?.uint32Value ?? 0
-                    emit(.engineRequest(
-                        requestId: requestId,
-                        request: .releaseWorkerPane(slotId: slotId, killGraceSeconds: killGrace)
-                    ))
                 case "attach_worker_pane":
                     let runId = request["run_id"] as? String ?? ""
                     let slotId = (request["slot_id"] as? NSNumber)?.intValue ?? 0

@@ -976,8 +976,6 @@ final class ChatViewModel: ObservableObject {
     /// through this model. The `engine_request` arms that call them live in
     /// [[ChatViewModel+EventHandling.swift]]; a build without GhosttyKit
     /// leaves them `nil` and those arms answer with a failure.
-    var paneSpawnHandler: ((EngineSpawnRequest) -> EngineSpawnResult)?
-    var paneReleaseHandler: ((Int, UInt32) -> EngineReleaseResult)?
     var paneAttachHandler: ((EngineAttachRequest) -> EngineAttachResult)?
     var coordinatorPaneAttachHandler: ((EngineCoordinatorAttachRequest) -> EngineCoordinatorAttachResult)?
     var paneDetachHandler: ((Int) -> EngineReleaseResult)?

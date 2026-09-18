@@ -621,15 +621,18 @@ impl WorkDb {
         Ok(updated > 0)
     }
 
-    /// Persist the real OS shell pid of a *local* libghostty worker pane onto
-    /// the agent-session `work_runs` row for `execution_id`. The macOS app
-    /// reports this via the `UpdateWorkerShellPid` RPC once the pane's
-    /// surface attaches; the engine stamps it here so the pid is durable
-    /// across an engine restart (the in-memory
+    /// Persist the real OS shell pid of a *local* worker pane onto the
+    /// agent-session `work_runs` row for `execution_id`, so the pid is
+    /// durable across an engine restart (the in-memory
     /// [`crate::live_worker_state::LiveWorkerStateRegistry`] is empty on
     /// boot). [`crate::dead_pane_sweep`] then probes this pid with
     /// `kill(pid, 0)` to detect a pane that died with its host app while the
     /// execution row is still `waiting_human`.
+    ///
+    /// The tmux-hosted spawn path writes this column directly via
+    /// [`Self::persist_tmux_identity_after_observation`] instead of this
+    /// method — this setter remains a standalone primitive for tests that
+    /// need to seed `shell_pid` without driving the full tmux spawn flow.
     ///
     /// Keyed by `execution_id` (the app's `run_id`), which the `work_runs` row
     /// always exists for by the time the pid arrives (the run row is inserted
@@ -1599,10 +1602,10 @@ impl WorkDb {
     /// Stamp the actual pane-slot identity onto an existing run record.
     /// The coordinator inserts the run with the worker-pool placeholder
     /// (`worker-N` from capacity tracking), then calls this once the
-    /// app has reported the real slot allocation back from
-    /// `SpawnWorkerPane`. After this point `agent_id` is treated as
-    /// immutable for the run's lifetime — re-spawning into a different
-    /// slot would create a new run rather than mutate this one.
+    /// spawn runner has allocated the real pane slot. After this point
+    /// `agent_id` is treated as immutable for the run's lifetime —
+    /// re-spawning into a different slot would create a new run rather
+    /// than mutate this one.
     pub fn set_run_agent_id(&self, run_id: &str, agent_id: &str) -> Result<WorkRun> {
         let conn = self.connect()?;
         let updated = conn.execute(

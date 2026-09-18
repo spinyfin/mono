@@ -253,7 +253,7 @@ impl ServerState {
         }
         if let Some(prior) = prior {
             for (_, tx) in prior.pending {
-                let _ = tx.send(EngineToAppResponse::SpawnWorkerPane {
+                let _ = tx.send(EngineToAppResponse::AttachWorkerPane {
                     result: Err(EngineToAppError::AppDisconnected),
                 });
             }
@@ -285,7 +285,7 @@ impl ServerState {
                  engine→app RPCs will report NotRegistered until the app reconnects",
             );
             for (_, tx) in prior.pending {
-                let _ = tx.send(EngineToAppResponse::SpawnWorkerPane {
+                let _ = tx.send(EngineToAppResponse::AttachWorkerPane {
                     result: Err(EngineToAppError::AppDisconnected),
                 });
             }

@@ -86,14 +86,6 @@ final class GhosttyTerminalHostView: NSView {
     private var screenObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
 
-    /// Set once we have reported a surface-creation failure to the session
-    /// (`session.onSurfaceCreationFailed`). Dedupes the NACK: `attemptSurfaceCreation`
-    /// can run several times for one spawn (init, `viewDidMoveToWindow`, the
-    /// screen-change observer), but the engine only needs to be told once that
-    /// this spawn produced no shell. Reset to `false` on a successful attach so
-    /// a Boss-pane restart that later fails can report again.
-    private var reportedSurfaceCreationFailure = false
-
     /// os_signpost interval state for an in-flight left-button selection
     /// drag (mouseDown→mouseUp), plus the dropped-frame counter that runs
     /// only for that span. See [[UISignpost]] / [[InteractionFrameCounter]]
@@ -220,9 +212,6 @@ final class GhosttyTerminalHostView: NSView {
         case .created(let surface):
             self.surface = surface
             removeScreenObserver()
-            // A surface came up: clear the failure latch so a later teardown and
-            // recreation can report a new failure.
-            reportedSurfaceCreationFailure = false
             session.statusMessage = nil
             session.attach(hostView: self)
             // Register with the event-loop diagnostics so the 1 Hz sampler can
@@ -232,36 +221,14 @@ final class GhosttyTerminalHostView: NSView {
             syncGeometry()
             reconcilePaneMonitor()
 
-        case .failed(let host, let diagnostic):
+        case .failed(let host, _):
             session.statusMessage = host.activeDisplayCount == 0
                 ? "Waiting for an active display…"
                 : "Surface creation failed…"
             installScreenObserverIfNeeded()
-            // Tell the session the SPAWN failed — never that the pane died.
-            // A surface that was never created hosted no pty and therefore no
-            // shell process, so there is no worker here to have died. Saying
-            // "died" routes the engine to its pane-death reap, which does not
-            // feed the cross-work-item spawn-capability breaker; saying
-            // "spawn failed" routes it to the never-started-spawn reap, which
-            // does. See `TerminalPaneSession.onSurfaceCreationFailed`.
-            //
-            // Dedupe: the screen observer / window-move retries call this
-            // again, but one report per spawn is enough — the engine reaps on
-            // the first. The pane stays in its surface-less placeholder either
-            // way; if the display returns before the engine reaps, the retry
-            // still recreates the surface.
-            //
-            // Forward the same host snapshot used for the reason string so
-            // the JSONL `host` object cannot disagree with `reason` if the
-            // display wakes between measurement and logging.
-            if !reportedSurfaceCreationFailure {
-                reportedSurfaceCreationFailure = true
-                session.onSurfaceCreationFailed?(
-                    Self.surfaceFailureReason(host: host),
-                    host,
-                    diagnostic
-                )
-            }
+            // The pane stays in its surface-less placeholder; if the display
+            // returns, the screen-change / window-move retries above recreate
+            // the surface.
         }
     }
 

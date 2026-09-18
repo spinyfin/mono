@@ -150,13 +150,12 @@
 //! **The liveness veto.** [`reap_never_started_spawn`] — the one reap every
 //! cause funnels through — now asks
 //! [`crate::transcript_liveness::probe_transcript_liveness`] before it does
-//! anything. The veto itself only applies to [`ReapCause::vetoable`] causes —
-//! [`ReapCause::SpawnAckTimeout`] and [`ReapCause::DriverStartTimeout`], the
-//! two the periodic sweep infers from silence. For those, a transcript for
-//! the execution on disk (a rollout newer than the pre-spawn baseline under
-//! the run's ingress root, or the run row's recorded transcript path scoped
-//! to this incarnation) is driver-originated evidence in its own right: the
-//! reap records it as a driver signal
+//! anything. [`ReapCause::SpawnAckTimeout`] and [`ReapCause::DriverStartTimeout`]
+//! are the two causes the periodic sweep infers from silence, and a
+//! transcript for the execution on disk (a rollout newer than the pre-spawn
+//! baseline under the run's ingress root, or the run row's recorded
+//! transcript path scoped to this incarnation) is driver-originated evidence
+//! in its own right: the reap records it as a driver signal
 //! ([`crate::live_worker_state::DriverSignalKind::CorrelatedTranscript`] or
 //! [`crate::live_worker_state::DriverSignalKind::CorrelatedTranscriptUnattachable`],
 //! permanent, first-write-wins) and returns [`ReapOutcome::Vetoed`]. An
@@ -167,18 +166,6 @@
 //! Only [`crate::transcript_liveness::TranscriptLiveness::Absent`] lets a
 //! reap proceed, and the probe's summary then becomes part of the orphan
 //! reason so the record says what was checked.
-//!
-//! [`ReapCause::AppNack`] and [`ReapCause::PaneDiedBeforeStart`] are
-//! different in kind: the app has positively reported that the pane failed
-//! to spawn or is gone. A transcript on disk answers "did the driver ever
-//! run?", not "does the pane still exist?" — it does not contradict the
-//! app's report, so it is never grounds to refuse those two reaps. The probe
-//! still runs for them (its summary is diagnostic value in the orphan
-//! reason), but it never blocks the reap and never records a permanent
-//! driver signal on that path — recording one for a pane the app itself
-//! says is gone would leave a `pid<=0`/`Spawning` slot no other sweep can
-//! reclaim (neither sweep pass, `dead_pid_sweep`, nor `stale_worker_sweep`
-//! — see this module's own doc above).
 //!
 //! **The failure class.** Pass 1 and pass 2 observe different things.
 //! Every reap records its [`crate::spawn_health::SpawnFailureClass`] on
@@ -199,7 +186,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use boss_protocol::{CreateAttentionItemInput, LiveWorkerState, WorkExecution, WorkerActivity};
+use boss_protocol::{CreateAttentionItemInput, WorkExecution, WorkerActivity};
 
 use crate::agent_jsonl_progress::{DiscoveryVerdict, IngressCheckpoint, IngressCheckpointStore};
 use crate::coordinator::{CubeClient, ExecutionCoordinator, worker_id_for_slot};
@@ -212,37 +199,6 @@ use crate::spawn_health::{
 };
 use crate::transcript_liveness::{TranscriptLiveness, probe_transcript_liveness};
 use crate::work::WorkDb;
-
-/// Whether a live slot has shown **no proof of life whatsoever** — no shell
-/// pid was ever reported, no hook event ever arrived, and it is still
-/// advertising `Spawning`. Such a slot has an execution the engine believes
-/// is running with, in fact, no process behind it: nothing was ever started,
-/// so nothing can have died.
-///
-/// This is the classifier that decides which reap an app report earns. Both
-/// app-originated reports about a not-yet-live pane land on it:
-///
-/// - `ReportWorkerSpawnFailed` (the diagnostic NACK) uses it as a staleness
-///   guard — a slot that HAS shown proof of life must never be reaped by a
-///   late NACK, because the pane demonstrably came up.
-/// - `WorkerPaneDied` uses it to tell "the pane never came up" apart from
-///   "the pane died after running". Only the latter is a death; the former
-///   belongs on [`reap_never_started_spawn`], which feeds the cross-work-item
-///   [`crate::spawn_health`] breaker. The pane-death path does not feed it,
-///   and routing never-started spawns there is what let the 2026-07
-///   no-active-display incident churn 818 executions across 79 work items
-///   without the one aggregator that would have stopped it ever seeing a
-///   single failure.
-///
-/// Pure and free-standing so the classification is unit-testable without a
-/// live registry, and so both call sites are provably asking the same
-/// question rather than maintaining two copies of the predicate.
-pub(crate) fn slot_never_started(live_states: &LiveWorkerStateRegistry, state: &LiveWorkerState) -> bool {
-    live_states.driver_start_expectation(state.slot_id) != Some(DriverStartExpectation::Readopted)
-        && state.shell_pid <= 0
-        && state.last_event_at.is_none()
-        && state.activity == WorkerActivity::Spawning
-}
 
 /// Kind string for the attention item raised when a spawn produced a
 /// pane but no driver. Stable — operator tooling pins it.
@@ -652,17 +608,14 @@ pub async fn run_one_pass(
     // Breaker half-open recovery: while dispatch is Breaker-paused, this is
     // the tick that periodically admits a single canary execution through
     // the pause. Runs every pass regardless of whether this pass reaped
-    // anything — the breaker may have tripped from an app NACK (a different
-    // code path) rather than from a timeout seen above.
+    // anything.
     maybe_admit_recovery_probe(work_db, &coordinator, spawn_health, dispatch_events, now_epoch_secs).await;
 
     outcome
 }
 
 /// Shared references the reap path needs, bundled so
-/// [`reap_never_started_spawn`] stays under the argument-count lint and both
-/// callers (the periodic sweep and the `ReportWorkerSpawnFailed` NACK handler)
-/// construct it the same way.
+/// [`reap_never_started_spawn`] stays under the argument-count lint.
 #[derive(bon::Builder)]
 pub(crate) struct SpawnReapCtx<'a> {
     pub work_db: &'a WorkDb,
@@ -685,21 +638,14 @@ pub(crate) struct SpawnReapCtx<'a> {
 
 /// Why a never-started spawn is being reaped. Selects the orphan reason text,
 /// the `[engine-reconcile]` audit note, and the dispatch stage emitted.
-pub(crate) enum ReapCause<'a> {
+pub(crate) enum ReapCause {
     /// The periodic sweep found total silence past the grace window.
     SpawnAckTimeout { grace_secs: i64 },
-    /// The app proactively reported the spawn failed (fast-fail NACK).
-    AppNack { reason: &'a str },
-    /// The app reported the worker pane died (`WorkerPaneDied`), but the
-    /// slot had never shown any proof of life — see [`slot_never_started`].
-    /// The pane never came up, so this is a never-started spawn wearing a
-    /// death report's clothing, and it is reaped as one.
-    PaneDiedBeforeStart { detail: &'a str },
     /// A pane came up — possibly with a live shell pid — and no
     /// driver-originated signal was observed within the window. That is
     /// what was seen; whether the driver never executed or its signal never
     /// reached the engine is what the liveness veto in
-    /// [`reap_never_started_spawn`] decides. Unlike the two above, this one
+    /// [`reap_never_started_spawn`] decides. Unlike the one above, this one
     /// also raises a per-execution attention item: nothing else in Boss
     /// surfaces it.
     DriverStartTimeout {
@@ -802,14 +748,12 @@ fn driver_start_reading(file_ingress: Option<&FileIngressState>) -> String {
     }
 }
 
-impl ReapCause<'_> {
+impl ReapCause {
     /// Which failure shape this cause observed — the breaker composes its
     /// pause reason from these, so the wording an operator reads matches
-    /// what each reap actually saw. Consults `shell_pid` and the probe
-    /// verdict rather than mapping purely on the variant: a pid-less
-    /// driver-start timeout is `NoShell`, and an app-reported reap whose
-    /// transcript is on disk is not.
-    pub(crate) fn failure_class(&self, shell_pid: i32, liveness: &TranscriptLiveness) -> SpawnFailureClass {
+    /// what each reap actually saw. Consults `shell_pid` rather than mapping
+    /// purely on the variant: a pid-less driver-start timeout is `NoShell`.
+    pub(crate) fn failure_class(&self, shell_pid: i32, _liveness: &TranscriptLiveness) -> SpawnFailureClass {
         match self {
             ReapCause::SpawnAckTimeout { .. } => SpawnFailureClass::NoShell,
             ReapCause::DriverStartTimeout { .. } => {
@@ -819,32 +763,7 @@ impl ReapCause<'_> {
                     SpawnFailureClass::NoShell
                 }
             }
-            ReapCause::AppNack { .. } | ReapCause::PaneDiedBeforeStart { .. } => {
-                if liveness.is_present() {
-                    SpawnFailureClass::ShellWithoutDriverSignal
-                } else {
-                    SpawnFailureClass::NoShell
-                }
-            }
         }
-    }
-
-    /// Whether the liveness veto applies to this cause.
-    ///
-    /// Only the two causes the periodic sweep *infers from silence*
-    /// (`SpawnAckTimeout`, `DriverStartTimeout`) ask "did the driver ever
-    /// run?" — a question a transcript on disk actually answers, and can
-    /// therefore contradict. `AppNack` and `PaneDiedBeforeStart` are the app
-    /// *reporting* that the pane failed or is gone: positive evidence a
-    /// transcript's mere existence does not contradict, so vetoing those
-    /// reaps on a transcript would refuse to act on the app's own report and
-    /// leave the slot in the exact `pid<=0`/`Spawning` shape no other sweep
-    /// can reclaim (see the module doc).
-    pub(crate) fn vetoable(&self) -> bool {
-        matches!(
-            self,
-            ReapCause::SpawnAckTimeout { .. } | ReapCause::DriverStartTimeout { .. }
-        )
     }
 }
 
@@ -888,12 +807,12 @@ fn pane_observation(shell_pid: i32) -> &'static str {
 }
 
 fn reap_narrative(
-    cause: &ReapCause<'_>,
+    cause: &ReapCause,
     execution_id: &str,
     liveness: &TranscriptLiveness,
     shell_pid: i32,
 ) -> (String, String, Stage) {
-    let (reason, audit, stage) = reap_narrative_for_cause(cause, execution_id, shell_pid, liveness);
+    let (reason, audit, stage) = reap_narrative_for_cause(cause, execution_id, shell_pid);
     let summary = liveness.to_string();
     (
         format!("{reason}; liveness probe: {summary}"),
@@ -902,12 +821,7 @@ fn reap_narrative(
     )
 }
 
-fn reap_narrative_for_cause(
-    cause: &ReapCause<'_>,
-    execution_id: &str,
-    shell_pid: i32,
-    liveness: &TranscriptLiveness,
-) -> (String, String, Stage) {
+fn reap_narrative_for_cause(cause: &ReapCause, execution_id: &str, shell_pid: i32) -> (String, String, Stage) {
     match &cause {
         ReapCause::SpawnAckTimeout { grace_secs } => (
             format!(
@@ -918,41 +832,6 @@ fn reap_narrative_for_cause(
             ),
             Stage::SpawnAckTimeout,
         ),
-        ReapCause::AppNack { reason } => {
-            let shell_note = if liveness.is_present() {
-                "after the driver had started (a transcript is on disk)"
-            } else {
-                "(no shell)"
-            };
-            (
-                format!("app reported spawn failure {shell_note}: {reason}"),
-                format!(
-                    "app reported worker-pane spawn failure (exec {execution_id}): {reason}; chore reset to todo for redispatch."
-                ),
-                Stage::SpawnNack,
-            )
-        }
-        ReapCause::PaneDiedBeforeStart { detail } => {
-            let (process_clause, audit_clause) = if liveness.is_present() {
-                (
-                    "a transcript on disk shows the driver had run, so the pane died after start rather than never coming up",
-                    "a transcript on disk shows the driver had run, so the pane died after start rather than never coming up",
-                )
-            } else {
-                (
-                    "no shell pid and no hook event was ever observed, so no worker process ever existed",
-                    "no shell pid or hook event was ever observed, so the pane never came up",
-                )
-            };
-            (
-                format!("pane-death-before-start: the app reported that {detail}, but {process_clause}"),
-                format!(
-                    "app reported worker-pane death before start (exec {execution_id}): {detail}; \
-                     {audit_clause}; chore reset to todo for redispatch."
-                ),
-                Stage::PaneDeathBeforeStart,
-            )
-        }
         ReapCause::DriverStartTimeout {
             grace_secs,
             silent_secs,
@@ -995,37 +874,26 @@ fn reap_narrative_for_cause(
 /// answered at all; `Skipped` when the execution was already terminal, or
 /// the orphan write failed.
 ///
-/// Shared by [`run_one_pass`] (the 60s timeout path),
-/// [`crate::app::sessions::handle_report_worker_spawn_failed`] (the immediate
-/// NACK path), and [`crate::app::sessions::handle_worker_pane_died`] when the
-/// reported "death" turns out to be a pane that never came up at all
-/// ([`slot_never_started`]) — so all three do exactly the same thing, and in
-/// particular all three feed the breaker and all three consult the liveness
-/// probe. The only difference is `cause`.
+/// Called from [`run_one_pass`] (the 60s timeout path) for every
+/// [`ReapCause`] it can produce.
 ///
 /// ## The liveness veto
 ///
 /// Before anything is written, the execution's transcript is looked for on
 /// disk ([`probe_transcript_liveness`], run via [`tokio::task::spawn_blocking`]
-/// so the scan never runs inline on the async runtime). Whether a present or
-/// undeterminable answer actually blocks the reap depends on
-/// [`ReapCause::vetoable`] — see that method's doc and the module doc's
-/// section on the veto. For a vetoable cause, a present transcript is
-/// recorded as the run's driver-start signal and the reap returns
+/// so the scan never runs inline on the async runtime). A present transcript
+/// is recorded as the run's driver-start signal and the reap returns
 /// [`ReapOutcome::Vetoed`]; an undeterminable answer returns
-/// [`ReapOutcome::LivenessUndeterminable`] and touches nothing. For a
-/// non-vetoable cause (an app-reported NACK or pane death), the probe still
-/// runs and its summary is folded into the orphan reason for diagnostic
-/// value, but neither answer blocks the reap or is recorded as a driver
-/// signal. Only a confirmed absence — or a non-vetoable cause — proceeds to
-/// the reap, and the probe's summary is always written into the orphan
-/// reason and audit line so the record shows what was checked.
+/// [`ReapOutcome::LivenessUndeterminable`] and touches nothing. Only a
+/// confirmed absence proceeds to the reap, and the probe's summary is always
+/// written into the orphan reason and audit line so the record shows what
+/// was checked.
 pub(crate) async fn reap_never_started_spawn(
     ctx: &SpawnReapCtx<'_>,
     execution: &WorkExecution,
     slot_id: u8,
     shell_pid: i32,
-    cause: ReapCause<'_>,
+    cause: ReapCause,
     now_epoch_secs: i64,
 ) -> ReapOutcome {
     let execution_id = execution.id.as_str();
@@ -1064,118 +932,89 @@ pub(crate) async fn reap_never_started_spawn(
         }
     };
 
-    if cause.vetoable() {
-        match &liveness {
-            TranscriptLiveness::Present {
-                source,
-                path,
-                age_secs,
-                bytes,
-                discovery_would_attach,
-                detail,
-            } => {
-                let kind = if *discovery_would_attach {
-                    DriverSignalKind::CorrelatedTranscript
-                } else {
-                    DriverSignalKind::CorrelatedTranscriptUnattachable
-                };
-                let recorded_slot = ctx.live_states.record_driver_signal(execution_id, kind);
-                match recorded_slot {
-                    Some(recorded_slot) => tracing::error!(
-                        execution_id,
-                        work_item_id,
-                        slot_id,
-                        shell_pid,
-                        stage = cause.failure_class(shell_pid, &liveness).as_str(),
-                        source = source.as_str(),
-                        transcript = %path.display(),
-                        age_secs,
-                        bytes,
-                        signal_kind = kind.as_str(),
-                        recorded_slot,
-                        detail,
-                        "REFUSING to reap as a never-started spawn: a transcript for this execution exists \
-                         on disk, so the driver ran. No driver-originated signal reached the engine through \
-                         the hook or progress ingress — that is an observation gap to fix, not a dead \
-                         worker. Recorded the transcript as the run's driver-start signal.",
-                    ),
-                    None => tracing::error!(
-                        execution_id,
-                        work_item_id,
-                        slot_id,
-                        shell_pid,
-                        stage = cause.failure_class(shell_pid, &liveness).as_str(),
-                        source = source.as_str(),
-                        transcript = %path.display(),
-                        age_secs,
-                        bytes,
-                        signal_kind = kind.as_str(),
-                        detail,
-                        "REFUSING to reap as a never-started spawn: a transcript for this execution exists \
-                         on disk, so the driver ran. No live slot is registered for this run any more, so \
-                         the transcript could NOT be recorded as a driver signal — the run will be \
-                         re-examined on the next pass rather than reaped.",
-                    ),
-                }
-                resolve_liveness_undeterminable_attention(ctx.work_db, execution_id);
-                return ReapOutcome::Vetoed;
-            }
-            TranscriptLiveness::Undeterminable { reasons, checked } => {
-                tracing::error!(
+    match &liveness {
+        TranscriptLiveness::Present {
+            source,
+            path,
+            age_secs,
+            bytes,
+            discovery_would_attach,
+            detail,
+        } => {
+            let kind = if *discovery_would_attach {
+                DriverSignalKind::CorrelatedTranscript
+            } else {
+                DriverSignalKind::CorrelatedTranscriptUnattachable
+            };
+            let recorded_slot = ctx.live_states.record_driver_signal(execution_id, kind);
+            match recorded_slot {
+                Some(recorded_slot) => tracing::error!(
                     execution_id,
                     work_item_id,
                     slot_id,
                     shell_pid,
                     stage = cause.failure_class(shell_pid, &liveness).as_str(),
-                    reasons = %reasons.join("; "),
-                    checked = %checked.join("; "),
-                    "NOT reaping: could not establish whether a transcript exists for this execution. An \
-                     unreadable answer is not an absent transcript; the slot will be re-examined on the \
-                     next pass.",
-                );
-                if ctx
-                    .live_states
-                    .record_liveness_undeterminable(execution_id, UNDETERMINABLE_LIVENESS_ATTENTION_THRESHOLD)
-                    == Some(true)
-                {
-                    raise_liveness_undeterminable_attention(
-                        ctx.work_db,
-                        execution,
-                        slot_id,
-                        shell_pid,
-                        reasons,
-                        checked,
-                    );
-                }
-                return ReapOutcome::LivenessUndeterminable;
+                    source = source.as_str(),
+                    transcript = %path.display(),
+                    age_secs,
+                    bytes,
+                    signal_kind = kind.as_str(),
+                    recorded_slot,
+                    detail,
+                    "REFUSING to reap as a never-started spawn: a transcript for this execution exists \
+                     on disk, so the driver ran. No driver-originated signal reached the engine through \
+                     the hook or progress ingress — that is an observation gap to fix, not a dead \
+                     worker. Recorded the transcript as the run's driver-start signal.",
+                ),
+                None => tracing::error!(
+                    execution_id,
+                    work_item_id,
+                    slot_id,
+                    shell_pid,
+                    stage = cause.failure_class(shell_pid, &liveness).as_str(),
+                    source = source.as_str(),
+                    transcript = %path.display(),
+                    age_secs,
+                    bytes,
+                    signal_kind = kind.as_str(),
+                    detail,
+                    "REFUSING to reap as a never-started spawn: a transcript for this execution exists \
+                     on disk, so the driver ran. No live slot is registered for this run any more, so \
+                     the transcript could NOT be recorded as a driver signal — the run will be \
+                     re-examined on the next pass rather than reaped.",
+                ),
             }
-            TranscriptLiveness::Absent { .. } => {}
+            resolve_liveness_undeterminable_attention(ctx.work_db, execution_id);
+            return ReapOutcome::Vetoed;
         }
-    } else if liveness.vetoes_reap() {
-        // `AppNack` / `PaneDiedBeforeStart`: the app itself is positive
-        // evidence the pane failed or is gone, which a transcript's mere
-        // existence does not contradict. Surfaced for diagnostic value only
-        // — see `ReapCause::vetoable`'s doc for why this must never block
-        // the reap or record a permanent driver signal.
-        tracing::info!(
-            execution_id,
-            work_item_id,
-            slot_id,
-            shell_pid,
-            stage = cause.failure_class(shell_pid, &liveness).as_str(),
-            liveness = %liveness,
-            "never-started-spawn reap: the liveness probe found something before an app-reported cause; \
-             proceeding with the reap regardless, since the app's own report is positive evidence the \
-             pane is gone",
-        );
+        TranscriptLiveness::Undeterminable { reasons, checked } => {
+            tracing::error!(
+                execution_id,
+                work_item_id,
+                slot_id,
+                shell_pid,
+                stage = cause.failure_class(shell_pid, &liveness).as_str(),
+                reasons = %reasons.join("; "),
+                checked = %checked.join("; "),
+                "NOT reaping: could not establish whether a transcript exists for this execution. An \
+                 unreadable answer is not an absent transcript; the slot will be re-examined on the \
+                 next pass.",
+            );
+            if ctx
+                .live_states
+                .record_liveness_undeterminable(execution_id, UNDETERMINABLE_LIVENESS_ATTENTION_THRESHOLD)
+                == Some(true)
+            {
+                raise_liveness_undeterminable_attention(ctx.work_db, execution, slot_id, shell_pid, reasons, checked);
+            }
+            return ReapOutcome::LivenessUndeterminable;
+        }
+        TranscriptLiveness::Absent { .. } => {}
     }
 
     let reap_kind = match &cause {
         ReapCause::SpawnAckTimeout { .. } => NeverStartedReapKind::SpawnAckTimeout,
         ReapCause::DriverStartTimeout { .. } => NeverStartedReapKind::DriverStartTimeout,
-        ReapCause::AppNack { .. } | ReapCause::PaneDiedBeforeStart { .. } => {
-            NeverStartedReapKind::AppReportedNeverStarted
-        }
     };
     let shell_pid = match ctx
         .live_states
@@ -1348,12 +1187,6 @@ pub(crate) async fn reap_never_started_spawn(
         ReapCause::SpawnAckTimeout { grace_secs } => {
             details["threshold_secs"] = serde_json::json!(grace_secs);
         }
-        ReapCause::AppNack { reason } => {
-            details["reason"] = serde_json::json!(reason);
-        }
-        ReapCause::PaneDiedBeforeStart { detail } => {
-            details["detail"] = serde_json::json!(detail);
-        }
         ReapCause::DriverStartTimeout {
             grace_secs,
             silent_secs,
@@ -1395,10 +1228,9 @@ pub(crate) async fn reap_never_started_spawn(
     // cannot catch; when enough DISTINCT items fail in the window the breaker
     // pauses dispatch and raises one loud attention item.
     //
-    // All four causes feed it, driver-start timeouts and app-reported pane
-    // deaths before start included: a driver
-    // binary that cannot exec on this host fails the same way for every work
-    // item routed to it, so it belongs in the aggregate. Pass 2's own
+    // Both causes feed it, driver-start timeouts included: a driver binary
+    // that cannot exec on this host fails the same way for every work item
+    // routed to it, so it belongs in the aggregate. Pass 2's own
     // per-execution attention item above is additional to this, not a
     // replacement for it — see the module doc.
     ctx.spawn_health.record_evidence(
@@ -1777,50 +1609,6 @@ mod tests {
 
     // ─── tests ───────────────────────────────────────────────────────────────
 
-    /// Every way a slot can prove it came up, and the one shape that proves
-    /// it did not. This predicate decides whether an app-reported pane death
-    /// is treated as a death or as a never-started spawn, and only the
-    /// latter feeds the spawn-capability breaker — so a false positive here
-    /// would let a genuinely crashed worker trip the fleet, and a false
-    /// negative reproduces the 2026-07 churn.
-    #[test]
-    fn slot_never_started_requires_the_total_absence_of_proof_of_life() {
-        let live_states = LiveWorkerStateRegistry::new();
-        register_slot_zero_pid(&live_states, 1, "exec-1", "wi-1");
-        let pristine = live_states.get(1).expect("slot 1");
-        assert!(
-            slot_never_started(&live_states, &pristine),
-            "no pid, no hook event, still Spawning is the never-started shape",
-        );
-
-        let with_pid = LiveWorkerState {
-            shell_pid: 4242,
-            ..pristine.clone()
-        };
-        assert!(
-            !slot_never_started(&live_states, &with_pid),
-            "a reported shell pid is proof of life"
-        );
-
-        let with_event = LiveWorkerState {
-            last_event_at: Some("2026-07-31T00:00:00Z".to_owned()),
-            ..pristine.clone()
-        };
-        assert!(
-            !slot_never_started(&live_states, &with_event),
-            "a hook event is proof of life"
-        );
-
-        let progressed = LiveWorkerState {
-            activity: WorkerActivity::Working,
-            ..pristine.clone()
-        };
-        assert!(
-            !slot_never_started(&live_states, &progressed),
-            "activity past Spawning is proof of life",
-        );
-    }
-
     /// A driver-start timeout must not assert "the binary never started"
     /// when the run's file ingress says otherwise. In the 2026-09-13 breaker
     /// incident five Codex workers were reaped with exactly that text while
@@ -1872,39 +1660,6 @@ mod tests {
             4242,
         );
         assert!(reason.contains("most likely never started"), "{reason}");
-    }
-
-    /// A never-started spawn reported to us as a pane death must not be
-    /// narrated as a death. The reason text is the only durable explanation
-    /// an operator gets, and "the worker pane died" for a pane that never
-    /// came up sent every reader of the 2026-07 incident looking for a
-    /// process that had never existed.
-    #[test]
-    fn pane_death_before_start_is_narrated_as_never_started() {
-        let absent = TranscriptLiveness::Absent {
-            checked: vec!["probe stub".to_owned()],
-        };
-        let (reason, audit, stage) = reap_narrative(
-            &ReapCause::PaneDiedBeforeStart {
-                detail: "surface failed to attach",
-            },
-            "exec-1",
-            &absent,
-            0,
-        );
-        assert_eq!(stage, Stage::PaneDeathBeforeStart);
-        assert!(
-            reason.starts_with("pane-death-before-start:"),
-            "reason must be greppable by cause; got: {reason}",
-        );
-        assert!(
-            reason.contains("no worker process ever existed"),
-            "reason must say no process existed, not that one died; got: {reason}",
-        );
-        assert!(
-            reason.contains("surface failed to attach") && audit.contains("surface failed to attach"),
-            "both surfaces must carry the app's observation verbatim",
-        );
     }
 
     /// `unverified_driver_starts` is blind to `shell_pid` by construction, so
@@ -2368,73 +2123,6 @@ mod tests {
             1,
             "the breaker trip must still raise its loud signal despite the pre-existing pause",
         );
-    }
-
-    /// The fast-fail NACK path: `reap_never_started_spawn` with the `AppNack`
-    /// cause (what `handle_report_worker_spawn_failed` calls) reaps the
-    /// execution immediately, orphans it, releases the slot, and emits a
-    /// `spawn_nack` event carrying the app-supplied reason. A single NACK is
-    /// below the distinct-work-item threshold, so the breaker does NOT trip.
-    #[tokio::test]
-    async fn app_nack_reaps_and_emits_spawn_nack_event() {
-        let (_dir, db) = open_db();
-        let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id, "test chore");
-        let db = Arc::new(db);
-
-        let execution_id = create_old_execution(&db, &work_item_id);
-        let execution = db.get_execution(&execution_id).unwrap();
-
-        let coordinator = make_coordinator(db.clone(), 1);
-        coordinator.worker_pool().claim_worker(&execution_id, None).await;
-
-        let spawn_health = SpawnHealthTracker::new();
-        let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
-        let sink = Arc::new(RecordingDispatchEventSink::new());
-        let live_states = LiveWorkerStateRegistry::new();
-        register_slot_zero_pid(&live_states, 1, &execution_id, &work_item_id);
-        let ctx = SpawnReapCtx::builder()
-            .work_db(db.as_ref())
-            .live_states(&live_states)
-            .coordinator(coordinator.clone())
-            .dispatch_events(sink.as_ref())
-            .reaper(reaper.as_ref())
-            .spawn_health(&spawn_health)
-            .cube_client(&NoopCube)
-            .build();
-        let now = boss_engine_utils::epoch_time::now_epoch_secs();
-        let reason = "ghostty_surface_new returned NULL (no active display)";
-        let reaped = reap_never_started_spawn(&ctx, &execution, 1, 0, ReapCause::AppNack { reason }, now).await;
-
-        assert_eq!(
-            reaped,
-            ReapOutcome::Reaped,
-            "app NACK must reap the never-started spawn"
-        );
-        assert_eq!(
-            db.get_execution(&execution_id).unwrap().status,
-            ExecutionStatus::Orphaned
-        );
-        assert!(
-            !coordinator
-                .worker_pool()
-                .claimed_execution_ids()
-                .await
-                .contains(&execution_id),
-            "pool slot must be released so the freed slot is reusable",
-        );
-
-        let events = sink.events().await;
-        let nack: Vec<_> = events.iter().filter(|e| e.stage == "spawn_nack").collect();
-        assert_eq!(nack.len(), 1, "AppNack cause must emit exactly one spawn_nack event");
-        assert_eq!(nack[0].outcome, "ok");
-        assert_eq!(nack[0].details["reason"], serde_json::json!(reason));
-        // One NACK is below the distinct-work-item threshold — no breaker trip.
-        assert!(
-            !coordinator.is_dispatch_paused(),
-            "a single NACK must not trip the breaker"
-        );
-        assert!(events.iter().all(|e| e.stage != "spawn_capability_unhealthy"));
     }
 
     // ─── driver-start verification (the 2026-07-30 class) ────────────────────

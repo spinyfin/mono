@@ -171,7 +171,7 @@ fn register_trust_accepts_relaunched_app_when_old_app_pid_is_dead() {
 #[test]
 fn set_app_pid_repins_trust_root() {
     // After a successful reattach the engine re-pins app_pid so RPC
-    // authorization (SpawnWorkerPane, BossOnly/AppOrBoss) follows the
+    // authorization (AttachWorkerPane, BossOnly/AppOrBoss) follows the
     // live app across the restart.
     let (server_state, _dir) = server_state_with_app_pid(1);
     assert_eq!(server_state.current_app_pid(), Some(1));

@@ -11,8 +11,12 @@ pub enum NeverStartedReapKind {
     SpawnAckTimeout,
     /// Pass 2: still this execution, no driver signal (a pid may exist).
     DriverStartTimeout,
-    /// App NACK / pane-death-before-start: the stale-report guard
-    /// ([`crate::spawn_ack_sweep::slot_never_started`]) still holds.
+    /// Historical: an app self-report NACK / pane-death-before-start —
+    /// wire paths that no longer exist now that tmux is the sole local
+    /// worker-hosting mechanism. Nothing constructs this variant any more;
+    /// it survives only so the match in
+    /// [`LiveWorkerStateRegistry::confirm_never_started_reap`] stays
+    /// exhaustive.
     AppReportedNeverStarted,
 }
 

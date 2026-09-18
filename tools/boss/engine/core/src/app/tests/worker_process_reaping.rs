@@ -91,7 +91,7 @@ async fn release_worker_pane_still_reports_no_live_worker_for_a_mid_spawn_run() 
     let db = server_state.work_db.as_ref();
     let product_id = create_product(db);
     let work_item_id = create_active_chore(db, &product_id, "test chore");
-    // No run row and no pid: the pre-`UpdateWorkerShellPid` shape.
+    // No run row and no pid: the never-had-a-pid-recorded shape.
     let execution_id = create_old_execution(db, &work_item_id);
 
     assert_eq!(
