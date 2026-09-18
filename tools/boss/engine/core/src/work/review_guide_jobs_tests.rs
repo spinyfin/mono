@@ -257,8 +257,13 @@ fn admission_enforces_one_active_attempt_per_series() {
     };
     assert_eq!(first.status, "running");
 
-    db.persist_pr_review_guide_source_capture(&root, 2, PrSourceCaptureTrigger::Poller, &review_guide_source_packet("base2", "head2"))
-        .unwrap();
+    db.persist_pr_review_guide_source_capture(
+        &root,
+        2,
+        PrSourceCaptureTrigger::Poller,
+        &review_guide_source_packet("base2", "head2"),
+    )
+    .unwrap();
     let RetryReviewGuideOutcome::Created(replacement) =
         db.retry_pr_review_guide(&root, None, "review-guide-v1").unwrap()
     else {
