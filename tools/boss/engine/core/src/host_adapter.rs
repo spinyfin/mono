@@ -662,11 +662,12 @@ impl SshHostAdapter {
         match self.transport.run_shell(probe.as_str()).await {
             Ok(out) if out.success() => {
                 let mut prompt_text = prompt_text;
-                // `false`: the remote path doesn't yet read
-                // `worker_signal_proposals_seam` (see the comment on the
-                // `compose_worker_spawn` call above) — legacy marker text
-                // matches the flag's registry default.
-                prompt_text.push_str(&bazel_prepush_gate_text(false));
+                // Both flags false: the remote path doesn't yet read
+                // `worker_signal_proposals_seam` or `run_done_proposals_seam`
+                // (see the comment on the `compose_worker_spawn` call above)
+                // — legacy marker text and the absolute do-not-push-red-code
+                // stop match each flag's registry default.
+                prompt_text.push_str(&bazel_prepush_gate_text(false, false));
                 prompt_text
             }
             Ok(_) => prompt_text,

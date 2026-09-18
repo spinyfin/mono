@@ -340,6 +340,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
                     bookmark_recovery.is_some_and(|(_, has_work)| *has_work),
                     worker_signal_proposals_seam_enabled,
                     deferred_scope_proposals_seam_enabled,
+                    run_done_proposals_seam_enabled,
                 ),
             ));
         }
@@ -389,8 +390,11 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
     if matches!(
         execution.kind,
         ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation
-    ) && let Some(gate) = bazel_prepush_gate_block(workspace_path, worker_signal_proposals_seam_enabled)
-    {
+    ) && let Some(gate) = bazel_prepush_gate_block(
+        workspace_path,
+        worker_signal_proposals_seam_enabled,
+        run_done_proposals_seam_enabled,
+    ) {
         prompt.push_str(&gate);
     }
     if matches!(
@@ -511,7 +515,11 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
     // PR (reviews, triage, conflict resolutions, revisions) are exactly the
     // ones whose ending the engine could otherwise only infer, so scoping
     // this to PR-producing kinds would miss the cases it exists for.
-    prompt.push_str(&run_done_directive(run_done_proposals_seam_enabled));
+    prompt.push_str(&run_done_directive(
+        run_done_proposals_seam_enabled,
+        worker_signal_proposals_seam_enabled,
+        conflict_attempt.is_some(),
+    ));
     prompt.push_str("\nRespond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
     prompt
@@ -537,14 +545,23 @@ fn is_bazel_workspace(workspace_path: &Path) -> bool {
 /// this states the requirement as a hard gate in the worker prompt.
 ///
 /// Returns `None` for non-Bazel repos so the block is only injected when
-/// bazel actually owns the workspace. `seam_enabled` selects which failure-
-/// escalation sentence [`bazel_prepush_gate_text`] renders — see that
-/// function's doc.
-fn bazel_prepush_gate_block(workspace_path: &Path, seam_enabled: bool) -> Option<String> {
+/// bazel actually owns the workspace. `worker_signal_seam_enabled` selects
+/// which failure-escalation sentence [`bazel_prepush_gate_text`] renders;
+/// `run_done_seam_enabled` selects whether that sentence keeps the absolute
+/// "do not push red code" stop or the evidence-gated unattributable-failure
+/// exception — see that function's doc.
+fn bazel_prepush_gate_block(
+    workspace_path: &Path,
+    worker_signal_seam_enabled: bool,
+    run_done_seam_enabled: bool,
+) -> Option<String> {
     if !is_bazel_workspace(workspace_path) {
         return None;
     }
-    Some(bazel_prepush_gate_text(seam_enabled))
+    Some(bazel_prepush_gate_text(
+        worker_signal_seam_enabled,
+        run_done_seam_enabled,
+    ))
 }
 
 /// The Bazel pre-push build-gate prompt block, independent of any
@@ -554,16 +571,45 @@ fn bazel_prepush_gate_block(workspace_path: &Path, seam_enabled: bool) -> Option
 /// matches and the gate has to be injected from the result of an
 /// over-SSH marker probe instead.
 ///
-/// `seam_enabled` mirrors `worker_signal_proposals_seam` (see
+/// `worker_signal_seam_enabled` mirrors `worker_signal_proposals_seam` (see
 /// [`worker_escalation_protocol_directive`]): `true` points a build-gate
 /// failure at `"$BOSS_BIN" propose blocked`; `false` reproduces the pre-migration
 /// `[blocked]` marker sentence, so a worker on the flag-off path is never
 /// told to call a verb the engine won't yet honor proposals-first.
-pub(crate) fn bazel_prepush_gate_text(seam_enabled: bool) -> String {
-    let failure_sentence = if seam_enabled {
-        "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT push red code and do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout, and is never a reason to stop short of a clean result. A command still producing output is slow, not wedged — wait for it. A command producing no output and no progress is wedged: re-run it wrapped in an explicit `timeout` so it returns a real result you can act on, rather than waiting on it or guessing. Call `\"$BOSS_BIN\" propose blocked --reason \"...\"` naming the failing/timed-out command and its output, and stop (see \"If you are blocked or the work is bigger than estimated\" below for the exact syntax). Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
+///
+/// `run_done_seam_enabled` mirrors `run_done_proposals_seam`. When off, a
+/// real failure or timeout is an absolute stop: do not push red code.
+/// When on, that absolute stop is replaced by the same evidence-gated
+/// unattributable-failure exception [`run_done_directive`] teaches for the
+/// terminal outcome, so a worker who reaches this gate is told they MAY
+/// push a still-red target that is evidenced as pre-existing or
+/// environmental — not merely which outcome to declare after the fact.
+/// The two flags are independently toggleable; this function must not
+/// teach `propose blocked` unless `worker_signal_seam_enabled` is on.
+pub(crate) fn bazel_prepush_gate_text(worker_signal_seam_enabled: bool, run_done_seam_enabled: bool) -> String {
+    let blocked_action = if worker_signal_seam_enabled {
+        "Call `\"$BOSS_BIN\" propose blocked --reason \"...\"` naming the failing/timed-out command and its output, and stop (see \"If you are blocked or the work is bigger than estimated\" below for the exact syntax)"
     } else {
-        "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT push red code and do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout, and is never a reason to stop short of a clean result. A command still producing output is slow, not wedged — wait for it. A command producing no output and no progress is wedged: re-run it wrapped in an explicit `timeout` so it returns a real result you can act on, rather than waiting on it or guessing. Emit a `[blocked] reason=\"...\"` marker in your final response naming the failing/timed-out command and its output, and stop (see \"If you are blocked or the work is bigger than estimated\" below for the exact syntax). Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
+        "Emit a `[blocked] reason=\"...\"` marker in your final response naming the failing/timed-out command and its output, and stop (see \"If you are blocked or the work is bigger than estimated\" below for the exact syntax)"
+    };
+    let clean_bullet = if run_done_seam_enabled {
+        "- Both `bazel build` and `bazel test` must finish clean — exit 0, no build errors, no failing tests — before you push, unless a still-red target is evidence-backed as pre-existing or environmental (see the exception in the next paragraph and in \"Declaring your run finished\"). Clippy/lint is not reported by bazel; it runs at push time via the checkleft guard (and in CI).\n"
+    } else {
+        "- Both `bazel build` and `bazel test` must finish clean — exit 0, no build errors, no failing tests — before you push. Clippy/lint is not reported by bazel; it runs at push time via the checkleft guard (and in CI).\n"
+    };
+    let timeout_clause = if run_done_seam_enabled {
+        "If you need an upper bound, wrap the command itself in a timeout (e.g. `timeout 1800 bazel test //...`) so it returns control to you on expiry; on a timeout, follow the failure paragraph below (retry the specific target; a timeout is not by itself a reason to stop), do not idle."
+    } else {
+        "If you need an upper bound, wrap the command itself in a timeout (e.g. `timeout 1800 bazel test //...`) so it returns control to you on expiry; on a timeout, treat it as a blocker (below), do not retry-and-idle."
+    };
+    let failure_sentence = if run_done_seam_enabled {
+        format!(
+            "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout. A command still producing output is slow, not wedged — wait for it. A command producing no output and no progress is wedged: re-run it wrapped in an explicit `timeout` so it returns a real result you can act on, rather than waiting on it or guessing. A failing or timed-out gate is a reason to stop without pushing only when the failure is reproducible AND attributable to your change — fix it. A timeout, a full-suite failure that passes in isolation, or a failure in untouched code is not by itself a reason to refuse the push: retry the specific Bazel target (two or three attempts maximum), and if it keeps failing, check whether it reproduces on an unmodified base revision. You MAY push with a still-red, evidence-backed-unattributable target — proceed only with evidence that the failure is pre-existing or environmental (a base reproduction, a passing rerun/isolation run, or a concrete code-path argument showing why your change cannot cause it), recording the target, failure, attempts and evidence in the PR body; merely calling it flaky is not evidence. See \"Declaring your run finished\" below for the matching terminal-outcome rule. If the failure is attributable to your change and you cannot fix it, do NOT push red code. {blocked_action}. Escalating a blocker is correct; pushing a known-broken branch you caused — or hanging on a wedged build — is not.\n"
+        )
+    } else {
+        format!(
+            "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT push red code and do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout, and is never a reason to stop short of a clean result. A command still producing output is slow, not wedged — wait for it. A command producing no output and no progress is wedged: re-run it wrapped in an explicit `timeout` so it returns a real result you can act on, rather than waiting on it or guessing. {blocked_action}. Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
+        )
     };
     format!(
         "\n## Pre-push build gate (Bazel workspace)\n\
@@ -574,9 +620,9 @@ pub(crate) fn bazel_prepush_gate_text(seam_enabled: bool) -> String {
          - `bazel build` every target you changed and `bazel test` their tests. Use `bazel query` to resolve the target labels covering the files you edited if you are unsure which they are.\n\
          - If reverse dependencies are quick to enumerate, build them too so you don't break consumers: `bazel query 'rdeps(//..., <changed-target>)'`, then build the results.\n\
          - If a CI workflow file exists (`.github/workflows/*.yml`), open it and mirror the exact bazel target set it builds/tests (these repos typically run `bazel build //...` or a curated rollup). Run that same command locally so your gate matches what CI will enforce.\n\
-         - Both `bazel build` and `bazel test` must finish clean — exit 0, no build errors, no failing tests — before you push. Clippy/lint is not reported by bazel; it runs at push time via the checkleft guard (and in CI).\n\
+         {clean_bullet}\
          \n\
-         Run every long-running build-class command (Bazel, checkleft, tests, etc.) in the FOREGROUND and read its exit code directly. For a tool that yields a session, FOREGROUND means keep polling that session until it returns `exit_code`; it does not mean issue one invocation and discard its session handle. Do NOT background one with a trailing shell `&` or a backgrounded/asynchronous invocation and then idle in a self-paced wait-loop \"until the gate is green\". If the command wedges (host contention, a hung toolchain), a self-paced wait-loop never terminates and you strand your slot. If you need an upper bound, wrap the command itself in a timeout (e.g. `timeout 1800 bazel test //...`) so it returns control to you on expiry; on a timeout, treat it as a blocker (below), do not retry-and-idle. To diagnose a command, inspect only this invocation's output base and logs; never infer ownership or blockage from global process-name matches.\n\
+         Run every long-running build-class command (Bazel, checkleft, tests, etc.) in the FOREGROUND and read its exit code directly. For a tool that yields a session, FOREGROUND means keep polling that session until it returns `exit_code`; it does not mean issue one invocation and discard its session handle. Do NOT background one with a trailing shell `&` or a backgrounded/asynchronous invocation and then idle in a self-paced wait-loop \"until the gate is green\". If the command wedges (host contention, a hung toolchain), a self-paced wait-loop never terminates and you strand your slot. {timeout_clause} To diagnose a command, inspect only this invocation's output base and logs; never infer ownership or blockage from global process-name matches.\n\
          \n\
          {failure_sentence}"
     )
@@ -611,9 +657,9 @@ fn bazel_conflict_resolution_gate_block(workspace_path: &Path, seam_enabled: boo
 /// and [`bazel_prepush_gate_text`] for what `seam_enabled` selects.
 pub(crate) fn bazel_conflict_resolution_gate_text(seam_enabled: bool) -> String {
     let failure_sentence = if seam_enabled {
-        "If `bazel build` fails (the merge does not compile) and you cannot make it compile, do NOT push. Deciding on your own that the run has gone on long enough is not a build failure, and is never a reason to stop short of a clean build. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; call `\"$BOSS_BIN\" propose blocked --reason \"...\"` naming the failure and stop.\n"
+        "If `bazel build` fails or times out, do NOT push. A successful build is required before delivery. Deciding on your own that the run has gone on long enough is not a build failure, and is never a reason to stop short of a clean build. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; call `\"$BOSS_BIN\" propose blocked --reason \"...\"` naming the failure and stop.\n"
     } else {
-        "If `bazel build` fails (the merge does not compile) and you cannot make it compile, do NOT push. Deciding on your own that the run has gone on long enough is not a build failure, and is never a reason to stop short of a clean build. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; emit a `[blocked] reason=\"...\"` marker naming the failure and stop.\n"
+        "If `bazel build` fails or times out, do NOT push. A successful build is required before delivery. Deciding on your own that the run has gone on long enough is not a build failure, and is never a reason to stop short of a clean build. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; emit a `[blocked] reason=\"...\"` marker naming the failure and stop.\n"
     };
     format!(
         "\n## Pre-push gate for conflict resolution (Bazel workspace) — merge correctness first, then push\n\
@@ -937,11 +983,75 @@ pub(crate) fn worker_escalation_protocol_directive(seam_enabled: bool) -> String
 /// declaring is no shortcut to being left alone: the wording states the
 /// real consequence — held, then asked, then failed visibly, never
 /// quietly successful.
-pub(crate) fn run_done_directive(seam_enabled: bool) -> String {
+///
+/// `worker_signal_seam_enabled` mirrors `worker_signal_proposals_seam`.
+/// Teaching `"$BOSS_BIN" propose blocked` is that flag's job (see
+/// [`worker_escalation_protocol_directive`]); this directive must not
+/// teach the verb when that flag is off, even if `run_done_proposals_seam`
+/// is on — the two flags are independently defaulted off, and a worker
+/// must never be taught a verb the engine won't yet read proposals-first
+/// for. The `propose done` verb itself remains gated only on `seam_enabled`.
+///
+/// `conflict_resolution` is true when this prompt also carries
+/// [`bazel_conflict_resolution_gate_text`]. That gate is an absolute
+/// compile-or-do-not-push stop and never receives the unattributable-failure
+/// exception; the closing paragraph here must not read as overriding it.
+/// The marker fallback (`worker_signal_seam_enabled` off) must also not
+/// claim a `[blocked]` marker records synchronously: that parser runs only
+/// at the Stop boundary (`completion::stop`), never from
+/// `finalize_declared_run_done`, so a marker emitted immediately before
+/// this terminal call is lost. The mixed-flag path therefore stores the
+/// blocker in `--summary` instead.
+pub(crate) fn run_done_directive(
+    seam_enabled: bool,
+    worker_signal_seam_enabled: bool,
+    conflict_resolution: bool,
+) -> String {
     if !seam_enabled {
         return String::new();
     }
     let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
+    let (blocked_file, blocked_while_continuing) = if worker_signal_seam_enabled {
+        (
+            format!("File `{boss} propose blocked --reason \"...\"` alongside it (before this call)"),
+            format!("`{boss} propose blocked --reason \"...\"` alone records"),
+        )
+    } else {
+        (
+            "Put the blocker reason in this call's `--summary` (a `[blocked] reason=\"...\"` marker \
+             emitted immediately before this call is never parsed — the marker is Stop-boundary-only)"
+                .to_string(),
+            "a `[blocked] reason=\"...\"` marker is parsed only at the Stop boundary (when the turn \
+             ends without a terminal `propose done`) and records"
+                .to_string(),
+        )
+    };
+    let gate_exception = if conflict_resolution {
+        "The merge-correctness pre-push gate is not covered by any unattributable-failure exception. \
+         If `bazel build` fails or times out, do NOT push: the merged code MUST COMPILE. \
+         A still-red compile is a reason to stop without delivery, not a reason to push, even if the \
+         failure looks pre-existing or environmental. Only the full test suite is deferred to CI; \
+         a successful `bazel build` is a precondition for this push. Bazel \
+         remains the source of truth: do not bypass or weaken checks, and still stop for required \
+         approval to relax a check, missing credentials or authorization, genuine instruction \
+         conflicts or contradictory briefs."
+            .to_string()
+    } else {
+        "For validation failures, this is a narrow exception to the earlier gate/stop rules, including \
+         the pre-push Bazel gate: a failing gate warrants stopping without delivery only when it is \
+         reproducible AND attributable to your change — fix it; if attribution remains unresolved, \
+         the failure still stands. A timeout, a full-suite failure that passes in isolation, or a \
+         failure in untouched code is not by itself a reason to stop or to refuse the push: retry the \
+         specific Bazel target (two or three attempts maximum), and if it keeps failing, check whether \
+         it reproduces on an unmodified base revision. You MAY push despite a still-red target, and \
+         declare `delivered`, only with evidence that the failure is pre-existing or environmental (a \
+         base reproduction, a passing rerun/isolation run, or a concrete code-path argument showing why \
+         your change cannot cause it), recording the target, failure, attempts and evidence in the \
+         PR body; merely calling it flaky is not evidence. Bazel remains the source of truth: do not \
+         bypass or weaken checks, and still stop for required approval to relax a check, missing \
+         credentials or authorization, genuine instruction conflicts or contradictory briefs."
+            .to_string()
+    };
     format!(
         "\n## Declaring your run finished\n\n\
      When your run is over, say so — as the ABSOLUTE LAST thing you do:\n\n\
@@ -964,9 +1074,12 @@ pub(crate) fn run_done_directive(seam_enabled: bool) -> String {
      the execution, releases its resources, and records the explanation on the task; it does not \
      park a live worker or automatically retry the same attempt. Fix recoverable failures first. \
      Never relax a repository check without approval. Include the exact failed command, missing \
-     credential, or decision needed in the summary. File `{boss} propose blocked --reason \"...\"` \
-     alongside it (before this call) so the blocker itself is recorded, not just the fact that you \
-     stopped.\n\n\
+     credential, or decision needed in the summary. {blocked_file} so the blocker itself is \
+     recorded, not just the fact that you stopped.\n\n\
+     {gate_exception}\n\n\
+     To flag a concern while continuing, {blocked_while_continuing} the blocker and pauses the \
+     nudge loop; it does NOT end the run. Only `{boss} propose done --outcome blocked` ends the \
+     run, releases the slot and lease, and parks the row for a human.\n\n\
      If you simply stop without declaring, you are not left alone: the engine holds the run open \
      while it can see you working, then asks you once whether you are finished, then fails the attempt \
      with a visible diagnostic. That is worse for you and for the human than \
@@ -1345,12 +1458,17 @@ fn compose_revision_directive(
     conflict_attempt: Option<&ConflictResolution>,
     ci_attempt: Option<&CiRemediation>,
     merge_order_preservation: &[String],
-    // (recovered_work, worker_signal_proposals_seam_enabled, deferred_scope_proposals_seam_enabled)
+    // (recovered_work, worker_signal_proposals_seam_enabled,
+    //  deferred_scope_proposals_seam_enabled, run_done_proposals_seam_enabled)
     // — bundled to keep the parameter count under clippy::too_many_arguments.
-    recovery_and_proposals: (bool, bool, bool),
+    recovery_and_proposals: (bool, bool, bool, bool),
 ) -> String {
-    let (recovered_work, worker_signal_proposals_seam_enabled, deferred_scope_proposals_seam_enabled) =
-        recovery_and_proposals;
+    let (
+        recovered_work,
+        worker_signal_proposals_seam_enabled,
+        deferred_scope_proposals_seam_enabled,
+        run_done_proposals_seam_enabled,
+    ) = recovery_and_proposals;
     let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     let description = match work_item {
         WorkItem::Task(task) | WorkItem::Chore(task) => task.description.trim().to_owned(),
@@ -1387,7 +1505,11 @@ fn compose_revision_directive(
     let prepush_gate = if is_conflict_resolution {
         bazel_conflict_resolution_gate_block(workspace_path, worker_signal_proposals_seam_enabled)
     } else {
-        bazel_prepush_gate_block(workspace_path, worker_signal_proposals_seam_enabled)
+        bazel_prepush_gate_block(
+            workspace_path,
+            worker_signal_proposals_seam_enabled,
+            run_done_proposals_seam_enabled,
+        )
     };
     if let Some(gate) = prepush_gate {
         out.push_str(&gate);
