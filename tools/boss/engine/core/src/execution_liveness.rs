@@ -38,9 +38,9 @@ use crate::work::WorkDb;
 /// pane ever reporting a shell pid before the pane is presumed to have never
 /// attached (a wedged spawn that stalled before `pane_spawned`).
 ///
-/// A healthy local worker reports its pid (`UpdateWorkerShellPid`) within
-/// seconds of the pane surface attaching — the whole pre-run dispatch
-/// (lease/repo-ensure/positioning) plus surface init is comfortably under a
+/// A healthy local worker's tmux shell pid is recorded by `spawn_flow.rs`
+/// at spawn — the whole pre-run dispatch
+/// (lease/repo-ensure/positioning) plus tmux startup is comfortably under a
 /// minute. 300 s is an order of magnitude beyond that, so a probe on an
 /// execution this old with NO recorded pid is positive evidence the pane
 /// never came up, not a race against a slow spawn. Deliberately far below the

@@ -4,8 +4,8 @@
 //!
 //! ## The incident this guards against
 //!
-//! `SpawnWorkerPane` can return `pane_spawned/ok` (the app accepted the
-//! slot and started asynchronously creating a libghostty surface) while
+//! Historically, app-owned spawning could return `pane_spawned/ok`
+//! before asynchronous libghostty surface creation completed, while
 //! no `claude` session — and in the worst case no shell at all — ever
 //! actually comes up. Three occurrences on the same slot within about
 //! 90 minutes on 2026-07-03/04 showed the pattern: `bossctl agents

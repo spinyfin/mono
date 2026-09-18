@@ -346,7 +346,7 @@ pub(super) struct FakeExecutionRunner {
     pub(super) pending: bool,
     /// If `Some`, the runner reports this slot id back to the
     /// coordinator in the `RunOutcome`, simulating a successful
-    /// `SpawnWorkerPane` round-trip. Used to verify that the
+    /// tmux worker spawn. Used to verify that the
     /// coordinator stamps the slot-based agent_id onto the run
     /// record.
     pub(super) slot_id: Option<u8>,
@@ -362,14 +362,9 @@ pub(super) struct FakeExecutionRunner {
     /// `RunWaitState::CancelledDuringSpawn`. The coordinator must
     /// then release the deferred lease and skip completion recording.
     pub(super) cancelled_during_spawn: bool,
-    /// When `true`, simulate a slow-ack provisional spawn: the real
-    /// `PaneSpawnRunner` converts a `SpawnWorkerPane` ack timeout into
-    /// a provisional (unverified) spawn — the pane may be live, so the
-    /// run is tracked in `waiting_human` with its slot retained and the
-    /// lease is NOT released. The fake returns that same outcome so the
-    /// coordinator-side contract (no release, no duplicate dispatch,
-    /// still tracked) can be asserted. The Timeout→provisional
-    /// conversion itself is unit-tested in `spawn_flow`.
+    /// Simulate a provisional spawn whose process state is not yet verified.
+    /// The coordinator retains the slot and lease while tracking the run in
+    /// waiting_human, avoiding duplicate dispatch while reconciliation runs.
     pub(super) ack_timed_out: bool,
     /// Handle used by the `cancelled_during_spawn` path to cancel the
     /// row before returning. `None` for the default fake.
@@ -447,7 +442,7 @@ impl ExecutionRunner for FakeExecutionRunner {
         }
 
         if self.ack_timed_out {
-            // Mirror the real PaneSpawnRunner after a SpawnWorkerPane
+            // Model a provisional spawn after a worker-start
             // ack timeout: a PROVISIONAL spawn. The pane may be live,
             // so the run is tracked live (`running`) with its slot
             // retained (slot_id = Some ⇒ the coordinator defers the
@@ -455,7 +450,7 @@ impl ExecutionRunner for FakeExecutionRunner {
             // lease). No attention item — this is not a failure.
             return Ok(RunOutcome {
                 wait_state: RunWaitState::WorkerPaneAlive,
-                result_summary: Some("provisional spawn: SpawnWorkerPane ack timed out".to_owned()),
+                result_summary: Some("provisional spawn: worker startup unverified".to_owned()),
                 attention: None,
                 slot_id: Some(1),
                 spawn_config: None,

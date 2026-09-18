@@ -62,7 +62,7 @@ impl ExecutionCoordinator {
         // down by `ServerState::release_worker_pane` (completion, force
         // release, or engine shutdown). Releasing it here would let a
         // concurrent dispatch re-claim the same slot while the pane
-        // still owns it, and the app would reject `SpawnWorkerPane`
+        // still owns it, and the app would reject `AttachWorkerPane`
         // with `SlotBusy`. Non-pane runs (test fakes, future
         // ACP-style runners) leave `slot_id = None` and still need
         // the inline release.
@@ -284,8 +284,7 @@ impl ExecutionCoordinator {
                 //
                 // `err` here is already a full anyhow chain naming the failing
                 // spawn step (prompt composition, driver provision, permission
-                // config, the initial-input script, or the `SpawnWorkerPane`
-                // send).
+                // config, the initial-input script, or tmux session creation).
                 let err_detail = format!("{err:#}");
                 let slot_id = slot_id_from_worker_id(&worker_id);
                 // A `SlotBusy` rejection is a benign, self-healing engine/app

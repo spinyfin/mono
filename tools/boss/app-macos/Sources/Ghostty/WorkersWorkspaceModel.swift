@@ -188,7 +188,10 @@ final class WorkersWorkspaceModel: ObservableObject {
             slots[index].taskTitle = request.taskTitle
         }
 
-        return .success(slotId: slotId, shellPid: 0)
+        SpawnDiagnosticsLog.shared.spawnRequested(
+            runId: request.runId, slotId: slotId, workspacePath: request.workspacePath
+        )
+        return .success(slotId: slotId)
     }
 
     /// Detach a tmux viewer surface. The worker process is owned by the

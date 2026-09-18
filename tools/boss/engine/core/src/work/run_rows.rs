@@ -693,8 +693,8 @@ impl WorkDb {
     /// rows between the two writes.
     ///
     /// Writing `shell_pid` here is essential: tmux owns the worker shell, so
-    /// the app's `UpdateWorkerShellPid` callback is not authoritative for this
-    /// hosting path. The liveness reconcilers read `shell_pid`, while
+    /// app viewer pids are not authoritative worker-liveness evidence.
+    /// The liveness reconcilers read `shell_pid`, while
     /// `tmux_pane_pid` retains the most recent tmux observation for comparison
     /// and token-verified teardown diagnostics.
     ///

@@ -146,8 +146,8 @@ pub(crate) fn migrate_work_runs_host_columns(conn: &Connection) -> Result<()> {
 
 /// Add the `shell_pid` column to `work_runs` on databases created before the
 /// durable-pane-liveness change. It holds the real OS shell pid of a *local*
-/// libghostty worker pane, reported by the macOS app via the
-/// `UpdateWorkerShellPid` RPC once the surface attaches. Unlike `remote_pid`
+/// tmux worker pane, recorded by `spawn_flow.rs` when tmux creates the
+/// detached worker session. Unlike `remote_pid`
 /// (the SSH-wrapper handshake pid) this is a local pid the engine can probe
 /// with `kill(pid, 0)` across a restart — the restart-robust signal
 /// [`crate::dead_pane_sweep`] uses to detect a pane that died with its host

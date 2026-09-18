@@ -23,6 +23,20 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
         XCTAssertTrue(session?.launchSpec.env.isEmpty ?? false)
     }
 
+    func testDetachUnknownSlotReturnsUnknownSlot() {
+        let result = WorkersWorkspaceModel().detachWorkerPane(slotId: 99)
+        guard case .failure(.unknownSlot) = result else {
+            return XCTFail("expected unknownSlot, got \(result)")
+        }
+    }
+
+    func testDetachIdleSlotReturnsUnknownSlot() {
+        let result = WorkersWorkspaceModel().detachWorkerPane(slotId: 1)
+        guard case .failure(.unknownSlot) = result else {
+            return XCTFail("expected unknownSlot, got \(result)")
+        }
+    }
+
     func testDetachRemovesTmuxViewerSurface() {
         let model = WorkersWorkspaceModel()
         _ = model.attachWorkerPane(EngineAttachRequest(
@@ -208,8 +222,8 @@ final class GhosttyTerminalHostSurfaceFailureDiagnosticTests: XCTestCase {
     }
 
     func testSurfaceFailureReasonNamesTheDisplayStateActuallyObserved() {
-        // The reason string is the human-facing explanation the engine
-        // stores as the orphan reason. A reason that names display
+        // The reason string is the human-facing explanation the app
+        // stores in its durable viewer attachment diagnostics. A reason that names display
         // availability whatever the real display state is makes the
         // recoverable #800 condition and a genuine non-transient rejection
         // (env pollution, bad cwd, version mismatch) indistinguishable in
@@ -276,7 +290,7 @@ final class WorkersWorkspaceModelFocusTests: XCTestCase {
         // All slots start without a session attached. Focusing an
         // idle slot should fail the same way as an unknown one — the
         // app has nothing to raise. Mirrors the
-        // `release_worker_pane` semantics for idle slots so the engine
+        // `detachWorkerPane` semantics for idle slots so the engine
         // can treat both cases the same way.
         let result = model.focusWorkerPane(slotId: 1)
         guard case .failure(.unknownSlot) = result else {
