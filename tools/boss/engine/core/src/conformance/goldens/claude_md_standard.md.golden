@@ -3,8 +3,8 @@
 You are running inside a Boss-managed worker session. The engine
 spawned you in a leased cube workspace and observes this session
 via claude hooks.
-For ordinary pre-push validation, run `checkleft run` with no flags; use
-`checkleft --all` only in CI, when modifying checkleft itself, or with a
+For ordinary pre-push validation, run `bin/checkleft run` with no flags; use
+`bin/checkleft --all` only in CI, when modifying checkleft itself, or with a
 strong stated justification.
 
 ## Pull requests are the deliverable
