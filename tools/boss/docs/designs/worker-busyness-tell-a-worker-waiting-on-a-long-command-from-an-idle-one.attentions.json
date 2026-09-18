@@ -1,0 +1,42 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "Keep the foreground mandate in the worker prompt unchanged until `boss run` and the busyness verdict have landed (entries 6, 8, 9)? The design recommends yes — relaxing it first trades silent gate-blindness for silent reaping.",
+    "anchor": "chosen-approach"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Enforcement layer 3 is the only layer that removes the payoff from sidestepping the wrapper rather than obstructing the act, and the only one that holds uniformly across drivers (it needs no hook surface). v1 ships layers 0, 1, 2 and 4 regardless. Does layer 3 — refusing a worker's 'checks passed' claim that cites no obligation with an `exited 0` verdict — come into v1?",
+    "choices": [
+      "Keep it deferred as entry 16 (design's recommendation) — ship detection first, let entry 12's adoption data inform the decision, accept that a worker can meanwhile make an unverifiable claim",
+      "Pull entry 16 into v1 — a worker claim resting on a command Boss never observed should never have been cashable, and the narrow version already ships for Codex unobserved commands",
+      "Pull it in narrowly — apply claim refusal only where an unwrapped build-class command was actually detected (entry 12), rather than requiring a cited handle from every worker"
+    ],
+    "anchor": "enforcement-what-stops-a-worker-sidestepping-the-wrapper"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "The interception guard (entry 11) gives real prevention on Claude. On Codex, the two routes a `Bash`-matcher guard cannot reach — `write_stdin` and `mcp__*` app tools — are already closed by the shipped, always-on `codex_tool_surface_guard` (`matcher = \".*\"`), independent of entry 11. What remains on Codex is narrower: that guard's interactive-interpreter denylist is a maintained list, not a structural guarantee (a determined agent could find an unlisted interactive stdin consumer), and Codex's `ToolUseInterception` is deny-only, so entry 11's own guard can block a bare build-class command but never silently rewrite it into the wrapped form. How should entry 11's guard be scoped on Codex?",
+    "choices": [
+      "Install it on Codex, and state the enumerable-list residual in the prompt rather than asserting complete coverage (design's recommendation) — it closes the accidental case, which is the common one, on top of the platform-level closures already shipped",
+      "Install it on Codex silently — partial prevention beats none and the residual is an engine-side concern",
+      "Do not install it on Codex — an enumerable list that reads as a structural guarantee is how the previous false assertion happened; rely on layers 3 and 4 there"
+    ],
+    "anchor": "enforcement-what-stops-a-worker-sidestepping-the-wrapper"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Entry 9 deletes `background_children` outright. If entry 1's measurement confirms the probe suppresses every nudge for 45 minutes, what should happen to the delegated-subagent coverage it nominally provided?",
+    "choices": [
+      "Delete it and defer the subagent case (design's recommendation) — the coverage was never real",
+      "Delete it and pull deferred entry 13 into v1 so there is no gap at any point",
+      "Keep the probe behind a flag until entry 13 lands"
+    ],
+    "anchor": "risks-open-questions"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Does this project own the `boss run` wrapper (entry 6), with the separately-filed Codex exit-code work consuming it rather than building its own? If not, entry 6 becomes a dependency on that project instead.",
+    "anchor": "risks-open-questions"
+  }
+]
