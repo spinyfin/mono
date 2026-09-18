@@ -43,35 +43,20 @@ pub(crate) fn lock_shared_settings_dir() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// RAII guard that points `$HOME` at a throwaway temp dir for the
-/// duration of a test. `write_workspace_files` now calls
-/// `pre_trust_workspace`, which writes `~/.claude.json`; without this
-/// redirection a test run would pollute the developer's real
-/// `~/.claude.json` with stale temp-dir project entries. `$HOME` is
-/// process-global, so hold this only while `lock_shared_settings_dir()`
-/// is held (every `write_workspace_files` test does). Restores the
-/// prior `$HOME` on drop.
-pub(crate) struct HomeGuard {
+/// Private trust store for synchronous workspace setup on the current thread.
+/// Other tests, including pane provisioning, cannot resolve this destination.
+pub(crate) struct ClaudeConfigGuard {
+    _config: crate::driver::test_support::ClaudeConfigOverride,
     _home: TempDir,
-    original: Option<std::ffi::OsString>,
 }
 
-impl HomeGuard {
+impl ClaudeConfigGuard {
     pub(crate) fn new() -> Self {
         let home = TempDir::new().unwrap();
-        let original = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", home.path());
-        }
-        Self { _home: home, original }
-    }
-}
-
-impl Drop for HomeGuard {
-    fn drop(&mut self) {
-        match self.original.take() {
-            Some(value) => unsafe { std::env::set_var("HOME", value) },
-            None => unsafe { std::env::remove_var("HOME") },
+        let config = crate::driver::test_support::claude_config_override(&home.path().join(".claude.json"));
+        Self {
+            _config: config,
+            _home: home,
         }
     }
 }

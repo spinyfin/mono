@@ -77,7 +77,7 @@ fn path_guard_script_has_the_load_bearing_logic() {
 #[test]
 fn write_workspace_files_writes_path_guard_script_outside_workspace() {
     let _shared = lock_shared_settings_dir();
-    let _home = HomeGuard::new();
+    let _home = ClaudeConfigGuard::new();
     let dir = TempDir::new().unwrap();
     let input = WorkerSetupInput {
         run_id: "run-guard".into(),

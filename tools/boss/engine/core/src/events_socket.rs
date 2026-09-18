@@ -1500,6 +1500,9 @@ mod tests {
             error: "database is locked".to_owned(),
         };
         retry_connection(&mut stream, &err).await;
+        // Production drops the connection after its best-effort notice. Close
+        // this fixture's owned socket too before the peer waits for EOF.
+        drop(stream);
         let response = client.await.unwrap();
 
         let response = String::from_utf8(response).unwrap();
