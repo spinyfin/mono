@@ -87,6 +87,8 @@ pub struct PrReviewGuideAttempt {
     pub created_at: String,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
+    /// Lossless provider usage snapshots collected through the execution hook path.
+    pub provider_usage_json: Option<String>,
 }
 
 /// One immutable, validated guide version. Never mutated after insertion —
@@ -173,6 +175,8 @@ pub(crate) fn migrate_pr_review_guide_job_tables(conn: &Connection) -> Result<()
             ON pr_review_guide_attempts(comparison_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS pr_review_guide_attempts_series_idx
             ON pr_review_guide_attempts(series_id, request_epoch DESC);
+        CREATE INDEX IF NOT EXISTS pr_review_guide_attempts_execution_idx
+            ON pr_review_guide_attempts(execution_id) WHERE execution_id IS NOT NULL;
         CREATE UNIQUE INDEX IF NOT EXISTS pr_review_guide_attempts_idempotency_idx
             ON pr_review_guide_attempts(series_id, idempotency_token)
             WHERE idempotency_token IS NOT NULL;
@@ -190,6 +194,12 @@ pub(crate) fn migrate_pr_review_guide_job_tables(conn: &Connection) -> Result<()
         CREATE INDEX IF NOT EXISTS pr_review_guide_versions_series_idx
             ON pr_review_guide_versions(series_id, generated_at DESC);",
     )?;
+    if !table_has_column(conn, "pr_review_guide_attempts", "provider_usage_json")? {
+        conn.execute(
+            "ALTER TABLE pr_review_guide_attempts ADD COLUMN provider_usage_json TEXT",
+            [],
+        )?;
+    }
     // Additive lifecycle columns on the series table `review_guide_sources.rs`
     // owns the CREATE for. `selected_comparison_id` (already present) IS the
     // series' desired-comparison pointer; these three columns are the only
@@ -530,8 +540,8 @@ impl WorkDb {
         self.terminate_pr_review_guide_attempt(attempt_id, PrReviewGuideAttemptStatus::Failed, Some(error), true)
     }
 
-    /// Record that generation was cancelled (operator cancel, a newer
-    /// comparison admitted, or an explicit retry replacing this attempt).
+    /// Record cancellation from terminal-execution reconciliation and the
+    /// execution cancel/orphan hooks. Admission supersedes attempts separately.
     /// Same selected-comparison fence as [`Self::fail_pr_review_guide_attempt`]:
     /// a stale cancel leaves card lifecycle untouched.
     pub fn cancel_pr_review_guide_attempt(&self, attempt_id: &str, reason: &str) -> Result<()> {
@@ -635,27 +645,6 @@ impl WorkDb {
             WorkItem::Task(task) | WorkItem::Chore(task) => Ok(task.repo_remote_url),
             _ => Ok(None),
         }
-    }
-
-    /// Cancel every non-terminal attempt for `series_id` (and its bound
-    /// execution, if any). Used before admitting a newer comparison or an
-    /// explicit retry so two Astra-high jobs cannot run for one PR at once.
-    #[cfg(test)]
-    pub(crate) fn cancel_live_pr_review_guide_attempts_for_series(
-        &self,
-        series_id: &str,
-        reason: &str,
-    ) -> Result<Vec<PrReviewGuideAttempt>> {
-        let live = self.live_pr_review_guide_attempts_for_series(series_id)?;
-        for attempt in &live {
-            self.cancel_pr_review_guide_attempt(&attempt.id, reason)?;
-            if let Some(execution_id) = &attempt.execution_id
-                && !self.get_execution(execution_id)?.status.is_terminal()
-            {
-                self.cancel_execution(execution_id)?;
-            }
-        }
-        Ok(live)
     }
 
     /// Finish a non-terminal attempt whose bound execution has reached a
@@ -885,7 +874,7 @@ fn classified_review_guide_terminal_reason(status: &ExecutionStatus) -> String {
 }
 
 const PR_REVIEW_GUIDE_ATTEMPT_COLUMNS: &str = "id, series_id, comparison_id, request_epoch, ordinal, execution_id, \
-     status, prompt_version, driver, model, effort_value, error, retries, idempotency_token, created_at, started_at, finished_at";
+     status, prompt_version, driver, model, effort_value, error, retries, idempotency_token, created_at, started_at, finished_at, provider_usage_json";
 
 fn query_pr_review_guide_attempt(conn: &Connection, attempt_id: &str) -> Result<Option<PrReviewGuideAttempt>> {
     conn.query_row(
@@ -916,6 +905,7 @@ fn map_pr_review_guide_attempt(row: &Row<'_>) -> rusqlite::Result<PrReviewGuideA
         created_at: row.get(14)?,
         started_at: row.get(15)?,
         finished_at: row.get(16)?,
+        provider_usage_json: row.get(17)?,
     })
 }
 

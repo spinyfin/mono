@@ -393,9 +393,12 @@ fn enqueue_review_guide_generation(
     }
     match work_db.repo_remote_url_for_root(&capture.root_task_id) {
         Ok(Some(_)) => {}
-        Ok(None) => return,
+        Ok(None) => {
+            tracing::warn!(root_task_id = %capture.root_task_id, "review-guide generation: root task has no repository; skipping enqueue");
+            return;
+        }
         Err(error) => {
-            tracing::warn!(?error, "review-guide generation: could not resolve repository");
+            tracing::warn!(root_task_id = %capture.root_task_id, ?error, "review-guide generation: could not resolve repository; skipping enqueue");
             return;
         }
     }

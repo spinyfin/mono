@@ -284,11 +284,19 @@ impl WorkDb {
         snapshot: crate::run_cost::RunCostSnapshot,
     ) -> Result<bool> {
         let conn = self.connect()?;
+        // Attempts retain usage even if they fail, are cancelled, or have no
+        // work-run row yet. The execution binding keeps retries independent.
+        let attempt_updated = conn.execute(
+            "UPDATE pr_review_guide_attempts
+             SET provider_usage_json = CASE WHEN ?3 THEN ?2 ELSE COALESCE(?2, provider_usage_json) END
+             WHERE execution_id = ?1",
+            params![execution_id, snapshot.provider_usage_json, snapshot.full_replacement],
+        )?;
         // Same target selection as `set_run_transcript_path_if_unset`: cost
         // and path ride the same hook seam, so they must land on the same
         // run row (the agent-session run, not a pre-start failure sibling).
         let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
-            return Ok(false);
+            return Ok(attempt_updated > 0);
         };
         let updated = conn.execute(
             "UPDATE work_runs
@@ -336,7 +344,7 @@ impl WorkDb {
                 snapshot.full_replacement,
             ],
         )?;
-        Ok(updated > 0)
+        Ok(updated > 0 || attempt_updated > 0)
     }
 
     /// Read-side companion to [`set_run_transcript_path_if_unset`].

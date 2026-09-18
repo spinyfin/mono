@@ -260,7 +260,7 @@ fn reconcile_finishes_a_running_attempt_whose_execution_is_already_terminal() {
 }
 
 #[test]
-fn cancel_live_attempts_enforces_one_active_attempt_per_series() {
+fn admission_enforces_one_active_attempt_per_series() {
     let (_dir, db) = open_db();
     let (root, series_id, _first_comparison) = seeded_series(&db);
     let first = db.retry_pr_review_guide(&root, None, "review-guide-v1").unwrap();
@@ -271,11 +271,14 @@ fn cancel_live_attempts_enforces_one_active_attempt_per_series() {
 
     db.persist_pr_review_guide_source_capture(&root, 2, PrSourceCaptureTrigger::Poller, &packet("base2", "head2"))
         .unwrap();
-    let cancelled = db
-        .cancel_live_pr_review_guide_attempts_for_series(&series_id, "superseded by a newer comparison")
-        .unwrap();
-    assert_eq!(cancelled.len(), 1);
-    assert_eq!(cancelled[0].id, first.id);
+    let RetryReviewGuideOutcome::Created(replacement) =
+        db.retry_pr_review_guide(&root, None, "review-guide-v1").unwrap()
+    else {
+        panic!("must create replacement")
+    };
+    let live = db.live_pr_review_guide_attempts_for_series(&series_id).unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].id, replacement.id);
 
     let status: String = db
         .connect()
@@ -288,7 +291,7 @@ fn cancel_live_attempts_enforces_one_active_attempt_per_series() {
         .unwrap();
     assert_eq!(
         status, "superseded",
-        "the first comparison is no longer selected, so cancel records superseded not failed"
+        "the first comparison is no longer selected, so admission records superseded not failed"
     );
     let exec = db.get_execution(first.execution_id.as_deref().unwrap()).unwrap();
     assert_eq!(exec.status, ExecutionStatus::Cancelled);
@@ -592,4 +595,63 @@ fn migration_retires_legacy_duplicates_and_enforces_one_live_series() {
         "INSERT INTO pr_review_guide_attempts (id, series_id, comparison_id, request_epoch, ordinal, status, prompt_version, created_at)
          VALUES ('duplicate', ?1, ?2, 3, 3, 'queued', 'test', datetime('now'))",
         params![series, comparison]).is_err());
+}
+
+#[tokio::test]
+async fn hook_usage_is_lossless_durable_and_isolated_between_attempts() {
+    let (dir, db) = open_db();
+    let (root, _, _) = seeded_series(&db);
+    let RetryReviewGuideOutcome::Created(first) = db.retry_pr_review_guide(&root, None, "test").unwrap() else {
+        panic!("must create");
+    };
+    let path = dir.path().join("usage.jsonl");
+    let usage = serde_json::json!({
+        "input_tokens": 100, "cached_input_tokens": 80, "output_tokens": 20,
+        "reasoning_output_tokens": 12, "future_category": {"tokens": 3}
+    });
+    let record = serde_json::json!({"type": "event_msg", "payload": {
+        "type": "token_count", "info": {"total_token_usage": usage}
+    }});
+    std::fs::write(&path, format!("{record}\n")).unwrap();
+    let capture = crate::run_cost::RunCostCapture::new();
+    let execution_id = first.execution_id.as_deref().unwrap();
+    capture
+        .capture_and_persist(&db, execution_id, &path, None)
+        .await
+        .unwrap();
+    // Repeated hooks replace cumulative observations; they do not add totals.
+    capture
+        .capture_and_persist(&db, execution_id, &path, None)
+        .await
+        .unwrap();
+    let read_usage = || {
+        let attempt = db.pr_review_guide_attempt_for_execution(execution_id).unwrap().unwrap();
+        serde_json::from_str::<serde_json::Value>(&attempt.provider_usage_json.unwrap()).unwrap()
+    };
+    let stored = read_usage();
+    assert_eq!(stored.as_object().unwrap().len(), 1);
+    assert_eq!(stored[format!("codex:{}", path.display())]["total_token_usage"], usage);
+    assert!(
+        stored[format!("codex:{}", path.display())]["total_token_usage"]
+            .get("cache_write_input_tokens")
+            .is_none()
+    );
+    let RetryReviewGuideOutcome::Created(second) = db.retry_pr_review_guide(&root, None, "test").unwrap() else {
+        panic!("must create retry");
+    };
+    assert!(second.provider_usage_json.is_none());
+    assert_eq!(read_usage(), stored, "superseded attempts retain usage");
+    // Truncating the transcript clears obsolete usage, including on a terminal attempt.
+    std::fs::write(&path, "").unwrap();
+    capture
+        .capture_and_persist(&db, execution_id, &path, None)
+        .await
+        .unwrap();
+    assert!(
+        db.pr_review_guide_attempt_for_execution(execution_id)
+            .unwrap()
+            .unwrap()
+            .provider_usage_json
+            .is_none()
+    );
 }
