@@ -667,6 +667,30 @@ final class ChatViewModel: ObservableObject {
     var pendingAsyncViewerTitle: String = ""
     var pendingAsyncViewerArtifact: CommentArtifactRef?
 
+    /// In-flight engine fetch for the async markdown viewer (review-guide
+    /// affordance). `applyReviewGuideContent` updates the window only when
+    /// the reply's version id matches this — the response-identity guard
+    /// for a late reply racing a since-abandoned open. `nil` whenever the
+    /// window is showing something else (a design doc, a task description).
+    var pendingReviewGuideVersionId: String?
+    /// The root task id the pending/open review-guide viewer belongs to —
+    /// carried alongside `pendingReviewGuideVersionId` so the merge control
+    /// and header metadata can resolve the live task without threading it
+    /// through the loaded-content payload.
+    var pendingReviewGuideRootTaskId: String?
+    /// Envelope request id of the in-flight `get_review_guide_content`
+    /// send. `WorkError` applies to this viewer only when it matches, so
+    /// a merge/CI failure (or an abandoned guide's error after the user
+    /// switched) cannot paint into the markdown window. Cleared on
+    /// navigate-away, on a matching content reply, and on a matching
+    /// failure. `nil` when nothing was sent (`sendLine` returned nil).
+    var pendingReviewGuideRequestId: String?
+
+    /// Root task ids for which `retry_review_guide` has been sent but
+    /// `review_guide_retry_queued` (or `work_error`) has not yet arrived.
+    /// Guards against a duplicate tap on the card's Retry affordance.
+    var retryingReviewGuideRootTaskIDs: Set<String> = []
+
     /// Indirection for opening the review-terminal window. Installed by
     /// [[ContentView]] using `@Environment(\.openWindow)`. Called on
     /// click (before the engine responds) so the window opens immediately
@@ -1181,6 +1205,23 @@ final class ChatViewModel: ObservableObject {
     /// expires unseen — acceptable for now since the section defaults to
     /// expanded. Set and auto-dismissed from `ChatViewModel+EventHandling`.
     @Published var mergeFeedbackNotice: MergeFeedbackNotice?
+
+    /// Per-task Merge When Ready failure message, keyed by work item id.
+    /// Populated from the `.workError` arm for every task whose
+    /// `merge_when_ready` request was in flight when the failure arrived
+    /// (the generic reply carries no request id to disambiguate further —
+    /// same limitation `mergeFeedbackNotice`'s doc comment describes for
+    /// success). Read by the review-guide viewer header, which — unlike the
+    /// board card — has no other surface for `workErrorMessage`'s modal
+    /// alert. Cleared on a fresh `mergeWhenReady(for:)` attempt, on
+    /// `.mergeWhenReadyAccepted`, and via `clearMergeError(for:)`.
+    @Published var mergeErrorNoticesByTaskID: [String: String] = [:]
+
+    /// Dismiss a per-task merge failure notice set via
+    /// `mergeErrorNoticesByTaskID`.
+    func clearMergeError(for taskID: String) {
+        mergeErrorNoticesByTaskID.removeValue(forKey: taskID)
+    }
 
     // MARK: - Optimistic kanban moves
 

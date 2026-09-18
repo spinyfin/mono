@@ -946,6 +946,125 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
     Ok(())
 }
 
+/// Resolve every derived `Task::review_guide_*` projection (`lifecycle`,
+/// `readable_version_id`, `selected_comparison_id`, `stale_source`) for
+/// every task/chore that carries a `pr_url`. Only a PR-bearing row can
+/// own a `pr_review_guide_source_series`, and the series is the one whose
+/// `canonical_pr_url` matches that row's current `pr_url` (see
+/// `tools/boss/docs/designs/automatic-pr-review-guides.md`, "Ownership and
+/// invariants"). Replacing the card's PR attaches a different series and
+/// preserves the previous one, so a root-id-only lookup would bind the
+/// retired PR's guide; until the current PR has a series the fields stay
+/// `None`. A revision row's own id is never a series key (the series
+/// belongs to the chain root), so this leaves a revision's fields `None`
+/// even when its root has a guide — matching the design's card placement
+/// (the affordance lives on the root's card, not a revision's). One batched
+/// `IN (...)` query, same shape as [`attach_ai_review_state`]'s verdict
+/// lookup.
+pub(crate) fn attach_review_guide_state(conn: &Connection, tasks: &mut [Task], chores: &mut [Task]) -> Result<()> {
+    let roots: Vec<(String, String)> = tasks
+        .iter()
+        .chain(chores.iter())
+        .filter_map(|task| task.pr_url.as_ref().map(|url| (task.id.clone(), url.clone())))
+        .collect();
+    if roots.is_empty() {
+        return Ok(());
+    }
+    let states = query_review_guide_card_states(conn, &roots)?;
+    for task in tasks.iter_mut().chain(chores.iter_mut()) {
+        if let Some(state) = states.get(&task.id) {
+            task.review_guide_lifecycle = Some(state.lifecycle.clone());
+            task.review_guide_readable_version_id = state.readable_version_id.clone();
+            task.review_guide_selected_comparison_id = state.selected_comparison_id.clone();
+            task.review_guide_stale_source = state.stale_source;
+        }
+    }
+    Ok(())
+}
+
+/// One series' derived card state, as returned by
+/// [`query_review_guide_card_states`].
+struct ReviewGuideCardState {
+    lifecycle: String,
+    readable_version_id: Option<String>,
+    /// Series' current comparison — the viewer's displayed version may lag
+    /// the readable pointer, so the client needs this to derive *displayed*
+    /// staleness rather than reusing `stale_source` (which is about the
+    /// current readable version only).
+    selected_comparison_id: Option<String>,
+    /// `true` when the readable version's own `comparison_id` no longer
+    /// matches the series' current `selected_comparison_id` — i.e. the PR's
+    /// source has actually moved since that version was generated, as
+    /// opposed to a same-comparison retry failure. `None` when there is no
+    /// readable version to compare.
+    stale_source: Option<bool>,
+}
+
+/// Batched `root_task_id -> ReviewGuideCardState` lookup for
+/// [`attach_review_guide_state`]. A free function (not a `WorkDb` method)
+/// so a board/work-tree read can call it on its own already-open connection
+/// rather than opening a second one — matches
+/// `query_latest_informative_review_verdicts`. The `LEFT JOIN` against
+/// `pr_review_guide_versions` resolves the readable version's own
+/// `comparison_id` so staleness can be derived without a second round trip.
+///
+/// `roots` is `(root_task_id, current_pr_url)` — the series must match
+/// both. One series per canonical PR (UNIQUE on `canonical_pr_url`), but
+/// one root may own several series after a PR replacement, so a root-id
+/// lookup without the URL would pick a sibling. Ordering matches
+/// `get_latest_pr_review_guide_source_capture` (`latest_observation_sequence
+/// DESC, id DESC`) so the two resolvers cannot disagree; first row per
+/// root wins.
+fn query_review_guide_card_states(
+    conn: &Connection,
+    roots: &[(String, String)],
+) -> Result<std::collections::HashMap<String, ReviewGuideCardState>> {
+    let placeholders = roots
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("(?{}, ?{})", 2 * i + 1, 2 * i + 2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT s.root_task_id, s.guide_lifecycle, s.readable_version_id,
+                s.selected_comparison_id, v.comparison_id
+         FROM pr_review_guide_source_series s
+         LEFT JOIN pr_review_guide_versions v ON v.id = s.readable_version_id
+         WHERE (s.root_task_id, s.canonical_pr_url) IN ({placeholders})
+         ORDER BY s.latest_observation_sequence DESC, s.id DESC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(roots.len() * 2);
+    for (root_task_id, pr_url) in roots {
+        params.push(root_task_id);
+        params.push(pr_url);
+    }
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+        ))
+    })?;
+    let mut result = std::collections::HashMap::new();
+    for row in rows {
+        let (root_task_id, lifecycle, readable_version_id, selected_comparison_id, version_comparison_id) = row?;
+        let stale_source = readable_version_id
+            .is_some()
+            .then(|| selected_comparison_id != version_comparison_id);
+        // DESC order: first row for this root is the active series.
+        result.entry(root_task_id).or_insert(ReviewGuideCardState {
+            lifecycle,
+            readable_version_id,
+            selected_comparison_id,
+            stale_source,
+        });
+    }
+    Ok(result)
+}
+
 /// Populate engine-derived `Task` projection fields for a single row so
 /// `WorkItemUpdated` payloads are complete rather than carrying mapper
 /// defaults. Mirrors the attach_* pipeline `get_work_tree` runs over the
@@ -982,6 +1101,13 @@ pub(crate) fn attach_task_derived_projections(conn: &Connection, task: &mut Task
             "attach_task_derived_projections: has_attachments failed; ignoring"
         );
     }
+    if let Err(err) = attach_review_guide_state(conn, &mut tasks, &mut chores) {
+        tracing::warn!(
+            ?err,
+            task_id = %task.id,
+            "attach_task_derived_projections: review_guide_state failed; ignoring"
+        );
+    }
     if let Some(projected) = tasks.iter().chain(chores.iter()).find(|t| t.id == task.id) {
         copy_derived_projection_fields(task, projected);
     }
@@ -997,6 +1123,10 @@ fn copy_derived_projection_fields(dst: &mut Task, src: &Task) {
     dst.ai_review_state = src.ai_review_state.clone();
     dst.ai_review_findings_revision_id = src.ai_review_findings_revision_id.clone();
     dst.ready_for_review = src.ready_for_review;
+    dst.review_guide_lifecycle = src.review_guide_lifecycle.clone();
+    dst.review_guide_readable_version_id = src.review_guide_readable_version_id.clone();
+    dst.review_guide_selected_comparison_id = src.review_guide_selected_comparison_id.clone();
+    dst.review_guide_stale_source = src.review_guide_stale_source;
 }
 
 fn push_projection_row(task: Task, tasks: &mut Vec<Task>, chores: &mut Vec<Task>) {

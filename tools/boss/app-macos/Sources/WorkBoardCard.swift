@@ -138,6 +138,12 @@ struct WorkBoardCardItem: View {
         let onMergeWhenReady: (() -> Void)? = snapshot.showsMergeWhenReady
             ? { model.mergeWhenReady(for: task) }
             : nil
+        let onOpenReviewGuide: (() -> Void)? = snapshot.reviewGuidePresentation?.showsDocumentButton == true
+            ? { model.openReviewGuide(for: task) }
+            : nil
+        let onRetryReviewGuide: (() -> Void)? = snapshot.reviewGuidePresentation?.showsRetry == true
+            ? { model.retryReviewGuide(for: task) }
+            : nil
         let onRevealAIReviewFindings: (() -> Void)? = snapshot.aiReviewFindingsRevisionId.map { revisionID in
             {
                 switch model.revealWorkCard(revisionID, productID: task.productID) {
@@ -184,6 +190,8 @@ struct WorkBoardCardItem: View {
                     },
                     onOpenTerminal: onOpenTerminal,
                     onMergeWhenReady: onMergeWhenReady,
+                    onOpenReviewGuide: onOpenReviewGuide,
+                    onRetryReviewGuide: onRetryReviewGuide,
                     onOpenAttachments: onOpenAttachments,
                     onRevealAIReviewFindings: onRevealAIReviewFindings,
                     onAcceptDeferredScope: { id in model.acceptDeferredScopeAttention(id: id) },
@@ -387,6 +395,12 @@ struct WorkBoardCardView: View, @MainActor Equatable {
     /// Invoked after the user confirms "Merge When Ready". `nil` hides
     /// the button (also gated by `snapshot.showsMergeWhenReady`).
     var onMergeWhenReady: (() -> Void)? = nil
+    /// Invoked when the user taps the review-guide document button. `nil`
+    /// hides it (also gated by `snapshot.reviewGuidePresentation`).
+    var onOpenReviewGuide: (() -> Void)? = nil
+    /// Invoked when the user taps the review-guide Retry affordance. `nil`
+    /// hides it (also gated by `snapshot.reviewGuidePresentation`).
+    var onRetryReviewGuide: (() -> Void)? = nil
     /// Invoked when the user taps the screenshots affordance. `nil` hides
     /// the button (also gated by `snapshot.showsAttachmentsAffordance`).
     var onOpenAttachments: (() -> Void)? = nil
@@ -437,6 +451,8 @@ struct WorkBoardCardView: View, @MainActor Equatable {
                 onDepBadgeHover: onDepBadgeHover,
                 onOpenTerminal: onOpenTerminal,
                 onMergeWhenReady: onMergeWhenReady,
+                onOpenReviewGuide: onOpenReviewGuide,
+                onRetryReviewGuide: onRetryReviewGuide,
                 onRevealAIReviewFindings: onRevealAIReviewFindings,
                 onAcceptDeferredScope: onAcceptDeferredScope,
                 onCreateTaskFromDeferredScope: onCreateTaskFromDeferredScope

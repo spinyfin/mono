@@ -1461,9 +1461,14 @@ pub enum FrontendEvent {
     ReviewGuideSummary {
         summary: Option<ReviewGuideSummary>,
     },
-    /// Response to [`FrontendRequest::GetReviewGuideContent`]. `None` when
-    /// `version_id` does not resolve to a stored version.
+    /// Response to [`FrontendRequest::GetReviewGuideContent`]. `content` is
+    /// `None` when `version_id` does not resolve to a stored version.
+    /// `version_id` is echoed from the request (even on a `None` result) so
+    /// the client can drop a reply for a version it has since navigated
+    /// away from — its own response-identity guard — rather than
+    /// misapplying a stale "not found" to whatever it is showing now.
     ReviewGuideContent {
+        version_id: String,
         content: Option<ReviewGuideVersion>,
     },
     /// Response to [`FrontendRequest::RetryReviewGuide`]. `already_requested`
@@ -1471,6 +1476,10 @@ pub enum FrontendEvent {
     /// attempt rather than creating a new one — mirrors
     /// [`Self::ProposalSubmitted`]'s `already_submitted`.
     ReviewGuideRetryQueued {
+        /// Echoed from the request so the client can clear its own
+        /// per-task "retry in flight" guard without having to resolve a
+        /// series id back to a root task id itself.
+        root_task_id: String,
         attempt: ReviewGuideAttempt,
         already_requested: bool,
     },

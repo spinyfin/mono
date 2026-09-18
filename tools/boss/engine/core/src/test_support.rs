@@ -22,7 +22,7 @@ use crate::coordinator::{
 };
 use crate::review_guide_capture::SourcePacketCollector;
 use crate::runner::{ExecutionRunner, RunOutcome, RunWaitState};
-use crate::work::{CreateChoreInput, WorkDb, WorkItemPatch};
+use crate::work::{CreateChoreInput, PrSourceCapturePersistOutcome, PrSourceCaptureTrigger, WorkDb, WorkItemPatch};
 use boss_pr_review_sources::SourcePacket;
 use boss_protocol::{
     Automation, AutomationTrigger, CreateAutomationInput, CreateExecutionInput, CreateProductInput, ExecutionKind,
@@ -129,6 +129,44 @@ pub fn create_active_chore(db: &WorkDb, product_id: &str, name: &str) -> String 
     )
     .unwrap();
     chore.id
+}
+
+/// Canonical `SourcePacket` used by review-guide job and projection tests.
+/// Shared so a schema bump or new required field cannot drift between
+/// those modules.
+pub(crate) fn review_guide_source_packet(base: &str, head: &str) -> SourcePacket {
+    SourcePacket {
+        schema_version: 2,
+        canonical_pr_url: "https://github.com/acme/widget/pull/9".to_owned(),
+        pr_number: 9,
+        title: "Fix retry".to_owned(),
+        body: None,
+        base_repository: "acme/widget".to_owned(),
+        head_repository: "acme/widget".to_owned(),
+        observed_base_sha: base.to_owned(),
+        probe_base_sha: None,
+        merge_base_sha: base.to_owned(),
+        head_sha: head.to_owned(),
+        files: Vec::new(),
+        omissions: Vec::new(),
+    }
+}
+
+/// Persist the first source capture for `root` and return
+/// `(series_id, comparison_id)`.
+pub(crate) fn seed_review_guide_series(db: &WorkDb, root: &str) -> (String, String) {
+    let stored = db
+        .persist_pr_review_guide_source_capture(
+            root,
+            1,
+            PrSourceCaptureTrigger::Creation,
+            &review_guide_source_packet("base", "head"),
+        )
+        .unwrap();
+    let PrSourceCapturePersistOutcome::Stored(capture) = stored else {
+        panic!("capture must persist")
+    };
+    (capture.series_id, capture.comparison_id)
 }
 
 /// Create a plain chore named `name` under `product_id` and return it.

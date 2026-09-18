@@ -20,6 +20,10 @@ extension ChatViewModel {
         guard let prURL = task.prURL, !prURL.isEmpty else { return }
         _ = prURL  // consumed by the engine; kept here for the guard above
         guard !mergingWhenReadyIDs.contains(task.id) else { return }
+        // A prior failure banner must not survive a fresh attempt — otherwise
+        // a later accept shows the green notice for five seconds and then
+        // falls through to the stale error for the rest of the session.
+        mergeErrorNoticesByTaskID.removeValue(forKey: task.id)
         mergingWhenReadyIDs.insert(task.id)
         engine.sendMergeWhenReady(workItemID: task.id)
     }

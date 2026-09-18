@@ -94,6 +94,17 @@ extension ChatViewModel {
             // without this, a disconnect mid-request leaves the row
             // permanently disabled since no work_error will ever arrive.
             deferredScopeActionInFlightIDs.removeAll()
+            // Same reasoning for a review-guide retry in flight: no
+            // `review_guide_retry_queued` or `work_error` reply is ever
+            // coming for a request the disconnect killed in transit, so
+            // without this the Retry button stays a permanent no-op for
+            // that task for the rest of the session.
+            retryingReviewGuideRootTaskIDs.removeAll()
+            // A `get_review_guide_content` request in flight when the link
+            // drops can never complete; without this the viewer stays
+            // `.loading` for the rest of the session, so fail it with a
+            // retry that re-opens the pending guide.
+            failLoadingReviewGuideViewer(message: "Connection lost while loading this guide.")
             // Same reasoning for a drag-to-Doing admission check in
             // flight: the socket drop means no `dispatch_admission_evaluated`
             // reply is ever coming, so nothing else would clear
@@ -224,7 +235,17 @@ extension ChatViewModel {
             }
             openingReviewTerminalIDs.removeAll()
             openingLiveWorkspaceTerminalIDs.removeAll()
+            for taskId in mergingWhenReadyIDs {
+                mergeErrorNoticesByTaskID[taskId] = message
+            }
             mergingWhenReadyIDs.removeAll()
+            // Mirror the disconnect path, but only when this WorkError is
+            // the in-flight `get_review_guide_content` envelope — the
+            // generic reply's message is otherwise as likely to belong to
+            // a merge/CI failure as to the guide fetch, and painting it
+            // into the markdown window would misattribute it.
+            failLoadingReviewGuideViewerIfRequestMatches(message: message, requestId: requestId)
+            retryingReviewGuideRootTaskIDs.removeAll()
             plannerActionInFlightProjectIDs.removeAll()
             deferredScopeActionInFlightIDs.removeAll()
             if case .loading = reviewTerminalVM.state {
@@ -359,6 +380,10 @@ extension ChatViewModel {
             applyProductDesignDocsList(productID: productID, state: state)
         case .productDesignDocContent(let ref, let content):
             applyProductDesignDocContent(ref: ref, content: content)
+        case .reviewGuideContent(let versionId, let content):
+            applyReviewGuideContent(versionId: versionId, content: content)
+        case .reviewGuideRetryQueued(let rootTaskId, _, _):
+            applyReviewGuideRetryQueued(rootTaskId: rootTaskId)
         case .conflictResolutionsList(let attempts):
             conflictResolutions = attempts
         case .conflictResolutionStarted(_, _, _, let prURL):
@@ -567,6 +592,7 @@ extension ChatViewModel {
             // WorkItemUpdated event carrying the new merge-queue / merged
             // state will arrive shortly.
             mergingWhenReadyIDs.remove(workItemID)
+            mergeErrorNoticesByTaskID.removeValue(forKey: workItemID)
             mergeFeedbackNotice = MergeFeedbackNotice(
                 taskID: workItemID,
                 message: Self.mergeWhenReadyFeedbackText(for: action)
@@ -819,12 +845,51 @@ extension ChatViewModel {
         if !openingReviewTerminalIDs.isEmpty { return true }
         if !openingLiveWorkspaceTerminalIDs.isEmpty { return true }
         if !mergingWhenReadyIDs.isEmpty { return true }
+        if !retryingReviewGuideRootTaskIDs.isEmpty { return true }
         if !plannerActionInFlightProjectIDs.isEmpty { return true }
         if !deferredScopeActionInFlightIDs.isEmpty { return true }
         if !pendingMoveOriginByTaskID.isEmpty { return true }
         if pendingDragAdmissionCheck != nil { return true }
         if engineAttemptDetailRequestID != nil { return true }
+        // `pendingReviewGuideVersionId` is retained after a successful load
+        // (it is the displayed version), so pair it with `.loading`.
+        if pendingReviewGuideVersionId != nil, case .loading = asyncMarkdownViewerVM.state {
+            return true
+        }
         return false
+    }
+
+    /// Fail a review-guide content fetch that can no longer complete (socket
+    /// drop or `WorkError`). Retry re-opens the pending version — a re-fetch,
+    /// not `retryReviewGuide`, which would enqueue a new generation.
+    /// Unconditional: disconnect has no envelope id to match.
+    private func failLoadingReviewGuideViewer(message: String) {
+        applyFailLoadingReviewGuideViewer(message: message)
+    }
+
+    /// Apply a `WorkError` to the loading review-guide viewer only when the
+    /// envelope id matches the in-flight `get_review_guide_content` send.
+    /// Both ids must be non-nil and equal — an abandoned guide's error or
+    /// an unrelated request's failure must not flip the current viewer.
+    private func failLoadingReviewGuideViewerIfRequestMatches(message: String, requestId: String?) {
+        guard let pending = pendingReviewGuideRequestId, let requestId, pending == requestId else { return }
+        applyFailLoadingReviewGuideViewer(message: message)
+    }
+
+    private func applyFailLoadingReviewGuideViewer(message: String) {
+        if pendingReviewGuideVersionId != nil, case .loading = asyncMarkdownViewerVM.state {
+            pendingReviewGuideRequestId = nil
+            asyncMarkdownViewerVM.state = .failed(
+                title: "Review guide",
+                message: message
+            )
+            asyncMarkdownViewerVM.canRetry = true
+            asyncMarkdownViewerVM.onRetry = { [weak self] in
+                guard let self, let rootTaskId = self.pendingReviewGuideRootTaskId,
+                      let task = self.task(withID: rootTaskId) else { return }
+                self.openReviewGuide(for: task)
+            }
+        }
     }
 
     /// Whether an `.error` message is a transport-level signal from

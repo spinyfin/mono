@@ -691,6 +691,20 @@ final class AsyncMarkdownViewerViewModel: ObservableObject {
     /// Engine-side revalidation. Nil when this viewer is showing
     /// something that isn't a GitHub fetch (task description).
     var onRetry: (() -> Void)?
+    /// Non-nil while the open document is a PR review guide — drives the
+    /// header metadata row (PR link, generation time) and the shared merge
+    /// control above the document body. `nil` for every other document
+    /// kind (design docs, task descriptions); every other `.loaded`
+    /// producer must reset this to `nil` so a guide header can't leak into
+    /// an unrelated document opened next in this shared singleton window.
+    @Published var reviewGuideRootTaskId: String? = nil
+    /// The open review-guide version's generation timestamp (RFC 3339).
+    /// `nil` alongside `reviewGuideRootTaskId == nil`.
+    var reviewGuideGeneratedAt: String? = nil
+    /// The open review-guide version's source comparison id. Used by the
+    /// header to derive displayed-guide staleness against the series'
+    /// current comparison. `nil` until content arrives.
+    var reviewGuideComparisonId: String? = nil
 }
 
 /// Content view for the `"async-markdown-viewer"` Window scene. Shows a
@@ -712,6 +726,7 @@ struct AsyncMarkdownViewerView: View {
     // timing. (See `tools/boss/experiments/textual-perf-layered` L10 for the
     // measured buggy-vs-fixed mount-latency contrast.)
     @EnvironmentObject private var vm: AsyncMarkdownViewerViewModel
+    @EnvironmentObject private var chatModel: ChatViewModel
 
     var body: some View {
         // Wrap in Group so `.registeredInWindowMenu()` is applied once
@@ -727,6 +742,13 @@ struct AsyncMarkdownViewerView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .loaded(let title, let markdown, let artifact):
                 VStack(spacing: 0) {
+                    if let rootTaskId = vm.reviewGuideRootTaskId {
+                        ReviewGuideViewerHeader(
+                            chatModel: chatModel,
+                            rootTaskId: rootTaskId,
+                            generatedAt: vm.reviewGuideGeneratedAt
+                        )
+                    }
                     if let stale = vm.staleReason {
                         HStack(alignment: .firstTextBaseline, spacing: 8) {
                             Image(systemName: "exclamationmark.triangle")

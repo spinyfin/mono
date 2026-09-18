@@ -59,6 +59,33 @@ final class RevisionBriefCollapsedHeadingsTests: XCTestCase {
         XCTAssertTrue(model.asyncMarkdownViewerVM.collapsedByDefaultHeadings.isEmpty)
     }
 
+    /// `openReviewGuide` clears `pendingAsyncViewerRef` so a late design-doc
+    /// reply cannot overwrite a guide — `openTaskDescription` is the sibling
+    /// identity-guard site for this shared singleton window and must clear
+    /// the same field, or a design doc opened earlier and still in flight
+    /// can land after `openTaskDescription` and overwrite the description
+    /// the user is now looking at.
+    func testOpenTaskDescriptionClearsPendingDesignDocIdentity() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        model.asyncMarkdownViewerOpener = {}
+        let ref = DesignDocRef(repoRemoteURL: "git@github.com:x/y.git", path: "docs/plan.md", gitRef: "main")
+        model.openDesignDocViaEngine(ref: ref, title: "Plan", artifact: nil, projectShortID: "42")
+        XCTAssertEqual(model.pendingAsyncViewerRef, ref)
+
+        let task = makeTask(kind: "chore", description: "# Task description")
+        model.openTaskDescription(task)
+        XCTAssertNil(model.pendingAsyncViewerRef)
+
+        model.applyProductDesignDocContent(ref: ref, content: .loaded(markdown: "# Late design doc reply"))
+
+        if case .loaded(let title, let markdown, _) = model.asyncMarkdownViewerVM.state {
+            XCTAssertEqual(title, task.name)
+            XCTAssertEqual(markdown, task.description, "a late design-doc reply must not overwrite the task description")
+        } else {
+            XCTFail("expected the task description to still be showing; got \(model.asyncMarkdownViewerVM.state)")
+        }
+    }
+
     // MARK: - Helpers
 
     private func makeTask(kind: String, description: String) -> WorkTask {

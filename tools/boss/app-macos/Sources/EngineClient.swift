@@ -569,6 +569,29 @@ final class EngineClient: @unchecked Sendable {
                     break
                 }
                 emit(.projectDesignDocResolved(output: output))
+            case "review_guide_content":
+                guard let versionId = payload["version_id"] as? String else {
+                    emit(.error(message: "received invalid review_guide_content payload"))
+                    break
+                }
+                let content: ReviewGuideVersionContent? = {
+                    guard let contentPayload = payload["content"] as? [String: Any],
+                          let contentData = try? JSONSerialization.data(withJSONObject: contentPayload)
+                    else { return nil }
+                    return try? JSONDecoder().decode(ReviewGuideVersionContent.self, from: contentData)
+                }()
+                emit(.reviewGuideContent(versionId: versionId, content: content))
+            case "review_guide_retry_queued":
+                guard let rootTaskId = payload["root_task_id"] as? String,
+                      let attemptPayload = payload["attempt"] as? [String: Any],
+                      let attemptData = try? JSONSerialization.data(withJSONObject: attemptPayload),
+                      let attempt = try? JSONDecoder().decode(ReviewGuideAttempt.self, from: attemptData)
+                else {
+                    emit(.error(message: "received invalid review_guide_retry_queued payload"))
+                    break
+                }
+                let alreadyRequested = (payload["already_requested"] as? NSNumber)?.boolValue ?? false
+                emit(.reviewGuideRetryQueued(rootTaskId: rootTaskId, attempt: attempt, alreadyRequested: alreadyRequested))
             case "dispatch_admission_evaluated":
                 guard let admissionPayload = payload["admission"] as? [String: Any],
                       let admissionData = try? JSONSerialization.data(withJSONObject: admissionPayload),
