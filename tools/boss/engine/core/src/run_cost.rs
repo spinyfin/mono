@@ -69,22 +69,27 @@ struct CostAccumulator {
 }
 
 impl CostAccumulator {
-    fn ingest(&mut self, transcript_path: &Path, value: &Value) {
-        if value.get("type").and_then(Value::as_str) == Some("assistant")
-            && let Some(id) = value.pointer("/message/id").and_then(Value::as_str)
-            && let Some(usage) = value.pointer("/message/usage").filter(|usage| usage.is_object())
-        {
-            self.provider_usage.insert(format!("claude:{id}"), usage.clone());
-        }
-        if value.get("type").and_then(Value::as_str) == Some("event_msg")
-            && value.pointer("/payload/type").and_then(Value::as_str) == Some("token_count")
-            && value
-                .pointer("/payload/info/total_token_usage")
-                .is_some_and(Value::is_object)
-            && let Some(info) = value.pointer("/payload/info").filter(|info| info.is_object())
-        {
-            self.provider_usage
-                .insert(format!("codex:{}", transcript_path.display()), info.clone());
+    fn ingest(&mut self, transcript_path: &Path, value: &Value, capture_provider_usage: bool) {
+        // Raw provider objects are only consumed by pr_review_guide_attempts.
+        // Ordinary executions still fold token totals below; skip the clone
+        // and per-run cache of unused JSON.
+        if capture_provider_usage {
+            if value.get("type").and_then(Value::as_str) == Some("assistant")
+                && let Some(id) = value.pointer("/message/id").and_then(Value::as_str)
+                && let Some(usage) = value.pointer("/message/usage").filter(|usage| usage.is_object())
+            {
+                self.provider_usage.insert(format!("claude:{id}"), usage.clone());
+            }
+            if value.get("type").and_then(Value::as_str) == Some("event_msg")
+                && value.pointer("/payload/type").and_then(Value::as_str) == Some("token_count")
+                && value
+                    .pointer("/payload/info/total_token_usage")
+                    .is_some_and(Value::is_object)
+                && let Some(info) = value.pointer("/payload/info").filter(|info| info.is_object())
+            {
+                self.provider_usage
+                    .insert(format!("codex:{}", transcript_path.display()), info.clone());
+            }
         }
         match value.get("type").and_then(Value::as_str) {
             Some("assistant") => self.ingest_assistant(value),
@@ -320,10 +325,16 @@ impl TranscriptCostTail {
 #[derive(Debug, Default)]
 struct RunCostTail {
     tails: HashMap<PathBuf, TranscriptCostTail>,
+    capture_provider_usage: Option<bool>,
 }
 
 impl RunCostTail {
-    async fn poll(&mut self, transcript_path: &Path, containment_root: Option<&Path>) -> Result<bool, String> {
+    async fn poll(
+        &mut self,
+        transcript_path: &Path,
+        containment_root: Option<&Path>,
+        capture_provider_usage: bool,
+    ) -> Result<bool, String> {
         let replace = match self.tails.get(transcript_path) {
             Some(state)
                 if state.containment_root.is_some() && state.containment_root.as_deref() != containment_root =>
@@ -352,7 +363,9 @@ impl RunCostTail {
             full_replacement = true;
         }
         for value in values {
-            state.accumulator.ingest(transcript_path, &value);
+            state
+                .accumulator
+                .ingest(transcript_path, &value, capture_provider_usage);
         }
         Ok(full_replacement)
     }
@@ -392,7 +405,15 @@ impl RunCostCapture {
                 .clone()
         };
         let mut state = state.lock().await;
-        let full_replacement = state.poll(transcript_path, containment_root).await?;
+        let capture_provider_usage = *state.capture_provider_usage.get_or_insert_with(|| {
+            work_db
+                .get_execution(execution_id)
+                .ok()
+                .is_some_and(|execution| execution.kind == boss_protocol::ExecutionKind::PrReviewGuide)
+        });
+        let full_replacement = state
+            .poll(transcript_path, containment_root, capture_provider_usage)
+            .await?;
         let mut snapshot = match state.snapshot() {
             Some(snapshot) => snapshot,
             None if full_replacement => RunCostSnapshot::default(),
@@ -433,6 +454,7 @@ mod tests {
                     "usage": {"input_tokens": 10, "output_tokens": 1}
                 }
             }),
+            true,
         );
         accumulator.ingest(
             Path::new("/tmp/transcript.jsonl"),
@@ -444,6 +466,7 @@ mod tests {
                     "usage": {"input_tokens": 10, "output_tokens": 7}
                 }
             }),
+            true,
         );
 
         let snapshot = accumulator.snapshot().unwrap();
@@ -458,6 +481,28 @@ mod tests {
     }
 
     #[test]
+    fn provider_usage_is_omitted_unless_requested() {
+        let mut accumulator = CostAccumulator::default();
+        accumulator.ingest(
+            Path::new("/tmp/transcript.jsonl"),
+            &json!({
+                "type": "assistant",
+                "message": {
+                    "id": "msg-1",
+                    "model": "claude-opus",
+                    "usage": {"input_tokens": 10, "output_tokens": 7}
+                }
+            }),
+            false,
+        );
+
+        let snapshot = accumulator.snapshot().unwrap();
+        assert_eq!(snapshot.input_tokens, Some(10));
+        assert_eq!(snapshot.output_tokens, Some(7));
+        assert_eq!(snapshot.provider_usage_json, None);
+    }
+
+    #[test]
     fn missing_turn_duration_remains_null() {
         let mut accumulator = CostAccumulator::default();
         accumulator.ingest(
@@ -466,6 +511,7 @@ mod tests {
                 "type": "assistant",
                 "message": {"id": "msg-1", "model": "claude-opus", "usage": {}}
             }),
+            false,
         );
 
         assert_eq!(accumulator.snapshot().unwrap().agent_active_ms, None);
@@ -478,6 +524,7 @@ mod tests {
         accumulator.ingest(
             path,
             &json!({"type":"turn_context","payload":{"model":"gpt-5.6-terra"}}),
+            true,
         );
         accumulator.ingest(
             path,
@@ -487,6 +534,7 @@ mod tests {
                 "cache_write_input_tokens": 0,
                 "output_tokens": 20
             }}}}),
+            true,
         );
         accumulator.ingest(
             path,
@@ -495,6 +543,7 @@ mod tests {
                 "turn_id":"turn-1",
                 "duration_ms":321
             }}),
+            true,
         );
 
         let snapshot = accumulator.snapshot().unwrap();
@@ -523,7 +572,7 @@ mod tests {
         )
         .unwrap();
         let mut tail = RunCostTail::default();
-        assert!(!tail.poll(&path, None).await.unwrap());
+        assert!(!tail.poll(&path, None, false).await.unwrap());
         let before = tail.snapshot().unwrap();
         assert_eq!(before.input_tokens, Some(150));
         assert_eq!(before.rounds, Some(2));
@@ -539,7 +588,7 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(tail.poll(&path, None).await.unwrap());
+        assert!(tail.poll(&path, None, false).await.unwrap());
         let after = tail.snapshot().unwrap();
         assert_eq!(after.model.as_deref(), Some("claude-sonnet"));
         assert_eq!(after.input_tokens, Some(7));
@@ -576,8 +625,8 @@ mod tests {
         .unwrap();
 
         let mut tail = RunCostTail::default();
-        tail.poll(&path, Some(&root)).await.unwrap();
-        let downgrade_error = tail.poll(&path, None).await.unwrap_err();
+        tail.poll(&path, Some(&root), false).await.unwrap();
+        let downgrade_error = tail.poll(&path, None, false).await.unwrap_err();
         assert!(
             downgrade_error.contains("containment downgrade"),
             "a contained cost tail must never become unrestricted: {downgrade_error}",
@@ -585,7 +634,7 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         symlink(&outside, &path).unwrap();
 
-        let error = tail.poll(&path, Some(&root)).await.unwrap_err();
+        let error = tail.poll(&path, Some(&root), false).await.unwrap_err();
         assert!(
             error.contains("transcript"),
             "contained run-cost tail must reject path replacement: {error}",

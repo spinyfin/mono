@@ -29,13 +29,22 @@ fn validate_review_guide_with_fallback(
     raw_output: &str,
     packet: &boss_pr_review_sources::SourcePacket,
 ) -> Result<boss_review_guide::ValidatedGuide, Vec<boss_review_guide::GuideValidationIssue>> {
-    boss_review_guide::validate_guide_output(markdown, packet).or_else(|issues| {
-        if markdown == raw_output {
-            Err(issues)
-        } else {
-            boss_review_guide::validate_guide_output(raw_output, packet)
-        }
-    })
+    match boss_review_guide::validate_guide_output(markdown, packet) {
+        Ok(guide) => Ok(guide),
+        Err(preferred_issues) if markdown == raw_output => Err(preferred_issues),
+        Err(preferred_issues) => match boss_review_guide::validate_guide_output(raw_output, packet) {
+            Ok(guide) => Ok(guide),
+            Err(fallback_issues) => {
+                let mut issues = preferred_issues;
+                for issue in fallback_issues {
+                    if !issues.contains(&issue) {
+                        issues.push(issue);
+                    }
+                }
+                Err(issues)
+            }
+        },
+    }
 }
 
 /// Result of [`WorkerCompletionHandler::check_pure_rebase_skip`].
@@ -2491,6 +2500,22 @@ mod review_guide_publish_texts_tests {
         );
         assert!(validate_review_guide_with_fallback("# Guide", "# Guide\n## One", &packet).is_err());
         assert!(validate_review_guide_with_fallback("No guide", "No guide", &packet).is_err());
+    }
+
+    #[test]
+    fn both_invalid_candidates_keep_preferred_and_fallback_issues() {
+        let packet = packet("base", "head");
+        let preferred = "## Problem\n## Implementation\n## Example\n## Review";
+        let fallback = "# Guide\n## One";
+        let issues = validate_review_guide_with_fallback(preferred, fallback, &packet).unwrap_err();
+        assert!(
+            issues.contains(&boss_review_guide::GuideValidationIssue::MissingTitle),
+            "preferred-guide issues must be retained when fallback also fails: {issues:?}"
+        );
+        assert!(
+            issues.contains(&boss_review_guide::GuideValidationIssue::TooFewSections { found: 1 }),
+            "fallback-transcript issues must be retained alongside preferred issues: {issues:?}"
+        );
     }
 
     #[test]
