@@ -73,7 +73,7 @@ const SUMMARY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Total attempts for the pane-summary utility-model call. One retry
 /// only: transport blips / 429 / 5xx are the common transient failures
 /// that a single re-issue absorbs, and this call sits on the
-/// `SpawnWorkerPane` path so every extra attempt adds directly to
+/// tmux worker spawn path so every extra attempt adds directly to
 /// spawn latency. Non-transient errors (auth, other 4xx, decode) are
 /// never retried — see [`claude_client::ClaudeError::is_retryable`].
 ///

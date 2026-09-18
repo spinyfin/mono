@@ -165,12 +165,6 @@ struct ContentView: View {
             // WorkersWorkspaceModel. Bazel builds without GhosttyKit
             // leave the handlers nil; ChatViewModel responds with
             // EngineToAppError::Internal in that path.
-            model.paneSpawnHandler = { [workspace = workersWorkspace] request in
-                workspace.spawnWorkerPane(request)
-            }
-            model.paneReleaseHandler = { [workspace = workersWorkspace] slotId, killGrace in
-                workspace.releaseWorkerPane(slotId: slotId, killGraceSeconds: killGrace)
-            }
             model.paneAttachHandler = { [workspace = workersWorkspace] request in
                 workspace.attachWorkerPane(request)
             }
@@ -212,31 +206,11 @@ struct ContentView: View {
             model.panePoolConfigHandler = { [workspace = workersWorkspace] workerSlots, automationSlots, reviewSlots, _ in
                 workspace.configureSlots(workerCount: workerSlots, automationCount: automationSlots, reviewCount: reviewSlots)
             }
-            // Forward worker-pane shell pids to the engine once surfaces
-            // attach. WorkersWorkspaceModel fires onShellPidAvailable after
-            // ghostty_surface_foreground_pid returns a valid pid so the
-            // engine can wire process tracking for reviewer and other panes.
-            workersWorkspace.onShellPidAvailable = { [model] runId, shellPid in
-                model.workerPaneShellPidAvailable(runId: runId, shellPid: shellPid)
-            }
-            // Forward worker-pane deaths to the engine immediately so it can
-            // reap the backing execution instead of waiting for the periodic
-            // dead-pid sweep. A surface that never attached goes to
-            // `onSpawnFailed` below instead.
-            workersWorkspace.onPaneDied = { [model] runId, reason in
-                model.workerPaneDied(runId: runId, reason: reason)
-            }
             // Report sleep/wake recovery to the engine so a worker-pane
             // spawn stranded by the sleep redispatches immediately
             // instead of waiting for the next periodic sweep.
             GhosttyRuntime.shared.onDisplaysDidWake = { [model] in
                 model.spawnCapabilityRestored()
-            }
-            // Forward surface-creation failures (no shell came up — the
-            // post-sleep "no active display" condition) so the engine fails
-            // the spawn fast instead of waiting out its 60s spawn-ack timeout.
-            workersWorkspace.onSpawnFailed = { [model] runId, reason in
-                model.workerPaneSpawnFailed(runId: runId, reason: reason)
             }
         }
         #endif

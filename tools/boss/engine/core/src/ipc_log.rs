@@ -20,7 +20,7 @@
 //!   `ts_epoch_ms`  – milliseconds since Unix epoch
 //!   `direction`    – `"engine→app"` or `"app→engine"`
 //!   `request_id`   – opaque id that pairs a request with its response
-//!   `kind`         – snake_case discriminant (e.g. `"release_worker_pane"`)
+//!   `kind`         – snake_case discriminant (e.g. `"detach_worker_pane"`)
 //!   `body`         – the full serialised request or response payload
 //!
 //! # Correlation
@@ -117,8 +117,6 @@ impl IpcLogger {
 
 fn request_kind(req: &EngineToAppRequest) -> &'static str {
     match req {
-        EngineToAppRequest::SpawnWorkerPane(_) => "spawn_worker_pane",
-        EngineToAppRequest::ReleaseWorkerPane(_) => "release_worker_pane",
         EngineToAppRequest::AttachWorkerPane(_) => "attach_worker_pane",
         EngineToAppRequest::AttachCoordinatorPane(_) => "attach_coordinator_pane",
         EngineToAppRequest::DetachWorkerPane(_) => "detach_worker_pane",
@@ -133,8 +131,6 @@ fn request_kind(req: &EngineToAppRequest) -> &'static str {
 
 fn response_kind(resp: &EngineToAppResponse) -> &'static str {
     match resp {
-        EngineToAppResponse::SpawnWorkerPane { .. } => "spawn_worker_pane",
-        EngineToAppResponse::ReleaseWorkerPane { .. } => "release_worker_pane",
         EngineToAppResponse::AttachWorkerPane { .. } => "attach_worker_pane",
         EngineToAppResponse::AttachCoordinatorPane { .. } => "attach_coordinator_pane",
         EngineToAppResponse::DetachWorkerPane { .. } => "detach_worker_pane",
@@ -154,9 +150,8 @@ mod tests {
         AttachCoordinatorPaneInput, AttachCoordinatorPaneResult, AttachWorkerPaneInput, AttachWorkerPaneResult,
         DetachWorkerPaneInput, DetachWorkerPaneResult, EngineToAppResponse, FocusWorkerPaneInput,
         FocusWorkerPaneResult, InterruptWorkerPaneInput, InterruptWorkerPaneResult, ListHostedPanesInput,
-        ListHostedPanesResult, OpenDocumentInput, OpenDocumentResult, ReleaseWorkerPaneInput, ReleaseWorkerPaneResult,
-        RevealWorkItemInput, RevealWorkItemResult, SendToPaneInput, SendToPaneResult, SpawnWorkerPaneInput,
-        SpawnWorkerPaneResult,
+        ListHostedPanesResult, OpenDocumentInput, OpenDocumentResult, RevealWorkItemInput, RevealWorkItemResult,
+        SendToPaneInput, SendToPaneResult,
     };
 
     /// Every `EngineToAppRequest` variant must emit its documented
@@ -166,26 +161,6 @@ mod tests {
     #[test]
     fn request_kind_covers_every_variant() {
         let cases: Vec<(EngineToAppRequest, &str)> = vec![
-            (
-                EngineToAppRequest::SpawnWorkerPane(SpawnWorkerPaneInput {
-                    run_id: "run-1".into(),
-                    workspace_path: "/tmp/ws".into(),
-                    slot_id: 1,
-                    initial_input: "claude\n".into(),
-                    env: vec![],
-                    summary: None,
-                    task_title: None,
-                    pane_monitor: None,
-                }),
-                "spawn_worker_pane",
-            ),
-            (
-                EngineToAppRequest::ReleaseWorkerPane(ReleaseWorkerPaneInput {
-                    slot_id: 1,
-                    kill_grace_seconds: 0,
-                }),
-                "release_worker_pane",
-            ),
             (
                 EngineToAppRequest::AttachWorkerPane(AttachWorkerPaneInput {
                     run_id: "run-1".into(),
@@ -258,21 +233,6 @@ mod tests {
     fn response_kind_covers_every_variant() {
         let cases: Vec<(EngineToAppResponse, &str)> = vec![
             (
-                EngineToAppResponse::SpawnWorkerPane {
-                    result: Ok(SpawnWorkerPaneResult {
-                        slot_id: 1,
-                        shell_pid: 42,
-                    }),
-                },
-                "spawn_worker_pane",
-            ),
-            (
-                EngineToAppResponse::ReleaseWorkerPane {
-                    result: Ok(ReleaseWorkerPaneResult {}),
-                },
-                "release_worker_pane",
-            ),
-            (
                 EngineToAppResponse::AttachWorkerPane {
                     result: Ok(AttachWorkerPaneResult {}),
                 },
@@ -338,14 +298,11 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let logger = IpcLogger::new(dir.path());
 
-        let req = EngineToAppRequest::ReleaseWorkerPane(ReleaseWorkerPaneInput {
-            slot_id: 3,
-            kill_grace_seconds: 5,
-        });
+        let req = EngineToAppRequest::DetachWorkerPane(DetachWorkerPaneInput { slot_id: 3 });
         logger.log_request("session-1-eng-req-42", &req);
 
-        let resp = EngineToAppResponse::ReleaseWorkerPane {
-            result: Ok(ReleaseWorkerPaneResult {}),
+        let resp = EngineToAppResponse::DetachWorkerPane {
+            result: Ok(DetachWorkerPaneResult {}),
         };
         logger.log_response("session-1-eng-req-42", &resp);
 
@@ -373,13 +330,13 @@ mod tests {
 
         let req_entry: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(req_entry["direction"], "engine→app");
-        assert_eq!(req_entry["kind"], "release_worker_pane");
+        assert_eq!(req_entry["kind"], "detach_worker_pane");
         assert_eq!(req_entry["request_id"], "session-1-eng-req-42");
         assert!(req_entry["ts_epoch_ms"].is_number());
 
         let resp_entry: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(resp_entry["direction"], "app→engine");
-        assert_eq!(resp_entry["kind"], "release_worker_pane");
+        assert_eq!(resp_entry["kind"], "detach_worker_pane");
         assert_eq!(resp_entry["request_id"], "session-1-eng-req-42");
     }
 }

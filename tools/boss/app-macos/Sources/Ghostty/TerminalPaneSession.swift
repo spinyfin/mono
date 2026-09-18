@@ -3,7 +3,7 @@ import GhosttyKit
 
 /// Driver-supplied (or Claude-default) substrings the pane monitor uses
 /// to screen-scrape a GhosttyKit viewport. Mirrors
-/// `boss_protocol::PaneMonitorSpec` on the spawn RPC.
+/// `boss_protocol::PaneMonitorSpec`.
 struct PaneMonitorSpec: Equatable, Sendable {
     let agentMarkers: [String]
     let busyMarkers: [String]
@@ -11,9 +11,8 @@ struct PaneMonitorSpec: Equatable, Sendable {
     let promptPrefixes: [String]
     let idleDebouncePolls: Int
 
-    /// Historical Claude literals from the pre-spec app. Used when the
-    /// spawn message carries no `pane_monitor` (older engine, or a
-    /// driver that declares no spec) so existing paths stay identical.
+    /// Historical Claude literals from the pre-spec app. Used whenever no
+    /// driver-specific spec is available so existing paths stay identical.
     static let claudeDefault = PaneMonitorSpec(
         agentMarkers: ["Claude Code", "auto mode on", "/effort"],
         busyMarkers: ["esc to interrupt"],
@@ -21,35 +20,6 @@ struct PaneMonitorSpec: Equatable, Sendable {
         promptPrefixes: ["❯"],
         idleDebouncePolls: 2
     )
-
-    /// Parse a wire dict from `SpawnWorkerPaneInput.pane_monitor`, or
-    /// return `claudeDefault` when the field is absent/malformed.
-    static func fromWire(_ dict: [String: Any]?) -> PaneMonitorSpec {
-        guard let dict else { return .claudeDefault }
-        let agent = dict["agent_markers"] as? [String] ?? []
-        let busy = dict["busy_markers"] as? [String] ?? []
-        let starting = dict["starting_markers"] as? [String] ?? []
-        let prompts = dict["prompt_prefixes"] as? [String] ?? []
-        let debounceRaw = dict["idle_debounce_polls"]
-        let debounce: Int
-        if let n = debounceRaw as? Int {
-            debounce = n
-        } else if let n = debounceRaw as? NSNumber {
-            debounce = n.intValue
-        } else {
-            debounce = claudeDefault.idleDebouncePolls
-        }
-        // An empty agent-marker list would permanently pin notDetected;
-        // treat a hollow payload the same as absent.
-        guard !agent.isEmpty else { return .claudeDefault }
-        return PaneMonitorSpec(
-            agentMarkers: agent,
-            busyMarkers: busy,
-            startingMarkers: starting,
-            promptPrefixes: prompts.isEmpty ? claudeDefault.promptPrefixes : prompts,
-            idleDebouncePolls: max(1, debounce)
-        )
-    }
 }
 
 enum PaneMonitorState: Equatable {
@@ -208,21 +178,13 @@ enum PaneRole: Equatable {
     }
 }
 
-/// App callback that supplied a worker-pane death observation. Raw values are
-/// the protocol strings sent to the engine in `worker_pane_died.reason`.
-enum WorkerPaneDeathReason: String, Equatable {
-    case surfaceCreationFailed = "surface_creation_failed"
-    case childProcessExited = "child_process_exited"
-}
-
 @MainActor
 final class TerminalPaneSession: ObservableObject, Identifiable {
     let id: String
     let role: PaneRole
     let launchSpec: TerminalLaunchSpec
     /// Driver-supplied (or Claude-default) markers for the pre-hook
-    /// viewport screen-scrape. Set at spawn from
-    /// `SpawnWorkerPaneInput.pane_monitor`.
+    /// viewport screen-scrape.
     let paneMonitorSpec: PaneMonitorSpec
 
     @Published var displayTitle: String
@@ -233,74 +195,25 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     @Published var paneMonitorState: PaneMonitorState = .unavailable
 
     weak var hostView: GhosttyTerminalHostView?
-    /// The foreground pid of this pane's PTY, or 0 when the surface is not
-    /// yet live. Delegates to `GhosttyTerminalHostView.foregroundPid`.
-    var shellPid: Int32 { hostView?.foregroundPid ?? 0 }
-    /// Set by `WorkersWorkspaceModel.releaseWorkerPane` the instant a slot is
-    /// released, before SwiftUI has necessarily torn down the host view.
+    /// Set by `WorkersWorkspaceModel.clearWorkerPane` the instant a slot is
+    /// detached, before SwiftUI has necessarily torn down the host view.
     /// `GhosttyTerminalHostView.attemptSurfaceCreation` checks this so a
-    /// display-change retry that fires after release (e.g. the fast-fail
-    /// NACK reaped the execution while a `NSScreen` observer was still
-    /// armed) can't create a fresh surface and spawn a duplicate `claude`
-    /// for an execution the engine has already given up on.
+    /// display-change retry that fires after detach (e.g. while an
+    /// `NSScreen` observer was still armed) can't create a fresh surface
+    /// and spawn a duplicate viewer for a slot the engine has already given
+    /// up on.
     private(set) var isReleased = false
-    /// One pane may produce more than one close/failure callback while its
-    /// surface is dismantled. Only the first genuine death observation is
-    /// reportable to the engine.
-    private var paneDeathReported = false
 
     /// Mark this session as released. Idempotent.
     func markReleased() {
         isReleased = true
     }
 
-    /// Atomically claim this session's one allowed pane-death report.
-    /// Main-actor isolation serializes the two callback sources.
-    func claimPaneDeathReport() -> Bool {
-        guard !paneDeathReported else { return false }
-        paneDeathReported = true
-        return true
-    }
     private var paneMonitorTracker: PaneMonitorTracker
-    /// Called on the main actor when the pane's child process exits. Worker
-    /// panes use it to report pane death to the engine; the coordinator pane
-    /// uses it to rebuild its local tmux client while the engine-owned
-    /// detached coordinator session remains unaffected.
+    /// Called on the main actor when the pane's child process exits. Only
+    /// the coordinator pane uses it, to rebuild its local tmux client while
+    /// the engine-owned detached coordinator session remains unaffected.
     var onChildExited: (() -> Void)?
-    /// Called on the main actor each time a libghostty surface is
-    /// successfully attached to this session. Fires on initial creation
-    /// and on every surface recreation. Worker panes use this to report a
-    /// shell pid once Ghostty has finished its asynchronous startup.
-    var onSurfaceAttached: (() -> Void)?
-    /// Called on the main actor when this session's libghostty surface
-    /// FAILS to create (`ghostty_surface_new` returned NULL — typically the
-    /// post-sleep "no active display" condition, #800). Worker panes set
-    /// this to a closure that NACKs the spawn back to the engine
-    /// (`report_worker_spawn_failed`) so it fails fast instead of waiting
-    /// out the 60s spawn-ack timeout, and logs a durable diagnostic. Fired
-    /// at most once per session — the host view dedupes — and never for a
-    /// surface that eventually succeeds. Boss pane leaves this nil.
-    ///
-    /// This is the ONLY channel for a surface that never came up. It is
-    /// deliberately not `onChildExited`: a pane with no surface hosted no
-    /// pty and so never had a child to exit, and reporting it as a pane
-    /// death sends the engine down its death-reap path, which does not feed
-    /// the cross-work-item spawn-capability breaker. A display-less host
-    /// fails every spawn the same way, spread thinly over many work items,
-    /// so the aggregate breaker is the only thing that can see it — a
-    /// per-work-item guard never will. Misclassifying here is what let the
-    /// 2026-07 no-active-display incident burn 818 executions across 79
-    /// work items with the breaker never fed once.
-    /// Called once when `ghostty_surface_new` returns NULL. Carries the
-    /// measured host snapshot (and the input diagnostic block) taken at
-    /// rejection time so the durable spawn log cannot disagree with the
-    /// reason string if the display state changes moments later.
-    var onSurfaceCreationFailed: ((
-        _ reason: String,
-        _ host: HostDisplaySnapshot,
-        _ diagnostic: String
-    ) -> Void)?
-
 
     init(
         id: String,
@@ -324,7 +237,6 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     func attach(hostView: GhosttyTerminalHostView) {
         self.hostView = hostView
         terminalReady = true
-        onSurfaceAttached?()
     }
 
     func updatePaneMonitor(snapshot: PaneMonitorSnapshot?) {

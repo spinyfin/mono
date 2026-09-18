@@ -1,5 +1,7 @@
 import Foundation
 
+/// Internal launch parameters for a worker-viewer libghostty surface.
+/// `attachWorkerPane` builds this from an `EngineAttachRequest`.
 struct EngineSpawnRequest: Sendable {
     let runId: String
     let workspacePath: String
@@ -10,6 +12,7 @@ struct EngineSpawnRequest: Sendable {
     /// the app has been removed.
     let slotId: Int
     let initialInput: String
+    /// Always empty for tmux attachment; the engine configured the worker environment.
     let env: [(String, String)]
     /// Engine-supplied 2–4 word present-continuous gerund phrase
     /// describing what the worker is doing (e.g. "fixing the fencer
@@ -21,13 +24,12 @@ struct EngineSpawnRequest: Sendable {
     /// fallback display label when `summary` is nil — rendered as
     /// `"<AgentName>: <taskTitle>"` rather than with a gerund "is".
     let taskTitle: String?
-    /// Driver-supplied pane-monitor markers (agent/busy/starting/
-    /// prompt prefixes + idle debounce). Nil when the engine omits
-    /// the field — the app falls back to Claude's historical
-    /// literals via `PaneMonitorSpec.claudeDefault`.
+    /// Viewer screen-scrape markers. The attach path always supplies
+    /// .claudeDefault; these markers are not supplied over the attach RPC.
     let paneMonitor: PaneMonitorSpec?
 }
 
+/// Shared failure type for `AttachWorkerPane` and `AttachCoordinatorPane`.
 enum EngineSpawnError: Sendable {
     case noAvailableSlot
     /// Engine asked us to host the pane in a slot that already has a
@@ -42,7 +44,7 @@ enum EngineSpawnError: Sendable {
 }
 
 enum EngineSpawnResult: Sendable {
-    case success(slotId: Int, shellPid: Int32)
+    case success(slotId: Int)
     case failure(EngineSpawnError)
 }
 
@@ -164,8 +166,6 @@ struct EngineHostedPaneEntry: Sendable {
 }
 
 enum EngineRequestKind: Sendable {
-    case spawnWorkerPane(EngineSpawnRequest)
-    case releaseWorkerPane(slotId: Int, killGraceSeconds: UInt32)
     case attachWorkerPane(EngineAttachRequest)
     case attachCoordinatorPane(EngineCoordinatorAttachRequest)
     case detachWorkerPane(slotId: Int)

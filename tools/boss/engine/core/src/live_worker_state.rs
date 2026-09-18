@@ -895,8 +895,9 @@ impl LiveWorkerStateRegistry {
 
     /// Update the shell pid for the slot that owns `run_id`. Returns
     /// the slot id if the entry was found and updated, or `None` if
-    /// no live slot matches. Called when the app sends
-    /// `UpdateWorkerShellPid` after the libghostty surface initializes.
+    /// no live slot matches. The tmux spawn path sets `shell_pid` when
+    /// registering the slot in `spawn_flow.rs`; this standalone setter
+    /// remains for tests that seed or mutate a pid without the full spawn flow.
     pub fn update_shell_pid(&self, run_id: &str, shell_pid: i32) -> Option<u8> {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         for entry in guard.values_mut() {

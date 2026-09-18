@@ -7,47 +7,6 @@ import Foundation
 // EngineClient.swift's `engine_request` decode case handles on the
 // way in.
 extension EngineClient {
-    func sendSpawnWorkerPaneResponse(requestId: String, result: EngineSpawnResult) {
-        let resultPayload: [String: Any]
-        switch result {
-        case .success(let slotId, let shellPid):
-            resultPayload = [
-                "Ok": [
-                    "slot_id": slotId,
-                    "shell_pid": Int(shellPid),
-                ]
-            ]
-        case .failure(let error):
-            resultPayload = ["Err": engineToAppErrorPayload(error)]
-        }
-        sendLine([
-            "type": "engine_response",
-            "request_id": requestId,
-            "response": [
-                "kind": "spawn_worker_pane",
-                "result": resultPayload,
-            ],
-        ])
-    }
-
-    func sendReleaseWorkerPaneResponse(requestId: String, result: EngineReleaseResult) {
-        let resultPayload: [String: Any]
-        switch result {
-        case .success:
-            resultPayload = ["Ok": [String: Any]()]
-        case .failure(let error):
-            resultPayload = ["Err": releaseEngineToAppErrorPayload(error)]
-        }
-        sendLine([
-            "type": "engine_response",
-            "request_id": requestId,
-            "response": [
-                "kind": "release_worker_pane",
-                "result": resultPayload,
-            ],
-        ])
-    }
-
     func sendAttachWorkerPaneResponse(requestId: String, result: EngineAttachResult) {
         let resultPayload: [String: Any]
         switch result {

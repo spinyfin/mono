@@ -155,8 +155,8 @@ fn register_trust_accepts_relaunched_app_when_old_app_pid_is_dead() {
     // so its pinned app pid belongs to a now-dead process, and the
     // relaunched app connects with a fresh, unrelated pid. The new
     // app must be trusted so it can re-register its session —
-    // otherwise every engine→app RPC (SpawnWorkerPane, reveal)
-    // dies with "no app session is registered". Mirror of T351.
+    // otherwise every engine→app RPC (AttachWorkerPane, reveal)
+    // dies with "no app session is registered".
     let engine_pid = std::process::id() as libc::pid_t;
     let dead_old_app = reaped_child_pid();
     let new_app = std::process::id() as libc::pid_t; // a live, unrelated pid
@@ -171,7 +171,7 @@ fn register_trust_accepts_relaunched_app_when_old_app_pid_is_dead() {
 #[test]
 fn set_app_pid_repins_trust_root() {
     // After a successful reattach the engine re-pins app_pid so RPC
-    // authorization (SpawnWorkerPane, BossOnly/AppOrBoss) follows the
+    // authorization (AttachWorkerPane, BossOnly/AppOrBoss) follows the
     // live app across the restart.
     let (server_state, _dir) = server_state_with_app_pid(1);
     assert_eq!(server_state.current_app_pid(), Some(1));

@@ -152,7 +152,7 @@ async fn confirm_next_pane_release(server: Arc<ServerState>, sink: Arc<SessionSi
 /// Regression: an unconfirmed orphan+respawn must **hold** the pool claim.
 /// Against the previous `release_slot` this fails — it freed the slot
 /// unconditionally, so the next `claim_worker` succeeded and the subsequent
-/// `SpawnWorkerPane` died `SlotBusy`.
+/// `AttachWorkerPane` died `SlotBusy`.
 #[tokio::test(start_paused = true)]
 async fn unconfirmed_orphan_respawn_holds_the_pool_claim() {
     let seeded = seed_stalled_worker(SOCKET_ERROR_LINE, true).await;

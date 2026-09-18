@@ -143,7 +143,7 @@ pub enum Stage {
     /// `start_execution_run` committed and `tasks.status` flipped
     /// to `active`.
     RunStarted,
-    /// `SpawnWorkerPane` returned ok / error. This is the stage
+    /// Worker pane creation returned ok / error. This is the stage
     /// whose silent failure motivated the structured stream:
     /// before this fix landed, a spawn failure marked the run
     /// `failed` and released the lease without surfacing anything
@@ -158,9 +158,8 @@ pub enum Stage {
     ExecutionCancelled,
     /// The dispatch aborted between `run_started` and any pane existing:
     /// `ExecutionRunner::run_execution` returned `Err` — a prompt-composition
-    /// failure, a driver provision/permission-config failure, an
-    /// undeliverable `SpawnWorkerPane` RPC, anything upstream of the app
-    /// actually being asked for a pane.
+    /// failure, a driver provision/permission-config failure, a
+    /// failed tmux session creation, or another error before a worker starts.
     ///
     /// Emitted the INSTANT the abort is observed, ahead of driver teardown
     /// and ahead of the (unbounded) `cube workspace release` that follows —
@@ -234,8 +233,8 @@ pub enum Stage {
     DeadPidReconcile,
     /// The periodic pane-death sweep (`boss_engine::dead_pane_sweep`) found a
     /// still-`running`/`waiting_human` local execution whose worker pane is
-    /// provably gone — its durable shell pid (persisted from the app's
-    /// `UpdateWorkerShellPid`) reports `ESRCH` from `kill(pid, 0)`. Unlike
+    /// provably gone — its durable shell pid (persisted by
+    /// the tmux spawn flow) reports `ESRCH` from `kill(pid, 0)`. Unlike
     /// `dead_pid_reconcile`, which reads the in-memory live-worker registry
     /// (empty after any engine restart), this probes the DB-persisted pid, so
     /// it catches a pane that died *with its host app* across a relaunch —
@@ -437,43 +436,17 @@ pub enum Stage {
     /// undispatched 45+ minutes with free slots available). See
     /// `boss_engine::dispatch_failure_recovery_sweep`.
     DispatchFailureRecoveryRedispatch,
-    /// The app proactively reported — via `ReportWorkerSpawnFailed` — that a
-    /// worker pane's shell never came up because the libghostty surface
-    /// failed to create (typically `ghostty_surface_new` returning NULL when
-    /// there is no active display after sleep/wake). Unlike
-    /// [`Stage::SpawnAckTimeout`], which the periodic sweep infers from 60s
-    /// of total silence, this fires the instant the app tells us, so the
-    /// execution is reaped and the slot freed in seconds rather than after
-    /// the grace window. The reap path is identical (orphan → pane teardown →
-    /// slot release), and both feed the same spawn-capability circuit breaker
-    /// (see [`Stage::SpawnCapabilityUnhealthy`]). The `details` object carries
-    /// the app-supplied `reason` and the `slot_id`.
+    /// Historical app-owned spawn rejection, retained for decoding old logs.
+    /// No current producer: viewer surface failures are recorded in the app's
+    /// spawn JSONL, while the engine's never-started reap uses SpawnAckTimeout.
     SpawnNack,
-    /// The app reported a worker pane died (`WorkerPaneDied`) for a slot that
-    /// had never shown any proof of life — no shell pid, no hook event, still
-    /// advertising `Spawning`. The pane did not *die*; it never came up, so
-    /// the execution is reaped through the never-started-spawn path (orphan →
-    /// driver teardown → pane teardown → slot release → cube lease release)
-    /// and feeds the same spawn-capability circuit breaker as
-    /// [`Stage::SpawnNack`] and [`Stage::SpawnAckTimeout`].
-    ///
-    /// Distinct from [`Stage::DeadPidReconcile`] / [`Stage::PaneDeathReconcile`],
-    /// which handle a pane that died *after* hosting a live worker. That
-    /// distinction is the 2026-07 no-active-display incident: a surface that
-    /// `ghostty_surface_new` refused to create was reported as a pane death,
-    /// so it took the death path — which does not feed the cross-work-item
-    /// breaker — and the diagnostic `ReportWorkerSpawnFailed` NACK that
-    /// followed found the slot already released and was dropped as stale.
-    /// 818 executions across 79 work items churned because no single work
-    /// item reached its own churn threshold and the one aggregator that
-    /// would have caught it was never fed.
-    ///
-    /// The `details` object carries `slot_id`, `shell_pid` (always `0`), and
-    /// the app-supplied `detail` describing what it observed.
+    /// Historical app-owned pane death before proof of life, retained for
+    /// decoding old logs. Engine-observed tmux driver death now uses the
+    /// driver reconciliation path; viewer closure is not worker death.
     PaneDeathBeforeStart,
     /// The app-spawn-capability circuit breaker tripped: too many worker-pane
     /// spawns failed across DIFFERENT work items within a short window
-    /// (`ReportWorkerSpawnFailed` NACKs and/or `spawn_ack_timeout` reaps),
+    /// (`spawn_ack_timeout` reaps),
     /// proving the app session's spawn path — not any one work item — is
     /// broken. This is the fix for the 2026-07-05 post-wake wedge, where
     /// every pane spawn silently produced no shell for 1.5+ hours and the

@@ -18,15 +18,13 @@ pub struct EnvVar {
     pub value: String,
 }
 
-/// Driver-supplied substrings the app uses to screen-scrape a
-/// GhosttyKit-hosted worker pane for a fallback status pill
-/// (`unavailable` / `notDetected` / `ready` / `working`) until the
-/// engine's first hook-driven [`crate::LiveWorkerState`] arrives.
+/// Driver-supplied substrings used to screen-scrape a worker's terminal
+/// pane content — e.g. the engine's own tmux-capture-based confirmation
+/// that a turn actually ended (see `probe_interrupt::pane_text_shows_turn_ended`
+/// in the engine crate). Sourced from `AgentDriver::pane_monitor_spec` in the
+/// driver crate (not currently carried on any engine↔app wire message).
 ///
-/// All marker lists are OR-semantics: any hit means the condition is
-/// true. The app falls back to Claude's historical literals when this
-/// is absent on the wire, so an older engine paired with a newer app
-/// is unaffected.
+/// All marker lists are OR-semantics: any hit means the condition is true.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PaneMonitorSpec {
     /// Substrings whose presence means "the agent is running in this pane".
@@ -41,7 +39,10 @@ pub struct PaneMonitorSpec {
     pub idle_debounce_polls: u8,
 }
 
-/// Engine asks the app to host a worker pane in a specific slot.
+/// Engine asks the app to attach a Ghostty surface to a worker already
+/// running in a Boss-owned tmux session. tmux owns the worker process and
+/// its environment; the app does not start a shell or supply an
+/// environment, it is only a viewer.
 ///
 /// The engine is the source of truth for which slot a worker lands
 /// in: it picks the slot via [`crate::WorkerPool::claim_worker`] and
@@ -55,88 +56,13 @@ pub struct PaneMonitorSpec {
 /// Naming: `worker-{N}` (engine side) and slot `N` (app side, also
 /// 1-indexed) refer to the same physical pane. There is one and
 /// only one numbering.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SpawnWorkerPaneInput {
-    pub run_id: String,
-    pub workspace_path: String,
-    /// 1-indexed slot the engine has claimed for this worker. The
-    /// app must host the pane in this exact slot or fail with
-    /// [`EngineToAppError::SlotBusy`] / `UnknownSlot`.
-    pub slot_id: u8,
-    /// Text written into the pty after the shell starts. Typically
-    /// `"claude\n"` so the shell types `claude` and runs the worker.
-    pub initial_input: String,
-    pub env: Vec<EnvVar>,
-    /// Short lowercase present-continuous verb phrase describing
-    /// what the worker is doing (e.g. `"fixing the fencer scraper"`).
-    /// The app renders this under the worker's display name as a
-    /// natural-language sentence: `"Riker is fixing the fencer
-    /// scraper"`. The full run id is still surfaced as a tooltip for
-    /// traceability. Present only when the engine successfully called
-    /// Claude to generate a proper gerund phrase (ANTHROPIC_API_KEY
-    /// was available and the call succeeded). When absent, the app
-    /// uses `task_title` for the fallback format `"Riker: <task>"`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
-    /// Raw work-item title (the task's `name` column), passed for
-    /// display when `summary` is absent (no API key or generation
-    /// failed). The app renders this as `"<AgentName>: <task_title>"`
-    /// — no gerund connector — so the pane header still identifies
-    /// the task without looking grammatically broken.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_title: Option<String>,
-    /// Driver-supplied pane-monitor markers for the app's pre-hook
-    /// status pill. Sourced from
-    /// `AgentDriver::pane_monitor_spec()` at the engine spawn site.
-    /// `None` (older engine, or a driver that declares no spec) keeps
-    /// the app's Claude-literal fallback so existing paths are
-    /// behaviour-identical.
-    ///
-    /// Boxed so this optional payload does not inflate
-    /// [`EngineToAppRequest`]'s largest variant by the full marker
-    /// struct when absent (the common case for non-spawn verbs).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pane_monitor: Option<Box<PaneMonitorSpec>>,
-}
-
-/// App's reply when allocation succeeds. The slot is dictated by
-/// the engine in [`SpawnWorkerPaneInput::slot_id`]; the app echoes
-/// it back here purely as a confirmation aid.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SpawnWorkerPaneResult {
-    /// Confirmation echo of [`SpawnWorkerPaneInput::slot_id`]. Engine
-    /// callers can debug-assert equality, but should otherwise treat
-    /// the slot they sent as authoritative.
-    pub slot_id: u8,
-    /// Pid of the shell the surface spawned. The actual `claude`
-    /// process will be a descendant of this pid; the engine registers
-    /// this pid in `WorkerRegistry` and relies on the ancestor walk
-    /// to correlate hook events from the shim back to the run.
-    pub shell_pid: i32,
-}
-
-/// Engine asks the app to release a previously allocated pane.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ReleaseWorkerPaneInput {
-    pub slot_id: u8,
-    /// SIGTERM, then SIGKILL after this many seconds. `0` means no
-    /// grace — go straight to SIGKILL.
-    pub kill_grace_seconds: u32,
-}
-
-/// App's reply when release succeeds. Empty for now; reserved for
-/// future fields (e.g., final shell exit status).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ReleaseWorkerPaneResult {}
-
-/// Engine asks the app to attach a Ghostty surface to a worker already
-/// running in a Boss-owned tmux session. Unlike [`SpawnWorkerPaneInput`], the
-/// app does not start a shell or supply an environment: tmux owns the worker
-/// process and the app is only a viewer.
 #[derive(bon::Builder, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[builder(on(String, into))]
 pub struct AttachWorkerPaneInput {
     pub run_id: String,
+    /// 1-indexed slot the engine has claimed for this worker. The
+    /// app must host the pane in this exact slot or fail with
+    /// [`EngineToAppError::SlotBusy`] / `UnknownSlot`.
     pub slot_id: u8,
     pub session_name: String,
     /// Explicit private tmux socket path used to attach the worker viewer.
@@ -301,8 +227,6 @@ pub struct OpenDocumentResult {}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EngineToAppRequest {
-    SpawnWorkerPane(SpawnWorkerPaneInput),
-    ReleaseWorkerPane(ReleaseWorkerPaneInput),
     AttachWorkerPane(AttachWorkerPaneInput),
     AttachCoordinatorPane(AttachCoordinatorPaneInput),
     DetachWorkerPane(DetachWorkerPaneInput),
@@ -324,12 +248,6 @@ pub enum EngineToAppRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EngineToAppResponse {
-    SpawnWorkerPane {
-        result: Result<SpawnWorkerPaneResult, EngineToAppError>,
-    },
-    ReleaseWorkerPane {
-        result: Result<ReleaseWorkerPaneResult, EngineToAppError>,
-    },
     AttachWorkerPane {
         result: Result<AttachWorkerPaneResult, EngineToAppError>,
     },
@@ -364,7 +282,7 @@ pub enum EngineToAppResponse {
 ///
 /// Capacity / concurrency limits are **not** expressed here. The engine
 /// decides whether a worker may claim a slot before it ever sends
-/// `SpawnWorkerPane`. Do not read [`Self::SlotBusy`] (or the legacy
+/// `AttachWorkerPane`. Do not read [`Self::SlotBusy`] (or the legacy
 /// [`Self::NoAvailableSlot`]) as "the system is at capacity" — that
 /// misread is the defect this surface exists to prevent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
@@ -372,21 +290,21 @@ pub enum EngineToAppResponse {
 pub enum EngineToAppError {
     /// Legacy "app could not free a slot" signal from before the engine
     /// owned slot allocation. Retained so older wire payloads still
-    /// deserialise; unreachable from modern `SpawnWorkerPane` because
-    /// the engine only requests a slot it has already claimed. **Not**
+    /// deserialise; unreachable from modern pane RPCs because the
+    /// engine only requests a slot it has already claimed. **Not**
     /// the operator-facing capacity signal — concurrency caps live on
     /// the engine claim path, not this RPC.
     #[error("no free worker slot (legacy app signal; engine-side claim already enforces concurrency)")]
     NoAvailableSlot,
-    /// `ReleaseWorkerPane` / `DetachWorkerPane` / `SendToPane` /
-    /// `FocusWorkerPane` / `InterruptWorkerPane` referred to a slot the app does not
+    /// `DetachWorkerPane` / `SendToPane` / `FocusWorkerPane` /
+    /// `InterruptWorkerPane` referred to a slot the app does not
     /// recognise — already released, never allocated, or stale after
     /// an app restart.
     #[error("unknown worker slot")]
     UnknownSlot,
     /// Engine↔app **slot occupancy desync** — not capacity exhaustion.
     ///
-    /// `SpawnWorkerPane` asked for a slot the app already hosts a
+    /// `AttachWorkerPane` asked for a slot the app already hosts a
     /// session in. The engine believed the slot free (it claimed it);
     /// the app disagrees. Reconcile husk panes / leaked claims rather
     /// than treating this as "no capacity" or retrying the same slot
@@ -395,7 +313,7 @@ pub enum EngineToAppError {
     /// `occupying_run_id` is the run id the app has stamped on the slot
     /// (`None` only for apps predating this field). The engine already
     /// knows the requested `slot_id` (it sent it on
-    /// [`SpawnWorkerPaneInput`]) and logs both into `dispatch.jsonl`
+    /// [`AttachWorkerPaneInput`]) and logs both into `dispatch.jsonl`
     /// under `details.slot_busy`, so an echoed `slot_id` on this error
     /// is unnecessary — the squatting pane is identifiable without it.
     #[error(
@@ -435,117 +353,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn spawn_request_round_trips_through_serde() {
-        let original = EngineToAppRequest::SpawnWorkerPane(SpawnWorkerPaneInput {
-            run_id: "run-1".into(),
-            workspace_path: "/tmp/ws".into(),
-            slot_id: 3,
-            initial_input: "claude\n".into(),
-            env: vec![EnvVar {
-                key: "BOSS_LEASE_ID".into(),
-                value: "lease-uuid".into(),
-            }],
-            summary: Some("fixing the fencer scraper".into()),
-            task_title: None,
-            pane_monitor: None,
-        });
-        let json = serde_json::to_string(&original).unwrap();
-        assert!(json.contains("\"slot_id\":3"));
-        let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, original);
-    }
-
-    #[test]
-    fn spawn_request_without_summary_round_trips_and_omits_field() {
-        let original = EngineToAppRequest::SpawnWorkerPane(SpawnWorkerPaneInput {
-            run_id: "run-1".into(),
-            workspace_path: "/tmp/ws".into(),
-            slot_id: 1,
-            initial_input: "claude\n".into(),
-            env: vec![],
-            summary: None,
-            task_title: None,
-            pane_monitor: None,
-        });
-        let json = serde_json::to_string(&original).unwrap();
-        // None should not serialize `summary`, `task_title`, or
-        // `pane_monitor`; they must be omitted so apps that predate
-        // the field continue to parse.
-        assert!(!json.contains("summary"));
-        assert!(!json.contains("task_title"));
-        assert!(!json.contains("pane_monitor"));
-        let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, original);
-    }
-
-    #[test]
-    fn spawn_request_with_task_title_round_trips() {
-        let original = EngineToAppRequest::SpawnWorkerPane(SpawnWorkerPaneInput {
-            run_id: "run-2".into(),
-            workspace_path: "/tmp/ws".into(),
-            slot_id: 2,
-            initial_input: "claude\n".into(),
-            env: vec![],
-            summary: None,
-            task_title: Some("kanban: revision cards render broken".into()),
-            pane_monitor: None,
-        });
-        let json = serde_json::to_string(&original).unwrap();
-        assert!(json.contains("task_title"));
-        assert!(!json.contains("\"summary\""));
-        let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, original);
-    }
-
-    #[test]
-    fn spawn_request_with_pane_monitor_round_trips() {
-        let original = EngineToAppRequest::SpawnWorkerPane(SpawnWorkerPaneInput {
-            run_id: "run-3".into(),
-            workspace_path: "/tmp/ws".into(),
-            slot_id: 1,
-            initial_input: "grok\n".into(),
-            env: vec![],
-            summary: None,
-            task_title: None,
-            pane_monitor: Some(Box::new(PaneMonitorSpec {
-                agent_markers: vec!["Grok 4".into(), "Shift+Tab:mode".into()],
-                busy_markers: vec!["Esc:cancel".into()],
-                starting_markers: vec!["Starting session".into()],
-                prompt_prefixes: vec!["│ ❯".into()],
-                idle_debounce_polls: 2,
-            })),
-        });
-        let json = serde_json::to_string(&original).unwrap();
-        assert!(json.contains("pane_monitor"));
-        assert!(json.contains("Esc:cancel"));
-        assert!(json.contains("idle_debounce_polls"));
-        let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, original);
-    }
-
-    #[test]
-    fn spawn_request_absent_pane_monitor_deserialises_as_none() {
-        // Older engine wire shape — no pane_monitor key at all.
-        let json = r#"{
-            "kind":"spawn_worker_pane",
-            "run_id":"run-old",
-            "workspace_path":"/tmp/ws",
-            "slot_id":1,
-            "initial_input":"claude\n",
-            "env":[]
-        }"#;
-        let parsed: EngineToAppRequest = serde_json::from_str(json).unwrap();
-        match parsed {
-            EngineToAppRequest::SpawnWorkerPane(input) => {
-                assert!(input.pane_monitor.is_none());
-            }
-            other => panic!("expected SpawnWorkerPane, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn slot_busy_error_round_trips() {
-        let original = EngineToAppResponse::SpawnWorkerPane {
+        let original = EngineToAppResponse::AttachWorkerPane {
             result: Err(EngineToAppError::SlotBusy { occupying_run_id: None }),
         };
         let json = serde_json::to_string(&original).unwrap();
@@ -556,7 +365,7 @@ mod tests {
 
     #[test]
     fn slot_busy_error_carries_occupying_run_id() {
-        let original = EngineToAppResponse::SpawnWorkerPane {
+        let original = EngineToAppResponse::AttachWorkerPane {
             result: Err(EngineToAppError::SlotBusy {
                 occupying_run_id: Some("run-husk".into()),
             }),
@@ -565,7 +374,7 @@ mod tests {
         assert!(json.contains("run-husk"));
         // Wire shape stays `slot_busy` + optional `occupying_run_id` only —
         // no `slot_id` echo and no pool/capacity fields. The engine already
-        // knows the requested slot from SpawnWorkerPaneInput.
+        // knows the requested slot from AttachWorkerPaneInput.
         assert!(!json.contains("slot_id"));
         assert!(!json.contains("pool"));
         assert!(!json.contains("capacity"));
@@ -629,17 +438,6 @@ mod tests {
         };
         let json = serde_json::to_string(&original).unwrap();
         let parsed: EngineToAppResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, original);
-    }
-
-    #[test]
-    fn release_request_round_trips() {
-        let original = EngineToAppRequest::ReleaseWorkerPane(ReleaseWorkerPaneInput {
-            slot_id: 3,
-            kill_grace_seconds: 5,
-        });
-        let json = serde_json::to_string(&original).unwrap();
-        let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, original);
     }
 
@@ -714,21 +512,9 @@ mod tests {
     }
 
     #[test]
-    fn spawn_response_ok_round_trips() {
-        let original = EngineToAppResponse::SpawnWorkerPane {
-            result: Ok(SpawnWorkerPaneResult {
-                slot_id: 1,
-                shell_pid: 12345,
-            }),
-        };
-        let json = serde_json::to_string(&original).unwrap();
-        let parsed: EngineToAppResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, original);
-    }
-
-    #[test]
-    fn spawn_response_err_round_trips() {
-        let original = EngineToAppResponse::SpawnWorkerPane {
+    fn attach_response_legacy_no_available_slot_error_round_trips() {
+        // Legacy wire compat: an older app may still send this variant.
+        let original = EngineToAppResponse::AttachWorkerPane {
             result: Err(EngineToAppError::NoAvailableSlot),
         };
         let json = serde_json::to_string(&original).unwrap();
@@ -745,16 +531,6 @@ mod tests {
         assert!(json.contains("surface init failed"));
         let parsed: EngineToAppError = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, err);
-    }
-
-    #[test]
-    fn release_response_round_trips() {
-        let original = EngineToAppResponse::ReleaseWorkerPane {
-            result: Ok(ReleaseWorkerPaneResult {}),
-        };
-        let json = serde_json::to_string(&original).unwrap();
-        let parsed: EngineToAppResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, original);
     }
 
     #[test]

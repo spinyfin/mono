@@ -87,13 +87,6 @@ pub enum TranscriptLiveness {
 }
 
 impl TranscriptLiveness {
-    /// Whether a reap must not proceed. `true` for a present transcript
-    /// (the driver demonstrably ran) and for an undeterminable answer (the
-    /// question could not be asked, which is not the same as "no").
-    pub fn vetoes_reap(&self) -> bool {
-        !matches!(self, TranscriptLiveness::Absent { .. })
-    }
-
     /// Whether a transcript for this execution was found on disk.
     pub fn is_present(&self) -> bool {
         matches!(self, TranscriptLiveness::Present { .. })

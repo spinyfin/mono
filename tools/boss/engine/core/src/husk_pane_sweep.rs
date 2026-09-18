@@ -19,8 +19,8 @@
 //! Historically the same shape (a pane the app still hosts that the
 //! engine's own bookkeeping no longer references) was reached from the
 //! *app*-hosted-pane side: `release_worker_pane` clears engine state
-//! unconditionally at the end of teardown — "successfully or not" — so an
-//! `ReleaseWorkerPane` RPC that timed out, or a terminal-transition site
+//! unconditionally at the end of teardown — "successfully or not" — so a
+//! pane-teardown RPC that timed out, or a terminal-transition site
 //! that cleared engine state without the app RPC ever landing, left the
 //! app still physically hosting a pane no engine-state-driven reconciler
 //! could see (`bossctl agents list` and `terminal_work_sweep`/
@@ -29,7 +29,7 @@
 //! created 06:26:19Z, pane spawned only 06:31:22Z; dispatch showed twelve
 //! `request_recorded` → `worker_claimed=skipped` cycles from 06:29:06 to
 //! 06:31:10) is that shape: a slot the engine's pool considered free was
-//! actually still occupied by a real hosted pane, so `SpawnWorkerPane` for
+//! actually still occupied by a real hosted pane, so an app-hosted spawn for
 //! the next dispatch kept losing the race against `SlotBusy` until the
 //! stray pane finally cleared. tmux-session enumeration closes the same gap
 //! from the resource-identity side instead of the app-RPC side: the tmux
@@ -38,8 +38,9 @@
 //!
 //! [`crate::app::ServerState::list_hosted_pane_statuses`] and
 //! [`crate::app::ServerState::retire_pane`] remain as the manual,
-//! operator-invoked break-glass path (`bossctl agents list --all` /
-//! `bossctl agents retire-pane`) over the app's own hosted-pane inventory.
+//! operator-invoked path (using `DetachWorkerPane` for viewer husks)
+//! via `bossctl agents list --all` /
+//! `bossctl agents retire-pane` over the app's own hosted-pane inventory.
 //! This sweep is the automatic backstop over the tmux server's inventory
 //! instead: once a leaked session has been reported untracked on two
 //! consecutive passes, it retires it (`tmux -S <state-root>/tmux.sock kill-session`),

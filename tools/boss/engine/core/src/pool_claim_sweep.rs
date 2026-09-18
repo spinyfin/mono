@@ -3,36 +3,15 @@
 //!
 //! ## The leak this closes
 //!
-//! A [`crate::coordinator::WorkerPool`] slot is claimed at dispatch
-//! (`drain_ready_queue` / `force_dispatch` → `claim_worker`) and, for a
-//! pane-spawned run, its release is DEFERRED to
-//! [`crate::app::ServerState::release_worker_pane`], which frees the
-//! slot only when the macOS app tears the libghostty pane down. Every
-//! other release path keys off a *live* worker:
+//! A worker-pool claim can outlive a terminal execution after a mid-spawn
+//! cancellation, a DB-error early return, or teardown that loses its live-state
+//! mapping. Completion and liveness reconciliation normally release claims
+//! through the registered worker; this sweep also examines the pool itself.
+//! tmux owns worker processes, and app panes are only viewers.
 //!
-//! * completion (`force_release` / `force_stop_execution` /
-//!   `finalize_pr_transition` / `finalize_automation_triage`) only frees
-//!   the slot as a side effect of `release_worker_pane`, and only when
-//!   the run→slot mapping is still registered;
-//! * the dead-pid and stale-worker sweeps iterate
-//!   [`LiveWorkerStateRegistry`] and derive the slot to release from a
-//!   *live-state entry*;
-//! * transient-recovery iterates the same registry but routes teardown
-//!   through [`crate::app::ServerState::release_worker_pane`], so the
-//!   pool claim is handed back only when the app confirms the pane is
-//!   gone.
-//!
-//! Nothing iterates the pool's OWN claimed slots. So a slot claimed by
-//! an execution that reached a terminal state WITHOUT a live pane —
-//! a mid-spawn cancel (claim taken, no slot registered yet), a
-//! `finalize_pr_transition` DB-error early-return, a teardown that
-//! dropped the run→slot mapping but not the pool claim, or a
-//! `bossctl agents stop` that released the cube lease but not the
-//! claim — is released by NOTHING. The claim outlives its execution
-//! forever. Once all [`MAX_AUTOMATION_POOL_SIZE`] automation slots leak
-//! this way, `claim_worker` returns `None` for every automation
-//! dispatch and the whole automation subsystem is wedged with no
-//! self-healing path short of an engine restart.
+//! Viewer attach can reject an occupied slot via AttachWorkerPane/SlotBusy;
+//! viewer teardown uses DetachWorkerPane. Neither viewer state nor a missing
+//! live-state mapping proves that a tmux worker has exited.
 //!
 //! ## Algorithm
 //!
@@ -44,7 +23,7 @@
 //!    live `run_id == execution_id`), SKIP — a live pane owns the slot
 //!    and the completion / dead-pid / stale-worker paths own its
 //!    teardown. Releasing it here would let a fresh dispatch hit
-//!    `SpawnWorkerPane` `SlotBusy` against a pane that is still up.
+//!    `AttachWorkerPane` `SlotBusy` against a pane that is still up.
 //! 2. Look up the execution. On a DB error, SKIP this pass (conservative
 //!    — a transient error is not proof the row is gone).
 //! 3. If the execution is NOT terminal, SKIP — the slot is legitimately
@@ -61,43 +40,15 @@
 //!    re-claim race can't yank a fresh, live claim, then emit a
 //!    `pool_claim_reconcile` dispatch event and kick the scheduler.
 //!
-//! ## Why the live-state cross-check is sound
+//! ## Why the live-state cross-check is needed
 //!
-//! On a CONFIRMED teardown, `release_worker_pane` frees the pool slot
-//! BEFORE it drops the live-state entry (`app.rs`: `release_worker_and_kick`
-//! then `live_worker_states.release_slot`). So a normal teardown's
-//! observable states are "claimed + live entry" → "free + live entry" →
-//! "free + no entry" — never "claimed + no entry" on that path.
-//!
-//! But an UNCONFIRMED teardown deliberately produces "claimed + no live
-//! entry": when the app never confirms the pane is actually gone (no
-//! session registered, a timed-out RPC, an unexpected response),
-//! `release_worker_pane` holds the pool claim instead of releasing it
-//! (see the `sweep_owns_handback` branch there) while still dropping the
-//! live-state entry unconditionally just below. This module is exactly
-//! how that state gets resolved. Three producers currently yield this
-//! shape:
-//!
-//! * a rejected `SpawnWorkerPane` in `coordinator/run.rs` (`hold_slot_busy`);
-//! * an unconfirmed teardown in `release_worker_pane` (`sweep_owns_handback`);
-//! * `TransientRecoveryReaper::reap_worker` dropping the live-state entry
-//!   for a claim `release_worker_pane` never held or released, when
-//!   transient-recovery finds no run→slot mapping. That path is reached
-//!   only after `request_resume_execution` / `mark_execution_orphaned`
-//!   has already terminalized the execution, so it is terminal-execution-
-//!   only for the same reason as the other two.
-//!
-//! A "claimed + no live entry" slot is therefore not proof the pane is
-//! gone — it may still be genuinely up, which is precisely what step 1
-//! above is written to avoid racing ("Releasing it here would let a
-//! fresh dispatch hit `SpawnWorkerPane` `SlotBusy` against a pane that
-//! is still up"). What makes releasing it anyway acceptable once
-//! `LEAK_GRACE_SECS` has passed is that all three known producers are
-//! terminal-execution-only and self-limiting: a genuine leak (no
-//! teardown owns the slot) must be reclaimed eventually, and an
-//! unconfirmed-but-actually-alive pane loses at most one dispatch to
-//! `SlotBusy` before this sweep frees it — the cost this whole module
-//! exists to bound, not eliminate.
+//! A live registry entry retains ownership of its pool claim even if its
+//! execution is terminal: normal teardown must finish first. A missing entry
+//! alone is insufficient, so this sweep also requires a terminal execution and
+//! a grace period, then compare-and-releases only the original execution's
+//! claim. The tmux adoption and husk sweeps independently reconcile physical
+//! sessions by durable spawn identity; releasing a claim is not proof that
+//! a session or viewer has disappeared.
 //!
 //! ## Cadence
 //!

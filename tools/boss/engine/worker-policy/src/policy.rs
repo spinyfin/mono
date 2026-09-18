@@ -441,12 +441,9 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::RegisterAppSession
         | FrontendRequest::RegisterCapabilities { .. }
         | FrontendRequest::ReportSelectedProduct { .. }
-        | FrontendRequest::ReportWorkerSpawnFailed { .. }
         | FrontendRequest::SetCoordinatorHandoff { .. }
         | FrontendRequest::Shutdown { .. }
-        | FrontendRequest::SpawnCapabilityRestored
-        | FrontendRequest::UpdateWorkerShellPid { .. }
-        | FrontendRequest::WorkerPaneDied { .. } => coordinator(variant_name(request)),
+        | FrontendRequest::SpawnCapabilityRestored => coordinator(variant_name(request)),
 
         // ── Denied: coordinator control surfaces ─────────────────────────
         //

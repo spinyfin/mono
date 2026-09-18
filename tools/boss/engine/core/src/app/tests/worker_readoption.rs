@@ -241,7 +241,7 @@ async fn durable_state_scan_reclaims_a_live_pane_after_its_work_closes() {
                     request,
                     EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id: 1, .. })
                 ),
-                "expected ReleaseWorkerPane for slot 1, got {request:?}",
+                "expected DetachWorkerPane for slot 1, got {request:?}",
             );
             request_id
         }
@@ -367,10 +367,10 @@ async fn a_survivor_is_reaped_when_a_replacement_execution_is_already_live() {
 ///
 /// The full production sequence, driven end to end:
 ///
-/// 1. The `SpawnWorkerPane` ack is lost, so the slot is registered
-///    provisionally with `shell_pid = 0` (`spawn_flow`'s ack-timeout branch).
-/// 2. The app hosted the pane anyway and the worker starts; the real pid lands
-///    via `UpdateWorkerShellPid`, which persists it to `work_runs`.
+/// 1. The spawn ack is lost, so the slot is registered provisionally with
+///    `shell_pid = 0` (`spawn_flow`'s ack-timeout branch).
+/// 2. The pane hosted the worker anyway and it starts; the real pid lands
+///    in `work_runs.shell_pid`.
 /// 3. Nothing else reports in before the grace window expires and a reap
 ///    orphans the execution — the engine now believes a running worker is dead.
 /// 4. The worker's next hook re-adopts it.
@@ -522,10 +522,6 @@ async fn readoption_derives_the_awaiting_input_capability_from_the_runs_driver()
     assert_eq!(
         state.shell_pid, 0,
         "a hook with no durable pid must still restore a provisional live-state entry",
-    );
-    assert!(
-        !crate::spawn_ack_sweep::slot_never_started(&server_state.live_worker_states, &state),
-        "a readopted zero-pid slot is not a never-started spawn",
     );
 
     // Re-adoption re-registers an already-running worker, so the `spawned_at`

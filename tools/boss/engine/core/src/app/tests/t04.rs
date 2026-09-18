@@ -69,7 +69,7 @@ async fn retire_pane_succeeds_for_husk_slot_with_no_app_session() {
 }
 
 #[tokio::test]
-async fn retire_pane_sends_slot_keyed_release_request_with_no_run_id_resolution() {
+async fn retire_pane_sends_slot_keyed_detach_request_with_no_run_id_resolution() {
     // The defining property of retire_pane vs release_worker_pane: it
     // never resolves through worker_registry (there is no run id for
     // a husk) — it goes straight to the app with the slot id the
@@ -114,18 +114,18 @@ async fn retire_pane_sends_slot_keyed_release_request_with_no_run_id_resolution(
         other => panic!("expected EngineRequest, got {other:?}"),
     };
     match request {
-        EngineToAppRequest::ReleaseWorkerPane(input) => {
+        EngineToAppRequest::DetachWorkerPane(input) => {
             assert_eq!(input.slot_id, 7);
         }
-        other => panic!("expected ReleaseWorkerPane, got {other:?}"),
+        other => panic!("expected DetachWorkerPane, got {other:?}"),
     }
 
     server_state
         .deliver_app_response(
             "session-app",
             &request_id,
-            EngineToAppResponse::ReleaseWorkerPane {
-                result: Ok(crate::protocol::ReleaseWorkerPaneResult {}),
+            EngineToAppResponse::DetachWorkerPane {
+                result: Ok(crate::protocol::DetachWorkerPaneResult {}),
             },
         )
         .await;
@@ -639,7 +639,7 @@ async fn retire_pane_reaps_an_untracked_slot_whose_durable_process_is_alive() {
     let release = sink
         .next()
         .await
-        .expect("a ReleaseWorkerPane request should be enqueued");
+        .expect("a DetachWorkerPane request should be enqueued");
     match release.payload {
         FrontendEvent::EngineRequest { request_id, request } => {
             assert!(
@@ -647,7 +647,7 @@ async fn retire_pane_reaps_an_untracked_slot_whose_durable_process_is_alive() {
                     request,
                     EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id: 4, .. })
                 ),
-                "expected ReleaseWorkerPane for slot 4, got {request:?}"
+                "expected DetachWorkerPane for slot 4, got {request:?}"
             );
             server_state
                 .deliver_app_response(

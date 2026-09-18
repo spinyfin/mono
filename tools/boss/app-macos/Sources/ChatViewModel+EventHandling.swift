@@ -668,12 +668,6 @@ extension ChatViewModel {
     /// leaving the engine's request hanging.
     private func handleEngineRequest(requestId: String, request: EngineRequestKind) {
         switch request {
-        case .spawnWorkerPane(let spawn):
-            let result = paneSpawnHandler.map { $0(spawn) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
-            engine.sendSpawnWorkerPaneResponse(requestId: requestId, result: result)
-        case .releaseWorkerPane(let slotId, let killGrace):
-            let result = paneReleaseHandler.map { $0(slotId, killGrace) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
-            engine.sendReleaseWorkerPaneResponse(requestId: requestId, result: result)
         case .attachWorkerPane(let attach):
             let result = paneAttachHandler.map { $0(attach) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
             engine.sendAttachWorkerPaneResponse(requestId: requestId, result: result)

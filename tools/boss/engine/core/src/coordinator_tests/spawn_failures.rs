@@ -517,7 +517,7 @@ async fn spawn_abort_survives_a_cancel_landing_during_the_cube_release() {
     );
 }
 
-/// Slow-ack provisional-spawn regression (outcome 3): a slow `SpawnWorkerPane` ack that
+/// Slow-ack provisional-spawn regression (outcome 3): a slow `AttachWorkerPane` ack that
 /// nonetheless spawned the pane must NOT be treated as a spawn
 /// failure. The real `PaneSpawnRunner` now converts the ack timeout
 /// into a PROVISIONAL spawn (waiting_human + slot retained); the fake

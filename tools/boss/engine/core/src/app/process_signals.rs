@@ -115,7 +115,7 @@ pub(super) fn current_parent_pid() -> Option<libc::pid_t> {
     // direct invocation of the binary, etc.) — the engine pins its
     // trust root to bazel/launchd and then rejects every legitimate
     // `RegisterAppSession` from the real app, which kills dispatch
-    // (every `SpawnWorkerPane` request fails because no app session
+    // (every `AttachWorkerPane` request fails because no app session
     // is registered to receive it). With None, the trust gate becomes
     // a no-op (matches the test path), the app registers, and the
     // coordinator tmux pane becomes the real trust root once created.
@@ -133,14 +133,13 @@ pub(super) fn current_parent_pid() -> Option<libc::pid_t> {
 /// from the panic hook, where we must not touch the runtime. The
 /// loop keeps going past `EPERM` / `ESRCH` because the worker may
 /// already be dead (good) or owned by another uid (we can't help).
-/// Engine-side backstop reap of a worker's OS process tree on pane
-/// release. The macOS app's `releaseWorkerPane` (→ `WorkerProcessKiller`)
-/// is the primary reaper, but it cannot act when no app session is
-/// registered, when the app is unresponsive, or when a wedged surface
-/// reports no foreground pid. In those cases `release_worker_pane` used
-/// to free the engine slot and the cube lease while the worker's
-/// `claude` process kept running — the leak in #975, where `bossctl
-/// agents stop` cleared the slot but left the OS process alive.
+/// Engine-side reap of a worker's OS process tree on tmux pane release
+/// ([`crate::app::tmux_teardown`]). Signalling the pane pid's process
+/// group directly is required in addition to `tmux kill-session`:
+/// node-based agents commonly ignore the `SIGHUP` a pty teardown
+/// delivers, so the session can be gone while the worker process
+/// tree survives it — the leak in #975, where `bossctl agents stop`
+/// cleared the slot but left the OS process alive.
 ///
 /// Fires `SIGTERM` at the *process group* of `shell_pid` synchronously
 /// (so a `claude` and anything it spawned — e.g. an MCP stdio child —
@@ -151,9 +150,8 @@ pub(super) fn current_parent_pid() -> Option<libc::pid_t> {
 /// Synchronous SIGTERM + detached SIGKILL (rather than a blocking
 /// ladder) keeps the release path — and the `bossctl agents stop`
 /// round-trip behind it — prompt: by the time it returns the worker
-/// has at minimum been asked to exit. Mirrors the app-side
-/// `WorkerProcessKiller` ladder and the `signal_shell_pids` shutdown
-/// fallback.
+/// has at minimum been asked to exit. Mirrors the `signal_shell_pids`
+/// shutdown fallback.
 pub(super) fn reap_worker_process_tree(shell_pid: i32, grace: Duration) {
     if shell_pid <= 0 {
         return;
@@ -189,8 +187,7 @@ pub(super) fn reap_worker_process_tree(shell_pid: i32, grace: Duration) {
 /// Resolve the `kill(2)` target for `pid`: the negated process group id
 /// when `getpgid` succeeds (so the whole group is signalled, reaching
 /// descendants), falling back to the bare pid when `getpgid` reports
-/// the process is already gone. Mirrors the app-side
-/// `WorkerProcessKiller.signalTarget`.
+/// the process is already gone.
 pub(super) fn process_group_signal_target(pid: libc::pid_t) -> libc::pid_t {
     // SAFETY: `getpgid` only reads kernel state for `pid`.
     let pgid = unsafe { libc::getpgid(pid) };
