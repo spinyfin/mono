@@ -63,68 +63,26 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        if existing.status.is_terminal() {
-            bail!(
-                "execution {execution_id} is already in terminal status `{}` and cannot be cancelled",
-                existing.status
-            );
-        }
-        if opts.queued_only && !existing.status.is_pre_run() {
-            if existing.status.is_live() {
-                bail!(
-                    "execution {execution_id} is `{}` (already started); \
-                     use `bossctl agents stop {execution_id}` to stop a live worker — \
-                     `executions cancel` only accepts never-started \
-                     (queued/ready/waiting_dependency/claimed) rows",
-                    existing.status
-                );
-            }
-            bail!(
-                "execution {execution_id} is `{}` and has already left the \
-                 never-started set (queued/ready/waiting_dependency/claimed); \
-                 use `bossctl work cancel {execution_id}` for any non-terminal \
-                 row, or `bossctl agents stop` if a live worker still backs it",
-                existing.status
-            );
-        }
-        let reason = normalize_optional_text(opts.reason).unwrap_or_else(|| "explicit cancel".to_owned());
-        let now = now_string();
-        tx.execute(
-            "UPDATE work_executions
-             SET status = 'cancelled',
-                 finished_at = ?2
-             WHERE id = ?1",
-            params![execution_id, now.as_str()],
-        )?;
-        // Live cancel only: demote active → todo when this execution is
-        // still the work item's latest. Never-started cancels leave the
-        // kanban alone (shared helper with cancel_running_execution_and_demote_task).
-        if existing.status.is_live() {
-            demote_active_if_latest_execution(&tx, &existing.work_item_id, execution_id, &now)?;
-        }
-        let updated = query_execution(&tx, execution_id)?
-            .with_context(|| format!("unknown execution after cancel: {execution_id}"))?;
-        // Canonical terminalization trace — see `mark_execution_orphaned` for
-        // why every terminal-transition site emits this line: a recurrence
-        // of the ack-timeout / stale-reap contradiction (a live worker whose
-        // execution the engine already terminalized) must be attributable
-        // regardless of which site actually fired.
-        //
-        // `reason` is the operator- or engine-supplied cancel reason so the
-        // audit trail distinguishes deliberate cancellation from
-        // `orphaned` (engine lost the run) and `abandoned`.
-        tracing::warn!(
-            execution_id = %execution_id,
-            work_item_id = %updated.work_item_id,
-            from_status = %existing.status,
-            to_status = %updated.status,
-            reason = %reason,
-            queued_only = opts.queued_only,
-            "execution terminalized: cancel",
-        );
+        let reason = normalize_optional_text(opts.reason.clone()).unwrap_or_else(|| "explicit cancel".to_owned());
         let mut pending = PendingEvents::new();
-        stage_execution_terminal(&mut pending, &tx, execution_id, &updated.work_item_id)?;
+        let updated = cancel_execution_in_tx(&tx, &mut pending, execution_id, opts)?;
         commit_and_publish(tx, pending, &self.event_bus)?;
+        // `connect()` is a process-wide mutex; drop it before the review-guide
+        // follow-up, which needs its own connection.
+        drop(conn);
+        if existing.kind == ExecutionKind::PrReviewGuide
+            && let Err(err) = self.finish_pr_review_guide_attempt_for_terminal_execution(
+                execution_id,
+                ExecutionStatus::Cancelled,
+                &reason,
+            )
+        {
+            tracing::warn!(
+                execution_id = %execution_id,
+                ?err,
+                "review-guide: cancelled the execution but failed to cancel the bound attempt",
+            );
+        }
         Ok(updated)
     }
 
@@ -225,6 +183,20 @@ impl WorkDb {
         let mut pending = PendingEvents::new();
         stage_execution_terminal(&mut pending, &tx, execution_id, &updated.work_item_id)?;
         commit_and_publish(tx, pending, &self.event_bus)?;
+        drop(conn);
+        if existing.kind == ExecutionKind::PrReviewGuide
+            && let Err(err) = self.finish_pr_review_guide_attempt_for_terminal_execution(
+                execution_id,
+                ExecutionStatus::Orphaned,
+                reason,
+            )
+        {
+            tracing::warn!(
+                execution_id = %execution_id,
+                ?err,
+                "review-guide: orphaned the execution but failed to fail the bound attempt",
+            );
+        }
         Ok(updated)
     }
 
@@ -2153,6 +2125,77 @@ impl WorkDb {
         commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(updated))
     }
+}
+
+/// Cancel within a caller's transaction, staging terminal events for publication after commit.
+pub(super) fn cancel_execution_in_tx(
+    tx: &Connection,
+    pending: &mut PendingEvents,
+    execution_id: &str,
+    opts: CancelExecutionOpts,
+) -> Result<WorkExecution> {
+    let existing = query_execution(tx, execution_id).require("execution", execution_id)?;
+    if existing.status.is_terminal() {
+        bail!(
+            "execution {execution_id} is already in terminal status `{}` and cannot be cancelled",
+            existing.status
+        );
+    }
+    if opts.queued_only && !existing.status.is_pre_run() {
+        if existing.status.is_live() {
+            bail!(
+                "execution {execution_id} is `{}` (already started); \
+                     use `bossctl agents stop {execution_id}` to stop a live worker — \
+                     `executions cancel` only accepts never-started \
+                     (queued/ready/waiting_dependency/claimed) rows",
+                existing.status
+            );
+        }
+        bail!(
+            "execution {execution_id} is `{}` and has already left the \
+                 never-started set (queued/ready/waiting_dependency/claimed); \
+                 use `bossctl work cancel {execution_id}` for any non-terminal \
+                 row, or `bossctl agents stop` if a live worker still backs it",
+            existing.status
+        );
+    }
+    let reason = normalize_optional_text(opts.reason).unwrap_or_else(|| "explicit cancel".to_owned());
+    let now = now_string();
+    tx.execute(
+        "UPDATE work_executions
+             SET status = 'cancelled',
+                 finished_at = ?2
+             WHERE id = ?1",
+        params![execution_id, now.as_str()],
+    )?;
+    // Live cancel only: demote active → todo when this execution is
+    // still the work item's latest. Never-started cancels leave the
+    // kanban alone (shared helper with cancel_running_execution_and_demote_task).
+    if existing.status.is_live() {
+        demote_active_if_latest_execution(tx, &existing.work_item_id, execution_id, &now)?;
+    }
+    let updated = query_execution(tx, execution_id)?
+        .with_context(|| format!("unknown execution after cancel: {execution_id}"))?;
+    // Canonical terminalization trace — see `mark_execution_orphaned` for
+    // why every terminal-transition site emits this line: a recurrence
+    // of the ack-timeout / stale-reap contradiction (a live worker whose
+    // execution the engine already terminalized) must be attributable
+    // regardless of which site actually fired.
+    //
+    // `reason` is the operator- or engine-supplied cancel reason so the
+    // audit trail distinguishes deliberate cancellation from
+    // `orphaned` (engine lost the run) and `abandoned`.
+    tracing::warn!(
+        execution_id = %execution_id,
+        work_item_id = %updated.work_item_id,
+        from_status = %existing.status,
+        to_status = %updated.status,
+        reason = %reason,
+        queued_only = opts.queued_only,
+        "execution terminalized: cancel",
+    );
+    stage_execution_terminal(pending, tx, execution_id, &updated.work_item_id)?;
+    Ok(updated)
 }
 
 #[cfg(test)]

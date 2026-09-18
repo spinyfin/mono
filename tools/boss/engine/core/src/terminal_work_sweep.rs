@@ -269,6 +269,9 @@ pub async fn run_one_pass(
     seen_terminal: &mut HashSet<String>,
 ) -> TerminalWorkSweepOutcome {
     let mut outcome = TerminalWorkSweepOutcome::default();
+    if let Err(err) = work_db.reconcile_pr_review_guide_attempts() {
+        tracing::warn!(?err, "terminal-work sweep: review-guide attempt reconcile failed",);
+    }
     // One clock read per pass: every candidate's teardown mark is judged
     // against the same instant, so a long pass can't classify two runs
     // inconsistently.

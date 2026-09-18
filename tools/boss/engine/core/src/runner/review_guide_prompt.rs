@@ -44,7 +44,11 @@ pub(super) fn compose_review_guide_prompt(work_db: &WorkDb, execution: &WorkExec
         pr_url: &packet.canonical_pr_url,
         repository: &packet.base_repository,
         pr_title: &packet.title,
-        base_sha: &packet.observed_base_sha,
+        // Before-side links validate against `merge_base_sha`, not the
+        // observed base-branch tip. Advertising the merge base here is
+        // what lets a model following "Use revision-pinned source links"
+        // pass `reference_repository_matches`.
+        base_sha: &packet.merge_base_sha,
         head_sha: &packet.head_sha,
     };
     let mut prompt = boss_review_guide::render_prompt(&metadata);

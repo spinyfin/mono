@@ -1,20 +1,18 @@
-//! Prompt composition for `answer_agent` executions (P3b of
-//! `comment-triggered-document-revisions.md`). Split out of `runner::prompt`
-//! (which sits at the repo's file-size limit) to keep the module boundary
-//! reviewable.
+//! Prompt composition for `answer_agent` executions from document content and
+//! comment-thread context. See `comment-triggered-document-revisions.md`.
 
 use crate::work::{WorkDb, WorkExecution, parse_pr_doc_artifact_id};
 
-/// Compose the initial prompt for an `answer_agent` execution (P3b of
-/// `comment-triggered-document-revisions.md`). `execution.work_item_id` is
-/// the comment id (see `WorkDb::create_answer_agent_execution`); this
-/// resolves it back to the comment, its doc owner, the doc's full content
-/// (fetched via `gh api` at the doc's own branch/ref — the leased workspace
-/// checkout is at whatever default ref cube gave it, not necessarily this
-/// branch, so the doc text is embedded directly rather than read from disk;
-/// see the answer-agent capability table's "read code in a leased checkout"
-/// vs. "read the commented-on document" distinction), and any prior thread
-/// entries (non-empty on a `thread_turn > 0` re-entered follow-up, phase 3c).
+/// Compose the initial prompt for an `answer_agent` execution.
+/// `execution.work_item_id` is the comment id (see
+/// `WorkDb::create_answer_agent_execution`); this resolves it back to the
+/// comment, its doc owner, the doc's full content (fetched via `gh api` at
+/// the doc's own branch/ref — the leased workspace checkout is at whatever
+/// default ref cube gave it, not necessarily this branch, so the doc text is
+/// embedded directly rather than read from disk; see the answer-agent
+/// capability table's "read code in a leased checkout" vs. "read the
+/// commented-on document" distinction), and any prior thread entries
+/// (non-empty on a `thread_turn > 0` re-entered follow-up).
 ///
 /// Falls back to the generic implementer prompt — logging a warning — if the
 /// comment or its doc owner can no longer be resolved (raced/deleted

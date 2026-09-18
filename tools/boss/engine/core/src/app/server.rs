@@ -1332,6 +1332,16 @@ pub async fn serve_with_overrides(
 
     post_bind.mark("release_stale_claimed");
 
+    match server_state.work_db.reconcile_pr_review_guide_attempts() {
+        Ok(acted) if acted > 0 => tracing::info!(
+            acted,
+            "engine startup: reconciled stranded or unbound review-guide attempts"
+        ),
+        Ok(_) => {}
+        Err(err) => tracing::warn!(?err, "engine startup: review-guide attempt reconcile failed"),
+    }
+    post_bind.mark("review_guide_attempt_reconcile");
+
     let in_flight = match server_state.work_db.list_in_flight_executions() {
         Ok(rows) => rows
             .into_iter()

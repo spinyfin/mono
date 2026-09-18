@@ -11,8 +11,8 @@ use std::path::Path;
 ///
 /// These rules are appended on top of the static deny rules that apply to
 /// every worker kind. They are kept as a named function (rather than inlined
-/// in `deny_rules`) so task 3 — which wires the reviewer execution kind to
-/// the spawn path — can confirm the exact rule set in tests.
+/// in `deny_rules`) so the reviewer spawn path can confirm the exact rule
+/// set in tests.
 ///
 /// **Read-only posture**: the reviewer reads the PR diff and workspace
 /// files but must not write, push, or post to any external surface.
@@ -63,7 +63,7 @@ pub fn reviewer_deny_rules(workspace_path: &Path) -> Vec<String> {
     rules
 }
 
-/// Tool deny rules for triage workers (Maint task 6, [`WorkerKind::Triage`]).
+/// Tool deny rules for triage workers ([`WorkerKind::Triage`]).
 ///
 /// A triage worker investigates the repo and emits a decision marker; it must
 /// NOT do the work itself — no edits, commits, pushes, or PRs. The rule set is
@@ -110,10 +110,8 @@ pub fn triage_deny_rules() -> Vec<String> {
 ///
 /// Reading code via read-only shell (`cat`, `grep`, `jj log`, `jj show`,
 /// `jj diff`, …) needs no entry — `dontAsk` auto-approves those. The read-only
-/// engine-query commands the agent uses (`boss …` reads) are added here in P3b
-/// alongside the query layer that ships with the spawn path; until then the
-/// allowlist is intentionally minimal (P3a builds the enforcement mechanism,
-/// not the agent that exercises it).
+/// engine-query commands the agent uses (`boss …` reads) live on this
+/// allowlist alongside the query layer that ships with the spawn path.
 ///
 /// Every entry MUST be read-only or the single reply command. Adding a
 /// mutating entry here is a capability escalation and must be reviewed as such.
@@ -146,17 +144,7 @@ pub fn answer_agent_allow_rules() -> Vec<String> {
 ///   checkout; it must not lease, release, or otherwise mutate cube state
 ///   itself (design capability table: "Release/mutate cube lease state … No").
 pub fn answer_agent_deny_rules() -> Vec<String> {
-    let mut rules = vec!["Edit(**)".to_owned(), "NotebookEdit(**)".to_owned()];
-    rules.extend(publish_deny_rules());
-    // `publish_deny_rules` already denies `cube pr`; deny the rest of `cube`
-    // (workspace lease/release, config, …) so the agent cannot touch cube state.
-    rules.push("Bash(cube)".to_owned());
-    rules.push("Bash(cube:*)".to_owned());
-    rules.push(r#"Bash("$CUBE_BIN")"#.to_owned());
-    rules.push(r#"Bash("$CUBE_BIN":*)"#.to_owned());
-    rules.push("Bash($CUBE_BIN)".to_owned());
-    rules.push("Bash($CUBE_BIN:*)".to_owned());
-    rules
+    read_only_worker_deny_rules()
 }
 
 /// The `permissions.deny` belt for [`WorkerKind::ReviewGuide`] — defense in
@@ -171,8 +159,19 @@ pub fn answer_agent_deny_rules() -> Vec<String> {
 /// prose), so the forced `dontAsk` permission mode with an *empty*
 /// `permissions.allow` is itself the belt; this deny list is the second one.
 pub fn review_guide_deny_rules() -> Vec<String> {
+    read_only_worker_deny_rules()
+}
+
+/// Shared deny body for workers that must not write files, publish, or
+/// mutate cube state. [`answer_agent_deny_rules`] and
+/// [`review_guide_deny_rules`] stay as named public builders so the two
+/// postures can still diverge and so each kind's tests can assert its own
+/// set.
+fn read_only_worker_deny_rules() -> Vec<String> {
     let mut rules = vec!["Edit(**)".to_owned(), "NotebookEdit(**)".to_owned()];
     rules.extend(publish_deny_rules());
+    // `publish_deny_rules` already denies `cube pr`; deny the rest of `cube`
+    // (workspace lease/release, config, …) so the worker cannot touch cube state.
     rules.push("Bash(cube)".to_owned());
     rules.push("Bash(cube:*)".to_owned());
     rules.push(r#"Bash("$CUBE_BIN")"#.to_owned());
