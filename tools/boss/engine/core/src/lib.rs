@@ -125,6 +125,7 @@ pub use boss_metrics as metrics;
 // are `#[macro_export]`ed from `boss_engine_metrics_registry` and
 // re-exported through `boss_metrics`.
 pub use boss_metrics::{register_counter, register_gauge};
+pub mod metric_series;
 pub mod metrics_init;
 pub mod metrics_store;
 pub mod no_op_signal;

@@ -97,6 +97,7 @@ mod ideas;
 pub mod isolation;
 mod launch_environment;
 mod live_status;
+mod metric_series;
 mod metrics;
 mod pane_delivery;
 mod pane_ops;
@@ -2389,6 +2390,8 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::GetExecution { .. } => Box::pin(executions::handle_get_execution(ctx, r)),
             r @ FrontendRequest::GetHost { .. } => Box::pin(hosts::handle_get_host(ctx, r)),
             r @ FrontendRequest::GetIdea { .. } => Box::pin(ideas::handle_get_idea(ctx, r)),
+            r @ FrontendRequest::GetMetricCatalog => Box::pin(metric_series::handle_get_metric_catalog(ctx, r)),
+            r @ FrontendRequest::GetMetricSeries { .. } => Box::pin(metric_series::handle_get_metric_series(ctx, r)),
             r @ FrontendRequest::GetPrBody { .. } => Box::pin(pr_status::handle_get_pr_body(ctx, r)),
             r @ FrontendRequest::GetProductDesignDoc { .. } => {
                 Box::pin(design_docs::handle_get_product_design_doc(ctx, r))
