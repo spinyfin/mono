@@ -433,9 +433,11 @@ impl ServerState {
                     "readopt: no positive shell pid was observable; registering the live-state entry with the provisional zero-pid sentinel",
                 );
             }
-            // Same durable hosting-mode snapshot spawn stamps. Missing or
-            // unreadable folds to legacy — the conservative bucket, matching
-            // classify treating unknown as terminate-on-quit.
+            // Same durable hosting-mode snapshot spawn stamps. A missing or
+            // unreadable stamp reads as not-tmux-hosted; such rows are
+            // quarantined and skipped by the `is_execution_quarantined`
+            // guard upstream, so this arm is a defensive default rather
+            // than a live path.
             let tmux_hosted = match self.work_db.latest_run_tmux_hosting_for_execution(run_id) {
                 Ok(Some(hosted)) => hosted,
                 Ok(None) => false,
@@ -443,7 +445,7 @@ impl ServerState {
                     tracing::warn!(
                         run_id,
                         error = %format!("{err:#}"),
-                        "readopt: could not read durable tmux hosting; treating as legacy-hosted",
+                        "readopt: could not read durable tmux hosting; treating as not tmux-hosted",
                     );
                     false
                 }
