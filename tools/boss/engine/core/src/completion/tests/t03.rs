@@ -1602,12 +1602,12 @@ async fn conflict_revision_on_stop_no_baseline_finalizes_without_false_failure()
     // `NudgeBreakerParked` — marks the bound `conflict_resolutions`
     // ledger row `failed` (a false classification: the worker DID
     // push). At the time of the original incident,
-    // `park_for_unproductive_nudges` never released the cube lease or
+    // `fail_for_unproductive_nudges` never released the cube lease or
     // the pane, so the execution stayed `waiting_human` forever with a
     // stranded, unresponsive pane — exactly "lingering Claude Not
-    // Detected panes." (`park_for_unproductive_nudges` now finalizes
-    // via `finalize_idle_park`, releasing both — see
-    // `record_worker_idle_abandonment` — but the false `failed`
+    // Detected panes." (`fail_for_unproductive_nudges` now finalizes
+    // via `finalize_worker_failure`, releasing both — see
+    // `record_worker_failure` — but the false `failed`
     // ledger classification this test guards against is unrelated to
     // that leak and remains possible on the nudge-breaker path.)
     //

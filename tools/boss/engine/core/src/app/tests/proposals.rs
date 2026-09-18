@@ -91,7 +91,8 @@ async fn call_with_peer(
         match req {
             r @ FrontendRequest::SubmitProposal { .. } => proposals::handle_submit_proposal(ctx, r).await,
             r @ FrontendRequest::ListProposals { .. } => proposals::handle_list_proposals(ctx, r).await,
-            other => panic!("not a proposal verb: {other:?}"),
+            r @ FrontendRequest::GetWorkItem { .. } => super::super::work_items::handle_get_work_item(ctx, r).await,
+            other => panic!("not a supported test verb: {other:?}"),
         }
     };
     tokio::pin!(handler);
@@ -663,13 +664,11 @@ async fn accepted_run_done_delivered_immediately_terminalizes_a_bound_pr() {
 /// A worker can declare `delivered` without the engine being able to resolve
 /// any PR (no bound `pr_url`, nothing staged, no artifact) — the declaration
 /// is still definitive: the run ends and its resources are released. The
-/// task is left untouched (there is nothing to bind it to) and a flagged
-/// attention records the mismatch, per the design's "post-hoc audit" split.
+/// task records a visible failure and a flagged attention records the mismatch.
 #[tokio::test]
 async fn accepted_run_done_delivered_without_a_resolvable_pr_still_terminalizes() {
     let (server_state, _dir, execution_id, work_item_id) = live_chore_execution();
     let peer_pid = std::process::id() as libc::pid_t;
-    let original_status = task_status(&server_state, &work_item_id);
 
     let (proposal, _) = submitted(
         call_with_peer(
@@ -687,13 +686,13 @@ async fn accepted_run_done_delivered_without_a_resolvable_pr_still_terminalizes(
     let execution = server_state.work_db.get_execution(&execution_id).unwrap();
     assert_eq!(
         execution.status,
-        boss_protocol::ExecutionStatus::Abandoned,
+        boss_protocol::ExecutionStatus::Failed,
         "still terminalizes — a declaration is definitive even when the engine cannot verify it"
     );
     assert_eq!(
         task_status(&server_state, &work_item_id),
-        original_status,
-        "no PR to bind means no task-status advance"
+        boss_protocol::TaskStatus::Blocked,
+        "an unverifiable delivery is a visible failure"
     );
     let items = server_state.work_db.list_attention_items(&execution_id).unwrap();
     assert!(
@@ -735,16 +734,20 @@ async fn accepted_run_done_no_changes_needed_immediately_closes_the_task() {
     );
 }
 
-/// `blocked` ends the run without delivering: the execution terminalizes and
-/// releases its slot/lease, but — unlike `delivered`/`no-changes-needed` —
-/// there is no claim of positive progress, so the task/chore's own status is
-/// left untouched for a human to redirect.
+/// A mandated stop fails visibly, without bypassing a check or cycling workers.
 #[tokio::test]
-async fn accepted_run_done_blocked_immediately_terminalizes_without_advancing_the_task() {
+async fn mandated_check_approval_stop_fails_visibly_without_replacement_workers() {
     let (server_state, _dir, execution_id, work_item_id) = live_chore_execution();
     let peer_pid = std::process::id() as libc::pid_t;
-    let original_status = task_status(&server_state, &work_item_id);
-
+    let reason = "Repository check requires an exclusion to proceed; AGENTS.md forbids relaxing it without approval";
+    submitted(
+        call_with_peer(
+            &server_state,
+            Some(peer_pid),
+            submit_request(&execution_id, ProposalKind::Blocked, json!({"reason": reason})),
+        )
+        .await,
+    );
     let (proposal, _) = submitted(
         call_with_peer(
             &server_state,
@@ -752,24 +755,59 @@ async fn accepted_run_done_blocked_immediately_terminalizes_without_advancing_th
             submit_request(
                 &execution_id,
                 ProposalKind::RunDone,
-                json!({"outcome": "blocked", "summary": "Cannot proceed without operator input"}),
+                json!({"outcome": "blocked", "summary": "Check policy decision required; no bypass applied"}),
             ),
         )
         .await,
     );
     assert_eq!(proposal.state, ProposalState::Applied);
-    assert_eq!(
-        server_state.work_db.get_execution(&execution_id).unwrap().status,
-        boss_protocol::ExecutionStatus::Abandoned
-    );
-    assert_eq!(task_status(&server_state, &work_item_id), original_status);
-    let items = server_state.work_db.list_attention_items(&execution_id).unwrap();
-    assert!(
-        items
-            .iter()
-            .any(|i| i.kind == crate::completion::RUN_DONE_BLOCKED_ATTENTION_KIND),
-        "the run's end must be visible to a human: {items:?}"
-    );
+    let db = &server_state.work_db;
+    let execution = db.get_execution(&execution_id).unwrap();
+    assert_eq!(execution.status, boss_protocol::ExecutionStatus::Failed);
+    assert!(execution.cube_lease_id.is_none());
+    assert!(execution.workspace_path.is_none());
+    let boss_protocol::WorkItem::Chore(task) = db.get_work_item(&work_item_id).unwrap() else {
+        panic!("expected chore");
+    };
+    assert_eq!(task.status, boss_protocol::TaskStatus::Blocked);
+    assert_eq!(task.blocked_reason.as_deref(), Some("worker_failed"));
+    let detail = task.blocked_detail.as_deref().unwrap();
+    assert!(detail.contains(reason));
+    assert!(detail.contains("no bypass applied"));
+    assert!(detail.contains(&execution_id));
+    assert!(!db.dispatch_admission_facts(&work_item_id).unwrap().deliberate_parked);
+    // Repeated automatic passes must not consume churn strikes or mint anything.
+    for _ in 0..4 {
+        assert!(
+            !db.list_orphan_active_candidates(0)
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate == &work_item_id)
+        );
+        assert!(!db.rescan_active_dispatch().unwrap().contains(&work_item_id));
+        db.reconcile_product_executions(&task.product_id).unwrap();
+        assert_eq!(
+            db.latest_execution_for_work_item(&work_item_id).unwrap().unwrap().id,
+            execution_id
+        );
+    }
+    // This is the task-show/board wire representation, not execution-only attention.
+    let response = call_with_peer(
+        &server_state,
+        None,
+        FrontendRequest::GetWorkItem {
+            id: work_item_id.clone(),
+        },
+    )
+    .await;
+    let FrontendEvent::WorkItemResult {
+        item: boss_protocol::WorkItem::Chore(shown),
+    } = response
+    else {
+        panic!("task show must return the failed chore");
+    };
+    let shown = serde_json::to_value(shown).unwrap();
+    assert!(shown["blocked_detail"].as_str().unwrap().contains(reason));
 }
 
 /// The end-to-end proof the incidents demand: submitting `run_done` reaps a

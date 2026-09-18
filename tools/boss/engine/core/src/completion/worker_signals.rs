@@ -779,6 +779,13 @@ impl WorkerCompletionHandler {
     /// the condition [`Self::nudge_or_park`] uses to suppress the
     /// "produce a PR" auto-nudge loop. `None` when there is none (never
     /// filed, or filed-and-resolved).
+    ///
+    /// Unbounded by design: kind and unresolved status are the only
+    /// predicates. A standalone `boss propose blocked` (no terminal
+    /// `done`) therefore keeps the execution live across an arbitrary
+    /// number of Stops until a coordinator resolves the attention item.
+    /// That is the AGENTS.md mandated-stop keep-alive, not a circuit the
+    /// nudge breaker is allowed to close.
     pub(super) fn unresolved_worker_signal_reason(&self, execution: &crate::work::WorkExecution) -> Option<String> {
         let items = self.work_db.list_attention_items(&execution.id).ok()?;
         let open: Vec<&str> = items

@@ -2124,10 +2124,9 @@ pub enum StopOutcome {
     EmptyDiffPr { pr_url: String },
     /// The auto-nudge circuit breaker tripped: the worker was nudged
     /// `max_unproductive_nudges` consecutive times with no new commit,
-    /// PR, or state transition. The execution is parked (an attention
-    /// item is filed and an `AttentionItemCreated` event published)
-    /// instead of being nudged again. `reason` is the human-readable
-    /// explanation recorded on the attention item.
+    /// PR, or state transition. The execution fails and releases its resources;
+    /// the task records the failure reason and is excluded from automatic retry.
+    /// The variant name is retained for existing consumers; no park is created.
     NudgeBreakerParked { reason: String },
     /// The nudge breaker rejected an otherwise valid probe because the same
     /// fingerprint was queued too recently. No probe was delivered; a
@@ -2139,9 +2138,13 @@ pub enum StopOutcome {
     /// queued via `nudge_or_park`) instead of dogging a worker that already
     /// declared itself stuck awaiting coordinator direction (incident
     /// 2026-07-02, exec_18b5243e65ff188_2d). `reason` names the
-    /// pending signal kind(s). The execution stays `waiting_human`; no
-    /// probe is sent. Resolving the attention item (coordinator ack)
-    /// resumes normal nudging on the next Stop.
+    /// pending signal kind(s). The execution stays `waiting_human` with its
+    /// lease and pane attached; no probe is sent. There is no time bound —
+    /// this is the AGENTS.md mandated-stop channel (`boss propose blocked`
+    /// without a terminal `done`). The coordinator-visible attention item
+    /// is the release valve (`bossctl probe`), not the nudge breaker.
+    /// Resolving the attention item (coordinator ack) resumes normal
+    /// nudging on the next Stop.
     EscalationPending { reason: String },
     /// The worker's Stop-boundary text matched the [`crate::build_wait`]
     /// heuristic — it is narrating that it is legitimately waiting on a
@@ -2342,11 +2345,11 @@ pub enum StopOutcome {
     /// The execution is finalised synchronously at submit time, not at a
     /// later Stop boundary that may never arrive. Fired for `blocked` (the
     /// run is over without delivering) or `delivered` with no PR the engine
-    /// could resolve — both terminalize without a positive task-status
-    /// change (mirrors [`Self::NudgeBreakerParked`]'s idle-park mechanics:
-    /// `abandoned`, lease/pane released, `autostart` cleared) and file a
-    /// [`RUN_DONE_AUDIT_FLAGGED_ATTENTION_KIND`] or
-    /// [`RUN_DONE_BLOCKED_ATTENTION_KIND`] attention so a human sees why.
+    /// could resolve. Both fail the execution and, for a task still in
+    /// `active`/`todo`, record `blocked:worker_failed` before releasing the
+    /// lease and pane; neither creates a deliberate park. A parent already
+    /// in `in_review` or a domain-owned blocked reason is left in that
+    /// recovery state — see [`crate::work::WorkDb::record_worker_failure`].
     /// `delivered` with a resolvable PR instead reaches [`Self::PrDetected`],
     /// and `no_changes_needed` reaches [`Self::NoChangesNeeded`] — both
     /// existing variants, reused because their semantics already fit.

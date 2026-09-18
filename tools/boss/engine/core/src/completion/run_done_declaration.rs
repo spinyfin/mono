@@ -44,7 +44,7 @@
 //! - The actual termination writes
 //!   ([`crate::work::WorkDb::record_worker_pr_completion`],
 //!   [`WorkerCompletionHandler::finalize_no_op_completion`],
-//!   [`WorkerCompletionHandler::finalize_idle_park`]) and the teardown
+//!   [`WorkerCompletionHandler::finalize_worker_failure`]) and the teardown
 //!   sequence ([`WorkerCompletionHandler::finish_worker_teardown`]) touch
 //!   only the local DB, the pane, the driver's local workspace state, and
 //!   the `cube` CLI (a local subprocess, not GitHub).
@@ -68,7 +68,7 @@
 //!   module's finalize call returning. Submission finalizes regardless of
 //!   response delivery, so acknowledgement loss is not a recovery boundary;
 //! - a run that never calls `boss propose done` at all — the backstop's
-//!   hold/ask/park sequence is unchanged and is what catches those.
+//!   hold/ask sequence ends in a visible failure for those attempts.
 
 use super::*;
 
@@ -249,19 +249,8 @@ impl WorkerCompletionHandler {
         StopOutcome::PrDetected { pr_url }
     }
 
-    /// `delivered` with no PR the engine could resolve without a network
-    /// call. Terminalizes anyway — the declaration is definitive, not a
-    /// claim the engine verifies before accepting — but leaves the
-    /// task/chore's own status untouched (there is nothing to bind it to)
-    /// and flags the mismatch for a human via
-    /// [`crate::completion::RUN_DONE_AUDIT_FLAGGED_ATTENTION_KIND`].
-    ///
-    /// Reuses [`Self::finalize_idle_park`]'s exact mechanics — `abandoned`,
-    /// lease/pane released, `autostart` cleared so the rescan does not
-    /// immediately re-dispatch onto a task whose worker just made an
-    /// unverifiable claim — because that is precisely the right shape here:
-    /// there is no positive evidence to advance the task on, only a
-    /// worker-declared end to the run.
+    /// An unverifiable delivery fails visibly without performing network I/O.
+    /// It uses the same atomic failure/teardown as a declared blocker.
     async fn finalize_declared_delivery_without_pr(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
         let detail = format!(
             "Execution `{}` declared `boss propose done --outcome delivered`, but the engine \
@@ -269,10 +258,12 @@ impl WorkerCompletionHandler {
              `pr_url`, no `execution.pr_url` (revision chain root), and nothing staged from the \
              hook stream or structured-output artifact this run. The declaration is still \
              terminal: the run has ended and its slot and lease are released. The task/chore's \
-             own status is left untouched pending review.",
+             status records a worker failure with this diagnostic.",
             execution.id
         );
-        self.finalize_idle_park(execution, &detail).await;
+        if !self.finalize_worker_failure(execution, &detail).await {
+            return StopOutcome::DbError;
+        }
         if let Err(err) = self
             .file_execution_attention(
                 execution,
@@ -291,50 +282,22 @@ impl WorkerCompletionHandler {
         tracing::warn!(
             execution_id = %execution.id,
             "run_done finalize: declared `delivered` but no PR was resolvable — terminalized \
-             without a task-status change",
+             with a durable task failure",
         );
         StopOutcome::RunDoneDeclaredWithoutDelivery { detail }
     }
 
-    /// `blocked`: the run is over without delivering. Terminalizes with the
-    /// same idle-park mechanics as
-    /// [`Self::finalize_declared_delivery_without_pr`] and for the same
-    /// reason — no positive evidence to advance the task/chore on — but
-    /// files [`crate::completion::RUN_DONE_BLOCKED_ATTENTION_KIND`] instead,
-    /// distinct from the companion (still-live-run) `blocked` proposal's own
-    /// [`crate::worker_escalation::WORKER_BLOCKED_ATTENTION_KIND`] attention: that one
-    /// says "the run hit a blocker and is asking for help while it keeps
-    /// going", this one says "the run itself has ended".
+    /// A genuine blocker fails the attempt. The failure transaction records the
+    /// submitted summary/reason on the task before releasing resources or events.
     async fn finalize_declared_blocked(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
         let detail = format!(
-            "Execution `{}` declared `boss propose done --outcome blocked` — the run is over \
-             without delivering. If a companion `boss propose blocked --reason ...` proposal was \
-             also submitted, its own attention item carries the blocker's explanation. The \
-             declaration is terminal: the run has ended and its slot and lease are released. The \
-             task/chore's own status is left untouched, and `autostart` has been cleared so the \
-             automated rescan will not immediately re-dispatch a replacement worker onto it.",
+            "Execution `{}` failed: worker declared it could not complete. The submitted \
+             explanation is recorded on the task. This attempt will not be retried automatically.",
             execution.id
         );
-        self.finalize_idle_park(execution, &detail).await;
-        if let Err(err) = self
-            .file_execution_attention(
-                execution,
-                RUN_DONE_BLOCKED_ATTENTION_KIND,
-                "Run ended: worker declared itself blocked",
-                detail.clone(),
-            )
-            .await
-        {
-            tracing::warn!(
-                execution_id = %execution.id,
-                ?err,
-                "run_done finalize (blocked): failed to file attention item",
-            );
+        if !self.finalize_worker_failure(execution, &detail).await {
+            return StopOutcome::DbError;
         }
-        tracing::warn!(
-            execution_id = %execution.id,
-            "run_done finalize: declared `blocked` — terminalized without a task-status change",
-        );
         StopOutcome::RunDoneDeclaredWithoutDelivery { detail }
     }
 

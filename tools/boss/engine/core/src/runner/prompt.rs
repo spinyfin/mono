@@ -935,7 +935,7 @@ pub(crate) fn worker_escalation_protocol_directive(seam_enabled: bool) -> String
 /// the very last tool call of the run: declaring first would end the run
 /// before the push ever happens (see [`pr_terminal_directive`]). And not
 /// declaring is no shortcut to being left alone: the wording states the
-/// real consequence — held, then asked, then parked for a human, never
+/// real consequence — held, then asked, then failed visibly, never
 /// quietly successful.
 pub(crate) fn run_done_directive(seam_enabled: bool) -> String {
     if !seam_enabled {
@@ -960,12 +960,16 @@ pub(crate) fn run_done_directive(seam_enabled: bool) -> String {
      posted the reply).\n\
      - `no-changes-needed` — you verified there was nothing to produce. This replaces the \
      `NO_CHANGES_NEEDED` marker; you do not need both.\n\
-     - `blocked` — you are stopping without delivering. File `{boss} propose blocked --reason \"...\"` \
+     - `blocked` — a genuine external blocker or mandated approval stop prevents delivery. This fails \
+     the execution, releases its resources, and records the explanation on the task; it does not \
+     park a live worker or automatically retry the same attempt. Fix recoverable failures first. \
+     Never relax a repository check without approval. Include the exact failed command, missing \
+     credential, or decision needed in the summary. File `{boss} propose blocked --reason \"...\"` \
      alongside it (before this call) so the blocker itself is recorded, not just the fact that you \
      stopped.\n\n\
      If you simply stop without declaring, you are not left alone: the engine holds the run open \
-     while it can see you working, then asks you once whether you are finished, then parks the run \
-     for a human with the outcome recorded as unknown. That is worse for you and for the human than \
+     while it can see you working, then asks you once whether you are finished, then fails the attempt \
+     with a visible diagnostic. That is worse for you and for the human than \
      one command.\n"
     )
 }

@@ -1824,7 +1824,7 @@ impl WorkDb {
         // `is_live()` (`Running` or `WaitingHuman`), not `== Running`: every
         // sibling terminalizer that can finish a run out from under a worker
         // — `record_worker_pr_completion`, `record_worker_no_op_completion`,
-        // `record_worker_idle_abandonment` — already gates on `is_live()`.
+        // `record_worker_failure` — already gates on `is_live()`.
         // Gating this one function on the narrower `Running` alone let a
         // `waiting_human` execution (live, pane possibly still alive) fall
         // between the two: reapable by neither, because every path that

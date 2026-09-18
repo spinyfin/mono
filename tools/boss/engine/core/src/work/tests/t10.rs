@@ -417,27 +417,18 @@ fn record_worker_no_op_completion_coalesce_stability() {
     );
 }
 
-/// record_worker_idle_abandonment (the auto-nudge-breaker-gave-up path) must
-/// finalize the EXECUTION — freeing its cube lease/workspace so it stops
-/// holding a slot forever — but must NOT touch the task/chore's `status` or
-/// `pr_url`: no status write, no `pr_url`, no `completed_at`. Unlike
-/// record_worker_no_op_completion, there is no positive evidence the work is
-/// done here, only that further nudging is unproductive. It DOES clear
-/// `autostart`, though — otherwise `rescan_active_dispatch` immediately
-/// re-dispatches a fresh worker onto the same task the moment this
-/// abandonment frees its slot, turning one stuck slot into an unbounded
-/// abandon/re-dispatch churn loop.
+/// Failure releases resources and records a task failure atomically.
 #[test]
-fn record_worker_idle_abandonment_finalizes_execution_leaves_task_status_untouched() {
+fn record_worker_failure_finalizes_execution_and_records_task_failure() {
     let db = WorkDb::open(temp_db_path("rwia-finalize")).unwrap();
     let (_product_id, chore_id, exec_id) = make_waiting_human_chore(&db, "rwia");
 
     let completion = db
-        .record_worker_idle_abandonment(&exec_id, "breaker tripped: no PR after 3 nudges")
+        .record_worker_failure(&exec_id, "breaker tripped: no PR after 3 nudges")
         .unwrap()
         .expect("a live execution must be finalized");
 
-    assert_eq!(completion.execution.status, ExecutionStatus::Abandoned);
+    assert_eq!(completion.execution.status, ExecutionStatus::Failed);
     assert!(completion.execution.cube_lease_id.is_none());
     assert!(completion.execution.cube_workspace_id.is_none());
     assert!(completion.execution.finished_at.is_some());
@@ -447,18 +438,18 @@ fn record_worker_idle_abandonment_finalizes_execution_leaves_task_status_untouch
         WorkItem::Chore(t) => {
             assert_eq!(
                 t.status,
-                TaskStatus::Active,
-                "idle abandonment must not touch task status"
+                TaskStatus::Blocked,
+                "worker failure must exclude the task from automatic orphan recovery"
             );
             assert!(t.pr_url.is_none());
             assert!(
                 !t.autostart,
-                "idle abandonment must clear autostart so the rescan doesn't immediately \
+                "worker failure must clear autostart so the rescan doesn't immediately \
                  re-dispatch the same task",
             );
             assert!(
                 t.dispatch_failed_reason.is_none(),
-                "idle abandonment must not stamp dispatch_failed_reason — those columns are the \
+                "worker failure must not stamp dispatch_failed_reason — those columns are the \
                  sole source of the kanban card's 'Failed to start' banner, and this worker did \
                  start; leave the row to a human's explicit re-arm instead of the loose \
                  dispatch-failure recovery sweep",
@@ -475,16 +466,16 @@ fn record_worker_idle_abandonment_finalizes_execution_leaves_task_status_untouch
     let redispatched = db.rescan_active_dispatch().unwrap();
     assert!(
         !redispatched.contains(&chore_id),
-        "rescan must not re-dispatch a task whose autostart was cleared by idle abandonment",
+        "rescan must not re-dispatch a task whose autostart was cleared by worker failure",
     );
 }
 
-/// If the task/chore row is gone by the time the breaker parks (e.g. hard
+/// If the task/chore row is gone by the time the breaker fails the attempt (e.g. hard
 /// deleted while the execution was still live), the lease/pane must still
 /// be freed — that is the entire point of this method. It must not bail
 /// out just because a best-effort work-item lookup came up empty.
 #[test]
-fn record_worker_idle_abandonment_frees_execution_even_if_task_row_missing() {
+fn record_worker_failure_frees_execution_even_if_task_row_missing() {
     let db = WorkDb::open(temp_db_path("rwia-no-task")).unwrap();
     let (_product_id, chore_id, exec_id) = make_waiting_human_chore(&db, "rwia-no-task");
 
@@ -495,11 +486,11 @@ fn record_worker_idle_abandonment_frees_execution_even_if_task_row_missing() {
     }
 
     let completion = db
-        .record_worker_idle_abandonment(&exec_id, "breaker tripped: task row missing")
+        .record_worker_failure(&exec_id, "breaker tripped: task row missing")
         .unwrap()
         .expect("a live execution must still be finalized when its task row is missing");
 
-    assert_eq!(completion.execution.status, ExecutionStatus::Abandoned);
+    assert_eq!(completion.execution.status, ExecutionStatus::Failed);
     assert!(completion.execution.cube_lease_id.is_none());
     assert!(completion.execution.cube_workspace_id.is_none());
     assert_eq!(completion.released_lease_id.as_deref(), Some("lease-1"));
@@ -509,21 +500,204 @@ fn record_worker_idle_abandonment_frees_execution_even_if_task_row_missing() {
     );
 }
 
-/// A second record_worker_idle_abandonment call on an already-abandoned
+/// A second record_worker_failure call on an already-failed
 /// execution must be a no-op (Ok(None)) — idempotent against a repeated
 /// Stop-hook fire, mirroring record_worker_no_op_completion's contract.
 #[test]
-fn record_worker_idle_abandonment_is_idempotent() {
+fn record_worker_failure_is_idempotent() {
     let db = WorkDb::open(temp_db_path("rwia-idempotent")).unwrap();
     let (_product_id, _chore_id, exec_id) = make_waiting_human_chore(&db, "rwia-idem");
 
-    db.record_worker_idle_abandonment(&exec_id, "breaker tripped").unwrap();
-    let second = db
-        .record_worker_idle_abandonment(&exec_id, "breaker tripped again")
-        .unwrap();
+    db.record_worker_failure(&exec_id, "breaker tripped").unwrap();
+    let second = db.record_worker_failure(&exec_id, "breaker tripped again").unwrap();
     assert!(
         second.is_none(),
-        "a second call on an already-abandoned execution must be Ok(None)"
+        "a second call on an already-failed execution must be Ok(None)"
+    );
+}
+
+fn make_live_helper_execution(db: &WorkDb, work_item_id: &str, kind: ExecutionKind) -> String {
+    let exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(work_item_id)
+                .kind(kind)
+                .status(ExecutionStatus::Ready)
+                .repo_remote_url("git@github.com:foo/bar.git")
+                .build(),
+        )
+        .unwrap();
+    let (exec, run) = db
+        .start_execution_run(
+            &exec.id,
+            "agent-helper",
+            "repo-1",
+            "lease-helper",
+            "ws-helper",
+            "/workspaces/ws-helper",
+        )
+        .unwrap();
+    db.finish_execution_run(
+        FinishExecutionRunInput::builder()
+            .execution_id(&exec.id)
+            .run_id(&run.id)
+            .execution_status(ExecutionStatus::WaitingHuman)
+            .run_status("completed")
+            .build(),
+    )
+    .unwrap();
+    exec.id
+}
+
+fn expect_chore(db: &WorkDb, id: &str) -> Task {
+    match db.get_work_item(id).unwrap() {
+        WorkItem::Chore(t) => t,
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
+/// An `in_review` parent with a live helper execution must keep its
+/// merge-poller status when the helper fails. Before this guard,
+/// `record_worker_failure` stomped `in_review` → `blocked:worker_failed`
+/// and dropped the row out of `list_chores_pending_merge_check`.
+#[test]
+fn record_worker_failure_preserves_in_review_parent_for_helper_execution() {
+    let db = WorkDb::open(temp_db_path("rwf-in-review")).unwrap();
+    let product_id = make_revision_product(&db, "rwf-ir");
+    let pr_url = "https://github.com/spinyfin/mono/pull/2989";
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+    let exec_id = make_live_helper_execution(&db, &parent_id, ExecutionKind::CiRemediation);
+
+    let completion = db
+        .record_worker_failure(&exec_id, "ci_remediation execution has no bound PR")
+        .unwrap()
+        .expect("live helper must be finalized");
+    assert_eq!(completion.execution.status, ExecutionStatus::Failed);
+
+    let parent = expect_chore(&db, &parent_id);
+    assert_eq!(parent.status, TaskStatus::InReview);
+    assert_eq!(parent.pr_url.as_deref(), Some(pr_url));
+    assert!(
+        parent.blocked_reason.is_none(),
+        "in_review parent must not gain a blocked_reason from helper failure"
+    );
+
+    let pending: Vec<String> = db
+        .list_chores_pending_merge_check()
+        .unwrap()
+        .into_iter()
+        .map(|c| c.work_item_id)
+        .collect();
+    assert!(
+        pending.contains(&parent_id),
+        "in_review parent must remain in list_chores_pending_merge_check after helper failure; got {pending:?}"
+    );
+}
+
+/// A parent already `blocked:ci_failure` with a pending remediation
+/// attempt must stay in the stranded-CI recovery sweep when its helper
+/// execution fails. Stomping the reason to `worker_failed` would silently
+/// end automatic CI-green recovery.
+#[test]
+fn record_worker_failure_preserves_ci_failure_parent_for_helper_execution() {
+    let db = WorkDb::open(temp_db_path("rwf-ci-failure")).unwrap();
+    let product_id = make_revision_product(&db, "rwf-ci");
+    let pr_url = "https://github.com/spinyfin/mono/pull/2990";
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+    let attempt = db
+        .insert_ci_remediation(
+            CiRemediationInsertInput::builder()
+                .product_id(&product_id)
+                .work_item_id(&parent_id)
+                .pr_url(pr_url)
+                .pr_number(2990)
+                .head_branch("feature")
+                .head_sha_at_trigger("head-rwf-ci")
+                .attempt_kind("fix")
+                .consumes_budget(1)
+                .failed_checks("[]")
+                .failure_kind("pr_branch_ci")
+                .build(),
+        )
+        .unwrap()
+        .expect("pending ci_remediation row");
+    db.mark_chore_blocked_ci_failure(&parent_id, pr_url, Some(&attempt.id))
+        .unwrap();
+    let exec_id = make_live_helper_execution(&db, &parent_id, ExecutionKind::CiRemediation);
+
+    let completion = db
+        .record_worker_failure(&exec_id, "breaker tripped on ci_remediation helper")
+        .unwrap()
+        .expect("live helper must be finalized");
+    assert_eq!(completion.execution.status, ExecutionStatus::Failed);
+
+    let parent = expect_chore(&db, &parent_id);
+    assert_eq!(parent.status, TaskStatus::Blocked);
+    assert_eq!(parent.blocked_reason.as_deref(), Some("ci_failure"));
+    assert_eq!(parent.pr_url.as_deref(), Some(pr_url));
+    assert!(
+        parent
+            .blocked_detail
+            .as_deref()
+            .is_some_and(|d| d.contains("breaker tripped on ci_remediation helper")),
+        "failure diagnostic must fold into blocked_detail; got {:?}",
+        parent.blocked_detail
+    );
+
+    let stranded: Vec<String> = db
+        .list_stranded_ci_remediation_attempts()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.work_item_id)
+        .collect();
+    assert!(
+        stranded.contains(&parent_id),
+        "ci_failure parent must remain in list_stranded_ci_remediation_attempts after helper failure; got {stranded:?}"
+    );
+}
+
+/// A parent already `blocked:merge_conflict` must stay in the
+/// conflict-recovery sweep when its helper execution fails.
+#[test]
+fn record_worker_failure_preserves_merge_conflict_parent_for_helper_execution() {
+    let db = WorkDb::open(temp_db_path("rwf-merge-conflict")).unwrap();
+    let product_id = make_revision_product(&db, "rwf-mc");
+    let pr_url = "https://github.com/spinyfin/mono/pull/2991";
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+    db.mark_chore_blocked_merge_conflict(&parent_id, pr_url).unwrap();
+    db.insert_conflict_resolution(
+        ConflictResolutionInsertInput::builder()
+            .product_id(&product_id)
+            .work_item_id(&parent_id)
+            .pr_url(pr_url)
+            .pr_number(2991)
+            .head_branch("feature")
+            .base_branch("main")
+            .build(),
+    )
+    .unwrap();
+    let exec_id = make_live_helper_execution(&db, &parent_id, ExecutionKind::RevisionImplementation);
+
+    let completion = db
+        .record_worker_failure(&exec_id, "breaker tripped on conflict helper")
+        .unwrap()
+        .expect("live helper must be finalized");
+    assert_eq!(completion.execution.status, ExecutionStatus::Failed);
+
+    let parent = expect_chore(&db, &parent_id);
+    assert_eq!(parent.status, TaskStatus::Blocked);
+    assert_eq!(parent.blocked_reason.as_deref(), Some("merge_conflict"));
+    assert_eq!(parent.pr_url.as_deref(), Some(pr_url));
+
+    let blocked: Vec<String> = db
+        .list_chores_blocked_on_merge_conflict()
+        .unwrap()
+        .into_iter()
+        .map(|c| c.work_item_id)
+        .collect();
+    assert!(
+        blocked.contains(&parent_id),
+        "merge_conflict parent must remain in list_chores_blocked_on_merge_conflict after helper failure; got {blocked:?}"
     );
 }
 
@@ -576,7 +750,7 @@ fn migration_completed_at_is_idempotent() {
 // A blocked declaration prevents automatic replacement on every dispatch
 // path. These tests exercise the durable park independently of the
 // idle-abandonment autostart gate, which
-// `record_worker_idle_abandonment_finalizes_execution_leaves_task_status_untouched`
+// `record_worker_failure_finalizes_execution_and_records_task_failure`
 // covers.
 
 fn stamp_blocked_declaration(db: &WorkDb, execution_id: &str) {

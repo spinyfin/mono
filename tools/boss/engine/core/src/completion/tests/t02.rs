@@ -758,12 +758,13 @@ async fn genuine_no_pr_chore_still_nudges_then_breaker_parks() {
         matches!(o3, StopOutcome::NudgeBreakerParked { .. }),
         "breaker must bound the no-PR nudge after the cap; got {o3:?}",
     );
-    // Chore is left exactly as it was — no false "done" finalize; a
-    // human or a re-dispatch decides what happens next.
+    // The failed attempt is visible and excluded from automatic replacement.
     match db.get_work_item(&chore_id).unwrap() {
         WorkItem::Chore(t) => {
-            assert_eq!(t.status, TaskStatus::Active);
+            assert_eq!(t.status, TaskStatus::Blocked);
             assert!(t.pr_url.is_none());
+            assert_eq!(t.blocked_reason.as_deref(), Some("worker_failed"));
+            assert!(t.blocked_detail.as_deref().unwrap().contains("circuit breaker"));
         }
         other => panic!("expected chore, got {other:?}"),
     }
@@ -773,7 +774,7 @@ async fn genuine_no_pr_chore_still_nudges_then_breaker_parks() {
     let execution = db.get_execution(&execution_id).unwrap();
     assert_eq!(
         execution.status,
-        ExecutionStatus::Abandoned,
+        ExecutionStatus::Failed,
         "a breaker-tripped no-op conclusion must finalize the execution, not leave it parked",
     );
     assert!(execution.cube_lease_id.is_none());
@@ -795,8 +796,8 @@ async fn genuine_no_pr_chore_still_nudges_then_breaker_parks() {
             .lock()
             .await
             .iter()
-            .any(|(_, _, _, reason)| reason == "worker_idle_park_finalized"),
-        "must publish a worker_idle_park_finalized event",
+            .any(|(_, _, _, reason)| reason == "worker_failure_finalized"),
+        "must publish a worker_failure_finalized event",
     );
 
     // Idempotent: a further Stop (hook re-fire) on the now-terminal
@@ -2324,7 +2325,7 @@ async fn blocked_worker_is_never_reaped_across_repeated_stops() {
     // the idle-park path, no matter how many Stops fire while it awaits
     // a coordinator decision. `nudge_or_park` short-circuits to
     // `EscalationPending` before the circuit breaker is ever consulted,
-    // so `park_for_unproductive_nudges` (and its new
+    // so `fail_for_unproductive_nudges` (and its new
     // lease/pane-releasing finalizer) must never run for this case.
     let workspace = tempdir().unwrap();
     let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
@@ -2346,7 +2347,7 @@ async fn blocked_worker_is_never_reaped_across_repeated_stops() {
 
     // Fire more Stops than the (lowered) breaker cap. If the blocked
     // marker were not correctly suppressing the breaker, this would
-    // trip `park_for_unproductive_nudges` and finalize the execution —
+    // trip `fail_for_unproductive_nudges` and finalize the execution —
     // exactly the wrong behaviour for a genuine pending question.
     for _ in 0..5 {
         let outcome = handler.on_stop(&execution_id).await;
@@ -2476,7 +2477,7 @@ async fn build_wait_narration_suppresses_nudge_across_repeated_stops() {
     // gate before it can push. Fire more Stops than the (lowered)
     // breaker cap would tolerate for an ordinary unproductive nudge —
     // if build-wait suppression did not short-circuit before the
-    // breaker, this would trip `park_for_unproductive_nudges` and
+    // breaker, this would trip `fail_for_unproductive_nudges` and
     // discard the worker's in-progress session.
     let workspace = tempdir().unwrap();
     let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
@@ -2583,7 +2584,7 @@ async fn background_children_suppress_nudge_across_repeated_stops() {
     // fire more Stops than the (lowered) breaker cap would tolerate for
     // an ordinary unproductive nudge — if background-children
     // suppression did not short-circuit before the breaker, this would
-    // trip `park_for_unproductive_nudges` and discard the worker's
+    // trip `fail_for_unproductive_nudges` and discard the worker's
     // in-progress session while its subagent is still running.
     let workspace = tempdir().unwrap();
     let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());

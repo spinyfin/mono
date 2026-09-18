@@ -1361,16 +1361,19 @@ impl WorkerCompletionHandler {
                 }
                 // No bound PR resolvable. A `ci_remediation` worker must
                 // NEVER be told to create a PR — if it somehow has no
-                // bound PR, that is an anomalous upstream state; park it
-                // for a human rather than nudging it to `gh pr create`.
+                // bound PR, that is an anomalous upstream state; fail the
+                // execution as a visible worker failure rather than
+                // nudging it to `gh pr create`. The parent task's
+                // recovery-owned status (`in_review` / `blocked:ci_failure`)
+                // is left intact by `record_worker_failure`.
                 if execution.kind == ExecutionKind::CiRemediation {
                     tracing::warn!(
                         execution_id,
                         kind = %execution.kind,
-                        "stop event: ci_remediation execution has no resolvable bound PR — parking instead of nudging to create one"
+                        "stop event: ci_remediation execution has no resolvable bound PR — failing the execution instead of nudging it to create one"
                     );
                     return self
-                        .park_for_unproductive_nudges(
+                        .fail_for_unproductive_nudges(
                             &execution,
                             0,
                             None,
@@ -1383,16 +1386,19 @@ asked to open one",
                 // create a PR — their deliverable is a commit on the parent
                 // task's existing PR branch.  The chain-root lookup above
                 // covers the common case; if we still have no resolvable PR
-                // it is an upstream data anomaly.  Park for a human instead
-                // of contradicting the worker's own task instructions.
+                // it is an upstream data anomaly.  Fail the execution as a
+                // visible worker failure instead of contradicting the
+                // worker's own task instructions. The parent task's
+                // recovery-owned status (`in_review` / `blocked:merge_conflict`)
+                // is left intact by `record_worker_failure`.
                 if execution.kind == ExecutionKind::RevisionImplementation {
                     tracing::warn!(
                         execution_id,
                         kind = %execution.kind,
-                        "stop event: revision_implementation execution has no resolvable bound PR — parking instead of nudging to create one"
+                        "stop event: revision_implementation execution has no resolvable bound PR — failing the execution instead of nudging it to create one"
                     );
                     return self
-                        .park_for_unproductive_nudges(
+                        .fail_for_unproductive_nudges(
                             &execution,
                             0,
                             None,

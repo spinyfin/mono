@@ -117,6 +117,8 @@ fn has_open_execution_attention_of_kind_on(conn: &Connection, execution_id: &str
         .map_err(Into::into)
 }
 
+/// Compatibility guard for executions parked by older engines. New worker
+/// failures use task status and blocked_reason, never this attention latch.
 /// `true` when automatic mint must not create a replacement execution for
 /// `work_item_id`. Keys on the *latest* execution's
 /// `run_done_outcome = 'blocked'` (the durable signal — the column is
@@ -131,19 +133,24 @@ fn has_open_execution_attention_of_kind_on(conn: &Connection, execution_id: &str
 /// instead require `in_review`, while a nudge-breaker park leaves work `active`.
 /// Takes `&Connection` so transactional callers need not re-lock the DB.
 pub(crate) fn work_item_is_deliberately_parked(conn: &Connection, work_item_id: &str) -> Result<bool> {
-    let latest: Option<(String, Option<String>)> = conn
+    // Compatibility only: new terminal failures move the task out of active
+    // atomically. Do not give their declarations or attention items park semantics.
+    let latest: Option<(String, Option<String>, String)> = conn
         .query_row(
-            "SELECT id, run_done_outcome FROM work_executions
+            "SELECT id, run_done_outcome, status FROM work_executions
              WHERE work_item_id = ?1
              ORDER BY created_at DESC, id DESC
              LIMIT 1",
             params![work_item_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let Some((latest_execution_id, latest_outcome)) = latest else {
+    let Some((latest_execution_id, latest_outcome, status)) = latest else {
         return Ok(false);
     };
+    if status == "failed" {
+        return Ok(false);
+    }
     if latest_outcome.as_deref() == Some(boss_protocol::RunDoneOutcome::Blocked.as_str()) {
         return Ok(true);
     }
