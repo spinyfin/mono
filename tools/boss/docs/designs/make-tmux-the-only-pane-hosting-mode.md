@@ -226,16 +226,17 @@ Historical local rows with null tmux columns are migration input, not a supporte
 
 Startup establishes the historical-worker quarantine before ordinary recovery runs. It selects nonterminal executions whose latest run is local and lacks any part of the durable tmux identity: server label, session name, or spawn token. The existing `durable_liveness` process probe supplies the evidence; neither a lost workspace lease nor missing app inventory proves death.
 
-| Evidence                                             | Startup behavior                                                                           |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| Recorded process is gone                             | Permit orphan recovery and redispatch through tmux.                                        |
-| Recorded process is alive                            | Preserve the execution, raise attention, and pause local dispatch.                         |
-| Process evidence is unknown, including a missing pid | Apply the same quarantine as a live process.                                               |
-| Historical inventory cannot be read                  | Fail closed: pause dispatch and prevent recovery from treating unknown executions as dead. |
+| Evidence                                             | Startup behavior                                                                            |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| Recorded process is gone                             | Permit orphan recovery and redispatch through tmux.                                         |
+| Recorded process is alive                            | Preserve the execution, raise attention, and pause local dispatch.                          |
+| Process evidence is unknown, including a missing pid | Apply the same quarantine as a live process.                                                |
+| Latest run was last written before the kernel booted | Proven dead regardless of pid evidence: permit orphan recovery and redispatch through tmux. |
+| Historical inventory cannot be read                  | Fail closed: pause dispatch and prevent recovery from treating unknown executions as dead.  |
 
 The quarantine is persisted in database metadata and checked at host selection, local spawn, orphaning, and dispatch reconciliation. A quarantined work item cannot evade the hold by dispatching remotely; unrelated remote work remains eligible when the inventory scan succeeds. A later terminal status does not clear an established hold. On restart, the engine re-probes held executions and clears each hold and its attention only after proving process death.
 
-This boundary takes effect on deploy without an enablement flag. For a live or unknown historical worker, the operator must stop or drain it using the prior release and restart the tmux-only engine. Missing evidence remains a hold; the upgrade does not infer death from elapsed time or a status change.
+This boundary takes effect on deploy without an enablement flag. For a live or unknown historical worker, the operator must stop or drain it using the prior release and restart the tmux-only engine. Missing evidence remains a hold; the upgrade does not infer death from elapsed time or a status change. A reboot is not elapsed time: no process survives the kernel, so a run whose newest durable write (`created_at`, `started_at` or `finished_at`) falls more than an hour before the kernel's boot time is proven dead. The margin covers a wall clock that was corrected after the row was written. Without this proof a historical row that never recorded a pid could never leave the hold, and rollback cannot drain a worker nobody can name. Attention items that explain the hold are filed best-effort; a held execution whose work item was since soft-deleted keeps its hold without failing startup.
 
 Regression coverage exercises tmux creation failure without app fallback, viewer attachment failure, token-verified teardown, live/dead/unknown historical rows, partial identity, persistence across restart and terminalization, remote placement, and recovery through an isolated engine. The local gate builds and tests `//...`, including the macOS app and installer, then runs `checkleft run` serially.
 
