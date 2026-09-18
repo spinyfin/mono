@@ -278,6 +278,18 @@ rust_test(
     ),
 )
 
+# Whole-HOME negative assertion: run apart from Claude-provisioning unit tests.
+rust_test(
+    name = "worker_setup_trust_isolation_test",
+    size = "small",
+    srcs = ["tests/worker_setup_trust_isolation.rs"],
+    edition = "2024",
+    deps = [":engine_lib"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 rust_test(
     name = "editorial_pretooluse_test",
     size = "small",

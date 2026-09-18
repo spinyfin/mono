@@ -1034,9 +1034,9 @@ pub(crate) fn try_advance_review_batch_quorum_in_tx(
 impl WorkDb {
     /// Atomically create a review batch and all of its initial member attempts.
     ///
-    /// SQLite enforces one immutable target per `(cycle_root_id, phase,
-    /// target_sha)` and one attempt per `(batch_id, role, attempt)`. The
-    /// in-process validation adds the phase/role contract that a row-local
+    /// SQLite enforces one batch per `(cycle_root_id, phase, target_sha,
+    /// generation)` and one attempt per `(batch_id, role, attempt)`.
+    /// In-process validation adds the phase/role contract that a row-local
     /// SQL constraint cannot express.
     pub fn create_review_batch(
         &self,
@@ -1248,7 +1248,7 @@ impl WorkDb {
             None => super::resolve_repo_for_work_item(&tx, &input.cycle_root_id)?
                 .ok_or_else(|| anyhow::anyhow!("cannot start review batch: repository is unresolved"))?,
         };
-        let mut executions = (0..3)
+        let executions = (0..3)
             .map(|_| {
                 insert_execution(
                     &tx,
@@ -1267,14 +1267,6 @@ impl WorkDb {
             .collect::<Vec<_>>();
         let members = leaf_member_inputs(&input.classification, &execution_ids)?;
         let (batch, _) = create_review_batch_in_tx(&tx, input, &members, generation, explicit)?;
-        // Freeze one timestamp even if insertion crosses a clock tick.
-        for execution in &mut executions {
-            tx.execute(
-                "UPDATE work_executions SET created_at = ?1 WHERE id = ?2",
-                params![batch.created_at, execution.id],
-            )?;
-            execution.created_at = batch.created_at.clone();
-        }
         if explicit {
             super::resolve_attention_kind_in_tx(&tx, &batch.cycle_root_id, super::CHURN_GUARD_PARKED_ATTENTION_KIND)?;
         }
@@ -1287,9 +1279,11 @@ impl WorkDb {
     /// (`target_sha == merge_sha`, enforced by [`validate_batch_input`]).
     ///
     /// Idempotent like [`Self::create_pre_merge_review_batch`]: the
-    /// `(cycle_root_id, phase, target_sha)` uniqueness check runs first, so
-    /// a caller that races or retries the merge-poller's eligibility check
-    /// gets back the existing batch rather than a duplicate. Unlike the
+    /// `(cycle_root_id, phase, target_sha, generation)` uniqueness check runs
+    /// first. The schema pins post-merge batches to generation 1 with
+    /// `CHECK (phase = 'pre_merge' OR generation = 1)`, so a caller that races
+    /// or retries the merge-poller's eligibility check gets back the existing
+    /// batch rather than a duplicate. Unlike the
     /// pre-merge path there is no legacy single-reviewer mode to fall back
     /// to and no three-way fan-out — one member is the whole batch.
     pub fn create_post_merge_review_batch(

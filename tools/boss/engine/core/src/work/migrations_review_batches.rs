@@ -8,8 +8,9 @@ use rusqlite::Connection;
 /// A batch freezes the target SHA and complete metadata classification before
 /// any reviewer is scheduled. Members record one immutable role attempt,
 /// including the driver, model, and effort selected from that snapshot. The
-/// unique keys ensure one batch covers each immutable target and retries stay
-/// explicit per batch role and attempt number.
+/// unique keys identify separate batches and explicit member attempts. The
+/// generation migration below allows one target SHA to carry multiple
+/// pre-merge generations; post-merge batches remain at generation 1.
 pub(crate) fn migrate_pr_review_batches_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS pr_review_batches (
