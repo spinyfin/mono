@@ -678,6 +678,13 @@ final class ChatViewModel: ObservableObject {
     /// and header metadata can resolve the live task without threading it
     /// through the loaded-content payload.
     var pendingReviewGuideRootTaskId: String?
+    /// Envelope request id of the in-flight `get_review_guide_content`
+    /// send. `WorkError` applies to this viewer only when it matches, so
+    /// a merge/CI failure (or an abandoned guide's error after the user
+    /// switched) cannot paint into the markdown window. Cleared on
+    /// navigate-away, on a matching content reply, and on a matching
+    /// failure. `nil` when nothing was sent (`sendLine` returned nil).
+    var pendingReviewGuideRequestId: String?
 
     /// Root task ids for which `retry_review_guide` has been sent but
     /// `review_guide_retry_queued` (or `work_error`) has not yet arrived.

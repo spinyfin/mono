@@ -13,8 +13,8 @@
 //! published over newer content — design invariant #2.
 
 use anyhow::ensure;
-use std::sync::Arc;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 use super::query_ensure::RequireRow;
 use super::*;
@@ -764,6 +764,17 @@ impl WorkDb {
         .map_err(Into::into)
     }
 
+    /// Resolve the root task id a review-guide series belongs to. A
+    /// `PrReviewGuide` execution's `work_item_id` is the comparison id, not
+    /// a task id (see [`Self::review_guide_source_root_for_execution`] for
+    /// the analogous execution-side resolution), so the completion
+    /// finalizer needs this to get back to the owning board card from an
+    /// attempt's `series_id` alone — including failure paths that never
+    /// load the comparison.
+    pub fn root_task_id_for_review_guide_series(&self, series_id: &str) -> Result<Option<String>> {
+        self.root_task_id_for_series(series_id)
+    }
+
     /// Series/comparison identity plus lifecycle for the `GetReviewGuide`
     /// RPC's summary half. `root_task_id` resolves the same way
     /// [`Self::get_latest_pr_review_guide_source_capture`] does.
@@ -854,24 +865,6 @@ fn classified_review_guide_terminal_reason(status: &ExecutionStatus) -> String {
         ExecutionStatus::Failed => "execution failed".to_owned(),
         ExecutionStatus::Completed => "execution completed without publishing a guide".to_owned(),
         other => format!("execution reached terminal status `{}`", other.as_str()),
-    }
-
-    /// Resolve the root task id a review-guide series belongs to. A
-    /// `PrReviewGuide` execution's `work_item_id` is the comparison id, not
-    /// a task id (see [`Self::review_guide_source_root_for_execution`] for
-    /// the analogous execution-side resolution), so the completion
-    /// finalizer needs this to get back to the owning board card from an
-    /// attempt's `series_id` alone — including failure paths that never
-    /// load the comparison.
-    pub fn root_task_id_for_review_guide_series(&self, series_id: &str) -> Result<Option<String>> {
-        let conn = self.connect()?;
-        conn.query_row(
-            "SELECT root_task_id FROM pr_review_guide_source_series WHERE id = ?1",
-            [series_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(Into::into)
     }
 }
 

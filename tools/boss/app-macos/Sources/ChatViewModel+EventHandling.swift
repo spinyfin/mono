@@ -239,10 +239,12 @@ extension ChatViewModel {
                 mergeErrorNoticesByTaskID[taskId] = message
             }
             mergingWhenReadyIDs.removeAll()
-            // Mirror the disconnect path: a `get_review_guide_content`
-            // WorkError (the engine's actual reply when the version lookup
-            // fails) must not leave the shared markdown window spinning.
-            failLoadingReviewGuideViewer(message: message)
+            // Mirror the disconnect path, but only when this WorkError is
+            // the in-flight `get_review_guide_content` envelope — the
+            // generic reply's message is otherwise as likely to belong to
+            // a merge/CI failure as to the guide fetch, and painting it
+            // into the markdown window would misattribute it.
+            failLoadingReviewGuideViewerIfRequestMatches(message: message, requestId: requestId)
             retryingReviewGuideRootTaskIDs.removeAll()
             plannerActionInFlightProjectIDs.removeAll()
             deferredScopeActionInFlightIDs.removeAll()
@@ -860,8 +862,23 @@ extension ChatViewModel {
     /// Fail a review-guide content fetch that can no longer complete (socket
     /// drop or `WorkError`). Retry re-opens the pending version — a re-fetch,
     /// not `retryReviewGuide`, which would enqueue a new generation.
+    /// Unconditional: disconnect has no envelope id to match.
     private func failLoadingReviewGuideViewer(message: String) {
+        applyFailLoadingReviewGuideViewer(message: message)
+    }
+
+    /// Apply a `WorkError` to the loading review-guide viewer only when the
+    /// envelope id matches the in-flight `get_review_guide_content` send.
+    /// Both ids must be non-nil and equal — an abandoned guide's error or
+    /// an unrelated request's failure must not flip the current viewer.
+    private func failLoadingReviewGuideViewerIfRequestMatches(message: String, requestId: String?) {
+        guard let pending = pendingReviewGuideRequestId, let requestId, pending == requestId else { return }
+        applyFailLoadingReviewGuideViewer(message: message)
+    }
+
+    private func applyFailLoadingReviewGuideViewer(message: String) {
         if pendingReviewGuideVersionId != nil, case .loading = asyncMarkdownViewerVM.state {
+            pendingReviewGuideRequestId = nil
             asyncMarkdownViewerVM.state = .failed(
                 title: "Review guide",
                 message: message

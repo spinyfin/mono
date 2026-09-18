@@ -35,7 +35,7 @@ extension ChatViewModel {
         }
         asyncMarkdownViewerVM.pendingRenderProjectShortID = nil
         asyncMarkdownViewerOpener?()
-        engine.sendGetReviewGuideContent(versionID: versionId)
+        pendingReviewGuideRequestId = engine.sendGetReviewGuideContent(versionID: versionId)
     }
 
     /// Apply a `review_guide_content` reply. Dropped when `versionId` no
@@ -47,6 +47,7 @@ extension ChatViewModel {
     @MainActor
     func applyReviewGuideContent(versionId: String, content: ReviewGuideVersionContent?) {
         guard pendingReviewGuideVersionId == versionId else { return }
+        pendingReviewGuideRequestId = nil
         guard let content else {
             asyncMarkdownViewerVM.state = .failed(
                 title: "Review guide",

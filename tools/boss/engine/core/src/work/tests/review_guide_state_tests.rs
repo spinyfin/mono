@@ -121,3 +121,108 @@ fn attach_review_guide_state_sets_ready_lifecycle_on_the_root_only() {
         "a revision row's own id is never a series key"
     );
 }
+
+fn publish_ready_guide(db: &WorkDb, series_id: &str, comparison_id: &str, markdown: &str) -> String {
+    let attempt = db
+        .create_pr_review_guide_attempt(series_id, comparison_id, "review-guide-v1")
+        .unwrap();
+    let published = db
+        .publish_pr_review_guide_version(&attempt.id, markdown, "raw")
+        .unwrap();
+    let PublishReviewGuideOutcome::Published(version) = published else {
+        panic!("must publish")
+    };
+    version.id
+}
+
+fn seed_review_guide_series_for_pr(db: &WorkDb, root: &str, pr_url: &str, base: &str, head: &str) -> (String, String) {
+    let mut packet = review_guide_source_packet(base, head);
+    packet.canonical_pr_url = pr_url.to_owned();
+    let stored = db
+        .persist_pr_review_guide_source_capture(root, 1, PrSourceCaptureTrigger::Creation, &packet)
+        .unwrap();
+    let PrSourceCapturePersistOutcome::Stored(capture) = stored else {
+        panic!("capture must persist")
+    };
+    (capture.series_id, capture.comparison_id)
+}
+
+/// Replacing the card's PR attaches a new series and preserves the previous
+/// one. The card projection must follow the task's current `pr_url`, not
+/// whichever series was touched last.
+#[test]
+fn attach_review_guide_state_follows_current_pr_not_retired_sibling() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let root = create_active_chore(&db, &product_id, "replaced PR");
+    let retired_pr = "https://github.com/acme/widget/pull/9";
+    let current_pr = "https://github.com/acme/widget/pull/10";
+
+    let (retired_series, retired_comparison) = seed_review_guide_series_for_pr(&db, &root, retired_pr, "base", "head");
+    let retired_version = publish_ready_guide(&db, &retired_series, &retired_comparison, "# Retired\n");
+
+    let (current_series, current_comparison) =
+        seed_review_guide_series_for_pr(&db, &root, current_pr, "base-b", "head-b");
+    let current_version = publish_ready_guide(&db, &current_series, &current_comparison, "# Current\n");
+
+    // A later capture on the retired PR bumps `updated_at` (and
+    // `latest_observation_sequence`) after the current series exists —
+    // the exact window a last-touched-wins lookup would mis-bind.
+    let mut late_packet = review_guide_source_packet("base-late", "head-late");
+    late_packet.canonical_pr_url = retired_pr.to_owned();
+    db.persist_pr_review_guide_source_capture(&root, 2, PrSourceCaptureTrigger::Poller, &late_packet)
+        .unwrap();
+
+    let ts = "2026-05-14T00:00:00Z";
+    let mut tasks = vec![make_bare_task(&root, "chore", None, Some(current_pr), ts)];
+    let mut chores: Vec<Task> = vec![];
+    {
+        let conn = db.connect().unwrap();
+        attach_review_guide_state(&conn, &mut tasks, &mut chores).unwrap();
+    }
+    let root_task = &tasks[0];
+    assert_eq!(root_task.review_guide_lifecycle.as_deref(), Some("ready"));
+    assert_eq!(
+        root_task.review_guide_readable_version_id.as_deref(),
+        Some(current_version.as_str()),
+        "projection must follow the current PR, not the retired series even after a late updated_at bump"
+    );
+    assert_ne!(
+        root_task.review_guide_readable_version_id.as_deref(),
+        Some(retired_version.as_str())
+    );
+    assert_eq!(
+        root_task.review_guide_selected_comparison_id.as_deref(),
+        Some(current_comparison.as_str())
+    );
+    assert_eq!(root_task.review_guide_stale_source, Some(false));
+}
+
+/// Until the replacement PR has a series of its own, the card must not
+/// fall back to the retired PR's guide.
+#[test]
+fn attach_review_guide_state_is_none_until_current_pr_has_a_series() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let root = create_active_chore(&db, &product_id, "replaced PR no capture yet");
+    let current_pr = "https://github.com/acme/widget/pull/10";
+
+    let (retired_series, retired_comparison) = seed_review_guide_series(&db, &root);
+    let _retired_version = publish_ready_guide(&db, &retired_series, &retired_comparison, "# Retired\n");
+
+    let ts = "2026-05-14T00:00:00Z";
+    let mut tasks = vec![make_bare_task(&root, "chore", None, Some(current_pr), ts)];
+    let mut chores: Vec<Task> = vec![];
+    {
+        let conn = db.connect().unwrap();
+        attach_review_guide_state(&conn, &mut tasks, &mut chores).unwrap();
+    }
+    let root_task = &tasks[0];
+    assert_eq!(
+        root_task.review_guide_lifecycle, None,
+        "a replacement PR with no series must not inherit the retired PR's guide"
+    );
+    assert_eq!(root_task.review_guide_readable_version_id, None);
+    assert_eq!(root_task.review_guide_selected_comparison_id, None);
+    assert_eq!(root_task.review_guide_stale_source, None);
+}

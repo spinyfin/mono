@@ -1112,7 +1112,8 @@ extension EngineClient {
     /// replies with `review_guide_content` carrying a
     /// `ReviewGuideVersionContent` (`content: nil` when the version id is
     /// unknown).
-    func sendGetReviewGuideContent(versionID: String) {
+    @discardableResult
+    func sendGetReviewGuideContent(versionID: String) -> String? {
         sendLine([
             "type": "get_review_guide_content",
             "version_id": versionID,

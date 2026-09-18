@@ -34,6 +34,7 @@ final class ReviewGuideTests: XCTestCase {
 
         XCTAssertEqual(model.pendingReviewGuideVersionId, "prgv_1")
         XCTAssertEqual(model.pendingReviewGuideRootTaskId, "task_1")
+        XCTAssertNil(model.pendingReviewGuideRequestId, "headless tests have no engine connection, so sendLine returns nil")
         XCTAssertEqual(model.asyncMarkdownViewerVM.reviewGuideRootTaskId, "task_1")
         guard case .loading = model.asyncMarkdownViewerVM.state else {
             return XCTFail("expected .loading immediately on open")
@@ -55,6 +56,7 @@ final class ReviewGuideTests: XCTestCase {
         )
 
         XCTAssertNil(model.pendingReviewGuideVersionId)
+        XCTAssertNil(model.pendingReviewGuideRequestId)
         XCTAssertNil(model.asyncMarkdownViewerVM.reviewGuideRootTaskId)
     }
 
@@ -179,6 +181,14 @@ final class ReviewGuideTests: XCTestCase {
             return XCTFail("a request that can never complete must fail, not stay loading forever")
         }
         XCTAssertTrue(model.asyncMarkdownViewerVM.canRetry)
+        model.asyncMarkdownViewerVM.onRetry?()
+        XCTAssertTrue(
+            model.retryingReviewGuideRootTaskIDs.isEmpty,
+            "retry must re-fetch content, not enqueue a new generation"
+        )
+        guard case .loading = model.asyncMarkdownViewerVM.state else {
+            return XCTFail("retry must re-open the pending version")
+        }
     }
 
     /// A `WorkError` while the async viewer is `.loading` a guide's content
@@ -194,18 +204,74 @@ final class ReviewGuideTests: XCTestCase {
         guard case .loading = model.asyncMarkdownViewerVM.state else {
             return XCTFail("expected .loading immediately after open")
         }
+        model.pendingReviewGuideRequestId = "req_guide"
         model.attachmentsInFlightTaskIDs.insert("task_2")
 
-        model.applyEventForTest(.workError(message: "no such version", requestId: nil))
+        model.applyEventForTest(.workError(message: "no such version", requestId: "req_guide"))
 
         guard case .failed(title: _, message: let message) = model.asyncMarkdownViewerVM.state else {
             return XCTFail("a content-fetch WorkError must fail the loading viewer")
         }
         XCTAssertEqual(message, "no such version")
         XCTAssertTrue(model.asyncMarkdownViewerVM.canRetry)
+        XCTAssertNil(model.pendingReviewGuideRequestId)
         XCTAssertEqual(
             model.attachmentsLoadFailureByTaskID["task_2"], "Loading failed. Retry?",
             "an in-flight guide fetch must count as another tracked request"
+        )
+        model.asyncMarkdownViewerVM.onRetry?()
+        XCTAssertTrue(
+            model.retryingReviewGuideRootTaskIDs.isEmpty,
+            "retry must re-fetch content, not enqueue a new generation"
+        )
+        guard case .loading = model.asyncMarkdownViewerVM.state else {
+            return XCTFail("retry must re-open the pending version")
+        }
+    }
+
+    /// A WorkError for an abandoned guide must not fail the guide the
+    /// user has since switched to.
+    func testWorkErrorForAbandonedGuideDoesNotFailCurrentViewer() {
+        let model = makeModel()
+        let taskA = Self.makeTask(id: "task_a", readableVersionId: "prgv_a")
+        let taskB = Self.makeTask(id: "task_b", readableVersionId: "prgv_b")
+        model.taskIndexByID = [taskA.id: taskA, taskB.id: taskB]
+        model.openReviewGuide(for: taskA)
+        model.pendingReviewGuideRequestId = "req_a"
+        model.openReviewGuide(for: taskB)
+        model.pendingReviewGuideRequestId = "req_b"
+        guard case .loading = model.asyncMarkdownViewerVM.state else {
+            return XCTFail("expected .loading for the current open")
+        }
+
+        model.applyEventForTest(.workError(message: "no such version", requestId: "req_a"))
+
+        guard case .loading = model.asyncMarkdownViewerVM.state else {
+            return XCTFail("an abandoned guide's WorkError must not fail the current viewer")
+        }
+        XCTAssertEqual(model.pendingReviewGuideRequestId, "req_b")
+        XCTAssertEqual(model.pendingReviewGuideVersionId, "prgv_b")
+    }
+
+    /// A WorkError for an unrelated in-flight request must not paint its
+    /// message into a loading review-guide viewer.
+    func testUnrelatedWorkErrorDoesNotFailLoadingGuideViewer() {
+        let model = makeModel()
+        let task = Self.makeTask(id: "task_1", readableVersionId: "prgv_1")
+        model.taskIndexByID = [task.id: task]
+        model.openReviewGuide(for: task)
+        model.pendingReviewGuideRequestId = "req_guide"
+        model.mergingWhenReadyIDs.insert("task_other")
+
+        model.applyEventForTest(.workError(message: "merge queue failed", requestId: "req_merge"))
+
+        guard case .loading = model.asyncMarkdownViewerVM.state else {
+            return XCTFail("an unrelated WorkError must not fail the loading guide viewer")
+        }
+        XCTAssertEqual(model.pendingReviewGuideRequestId, "req_guide")
+        XCTAssertEqual(
+            model.mergeErrorNoticesByTaskID["task_other"], "merge queue failed",
+            "the merge path still records its own failure"
         )
     }
 

@@ -84,6 +84,7 @@ extension ChatViewModel {
         pendingAsyncViewerArtifact = artifact
         pendingReviewGuideVersionId = nil
         pendingReviewGuideRootTaskId = nil
+        pendingReviewGuideRequestId = nil
         asyncMarkdownViewerVM.reviewGuideRootTaskId = nil
         asyncMarkdownViewerVM.reviewGuideGeneratedAt = nil
         asyncMarkdownViewerVM.reviewGuideComparisonId = nil
@@ -313,6 +314,7 @@ extension ChatViewModel {
     func openTaskDescription(_ task: WorkTask) {
         pendingReviewGuideVersionId = nil
         pendingReviewGuideRootTaskId = nil
+        pendingReviewGuideRequestId = nil
         // Clear the design-doc identity guard too — this is the sibling
         // identity-guard site to `openReviewGuide`'s clearing of
         // `pendingAsyncViewerRef`, and without it a late

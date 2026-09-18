@@ -946,27 +946,31 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
     Ok(())
 }
 
-/// Resolve [`Task::review_guide_lifecycle`] / [`Task::review_guide_readable_version_id`]
-/// for every task/chore that carries a `pr_url` — only a PR-bearing row can
-/// own a `pr_review_guide_source_series`, keyed by chain-root task id (see
+/// Resolve every derived `Task::review_guide_*` projection (`lifecycle`,
+/// `readable_version_id`, `selected_comparison_id`, `stale_source`) for
+/// every task/chore that carries a `pr_url`. Only a PR-bearing row can
+/// own a `pr_review_guide_source_series`, and the series is the one whose
+/// `canonical_pr_url` matches that row's current `pr_url` (see
 /// `tools/boss/docs/designs/automatic-pr-review-guides.md`, "Ownership and
-/// invariants"). A revision row's own id is never a series key (the series
+/// invariants"). Replacing the card's PR attaches a different series and
+/// preserves the previous one, so a root-id-only lookup would bind the
+/// retired PR's guide; until the current PR has a series the fields stay
+/// `None`. A revision row's own id is never a series key (the series
 /// belongs to the chain root), so this leaves a revision's fields `None`
 /// even when its root has a guide — matching the design's card placement
 /// (the affordance lives on the root's card, not a revision's). One batched
 /// `IN (...)` query, same shape as [`attach_ai_review_state`]'s verdict
 /// lookup.
 pub(crate) fn attach_review_guide_state(conn: &Connection, tasks: &mut [Task], chores: &mut [Task]) -> Result<()> {
-    let root_task_ids: Vec<String> = tasks
+    let roots: Vec<(String, String)> = tasks
         .iter()
         .chain(chores.iter())
-        .filter(|task| task.pr_url.is_some())
-        .map(|task| task.id.clone())
+        .filter_map(|task| task.pr_url.as_ref().map(|url| (task.id.clone(), url.clone())))
         .collect();
-    if root_task_ids.is_empty() {
+    if roots.is_empty() {
         return Ok(());
     }
-    let states = query_review_guide_card_states(conn, &root_task_ids)?;
+    let states = query_review_guide_card_states(conn, &roots)?;
     for task in tasks.iter_mut().chain(chores.iter_mut()) {
         if let Some(state) = states.get(&task.id) {
             task.review_guide_lifecycle = Some(state.lifecycle.clone());
@@ -1003,14 +1007,22 @@ struct ReviewGuideCardState {
 /// `query_latest_informative_review_verdicts`. The `LEFT JOIN` against
 /// `pr_review_guide_versions` resolves the readable version's own
 /// `comparison_id` so staleness can be derived without a second round trip.
+///
+/// `roots` is `(root_task_id, current_pr_url)` — the series must match
+/// both. One series per canonical PR (UNIQUE on `canonical_pr_url`), but
+/// one root may own several series after a PR replacement, so a root-id
+/// lookup without the URL would pick a sibling. Ordering matches
+/// `get_latest_pr_review_guide_source_capture` (`latest_observation_sequence
+/// DESC, id DESC`) so the two resolvers cannot disagree; first row per
+/// root wins.
 fn query_review_guide_card_states(
     conn: &Connection,
-    root_task_ids: &[String],
+    roots: &[(String, String)],
 ) -> Result<std::collections::HashMap<String, ReviewGuideCardState>> {
-    let placeholders = root_task_ids
+    let placeholders = roots
         .iter()
         .enumerate()
-        .map(|(i, _)| format!("?{}", i + 1))
+        .map(|(i, _)| format!("(?{}, ?{})", 2 * i + 1, 2 * i + 2))
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
@@ -1018,11 +1030,15 @@ fn query_review_guide_card_states(
                 s.selected_comparison_id, v.comparison_id
          FROM pr_review_guide_source_series s
          LEFT JOIN pr_review_guide_versions v ON v.id = s.readable_version_id
-         WHERE s.root_task_id IN ({placeholders})
-         ORDER BY s.updated_at ASC, s.id ASC"
+         WHERE (s.root_task_id, s.canonical_pr_url) IN ({placeholders})
+         ORDER BY s.latest_observation_sequence DESC, s.id DESC"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::ToSql> = root_task_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(roots.len() * 2);
+    for (root_task_id, pr_url) in roots {
+        params.push(root_task_id);
+        params.push(pr_url);
+    }
     let rows = stmt.query_map(params.as_slice(), |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -1032,25 +1048,19 @@ fn query_review_guide_card_states(
             row.get::<_, Option<String>>(4)?,
         ))
     })?;
-    // One series per canonical repository/PR (design invariant), so this is
-    // never actually contested — ascending order + insert-overwrite is
-    // defensive "most recent wins", matching how
-    // `query_latest_informative_review_verdicts` treats duplicates.
     let mut result = std::collections::HashMap::new();
     for row in rows {
         let (root_task_id, lifecycle, readable_version_id, selected_comparison_id, version_comparison_id) = row?;
         let stale_source = readable_version_id
             .is_some()
             .then(|| selected_comparison_id != version_comparison_id);
-        result.insert(
-            root_task_id,
-            ReviewGuideCardState {
-                lifecycle,
-                readable_version_id,
-                selected_comparison_id,
-                stale_source,
-            },
-        );
+        // DESC order: first row for this root is the active series.
+        result.entry(root_task_id).or_insert(ReviewGuideCardState {
+            lifecycle,
+            readable_version_id,
+            selected_comparison_id,
+            stale_source,
+        });
     }
     Ok(result)
 }
