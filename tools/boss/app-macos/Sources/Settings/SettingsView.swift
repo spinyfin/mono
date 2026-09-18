@@ -375,10 +375,6 @@ private struct WorkerSettingsPane: View {
         chatModel.engineSettings.filter { $0.key == "coordinator.direct_developer_mode" }
     }
 
-    private var tmuxHostingSetting: EngineSetting? {
-        chatModel.engineSettings.first { $0.key == "workers.tmux_hosting" }
-    }
-
     var body: some View {
         Form {
             if chatModel.engineSettings.isEmpty {
@@ -413,23 +409,6 @@ private struct WorkerSettingsPane: View {
                         }
                     } header: {
                         Text("Worker Priority")
-                    }
-                }
-                if let setting = tmuxHostingSetting {
-                    Section {
-                        SettingToggleRow(setting: setting) { enabled in
-                            chatModel.setEngineSetting(key: setting.key, enabled: enabled)
-                        }
-                    } header: {
-                        Text("Session Hosting")
-                    } footer: {
-                        Text(
-                            "Deprecated temporary rollback control, enabled by default and scheduled for " +
-                            "removal after this release. Disabling it affects new worker panes only; the " +
-                            "coordinator's own session is always tmux-hosted."
-                        )
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                     }
                 }
                 Section {
@@ -511,8 +490,6 @@ private struct SettingToggleRow: View {
             return "Default new PRs to draft mode"
         case "coordinator.direct_developer_mode":
             return "Direct Boss developer mode"
-        case "workers.tmux_hosting":
-            return "Host workers in tmux (deprecated)"
         default:
             return key
         }

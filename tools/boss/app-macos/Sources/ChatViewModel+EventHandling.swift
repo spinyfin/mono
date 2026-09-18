@@ -49,9 +49,8 @@ extension ChatViewModel {
             // not the one we attached to before a restart (#699).
             engine.sendGetEngineHealth()
             // Pull the current per-installation settings snapshot so
-            // `tmuxHostingEnabled` (the Workers grid's "legacy hosting"
-            // badge) reflects reality immediately after connecting,
-            // rather than waiting on the operator to open Settings.
+            // Settings reflects the engine immediately after connecting
+            // rather than waiting on the operator to open the pane.
             engine.sendGetSettings()
             // Pull the current GitHub OAuth auth state so the "GitHub
             // account" settings subsection reflects a token persisted by a

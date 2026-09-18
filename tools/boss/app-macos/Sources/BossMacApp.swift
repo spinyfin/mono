@@ -534,12 +534,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// hosting mode without presenting it. `applicationShouldTerminate`
     /// presents the result; tests inspect the same `NSAlert`.
     func makeQuitConfirmationAlert() -> NSAlert? {
-        QuitConfirmation.alert(
-            agentCount: liveWorkerStates?.activeAgentCount ?? 0,
-            hostingMakeup: QuitConfirmation.HostingMakeup.classify(
-                liveWorkerStates?.activeAgentTmuxHostedFlags ?? []
-            )
-        )
+        QuitConfirmation.alert(agentCount: liveWorkerStates?.activeAgentCount ?? 0)
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
