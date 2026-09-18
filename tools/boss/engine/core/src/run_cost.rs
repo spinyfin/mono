@@ -38,6 +38,9 @@ pub(crate) struct RunCostSnapshot {
     pub cache_creation_ttl_split_known: Option<bool>,
     pub rounds: Option<i64>,
     pub agent_active_ms: Option<i64>,
+    /// Provider usage objects, keyed by provider and transcript/message identity.
+    /// Preserve missing fields and provider-specific categories verbatim.
+    pub provider_usage_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, bon::Builder)]
@@ -55,6 +58,7 @@ struct MessageUsage {
 #[derive(Debug, Default, bon::Builder)]
 #[builder(on(String, into))]
 struct CostAccumulator {
+    provider_usage: std::collections::BTreeMap<String, Value>,
     model: Option<String>,
     messages: HashMap<String, Option<MessageUsage>>,
     codex_usage_by_transcript: HashMap<PathBuf, MessageUsage>,
@@ -66,6 +70,22 @@ struct CostAccumulator {
 
 impl CostAccumulator {
     fn ingest(&mut self, transcript_path: &Path, value: &Value) {
+        if value.get("type").and_then(Value::as_str) == Some("assistant")
+            && let Some(id) = value.pointer("/message/id").and_then(Value::as_str)
+            && let Some(usage) = value.pointer("/message/usage").filter(|usage| usage.is_object())
+        {
+            self.provider_usage.insert(format!("claude:{id}"), usage.clone());
+        }
+        if value.get("type").and_then(Value::as_str) == Some("event_msg")
+            && value.pointer("/payload/type").and_then(Value::as_str) == Some("token_count")
+            && value
+                .pointer("/payload/info/total_token_usage")
+                .is_some_and(Value::is_object)
+            && let Some(info) = value.pointer("/payload/info").filter(|info| info.is_object())
+        {
+            self.provider_usage
+                .insert(format!("codex:{}", transcript_path.display()), info.clone());
+        }
         match value.get("type").and_then(Value::as_str) {
             Some("assistant") => self.ingest_assistant(value),
             Some("system") if value.get("subtype").and_then(Value::as_str) == Some("turn_duration") => {
@@ -219,6 +239,8 @@ impl CostAccumulator {
             });
 
         Some(RunCostSnapshot {
+            provider_usage_json: (!self.provider_usage.is_empty())
+                .then(|| serde_json::to_string(&self.provider_usage).expect("usage objects serialize")),
             full_replacement: false,
             model: self.model.clone(),
             output_tokens: saw_usage.then(|| sum(|usage| usage.output_tokens)),
@@ -237,6 +259,7 @@ impl CostAccumulator {
     }
 
     fn merge_from(&mut self, other: &Self) {
+        self.provider_usage.extend(other.provider_usage.clone());
         if let Some(model) = other.model.as_ref() {
             self.model = Some(model.clone());
         }
@@ -427,6 +450,11 @@ mod tests {
         assert_eq!(snapshot.rounds, Some(1));
         assert_eq!(snapshot.input_tokens, Some(10));
         assert_eq!(snapshot.output_tokens, Some(7));
+        let provider_usage: Value = serde_json::from_str(&snapshot.provider_usage_json.unwrap()).unwrap();
+        assert_eq!(
+            provider_usage,
+            json!({"claude:msg-1": {"input_tokens": 10, "output_tokens": 7}})
+        );
     }
 
     #[test]

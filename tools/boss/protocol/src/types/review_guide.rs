@@ -61,4 +61,8 @@ pub struct ReviewGuideAttempt {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Provider usage objects keyed by provider and transcript/message identity.
+    /// Absent categories remain absent; no usage observation is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_usage_json: Option<String>,
 }

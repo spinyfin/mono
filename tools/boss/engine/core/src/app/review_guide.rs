@@ -127,5 +127,29 @@ fn wire_attempt(attempt: crate::work::PrReviewGuideAttempt) -> boss_protocol::Re
         .request_epoch(attempt.request_epoch)
         .status(attempt.status)
         .maybe_error(attempt.error)
+        .maybe_provider_usage_json(attempt.provider_usage_json)
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn attempt_diagnostics_preserve_native_usage() {
+        let usage = r#"{"codex:rollout":{"total_token_usage":{"cached_input_tokens":8}}}"#;
+        let attempt = crate::work::PrReviewGuideAttempt::builder()
+            .id("attempt")
+            .series_id("series")
+            .comparison_id("comparison")
+            .request_epoch(1)
+            .ordinal(1)
+            .status("succeeded")
+            .prompt_version("test")
+            .retries(0)
+            .created_at("now")
+            .provider_usage_json(usage)
+            .build();
+        let wire = super::wire_attempt(attempt);
+        let encoded = serde_json::to_value(wire).unwrap();
+        assert_eq!(encoded["provider_usage_json"], usage);
+    }
 }
