@@ -3,6 +3,13 @@
 //! Lease loss and missing app inventory do not prove process death. Preserve
 //! these executions and hold local dispatch until rollback/drain and restart.
 //! The metadata record also prevents later recovery sweeps undoing the hold.
+//!
+//! Two kinds of evidence prove death. The durable pid probe is one. The other
+//! is the kernel boot: a run whose last durable write predates the current
+//! boot (by more than [`PRE_BOOT_MARGIN_SECS`]) cannot own a live process,
+//! because no process survives a reboot. Without that second proof a
+//! historical row that never recorded a pid could never leave the hold, and
+//! neither rollback nor drain can act on a worker nobody can name.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -15,6 +22,15 @@ use crate::work::WorkDb;
 
 const METADATA_KEY: &str = "local_worker_startup_quarantine";
 pub(crate) const ATTENTION_KIND: &str = "local_worker_startup_quarantine";
+
+/// How far before the kernel boot a run's last durable write must fall before
+/// the boot alone proves its worker dead. The margin absorbs a wall clock that
+/// was behind when the row was written and corrected after boot (the kernel
+/// re-anchors its boot time on clock corrections, the row does not move).
+/// The failure direction of a margin that is too small is a duplicate worker,
+/// so it is generous; a row inside the margin simply stays held until the
+/// pid probe or a later boot can prove it.
+pub(crate) const PRE_BOOT_MARGIN_SECS: i64 = 3600;
 
 #[derive(Default, Serialize, Deserialize)]
 struct Quarantine {
@@ -58,6 +74,28 @@ impl WorkDb {
         ensure_work_item_not_quarantined_in(&conn, work_item_id)
     }
 
+    /// Epoch seconds of the newest durable write on the latest local run of
+    /// `execution_id`: the greatest of `created_at`, `started_at` and
+    /// `finished_at`. `None` when the execution has no local run.
+    fn latest_local_run_last_write_epoch(&self, execution_id: &str) -> Result<Option<i64>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT MAX(
+                 CAST(created_at AS INTEGER),
+                 CAST(COALESCE(started_at, '0') AS INTEGER),
+                 CAST(COALESCE(finished_at, '0') AS INTEGER)
+             ) FROM work_runs
+             WHERE execution_id = ?1 AND host_id = 'local'
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+            [execution_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(Into::into)
+    }
+
     fn local_workers_without_tmux_identity(&self) -> Result<Vec<(String, String)>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
@@ -77,10 +115,69 @@ impl WorkDb {
 }
 
 pub(crate) fn quarantine_historical_local_workers(db: &WorkDb) -> Result<StartupQuarantineReport> {
-    quarantine_with_probe(db, |id| probe_execution_worker(db, id))
+    let boot = kernel_boot_epoch_secs();
+    if boot.is_none() {
+        tracing::warn!("kernel boot time is unavailable; pre-boot historical runs cannot be proven dead this startup");
+    }
+    quarantine_with_probe(db, |id| probe_execution_worker(db, id), boot)
 }
 
-fn quarantine_with_probe(db: &WorkDb, probe: impl Fn(&str) -> WorkerProcess) -> Result<StartupQuarantineReport> {
+/// Epoch seconds at which the running kernel booted, or `None` when the
+/// platform cannot say. `None` is never treated as evidence.
+pub(crate) fn kernel_boot_epoch_secs() -> Option<i64> {
+    kernel_boot_epoch_secs_impl()
+}
+
+#[cfg(target_os = "macos")]
+fn kernel_boot_epoch_secs_impl() -> Option<i64> {
+    let mut boottime = libc::timeval { tv_sec: 0, tv_usec: 0 };
+    let mut len = std::mem::size_of::<libc::timeval>();
+    let name = c"kern.boottime";
+    // SAFETY: `boottime` is a valid, writable timeval of exactly `len` bytes,
+    // and sysctl writes at most `len` bytes into it.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&mut boottime as *mut libc::timeval).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len != std::mem::size_of::<libc::timeval>() || boottime.tv_sec <= 0 {
+        return None;
+    }
+    Some(boottime.tv_sec)
+}
+
+#[cfg(target_os = "linux")]
+fn kernel_boot_epoch_secs_impl() -> Option<i64> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    stat.lines()
+        .find_map(|line| line.strip_prefix("btime "))
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|secs| *secs > 0)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn kernel_boot_epoch_secs_impl() -> Option<i64> {
+    None
+}
+
+/// Whether a run whose last durable write was at `last_write_epoch` is proven
+/// dead by a kernel that booted at `boot_epoch`.
+fn run_predates_boot(last_write_epoch: Option<i64>, boot_epoch: Option<i64>) -> bool {
+    match (last_write_epoch, boot_epoch) {
+        (Some(last_write), Some(boot)) => last_write.saturating_add(PRE_BOOT_MARGIN_SECS) < boot,
+        _ => false,
+    }
+}
+
+fn quarantine_with_probe(
+    db: &WorkDb,
+    probe: impl Fn(&str) -> WorkerProcess,
+    boot_epoch_secs: Option<i64>,
+) -> Result<StartupQuarantineReport> {
     let previous = db.read_local_worker_quarantine()?;
     let mut quarantine = Quarantine::default();
     let mut report = StartupQuarantineReport::default();
@@ -91,13 +188,38 @@ fn quarantine_with_probe(db: &WorkDb, probe: impl Fn(&str) -> WorkerProcess) -> 
             let mut rows: BTreeMap<_, _> = rows.into_iter().collect();
             rows.extend(previous.executions.clone());
             for (execution_id, work_item_id) in rows {
-                let process = probe(&execution_id);
-                if matches!(process, WorkerProcess::Gone { .. }) {
+                // A run written entirely before the kernel booted has no
+                // process left to probe: whatever pid it recorded (or did
+                // not) belongs to a previous boot. This outranks the pid
+                // probe, which after a reboot can only report pid reuse.
+                let last_write = match db.latest_local_run_last_write_epoch(&execution_id) {
+                    Ok(last_write) => last_write,
+                    Err(err) => {
+                        tracing::warn!(
+                            execution_id,
+                            error = %format!("{err:#}"),
+                            "failed to read the historical run's last write time; treating boot evidence as unknown"
+                        );
+                        None
+                    }
+                };
+                let (dead, evidence) = if run_predates_boot(last_write, boot_epoch_secs) {
+                    (true, "run_predates_kernel_boot")
+                } else {
+                    let process = probe(&execution_id);
+                    (matches!(process, WorkerProcess::Gone { .. }), process.reason())
+                };
+                if dead {
+                    tracing::info!(
+                        execution_id,
+                        evidence,
+                        "historical local worker has no tmux identity and its process is proven dead; permitting orphan recovery"
+                    );
                     report.dead_execution_ids.insert(execution_id);
                 } else {
                     tracing::error!(
                         execution_id,
-                        evidence = process.reason(),
+                        evidence,
                         "historical local worker has no tmux identity; preserving execution and quarantining local dispatch for rollback/drain"
                     );
                     report.protected_execution_ids.insert(execution_id.clone());
@@ -194,15 +316,19 @@ mod tests {
         let (live, live_item) = seed(&db, "live");
         let (unknown, unknown_item) = seed(&db, "unknown");
         let (dead, dead_item) = seed(&db, "dead");
-        let report = quarantine_with_probe(&db, |id| {
-            if id == live {
-                WorkerProcess::Alive { shell_pid: 42 }
-            } else if id == dead {
-                WorkerProcess::Gone { shell_pid: 43 }
-            } else {
-                WorkerProcess::Unknown
-            }
-        })
+        let report = quarantine_with_probe(
+            &db,
+            |id| {
+                if id == live {
+                    WorkerProcess::Alive { shell_pid: 42 }
+                } else if id == dead {
+                    WorkerProcess::Gone { shell_pid: 43 }
+                } else {
+                    WorkerProcess::Unknown
+                }
+            },
+            None,
+        )
         .unwrap();
         assert_eq!(
             report.protected_execution_ids,
@@ -232,7 +358,7 @@ mod tests {
         // An engine restart cannot erase the hold before it re-probes.
         let reopened = WorkDb::open(path).unwrap();
         assert!(reopened.is_execution_quarantined(&live).unwrap());
-        let drained = quarantine_with_probe(&reopened, |_| WorkerProcess::Gone { shell_pid: 42 }).unwrap();
+        let drained = quarantine_with_probe(&reopened, |_| WorkerProcess::Gone { shell_pid: 42 }, None).unwrap();
         assert!(drained.protected_execution_ids.is_empty());
         assert!(reopened.local_dispatch_quarantine_reason().unwrap().is_none());
         assert!(
@@ -259,7 +385,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = WorkDb::open(dir.path().join("work.db")).unwrap();
         let (execution, item) = seed(&db, "still live");
-        quarantine_with_probe(&db, |_| WorkerProcess::Alive { shell_pid: 42 }).unwrap();
+        quarantine_with_probe(&db, |_| WorkerProcess::Alive { shell_pid: 42 }, None).unwrap();
         db.connect()
             .unwrap()
             .execute(
@@ -267,10 +393,10 @@ mod tests {
                 [&execution],
             )
             .unwrap();
-        let report = quarantine_with_probe(&db, |_| WorkerProcess::Unknown).unwrap();
+        let report = quarantine_with_probe(&db, |_| WorkerProcess::Unknown, None).unwrap();
         assert!(report.protected_execution_ids.contains(&execution));
         assert!(db.ensure_work_item_not_quarantined(&item).is_err());
-        quarantine_with_probe(&db, |_| WorkerProcess::Gone { shell_pid: 42 }).unwrap();
+        quarantine_with_probe(&db, |_| WorkerProcess::Gone { shell_pid: 42 }, None).unwrap();
         assert!(db.local_dispatch_quarantine_reason().unwrap().is_none());
     }
 
@@ -317,7 +443,7 @@ mod tests {
             )
             .unwrap();
         }
-        let report = quarantine_with_probe(&db, |_| panic!("excluded rows must never be probed")).unwrap();
+        let report = quarantine_with_probe(&db, |_| panic!("excluded rows must never be probed"), None).unwrap();
         assert!(report.protected_execution_ids.is_empty());
         assert!(db.local_dispatch_quarantine_reason().unwrap().is_none());
     }
@@ -348,16 +474,64 @@ mod tests {
         db.delete_work_item(&item).unwrap();
         // Filing attention against a tombstoned task is refused; the hold
         // must still land and the sweep must still return `Ok`.
-        let report = quarantine_with_probe(&db, |_| WorkerProcess::Unknown).unwrap();
+        let report = quarantine_with_probe(&db, |_| WorkerProcess::Unknown, None).unwrap();
         assert!(report.protected_execution_ids.contains(&execution));
         assert!(db.is_execution_quarantined(&execution).unwrap());
         assert!(db.ensure_work_item_not_quarantined(&item).is_err());
         assert!(db.local_dispatch_quarantine_reason().unwrap().is_some());
         // ...and proven death still lifts it, again without an attention error
         // surfacing as a startup failure.
-        let drained = quarantine_with_probe(&db, |_| WorkerProcess::Gone { shell_pid: 42 }).unwrap();
+        let drained = quarantine_with_probe(&db, |_| WorkerProcess::Gone { shell_pid: 42 }, None).unwrap();
         assert!(drained.dead_execution_ids.contains(&execution));
         assert!(!db.is_execution_quarantined(&execution).unwrap());
         assert!(db.local_dispatch_quarantine_reason().unwrap().is_none());
+    }
+
+    #[test]
+    fn run_written_before_the_kernel_booted_is_proven_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("work.db")).unwrap();
+        let (execution, item) = seed(&db, "pre-boot");
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        // Establish the hold first, as a build that lacked boot evidence
+        // would have, so this also covers lifting a persisted hold.
+        quarantine_with_probe(&db, |_| WorkerProcess::Unknown, None).unwrap();
+        assert!(db.is_execution_quarantined(&execution).unwrap());
+        // A kernel that booted well after the row's last write outranks a
+        // probe that claims the (recycled) pid is alive.
+        let boot = now + PRE_BOOT_MARGIN_SECS * 2;
+        let report = quarantine_with_probe(&db, |_| WorkerProcess::Alive { shell_pid: 42 }, Some(boot)).unwrap();
+        assert_eq!(report.dead_execution_ids, HashSet::from([execution.clone()]));
+        assert!(report.protected_execution_ids.is_empty());
+        assert!(!db.is_execution_quarantined(&execution).unwrap());
+        assert!(db.local_dispatch_quarantine_reason().unwrap().is_none());
+        db.ensure_work_item_not_quarantined(&item).unwrap();
+        db.mark_execution_orphaned(&execution, "run predates kernel boot")
+            .unwrap();
+    }
+
+    #[test]
+    fn run_inside_the_pre_boot_margin_or_without_boot_evidence_stays_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("work.db")).unwrap();
+        let (execution, _) = seed(&db, "recent");
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        for boot in [None, Some(now + PRE_BOOT_MARGIN_SECS / 2), Some(now - 1)] {
+            let report = quarantine_with_probe(&db, |_| WorkerProcess::Unknown, boot).unwrap();
+            assert!(report.protected_execution_ids.contains(&execution), "boot={boot:?}");
+            assert!(report.dead_execution_ids.is_empty(), "boot={boot:?}");
+            assert!(db.is_execution_quarantined(&execution).unwrap(), "boot={boot:?}");
+        }
+    }
+
+    #[test]
+    fn kernel_boot_time_is_in_the_past_on_supported_platforms() {
+        let boot = kernel_boot_epoch_secs();
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            let boot = boot.expect("boot time readable");
+            assert!(boot > 0 && boot <= boss_engine_utils::epoch_time::now_epoch_secs());
+        } else {
+            assert!(boot.is_none());
+        }
     }
 }
