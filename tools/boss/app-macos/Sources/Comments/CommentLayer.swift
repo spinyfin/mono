@@ -59,6 +59,8 @@ final class CommentLayer: NSObject, ObservableObject {
     /// the artifact-less in-memory path.
     private(set) var artifactKind: String = ""
     private(set) var artifactId: String = ""
+    private(set) var guideVersionId: String?
+    var openOriginalGuide: ((String) -> Void)?
     /// The raw markdown the viewer renders; the plain-text projection (for
     /// anchoring + `doc_version`) is derived from it.
     private var source: String = ""
@@ -70,7 +72,7 @@ final class CommentLayer: NSObject, ObservableObject {
     var isEngineBacked: Bool { backend != nil && !artifactId.isEmpty }
 
     /// Occurrence index computed at selection time; consumed by addComment().
-    private var pendingOccurrenceIndex: Int = 0
+    var pendingOccurrenceIndex: Int = 0
     /// Text that precedes the selection in the Textual NSTextInteractionView path,
     /// captured at mouseUp. Used to count prior occurrences of the quoted text.
     private var anchorTextBeforeSelection: String? = nil
@@ -289,12 +291,13 @@ final class CommentLayer: NSObject, ObservableObject {
     // MARK: - Authoring
 
     func requestNewComment(firstChar: Character? = nil) {
-        pendingQuotedText = captureCurrentSelection() ?? ""
-        pendingOccurrenceIndex = computeOccurrenceIndex(for: pendingQuotedText)
+        let draft = guideDraft
+        pendingQuotedText = draft?.quote ?? captureCurrentSelection() ?? ""
+        pendingOccurrenceIndex = draft?.occurrenceIndex ?? computeOccurrenceIndex(for: pendingQuotedText)
         // Seed typeahead with the key that opened the form (if any). Further
         // keystrokes during the show-animation dead window append here (or insert
         // directly into the text view once it exists) so nothing is dropped.
-        pendingTypeahead = firstChar.map { String($0) } ?? ""
+        pendingTypeahead = draft?.body ?? firstChar.map { String($0) } ?? ""
         commentTextView = nil
         needsCommentTextFocus = true
 
@@ -395,6 +398,7 @@ final class CommentLayer: NSObject, ObservableObject {
         let anchor = Self.captureAnchor(
             quoted: quoted, occurrenceIndex: pendingOccurrenceIndex, in: projection)
 
+        discardGuideDraft()
         resetAuthoringState()
 
         if let backend, !artifactId.isEmpty {
@@ -405,7 +409,8 @@ final class CommentLayer: NSObject, ObservableObject {
                 artifactId: artifactId,
                 anchor: anchor,
                 body: trimmed,
-                docVersion: CommentProjection.docVersion(forPlainText: projection)
+                docVersion: CommentProjection.docVersion(forPlainText: projection),
+                guideVersionId: guideVersionId
             )
         } else {
             // In-memory fallback (artifact-less viewer / unit test).
@@ -433,6 +438,7 @@ final class CommentLayer: NSObject, ObservableObject {
     }
 
     func cancelNewComment() {
+        discardGuideDraft()
         activePopover?.close()
     }
 
@@ -463,7 +469,11 @@ final class CommentLayer: NSObject, ObservableObject {
         self.baseURL = baseURL
         guard let artifact, let backend else { return }
         // Re-configuring the same artifact is a no-op beyond refreshing source.
-        if artifactId == artifact.id, self.backend != nil { return }
+        if artifactId == artifact.id, artifactKind == artifact.kind,
+           guideVersionId == artifact.guideVersionId, self.backend != nil { return }
+        self.backend?.unregisterCommentLayer(self)
+        comments = []
+        self.guideVersionId = artifact.guideVersionId
         self.artifactKind = artifact.kind
         self.artifactId = artifact.id
         self.backend = backend
@@ -481,14 +491,14 @@ final class CommentLayer: NSObject, ObservableObject {
     /// `configure`). Re-resolves anchors against the freshly-available projection
     /// so highlights + the ⚠/orphan glyphs settle once the doc text arrives.
     func updateSource(_ source: String, baseURL: URL?) {
-        guard source != self.source else { return }
+        guard guideVersionId == nil, source != self.source else { return }
         self.source = source
         self.baseURL = baseURL
         guard let backend, isEngineBacked else { return }
         let projection = currentProjection()
         if !projection.isEmpty {
             backend.resolveComments(
-                artifactKind: artifactKind, artifactId: artifactId, plainText: projection)
+                artifactKind: artifactKind, artifactId: artifactId, plainText: projection, guideVersionId: guideVersionId)
         }
     }
 
@@ -503,7 +513,7 @@ final class CommentLayer: NSObject, ObservableObject {
         let projection = currentProjection()
         if !projection.isEmpty {
             backend.resolveComments(
-                artifactKind: artifactKind, artifactId: artifactId, plainText: projection)
+                artifactKind: artifactKind, artifactId: artifactId, plainText: projection, guideVersionId: guideVersionId)
         }
     }
 
@@ -522,6 +532,9 @@ final class CommentLayer: NSObject, ObservableObject {
             comments.compactMap { c in c.lastResolvedWith.map { (c.id, $0) } },
             uniquingKeysWith: { first, _ in first }
         )
+        let priorDisplayAnchors = Dictionary(
+            comments.compactMap { comment in comment.resolvedAnchor.map { (comment.id, $0) } },
+            uniquingKeysWith: { first, _ in first })
         comments = wire.map { cw in
             var c = Comment.from(
                 cw.comment,
@@ -530,6 +543,7 @@ final class CommentLayer: NSObject, ObservableObject {
                 answerAgentFailed: cw.answerAgentFailed
             )
             if c.lastResolvedWith == nil { c.lastResolvedWith = priorResolved[c.id] }
+            c.resolvedAnchor = priorDisplayAnchors[c.id]
             return c
         }
     }
@@ -541,9 +555,14 @@ final class CommentLayer: NSObject, ObservableObject {
     func applyResolved(_ resolved: [ResolvedComment]) {
         let byId = Dictionary(resolved.map { ($0.comment.id, $0) }, uniquingKeysWith: { first, _ in first })
         for i in comments.indices {
-            guard let rc = byId[comments[i].id] else { continue }
+            guard let rc = byId[comments[i].id],
+                  rc.comment.guideContext?.versionId == guideVersionId else { continue }
             comments[i].lastResolvedWith = ResolvedWith(rawValue: rc.resolution.kind) ?? .exact
-            if rc.resolution.isOrphan { comments[i].status = .orphaned }
+            if guideVersionId != nil {
+                comments[i].resolvedAnchor = displayAnchor(for: rc.resolution)
+            } else if rc.resolution.isOrphan {
+                comments[i].status = .orphaned
+            }
         }
     }
 
@@ -764,6 +783,7 @@ final class CommentLayer: NSObject, ObservableObject {
     /// simulates the same guarded `active` → `in_revision` batch transition
     /// locally, since there's no engine to persist it.
     func reviseDoc() {
+        guard guideVersionId == nil else { return }
         if let backend, isEngineBacked {
             backend.reviseDoc(artifactKind: artifactKind, artifactId: artifactId)
             return
@@ -815,7 +835,11 @@ final class CommentLayer: NSObject, ObservableObject {
     // MARK: - Click-to-jump
 
     func jumpTo(_ comment: Comment) {
-        let anchor = comment.anchor
+        if let original = comment.guideContext?.versionId, original != guideVersionId {
+            openOriginalGuide?(original)
+            return
+        }
+        let anchor = comment.displayAnchor
         flashingAnchor = anchor
         Task {
             try? await Task.sleep(for: .milliseconds(900))
@@ -1176,6 +1200,11 @@ private final class CommentMenuTarget: NSObject, @unchecked Sendable {
 struct CommentArtifactRef: Equatable {
     let kind: String
     let id: String
+    var guideVersionId: String? = nil
+
+    static func reviewGuide(seriesID: String, versionID: String) -> CommentArtifactRef {
+        CommentArtifactRef(kind: WireArtifactKind.reviewGuide, id: seriesID, guideVersionId: versionID)
+    }
 
     /// A comment on an engine-owned work-item description. `artifact_id` is the
     /// raw work-item id.
@@ -1238,6 +1267,7 @@ struct WithCommentsModifier: ViewModifier {
     let baseURL: URL?
 
     @Environment(\.commentBackend) private var commentBackend
+    @Environment(\.openOriginalGuide) private var openOriginalGuide
     @StateObject private var layer = CommentLayer()
     /// Whether the full comment sidebar is shown. Collapsed by default: an
     /// engine-backed doc with no comments no longer opens onto a wide empty
@@ -1254,7 +1284,7 @@ struct WithCommentsModifier: ViewModifier {
     @State private var sidebarExpanded = false
 
     func body(content: Content) -> some View {
-        let commentedAnchors = layer.comments.filter(\.isHighlightable).map(\.anchor)
+        let commentedAnchors = layer.currentVersionComments.filter(\.isHighlightable).map(\.displayAnchor)
         let flashingAnchor = layer.flashingAnchor
 
         HStack(spacing: 0) {
@@ -1299,7 +1329,9 @@ struct WithCommentsModifier: ViewModifier {
             set: { layer.suppressTypeToComment = $0 }
         ))
         .onAppear {
+            layer.openOriginalGuide = openOriginalGuide
             layer.configure(source: source, baseURL: baseURL, artifact: artifact, backend: commentBackend)
+            if layer.guideDraft != nil { sidebarExpanded = true }
             layer.installMonitors()
         }
         .onChange(of: source) { _, newSource in

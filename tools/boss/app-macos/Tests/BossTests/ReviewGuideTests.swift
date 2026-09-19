@@ -115,7 +115,7 @@ final class ReviewGuideTests: XCTestCase {
         }
         XCTAssertEqual(title, "Review guide: Fix retry")
         XCTAssertEqual(markdown, "# The guide")
-        XCTAssertNil(artifact, "guide comments are a separate follow-up; no artifact yet")
+        XCTAssertEqual(artifact, .reviewGuide(seriesID: "prgs_1", versionID: "prgv_1"))
         XCTAssertEqual(model.asyncMarkdownViewerVM.reviewGuideGeneratedAt, "2026-09-16T00:00:00Z")
     }
 

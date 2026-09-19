@@ -18,6 +18,7 @@ import SwiftUI
 /// only and never disables the merge control below it.
 struct ReviewGuideViewerHeader: View {
     @ObservedObject var chatModel: ChatViewModel
+    @ObservedObject private var drafts = GuideCommentDrafts.shared
     let rootTaskId: String
     /// The open version's generation timestamp (RFC 3339), or `nil` while
     /// still loading.
@@ -49,6 +50,17 @@ struct ReviewGuideViewerHeader: View {
                         Text("Generated \(AutomationTime.relative(generatedAt, now: Date()))")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                    }
+                }
+                if case .loaded(_, _, let artifact) = chatModel.asyncMarkdownViewerVM.state {
+                    ForEach(drafts.byVersion.keys.sorted(), id: \.self) { versionId in
+                        if drafts.byVersion[versionId]?.seriesId == artifact?.id,
+                           versionId != artifact?.guideVersionId {
+                            Button("Resume draft on original guide") {
+                                chatModel.openReviewGuide(versionId: versionId, rootTaskId: rootTaskId)
+                            }
+                            .controlSize(.small)
+                        }
                     }
                 }
                 currentnessBanner(for: task)

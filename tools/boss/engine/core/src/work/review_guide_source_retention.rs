@@ -52,6 +52,7 @@ impl WorkDb {
                 LEFT JOIN tasks t ON t.id = s.root_task_id
                 WHERE (t.id IS NULL OR t.deleted_at IS NOT NULL OR t.status IN ('done', 'archived'))
                   AND CAST(c.captured_at AS INTEGER) < ?1
+                  AND NOT EXISTS (SELECT 1 FROM pr_review_guide_versions v WHERE v.comparison_id = c.id)
             )",
             [now - policy.terminal_age_seconds],
         )?;
@@ -63,6 +64,7 @@ impl WorkDb {
                     FROM pr_review_guide_source_comparisons c
                     JOIN pr_review_guide_source_series s ON s.id = c.series_id
                     WHERE c.id IS NOT s.selected_comparison_id
+                      AND NOT EXISTS (SELECT 1 FROM pr_review_guide_versions v WHERE v.comparison_id = c.id)
                 ) WHERE rank > ?1
             )", [policy.recent_comparisons],
         )?;

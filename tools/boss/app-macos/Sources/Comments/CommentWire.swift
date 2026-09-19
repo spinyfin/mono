@@ -42,6 +42,7 @@ enum WireResolvedWith {
 enum WireArtifactKind {
     static let workItem = "work_item"
     static let prDoc = "pr_doc"
+    static let reviewGuide = "pr_review_guide"
 }
 
 // MARK: - CommentResolution (types.rs:948-961)
@@ -64,7 +65,22 @@ struct CommentResolution: Codable, Equatable, Sendable {
 // MARK: - WorkComment (types.rs:3398-3479)
 
 /// The `work_comments` row. Anchor is embedded inline as a nested object.
+struct GuideCommentContext: Codable, Equatable, Sendable {
+    let versionId: String
+    let comparisonId: String
+    let packetHash: String
+    let baseSha: String
+    let mergeBaseSha: String
+    let headSha: String
+
+    enum CodingKeys: String, CodingKey {
+        case versionId = "version_id", comparisonId = "comparison_id", packetHash = "packet_hash"
+        case baseSha = "base_sha", mergeBaseSha = "merge_base_sha", headSha = "head_sha"
+    }
+}
+
 struct WorkComment: Codable, Equatable, Sendable {
+    let guideContext: GuideCommentContext?
     let id: String
     let artifactId: String
     let anchor: CommentAnchor
@@ -87,6 +103,7 @@ struct WorkComment: Codable, Equatable, Sendable {
     let reopenedAt: String?
 
     enum CodingKeys: String, CodingKey {
+        case guideContext = "guide_context"
         case id
         case artifactId = "artifact_id"
         case anchor
@@ -111,6 +128,7 @@ struct WorkComment: Codable, Equatable, Sendable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        guideContext = try c.decodeIfPresent(GuideCommentContext.self, forKey: .guideContext)
         id = try c.decode(String.self, forKey: .id)
         artifactId = try c.decode(String.self, forKey: .artifactId)
         anchor = try c.decode(CommentAnchor.self, forKey: .anchor)
@@ -156,8 +174,10 @@ struct WorkComment: Codable, Equatable, Sendable {
         intentClassifiedAt: String? = nil,
         intentOverriddenBy: String? = nil,
         reviseTaskId: String? = nil,
-        reopenedAt: String? = nil
+        reopenedAt: String? = nil,
+        guideContext: GuideCommentContext? = nil
     ) {
+        self.guideContext = guideContext
         self.id = id
         self.artifactId = artifactId
         self.anchor = anchor

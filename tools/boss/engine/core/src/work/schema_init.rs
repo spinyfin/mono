@@ -740,6 +740,7 @@ impl WorkDb {
         // must exist first). Rollout stays behind the source-capture flag;
         // schema creation is additive.
         step!(timer, conn, migrate_pr_review_guide_job_tables)?;
+        step!(timer, conn, guide_comments::migrate_guide_comments)?;
         step!(timer, conn, execution_bookmarks::migrate_execution_bookmarks)?;
         step!(timer, conn, Self::stamp_schema_version)?;
         timer.finish();

@@ -78,7 +78,7 @@ const COMMENT_COLUMNS: &str = "id, artifact_kind, artifact_id, doc_version, anch
      author, status, status_actor, last_resolved_with, plain_text_projection_version, \
      created_at, updated_at, dismissed_at, intent, intent_confidence, intent_classified_at, \
      intent_overridden_by, revise_task_id, intent_classification_failed_at, \
-     intent_classification_error, reopened_at";
+     intent_classification_error, reopened_at, guide_context_json";
 
 /// The one definition of "this comment is a `[Revise]` candidate": `active`
 /// status **and** a `revision` intent. A SQL fragment rather than a Rust
@@ -119,6 +119,14 @@ const COMMENT_INSERT_SQL: &str = "INSERT INTO work_comments \
 impl WorkDb {
     /// Create an `active` comment. Returns the inserted row.
     pub fn create_comment(&self, input: CreateCommentInput) -> Result<WorkComment> {
+        self.create_comment_with_guide_version(input, None)
+    }
+
+    pub fn create_comment_with_guide_version(
+        &self,
+        input: CreateCommentInput,
+        guide_version_id: Option<&str>,
+    ) -> Result<WorkComment> {
         if input.body.trim().is_empty() {
             bail!("comment body may not be empty");
         }
@@ -128,7 +136,9 @@ impl WorkDb {
         if input.artifact_id.trim().is_empty() {
             bail!("comment artifact_id may not be empty");
         }
-        let conn = self.connect()?;
+        let mut conn = self.connect()?;
+        let conn = conn.transaction()?;
+        let guide_context = super::guide_comments::context_for_create(&conn, &input, guide_version_id)?;
         let id = next_id("cmt");
         let now = now_string();
         let anchor_json = serde_json::to_string(&input.anchor)?;
@@ -151,7 +161,15 @@ impl WorkDb {
                 Option::<String>::None,
             ],
         )?;
-        query_comment(&conn, &id)?.with_context(|| format!("missing comment after insert: {id}"))
+        if let Some(context) = guide_context {
+            conn.execute(
+                "UPDATE work_comments SET guide_version_id = ?2, guide_context_json = ?3 WHERE id = ?1",
+                params![id, context.version_id, serde_json::to_string(&context)?],
+            )?;
+        }
+        let comment = query_comment(&conn, &id)?.with_context(|| format!("missing comment after insert: {id}"))?;
+        conn.commit()?;
+        Ok(comment)
     }
 
     /// List comments for an artifact in document-creation order. Excludes
@@ -793,6 +811,9 @@ impl WorkDb {
         plain_text_projection_version: i64,
         config: &CommentFuzzyConfig,
     ) -> Result<Vec<ResolvedComment>> {
+        if artifact_kind == "pr_review_guide" {
+            bail!("guide anchor resolution requires an immutable guide version");
+        }
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         // Resolve active + orphaned (orphans can recover); resolved/dismissed

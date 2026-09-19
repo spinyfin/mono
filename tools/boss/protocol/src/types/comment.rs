@@ -4,6 +4,18 @@
 use super::common::{EffortLevel, ReasoningMode, default_true};
 use serde::{Deserialize, Serialize};
 
+/// Server-derived immutable source identity for feedback on a guide.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct GuideCommentContext {
+    pub version_id: String,
+    pub comparison_id: String,
+    pub packet_hash: String,
+    pub base_sha: String,
+    pub merge_base_sha: String,
+    pub head_sha: String,
+}
+
 // ===========================================================================
 // Comments in the markdown viewer (design:
 // tools/boss/docs/designs/comments-in-markdown-viewer.md). Phase 2 adds the
@@ -452,6 +464,8 @@ pub const ANSWER_AGENT_RUN_STATUS_SUPERSEDED: &str = "superseded";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct WorkComment {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide_context: Option<GuideCommentContext>,
     pub id: String,
     /// The work-item id, or the synthetic `pr_doc:<repo>:<branch>:<path>`
     /// composite key.

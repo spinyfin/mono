@@ -16,9 +16,11 @@ struct CommentPopover: View {
     @ObservedObject var layer: CommentLayer
 
     @State private var commentBody: String
+    private let isResumingDraft: Bool
 
     init(layer: CommentLayer) {
         _layer = ObservedObject(wrappedValue: layer)
+        isResumingDraft = layer.guideDraft != nil
         // Seed from any typeahead already buffered before the first frame so
         // `CommentTextEditor.makeNSView` / `updateNSView` see the character(s)
         // immediately instead of starting empty and racing a later onAppear.
@@ -27,8 +29,14 @@ struct CommentPopover: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("New Comment")
+            Text(isResumingDraft ? "Resume Comment" : "New Comment")
                 .font(.headline)
+            if isResumingDraft {
+                Text(layer.pendingQuotedText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+            }
 
             CommentTextEditor(
                 text: $commentBody,
@@ -73,6 +81,8 @@ struct CommentPopover: View {
                 .disabled(commentBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
+        .onAppear { layer.saveGuideDraft(body: commentBody) }
+        .onChange(of: commentBody) { _, body in layer.saveGuideDraft(body: body) }
         .padding(16)
         .frame(width: 320)
     }

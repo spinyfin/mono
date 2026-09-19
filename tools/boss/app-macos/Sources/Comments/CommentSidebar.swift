@@ -17,7 +17,7 @@ struct CommentSidebar: View {
         VStack(spacing: 0) {
             header
             Divider()
-            if layer.bannerState.revisable || layer.bannerState.inRevisionCount > 0 {
+            if layer.guideVersionId == nil && (layer.bannerState.revisable || layer.bannerState.inRevisionCount > 0) {
                 ReviseBanner(layer: layer)
                 Divider()
             }
@@ -38,12 +38,35 @@ struct CommentSidebar: View {
             } else {
                 ScrollView {
                     LazyVStack(spacing: 0) {
-                        ForEach(layer.comments) { comment in
+                        ForEach(layer.currentVersionComments) { comment in
                             CommentRow(comment: comment, layer: layer)
                             Divider()
                         }
+                        if !layer.otherVersionComments.isEmpty {
+                            Text("Feedback on other guide versions")
+                                .font(.caption.weight(.semibold))
+                                .padding(12)
+                            ForEach(layer.otherVersionComments) { comment in
+                                CommentRow(comment: comment, layer: layer)
+                                if let context = comment.guideContext {
+                                    Text("Original revision: \(context.headSha.prefix(12))")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    Button("Open original guide") { layer.jumpTo(comment) }
+                                        .controlSize(.small)
+                                        .padding(.bottom, 8)
+                                }
+                                Divider()
+                            }
+                        }
                     }
                 }
+            }
+            if layer.guideVersionId != nil {
+                Text("Comments are saved. Revise PR is not available yet.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(12)
             }
             addCommentRow
         }
@@ -87,7 +110,7 @@ struct CommentSidebar: View {
         Button {
             layer.requestNewComment()
         } label: {
-            Label("Add Comment", systemImage: "plus.bubble")
+            Label(layer.guideDraft == nil ? "Add Comment" : "Resume draft", systemImage: "plus.bubble")
                 .font(.callout)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }

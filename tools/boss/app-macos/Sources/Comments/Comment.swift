@@ -161,6 +161,10 @@ struct Comment: Identifiable, Equatable {
     var artifactKind: String = ""
     var artifactId: String = ""
     var docVersion: String = ""
+    var guideContext: GuideCommentContext? = nil
+    /// Display-only anchor; the authored quote remains immutable.
+    var resolvedAnchor: CommentAnchor? = nil
+    var displayAnchor: CommentAnchor { resolvedAnchor ?? anchor }
 
     /// The selected text this comment is anchored to. Alias for `anchor.exact`,
     /// kept so the sidebar snippet and tests read naturally.
@@ -249,6 +253,7 @@ extension Comment {
         c.artifactKind = wc.artifactKind
         c.artifactId = wc.artifactId
         c.docVersion = wc.docVersion
+        c.guideContext = wc.guideContext
         return c
     }
 

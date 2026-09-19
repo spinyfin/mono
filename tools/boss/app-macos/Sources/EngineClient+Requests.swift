@@ -963,9 +963,10 @@ extension EngineClient {
         body: String,
         author: String,
         docVersion: String,
-        plainTextProjectionVersion: Int
+        plainTextProjectionVersion: Int,
+        guideVersionId: String? = nil
     ) {
-        sendLine([
+        var payload: [String: Any] = [
             "type": "comments_create",
             "artifact_kind": artifactKind,
             "artifact_id": artifactId,
@@ -974,7 +975,9 @@ extension EngineClient {
             "author": author,
             "doc_version": docVersion,
             "plain_text_projection_version": plainTextProjectionVersion,
-        ])
+        ]
+        if let guideVersionId { payload["guide_version_id"] = guideVersionId }
+        sendLine(payload)
     }
 
     /// List comments for an artifact. Excludes `resolved` / `dismissed` unless
@@ -996,15 +999,18 @@ extension EngineClient {
         artifactKind: String,
         artifactId: String,
         plainText: String,
-        plainTextProjectionVersion: Int
+        plainTextProjectionVersion: Int,
+        guideVersionId: String? = nil
     ) {
-        sendLine([
+        var payload: [String: Any] = [
             "type": "comments_resolve",
             "artifact_kind": artifactKind,
             "artifact_id": artifactId,
             "plain_text": plainText,
             "plain_text_projection_version": plainTextProjectionVersion,
-        ])
+        ]
+        if let guideVersionId { payload["guide_version_id"] = guideVersionId }
+        sendLine(payload)
     }
 
     /// Soft-dismiss: transition a comment to `resolved`. Engine replies
