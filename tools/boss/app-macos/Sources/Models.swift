@@ -211,6 +211,35 @@ struct WorkTask: Identifiable, Hashable {
     /// card feeds this into the doc-link affordance. `nil` when the item
     /// has no per-task pointer (hides the affordance).
     var docLinkState: ProjectDesignDocState? = nil
+    /// Current lifecycle of this task's PR review-guide series: one of
+    /// `"idle"`, `"queued"`, `"ready"`, `"failed"`, or `nil` when no series
+    /// has been captured yet for this task's PR (including every non-root
+    /// row — a series is always keyed by the chain-root task id). Mirrors
+    /// `Task.review_guide_lifecycle` on the wire. Independent of
+    /// `ciRequiredState` / `reviewRequiredState` / merge readiness — this
+    /// says nothing about whether the PR is approved or mergeable, only
+    /// whether an explanation is available. `"queued"` covers both
+    /// "not yet started" and "actively generating".
+    var reviewGuideLifecycle: String? = nil
+    /// The review-guide series' currently readable version id, if any —
+    /// pass to `GetReviewGuideContent` to fetch its Markdown. Mirrors
+    /// `Task.review_guide_readable_version_id` on the wire. Can be
+    /// non-nil even while `reviewGuideLifecycle` is `"queued"` or
+    /// `"failed"`: an older version stays open/readable while a refresh
+    /// is in flight or has failed.
+    var reviewGuideReadableVersionId: String? = nil
+    /// The series' current source comparison. The viewer pins whatever
+    /// version the user opened, so displayed staleness is this id compared
+    /// against that version's own `comparisonId`, not
+    /// `reviewGuideStaleSource` (which describes only the current readable
+    /// version). Mirrors `Task.review_guide_selected_comparison_id`.
+    var reviewGuideSelectedComparisonId: String? = nil
+    /// `true` when `reviewGuideReadableVersionId` was generated against a
+    /// source comparison that is no longer current — the PR's head actually
+    /// moved since that version was produced, not merely a same-comparison
+    /// prompt/prose retry. Mirrors `Task.review_guide_stale_source` on the
+    /// wire. `nil` until a readable version exists.
+    var reviewGuideStaleSource: Bool? = nil
 
     /// Short id of the reviewed task that produced this follow-up.
     /// `nil` for every task whose `kind` is not `"followup"`.
@@ -508,6 +537,24 @@ extension WorkTask {
     /// buckets.
     var isInMergingSection: Bool {
         status == "in_review" && mergeQueueState != nil
+    }
+
+    /// `true` when the Merge When Ready control should be offered for this
+    /// task: it is sitting in the Review column, its status is genuinely
+    /// `"in_review"` (not merely review-phase-blocked), it has a non-empty
+    /// PR URL, and it is not already in the merge queue
+    /// (`mergeQueueState == nil`). This is the single source of truth for
+    /// that eligibility — both the board card's snapshot builder
+    /// (`ChatViewModel+BoardHelpers.swift`) and the review-guide viewer
+    /// header (`ReviewGuideViewerHeader.swift`) call this so they cannot
+    /// drift: a task that is only in Review because it is `blocked` with a
+    /// review-phase reason (`isReviewPhaseBlocked`) must never show the
+    /// control.
+    var isMergeWhenReadyEligible: Bool {
+        boardColumn == .review
+            && status == "in_review"
+            && prURL.map { !$0.isEmpty } == true
+            && mergeQueueState == nil
     }
 
 }

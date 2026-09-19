@@ -1187,6 +1187,16 @@ impl WorkDb {
         }
         trace.record_plain(segment::DB_HAS_ATTACHMENTS, elapsed_ms(t));
 
+        // Resolve review-guide lifecycle/readable-version for every PR-bearing
+        // task/chore so the Review-card guide affordance renders without a
+        // per-card query. Errors are non-fatal — log and leave the fields at
+        // their default (affordance hidden). Single batched `IN (...)` query.
+        let t = Instant::now();
+        if let Err(err) = attach_review_guide_state(&conn, &mut tasks, &mut chores) {
+            tracing::warn!(?err, "get_work_tree: failed to attach review_guide_state; ignoring");
+        }
+        trace.record_plain(segment::DB_REVIEW_GUIDE_STATE, elapsed_ms(t));
+
         // Resolve the per-task doc-link state for every work item so a
         // card with `tasks.doc_*` set renders the Review-lane doc-link
         // icon — independent of `kind`. Design cards with a project also

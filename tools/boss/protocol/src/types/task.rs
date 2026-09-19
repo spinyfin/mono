@@ -925,6 +925,51 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_remote_url: Option<String>,
 
+    /// Current lifecycle of this task's PR review-guide series, one of
+    /// `"idle"` / `"queued"` / `"ready"` / `"failed"` — see
+    /// `tools/boss/docs/designs/automatic-pr-review-guides.md`. `None` when
+    /// no series has been captured for this task's PR yet (including every
+    /// non-root/non-PR row: a series is always keyed by the chain-root
+    /// task id). Independent of `ci_required_state` / `review_required_state`
+    /// / merge readiness (design invariant #6) — this says nothing about
+    /// whether the PR is approved or mergeable, only whether an explanation
+    /// is available. `"queued"` covers both "not yet started" and "a
+    /// generation attempt is actively running": the series has no separate
+    /// "generating" state, so the card renders both as one indeterminate
+    /// state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_guide_lifecycle: Option<String>,
+
+    /// The series' currently readable guide version id, if any — pass to
+    /// `GetReviewGuideContent` to fetch its Markdown. `Some` even while
+    /// `review_guide_lifecycle == "queued"` or `"failed"`: an older
+    /// version can remain open/readable while a refresh is in flight or
+    /// has failed (design's "Job state and concurrency" table). `None`
+    /// until the first guide for this PR has ever published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_guide_readable_version_id: Option<String>,
+
+    /// The series' current `selected_comparison_id`. The long-lived viewer
+    /// pins whatever version the user opened, which may lag the readable
+    /// pointer; comparing that version's own `comparison_id` against this
+    /// field is how the viewer derives *displayed* source-staleness (the
+    /// `review_guide_stale_source` flag is computed only for the current
+    /// readable version). `None` until a series exists for this root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_guide_selected_comparison_id: Option<String>,
+
+    /// `true` when `review_guide_readable_version_id` was generated against
+    /// a source comparison that is no longer the series' current one — i.e.
+    /// the PR's head genuinely moved since that version was produced, not
+    /// merely a same-comparison prompt/prose retry. Distinguishes "this
+    /// guide covers an older revision" (source staleness) from "Explanation
+    /// refresh failed" (a retry of the same source failed) per the design's
+    /// "Review card and viewer" section — lifecycle plus the presence of a
+    /// readable version id cannot tell those apart on their own. `None`
+    /// until a readable version exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_guide_stale_source: Option<bool>,
+
     /// Reviewer names for the review indicator tooltip. JSON-encoded list of
     /// login strings. For `"approved"`: the approving reviewers. For
     /// `"changes_requested"`: the requesting reviewers. `None` otherwise.

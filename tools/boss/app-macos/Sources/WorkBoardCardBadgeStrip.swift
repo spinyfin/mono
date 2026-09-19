@@ -42,6 +42,7 @@ struct WorkBoardCardBadgeStripSlice: Equatable {
     let externalRefLink: ExternalRefLinkPresentation?
     let showsDesignDocAffordance: Bool
     let designDocState: ProjectDesignDocState?
+    let reviewGuidePresentation: ReviewGuideCardPresentation?
     let showsAttachmentsAffordance: Bool
     let showsTerminalButton: Bool
     let terminalTooltip: String
@@ -81,6 +82,7 @@ struct WorkBoardCardBadgeStripSlice: Equatable {
         self.externalRefLink = snapshot.externalRefLink
         self.showsDesignDocAffordance = snapshot.showsDesignDocAffordance
         self.designDocState = snapshot.designDocState
+        self.reviewGuidePresentation = snapshot.reviewGuidePresentation
         self.showsAttachmentsAffordance = snapshot.showsAttachmentsAffordance
         self.showsTerminalButton = snapshot.showsTerminalButton
         self.terminalTooltip = snapshot.terminalTooltip
@@ -105,14 +107,18 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
     var onOpenTerminal: (() -> Void)? = nil
     /// Merge-when-ready confirm; also gated by `slice.showsMergeWhenReady`.
     var onMergeWhenReady: (() -> Void)? = nil
+    /// Open the review guide; gated by `slice.reviewGuidePresentation`
+    /// having a readable version to show.
+    var onOpenReviewGuide: (() -> Void)? = nil
+    /// Retry a failed/no-content review-guide generation; gated by
+    /// `slice.reviewGuidePresentation.showsRetry`.
+    var onRetryReviewGuide: (() -> Void)? = nil
     /// Invoked when the user taps the `reviewed_with_findings` badge —
     /// reveals the follow-up revision that carries the review comments.
     /// Only called when `slice.aiReviewFindingsRevisionId` is non-nil.
     var onRevealAIReviewFindings: (() -> Void)? = nil
     var onAcceptDeferredScope: ((String) -> Void)? = nil
     var onCreateTaskFromDeferredScope: ((String) -> Void)? = nil
-
-    @State private var showMergeConfirmation: Bool = false
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.slice == rhs.slice
@@ -243,31 +249,15 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
                 .buttonStyle(.plain)
                 .help(slice.terminalTooltip)
             }
+            if let presentation = slice.reviewGuidePresentation {
+                ReviewGuideCardBadge(
+                    presentation: presentation,
+                    onOpen: { onOpenReviewGuide?() },
+                    onRetry: { onRetryReviewGuide?() }
+                )
+            }
             if slice.showsMergeWhenReady {
-                Button {
-                    showMergeConfirmation = true
-                } label: {
-                    Image(systemName: "arrow.triangle.merge")
-                        .font(.caption)
-                        .foregroundStyle(Color.secondary)
-                        .accessibilityLabel("Merge when ready")
-                }
-                .buttonStyle(.plain)
-                .help("Merge When Ready: enqueue this PR for merging once all required checks pass")
-                // Always-attached: confirmationDialog needs false→true while
-                // installed; mount-with-true is a known intermittent failure.
-                .confirmationDialog(
-                    "Merge When Ready",
-                    isPresented: $showMergeConfirmation,
-                    titleVisibility: .visible
-                ) {
-                    Button("Confirm Merge When Ready") {
-                        onMergeWhenReady?()
-                    }
-                    Button("Cancel", role: .cancel) {}
-                } message: {
-                    Text("This will queue the PR for merging once all required checks pass. This action cannot be undone.")
-                }
+                MergeWhenReadyControl(onConfirm: { onMergeWhenReady?() })
             }
             if slice.showsDeferredScopeBadge {
                 DeferredScopeCardBadge(

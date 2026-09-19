@@ -628,6 +628,10 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
         ai_review_findings_revision_id: None,
         ready_for_review: false,
         doc_link_state: None,
+        review_guide_lifecycle: None,
+        review_guide_readable_version_id: None,
+        review_guide_selected_comparison_id: None,
+        review_guide_stale_source: None,
         origin_task_short_id: None,
         origin_pr_number: None,
         completed_at: None,
@@ -658,6 +662,7 @@ mod idea_tests;
 mod project_membership_move_tests;
 mod resolve_repo_tests;
 mod review_batches_tests;
+mod review_guide_state_tests;
 mod review_verdict_apply_tests;
 mod review_verdicts_tests;
 mod schema_migration_tests;

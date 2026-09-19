@@ -1,3 +1,5 @@
+import AppKit
+import SwiftUI
 import XCTest
 @testable import Boss
 
@@ -69,6 +71,77 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
 
         XCTAssertEqual(model.mergeFeedbackNotice?.taskID, "task_2")
         XCTAssertEqual(model.mergeFeedbackNotice?.message, "Merge requested")
+    }
+
+    /// A failed merge, then a retry that is accepted, must leave the error
+    /// map empty — otherwise dismissing the success banner resurrects the
+    /// stale failure for the rest of the session.
+    func testFailRetryAcceptClearsMergeErrorNotice() {
+        let model = makeModel()
+        var task = WorkTask(
+            id: "task_1",
+            productID: "prod_test",
+            projectID: nil,
+            kind: "task",
+            name: "Merge me",
+            description: "",
+            status: "in_review",
+            priority: "medium",
+            ordinal: nil,
+            prURL: "https://github.com/x/y/pull/1",
+            deletedAt: nil,
+            createdAt: "2026-05-14T00:00:00Z",
+            updatedAt: "2026-05-14T00:00:00Z"
+        )
+        task.mergeQueueState = nil
+        model.taskIndexByID = [task.id: task]
+
+        model.mergeWhenReady(for: task)
+        XCTAssertTrue(model.mergingWhenReadyIDs.contains(task.id))
+
+        model.applyEventForTest(.workError(message: "merge failed", requestId: nil))
+        XCTAssertEqual(model.mergeErrorNoticesByTaskID[task.id], "merge failed")
+        XCTAssertTrue(model.mergingWhenReadyIDs.isEmpty)
+
+        model.mergeWhenReady(for: task)
+        XCTAssertNil(
+            model.mergeErrorNoticesByTaskID[task.id],
+            "a fresh attempt must clear the stale error immediately"
+        )
+
+        model.applyEventForTest(.mergeWhenReadyAccepted(
+            workItemID: task.id,
+            prURL: "https://github.com/x/y/pull/1",
+            action: "trunk_enqueued"
+        ))
+        XCTAssertTrue(model.mergeErrorNoticesByTaskID.isEmpty)
+        XCTAssertEqual(model.mergeFeedbackNotice?.taskID, task.id)
+
+        model.clearMergeFeedback()
+        XCTAssertTrue(
+            model.mergeErrorNoticesByTaskID.isEmpty,
+            "dismissing the success banner must not resurrect the failure"
+        )
+    }
+
+    // MARK: - Shared control (card + review-guide viewer)
+
+    /// The extracted `MergeWhenReadyControl` (design: "Extract the current
+    /// card merge control and confirmation into one reusable
+    /// presentation/action component, used by both card and viewer") hosts
+    /// and lays out on its own, independent of a `WorkCardSnapshot`. The
+    /// card and the review-guide viewer header both mount it with only an
+    /// `onConfirm` closure that calls `mergeWhenReady(for:)` — this test
+    /// pins that the shared view itself renders without needing snapshot
+    /// or task context.
+    @MainActor
+    func testMergeWhenReadyControlHostsAndRenders() {
+        let view = MergeWhenReadyControl(onConfirm: {})
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: 60, height: 30)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(hosting.fittingSize.width, 0)
+        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
     }
 
     // MARK: - Helpers

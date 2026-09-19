@@ -1,24 +1,7 @@
 use super::*;
-use crate::test_support::{create_active_chore, create_product, open_db};
-use boss_pr_review_sources::SourcePacket;
-
-fn packet(base: &str, head: &str) -> SourcePacket {
-    SourcePacket {
-        schema_version: 2,
-        canonical_pr_url: "https://github.com/acme/widget/pull/9".to_owned(),
-        pr_number: 9,
-        title: "Fix retry".to_owned(),
-        body: None,
-        base_repository: "acme/widget".to_owned(),
-        head_repository: "acme/widget".to_owned(),
-        observed_base_sha: base.to_owned(),
-        probe_base_sha: None,
-        merge_base_sha: base.to_owned(),
-        head_sha: head.to_owned(),
-        files: Vec::new(),
-        omissions: Vec::new(),
-    }
-}
+use crate::test_support::{
+    create_active_chore, create_product, open_db, review_guide_source_packet, seed_review_guide_series,
+};
 
 fn seeded_series(db: &WorkDb) -> (String, String, String) {
     let product = create_product(db);
@@ -30,13 +13,8 @@ fn seeded_series(db: &WorkDb) -> (String, String, String) {
             params!["https://github.com/acme/widget.git", root],
         )
         .unwrap();
-    let stored = db
-        .persist_pr_review_guide_source_capture(&root, 1, PrSourceCaptureTrigger::Creation, &packet("base", "head"))
-        .unwrap();
-    let PrSourceCapturePersistOutcome::Stored(capture) = stored else {
-        panic!("capture must persist")
-    };
-    (root, capture.series_id, capture.comparison_id)
+    let (series_id, comparison_id) = seed_review_guide_series(db, &root);
+    (root, series_id, comparison_id)
 }
 
 #[test]
@@ -91,8 +69,13 @@ fn publish_for_a_superseded_comparison_does_not_advance_the_pointer() {
 
     // A newer comparison is captured and selected while the first attempt
     // is still in flight.
-    db.persist_pr_review_guide_source_capture(&root, 2, PrSourceCaptureTrigger::Poller, &packet("base2", "head2"))
-        .unwrap();
+    db.persist_pr_review_guide_source_capture(
+        &root,
+        2,
+        PrSourceCaptureTrigger::Poller,
+        &review_guide_source_packet("base2", "head2"),
+    )
+    .unwrap();
 
     let outcome = db
         .publish_pr_review_guide_version(&first_attempt.id, "# Stale guide\n\n## X\n## Y\n## Z\n## W\n", "raw")
@@ -207,8 +190,13 @@ fn failing_a_stale_attempt_does_not_downgrade_a_newer_ready_series() {
         .create_pr_review_guide_attempt(&series_id, &first_comparison, "review-guide-v1")
         .unwrap();
 
-    db.persist_pr_review_guide_source_capture(&root, 2, PrSourceCaptureTrigger::Poller, &packet("base2", "head2"))
-        .unwrap();
+    db.persist_pr_review_guide_source_capture(
+        &root,
+        2,
+        PrSourceCaptureTrigger::Poller,
+        &review_guide_source_packet("base2", "head2"),
+    )
+    .unwrap();
     let second_comparison = db
         .get_pr_review_guide_summary_for_root(&root)
         .unwrap()
@@ -269,8 +257,13 @@ fn admission_enforces_one_active_attempt_per_series() {
     };
     assert_eq!(first.status, "running");
 
-    db.persist_pr_review_guide_source_capture(&root, 2, PrSourceCaptureTrigger::Poller, &packet("base2", "head2"))
-        .unwrap();
+    db.persist_pr_review_guide_source_capture(
+        &root,
+        2,
+        PrSourceCaptureTrigger::Poller,
+        &review_guide_source_packet("base2", "head2"),
+    )
+    .unwrap();
     let RetryReviewGuideOutcome::Created(replacement) =
         db.retry_pr_review_guide(&root, None, "review-guide-v1").unwrap()
     else {

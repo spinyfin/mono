@@ -14,9 +14,11 @@
 
 use anyhow::ensure;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 use super::query_ensure::RequireRow;
 use super::*;
+use crate::coordinator::ExecutionPublisher;
 
 /// Lifecycle of one `pr_review_guide_attempts` row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -762,30 +764,23 @@ impl WorkDb {
         .map_err(Into::into)
     }
 
+    /// Resolve the root task id a review-guide series belongs to. A
+    /// `PrReviewGuide` execution's `work_item_id` is the comparison id, not
+    /// a task id (see [`Self::review_guide_source_root_for_execution`] for
+    /// the analogous execution-side resolution), so the completion
+    /// finalizer needs this to get back to the owning board card from an
+    /// attempt's `series_id` alone — including failure paths that never
+    /// load the comparison.
+    pub fn root_task_id_for_review_guide_series(&self, series_id: &str) -> Result<Option<String>> {
+        self.root_task_id_for_series(series_id)
+    }
+
     /// Series/comparison identity plus lifecycle for the `GetReviewGuide`
     /// RPC's summary half. `root_task_id` resolves the same way
     /// [`Self::get_latest_pr_review_guide_source_capture`] does.
     pub fn get_pr_review_guide_summary_for_root(&self, root_task_id: &str) -> Result<Option<PrReviewGuideSummary>> {
         let conn = self.connect()?;
-        conn.query_row(
-            "SELECT id, root_task_id, canonical_pr_url, guide_lifecycle, request_epoch, selected_comparison_id, readable_version_id
-             FROM pr_review_guide_source_series
-             WHERE root_task_id = ?1 ORDER BY updated_at DESC, id DESC LIMIT 1",
-            [root_task_id],
-            |row| {
-                Ok(PrReviewGuideSummary {
-                    series_id: row.get(0)?,
-                    root_task_id: row.get(1)?,
-                    canonical_pr_url: row.get(2)?,
-                    lifecycle: row.get(3)?,
-                    request_epoch: row.get(4)?,
-                    selected_comparison_id: row.get(5)?,
-                    readable_version_id: row.get(6)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(Into::into)
+        query_pr_review_guide_summary_for_root(&conn, root_task_id).map_err(Into::into)
     }
 
     /// One immutable version's full content, by id — the `GetReviewGuide`
@@ -975,6 +970,82 @@ fn bind_review_guide_execution(tx: &Connection, attempt_id: &str, execution_id: 
         params![attempt_id, now],
     )?;
     Ok(())
+}
+
+/// The query body behind [`WorkDb::get_pr_review_guide_summary_for_root`],
+/// factored out to a `&Connection` so a future caller already holding one
+/// open (a board/task read inside a transaction) is not forced to open a
+/// second one just for this lookup.
+fn query_pr_review_guide_summary_for_root(
+    conn: &Connection,
+    root_task_id: &str,
+) -> rusqlite::Result<Option<PrReviewGuideSummary>> {
+    conn.query_row(
+        "SELECT id, root_task_id, canonical_pr_url, guide_lifecycle, request_epoch, selected_comparison_id, readable_version_id
+         FROM pr_review_guide_source_series
+         WHERE root_task_id = ?1 ORDER BY latest_observation_sequence DESC, id DESC LIMIT 1",
+        [root_task_id],
+        |row| {
+            Ok(PrReviewGuideSummary {
+                series_id: row.get(0)?,
+                root_task_id: row.get(1)?,
+                canonical_pr_url: row.get(2)?,
+                lifecycle: row.get(3)?,
+                request_epoch: row.get(4)?,
+                selected_comparison_id: row.get(5)?,
+                readable_version_id: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// The `GetReviewGuideSummary` RPC's wire projection.
+pub(crate) fn to_wire_review_guide_summary(summary: PrReviewGuideSummary) -> boss_protocol::ReviewGuideSummary {
+    boss_protocol::ReviewGuideSummary::builder()
+        .series_id(summary.series_id)
+        .root_task_id(summary.root_task_id)
+        .canonical_pr_url(summary.canonical_pr_url)
+        .lifecycle(summary.lifecycle)
+        .request_epoch(summary.request_epoch)
+        .maybe_selected_comparison_id(summary.selected_comparison_id)
+        .maybe_readable_version_id(summary.readable_version_id)
+        .build()
+}
+
+/// Broadcast a work-item invalidation for `root_task_id` after a review-guide
+/// lifecycle transition that did not itself touch the `tasks` row (guide
+/// state lives in `pr_review_guide_source_series` / `_attempts` /
+/// `_versions`, keyed by `root_task_id`, not in `tasks`). Mirrors the
+/// `"task_doc_pointer_set"` / `"design_doc_pointer_set"` precedent in
+/// `completion/pr_transition.rs`: a derived projection changed on read, so
+/// subscribers (the kanban view) need a refetch hint, not a payload push.
+/// Best-effort — a failure to resolve the task's product only means the
+/// card catches up on its next unrelated refresh instead of immediately.
+/// Takes the publisher directly (rather than `Arc<ServerState>`) so both a
+/// `Dispatch` request handler (`server_state.publisher`) and
+/// `WorkerCompletionHandler` (its own `publisher` field) can share it.
+pub(crate) async fn notify_review_guide_changed(
+    work_db: &WorkDb,
+    publisher: &Arc<dyn ExecutionPublisher>,
+    root_task_id: &str,
+    reason: &str,
+) {
+    match work_db.get_work_item(root_task_id) {
+        Ok(item) => {
+            publisher
+                .publish_work_item_changed(item.product_id(), root_task_id, reason)
+                .await;
+        }
+        Err(err) => {
+            tracing::warn!(
+                root_task_id,
+                reason,
+                ?err,
+                "notify_review_guide_changed: failed to resolve root task's product; skipping broadcast"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
