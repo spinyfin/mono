@@ -2025,8 +2025,8 @@ impl WorkDb {
     }
 
     /// Recovery sweep: find `todo, autostart=true` tasks whose latest execution
-    /// is `waiting_dependency`, terminal, or absent and whose gating prereqs
-    /// are all satisfied, then reconcile them to `ready`. Returns the ids of
+    /// is `waiting_dependency`, absent, or a terminal revision converted to a
+    /// chore, with all gating prereqs satisfied, then reconcile them to `ready`. Returns the ids of
     /// tasks that were recovered.
     ///
     /// This handles tasks that got stuck after an auto-unblock (Part B
@@ -2052,14 +2052,20 @@ impl WorkDb {
             if !deps::gating_prereqs_for(&tx, &work_item_id)?.is_empty() {
                 continue;
             }
+            let kind = execution_kind_for_work_item(&tx, &work_item_id)?;
             let needs_promotion = match query_latest_execution_for_work_item(&tx, &work_item_id)? {
-                Some(exec) => exec.status == ExecutionStatus::WaitingDependency || exec.status.is_terminal(),
+                Some(exec) => {
+                    exec.status == ExecutionStatus::WaitingDependency
+                        // Match the terminal replacement supported by reconciliation.
+                        || (exec.status.is_terminal()
+                            && exec.kind == ExecutionKind::RevisionImplementation
+                            && kind == ExecutionKind::ChoreImplementation)
+                }
                 None => true,
             };
             if !needs_promotion {
                 continue;
             }
-            let kind = execution_kind_for_work_item(&tx, &work_item_id)?;
             let mut result = ExecutionReconcileResult::default();
             reconcile_work_item_execution(&tx, &mut result, &work_item_id, kind, ExecutionStatus::Ready)?;
             if !result.created.is_empty() || !result.updated.is_empty() {
