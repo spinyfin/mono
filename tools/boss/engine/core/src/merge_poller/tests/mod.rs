@@ -548,6 +548,7 @@ fn seed_queued(db: &WorkDb, task_id: &str, position: Option<i64>, enqueued_at: &
 
 mod adaptive_tests;
 mod classify_tests;
+mod converted_followup_tests;
 mod merge_queue_tests;
 mod metrics_tests;
 mod post_merge_review_trigger_tests;

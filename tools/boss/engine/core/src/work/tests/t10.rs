@@ -992,7 +992,7 @@ fn request_execution_still_dispatches_a_blocked_declaration() {
     assert_eq!(executions.len(), 2);
 }
 
-fn assert_converted_followup_dispatch(blocked: bool) {
+fn assert_converted_followup_dispatch(blocked: bool, sweep: bool) {
     let db = WorkDb::open(temp_db_path("park-converted-followup")).unwrap();
     let product = create_test_product_named(&db, "Converted followup");
     let chore = create_test_chore(&db, product.id.clone(), "Continue review findings");
@@ -1015,14 +1015,20 @@ fn assert_converted_followup_dispatch(blocked: bool) {
     if blocked {
         stamp_blocked_declaration(&db, &predecessor.id);
     }
-    let result = db.reconcile_product_executions(&product.id).unwrap();
+    let created = if sweep {
+        let promoted = db.promote_todo_autostart_stuck_executions().unwrap();
+        assert_eq!(promoted.contains(&chore.id), !blocked);
+        assert!(db.promote_todo_autostart_stuck_executions().unwrap().is_empty());
+        db.list_executions(Some(&chore.id))
+            .unwrap()
+            .into_iter()
+            .filter(|execution| execution.id != predecessor.id)
+            .collect::<Vec<_>>()
+    } else {
+        db.reconcile_product_executions(&product.id).unwrap().created
+    };
     if blocked {
-        assert!(
-            result
-                .created
-                .iter()
-                .all(|execution| execution.work_item_id != chore.id)
-        );
+        assert!(created.iter().all(|execution| execution.work_item_id != chore.id));
         let executions = db.list_executions(Some(&chore.id)).unwrap();
         assert_eq!(
             executions.len(),
@@ -1033,8 +1039,7 @@ fn assert_converted_followup_dispatch(blocked: bool) {
         assert!(db.dispatch_admission_facts(&chore.id).unwrap().deliberate_parked);
         return;
     }
-    let created = result
-        .created
+    let created = created
         .iter()
         .find(|execution| execution.work_item_id == chore.id)
         .unwrap();
@@ -1046,12 +1051,12 @@ fn assert_converted_followup_dispatch(blocked: bool) {
 
 #[test]
 fn reconcile_converted_followup_does_not_remint_a_blocked_revision() {
-    assert_converted_followup_dispatch(true);
+    assert_converted_followup_dispatch(true, false);
 }
 
 #[test]
 fn reconcile_converted_followup_starts_after_unblocked_revision() {
-    assert_converted_followup_dispatch(false);
+    assert_converted_followup_dispatch(false, false);
 }
 
 #[test]
@@ -1081,4 +1086,60 @@ fn explicit_start_resolves_execution_scoped_park_attention_synchronously() {
         [&execution_id], |row| row.get(0),
     ).unwrap();
     assert_eq!(unresolved, 0);
+}
+
+#[test]
+fn sweep_converted_followup_remints_abandoned_revision() {
+    assert_converted_followup_dispatch(false, true);
+}
+
+#[test]
+fn sweep_converted_followup_preserves_deliberate_park() {
+    assert_converted_followup_dispatch(true, true);
+}
+
+#[test]
+fn sweep_preserves_terminal_chore_after_churn_guard_bounce() {
+    let db = WorkDb::open(temp_db_path("sweep-churn-bounced-chore")).unwrap();
+    let (chore_id, execution_id) = unparked_active_chore(&db, "sweep-churn-bounce");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'failed' WHERE id = ?1",
+            [&execution_id],
+        )
+        .unwrap();
+    db.bounce_churn_guard_parked_to_backlog(
+        &chore_id,
+        "orphan_sweep",
+        1,
+        std::slice::from_ref(&execution_id),
+        "work item",
+        ChurnTrip::Window,
+    );
+    // Bounce disables autostart; restore it to exercise the sweep's candidate
+    // gate without an explicit start minting a replacement execution.
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET autostart = 1 WHERE id = ?1", [&chore_id])
+        .unwrap();
+    let WorkItem::Chore(before) = db.get_work_item(&chore_id).unwrap() else {
+        panic!("expected chore");
+    };
+    assert_eq!(before.status, TaskStatus::Todo);
+    assert_eq!(before.dispatch_failed_reason.as_deref(), Some("churn_guard"));
+    assert!(!db.dispatch_admission_facts(&chore_id).unwrap().deliberate_parked);
+    for _ in 0..2 {
+        assert!(db.promote_todo_autostart_stuck_executions().unwrap().is_empty());
+        let executions = db.list_executions(Some(&chore_id)).unwrap();
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0].id, execution_id);
+        assert_eq!(executions[0].kind, ExecutionKind::ChoreImplementation);
+        assert_eq!(executions[0].status, ExecutionStatus::Failed);
+        let WorkItem::Chore(after) = db.get_work_item(&chore_id).unwrap() else {
+            panic!("expected chore");
+        };
+        assert_eq!(after.dispatch_failed_reason, before.dispatch_failed_reason);
+        assert_eq!(after.dispatch_failed_error, before.dispatch_failed_error);
+    }
 }
