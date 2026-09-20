@@ -233,14 +233,13 @@ pub const UNDETERMINABLE_LIVENESS_ATTENTION_THRESHOLD: u32 = 5;
 /// hook, nothing reported in at all.
 pub const SPAWN_ACK_GRACE_SECS: i64 = 60;
 
-/// Reaps a confirmed spawn-ack-timeout slot's (possibly ghost) app pane
+/// Reaps a confirmed spawn-ack-timeout slot's (possibly ghost) tmux pane
 /// and process tree, mirroring [`crate::stale_worker_sweep::StaleWorkerReaper`].
 /// A pid-less spawn has nothing for a direct `kill(pid, 0)` to act on,
-/// but the app may still be holding a `TerminalPaneSession` for the
-/// slot (surface creation started but never produced a live shell) —
-/// tearing it down through `release_worker_pane` is what lets the next
-/// dispatch reuse the slot instead of the app rejecting the respawn
-/// with `SlotBusy`.
+/// but tmux may still be holding a session for the slot (the pane was
+/// created but never produced a live shell) — tearing it down through
+/// `release_worker_pane` is what lets the next dispatch reuse the slot
+/// instead of `SlotBusy` rejecting the respawn.
 #[async_trait::async_trait]
 pub trait SpawnAckReaper: Send + Sync {
     /// Tear down the app pane (if any) and release resources for

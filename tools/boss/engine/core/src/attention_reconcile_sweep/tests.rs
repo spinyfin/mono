@@ -432,34 +432,31 @@ async fn a_condition_that_re_trips_after_resolution_shows_again() {
 /// while its first row is still `open` must not be cleared by evidence from
 /// before the current occurrence.
 ///
-/// Every filer dedups onto the open row rather than inserting a second one —
-/// `file_pane_death_attention_item` documents this explicitly ("It won't be
-/// re-filed for this chore while it stays open, even if further relaunches
-/// kill subsequent panes") — so `created_at` stays pinned to the first trip
-/// forever. The sequence below is the real one: pane dies, the orphan sweep
-/// redispatches and a run starts, that pane dies too. Anchored on
-/// `created_at` the sweep would accept the intervening run start and resolve
-/// a signal whose condition is live; anchored on `last_raised_at` it does
-/// not.
+/// Every filer dedups onto the open row rather than inserting a second one,
+/// so `created_at` stays pinned to the first trip forever. The sequence
+/// below is the real one: the guard parks the item, the redispatch's run
+/// start clears the first trip's condition, but the guard parks it again
+/// before this pass runs. Anchored on `created_at` the sweep would accept
+/// the intervening run start and resolve a signal whose condition is live;
+/// anchored on `last_raised_at` it does not.
 #[tokio::test]
 async fn a_condition_that_re_trips_onto_its_still_open_row_is_not_cleared_by_the_earlier_run() {
     let (_dir, db) = open_db();
     let product = create_test_product(&db);
-    let chore = create_test_chore(&db, product.id, "Pane keeps dying");
+    let chore = create_test_chore(&db, product.id, "Guard keeps re-parking");
 
     // First trip, then the redispatch's run start — the evidence that would
     // legitimately clear it if nothing else had happened.
-    let attention =
-        open_attention_for_work_item(&db, &chore.id, crate::dead_pid_sweep::PANE_DEATH_ATTENTION_KIND, 1000);
+    let attention = open_attention_for_work_item(&db, &chore.id, crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND, 1000);
     start_run_at(&db, &chore.id, 1500);
 
-    // The replacement pane dies too. The filer dedups onto the open row and
+    // The guard re-parks the item. The filer dedups onto the open row and
     // returns its id — no second row — but stamps the re-raise.
     let reraised = db
         .upsert_work_item_attention(
             &chore.id,
-            crate::dead_pid_sweep::PANE_DEATH_ATTENTION_KIND,
-            "App relaunch killed a worker pane",
+            crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND,
+            "Auto-redispatch paused",
             "body",
         )
         .unwrap();

@@ -585,9 +585,13 @@ async fn retire_pane_reaps_an_untracked_slot_whose_durable_process_is_alive() {
         .await;
 
     let server_clone = server_state.clone();
-    let retire = tokio::spawn(async move { server_clone.retire_pane(4).await });
+    // Slot 1: `create_spawned_execution`'s durable run row always records
+    // worker id `worker-1`, and the durable reverse lookup below resolves
+    // the slot from that id — so the scenario's slot number must agree
+    // with it rather than being arbitrary.
+    let retire = tokio::spawn(async move { server_clone.retire_pane(1).await });
 
-    // Guard 3's own liveness probe: "what does the app host in slot 4?"
+    // Guard 3's own liveness probe: "what does the app host in slot 1?"
     let probe = sink.next().await.expect("an EngineRequest event should be enqueued");
     match probe.payload {
         FrontendEvent::EngineRequest { request_id, request } => {
@@ -601,7 +605,7 @@ async fn retire_pane_reaps_an_untracked_slot_whose_durable_process_is_alive() {
                     &request_id,
                     EngineToAppResponse::ListHostedPanes {
                         result: Ok(crate::protocol::ListHostedPanesResult {
-                            panes: vec![hosted(4, &execution_id)],
+                            panes: vec![hosted(1, &execution_id)],
                         }),
                     },
                 )
@@ -611,30 +615,8 @@ async fn retire_pane_reaps_an_untracked_slot_whose_durable_process_is_alive() {
     }
 
     // The durable teardown's own reverse lookup ("which slot hosts this
-    // run?", shared with `agents stop`'s fallback) — same question, asked
-    // again since the engine has no bookkeeping to read it from.
-    let reverse_lookup = sink.next().await.expect("a second EngineRequest should be enqueued");
-    match reverse_lookup.payload {
-        FrontendEvent::EngineRequest { request_id, request } => {
-            assert!(
-                matches!(request, EngineToAppRequest::ListHostedPanes(_)),
-                "expected the reverse hosted-pane lookup, got {request:?}"
-            );
-            server_state
-                .deliver_app_response(
-                    "session-app",
-                    &request_id,
-                    EngineToAppResponse::ListHostedPanes {
-                        result: Ok(crate::protocol::ListHostedPanesResult {
-                            panes: vec![hosted(4, &execution_id)],
-                        }),
-                    },
-                )
-                .await;
-        }
-        other => panic!("expected EngineRequest, got {other:?}"),
-    }
-
+    // run?", shared with `agents stop`'s fallback) now reads the durable
+    // worker id off the run row directly — no second app round-trip.
     // Then the actual slot-keyed teardown request.
     let release = sink
         .next()
@@ -645,9 +627,9 @@ async fn retire_pane_reaps_an_untracked_slot_whose_durable_process_is_alive() {
             assert!(
                 matches!(
                     request,
-                    EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id: 4, .. })
+                    EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id: 1, .. })
                 ),
-                "expected DetachWorkerPane for slot 4, got {request:?}"
+                "expected DetachWorkerPane for slot 1, got {request:?}"
             );
             server_state
                 .deliver_app_response(

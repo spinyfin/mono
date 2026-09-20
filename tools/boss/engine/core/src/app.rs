@@ -1949,7 +1949,7 @@ impl ServerState {
 
     /// Detach presentation for a worker whose tmux teardown was already verified.
     async fn detach_untracked_worker_viewer(&self, run_id: &str) -> PaneReleaseOutcome {
-        if let Some(slot_id) = self.hosted_pane_slot_for_run(run_id).await {
+        if let Some(slot_id) = self.hosted_pane_slot_for_run(run_id) {
             let request = EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id });
             if let Err(err) = self.send_to_app(request, PANE_RELEASE_ACK_TIMEOUT).await {
                 tracing::warn!(run_id, slot_id, ?err, "failed to detach untracked tmux viewer");

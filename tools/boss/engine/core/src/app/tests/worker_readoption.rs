@@ -205,34 +205,9 @@ async fn durable_state_scan_reclaims_a_live_pane_after_its_work_closes() {
         .await
     });
 
-    let hosted_lookup = sink.next().await.expect("hosted-pane lookup should be enqueued");
-    let lookup_id = match hosted_lookup.payload {
-        FrontendEvent::EngineRequest { request_id, request } => {
-            assert!(
-                matches!(request, EngineToAppRequest::ListHostedPanes(_)),
-                "expected ListHostedPanes, got {request:?}",
-            );
-            request_id
-        }
-        other => panic!("expected EngineRequest, got {other:?}"),
-    };
-    server_state
-        .deliver_app_response(
-            "session-app",
-            &lookup_id,
-            EngineToAppResponse::ListHostedPanes {
-                result: Ok(crate::protocol::ListHostedPanesResult {
-                    panes: vec![crate::protocol::HostedPaneEntry {
-                        slot_id: 1,
-                        run_id: execution_id.clone(),
-                        summary: None,
-                        task_title: None,
-                    }],
-                }),
-            },
-        )
-        .await;
-
+    // The slot this run's durable teardown resolves to comes straight from
+    // its recorded worker id (`worker-1` → slot 1, asserted above) — no
+    // `ListHostedPanes` round-trip is needed to find it.
     let release = sink.next().await.expect("pane release should be enqueued");
     let release_id = match release.payload {
         FrontendEvent::EngineRequest { request_id, request } => {
@@ -470,50 +445,23 @@ async fn readoption_derives_the_awaiting_input_capability_from_the_runs_driver()
     db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
     let execution = db.get_execution(&execution_id).unwrap();
 
-    // The live-state slot is only restored when the app can say which slot
-    // hosts the pane, so stand one up and answer the probe.
-    let sink = make_session_sink();
-    server_state
-        .register_app_session("session-app".into(), sink.clone())
-        .await;
-    let server_clone = server_state.clone();
-    let execution_clone = execution.clone();
-    let converge = tokio::spawn(async move {
-        server_clone
-            .converge_terminal_execution(&execution_clone, "hook_after_terminal")
-            .await
-    });
-
-    let envelope = sink.next().await.expect("an EngineRequest event should be enqueued");
-    let request_id = match envelope.payload {
-        FrontendEvent::EngineRequest { request_id, .. } => request_id,
-        other => panic!("expected EngineRequest, got {other:?}"),
-    };
-    server_state
-        .deliver_app_response(
-            "session-app",
-            &request_id,
-            EngineToAppResponse::ListHostedPanes {
-                result: Ok(crate::protocol::ListHostedPanesResult {
-                    panes: vec![crate::protocol::HostedPaneEntry {
-                        slot_id: 4,
-                        run_id: execution_id.clone(),
-                        summary: None,
-                        task_title: None,
-                    }],
-                }),
-            },
-        )
-        .await;
-    assert_eq!(converge.await.expect("converge task"), "readopt");
+    // The re-adopted slot now comes straight from the run's durable worker
+    // id (`create_spawned_execution` records `worker-1` → slot 1) — no app
+    // round-trip is needed to find it.
+    assert_eq!(
+        server_state
+            .converge_terminal_execution(&execution, "hook_after_terminal")
+            .await,
+        "readopt"
+    );
 
     assert!(
-        !server_state.live_worker_states.awaiting_input_capable(4),
+        !server_state.live_worker_states.awaiting_input_capable(1),
         "a re-adopted Codex worker must not be paintable as awaiting input",
     );
     let state = server_state
         .live_worker_states
-        .get(4)
+        .get(1)
         .expect("the re-adopted slot must carry a live-state entry");
     assert_eq!(
         state.model, "OpenAI Codex",
@@ -530,11 +478,11 @@ async fn readoption_derives_the_awaiting_input_capability_from_the_runs_driver()
     // live worker; and the hook that triggered this convergence is genuine
     // driver-originated proof, so it is recorded rather than discarded.
     assert_eq!(
-        server_state.live_worker_states.driver_start_expectation(4),
+        server_state.live_worker_states.driver_start_expectation(1),
         Some(crate::live_worker_state::DriverStartExpectation::Readopted),
     );
     assert!(
-        server_state.live_worker_states.driver_signal_at(4).is_some(),
+        server_state.live_worker_states.driver_signal_at(1).is_some(),
         "the hook that triggered the re-adoption is driver-start proof",
     );
     assert!(
