@@ -78,7 +78,7 @@ const COMMENT_COLUMNS: &str = "id, artifact_kind, artifact_id, doc_version, anch
      author, status, status_actor, last_resolved_with, plain_text_projection_version, \
      created_at, updated_at, dismissed_at, intent, intent_confidence, intent_classified_at, \
      intent_overridden_by, revise_task_id, intent_classification_failed_at, \
-     intent_classification_error, reopened_at";
+     intent_classification_error, reopened_at, guide_context_json";
 
 /// The one definition of "this comment is a `[Revise]` candidate": `active`
 /// status **and** a `revision` intent. A SQL fragment rather than a Rust
@@ -116,9 +116,42 @@ const COMMENT_INSERT_SQL: &str = "INSERT INTO work_comments \
       dismissed_at) \
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)";
 
+/// Shared wire shape for an [`AnchorResolution`]. Guide display-resolution
+/// and the mutating `resolve_comments` path must stay in lockstep.
+pub(super) fn wire_resolution(resolution: AnchorResolution) -> CommentResolution {
+    match resolution {
+        AnchorResolution::Exact { start, length } => CommentResolution {
+            kind: RESOLVED_WITH_EXACT.to_owned(),
+            start: Some(start as i64),
+            length: Some(length as i64),
+            score: None,
+        },
+        AnchorResolution::Fuzzy { start, length, score } => CommentResolution {
+            kind: RESOLVED_WITH_FUZZY.to_owned(),
+            start: Some(start as i64),
+            length: Some(length as i64),
+            score: Some(score),
+        },
+        AnchorResolution::Orphan(_) => CommentResolution {
+            kind: RESOLVED_WITH_ORPHAN.to_owned(),
+            start: None,
+            length: None,
+            score: None,
+        },
+    }
+}
+
 impl WorkDb {
     /// Create an `active` comment. Returns the inserted row.
     pub fn create_comment(&self, input: CreateCommentInput) -> Result<WorkComment> {
+        self.create_comment_with_guide_version(input, None)
+    }
+
+    pub fn create_comment_with_guide_version(
+        &self,
+        input: CreateCommentInput,
+        guide_version_id: Option<&str>,
+    ) -> Result<WorkComment> {
         if input.body.trim().is_empty() {
             bail!("comment body may not be empty");
         }
@@ -128,7 +161,9 @@ impl WorkDb {
         if input.artifact_id.trim().is_empty() {
             bail!("comment artifact_id may not be empty");
         }
-        let conn = self.connect()?;
+        let mut conn = self.connect()?;
+        let conn = conn.transaction()?;
+        let guide_context = super::guide_comments::context_for_create(&conn, &input, guide_version_id)?;
         let id = next_id("cmt");
         let now = now_string();
         let anchor_json = serde_json::to_string(&input.anchor)?;
@@ -151,7 +186,15 @@ impl WorkDb {
                 Option::<String>::None,
             ],
         )?;
-        query_comment(&conn, &id)?.with_context(|| format!("missing comment after insert: {id}"))
+        if let Some(context) = guide_context {
+            conn.execute(
+                "UPDATE work_comments SET guide_version_id = ?2, guide_context_json = ?3 WHERE id = ?1",
+                params![id, context.version_id, serde_json::to_string(&context)?],
+            )?;
+        }
+        let comment = query_comment(&conn, &id)?.with_context(|| format!("missing comment after insert: {id}"))?;
+        conn.commit()?;
+        Ok(comment)
     }
 
     /// List comments for an artifact in document-creation order. Excludes
@@ -793,6 +836,9 @@ impl WorkDb {
         plain_text_projection_version: i64,
         config: &CommentFuzzyConfig,
     ) -> Result<Vec<ResolvedComment>> {
+        if artifact_kind == "pr_review_guide" {
+            bail!("guide anchor resolution requires an immutable guide version");
+        }
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         // Resolve active + orphaned (orphans can recover); resolved/dismissed
@@ -806,8 +852,8 @@ impl WorkDb {
             }
             let was_orphaned = comment.status == COMMENT_STATUS_ORPHANED;
             let resolution = resolve_anchor(plain_text, &comment.anchor, config);
-            let wire = match resolution {
-                AnchorResolution::Exact { start, length } => {
+            match resolution {
+                AnchorResolution::Exact { .. } => {
                     tx.execute(
                         "UPDATE work_comments
                          SET status = 'active', last_resolved_with = ?2, updated_at = ?3
@@ -817,14 +863,8 @@ impl WorkDb {
                     comment.status = COMMENT_STATUS_ACTIVE.to_owned();
                     comment.last_resolved_with = Some(RESOLVED_WITH_EXACT.to_owned());
                     comment.updated_at = now.clone();
-                    CommentResolution {
-                        kind: RESOLVED_WITH_EXACT.to_owned(),
-                        start: Some(start as i64),
-                        length: Some(length as i64),
-                        score: None,
-                    }
                 }
-                AnchorResolution::Fuzzy { start, length, score } => {
+                AnchorResolution::Fuzzy { start, length, .. } => {
                     let new_anchor = extract_anchor(plain_text, start, length);
                     let anchor_json = serde_json::to_string(&new_anchor)?;
                     tx.execute(
@@ -845,12 +885,6 @@ impl WorkDb {
                     comment.last_resolved_with = Some(RESOLVED_WITH_FUZZY.to_owned());
                     comment.plain_text_projection_version = plain_text_projection_version;
                     comment.updated_at = now.clone();
-                    CommentResolution {
-                        kind: RESOLVED_WITH_FUZZY.to_owned(),
-                        start: Some(start as i64),
-                        length: Some(length as i64),
-                        score: Some(score),
-                    }
                 }
                 AnchorResolution::Orphan(reason) => {
                     tx.execute(
@@ -865,14 +899,9 @@ impl WorkDb {
                     comment.status = COMMENT_STATUS_ORPHANED.to_owned();
                     comment.last_resolved_with = Some(RESOLVED_WITH_ORPHAN.to_owned());
                     comment.updated_at = now.clone();
-                    CommentResolution {
-                        kind: RESOLVED_WITH_ORPHAN.to_owned(),
-                        start: None,
-                        length: None,
-                        score: None,
-                    }
                 }
             };
+            let wire = wire_resolution(resolution);
             out.push(ResolvedComment {
                 comment,
                 resolution: wire,

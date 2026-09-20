@@ -17,9 +17,9 @@ protocol CommentBackend: AnyObject {
     /// Stop backing `layer` and unsubscribe (when it's the last on its topic).
     func unregisterCommentLayer(_ layer: CommentLayer)
 
-    func createComment(artifactKind: String, artifactId: String, anchor: CommentAnchor, body: String, docVersion: String)
+    func createComment(artifactKind: String, artifactId: String, anchor: CommentAnchor, body: String, docVersion: String, guideVersionId: String?)
     func listComments(artifactKind: String, artifactId: String, includeResolved: Bool)
-    func resolveComments(artifactKind: String, artifactId: String, plainText: String)
+    func resolveComments(artifactKind: String, artifactId: String, plainText: String, guideVersionId: String?)
     func dismissComment(commentId: String)
     func setStatus(commentId: String, status: String)
     func updateAnchor(commentId: String, anchor: CommentAnchor, newDocVersion: String)
@@ -107,7 +107,7 @@ final class CommentEngineBridge: CommentBackend {
 
     // MARK: CommentBackend — mutations / reads
 
-    func createComment(artifactKind: String, artifactId: String, anchor: CommentAnchor, body: String, docVersion: String) {
+    func createComment(artifactKind: String, artifactId: String, anchor: CommentAnchor, body: String, docVersion: String, guideVersionId: String?) {
         engine.sendCommentsCreate(
             artifactKind: artifactKind,
             artifactId: artifactId,
@@ -115,7 +115,8 @@ final class CommentEngineBridge: CommentBackend {
             body: body,
             author: author,
             docVersion: docVersion,
-            plainTextProjectionVersion: CommentProjection.version
+            plainTextProjectionVersion: CommentProjection.version,
+            guideVersionId: guideVersionId
         )
     }
 
@@ -123,12 +124,13 @@ final class CommentEngineBridge: CommentBackend {
         engine.sendCommentsList(artifactKind: artifactKind, artifactId: artifactId, includeResolved: includeResolved)
     }
 
-    func resolveComments(artifactKind: String, artifactId: String, plainText: String) {
+    func resolveComments(artifactKind: String, artifactId: String, plainText: String, guideVersionId: String?) {
         engine.sendCommentsResolve(
             artifactKind: artifactKind,
             artifactId: artifactId,
             plainText: plainText,
-            plainTextProjectionVersion: CommentProjection.version
+            plainTextProjectionVersion: CommentProjection.version,
+            guideVersionId: guideVersionId
         )
     }
 
@@ -180,6 +182,7 @@ final class CommentEngineBridge: CommentBackend {
     /// own topic invalidation, so reload the owning artifact's layer(s) here to
     /// stay fresh after a self-initiated create/dismiss.
     func handleCommentResult(_ comment: WorkComment) {
+        GuideCommentDrafts.shared.acknowledge(comment)
         forEachLayer(kind: comment.artifactKind, id: comment.artifactId) { $0.reload() }
     }
 

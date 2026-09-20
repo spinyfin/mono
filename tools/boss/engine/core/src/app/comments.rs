@@ -23,7 +23,11 @@ pub(super) async fn handle_comments_create(ctx: Dispatch, req: FrontendRequest) 
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::CommentsCreate { mut input } = req else {
+    let FrontendRequest::CommentsCreate {
+        mut input,
+        guide_version_id,
+    } = req
+    else {
         unreachable!()
     };
     // Mirror `handle_comments_list`: `pr_doc` keys are stored with the full
@@ -43,7 +47,7 @@ pub(super) async fn handle_comments_create(ctx: Dispatch, req: FrontendRequest) 
     {
         let artifact_kind = input.artifact_kind.clone();
         let artifact_id = input.artifact_id.clone();
-        match work_db.create_comment(input) {
+        match work_db.create_comment_with_guide_version(input, guide_version_id.as_deref()) {
             Ok(comment) => {
                 let revision = publish_comment_invalidation(
                     &server_state,
@@ -1018,6 +1022,7 @@ pub(super) async fn handle_comments_resolve(ctx: Dispatch, req: FrontendRequest)
         ..
     } = ctx;
     let FrontendRequest::CommentsResolve {
+        guide_version_id,
         artifact_kind,
         artifact_id,
         plain_text,
@@ -1028,13 +1033,18 @@ pub(super) async fn handle_comments_resolve(ctx: Dispatch, req: FrontendRequest)
     };
     {
         let config = crate::comments_anchor::CommentFuzzyConfig::from_env();
-        match work_db.resolve_comments(
-            &artifact_kind,
-            &artifact_id,
-            &plain_text,
-            plain_text_projection_version,
-            &config,
-        ) {
+        let result = if artifact_kind == "pr_review_guide" {
+            work_db.resolve_guide_comments(&artifact_id, guide_version_id.as_deref(), &plain_text, &config)
+        } else {
+            work_db.resolve_comments(
+                &artifact_kind,
+                &artifact_id,
+                &plain_text,
+                plain_text_projection_version,
+                &config,
+            )
+        };
+        match result {
             Ok(comments) => send_response_with_revision(
                 &sink,
                 &request_id,

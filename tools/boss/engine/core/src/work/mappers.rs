@@ -107,7 +107,16 @@ pub(crate) fn map_project(row: &Row<'_>) -> rusqlite::Result<Project> {
 pub(crate) fn map_comment(row: &Row<'_>) -> rusqlite::Result<WorkComment> {
     let anchor_json: String = row.get(4)?;
     let anchor: CommentAnchor = serde_json::from_str(&anchor_json).unwrap_or_default();
+    let guide_context = row
+        .get::<_, Option<String>>(22)?
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(22, rusqlite::types::Type::Text, Box::new(error))
+            })
+        })
+        .transpose()?;
     Ok(WorkComment {
+        guide_context,
         id: row.get(0)?,
         artifact_kind: row.get(1)?,
         artifact_id: row.get(2)?,

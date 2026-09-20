@@ -1163,7 +1163,7 @@ final class FakeCommentBackend: CommentBackend {
     var unregisterCount = 0
     var listCalls: [(kind: String, id: String, includeResolved: Bool)] = []
     var resolveCalls: [(kind: String, id: String, plainText: String)] = []
-    var createCalls: [(artifactKind: String, artifactId: String, anchor: CommentAnchor, body: String, docVersion: String)] = []
+    var createCalls: [(artifactKind: String, artifactId: String, anchor: CommentAnchor, body: String, docVersion: String, guideVersionId: String?)] = []
     var dismissCalls: [String] = []
     var setStatusCalls: [(commentId: String, status: String)] = []
     var updateAnchorCalls: [(commentId: String, anchor: CommentAnchor)] = []
@@ -1176,13 +1176,13 @@ final class FakeCommentBackend: CommentBackend {
         registerCount += 1
     }
     func unregisterCommentLayer(_ layer: CommentLayer) { unregisterCount += 1 }
-    func createComment(artifactKind: String, artifactId: String, anchor: CommentAnchor, body: String, docVersion: String) {
-        createCalls.append((artifactKind, artifactId, anchor, body, docVersion))
+    func createComment(artifactKind: String, artifactId: String, anchor: CommentAnchor, body: String, docVersion: String, guideVersionId: String?) {
+        createCalls.append((artifactKind, artifactId, anchor, body, docVersion, guideVersionId))
     }
     func listComments(artifactKind: String, artifactId: String, includeResolved: Bool) {
         listCalls.append((artifactKind, artifactId, includeResolved))
     }
-    func resolveComments(artifactKind: String, artifactId: String, plainText: String) {
+    func resolveComments(artifactKind: String, artifactId: String, plainText: String, guideVersionId: String?) {
         resolveCalls.append((artifactKind, artifactId, plainText))
     }
     func dismissComment(commentId: String) { dismissCalls.append(commentId) }

@@ -16,22 +16,27 @@ extension ChatViewModel {
     @MainActor
     func openReviewGuide(for task: WorkTask) {
         guard let versionId = task.reviewGuideReadableVersionId else { return }
+        openReviewGuide(versionId: versionId, rootTaskId: task.id)
+    }
+
+    @MainActor
+    func openReviewGuide(versionId: String, rootTaskId: String) {
         pendingReviewGuideVersionId = versionId
-        pendingReviewGuideRootTaskId = task.id
+        pendingReviewGuideRootTaskId = rootTaskId
         // Clear the design-doc / task-description identity guards for this
         // shared singleton window so a late reply for either cannot
         // overwrite the guide we are about to show.
         pendingAsyncViewerRef = nil
         asyncMarkdownViewerVM.clickStartTime = Date()
         asyncMarkdownViewerVM.collapsedByDefaultHeadings = []
-        asyncMarkdownViewerVM.reviewGuideRootTaskId = task.id
+        asyncMarkdownViewerVM.reviewGuideRootTaskId = rootTaskId
         asyncMarkdownViewerVM.reviewGuideGeneratedAt = nil
         asyncMarkdownViewerVM.reviewGuideComparisonId = nil
         asyncMarkdownViewerVM.state = .loading
         asyncMarkdownViewerVM.staleReason = nil
         asyncMarkdownViewerVM.canRetry = false
         asyncMarkdownViewerVM.onRetry = { [weak self] in
-            self?.retryReviewGuide(for: task)
+            if let self, let task = self.task(withID: rootTaskId) { self.retryReviewGuide(for: task) }
         }
         asyncMarkdownViewerVM.pendingRenderProjectShortID = nil
         asyncMarkdownViewerOpener?()
@@ -63,7 +68,7 @@ extension ChatViewModel {
         asyncMarkdownViewerVM.canRetry = false
         asyncMarkdownViewerVM.reviewGuideGeneratedAt = content.generatedAt
         asyncMarkdownViewerVM.reviewGuideComparisonId = content.comparisonId
-        asyncMarkdownViewerVM.state = .loaded(title: title, markdown: content.markdown, artifact: nil)
+        asyncMarkdownViewerVM.state = .loaded(title: title, markdown: content.markdown, artifact: .reviewGuide(seriesID: content.seriesId, versionID: content.id))
     }
 
     /// Ask the engine for another generation attempt. Guards against a

@@ -59,6 +59,8 @@ final class CommentLayer: NSObject, ObservableObject {
     /// the artifact-less in-memory path.
     private(set) var artifactKind: String = ""
     private(set) var artifactId: String = ""
+    private(set) var guideVersionId: String?
+    var openOriginalGuide: ((String) -> Void)?
     /// The raw markdown the viewer renders; the plain-text projection (for
     /// anchoring + `doc_version`) is derived from it.
     private var source: String = ""
@@ -70,7 +72,7 @@ final class CommentLayer: NSObject, ObservableObject {
     var isEngineBacked: Bool { backend != nil && !artifactId.isEmpty }
 
     /// Occurrence index computed at selection time; consumed by addComment().
-    private var pendingOccurrenceIndex: Int = 0
+    var pendingOccurrenceIndex: Int = 0
     /// Text that precedes the selection in the Textual NSTextInteractionView path,
     /// captured at mouseUp. Used to count prior occurrences of the quoted text.
     private var anchorTextBeforeSelection: String? = nil
@@ -142,6 +144,9 @@ final class CommentLayer: NSObject, ObservableObject {
     /// falling back to matching any window's events.
     func setHostWindow(_ window: NSWindow?) {
         hostWindow = window
+        if window != nil, GuideCommentDrafts.shared.hasPendingResume(for: guideVersionId) {
+            resumeGuideDraft()
+        }
     }
 
     // MARK: - Monitor lifecycle
@@ -288,21 +293,78 @@ final class CommentLayer: NSObject, ObservableObject {
 
     // MARK: - Authoring
 
+    /// Unit-test seam for `requestNewComment`. When set, it is the live
+    /// selection instead of a pasteboard copy. `nil` uses the real selection.
+    var liveSelectionProvider: (() -> String?)?
+
+    /// True while the open (or about-to-open) popover is restoring a saved
+    /// guide draft rather than starting a new comment on the live selection.
+    private(set) var pendingResumeDraft = false
+    var ownsGuideDraft = false
+    /// Identity of the current composer. A new comment mints a new id so a
+    /// parked draft on this version is not overwritten.
+    private(set) var composerId = UUID()
+
     func requestNewComment(firstChar: Character? = nil) {
-        pendingQuotedText = captureCurrentSelection() ?? ""
-        pendingOccurrenceIndex = computeOccurrenceIndex(for: pendingQuotedText)
-        // Seed typeahead with the key that opened the form (if any). Further
-        // keystrokes during the show-animation dead window append here (or insert
-        // directly into the text view once it exists) so nothing is dropped.
-        pendingTypeahead = firstChar.map { String($0) } ?? ""
+        composerId = UUID()
+        ownsGuideDraft = true
+        // A live selection always starts a new comment, even when a draft
+        // exists for this version. Resume is an explicit action.
+        if let live = captureCurrentSelection(), !live.isEmpty {
+            pendingQuotedText = live
+            pendingOccurrenceIndex = computeOccurrenceIndex(for: live)
+            pendingTypeahead = firstChar.map { String($0) } ?? ""
+            pendingResumeDraft = false
+        } else {
+            pendingQuotedText = ""
+            pendingOccurrenceIndex = 0
+            pendingTypeahead = firstChar.map { String($0) } ?? ""
+            pendingResumeDraft = false
+        }
+        presentCommentPopover()
+    }
+
+    /// Reopen the saved draft, adopting the live selection only when its quote is empty.
+    /// Used by the sidebar "Resume draft" control and by the
+    /// header's "Resume draft on original guide" path after that version
+    /// is on screen.
+    @discardableResult
+    func resumeGuideDraft() -> Bool {
+        guard let draft = guideDraft else { return false }
+        composerId = draft.composerId
+        applyGuideDraft(draft)
+        let presented = presentCommentPopover()
+        if presented, GuideCommentDrafts.shared.hasPendingResume(for: guideVersionId) {
+            GuideCommentDrafts.shared.pendingResumeVersionId = nil
+        }
+        return presented
+    }
+
+    private func applyGuideDraft(_ draft: GuideCommentDraft) {
+        ownsGuideDraft = true
+        let live = draft.quote.isEmpty ? captureCurrentSelection() : nil
+        pendingQuotedText = live ?? draft.quote
+        pendingOccurrenceIndex = live.map { computeOccurrenceIndex(for: $0) } ?? draft.occurrenceIndex
+        pendingTypeahead = draft.body
+        pendingResumeDraft = true
+    }
+
+    @discardableResult
+    private func presentCommentPopover() -> Bool {
         commentTextView = nil
         needsCommentTextFocus = true
+
+        if let existing = activePopover {
+            existing.delegate = nil
+            existing.close()
+            activePopover = nil
+            isShowingPopover = false
+        }
 
         guard let (posRect, posView) = resolveAnchor() else {
             anchorLog.error("requestNewComment: resolveAnchor returned nil — popover not shown")
             needsCommentTextFocus = false
-            pendingTypeahead = ""
-            return
+            return false
         }
 
         anchorLog.info("requestNewComment: showing popover relativeTo=\(NSStringFromRect(posRect)) of=\(NSStringFromClass(type(of: posView))) isFlipped=\(posView.isFlipped)")
@@ -326,6 +388,7 @@ final class CommentLayer: NSObject, ObservableObject {
         // moment later via `setCommentTextView`; either way we re-assert until
         // first responder sticks (see `needsCommentTextFocus`).
         claimCommentTextFocus()
+        return true
     }
 
     /// Registers the comment form's text view and claims first responder immediately.
@@ -385,7 +448,7 @@ final class CommentLayer: NSObject, ObservableObject {
 
     func addComment(quoted: String, body: String) {
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty, guideVersionId == nil || !quoted.isEmpty else { return }
 
         // Build the W3C anchor from the plain-text projection: locate the
         // selected occurrence, take the verbatim `exact` span plus ~64 chars of
@@ -395,6 +458,15 @@ final class CommentLayer: NSObject, ObservableObject {
         let anchor = Self.captureAnchor(
             quoted: quoted, occurrenceIndex: pendingOccurrenceIndex, in: projection)
 
+        if let version = guideVersionId {
+            saveGuideDraft(body: body)
+            if let parked = GuideCommentDrafts.shared.drafts(for: version)
+                .first(where: { $0.composerId == composerId })
+            {
+                GuideCommentDrafts.shared.submitted[composerId] = parked.withQuote(anchor.exact)
+            }
+        }
+        let ownedDraft = ownsGuideDraft
         resetAuthoringState()
 
         if let backend, !artifactId.isEmpty {
@@ -405,7 +477,8 @@ final class CommentLayer: NSObject, ObservableObject {
                 artifactId: artifactId,
                 anchor: anchor,
                 body: trimmed,
-                docVersion: CommentProjection.docVersion(forPlainText: projection)
+                docVersion: CommentProjection.docVersion(forPlainText: projection),
+                guideVersionId: guideVersionId
             )
         } else {
             // In-memory fallback (artifact-less viewer / unit test).
@@ -417,6 +490,7 @@ final class CommentLayer: NSObject, ObservableObject {
                 createdAt: Date()
             )
             comments.append(comment)
+            if ownedDraft { discardCurrentComposerDraft() }
         }
     }
 
@@ -428,12 +502,16 @@ final class CommentLayer: NSObject, ObservableObject {
         pendingQuotedText = ""
         pendingOccurrenceIndex = 0
         pendingTypeahead = ""
+        pendingResumeDraft = false
+        ownsGuideDraft = false
+        composerId = UUID()
         needsCommentTextFocus = false
         commentTextView = nil
     }
 
     func cancelNewComment() {
-        activePopover?.close()
+        if ownsGuideDraft { discardCurrentComposerDraft() }
+        resetAuthoringState()
     }
 
     /// Soft-dismiss. Engine-backed comments transition to `resolved` (hidden
@@ -463,7 +541,11 @@ final class CommentLayer: NSObject, ObservableObject {
         self.baseURL = baseURL
         guard let artifact, let backend else { return }
         // Re-configuring the same artifact is a no-op beyond refreshing source.
-        if artifactId == artifact.id, self.backend != nil { return }
+        if artifactId == artifact.id, artifactKind == artifact.kind,
+           guideVersionId == artifact.guideVersionId, self.backend != nil { return }
+        self.backend?.unregisterCommentLayer(self)
+        comments = []
+        self.guideVersionId = artifact.guideVersionId
         self.artifactKind = artifact.kind
         self.artifactId = artifact.id
         self.backend = backend
@@ -478,17 +560,20 @@ final class CommentLayer: NSObject, ObservableObject {
     }
 
     /// Update the rendered source (the viewer may load it asynchronously, after
-    /// `configure`). Re-resolves anchors against the freshly-available projection
-    /// so highlights + the ⚠/orphan glyphs settle once the doc text arrives.
+    /// `configure`). Always records the latest markdown so a guide that mounted
+    /// before its body arrived still has a projection for authoring and later
+    /// `reload()`. Re-resolves work-item comments against that projection;
+    /// guide comments stay bound to the version they were authored against
+    /// and are not re-resolved here.
     func updateSource(_ source: String, baseURL: URL?) {
         guard source != self.source else { return }
         self.source = source
         self.baseURL = baseURL
-        guard let backend, isEngineBacked else { return }
+        guard guideVersionId == nil, let backend, isEngineBacked else { return }
         let projection = currentProjection()
         if !projection.isEmpty {
             backend.resolveComments(
-                artifactKind: artifactKind, artifactId: artifactId, plainText: projection)
+                artifactKind: artifactKind, artifactId: artifactId, plainText: projection, guideVersionId: guideVersionId)
         }
     }
 
@@ -503,7 +588,7 @@ final class CommentLayer: NSObject, ObservableObject {
         let projection = currentProjection()
         if !projection.isEmpty {
             backend.resolveComments(
-                artifactKind: artifactKind, artifactId: artifactId, plainText: projection)
+                artifactKind: artifactKind, artifactId: artifactId, plainText: projection, guideVersionId: guideVersionId)
         }
     }
 
@@ -522,6 +607,9 @@ final class CommentLayer: NSObject, ObservableObject {
             comments.compactMap { c in c.lastResolvedWith.map { (c.id, $0) } },
             uniquingKeysWith: { first, _ in first }
         )
+        let priorDisplayAnchors = Dictionary(
+            comments.compactMap { comment in comment.resolvedAnchor.map { (comment.id, $0) } },
+            uniquingKeysWith: { first, _ in first })
         comments = wire.map { cw in
             var c = Comment.from(
                 cw.comment,
@@ -530,6 +618,7 @@ final class CommentLayer: NSObject, ObservableObject {
                 answerAgentFailed: cw.answerAgentFailed
             )
             if c.lastResolvedWith == nil { c.lastResolvedWith = priorResolved[c.id] }
+            c.resolvedAnchor = priorDisplayAnchors[c.id]
             return c
         }
     }
@@ -541,9 +630,14 @@ final class CommentLayer: NSObject, ObservableObject {
     func applyResolved(_ resolved: [ResolvedComment]) {
         let byId = Dictionary(resolved.map { ($0.comment.id, $0) }, uniquingKeysWith: { first, _ in first })
         for i in comments.indices {
-            guard let rc = byId[comments[i].id] else { continue }
+            guard let rc = byId[comments[i].id],
+                  rc.comment.guideContext?.versionId == guideVersionId else { continue }
             comments[i].lastResolvedWith = ResolvedWith(rawValue: rc.resolution.kind) ?? .exact
-            if rc.resolution.isOrphan { comments[i].status = .orphaned }
+            if guideVersionId != nil {
+                comments[i].resolvedAnchor = displayAnchor(for: rc.resolution)
+            } else if rc.resolution.isOrphan {
+                comments[i].status = .orphaned
+            }
         }
     }
 
@@ -764,6 +858,7 @@ final class CommentLayer: NSObject, ObservableObject {
     /// simulates the same guarded `active` → `in_revision` batch transition
     /// locally, since there's no engine to persist it.
     func reviseDoc() {
+        guard guideVersionId == nil else { return }
         if let backend, isEngineBacked {
             backend.reviseDoc(artifactKind: artifactKind, artifactId: artifactId)
             return
@@ -815,7 +910,11 @@ final class CommentLayer: NSObject, ObservableObject {
     // MARK: - Click-to-jump
 
     func jumpTo(_ comment: Comment) {
-        let anchor = comment.anchor
+        if let original = comment.guideContext?.versionId, original != guideVersionId {
+            openOriginalGuide?(original)
+            return
+        }
+        let anchor = comment.displayAnchor
         flashingAnchor = anchor
         Task {
             try? await Task.sleep(for: .milliseconds(900))
@@ -893,6 +992,7 @@ final class CommentLayer: NSObject, ObservableObject {
     /// when unbound (artifact-less unit tests, or the ⌘⇧K SwiftUI shortcut path, which
     /// SwiftUI only ever invokes while this layer's own window is already key).
     func hasCurrentSelection() -> Bool {
+        if let live = liveSelectionProvider?() { return !live.isEmpty }
         guard let firstResponder = (hostWindow ?? NSApp.keyWindow)?.firstResponder else { return false }
         let copyItem = NSMenuItem(
             title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
@@ -950,9 +1050,9 @@ final class CommentLayer: NSObject, ObservableObject {
         }
 
         // --- 3. Fallback ---
-        // Place anchor near the top-left of the key window's content view.
+        // Prefer the bound viewer window; guides must never open in a previous key window.
         // Uses minY (top in flipped SwiftUI hosting views) + small offset.
-        if let contentView = NSApp.keyWindow?.contentView {
+        if let contentView = (hostWindow ?? (guideVersionId == nil ? NSApp.keyWindow : nil))?.contentView {
             let topY: CGFloat = contentView.isFlipped
                 ? 60                              // flipped: y=0 is top, increase down
                 : contentView.bounds.maxY - 60    // non-flipped: maxY is top
@@ -971,6 +1071,7 @@ final class CommentLayer: NSObject, ObservableObject {
     /// Reads the selection via pasteboard copy. Acceptable Phase 1 trade-off:
     /// called only when the user explicitly opens the comment form.
     private func captureCurrentSelection() -> String? {
+        if let provided = liveSelectionProvider { return provided() }
         let before = NSPasteboard.general.changeCount
         NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil)
         guard NSPasteboard.general.changeCount != before else { return nil }
@@ -1141,12 +1242,15 @@ extension CommentLayer: NSPopoverDelegate {
     /// programmatic close. Resets authoring state. The extension lives in the same file
     /// so it can access private members directly.
     nonisolated func popoverDidClose(_ notification: Notification) {
+        let closed = notification.object as? NSPopover
         Task { @MainActor [weak self] in
             guard let self else { return }
+            guard self.activePopover === closed else { return }
             self.isShowingPopover = false
             self.pendingTypeahead = ""
             self.pendingQuotedText = ""
             self.pendingOccurrenceIndex = 0
+            self.pendingResumeDraft = false
             self.needsCommentTextFocus = false
             self.activePopover = nil
             self.commentTextView = nil
@@ -1176,6 +1280,11 @@ private final class CommentMenuTarget: NSObject, @unchecked Sendable {
 struct CommentArtifactRef: Equatable {
     let kind: String
     let id: String
+    var guideVersionId: String? = nil
+
+    static func reviewGuide(seriesID: String, versionID: String) -> CommentArtifactRef {
+        CommentArtifactRef(kind: WireArtifactKind.reviewGuide, id: seriesID, guideVersionId: versionID)
+    }
 
     /// A comment on an engine-owned work-item description. `artifact_id` is the
     /// raw work-item id.
@@ -1238,6 +1347,7 @@ struct WithCommentsModifier: ViewModifier {
     let baseURL: URL?
 
     @Environment(\.commentBackend) private var commentBackend
+    @Environment(\.openOriginalGuide) private var openOriginalGuide
     @StateObject private var layer = CommentLayer()
     /// Whether the full comment sidebar is shown. Collapsed by default: an
     /// engine-backed doc with no comments no longer opens onto a wide empty
@@ -1254,7 +1364,7 @@ struct WithCommentsModifier: ViewModifier {
     @State private var sidebarExpanded = false
 
     func body(content: Content) -> some View {
-        let commentedAnchors = layer.comments.filter(\.isHighlightable).map(\.anchor)
+        let commentedAnchors = layer.currentVersionComments.filter(\.isHighlightable).map(\.displayAnchor)
         let flashingAnchor = layer.flashingAnchor
 
         HStack(spacing: 0) {
@@ -1268,7 +1378,7 @@ struct WithCommentsModifier: ViewModifier {
                     .frame(width: 280)
             } else {
                 CollapsedCommentRail(
-                    commentCount: layer.comments.count,
+                    commentCount: layer.currentVersionComments.count,
                     isEngineBacked: layer.isEngineBacked,
                     onExpand: { sidebarExpanded = true },
                     onAddComment: { layer.requestNewComment() }
@@ -1299,7 +1409,14 @@ struct WithCommentsModifier: ViewModifier {
             set: { layer.suppressTypeToComment = $0 }
         ))
         .onAppear {
+            layer.openOriginalGuide = openOriginalGuide
             layer.configure(source: source, baseURL: baseURL, artifact: artifact, backend: commentBackend)
+            if GuideCommentDrafts.shared.hasPendingResume(for: layer.guideVersionId) {
+                sidebarExpanded = true
+                layer.resumeGuideDraft()
+            } else if layer.guideDraft != nil {
+                sidebarExpanded = true
+            }
             layer.installMonitors()
         }
         .onChange(of: source) { _, newSource in

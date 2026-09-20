@@ -17,7 +17,7 @@ struct CommentSidebar: View {
         VStack(spacing: 0) {
             header
             Divider()
-            if layer.bannerState.revisable || layer.bannerState.inRevisionCount > 0 {
+            if layer.guideVersionId == nil && (layer.bannerState.revisable || layer.bannerState.inRevisionCount > 0) {
                 ReviseBanner(layer: layer)
                 Divider()
             }
@@ -38,12 +38,35 @@ struct CommentSidebar: View {
             } else {
                 ScrollView {
                     LazyVStack(spacing: 0) {
-                        ForEach(layer.comments) { comment in
+                        ForEach(layer.currentVersionComments) { comment in
                             CommentRow(comment: comment, layer: layer)
                             Divider()
                         }
+                        if !layer.otherVersionComments.isEmpty {
+                            Text("Feedback on other guide versions")
+                                .font(.caption.weight(.semibold))
+                                .padding(12)
+                            ForEach(layer.otherVersionComments) { comment in
+                                CommentRow(comment: comment, layer: layer)
+                                if let context = comment.guideContext {
+                                    Text("Original revision: \(context.headSha.prefix(12))")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    Button("Open original guide") { layer.jumpTo(comment) }
+                                        .controlSize(.small)
+                                        .padding(.bottom, 8)
+                                }
+                                Divider()
+                            }
+                        }
                     }
                 }
+            }
+            if layer.guideVersionId != nil {
+                Text("Comments are saved. Revise PR is not available yet.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(12)
             }
             addCommentRow
         }
@@ -70,8 +93,8 @@ struct CommentSidebar: View {
                     .accessibilityIdentifier("comment-sidebar-collapse")
                 }
             }
-            // Soft-dismiss "show resolved" toggle (P529 Phase 2). Only meaningful
-            // on an engine-backed viewer, where resolved comments are retained.
+            // Soft-dismiss "show resolved" toggle. Only meaningful on an engine-backed viewer,
+            // where resolved comments are retained.
             if layer.isEngineBacked {
                 Toggle("Show resolved", isOn: $layer.showResolved)
                     .toggleStyle(.checkbox)
@@ -84,12 +107,18 @@ struct CommentSidebar: View {
     }
 
     private var addCommentRow: some View {
-        Button {
-            layer.requestNewComment()
-        } label: {
-            Label("Add Comment", systemImage: "plus.bubble")
-                .font(.callout)
-                .frame(maxWidth: .infinity, alignment: .leading)
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                layer.requestNewComment()
+            } label: {
+                Label("Add Comment", systemImage: "plus.bubble")
+                    .font(.callout)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if layer.guideDraft != nil {
+                Button("Resume draft") { layer.resumeGuideDraft() }
+                    .font(.callout)
+            }
         }
         .buttonStyle(.borderless)
         .padding(.horizontal, 12)

@@ -1089,7 +1089,10 @@ async fn create_and_print_comment(
     input: CreateCommentInput,
 ) -> Result<(), CliError> {
     match client
-        .send_request(&FrontendRequest::CommentsCreate { input })
+        .send_request(&FrontendRequest::CommentsCreate {
+            input,
+            guide_version_id: None,
+        })
         .await
         .map_err(CliError::internal)?
     {

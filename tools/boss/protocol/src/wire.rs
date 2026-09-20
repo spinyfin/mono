@@ -346,6 +346,9 @@ pub enum FrontendRequest {
 
     /// Create an `active` comment on an artifact. Returns the row.
     CommentsCreate {
+        /// Required for pr_review_guide artifacts; absent for existing documents.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        guide_version_id: Option<String>,
         #[serde(flatten)]
         input: CreateCommentInput,
     },
@@ -420,6 +423,8 @@ pub enum FrontendRequest {
     /// `last_resolved_with = 'fuzzy'`) and flips unresolvable comments to
     /// `orphaned`, then returns each comment with its [`CommentResolution`].
     CommentsResolve {
+        #[serde(default)]
+        guide_version_id: Option<String>,
         artifact_kind: String,
         artifact_id: String,
         /// The doc's current rendered plain-text projection.

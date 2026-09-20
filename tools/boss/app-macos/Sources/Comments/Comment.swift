@@ -28,13 +28,13 @@ enum CommentIntent: String, CaseIterable, Equatable {
 }
 
 /// Mirrors the engine's full `work_comments.status` domain
-/// (`boss-protocol/src/types.rs` `COMMENT_STATUS_*`, types.rs:892-923):
+/// (`boss-protocol/src/types.rs` `COMMENT_STATUS_*`):
 /// `active`/`resolved`/`inRevision` drive the bucket-1&3 `[Revise]`-track chip;
 /// `answering`/`answered`/`awaitingFollowup` drive the bucket-2 thread's
 /// thinking indicator and follow-up composer; `orphaned` (anchor lost) and
 /// `dismissed` are terminal states the sidebar surfaces distinctly. The full
-/// set is mirrored (P529 Phase-2 scope item 6) so a comment loaded from the
-/// engine in any state round-trips without falling through to a default.
+/// set is mirrored so a comment loaded from the engine in any state round-trips without
+/// falling through to a default.
 enum CommentStatus: String, Equatable {
     case active
     case resolved
@@ -102,11 +102,9 @@ struct CommentAnchor: Codable, Equatable, Sendable {
     }
 }
 
-/// A comment attached to a markdown viewer. Since P529 Phase 2 comments are
-/// engine-backed: `id` is the engine's `work_comments.id` (`cmt_…`) for a
-/// persisted comment, or a `local:` sentinel for an optimistic in-memory
-/// comment on an artifact-less viewer. Anchoring is W3C `{exact, prefix,
-/// suffix}`; the occurrence-index scheme is gone.
+/// A comment attached to a markdown viewer. Comments are engine-backed: `id` is the
+/// engine's `work_comments.id` (`cmt_…`) for a persisted comment, or a `local:` sentinel for
+/// an in-memory comment on an artifact-less viewer. Anchoring is W3C `{exact, prefix, suffix}`.
 struct Comment: Identifiable, Equatable {
     /// Engine `work_comments.id`, or a `local:<uuid>` sentinel for the
     /// artifact-less in-memory fallback path.
@@ -161,6 +159,10 @@ struct Comment: Identifiable, Equatable {
     var artifactKind: String = ""
     var artifactId: String = ""
     var docVersion: String = ""
+    var guideContext: GuideCommentContext? = nil
+    /// Display-only anchor; the authored quote remains immutable.
+    var resolvedAnchor: CommentAnchor? = nil
+    var displayAnchor: CommentAnchor { resolvedAnchor ?? anchor }
 
     /// The selected text this comment is anchored to. Alias for `anchor.exact`,
     /// kept so the sidebar snippet and tests read naturally.
@@ -249,6 +251,7 @@ extension Comment {
         c.artifactKind = wc.artifactKind
         c.artifactId = wc.artifactId
         c.docVersion = wc.docVersion
+        c.guideContext = wc.guideContext
         return c
     }
 

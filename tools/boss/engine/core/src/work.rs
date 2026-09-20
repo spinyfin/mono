@@ -637,6 +637,7 @@ mod execution_retention;
 mod executions_runs;
 mod github_api_usage_db;
 mod github_merge_intents;
+mod guide_comments;
 mod host_reconcile_queries;
 mod ideas;
 mod insert_helpers;

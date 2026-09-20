@@ -780,6 +780,10 @@ struct AsyncMarkdownViewerView: View {
                 // content load, so .onAppear fires even when the window is reused across
                 // documents (stable case identity would otherwise suppress it).
                 .id(vm.renderContentID)
+                .environment(\.openOriginalGuide, { versionId in
+                    guard let rootTaskId = vm.reviewGuideRootTaskId else { return }
+                    chatModel.openReviewGuide(versionId: versionId, rootTaskId: rootTaskId)
+                })
                 .navigationTitle(title)
                 .onAppear {
                     if let start = vm.renderStartTime,

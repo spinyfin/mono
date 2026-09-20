@@ -317,6 +317,7 @@ rust_test(
     srcs = [
         "tests/comments_crud.rs",
         "tests/common/mod.rs",
+        "tests/guide_comments_crud.rs",
         "tests/watcher_support.rs",
     ],
     crate_root = "tests/comments_crud.rs",

@@ -14,6 +14,7 @@ use boss_protocol::{
 };
 
 mod common;
+mod guide_comments_crud;
 mod watcher_support;
 use common::TestEngine;
 use watcher_support::subscribe_watcher;
@@ -27,7 +28,13 @@ fn anchor(exact: &str, prefix: &str, suffix: &str) -> CommentAnchor {
 }
 
 async fn create_comment(client: &mut BossClient, input: CreateCommentInput) -> Result<WorkComment> {
-    match client.send_request(&FrontendRequest::CommentsCreate { input }).await? {
+    match client
+        .send_request(&FrontendRequest::CommentsCreate {
+            input,
+            guide_version_id: None,
+        })
+        .await?
+    {
         FrontendEvent::CommentResult { comment } => Ok(comment),
         other => Err(unexpected("comments_create", other)),
     }
@@ -60,6 +67,7 @@ async fn resolve_comments(
 ) -> Result<Vec<ResolvedComment>> {
     match client
         .send_request(&FrontendRequest::CommentsResolve {
+            guide_version_id: None,
             artifact_kind: artifact_kind.to_owned(),
             artifact_id: artifact_id.to_owned(),
             plain_text: plain_text.to_owned(),
