@@ -1824,15 +1824,14 @@ pub trait AgentDriver: Send + Sync {
     /// must not be downgradable. `None` keeps the default per-model behaviour.
     fn spawn_invocation(&self, request: SpawnRequest<'_>) -> SpawnPlan;
 
-    /// Substrings the app uses to screen-scrape this driver's GhosttyKit
-    /// pane for a fallback status pill until the first hook-driven
-    /// `LiveWorkerState` arrives. Populated onto
-    /// [`boss_protocol::SpawnWorkerPaneInput::pane_monitor`] at spawn.
+    /// Substrings the engine uses to screen-scrape this driver's tmux pane
+    /// content — e.g. confirming a turn actually ended before declaring an
+    /// interrupt delivered (see `probe_interrupt::pane_text_shows_turn_ended`).
     ///
-    /// Default `None` — the app falls back to Claude's historical
-    /// literals, so an older driver (or a headless one with no TUI
-    /// chrome) keeps today's behaviour. Interactive drivers that own
-    /// a distinctive surface override this with their own markers.
+    /// Default `None` — a driver with no spec contributes nothing positive
+    /// to that confirmation, so callers fall back to other evidence.
+    /// Interactive drivers that own a distinctive surface override this
+    /// with their own markers.
     fn pane_monitor_spec(&self) -> Option<PaneMonitorSpec> {
         None
     }

@@ -1,20 +1,22 @@
 use super::*;
 
+fn sample_attach_request(run_id: &str) -> crate::protocol::AttachWorkerPaneInput {
+    crate::protocol::AttachWorkerPaneInput {
+        run_id: run_id.to_owned(),
+        slot_id: 1,
+        session_name: format!("boss-1-{run_id}"),
+        tmux_socket_path: "/state/boss/tmux.sock".into(),
+        summary: None,
+        task_title: None,
+    }
+}
+
 #[tokio::test]
 async fn send_to_app_returns_not_registered_when_no_app() {
     let (server_state, _dir) = test_server_state();
     let result = server_state
         .send_to_app(
-            EngineToAppRequest::SpawnWorkerPane(crate::protocol::SpawnWorkerPaneInput {
-                run_id: "r".into(),
-                workspace_path: "/tmp".into(),
-                slot_id: 1,
-                initial_input: "claude\n".into(),
-                env: vec![],
-                summary: None,
-                task_title: None,
-                pane_monitor: None,
-            }),
+            EngineToAppRequest::AttachWorkerPane(sample_attach_request("r")),
             Duration::from_millis(50),
         )
         .await;
@@ -33,16 +35,7 @@ async fn send_to_app_round_trips_via_deliver_response() {
     let send = tokio::spawn(async move {
         server_clone
             .send_to_app(
-                EngineToAppRequest::SpawnWorkerPane(crate::protocol::SpawnWorkerPaneInput {
-                    run_id: "run-7".into(),
-                    workspace_path: "/tmp".into(),
-                    slot_id: 1,
-                    initial_input: "claude\n".into(),
-                    env: vec![],
-                    summary: None,
-                    task_title: None,
-                    pane_monitor: None,
-                }),
+                EngineToAppRequest::AttachWorkerPane(sample_attach_request("run-7")),
                 Duration::from_secs(2),
             )
             .await
@@ -61,24 +54,17 @@ async fn send_to_app_round_trips_via_deliver_response() {
         .deliver_app_response(
             "session-app",
             &request_id,
-            EngineToAppResponse::SpawnWorkerPane {
-                result: Ok(crate::protocol::SpawnWorkerPaneResult {
-                    slot_id: 4,
-                    shell_pid: 9001,
-                }),
+            EngineToAppResponse::AttachWorkerPane {
+                result: Ok(crate::protocol::AttachWorkerPaneResult {}),
             },
         )
         .await;
 
     let response = send.await.expect("send_to_app task panicked").expect("ok");
-    match response {
-        EngineToAppResponse::SpawnWorkerPane { result } => {
-            let result = result.expect("ok variant");
-            assert_eq!(result.slot_id, 4);
-            assert_eq!(result.shell_pid, 9001);
-        }
-        other => panic!("unexpected response: {other:?}"),
-    }
+    assert!(
+        matches!(response, EngineToAppResponse::AttachWorkerPane { result: Ok(_) }),
+        "expected the delivered Ok response to round-trip, got {response:?}",
+    );
 }
 
 #[tokio::test]
@@ -93,10 +79,7 @@ async fn send_to_app_resolves_app_disconnected_on_session_drop() {
     let send = tokio::spawn(async move {
         server_clone
             .send_to_app(
-                EngineToAppRequest::ReleaseWorkerPane(crate::protocol::ReleaseWorkerPaneInput {
-                    slot_id: 1,
-                    kill_grace_seconds: 2,
-                }),
+                EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id: 1 }),
                 Duration::from_secs(5),
             )
             .await
@@ -109,16 +92,11 @@ async fn send_to_app_resolves_app_disconnected_on_session_drop() {
     // Simulate the app session disconnecting.
     server_state.drop_app_session_if_matches("session-app").await;
 
-    let response = send.await.expect("send task panicked").expect("ok");
-    match response {
-        EngineToAppResponse::SpawnWorkerPane {
-            result: Err(EngineToAppError::AppDisconnected),
-        } => {} // currently the cleanup path uses SpawnWorkerPane variant uniformly; ok.
-        EngineToAppResponse::ReleaseWorkerPane {
-            result: Err(EngineToAppError::AppDisconnected),
-        } => {}
-        other => panic!("expected AppDisconnected, got {other:?}"),
-    }
+    let response = send.await.expect("send task panicked");
+    assert!(
+        matches!(response, Err(SendToAppError::AppDisconnected)),
+        "expected transport AppDisconnected, got {response:?}",
+    );
 }
 
 #[tokio::test]
@@ -129,16 +107,7 @@ async fn send_to_app_times_out_when_app_silent() {
 
     let result = server_state
         .send_to_app(
-            EngineToAppRequest::SpawnWorkerPane(crate::protocol::SpawnWorkerPaneInput {
-                run_id: "r".into(),
-                workspace_path: "/tmp".into(),
-                slot_id: 1,
-                initial_input: "claude\n".into(),
-                env: vec![],
-                summary: None,
-                task_title: None,
-                pane_monitor: None,
-            }),
+            EngineToAppRequest::AttachWorkerPane(sample_attach_request("r")),
             Duration::from_millis(50),
         )
         .await;
@@ -175,16 +144,7 @@ async fn send_to_app_reports_session_wedged_when_priority_lane_saturated() {
     // returning immediately.
     let result = server_state
         .send_to_app(
-            EngineToAppRequest::SpawnWorkerPane(crate::protocol::SpawnWorkerPaneInput {
-                run_id: "r".into(),
-                workspace_path: "/tmp".into(),
-                slot_id: 1,
-                initial_input: "claude\n".into(),
-                env: vec![],
-                summary: None,
-                task_title: None,
-                pane_monitor: None,
-            }),
+            EngineToAppRequest::AttachWorkerPane(sample_attach_request("r")),
             Duration::from_secs(30),
         )
         .await;
@@ -201,7 +161,7 @@ async fn send_to_app_reports_session_wedged_when_priority_lane_saturated() {
     assert_eq!(server_state.app_channel_health.snapshot().consecutive_failures, 1);
 }
 
-/// The acceptance criterion for the `reveal_work_item` / `release_worker_pane`
+/// The acceptance criterion for the `reveal_work_item` / `detach_worker_pane`
 /// incident: with the **bulk** lane saturated (a ~2,000-item `WorkTree` drain
 /// backed up and latched `slow`), an engine→app control push must still be
 /// delivered — it no longer fails fast as `SessionWedged` the way it did when
@@ -233,16 +193,7 @@ async fn send_to_app_admitted_when_only_bulk_lane_saturated() {
     let send = tokio::spawn(async move {
         server_clone
             .send_to_app(
-                EngineToAppRequest::SpawnWorkerPane(crate::protocol::SpawnWorkerPaneInput {
-                    run_id: "r".into(),
-                    workspace_path: "/tmp".into(),
-                    slot_id: 1,
-                    initial_input: "claude\n".into(),
-                    env: vec![],
-                    summary: None,
-                    task_title: None,
-                    pane_monitor: None,
-                }),
+                EngineToAppRequest::AttachWorkerPane(sample_attach_request("r")),
                 Duration::from_secs(5),
             )
             .await
@@ -282,18 +233,15 @@ async fn send_to_app_admitted_when_only_bulk_lane_saturated() {
         .deliver_app_response(
             "session-app",
             &request_id,
-            EngineToAppResponse::SpawnWorkerPane {
-                result: Ok(crate::protocol::SpawnWorkerPaneResult {
-                    slot_id: 1,
-                    shell_pid: 42,
-                }),
+            EngineToAppResponse::AttachWorkerPane {
+                result: Ok(crate::protocol::AttachWorkerPaneResult {}),
             },
         )
         .await;
 
     let response = send.await.expect("send task panicked").expect("ok");
     assert!(
-        matches!(response, EngineToAppResponse::SpawnWorkerPane { result: Ok(_) }),
+        matches!(response, EngineToAppResponse::AttachWorkerPane { result: Ok(_) }),
         "a control push must round-trip even while the bulk lane is saturated, got {response:?}",
     );
 }
@@ -358,16 +306,7 @@ async fn second_register_invalidates_first() {
     let in_flight = tokio::spawn(async move {
         server_clone
             .send_to_app(
-                EngineToAppRequest::SpawnWorkerPane(crate::protocol::SpawnWorkerPaneInput {
-                    run_id: "r".into(),
-                    workspace_path: "/tmp".into(),
-                    slot_id: 1,
-                    initial_input: "claude\n".into(),
-                    env: vec![],
-                    summary: None,
-                    task_title: None,
-                    pane_monitor: None,
-                }),
+                EngineToAppRequest::AttachWorkerPane(sample_attach_request("r")),
                 Duration::from_secs(5),
             )
             .await
@@ -379,11 +318,9 @@ async fn second_register_invalidates_first() {
     let second_sink = make_session_sink();
     server_state.register_app_session("session-2".into(), second_sink).await;
 
-    let response = in_flight.await.expect("send task").expect("ok");
-    match response {
-        EngineToAppResponse::SpawnWorkerPane {
-            result: Err(EngineToAppError::AppDisconnected),
-        } => {}
-        other => panic!("expected AppDisconnected, got {other:?}"),
-    }
+    let response = in_flight.await.expect("send task");
+    assert!(
+        matches!(response, Err(SendToAppError::AppDisconnected)),
+        "expected transport AppDisconnected, got {response:?}",
+    );
 }

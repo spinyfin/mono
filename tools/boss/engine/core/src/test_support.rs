@@ -302,7 +302,7 @@ pub fn create_old_execution(db: &WorkDb, work_item_id: &str) -> String {
 /// `work_runs` row on the local host, `shell_pid` recorded on that row, and
 /// the execution parked in `waiting_human` with its run `completed` — exactly
 /// the sequence `PaneSpawnRunner` drives (`start_execution_run` →
-/// `UpdateWorkerShellPid` → `finish_execution_run`).
+/// persisting tmux shell identity → `finish_execution_run`).
 ///
 /// Returns the execution id.
 ///

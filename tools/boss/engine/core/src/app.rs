@@ -45,9 +45,9 @@ use crate::protocol::{
     DispatchAdmissionEntryPoint, EngineToAppError, EngineToAppRequest, EngineToAppResponse, FocusWorkerPaneInput,
     FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, GitHubAuthStateDto,
     HostedPaneState, HostedPaneStatus, InterruptWorkerPaneInput, ListHostedPanesInput, OpenDocumentInput, OrgAuthState,
-    ReleaseWorkerPaneInput, RequestExecutionInput, RevealWorkItemInput, SendToPaneInput, TOPIC_ENGINE_HEALTH,
-    TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload, comment_topic,
-    editorial_actions_topic, execution_topic, probe_topic, work_product_topic,
+    RequestExecutionInput, RevealWorkItemInput, SendToPaneInput, TOPIC_ENGINE_HEALTH, TOPIC_GITHUB_AUTH,
+    TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload, comment_topic, editorial_actions_topic,
+    execution_topic, probe_topic, work_product_topic,
 };
 use crate::repo_slug;
 use crate::runner::ExecutionRunner;
@@ -632,8 +632,7 @@ struct ServerState {
     /// still running. See [`crate::teardown_registry`].
     #[builder(default)]
     teardown_registry: Arc<crate::teardown_registry::TeardownRegistry>,
-    /// Cross-work-item spawn-capability circuit breaker. Fed by both the
-    /// `ReportWorkerSpawnFailed` NACK handler and the periodic
+    /// Cross-work-item spawn-capability circuit breaker. Fed by the periodic
     /// [`crate::spawn_ack_sweep`]; when too many DISTINCT work items fail to
     /// spawn a shell in a short window it pauses dispatch and raises one loud
     /// attention item. Shared with the sweep loop (wired in
@@ -2090,13 +2089,12 @@ async fn handle_frontend_connection(
     // opens a connection per invocation so this is still per-command for
     // workers, while the macOS app — which holds one connection for its
     // lifetime and sends thousands of requests over it — pays a single
-    // ancestry walk instead of one per frame. Registration normally happens
-    // at spawn, before the pane's first `boss` call; on the ack-timeout path
-    // (`spawn_flow.rs`, shell_pid 0) it is deferred until the app sends
-    // `UpdateWorkerShellPid` once the libghostty surface attaches, so a call
-    // in that interval classifies as `Other` and keeps `User` tier — the
-    // same fail-open direction `PeerClass::Other` documents for broken
-    // lineage.
+    // ancestry walk instead of one per frame. Registration happens at
+    // spawn (`spawn_flow.rs` registers the real tmux-reported shell pid
+    // synchronously), before the pane's first `boss` call, so a call
+    // racing that window is the rare case this classifies as `Other` and
+    // keeps `User` tier — the same fail-open direction `PeerClass::Other`
+    // documents for broken lineage.
     let peer_class = server_state.classify_peer(peer_pid);
     if let Some(run_id) = peer_class.worker_run_id() {
         tracing::debug!(
@@ -2634,13 +2632,6 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::ReportSelectedProduct { .. } => {
                 Box::pin(selected_product::handle_report_selected_product(ctx, r))
             }
-            r @ FrontendRequest::ReportWorkerSpawnFailed { .. } => {
-                Box::pin(sessions::handle_report_worker_spawn_failed(ctx, r))
-            }
-            r @ FrontendRequest::UpdateWorkerShellPid { .. } => {
-                Box::pin(sessions::handle_update_worker_shell_pid(ctx, r))
-            }
-            r @ FrontendRequest::WorkerPaneDied { .. } => Box::pin(sessions::handle_worker_pane_died(ctx, r)),
             r @ FrontendRequest::WorkerPoolSummary => Box::pin(engine_meta::handle_worker_pool_summary(ctx, r)),
             r @ FrontendRequest::WorkspacePoolSummary => Box::pin(engine_meta::handle_workspace_pool_summary(ctx, r)),
         };

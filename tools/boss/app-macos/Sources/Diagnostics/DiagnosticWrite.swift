@@ -4,7 +4,7 @@ import os
 
 /// Shared logger for diagnostic-write failures across the app's JSONL
 /// diagnostic writers (`TerminalLoopLog`, `StallLog`, `PopulationTimingLog`,
-/// `IpcLog`, `SpawnDiagnosticsLog`, …).
+/// `IpcLog`, …).
 private let diagnosticWriteLog = Logger(subsystem: "com.boss.app", category: "diagnostic-write")
 
 /// Non-throwing wrapper around `FileHandle.write(contentsOf:)`.

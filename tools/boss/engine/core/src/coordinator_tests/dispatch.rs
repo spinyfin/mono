@@ -1118,9 +1118,9 @@ async fn slot_id_from_outcome_is_stamped_onto_run_agent_id() {
 
 #[tokio::test]
 async fn pane_spawn_run_does_not_release_worker_pool_slot() {
-    // The libghostty pane outlives the `run_execution` call —
+    // The tmux-hosted pane outlives the `run_execution` call —
     // PaneSpawnRunner returns Ok(WorkerPaneAlive) the instant the
-    // SpawnWorkerPane RPC completes, but the user-visible worker
+    // tmux worker spawn completes, but the user-visible worker
     // is just getting started. If the coordinator freed the
     // WorkerPool slot at that moment, the next dispatch could
     // re-claim the slot and the app would reject the spawn with

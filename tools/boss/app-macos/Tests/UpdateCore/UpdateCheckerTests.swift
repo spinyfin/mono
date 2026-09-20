@@ -587,7 +587,7 @@ extension UpdateCheckerTests {
     }
 }
 
-// MARK: - Request recorder (mirrors SignalRecorder in WorkerProcessKillerTests)
+// MARK: - Request recorder
 
 private final class RequestRecorder: @unchecked Sendable {
     private let lock = NSLock()

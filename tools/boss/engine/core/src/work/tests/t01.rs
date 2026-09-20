@@ -1289,9 +1289,9 @@ fn starts_ready_execution_run_and_attaches_workspace() {
     }
 
     // Stamping the real pane slot back onto agent_id: the
-    // coordinator calls this once SpawnWorkerPane responds with
-    // the slot the app actually allocated. Looking it up
-    // afterwards must reflect the new value.
+    // coordinator calls this once the spawn runner allocates
+    // the real pane slot. Looking it up afterwards must reflect
+    // the new value.
     let updated = db.set_run_agent_id(&run.id, "worker-3").unwrap();
     assert_eq!(updated.agent_id, "worker-3");
     let reread = db.get_run(&run.id).unwrap();

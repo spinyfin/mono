@@ -605,11 +605,11 @@ impl ServerState {
     /// handles the case instead of redirecting to a second one.
     ///
     /// Otherwise (no live-state entry and no durable evidence at all —
-    /// a genuine husk) sends the same slot-keyed `ReleaseWorkerPane`
-    /// request [`Self::release_worker_pane`] uses — the app's teardown
-    /// is already keyed purely by `slot_id` with zero dependency on
-    /// engine run-tracking state, so no app-side change is needed to
-    /// honor this for a husk. Then defensively clears whatever
+    /// a genuine husk) sends a slot-keyed `DetachWorkerPane` request —
+    /// the app's viewer teardown is already keyed purely by `slot_id`
+    /// with zero dependency on engine run-tracking state, so this is
+    /// the only signal a true husk (no run id, no session identity) can
+    /// give the app. Then defensively clears whatever
     /// engine-side bookkeeping might still reference the slot; for a
     /// genuine husk this is a no-op (the engine already dropped it),
     /// but it fully reconciles a slot that straddled both states (a
@@ -689,20 +689,17 @@ impl ServerState {
             );
             return Ok(());
         }
-        let request = EngineToAppRequest::ReleaseWorkerPane(ReleaseWorkerPaneInput {
-            slot_id,
-            kill_grace_seconds: 5,
-        });
+        let request = EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id });
         match self.send_to_app(request, Duration::from_secs(5)).await {
-            Ok(EngineToAppResponse::ReleaseWorkerPane { result: Ok(_) }) => {
+            Ok(EngineToAppResponse::DetachWorkerPane { result: Ok(_) }) => {
                 tracing::info!(slot_id, "retire_pane: released husk pane");
             }
-            Ok(EngineToAppResponse::ReleaseWorkerPane {
+            Ok(EngineToAppResponse::DetachWorkerPane {
                 result: Err(EngineToAppError::UnknownSlot),
             }) => {
                 tracing::debug!(slot_id, "retire_pane: app reports unknown slot — nothing hosted there");
             }
-            Ok(EngineToAppResponse::ReleaseWorkerPane { result: Err(err) }) => {
+            Ok(EngineToAppResponse::DetachWorkerPane { result: Err(err) }) => {
                 return Err(RetirePaneError::App(err));
             }
             Ok(other) => {

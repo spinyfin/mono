@@ -12,8 +12,8 @@
 //! number chosen by a test.
 //!
 //! So this module spawns a real long-lived child, registers it as the
-//! pane's foreground shell exactly as `update_shell_pid` would after
-//! `onSurfaceAttached`, and then runs the **real** sweeps in sequence:
+//! pane's foreground shell the way production stamps `shell_pid` at
+//! spawn-registration time, and then runs the **real** sweeps in sequence:
 //!
 //! 1. [`crate::dead_pid_sweep`] — `kill(pid, 0)` finds the child alive, so
 //!    it declines to reap. `dead_pid_sweep` is the nominal fallback for

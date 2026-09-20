@@ -698,31 +698,6 @@ extension EngineClient {
         ])
     }
 
-    /// Report the real shell pid for a worker pane after the libghostty
-    /// surface initializes. The engine uses this to wire process tracking
-    /// so the dead-pid sweep and `bossctl agents stop` can observe and
-    /// reap reviewer and other pane-spawned workers.
-    func sendUpdateWorkerShellPid(runId: String, shellPid: Int32) {
-        sendLine([
-            "type": "update_worker_shell_pid",
-            "run_id": runId,
-            "shell_pid": Int(shellPid),
-        ])
-    }
-
-    /// Report that a worker pane died before the engine could observe it
-    /// any other way — either its libghostty surface never attached or
-    /// its shell process exited. The engine reaps the backing execution
-    /// immediately instead of waiting for the next dead-pid sweep pass
-    /// (up to 60s later) or an app restart.
-    func sendWorkerPaneDied(runId: String, reason: WorkerPaneDeathReason) {
-        sendLine([
-            "type": "worker_pane_died",
-            "run_id": runId,
-            "reason": reason.rawValue,
-        ])
-    }
-
     /// Report that the app can once again host worker panes after a
     /// sleep/wake cycle — `GhosttyRuntime` observed `NSWorkspace`
     /// sleep/wake notifications and confirmed an active display is
@@ -732,23 +707,6 @@ extension EngineClient {
     func sendSpawnCapabilityRestored() {
         sendLine([
             "type": "spawn_capability_restored",
-        ])
-    }
-
-    /// Report that a worker pane's shell never came up — the libghostty
-    /// surface failed to create (typically `ghostty_surface_new` returning
-    /// NULL when there is no active display after sleep/wake). This is the
-    /// proactive NACK for the false-live spawn: the spawn RPC was already
-    /// answered `Ok(shell_pid: 0)` synchronously because the surface is
-    /// created asynchronously, so this is the only way — short of the
-    /// engine's 60s spawn-ack timeout — the engine learns the shell never
-    /// started. The engine reaps the execution immediately and feeds its
-    /// spawn-capability circuit breaker. Fire-and-forget; no response.
-    func sendReportWorkerSpawnFailed(runId: String, reason: String) {
-        sendLine([
-            "type": "report_worker_spawn_failed",
-            "run_id": runId,
-            "reason": reason,
         ])
     }
 

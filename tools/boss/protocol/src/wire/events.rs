@@ -263,7 +263,7 @@ pub enum FrontendEvent {
     /// Engine's live pool-size configuration, pushed to the macOS app
     /// immediately after [`FrontendEvent::AppSessionRegistered`] so the
     /// app's `WorkersWorkspaceModel` knows the exact slot ranges to
-    /// accept for `SpawnWorkerPane` requests. The engine is the source
+    /// accept for `AttachWorkerPane` requests. The engine is the source
     /// of truth; the app must configure itself from this on every
     /// connection rather than relying on independently-maintained
     /// hardcoded counts that drift when pool sizes change.

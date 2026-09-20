@@ -431,7 +431,7 @@ async fn no_recorded_pid_emits_no_decline_event() {
 /// A worker that never reported a pid (mid-spawn, or a spawn that never
 /// produced a shell) must not be treated as alive. `Unknown` is not
 /// `Alive`: reading it as such would disable orphan recovery for every
-/// execution that dies before `UpdateWorkerShellPid`.
+/// execution that dies before its tmux shell pid is persisted.
 #[tokio::test]
 async fn a_never_reported_pid_does_not_block_redispatch() {
     let (_dir, db) = open_db();

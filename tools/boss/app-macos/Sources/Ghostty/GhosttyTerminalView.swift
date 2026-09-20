@@ -86,12 +86,12 @@ final class GhosttyTerminalHostView: NSView {
     private var screenObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
 
-    /// Set once we have reported a surface-creation failure to the session
-    /// (`session.onSurfaceCreationFailed`). Dedupes the NACK: `attemptSurfaceCreation`
-    /// can run several times for one spawn (init, `viewDidMoveToWindow`, the
-    /// screen-change observer), but the engine only needs to be told once that
-    /// this spawn produced no shell. Reset to `false` on a successful attach so
-    /// a Boss-pane restart that later fails can report again.
+    /// Set once we have written a `surface_failed` JSONL record for this
+    /// attach attempt. Dedupes retries: `attemptSurfaceCreation` can run
+    /// several times for one viewer (init, `viewDidMoveToWindow`, the
+    /// screen-change and display-wake observers), but one spawn should
+    /// produce one `surface_failed` line. Reset to `false` on a successful
+    /// attach so a later teardown/recreate can record a fresh failure.
     private var reportedSurfaceCreationFailure = false
 
     /// os_signpost interval state for an in-flight left-button selection
@@ -206,10 +206,9 @@ final class GhosttyTerminalHostView: NSView {
     /// retries.
     private func attemptSurfaceCreation() {
         guard surface == nil else { return }
-        // The session's slot may have been released (e.g. the engine
-        // reaped this run off the fast-fail NACK path) while this view's
+        // The viewer may have been detached while this view's
         // display-change retry was still armed. Creating a surface now
-        // would start a shell for a run nobody is tracking anymore —
+        // would start a tmux client for a released viewer —
         // bail and drop the observer instead.
         guard !session.isReleased else {
             removeScreenObserver()
@@ -220,11 +219,16 @@ final class GhosttyTerminalHostView: NSView {
         case .created(let surface):
             self.surface = surface
             removeScreenObserver()
-            // A surface came up: clear the failure latch so a later teardown and
-            // recreation can report a new failure.
+            // A surface came up: clear the failure latch so a later teardown
+            // and recreation can record a new `surface_failed`.
             reportedSurfaceCreationFailure = false
             session.statusMessage = nil
             session.attach(hostView: self)
+            if case .worker(let slotId) = session.role, session.id.hasPrefix("run-") {
+                SpawnDiagnosticsLog.shared.surfaceAttached(
+                    runId: String(session.id.dropFirst(4)), slotId: slotId, shellPid: foregroundPid
+                )
+            }
             // Register with the event-loop diagnostics so the 1 Hz sampler can
             // probe this pane's pty/EOF/pid liveness (idempotent; safe across
             // restarts). See [[TerminalLoopMonitor]].
@@ -233,35 +237,24 @@ final class GhosttyTerminalHostView: NSView {
             reconcilePaneMonitor()
 
         case .failed(let host, let diagnostic):
+            if case .worker = session.role, session.id.hasPrefix("run-"),
+               !reportedSurfaceCreationFailure
+            {
+                reportedSurfaceCreationFailure = true
+                SpawnDiagnosticsLog.shared.surfaceFailed(
+                    runId: String(session.id.dropFirst(4)),
+                    reason: Self.surfaceFailureReason(host: host),
+                    host: host,
+                    diagnostic: diagnostic
+                )
+            }
             session.statusMessage = host.activeDisplayCount == 0
                 ? "Waiting for an active display…"
                 : "Surface creation failed…"
             installScreenObserverIfNeeded()
-            // Tell the session the SPAWN failed — never that the pane died.
-            // A surface that was never created hosted no pty and therefore no
-            // shell process, so there is no worker here to have died. Saying
-            // "died" routes the engine to its pane-death reap, which does not
-            // feed the cross-work-item spawn-capability breaker; saying
-            // "spawn failed" routes it to the never-started-spawn reap, which
-            // does. See `TerminalPaneSession.onSurfaceCreationFailed`.
-            //
-            // Dedupe: the screen observer / window-move retries call this
-            // again, but one report per spawn is enough — the engine reaps on
-            // the first. The pane stays in its surface-less placeholder either
-            // way; if the display returns before the engine reaps, the retry
-            // still recreates the surface.
-            //
-            // Forward the same host snapshot used for the reason string so
-            // the JSONL `host` object cannot disagree with `reason` if the
-            // display wakes between measurement and logging.
-            if !reportedSurfaceCreationFailure {
-                reportedSurfaceCreationFailure = true
-                session.onSurfaceCreationFailed?(
-                    Self.surfaceFailureReason(host: host),
-                    host,
-                    diagnostic
-                )
-            }
+            // The pane stays in its surface-less placeholder; if the display
+            // returns, the screen-change / window-move retries above recreate
+            // the surface.
         }
     }
 
@@ -272,19 +265,11 @@ final class GhosttyTerminalHostView: NSView {
         case failed(host: HostDisplaySnapshot, diagnostic: String)
     }
 
-    /// The reason string reported to the engine when `ghostty_surface_new`
-    /// returns NULL, **diagnosed from measured CoreGraphics / session state**
-    /// rather than `NSScreen.main` (which lies when the screen is locked).
-    ///
-    /// This string is the human-facing explanation: it is what the engine
-    /// writes as the execution's orphan reason, what lands on the dispatch
-    /// event, and what `bossctl logs spawn` shows on `surface_failed`. The
-    /// measured host summary is always embedded; the rejected input block
-    /// (cwd, env, app handle) is mirrored into the durable spawn JSONL
-    /// `diagnostic` field — app fd 2 is `/dev/null` in production, so
-    /// reason strings never point at stderr.
-    ///
-    /// Free / static so it is unit-testable without a live surface/window.
+    /// Human-facing viewer failure explanation measured from CoreGraphics and
+    /// session state. Stored with the rejected inputs in the durable
+    /// surface_failed record exposed by bossctl logs spawn; it does not
+    /// change the engine's execution state or emit a lifecycle RPC.
+    /// Static so the measured-display diagnosis is testable without a surface.
     static func surfaceFailureReason(host: HostDisplaySnapshot) -> String {
         // Prefer the CG active-display count (what DisplayLink uses) over
         // AppKit's NSScreen.main, which remains non-nil across lock/sleep.

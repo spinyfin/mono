@@ -44,7 +44,10 @@
 //!    live `run_id == execution_id`), SKIP — a live pane owns the slot
 //!    and the completion / dead-pid / stale-worker paths own its
 //!    teardown. Releasing it here would let a fresh dispatch hit
-//!    `SpawnWorkerPane` `SlotBusy` against a pane that is still up.
+//!    `AttachWorkerPane` `SlotBusy` against a pane that is still up.
+//!    Viewer attach can reject an occupied slot via AttachWorkerPane/SlotBusy;
+//!    viewer teardown uses DetachWorkerPane. Neither viewer state nor a
+//!    missing live-state mapping proves that a tmux worker has exited.
 //! 2. Look up the execution. On a DB error, SKIP this pass (conservative
 //!    — a transient error is not proof the row is gone).
 //! 3. If the execution is NOT terminal, SKIP — the slot is legitimately
@@ -78,7 +81,7 @@
 //! how that state gets resolved. Three producers currently yield this
 //! shape:
 //!
-//! * a rejected `SpawnWorkerPane` in `coordinator/run.rs` (`hold_slot_busy`);
+//! * a rejected `AttachWorkerPane` in `coordinator/run.rs` (`hold_slot_busy`);
 //! * an unconfirmed teardown in `release_worker_pane` (`sweep_owns_handback`);
 //! * `TransientRecoveryReaper::reap_worker` dropping the live-state entry
 //!   for a claim `release_worker_pane` never held or released, when
@@ -90,7 +93,7 @@
 //! A "claimed + no live entry" slot is therefore not proof the pane is
 //! gone — it may still be genuinely up, which is precisely what step 1
 //! above is written to avoid racing ("Releasing it here would let a
-//! fresh dispatch hit `SpawnWorkerPane` `SlotBusy` against a pane that
+//! fresh dispatch hit `AttachWorkerPane` `SlotBusy` against a pane that
 //! is still up"). What makes releasing it anyway acceptable once
 //! `LEAK_GRACE_SECS` has passed is that all three known producers are
 //! terminal-execution-only and self-limiting: a genuine leak (no
@@ -98,6 +101,10 @@
 //! unconfirmed-but-actually-alive pane loses at most one dispatch to
 //! `SlotBusy` before this sweep frees it — the cost this whole module
 //! exists to bound, not eliminate.
+//!
+//! The tmux adoption and husk sweeps independently reconcile physical
+//! sessions by durable spawn identity; releasing a claim is not proof that
+//! a session or viewer has disappeared.
 //!
 //! ## Cadence
 //!

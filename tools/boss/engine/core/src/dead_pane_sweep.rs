@@ -38,9 +38,9 @@
 //!
 //! It closes both sides of the gap by making pane liveness **durable and
 //! restart-robust**.
-//! The app reports the real shell pid via `UpdateWorkerShellPid`, which the
-//! engine now persists to `work_runs.shell_pid` (see
-//! [`crate::work::WorkDb::set_run_shell_pid_for_execution`]). This sweep reads
+//! The tmux spawn path in `spawn_flow.rs` obtains the real shell pid and
+//! persists it to `work_runs.shell_pid` (see
+//! [`crate::work::WorkDb::persist_tmux_identity_after_observation`]). This sweep reads
 //! that DB pid — NOT the in-memory registry — and probes it with the same
 //! `kill(pid, 0)` primitive [`crate::dead_pid_sweep`] uses.
 //!

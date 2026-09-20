@@ -168,7 +168,7 @@ enum EngineEvent {
     case trunkStatus(configured: Bool, source: String?, queueCheck: TrunkQueueCheck?, note: String?)
     /// Engine's live pool-size configuration, pushed immediately after
     /// `app_session_registered` so `WorkersWorkspaceModel` can configure
-    /// its slot ranges before any `SpawnWorkerPane` request arrives.
+    /// its slot ranges before any `AttachWorkerPane` request arrives.
     /// This is the single source of truth: the engine's runtime config
     /// drives the app's capacity check so they can never drift out of sync.
     /// `coordinatorModel` is the engine's requested model for coordinator

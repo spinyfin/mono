@@ -1,11 +1,12 @@
 import XCTest
 @testable import Boss
 
+@MainActor
 final class SpawnDiagnosticsLogTests: XCTestCase {
     func testLineCarriesEventRunIdTimestampAndExtras() throws {
         // The durable spawn diagnostic must always carry the execution id
-        // (`run_id`) so a spawn the engine saw ack `shell_pid: 0` can be
-        // joined to its eventual outcome. Pin the wire shape.
+        // (`run_id`) so a viewer attach request can be joined to its
+        // eventual outcome. Pin the wire shape.
         let data = try XCTUnwrap(
             SpawnDiagnosticsLog.line(
                 event: SpawnDiagnosticsLog.eventSurfaceFailed,
@@ -45,10 +46,15 @@ final class SpawnDiagnosticsLogTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dir) }
 
         let log = SpawnDiagnosticsLog(directory: dir.path)
-        log.spawnRequested(runId: "exec-99", slotId: 7, workspacePath: "/tmp/ws")
+        log.spawnRequested(
+            runId: "exec-99",
+            slotId: 7,
+            sessionName: "boss-7-exec-99",
+            tmuxSocketPath: "/state/boss/tmux.sock"
+        )
         log.surfaceFailed(
             runId: "exec-99",
-            reason: "ghostty_surface_new returned NULL",
+            reason: GhosttyTerminalHostView.surfaceFailureReason(host: .make(activeDisplayCount: 0)),
             host: .make(
                 activeDisplayCount: 0,
                 onlineDisplayCount: 1,
@@ -59,6 +65,7 @@ final class SpawnDiagnosticsLogTests: XCTestCase {
             ),
             diagnostic: "[GhosttyTerminalView] ghostty_surface_new returned NULL. Context:\n  workingDirectory: /tmp/ws\n"
         )
+        log.surfaceAttached(runId: "exec-99", slotId: 7, shellPid: 123)
         log.flushForTesting()
 
         let files = try FileManager.default.contentsOfDirectory(atPath: dir.path)
@@ -67,11 +74,31 @@ final class SpawnDiagnosticsLogTests: XCTestCase {
 
         let contents = try String(contentsOfFile: (dir.path as NSString).appendingPathComponent(files[0]), encoding: .utf8)
         let lines = contents.split(separator: "\n").map(String.init)
-        XCTAssertEqual(lines.count, 2, "both events must be recorded")
+        XCTAssertEqual(lines.count, 3, "request, failure, and recovery must be recorded")
+        for line in lines {
+            let record = try XCTUnwrap(
+                try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+            )
+            XCTAssertEqual(record["run_id"] as? String, "exec-99",
+                           "every viewer event must be discoverable by execution id")
+        }
         XCTAssertTrue(lines[0].contains("\"event\":\"spawn_requested\""))
         XCTAssertTrue(lines[0].contains("\"run_id\":\"exec-99\""))
+        let requested = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(lines[0].utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(requested["session_name"] as? String, "boss-7-exec-99")
+        XCTAssertEqual(requested["tmux_socket_path"] as? String, "/state/boss/tmux.sock")
+        XCTAssertNil(requested["workspace_path"], "viewer attach does not know a workspace")
+        XCTAssertFalse(
+            lines[0].contains(FileManager.default.homeDirectoryForCurrentUser.path),
+            "home directory must not masquerade as workspace_path"
+        )
         XCTAssertTrue(lines[1].contains("\"event\":\"surface_failed\""))
         XCTAssertTrue(lines[1].contains("ghostty_surface_new returned NULL"))
+        XCTAssertTrue(lines[1].contains("no active CG displays"))
+        XCTAssertTrue(lines[2].contains("\"event\":\"surface_attached\""))
+        XCTAssertTrue(lines[2].contains("\"shell_pid\":123"))
         // Measured host state must be on the wire so `bossctl logs spawn`
         // can diagnose without the app's stderr.
         XCTAssertTrue(lines[1].contains("\"host\""), lines[1])
@@ -80,5 +107,38 @@ final class SpawnDiagnosticsLogTests: XCTestCase {
         // Rejected-input block is durable here (fd 2 is /dev/null in prod).
         XCTAssertTrue(lines[1].contains("\"diagnostic\""), lines[1])
         XCTAssertTrue(lines[1].contains("workingDirectory"), lines[1])
+    }
+
+    func testAttachWorkerPanePathRecordsTmuxIdentityNotHomeDirectory() {
+        // Production attachWorkerPane builds EngineSpawnRequest via
+        // `init(attaching:)` and hostAttachedPane logs spawnRequested
+        // from those fields. Pin that path so a synthesized home
+        // directory cannot silently return as workspace_path.
+        let request = EngineAttachRequest(
+            runId: "run-tmux",
+            slotId: 3,
+            sessionName: "boss-3-run-tmux",
+            tmuxSocketPath: "/state/boss/tmux.sock",
+            summary: nil,
+            taskTitle: nil
+        )
+        let launch = EngineSpawnRequest(attaching: request)
+        XCTAssertEqual(launch.sessionName, request.sessionName)
+        XCTAssertEqual(launch.tmuxSocketPath, request.tmuxSocketPath)
+        XCTAssertEqual(launch.workspacePath, FileManager.default.homeDirectoryForCurrentUser.path)
+
+        let extra = SpawnDiagnosticsLog.spawnRequestedExtra(
+            slotId: Int(launch.slotId),
+            sessionName: launch.sessionName,
+            tmuxSocketPath: launch.tmuxSocketPath
+        )
+        XCTAssertEqual(extra["slot_id"] as? Int, 3)
+        XCTAssertEqual(extra["session_name"] as? String, "boss-3-run-tmux")
+        XCTAssertEqual(extra["tmux_socket_path"] as? String, "/state/boss/tmux.sock")
+        XCTAssertNil(extra["workspace_path"])
+        XCTAssertFalse(
+            extra.values.contains { ($0 as? String) == launch.workspacePath },
+            "tmux client cwd must not appear in spawn_requested extras"
+        )
     }
 }

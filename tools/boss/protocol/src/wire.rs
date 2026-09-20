@@ -2075,25 +2075,6 @@ pub enum FrontendRequest {
         product_id: Option<String>,
     },
 
-    /// App reports that a worker pane's shell never came up — the
-    /// libghostty surface failed to create (typically `ghostty_surface_new`
-    /// returning NULL when there is no active display after sleep/wake,
-    /// the #800 condition). This is the proactive NACK for the false-live
-    /// spawn: the spawn RPC was already answered `Ok(shell_pid: 0)`
-    /// synchronously because the surface is created asynchronously, so the
-    /// only way the engine learns the shell never started — short of the
-    /// 60s `spawn_ack_sweep` timeout — is this message. The engine reaps
-    /// the execution immediately (mirroring the sweep) and feeds its
-    /// spawn-capability circuit breaker, so a systemic post-wake failure
-    /// is caught in seconds instead of churning for hours. `reason` is a
-    /// short human-readable cause for the orphan record and diagnostics.
-    /// Fire-and-forget; no response expected. Only the registered app
-    /// session may call this.
-    ReportWorkerSpawnFailed {
-        run_id: String,
-        reason: String,
-    },
-
     RequestExecution {
         #[serde(flatten)]
         input: RequestExecutionInput,
@@ -2514,13 +2495,12 @@ pub enum FrontendRequest {
     /// `GhosttyRuntime` observes `NSWorkspace.didWakeNotification` /
     /// `screensDidWakeNotification` and confirms an active display is
     /// present. Without this, a sleep/wake cycle that briefly stranded a
-    /// spawn (`ghostty_surface_new` returning NULL for the #800
-    /// no-active-display condition, or an orphaned execution reported via
-    /// `WorkerPaneDied`) only gets redispatched on the next periodic
-    /// sweep/heartbeat tick, which can lag the wake by up to a minute.
-    /// The engine reacts by kicking the scheduler immediately so any work
-    /// stranded by the sleep is redispatched as soon as the app can host
-    /// it again. Fire-and-forget; no response expected.
+    /// viewer attach (`ghostty_surface_new` returning NULL for the #800
+    /// no-active-display condition) only gets redispatched on the next
+    /// periodic sweep/heartbeat tick, which can lag the wake by up to a
+    /// minute. The engine reacts by kicking the scheduler immediately so
+    /// any work stranded by the sleep is redispatched as soon as the app
+    /// can host it again. Fire-and-forget; no response expected.
     SpawnCapabilityRestored,
 
     /// Boss-tier RPC: tear down the libghostty pane hosting `run_id`
@@ -2745,41 +2725,9 @@ pub enum FrontendRequest {
         patch: IdeaPatch,
     },
 
-    /// App reports the real shell pid for a worker pane after the
-    /// libghostty surface initializes. The engine stores this in
-    /// `WorkerRegistry` and `LiveWorkerStateRegistry` so process
-    /// tracking, dead-pid sweep, and `bossctl agents stop` work for
-    /// reviewer and other shell_pid-0 spawns. Fire-and-forget; no
-    /// response expected.
-    UpdateWorkerShellPid {
-        run_id: String,
-        shell_pid: i32,
-    },
-
     UpdateWorkItem {
         id: String,
         patch: WorkItemPatch,
-    },
-
-    /// App reports that a worker pane died before the engine could
-    /// observe it any other way — either `ghostty_surface_new` returned
-    /// NULL (surface never attached) or the pane's child process exited
-    /// and the app has no restart-on-exit handler wired up for worker
-    /// panes (only the Boss pane restarts itself). Without this, the
-    /// engine only learns of the dead pane on the next 60s
-    /// `dead_pid_sweep` pass or on app restart. The engine
-    /// reaps the backing execution immediately using the same DB/pool
-    /// effects as the periodic sweep, skipping its grace period and
-    /// PID-liveness probe since the app's report is a direct
-    /// observation, not a speculative signal. Fire-and-forget; no
-    /// response expected.
-    WorkerPaneDied {
-        run_id: String,
-        /// The app callback that supplied the death observation. Older app
-        /// builds omitted this field, so `Unknown` preserves wire
-        /// compatibility while making every new report attributable.
-        #[serde(default)]
-        reason: WorkerPaneDeathReason,
     },
 
     /// Snapshot every engine worker pool's (main, automation, review)
@@ -2800,9 +2748,9 @@ pub enum FrontendRequest {
     WorkspacePoolSummary,
 }
 
-/// App-side observation that caused a [`FrontendRequest::WorkerPaneDied`]
-/// report. The distinction matters because surface creation and a child
-/// process exit have different lifecycle guards and recovery semantics.
+/// The observed cause behind a dead worker pane. The distinction matters
+/// because surface creation, a child process exit, and a pre-write driver
+/// liveness check have different lifecycle guards and recovery semantics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerPaneDeathReason {

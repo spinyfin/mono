@@ -893,10 +893,12 @@ impl LiveWorkerStateRegistry {
         out
     }
 
-    /// Update the shell pid for the slot that owns `run_id`. Returns
-    /// the slot id if the entry was found and updated, or `None` if
-    /// no live slot matches. Called when the app sends
-    /// `UpdateWorkerShellPid` after the libghostty surface initializes.
+    /// Test-only pid seeder. Production stamps `shell_pid` at registration
+    /// via [`Self::register_spawn_with_capabilities`]; this remains for
+    /// tests that seed or mutate a pid without the full spawn flow.
+    /// Returns the slot id if the entry was found and updated, or `None`
+    /// if no live slot matches.
+    #[cfg(test)]
     pub fn update_shell_pid(&self, run_id: &str, shell_pid: i32) -> Option<u8> {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         for entry in guard.values_mut() {
@@ -1058,12 +1060,12 @@ impl LiveWorkerStateRegistry {
         out
     }
 
-    /// Set the `held` flag for the slot that owns `run_id` — mirrors
-    /// [`Self::update_shell_pid`]'s find-and-set shape. Returns the slot
-    /// id if the entry was found and updated, or `None` if no live slot
-    /// matches. Called by the `HoldRun`/`ReleaseHoldRun` RPC handlers so
-    /// `bossctl agents list`/`status` reflect an operator hold
-    /// immediately, without waiting for the next hook event.
+    /// Set the `held` flag for the slot that owns `run_id`. Walks the
+    /// registry for a matching `run_id` and writes the flag in place.
+    /// Returns the slot id if the entry was found and updated, or `None`
+    /// if no live slot matches. Called by the `HoldRun`/`ReleaseHoldRun`
+    /// RPC handlers so `bossctl agents list`/`status` reflect an operator
+    /// hold immediately, without waiting for the next hook event.
     pub fn set_held(&self, run_id: &str, held: bool) -> Option<u8> {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         for entry in guard.values_mut() {

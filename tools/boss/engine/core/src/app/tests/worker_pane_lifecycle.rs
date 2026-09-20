@@ -262,12 +262,12 @@ async fn release_worker_pane_reaps_the_tmux_session_for_a_slot_mapped_run() {
 #[tokio::test]
 async fn release_worker_pane_releases_matching_worker_pool_slot() {
     // Engine-side lifecycle pairing: the WorkerPool slot is held
-    // for the lifetime of the libghostty pane (not just for the
+    // for the lifetime of the tmux-hosted pane (not just for the
     // duration of `run_execution`). Tearing the pane down via
     // `release_worker_pane` must hand the pool slot back so a
     // subsequent `claim_worker` can reuse it — otherwise the
     // engine and the app drift apart and the next
-    // SpawnWorkerPane gets rejected as SlotBusy.
+    // AttachWorkerPane gets rejected as SlotBusy.
     let (server_state, _dir) = test_server_state();
     let run_id = super::tmux_stub::seed_teardown(&server_state);
     let pool = server_state.execution_coordinator.worker_pool();
@@ -531,7 +531,7 @@ async fn release_worker_pane_holds_the_pool_claim_when_the_app_never_confirms() 
     // WorkerPool slot back "successfully or not" — including when the app
     // never answered the teardown request at all. The app is then still
     // hosting the pane while the engine advertises the slot as free, so the
-    // next dispatch claims it, `SpawnWorkerPane` is rejected `SlotBusy`, and
+    // next dispatch claims it, `AttachWorkerPane` is rejected `SlotBusy`, and
     // that execution is terminalized `failed` seconds after start with
     // `work_executions.driver` still NULL.
     //

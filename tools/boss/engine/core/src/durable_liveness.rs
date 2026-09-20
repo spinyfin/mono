@@ -22,8 +22,8 @@
 //!
 //! The engine already persists the one fact that would have settled it:
 //! `work_runs.shell_pid`, written by
-//! [`crate::work::WorkDb::set_run_shell_pid_for_execution`] the moment the
-//! app reports the pane's shell pid. It survives an engine restart, it
+//! [`crate::work::WorkDb::persist_tmux_identity_after_observation`] when
+//! the tmux spawn path observes the pane pid. It survives an engine restart, it
 //! survives `release_worker_pane` clearing the registry, and it survives the
 //! execution row going terminal.
 //!

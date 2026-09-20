@@ -1,27 +1,9 @@
 import Foundation
 
-/// Append-only JSONL log of every worker-pane spawn's lifecycle on the app
-/// side — the spawn request, the surface-creation result, and the shell pid
-/// (or the failure reason). Modeled on [[IpcLog]]: all I/O runs on a private
-/// serial queue so logging never blocks the main thread, daily files rotate,
-/// and `retainDays` of history is kept.
-///
-/// This is the durable, execution-id-correlatable diagnostic the 2026-07-05
-/// post-wake incident wished it had: engine-side evidence hit a wall precisely
-/// because nothing app-side recorded WHY the shell never started
-/// (`ghostty_surface_new` returning NULL leaves only a stderr dump). Every
-/// record is keyed by `run_id` — the raw execution id — so a spawn that the
-/// engine saw ack `shell_pid: 0` can be joined here to its eventual
-/// `surface_attached` (pid) or `surface_failed` (reason).
-///
-/// Files live at:
-///   `~/Library/Application Support/Boss/diagnostics/spawn-YYYY-MM-DD.jsonl`
-///
-/// Each line is a JSON object:
-///   `ts_epoch_ms` – milliseconds since Unix epoch
-///   `event`       – `"spawn_requested"` | `"surface_attached"` | `"surface_failed"`
-///   `run_id`      – the execution id this pane hosts
-///   plus event-specific fields (`slot_id`, `shell_pid`, `reason`, …)
+/// Durable daily JSONL diagnostics for worker viewer attachment. The historical
+/// spawn filenames and event tags remain compatible with bossctl logs spawn.
+/// These events describe the app's tmux viewer, not worker process startup or
+/// death. I/O uses a private serial queue.
 final class SpawnDiagnosticsLog: @unchecked Sendable {
     static let shared: SpawnDiagnosticsLog = {
         let appSupport = FileManager.default
@@ -56,19 +38,30 @@ final class SpawnDiagnosticsLog: @unchecked Sendable {
         self.retainDays = retainDays
     }
 
-    /// Log that the engine asked the app to spawn a worker pane. Recorded the
-    /// moment the RPC is honored, before the (asynchronous) surface creation —
-    /// so a spawn that never progresses to `surface_attached`/`surface_failed`
-    /// is visible as a request with no outcome.
-    func spawnRequested(runId: String, slotId: Int, workspacePath: String) {
+    /// Extra fields for a `spawn_requested` record. The viewer does not
+    /// know the worker workspace, so this omits `workspace_path` and
+    /// records the tmux identity the attach RPC actually supplies.
+    static func spawnRequestedExtra(slotId: Int, sessionName: String, tmuxSocketPath: String) -> [String: Any] {
+        [
+            "slot_id": slotId,
+            "session_name": sessionName,
+            "tmux_socket_path": tmuxSocketPath,
+        ]
+    }
+
+    /// Record an accepted viewer attach request before surface creation.
+    /// The historical event tag remains spawn_requested for log readers.
+    func spawnRequested(runId: String, slotId: Int, sessionName: String, tmuxSocketPath: String) {
         record(
             event: Self.eventSpawnRequested,
             runId: runId,
-            extra: ["slot_id": slotId, "workspace_path": workspacePath]
+            extra: Self.spawnRequestedExtra(
+                slotId: slotId, sessionName: sessionName, tmuxSocketPath: tmuxSocketPath
+            )
         )
     }
 
-    /// Log that the libghostty surface attached and produced a shell pid.
+    /// Record the viewer surface attachment and its local tmux client pid.
     func surfaceAttached(runId: String, slotId: Int, shellPid: Int32) {
         record(
             event: Self.eventSurfaceAttached,
@@ -77,13 +70,16 @@ final class SpawnDiagnosticsLog: @unchecked Sendable {
         )
     }
 
-    /// Log that surface creation failed and no shell came up. `reason` mirrors
-    /// the NACK sent to the engine. When `host` is provided, its measured
-    /// fields are embedded as a nested `host` object so `bossctl logs spawn`
-    /// can show the rejected display precondition. When `diagnostic` is
-    /// provided, the rejected-input block (cwd, env, app handle) is stored
-    /// under `diagnostic` — production fd 2 is `/dev/null`, so this is the
-    /// durable place that block is readable.
+    /// Persist viewer failure context for bossctl logs spawn. This does not
+    /// report a worker failure to the engine: the detached tmux worker can
+    /// remain healthy while the app cannot create its viewer surface.
+    ///
+    /// Callers must latch this to one record per attach attempt.
+    /// `GhosttyTerminalHostView.attemptSurfaceCreation` retries on
+    /// screen-change and display-wake while a locked or sleeping Mac has
+    /// no active display; logging each retry would bury the later
+    /// `surface_attached` recovery line under a burst of identical
+    /// `surface_failed` records. Per-attempt records are not wanted.
     func surfaceFailed(
         runId: String,
         reason: String,

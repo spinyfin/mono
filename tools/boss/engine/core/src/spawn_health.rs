@@ -15,9 +15,8 @@
 //!
 //! ## What this adds
 //!
-//! A cross-work-item aggregator. Every never-started spawn — whether inferred
-//! by the 60s [`crate::spawn_ack_sweep`] or reported proactively by the app via
-//! `ReportWorkerSpawnFailed` (the fast-fail NACK) — feeds
+//! A cross-work-item aggregator. Never-started spawns inferred by the
+//! periodic [`crate::spawn_ack_sweep`] feed
 //! [`SpawnHealthTracker::record_failure`]. When
 //! [`SPAWN_HEALTH_DISTINCT_WORK_ITEM_THRESHOLD`] **distinct** work items have
 //! failed to spawn a shell within [`SPAWN_HEALTH_WINDOW_SECS`], the app

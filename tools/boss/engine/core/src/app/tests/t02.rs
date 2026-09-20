@@ -1435,7 +1435,7 @@ async fn tail_transcript_resolver_surfaces_path_via_both_namespaces() {
 /// daemon (in `bazel run` dev setups) or launchd (1) — neither
 /// matches the real macOS app, so every `RegisterAppSession` from
 /// the actual app got rejected, no app session ever registered,
-/// and every `SpawnWorkerPane` request fell on the floor. Drag-to
+/// and every `AttachWorkerPane` request fell on the floor. Drag-to
 /// -Doing visibly accepted the request, the dispatcher created
 /// the run row, then `start_worker` returned `AppDisconnected`
 /// and the run flipped to `failed` with no surface explanation.

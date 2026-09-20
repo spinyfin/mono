@@ -21,7 +21,7 @@ import Foundation
 ///   `ts_epoch_ms`  – milliseconds since Unix epoch
 ///   `direction`    – `"engine→app"` or `"app→engine"`
 ///   `request_id`   – opaque id that pairs a request with its response
-///   `kind`         – snake_case discriminant (e.g. `"release_worker_pane"`)
+///   `kind`         – snake_case discriminant (e.g. `"detach_worker_pane"`)
 ///   `body`         – the full request or response payload
 ///
 /// Correlation: `request_id` is minted by the engine as

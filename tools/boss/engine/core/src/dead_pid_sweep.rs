@@ -101,12 +101,11 @@
 //!
 //! ## Immediate reconciliation
 //!
-//! [`reap_reported_pane_death`] is the event-driven counterpart: the app
-//! calls it (via `FrontendRequest::WorkerPaneDied`) when it directly observes
-//! a worker pane die, and the pane-input boundary calls it when its fresh
-//! foreground-driver check finds the agent gone. It shares [`run_one_pass`]'s
-//! reap effects but skips the grace period and PID probe, since either source
-//! is a direct observation rather than a speculative one.
+//! [`reap_reported_pane_death`] is the event-driven counterpart: the
+//! pane-input boundary calls it when its fresh foreground-driver check finds
+//! the agent gone. It shares [`run_one_pass`]'s reap effects but skips the
+//! grace period and PID probe, since that is a direct observation rather
+//! than a speculative one.
 //!
 //! ## Every vanished process is a death
 //!
@@ -496,9 +495,8 @@ pub async fn run_one_pass(
 }
 
 /// Immediately reap the execution behind `run_id` after a direct pane-death
-/// report or a foreground-driver check finds it gone. App reports cover
-/// failed surface creation and child exit; the input boundary reports a
-/// driver that returned to a shell.
+/// observation: the pane-input boundary reports a driver that returned to
+/// a shell.
 ///
 /// Unlike [`run_one_pass`], this skips [`DEAD_PID_GRACE_SECS`] and the
 /// `kill(pid, 0)` liveness probe: those exist to protect the periodic
@@ -714,9 +712,9 @@ struct ReapOptions<'a> {
 /// [`PANE_DEATH_ATTENTION_KIND`] attention item. Shared between
 /// [`run_one_pass`], [`reap_reported_pane_death`], and
 /// [`reap_observed_worker_death`] so all paths — the periodic sweep, an
-/// app-reattach reconcile, an authoritative app report, and a death the
-/// engine itself observed in tmux — leave the DB, pool, and audit trail in
-/// the same shape.
+/// app-reattach reconcile, a directly observed pane-input-boundary death,
+/// and a death the engine itself observed in tmux — leave the DB, pool,
+/// and audit trail in the same shape.
 /// Returns `false` (with no other effect) if the DB write to mark the
 /// execution orphaned fails.
 async fn reap_dead_execution(

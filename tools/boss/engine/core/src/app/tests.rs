@@ -28,10 +28,7 @@ fn response_envelope(request_id: &str) -> FrontendEventEnvelope {
 fn engine_request_envelope(request_id: &str) -> FrontendEventEnvelope {
     FrontendEventEnvelope::push(FrontendEvent::EngineRequest {
         request_id: request_id.to_owned(),
-        request: EngineToAppRequest::ReleaseWorkerPane(ReleaseWorkerPaneInput {
-            slot_id: 1,
-            kill_grace_seconds: 5,
-        }),
+        request: EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id: 1 }),
     })
 }
 

@@ -131,7 +131,7 @@ async fn shutdown_workers_leaves_tmux_hosted_session_and_shell_intact() {
             .ok()
             .flatten()
             .is_none(),
-        "shutdown must not send DetachWorkerPane or ReleaseWorkerPane for a tmux-hosted worker",
+        "shutdown must not send DetachWorkerPane for a tmux-hosted worker",
     );
     assert_eq!(
         server_state.worker_registry.slot_for_run(&execution_id),
