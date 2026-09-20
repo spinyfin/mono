@@ -1043,18 +1043,30 @@ impl ExecutionCoordinator {
         execution: &WorkExecution,
     ) -> Result<()> {
         // This path resumes an already-held live lease after an engine restart.
-        // It must uphold the same bookmark-before-spawn invariant as dispatch.
+        // A recorded bookmark is still inspected; a missing pointer must not
+        // wedge a live worker.
         let inspection = async {
-            let record = self.work_db.execution_bookmark(&execution.id)?;
-            self.inspect_execution_bookmark(&record).await
+            let Some(record) = self.work_db.execution_bookmark_optional(&execution.id)? else {
+                return Ok(None);
+            };
+            self.inspect_execution_bookmark(&record).await.map(Some)
         }
         .await;
-        if let Err(err) = inspection {
-            crate::execution_bookmark_recovery::report_failure(&self.work_db, execution, &format!("{err:#}"));
-            return Err(err);
+        match inspection {
+            Ok(None) => {
+                self.warn_missing_execution_bookmark(execution, None).await;
+            }
+            Ok(Some(_)) => {
+                self.work_db.resolve_attention_kind_for_execution(
+                    &execution.id,
+                    crate::execution_bookmark_recovery::RECOVERY_FAILED,
+                )?;
+            }
+            Err(err) => {
+                crate::execution_bookmark_recovery::report_failure(&self.work_db, execution, &format!("{err:#}"));
+                return Err(err);
+            }
         }
-        self.work_db
-            .resolve_attention_kind_for_execution(&execution.id, crate::execution_bookmark_recovery::RECOVERY_FAILED)?;
         let lease_id = execution
             .cube_lease_id
             .as_deref()

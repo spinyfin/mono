@@ -714,23 +714,17 @@ async fn resume_pane_spawn_reenters_the_runner_for_a_running_leased_execution() 
         runner.clone(),
     ));
 
-    let err = coordinator
-        .resume_pane_spawn_for_running_execution(&exec)
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("no engine-created recovery bookmark"));
-    assert!(runner.calls.lock().await.is_empty());
-    assert!(
-        db.list_attention_items(&exec.id)
-            .unwrap()
-            .iter()
-            .any(|a| a.kind == crate::execution_bookmark_recovery::RECOVERY_FAILED)
-    );
-    let _bookmark_store = crate::test_support::seed_empty_execution_bookmark(&db, &exec.id).await;
     coordinator
         .resume_pane_spawn_for_running_execution(&exec)
         .await
-        .expect("resume must accept a running leased execution with its recorded bookmark");
+        .expect("a missing recovery bookmark must not wedge a live worker");
+    assert!(
+        !db.list_attention_items(&exec.id)
+            .unwrap()
+            .iter()
+            .any(|a| a.kind == crate::execution_bookmark_recovery::RECOVERY_FAILED),
+        "missing bookmark on resume is loud in logs, not an attention failure"
+    );
 
     let mut saw_call = false;
     for _ in 0..100 {
@@ -749,4 +743,55 @@ async fn resume_pane_spawn_reenters_the_runner_for_a_running_leased_execution() 
         Some("lease-stranded"),
         "resume must keep the already-adopted lease"
     );
+}
+
+#[tokio::test]
+async fn resume_pane_spawn_still_reenters_when_the_bookmark_is_present() {
+    let (_dir, db) = open_db_arc();
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let chore = create_test_chore_manual(&db, product.id.clone(), "stranded-with-bookmark");
+    db.reconcile_product_executions(&product.id).unwrap();
+    db.request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    let exec = db.list_executions(Some(&chore.id)).unwrap().into_iter().next().unwrap();
+    let (exec, _run) = db
+        .start_execution_run(
+            &exec.id,
+            "worker-1",
+            "mono",
+            "lease-stranded",
+            "ws-stranded",
+            "/tmp/ws-stranded",
+        )
+        .unwrap();
+    let _bookmark_store = crate::test_support::seed_empty_execution_bookmark(&db, &exec.id).await;
+
+    let runner = Arc::new(FakeExecutionRunner {
+        slot_id: Some(1),
+        ..FakeExecutionRunner::default()
+    });
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(2),
+        Arc::new(FakeCubeClient::default()),
+        runner.clone(),
+    ));
+
+    coordinator
+        .resume_pane_spawn_for_running_execution(&exec)
+        .await
+        .expect("resume must accept a running leased execution with its recorded bookmark");
+
+    let mut saw_call = false;
+    for _ in 0..100 {
+        let calls = runner.calls.lock().await;
+        if calls.iter().any(|(_, id, _, _)| id == &exec.id) {
+            saw_call = true;
+            break;
+        }
+        drop(calls);
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert!(saw_call, "the runner must be invoked for the already-running execution");
 }

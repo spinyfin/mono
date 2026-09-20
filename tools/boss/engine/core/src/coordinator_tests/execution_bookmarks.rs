@@ -127,6 +127,9 @@ async fn sweep_reports_real_unpushed_revisions_independent_of_original_workspace
     }
 }
 
+/// The abandoned-bookmark sweep is the loudness path that still fails a
+/// missing pointer: dispatch and resume must not, but the sweep still
+/// raises `execution_bookmark_recovery_failed` attention.
 #[tokio::test]
 async fn missing_pointer_is_reported_instead_of_skipped_by_the_sweep() {
     let dir = tempdir().unwrap();
