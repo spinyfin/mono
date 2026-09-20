@@ -163,32 +163,95 @@ async fn blocked_revision_retry_ignores_old_workspace_markers() {
 }
 
 #[tokio::test]
-async fn blocked_recovery_missing_bookmark_fails_even_when_cube_claims_recovery() {
+async fn blocked_recovery_missing_bookmark_yields_none_and_dispatch_proceeds() {
     for dirty_verified in [None, Some(false), Some(true)] {
         let dir = tempdir().unwrap();
         let (db, prior, next) = blocked_pair(&dir.path().join("boss.db"));
-        let coordinator = Arc::new(ExecutionCoordinator::new(
-            db,
-            WorkerPool::new(1),
-            Arc::new(FakeCubeClient::default()),
-            Arc::new(FakeExecutionRunner::default()),
-        ));
+        let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(
+                db,
+                WorkerPool::new(1),
+                Arc::new(FakeCubeClient::default()),
+                Arc::new(FakeExecutionRunner::default()),
+            )
+            .with_dispatch_events(recording.clone()),
+        );
         let lease = CubeWorkspaceLease {
             lease_id: "lease-new".into(),
             workspace_id: "workspace-old".into(),
             workspace_path: dir.path().to_path_buf(),
             dirty_verified,
         };
-        let err = coordinator
+        let recovered = coordinator
             .recover_execution_bookmark(&next, &lease, &coordinator.host_adapter)
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains(&prior.id), "{err:#}");
-        assert!(
-            err.to_string().contains("no engine-created recovery bookmark"),
-            "{err:#}"
-        );
+            .unwrap();
+        assert_eq!(recovered, None, "missing predecessor bookmark is nothing to recover");
+        let events = recording.events_for(&next.id).await;
+        let skipped = events
+            .iter()
+            .find(|e| e.stage == "workspace_recovery")
+            .expect("missing bookmark must still emit a workspace_recovery event");
+        assert_eq!(skipped.outcome, "skipped");
+        assert_eq!(skipped.details["reason"], "missing_bookmark");
+        assert_eq!(skipped.details["predecessor"], prior.id);
     }
+}
+
+#[tokio::test]
+async fn missing_predecessor_bookmark_dispatches_into_a_clean_workspace() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("boss.db");
+    let (db, prior, next) = blocked_pair(&path);
+    seed_local_claude_driver(&db);
+    use boss_engine_test_git::jj::JjRepo;
+    let repo = JjRepo::new(dir.path());
+    std::fs::write(repo.worker.join("revision.txt"), "unpushed revision").unwrap();
+    JjRepo::run(&repo.worker, &["status"]);
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let cube = Arc::new(FakeCubeClient {
+        workspace_root: Some(dir.path().to_path_buf()),
+        next_workspace_id: Mutex::new(Some("replacement".into())),
+        real_bookmarks: true,
+        ..FakeCubeClient::default()
+    });
+    let runner = Arc::new(FakeExecutionRunner {
+        pending: true,
+        ..FakeExecutionRunner::default()
+    });
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner)
+            .with_dispatch_events(recording.clone()),
+    );
+    let worker = coordinator
+        .pool_for_execution(&next)
+        .claim_worker(&next.id, None)
+        .await
+        .unwrap();
+    coordinator
+        .schedule_execution(&next, &worker, DispatchAdmission::Queued)
+        .await
+        .unwrap();
+    assert_ne!(
+        cube.lease_calls.lock().await[0].2.clone().unwrap_or_default(),
+        "workspace-old",
+        "missing bookmark must not pin the predecessor workspace"
+    );
+    assert!(cube.lease_calls.lock().await[0].2.is_none());
+    assert!(!repo.replacement.join("revision.txt").exists());
+    assert_eq!(db.bookmark_recovery(&next.id).unwrap(), None);
+    assert_eq!(
+        db.execution_bookmark(&next.id).unwrap().head(),
+        format!("boss-recovery/{}", next.id)
+    );
+    let events = recording.events_for(&next.id).await;
+    let skipped = events
+        .iter()
+        .find(|e| e.stage == "workspace_recovery")
+        .expect("dispatch must record the skipped recovery");
+    assert_eq!(skipped.outcome, "skipped");
+    assert_eq!(skipped.details["predecessor"], prior.id);
 }
 
 #[tokio::test]
