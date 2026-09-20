@@ -225,9 +225,26 @@ final class GhosttyTerminalHostView: NSView {
             session.statusMessage = nil
             session.attach(hostView: self)
             if case .worker(let slotId) = session.role, session.id.hasPrefix("run-") {
-                SpawnDiagnosticsLog.shared.surfaceAttached(
-                    runId: String(session.id.dropFirst(4)), slotId: slotId, shellPid: foregroundPid
-                )
+                let runId = String(session.id.dropFirst(4))
+                let pid = foregroundPid
+                if pid > 0 {
+                    SpawnDiagnosticsLog.shared.surfaceAttached(
+                        runId: runId, slotId: slotId, shellPid: pid
+                    )
+                } else {
+                    // The tmux client may not have called tcsetpgrp yet;
+                    // re-read after a short delay so a healthy attach is
+                    // not recorded as shell_pid 0.
+                    Task { @MainActor [weak self] in
+                        try? await Task.sleep(nanoseconds: 250_000_000)
+                        guard let self, self.surface != nil, !self.session.isReleased else { return }
+                        let retryPid = self.foregroundPid
+                        guard retryPid > 0 else { return }
+                        SpawnDiagnosticsLog.shared.surfaceAttached(
+                            runId: runId, slotId: slotId, shellPid: retryPid
+                        )
+                    }
+                }
             }
             // Register with the event-loop diagnostics so the 1 Hz sampler can
             // probe this pane's pty/EOF/pid liveness (idempotent; safe across
