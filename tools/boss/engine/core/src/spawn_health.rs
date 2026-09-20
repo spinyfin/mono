@@ -74,10 +74,10 @@
 //! spawn path works again and auto-resumes dispatch
 //! ([`resume_dispatch_after_breaker_recovery`]); a reap of the canary
 //! (spawn-ack timeout) backs off exponentially before the next attempt.
-//! Dispatch also auto-resumes on a fresh app session registering — an app
-//! relaunch is the operator's natural recovery action after e.g. waking the
-//! display, so it clears the breaker exactly like a proven tmux pane pid
-//! would. This recovery machinery is
+//! Dispatch also auto-resumes when a fresh app session registers, including
+//! after an app relaunch (e.g. following the display waking); this clears
+//! the breaker exactly like a proven tmux pane pid would. This recovery
+//! machinery is
 //! self-gating: it only ever activates on top of a real Breaker-origin
 //! pause, and a real pause only happens when the flag is enabled, so no
 //! separate flag check is needed inside it.
@@ -834,9 +834,8 @@ pub async fn maybe_admit_recovery_probe(
 
 /// Auto-resume dispatch after Breaker-origin evidence that the app's spawn
 /// path is healthy again — either the half-open recovery probe's canary
-/// reported a real shell pid, or a fresh app session registered (the
-/// operator's natural recovery action, e.g. relaunching the app after
-/// waking the display).
+/// reported a real shell pid, or a fresh app session registered, including
+/// after an app relaunch (e.g. following the display waking).
 ///
 /// No-ops when dispatch isn't currently paused, and — critically — when the
 /// current pause is [`DispatchPauseOrigin::Operator`]: a human pause stays
