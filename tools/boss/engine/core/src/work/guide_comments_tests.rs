@@ -100,6 +100,36 @@ fn guide_comment_context_survives_regeneration_resolution_and_reopen() {
 }
 
 #[test]
+fn terminal_aged_published_guide_without_comments_is_collected() {
+    let (dir, db) = open_db();
+    let root = create_active_chore(&db, &create_product(&db), "uncommented guide retention");
+    let (series, comparison) = seed_review_guide_series(&db, &root);
+    let version = publish(&db, &series, &comparison);
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET status = 'done' WHERE id = ?1", [&root])
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute("UPDATE pr_review_guide_source_comparisons SET captured_at = '1'", [])
+        .unwrap();
+    db.gc_unreferenced_pr_review_guide_source_artifacts().unwrap();
+    assert!(db.get_pr_review_guide_version(&version.id).unwrap().is_none());
+    assert!(db.get_pr_review_guide_comparison_by_id(&comparison).unwrap().is_none());
+    assert!(db.get_latest_pr_review_guide_source_capture(&root).unwrap().is_none());
+    let leftover = std::fs::read_dir(dir.path().join("review-guide-sources")).map(|entries| {
+        entries
+            .flatten()
+            .filter_map(|shard| std::fs::read_dir(shard.path()).ok())
+            .flatten()
+            .flatten()
+            .filter(|file| !file.file_name().to_string_lossy().ends_with(".tmp"))
+            .count()
+    });
+    assert_eq!(leftover.unwrap_or(0), 0);
+}
+
+#[test]
 fn create_and_resolve_reject_missing_or_cross_series_version() {
     let (_dir, db) = open_db();
     let root = create_active_chore(&db, &create_product(&db), "guide validation");

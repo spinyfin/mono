@@ -5,7 +5,7 @@ use boss_protocol::GuideCommentContext;
 #[cfg(test)]
 #[path = "guide_comments_tests.rs"]
 mod tests;
-use crate::comments_anchor::{AnchorResolution, CommentFuzzyConfig, resolve_anchor};
+use crate::comments_anchor::{CommentFuzzyConfig, resolve_anchor};
 
 pub(crate) fn migrate_guide_comments(conn: &Connection) -> Result<()> {
     for (column, definition) in [
@@ -90,26 +90,7 @@ impl WorkDb {
                     .is_some_and(|c| c.version_id == version_id)
             })
             .map(|comment| {
-                let resolution = match resolve_anchor(plain_text, &comment.anchor, config) {
-                    AnchorResolution::Exact { start, length } => CommentResolution {
-                        kind: RESOLVED_WITH_EXACT.into(),
-                        start: Some(start as i64),
-                        length: Some(length as i64),
-                        score: None,
-                    },
-                    AnchorResolution::Fuzzy { start, length, score } => CommentResolution {
-                        kind: RESOLVED_WITH_FUZZY.into(),
-                        start: Some(start as i64),
-                        length: Some(length as i64),
-                        score: Some(score),
-                    },
-                    AnchorResolution::Orphan(_) => CommentResolution {
-                        kind: RESOLVED_WITH_ORPHAN.into(),
-                        start: None,
-                        length: None,
-                        score: None,
-                    },
-                };
+                let resolution = super::comments::wire_resolution(resolve_anchor(plain_text, &comment.anchor, config));
                 ResolvedComment { comment, resolution }
             })
             .collect())

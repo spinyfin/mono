@@ -116,6 +116,31 @@ const COMMENT_INSERT_SQL: &str = "INSERT INTO work_comments \
       dismissed_at) \
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)";
 
+/// Shared wire shape for an [`AnchorResolution`]. Guide display-resolution
+/// and the mutating `resolve_comments` path must stay in lockstep.
+pub(super) fn wire_resolution(resolution: AnchorResolution) -> CommentResolution {
+    match resolution {
+        AnchorResolution::Exact { start, length } => CommentResolution {
+            kind: RESOLVED_WITH_EXACT.to_owned(),
+            start: Some(start as i64),
+            length: Some(length as i64),
+            score: None,
+        },
+        AnchorResolution::Fuzzy { start, length, score } => CommentResolution {
+            kind: RESOLVED_WITH_FUZZY.to_owned(),
+            start: Some(start as i64),
+            length: Some(length as i64),
+            score: Some(score),
+        },
+        AnchorResolution::Orphan(_) => CommentResolution {
+            kind: RESOLVED_WITH_ORPHAN.to_owned(),
+            start: None,
+            length: None,
+            score: None,
+        },
+    }
+}
+
 impl WorkDb {
     /// Create an `active` comment. Returns the inserted row.
     pub fn create_comment(&self, input: CreateCommentInput) -> Result<WorkComment> {
@@ -827,8 +852,8 @@ impl WorkDb {
             }
             let was_orphaned = comment.status == COMMENT_STATUS_ORPHANED;
             let resolution = resolve_anchor(plain_text, &comment.anchor, config);
-            let wire = match resolution {
-                AnchorResolution::Exact { start, length } => {
+            match resolution {
+                AnchorResolution::Exact { .. } => {
                     tx.execute(
                         "UPDATE work_comments
                          SET status = 'active', last_resolved_with = ?2, updated_at = ?3
@@ -838,14 +863,8 @@ impl WorkDb {
                     comment.status = COMMENT_STATUS_ACTIVE.to_owned();
                     comment.last_resolved_with = Some(RESOLVED_WITH_EXACT.to_owned());
                     comment.updated_at = now.clone();
-                    CommentResolution {
-                        kind: RESOLVED_WITH_EXACT.to_owned(),
-                        start: Some(start as i64),
-                        length: Some(length as i64),
-                        score: None,
-                    }
                 }
-                AnchorResolution::Fuzzy { start, length, score } => {
+                AnchorResolution::Fuzzy { start, length, .. } => {
                     let new_anchor = extract_anchor(plain_text, start, length);
                     let anchor_json = serde_json::to_string(&new_anchor)?;
                     tx.execute(
@@ -866,12 +885,6 @@ impl WorkDb {
                     comment.last_resolved_with = Some(RESOLVED_WITH_FUZZY.to_owned());
                     comment.plain_text_projection_version = plain_text_projection_version;
                     comment.updated_at = now.clone();
-                    CommentResolution {
-                        kind: RESOLVED_WITH_FUZZY.to_owned(),
-                        start: Some(start as i64),
-                        length: Some(length as i64),
-                        score: Some(score),
-                    }
                 }
                 AnchorResolution::Orphan(reason) => {
                     tx.execute(
@@ -886,14 +899,9 @@ impl WorkDb {
                     comment.status = COMMENT_STATUS_ORPHANED.to_owned();
                     comment.last_resolved_with = Some(RESOLVED_WITH_ORPHAN.to_owned());
                     comment.updated_at = now.clone();
-                    CommentResolution {
-                        kind: RESOLVED_WITH_ORPHAN.to_owned(),
-                        start: None,
-                        length: None,
-                        score: None,
-                    }
                 }
             };
+            let wire = wire_resolution(resolution);
             out.push(ResolvedComment {
                 comment,
                 resolution: wire,

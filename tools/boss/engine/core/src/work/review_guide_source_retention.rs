@@ -41,8 +41,51 @@ pub(super) fn packet_store_lock(root: &Path, exclusive: bool) -> Result<Option<f
 impl WorkDb {
     pub(super) fn prune_pr_review_guide_sources(&self, policy: SourceRetentionPolicy) -> Result<()> {
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let cutoff = now - policy.terminal_age_seconds;
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Terminal, aged series: drop published guide versions that no
+        // `work_comments` row still cites, then their attempts, so the
+        // comparison DELETE below can reclaim the packet blob. Versions that
+        // still have comments keep the comparison (RESTRICT) and therefore
+        // the on-disk packet. Active series are untouched here.
+        tx.execute(
+            "UPDATE pr_review_guide_source_series SET readable_version_id = NULL
+             WHERE readable_version_id IN (
+                SELECT v.id FROM pr_review_guide_versions v
+                JOIN pr_review_guide_source_comparisons c ON c.id = v.comparison_id
+                JOIN pr_review_guide_source_series s ON s.id = v.series_id
+                LEFT JOIN tasks t ON t.id = s.root_task_id
+                WHERE (t.id IS NULL OR t.deleted_at IS NOT NULL OR t.status IN ('done', 'archived'))
+                  AND CAST(c.captured_at AS INTEGER) < ?1
+                  AND NOT EXISTS (SELECT 1 FROM work_comments w WHERE w.guide_version_id = v.id)
+             )",
+            [cutoff],
+        )?;
+        tx.execute(
+            "DELETE FROM pr_review_guide_versions WHERE id IN (
+                SELECT v.id FROM pr_review_guide_versions v
+                JOIN pr_review_guide_source_comparisons c ON c.id = v.comparison_id
+                JOIN pr_review_guide_source_series s ON s.id = v.series_id
+                LEFT JOIN tasks t ON t.id = s.root_task_id
+                WHERE (t.id IS NULL OR t.deleted_at IS NOT NULL OR t.status IN ('done', 'archived'))
+                  AND CAST(c.captured_at AS INTEGER) < ?1
+                  AND NOT EXISTS (SELECT 1 FROM work_comments w WHERE w.guide_version_id = v.id)
+            )",
+            [cutoff],
+        )?;
+        tx.execute(
+            "DELETE FROM pr_review_guide_attempts WHERE id IN (
+                SELECT a.id FROM pr_review_guide_attempts a
+                JOIN pr_review_guide_source_comparisons c ON c.id = a.comparison_id
+                JOIN pr_review_guide_source_series s ON s.id = a.series_id
+                LEFT JOIN tasks t ON t.id = s.root_task_id
+                WHERE (t.id IS NULL OR t.deleted_at IS NOT NULL OR t.status IN ('done', 'archived'))
+                  AND CAST(c.captured_at AS INTEGER) < ?1
+                  AND NOT EXISTS (SELECT 1 FROM pr_review_guide_versions v WHERE v.attempt_id = a.id)
+            )",
+            [cutoff],
+        )?;
         // Expire old evidence only for closed/deleted roots. Active series keep
         // their selection plus the most recent comparisons, regardless of age.
         tx.execute(
@@ -54,7 +97,7 @@ impl WorkDb {
                   AND CAST(c.captured_at AS INTEGER) < ?1
                   AND NOT EXISTS (SELECT 1 FROM pr_review_guide_versions v WHERE v.comparison_id = c.id)
             )",
-            [now - policy.terminal_age_seconds],
+            [cutoff],
         )?;
         tx.execute(
             "DELETE FROM pr_review_guide_source_comparisons WHERE id IN (

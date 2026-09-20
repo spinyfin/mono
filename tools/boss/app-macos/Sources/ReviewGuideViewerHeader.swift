@@ -57,6 +57,7 @@ struct ReviewGuideViewerHeader: View {
                         if drafts.byVersion[versionId]?.seriesId == artifact?.id,
                            versionId != artifact?.guideVersionId {
                             Button("Resume draft on original guide") {
+                                drafts.pendingResumeVersionId = versionId
                                 chatModel.openReviewGuide(versionId: versionId, rootTaskId: rootTaskId)
                             }
                             .controlSize(.small)

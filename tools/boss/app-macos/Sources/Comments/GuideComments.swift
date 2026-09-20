@@ -13,6 +13,15 @@ struct GuideCommentDraft: Equatable {
 final class GuideCommentDrafts: ObservableObject {
     static let shared = GuideCommentDrafts()
     @Published var byVersion: [String: GuideCommentDraft] = [:]
+    /// Set by "Resume draft on original guide" before that version is open.
+    /// The comment layer consumes it on appear and opens the draft popover.
+    var pendingResumeVersionId: String?
+
+    func takePendingResume(for versionId: String?) -> Bool {
+        guard let versionId, pendingResumeVersionId == versionId else { return false }
+        pendingResumeVersionId = nil
+        return true
+    }
 }
 
 extension CommentLayer {
@@ -21,7 +30,7 @@ extension CommentLayer {
     }
 
     func saveGuideDraft(body: String) {
-        guard let guideVersionId, !pendingQuotedText.isEmpty else { return }
+        guard let guideVersionId else { return }
         guard !body.isEmpty else { discardGuideDraft(); return }
         GuideCommentDrafts.shared.byVersion[guideVersionId] = GuideCommentDraft(
             seriesId: artifactId, quote: pendingQuotedText, occurrenceIndex: pendingOccurrenceIndex, body: body)

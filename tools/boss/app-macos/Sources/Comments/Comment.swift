@@ -33,7 +33,7 @@ enum CommentIntent: String, CaseIterable, Equatable {
 /// `answering`/`answered`/`awaitingFollowup` drive the bucket-2 thread's
 /// thinking indicator and follow-up composer; `orphaned` (anchor lost) and
 /// `dismissed` are terminal states the sidebar surfaces distinctly. The full
-/// set is mirrored (P529 Phase-2 scope item 6) so a comment loaded from the
+/// set is mirrored so a comment loaded from the
 /// engine in any state round-trips without falling through to a default.
 enum CommentStatus: String, Equatable {
     case active
@@ -102,7 +102,7 @@ struct CommentAnchor: Codable, Equatable, Sendable {
     }
 }
 
-/// A comment attached to a markdown viewer. Since P529 Phase 2 comments are
+/// A comment attached to a markdown viewer. Comments are
 /// engine-backed: `id` is the engine's `work_comments.id` (`cmt_…`) for a
 /// persisted comment, or a `local:` sentinel for an optimistic in-memory
 /// comment on an artifact-less viewer. Anchoring is W3C `{exact, prefix,

@@ -20,7 +20,7 @@ struct CommentPopover: View {
 
     init(layer: CommentLayer) {
         _layer = ObservedObject(wrappedValue: layer)
-        isResumingDraft = layer.guideDraft != nil
+        isResumingDraft = layer.pendingResumeDraft
         // Seed from any typeahead already buffered before the first frame so
         // `CommentTextEditor.makeNSView` / `updateNSView` see the character(s)
         // immediately instead of starting empty and racing a later onAppear.

@@ -93,7 +93,7 @@ struct CommentSidebar: View {
                     .accessibilityIdentifier("comment-sidebar-collapse")
                 }
             }
-            // Soft-dismiss "show resolved" toggle (P529 Phase 2). Only meaningful
+            // Soft-dismiss "show resolved" toggle. Only meaningful
             // on an engine-backed viewer, where resolved comments are retained.
             if layer.isEngineBacked {
                 Toggle("Show resolved", isOn: $layer.showResolved)
@@ -108,7 +108,11 @@ struct CommentSidebar: View {
 
     private var addCommentRow: some View {
         Button {
-            layer.requestNewComment()
+            if layer.guideDraft != nil {
+                layer.resumeGuideDraft()
+            } else {
+                layer.requestNewComment()
+            }
         } label: {
             Label(layer.guideDraft == nil ? "Add Comment" : "Resume draft", systemImage: "plus.bubble")
                 .font(.callout)

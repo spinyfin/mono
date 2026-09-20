@@ -71,6 +71,65 @@ final class GuideCommentTests: XCTestCase {
         XCTAssertNil(original.guideDraft)
     }
 
+    func testRequestNewCommentPrefersLiveSelectionOverSavedDraft() {
+        let backend = GuideCommentBackend()
+        let layer = CommentLayer()
+        layer.configure(source: "Original quote then Different quote", baseURL: nil,
+                        artifact: .reviewGuide(seriesID: "series", versionID: "draft-sel"), backend: backend)
+        defer { layer.discardGuideDraft() }
+        layer.pendingQuotedText = "Original quote"
+        layer.pendingOccurrenceIndex = 0
+        layer.saveGuideDraft(body: "Unsaved feedback")
+        layer.testingLiveSelection = "Different quote"
+        layer.requestNewComment()
+        XCTAssertEqual(layer.pendingQuotedText, "Different quote")
+        XCTAssertFalse(layer.pendingResumeDraft)
+        XCTAssertEqual(layer.guideDraft?.quote, "Original quote")
+        XCTAssertEqual(layer.guideDraft?.body, "Unsaved feedback")
+    }
+
+    func testResumeGuideDraftIgnoresLiveSelection() {
+        let backend = GuideCommentBackend()
+        let layer = CommentLayer()
+        layer.configure(source: "Original quote then Different quote", baseURL: nil,
+                        artifact: .reviewGuide(seriesID: "series", versionID: "draft-resume"), backend: backend)
+        defer { layer.discardGuideDraft() }
+        layer.pendingQuotedText = "Original quote"
+        layer.pendingOccurrenceIndex = 2
+        layer.saveGuideDraft(body: "Unsaved feedback")
+        layer.testingLiveSelection = "Different quote"
+        layer.resumeGuideDraft()
+        XCTAssertEqual(layer.pendingQuotedText, "Original quote")
+        XCTAssertEqual(layer.pendingOccurrenceIndex, 2)
+        XCTAssertEqual(layer.pendingTypeahead, "Unsaved feedback")
+        XCTAssertTrue(layer.pendingResumeDraft)
+    }
+
+    func testEmptyQuoteDraftSurvivesViewerReplacementOnOriginalVersion() {
+        let backend = GuideCommentBackend()
+        let old = CommentLayer()
+        old.configure(source: "Guide prose", baseURL: nil,
+                      artifact: .reviewGuide(seriesID: "series", versionID: "empty-quote-old"), backend: backend)
+        defer { old.discardGuideDraft() }
+        old.pendingQuotedText = ""
+        old.pendingOccurrenceIndex = 0
+        old.saveGuideDraft(body: "General feedback")
+        old.reload()
+        old.unbindFromEngine()
+        let replacement = CommentLayer()
+        replacement.configure(source: "New prose", baseURL: nil,
+                              artifact: .reviewGuide(seriesID: "series", versionID: "empty-quote-new"), backend: backend)
+        XCTAssertNil(replacement.guideDraft)
+        let original = CommentLayer()
+        original.configure(source: "Guide prose", baseURL: nil,
+                           artifact: .reviewGuide(seriesID: "series", versionID: "empty-quote-old"), backend: backend)
+        XCTAssertEqual(original.guideDraft?.body, "General feedback")
+        XCTAssertEqual(original.guideDraft?.quote, "")
+        XCTAssertEqual(original.guideDraft?.occurrenceIndex, 0)
+        original.cancelNewComment()
+        XCTAssertNil(original.guideDraft)
+    }
+
     private func wireComment(id: String, version: String) -> CommentWithThread {
         CommentWithThread(comment: WorkComment(
             id: id, artifactId: "series", anchor: CommentAnchor(exact: "Same quote"),

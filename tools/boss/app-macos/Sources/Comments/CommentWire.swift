@@ -5,7 +5,7 @@ import Textual
 /// Swift Codable mirrors of the engine's comment wire types
 /// (`boss-protocol` `tools/boss/protocol/src/types.rs` + `wire.rs`) plus the
 /// small helpers the renderer needs to speak the `comments_*` protocol. This
-/// is the P529 Phase-2 half PR #915 deferred: the engine ships the RPCs; this
+/// is the client half PR #915 deferred: the engine ships the RPCs; this
 /// is the macOS side that finally calls them.
 ///
 /// The engine serialises every field under its verbatim `snake_case` Rust name

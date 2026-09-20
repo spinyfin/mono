@@ -290,21 +290,57 @@ final class CommentLayer: NSObject, ObservableObject {
 
     // MARK: - Authoring
 
+    /// Unit-test seam for `requestNewComment`. When set, it is the live
+    /// selection instead of a pasteboard copy. `nil` uses the real selection.
+    var testingLiveSelection: String?
+
+    /// True while the open (or about-to-open) popover is restoring a saved
+    /// guide draft rather than starting a new comment on the live selection.
+    private(set) var pendingResumeDraft = false
+
     func requestNewComment(firstChar: Character? = nil) {
-        let draft = guideDraft
-        pendingQuotedText = draft?.quote ?? captureCurrentSelection() ?? ""
-        pendingOccurrenceIndex = draft?.occurrenceIndex ?? computeOccurrenceIndex(for: pendingQuotedText)
-        // Seed typeahead with the key that opened the form (if any). Further
-        // keystrokes during the show-animation dead window append here (or insert
-        // directly into the text view once it exists) so nothing is dropped.
-        pendingTypeahead = draft?.body ?? firstChar.map { String($0) } ?? ""
+        // A live selection always starts a new comment, even when a draft
+        // exists for this version. Resume is an explicit action.
+        if let live = captureCurrentSelection(), !live.isEmpty {
+            pendingQuotedText = live
+            pendingOccurrenceIndex = computeOccurrenceIndex(for: live)
+            pendingTypeahead = firstChar.map { String($0) } ?? ""
+            pendingResumeDraft = false
+        } else if let draft = guideDraft {
+            applyGuideDraft(draft)
+        } else {
+            pendingQuotedText = ""
+            pendingOccurrenceIndex = 0
+            pendingTypeahead = firstChar.map { String($0) } ?? ""
+            pendingResumeDraft = false
+        }
+        presentCommentPopover()
+    }
+
+    /// Reopen the saved draft for this guide version, ignoring any live
+    /// selection. Used by the sidebar "Resume draft" control and by the
+    /// header's "Resume draft on original guide" path after that version
+    /// is on screen.
+    func resumeGuideDraft() {
+        guard let draft = guideDraft else { return }
+        applyGuideDraft(draft)
+        presentCommentPopover()
+    }
+
+    private func applyGuideDraft(_ draft: GuideCommentDraft) {
+        pendingQuotedText = draft.quote
+        pendingOccurrenceIndex = draft.occurrenceIndex
+        pendingTypeahead = draft.body
+        pendingResumeDraft = true
+    }
+
+    private func presentCommentPopover() {
         commentTextView = nil
         needsCommentTextFocus = true
 
         guard let (posRect, posView) = resolveAnchor() else {
             anchorLog.error("requestNewComment: resolveAnchor returned nil — popover not shown")
             needsCommentTextFocus = false
-            pendingTypeahead = ""
             return
         }
 
@@ -433,6 +469,7 @@ final class CommentLayer: NSObject, ObservableObject {
         pendingQuotedText = ""
         pendingOccurrenceIndex = 0
         pendingTypeahead = ""
+        pendingResumeDraft = false
         needsCommentTextFocus = false
         commentTextView = nil
     }
@@ -995,6 +1032,7 @@ final class CommentLayer: NSObject, ObservableObject {
     /// Reads the selection via pasteboard copy. Acceptable Phase 1 trade-off:
     /// called only when the user explicitly opens the comment form.
     private func captureCurrentSelection() -> String? {
+        if let testingLiveSelection { return testingLiveSelection }
         let before = NSPasteboard.general.changeCount
         NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil)
         guard NSPasteboard.general.changeCount != before else { return nil }
@@ -1171,6 +1209,7 @@ extension CommentLayer: NSPopoverDelegate {
             self.pendingTypeahead = ""
             self.pendingQuotedText = ""
             self.pendingOccurrenceIndex = 0
+            self.pendingResumeDraft = false
             self.needsCommentTextFocus = false
             self.activePopover = nil
             self.commentTextView = nil
@@ -1331,7 +1370,12 @@ struct WithCommentsModifier: ViewModifier {
         .onAppear {
             layer.openOriginalGuide = openOriginalGuide
             layer.configure(source: source, baseURL: baseURL, artifact: artifact, backend: commentBackend)
-            if layer.guideDraft != nil { sidebarExpanded = true }
+            if GuideCommentDrafts.shared.takePendingResume(for: layer.guideVersionId) {
+                sidebarExpanded = true
+                layer.resumeGuideDraft()
+            } else if layer.guideDraft != nil {
+                sidebarExpanded = true
+            }
             layer.installMonitors()
         }
         .onChange(of: source) { _, newSource in
