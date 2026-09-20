@@ -21,6 +21,27 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
         let session = model.slots.first(where: { $0.slotId == 1 })?.session
         XCTAssertEqual(session?.launchSpec.initialInput, "exec tmux -S '/state/boss/tmux.sock' attach-session -t 'boss-1-run-tmux'\n")
         XCTAssertTrue(session?.launchSpec.env.isEmpty ?? false)
+
+        let launch = EngineSpawnRequest(attaching: EngineAttachRequest(
+            runId: "run-tmux",
+            slotId: 1,
+            sessionName: "boss-1-run-tmux",
+            tmuxSocketPath: "/state/boss/tmux.sock",
+            summary: nil,
+            taskTitle: nil
+        ))
+        let extra = SpawnDiagnosticsLog.spawnRequestedExtra(
+            slotId: Int(launch.slotId),
+            sessionName: launch.sessionName,
+            tmuxSocketPath: launch.tmuxSocketPath
+        )
+        XCTAssertEqual(extra["session_name"] as? String, "boss-1-run-tmux")
+        XCTAssertEqual(extra["tmux_socket_path"] as? String, "/state/boss/tmux.sock")
+        XCTAssertNil(extra["workspace_path"])
+        XCTAssertFalse(
+            extra.values.contains { ($0 as? String) == FileManager.default.homeDirectoryForCurrentUser.path },
+            "attachWorkerPane must not write the user's home into spawn_requested"
+        )
     }
 
     func testDetachUnknownSlotReturnsUnknownSlot() {

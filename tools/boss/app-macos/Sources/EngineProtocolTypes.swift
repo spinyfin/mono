@@ -4,6 +4,10 @@ import Foundation
 /// `attachWorkerPane` builds this from an `EngineAttachRequest`.
 struct EngineSpawnRequest: Sendable {
     let runId: String
+    /// Working directory of the local tmux *client* process (typically
+    /// the user's home). This is not the worker workspace — AttachWorkerPane
+    /// does not carry that path, and spawn diagnostics must not report it
+    /// as `workspace_path`.
     let workspacePath: String
     /// 1-indexed slot the engine has claimed for this worker. The
     /// app must host the pane in this exact slot or fail with
@@ -27,6 +31,13 @@ struct EngineSpawnRequest: Sendable {
     /// Viewer screen-scrape markers. The attach path always supplies
     /// .claudeDefault; these markers are not supplied over the attach RPC.
     let paneMonitor: PaneMonitorSpec?
+    /// Detached tmux session the viewer attaches to. Recorded on
+    /// `spawn_requested` so the JSONL identifies the worker without a
+    /// workspace path.
+    let sessionName: String
+    /// Absolute tmux `-S` socket path from the attach RPC. Recorded on
+    /// `spawn_requested` alongside `sessionName`.
+    let tmuxSocketPath: String
 }
 
 /// Shared failure type for `AttachWorkerPane` and `AttachCoordinatorPane`.

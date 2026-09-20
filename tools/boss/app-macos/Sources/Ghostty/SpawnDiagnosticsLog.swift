@@ -38,13 +38,26 @@ final class SpawnDiagnosticsLog: @unchecked Sendable {
         self.retainDays = retainDays
     }
 
+    /// Extra fields for a `spawn_requested` record. The viewer does not
+    /// know the worker workspace, so this omits `workspace_path` and
+    /// records the tmux identity the attach RPC actually supplies.
+    static func spawnRequestedExtra(slotId: Int, sessionName: String, tmuxSocketPath: String) -> [String: Any] {
+        [
+            "slot_id": slotId,
+            "session_name": sessionName,
+            "tmux_socket_path": tmuxSocketPath,
+        ]
+    }
+
     /// Record an accepted viewer attach request before surface creation.
     /// The historical event tag remains spawn_requested for log readers.
-    func spawnRequested(runId: String, slotId: Int, workspacePath: String) {
+    func spawnRequested(runId: String, slotId: Int, sessionName: String, tmuxSocketPath: String) {
         record(
             event: Self.eventSpawnRequested,
             runId: runId,
-            extra: ["slot_id": slotId, "workspace_path": workspacePath]
+            extra: Self.spawnRequestedExtra(
+                slotId: slotId, sessionName: sessionName, tmuxSocketPath: tmuxSocketPath
+            )
         )
     }
 
@@ -60,6 +73,13 @@ final class SpawnDiagnosticsLog: @unchecked Sendable {
     /// Persist viewer failure context for bossctl logs spawn. This does not
     /// report a worker failure to the engine: the detached tmux worker can
     /// remain healthy while the app cannot create its viewer surface.
+    ///
+    /// Callers must latch this to one record per attach attempt.
+    /// `GhosttyTerminalHostView.attemptSurfaceCreation` retries on
+    /// screen-change and display-wake while a locked or sleeping Mac has
+    /// no active display; logging each retry would bury the later
+    /// `surface_attached` recovery line under a burst of identical
+    /// `surface_failed` records. Per-attempt records are not wanted.
     func surfaceFailed(
         runId: String,
         reason: String,

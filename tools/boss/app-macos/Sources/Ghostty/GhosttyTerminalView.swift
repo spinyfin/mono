@@ -86,6 +86,14 @@ final class GhosttyTerminalHostView: NSView {
     private var screenObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
 
+    /// Set once we have written a `surface_failed` JSONL record for this
+    /// attach attempt. Dedupes retries: `attemptSurfaceCreation` can run
+    /// several times for one viewer (init, `viewDidMoveToWindow`, the
+    /// screen-change and display-wake observers), but one spawn should
+    /// produce one `surface_failed` line. Reset to `false` on a successful
+    /// attach so a later teardown/recreate can record a fresh failure.
+    private var reportedSurfaceCreationFailure = false
+
     /// os_signpost interval state for an in-flight left-button selection
     /// drag (mouseDown→mouseUp), plus the dropped-frame counter that runs
     /// only for that span. See [[UISignpost]] / [[InteractionFrameCounter]]
@@ -211,6 +219,9 @@ final class GhosttyTerminalHostView: NSView {
         case .created(let surface):
             self.surface = surface
             removeScreenObserver()
+            // A surface came up: clear the failure latch so a later teardown
+            // and recreation can record a new `surface_failed`.
+            reportedSurfaceCreationFailure = false
             session.statusMessage = nil
             session.attach(hostView: self)
             if case .worker(let slotId) = session.role, session.id.hasPrefix("run-") {
@@ -226,7 +237,10 @@ final class GhosttyTerminalHostView: NSView {
             reconcilePaneMonitor()
 
         case .failed(let host, let diagnostic):
-            if case .worker = session.role, session.id.hasPrefix("run-") {
+            if case .worker = session.role, session.id.hasPrefix("run-"),
+               !reportedSurfaceCreationFailure
+            {
+                reportedSurfaceCreationFailure = true
                 SpawnDiagnosticsLog.shared.surfaceFailed(
                     runId: String(session.id.dropFirst(4)),
                     reason: Self.surfaceFailureReason(host: host),

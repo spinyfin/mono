@@ -46,7 +46,12 @@ final class SpawnDiagnosticsLogTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dir) }
 
         let log = SpawnDiagnosticsLog(directory: dir.path)
-        log.spawnRequested(runId: "exec-99", slotId: 7, workspacePath: "/tmp/ws")
+        log.spawnRequested(
+            runId: "exec-99",
+            slotId: 7,
+            sessionName: "boss-7-exec-99",
+            tmuxSocketPath: "/state/boss/tmux.sock"
+        )
         log.surfaceFailed(
             runId: "exec-99",
             reason: GhosttyTerminalHostView.surfaceFailureReason(host: .make(activeDisplayCount: 0)),
@@ -79,6 +84,16 @@ final class SpawnDiagnosticsLogTests: XCTestCase {
         }
         XCTAssertTrue(lines[0].contains("\"event\":\"spawn_requested\""))
         XCTAssertTrue(lines[0].contains("\"run_id\":\"exec-99\""))
+        let requested = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(lines[0].utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(requested["session_name"] as? String, "boss-7-exec-99")
+        XCTAssertEqual(requested["tmux_socket_path"] as? String, "/state/boss/tmux.sock")
+        XCTAssertNil(requested["workspace_path"], "viewer attach does not know a workspace")
+        XCTAssertFalse(
+            lines[0].contains(FileManager.default.homeDirectoryForCurrentUser.path),
+            "home directory must not masquerade as workspace_path"
+        )
         XCTAssertTrue(lines[1].contains("\"event\":\"surface_failed\""))
         XCTAssertTrue(lines[1].contains("ghostty_surface_new returned NULL"))
         XCTAssertTrue(lines[1].contains("no active CG displays"))
@@ -92,5 +107,38 @@ final class SpawnDiagnosticsLogTests: XCTestCase {
         // Rejected-input block is durable here (fd 2 is /dev/null in prod).
         XCTAssertTrue(lines[1].contains("\"diagnostic\""), lines[1])
         XCTAssertTrue(lines[1].contains("workingDirectory"), lines[1])
+    }
+
+    func testAttachWorkerPanePathRecordsTmuxIdentityNotHomeDirectory() {
+        // Production attachWorkerPane builds EngineSpawnRequest via
+        // `init(attaching:)` and hostAttachedPane logs spawnRequested
+        // from those fields. Pin that path so a synthesized home
+        // directory cannot silently return as workspace_path.
+        let request = EngineAttachRequest(
+            runId: "run-tmux",
+            slotId: 3,
+            sessionName: "boss-3-run-tmux",
+            tmuxSocketPath: "/state/boss/tmux.sock",
+            summary: nil,
+            taskTitle: nil
+        )
+        let launch = EngineSpawnRequest(attaching: request)
+        XCTAssertEqual(launch.sessionName, request.sessionName)
+        XCTAssertEqual(launch.tmuxSocketPath, request.tmuxSocketPath)
+        XCTAssertEqual(launch.workspacePath, FileManager.default.homeDirectoryForCurrentUser.path)
+
+        let extra = SpawnDiagnosticsLog.spawnRequestedExtra(
+            slotId: Int(launch.slotId),
+            sessionName: launch.sessionName,
+            tmuxSocketPath: launch.tmuxSocketPath
+        )
+        XCTAssertEqual(extra["slot_id"] as? Int, 3)
+        XCTAssertEqual(extra["session_name"] as? String, "boss-3-run-tmux")
+        XCTAssertEqual(extra["tmux_socket_path"] as? String, "/state/boss/tmux.sock")
+        XCTAssertNil(extra["workspace_path"])
+        XCTAssertFalse(
+            extra.values.contains { ($0 as? String) == launch.workspacePath },
+            "tmux client cwd must not appear in spawn_requested extras"
+        )
     }
 }

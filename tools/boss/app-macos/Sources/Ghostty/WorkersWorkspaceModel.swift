@@ -102,16 +102,7 @@ final class WorkersWorkspaceModel: ObservableObject {
         guard !request.tmuxSocketPath.isEmpty, request.tmuxSocketPath.hasPrefix("/") else {
             return .failure(.internalFailure("engine supplied an invalid tmux socket path"))
         }
-        let launch = EngineSpawnRequest(
-            runId: request.runId,
-            workspacePath: FileManager.default.homeDirectoryForCurrentUser.path,
-            slotId: request.slotId,
-            initialInput: "exec tmux -S \(bossShellQuote(request.tmuxSocketPath)) attach-session -t \(bossShellQuote(request.sessionName))\n",
-            env: [],
-            summary: request.summary,
-            taskTitle: request.taskTitle,
-            paneMonitor: .claudeDefault
-        )
+        let launch = EngineSpawnRequest(attaching: request)
         switch hostAttachedPane(launch) {
         case .success:
             return .success
@@ -189,7 +180,10 @@ final class WorkersWorkspaceModel: ObservableObject {
         }
 
         SpawnDiagnosticsLog.shared.spawnRequested(
-            runId: request.runId, slotId: slotId, workspacePath: request.workspacePath
+            runId: request.runId,
+            slotId: slotId,
+            sessionName: request.sessionName,
+            tmuxSocketPath: request.tmuxSocketPath
         )
         return .success(slotId: slotId)
     }
@@ -456,5 +450,28 @@ struct WorkerSlot: Identifiable, Equatable {
             && lhs.taskTitle == rhs.taskTitle
             && lhs.idleFlavorCycle == rhs.idleFlavorCycle
             && lhs.session === rhs.session
+    }
+}
+
+extension EngineSpawnRequest {
+    /// Viewer-launch parameters derived from `AttachWorkerPane`.
+    ///
+    /// `workspacePath` is the tmux client's working directory (the current
+    /// user's home), not the worker workspace — the attach RPC does not
+    /// carry that path. Spawn diagnostics must record `sessionName` and
+    /// `tmuxSocketPath` instead of treating this directory as `workspace_path`.
+    init(attaching request: EngineAttachRequest) {
+        self.init(
+            runId: request.runId,
+            workspacePath: FileManager.default.homeDirectoryForCurrentUser.path,
+            slotId: request.slotId,
+            initialInput: "exec tmux -S \(bossShellQuote(request.tmuxSocketPath)) attach-session -t \(bossShellQuote(request.sessionName))\n",
+            env: [],
+            summary: request.summary,
+            taskTitle: request.taskTitle,
+            paneMonitor: .claudeDefault,
+            sessionName: request.sessionName,
+            tmuxSocketPath: request.tmuxSocketPath
+        )
     }
 }
