@@ -182,6 +182,7 @@ final class CommentEngineBridge: CommentBackend {
     /// own topic invalidation, so reload the owning artifact's layer(s) here to
     /// stay fresh after a self-initiated create/dismiss.
     func handleCommentResult(_ comment: WorkComment) {
+        GuideCommentDrafts.shared.acknowledge(comment)
         forEachLayer(kind: comment.artifactKind, id: comment.artifactId) { $0.reload() }
     }
 

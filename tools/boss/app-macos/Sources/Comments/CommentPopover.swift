@@ -47,6 +47,7 @@ struct CommentPopover: View {
                     // state update from racing a later direct NSTextView insertion.
                     let typeahead = layer.drainPendingTypeahead()
                     commentBody = typeahead
+                    if !typeahead.isEmpty { layer.saveGuideDraft(body: typeahead) }
                     textView.string = typeahead
                     textView.setSelectedRange(
                         NSRange(location: (typeahead as NSString).length, length: 0))
@@ -71,17 +72,14 @@ struct CommentPopover: View {
                 }
                 .keyboardShortcut(.cancelAction)
 
-                // Disable is based on a local snapshot of emptiness only — avoid
-                // re-reading observed layer fields that would force an extra
-                // representable update cycle per keystroke.
                 Button("Comment") {
                     submit()
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(commentBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled((layer.guideVersionId != nil && layer.pendingQuotedText.isEmpty)
+                    || commentBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
-        .onAppear { layer.saveGuideDraft(body: commentBody) }
         .onChange(of: commentBody) { _, body in layer.saveGuideDraft(body: body) }
         .padding(16)
         .frame(width: 320)
@@ -89,11 +87,9 @@ struct CommentPopover: View {
 
     private func submit() {
         layer.addComment(quoted: layer.pendingQuotedText, body: commentBody)
-        commentBody = ""
     }
 
     private func cancel() {
-        commentBody = ""
         layer.cancelNewComment()
     }
 }

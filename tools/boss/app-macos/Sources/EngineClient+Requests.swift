@@ -260,12 +260,11 @@ extension EngineClient {
     /// product-switch breakdowns can be grepped apart, and lets
     /// [[PopulationTiming]] record the send timestamp for the
     /// request→reply segment plus the per-product session issue count
-    /// (which surfaces the cold-start double-fetch — see T2101 R1).
+    /// (which surfaces the cold-start double-fetch).
     func sendGetWorkTree(productId: String, flow: PopulationFlow) {
         // Propagate the app-side `fetch_seq` on the wire so the engine can
         // stamp it on its `engine-population-timing-*.jsonl` segments and the
-        // two sides join on `(product_id, fetch_seq)` (T2101 engine-side
-        // instrumentation follow-up).
+        // two sides join on `(product_id, fetch_seq)`.
         let fetchSeq = PopulationTiming.shared.fetchIssued(productId: productId, flow: flow)
         sendLine([
             "type": "get_work_tree",
@@ -793,7 +792,7 @@ extension EngineClient {
         ])
     }
 
-    // MARK: - Automation RPCs (maintenance-tasks.md T7)
+    // MARK: - Automation RPCs (designs/maintenance-tasks.md, Engine ownership)
 
     /// Ask the engine for all automations for a product, ordered `created_at ASC`.
     /// The engine replies with `automations_list`.
@@ -946,10 +945,10 @@ extension EngineClient {
         sendLine(payload)
     }
 
-    // MARK: - Comments in the markdown viewer (P529 Phase 2)
+    // MARK: - Comments in the markdown viewer
     //
-    // The engine ships these RPCs (`engine/core/src/app/comments.rs`); this is
-    // the macOS half PR #915 deferred. Requests are `FrontendRequest` variants
+    // Adapts the engine comment RPCs (`engine/core/src/app/comments.rs`).
+    // Requests are `FrontendRequest` variants
     // tagged by a snake_case `type`; `comments_create` / `comments_revise_doc`
     // flatten their input struct, so those fields sit at the top level. The
     // engine's `CommentAnchor` serialises `{exact, prefix, suffix}`.

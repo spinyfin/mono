@@ -14,12 +14,22 @@ final class GuideCommentDrafts: ObservableObject {
     static let shared = GuideCommentDrafts()
     @Published var byVersion: [String: GuideCommentDraft] = [:]
     /// Set by "Resume draft on original guide" before that version is open.
-    /// The comment layer consumes it on appear and opens the draft popover.
+    /// Cleared only after the comment layer presents the draft popover.
     var pendingResumeVersionId: String?
 
-    func takePendingResume(for versionId: String?) -> Bool {
+    var submitted: [String: GuideCommentDraft] = [:]
+
+    func acknowledge(_ comment: WorkComment) {
+        guard let version = comment.guideContext?.versionId,
+              let draft = submitted[version], draft.seriesId == comment.artifactId,
+              draft.body.trimmingCharacters(in: .whitespacesAndNewlines) == comment.body,
+              draft.quote == comment.anchor.exact else { return }
+        if byVersion[version] == draft { byVersion.removeValue(forKey: version) }
+        submitted.removeValue(forKey: version)
+    }
+
+    func hasPendingResume(for versionId: String?) -> Bool {
         guard let versionId, pendingResumeVersionId == versionId else { return false }
-        pendingResumeVersionId = nil
         return true
     }
 }
@@ -31,7 +41,12 @@ extension CommentLayer {
 
     func saveGuideDraft(body: String) {
         guard let guideVersionId else { return }
-        guard !body.isEmpty else { discardGuideDraft(); return }
+        guard ownsGuideDraft || guideDraft == nil else { return }
+        guard !body.isEmpty else {
+            if ownsGuideDraft { discardGuideDraft() }
+            return
+        }
+        ownsGuideDraft = true
         GuideCommentDrafts.shared.byVersion[guideVersionId] = GuideCommentDraft(
             seriesId: artifactId, quote: pendingQuotedText, occurrenceIndex: pendingOccurrenceIndex, body: body)
         objectWillChange.send()

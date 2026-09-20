@@ -91,6 +91,11 @@ fn guide_comment_context_survives_regeneration_resolution_and_reopen() {
         .unwrap();
     db.gc_unreferenced_pr_review_guide_source_artifacts().unwrap();
     assert!(db.get_pr_review_guide_comparison_by_id(&comparison).unwrap().is_some());
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    let readable = summary.readable_version_id.unwrap();
+    assert_eq!(summary.lifecycle, "ready");
+    assert_eq!(readable, old.id);
+    assert!(db.get_pr_review_guide_version(&readable).unwrap().is_some());
     let reopened = WorkDb::open(dir.path().join("state.db")).unwrap();
     // Reopening must preserve authored evidence even on a resolved comment.
     assert_eq!(
@@ -187,4 +192,47 @@ fn additive_migration_preserves_legacy_comments_and_is_repeatable() {
         )
         .unwrap();
     assert_eq!(row, ("Keep me".into(), None, None));
+}
+
+#[test]
+fn active_guide_history_keeps_recent_versions_and_commented_evidence() {
+    let (_dir, db) = open_db();
+    let root = create_active_chore(&db, &create_product(&db), "active guide retention");
+    let (series, comparison) = seed_review_guide_series(&db, &root);
+    let old = publish(&db, &series, &comparison);
+    db.create_comment_with_guide_version(input(&series), Some(&old.id))
+        .unwrap();
+    let mut versions = Vec::new();
+    for sequence in 2..=9 {
+        let captured = db
+            .persist_pr_review_guide_source_capture(
+                &root,
+                sequence,
+                PrSourceCaptureTrigger::Poller,
+                &crate::test_support::review_guide_source_packet("base", &format!("head-{sequence}")),
+            )
+            .unwrap();
+        let PrSourceCapturePersistOutcome::Stored(capture) = captured else {
+            panic!("expected capture")
+        };
+        versions.push(publish(&db, &series, &capture.comparison_id));
+    }
+    db.gc_unreferenced_pr_review_guide_source_artifacts().unwrap();
+    assert!(db.get_pr_review_guide_version(&old.id).unwrap().is_some());
+    let count: i64 = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM pr_review_guide_source_comparisons WHERE series_id = ?1",
+            [&series],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 7, "five recent comparisons plus selected and commented evidence");
+    for (index, version) in versions.iter().enumerate() {
+        assert_eq!(
+            db.get_pr_review_guide_version(&version.id).unwrap().is_some(),
+            index >= 3
+        );
+    }
 }

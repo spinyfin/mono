@@ -50,7 +50,12 @@ impl WorkDb {
         // still have comments keep the comparison (RESTRICT) and therefore
         // the on-disk packet. Active series are untouched here.
         tx.execute(
-            "UPDATE pr_review_guide_source_series SET readable_version_id = NULL
+            "UPDATE pr_review_guide_source_series SET readable_version_id = (
+                SELECT retained.id FROM pr_review_guide_versions retained
+                WHERE retained.series_id = pr_review_guide_source_series.id
+                  AND EXISTS (SELECT 1 FROM work_comments w WHERE w.guide_version_id = retained.id)
+                ORDER BY CAST(retained.generated_at AS INTEGER) DESC, retained.rowid DESC LIMIT 1
+             )
              WHERE readable_version_id IN (
                 SELECT v.id FROM pr_review_guide_versions v
                 JOIN pr_review_guide_source_comparisons c ON c.id = v.comparison_id
@@ -86,6 +91,36 @@ impl WorkDb {
             )",
             [cutoff],
         )?;
+        // Bound active history too. Comments and the readable entry point pin
+        // versions independently of the recent-version allowance.
+        tx.execute(
+            "DELETE FROM pr_review_guide_versions WHERE id IN (
+                SELECT id FROM (
+                    SELECT id, ROW_NUMBER() OVER (
+                        PARTITION BY series_id ORDER BY CAST(generated_at AS INTEGER) DESC, rowid DESC
+                    ) AS rank FROM pr_review_guide_versions
+                ) WHERE rank > ?1
+            )
+            AND NOT EXISTS (SELECT 1 FROM work_comments w WHERE w.guide_version_id = pr_review_guide_versions.id)
+            AND NOT EXISTS (SELECT 1 FROM pr_review_guide_source_series s WHERE s.readable_version_id = pr_review_guide_versions.id)",
+            [policy.recent_comparisons],
+        )?;
+        tx.execute(
+            "DELETE FROM pr_review_guide_attempts
+             WHERE status IN ('succeeded', 'failed', 'cancelled', 'superseded')
+               AND NOT EXISTS (SELECT 1 FROM pr_review_guide_versions v WHERE v.attempt_id = pr_review_guide_attempts.id)
+               AND comparison_id IN (
+                   SELECT id FROM (
+                       SELECT c.id, ROW_NUMBER() OVER (
+                           PARTITION BY c.series_id ORDER BY c.observation_sequence DESC, c.id DESC
+                       ) AS rank
+                       FROM pr_review_guide_source_comparisons c
+                       JOIN pr_review_guide_source_series s ON s.id = c.series_id
+                       WHERE c.id IS NOT s.selected_comparison_id
+                   ) WHERE rank > ?1
+               )",
+            [policy.recent_comparisons],
+        )?;
         // Expire old evidence only for closed/deleted roots. Active series keep
         // their selection plus the most recent comparisons, regardless of age.
         tx.execute(
@@ -107,9 +142,10 @@ impl WorkDb {
                     FROM pr_review_guide_source_comparisons c
                     JOIN pr_review_guide_source_series s ON s.id = c.series_id
                     WHERE c.id IS NOT s.selected_comparison_id
-                      AND NOT EXISTS (SELECT 1 FROM pr_review_guide_versions v WHERE v.comparison_id = c.id)
                 ) WHERE rank > ?1
-            )", [policy.recent_comparisons],
+            )
+            AND NOT EXISTS (SELECT 1 FROM pr_review_guide_versions v WHERE v.comparison_id = pr_review_guide_source_comparisons.id)
+            AND NOT EXISTS (SELECT 1 FROM pr_review_guide_attempts a WHERE a.comparison_id = pr_review_guide_source_comparisons.id)", [policy.recent_comparisons],
         )?;
         tx.execute(
             "UPDATE pr_review_guide_source_series SET selected_comparison_id = NULL

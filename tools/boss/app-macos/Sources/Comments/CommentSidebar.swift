@@ -93,8 +93,8 @@ struct CommentSidebar: View {
                     .accessibilityIdentifier("comment-sidebar-collapse")
                 }
             }
-            // Soft-dismiss "show resolved" toggle. Only meaningful
-            // on an engine-backed viewer, where resolved comments are retained.
+            // Soft-dismiss "show resolved" toggle. Only meaningful on an engine-backed viewer,
+            // where resolved comments are retained.
             if layer.isEngineBacked {
                 Toggle("Show resolved", isOn: $layer.showResolved)
                     .toggleStyle(.checkbox)
@@ -107,16 +107,18 @@ struct CommentSidebar: View {
     }
 
     private var addCommentRow: some View {
-        Button {
-            if layer.guideDraft != nil {
-                layer.resumeGuideDraft()
-            } else {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
                 layer.requestNewComment()
+            } label: {
+                Label("Add Comment", systemImage: "plus.bubble")
+                    .font(.callout)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-        } label: {
-            Label(layer.guideDraft == nil ? "Add Comment" : "Resume draft", systemImage: "plus.bubble")
-                .font(.callout)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            if layer.guideDraft != nil {
+                Button("Resume draft") { layer.resumeGuideDraft() }
+                    .font(.callout)
+            }
         }
         .buttonStyle(.borderless)
         .padding(.horizontal, 12)

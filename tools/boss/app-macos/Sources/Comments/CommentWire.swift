@@ -2,11 +2,8 @@ import CryptoKit
 import Foundation
 import Textual
 
-/// Swift Codable mirrors of the engine's comment wire types
-/// (`boss-protocol` `tools/boss/protocol/src/types.rs` + `wire.rs`) plus the
-/// small helpers the renderer needs to speak the `comments_*` protocol. This
-/// is the client half PR #915 deferred: the engine ships the RPCs; this
-/// is the macOS side that finally calls them.
+/// These types and helpers adapt the macOS comment viewer to the engine comments RPCs.
+/// Codable mirrors follow `boss-protocol`'s `types.rs` and `wire.rs`.
 ///
 /// The engine serialises every field under its verbatim `snake_case` Rust name
 /// with no container `rename_all`, so these `CodingKeys` map 1:1. Every engine

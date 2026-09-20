@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 @testable import Boss
 
 @MainActor
@@ -67,6 +68,7 @@ final class GuideCommentTests: XCTestCase {
         XCTAssertEqual(original.guideDraft?.body, "Unsaved feedback")
         XCTAssertEqual(original.guideDraft?.quote, "Original quote")
         XCTAssertEqual(original.guideDraft?.occurrenceIndex, 2)
+        original.resumeGuideDraft()
         original.cancelNewComment()
         XCTAssertNil(original.guideDraft)
     }
@@ -84,6 +86,17 @@ final class GuideCommentTests: XCTestCase {
         layer.requestNewComment()
         XCTAssertEqual(layer.pendingQuotedText, "Different quote")
         XCTAssertFalse(layer.pendingResumeDraft)
+        XCTAssertEqual(layer.guideDraft?.quote, "Original quote")
+        XCTAssertEqual(layer.guideDraft?.body, "Unsaved feedback")
+        let composer = NSHostingController(rootView: CommentPopover(layer: layer))
+        composer.loadView()
+        layer.saveGuideDraft(body: "")
+        layer.saveGuideDraft(body: "New feedback")
+        layer.cancelNewComment()
+        XCTAssertEqual(layer.guideDraft?.body, "Unsaved feedback")
+        layer.requestNewComment(firstChar: "N")
+        layer.saveGuideDraft(body: "New feedback")
+        layer.addComment(quoted: "Different quote", body: "New feedback")
         XCTAssertEqual(layer.guideDraft?.quote, "Original quote")
         XCTAssertEqual(layer.guideDraft?.body, "Unsaved feedback")
     }
@@ -126,8 +139,41 @@ final class GuideCommentTests: XCTestCase {
         XCTAssertEqual(original.guideDraft?.body, "General feedback")
         XCTAssertEqual(original.guideDraft?.quote, "")
         XCTAssertEqual(original.guideDraft?.occurrenceIndex, 0)
-        original.cancelNewComment()
+        original.testingLiveSelection = ""
+        original.resumeGuideDraft()
+        original.addComment(quoted: "", body: "General feedback")
+        XCTAssertNil(backend.createdVersion)
+        XCTAssertNotNil(original.guideDraft)
+        original.testingLiveSelection = "Guide prose"
+        original.resumeGuideDraft()
+        XCTAssertEqual(original.pendingQuotedText, "Guide prose")
+        original.addComment(quoted: original.pendingQuotedText, body: "General feedback")
+        XCTAssertEqual(backend.createdVersion, "empty-quote-old")
+        XCTAssertNotNil(original.guideDraft, "keep draft until the engine confirms persistence")
+        let persisted = WorkComment(
+            id: "persisted", artifactId: "series", anchor: CommentAnchor(exact: "Guide prose"),
+            artifactKind: WireArtifactKind.reviewGuide, author: "user:test", body: "General feedback",
+            createdAt: "1", guideContext: GuideCommentContext(versionId: "empty-quote-old",
+                comparisonId: "comparison", packetHash: "hash", baseSha: "base",
+                mergeBaseSha: "merge", headSha: "head"))
+        GuideCommentDrafts.shared.acknowledge(persisted)
         XCTAssertNil(original.guideDraft)
+    }
+
+    func testFailedPresentationKeepsResumeIntent() {
+        let layer = CommentLayer()
+        layer.configure(source: "Quote", baseURL: nil,
+                        artifact: .reviewGuide(seriesID: "series", versionID: "pending"), backend: GuideCommentBackend())
+        layer.pendingQuotedText = "Quote"
+        layer.saveGuideDraft(body: "Feedback")
+        GuideCommentDrafts.shared.pendingResumeVersionId = "pending"
+        defer {
+            layer.discardGuideDraft()
+            GuideCommentDrafts.shared.pendingResumeVersionId = nil
+        }
+        XCTAssertTrue(GuideCommentDrafts.shared.hasPendingResume(for: "pending"))
+        XCTAssertFalse(layer.resumeGuideDraft(), "a guide without its host window cannot present")
+        XCTAssertTrue(GuideCommentDrafts.shared.hasPendingResume(for: "pending"))
     }
 
     private func wireComment(id: String, version: String) -> CommentWithThread {
