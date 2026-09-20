@@ -91,20 +91,12 @@ impl WorkDb {
             )",
             [cutoff],
         )?;
-        // Bound active history too. Comments and the readable entry point pin
-        // versions independently of the recent-version allowance.
-        tx.execute(
-            "DELETE FROM pr_review_guide_versions WHERE id IN (
-                SELECT id FROM (
-                    SELECT id, ROW_NUMBER() OVER (
-                        PARTITION BY series_id ORDER BY CAST(generated_at AS INTEGER) DESC, rowid DESC
-                    ) AS rank FROM pr_review_guide_versions
-                ) WHERE rank > ?1
-            )
-            AND NOT EXISTS (SELECT 1 FROM work_comments w WHERE w.guide_version_id = pr_review_guide_versions.id)
-            AND NOT EXISTS (SELECT 1 FROM pr_review_guide_source_series s WHERE s.readable_version_id = pr_review_guide_versions.id)",
-            [policy.recent_comparisons],
-        )?;
+        // Published versions on an active series are not collected by age or
+        // recency. An open viewer and an in-memory draft pin neither a
+        // `work_comments` row nor `readable_version_id`, so a recency cap
+        // would delete the version a draft still needs. Owning-history
+        // deletion (terminal-aged series above) is the only collector for
+        // published versions.
         tx.execute(
             "DELETE FROM pr_review_guide_attempts
              WHERE status IN ('succeeded', 'failed', 'cancelled', 'superseded')

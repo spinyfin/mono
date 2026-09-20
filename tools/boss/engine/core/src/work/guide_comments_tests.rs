@@ -65,6 +65,54 @@ fn guide_comment_context_survives_regeneration_resolution_and_reopen() {
         db.update_comment_anchor(&comment.id, &CommentAnchor::default(), "new-hash", 2)
             .is_err()
     );
+    assert!(
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_comments SET guide_context_json = '{}' WHERE id = ?1",
+                [&comment.id],
+            )
+            .is_err()
+    );
+    assert!(
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_comments SET artifact_id = 'other' WHERE id = ?1",
+                [&comment.id],
+            )
+            .is_err()
+    );
+    let ordinary = db
+        .create_comment(
+            CreateCommentInput::builder()
+                .artifact_kind("work_item")
+                .artifact_id(&root)
+                .anchor(CommentAnchor {
+                    exact: "work item quote".into(),
+                    ..Default::default()
+                })
+                .body("ordinary comment")
+                .author("user:test")
+                .doc_version("hash")
+                .plain_text_projection_version(1)
+                .build(),
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_comments SET guide_context_json = '{}' WHERE id = ?1",
+            [&ordinary.id],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_comments SET artifact_id = 'other' WHERE id = ?1",
+            [&ordinary.id],
+        )
+        .unwrap();
     db.create_comment_thread_entry(
         &comment.id,
         THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP,
@@ -195,14 +243,12 @@ fn additive_migration_preserves_legacy_comments_and_is_repeatable() {
 }
 
 #[test]
-fn active_guide_history_keeps_recent_versions_and_commented_evidence() {
+fn active_published_guide_versions_survive_beyond_recent_comparisons() {
     let (_dir, db) = open_db();
     let root = create_active_chore(&db, &create_product(&db), "active guide retention");
     let (series, comparison) = seed_review_guide_series(&db, &root);
     let old = publish(&db, &series, &comparison);
-    db.create_comment_with_guide_version(input(&series), Some(&old.id))
-        .unwrap();
-    let mut versions = Vec::new();
+    let mut versions = vec![old.id.clone()];
     for sequence in 2..=9 {
         let captured = db
             .persist_pr_review_guide_source_capture(
@@ -215,10 +261,15 @@ fn active_guide_history_keeps_recent_versions_and_commented_evidence() {
         let PrSourceCapturePersistOutcome::Stored(capture) = captured else {
             panic!("expected capture")
         };
-        versions.push(publish(&db, &series, &capture.comparison_id));
+        versions.push(publish(&db, &series, &capture.comparison_id).id);
     }
     db.gc_unreferenced_pr_review_guide_source_artifacts().unwrap();
-    assert!(db.get_pr_review_guide_version(&old.id).unwrap().is_some());
+    for id in &versions {
+        assert!(
+            db.get_pr_review_guide_version(id).unwrap().is_some(),
+            "published active versions must survive a sweep even without comments or a draft pin"
+        );
+    }
     let count: i64 = db
         .connect()
         .unwrap()
@@ -228,11 +279,5 @@ fn active_guide_history_keeps_recent_versions_and_commented_evidence() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(count, 7, "five recent comparisons plus selected and commented evidence");
-    for (index, version) in versions.iter().enumerate() {
-        assert_eq!(
-            db.get_pr_review_guide_version(&version.id).unwrap().is_some(),
-            index >= 3
-        );
-    }
+    assert_eq!(count, 9, "comparisons that still have published versions stay");
 }

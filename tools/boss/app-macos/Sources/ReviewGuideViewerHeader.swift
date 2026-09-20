@@ -54,7 +54,7 @@ struct ReviewGuideViewerHeader: View {
                 }
                 if case .loaded(_, _, let artifact) = chatModel.asyncMarkdownViewerVM.state {
                     ForEach(drafts.byVersion.keys.sorted(), id: \.self) { versionId in
-                        if drafts.byVersion[versionId]?.seriesId == artifact?.id,
+                        if drafts.drafts(for: versionId).contains(where: { $0.seriesId == artifact?.id }),
                            versionId != artifact?.guideVersionId {
                             Button("Resume draft on original guide") {
                                 drafts.pendingResumeVersionId = versionId

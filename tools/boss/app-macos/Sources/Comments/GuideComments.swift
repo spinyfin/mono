@@ -2,30 +2,76 @@ import SwiftUI
 
 /// Drafts survive replacement of the shared viewer's view hierarchy. Their
 /// immutable version key prevents a refresh from moving a quote to new prose.
+/// `composerId` distinguishes a parked draft from a later composer on the
+/// same version so neither can overwrite the other.
 struct GuideCommentDraft: Equatable {
     let seriesId: String
     let quote: String
     let occurrenceIndex: Int
     let body: String
+    let composerId: UUID
+
+    func withQuote(_ quote: String) -> GuideCommentDraft {
+        GuideCommentDraft(
+            seriesId: seriesId, quote: quote, occurrenceIndex: occurrenceIndex,
+            body: body, composerId: composerId)
+    }
 }
 
 @MainActor
 final class GuideCommentDrafts: ObservableObject {
     static let shared = GuideCommentDrafts()
-    @Published var byVersion: [String: GuideCommentDraft] = [:]
+    /// Parked and in-flight drafts, insertion-ordered per version.
+    @Published var byVersion: [String: [GuideCommentDraft]] = [:]
     /// Set by "Resume draft on original guide" before that version is open.
     /// Cleared only after the comment layer presents the draft popover.
     var pendingResumeVersionId: String?
 
-    var submitted: [String: GuideCommentDraft] = [:]
+    /// In-flight creates, keyed by composer. `quote` is the persisted
+    /// `anchor.exact` so acknowledgement can match the engine echo.
+    var submitted: [UUID: GuideCommentDraft] = [:]
+
+    func drafts(for version: String) -> [GuideCommentDraft] {
+        byVersion[version] ?? []
+    }
+
+    func upsert(_ draft: GuideCommentDraft, version: String) {
+        var list = byVersion[version] ?? []
+        if let index = list.firstIndex(where: { $0.composerId == draft.composerId }) {
+            list[index] = draft
+        } else {
+            list.append(draft)
+        }
+        byVersion[version] = list
+    }
+
+    func remove(version: String, composerId: UUID) {
+        if var list = byVersion[version] {
+            list.removeAll { $0.composerId == composerId }
+            if list.isEmpty {
+                byVersion.removeValue(forKey: version)
+            } else {
+                byVersion[version] = list
+            }
+        }
+        submitted.removeValue(forKey: composerId)
+    }
+
+    func removeAll(for version: String) {
+        for draft in byVersion[version] ?? [] {
+            submitted.removeValue(forKey: draft.composerId)
+        }
+        byVersion.removeValue(forKey: version)
+    }
 
     func acknowledge(_ comment: WorkComment) {
         guard let version = comment.guideContext?.versionId,
-              let draft = submitted[version], draft.seriesId == comment.artifactId,
-              draft.body.trimmingCharacters(in: .whitespacesAndNewlines) == comment.body,
-              draft.quote == comment.anchor.exact else { return }
-        if byVersion[version] == draft { byVersion.removeValue(forKey: version) }
-        submitted.removeValue(forKey: version)
+              let (composerId, _) = submitted.first(where: { _, draft in
+                  draft.seriesId == comment.artifactId
+                      && draft.body.trimmingCharacters(in: .whitespacesAndNewlines) == comment.body
+                      && draft.quote == comment.anchor.exact
+              }) else { return }
+        remove(version: version, composerId: composerId)
     }
 
     func hasPendingResume(for versionId: String?) -> Bool {
@@ -35,26 +81,43 @@ final class GuideCommentDrafts: ObservableObject {
 }
 
 extension CommentLayer {
+    var guideDrafts: [GuideCommentDraft] {
+        guideVersionId.map { GuideCommentDrafts.shared.drafts(for: $0) } ?? []
+    }
+
     var guideDraft: GuideCommentDraft? {
-        guideVersionId.flatMap { GuideCommentDrafts.shared.byVersion[$0] }
+        let drafts = guideDrafts
+        if let mine = drafts.first(where: { $0.composerId == composerId }) { return mine }
+        return drafts.first { GuideCommentDrafts.shared.submitted[$0.composerId] == nil } ?? drafts.first
     }
 
     func saveGuideDraft(body: String) {
         guard let guideVersionId else { return }
-        guard ownsGuideDraft || guideDraft == nil else { return }
         guard !body.isEmpty else {
-            if ownsGuideDraft { discardGuideDraft() }
+            if ownsGuideDraft {
+                GuideCommentDrafts.shared.remove(version: guideVersionId, composerId: composerId)
+                objectWillChange.send()
+            }
             return
         }
         ownsGuideDraft = true
-        GuideCommentDrafts.shared.byVersion[guideVersionId] = GuideCommentDraft(
-            seriesId: artifactId, quote: pendingQuotedText, occurrenceIndex: pendingOccurrenceIndex, body: body)
+        GuideCommentDrafts.shared.upsert(
+            GuideCommentDraft(
+                seriesId: artifactId, quote: pendingQuotedText, occurrenceIndex: pendingOccurrenceIndex,
+                body: body, composerId: composerId),
+            version: guideVersionId)
         objectWillChange.send()
     }
 
     func discardGuideDraft() {
         guard let guideVersionId else { return }
-        GuideCommentDrafts.shared.byVersion.removeValue(forKey: guideVersionId)
+        GuideCommentDrafts.shared.removeAll(for: guideVersionId)
+        objectWillChange.send()
+    }
+
+    func discardCurrentComposerDraft() {
+        guard let guideVersionId else { return }
+        GuideCommentDrafts.shared.remove(version: guideVersionId, composerId: composerId)
         objectWillChange.send()
     }
 

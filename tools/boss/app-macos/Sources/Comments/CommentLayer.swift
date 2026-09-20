@@ -144,6 +144,9 @@ final class CommentLayer: NSObject, ObservableObject {
     /// falling back to matching any window's events.
     func setHostWindow(_ window: NSWindow?) {
         hostWindow = window
+        if window != nil, GuideCommentDrafts.shared.hasPendingResume(for: guideVersionId) {
+            resumeGuideDraft()
+        }
     }
 
     // MARK: - Monitor lifecycle
@@ -292,15 +295,19 @@ final class CommentLayer: NSObject, ObservableObject {
 
     /// Unit-test seam for `requestNewComment`. When set, it is the live
     /// selection instead of a pasteboard copy. `nil` uses the real selection.
-    var testingLiveSelection: String?
+    var liveSelectionProvider: (() -> String?)?
 
     /// True while the open (or about-to-open) popover is restoring a saved
     /// guide draft rather than starting a new comment on the live selection.
     private(set) var pendingResumeDraft = false
     var ownsGuideDraft = false
+    /// Identity of the current composer. A new comment mints a new id so a
+    /// parked draft on this version is not overwritten.
+    private(set) var composerId = UUID()
 
     func requestNewComment(firstChar: Character? = nil) {
-        ownsGuideDraft = false
+        composerId = UUID()
+        ownsGuideDraft = true
         // A live selection always starts a new comment, even when a draft
         // exists for this version. Resume is an explicit action.
         if let live = captureCurrentSelection(), !live.isEmpty {
@@ -324,6 +331,7 @@ final class CommentLayer: NSObject, ObservableObject {
     @discardableResult
     func resumeGuideDraft() -> Bool {
         guard let draft = guideDraft else { return false }
+        composerId = draft.composerId
         applyGuideDraft(draft)
         let presented = presentCommentPopover()
         if presented, GuideCommentDrafts.shared.hasPendingResume(for: guideVersionId) {
@@ -345,6 +353,13 @@ final class CommentLayer: NSObject, ObservableObject {
     private func presentCommentPopover() -> Bool {
         commentTextView = nil
         needsCommentTextFocus = true
+
+        if let existing = activePopover {
+            existing.delegate = nil
+            existing.close()
+            activePopover = nil
+            isShowingPopover = false
+        }
 
         guard let (posRect, posView) = resolveAnchor() else {
             anchorLog.error("requestNewComment: resolveAnchor returned nil — popover not shown")
@@ -443,9 +458,13 @@ final class CommentLayer: NSObject, ObservableObject {
         let anchor = Self.captureAnchor(
             quoted: quoted, occurrenceIndex: pendingOccurrenceIndex, in: projection)
 
-        if ownsGuideDraft, let version = guideVersionId {
+        if let version = guideVersionId {
             saveGuideDraft(body: body)
-            GuideCommentDrafts.shared.submitted[version] = guideDraft
+            if let parked = GuideCommentDrafts.shared.drafts(for: version)
+                .first(where: { $0.composerId == composerId })
+            {
+                GuideCommentDrafts.shared.submitted[composerId] = parked.withQuote(anchor.exact)
+            }
         }
         let ownedDraft = ownsGuideDraft
         resetAuthoringState()
@@ -471,7 +490,7 @@ final class CommentLayer: NSObject, ObservableObject {
                 createdAt: Date()
             )
             comments.append(comment)
-            if ownedDraft { discardGuideDraft() }
+            if ownedDraft { discardCurrentComposerDraft() }
         }
     }
 
@@ -485,12 +504,13 @@ final class CommentLayer: NSObject, ObservableObject {
         pendingTypeahead = ""
         pendingResumeDraft = false
         ownsGuideDraft = false
+        composerId = UUID()
         needsCommentTextFocus = false
         commentTextView = nil
     }
 
     func cancelNewComment() {
-        if ownsGuideDraft { discardGuideDraft() }
+        if ownsGuideDraft { discardCurrentComposerDraft() }
         resetAuthoringState()
     }
 
@@ -540,13 +560,16 @@ final class CommentLayer: NSObject, ObservableObject {
     }
 
     /// Update the rendered source (the viewer may load it asynchronously, after
-    /// `configure`). Re-resolves anchors against the freshly-available projection
-    /// so highlights + the ⚠/orphan glyphs settle once the doc text arrives.
+    /// `configure`). Always records the latest markdown so a guide that mounted
+    /// before its body arrived still has a projection for authoring and later
+    /// `reload()`. Re-resolves work-item comments against that projection;
+    /// guide comments stay bound to the version they were authored against
+    /// and are not re-resolved here.
     func updateSource(_ source: String, baseURL: URL?) {
-        guard guideVersionId == nil, source != self.source else { return }
+        guard source != self.source else { return }
         self.source = source
         self.baseURL = baseURL
-        guard let backend, isEngineBacked else { return }
+        guard guideVersionId == nil, let backend, isEngineBacked else { return }
         let projection = currentProjection()
         if !projection.isEmpty {
             backend.resolveComments(
@@ -969,7 +992,7 @@ final class CommentLayer: NSObject, ObservableObject {
     /// when unbound (artifact-less unit tests, or the ⌘⇧K SwiftUI shortcut path, which
     /// SwiftUI only ever invokes while this layer's own window is already key).
     func hasCurrentSelection() -> Bool {
-        if let testingLiveSelection { return !testingLiveSelection.isEmpty }
+        if let live = liveSelectionProvider?() { return !live.isEmpty }
         guard let firstResponder = (hostWindow ?? NSApp.keyWindow)?.firstResponder else { return false }
         let copyItem = NSMenuItem(
             title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
@@ -1048,7 +1071,7 @@ final class CommentLayer: NSObject, ObservableObject {
     /// Reads the selection via pasteboard copy. Acceptable Phase 1 trade-off:
     /// called only when the user explicitly opens the comment form.
     private func captureCurrentSelection() -> String? {
-        if let testingLiveSelection { return testingLiveSelection }
+        if let provided = liveSelectionProvider { return provided() }
         let before = NSPasteboard.general.changeCount
         NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil)
         guard NSPasteboard.general.changeCount != before else { return nil }
@@ -1219,8 +1242,10 @@ extension CommentLayer: NSPopoverDelegate {
     /// programmatic close. Resets authoring state. The extension lives in the same file
     /// so it can access private members directly.
     nonisolated func popoverDidClose(_ notification: Notification) {
+        let closed = notification.object as? NSPopover
         Task { @MainActor [weak self] in
             guard let self else { return }
+            guard self.activePopover === closed else { return }
             self.isShowingPopover = false
             self.pendingTypeahead = ""
             self.pendingQuotedText = ""
@@ -1353,7 +1378,7 @@ struct WithCommentsModifier: ViewModifier {
                     .frame(width: 280)
             } else {
                 CollapsedCommentRail(
-                    commentCount: layer.comments.count,
+                    commentCount: layer.currentVersionComments.count,
                     isEngineBacked: layer.isEngineBacked,
                     onExpand: { sidebarExpanded = true },
                     onAddComment: { layer.requestNewComment() }
