@@ -416,6 +416,11 @@ pub const CREATED_VIA_ATTENTION: &str = "attention";
 /// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
 /// §"Association model".
 pub const CREATED_VIA_DOC_COMMENT_PREFIX: &str = "doc-comment:";
+/// Prefix for the same-PR revision spawned by guide **Revise PR**:
+/// `guide-comment:<series_id>`. Distinct from `doc-comment:` so the
+/// revision prompt can attach implementation/test directives without
+/// changing document-comment chores.
+pub const CREATED_VIA_GUIDE_COMMENT_PREFIX: &str = "guide-comment:";
 /// Prefix for work Boothby files during a maintenance pass:
 /// `boothby:<boothby_passes.id>`. The pass id is the back-pointer — every
 /// row Boothby touched in that pass is recoverable from `boothby_actions`,
@@ -443,14 +448,16 @@ pub const KNOWN_CREATED_VIA: &[&str] = &[
 
 /// `true` when `value` is one of the documented `created_via` strings
 /// or matches a documented prefix pattern (`merge-conflict:*`,
-/// `ci-fix:*`, `pr-comment:*`, `boothby:*`). Engine writes for unknown
-/// values still go through, but a warning is logged at the insert site.
+/// `ci-fix:*`, `pr-comment:*`, `doc-comment:*`, `guide-comment:*`,
+/// `boothby:*`). Engine writes for unknown values still go through, but
+/// a warning is logged at the insert site.
 pub fn is_known_created_via(value: &str) -> bool {
     KNOWN_CREATED_VIA.contains(&value)
         || value.starts_with(CREATED_VIA_MERGE_CONFLICT_PREFIX)
         || value.starts_with(CREATED_VIA_CI_FIX_PREFIX)
         || value.starts_with(CREATED_VIA_PR_REVIEW_PREFIX)
         || value.starts_with(CREATED_VIA_DOC_COMMENT_PREFIX)
+        || value.starts_with(CREATED_VIA_GUIDE_COMMENT_PREFIX)
         || value.starts_with(CREATED_VIA_BOOTHBY_PREFIX)
         || value.starts_with(CREATED_VIA_IDEA_GRADUATION_PREFIX)
         || value.starts_with("pr-comment:")

@@ -19,7 +19,7 @@ final class GuideCommentTests: XCTestCase {
         XCTAssertEqual(backend.resolveCount, 1, "guides must not re-resolve against mutated prose")
         XCTAssertEqual(layer.currentProjection(), CommentProjection.plainText(for: "New guide prose"))
         layer.reviseDoc()
-        XCTAssertFalse(backend.didRevise)
+        XCTAssertTrue(backend.didRevise)
     }
 
     func testUpdateSourceAssignsEmptyGuideMarkdownWithoutReresolving() {

@@ -69,19 +69,49 @@ pub struct Classification {
     pub confidence: f64,
 }
 
-fn build_prompt(body: &str, anchor: &CommentAnchor) -> String {
-    format!(
-        "You classify a reviewer's comment on a design/investigation document into \
-exactly one of two intents:\n\
-\n\
-- \"revision\": wants the doc changed — anything from a clear, small, actionable \
+/// What the classifier is looking at. Document comments want a doc edit;
+/// pull-request comments want an implementation/test change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassifierSubject {
+    Document,
+    PullRequest,
+}
+
+impl ClassifierSubject {
+    pub fn from_artifact_kind(kind: &str) -> Self {
+        if kind == "pr_review_guide" {
+            Self::PullRequest
+        } else {
+            Self::Document
+        }
+    }
+}
+
+fn build_prompt(body: &str, anchor: &CommentAnchor, subject: ClassifierSubject) -> String {
+    let (target, revision_rubric, question_rubric) = match subject {
+        ClassifierSubject::Document => (
+            "a design/investigation document",
+            "wants the doc changed — anything from a clear, small, actionable \
 instruction (e.g. \"typo, should be X\", \"reword this sentence\", \"add a link to Y \
 here\") to a substantive change that isn't a one-line edit (e.g. \"this section needs \
 a new alternative considered\", \"rethink this approach\", \"this whole section is \
-missing an important case\").\n\
-- \"question\": asks something rather than asking for an edit (e.g. \"why did you \
+missing an important case\")",
+            "asks something rather than asking for an edit (e.g. \"why did you \
 choose X over Y?\", \"what does this mean?\", \"does this handle Z?\"). Not a \
-request to change the doc.\n\
+request to change the doc",
+        ),
+        ClassifierSubject::PullRequest => (
+            "a PR review guide (an explanation of a pull request). Feedback targets the PR implementation, not the guide prose",
+            "wants the PR implementation or tests changed (e.g. \"this retry should stop on permission errors\", \"add a test for the empty-input case\", \"the guide describes X but the code should do Y\")",
+            "asks something about the current or described behavior rather than asking for an implementation change (e.g. \"why did you choose X over Y?\", \"does this handle Z?\"). Not a request to change the PR",
+        ),
+    };
+    format!(
+        "You classify a reviewer's comment on {target} into \
+exactly one of two intents:\n\
+\n\
+- \"revision\": {revision_rubric}.\n\
+- \"question\": {question_rubric}.\n\
 \n\
 Quoted section from the document (the highlighted span, with surrounding context):\n\
 > {prefix}[[{exact}]]{suffix}\n\
@@ -109,23 +139,35 @@ fn build_followup_prompt(
     anchor: &CommentAnchor,
     thread: &[CommentThreadEntry],
     followup_body: &str,
+    subject: ClassifierSubject,
 ) -> String {
     let mut thread_block = String::new();
     for entry in thread {
         thread_block.push_str(&format!("{} ({}):\n{}\n\n", entry.entry_kind, entry.author, entry.body));
     }
-    format!(
-        "You classify a reviewer's follow-up reply in an ongoing thread on a design/investigation \
-document comment, into exactly one of two intents:\n\
-\n\
-- \"revision\": wants the doc changed — anything from a clear, small, actionable \
+    let (target, revision_rubric, question_rubric) = match subject {
+        ClassifierSubject::Document => (
+            "a design/investigation document comment",
+            "wants the doc changed — anything from a clear, small, actionable \
 instruction (e.g. \"typo, should be X\", \"reword this sentence\", \"add a link to Y \
 here\") to a substantive change that isn't a one-line edit (e.g. \"this section needs \
 a new alternative considered\", \"rethink this approach\", \"this whole section is \
-missing an important case\").\n\
-- \"question\": asks something rather than asking for an edit (e.g. \"why did you \
+missing an important case\")",
+            "asks something rather than asking for an edit (e.g. \"why did you \
 choose X over Y?\", \"what does this mean?\", \"does this handle Z?\"). Not a \
-request to change the doc.\n\
+request to change the doc",
+        ),
+        ClassifierSubject::PullRequest => (
+            "a PR review-guide comment (feedback targets the PR implementation)",
+            "wants the PR implementation or tests changed",
+            "asks something rather than asking for an implementation change",
+        ),
+    };
+    format!(
+        "You classify a reviewer's follow-up reply in an ongoing thread on {target}, into exactly one of two intents:\n\
+\n\
+- \"revision\": {revision_rubric}.\n\
+- \"question\": {question_rubric}.\n\
 \n\
 Quoted section from the document (the highlighted span, with surrounding context):\n\
 > {prefix}[[{exact}]]{suffix}\n\
@@ -241,8 +283,13 @@ async fn call_classifier_with_retries(call: &UtilityCall, prompt: String) -> Res
 
 /// Make a classification call for a fresh top-level comment, retrying
 /// transient failures (see [`call_classifier_with_retries`]).
-pub async fn classify(call: &UtilityCall, body: &str, anchor: &CommentAnchor) -> Result<Classification, String> {
-    call_classifier_with_retries(call, build_prompt(body, anchor)).await
+pub async fn classify(
+    call: &UtilityCall,
+    body: &str,
+    anchor: &CommentAnchor,
+    subject: ClassifierSubject,
+) -> Result<Classification, String> {
+    call_classifier_with_retries(call, build_prompt(body, anchor, subject)).await
 }
 
 /// Make a classification call for an operator's follow-up reply (P3c), with
@@ -257,7 +304,29 @@ pub async fn classify_followup(
 ) -> Result<Classification, String> {
     call_classifier_with_retries(
         call,
-        build_followup_prompt(original_body, anchor, thread, followup_body),
+        build_followup_prompt(
+            original_body,
+            anchor,
+            thread,
+            followup_body,
+            ClassifierSubject::Document,
+        ),
+    )
+    .await
+}
+
+/// Follow-up classification with an explicit subject (document vs PR).
+pub async fn classify_followup_for_subject(
+    call: &UtilityCall,
+    original_body: &str,
+    anchor: &CommentAnchor,
+    thread: &[CommentThreadEntry],
+    followup_body: &str,
+    subject: ClassifierSubject,
+) -> Result<Classification, String> {
+    call_classifier_with_retries(
+        call,
+        build_followup_prompt(original_body, anchor, thread, followup_body, subject),
     )
     .await
 }
@@ -273,11 +342,28 @@ mod tests {
             prefix: "before ".to_owned(),
             suffix: " after".to_owned(),
         };
-        let prompt = build_prompt("why does this retry three times?", &anchor);
+        let prompt = build_prompt("why does this retry three times?", &anchor, ClassifierSubject::Document);
         assert!(prompt.contains("the retry logic"));
         assert!(prompt.contains("why does this retry three times?"));
         assert!(prompt.contains("revision"));
         assert!(prompt.contains("question"));
+    }
+
+    #[test]
+    fn pull_request_prompt_targets_implementation() {
+        let anchor = CommentAnchor {
+            exact: "retry on transient failures".to_owned(),
+            prefix: String::new(),
+            suffix: String::new(),
+        };
+        let prompt = build_prompt(
+            "stop immediately on permission errors",
+            &anchor,
+            ClassifierSubject::PullRequest,
+        );
+        assert!(prompt.contains("PR implementation"));
+        assert!(!prompt.contains("design/investigation document"));
+        assert!(prompt.contains("stop immediately on permission errors"));
     }
 
     #[test]
@@ -310,6 +396,7 @@ mod tests {
             &anchor,
             &thread,
             "ok, please document that in the doc then",
+            ClassifierSubject::Document,
         );
         assert!(prompt.contains("the retry logic"));
         assert!(prompt.contains("why does this retry three times?"));
@@ -326,7 +413,7 @@ mod tests {
             prefix: String::new(),
             suffix: String::new(),
         };
-        let prompt = build_followup_prompt("original", &anchor, &[], "follow-up");
+        let prompt = build_followup_prompt("original", &anchor, &[], "follow-up", ClassifierSubject::Document);
         assert!(prompt.contains("original"));
         assert!(prompt.contains("follow-up"));
     }

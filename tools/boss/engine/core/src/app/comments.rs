@@ -125,7 +125,14 @@ fn spawn_comment_classifier(
             }
         };
 
-        match crate::comment_classifier::classify(&call, &body, &anchor).await {
+        match crate::comment_classifier::classify(
+            &call,
+            &body,
+            &anchor,
+            crate::comment_classifier::ClassifierSubject::from_artifact_kind(&artifact_kind),
+        )
+        .await
+        {
             Ok(result) => match work_db.set_comment_intent(&comment_id, &result.intent, result.confidence) {
                 Ok(classified) => {
                     publish_comment_invalidation(
@@ -404,14 +411,14 @@ enum AnswerAgentRepoResolution {
 /// [`respawn_answer_agent_for_followup`] (P3c) — the doc-owner/repo lookup
 /// is identical for a fresh spawn and a follow-up re-entry.
 fn resolve_answer_agent_repo(work_db: &WorkDb, comment: &WorkComment) -> AnswerAgentRepoResolution {
-    let doc_owner = match work_db.resolve_doc_owner(&comment.artifact_kind, &comment.artifact_id) {
-        Ok(Some(owner)) => owner,
+    let owner_task_id = match work_db.resolve_feedback_target(&comment.artifact_kind, &comment.artifact_id) {
+        Ok(Some(target)) => target.owner_task_id().to_owned(),
         Ok(None) => {
             tracing::debug!(
                 comment_id = %comment.id,
                 artifact_kind = %comment.artifact_kind,
                 artifact_id = %comment.artifact_id,
-                "answer-agent spawn: comment's artifact has no design/investigation doc owner; skipping (out of bucket-2 scope)",
+                "answer-agent spawn: comment's artifact has no feedback target; skipping (out of bucket-2 scope)",
             );
             return AnswerAgentRepoResolution::OutOfScope;
         }
@@ -419,18 +426,18 @@ fn resolve_answer_agent_repo(work_db: &WorkDb, comment: &WorkComment) -> AnswerA
             tracing::warn!(
                 comment_id = %comment.id,
                 err = %err,
-                "answer-agent spawn: resolve_doc_owner failed; leaving comment as-is",
+                "answer-agent spawn: resolve_feedback_target failed; leaving comment as-is",
             );
             return AnswerAgentRepoResolution::Failed("doc_owner_resolution_failed");
         }
     };
 
-    match work_db.resolve_repo_for_task(&doc_owner.task_id) {
+    match work_db.resolve_repo_for_task(&owner_task_id) {
         Ok(Some(url)) => AnswerAgentRepoResolution::Resolved(url),
         Ok(None) => {
             tracing::warn!(
                 comment_id = %comment.id,
-                task_id = %doc_owner.task_id,
+                task_id = %owner_task_id,
                 "answer-agent spawn: doc owner task has no resolvable repo; skipping",
             );
             AnswerAgentRepoResolution::Failed("repo_unresolved")
@@ -438,7 +445,7 @@ fn resolve_answer_agent_repo(work_db: &WorkDb, comment: &WorkComment) -> AnswerA
         Err(err) => {
             tracing::warn!(
                 comment_id = %comment.id,
-                task_id = %doc_owner.task_id,
+                task_id = %owner_task_id,
                 err = %err,
                 "answer-agent spawn: failed to resolve doc owner task's repo; skipping",
             );
@@ -784,12 +791,13 @@ fn spawn_followup_classifier(
 
     tokio::spawn(async move {
         let thread = work_db.list_comment_thread_entries(&comment.id).unwrap_or_default();
-        let result = crate::comment_classifier::classify_followup(
+        let result = crate::comment_classifier::classify_followup_for_subject(
             &call,
             &comment.body,
             &comment.anchor,
             &thread,
             &followup_body,
+            crate::comment_classifier::ClassifierSubject::from_artifact_kind(&comment.artifact_kind),
         )
         .await;
         let classification = match result {
@@ -1480,6 +1488,77 @@ async fn end_answer_agent_on_thread_terminal(
 /// `answering → answered`. No `authorize_rpc` gate — worker-callable RPCs
 /// (like `CreateAutomationTask`) run without a special tier, matching that
 /// precedent.
+pub(super) async fn handle_comments_record_guide_outcome(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        session_id,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::CommentsRecordGuideOutcome {
+        run_id,
+        comment_id,
+        disposition,
+        body,
+        request_regeneration,
+    } = req
+    else {
+        unreachable!()
+    };
+    if body.trim().is_empty() {
+        send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::WorkError {
+                message: "guide outcome body may not be empty".to_owned(),
+            },
+        );
+        return;
+    }
+    let execution = match work_db.get_execution(&run_id) {
+        Ok(execution) => execution,
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
+    };
+    if execution.kind != ExecutionKind::RevisionImplementation {
+        send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::WorkError {
+                message: format!("run '{run_id}' is not a revision execution"),
+            },
+        );
+        return;
+    }
+    match work_db.record_guide_comment_outcome(
+        &execution.work_item_id,
+        boss_protocol::GuideCommentOutcome::builder()
+            .comment_id(comment_id)
+            .disposition(disposition)
+            .response(body)
+            .request_regeneration(request_regeneration)
+            .build(),
+    ) {
+        Ok(comment) => {
+            let revision = publish_comment_invalidation(
+                &server_state,
+                &session_id,
+                &request_id,
+                &comment.artifact_kind,
+                &comment.artifact_id,
+                "guide_comment_outcome_recorded",
+            )
+            .await;
+            send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment });
+        }
+        Err(err) => send_work_error(&sink, &request_id, &err),
+    }
+}
+
 pub(super) async fn handle_comments_post_answer(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,

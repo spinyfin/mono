@@ -8,7 +8,7 @@ use super::*;
 
 /// Outcome of the guarded batch UPDATE that claims comments for a freshly
 /// created revision/chore. See [`WorkDb::claim_revisable_comments`].
-enum ClaimOutcome {
+pub(super) enum ClaimOutcome {
     /// The comments actually claimed by this call's task (may be a subset
     /// of the candidates under a partial race).
     Claimed(Vec<String>),
@@ -29,6 +29,9 @@ impl WorkDb {
     /// `pr_checker` is threaded straight through to [`WorkDb::create_revision`]
     /// (production: [`GhPrStateChecker`]; tests: a fake).
     pub fn revise_doc(&self, input: ReviseDocInput, pr_checker: &dyn PrStateChecker) -> Result<ReviseDocOutcome> {
+        if input.artifact_kind == "pr_review_guide" {
+            return self.revise_guide_pr(input, pr_checker);
+        }
         let Some(owner) = self.resolve_doc_owner(&input.artifact_kind, &input.artifact_id)? else {
             return Ok(ReviseDocOutcome::NotApplicable {
                 reason: format!(
@@ -184,56 +187,65 @@ impl WorkDb {
     /// left and returns `AlreadyInFlight{task_id}`".
     fn claim_revisable_comments(&self, candidates: &[WorkComment], task_id: &str) -> Result<ClaimOutcome> {
         let conn = self.connect()?;
-        let now = now_string();
-        let candidate_ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
-        let placeholders = std::iter::repeat_n("?", candidate_ids.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        claim_revisable_comments_in_tx(&conn, candidates, task_id)
+    }
+}
 
-        let revisable = comments::revisable_comment_predicate();
-        let update_sql = format!(
-            "UPDATE work_comments
-             SET status = '{COMMENT_STATUS_IN_REVISION}', revise_task_id = ?, status_actor = 'engine',
-                 updated_at = ?, reopened_at = NULL
-             WHERE id IN ({placeholders}) AND {revisable}"
-        );
-        let mut update_params: Vec<&dyn rusqlite::ToSql> = vec![&task_id, &now];
-        for id in &candidate_ids {
-            update_params.push(id);
-        }
-        let affected = conn.execute(&update_sql, update_params.as_slice())?;
+/// Guarded batch UPDATE used by both document and guide `[Revise]` paths.
+pub(super) fn claim_revisable_comments_in_tx(
+    conn: &Connection,
+    candidates: &[WorkComment],
+    task_id: &str,
+) -> Result<ClaimOutcome> {
+    let now = now_string();
+    let candidate_ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
+    let placeholders = std::iter::repeat_n("?", candidate_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
 
-        if affected == 0 {
-            // Only a genuinely in-flight claim counts as a winner here.
-            // `revise_task_id` is intentionally left un-cleared when a
-            // comment transitions out of `in_revision` (see its doc
-            // comment), so without the status filter a comment carrying a
-            // stale id from a prior, already-completed batch would be
-            // misreported as `AlreadyInFlight`.
-            let winner_sql = format!(
-                "SELECT revise_task_id FROM work_comments
+    let revisable = comments::revisable_comment_predicate();
+    let update_sql = format!(
+        "UPDATE work_comments
+         SET status = '{COMMENT_STATUS_IN_REVISION}', revise_task_id = ?, status_actor = 'engine',
+             updated_at = ?, reopened_at = NULL
+         WHERE id IN ({placeholders}) AND {revisable}"
+    );
+    let mut update_params: Vec<&dyn rusqlite::ToSql> = vec![&task_id, &now];
+    for id in &candidate_ids {
+        update_params.push(id);
+    }
+    let affected = conn.execute(&update_sql, update_params.as_slice())?;
+
+    if affected == 0 {
+        // Only a genuinely in-flight claim counts as a winner here.
+        // `revise_task_id` is intentionally left un-cleared when a
+        // comment transitions out of `in_revision` (see its doc
+        // comment), so without the status filter a comment carrying a
+        // stale id from a prior, already-completed batch would be
+        // misreported as `AlreadyInFlight`.
+        let winner_sql = format!(
+            "SELECT revise_task_id FROM work_comments
                  WHERE id IN ({placeholders}) AND revise_task_id IS NOT NULL
                    AND status = '{COMMENT_STATUS_IN_REVISION}' LIMIT 1"
-            );
-            let winner_params: Vec<&dyn rusqlite::ToSql> =
-                candidate_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-            let winner: Option<String> = conn
-                .query_row(&winner_sql, winner_params.as_slice(), |row| row.get(0))
-                .optional()?;
-            return Ok(match winner {
-                Some(winner_task_id) => ClaimOutcome::AlreadyInFlight(winner_task_id),
-                None => ClaimOutcome::NoneLeft,
-            });
-        }
-
-        let select_sql = format!("SELECT id FROM work_comments WHERE id IN ({placeholders}) AND revise_task_id = ?");
-        let mut select_params: Vec<&dyn rusqlite::ToSql> =
+        );
+        let winner_params: Vec<&dyn rusqlite::ToSql> =
             candidate_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-        select_params.push(&task_id);
-        let mut stmt = conn.prepare(&select_sql)?;
-        let addressed: Vec<String> = collect_rows(stmt.query_map(select_params.as_slice(), |row| row.get(0))?)?;
-        Ok(ClaimOutcome::Claimed(addressed))
+        let winner: Option<String> = conn
+            .query_row(&winner_sql, winner_params.as_slice(), |row| row.get(0))
+            .optional()?;
+        return Ok(match winner {
+            Some(winner_task_id) => ClaimOutcome::AlreadyInFlight(winner_task_id),
+            None => ClaimOutcome::NoneLeft,
+        });
     }
+
+    let select_sql = format!("SELECT id FROM work_comments WHERE id IN ({placeholders}) AND revise_task_id = ?");
+    let mut select_params: Vec<&dyn rusqlite::ToSql> =
+        candidate_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    select_params.push(&task_id);
+    let mut stmt = conn.prepare(&select_sql)?;
+    let addressed: Vec<String> = collect_rows(stmt.query_map(select_params.as_slice(), |row| row.get(0))?)?;
+    Ok(ClaimOutcome::Claimed(addressed))
 }
 
 /// Assemble the worker directive from every addressed comment: the doc's

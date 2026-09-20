@@ -2310,6 +2310,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::CommentsPostFollowup { .. } => {
                 Box::pin(comments::handle_comments_post_followup(ctx, r))
             }
+            r @ FrontendRequest::CommentsRecordGuideOutcome { .. } => {
+                Box::pin(comments::handle_comments_record_guide_outcome(ctx, r))
+            }
             r @ FrontendRequest::CommentsResolve { .. } => Box::pin(comments::handle_comments_resolve(ctx, r)),
             r @ FrontendRequest::CommentsReviseDoc { .. } => Box::pin(comments::handle_comments_revise_doc(ctx, r)),
             r @ FrontendRequest::CommentsSetIntent { .. } => Box::pin(comments::handle_comments_set_intent(ctx, r)),

@@ -189,6 +189,17 @@ fn answer_agent_reply_stays_allowed() {
 }
 
 #[test]
+fn guide_outcome_stays_allowed() {
+    assert_allowed(FrontendRequest::CommentsRecordGuideOutcome {
+        run_id: "exec_1".into(),
+        comment_id: "cmt_1".into(),
+        disposition: boss_protocol::GuideCommentDisposition::NoChange,
+        body: "Already handled.".into(),
+        request_regeneration: false,
+    });
+}
+
+#[test]
 fn proposal_verbs_are_allowed() {
     assert_allowed(FrontendRequest::SubmitProposal {
         run_id: "exec_1".into(),

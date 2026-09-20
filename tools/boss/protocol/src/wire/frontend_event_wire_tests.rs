@@ -1752,6 +1752,7 @@ fn tag_cases() -> Vec<TagCase> {
                     unresolved_count: 0,
                     in_revision_count: 0,
                     doc_kind: None,
+                    pr_closed: false,
                 },
             },
             expected_tag: "comments_banner_state",

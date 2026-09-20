@@ -273,8 +273,13 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         // - `CommentsPostAnswer` is the answer agent's reply; it already
         //   resolves comment and run from the caller's own `BOSS_RUN_ID`
         //   and cannot target another thread (see `app/comments.rs`).
+        // - `CommentsRecordGuideOutcome` is the revision worker's grounded
+        //   per-comment disposition; the handler binds the comment to the
+        //   caller's own revision run and cannot claim another task's
+        //   comments.
         FrontendRequest::ClassifyCiRemediation { .. }
         | FrontendRequest::CommentsPostAnswer { .. }
+        | FrontendRequest::CommentsRecordGuideOutcome { .. }
         | FrontendRequest::CreateAutomationTask { .. }
         | FrontendRequest::MarkCiRemediationFailed { .. }
         | FrontendRequest::MarkCiRemediationNoop { .. }
