@@ -43,7 +43,7 @@ struct CommentSidebar: View {
                             Divider()
                         }
                         if !layer.otherVersionComments.isEmpty {
-                            Text("Feedback on other guide versions")
+                            Text("Feedback on other guide versions (\(layer.otherVersionComments.count))")
                                 .font(.caption.weight(.semibold))
                                 .padding(12)
                             ForEach(layer.otherVersionComments) { comment in
@@ -79,7 +79,7 @@ struct CommentSidebar: View {
                 Text("Comments")
                     .font(.callout.weight(.semibold))
                 Spacer()
-                Text("\(layer.comments.count)")
+                Text("\(layer.currentVersionComments.count)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
@@ -573,7 +573,9 @@ private struct CommentRow: View {
                 bucketTwoTrack
 
                 HStack(spacing: 8) {
-                    IntentBadge(comment: comment, layer: layer)
+                    if layer.guideVersionId == nil {
+                        IntentBadge(comment: comment, layer: layer)
+                    }
                     if let chipState = comment.revisionChipState {
                         RevisionChip(state: chipState)
                     }

@@ -18,7 +18,14 @@ import SwiftUI
 /// only and never disables the merge control below it.
 struct ReviewGuideViewerHeader: View {
     @ObservedObject var chatModel: ChatViewModel
-    @ObservedObject private var drafts = GuideCommentDrafts.shared
+    @ObservedObject private var drafts: GuideCommentDrafts
+
+    init(chatModel: ChatViewModel, rootTaskId: String, generatedAt: String?) {
+        self.chatModel = chatModel
+        self.rootTaskId = rootTaskId
+        self.generatedAt = generatedAt
+        self.drafts = chatModel.commentBridge.draftStore
+    }
     let rootTaskId: String
     /// The open version's generation timestamp (RFC 3339), or `nil` while
     /// still loading.
@@ -54,13 +61,15 @@ struct ReviewGuideViewerHeader: View {
                 }
                 if case .loaded(_, _, let artifact) = chatModel.asyncMarkdownViewerVM.state {
                     ForEach(drafts.byVersion.keys.sorted(), id: \.self) { versionId in
-                        if drafts.drafts(for: versionId).contains(where: { $0.seriesId == artifact?.id }),
-                           versionId != artifact?.guideVersionId {
-                            Button("Resume draft on original guide") {
-                                drafts.pendingResumeVersionId = versionId
-                                chatModel.openReviewGuide(versionId: versionId, rootTaskId: rootTaskId)
+                        if versionId != artifact?.guideVersionId {
+                            ForEach(drafts.drafts(for: versionId).filter { $0.seriesId == artifact?.id }, id: \.composerId) { draft in
+                                Button("Resume draft: " + String(draft.body.prefix(32))) {
+                                    drafts.pendingResumeVersionId = versionId
+                                    drafts.pendingResumeComposerId = draft.composerId
+                                    chatModel.openReviewGuide(versionId: versionId, rootTaskId: rootTaskId)
+                                }
+                                .controlSize(.small)
                             }
-                            .controlSize(.small)
                         }
                     }
                 }

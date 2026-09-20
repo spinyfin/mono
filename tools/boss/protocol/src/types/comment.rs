@@ -355,8 +355,8 @@ pub struct AnswerAgentRun {
 
 /// An engine-authored (or operator-authored) turn in a comment's thread —
 /// `comment_thread_entries` table (comment-triggered-document-revisions.md
-/// §"Reply/link mechanics"): the base comment model is single-level (P529
-/// non-goal), so this table is the minimal "conversation" shape layered on
+/// §"Reply/link mechanics"): the base comment model is single-level by design,
+/// so this table is the minimal "conversation" shape layered on
 /// top of one `work_comments` row — every entry is a child of exactly one
 /// comment, never a sibling top-level comment.
 ///
