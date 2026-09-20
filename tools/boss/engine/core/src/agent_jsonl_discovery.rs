@@ -60,6 +60,10 @@ use crate::driver::AgentJsonlFileIngress;
 
 /// How often discovery re-scans the root while waiting for the rollout.
 pub(crate) const DISCOVERY_POLL: Duration = Duration::from_millis(100);
+/// The slower re-scan cadence once discovery is overdue — see
+/// [`DISCOVERY_OVERDUE_AFTER`]'s doc: "the threshold also slows scans from
+/// 100ms to one second".
+const DISCOVERY_POLL_AFTER_OVERDUE: Duration = Duration::from_secs(1);
 /// Historical discovery window, now the production overdue reporting threshold.
 /// Discovery continues after this interval until attachment or cancellation.
 pub(crate) const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -229,7 +233,13 @@ fn matching_file_shows_progress(prepared: &PreparedSource, paths: &HashSet<PathB
 pub(crate) struct PreparedSource {
     pub(crate) ingress: crate::driver::AgentJsonlFileIngress,
     pub(crate) root: VerifiedRoot,
-    pub(crate) canonical_workspace: PathBuf,
+    /// `None` when the run's configured workspace could not be
+    /// canonicalized (e.g. its cube workspace was reclaimed or reset). The
+    /// rollout root is independent of the workspace and is still verified
+    /// unconditionally via `root` above — an unresolvable workspace only
+    /// means cwd correlation can't be evaluated, not that the probe itself
+    /// must fail; see [`session_meta_verdict`].
+    pub(crate) canonical_workspace: Option<PathBuf>,
     pub(crate) baseline: HashSet<PathBuf>,
     baseline_progress: HashMap<PathBuf, FileProgress>,
 }
@@ -251,8 +261,14 @@ impl PreparedSource {
         baseline: HashSet<PathBuf>,
     ) -> Result<Self, String> {
         let root = VerifiedRoot::new(&ingress.directory)?;
-        let canonical_workspace = fs::canonicalize(&ingress.workspace_path)
-            .map_err(|err| format!("canonicalize workspace {}: {err}", ingress.workspace_path.display()))?;
+        // A workspace that will not canonicalize (e.g. a reclaimed or reset
+        // cube workspace) must not abort the whole probe: the rollout root
+        // above is independently verified and may still hold a readable,
+        // run-private rollout. Degrade to `None` so every candidate is
+        // rejected as workspace-not-resolvable instead, rather than making
+        // liveness permanently Undeterminable for a run whose rollout root
+        // is otherwise perfectly readable.
+        let canonical_workspace = fs::canonicalize(&ingress.workspace_path).ok();
         let baseline_progress = snapshot_file_progress(&baseline);
         Ok(Self {
             ingress,
@@ -346,6 +362,10 @@ pub enum CandidateRejection {
     CwdNotResolvable { cwd: String },
     /// The `cwd` canonicalizes to a directory other than the run's workspace.
     CwdMismatch { cwd: String, expected: PathBuf },
+    /// This run's own configured workspace could not be canonicalized (e.g.
+    /// its cube workspace was reclaimed or reset), so cwd correlation could
+    /// not be evaluated for this candidate at all.
+    WorkspaceNotResolvable { workspace: PathBuf },
     /// The filename does not end in `-<session id><suffix>`.
     NameMismatch { expected_suffix: String },
     /// An I/O error while validating — the file may have vanished between
@@ -415,6 +435,12 @@ impl fmt::Display for CandidateRejection {
                 f,
                 "session_meta cwd `{cwd}` is not the run's workspace `{}`",
                 expected.display()
+            ),
+            CandidateRejection::WorkspaceNotResolvable { workspace } => write!(
+                f,
+                "this run's own workspace `{}` could not be canonicalized, so cwd correlation could not \
+                 be evaluated",
+                workspace.display()
             ),
             CandidateRejection::NameMismatch { expected_suffix } => {
                 write!(
@@ -604,10 +630,15 @@ fn session_meta_verdict(
         let Ok(canonical_cwd) = fs::canonicalize(cwd) else {
             return Ok(Err(CandidateRejection::CwdNotResolvable { cwd: cwd.to_owned() }));
         };
-        if canonical_cwd != prepared.canonical_workspace {
+        let Some(expected_workspace) = &prepared.canonical_workspace else {
+            return Ok(Err(CandidateRejection::WorkspaceNotResolvable {
+                workspace: prepared.ingress.workspace_path.clone(),
+            }));
+        };
+        if canonical_cwd != *expected_workspace {
             return Ok(Err(CandidateRejection::CwdMismatch {
                 cwd: cwd.to_owned(),
-                expected: prepared.canonical_workspace.clone(),
+                expected: expected_workspace.clone(),
             }));
         }
         let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
@@ -631,6 +662,29 @@ pub(crate) struct DiscoveryScan {
     pub(crate) rejected: Vec<(PathBuf, CandidateRejection)>,
 }
 
+/// Why [`scan_once`] failed outright (as opposed to a per-file rejection,
+/// which it records on the scan instead of failing).
+///
+/// The caller must not retry [`ScanError::RootChanged`]: the watched root
+/// itself was removed, replaced, or relinked since it was verified, so no
+/// later scan of it can be trusted to describe the same rollout. Every
+/// other failure is [`ScanError::Other`] and worth retrying until the
+/// discovery window expires — the directory may simply be transiently
+/// unreadable.
+#[derive(Debug)]
+pub(crate) enum ScanError {
+    RootChanged(String),
+    Other(String),
+}
+
+impl fmt::Display for ScanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ScanError::RootChanged(err) | ScanError::Other(err) => write!(f, "{err}"),
+        }
+    }
+}
+
 /// Walk the root once and validate every file with the rollout name shape.
 ///
 /// Blocking: call it from [`tokio::task::spawn_blocking`] or a plain thread.
@@ -638,9 +692,17 @@ pub(crate) struct DiscoveryScan {
 /// [`CandidateRejection::Unreadable`] for that file rather than failing the
 /// whole scan — the file may simply have vanished between `read_dir` and
 /// `open`, and the other files still deserve a verdict.
-pub(crate) fn scan_once(prepared: &PreparedSource) -> Result<DiscoveryScan, String> {
-    prepared.root.revalidate()?;
-    let paths = scan_matching_paths(&prepared.root, &prepared.ingress)?;
+///
+/// The root is (re)validated here, on the blocking pool, rather than by a
+/// duplicate call on the async task before dispatching to
+/// [`tokio::task::spawn_blocking`]: that would pay the same `stat`/
+/// `canonicalize` syscalls twice per poll for no benefit, since this call
+/// already runs on the blocking pool where the rest of the scan does. The
+/// [`ScanError`] distinction is what lets the caller still treat a changed
+/// root as fatal without a second check.
+pub(crate) fn scan_once(prepared: &PreparedSource) -> Result<DiscoveryScan, ScanError> {
+    prepared.root.revalidate().map_err(ScanError::RootChanged)?;
+    let paths = scan_matching_paths(&prepared.root, &prepared.ingress).map_err(ScanError::Other)?;
     let file_progress = matching_file_shows_progress(prepared, &paths);
     let mut paths: Vec<PathBuf> = paths.into_iter().collect();
     paths.sort();
@@ -830,11 +892,11 @@ where
         if *halt.borrow() != StreamHalt::Running {
             return Ok(None);
         }
-        prepared.root.revalidate()?;
         let scan_source = Arc::clone(&prepared);
         let scan = match tokio::task::spawn_blocking(move || scan_once(&scan_source)).await {
             Err(err) => return Err(format!("rollout discovery scan task failed: {err}")),
-            Ok(Err(err)) => {
+            Ok(Err(ScanError::RootChanged(err))) => return Err(err),
+            Ok(Err(ScanError::Other(err))) => {
                 tracing::warn!(
                     root = %prepared.root.path.display(),
                     error = %err,
@@ -869,7 +931,7 @@ where
                 if wait_for_next_poll(
                     halt,
                     if now >= deadline {
-                        Duration::from_secs(1)
+                        DISCOVERY_POLL_AFTER_OVERDUE
                     } else {
                         DISCOVERY_POLL
                     },
@@ -903,7 +965,7 @@ where
         }
         let DiscoveryScan {
             mut matched,
-            rejected,
+            rejected: _,
             file_progress,
         } = scan;
         let reason = deadline_failure(
@@ -915,8 +977,13 @@ where
             failed_scans,
             last_scan_error.clone(),
         );
+        // Pass the cumulative `ever_rejected` map, not this scan's own
+        // `rejected`: a file rejected earlier in the window and then
+        // rotated, renamed, or removed before this scan must still be
+        // reflected in the overdue count, matching `reason` above (which is
+        // built from the same cumulative map) and the failed-scan branch.
         let stop = overdue(
-            rejected,
+            ever_rejected.clone().into_iter().collect(),
             reason.clone(),
             now.duration_since(started).as_secs(),
             now >= deadline && matched.is_empty(),
@@ -938,7 +1005,7 @@ where
         if wait_for_next_poll(
             halt,
             if now >= deadline {
-                Duration::from_secs(1)
+                DISCOVERY_POLL_AFTER_OVERDUE
             } else {
                 DISCOVERY_POLL
             },
@@ -1654,7 +1721,9 @@ mod tests {
         // Restore permissions so the tempdir can be cleaned up.
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let err = result.expect_err("an unreadable directory must fail the scan, not silently skip it");
+        let err = result
+            .expect_err("an unreadable directory must fail the scan, not silently skip it")
+            .to_string();
         assert!(err.contains("locked") || err.contains("read"), "got: {err}");
     }
 
@@ -1685,7 +1754,9 @@ mod tests {
 
         fs::set_permissions(&noexec, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let err = result.expect_err("canonicalize of a child in an unsearchable directory must fail the scan");
+        let err = result
+            .expect_err("canonicalize of a child in an unsearchable directory must fail the scan")
+            .to_string();
         assert!(
             err.contains("canonicalize") || err.contains("noexec") || err.contains("Permission denied"),
             "got: {err}"
@@ -1777,6 +1848,34 @@ mod tests {
         assert!(
             err.contains("scan(s) failed"),
             "the transient error must still be footnoted; got: {err}"
+        );
+    }
+
+    /// A root that changes identity mid-window (removed and replaced) must
+    /// end discovery outright rather than being retried as a transient scan
+    /// error — no later scan of a replaced root can be trusted to describe
+    /// the same rollout. This is the fatal/transient distinction
+    /// [`ScanError`] exists to preserve now that the loop no longer
+    /// double-checks the root on the async task before dispatching to the
+    /// blocking pool (`scan_once` already revalidates there).
+    #[tokio::test]
+    async fn root_identity_change_ends_discovery_rather_than_retrying_it() {
+        let fx = fixture();
+        let prepared = PreparedSource::new(fx.ingress.clone()).unwrap();
+
+        fs::remove_dir_all(&fx.root).unwrap();
+        fs::create_dir_all(&fx.root).unwrap();
+
+        let started = tokio::time::Instant::now();
+        let err = discover_candidate(&prepared, &mut running_halt(), Duration::from_secs(5))
+            .await
+            .expect_err("a replaced root must end discovery, not retry it as a transient error");
+        assert!(err.contains("changed identity"), "got: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a root identity change must end discovery immediately rather than retrying until the \
+             5s window expires; took {:?}",
+            started.elapsed()
         );
     }
 
@@ -1889,5 +1988,46 @@ mod tests {
             probe_correlated_rollout(&store, "run-gone", now),
             RolloutLiveness::Undeterminable(_)
         ));
+
+        // A workspace that will not canonicalize (e.g. a reclaimed or reset
+        // cube workspace) must not make liveness permanently Undeterminable:
+        // the rollout root is independently verified, so an empty root
+        // still yields Absent...
+        let reclaimed_workspace = fx.root.join("reclaimed-workspace");
+        fs::create_dir_all(&reclaimed_workspace).unwrap();
+        let mut no_workspace = fx.ingress.clone();
+        no_workspace.directory = fx.root.join("no-workspace-root");
+        fs::create_dir_all(&no_workspace.directory).unwrap();
+        no_workspace.workspace_path = reclaimed_workspace.clone();
+        fs::remove_dir_all(&reclaimed_workspace).unwrap();
+        store.store(
+            "run-no-workspace",
+            RolloutProbeTarget::Armed {
+                ingress: no_workspace.clone(),
+                baseline: Vec::new(),
+            },
+        );
+        assert!(
+            matches!(
+                probe_correlated_rollout(&store, "run-no-workspace", now),
+                RolloutLiveness::Absent { baseline_files: 0, .. }
+            ),
+            "an empty root must still yield Absent even when the run's workspace can't be canonicalized"
+        );
+
+        // ...and a rollout on disk still yields Present (a veto), with the
+        // correlation rejected as workspace-not-resolvable rather than the
+        // whole probe going Undeterminable.
+        let orphan = no_workspace.directory.join("rollout-orphan-sess-1.jsonl");
+        fs::write(&orphan, session_meta_line("sess-1", &fx.workspace)).unwrap();
+        match probe_correlated_rollout(&store, "run-no-workspace", now) {
+            RolloutLiveness::Present { correlation, .. } => {
+                assert!(
+                    matches!(correlation, Err(CandidateRejection::WorkspaceNotResolvable { .. })),
+                    "got: {correlation:?}"
+                );
+            }
+            other => panic!("expected Present even with an unresolvable workspace, got {other:?}"),
+        }
     }
 }
