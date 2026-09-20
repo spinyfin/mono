@@ -68,14 +68,16 @@
 //! a [`Stage::BreakerRecoveryProbeAdmitted`] event, so it is distinguishable
 //! in `bossctl dispatch tail` from a pause that is not being honoured.
 //! `pr_review` rows are never eligible — see
-//! [`maybe_admit_recovery_probe`]. A real shell
-//! pid reported for that canary is proof the spawn path works again and
-//! auto-resumes dispatch ([`resume_dispatch_after_breaker_recovery`]); a
-//! reap of the canary (spawn-ack timeout or app NACK) backs off
-//! exponentially before the next attempt. Dispatch also auto-resumes on a
-//! fresh app session registering — an app relaunch is the operator's
-//! natural recovery action after e.g. waking the display, so it clears the
-//! breaker exactly like a real shell pid would. This recovery machinery is
+//! [`maybe_admit_recovery_probe`]. A proven tmux pane pid for that canary
+//! (recorded by [`crate::spawn_flow::start_worker`] after
+//! `record_tmux_session_created` confirms a positive pid) is proof the
+//! spawn path works again and auto-resumes dispatch
+//! ([`resume_dispatch_after_breaker_recovery`]); a reap of the canary
+//! (spawn-ack timeout) backs off exponentially before the next attempt.
+//! Dispatch also auto-resumes on a fresh app session registering — an app
+//! relaunch is the operator's natural recovery action after e.g. waking the
+//! display, so it clears the breaker exactly like a proven tmux pane pid
+//! would. This recovery machinery is
 //! self-gating: it only ever activates on top of a real Breaker-origin
 //! pause, and a real pause only happens when the flag is enabled, so no
 //! separate flag check is needed inside it.
@@ -127,12 +129,13 @@ pub const SPAWN_HEALTH_PROBE_BACKOFF_MAX_SECS: i64 = 900;
 
 /// Deadline (seconds since [`SpawnHealthTracker::mark_probe_dispatched`])
 /// after which an in-flight probe that never resolved through
-/// [`SpawnHealthTracker::record_probe_success`] or
+/// [`SpawnHealthTracker::record_probe_success`] (a proven tmux pane pid
+/// from [`crate::spawn_flow::start_worker`]) or
 /// [`SpawnHealthTracker::record_probe_failure`] is treated as failed by
 /// [`SpawnHealthTracker::try_admit_probe`] itself.
 ///
-/// Both of those normal resolution paths assume the canary either reports a
-/// shell pid or gets reaped by [`crate::spawn_ack_sweep::reap_never_started_spawn`].
+/// Both of those normal resolution paths assume the canary either records a
+/// proven tmux pane pid or gets reaped by [`crate::spawn_ack_sweep::reap_never_started_spawn`].
 /// But `force_dispatch` returns as soon as scheduling completes, and the
 /// actual pane spawn happens later in a detached task — if that task's
 /// `adapter.spawn_worker` call itself errors, the execution goes straight to
@@ -575,8 +578,8 @@ impl SpawnHealthTracker {
             .collect()
     }
 
-    /// Reset the breaker. Called when a spawn provably worked (a real shell
-    /// pid was reported) or a fresh app session registered, so stale
+    /// Reset the breaker. Called when a spawn provably worked (tmux
+    /// recorded a real pane pid) or a fresh app session registered, so stale
     /// pre-recovery failures no longer count toward a trip.
     ///
     /// Deliberately does NOT clear the disabled-mode signal window
@@ -665,9 +668,9 @@ impl SpawnHealthTracker {
         probe.next_attempt_at = now_epoch_secs + probe_backoff_secs(probe.consecutive_failures);
     }
 
-    /// The in-flight probe succeeded (a real shell pid was reported for
-    /// it): fully reset the probe state so the next outage's probing starts
-    /// fresh, with no inherited backoff. Returns `true` only when
+    /// The in-flight probe succeeded (tmux spawn reported a real pane pid
+    /// for it): fully reset the probe state so the next outage's probing
+    /// starts fresh, with no inherited backoff. Returns `true` only when
     /// `execution_id` was in fact the in-flight probe — the caller uses
     /// this to decide whether to auto-resume dispatch.
     pub fn record_probe_success(&self, execution_id: &str) -> bool {
@@ -1086,7 +1089,7 @@ pub async fn trip_spawn_capability_circuit(
              `driver_start_timeout` events in `dispatch-events/current.jsonl`).\n\n\
              **Recovery is automatic:** the engine periodically force-dispatches a single queued \
              execution as a recovery probe (backing off between attempts) and auto-resumes dispatch \
-             the moment one reports a real shell pid — see `spawn_capability_recovered` in \
+             the moment one records a proven tmux pane pid — see `spawn_capability_recovered` in \
              `dispatch-events/current.jsonl`. Relaunching the Boss app also clears the breaker \
              immediately on reconnect. No manual action is required, but you can force it with \
              `bossctl dispatch resume` / the app's dispatch toggle if recovery is taking longer than \

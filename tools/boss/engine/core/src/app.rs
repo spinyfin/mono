@@ -320,6 +320,18 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
         Some(&self.live_worker_states)
     }
 
+    fn spawn_health(&self) -> Option<&crate::spawn_health::SpawnHealthTracker> {
+        Some(&self.spawn_health)
+    }
+
+    fn spawn_health_recovery(&self) -> Option<crate::spawn_flow::SpawnHealthRecovery<'_>> {
+        Some(crate::spawn_flow::SpawnHealthRecovery {
+            work_db: self.work_db.as_ref(),
+            coordinator: &self.execution_coordinator,
+            dispatch_events: self.dispatch_events.as_ref(),
+        })
+    }
+
     async fn publish_live_worker_states(&self) {
         self.broadcast_live_worker_states().await;
     }
