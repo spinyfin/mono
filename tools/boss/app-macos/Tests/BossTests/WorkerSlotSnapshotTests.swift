@@ -353,7 +353,6 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             workspace: workspace,
             liveStates: liveStates,
             isVisible: true,
-            tmuxHostingEnabled: true,
             liveStatusDisabledSlotIDs: [],
             onToggleLiveStatus: { _, _ in }
         )
@@ -361,34 +360,10 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             workspace: workspace,
             liveStates: liveStates,
             isVisible: true,
-            tmuxHostingEnabled: true,
             liveStatusDisabledSlotIDs: [],
             onToggleLiveStatus: { _, _ in }
         )
         XCTAssertEqual(a, b)
-    }
-
-    func testDetailViewEquatableTracksTmuxHostingFlag() {
-        let workspace = WorkersWorkspaceModel()
-        let liveStates = LiveWorkerStateStore()
-        let on: (Int, Bool) -> Void = { _, _ in }
-        let a = WorkersDetailView(
-            workspace: workspace,
-            liveStates: liveStates,
-            isVisible: true,
-            tmuxHostingEnabled: true,
-            liveStatusDisabledSlotIDs: [],
-            onToggleLiveStatus: on
-        )
-        let b = WorkersDetailView(
-            workspace: workspace,
-            liveStates: liveStates,
-            isVisible: true,
-            tmuxHostingEnabled: false,
-            liveStatusDisabledSlotIDs: [],
-            onToggleLiveStatus: on
-        )
-        XCTAssertNotEqual(a, b)
     }
 
     func testDetailViewEquatableTracksLiveStatusDisabledSet() {
@@ -399,7 +374,6 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             workspace: workspace,
             liveStates: liveStates,
             isVisible: true,
-            tmuxHostingEnabled: true,
             liveStatusDisabledSlotIDs: [],
             onToggleLiveStatus: on
         )
@@ -407,7 +381,6 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             workspace: workspace,
             liveStates: liveStates,
             isVisible: true,
-            tmuxHostingEnabled: true,
             liveStatusDisabledSlotIDs: [3],
             onToggleLiveStatus: on
         )
@@ -422,7 +395,6 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             workspace: workspace,
             liveStates: liveStates,
             isVisible: true,
-            tmuxHostingEnabled: true,
             liveStatusDisabledSlotIDs: [],
             onToggleLiveStatus: on
         )
@@ -430,7 +402,6 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             workspace: workspace,
             liveStates: liveStates,
             isVisible: false,
-            tmuxHostingEnabled: true,
             liveStatusDisabledSlotIDs: [],
             onToggleLiveStatus: on
         )
@@ -446,7 +417,6 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             workspace: workspace,
             liveStates: liveStates,
             isVisible: true,
-            tmuxHostingEnabled: true,
             liveStatusDisabledSlotIDs: [],
             onToggleLiveStatus: { _, _ in }
         )
@@ -455,7 +425,6 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             workspace: otherWorkspace,
             liveStates: liveStates,
             isVisible: true,
-            tmuxHostingEnabled: true,
             liveStatusDisabledSlotIDs: [],
             onToggleLiveStatus: { _, _ in }
         )

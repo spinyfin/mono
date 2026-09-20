@@ -42,10 +42,8 @@ struct WorkerLiveState {
     /// released.
     let recoveryStatus: String?
     /// Whether this worker was actually dispatched onto the tmux-hosting
-    /// path (`true`) or the legacy app-owned pty path (`false`), mirroring
-    /// the engine's `LiveWorkerState.tmux_hosted` — stamped once at spawn
-    /// from the spawn decision itself, not from the current
-    /// `workers.tmux_hosting` setting value. `nil` when the engine hasn't
+    /// path (`true`) or not (`false`), mirroring the engine's
+    /// `LiveWorkerState.tmux_hosted`. `nil` when the engine hasn't
     /// reported it (remote workers, or an older engine).
     let tmuxHosted: Bool?
 

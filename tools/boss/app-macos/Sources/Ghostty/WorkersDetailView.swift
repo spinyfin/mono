@@ -41,7 +41,6 @@ struct WorkersDetailView: View, @MainActor Equatable {
     @ObservedObject var workspace: WorkersWorkspaceModel
     @ObservedObject var liveStates: LiveWorkerStateStore
     let isVisible: Bool
-    let tmuxHostingEnabled: Bool
     let liveStatusDisabledSlotIDs: Set<Int>
     let onToggleLiveStatus: (Int, Bool) -> Void
 
@@ -52,14 +51,12 @@ struct WorkersDetailView: View, @MainActor Equatable {
         workspace: WorkersWorkspaceModel,
         liveStates: LiveWorkerStateStore,
         isVisible: Bool,
-        tmuxHostingEnabled: Bool,
         liveStatusDisabledSlotIDs: Set<Int>,
         onToggleLiveStatus: @escaping (Int, Bool) -> Void
     ) {
         self.workspace = workspace
         self.liveStates = liveStates
         self.isVisible = isVisible
-        self.tmuxHostingEnabled = tmuxHostingEnabled
         self.liveStatusDisabledSlotIDs = liveStatusDisabledSlotIDs
         self.onToggleLiveStatus = onToggleLiveStatus
         _snapshotCache = State(initialValue: WorkerSlotSnapshotCache(
@@ -73,7 +70,6 @@ struct WorkersDetailView: View, @MainActor Equatable {
         lhs.workspace === rhs.workspace
             && lhs.liveStates === rhs.liveStates
             && lhs.isVisible == rhs.isVisible
-            && lhs.tmuxHostingEnabled == rhs.tmuxHostingEnabled
             && lhs.liveStatusDisabledSlotIDs == rhs.liveStatusDisabledSlotIDs
     }
 
@@ -144,9 +140,6 @@ struct WorkersDetailView: View, @MainActor Equatable {
                 }
             )
             .frame(maxWidth: 460)
-            if !tmuxHostingEnabled {
-                LegacyHostingBadge()
-            }
             Spacer()
         }
         .padding(.horizontal, 12)
@@ -222,31 +215,6 @@ final class WorkerSlotSnapshotCache {
                 liveStatusEnabled: !liveStatusDisabledSlotIDs.contains(slot.slotId)
             )
         }
-    }
-}
-
-/// Shown on the Workers grid whenever the deprecated temporary rollback
-/// control `workers.tmux_hosting` is off, so an operator-selected legacy
-/// mode is never silently indistinguishable from the durability gap it
-/// restores — one of the tmux-hosting migration's three required visibility
-/// surfaces (alongside the dispatch-event stamp and `bossctl doctor`).
-private struct LegacyHostingBadge: View {
-    var body: some View {
-        HStack(spacing: 4) {
-            Image(systemName: "exclamationmark.triangle.fill")
-            Text("Legacy pane hosting")
-        }
-        .font(.caption.weight(.medium))
-        .foregroundStyle(.orange)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 3)
-        .background(Color.orange.opacity(0.15))
-        .clipShape(Capsule())
-        .help(
-            "Worker panes are using the temporary legacy-hosting rollback, so they will not " +
-            "survive an app or engine restart. Re-enable \"Host workers in tmux (deprecated)\" " +
-            "in Settings ▸ Workers."
-        )
     }
 }
 

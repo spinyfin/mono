@@ -247,16 +247,10 @@ pub struct LiveWorkerState {
     #[serde(default)]
     pub held: bool,
     /// Whether this run was actually dispatched onto the tmux-hosting path
-    /// (`Some(true)`) or the legacy app-owned pty path (`Some(false)`) —
-    /// stamped once, at spawn, from the spawn decision itself
-    /// (`StartWorkerInput::tmux_host.is_some()`), not from the current
-    /// `workers.tmux_hosting` setting value. The two diverge whenever the
-    /// setting is toggled while a worker dispatched under the old value is
-    /// still running: `settings.rs` documents that disabling the setting
-    /// "affects only new dispatches; already-running tmux workers keep
-    /// their durable teardown path". `None` for spawns where hosting mode
-    /// isn't meaningful (remote workers, which have no local pane at all)
-    /// or for payloads from an older engine that predates this field.
+    /// (`Some(true)`) or not (`Some(false)`) — stamped once, at spawn, from
+    /// the spawn decision itself. `None` for spawns where hosting mode isn't
+    /// meaningful (remote workers, which have no local pane at all) or for
+    /// payloads from an older engine that predates this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux_hosted: Option<bool>,
 }

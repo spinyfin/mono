@@ -1281,13 +1281,24 @@ impl ServerState {
             // TODO(@brianduff,2026-12-31): spawn one-shot dedup sweep background task.
         }
 
-        // Load per-installation settings. Same boot contract as feature
-        // flags: a missing or unreadable file falls back to registry
-        // defaults; parse failures are logged but don't block startup.
+        // Load per-installation settings. A missing or unreadable file
+        // falls back to registry defaults; ordinary parse failures are
+        // logged but don't block startup. A leftover
+        // `workers.tmux_hosting` key is the exception: accepting it as
+        // a no-op would start workers under a different ownership
+        // model than the file claims.
         let settings = Arc::new(crate::settings::SettingsStore::new(
             crate::settings::SettingsStore::default_path(&state_root),
         ));
         if let Err(err) = settings.load() {
+            if crate::settings::is_removed_tmux_hosting_error(&err) {
+                return Err(err).with_context(|| {
+                    format!(
+                        "settings: refuse to start with removed key in {}",
+                        settings.path().display()
+                    )
+                });
+            }
             tracing::warn!(
                 ?err,
                 path = %settings.path().display(),
@@ -1311,17 +1322,9 @@ impl ServerState {
         // under the same state root. Build it before the completion handler
         // so merge-triggered cancellation and ordinary dispatch share one
         // timeline sink.
-        //
-        // Wrapped so every emitted dispatch event carries the tmux-hosting
-        // pool snapshot active at emit time — one of the three visibility
-        // surfaces the tmux-hosting design requires alongside the Workers
-        // grid badge and `bossctl doctor` (see `dispatch_hosting_stamp`).
         let dispatch_event_root: PathBuf = state_root.clone();
         let dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink> =
-            Arc::new(crate::dispatch_hosting_stamp::HostingModeStampingSink::new(
-                Arc::new(crate::dispatch_events::JsonlFileSink::new(dispatch_event_root.clone())),
-                settings.clone(),
-            ));
+            Arc::new(crate::dispatch_events::JsonlFileSink::new(dispatch_event_root.clone()));
 
         // Engine counter-metrics registry. Built up front so it can
         // be cloned into ServerState; the registry is plumbed

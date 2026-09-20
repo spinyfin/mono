@@ -633,7 +633,6 @@ struct ContentView: View {
             workspace: workersWorkspace,
             liveStates: model.liveWorkerStates,
             isVisible: model.navigationMode == .agents,
-            tmuxHostingEnabled: model.tmuxHostingEnabled,
             liveStatusDisabledSlotIDs: model.liveStatusDisabledSlotIDs,
             onToggleLiveStatus: { slotId, enabled in
                 model.setLiveStatusEnabled(slotId: slotId, enabled: enabled)
