@@ -2102,6 +2102,13 @@ fn list_live_review_batches_excludes_terminal_batches_and_respects_limit() {
                 &[member(ReviewBatchMemberRole::ClaudeReviewer, None)],
             )
             .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE pr_review_batches SET generation = ?2, explicit = ?3 WHERE id = ?1",
+                rusqlite::params![batch.id, i + 1, i == 1],
+            )
+            .unwrap();
         live_ids.push(batch.id);
     }
 
@@ -2133,6 +2140,10 @@ fn list_live_review_batches_excludes_terminal_batches_and_respects_limit() {
     }
 
     let live = db.list_live_review_batches(100).unwrap();
+    for (i, batch) in live.iter().enumerate() {
+        assert_eq!(batch.generation, (i + 1) as i64);
+        assert_eq!(batch.explicit, i == 1);
+    }
     let live_returned_ids: Vec<_> = live.iter().map(|b| b.id.clone()).collect();
     assert_eq!(
         live_returned_ids, live_ids,

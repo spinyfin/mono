@@ -1403,7 +1403,7 @@ impl WorkDb {
         let mut statement = conn.prepare(
             "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
                     phase, pr_number, pr_url, status, target_sha, updated_at,
-                    completed_at, final_verdict_proposal_id, merge_sha
+                    completed_at, final_verdict_proposal_id, merge_sha, generation, explicit
              FROM pr_review_batches
              WHERE status NOT IN ('completed', 'failed')
              ORDER BY created_at ASC, id ASC
