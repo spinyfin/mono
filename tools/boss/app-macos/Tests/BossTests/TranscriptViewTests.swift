@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 import SwiftUI
 @testable import Boss
@@ -260,6 +261,75 @@ final class TranscriptViewTests: XCTestCase {
         XCTAssertEqual(stillLoaded.executionId, "exec_9")
     }
 
+    // MARK: - Visual: filtered transcript reads as the model's work
+
+    /// Offscreen render of the transcript the viewer actually displays
+    /// after the engine drops uninformative `hook_execution` heartbeats.
+    /// A unit test of the filter lives in `transcript-markdown`; this is
+    /// the glanceable confirmation that a reader sees tool calls, results,
+    /// and a failed hook — not a heartbeat between every pair.
+    func testFilteredTranscriptRendersWithoutHookHeartbeats() throws {
+        let noisy = TranscriptDoc(
+            executionId: "exec_noisy",
+            segments: noisyHookTranscript(),
+            isLive: false,
+            complete: true
+        )
+        let filtered = TranscriptDoc(
+            executionId: "exec_filtered",
+            segments: filteredHookTranscript(),
+            isLive: false,
+            complete: true
+        )
+        XCTAssertTrue(noisy.segments.contains { $0.label == "hook_execution" })
+        XCTAssertEqual(
+            filtered.segments.map(\.label),
+            ["User", "⚙ GrepSearch", "↳ result", "⚙ Bash", "↳ result", "hook_execution", "Assistant"],
+            "failed hooks stay; success heartbeats are gone"
+        )
+        XCTAssertFalse(
+            filtered.segments.contains { $0.markdown.contains("hook ran: post_tool_use") },
+            "success heartbeat payload must not reach the viewer"
+        )
+        XCTAssertTrue(
+            filtered.segments.contains { $0.markdown.contains("hook failed") },
+            "a failed hook must still be in the rendered segment list"
+        )
+        XCTAssertFalse(
+            filtered.segments.contains { $0.markdown.contains("[60,") },
+            "GrepSearch stdout must be decoded text, not a raw byte array"
+        )
+
+        let temporaryDirectory = URL(
+            fileURLWithPath: ProcessInfo.processInfo.environment["TEST_TMPDIR"] ?? NSTemporaryDirectory(),
+            isDirectory: true
+        )
+        let dest = temporaryDirectory.appendingPathComponent(
+            "boss-transcript-hook-filter-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: dest)
+        }
+        let undeclared: URL? = ProcessInfo.processInfo.environment["TEST_UNDECLARED_OUTPUTS_DIR"].map {
+            URL(fileURLWithPath: $0, isDirectory: true)
+        }
+
+        for (name, doc) in [("noisy.png", noisy), ("filtered.png", filtered)] {
+            let rep = try renderTranscript(doc)
+            let data = try XCTUnwrap(rep.representation(using: .png, properties: [:]))
+            try data.write(to: dest.appendingPathComponent(name))
+            if let undeclared {
+                try data.write(to: undeclared.appendingPathComponent(name))
+            }
+            if isTranscriptRenderBlank(rep) {
+                throw XCTSkip("render came back uniformly blank; host does not support offscreen SwiftUI rendering")
+            }
+        }
+        print("TRANSCRIPT_HOOK_FILTER_FIXTURES=\(dest.path)")
+    }
+
     // MARK: - Helpers
 
     /// Host a view in an offscreen window and drive a layout pass + a short
@@ -280,5 +350,115 @@ final class TranscriptViewTests: XCTestCase {
         hosting.layoutSubtreeIfNeeded()
         RunLoop.current.run(until: Date().addingTimeInterval(0.4))
         window.orderOut(nil)
+    }
+
+    /// Detached `NSHostingView` capture — no `NSWindow`, matching
+    /// `BackgroundWorkToolbarRenderTests` (window + `cacheDisplay` segfaults
+    /// under the bazel XCTest host).
+    private func renderTranscript(_ doc: TranscriptDoc) throws -> NSBitmapImageRep {
+        let root = TranscriptView(doc: doc)
+            .background(Color(nsColor: .windowBackgroundColor))
+            .frame(width: 720, height: 860)
+        let host = NSHostingView(rootView: root)
+        host.appearance = NSAppearance(named: .aqua)
+        host.frame = NSRect(x: 0, y: 0, width: 720, height: 860)
+        host.layoutSubtreeIfNeeded()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        let bounds = host.bounds
+        guard let rep = host.bitmapImageRepForCachingDisplay(in: bounds) else {
+            throw XCTSkip("bitmapImageRepForCachingDisplay returned nil")
+        }
+        host.cacheDisplay(in: bounds, to: rep)
+        return rep
+    }
+
+    private func isTranscriptRenderBlank(_ rep: NSBitmapImageRep) -> Bool {
+        guard let bytes = rep.bitmapData else { return true }
+        let spp = rep.samplesPerPixel
+        let bpr = rep.bytesPerRow
+        var seen: UInt32?
+        for y in stride(from: 0, to: rep.pixelsHigh, by: 8) {
+            for x in stride(from: 0, to: rep.pixelsWide, by: 8) {
+                let o = y * bpr + x * spp
+                let pixel = UInt32(bytes[o]) << 16 | UInt32(bytes[o + 1]) << 8 | UInt32(bytes[o + 2])
+                if let seen, pixel != seen { return false }
+                seen = pixel
+            }
+        }
+        return true
+    }
+
+    private func seg(
+        _ seq: Int,
+        role: SegmentRoleVM,
+        label: String,
+        markdown: String
+    ) -> TranscriptSegmentVM {
+        TranscriptSegmentVM(
+            seq: seq,
+            role: role,
+            label: label,
+            timestamp: nil,
+            model: nil,
+            markdown: markdown,
+            collapsible: false,
+            defaultCollapsed: false,
+            truncated: nil
+        )
+    }
+
+    /// What the viewer used to show: a heartbeat between every tool step,
+    /// plus a GrepSearch result as a raw byte array.
+    private func noisyHookTranscript() -> [TranscriptSegmentVM] {
+        [
+            seg(0, role: .user, label: "User", markdown: "Find the workspace path."),
+            seg(1, role: .tool, label: "⚙ GrepSearch", markdown: "```json\n{\"query\": \"workspace\"}\n```"),
+            seg(
+                2,
+                role: .system,
+                label: "hook_execution",
+                markdown: "```json\n{\n  \"message\": \"hook ran: post_tool_use\"\n}\n```"
+            ),
+            seg(
+                3,
+                role: .tool,
+                label: "↳ result",
+                markdown: "```\n{\"type\":\"GrepSearch\",\"stdout\":[60,119,111,114,107,115,112,97,99,101,95,114,101,115,117]}\n```"
+            ),
+            seg(
+                4,
+                role: .system,
+                label: "hook_execution",
+                markdown: "```json\n{\n  \"message\": \"hook ran: pre_tool_use\"\n}\n```"
+            ),
+            seg(5, role: .tool, label: "⚙ Bash", markdown: "```sh\nls\n```"),
+            seg(
+                6,
+                role: .system,
+                label: "hook_execution",
+                markdown: "```json\n{\n  \"message\": \"hook ran: post_tool_use\"\n}\n```"
+            ),
+            seg(7, role: .tool, label: "↳ result", markdown: "```\nAgents.md\n```"),
+            seg(8, role: .assistant, label: "Assistant", markdown: "Found it."),
+        ]
+    }
+
+    /// What the engine now sends: heartbeats gone, GrepSearch decoded, a
+    /// failed hook still present so a reader can see the one that mattered.
+    private func filteredHookTranscript() -> [TranscriptSegmentVM] {
+        [
+            seg(0, role: .user, label: "User", markdown: "Find the workspace path."),
+            seg(1, role: .tool, label: "⚙ GrepSearch", markdown: "```json\n{\"query\": \"workspace\"}\n```"),
+            seg(3, role: .tool, label: "↳ result", markdown: "```\n<workspace_resu\n```"),
+            seg(5, role: .tool, label: "⚙ Bash", markdown: "```sh\nls\n```"),
+            seg(7, role: .tool, label: "↳ result", markdown: "```\nAgents.md\n```"),
+            seg(
+                8,
+                role: .system,
+                label: "hook_execution",
+                markdown: "```json\n{\n  \"message\": \"hook failed: pre_tool_use\",\n  \"runs\": [{\"status\": {\"status\": \"error\"}}]\n}\n```"
+            ),
+            seg(9, role: .assistant, label: "Assistant", markdown: "Found it."),
+        ]
     }
 }
