@@ -96,14 +96,15 @@ fn canonical_tool_result(output: Value) -> (String, bool) {
                 .map(|code| code != 0)
         })
         .unwrap_or(false);
+    // `grok_bash_output_text` prefers `output_for_prompt`, then `output`
+    // (string or 0..=255 bytes via the shared decoder). Remaining keys are
+    // transcript-only: `text`, then stdout and stderr independently so a
+    // result that carries both streams does not drop stderr on the first
+    // successful decode.
     let grok_text = super::grok_bash_output_text(&output);
     let content = if grok_text.is_empty() {
-        output
-            .get("output")
-            .or_else(|| output.get("text"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| output.as_str().map(str::to_owned))
+        decode_tool_text_field(&output, "text")
+            .or_else(|| combined_stdio_text(&output))
             .unwrap_or_default()
     } else {
         grok_text
@@ -114,6 +115,28 @@ fn canonical_tool_result(output: Value) -> (String, bool) {
         content
     };
     (content, is_error)
+}
+
+/// Join nonempty stdout and stderr rather than `or_else`-ing, so a tool
+/// result that carries both (matches on stdout, a diagnostic on stderr)
+/// keeps both in the rendered transcript.
+fn combined_stdio_text(output: &Value) -> Option<String> {
+    let stdout = decode_tool_text_field(output, "stdout");
+    let stderr = decode_tool_text_field(output, "stderr");
+    match (stdout, stderr) {
+        (None, None) => None,
+        (Some(out), None) => Some(out),
+        (None, Some(err)) => Some(err),
+        (Some(out), Some(err)) => Some(format!("{out}\n{err}")),
+    }
+}
+
+/// Grok tool results sometimes carry text as a UTF-8 string and sometimes
+/// as a JSON array of bytes (`stdout: [60, 119, …]`). Decode either so the
+/// transcript viewer does not render a raw byte array for ordinary text.
+/// Values outside 0..=255 are not bytes — leave those arrays as JSON.
+fn decode_tool_text_field(output: &Value, key: &str) -> Option<String> {
+    super::decode_tool_utf8(output.get(key)?)
 }
 
 enum ProseRole {
@@ -143,6 +166,7 @@ enum AcpEnvelope {
     },
     HookExecution {
         event_name: Option<String>,
+        runs: Option<Value>,
     },
     Unknown {
         kind: String,
@@ -183,6 +207,7 @@ fn parse_acp_envelope(obj: &Map<String, Value>) -> Option<AcpEnvelope> {
         },
         "hook_execution" => AcpEnvelope::HookExecution {
             event_name: update.get("event_name").and_then(Value::as_str).map(str::to_owned),
+            runs: update.get("runs").cloned(),
         },
         other => AcpEnvelope::Unknown { kind: other.to_owned() },
     })
@@ -205,6 +230,113 @@ fn assistant_thinking(text: &str) -> Value {
 /// `codex/progress.rs::lifecycle_system` exists for Codex's own fillers.
 fn lifecycle_system(subtype: &str, message: &str) -> Value {
     json!({"type": "system", "subtype": subtype, "message": message})
+}
+
+/// Map a Grok `hook_execution` ACP update to a canonical system event.
+///
+/// Successful pre/post_tool_use firings are a fixed heartbeat
+/// (`hook ran: <event>`) with no extra fields — the transcript renderer
+/// suppresses those as uninformative. A run that failed, was blocked, or
+/// produced output keeps its `runs` payload so the same renderer still
+/// shows it. Recording is unchanged: the raw `updates.jsonl` line stays
+/// intact; this only shapes the normalized event the viewer reads.
+fn hook_execution_system(event_name: Option<&str>, runs: Option<&Value>) -> Value {
+    let name = event_name.unwrap_or("unknown");
+    if hook_runs_are_uninformative(runs) {
+        return lifecycle_system("hook_execution", &format!("hook ran: {name}"));
+    }
+    let message = if hook_runs_failed(runs) {
+        format!("hook failed: {name}")
+    } else {
+        format!("hook ran: {name}")
+    };
+    let mut out = json!({"type": "system", "subtype": "hook_execution", "message": message});
+    if let Some(runs) = runs {
+        out["runs"] = runs.clone();
+    }
+    out
+}
+
+fn hook_runs_are_uninformative(runs: Option<&Value>) -> bool {
+    match runs {
+        None => true,
+        Some(Value::Array(runs)) => runs.is_empty() || runs.iter().all(run_is_uninformative),
+        Some(_) => false,
+    }
+}
+
+fn hook_runs_failed(runs: Option<&Value>) -> bool {
+    let Some(Value::Array(runs)) = runs else {
+        return false;
+    };
+    runs.iter().any(|run| !run_status_is_success(run))
+}
+
+fn run_is_uninformative(run: &Value) -> bool {
+    let Some(obj) = run.as_object() else {
+        return false;
+    };
+    for (key, value) in obj {
+        match key.as_str() {
+            "name" | "hook_name" | "id" => continue,
+            "status" => {
+                if !status_is_uninformative(value) {
+                    return false;
+                }
+            }
+            _ => {
+                if !json_value_is_empty(value) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn run_status_is_success(run: &Value) -> bool {
+    match run.get("status") {
+        None => true,
+        Some(Value::String(status)) => status == "success",
+        Some(Value::Object(obj)) => obj.get("status").and_then(Value::as_str) == Some("success"),
+        Some(_) => false,
+    }
+}
+
+fn status_is_uninformative(status: &Value) -> bool {
+    match status {
+        Value::String(s) => s == "success",
+        Value::Object(obj) => {
+            for (key, value) in obj {
+                match key.as_str() {
+                    "status" => {
+                        if value.as_str() != Some("success") {
+                            return false;
+                        }
+                    }
+                    // Timing of a successful fire is not diagnostic.
+                    "elapsed_ms" | "duration_ms" | "elapsed" => continue,
+                    _ => {
+                        if !json_value_is_empty(value) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn json_value_is_empty(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(s) => s.is_empty(),
+        Value::Array(a) => a.is_empty(),
+        Value::Object(o) => o.is_empty(),
+        _ => false,
+    }
 }
 
 /// Per-tail correlation state for one Grok transcript tail.
@@ -310,10 +442,9 @@ impl GrokTranscriptSession {
                 "turn_completed",
                 &format!("turn completed: {}", stop_reason.as_deref().unwrap_or("unknown")),
             ),
-            AcpEnvelope::HookExecution { event_name } => lifecycle_system(
-                "hook_execution",
-                &format!("hook ran: {}", event_name.as_deref().unwrap_or("unknown")),
-            ),
+            AcpEnvelope::HookExecution { event_name, runs } => {
+                hook_execution_system(event_name.as_deref(), runs.as_ref())
+            }
             AcpEnvelope::Unknown { kind } => {
                 tracing::debug!(
                     session_update = kind,
@@ -564,6 +695,221 @@ mod tests {
         assert_eq!(normalized["type"], "system");
         assert_eq!(normalized["subtype"], "hook_execution");
         assert_eq!(normalized["message"], "hook ran: pre_tool_use");
+        assert!(
+            normalized.get("runs").is_none(),
+            "success-only heartbeats must not carry runs — that extra field would keep them visible in the viewer"
+        );
+    }
+
+    #[test]
+    fn hook_execution_preserves_failed_runs_for_the_viewer() {
+        let raw = json!({
+            "method": "_x.ai/session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "hook_execution",
+                "event_name": "pre_tool_use",
+                "tool_name": "run_terminal_command",
+                "runs": [{"name": "global/guard:pre_tool_use[0].hooks[0]", "status": {"status": "error", "error": "blocked: inside boss data dir"}}]
+            }}
+        });
+        let normalized = normalize_acp_update(raw);
+        assert_eq!(normalized["subtype"], "hook_execution");
+        assert_eq!(normalized["message"], "hook failed: pre_tool_use");
+        assert_eq!(
+            normalized["runs"][0]["status"]["status"], "error",
+            "failed hook runs must remain on the normalized event so render keeps them"
+        );
+    }
+
+    #[test]
+    fn hook_execution_preserves_runs_that_produced_output() {
+        let raw = json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "hook_execution",
+                "event_name": "stop",
+                "runs": [{"name": "global/dump-all:stop[0].hooks[0]", "status": {"status": "success"}, "output": "session summary"}]
+            }}
+        });
+        let normalized = normalize_acp_update(raw);
+        assert_eq!(normalized["message"], "hook ran: stop");
+        assert_eq!(normalized["runs"][0]["output"], "session summary");
+    }
+
+    #[test]
+    fn grep_search_stdout_bytes_decode_to_text() {
+        let mut session = GrokTranscriptSession::default();
+        session.normalize(json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-grep",
+                "title": "grep_search",
+                "rawInput": {"query": "workspace"}
+            }}
+        }));
+        // "workspace" as a UTF-8 byte array — the shape the viewer was
+        // rendering as `{"type":"GrepSearch","stdout":[60,119,…]}`.
+        let stdout: Vec<u8> = b"<workspace_".to_vec();
+        let result = session.normalize(json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-grep",
+                "rawOutput": {"type": "GrepSearch", "stdout": stdout}
+            }}
+        }));
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["content"], "<workspace_");
+        assert_eq!(result["is_error"], false);
+    }
+
+    #[test]
+    fn bash_output_non_byte_values_stay_json() {
+        let mut session = GrokTranscriptSession::default();
+        session.normalize(json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-bash",
+                "title": "run_terminal_command",
+                "rawInput": {"command": "true"}
+            }}
+        }));
+        let result = session.normalize(json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-bash",
+                "rawOutput": {"exit_code": 0, "output": [300, 400]}
+            }}
+        }));
+        assert_eq!(result["type"], "tool_result");
+        let content = result["content"].as_str().expect("content");
+        assert!(
+            content.contains("300") && content.contains("400"),
+            "output-field values outside 0..=255 must not wrap via grok_bash_output_text; got {content}"
+        );
+    }
+
+    #[test]
+    fn tool_result_renders_stdout_and_stderr_together() {
+        let mut session = GrokTranscriptSession::default();
+        session.normalize(json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-grep",
+                "title": "grep_search",
+                "rawInput": {"query": "workspace"}
+            }}
+        }));
+        let result = session.normalize(json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-grep",
+                "rawOutput": {
+                    "type": "GrepSearch",
+                    "stdout": "workspace/foo.rs:1:match\n",
+                    "stderr": "permission denied: /secret\n"
+                }
+            }}
+        }));
+        assert_eq!(result["type"], "tool_result");
+        let content = result["content"].as_str().expect("content");
+        assert!(
+            content.contains("workspace/foo.rs:1:match") && content.contains("permission denied: /secret"),
+            "stdout and stderr must both render; got {content}"
+        );
+    }
+
+    #[test]
+    fn grep_search_stdout_non_byte_values_stay_json() {
+        let mut session = GrokTranscriptSession::default();
+        session.normalize(json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-grep",
+                "title": "grep_search",
+                "rawInput": {"query": "workspace"}
+            }}
+        }));
+        let result = session.normalize(json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-grep",
+                "rawOutput": {"type": "GrepSearch", "stdout": [300, 400]}
+            }}
+        }));
+        assert_eq!(result["type"], "tool_result");
+        let content = result["content"].as_str().expect("content");
+        assert!(
+            content.contains("300") && content.contains("400"),
+            "values outside 0..=255 must not wrap into bytes; got {content}"
+        );
+    }
+
+    #[test]
+    fn hook_execution_preserves_blocked_runs_for_the_viewer() {
+        let raw = json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "hook_execution",
+                "event_name": "pre_tool_use",
+                "tool_name": "run_terminal_command",
+                "runs": [{"name": "global/guard:pre_tool_use[0].hooks[0]", "status": {"status": "blocked", "error": "denied"}}]
+            }}
+        });
+        let normalized = normalize_acp_update(raw);
+        assert_eq!(normalized["subtype"], "hook_execution");
+        assert_eq!(normalized["message"], "hook failed: pre_tool_use");
+        assert_eq!(normalized["runs"][0]["status"]["status"], "blocked");
+    }
+
+    #[test]
+    fn noisy_tool_turn_strips_success_hook_runs_and_decodes_grep_stdout() {
+        let mut session = GrokTranscriptSession::default();
+        let tool = session.normalize(json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-1",
+                "title": "grep_search",
+                "rawInput": {"query": "workspace"}
+            }}
+        }));
+        let post = session.normalize(json!({
+            "method": "_x.ai/session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "hook_execution",
+                "event_name": "post_tool_use",
+                "tool_name": "grep_search",
+                "runs": [{"name": "global/dump-all:post_tool_use[0].hooks[0]", "status": {"status": "success", "elapsed_ms": 17}}]
+            }}
+        }));
+        let stdout: Vec<u8> = b"<workspace_path>".to_vec();
+        let result = session.normalize(json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-1",
+                "rawOutput": {"type": "GrepSearch", "stdout": stdout}
+            }}
+        }));
+        assert_eq!(tool["type"], "assistant");
+        assert_eq!(tool["content"][0]["name"], "grep_search");
+        assert_eq!(post["type"], "system");
+        assert_eq!(post["subtype"], "hook_execution");
+        assert_eq!(post["message"], "hook ran: post_tool_use");
+        assert!(
+            post.get("runs").is_none(),
+            "success heartbeat must stay a filler so render can drop it"
+        );
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["content"], "<workspace_path>");
     }
 
     #[test]

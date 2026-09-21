@@ -932,6 +932,16 @@ fn render_system_segment(event: &TranscriptEvent, subtype: Option<&str>, body: &
     if subtype.is_none() && body.is_empty() {
         return None;
     }
+    // Grok (and similar ACP drivers) emit a `hook_execution` system event
+    // around every tool call. Successful pre/post_tool_use firings carry
+    // only the fixed heartbeat "hook ran: <event>" — no output, no
+    // failure, no effect on the call. Drop those at render so a reader
+    // sees the model's work. The underlying JSONL and parsed events are
+    // unchanged; a hook that failed, blocked, or produced output still
+    // renders because its body is no longer a heartbeat.
+    if is_uninformative_hook_execution(subtype, body) {
+        return None;
+    }
     match subtype {
         Some("init") => None,
         Some("pr-link") => {
@@ -1084,6 +1094,61 @@ fn render_body_as_markdown(body: &str) -> String {
     } else {
         blockquote(trimmed)
     }
+}
+
+/// True when a system event is a hook-execution heartbeat: the payload
+/// names the hook and nothing else. Conditioned on content, not merely
+/// `subtype == hook_execution` — a failed, blocked, or output-bearing
+/// hook of the same kind must still render.
+fn is_uninformative_hook_execution(subtype: Option<&str>, body: &str) -> bool {
+    if subtype != Some("hook_execution") {
+        return false;
+    }
+    is_hook_ran_heartbeat(body)
+}
+
+fn is_hook_ran_heartbeat(body: &str) -> bool {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if is_heartbeat_message(trimmed) {
+        return true;
+    }
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed) else {
+        return false;
+    };
+    if map.is_empty() {
+        return true;
+    }
+    let mut saw_heartbeat = false;
+    for (key, value) in &map {
+        match key.as_str() {
+            "message" => {
+                let Some(text) = value.as_str() else {
+                    return false;
+                };
+                if !is_heartbeat_message(text) {
+                    return false;
+                }
+                saw_heartbeat = true;
+            }
+            _ => return false,
+        }
+    }
+    saw_heartbeat
+}
+
+/// The Grok normalizer's success-only filler: `hook ran: pre_tool_use`.
+/// Any extra text (failure detail, run JSON, output) is informative.
+fn is_heartbeat_message(text: &str) -> bool {
+    let Some(event_name) = text.strip_prefix("hook ran: ") else {
+        return false;
+    };
+    !event_name.is_empty()
+        && event_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 fn strip_markdown(md: &str) -> String {
@@ -1554,6 +1619,204 @@ mod tests {
         }];
         let segs = events_to_segments(&events, &RenderOpts::default());
         assert!(segs.is_empty(), "init events should be filtered");
+    }
+
+    fn system_event(seq: u64, subtype: &str, body: &str) -> TranscriptEvent {
+        TranscriptEvent {
+            seq,
+            kind: TranscriptEventKind::System {
+                subtype: Some(subtype.to_owned()),
+                body: body.to_owned(),
+            },
+            timestamp: None,
+            model: None,
+        }
+    }
+
+    #[test]
+    fn uninformative_hook_execution_heartbeat_is_skipped() {
+        // The body shape `parse_system_event` produces from the Grok
+        // normalizer's `{"type":"system","subtype":"hook_execution","message":"hook ran: …"}`.
+        let pretty = "{\n  \"message\": \"hook ran: post_tool_use\"\n}";
+        let events = vec![
+            system_event(0, "hook_execution", pretty),
+            system_event(1, "hook_execution", "hook ran: pre_tool_use"),
+            system_event(2, "hook_execution", "hook ran: Stop"),
+        ];
+        let segs = events_to_segments(&events, &RenderOpts::default());
+        assert!(
+            segs.is_empty(),
+            "success-only hook heartbeats must not render; got {segs:?}"
+        );
+    }
+
+    #[test]
+    fn informative_hook_execution_still_renders() {
+        let failed =
+            "{\n  \"message\": \"hook failed: pre_tool_use\",\n  \"runs\": [{\"status\": {\"status\": \"error\"}}]\n}";
+        let with_output =
+            "{\n  \"message\": \"hook ran: pre_tool_use\",\n  \"output\": \"blocked: inside boss data dir\"\n}";
+        let events = vec![
+            system_event(0, "hook_execution", failed),
+            system_event(1, "hook_execution", with_output),
+            system_event(2, "hook_execution", "hook failed: post_tool_use: denied"),
+            system_event(3, "stop_hook_summary", "Task complete."),
+        ];
+        let segs = events_to_segments(&events, &RenderOpts::default());
+        let labels: Vec<&str> = segs.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "hook_execution",
+                "hook_execution",
+                "hook_execution",
+                "stop_hook_summary"
+            ],
+            "failed/output hooks and stop_hook_summary must remain visible; got {segs:?}"
+        );
+    }
+
+    #[test]
+    fn hook_heartbeats_do_not_interleave_tool_calls() {
+        let events = vec![
+            TranscriptEvent {
+                seq: 0,
+                kind: TranscriptEventKind::ToolUse {
+                    name: "GrepSearch".to_owned(),
+                    input: serde_json::json!({"query": "hook_execution"}),
+                },
+                timestamp: None,
+                model: None,
+            },
+            system_event(1, "hook_execution", "{\n  \"message\": \"hook ran: post_tool_use\"\n}"),
+            TranscriptEvent {
+                seq: 2,
+                kind: TranscriptEventKind::ToolResult {
+                    output: "matches".to_owned(),
+                    is_error: false,
+                },
+                timestamp: None,
+                model: None,
+            },
+            system_event(3, "hook_execution", "hook ran: pre_tool_use"),
+            TranscriptEvent {
+                seq: 4,
+                kind: TranscriptEventKind::AssistantText("done".to_owned()),
+                timestamp: None,
+                model: None,
+            },
+        ];
+        let segs = events_to_segments(&events, &RenderOpts::default());
+        let labels: Vec<&str> = segs.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["⚙ GrepSearch", "↳ result", "Assistant"],
+            "a reader must not skip a hook block between every tool step; got {labels:?}"
+        );
+        let md = segments_to_markdown(&segs);
+        assert!(
+            !md.contains("hook ran:"),
+            "rendered markdown must not show heartbeat payloads; got {md}"
+        );
+        assert!(md.contains("## ⚙ GrepSearch"), "got {md}");
+        assert!(md.contains("## ↳ result"), "got {md}");
+        assert!(md.contains("## Assistant"), "got {md}");
+    }
+
+    #[test]
+    fn dense_hook_heartbeats_collapse_to_the_model_work() {
+        // A short stand-in for the 1,512-segment transcript: every tool
+        // step is bracketed by success-only pre/post_tool_use heartbeats.
+        let mut events = Vec::new();
+        events.push(TranscriptEvent {
+            seq: 0,
+            kind: TranscriptEventKind::UserText("Find the workspace path.".to_owned()),
+            timestamp: None,
+            model: None,
+        });
+        let mut seq = 1;
+        for i in 0..8 {
+            events.push(system_event(
+                seq,
+                "hook_execution",
+                "{\n  \"message\": \"hook ran: pre_tool_use\"\n}",
+            ));
+            seq += 1;
+            events.push(TranscriptEvent {
+                seq,
+                kind: TranscriptEventKind::ToolUse {
+                    name: format!("tool_{i}"),
+                    input: serde_json::json!({"i": i}),
+                },
+                timestamp: None,
+                model: None,
+            });
+            seq += 1;
+            events.push(system_event(
+                seq,
+                "hook_execution",
+                "{\n  \"message\": \"hook ran: post_tool_use\"\n}",
+            ));
+            seq += 1;
+            events.push(TranscriptEvent {
+                seq,
+                kind: TranscriptEventKind::ToolResult {
+                    output: format!("ok {i}"),
+                    is_error: false,
+                },
+                timestamp: None,
+                model: None,
+            });
+            seq += 1;
+        }
+        events.push(system_event(
+            seq,
+            "hook_execution",
+            "{\n  \"message\": \"hook failed: pre_tool_use\",\n  \"runs\": [{\"status\": {\"status\": \"error\"}}]\n}",
+        ));
+        seq += 1;
+        events.push(TranscriptEvent {
+            seq,
+            kind: TranscriptEventKind::AssistantText("Found it.".to_owned()),
+            timestamp: None,
+            model: None,
+        });
+        let segs = events_to_segments(&events, &RenderOpts::default());
+        let labels: Vec<&str> = segs.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(
+            labels.len(),
+            1 + 8 * 2 + 1 + 1,
+            "user + 8 tool/result pairs + failed hook + assistant; got {labels:?}"
+        );
+        assert_eq!(labels[0], "User");
+        assert_eq!(labels[labels.len() - 2], "hook_execution");
+        assert_eq!(labels[labels.len() - 1], "Assistant");
+        assert_eq!(
+            labels.iter().filter(|l| **l == "hook_execution").count(),
+            1,
+            "only the failed hook remains; got {labels:?}"
+        );
+        assert!(!segments_to_markdown(&segs).contains("hook ran:"));
+    }
+
+    #[test]
+    fn is_uninformative_hook_execution_is_content_not_kind() {
+        assert!(super::is_uninformative_hook_execution(
+            Some("hook_execution"),
+            "{\n  \"message\": \"hook ran: post_tool_use\"\n}"
+        ));
+        assert!(!super::is_uninformative_hook_execution(
+            Some("hook_execution"),
+            "{\n  \"message\": \"hook failed: pre_tool_use\"\n}"
+        ));
+        assert!(!super::is_uninformative_hook_execution(
+            Some("hook_execution"),
+            "{\n  \"message\": \"hook ran: pre_tool_use\",\n  \"runs\": [{\"status\": \"error\"}]\n}"
+        ));
+        assert!(
+            !super::is_uninformative_hook_execution(Some("stop_hook_summary"), "hook ran: Stop"),
+            "must not hide other system subtypes just because the body mentions a hook"
+        );
     }
 
     #[test]
