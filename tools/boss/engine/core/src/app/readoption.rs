@@ -13,7 +13,7 @@ use super::*;
 
 use std::collections::HashSet;
 
-use boss_protocol::CreateAttentionItemInput;
+use boss_protocol::{AttachWorkerPaneInput, CreateAttentionItemInput, LiveWorkerState};
 
 use crate::agent_jsonl_progress::IngressCheckpointStore;
 use crate::work::WorkExecution;
@@ -801,5 +801,140 @@ impl ServerState {
             .collect();
         self.reconcile_unspawned_running_panes(&HashSet::new(), &verdicts, Some(&candidate_ids))
             .await;
+    }
+
+    /// Re-send `AttachWorkerPane` for every live, tmux-hosted local run the
+    /// currently registered app session has no viewer for.
+    ///
+    /// `AttachWorkerPane` is sent from exactly one production site
+    /// (`spawn_flow::start_worker`'s spawn act itself), so a worker whose
+    /// pane was never attached by *this* app session — because the app
+    /// restarted after the worker was spawned, or because this engine
+    /// process readopted the worker across its own restart while the app
+    /// stayed up — never receives a viewer. Mirrors the coordinator's
+    /// already-working restart re-attach
+    /// ([`super::sessions::attach_coordinator_to_registered_app`]); unlike
+    /// the coordinator there is no single durable record to re-attach, so
+    /// this walks every live-state entry instead of one record.
+    ///
+    /// Call sites: after `RegisterAppSession` (app (re)launch — the run
+    /// this engine process spawned may predate the current app session),
+    /// and after boot-time tmux adoption when an app session is already
+    /// registered (engine restart — every readopted run predates this
+    /// engine process's own spawn history).
+    pub(crate) async fn reattach_worker_panes_to_registered_app(&self) {
+        let candidates: Vec<LiveWorkerState> = self
+            .live_worker_states
+            .snapshot()
+            .into_iter()
+            .filter(|state| !state.activity.is_terminal() && state.tmux_hosted == Some(true))
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        // Never attach into a slot the app already hosts a live session
+        // for — `hostAttachedPane` refuses those with `SlotBusy`, but that
+        // refusal is app-side flow control, not something the engine
+        // should lean on to avoid sending a request it can determine is
+        // redundant up front.
+        let already_hosted = match self.hosted_pane_run_ids().await {
+            Ok(ids) => ids,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "worker pane reattach: app could not be asked what it already hosts; \
+                     proceeding without dedup (the app still refuses a slot it already \
+                     occupies)",
+                );
+                HashSet::new()
+            }
+        };
+        for state in candidates {
+            if already_hosted.contains(&state.run_id) {
+                continue;
+            }
+            self.reattach_one_worker_pane(&state).await;
+        }
+    }
+
+    async fn reattach_one_worker_pane(&self, state: &LiveWorkerState) {
+        let run_id = state.run_id.as_str();
+        let identity = match self.work_db.tmux_identity_for_execution(run_id) {
+            Ok(Some(identity)) => identity,
+            Ok(None) => {
+                tracing::warn!(
+                    run_id,
+                    "worker pane reattach: no durable tmux identity; cannot re-attach a viewer",
+                );
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    run_id,
+                    error = %format!("{err:#}"),
+                    "worker pane reattach: failed reading durable tmux identity",
+                );
+                return;
+            }
+        };
+        // Same durable-socket / legacy-label resolution `pane_delivery` and
+        // `tmux_teardown` already use for a recorded execution; shares the
+        // `pane_delivery_tmux_override` test seam rather than resolving a
+        // real `tmux` binary from PATH.
+        let tmux = match self.tmux_for_pane_delivery(run_id) {
+            Ok(tmux) => tmux,
+            Err(err) => {
+                tracing::error!(
+                    run_id,
+                    server_label = %identity.server_label,
+                    error = %format!("{err:#}"),
+                    "worker pane reattach: could not resolve a tmux handle for the recorded server",
+                );
+                return;
+            }
+        };
+        let Some(tmux_socket_path) = tmux.socket_path().map(|path| path.display().to_string()) else {
+            tracing::error!(run_id, "worker pane reattach: resolved tmux handle has no socket path",);
+            return;
+        };
+        match self
+            .send_to_app(
+                EngineToAppRequest::AttachWorkerPane(AttachWorkerPaneInput {
+                    run_id: run_id.to_owned(),
+                    slot_id: state.slot_id,
+                    session_name: identity.session_name.clone(),
+                    tmux_socket_path,
+                    summary: None,
+                    task_title: state.work_item_name.clone(),
+                }),
+                Duration::from_secs(5),
+            )
+            .await
+        {
+            Ok(EngineToAppResponse::AttachWorkerPane { result: Ok(_) }) => {
+                tracing::info!(
+                    run_id,
+                    slot_id = state.slot_id,
+                    session_name = %identity.session_name,
+                    "worker pane reattach: attached tmux-hosted worker pane to the registered app session",
+                );
+            }
+            Ok(response) => {
+                tracing::warn!(
+                    run_id,
+                    slot_id = state.slot_id,
+                    ?response,
+                    "worker pane reattach: app did not attach its viewer surface",
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    run_id,
+                    slot_id = state.slot_id,
+                    error = %format!("{err:#}"),
+                    "worker pane reattach: request to the app failed",
+                );
+            }
+        }
     }
 }

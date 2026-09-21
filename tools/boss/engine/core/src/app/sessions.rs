@@ -172,6 +172,14 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
         tokio::spawn(async move {
             attach_coordinator_to_registered_app(state).await;
         });
+        // Mirror the coordinator re-attach for worker panes: a run this
+        // engine process spawned under a prior app session (now dead —
+        // an app restart) never received `AttachWorkerPane` from anywhere
+        // else, so every live tmux-hosted worker needs one now.
+        let state = server_state.clone();
+        tokio::spawn(async move {
+            state.reattach_worker_panes_to_registered_app().await;
+        });
     }
 }
 
