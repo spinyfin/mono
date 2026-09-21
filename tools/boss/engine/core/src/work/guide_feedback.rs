@@ -3,7 +3,7 @@
 //! §"Comments target the implementation".
 
 use super::feedback_target::FeedbackTarget;
-use super::revise_doc::{ClaimOutcome, claim_revisable_comments_in_tx};
+use super::revise_doc::{ClaimOutcome, claim_revisable_comments_in_tx, push_comment_directive_block};
 use super::revision_helpers::assert_parent_revisable_and_insert;
 use super::*;
 use boss_protocol::{GuideCommentOutcome, THREAD_ENTRY_AUTHOR_ENGINE};
@@ -35,12 +35,12 @@ impl WorkDb {
         pr_checker: &dyn PrStateChecker,
     ) -> Result<ReviseDocOutcome> {
         let Some(FeedbackTarget::PullRequestImplementation {
-            root_task_id,
             series_id,
             canonical_pr,
             chain_root_id,
             pr_lifecycle,
             pr_url,
+            ..
         }) = self.resolve_feedback_target(&input.artifact_kind, &input.artifact_id)?
         else {
             return Ok(ReviseDocOutcome::NotApplicable {
@@ -69,7 +69,7 @@ impl WorkDb {
             return Ok(ReviseDocOutcome::NoUnresolvedComments);
         }
 
-        let directive = compose_guide_comment_directive(&canonical_pr, &series_id, &candidates);
+        let directive = compose_guide_comment_directive(self, &canonical_pr, &series_id, &candidates);
         let name = format!(
             "Address {} reviewer comment{}",
             candidates.len(),
@@ -106,7 +106,6 @@ impl WorkDb {
                         .collect::<Vec<_>>();
                 let task_id = task.id.clone();
                 commit_and_publish(tx, pending, self.event_bus())?;
-                let _ = root_task_id;
                 Ok(ReviseDocOutcome::Created {
                     task_id,
                     task_kind: "revision".to_owned(),
@@ -164,8 +163,9 @@ impl WorkDb {
         let series_id = comment.artifact_id.clone();
         let comment_id = comment.id.clone();
         {
-            let conn = self.connect()?;
-            conn.execute(
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
                 "INSERT INTO guide_comment_outcomes
                  (comment_id, revise_task_id, disposition, response, request_regeneration, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -184,23 +184,48 @@ impl WorkDb {
                     now
                 ],
             )?;
-            let entry_id = next_id("cte");
-            conn.execute(
-                "INSERT INTO comment_thread_entries \
-                 (id, comment_id, entry_kind, author, body, revise_task_id, answer_agent_run_id, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
-                params![
-                    entry_id,
-                    comment_id,
-                    THREAD_ENTRY_KIND_ANSWER,
-                    THREAD_ENTRY_AUTHOR_ENGINE,
-                    outcome.response,
-                    revise_task_id,
-                    now
-                ],
-            )?;
-            if self.guide_revision_is_terminal_on(&conn, revise_task_id)? {
-                conn.execute(
+            // A re-record for the same comment (retry after a transport
+            // failure, or the worker re-running `boss comment guide-outcome`)
+            // must update the existing thread entry rather than append a
+            // duplicate — the outcome upsert above is already idempotent on
+            // `comment_id`, so the thread entry should be too.
+            let existing_entry_id: Option<String> = tx
+                .query_row(
+                    &format!(
+                        "SELECT id FROM comment_thread_entries
+                         WHERE comment_id = ?1 AND revise_task_id = ?2 AND entry_kind = '{THREAD_ENTRY_KIND_ANSWER}'"
+                    ),
+                    params![comment_id, revise_task_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match existing_entry_id {
+                Some(entry_id) => {
+                    tx.execute(
+                        "UPDATE comment_thread_entries SET body = ?2, created_at = ?3 WHERE id = ?1",
+                        params![entry_id, outcome.response, now],
+                    )?;
+                }
+                None => {
+                    let entry_id = next_id("cte");
+                    tx.execute(
+                        "INSERT INTO comment_thread_entries \
+                         (id, comment_id, entry_kind, author, body, revise_task_id, answer_agent_run_id, created_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
+                        params![
+                            entry_id,
+                            comment_id,
+                            THREAD_ENTRY_KIND_ANSWER,
+                            THREAD_ENTRY_AUTHOR_ENGINE,
+                            outcome.response,
+                            revise_task_id,
+                            now
+                        ],
+                    )?;
+                }
+            }
+            if self.guide_revision_is_terminal_on(&tx, revise_task_id)? {
+                tx.execute(
                     &format!(
                         "UPDATE work_comments
                          SET status = '{COMMENT_STATUS_RESOLVED}',
@@ -212,11 +237,19 @@ impl WorkDb {
                     params![comment_id, now],
                 )?;
             }
+            tx.commit()?;
         }
 
         if request_regeneration && let Some(root) = self.root_task_id_for_review_guide_series(&series_id)? {
             let token = format!("guide-regen:{revise_task_id}");
-            let _ = self.retry_pr_review_guide(&root, Some(&token), boss_review_guide::PROMPT_VERSION);
+            if let Err(err) = self.retry_pr_review_guide(&root, Some(&token), boss_review_guide::PROMPT_VERSION) {
+                tracing::warn!(
+                    root_task_id = %root,
+                    revise_task_id,
+                    err = %err,
+                    "guide comment outcome: regeneration request failed",
+                );
+            }
         }
 
         self.get_comment(&comment_id)?
@@ -258,16 +291,25 @@ pub(crate) fn resolve_guide_aware_comments(conn: &Connection, task_id: &str, now
     .map_err(Into::into)
 }
 
-fn compose_guide_comment_directive(canonical_pr: &str, series_id: &str, comments: &[WorkComment]) -> String {
+/// Assemble the worker directive from every addressed guide comment: the
+/// comment id, its guide version triple, then its block from
+/// [`push_comment_directive_block`] (quoted section, body, and any
+/// answer-agent-reply / operator-follow-up bridge context — the same
+/// bridging `compose_doc_comment_directive` supplies for the document path,
+/// which matters here because `spawn_followup_classifier` can reclassify a
+/// guide follow-up into a revision). The same-PR revision instructions and
+/// the `boss comment guide-outcome` usage line are NOT repeated here — they
+/// live in `compose_revision_directive`'s `CREATED_VIA_GUIDE_COMMENT_PREFIX`
+/// branch (`runner/prompt.rs`), which fires for every dispatch of this
+/// revision, so keeping one copy avoids the two prose blocks drifting apart.
+fn compose_guide_comment_directive(
+    db: &WorkDb,
+    canonical_pr: &str,
+    series_id: &str,
+    comments: &[WorkComment],
+) -> String {
     let mut out = format!(
-        "Reviewer comment{} on review guide `{series_id}` for `{canonical_pr}` request{} a change to the PR implementation/tests.\n\n\
-         This is a REVISION of the existing PR {canonical_pr}. Do NOT open a new PR. \
-         Editing generated Markdown cannot satisfy an implementation request. \
-         An outdated quoted guide is context, not authority over the current code. \
-         Inspect the actual current PR, address implementation and tests, validate with the repository's normal workflow, and update that PR.\n\n\
-         For each submitted comment, record a grounded outcome with:\n\
-         `boss comment guide-outcome --comment-id <id> --disposition source_changed|answered|no_change --body \"<grounded response>\"`\n\
-         Add `--regenerate` only after a confirmed prose error; regeneration goes through guide reconciliation and does not resolve the comment by itself.\n\n",
+        "Reviewer comment{} on review guide `{series_id}` for `{canonical_pr}` request{} a change to the PR implementation/tests.\n\n",
         if comments.len() == 1 { "" } else { "s" },
         if comments.len() == 1 { "s" } else { "" },
     );
@@ -279,11 +321,7 @@ fn compose_guide_comment_directive(canonical_pr: &str, series_id: &str, comments
                 context.version_id, context.comparison_id, context.head_sha
             ));
         }
-        out.push_str("Quoted section:\n> ");
-        out.push_str(&comment.anchor.exact);
-        out.push_str("\n\nComment:\n> ");
-        out.push_str(&comment.body);
-        out.push_str("\n\n");
+        push_comment_directive_block(db, &mut out, comment);
     }
     out.push_str(
         "Please update the PR implementation and tests. Do not treat a regenerated guide as completing this work.",
@@ -394,11 +432,73 @@ mod tests {
         };
         assert_eq!(task.parent_task_id.as_deref(), Some(root.as_str()));
         assert!(task.created_via.starts_with(CREATED_VIA_GUIDE_COMMENT_PREFIX));
-        assert!(task.description.contains("cannot satisfy an implementation request"));
+        assert!(task.description.contains("a change to the PR implementation/tests"));
         assert!(task.description.contains(&c1.id));
         let reloaded = db.get_comment(&c1.id).unwrap().unwrap();
         assert_eq!(reloaded.status, COMMENT_STATUS_IN_REVISION);
         assert_eq!(db.get_comment(&question.id).unwrap().unwrap().status, "active");
+    }
+
+    #[test]
+    fn directive_includes_bridged_bucket2_context_when_present() {
+        let (_dir, db) = open_db();
+        let (_root, series, _) = seed_open_guide(&db);
+
+        // A guide comment that started as a `question`, got an answer-agent
+        // reply, then an operator follow-up that reclassified it into a
+        // revision — this PR is what wires `spawn_followup_classifier` to
+        // classify guide follow-ups against `ClassifierSubject::PullRequest`,
+        // so this bridge must reach the guide directive the same way it
+        // reaches the document directive (`revise_doc`'s
+        // `directive_includes_bridged_bucket2_context_when_present`).
+        let c1 = make_guide_comment(&db, &series, "why retry?");
+        db.set_comment_intent(&c1.id, "question", 0.9).unwrap();
+        db.transition_comment_to_answering(&c1.id).unwrap();
+        let run = db
+            .create_answer_agent_run(&c1.id, "pr_review_guide", &series, "v0", 0)
+            .unwrap();
+        db.complete_answer_agent_run(&run.id, "replied", Some("It stops after 3 attempts."), None)
+            .unwrap();
+        db.create_comment_thread_entry(
+            &c1.id,
+            THREAD_ENTRY_KIND_ANSWER,
+            "engine",
+            "It stops after 3 attempts.",
+            None,
+            Some(&run.id),
+        )
+        .unwrap();
+        db.transition_comment_to_answered(&c1.id).unwrap();
+        db.transition_comment_to_awaiting_followup(&c1.id).unwrap();
+        db.create_comment_thread_entry(
+            &c1.id,
+            THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP,
+            "user:test@example.com",
+            "please make it stop after 5 instead",
+            None,
+            None,
+        )
+        .unwrap();
+        db.reclassify_comment_intent(&c1.id, "revision", 0.85).unwrap();
+        db.transition_comment_awaiting_followup_to_active(&c1.id).unwrap();
+
+        let outcome = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_review_guide")
+                    .artifact_id(series)
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap();
+        let ReviseDocOutcome::Created { task_id, .. } = outcome else {
+            panic!("expected Created, got {outcome:?}");
+        };
+        let (WorkItem::Task(task) | WorkItem::Chore(task)) = db.get_work_item(&task_id).unwrap() else {
+            panic!("expected task");
+        };
+        assert!(task.description.contains("It stops after 3 attempts."));
+        assert!(task.description.contains("please make it stop after 5 instead"));
     }
 
     #[test]
@@ -525,6 +625,203 @@ mod tests {
             COMMENT_STATUS_IN_REVISION,
             "missing disposition must remain outstanding"
         );
+    }
+
+    #[test]
+    fn source_changed_and_answered_dispositions_are_persisted() {
+        let (_dir, db) = open_db();
+        let (_root, series, _) = seed_open_guide(&db);
+        let c1 = make_guide_comment(&db, &series, "fix retry");
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
+        let c2 = make_guide_comment(&db, &series, "why not exponential backoff?");
+        db.set_comment_intent(&c2.id, "revision", 0.9).unwrap();
+        let ReviseDocOutcome::Created { task_id, .. } = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_review_guide")
+                    .artifact_id(series)
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap()
+        else {
+            panic!("expected Created");
+        };
+
+        db.record_guide_comment_outcome(
+            &task_id,
+            GuideCommentOutcome::builder()
+                .comment_id(c1.id.clone())
+                .disposition(GuideCommentDisposition::SourceChanged)
+                .response("Switched retries to stop after 3 attempts.")
+                .build(),
+        )
+        .unwrap();
+        db.record_guide_comment_outcome(
+            &task_id,
+            GuideCommentOutcome::builder()
+                .comment_id(c2.id.clone())
+                .disposition(GuideCommentDisposition::Answered)
+                .response("Exponential backoff isn't needed here; the endpoint is idempotent.")
+                .build(),
+        )
+        .unwrap();
+
+        // Scoped so the connection guard (a single shared `Mutex<Connection>`,
+        // not a pool — see `WorkDb::conn`) is released before the
+        // `list_comment_thread_entries` calls below reacquire it; holding it
+        // open across those calls deadlocks on the same thread.
+        {
+            let conn = db.connect().unwrap();
+            let d1: String = conn
+                .query_row(
+                    "SELECT disposition FROM guide_comment_outcomes WHERE comment_id = ?1",
+                    [&c1.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let d2: String = conn
+                .query_row(
+                    "SELECT disposition FROM guide_comment_outcomes WHERE comment_id = ?1",
+                    [&c2.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(d1, GuideCommentDisposition::SourceChanged.as_str());
+            assert_eq!(d2, GuideCommentDisposition::Answered.as_str());
+        }
+
+        let entries1 = db.list_comment_thread_entries(&c1.id).unwrap();
+        assert!(
+            entries1
+                .iter()
+                .any(|e| e.body.contains("Switched retries to stop after 3 attempts."))
+        );
+        let entries2 = db.list_comment_thread_entries(&c2.id).unwrap();
+        assert!(entries2.iter().any(|e| e.body.contains("the endpoint is idempotent")));
+    }
+
+    #[test]
+    fn re_recording_an_outcome_updates_the_existing_thread_entry_without_duplicating() {
+        let (_dir, db) = open_db();
+        let (_root, series, _) = seed_open_guide(&db);
+        let c1 = make_guide_comment(&db, &series, "fix retry");
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
+        let ReviseDocOutcome::Created { task_id, .. } = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_review_guide")
+                    .artifact_id(series)
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap()
+        else {
+            panic!("expected Created");
+        };
+
+        db.record_guide_comment_outcome(
+            &task_id,
+            GuideCommentOutcome::builder()
+                .comment_id(c1.id.clone())
+                .disposition(GuideCommentDisposition::NoChange)
+                .response("first pass response")
+                .build(),
+        )
+        .unwrap();
+        // A worker re-running `boss comment guide-outcome` for the same
+        // comment — after a transport failure, or simply re-recording with
+        // a refined response — must update the existing thread entry rather
+        // than append a duplicate.
+        db.record_guide_comment_outcome(
+            &task_id,
+            GuideCommentOutcome::builder()
+                .comment_id(c1.id.clone())
+                .disposition(GuideCommentDisposition::SourceChanged)
+                .response("refined response after re-record")
+                .build(),
+        )
+        .unwrap();
+
+        let entries = db.list_comment_thread_entries(&c1.id).unwrap();
+        let answer_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| e.entry_kind == THREAD_ENTRY_KIND_ANSWER)
+            .collect();
+        assert_eq!(
+            answer_entries.len(),
+            1,
+            "re-recording must not duplicate the thread entry: {entries:?}"
+        );
+        assert_eq!(answer_entries[0].body, "refined response after re-record");
+
+        let conn = db.connect().unwrap();
+        let disposition: String = conn
+            .query_row(
+                "SELECT disposition FROM guide_comment_outcomes WHERE comment_id = ?1",
+                [&c1.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(disposition, GuideCommentDisposition::SourceChanged.as_str());
+    }
+
+    #[test]
+    fn request_regeneration_triggers_a_new_guide_attempt() {
+        let (_dir, db) = open_db();
+        let (root, series, _) = seed_open_guide(&db);
+        let c1 = make_guide_comment(&db, &series, "the quoted section is stale prose");
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
+        let ReviseDocOutcome::Created { task_id, .. } = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_review_guide")
+                    .artifact_id(series)
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap()
+        else {
+            panic!("expected Created");
+        };
+
+        let count_before: i64 = db
+            .connect()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM pr_review_guide_attempts", [], |row| row.get(0))
+            .unwrap();
+
+        db.record_guide_comment_outcome(
+            &task_id,
+            GuideCommentOutcome::builder()
+                .comment_id(c1.id.clone())
+                .disposition(GuideCommentDisposition::SourceChanged)
+                .response("Confirmed prose error; regenerating the guide.")
+                .request_regeneration(true)
+                .build(),
+        )
+        .unwrap();
+
+        let count_after: i64 = db
+            .connect()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM pr_review_guide_attempts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count_after,
+            count_before + 1,
+            "request_regeneration must admit a new guide attempt for {root}"
+        );
+
+        let conn = db.connect().unwrap();
+        let request_regeneration: i64 = conn
+            .query_row(
+                "SELECT request_regeneration FROM guide_comment_outcomes WHERE comment_id = ?1",
+                [&c1.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(request_regeneration, 1);
     }
 
     #[test]

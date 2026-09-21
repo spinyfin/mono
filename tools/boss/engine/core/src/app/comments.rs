@@ -239,15 +239,17 @@ async fn record_classification_failure(
 /// `comment_topic` invalidation every other comment mutation uses — no
 /// separate indicator channel.
 ///
-/// Scope guard: only artifacts that `resolve_doc_owner` resolves to a
-/// `Design`/`Investigation` task are eligible (design §"Scope guard" — the
-/// classifier itself runs unconditionally today, so this is the point where
-/// bucket 2 enforces the doc-owner gate before spawning anything). A comment
-/// that doesn't resolve — e.g. `artifact_kind = 'work_item'`, or a `pr_doc`
-/// whose owning task the resolver can't find — is intentionally left
-/// `active` with `intent = question` and no bucket-2 affordance: the same
-/// "no comment-driven affordance" outcome the migration section already
-/// accepts for `work_item` comments post-magic-wand.
+/// Scope guard: only artifacts that `resolve_feedback_target` resolves to
+/// are eligible — either a `Design`/`Investigation`-owned `pr_doc`, or a
+/// `pr_review_guide` series bound to a PR implementation of any task kind
+/// (design §"Scope guard" — the classifier itself runs unconditionally
+/// today, so this is the point where bucket 2 enforces the feedback-target
+/// gate before spawning anything). A comment that doesn't resolve — e.g.
+/// `artifact_kind = 'work_item'`, or a `pr_doc`/`pr_review_guide` whose
+/// owning task the resolver can't find — is intentionally left `active` with
+/// `intent = question` and no bucket-2 affordance: the same "no
+/// comment-driven affordance" outcome the migration section already accepts
+/// for `work_item` comments post-magic-wand.
 async fn spawn_answer_agent(
     server_state: &Arc<ServerState>,
     work_db: &Arc<WorkDb>,
@@ -400,7 +402,8 @@ enum AnswerAgentRepoResolution {
 }
 
 /// Resolve the repo an answer-agent execution should be spawned against, for
-/// `resolve_doc_owner`'s owning task. Routes through
+/// `resolve_feedback_target`'s owner task (`FeedbackTarget::owner_task_id`).
+/// Routes through
 /// [`WorkDb::resolve_repo_for_task`] — the multi-repo design's single
 /// resolution point — rather than reading `tasks.repo_remote_url` directly:
 /// an `investigation` (or project-less `design`) task's repo lives on the
@@ -428,7 +431,7 @@ fn resolve_answer_agent_repo(work_db: &WorkDb, comment: &WorkComment) -> AnswerA
                 err = %err,
                 "answer-agent spawn: resolve_feedback_target failed; leaving comment as-is",
             );
-            return AnswerAgentRepoResolution::Failed("doc_owner_resolution_failed");
+            return AnswerAgentRepoResolution::Failed("feedback_target_resolution_failed");
         }
     };
 
@@ -791,7 +794,7 @@ fn spawn_followup_classifier(
 
     tokio::spawn(async move {
         let thread = work_db.list_comment_thread_entries(&comment.id).unwrap_or_default();
-        let result = crate::comment_classifier::classify_followup_for_subject(
+        let result = crate::comment_classifier::classify_followup(
             &call,
             &comment.body,
             &comment.anchor,
@@ -1069,10 +1072,13 @@ pub(super) async fn handle_comments_resolve(ctx: Dispatch, req: FrontendRequest)
 }
 
 /// Batch-address every unaddressed `revision` comment on a
-/// design/investigation-owned `pr_doc` artifact — the `[Revise]`-banner
-/// action. App-or-Boss tier — replaces the retired magic-wand dispatch path.
+/// design/investigation-owned `pr_doc` artifact or a `pr_review_guide`
+/// series: creates a revision (open PR) or, for documents only, a chore
+/// (merged/closed/no-PR) — the `[Revise]` / **Revise PR** banner action.
+/// App-or-Boss tier — replaces the retired magic-wand dispatch path.
 /// Design: `tools/boss/docs/designs/comment-triggered-document-revisions.md`
-/// §"Buckets 1 & 3".
+/// §"Buckets 1 & 3" and `automatic-pr-review-guides.md`
+/// §"Comments target the implementation".
 pub(super) async fn handle_comments_revise_doc(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -1476,17 +1482,17 @@ async fn end_answer_agent_on_thread_terminal(
     stand_down_answer_agent(server_state, work_db, &comment.id).await;
 }
 
-/// Worker-callable: post the answer agent's reply (P3b). `run_id` is the
-/// caller's own `BOSS_RUN_ID` — resolved to its bound `answer_agent`
-/// execution, then to that execution's comment, then to the comment's
-/// currently-`running` `answer_agent_runs` row. The caller cannot target any
-/// other comment or run: nothing in the request names one directly (see
-/// `boss comment reply`'s security note in `crate::answer_agent`).
-///
-/// On success: completes the run (`replied`), appends an
-/// `entry_kind = 'answer'` thread entry, and transitions the comment
-/// `answering → answered`. No `authorize_rpc` gate — worker-callable RPCs
-/// (like `CreateAutomationTask`) run without a special tier, matching that
+/// Worker-callable: record a grounded per-comment outcome for a review-guide
+/// revision (`boss comment guide-outcome`). `run_id` is the caller's own
+/// `BOSS_RUN_ID` — resolved to its bound `RevisionImplementation` execution,
+/// then to that execution's work item, which must be the revision that
+/// claimed `comment_id` (`WorkDb::record_guide_comment_outcome` enforces the
+/// claim). The caller cannot target a comment claimed by a different
+/// revision. On success: upserts the `guide_comment_outcomes` disposition,
+/// appends an `entry_kind = 'answer'` thread entry with the grounded
+/// response, and resolves the comment once its owning revision is terminal.
+/// No `authorize_rpc` gate — worker-callable RPCs (like
+/// `CreateAutomationTask`) run without a special tier, matching that
 /// precedent.
 pub(super) async fn handle_comments_record_guide_outcome(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
@@ -1559,6 +1565,18 @@ pub(super) async fn handle_comments_record_guide_outcome(ctx: Dispatch, req: Fro
     }
 }
 
+/// Worker-callable: post the answer agent's reply (P3b). `run_id` is the
+/// caller's own `BOSS_RUN_ID` — resolved to its bound `answer_agent`
+/// execution, then to that execution's comment, then to the comment's
+/// currently-`running` `answer_agent_runs` row. The caller cannot target any
+/// other comment or run: nothing in the request names one directly (see
+/// `boss comment reply`'s security note in `crate::answer_agent`).
+///
+/// On success: completes the run (`replied`), appends an
+/// `entry_kind = 'answer'` thread entry, and transitions the comment
+/// `answering → answered`. No `authorize_rpc` gate — worker-callable RPCs
+/// (like `CreateAutomationTask`) run without a special tier, matching that
+/// precedent.
 pub(super) async fn handle_comments_post_answer(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -2590,5 +2608,202 @@ mod tests {
         // bumped the work revision (no separate assertion possible without
         // a live subscriber here, but the call must not panic).
         let _ = sink;
+    }
+
+    // --- `handle_comments_record_guide_outcome` rejection paths ---
+
+    /// Stand up a `pr_review_guide` comment claimed by a same-PR revision,
+    /// with a bound `RevisionImplementation` execution — the state
+    /// `handle_comments_record_guide_outcome` expects to resolve `run_id`
+    /// against. Returns `(comment_id, execution_id)`.
+    fn seed_claimed_guide_comment(work_db: &Arc<WorkDb>, pr_number: u32) -> (String, String) {
+        use crate::work::{CreateExecutionInput, FakePrStateChecker, PrOpenState};
+
+        let product = crate::test_support::create_product(work_db);
+        let root = crate::test_support::create_active_chore(work_db, &product, "impl");
+        work_db
+            .update_work_item(
+                &root,
+                boss_protocol::WorkItemPatch {
+                    status: Some("in_review".to_owned()),
+                    pr_url: Some(format!("https://github.com/acme/widget/pull/{pr_number}")),
+                    ..boss_protocol::WorkItemPatch::default()
+                },
+            )
+            .unwrap();
+        // `seed_review_guide_series` hardcodes canonical_pr_url to pull/9
+        // (via `review_guide_source_packet`), which would collide with a
+        // second call at a different `pr_number` — build the packet
+        // directly so each call's series stays on its own canonical PR.
+        let mut packet = crate::test_support::review_guide_source_packet("base", "head");
+        packet.canonical_pr_url = format!("https://github.com/acme/widget/pull/{pr_number}");
+        packet.pr_number = pr_number as u64;
+        let stored = work_db
+            .persist_pr_review_guide_source_capture(&root, 1, crate::work::PrSourceCaptureTrigger::Creation, &packet)
+            .unwrap();
+        let crate::work::PrSourceCapturePersistOutcome::Stored(capture) = stored else {
+            panic!("capture must persist")
+        };
+        let (series, comparison) = (capture.series_id, capture.comparison_id);
+        let attempt = work_db
+            .create_pr_review_guide_attempt(&series, &comparison, "review-guide-v1")
+            .unwrap();
+        let crate::work::PublishReviewGuideOutcome::Published(_) = work_db
+            .publish_pr_review_guide_version(&attempt.id, "# Guide\n\nOriginal quote", "raw")
+            .unwrap()
+        else {
+            panic!("expected published guide")
+        };
+        let version_id = work_db
+            .get_pr_review_guide_summary_for_root(&root)
+            .unwrap()
+            .expect("summary")
+            .readable_version_id
+            .expect("readable version");
+        let comment = work_db
+            .create_comment_with_guide_version(
+                boss_protocol::CreateCommentInput::builder()
+                    .artifact_kind("pr_review_guide")
+                    .artifact_id(series.clone())
+                    .anchor(boss_protocol::CommentAnchor {
+                        exact: "Original quote".into(),
+                        ..Default::default()
+                    })
+                    .body("fix retry")
+                    .author("user:test")
+                    .doc_version("hash")
+                    .plain_text_projection_version(1)
+                    .build(),
+                Some(&version_id),
+            )
+            .unwrap();
+        work_db.set_comment_intent(&comment.id, INTENT_REVISION, 0.9).unwrap();
+
+        let outcome = work_db
+            .revise_doc(
+                crate::work::ReviseDocInput::builder()
+                    .artifact_kind("pr_review_guide")
+                    .artifact_id(series)
+                    .build(),
+                &FakePrStateChecker::always(PrOpenState::Open),
+            )
+            .unwrap();
+        let crate::work::ReviseDocOutcome::Created { task_id, .. } = outcome else {
+            panic!("expected Created, got {outcome:?}");
+        };
+        let execution = work_db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(task_id)
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Running)
+                    .build(),
+            )
+            .unwrap();
+        (comment.id, execution.id)
+    }
+
+    #[tokio::test]
+    async fn record_guide_outcome_rejects_empty_body() {
+        let (server_state, _dir) = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        let (comment_id, execution_id) = seed_claimed_guide_comment(&work_db, 9);
+
+        let ctx = dispatch_ctx(&server_state, &work_db, &sink);
+        handle_comments_record_guide_outcome(
+            ctx,
+            FrontendRequest::CommentsRecordGuideOutcome {
+                run_id: execution_id,
+                comment_id: comment_id.clone(),
+                disposition: boss_protocol::GuideCommentDisposition::NoChange,
+                body: "   ".to_owned(),
+                request_regeneration: false,
+            },
+        )
+        .await;
+
+        let envelope = sink.next().await.expect("a response should have been enqueued");
+        assert!(
+            matches!(
+                envelope.payload,
+                FrontendEvent::WorkError { message } if message.contains("body may not be empty")
+            ),
+            "empty body must be rejected before touching the comment",
+        );
+        // The comment must still be claimed/in_revision — nothing was recorded.
+        let comment = work_db.get_comment(&comment_id).unwrap().unwrap();
+        assert_eq!(comment.status, COMMENT_STATUS_IN_REVISION);
+    }
+
+    #[tokio::test]
+    async fn record_guide_outcome_rejects_a_run_that_is_not_a_revision_execution() {
+        let (server_state, _dir) = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        let (comment_id, _execution_id) = seed_claimed_guide_comment(&work_db, 9);
+
+        // A comment-artifact `answer_agent` execution — the wrong kind for
+        // this RPC's security boundary (worker-policy/src/policy.rs:276-279
+        // relies on the handler enforcing exactly this).
+        let other = work_db
+            .create_answer_agent_execution(&comment_id, "git@github.com:acme/widget.git")
+            .unwrap();
+
+        let ctx = dispatch_ctx(&server_state, &work_db, &sink);
+        handle_comments_record_guide_outcome(
+            ctx,
+            FrontendRequest::CommentsRecordGuideOutcome {
+                run_id: other.id,
+                comment_id: comment_id.clone(),
+                disposition: boss_protocol::GuideCommentDisposition::NoChange,
+                body: "current code already handles this".to_owned(),
+                request_regeneration: false,
+            },
+        )
+        .await;
+
+        let envelope = sink.next().await.expect("a response should have been enqueued");
+        assert!(
+            matches!(
+                envelope.payload,
+                FrontendEvent::WorkError { message } if message.contains("is not a revision execution")
+            ),
+            "a non-revision execution must be rejected",
+        );
+    }
+
+    #[tokio::test]
+    async fn record_guide_outcome_rejects_a_comment_claimed_by_a_different_revision() {
+        let (server_state, _dir) = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        let (comment_id, _execution_id) = seed_claimed_guide_comment(&work_db, 9);
+        // A second, unrelated claimed guide comment/revision pair — its
+        // execution must not be able to record an outcome for the first
+        // comment.
+        let (_other_comment_id, other_execution_id) = seed_claimed_guide_comment(&work_db, 10);
+
+        let ctx = dispatch_ctx(&server_state, &work_db, &sink);
+        handle_comments_record_guide_outcome(
+            ctx,
+            FrontendRequest::CommentsRecordGuideOutcome {
+                run_id: other_execution_id,
+                comment_id: comment_id.clone(),
+                disposition: boss_protocol::GuideCommentDisposition::NoChange,
+                body: "current code already handles this".to_owned(),
+                request_regeneration: false,
+            },
+        )
+        .await;
+
+        let envelope = sink.next().await.expect("a response should have been enqueued");
+        assert!(
+            matches!(
+                envelope.payload,
+                FrontendEvent::WorkError { message } if message.contains("is not claimed by revision")
+            ),
+            "a revision must not record an outcome for a comment claimed by a different revision",
+        );
     }
 }

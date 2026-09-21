@@ -20,22 +20,7 @@ use crate::work::{FeedbackTarget, WorkDb, WorkExecution, parse_pr_doc_artifact_i
 /// weaker prompt is better than no spawn at all.
 pub(super) async fn compose_answer_agent_prompt(work_db: &WorkDb, execution: &WorkExecution) -> String {
     let comment_id = &execution.work_item_id;
-    let fallback = |reason: &str| -> String {
-        tracing::warn!(
-            execution_id = %execution.id,
-            comment_id = %comment_id,
-            reason,
-            "answer_agent execution: could not compose the answer-agent prompt; \
-             falling back to a minimal generic prompt",
-        );
-        format!(
-            "You are a read-only answer agent (see your CLAUDE.md for the full \
-             read-only mandate). The engine could not resolve the comment this run was \
-             spawned for ({reason}). Post a single reply via `{cmd}` explaining that you \
-             were unable to load the question, then stop.",
-            cmd = crate::answer_agent::THREAD_REPLY_COMMAND,
-        )
-    };
+    let fallback = |reason: &str| -> String { fallback_prompt(&execution.id, comment_id, reason) };
 
     let comment = match work_db.get_comment(comment_id) {
         Ok(Some(c)) => c,
@@ -152,6 +137,26 @@ pub(super) async fn compose_answer_agent_prompt(work_db: &WorkDb, execution: &Wo
     prompt
 }
 
+/// A diagnosable fallback prompt for when the comment/target this run was
+/// spawned for can no longer be resolved — a weaker prompt is better than an
+/// empty one, which would spawn a worker with no instructions at all.
+fn fallback_prompt(execution_id: &str, comment_id: &str, reason: &str) -> String {
+    tracing::warn!(
+        execution_id,
+        comment_id,
+        reason,
+        "answer_agent execution: could not compose the answer-agent prompt; \
+         falling back to a minimal generic prompt",
+    );
+    format!(
+        "You are a read-only answer agent (see your CLAUDE.md for the full \
+         read-only mandate). The engine could not resolve the comment this run was \
+         spawned for ({reason}). Post a single reply via `{cmd}` explaining that you \
+         were unable to load the question, then stop.",
+        cmd = crate::answer_agent::THREAD_REPLY_COMMAND,
+    )
+}
+
 async fn compose_guide_answer_prompt(
     work_db: &WorkDb,
     comment: &boss_protocol::WorkComment,
@@ -164,7 +169,11 @@ async fn compose_guide_answer_prompt(
         ..
     } = target
     else {
-        return String::new();
+        return fallback_prompt(
+            execution_id,
+            &comment.id,
+            "resolved feedback target is not a PR implementation target",
+        );
     };
     let thread = work_db.list_comment_thread_entries(&comment.id).unwrap_or_default();
     let context = comment.guide_context.as_ref();
@@ -236,4 +245,160 @@ async fn compose_guide_answer_prompt(
         cmd = crate::answer_agent::THREAD_REPLY_COMMAND,
     ));
     prompt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{create_active_chore, create_product, open_db, seed_review_guide_series};
+    use crate::work::{ExecutionKind, ExecutionStatus, PublishReviewGuideOutcome};
+    use boss_protocol::{CommentAnchor, CreateCommentInput, WorkItemPatch};
+
+    fn seed_guide_comment(db: &WorkDb) -> (String, boss_protocol::WorkComment) {
+        let root = create_active_chore(db, &create_product(db), "impl");
+        db.update_work_item(
+            &root,
+            WorkItemPatch {
+                status: Some("in_review".to_owned()),
+                pr_url: Some("https://github.com/acme/widget/pull/9".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let (series, comparison) = seed_review_guide_series(db, &root);
+        let attempt = db
+            .create_pr_review_guide_attempt(&series, &comparison, "review-guide-v1")
+            .unwrap();
+        let PublishReviewGuideOutcome::Published(_) = db
+            .publish_pr_review_guide_version(&attempt.id, "# Guide\n\nOriginal quote", "raw")
+            .unwrap()
+        else {
+            panic!("expected published guide")
+        };
+        let version_id = db
+            .get_pr_review_guide_summary_for_root(&root)
+            .unwrap()
+            .expect("summary")
+            .readable_version_id
+            .expect("readable version");
+        let comment = db
+            .create_comment_with_guide_version(
+                CreateCommentInput::builder()
+                    .artifact_kind("pr_review_guide")
+                    .artifact_id(series)
+                    .anchor(CommentAnchor {
+                        exact: "Original quote".into(),
+                        ..Default::default()
+                    })
+                    .body("why does this retry forever?")
+                    .author("user:test")
+                    .doc_version("hash")
+                    .plain_text_projection_version(1)
+                    .build(),
+                Some(&version_id),
+            )
+            .unwrap();
+        (root, comment)
+    }
+
+    fn execution_for(comment_id: &str) -> WorkExecution {
+        WorkExecution::builder()
+            .id("exec_answer_01")
+            .work_item_id(comment_id)
+            .kind(ExecutionKind::AnswerAgent)
+            .status(ExecutionStatus::Running)
+            .repo_remote_url("git@github.com:acme/widget.git")
+            .workspace_path("/tmp/workspace")
+            .created_at("2026-05-15T00:00:00Z")
+            .build()
+    }
+
+    #[tokio::test]
+    async fn guide_answer_prompt_carries_pr_identity_and_guide_content() {
+        let (_dir, db) = open_db();
+        let (root, comment) = seed_guide_comment(&db);
+        let execution = execution_for(&comment.id);
+
+        let prompt = compose_answer_agent_prompt(&db, &execution).await;
+
+        assert!(
+            prompt.contains("https://github.com/acme/widget/pull/9"),
+            "prompt must carry the canonical current PR:\n{prompt}",
+        );
+        assert!(prompt.contains(&root), "prompt must carry the root task id:\n{prompt}",);
+        assert!(
+            prompt.contains("Original guide version"),
+            "prompt must carry the version/comparison/head triple:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("Original quote"),
+            "prompt must embed the guide markdown:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("why does this retry forever?"),
+            "prompt must carry the comment body:\n{prompt}",
+        );
+    }
+
+    #[tokio::test]
+    async fn guide_answer_prompt_falls_back_when_guide_version_missing() {
+        let (_dir, db) = open_db();
+        let (_root, mut comment) = seed_guide_comment(&db);
+        // Simulate an unresolvable guide version: the fallback branch at
+        // L217-L226 must still produce a diagnosable prompt, not an empty
+        // section.
+        if let Some(ctx) = comment.guide_context.as_mut() {
+            ctx.version_id = "missing-version".to_owned();
+        }
+        let target = db
+            .resolve_feedback_target(&comment.artifact_kind, &comment.artifact_id)
+            .unwrap()
+            .expect("feedback target");
+        let prompt = compose_guide_answer_prompt(&db, &comment, &target, "exec_answer_02").await;
+        assert!(
+            prompt.contains("Original guide content\n\nNot available"),
+            "missing guide version must fall back to a diagnosable placeholder:\n{prompt}",
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_prompt_used_when_feedback_target_is_not_pr_implementation() {
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        let task = create_active_chore(&db, &product, "some-chore");
+        // A comment whose artifact resolves to no feedback target at all —
+        // `compose_answer_agent_prompt`'s own `OutOfScope` branch already
+        // returns fallback text; this exercises `compose_guide_answer_prompt`
+        // directly with a non-PR-implementation target to prove its own
+        // fallback (not `String::new()`) fires too.
+        let comment = db
+            .create_comment_with_guide_version(
+                CreateCommentInput::builder()
+                    .artifact_kind("work_item")
+                    .artifact_id(task.clone())
+                    .anchor(CommentAnchor {
+                        exact: "the whole task".into(),
+                        ..Default::default()
+                    })
+                    .body("hello")
+                    .author("user:test")
+                    .doc_version("hash")
+                    .plain_text_projection_version(1)
+                    .build(),
+                None,
+            )
+            .unwrap();
+        let bogus_target = FeedbackTarget::RepositoryDocument(boss_protocol::DocOwner {
+            task_id: task.clone(),
+            task_kind: boss_protocol::TaskKind::Chore,
+            chain_root_id: task,
+            pr_url: None,
+            pr_lifecycle: boss_protocol::DocOwnerPrLifecycle::NoPr,
+        });
+        let prompt = compose_guide_answer_prompt(&db, &comment, &bogus_target, "exec_answer_03").await;
+        assert!(
+            prompt.contains("could not resolve the comment this run was spawned for"),
+            "non-PR-implementation target must produce a diagnosable fallback, not an empty prompt:\n{prompt}",
+        );
+    }
 }
