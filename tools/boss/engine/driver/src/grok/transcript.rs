@@ -96,13 +96,15 @@ fn canonical_tool_result(output: Value) -> (String, bool) {
                 .map(|code| code != 0)
         })
         .unwrap_or(false);
+    // `grok_bash_output_text` prefers `output_for_prompt`, then `output`
+    // (string or 0..=255 bytes via the shared decoder). Remaining keys are
+    // transcript-only: `text`, then stdout and stderr independently so a
+    // result that carries both streams does not drop stderr on the first
+    // successful decode.
     let grok_text = super::grok_bash_output_text(&output);
     let content = if grok_text.is_empty() {
-        decode_tool_text_field(&output, "output")
-            .or_else(|| decode_tool_text_field(&output, "text"))
-            .or_else(|| decode_tool_text_field(&output, "stdout"))
-            .or_else(|| decode_tool_text_field(&output, "stderr"))
-            .or_else(|| output.as_str().map(str::to_owned))
+        decode_tool_text_field(&output, "text")
+            .or_else(|| combined_stdio_text(&output))
             .unwrap_or_default()
     } else {
         grok_text
@@ -115,29 +117,26 @@ fn canonical_tool_result(output: Value) -> (String, bool) {
     (content, is_error)
 }
 
+/// Join nonempty stdout and stderr rather than `or_else`-ing, so a tool
+/// result that carries both (matches on stdout, a diagnostic on stderr)
+/// keeps both in the rendered transcript.
+fn combined_stdio_text(output: &Value) -> Option<String> {
+    let stdout = decode_tool_text_field(output, "stdout");
+    let stderr = decode_tool_text_field(output, "stderr");
+    match (stdout, stderr) {
+        (None, None) => None,
+        (Some(out), None) => Some(out),
+        (None, Some(err)) => Some(err),
+        (Some(out), Some(err)) => Some(format!("{out}\n{err}")),
+    }
+}
+
 /// Grok tool results sometimes carry text as a UTF-8 string and sometimes
 /// as a JSON array of bytes (`stdout: [60, 119, …]`). Decode either so the
 /// transcript viewer does not render a raw byte array for ordinary text.
 /// Values outside 0..=255 are not bytes — leave those arrays as JSON.
 fn decode_tool_text_field(output: &Value, key: &str) -> Option<String> {
-    let value = output.get(key)?;
-    if let Some(text) = value.as_str() {
-        return if text.is_empty() { None } else { Some(text.to_owned()) };
-    }
-    let bytes = value.as_array()?;
-    if bytes.is_empty() {
-        return None;
-    }
-    let mut raw = Vec::with_capacity(bytes.len());
-    for n in bytes {
-        let b = n.as_u64()?;
-        if b > 255 {
-            return None;
-        }
-        raw.push(b as u8);
-    }
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    if text.is_empty() { None } else { Some(text) }
+    super::decode_tool_utf8(output.get(key)?)
 }
 
 enum ProseRole {
@@ -763,6 +762,66 @@ mod tests {
         assert_eq!(result["type"], "tool_result");
         assert_eq!(result["content"], "<workspace_");
         assert_eq!(result["is_error"], false);
+    }
+
+    #[test]
+    fn bash_output_non_byte_values_stay_json() {
+        let mut session = GrokTranscriptSession::default();
+        session.normalize(json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-bash",
+                "title": "run_terminal_command",
+                "rawInput": {"command": "true"}
+            }}
+        }));
+        let result = session.normalize(json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-bash",
+                "rawOutput": {"exit_code": 0, "output": [300, 400]}
+            }}
+        }));
+        assert_eq!(result["type"], "tool_result");
+        let content = result["content"].as_str().expect("content");
+        assert!(
+            content.contains("300") && content.contains("400"),
+            "output-field values outside 0..=255 must not wrap via grok_bash_output_text; got {content}"
+        );
+    }
+
+    #[test]
+    fn tool_result_renders_stdout_and_stderr_together() {
+        let mut session = GrokTranscriptSession::default();
+        session.normalize(json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-grep",
+                "title": "grep_search",
+                "rawInput": {"query": "workspace"}
+            }}
+        }));
+        let result = session.normalize(json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-grep",
+                "rawOutput": {
+                    "type": "GrepSearch",
+                    "stdout": "workspace/foo.rs:1:match\n",
+                    "stderr": "permission denied: /secret\n"
+                }
+            }}
+        }));
+        assert_eq!(result["type"], "tool_result");
+        let content = result["content"].as_str().expect("content");
+        assert!(
+            content.contains("workspace/foo.rs:1:match") && content.contains("permission denied: /secret"),
+            "stdout and stderr must both render; got {content}"
+        );
     }
 
     #[test]

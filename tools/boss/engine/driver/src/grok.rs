@@ -595,9 +595,9 @@ impl AgentDriver for GrokDriver {
     /// falls onto the reconstruction fallback, exactly the failure state
     /// design T-19 forbids. Read `output_for_prompt` instead — the
     /// exit-annotated combined-output text observed on the wire — falling
-    /// back to a lossy decode of the raw `output` byte array so a future
-    /// toolResult shape that drops `output_for_prompt` still yields
-    /// something scannable rather than going dark again.
+    /// back to a validated UTF-8 decode of `output` (string or 0..=255 byte
+    /// array) so a future toolResult shape that drops `output_for_prompt`
+    /// still yields something scannable rather than going dark again.
     fn pr_url_capture_feed(
         &self,
         tool_name: &str,
@@ -895,12 +895,15 @@ impl AgentDriver for GrokDriver {
 /// it exactly as it would in a Claude `stdout` field. A present-but-empty
 /// `output_for_prompt` is treated as absent so a genuinely empty capture
 /// still tries the byte fallback rather than short-circuiting on `""`.
-/// Falls back to a lossy UTF-8 decode of the raw `output` byte array on the
-/// chance a future toolResult shape omits `output_for_prompt`, so this never
-/// regresses to silently scanning nothing. A bare-string `tool_response` is
-/// handled first, mirroring [`crate::default_pr_url_capture_feed`]'s own
-/// bare-string arm, so a future Grok ingress that ever delivers free text
-/// instead of an object still degrades gracefully instead of going dark.
+/// Falls back to a lossy UTF-8 decode of the raw `output` field (string or
+/// byte array) on the chance a future toolResult shape omits
+/// `output_for_prompt`, so this never regresses to silently scanning nothing.
+/// Byte arrays must be 0..=255; out-of-range values are rejected rather than
+/// wrapped (`300 as u8` → 44), matching transcript rendering. A bare-string
+/// `tool_response` is handled first, mirroring
+/// [`crate::default_pr_url_capture_feed`]'s own bare-string arm, so a future
+/// Grok ingress that ever delivers free text instead of an object still
+/// degrades gracefully instead of going dark.
 fn grok_bash_output_text(tool_response: &Value) -> String {
     if let Some(text) = tool_response.as_str() {
         // Degrade the same way the default does if a future Grok ingress
@@ -914,11 +917,34 @@ fn grok_bash_output_text(tool_response: &Value) -> String {
     {
         return text.to_owned();
     }
-    let Some(bytes) = tool_response.get("output").and_then(Value::as_array) else {
-        return String::new();
-    };
-    let bytes: Vec<u8> = bytes.iter().filter_map(Value::as_u64).map(|n| n as u8).collect();
-    String::from_utf8_lossy(&bytes).into_owned()
+    tool_response
+        .get("output")
+        .and_then(decode_tool_utf8)
+        .unwrap_or_default()
+}
+
+/// Decode a JSON string or a JSON array of bytes (each 0..=255) as UTF-8.
+/// Values outside 0..=255 are not bytes — return None so callers keep the
+/// original JSON instead of wrapping (`300 as u8` → 44). Empty strings and
+/// empty arrays are absent, not `""`.
+fn decode_tool_utf8(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return if text.is_empty() { None } else { Some(text.to_owned()) };
+    }
+    let bytes = value.as_array()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut raw = Vec::with_capacity(bytes.len());
+    for n in bytes {
+        let b = n.as_u64()?;
+        if b > 255 {
+            return None;
+        }
+        raw.push(b as u8);
+    }
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    if text.is_empty() { None } else { Some(text) }
 }
 
 // ---------------------------------------------------------------------------
@@ -1142,6 +1168,20 @@ mod tests {
     #[test]
     fn grok_bash_output_text_is_empty_when_neither_field_present() {
         assert_eq!(grok_bash_output_text(&json!({"type": "Bash"})), "");
+    }
+
+    #[test]
+    fn grok_bash_output_text_rejects_out_of_range_output_bytes() {
+        let tool_result = json!({
+            "type": "Bash",
+            "output": [300, 400],
+            "exit_code": 0,
+        });
+        assert_eq!(
+            grok_bash_output_text(&tool_result),
+            "",
+            "values outside 0..=255 must not wrap into bytes (300 as u8 == 44)"
+        );
     }
 
     #[test]
