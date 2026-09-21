@@ -118,16 +118,24 @@ fn canonical_tool_result(output: Value) -> (String, bool) {
 /// Grok tool results sometimes carry text as a UTF-8 string and sometimes
 /// as a JSON array of bytes (`stdout: [60, 119, …]`). Decode either so the
 /// transcript viewer does not render a raw byte array for ordinary text.
+/// Values outside 0..=255 are not bytes — leave those arrays as JSON.
 fn decode_tool_text_field(output: &Value, key: &str) -> Option<String> {
     let value = output.get(key)?;
     if let Some(text) = value.as_str() {
         return if text.is_empty() { None } else { Some(text.to_owned()) };
     }
     let bytes = value.as_array()?;
-    if bytes.is_empty() || !bytes.iter().all(|n| n.as_u64().is_some()) {
+    if bytes.is_empty() {
         return None;
     }
-    let raw: Vec<u8> = bytes.iter().filter_map(Value::as_u64).map(|n| n as u8).collect();
+    let mut raw = Vec::with_capacity(bytes.len());
+    for n in bytes {
+        let b = n.as_u64()?;
+        if b > 255 {
+            return None;
+        }
+        raw.push(b as u8);
+    }
     let text = String::from_utf8_lossy(&raw).into_owned();
     if text.is_empty() { None } else { Some(text) }
 }
@@ -755,6 +763,94 @@ mod tests {
         assert_eq!(result["type"], "tool_result");
         assert_eq!(result["content"], "<workspace_");
         assert_eq!(result["is_error"], false);
+    }
+
+    #[test]
+    fn grep_search_stdout_non_byte_values_stay_json() {
+        let mut session = GrokTranscriptSession::default();
+        session.normalize(json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-grep",
+                "title": "grep_search",
+                "rawInput": {"query": "workspace"}
+            }}
+        }));
+        let result = session.normalize(json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-grep",
+                "rawOutput": {"type": "GrepSearch", "stdout": [300, 400]}
+            }}
+        }));
+        assert_eq!(result["type"], "tool_result");
+        let content = result["content"].as_str().expect("content");
+        assert!(
+            content.contains("300") && content.contains("400"),
+            "values outside 0..=255 must not wrap into bytes; got {content}"
+        );
+    }
+
+    #[test]
+    fn hook_execution_preserves_blocked_runs_for_the_viewer() {
+        let raw = json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "hook_execution",
+                "event_name": "pre_tool_use",
+                "tool_name": "run_terminal_command",
+                "runs": [{"name": "global/guard:pre_tool_use[0].hooks[0]", "status": {"status": "blocked", "error": "denied"}}]
+            }}
+        });
+        let normalized = normalize_acp_update(raw);
+        assert_eq!(normalized["subtype"], "hook_execution");
+        assert_eq!(normalized["message"], "hook failed: pre_tool_use");
+        assert_eq!(normalized["runs"][0]["status"]["status"], "blocked");
+    }
+
+    #[test]
+    fn noisy_tool_turn_strips_success_hook_runs_and_decodes_grep_stdout() {
+        let mut session = GrokTranscriptSession::default();
+        let tool = session.normalize(json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-1",
+                "title": "grep_search",
+                "rawInput": {"query": "workspace"}
+            }}
+        }));
+        let post = session.normalize(json!({
+            "method": "_x.ai/session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "hook_execution",
+                "event_name": "post_tool_use",
+                "tool_name": "grep_search",
+                "runs": [{"name": "global/dump-all:post_tool_use[0].hooks[0]", "status": {"status": "success", "elapsed_ms": 17}}]
+            }}
+        }));
+        let stdout: Vec<u8> = b"<workspace_path>".to_vec();
+        let result = session.normalize(json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-1",
+                "rawOutput": {"type": "GrepSearch", "stdout": stdout}
+            }}
+        }));
+        assert_eq!(tool["type"], "assistant");
+        assert_eq!(tool["content"][0]["name"], "grep_search");
+        assert_eq!(post["type"], "system");
+        assert_eq!(post["subtype"], "hook_execution");
+        assert_eq!(post["message"], "hook ran: post_tool_use");
+        assert!(
+            post.get("runs").is_none(),
+            "success heartbeat must stay a filler so render can drop it"
+        );
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["content"], "<workspace_path>");
     }
 
     #[test]

@@ -1713,6 +1713,90 @@ mod tests {
             ["⚙ GrepSearch", "↳ result", "Assistant"],
             "a reader must not skip a hook block between every tool step; got {labels:?}"
         );
+        let md = segments_to_markdown(&segs);
+        assert!(
+            !md.contains("hook ran:"),
+            "rendered markdown must not show heartbeat payloads; got {md}"
+        );
+        assert!(md.contains("## ⚙ GrepSearch"), "got {md}");
+        assert!(md.contains("## ↳ result"), "got {md}");
+        assert!(md.contains("## Assistant"), "got {md}");
+    }
+
+    #[test]
+    fn dense_hook_heartbeats_collapse_to_the_model_work() {
+        // A short stand-in for the 1,512-segment transcript: every tool
+        // step is bracketed by success-only pre/post_tool_use heartbeats.
+        let mut events = Vec::new();
+        events.push(TranscriptEvent {
+            seq: 0,
+            kind: TranscriptEventKind::UserText("Find the workspace path.".to_owned()),
+            timestamp: None,
+            model: None,
+        });
+        let mut seq = 1;
+        for i in 0..8 {
+            events.push(system_event(
+                seq,
+                "hook_execution",
+                "{\n  \"message\": \"hook ran: pre_tool_use\"\n}",
+            ));
+            seq += 1;
+            events.push(TranscriptEvent {
+                seq,
+                kind: TranscriptEventKind::ToolUse {
+                    name: format!("tool_{i}"),
+                    input: serde_json::json!({"i": i}),
+                },
+                timestamp: None,
+                model: None,
+            });
+            seq += 1;
+            events.push(system_event(
+                seq,
+                "hook_execution",
+                "{\n  \"message\": \"hook ran: post_tool_use\"\n}",
+            ));
+            seq += 1;
+            events.push(TranscriptEvent {
+                seq,
+                kind: TranscriptEventKind::ToolResult {
+                    output: format!("ok {i}"),
+                    is_error: false,
+                },
+                timestamp: None,
+                model: None,
+            });
+            seq += 1;
+        }
+        events.push(system_event(
+            seq,
+            "hook_execution",
+            "{\n  \"message\": \"hook failed: pre_tool_use\",\n  \"runs\": [{\"status\": {\"status\": \"error\"}}]\n}",
+        ));
+        seq += 1;
+        events.push(TranscriptEvent {
+            seq,
+            kind: TranscriptEventKind::AssistantText("Found it.".to_owned()),
+            timestamp: None,
+            model: None,
+        });
+        let segs = events_to_segments(&events, &RenderOpts::default());
+        let labels: Vec<&str> = segs.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(
+            labels.len(),
+            1 + 8 * 2 + 1 + 1,
+            "user + 8 tool/result pairs + failed hook + assistant; got {labels:?}"
+        );
+        assert_eq!(labels[0], "User");
+        assert_eq!(labels[labels.len() - 2], "hook_execution");
+        assert_eq!(labels[labels.len() - 1], "Assistant");
+        assert_eq!(
+            labels.iter().filter(|l| **l == "hook_execution").count(),
+            1,
+            "only the failed hook remains; got {labels:?}"
+        );
+        assert!(!segments_to_markdown(&segs).contains("hook ran:"));
     }
 
     #[test]

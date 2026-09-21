@@ -423,7 +423,7 @@ final class TranscriptViewTests: XCTestCase {
                 3,
                 role: .tool,
                 label: "↳ result",
-                markdown: "```\n{\"type\":\"GrepSearch\",\"stdout\":[60,119,111,114,107,115,112,97,99,101,95,114,101,115,117]}\n```"
+                markdown: "```\n{\"type\":\"GrepSearch\",\"stdout\":[60,119,111,114,107,115,112,97,99,101,95,112,97,116,104,62]}\n```"
             ),
             seg(
                 4,
@@ -449,7 +449,7 @@ final class TranscriptViewTests: XCTestCase {
         [
             seg(0, role: .user, label: "User", markdown: "Find the workspace path."),
             seg(1, role: .tool, label: "⚙ GrepSearch", markdown: "```json\n{\"query\": \"workspace\"}\n```"),
-            seg(3, role: .tool, label: "↳ result", markdown: "```\n<workspace_resu\n```"),
+            seg(3, role: .tool, label: "↳ result", markdown: "```\n<workspace_path>\n```"),
             seg(5, role: .tool, label: "⚙ Bash", markdown: "```sh\nls\n```"),
             seg(7, role: .tool, label: "↳ result", markdown: "```\nAgents.md\n```"),
             seg(
