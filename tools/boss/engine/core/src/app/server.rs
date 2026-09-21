@@ -1273,6 +1273,19 @@ pub async fn serve_with_overrides(
 
     post_bind.mark("tmux_adoption");
 
+    // The frontend socket is already accepting connections by this point in
+    // startup (everything above is a post-bind step), so an app session that
+    // reconnects quickly — the engine-restart ordering, app already running
+    // — can register and run its own `reattach_worker_panes_to_registered_app`
+    // pass (see `sessions::handle_register_app_session`) before boot-time
+    // tmux adoption above has populated `live_worker_states`, finding zero
+    // candidates and leaving every readopted worker without a viewer. Run
+    // the same pass again now, for whichever app session (if any) won that
+    // race and is already registered.
+    if server_state.app_session.lock().await.is_some() {
+        server_state.reattach_worker_panes_to_registered_app().await;
+    }
+
     // Rehydrate dispatch for any work items that were in "Doing"
     // (status=active) when the engine last shut down but whose
     // executions ended without being moved out of the column. See

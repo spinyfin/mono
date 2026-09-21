@@ -7,8 +7,9 @@ import AppKit
 /// no-op unless `BOSS_ENGINE_STOP_ON_EXIT=1`. Detaching `tmux attach-session`
 /// clients leaves the sessions (and the agents) running.
 ///
-/// This dialog does **not** promise that panes reappear on relaunch —
-/// worker pane re-attachment on app registration is unbuilt. It also
+/// Panes do reappear on relaunch: `RegisterAppSession` re-attaches every
+/// live tmux-hosted worker's viewer (`ServerState::reattach_worker_panes_to_registered_app`),
+/// mirroring the coordinator pane's own restart re-attach. This dialog
 /// does **not** mention engine replacement: that is a *next-launch*
 /// `EngineProcessController.start()` fingerprint mismatch, not a
 /// consequence of this quit. Warning about it here would make a
