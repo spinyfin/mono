@@ -1,5 +1,13 @@
 import SwiftUI
 
+extension WorkTask {
+    /// Available on any PR card, including merged and closed work.
+    var generateReviewGuideMenuTitle: String? {
+        guard let prURL, !prURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return reviewGuideReadableVersionId == nil ? "Generate Review Guide…" : "Regenerate Review Guide…"
+    }
+}
+
 // ===========================================================================
 // PR review-guide wire types and card/popover presentation.
 //
@@ -134,7 +142,7 @@ struct ReviewGuideCardPresentation: Equatable {
         guard let lifecycle else { return nil }
         let hasContent = readableVersionId != nil
         switch lifecycle {
-        case "queued":
+        case "queued", "generating":
             return ReviewGuideCardPresentation(
                 kind: hasContent ? .refreshing : .generating,
                 readableVersionId: readableVersionId
@@ -185,7 +193,7 @@ struct ReviewGuideViewerCurrentness: Equatable {
             && displayedComparisonId != selectedComparisonId
         let status: Status
         switch lifecycle {
-        case "queued":
+        case "queued", "generating":
             status = readableVersionId != nil ? .refreshing : .none
         case "failed":
             status = readableVersionId != nil

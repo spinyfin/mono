@@ -71,6 +71,17 @@ extension ChatViewModel {
         asyncMarkdownViewerVM.state = .loaded(title: title, markdown: content.markdown, artifact: .reviewGuide(seriesID: content.seriesId, versionID: content.id))
     }
 
+    /// Called only after the card's generation confirmation. Uses the same
+    /// in-flight guard and queued/error replies as Retry.
+    func generateReviewGuide(for task: WorkTask) {
+        guard !retryingReviewGuideRootTaskIDs.contains(task.id) else { return }
+        retryingReviewGuideRootTaskIDs.insert(task.id)
+        if engine.sendGenerateReviewGuide(rootTaskID: task.id, idempotencyToken: UUID().uuidString) == nil {
+            retryingReviewGuideRootTaskIDs.remove(task.id)
+            workErrorMessage = "Not connected to the engine — reconnect and try again."
+        }
+    }
+
     /// Ask the engine for another generation attempt. Guards against a
     /// duplicate tap while one is already in flight for this task.
     func retryReviewGuide(for task: WorkTask) {

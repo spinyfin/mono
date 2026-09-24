@@ -182,6 +182,12 @@ pub(crate) fn migrate_pr_review_guide_job_tables(conn: &Connection) -> Result<()
         CREATE UNIQUE INDEX IF NOT EXISTS pr_review_guide_attempts_idempotency_idx
             ON pr_review_guide_attempts(series_id, idempotency_token)
             WHERE idempotency_token IS NOT NULL;
+        CREATE TABLE IF NOT EXISTS pr_review_guide_request_tokens (
+            series_id TEXT NOT NULL REFERENCES pr_review_guide_source_series(id) ON DELETE CASCADE,
+            token TEXT NOT NULL,
+            attempt_id TEXT NOT NULL REFERENCES pr_review_guide_attempts(id) ON DELETE CASCADE,
+            PRIMARY KEY (series_id, token)
+        );
         CREATE TABLE IF NOT EXISTS pr_review_guide_versions (
             id TEXT PRIMARY KEY,
             series_id TEXT NOT NULL REFERENCES pr_review_guide_source_series(id),
@@ -287,7 +293,7 @@ impl WorkDb {
         let mut pending = PendingEvents::new();
         if let Some(token) = idempotency_token {
             let existing = tx.query_row(
-                &format!("SELECT {PR_REVIEW_GUIDE_ATTEMPT_COLUMNS} FROM pr_review_guide_attempts WHERE series_id = ?1 AND idempotency_token = ?2"),
+                &format!("SELECT {PR_REVIEW_GUIDE_ATTEMPT_COLUMNS} FROM pr_review_guide_attempts WHERE series_id = ?1 AND (idempotency_token = ?2 OR id IN (SELECT attempt_id FROM pr_review_guide_request_tokens WHERE series_id = ?1 AND token = ?2))"),
                 params![series_id, token], map_pr_review_guide_attempt,
             ).optional()?;
             if let Some(existing) = existing {
@@ -311,6 +317,15 @@ impl WorkDb {
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         if !replace && let Some(existing) = live.iter().find(|a| a.comparison_id == comparison_id) {
+            // Remember every coalesced click's token, so replay after this
+            // attempt finishes still returns it instead of spending again.
+            if let Some(token) = idempotency_token {
+                tx.execute(
+                    "INSERT INTO pr_review_guide_request_tokens (series_id, token, attempt_id) VALUES (?1, ?2, ?3)",
+                    params![series_id, token, existing.id],
+                )?;
+            }
+            tx.commit()?;
             return Ok((existing.clone(), false));
         }
         for attempt in live {
@@ -813,6 +828,31 @@ impl WorkDb {
         idempotency_token: Option<&str>,
         prompt_version: &str,
     ) -> Result<RetryReviewGuideOutcome> {
+        self.request_pr_review_guide(root_task_id, idempotency_token, prompt_version, true)
+    }
+
+    /// Manual generation reuses a live attempt for the selected comparison.
+    /// Once terminal, a new token admits a fresh epoch, preserving versions.
+    pub(crate) fn generate_pr_review_guide(
+        &self,
+        root_task_id: &str,
+        idempotency_token: Option<&str>,
+    ) -> Result<RetryReviewGuideOutcome> {
+        self.request_pr_review_guide(
+            root_task_id,
+            idempotency_token,
+            boss_review_guide::PROMPT_VERSION,
+            false,
+        )
+    }
+
+    fn request_pr_review_guide(
+        &self,
+        root_task_id: &str,
+        idempotency_token: Option<&str>,
+        prompt_version: &str,
+        replace: bool,
+    ) -> Result<RetryReviewGuideOutcome> {
         let Some(summary) = self.get_pr_review_guide_summary_for_root(root_task_id)? else {
             return Ok(RetryReviewGuideOutcome::NoComparison);
         };
@@ -824,7 +864,7 @@ impl WorkDb {
             &comparison_id,
             prompt_version,
             idempotency_token,
-            true,
+            replace,
         )?;
         let attempt = self.dispatch_if_unbound(attempt, root_task_id);
         Ok(if created {

@@ -383,6 +383,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::GetReviewGuideContent { .. }
         | FrontendRequest::GetReviewGuideSummary { .. }
         | FrontendRequest::RetryReviewGuide { .. }
+        | FrontendRequest::GenerateReviewGuide { .. }
         | FrontendRequest::GetSelectedProduct
         | FrontendRequest::GetSettings
         | FrontendRequest::GetTaskRuntime { .. }

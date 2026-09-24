@@ -137,6 +137,13 @@ fn guide_comment_context_survives_regeneration_resolution_and_reopen() {
         .unwrap()
         .execute("UPDATE pr_review_guide_source_comparisons SET captured_at = '1'", [])
         .unwrap();
+    db.connect()
+        .unwrap()
+        .execute_batch(
+            "UPDATE pr_review_guide_versions SET generated_at = '1';
+         UPDATE pr_review_guide_attempts SET created_at = '1';",
+        )
+        .unwrap();
     db.gc_unreferenced_pr_review_guide_source_artifacts().unwrap();
     assert!(db.get_pr_review_guide_comparison_by_id(&comparison).unwrap().is_some());
     let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
@@ -165,6 +172,13 @@ fn terminal_aged_published_guide_without_comments_is_collected() {
     db.connect()
         .unwrap()
         .execute("UPDATE pr_review_guide_source_comparisons SET captured_at = '1'", [])
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute_batch(
+            "UPDATE pr_review_guide_versions SET generated_at = '1';
+         UPDATE pr_review_guide_attempts SET created_at = '1';",
+        )
         .unwrap();
     db.gc_unreferenced_pr_review_guide_source_artifacts().unwrap();
     assert!(db.get_pr_review_guide_version(&version.id).unwrap().is_none());

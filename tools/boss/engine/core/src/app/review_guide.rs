@@ -6,6 +6,87 @@
 
 use super::*;
 
+pub(super) async fn handle_generate_review_guide(ctx: Dispatch, req: FrontendRequest) {
+    let FrontendRequest::GenerateReviewGuide {
+        root_task_id,
+        idempotency_token,
+    } = req
+    else {
+        unreachable!()
+    };
+    let result = generate_review_guide(&ctx, &root_task_id, idempotency_token.as_deref()).await;
+    match result {
+        Ok((resolved_root_id, outcome)) => {
+            crate::work::notify_review_guide_changed(
+                &ctx.work_db,
+                &ctx.server_state.publisher,
+                &resolved_root_id,
+                "review_guide_generation_queued",
+            )
+            .await;
+            let (attempt, already_requested) = match outcome {
+                crate::work::RetryReviewGuideOutcome::Created(attempt) => (attempt, false),
+                crate::work::RetryReviewGuideOutcome::AlreadyRequested(attempt) => (attempt, true),
+                crate::work::RetryReviewGuideOutcome::NoComparison => unreachable!(),
+            };
+            send_response(
+                &ctx.sink,
+                &ctx.request_id,
+                FrontendEvent::ReviewGuideRetryQueued {
+                    // Echo the requested card so its in-flight guard clears even
+                    // when it was a revision resolved to a different chain root.
+                    root_task_id,
+                    attempt: wire_attempt(attempt),
+                    already_requested,
+                },
+            );
+        }
+        Err(error) => send_work_error(&ctx.sink, &ctx.request_id, &error),
+    }
+}
+
+async fn generate_review_guide(
+    ctx: &Dispatch,
+    task_id: &str,
+    idempotency_token: Option<&str>,
+) -> anyhow::Result<(String, crate::work::RetryReviewGuideOutcome)> {
+    let db = &ctx.work_db;
+    let root_id = {
+        let conn = db.connect()?;
+        crate::work::chain_root(&conn, task_id)?
+    };
+    let task = match db.get_work_item(&root_id)? {
+        boss_protocol::WorkItem::Task(task) | boss_protocol::WorkItem::Chore(task) => task,
+        _ => anyhow::bail!("review guides require a task with a PR"),
+    };
+    let pr_url = task
+        .pr_url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("work item has no PR URL; cannot generate a review guide"))?;
+    anyhow::ensure!(
+        task.repo_remote_url
+            .as_deref()
+            .is_some_and(|url| !url.trim().is_empty()),
+        "work item has no repository remote; cannot generate a review guide"
+    );
+    if db
+        .get_pr_review_guide_summary_for_root(&root_id)?
+        .is_none_or(|summary| summary.selected_comparison_id.is_none())
+    {
+        ctx.server_state
+            .completion_handler
+            .capture_review_guide_source_manually(&root_id, pr_url)
+            .await?;
+    }
+    let outcome = db.generate_pr_review_guide(&root_id, idempotency_token)?;
+    anyhow::ensure!(
+        !matches!(outcome, crate::work::RetryReviewGuideOutcome::NoComparison),
+        "source capture did not select a comparison; cannot generate a review guide"
+    );
+    Ok((root_id, outcome))
+}
+
 pub(super) async fn handle_get_review_guide_summary(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         work_db,

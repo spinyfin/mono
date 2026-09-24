@@ -758,6 +758,19 @@ pub enum FrontendRequest {
         run_id: String,
     },
 
+    /// Generate a guide for an existing PR, capturing sources if needed.
+    /// Resolves revisions to their chain root and requires a PR and repository.
+    /// Works for open, merged, and closed PRs regardless of automatic rollout
+    /// flags. Reuses a live attempt or an already used idempotency token;
+    /// otherwise admits a new epoch and immutable version, preserving history.
+    /// Replies with [`FrontendEvent::ReviewGuideRetryQueued`] or
+    /// [`FrontendEvent::WorkError`].
+    GenerateReviewGuide {
+        root_task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_token: Option<String>,
+    },
+
     /// Fetch one attention group by id (`atg_…` or `A<n>` short id).
     /// Replies with [`FrontendEvent::AttentionGroupResult`].
     GetAttentionGroup {
@@ -2168,14 +2181,10 @@ pub enum FrontendRequest {
         attempt_id: String,
     },
 
-    /// Idempotently create the next generation attempt for a review-guide
-    /// series' current desired comparison. A repeated call with the same
-    /// `idempotency_token` returns the original attempt rather than
-    /// creating a second one; omitting the token always creates a fresh
-    /// attempt. Replies with [`FrontendEvent::ReviewGuideRetryQueued`], or
-    /// [`FrontendEvent::WorkError`] when no comparison has been captured
-    /// for this root task yet. See
-    /// `tools/boss/docs/designs/automatic-pr-review-guides.md`.
+    /// Retry generation from an already selected comparison. Unlike
+    /// `GenerateReviewGuide`, this explicitly replaces a live attempt.
+    /// Replaying an idempotency token returns its original attempt. Replies
+    /// with `ReviewGuideRetryQueued`, or `WorkError` if no comparison exists.
     RetryReviewGuide {
         root_task_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
