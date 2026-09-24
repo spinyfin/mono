@@ -1636,10 +1636,10 @@ pub fn pool_dispatch_policy_for_worker_id(worker_id: &str) -> Option<PoolDispatc
 pub fn kind_always_dispatches_on_pool_driver(kind: &ExecutionKind) -> bool {
     match kind {
         ExecutionKind::PrReview | ExecutionKind::AutomationTriage => true,
-        // Pool-bound but NOT on `REVIEWER_POOL_DRIVER` ("claude") — this kind
-        // pins its own fixed `codex`/`gpt-6-astra` profile in
-        // `compose_worker_spawn`, independent of this generic pool-driver
-        // mechanism. See `execution_targets_automation_pool`.
+        // Pool-bound (review pool) but NOT on `REVIEWER_POOL_DRIVER`
+        // ("claude") — this kind pins its own fixed `codex`/`gpt-6-astra`
+        // profile in `compose_worker_spawn`, independent of this generic
+        // pool-driver mechanism. See `execution_targets_review_pool`.
         ExecutionKind::PrReviewGuide => false,
         ExecutionKind::AnswerAgent
         | ExecutionKind::ChoreImplementation
