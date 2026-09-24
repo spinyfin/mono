@@ -493,6 +493,7 @@ mod proposals;
 mod resumed_turn_activity;
 mod reveal_deadline;
 mod review_guide;
+mod review_guide_viewer;
 mod revision_no_op_live_seam_reproduction;
 mod selected_product;
 mod semantic_progress_ingress;
