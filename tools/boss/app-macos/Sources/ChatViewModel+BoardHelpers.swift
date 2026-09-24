@@ -510,6 +510,7 @@ extension ChatViewModel {
             task: task,
             context: WorkCardSnapshotContext(
                 column: column,
+                reviewGuideRequestInFlight: retryingReviewGuideRootTaskIDs.contains(task.id),
                 projectName: cardProjectBadge(for: task),
                 isSelected: isSelected,
                 runtime: runtime,

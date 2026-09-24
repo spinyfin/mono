@@ -70,16 +70,11 @@ async fn generate_review_guide(
             .is_some_and(|url| !url.trim().is_empty()),
         "work item has no repository remote; cannot generate a review guide"
     );
-    if db
-        .get_pr_review_guide_summary_for_root(&root_id)?
-        .is_none_or(|summary| summary.selected_comparison_id.is_none())
-    {
-        ctx.server_state
-            .completion_handler
-            .capture_review_guide_source_manually(&root_id, pr_url)
-            .await?;
-    }
-    let outcome = db.generate_pr_review_guide(&root_id, idempotency_token)?;
+    ctx.server_state
+        .completion_handler
+        .capture_review_guide_source_manually(&root_id, pr_url)
+        .await?;
+    let outcome = db.generate_pr_review_guide(&root_id, pr_url, idempotency_token)?;
     anyhow::ensure!(
         !matches!(outcome, crate::work::RetryReviewGuideOutcome::NoComparison),
         "source capture did not select a comparison; cannot generate a review guide"

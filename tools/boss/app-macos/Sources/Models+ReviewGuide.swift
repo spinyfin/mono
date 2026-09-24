@@ -1,9 +1,9 @@
 import SwiftUI
 
 extension WorkTask {
-    /// Available on any PR card, including merged and closed work.
+    /// Available on root PR cards, including merged and closed work.
     var generateReviewGuideMenuTitle: String? {
-        guard let prURL, !prURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        guard kind != "revision", let prURL, !prURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         return reviewGuideReadableVersionId == nil ? "Generate Review Guide…" : "Regenerate Review Guide…"
     }
 }

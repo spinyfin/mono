@@ -29,6 +29,33 @@ final class ReviewGuideTests: XCTestCase {
         }
     }
 
+    func testRevisionCardDoesNotOfferGeneration() {
+        let task = Self.makeTask(id: "revision", readableVersionId: nil, kind: "revision")
+        XCTAssertNotNil(task.prURL)
+        XCTAssertNil(task.generateReviewGuideMenuTitle)
+    }
+
+    func testCaptureProgressUsesInFlightStateAndClearsOnError() {
+        let model = makeModel()
+        var task = Self.makeTask(id: "root", readableVersionId: nil)
+        task.reviewGuideLifecycle = nil
+        func snapshot(_ column: WorkBoardColumnKey) -> WorkCardSnapshot {
+            model.workCardSnapshot(
+                for: task, column: column, isSelected: false, isFrontierHighlighted: false,
+                boardStyle: .classic, liveState: nil
+            )
+        }
+        XCTAssertNil(snapshot(.review).reviewGuidePresentation)
+        model.retryingReviewGuideRootTaskIDs.insert(task.id)
+        XCTAssertEqual(snapshot(.review).reviewGuidePresentation?.kind, .generating)
+        XCTAssertEqual(snapshot(.done).reviewGuidePresentation?.kind, .generating)
+        task.reviewGuideReadableVersionId = "old"
+        XCTAssertEqual(snapshot(.review).reviewGuidePresentation?.kind, .refreshing)
+        XCTAssertEqual(snapshot(.review).reviewGuidePresentation?.readableVersionId, "old")
+        model.applyEventForTest(.workError(message: "capture failed", requestId: "request"))
+        XCTAssertNil(snapshot(.review).reviewGuidePresentation)
+    }
+
     func testGeneratingPresentationKeepsProgressAndPriorDocument() {
         let initial = ReviewGuideCardPresentation.from(lifecycle: "generating", readableVersionId: nil)
         XCTAssertEqual(initial?.kind, .generating)
@@ -431,12 +458,12 @@ final class ReviewGuideTests: XCTestCase {
         ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
     }
 
-    private static func makeTask(id: String, readableVersionId: String?, name: String = "Test work") -> WorkTask {
+    private static func makeTask(id: String, readableVersionId: String?, name: String = "Test work", kind: String = "task") -> WorkTask {
         var task = WorkTask(
             id: id,
             productID: "prod_test",
             projectID: nil,
-            kind: "task",
+            kind: kind,
             name: name,
             description: "",
             status: "in_review",

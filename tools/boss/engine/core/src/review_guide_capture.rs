@@ -131,7 +131,7 @@ pub(crate) fn github_source_packet_collector() -> SourcePacketCollector {
     }
 }
 
-/// Capture for an explicit operator request, independently of automatic
+/// Capture for an explicit `GenerateReviewGuide` request, independently of automatic
 /// rollout gates. Await persistence so the caller can admit generation even
 /// when another collector already stored the packet, and report failures.
 pub(crate) async fn capture_review_guide_source_manually(

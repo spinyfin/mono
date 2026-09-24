@@ -476,7 +476,7 @@ struct WorkCardPopoverView: View {
     @ViewBuilder
     private var reviewGuideRow: some View {
         if let presentation = ReviewGuideCardPresentation.from(
-            lifecycle: task.reviewGuideLifecycle,
+            lifecycle: model.retryingReviewGuideRootTaskIDs.contains(task.id) ? "generating" : task.reviewGuideLifecycle,
             readableVersionId: task.reviewGuideReadableVersionId,
             staleSource: task.reviewGuideStaleSource ?? false
         ) {

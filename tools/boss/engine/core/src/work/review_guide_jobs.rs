@@ -795,7 +795,7 @@ impl WorkDb {
     /// [`Self::get_latest_pr_review_guide_source_capture`] does.
     pub fn get_pr_review_guide_summary_for_root(&self, root_task_id: &str) -> Result<Option<PrReviewGuideSummary>> {
         let conn = self.connect()?;
-        query_pr_review_guide_summary_for_root(&conn, root_task_id).map_err(Into::into)
+        query_pr_review_guide_summary_for_root(&conn, root_task_id, None).map_err(Into::into)
     }
 
     /// One immutable version's full content, by id — the `GetReviewGuide`
@@ -828,7 +828,7 @@ impl WorkDb {
         idempotency_token: Option<&str>,
         prompt_version: &str,
     ) -> Result<RetryReviewGuideOutcome> {
-        self.request_pr_review_guide(root_task_id, idempotency_token, prompt_version, true)
+        self.request_pr_review_guide(root_task_id, None, idempotency_token, prompt_version, true)
     }
 
     /// Manual generation reuses a live attempt for the selected comparison.
@@ -836,10 +836,12 @@ impl WorkDb {
     pub(crate) fn generate_pr_review_guide(
         &self,
         root_task_id: &str,
+        pr_url: &str,
         idempotency_token: Option<&str>,
     ) -> Result<RetryReviewGuideOutcome> {
         self.request_pr_review_guide(
             root_task_id,
+            Some(pr_url),
             idempotency_token,
             boss_review_guide::PROMPT_VERSION,
             false,
@@ -849,11 +851,16 @@ impl WorkDb {
     fn request_pr_review_guide(
         &self,
         root_task_id: &str,
+        pr_url: Option<&str>,
         idempotency_token: Option<&str>,
         prompt_version: &str,
         replace: bool,
     ) -> Result<RetryReviewGuideOutcome> {
-        let Some(summary) = self.get_pr_review_guide_summary_for_root(root_task_id)? else {
+        let summary = {
+            let conn = self.connect()?;
+            query_pr_review_guide_summary_for_root(&conn, root_task_id, pr_url)?
+        };
+        let Some(summary) = summary else {
             return Ok(RetryReviewGuideOutcome::NoComparison);
         };
         let Some(comparison_id) = summary.selected_comparison_id else {
@@ -1019,12 +1026,14 @@ fn bind_review_guide_execution(tx: &Connection, attempt_id: &str, execution_id: 
 fn query_pr_review_guide_summary_for_root(
     conn: &Connection,
     root_task_id: &str,
+    pr_url: Option<&str>,
 ) -> rusqlite::Result<Option<PrReviewGuideSummary>> {
     conn.query_row(
         "SELECT id, root_task_id, canonical_pr_url, guide_lifecycle, request_epoch, selected_comparison_id, readable_version_id
          FROM pr_review_guide_source_series
-         WHERE root_task_id = ?1 ORDER BY latest_observation_sequence DESC, id DESC LIMIT 1",
-        [root_task_id],
+         WHERE root_task_id = ?1 AND (?2 IS NULL OR canonical_pr_url = ?2)
+         ORDER BY latest_observation_sequence DESC, id DESC LIMIT 1",
+        params![root_task_id, pr_url],
         |row| {
             Ok(PrReviewGuideSummary {
                 series_id: row.get(0)?,

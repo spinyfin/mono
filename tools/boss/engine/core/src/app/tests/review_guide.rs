@@ -136,11 +136,11 @@ async fn manual_generation_captures_and_dispatches_with_both_flags_off() {
 }
 
 #[tokio::test]
-async fn existing_idle_comparison_is_generated_without_recapture() {
+async fn existing_idle_comparison_is_refreshed_and_generated() {
     let f = Fixture::new(false);
     f.capture_idle();
     f.generate("idle", false).await;
-    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -188,7 +188,7 @@ async fn regenerate_ready_guide_keeps_old_version_and_advances_epoch() {
     };
     assert_ne!(old.id, new.id);
     assert_eq!(db.get_pr_review_guide_version(&old.id).unwrap().unwrap(), *old);
-    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -306,4 +306,59 @@ async fn capture_failure_is_reported_and_does_not_enqueue() {
         .unwrap();
     assert!(summary.selected_comparison_id.is_none());
     assert_eq!(summary.request_epoch, 0);
+}
+
+#[tokio::test]
+async fn replaced_pr_captures_and_admits_the_current_pr_series() {
+    let f = Fixture::new(false);
+    let db = &f.state.work_db;
+    let retired_url = "https://github.com/acme/widget/pull/90";
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = ?1 WHERE id = ?2",
+            rusqlite::params![retired_url, f.root],
+        )
+        .unwrap();
+    db.persist_pr_review_guide_source_capture(
+        &f.root,
+        db.allocate_pr_review_guide_source_observation_sequence().unwrap(),
+        PrSourceCaptureTrigger::Creation,
+        &source_capture_packet(retired_url, "base", "retired"),
+    )
+    .unwrap();
+    let retired = db.get_pr_review_guide_summary_for_root(&f.root).unwrap().unwrap();
+    assert!(retired.selected_comparison_id.is_some());
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = ?1 WHERE id = ?2",
+            rusqlite::params![PR_URL, f.root],
+        )
+        .unwrap();
+    let attempt = f.generate("replacement", false).await;
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    let current = db.get_pr_review_guide_summary_for_root(&f.root).unwrap().unwrap();
+    assert_eq!(current.canonical_pr_url, PR_URL);
+    assert_eq!(attempt.series_id, current.series_id);
+    assert_ne!(attempt.series_id, retired.series_id);
+    assert_eq!(Some(attempt.comparison_id), current.selected_comparison_id);
+}
+
+#[tokio::test]
+async fn regeneration_refreshes_a_changed_head() {
+    let f = Fixture::new(false);
+    let db = &f.state.work_db;
+    db.persist_pr_review_guide_source_capture(
+        &f.root,
+        db.allocate_pr_review_guide_source_observation_sequence().unwrap(),
+        PrSourceCaptureTrigger::Creation,
+        &source_capture_packet(PR_URL, "base", "old-head"),
+    )
+    .unwrap();
+    let old = db.get_pr_review_guide_summary_for_root(&f.root).unwrap().unwrap();
+    let attempt = f.generate("fresh-head", false).await;
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    assert_ne!(Some(attempt.comparison_id), old.selected_comparison_id);
+    assert_eq!(attempt.series_id, old.series_id);
 }
