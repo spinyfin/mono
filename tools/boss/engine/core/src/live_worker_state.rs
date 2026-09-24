@@ -24,7 +24,7 @@ pub use never_started_reap::{NeverStartedReapCommit, NeverStartedReapKind};
 /// Attributed worker-pool label for a live run (`"main"`, `"automation"`,
 /// or `"review"`). Matches
 /// [`crate::coordinator::ExecutionCoordinator::attributed_pool_label`]:
-/// review work always reports `"review"`, automation triage and any
+/// PR reviews and review guides always report `"review"`, automation triage and other
 /// automation-sourced work report `"automation"`, everything else
 /// reports `"main"`. Independent of which physical slot the run
 /// occupies (automation can spill into a main-pool Lower Decks slot).
@@ -34,7 +34,7 @@ pub use never_started_reap::{NeverStartedReapCommit, NeverStartedReapKind};
 /// table or re-deriving attribution.
 pub fn attributed_pool_label(kind: ExecutionKind, has_source_automation: bool) -> &'static str {
     match kind {
-        ExecutionKind::PrReview => "review",
+        ExecutionKind::PrReview | ExecutionKind::PrReviewGuide => "review",
         ExecutionKind::AutomationTriage => "automation",
         _ if has_source_automation => "automation",
         _ => "main",
@@ -1873,6 +1873,8 @@ mod tests {
     fn attributed_pool_label_matches_coordinator_routing() {
         assert_eq!(attributed_pool_label(ExecutionKind::PrReview, false), "review");
         assert_eq!(attributed_pool_label(ExecutionKind::PrReview, true), "review");
+        assert_eq!(attributed_pool_label(ExecutionKind::PrReviewGuide, false), "review");
+        assert_eq!(attributed_pool_label(ExecutionKind::PrReviewGuide, true), "review");
         assert_eq!(
             attributed_pool_label(ExecutionKind::AutomationTriage, false),
             "automation"
