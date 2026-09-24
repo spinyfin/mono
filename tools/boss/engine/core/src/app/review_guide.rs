@@ -65,7 +65,7 @@ async fn generate_review_guide(
         .filter(|url| !url.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("work item has no PR URL; cannot generate a review guide"))?;
     anyhow::ensure!(
-        task.repo_remote_url
+        db.resolve_repo_for_task(&root_id)?
             .as_deref()
             .is_some_and(|url| !url.trim().is_empty()),
         "work item has no repository remote; cannot generate a review guide"
