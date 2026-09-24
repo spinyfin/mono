@@ -1083,6 +1083,16 @@ extension EngineClient {
         ])
     }
 
+    /// Capture sources if needed and generate a guide for an existing PR.
+    @discardableResult
+    func sendGenerateReviewGuide(rootTaskID: String, idempotencyToken: String) -> String? {
+        sendLine([
+            "type": "generate_review_guide",
+            "root_task_id": rootTaskID,
+            "idempotency_token": idempotencyToken,
+        ])
+    }
+
     /// Idempotently request another generation attempt for a PR's current
     /// review-guide series. Engine replies with `review_guide_retry_queued`
     /// carrying a `ReviewGuideAttempt`.

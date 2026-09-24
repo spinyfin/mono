@@ -26,6 +26,7 @@ pub enum PrSourceCaptureTrigger {
     Creation,
     Completion,
     Poller,
+    Manual,
 }
 
 impl PrSourceCaptureTrigger {
@@ -34,6 +35,7 @@ impl PrSourceCaptureTrigger {
             Self::Creation => "creation",
             Self::Completion => "completion",
             Self::Poller => "poller",
+            Self::Manual => "manual",
         }
     }
 }

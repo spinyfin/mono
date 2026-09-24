@@ -1,6 +1,6 @@
 //! PR review-guide wire types — the `GetReviewGuideSummary` /
-//! `GetReviewGuideContent` / `RetryReviewGuide` RPC surface. Board/task
-//! detail replies use [`ReviewGuideSummary`] alone; only an opened viewer
+//! `GetReviewGuideContent` / `GenerateReviewGuide` / `RetryReviewGuide` RPC
+//! surface. Board/task detail replies use [`ReviewGuideSummary`] alone; only an opened viewer
 //! fetches [`ReviewGuideVersion`]'s full Markdown. See
 //! `tools/boss/docs/designs/automatic-pr-review-guides.md`.
 
@@ -47,8 +47,8 @@ pub struct ReviewGuideVersion {
 }
 
 /// One durable generation attempt's diagnostic state. Returned by
-/// `RetryReviewGuide` so the caller can show progress without a second
-/// round trip.
+/// `GenerateReviewGuide` / `RetryReviewGuide` so the caller can show progress
+/// without a second round trip.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct ReviewGuideAttempt {
@@ -65,4 +65,29 @@ pub struct ReviewGuideAttempt {
     /// Absent categories remain absent; no usage observation is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_usage_json: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn manual_generation_request_round_trips_with_optional_token() {
+        for token in [None, Some("click-token".to_owned())] {
+            let request = crate::FrontendRequest::GenerateReviewGuide {
+                root_task_id: "root".to_owned(),
+                idempotency_token: token.clone(),
+            };
+            let encoded = serde_json::to_value(request).unwrap();
+            assert_eq!(encoded["type"], "generate_review_guide");
+            assert_eq!(encoded.get("idempotency_token").is_some(), token.is_some());
+            let crate::FrontendRequest::GenerateReviewGuide {
+                root_task_id,
+                idempotency_token,
+            } = serde_json::from_value(encoded).unwrap()
+            else {
+                panic!("wrong request")
+            };
+            assert_eq!(root_task_id, "root");
+            assert_eq!(idempotency_token, token);
+        }
+    }
 }

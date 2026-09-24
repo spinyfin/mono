@@ -2556,6 +2556,9 @@ async fn handle_frontend_connection(
                 Box::pin(conflict_resolution::handle_retry_conflict_resolution(ctx, r))
             }
             r @ FrontendRequest::RetryReviewGuide { .. } => Box::pin(review_guide::handle_retry_review_guide(ctx, r)),
+            r @ FrontendRequest::GenerateReviewGuide { .. } => {
+                Box::pin(review_guide::handle_generate_review_guide(ctx, r))
+            }
             r @ FrontendRequest::RevealWorkItem { .. } => Box::pin(work_items::handle_reveal_work_item(ctx, r)),
             r @ FrontendRequest::RevokeDecision { .. } => Box::pin(decisions::handle_revoke_decision(ctx, r)),
             r @ FrontendRequest::RunAutomation { .. } => Box::pin(automations::handle_run_automation(ctx, r)),

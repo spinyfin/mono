@@ -13,6 +13,93 @@ final class ReviewGuideTests: XCTestCase {
 
     // MARK: - Opening
 
+    func testGenerateMenuVisibilityAndLabelIncludingDoneWork() {
+        var task = Self.makeTask(id: "task_1", readableVersionId: nil)
+        for url: String? in [nil, "", " "] {
+            task.prURL = url
+            XCTAssertNil(task.generateReviewGuideMenuTitle)
+        }
+        task.prURL = "https://github.com/acme/widget/pull/9"
+        for status in ["in_review", "done"] {
+            task.status = status
+            task.reviewGuideReadableVersionId = nil
+            XCTAssertEqual(task.generateReviewGuideMenuTitle, "Generate Review Guide…")
+            task.reviewGuideReadableVersionId = "old-guide"
+            XCTAssertEqual(task.generateReviewGuideMenuTitle, "Regenerate Review Guide…")
+        }
+    }
+
+    func testRevisionCardDoesNotOfferGeneration() {
+        let task = Self.makeTask(id: "revision", readableVersionId: nil, kind: "revision")
+        XCTAssertNotNil(task.prURL)
+        XCTAssertNil(task.generateReviewGuideMenuTitle)
+    }
+
+    func testCaptureProgressUsesInFlightStateAndClearsOnError() {
+        let model = makeModel()
+        var task = Self.makeTask(id: "root", readableVersionId: nil)
+        task.reviewGuideLifecycle = nil
+        func snapshot(_ column: WorkBoardColumnKey) -> WorkCardSnapshot {
+            model.workCardSnapshot(
+                for: task, column: column, isSelected: false, isFrontierHighlighted: false,
+                boardStyle: .classic, liveState: nil
+            )
+        }
+        XCTAssertNil(snapshot(.review).reviewGuidePresentation)
+        model.retryingReviewGuideRootTaskIDs.insert(task.id)
+        XCTAssertEqual(snapshot(.review).reviewGuidePresentation?.kind, .generating)
+        XCTAssertEqual(snapshot(.done).reviewGuidePresentation?.kind, .generating)
+        task.reviewGuideReadableVersionId = "old"
+        XCTAssertEqual(snapshot(.review).reviewGuidePresentation?.kind, .refreshing)
+        XCTAssertEqual(snapshot(.review).reviewGuidePresentation?.readableVersionId, "old")
+        model.applyEventForTest(.workError(message: "capture failed", requestId: "request"))
+        XCTAssertNil(snapshot(.review).reviewGuidePresentation)
+    }
+
+    func testGeneratingPresentationKeepsProgressAndPriorDocument() {
+        let initial = ReviewGuideCardPresentation.from(lifecycle: "generating", readableVersionId: nil)
+        XCTAssertEqual(initial?.kind, .generating)
+        XCTAssertEqual(initial?.showsProgress, true)
+        XCTAssertEqual(initial?.showsDocumentButton, false)
+        let refresh = ReviewGuideCardPresentation.from(lifecycle: "generating", readableVersionId: "old")
+        XCTAssertEqual(refresh?.kind, .refreshing)
+        XCTAssertEqual(refresh?.showsProgress, true)
+        XCTAssertEqual(refresh?.showsDocumentButton, true)
+        XCTAssertEqual(refresh?.readableVersionId, "old")
+        let viewer = ReviewGuideViewerCurrentness.from(
+            lifecycle: "generating", readableVersionId: "old", selectedComparisonId: "comparison",
+            displayedVersionId: "old", displayedComparisonId: "comparison"
+        )
+        XCTAssertEqual(viewer.status, .refreshing)
+    }
+
+    func testGenerateUsesWireRequestAndSurfacesDisconnectedError() {
+        let model = makeModel()
+        var sent: [[String: Any]] = []
+        model.engine.outboundRecorder = { sent.append($0) }
+        let task = Self.makeTask(id: "task_1", readableVersionId: nil)
+        model.generateReviewGuide(for: task)
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertEqual(sent[0]["type"] as? String, "generate_review_guide")
+        XCTAssertEqual(sent[0]["root_task_id"] as? String, task.id)
+        XCTAssertNotNil(UUID(uuidString: sent[0]["idempotency_token"] as? String ?? ""))
+        XCTAssertNotNil(model.workErrorMessage)
+        XCTAssertFalse(model.retryingReviewGuideRootTaskIDs.contains(task.id))
+    }
+
+    func testGenerateSharesRetryGuardAndEngineErrorsAreVisible() {
+        let model = makeModel()
+        var sent = 0
+        model.engine.outboundRecorder = { _ in sent += 1 }
+        let task = Self.makeTask(id: "task_1", readableVersionId: nil)
+        model.retryingReviewGuideRootTaskIDs.insert(task.id)
+        model.generateReviewGuide(for: task)
+        XCTAssertEqual(sent, 0)
+        model.applyEventForTest(.workError(message: "source access refused", requestId: "request"))
+        XCTAssertEqual(model.workErrorMessage, "source access refused")
+        XCTAssertFalse(model.retryingReviewGuideRootTaskIDs.contains(task.id))
+    }
+
     func testOpenReviewGuideNoOpWithoutReadableVersion() {
         let model = makeModel()
         let task = Self.makeTask(id: "task_1", readableVersionId: nil)
@@ -345,6 +432,8 @@ final class ReviewGuideTests: XCTestCase {
 
     func testCardBadgeHostsAndRendersEveryState() {
         let states: [ReviewGuideCardPresentation] = [
+            ReviewGuideCardPresentation.from(lifecycle: "generating", readableVersionId: nil)!,
+            ReviewGuideCardPresentation.from(lifecycle: "generating", readableVersionId: "prgv_1")!,
             ReviewGuideCardPresentation.from(lifecycle: "queued", readableVersionId: nil)!,
             ReviewGuideCardPresentation.from(lifecycle: "queued", readableVersionId: "prgv_1")!,
             ReviewGuideCardPresentation.from(lifecycle: "ready", readableVersionId: "prgv_1")!,
@@ -369,12 +458,12 @@ final class ReviewGuideTests: XCTestCase {
         ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
     }
 
-    private static func makeTask(id: String, readableVersionId: String?, name: String = "Test work") -> WorkTask {
+    private static func makeTask(id: String, readableVersionId: String?, name: String = "Test work", kind: String = "task") -> WorkTask {
         var task = WorkTask(
             id: id,
             productID: "prod_test",
             projectID: nil,
-            kind: "task",
+            kind: kind,
             name: name,
             description: "",
             status: "in_review",

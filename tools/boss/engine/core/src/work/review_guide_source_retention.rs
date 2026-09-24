@@ -46,8 +46,10 @@ impl WorkDb {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Terminal, aged series: drop published guide versions that no
         // `work_comments` row still cites, then their attempts, so the
-        // comparison DELETE below can reclaim the packet blob. Versions that
-        // still have comments keep the comparison (RESTRICT) and therefore
+        // comparison DELETE below can reclaim the packet blob. A manual run
+        // on a completed PR may reuse old sources: retain fresh versions and
+        // live/recent attempts independently of the source packet's age.
+        // Versions that still have comments keep the comparison (RESTRICT) and therefore
         // the on-disk packet. Active series are untouched here.
         tx.execute(
             "UPDATE pr_review_guide_source_series SET readable_version_id = (
@@ -63,6 +65,7 @@ impl WorkDb {
                 LEFT JOIN tasks t ON t.id = s.root_task_id
                 WHERE (t.id IS NULL OR t.deleted_at IS NOT NULL OR t.status IN ('done', 'archived'))
                   AND CAST(c.captured_at AS INTEGER) < ?1
+                  AND CAST(v.generated_at AS INTEGER) < ?1
                   AND NOT EXISTS (SELECT 1 FROM work_comments w WHERE w.guide_version_id = v.id)
              )",
             [cutoff],
@@ -75,6 +78,7 @@ impl WorkDb {
                 LEFT JOIN tasks t ON t.id = s.root_task_id
                 WHERE (t.id IS NULL OR t.deleted_at IS NOT NULL OR t.status IN ('done', 'archived'))
                   AND CAST(c.captured_at AS INTEGER) < ?1
+                  AND CAST(v.generated_at AS INTEGER) < ?1
                   AND NOT EXISTS (SELECT 1 FROM work_comments w WHERE w.guide_version_id = v.id)
             )",
             [cutoff],
@@ -87,6 +91,8 @@ impl WorkDb {
                 LEFT JOIN tasks t ON t.id = s.root_task_id
                 WHERE (t.id IS NULL OR t.deleted_at IS NOT NULL OR t.status IN ('done', 'archived'))
                   AND CAST(c.captured_at AS INTEGER) < ?1
+                  AND a.status IN ('succeeded', 'failed', 'cancelled', 'superseded')
+                  AND CAST(a.created_at AS INTEGER) < ?1
                   AND NOT EXISTS (SELECT 1 FROM pr_review_guide_versions v WHERE v.attempt_id = a.id)
             )",
             [cutoff],
@@ -123,6 +129,7 @@ impl WorkDb {
                 WHERE (t.id IS NULL OR t.deleted_at IS NOT NULL OR t.status IN ('done', 'archived'))
                   AND CAST(c.captured_at AS INTEGER) < ?1
                   AND NOT EXISTS (SELECT 1 FROM pr_review_guide_versions v WHERE v.comparison_id = c.id)
+                  AND NOT EXISTS (SELECT 1 FROM pr_review_guide_attempts a WHERE a.comparison_id = c.id)
             )",
             [cutoff],
         )?;

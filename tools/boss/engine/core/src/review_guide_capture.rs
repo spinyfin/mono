@@ -131,6 +131,34 @@ pub(crate) fn github_source_packet_collector() -> SourcePacketCollector {
     }
 }
 
+/// Capture for an explicit `GenerateReviewGuide` request, independently of automatic
+/// rollout gates. Await persistence so the caller can admit generation even
+/// when another collector already stored the packet, and report failures.
+pub(crate) async fn capture_review_guide_source_manually(
+    work_db: &WorkDb,
+    root_task_id: &str,
+    pr_url: &str,
+    collector: &SourcePacketCollector,
+) -> Result<()> {
+    let sequence = work_db.allocate_pr_review_guide_source_observation_sequence()?;
+    let result = boss_gh_telemetry::scope(boss_gh_telemetry::callers::REVIEW_GUIDE_SOURCE_CAPTURE, async {
+        let metadata = (collector.metadata)(pr_url.to_owned(), None).await?;
+        let packet = (collector.collect)(pr_url.to_owned(), None, None, Some(metadata)).await?;
+        work_db.persist_pr_review_guide_source_capture(
+            root_task_id,
+            sequence,
+            PrSourceCaptureTrigger::Manual,
+            &packet,
+        )?;
+        Ok(())
+    })
+    .await;
+    if let Err(error) = &result {
+        record_capture_failure(work_db, root_task_id, pr_url, sequence, error);
+    }
+    result
+}
+
 /// One durable source-capture request formed by a verified lifecycle seam.
 /// Optional probe data makes creation/completion fetch fresh metadata while a
 /// successful poller probe supplies its exact immutable endpoints.

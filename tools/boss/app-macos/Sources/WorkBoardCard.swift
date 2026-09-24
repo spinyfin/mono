@@ -120,6 +120,7 @@ struct WorkBoardCardItem: View {
     var mergeFeedbackMessage: String? = nil
     @Environment(\.openWindow) private var openWindow
     @State private var showingDeleteConfirmation = false
+    @State private var showingGenerateReviewGuideConfirmation = false
 
     var body: some View {
         let isFrontierHighlighted = snapshot.isFrontierHighlighted
@@ -233,6 +234,11 @@ struct WorkBoardCardItem: View {
                 Button("View transcripts…") {
                     openWindow(id: "transcript-viewer", value: TranscriptViewerRef(taskId: task.id))
                 }
+                if let title = task.generateReviewGuideMenuTitle {
+                    Button(title) {
+                        showingGenerateReviewGuideConfirmation = true
+                    }
+                }
                 Divider()
                 Button("Delete", role: .destructive) {
                     showingDeleteConfirmation = true
@@ -274,6 +280,18 @@ struct WorkBoardCardItem: View {
         }
         .onAppear { logDocLinkState("appeared") }
         .onChange(of: task.prURL) { _, _ in logDocLinkState("prURL-changed") }
+        .confirmationDialog(
+            task.generateReviewGuideMenuTitle ?? "Generate Review Guide…",
+            isPresented: $showingGenerateReviewGuideConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button(task.reviewGuideReadableVersionId == nil ? "Generate" : "Regenerate") {
+                model.generateReviewGuide(for: task)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Generate a review guide for \"\(task.name)\"? This uses one gpt-6-astra run at high effort. Previous guides and their comments remain available.")
+        }
         // Always-attached: confirmationDialog needs false→true while
         // installed; mount-with-true is a known intermittent failure.
         .confirmationDialog(

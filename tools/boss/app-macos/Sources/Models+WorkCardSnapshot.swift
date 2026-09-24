@@ -47,6 +47,7 @@ struct WorkCardRevisionRollup: Equatable, Identifiable {
 /// on the snapshot.
 struct WorkCardSnapshotContext: Equatable {
     var column: WorkBoardColumnKey
+    var reviewGuideRequestInFlight: Bool = false
     var projectName: String?
     var isSelected: Bool = false
     var runtime: WorkTaskRuntime? = nil
@@ -267,9 +268,9 @@ struct WorkCardSnapshot: Equatable {
         let ciRequiredDetail: String? = (column == .review || inMerging) ? task.ciRequiredDetail : nil
         let reviewRequiredState: String? = column == .review ? task.reviewRequiredState : nil
         let reviewRequiredDetail: String? = column == .review ? task.reviewRequiredDetail : nil
-        let reviewGuidePresentation: ReviewGuideCardPresentation? = column == .review
+        let reviewGuidePresentation: ReviewGuideCardPresentation? = (column == .review || context.reviewGuideRequestInFlight)
             ? ReviewGuideCardPresentation.from(
-                lifecycle: task.reviewGuideLifecycle,
+                lifecycle: context.reviewGuideRequestInFlight ? "generating" : task.reviewGuideLifecycle,
                 readableVersionId: task.reviewGuideReadableVersionId,
                 staleSource: task.reviewGuideStaleSource ?? false
             )

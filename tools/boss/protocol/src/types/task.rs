@@ -933,16 +933,15 @@ pub struct Task {
     /// task id). Independent of `ci_required_state` / `review_required_state`
     /// / merge readiness (design invariant #6) — this says nothing about
     /// whether the PR is approved or mergeable, only whether an explanation
-    /// is available. `"queued"` covers both "not yet started" and "a
-    /// generation attempt is actively running": the series has no separate
-    /// "generating" state, so the card renders both as one indeterminate
-    /// state.
+    /// is available. `"queued"` means awaiting execution binding;
+    /// `"generating"` means an attempt has bound to an execution. Both render
+    /// as indeterminate progress while preserving any readable version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_guide_lifecycle: Option<String>,
 
     /// The series' currently readable guide version id, if any — pass to
     /// `GetReviewGuideContent` to fetch its Markdown. `Some` even while
-    /// `review_guide_lifecycle == "queued"` or `"failed"`: an older
+    /// `review_guide_lifecycle` is `"queued"`, `"generating"`, or `"failed"`: an older
     /// version can remain open/readable while a refresh is in flight or
     /// has failed (design's "Job state and concurrency" table). `None`
     /// until the first guide for this PR has ever published.

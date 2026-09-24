@@ -379,6 +379,16 @@ impl WorkerCompletionHandler {
         );
     }
 
+    pub(crate) async fn capture_review_guide_source_manually(&self, root_task_id: &str, pr_url: &str) -> Result<()> {
+        crate::review_guide_capture::capture_review_guide_source_manually(
+            &self.work_db,
+            root_task_id,
+            pr_url,
+            &self.source_packet_collector,
+        )
+        .await
+    }
+
     /// Inject a source-packet collector. Tests use this to spy on capture
     /// without calling GitHub; production keeps the default GitHub collector.
     pub(crate) fn with_source_packet_collector(
