@@ -538,6 +538,16 @@ fn reconcile_bounds_dispatch_failures_and_fails_missing_repository() {
                 .unwrap()
                 .execute("UPDATE tasks SET repo_remote_url = NULL WHERE id = ?1", [&root])
                 .unwrap();
+            db.connect().unwrap().execute(
+                "UPDATE products SET repo_remote_url = NULL WHERE id = (SELECT product_id FROM tasks WHERE id = ?1)",
+                [&root],
+            ).unwrap();
+            let error = db.dispatch_pr_review_guide_attempt(&attempt.id, &root).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("has no repository; cannot dispatch review-guide attempt")
+            );
         } else {
             db.connect().unwrap().execute_batch(
                 "CREATE TRIGGER reject_execution BEFORE INSERT ON work_executions BEGIN SELECT RAISE(ABORT, 'injected dispatch failure'); END;"
@@ -647,4 +657,33 @@ async fn hook_usage_is_lossless_durable_and_isolated_between_attempts() {
             .provider_usage_json
             .is_none()
     );
+}
+
+#[test]
+fn retry_dispatch_resolves_product_repository_and_task_override() {
+    let product_repo = "https://github.com/acme/widget.git";
+    let override_repo = "https://github.com/acme/override.git";
+    for task_repo in [None, Some(override_repo)] {
+        let (_dir, db) = open_db();
+        let product = crate::test_support::create_test_product_with_repo(&db, "retry repository", Some(product_repo));
+        let root = create_active_chore(&db, &product.id, "retry repository resolution");
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET repo_remote_url = ?1 WHERE id = ?2",
+                params![task_repo, root],
+            )
+            .unwrap();
+        seed_review_guide_series(&db, &root);
+
+        let RetryReviewGuideOutcome::Created(attempt) = db.retry_pr_review_guide(&root, None, "test").unwrap() else {
+            panic!("must create retry")
+        };
+        let execution = db
+            .get_execution(attempt.execution_id.as_deref().expect("retry must dispatch"))
+            .unwrap();
+        assert_eq!(execution.repo_remote_url, task_repo.unwrap_or(product_repo));
+        assert_eq!(execution.kind, ExecutionKind::PrReviewGuide);
+        assert_eq!(execution.status, ExecutionStatus::Ready);
+    }
 }

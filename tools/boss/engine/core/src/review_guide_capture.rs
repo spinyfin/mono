@@ -391,7 +391,7 @@ fn enqueue_review_guide_generation(
     if !feature_flags.is_enabled(REVIEW_GUIDE_GENERATION_FLAG) {
         return;
     }
-    match work_db.repo_remote_url_for_root(&capture.root_task_id) {
+    match work_db.resolve_repo_for_task(&capture.root_task_id) {
         Ok(Some(_)) => {}
         Ok(None) => {
             tracing::warn!(root_task_id = %capture.root_task_id, "review-guide generation: root task has no repository; skipping enqueue");

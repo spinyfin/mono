@@ -610,13 +610,13 @@ impl WorkDb {
 
     /// Create the `work_executions` row for a queued attempt and bind it.
     /// Idempotent: an already-bound or already-terminal attempt is returned
-    /// unchanged. The root task must have a `repo_remote_url`.
+    /// unchanged. The root task must resolve to a repository (override or product).
     pub(crate) fn dispatch_pr_review_guide_attempt(
         &self,
         attempt_id: &str,
         root_task_id: &str,
     ) -> Result<PrReviewGuideAttempt> {
-        let repo = self.repo_remote_url_for_root(root_task_id)?.ok_or_else(|| {
+        let repo = self.resolve_repo_for_task(root_task_id)?.ok_or_else(|| {
             anyhow::anyhow!(
                 "root task {root_task_id} has no repository; cannot dispatch review-guide attempt {attempt_id}"
             )
@@ -640,13 +640,6 @@ impl WorkDb {
         let bound = query_pr_review_guide_attempt(&tx, attempt_id).require("pr_review_guide_attempt", attempt_id)?;
         tx.commit()?;
         Ok(bound)
-    }
-
-    pub(crate) fn repo_remote_url_for_root(&self, root_task_id: &str) -> Result<Option<String>> {
-        match self.get_work_item(root_task_id)? {
-            WorkItem::Task(task) | WorkItem::Chore(task) => Ok(task.repo_remote_url),
-            _ => Ok(None),
-        }
     }
 
     /// Finish a non-terminal attempt whose bound execution has reached a
