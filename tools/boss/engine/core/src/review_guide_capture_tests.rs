@@ -300,6 +300,10 @@ fn enqueue_without_repository_does_not_create_an_attempt() {
     let root = create_active_chore(&db, &product, "repository missing");
     db.connect()
         .unwrap()
+        .execute("UPDATE products SET repo_remote_url = NULL WHERE id = ?1", [&product])
+        .unwrap();
+    db.connect()
+        .unwrap()
         .execute("UPDATE tasks SET repo_remote_url = NULL WHERE id = ?1", [&root])
         .unwrap();
     let packet = crate::test_support::source_capture_packet("https://github.com/acme/widget/pull/9", "base", "head");
@@ -324,4 +328,47 @@ fn enqueue_without_repository_does_not_create_an_attempt() {
         )
         .unwrap();
     assert_eq!(count, 0);
+}
+
+#[test]
+fn enqueue_resolves_product_repository_and_task_override() {
+    let product_repo = "https://github.com/acme/widget.git";
+    let override_repo = "https://github.com/acme/override.git";
+    for task_repo in [None, Some(""), Some(override_repo)] {
+        let (_dir, db) = open_db();
+        let product =
+            crate::test_support::create_test_product_with_repo(&db, "repository resolution", Some(product_repo));
+        let root = create_active_chore(&db, &product.id, "enqueue repository resolution");
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET repo_remote_url = ?1 WHERE id = ?2",
+                rusqlite::params![task_repo, root],
+            )
+            .unwrap();
+        let packet =
+            crate::test_support::source_capture_packet("https://github.com/acme/widget/pull/9", "base", "head");
+        let PrSourceCapturePersistOutcome::Stored(capture) = db
+            .persist_pr_review_guide_source_capture(&root, 1, PrSourceCaptureTrigger::Creation, &packet)
+            .unwrap()
+        else {
+            panic!("capture must persist")
+        };
+        let flags_dir = tempfile::tempdir().unwrap();
+        let flags = FeatureFlagsStore::new(flags_dir.path().join("flags.toml"));
+        flags.load().unwrap();
+        flags.set(REVIEW_GUIDE_GENERATION_FLAG, true).unwrap();
+
+        enqueue_review_guide_generation(&db, &flags, &capture);
+
+        let live = db.live_pr_review_guide_attempts_for_series(&capture.series_id).unwrap();
+        assert_eq!(live.len(), 1, "must enqueue with task repository {task_repo:?}");
+        let execution = db
+            .get_execution(live[0].execution_id.as_deref().expect("must dispatch"))
+            .unwrap();
+        let expected = task_repo.filter(|repo| !repo.is_empty()).unwrap_or(product_repo);
+        assert_eq!(execution.repo_remote_url, expected);
+        assert_eq!(execution.kind, ExecutionKind::PrReviewGuide);
+        assert_eq!(execution.status, ExecutionStatus::Ready);
+    }
 }
