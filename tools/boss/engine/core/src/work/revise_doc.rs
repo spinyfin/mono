@@ -8,6 +8,7 @@ use super::*;
 
 /// Outcome of the guarded batch UPDATE that claims comments for a freshly
 /// created revision/chore. See [`WorkDb::claim_revisable_comments`].
+#[derive(Debug)]
 pub(super) enum ClaimOutcome {
     /// The comments actually claimed by this call's task (may be a subset
     /// of the candidates under a partial race).
@@ -248,6 +249,70 @@ pub(super) fn claim_revisable_comments_in_tx(
     Ok(ClaimOutcome::Claimed(addressed))
 }
 
+/// Per-comment body shared by document and guide revision directives:
+/// quoted anchor, original body, replied answer-agent bridge, and operator
+/// follow-ups. Header and footer stay with each composer.
+///
+/// Reads thread context on `conn` so callers that already hold WorkDb's
+/// single pooled connection (an Immediate transaction) do not deadlock.
+pub(super) fn append_comment_directive_body(out: &mut String, conn: &Connection, comment: &WorkComment) {
+    out.push_str("Quoted section:\n> ");
+    out.push_str(&comment.anchor.exact);
+    out.push_str("\n\nComment:\n> ");
+    out.push_str(&comment.body);
+    out.push('\n');
+
+    // Only a genuinely `replied` run is bridge context. A run the operator
+    // stood down by reclassifying the comment (`superseded`) is a question
+    // they retracted — feeding its answer into the directive would put a
+    // stale answer to a withdrawn question in front of the worker. Guarding
+    // on the status rather than on `reply_body` being present keeps that
+    // true even if a future terminal state starts carrying a partial body.
+    let latest_run = conn
+        .query_row(
+            "SELECT id, comment_id, artifact_kind, artifact_id, doc_version, thread_turn, \
+             status, execution_id, workspace_lease_id, reply_body, error_kind, created_at, completed_at \
+             FROM answer_agent_runs WHERE comment_id = ?1 \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            [&comment.id],
+            map_answer_agent_run,
+        )
+        .optional()
+        .ok()
+        .flatten();
+    if let Some(run) = latest_run
+        && run.status == ANSWER_AGENT_RUN_STATUS_REPLIED
+        && let Some(reply) = run.reply_body.as_deref()
+    {
+        out.push_str("\nPrior answer-agent reply on this thread (bucket-2 bridge context):\n> ");
+        out.push_str(reply);
+        out.push('\n');
+    }
+    let entries: Vec<CommentThreadEntry> = (|| -> Result<Vec<CommentThreadEntry>> {
+        let mut stmt = conn.prepare(
+            "SELECT id, comment_id, entry_kind, author, body, revise_task_id, answer_agent_run_id, created_at \
+             FROM comment_thread_entries \
+             WHERE comment_id = ?1 AND entry_kind <> ?2 \
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![comment.id, boss_protocol::THREAD_ENTRY_KIND_NUDGE],
+            map_comment_thread_entry,
+        )?;
+        collect_rows(rows)
+    })()
+    .unwrap_or_default();
+    for entry in entries
+        .iter()
+        .filter(|e| e.entry_kind == THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP)
+    {
+        out.push_str("\nOperator follow-up on this thread:\n> ");
+        out.push_str(&entry.body);
+        out.push('\n');
+    }
+    out.push('\n');
+}
+
 /// Assemble the worker directive from every addressed comment: the doc's
 /// artifact id, each comment's quoted anchor, and its body (design
 /// §"Risks" — "directive assembly includes doc path, quoted anchors, and
@@ -265,38 +330,18 @@ fn compose_doc_comment_directive(db: &WorkDb, artifact_id: &str, comments: &[Wor
         if comments.len() == 1 { "s" } else { "" },
         if comments.len() == 1 { "" } else { "s" },
     );
-    for comment in comments {
-        out.push_str("Quoted section:\n> ");
-        out.push_str(&comment.anchor.exact);
-        out.push_str("\n\nComment:\n> ");
-        out.push_str(&comment.body);
-        out.push('\n');
-
-        // Only a genuinely `replied` run is bridge context. A run the operator
-        // stood down by reclassifying the comment (`superseded`) is a question
-        // they retracted — feeding its answer into the directive would put a
-        // stale answer to a withdrawn question in front of the worker. Guarding
-        // on the status rather than on `reply_body` being present keeps that
-        // true even if a future terminal state starts carrying a partial body.
-        if let Ok(Some(run)) = db.latest_answer_agent_run_for_comment(&comment.id)
-            && run.status == ANSWER_AGENT_RUN_STATUS_REPLIED
-            && let Some(reply) = run.reply_body.as_deref()
-        {
-            out.push_str("\nPrior answer-agent reply on this thread (bucket-2 bridge context):\n> ");
-            out.push_str(reply);
-            out.push('\n');
+    if let Ok(conn) = db.connect() {
+        for comment in comments {
+            append_comment_directive_body(&mut out, &conn, comment);
         }
-        if let Ok(entries) = db.list_comment_thread_entries(&comment.id) {
-            for entry in entries
-                .iter()
-                .filter(|e| e.entry_kind == THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP)
-            {
-                out.push_str("\nOperator follow-up on this thread:\n> ");
-                out.push_str(&entry.body);
-                out.push('\n');
-            }
+    } else {
+        for comment in comments {
+            out.push_str("Quoted section:\n> ");
+            out.push_str(&comment.anchor.exact);
+            out.push_str("\n\nComment:\n> ");
+            out.push_str(&comment.body);
+            out.push_str("\n\n");
         }
-        out.push('\n');
     }
     out.push_str("Please update the document accordingly.");
     out

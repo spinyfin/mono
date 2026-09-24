@@ -184,6 +184,22 @@ async fn compose_guide_answer_prompt(
         "## The question\n\n\
          Current PR: `{canonical_pr}` (root task {root_task_id})\n"
     ));
+    if let Some(capture) = work_db
+        .get_latest_pr_review_guide_source_capture(root_task_id)
+        .ok()
+        .flatten()
+    {
+        let pr_number = boss_github::pr_url::pr_number_from_url(canonical_pr);
+        prompt.push_str(&format!(
+            "Current captured PR head SHA: `{head}` (comparison `{comparison}`",
+            head = capture.packet.head_sha,
+            comparison = capture.comparison_id,
+        ));
+        if let Some(n) = pr_number {
+            prompt.push_str(&format!(", pull request #{n}"));
+        }
+        prompt.push_str("). Your leased checkout is positioned on this PR head; inspect that code as current.\n");
+    }
     if let Some(ctx) = context {
         prompt.push_str(&format!(
             "Original guide version: `{version}` (comparison `{comparison}`, head `{head}`)\n\n",
@@ -236,4 +252,82 @@ async fn compose_guide_answer_prompt(
         cmd = crate::answer_agent::THREAD_REPLY_COMMAND,
     ));
     prompt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compose_answer_agent_prompt;
+    use crate::test_support::{create_active_chore, create_product, open_db, seed_review_guide_series};
+    use crate::work::{CreateCommentInput, PublishReviewGuideOutcome, WorkItemPatch};
+    use boss_protocol::CommentAnchor;
+
+    #[tokio::test]
+    async fn guide_answer_prompt_carries_original_and_current_pr_head() {
+        let (_dir, db) = open_db();
+        let root = create_active_chore(&db, &create_product(&db), "impl");
+        db.update_work_item(
+            &root,
+            WorkItemPatch {
+                status: Some("in_review".to_owned()),
+                pr_url: Some("https://github.com/acme/widget/pull/9".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let (series, comparison) = seed_review_guide_series(&db, &root);
+        let attempt = db
+            .create_pr_review_guide_attempt(&series, &comparison, "review-guide-v1")
+            .unwrap();
+        let PublishReviewGuideOutcome::Published(version) = db
+            .publish_pr_review_guide_version(&attempt.id, "# Guide\n\nOriginal quote", "raw")
+            .unwrap()
+        else {
+            panic!("expected published guide")
+        };
+        let comment = db
+            .create_comment_with_guide_version(
+                CreateCommentInput::builder()
+                    .artifact_kind("pr_review_guide")
+                    .artifact_id(&series)
+                    .anchor(CommentAnchor {
+                        exact: "Original quote".into(),
+                        ..Default::default()
+                    })
+                    .body("why does this retry?")
+                    .author("user:test")
+                    .doc_version("hash")
+                    .plain_text_projection_version(1)
+                    .build(),
+                Some(&version.id),
+            )
+            .unwrap();
+        let execution = db
+            .create_answer_agent_execution(&comment.id, "https://github.com/acme/widget")
+            .unwrap();
+        let prompt = compose_answer_agent_prompt(&db, &execution).await;
+        assert!(
+            prompt.contains("https://github.com/acme/widget/pull/9"),
+            "prompt must name the current PR:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Current captured PR head SHA: `head`"),
+            "prompt must name the current captured head:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("pull request #9"),
+            "prompt must name the PR number:\n{prompt}"
+        );
+        assert!(
+            prompt.contains(&format!("Original guide version: `{}`", version.id)),
+            "prompt must name the original version:\n{prompt}"
+        );
+        assert!(
+            prompt.contains(&format!("comparison `{comparison}`")),
+            "prompt must name the original comparison:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("head `head`"),
+            "prompt must name the original comparison head:\n{prompt}"
+        );
+    }
 }

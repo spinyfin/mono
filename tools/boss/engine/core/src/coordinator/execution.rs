@@ -16,6 +16,64 @@ enum GotoTarget<'a> {
     Revision(&'a str),
 }
 
+/// PR number for `cube workspace goto --pr` after the lease.
+///
+/// `AnswerAgent` executions bind to a comment, not a task. When that
+/// comment's feedback target is an open implementation PR, position the
+/// lease on the PR so the read-only agent inspects current code rather
+/// than a fresh change off the default base.
+pub(crate) fn pr_number_for_workspace_goto(
+    work_db: &crate::work::WorkDb,
+    execution: &WorkExecution,
+    work_item: &WorkItem,
+) -> Option<u64> {
+    match execution.kind {
+        ExecutionKind::RevisionImplementation => execution
+            .pr_url
+            .as_deref()
+            .and_then(boss_github::pr_url::pr_number_from_url)
+            // `execution.pr_url` is not reliably stamped on every revision dispatch
+            // path (e.g. orphan-sweep re-dispatch, user-initiated `bossctl work start`).
+            // Fall back to the chain root's PR URL — the same authoritative lookup
+            // used by completion.rs — so positioning is never skipped for revisions.
+            .or_else(|| {
+                work_db
+                    .get_revision_chain_root_pr_url(&execution.work_item_id)
+                    .as_deref()
+                    .and_then(boss_github::pr_url::pr_number_from_url)
+            }),
+        ExecutionKind::PrReview => match work_item {
+            WorkItem::Task(task) | WorkItem::Chore(task) => task
+                .pr_url
+                .as_deref()
+                .filter(|u| !u.is_empty())
+                .and_then(boss_github::pr_url::pr_number_from_url),
+            _ => None,
+        },
+        ExecutionKind::AnswerAgent => {
+            let comment = work_db.get_comment(&execution.work_item_id).ok().flatten()?;
+            match work_db
+                .resolve_feedback_target(&comment.artifact_kind, &comment.artifact_id)
+                .ok()
+                .flatten()?
+            {
+                crate::work::FeedbackTarget::PullRequestImplementation {
+                    pr_lifecycle: boss_protocol::DocOwnerPrLifecycle::Open,
+                    pr_url,
+                    canonical_pr,
+                    ..
+                } => pr_url
+                    .as_deref()
+                    .filter(|url| !url.is_empty())
+                    .or(Some(canonical_pr.as_str()).filter(|url| !url.is_empty()))
+                    .and_then(boss_github::pr_url::pr_number_from_url),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 impl ExecutionCoordinator {
     /// Reject an explicit host request before the work DB can create or
     /// refresh an execution. This makes `bossctl ... --host` failures
@@ -1153,35 +1211,12 @@ impl ExecutionCoordinator {
         };
 
         // PR number to pass to `cube workspace goto` after the lease.
-        // Set for pr_review and revision_implementation executions that have a PR URL.
+        // Set for pr_review, revision_implementation, and answer_agent
+        // executions whose comment targets an open implementation PR.
         let pr_for_goto: Option<u64> = if post_merge_target_sha.is_some() {
             None
         } else {
-            match execution.kind {
-                ExecutionKind::RevisionImplementation => execution
-                    .pr_url
-                    .as_deref()
-                    .and_then(boss_github::pr_url::pr_number_from_url)
-                    // `execution.pr_url` is not reliably stamped on every revision dispatch
-                    // path (e.g. orphan-sweep re-dispatch, user-initiated `bossctl work start`).
-                    // Fall back to the chain root's PR URL — the same authoritative lookup
-                    // used by completion.rs — so positioning is never skipped for revisions.
-                    .or_else(|| {
-                        self.work_db
-                            .get_revision_chain_root_pr_url(&execution.work_item_id)
-                            .as_deref()
-                            .and_then(boss_github::pr_url::pr_number_from_url)
-                    }),
-                ExecutionKind::PrReview => match &work_item {
-                    WorkItem::Task(task) | WorkItem::Chore(task) => task
-                        .pr_url
-                        .as_deref()
-                        .filter(|u| !u.is_empty())
-                        .and_then(boss_github::pr_url::pr_number_from_url),
-                    _ => None,
-                },
-                _ => None,
-            }
+            pr_number_for_workspace_goto(&self.work_db, execution, &work_item)
         };
 
         let lease = match self
@@ -2424,5 +2459,91 @@ impl ExecutionCoordinator {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pr_number_for_workspace_goto;
+    use crate::test_support::{create_active_chore, create_product, open_db, seed_review_guide_series};
+    use crate::work::{CreateCommentInput, WorkItemPatch};
+    use boss_protocol::{CommentAnchor, ExecutionKind, ExecutionStatus, WorkExecution, WorkItem};
+
+    #[test]
+    fn answer_agent_on_open_guide_pr_positions_on_that_pr() {
+        let (_dir, db) = open_db();
+        let root = create_active_chore(&db, &create_product(&db), "impl");
+        db.update_work_item(
+            &root,
+            WorkItemPatch {
+                status: Some("in_review".to_owned()),
+                pr_url: Some("https://github.com/acme/widget/pull/9".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let (series, comparison) = seed_review_guide_series(&db, &root);
+        let attempt = db
+            .create_pr_review_guide_attempt(&series, &comparison, "review-guide-v1")
+            .unwrap();
+        let crate::work::PublishReviewGuideOutcome::Published(version) = db
+            .publish_pr_review_guide_version(&attempt.id, "# Guide\n\nquote", "raw")
+            .unwrap()
+        else {
+            panic!("expected published guide")
+        };
+        let comment = db
+            .create_comment_with_guide_version(
+                CreateCommentInput::builder()
+                    .artifact_kind("pr_review_guide")
+                    .artifact_id(series)
+                    .anchor(CommentAnchor {
+                        exact: "quote".into(),
+                        ..Default::default()
+                    })
+                    .body("why retry?")
+                    .author("user:test")
+                    .doc_version("hash")
+                    .plain_text_projection_version(1)
+                    .build(),
+                Some(&version.id),
+            )
+            .unwrap();
+        let execution = WorkExecution::builder()
+            .id("exec_answer")
+            .work_item_id(comment.id)
+            .kind(ExecutionKind::AnswerAgent)
+            .status(ExecutionStatus::Ready)
+            .repo_remote_url("https://github.com/acme/widget")
+            .created_at("2026-01-01T00:00:00Z")
+            .build();
+        let work_item = db.get_work_item(&root).unwrap();
+        assert_eq!(pr_number_for_workspace_goto(&db, &execution, &work_item), Some(9));
+    }
+
+    #[test]
+    fn answer_agent_on_document_does_not_position_on_a_pr() {
+        let (_dir, db) = open_db();
+        let execution = WorkExecution::builder()
+            .id("exec_doc")
+            .work_item_id("cmt_missing")
+            .kind(ExecutionKind::AnswerAgent)
+            .status(ExecutionStatus::Ready)
+            .repo_remote_url("https://github.com/acme/widget")
+            .created_at("2026-01-01T00:00:00Z")
+            .build();
+        let work_item = WorkItem::Chore(
+            boss_protocol::Task::builder()
+                .id("task_x")
+                .product_id("prod")
+                .kind(boss_protocol::TaskKind::Chore)
+                .name("x")
+                .description("x")
+                .status(boss_protocol::TaskStatus::Active)
+                .created_at("2026-01-01T00:00:00Z")
+                .updated_at("2026-01-01T00:00:00Z")
+                .build(),
+        );
+        assert_eq!(pr_number_for_workspace_goto(&db, &execution, &work_item), None);
     }
 }
