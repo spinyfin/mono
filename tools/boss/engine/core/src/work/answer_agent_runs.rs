@@ -20,14 +20,37 @@ use super::*;
 pub(crate) const ANSWER_AGENT_NO_REPLY_BODY: &str = "I wasn't able to finish answering this question — the session ended before \
      posting a reply. Please try again, or answer directly.";
 
-impl WorkDb {
-    /// Column list for every `answer_agent_runs` SELECT. Order must match
-    /// [`map_answer_agent_run`].
-    fn answer_agent_run_columns() -> &'static str {
-        "id, comment_id, artifact_kind, artifact_id, doc_version, thread_turn, \
-         status, execution_id, workspace_lease_id, reply_body, error_kind, created_at, completed_at"
-    }
+/// Column list for every `answer_agent_runs` SELECT. Order must match
+/// [`map_answer_agent_run`]. `pub(crate)` so callers that already hold a
+/// connection (e.g. [`crate::work::revise_doc::latest_answer_agent_run_for_comment_on`])
+/// can build the same SELECT without duplicating the column list.
+pub(crate) fn answer_agent_run_columns() -> &'static str {
+    "id, comment_id, artifact_kind, artifact_id, doc_version, thread_turn, \
+     status, execution_id, workspace_lease_id, reply_body, error_kind, created_at, completed_at, \
+     workspace_positioned"
+}
 
+/// The most recent answer-agent run for a comment (by `created_at`, then
+/// `id` as a stable tiebreak), on an already-open connection. Shared by
+/// [`WorkDb::latest_answer_agent_run_for_comment`] and by
+/// `append_comment_directive_body`, which holds the single pooled connection
+/// inside an Immediate transaction and cannot call back through
+/// `WorkDb::connect`.
+pub(crate) fn latest_answer_agent_run_for_comment_on(
+    conn: &Connection,
+    comment_id: &str,
+) -> Result<Option<AnswerAgentRun>> {
+    let cols = answer_agent_run_columns();
+    let sql = format!(
+        "SELECT {cols} FROM answer_agent_runs WHERE comment_id = ?1 \
+         ORDER BY created_at DESC, id DESC LIMIT 1"
+    );
+    conn.query_row(&sql, [comment_id], map_answer_agent_run)
+        .optional()
+        .map_err(Into::into)
+}
+
+impl WorkDb {
     /// Insert a `running` answer-agent run row and return it. `thread_turn` is
     /// `0` for the first answer on a comment and `1+` for re-entered follow-ups.
     /// `workspace_lease_id` is `None` at creation and stamped later if/when the
@@ -59,7 +82,7 @@ impl WorkDb {
                 now,
             ],
         )?;
-        let cols = Self::answer_agent_run_columns();
+        let cols = answer_agent_run_columns();
         let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE id = ?1");
         conn.query_row(&sql, [&id], map_answer_agent_run).map_err(Into::into)
     }
@@ -77,7 +100,7 @@ impl WorkDb {
         if n == 0 {
             bail!("answer-agent run {run_id} not found or already in a terminal state (expected running)");
         }
-        let cols = Self::answer_agent_run_columns();
+        let cols = answer_agent_run_columns();
         let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE id = ?1");
         conn.query_row(&sql, [run_id], map_answer_agent_run).map_err(Into::into)
     }
@@ -97,7 +120,7 @@ impl WorkDb {
         if n == 0 {
             bail!("answer-agent run {run_id} not found, terminal, or bound to another execution");
         }
-        let cols = Self::answer_agent_run_columns();
+        let cols = answer_agent_run_columns();
         let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE id = ?1");
         conn.query_row(&sql, [run_id], map_answer_agent_run).map_err(Into::into)
     }
@@ -116,9 +139,51 @@ impl WorkDb {
              WHERE execution_id = ?1 AND status = 'running'",
             params![execution_id, workspace_lease_id],
         )?;
-        let cols = Self::answer_agent_run_columns();
+        let cols = answer_agent_run_columns();
         let sql =
             format!("SELECT {cols} FROM answer_agent_runs WHERE execution_id = ?1 AND status = 'running' LIMIT 1");
+        conn.query_row(&sql, [execution_id], map_answer_agent_run)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Stamp whether `cube workspace goto --pr` actually positioned this
+    /// run's leased checkout on the PR head — `true` on success, `false`
+    /// when goto was attempted and failed (the coordinator fell back to a
+    /// fresh `cube change create` checkout). Called from the coordinator's
+    /// dispatch path right after the goto attempt, alongside
+    /// [`Self::set_answer_agent_execution_lease`]. Returning `None` is
+    /// expected for non-answer-agent executions.
+    pub fn set_answer_agent_run_positioning(
+        &self,
+        execution_id: &str,
+        positioned: bool,
+    ) -> Result<Option<AnswerAgentRun>> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE answer_agent_runs SET workspace_positioned = ?2 \
+             WHERE execution_id = ?1 AND status = 'running'",
+            params![execution_id, positioned],
+        )?;
+        let cols = answer_agent_run_columns();
+        let sql =
+            format!("SELECT {cols} FROM answer_agent_runs WHERE execution_id = ?1 AND status = 'running' LIMIT 1");
+        conn.query_row(&sql, [execution_id], map_answer_agent_run)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// The run bound to an execution, regardless of status — unlike
+    /// [`Self::set_answer_agent_execution_lease`]'s read-back, this is used
+    /// by prompt composition, which may run after the run has already
+    /// reached a terminal status in a resume/redispatch.
+    pub fn get_answer_agent_run_by_execution(&self, execution_id: &str) -> Result<Option<AnswerAgentRun>> {
+        let conn = self.connect()?;
+        let cols = answer_agent_run_columns();
+        let sql = format!(
+            "SELECT {cols} FROM answer_agent_runs WHERE execution_id = ?1 \
+             ORDER BY created_at DESC, id DESC LIMIT 1"
+        );
         conn.query_row(&sql, [execution_id], map_answer_agent_run)
             .optional()
             .map_err(Into::into)
@@ -147,7 +212,7 @@ impl WorkDb {
         if n == 0 {
             bail!("answer-agent run {run_id} not found or already in a terminal state (expected running)");
         }
-        let cols = Self::answer_agent_run_columns();
+        let cols = answer_agent_run_columns();
         let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE id = ?1");
         conn.query_row(&sql, [run_id], map_answer_agent_run).map_err(Into::into)
     }
@@ -248,7 +313,7 @@ impl WorkDb {
     /// Fetch an answer-agent run by id.
     pub fn get_answer_agent_run(&self, run_id: &str) -> Result<Option<AnswerAgentRun>> {
         let conn = self.connect()?;
-        let cols = Self::answer_agent_run_columns();
+        let cols = answer_agent_run_columns();
         let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE id = ?1");
         conn.query_row(&sql, [run_id], map_answer_agent_run)
             .optional()
@@ -264,7 +329,7 @@ impl WorkDb {
     /// raw SQL against `answer_agent_runs`.
     pub fn list_answer_agent_runs_for_comment(&self, comment_id: &str) -> Result<Vec<AnswerAgentRun>> {
         let conn = self.connect()?;
-        let cols = Self::answer_agent_run_columns();
+        let cols = answer_agent_run_columns();
         let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE comment_id = ?1 ORDER BY created_at ASC, id ASC");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([comment_id], map_answer_agent_run)?;
@@ -278,14 +343,7 @@ impl WorkDb {
     /// per-comment concurrency guard (at most one live run per comment).
     pub fn latest_answer_agent_run_for_comment(&self, comment_id: &str) -> Result<Option<AnswerAgentRun>> {
         let conn = self.connect()?;
-        let cols = Self::answer_agent_run_columns();
-        let sql = format!(
-            "SELECT {cols} FROM answer_agent_runs WHERE comment_id = ?1 \
-             ORDER BY created_at DESC, id DESC LIMIT 1"
-        );
-        conn.query_row(&sql, [comment_id], map_answer_agent_run)
-            .optional()
-            .map_err(Into::into)
+        latest_answer_agent_run_for_comment_on(&conn, comment_id)
     }
 
     /// Create a `ready` `answer_agent` work_execution bound to a comment
@@ -344,7 +402,7 @@ impl WorkDb {
     /// once the prior run for the same comment has left `running`.
     pub fn running_answer_agent_run_for_comment(&self, comment_id: &str) -> Result<Option<AnswerAgentRun>> {
         let conn = self.connect()?;
-        let cols = Self::answer_agent_run_columns();
+        let cols = answer_agent_run_columns();
         let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE comment_id = ?1 AND status = ?2 LIMIT 1");
         conn.query_row(
             &sql,

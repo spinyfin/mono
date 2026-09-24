@@ -1539,7 +1539,7 @@ pub(super) async fn handle_comments_record_guide_outcome(ctx: Dispatch, req: Fro
     ) {
         Ok(recorded) => {
             match recorded.regeneration {
-                Some(crate::work::RetryReviewGuideOutcome::Created(_)) => {
+                Some(Ok(crate::work::RetryReviewGuideOutcome::Created(_))) => {
                     if let Some(root) = work_db
                         .root_task_id_for_review_guide_series(&recorded.comment.artifact_id)
                         .ok()
@@ -1554,18 +1554,38 @@ pub(super) async fn handle_comments_record_guide_outcome(ctx: Dispatch, req: Fro
                         .await;
                     }
                 }
-                Some(crate::work::RetryReviewGuideOutcome::AlreadyRequested(_)) => {
+                Some(Ok(crate::work::RetryReviewGuideOutcome::AlreadyRequested(_))) => {
                     tracing::info!(
                         comment_id = %recorded.comment.id,
                         series_id = %recorded.comment.artifact_id,
                         "guide outcome regeneration already queued for this revision"
                     );
                 }
-                Some(crate::work::RetryReviewGuideOutcome::NoComparison) => {
+                Some(Ok(crate::work::RetryReviewGuideOutcome::NoComparison)) => {
                     tracing::warn!(
                         comment_id = %recorded.comment.id,
                         series_id = %recorded.comment.artifact_id,
                         "guide outcome requested regeneration but no source comparison exists"
+                    );
+                }
+                Some(Err(err)) => {
+                    // The outcome itself is already durably recorded (see
+                    // `RecordedGuideCommentOutcome::regeneration`'s doc) —
+                    // only the regeneration retry failed. Still publish the
+                    // comment invalidation and reply with success below;
+                    // surfacing this as a `WorkError` would tell the caller
+                    // the whole request failed when the disposition it
+                    // asked to record is sitting in the DB. This is logged
+                    // at `warn` (not just `info`) so an operator scanning
+                    // engine logs for "guide outcome recorded but its
+                    // regeneration request failed" can follow up manually —
+                    // there is currently no other response channel back to
+                    // the caller for a partial-success outcome like this.
+                    tracing::warn!(
+                        comment_id = %recorded.comment.id,
+                        series_id = %recorded.comment.artifact_id,
+                        error = %err,
+                        "guide comment outcome recorded but its regeneration request failed"
                     );
                 }
                 None => {}

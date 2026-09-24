@@ -10,11 +10,20 @@ use boss_protocol::{GuideCommentOutcome, THREAD_ENTRY_AUTHOR_ENGINE};
 
 /// Result of recording a grounded per-comment guide outcome. Regeneration
 /// is attempted after the outcome writes commit, so a retry failure does
-/// not roll back the recorded disposition.
+/// not roll back the recorded disposition — and, because the outcome is
+/// already durably recorded at that point, a regeneration failure is
+/// reported as a warning inside this `Ok` result rather than surfacing as
+/// an `Err` from [`WorkDb::record_guide_comment_outcome`]: the caller must
+/// still treat the outcome as successfully recorded (publish the comment
+/// invalidation, etc.) even when regeneration failed.
 #[derive(Debug)]
 pub struct RecordedGuideCommentOutcome {
     pub comment: WorkComment,
-    pub regeneration: Option<RetryReviewGuideOutcome>,
+    /// `Some(Ok(_))` when regeneration was requested and queued
+    /// successfully, `Some(Err(_))` when it was requested but the retry
+    /// call itself failed (the error's `Display` text), `None` when
+    /// regeneration was not requested at all.
+    pub regeneration: Option<Result<RetryReviewGuideOutcome, String>>,
 }
 
 pub(crate) fn migrate_guide_feedback_outcomes(conn: &Connection) -> Result<()> {
@@ -217,8 +226,17 @@ impl WorkDb {
                 Some(root) => {
                     let token = format!("guide-regen:{revise_task_id}");
                     match self.retry_pr_review_guide(&root, Some(&token), boss_review_guide::PROMPT_VERSION) {
-                        Ok(outcome) => Some(outcome),
+                        Ok(outcome) => Some(Ok(outcome)),
                         Err(err) => {
+                            // The outcome row, thread entry, and any
+                            // resolve above already committed — this
+                            // comment's disposition is durably recorded
+                            // regardless of what happens here. Report the
+                            // failure inside the `Ok` result (see the
+                            // field doc) instead of returning `Err`, so the
+                            // caller doesn't treat an already-recorded
+                            // outcome as failed and skip the comment
+                            // invalidation.
                             tracing::error!(
                                 revise_task_id,
                                 comment_id = %comment_id,
@@ -226,7 +244,7 @@ impl WorkDb {
                                 error = %format!("{err:#}"),
                                 "guide outcome recorded but regeneration request failed"
                             );
-                            return Err(err);
+                            Some(Err(format!("{err:#}")))
                         }
                     }
                 }
@@ -839,10 +857,79 @@ mod tests {
             )
             .unwrap();
         assert!(
-            matches!(recorded.regeneration, Some(RetryReviewGuideOutcome::Created(_))),
+            matches!(recorded.regeneration, Some(Ok(RetryReviewGuideOutcome::Created(_)))),
             "got {:?}",
             recorded.regeneration
         );
+    }
+
+    /// A retry failure (no source comparison for the series) must not turn
+    /// the whole outcome recording into an error — the disposition is
+    /// already committed by the time regeneration is attempted, so the
+    /// caller must still get `Ok` with the failure carried inside
+    /// `regeneration`.
+    #[test]
+    fn regeneration_failure_does_not_fail_the_outcome_recording() {
+        let (_dir, db) = open_db();
+        let (_root, series, _) = seed_open_guide(&db);
+        let c1 = make_guide_comment(&db, &series, "fix retry");
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
+        let ReviseDocOutcome::Created { task_id, .. } = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_review_guide")
+                    .artifact_id(series.clone())
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap()
+        else {
+            panic!("expected Created");
+        };
+        // No comparison at all makes `retry_pr_review_guide` return
+        // `Ok(NoComparison)`, not an error, so force a genuine failure
+        // instead: point the series' `selected_comparison_id` at a
+        // comparison row that doesn't exist. `admit_pr_review_guide_attempt`
+        // re-reads that column inside its transaction and sees it still
+        // selected (matching what it just read), so the `ensure!` guard
+        // passes — but the subsequent INSERT into `pr_review_guide_attempts`
+        // trips its `REFERENCES pr_review_guide_source_comparisons(id)`
+        // foreign key and returns a real `Err`.
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE pr_review_guide_source_series SET selected_comparison_id = 'prgc_missing' WHERE id = ?1",
+                [&series],
+            )
+            .unwrap();
+        let recorded = db
+            .record_guide_comment_outcome(
+                &task_id,
+                GuideCommentOutcome::builder()
+                    .comment_id(c1.id.clone())
+                    .disposition(GuideCommentDisposition::SourceChanged)
+                    .response("Fixed; the quoted guide is stale.")
+                    .request_regeneration(true)
+                    .build(),
+            )
+            .expect("recording the outcome must succeed even though regeneration will fail");
+        assert_eq!(recorded.comment.id, c1.id, "the disposition must still be recorded");
+        assert!(
+            matches!(recorded.regeneration, Some(Err(_))),
+            "got {:?}",
+            recorded.regeneration
+        );
+        // The outcome row itself is durable, independent of the failed retry.
+        let outcome_row: i64 = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM guide_comment_outcomes WHERE comment_id = ?1",
+                [&c1.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outcome_row, 1);
     }
 
     #[test]

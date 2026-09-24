@@ -4,6 +4,8 @@
 //! `tools/boss/docs/designs/comment-triggered-document-revisions.md`
 //! §"Buckets 1 & 3 — unified (revision)".
 
+use super::answer_agent_runs::latest_answer_agent_run_for_comment_on;
+use super::comment_thread_entries::list_comment_thread_entries_on;
 use super::*;
 
 /// Outcome of the guarded batch UPDATE that claims comments for a freshly
@@ -268,18 +270,7 @@ pub(super) fn append_comment_directive_body(out: &mut String, conn: &Connection,
     // stale answer to a withdrawn question in front of the worker. Guarding
     // on the status rather than on `reply_body` being present keeps that
     // true even if a future terminal state starts carrying a partial body.
-    let latest_run = conn
-        .query_row(
-            "SELECT id, comment_id, artifact_kind, artifact_id, doc_version, thread_turn, \
-             status, execution_id, workspace_lease_id, reply_body, error_kind, created_at, completed_at \
-             FROM answer_agent_runs WHERE comment_id = ?1 \
-             ORDER BY created_at DESC, id DESC LIMIT 1",
-            [&comment.id],
-            map_answer_agent_run,
-        )
-        .optional()
-        .ok()
-        .flatten();
+    let latest_run = latest_answer_agent_run_for_comment_on(conn, &comment.id).ok().flatten();
     if let Some(run) = latest_run
         && run.status == ANSWER_AGENT_RUN_STATUS_REPLIED
         && let Some(reply) = run.reply_body.as_deref()
@@ -288,20 +279,7 @@ pub(super) fn append_comment_directive_body(out: &mut String, conn: &Connection,
         out.push_str(reply);
         out.push('\n');
     }
-    let entries: Vec<CommentThreadEntry> = (|| -> Result<Vec<CommentThreadEntry>> {
-        let mut stmt = conn.prepare(
-            "SELECT id, comment_id, entry_kind, author, body, revise_task_id, answer_agent_run_id, created_at \
-             FROM comment_thread_entries \
-             WHERE comment_id = ?1 AND entry_kind <> ?2 \
-             ORDER BY created_at ASC, id ASC",
-        )?;
-        let rows = stmt.query_map(
-            params![comment.id, boss_protocol::THREAD_ENTRY_KIND_NUDGE],
-            map_comment_thread_entry,
-        )?;
-        collect_rows(rows)
-    })()
-    .unwrap_or_default();
+    let entries = list_comment_thread_entries_on(conn, &comment.id).unwrap_or_default();
     for entry in entries
         .iter()
         .filter(|e| e.entry_kind == THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP)
@@ -330,18 +308,13 @@ fn compose_doc_comment_directive(db: &WorkDb, artifact_id: &str, comments: &[Wor
         if comments.len() == 1 { "s" } else { "" },
         if comments.len() == 1 { "" } else { "s" },
     );
-    if let Ok(conn) = db.connect() {
-        for comment in comments {
-            append_comment_directive_body(&mut out, &conn, comment);
-        }
-    } else {
-        for comment in comments {
-            out.push_str("Quoted section:\n> ");
-            out.push_str(&comment.anchor.exact);
-            out.push_str("\n\nComment:\n> ");
-            out.push_str(&comment.body);
-            out.push_str("\n\n");
-        }
+    // `db.connect()` only fails if the pooled connection's mutex is
+    // poisoned by a prior panic elsewhere in the process — at that point the
+    // whole `WorkDb` is unusable, so there is no meaningful degraded mode to
+    // fall back to here.
+    let conn = db.connect().expect("WorkDb connection pool poisoned");
+    for comment in comments {
+        append_comment_directive_body(&mut out, &conn, comment);
     }
     out.push_str("Please update the document accordingly.");
     out

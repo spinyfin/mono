@@ -1513,6 +1513,10 @@ impl ExecutionCoordinator {
             (Some(pr), None) => Some(GotoTarget::Pr(pr)),
             (None, None) => None,
         };
+        // Set only on the AnswerAgent fallback below: a goto failure there
+        // is non-fatal, so `keep_change` further down must not treat the
+        // workspace as PR-positioned when it demonstrably isn't.
+        let mut answer_agent_goto_failed = false;
         if let Some(target) = goto_target {
             let workspace_path_str = lease.workspace_path.display().to_string();
             let goto_repr = match target {
@@ -1571,15 +1575,17 @@ impl ExecutionCoordinator {
                                 .with_details(details),
                         )
                         .await;
-                }
-                Err(err) => {
-                    if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
-                        tracing::error!(
-                            ?release_err,
-                            lease_id = %lease.lease_id,
-                            "failed to release workspace after goto positioning failure"
+                    if execution.kind == ExecutionKind::AnswerAgent
+                        && let Err(err) = self.work_db.set_answer_agent_run_positioning(&execution.id, true)
+                    {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            ?err,
+                            "failed to stamp answer-agent run positioning=true after a successful goto",
                         );
                     }
+                }
+                Err(err) => {
                     self.dispatch_events
                         .emit(
                             DispatchEvent::new(
@@ -1596,19 +1602,59 @@ impl ExecutionCoordinator {
                             .with_cube_invocation(goto_repr),
                         )
                         .await;
-                    let failure_label = match target {
-                        GotoTarget::Pr(_) => "Cube `workspace goto` positioning failed",
-                        GotoTarget::Revision(_) => "Cube `workspace goto --revision` positioning failed",
-                    };
-                    self.record_start_failure(
-                        Arc::clone(self),
-                        execution,
-                        worker_id,
-                        Some(repo.repo_id.as_str()),
-                        ("cube_workspace_positioning_failed", failure_label),
-                        &err,
-                    )?;
-                    return Err(err);
+
+                    // `AnswerAgent` is read-only positioning-as-convenience,
+                    // not positioning-as-correctness: the DB-derived
+                    // `pr_lifecycle == Open` this decision is based on can
+                    // be stale (merged-on-GitHub-but-not-yet-polled, or
+                    // closed-unmerged), and `cube workspace goto --pr` hard-
+                    // errors on a non-open PR. Before this fallback, that
+                    // hard error failed the whole run
+                    // (`cube_workspace_positioning_failed`) even though the
+                    // answer agent could perfectly well answer from a fresh
+                    // `cube change create` checkout instead — which is what
+                    // happened before positioning existed at all. Every
+                    // other execution kind only reaches `goto` when its own
+                    // PR is genuinely open (revision/PR-review target their
+                    // own task's PR, not a DB snapshot of someone else's
+                    // comment target), so they keep the hard-fail path.
+                    if execution.kind == ExecutionKind::AnswerAgent {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            ?err,
+                            "answer_agent: cube workspace goto --pr failed (stale/closed PR lifecycle); \
+                             falling back to a fresh checkout instead of failing the run",
+                        );
+                        answer_agent_goto_failed = true;
+                        if let Err(err) = self.work_db.set_answer_agent_run_positioning(&execution.id, false) {
+                            tracing::warn!(
+                                execution_id = %execution.id,
+                                ?err,
+                                "failed to stamp answer-agent run positioning=false after a failed goto",
+                            );
+                        }
+                    } else {
+                        if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
+                            tracing::error!(
+                                ?release_err,
+                                lease_id = %lease.lease_id,
+                                "failed to release workspace after goto positioning failure"
+                            );
+                        }
+                        let failure_label = match target {
+                            GotoTarget::Pr(_) => "Cube `workspace goto` positioning failed",
+                            GotoTarget::Revision(_) => "Cube `workspace goto --revision` positioning failed",
+                        };
+                        self.record_start_failure(
+                            Arc::clone(self),
+                            execution,
+                            worker_id,
+                            Some(repo.repo_id.as_str()),
+                            ("cube_workspace_positioning_failed", failure_label),
+                            &err,
+                        )?;
+                        return Err(err);
+                    }
                 }
             }
         }
@@ -1617,8 +1663,12 @@ impl ExecutionCoordinator {
         // head (or, for a post-merge review, on the merge commit) — skip
         // create_change (there is nothing to create; the worker edits or
         // reviews the branch/commit directly). For all other executions
-        // create a fresh jj change via `cube change create`.
-        let keep_change = recovered_blocked || pr_for_goto.is_some() || post_merge_target_sha.is_some();
+        // create a fresh jj change via `cube change create`. An AnswerAgent
+        // whose goto fell back (see above) was never positioned, so it needs
+        // the fresh change like any other non-PR-targeting execution.
+        let keep_change = recovered_blocked
+            || (pr_for_goto.is_some() && !answer_agent_goto_failed)
+            || post_merge_target_sha.is_some();
         let change: Option<CubeChangeHandle> = if keep_change {
             None
         } else {
