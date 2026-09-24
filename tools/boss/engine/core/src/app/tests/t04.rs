@@ -615,9 +615,10 @@ async fn retire_pane_reaps_an_untracked_slot_whose_durable_process_is_alive() {
     }
 
     // The durable teardown's own reverse lookup ("which slot hosts this
-    // run?", shared with `agents stop`'s fallback) now reads the durable
-    // worker id off the run row directly — no second app round-trip.
-    // Then the actual slot-keyed teardown request.
+    // run?", shared with `agents stop`'s fallback) reads the durable worker
+    // id off the run row directly — no second app round-trip — and the
+    // worker pool confirms nothing else claims that slot, so the teardown
+    // proceeds. Then the actual slot-keyed teardown request.
     let release = sink
         .next()
         .await
@@ -654,5 +655,106 @@ async fn retire_pane_reaps_an_untracked_slot_whose_durable_process_is_alive() {
     assert!(
         !status.success(),
         "the untracked worker's process tree must actually go down",
+    );
+}
+
+/// Regression for a slot handed to a NEWER run between when execution A's
+/// pool claim leaked and when A's own untracked teardown finally reaches
+/// `detach_untracked_worker_viewer`. `hosted_pane_slot_for_run` derives the
+/// slot from A's durable `work_runs.agent_id` — the slot A was once given,
+/// not necessarily the slot it holds now — so if that slot (`worker-1`) has
+/// since been reclaimed by a live execution B, tearing it down unconditionally
+/// would detach B's viewer, free B's pool claim and drop B's live-state entry
+/// out from under it, even though B is still running. The fix must refuse to
+/// touch the slot when the worker pool disagrees that A still owns it.
+#[tokio::test]
+async fn retire_pane_does_not_clobber_a_slot_reclaimed_by_a_newer_run() {
+    use crate::test_support::*;
+
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+
+    let mut child = spawn_group_leader_sleeper();
+    let pid = child.id() as i32;
+    // `create_spawned_execution` always records `worker-1` as the durable
+    // worker id, so this run's derived slot is slot 1 regardless of which
+    // slot actually hosts it today.
+    let execution_id = create_spawned_execution(db, &work_item_id, i64::from(pid));
+    super::tmux_stub::install_teardown(&server_state, &execution_id, i64::from(child.id()));
+    db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
+
+    // Slot `worker-1` has since been claimed by a DIFFERENT, live execution —
+    // the scenario the derived slot id cannot see, because it only reads the
+    // retiring run's own historical record.
+    let other_execution_id = "run-newer-occupant";
+    assert!(
+        server_state
+            .execution_coordinator
+            .reclaim_slot("worker-1", other_execution_id)
+            .await,
+        "the newer run must be able to claim the slot the retiring run once held",
+    );
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    let server_clone = server_state.clone();
+    let retire = tokio::spawn(async move { server_clone.retire_pane(1).await });
+
+    // Guard 3's own liveness probe: "what does the app host in slot 1?"
+    let probe = sink.next().await.expect("an EngineRequest event should be enqueued");
+    match probe.payload {
+        FrontendEvent::EngineRequest { request_id, request } => {
+            assert!(
+                matches!(request, EngineToAppRequest::ListHostedPanes(_)),
+                "expected the liveness probe, got {request:?}"
+            );
+            server_state
+                .deliver_app_response(
+                    "session-app",
+                    &request_id,
+                    EngineToAppResponse::ListHostedPanes {
+                        result: Ok(crate::protocol::ListHostedPanesResult {
+                            panes: vec![hosted(1, &execution_id)],
+                        }),
+                    },
+                )
+                .await;
+        }
+        other => panic!("expected EngineRequest, got {other:?}"),
+    }
+
+    // No `DetachWorkerPane` must follow: the derived slot is owned by a
+    // different live execution, so `detach_untracked_worker_viewer` must
+    // refuse to act on it.
+    let no_further_request = tokio::time::timeout(std::time::Duration::from_millis(200), sink.next()).await;
+    assert!(
+        no_further_request.is_err(),
+        "expected no further app request, but got {no_further_request:?}",
+    );
+
+    let result = retire.await.expect("retire task");
+    assert!(result.is_ok(), "expected retirement to succeed, got {result:?}");
+
+    // The newer run's pool claim must survive untouched.
+    let claims = server_state.execution_coordinator.worker_pool().claims().await;
+    assert!(
+        claims
+            .iter()
+            .any(|claim| claim.worker_id == "worker-1" && claim.execution_id == other_execution_id),
+        "expected the newer run's pool claim to survive, got {claims:?}",
+    );
+
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .expect("join wait task")
+        .expect("wait on child");
+    assert!(
+        !status.success(),
+        "the retiring run's own untracked process tree must still go down",
     );
 }

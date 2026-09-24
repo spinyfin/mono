@@ -241,24 +241,33 @@ impl ServerState {
     ///    [`Self::readopt_progress_ingress`].
     ///
     ///    Ahead of steps 3 and 4 rather than after them, because it is the
-    ///    one restore step that does not need a slot id: a run whose pane the
-    ///    app cannot name — or will not answer about — still has a rollout to
-    ///    read, and making the tail wait on that answer would put the
-    ///    ballgame behind the cosmetics.
-    /// 3. **The pool claim**, keyed to the slot the app actually hosts the
-    ///    pane in. This is the `is_live` oracle the re-dispatchers consult, so
-    ///    without it the row would still read as re-dispatchable to
+    ///    one restore step that does not need a slot id: a run whose durable
+    ///    worker id cannot be resolved to a slot — or whose derived slot is
+    ///    no longer its own — still has a rollout to read, and making the
+    ///    tail wait on that answer would put the ballgame behind the
+    ///    cosmetics.
+    /// 3. **The pool claim**, keyed to the slot [`Self::hosted_pane_slot_for_run`]
+    ///    derives from the run's durable `work_runs.agent_id`, reclaimed only
+    ///    when the pool confirms that slot is unclaimed or already claimed by
+    ///    this run. This is the `is_live` oracle the re-dispatchers consult,
+    ///    so without it the row would still read as re-dispatchable to
     ///    `orphan_sweep` even though its status now says otherwise.
     /// 4. **The live-state entry**, which is what the agent indicator paints
     ///    from and what `bossctl agents list` / `agents stop` resolve against.
     ///
-    /// Steps 3 and 4 need a slot id, and the only trustworthy source for it is
-    /// the app: the engine's own mapping was cleared by the teardown being
-    /// reversed. When the app cannot be asked, re-adoption still completes at
-    /// steps 1 and 2 — degraded (the indicator stays blank until the worker's
-    /// pane is re-observed) but convergent in the way that matters, because
-    /// the row no longer invites a duplicate dispatch and the session is
-    /// still being read.
+    /// Steps 3 and 4 need a slot id, and the durable derivation in
+    /// [`Self::hosted_pane_slot_for_run`] is only a hint — it names the slot
+    /// this run once held, not necessarily the slot it holds now. Before
+    /// either step touches slot-scoped state it also checks the worker pool's
+    /// claim (via `reclaim_slot`) and the live-state registry's current
+    /// occupant for that slot; if either says the slot now belongs to a
+    /// different live execution, both steps are skipped so that run's
+    /// tracking is not overwritten. When no slot id resolves at all, or the
+    /// slot is owned by another run, re-adoption still completes at steps 1
+    /// and 2 — degraded (the indicator stays blank until the worker's pane is
+    /// re-observed) but convergent in the way that matters, because the row
+    /// no longer invites a duplicate dispatch and the session is still being
+    /// read.
     async fn readopt_live_worker(&self, execution: &WorkExecution, trigger: &str) {
         let run_id = execution.id.as_str();
         let prior_status = execution.status.to_string();
@@ -311,8 +320,9 @@ impl ServerState {
 
         // Resolved once, ahead of the slot lookup, because both the live-state
         // entry and the progress ingress need the same answer and only one of
-        // them depends on the app hosting a pane. A run whose pane the app
-        // cannot name still has a rollout to read.
+        // them depends on a slot resolving at all. A run whose durable worker
+        // id does not resolve to a slot — or whose derived slot now belongs
+        // to a different live execution — still has a rollout to read.
         //
         // Ask the resolved driver, rather than assume — the same
         // derivation `spawn_flow` makes at spawn time. The driver is
@@ -338,20 +348,46 @@ impl ServerState {
                 .ok()
         });
         let ingress_outcome = self.readopt_progress_ingress(&restored, driver.clone()).await;
-        let slot_id = self.hosted_pane_slot_for_run(run_id);
+        // The durably-derived slot is only a hint: it names the slot this run
+        // once held, not necessarily the slot it holds now. Before touching
+        // any bookkeeping keyed by that slot, confirm current ownership
+        // through both oracles that could disagree with it — the worker
+        // pool's claim (`reclaim_slot` refuses to yank a claim held by a
+        // different execution) and the live-state registry (whose own
+        // `register_readoption` would otherwise silently overwrite a
+        // different run's entry). Either disagreeing means the slot has
+        // already been handed to a newer run, and re-adoption must leave
+        // that run's tracking alone rather than clobber it.
+        let slot_id = match self.hosted_pane_slot_for_run(run_id) {
+            Some(candidate_slot_id) => {
+                let worker_id = crate::coordinator::worker_id_for_slot(candidate_slot_id);
+                let reclaimed = self.execution_coordinator.reclaim_slot(&worker_id, run_id).await;
+                let held_by_other_run = self
+                    .live_worker_states
+                    .get(candidate_slot_id)
+                    .is_some_and(|state| state.run_id != run_id);
+                if reclaimed && !held_by_other_run {
+                    Some(candidate_slot_id)
+                } else {
+                    tracing::warn!(
+                        run_id,
+                        slot_id = candidate_slot_id,
+                        reclaimed,
+                        held_by_other_run,
+                        "readopt: the durably-derived slot is currently owned by a different live \
+                         execution; skipping worker-registry and live-state registration so this \
+                         readoption does not overwrite its tracking. The row is restored but \
+                         re-dispatch protection rests on its status alone",
+                    );
+                    None
+                }
+            }
+            None => None,
+        };
         if let Some(slot_id) = slot_id {
             self.worker_registry.register_run_slot(run_id.to_owned(), slot_id);
             if let Some(shell_pid) = observed_shell_pid {
                 self.worker_registry.register(shell_pid, run_id.to_owned());
-            }
-            let worker_id = crate::coordinator::worker_id_for_slot(slot_id);
-            if !self.execution_coordinator.reclaim_slot(&worker_id, run_id).await {
-                tracing::warn!(
-                    run_id,
-                    slot_id,
-                    "readopt: pool slot could not be re-claimed (occupied by another execution); \
-                     the row is restored but re-dispatch protection rests on its status alone",
-                );
             }
             let binding =
                 self.work_db
@@ -481,9 +517,11 @@ impl ServerState {
         } else {
             tracing::warn!(
                 run_id,
-                "readopt: the app hosts no pane for this run, so the live-state slot could not be \
-                 restored. The execution row is back to live — which is what stops the duplicate \
-                 dispatch — but the agent indicator stays blank until the pane is re-observed.",
+                "readopt: no local pool slot could be restored for this run (remote run, no durable \
+                 worker id recorded, or the derived slot is owned by a different live execution), so \
+                 the live-state slot could not be restored. The execution row is back to live — which \
+                 is what stops the duplicate dispatch — but the agent indicator stays blank until the \
+                 pane is re-observed.",
             );
         }
 
@@ -684,11 +722,11 @@ impl ServerState {
             .await;
     }
 
-    /// The pool slot `run_id`'s worker occupies, derived from its durable
-    /// `work_runs.agent_id` rather than asked of the app.
+    /// The pool slot `run_id`'s worker was assigned at spawn time, derived
+    /// from its durable `work_runs.agent_id`.
     ///
     /// Tmux is the sole *local* pane host, so a local worker id a spawn
-    /// recorded durably decides the slot for the life of the run
+    /// recorded durably decides the slot the run was given
     /// ([`crate::coordinator::slot_id_from_worker_id`]) — the same derivation
     /// [`crate::tmux_adoption`]'s boot-time adoption uses to rebuild a slot
     /// claim. Every caller here is resolving a case where in-memory
@@ -697,15 +735,21 @@ impl ServerState {
     /// engine restart and needs no live app round-trip — an app session may
     /// not even be connected.
     ///
+    /// This is a durable *hint*, not a current-ownership claim: the slot a
+    /// run was once given can already have been freed and handed to a
+    /// different execution (e.g. a leaked pool claim that `pool_claim_sweep`
+    /// reclaimed and a later dispatch reused). Callers that act on the
+    /// returned slot id must independently confirm it is still owned by
+    /// `run_id` — or is unowned — before touching any slot-scoped state; see
+    /// the ownership checks in [`Self::readopt_live_worker`] and
+    /// `detach_untracked_worker_viewer`.
+    ///
     /// Host safety: a remote run never occupies a tmux/app-hosted local
     /// slot, but it still records a `work_runs.agent_id` (e.g. a
     /// re-adoption placeholder), and that id is never authoritative for a
     /// local pool slot — so this returns `None` outright for anything but a
-    /// `host_id == "local"` run, exactly as `hosted_pane_slot_for_run`'s
-    /// deleted app-oracle predecessor did implicitly (the app never hosted a
-    /// remote pane to answer with in the first place). `None` also covers
-    /// "no run row recorded a worker id" and "the recorded id does not parse
-    /// as a pool slot".
+    /// `host_id == "local"` run. `None` also covers "no run row recorded a
+    /// worker id" and "the recorded id does not parse as a pool slot".
     pub(super) fn hosted_pane_slot_for_run(&self, run_id: &str) -> Option<u8> {
         match self.work_db.latest_run_host_for_execution(run_id) {
             Ok(Some(host)) if host == "local" => {}
@@ -728,12 +772,18 @@ impl ServerState {
     /// Run ids the app currently hosts a *viewer* for. `Err` when the app
     /// could not be asked — callers must not treat that as "no viewers".
     ///
-    /// Tmux, not the app, is the sole worker-process oracle
-    /// ([`Self::hosted_pane_slot_for_run`]); this is the one remaining
-    /// legitimate use of `ListHostedPanes` — describing which slots already
-    /// have a Ghostty viewer attached, so [`Self::reattach_worker_panes_to_registered_app`]
-    /// does not send a redundant `AttachWorkerPane` for one the app already
-    /// holds.
+    /// Tmux, not the app, is the sole worker-*process* oracle
+    /// ([`Self::hosted_pane_slot_for_run`]); this is a legitimate use of
+    /// `ListHostedPanes` for viewer presentation — describing which slots
+    /// already have a Ghostty viewer attached, so
+    /// [`Self::reattach_worker_panes_to_registered_app`] does not send a
+    /// redundant `AttachWorkerPane` for one the app already holds. It is not
+    /// the *only* remaining use: `retire_pane`'s Guard 3
+    /// (`hosted_pane_run_for_slot`, `super::pane_ops`) and
+    /// `list_hosted_pane_statuses`'s husk classification still ask the app
+    /// which run occupies a slot as process evidence — converting those to
+    /// tmux inventory plus durable run identity is deliberately left for a
+    /// later pass.
     async fn app_hosted_viewer_run_ids(&self) -> Result<HashSet<String>, String> {
         let request = EngineToAppRequest::ListHostedPanes(ListHostedPanesInput {});
         match self.send_to_app(request, Duration::from_secs(5)).await {

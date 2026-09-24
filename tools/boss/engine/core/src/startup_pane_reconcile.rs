@@ -39,8 +39,11 @@ use crate::work::WorkDb;
 /// How pane-presence oracles answered for one execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PanePresence {
-    /// A live pane is already registered (tmux adoption, a live-state slot,
-    /// or a durable tmux identity).
+    /// A live pane is already registered — boot-time tmux adoption claimed
+    /// it, or the live-state registry already tracks it as running. A
+    /// durable tmux identity with neither of those recorded is NOT this
+    /// variant: it means the intended session was never created, so it
+    /// reads as [`Self::Absent`] instead.
     Present,
     /// Every reachable oracle agrees there is no pane.
     Absent,
@@ -299,8 +302,9 @@ async fn consider_one(
                 execution_id = %execution.id,
                 work_item_id = %execution.work_item_id,
                 reason = %reason,
-                "startup pane reconcile: cannot determine pane presence; not respawning \
-                 (will retry when the app session registers)"
+                "startup pane reconcile: cannot determine pane presence (no durable tmux identity \
+                 recorded, or it could not be read); not respawning — retried on the next app \
+                 session registration, the only currently-wired retry trigger"
             );
             emit(
                 dispatch_events,
@@ -674,9 +678,11 @@ mod tests {
         assert!(resumer.calls.lock().unwrap().is_empty());
     }
 
-    /// A run adopted from a live tmux session at boot must not be spawned
-    /// again just because this pass's candidate set omits it from
-    /// `tmux_adopted` — the adoption pass already proved the pane is live.
+    /// A run adopted from a live tmux session at boot (present in this
+    /// pass's `tmux_adopted` set) must not be spawned again — the adoption
+    /// pass already proved the pane is live, so the oracle must read it as
+    /// `Present` rather than treating tmux-hosting intent alone as grounds
+    /// to respawn.
     #[tokio::test]
     async fn adopted_tmux_pane_is_not_duplicated_or_stranded_after_restart() {
         let (_dir, db) = open_db();

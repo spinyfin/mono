@@ -301,6 +301,37 @@ async fn work_resumed_kinds_resolve_once_a_later_run_starts() {
     );
 }
 
+/// Regression: the now-deleted app-reattach pane-death reconcile used to
+/// file `crate::attention_lifecycle::LEGACY_PANE_DEATH_RECONCILE_ATTENTION_KIND`
+/// ("pane_death_reconcile"). Its producer and lifecycle entry were both
+/// deleted along with the app-hosted pane path, but a pre-upgrade engine can
+/// still have left an `open` row of that literal kind in the DB. A legacy
+/// `ClearedBy::WorkResumed` registration must still auto-clear it, or it
+/// would stay open forever with nothing left able to resolve it.
+#[tokio::test]
+async fn legacy_pane_death_reconcile_rows_still_resolve_once_a_later_run_starts() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id, "Pane died on relaunch, then resumed");
+
+    let attention = open_attention_for_work_item(
+        &db,
+        &chore.id,
+        crate::attention_lifecycle::LEGACY_PANE_DEATH_RECONCILE_ATTENTION_KIND,
+        1000,
+    );
+    start_run_at(&db, &chore.id, 1500);
+
+    let outcome = run_one_pass(&db).await;
+    assert_eq!(outcome.attentions_resolved, 1);
+    let (status, resolved_at) = attention_status(&db, &attention);
+    assert_eq!(status, "resolved");
+    assert!(
+        resolved_at.is_some(),
+        "a legacy row must resolve and stay inspectable, not stay open with nothing able to clear it",
+    );
+}
+
 #[tokio::test]
 async fn work_resumed_kinds_stay_open_when_the_only_run_predates_the_signal() {
     let (_dir, db) = open_db();
