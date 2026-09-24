@@ -1484,6 +1484,102 @@ mod trunk_queue_tests {
         server.verify().await;
     }
 
+    /// A stale, failed review guide on the merge-eligible root must never
+    /// affect eligibility or the Direct-merge path — design invariant #6 in
+    /// `automatic-pr-review-guides.md` ("Guide status is an independent
+    /// axis from CI, approval, task status, and merge readiness"). Mirrors
+    /// [`merge_mechanism_null_still_routes_direct`] with the worst-case
+    /// guide state (no published content, and a superseded comparison)
+    /// layered on top of the same root.
+    #[tokio::test]
+    async fn stale_failed_review_guide_never_gates_the_direct_merge_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/submitPullRequest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let direct_executor = Arc::new(FakeDirectMergeExecutor::default());
+        let (state, _temp) =
+            test_server_state_with_direct_executor(trunk_client_for(server.uri()), Some(direct_executor.clone()));
+        let product = create_test_product_with_repo(
+            &state.work_db,
+            "guide-stale-product",
+            Some("git@github.com:brianduff/flunge.git"),
+        );
+        let chore = create_test_chore_manual(&state.work_db, product.id.clone(), "guide-stale-chore");
+        state
+            .work_db
+            .update_work_item(
+                &chore.id,
+                WorkItemPatch {
+                    status: Some("in_review".into()),
+                    pr_url: Some("https://github.com/brianduff/flunge/pull/991".into()),
+                    ..WorkItemPatch::default()
+                },
+            )
+            .unwrap();
+
+        // A failed generation attempt against a since-superseded comparison
+        // — no readable content, and the source is stale.
+        let (series_id, comparison_id) = crate::test_support::seed_review_guide_series(&state.work_db, &chore.id);
+        let attempt = state
+            .work_db
+            .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
+            .unwrap();
+        state.work_db.fail_pr_review_guide_attempt(&attempt.id, "boom").unwrap();
+        state
+            .work_db
+            .persist_pr_review_guide_source_capture(
+                &chore.id,
+                2,
+                crate::work::PrSourceCaptureTrigger::Poller,
+                &crate::test_support::review_guide_source_packet("base2", "head2"),
+            )
+            .unwrap();
+        let summary = state
+            .work_db
+            .get_pr_review_guide_summary_for_root(&chore.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.lifecycle, "failed");
+        assert!(summary.readable_version_id.is_none(), "no version was ever published");
+
+        let sink = make_session_sink();
+        let mut pr_reconcile_requests = state.event_bus.subscribe(boss_event_bus::TopicFilter::kind(
+            boss_event_bus::EventKind::PrReconcileRequested,
+        ));
+
+        handle_merge_when_ready(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::MergeWhenReady {
+                work_item_id: chore.id.clone(),
+            },
+        )
+        .await;
+
+        let envelope = sink.next().await.expect("a response should be enqueued");
+        assert!(
+            matches!(envelope.payload, FrontendEvent::MergeWhenReadyAccepted { .. }),
+            "a failed/stale review guide must not refuse the merge; got {:?}",
+            envelope.payload
+        );
+        assert_eq!(
+            direct_executor.calls.lock().unwrap().as_slice(),
+            ["https://github.com/brianduff/flunge/pull/991"],
+            "merge eligibility must be unaffected by review-guide state"
+        );
+        match pr_reconcile_requests.recv().await {
+            Some(boss_event_bus::Event::PrReconcileRequested { pr_url }) => {
+                assert_eq!(pr_url, "https://github.com/brianduff/flunge/pull/991");
+            }
+            other => panic!("expected a PrReconcileRequested event for the merged PR, got {other:?}"),
+        }
+        server.verify().await;
+    }
+
     /// A product with `merge_mechanism` explicitly `"direct"` also routes
     /// through the Direct path — mirrors the NULL case above, pinning that
     /// the explicit value behaves identically. Also uses the fake Direct

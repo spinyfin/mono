@@ -294,7 +294,9 @@ fn compose_guide_comment_directive(canonical_pr: &str, series_id: &str, comments
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{create_active_chore, create_product, open_db, seed_review_guide_series};
+    use crate::test_support::{
+        create_active_chore, create_product, open_db, review_guide_source_packet, seed_review_guide_series,
+    };
     use crate::work::{FakePrStateChecker, PrOpenState};
     use boss_protocol::{
         CommentAnchor, CreateCommentInput, GuideCommentDisposition, GuideCommentOutcome, TaskKind, WorkItem,
@@ -547,5 +549,118 @@ mod tests {
         let closed = db.comments_banner_state("pr_review_guide", &series).unwrap();
         assert!(!closed.revisable);
         assert!(closed.pr_closed);
+    }
+
+    /// Full loop from design §"Comments target the implementation": a
+    /// same-PR revision completes, the worker records a grounded outcome
+    /// and requests regeneration, and the resulting new version is
+    /// published against the NEW comparison the revision's push produced —
+    /// while the original comment stays resolved with its immutable
+    /// original quote/version, never rewritten onto the new prose.
+    #[test]
+    fn regenerate_after_revision_preserves_the_earlier_comment_and_version() {
+        let (_dir, db) = open_db();
+        let (root, series, _pr_url) = seed_open_guide(&db);
+        let version1 = db
+            .get_pr_review_guide_summary_for_root(&root)
+            .unwrap()
+            .unwrap()
+            .readable_version_id
+            .expect("seed_open_guide publishes an initial version");
+        let c1 = make_guide_comment(&db, &series, "fix retry");
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
+
+        let ReviseDocOutcome::Created { task_id, .. } = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_review_guide")
+                    .artifact_id(series.clone())
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap()
+        else {
+            panic!("expected Created");
+        };
+
+        // The revision worker pushed to the same PR; the resulting
+        // comparison is observed (mirroring `finalize_pr_transition`'s
+        // completion-triggered reconciliation) and becomes the series'
+        // desired comparison before the revision task's own completion is
+        // recorded.
+        db.persist_pr_review_guide_source_capture(
+            &root,
+            2,
+            PrSourceCaptureTrigger::Completion,
+            &review_guide_source_packet("base2", "head2"),
+        )
+        .unwrap();
+
+        db.update_work_item(
+            &task_id,
+            WorkItemPatch {
+                status: Some("done".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        // The real `boss comment guide-outcome --regenerate` path: a
+        // grounded outcome plus a regeneration request.
+        db.record_guide_comment_outcome(
+            &task_id,
+            GuideCommentOutcome::builder()
+                .comment_id(c1.id.clone())
+                .disposition(GuideCommentDisposition::SourceChanged)
+                .response("Retry now stops immediately on permission errors.")
+                .request_regeneration(true)
+                .build(),
+        )
+        .unwrap();
+
+        // The comment resolves immediately (its revision task is already
+        // terminal) but its authored context is untouched.
+        let resolved = db.get_comment(&c1.id).unwrap().unwrap();
+        assert_eq!(resolved.status, COMMENT_STATUS_RESOLVED);
+        let original_context = resolved.guide_context.clone().expect("guide context");
+        assert_eq!(original_context.version_id, version1);
+
+        // Regeneration targeted the NEW comparison. The old content stays
+        // the readable version while the new attempt is queued —
+        // "Refreshing with earlier content" in the design's state table.
+        let mid_summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+        assert_eq!(mid_summary.lifecycle, "queued");
+        assert_eq!(mid_summary.readable_version_id.as_deref(), Some(version1.as_str()));
+        assert_ne!(
+            mid_summary.selected_comparison_id.as_deref(),
+            Some(original_context.comparison_id.as_str()),
+            "regeneration must target the newly observed comparison, not the one the resolved comment was authored against"
+        );
+
+        let live = db.live_pr_review_guide_attempts_for_series(&series).unwrap();
+        assert_eq!(live.len(), 1, "regeneration must create exactly one new attempt");
+        let attempt2 = &live[0];
+
+        let published = db
+            .publish_pr_review_guide_version(
+                &attempt2.id,
+                "# Guide v2\n\n## Problem\n## Fix\n## Changes\n## Tests\n",
+                "raw",
+            )
+            .unwrap();
+        let PublishReviewGuideOutcome::Published(version2) = published else {
+            panic!("regenerated attempt must publish")
+        };
+        assert_ne!(version2.id, version1);
+
+        let refreshed = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+        assert_eq!(refreshed.lifecycle, "ready");
+        assert_eq!(refreshed.readable_version_id.as_deref(), Some(version2.id.as_str()));
+
+        // Old feedback survives the refresh: still resolved, still pointed
+        // at its original (now superseded) version and quote.
+        let still_there = db.get_comment(&c1.id).unwrap().unwrap();
+        assert_eq!(still_there.status, COMMENT_STATUS_RESOLVED);
+        assert_eq!(still_there.guide_context, Some(original_context));
     }
 }

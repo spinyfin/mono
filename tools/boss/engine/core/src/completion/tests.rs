@@ -1889,3 +1889,130 @@ async fn disabled_finalize_does_not_allocate_a_source_observation() {
         .await;
     assert_eq!(db.allocate_pr_review_guide_source_observation_sequence().unwrap(), 1);
 }
+
+/// Stand up a `pr_review_guide` execution bound to a queued attempt for a
+/// captured comparison, parked exactly like `PaneSpawnRunner` leaves a
+/// worker awaiting its Stop hook — the state `finalize_review_guide`
+/// expects to find. A plain (non-pool) `worker_id` keeps
+/// `driver_for_execution` unresolved, so [`write_assistant_transcript`]'s
+/// Claude-native envelope is the shape the finalizer actually reads.
+/// Returns `(dir, db, root_task_id, series_id, execution_id)`.
+fn review_guide_execution_fixture(workspace_path: &Path) -> (TempDir, Arc<WorkDb>, String, String, String) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("boss.db");
+    let db = Arc::new(WorkDb::open(path).unwrap());
+    let product = create_test_product(&db);
+    let root = create_active_chore(&db, &product.id, "review guide finalize test");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET repo_remote_url = ?1 WHERE id = ?2",
+            rusqlite::params!["https://github.com/acme/widget.git", root],
+        )
+        .unwrap();
+    let (series_id, comparison_id) = seed_review_guide_series(&db, &root);
+    let attempt = db
+        .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
+        .unwrap();
+    let attempt = db.dispatch_pr_review_guide_attempt(&attempt.id, &root).unwrap();
+    let execution_id = attempt.execution_id.expect("dispatch binds an execution");
+    let (execution, run) = db
+        .start_execution_run(
+            &execution_id,
+            "worker-1",
+            "mono",
+            "lease-1",
+            "mono-agent-001",
+            workspace_path.to_str().unwrap(),
+        )
+        .unwrap();
+    finish_run_worker_pane_alive(&db, &execution.id, &run.id, Some("spawned worker pane"));
+    (dir, db, root, series_id, execution_id)
+}
+
+#[tokio::test]
+async fn finalize_review_guide_publishes_a_valid_guide_and_advances_the_readable_pointer() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, root, _series_id, execution_id) = review_guide_execution_fixture(workspace.path());
+    write_assistant_transcript(
+        &db,
+        workspace.path(),
+        &execution_id,
+        "# The Guide\n\n## Problem\n## Fix\n## Changes\n## Tests\n",
+    );
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None)).handler;
+    let execution = db.get_execution(&execution_id).unwrap();
+
+    let outcome = handler.finalize_review_guide(&execution).await;
+    assert!(
+        matches!(outcome, StopOutcome::ReviewGuide { published: true }),
+        "expected a published outcome, got {outcome:?}"
+    );
+
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert_eq!(summary.lifecycle, "ready");
+    let version_id = summary
+        .readable_version_id
+        .expect("a published attempt must set the readable version");
+    let version = db.get_pr_review_guide_version(&version_id).unwrap().unwrap();
+    assert!(version.markdown.contains("## Problem"));
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn finalize_review_guide_fails_the_attempt_when_the_driver_produced_no_text() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, root, series_id, execution_id) = review_guide_execution_fixture(workspace.path());
+    // No transcript is written: `transcript_path_for_execution` resolves to
+    // `None`, so the finalizer reads zero assistant turns.
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None)).handler;
+    let execution = db.get_execution(&execution_id).unwrap();
+
+    let outcome = handler.finalize_review_guide(&execution).await;
+    assert!(
+        matches!(outcome, StopOutcome::ReviewGuide { published: false }),
+        "expected an unpublished outcome, got {outcome:?}"
+    );
+
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert!(
+        summary.readable_version_id.is_none(),
+        "a text-less run must never publish"
+    );
+    let live = db.live_pr_review_guide_attempts_for_series(&series_id).unwrap();
+    assert!(
+        live.is_empty(),
+        "the attempt must have moved to a terminal (failed) status"
+    );
+}
+
+#[tokio::test]
+async fn finalize_review_guide_fails_the_attempt_when_the_output_does_not_validate() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, root, series_id, execution_id) = review_guide_execution_fixture(workspace.path());
+    // No title, no section headings — `validate_guide_output` must reject
+    // this as a guide even though the driver did produce assistant text.
+    write_assistant_transcript(&db, workspace.path(), &execution_id, "looks fine to me, shipped it");
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None)).handler;
+    let execution = db.get_execution(&execution_id).unwrap();
+
+    let outcome = handler.finalize_review_guide(&execution).await;
+    assert!(
+        matches!(outcome, StopOutcome::ReviewGuide { published: false }),
+        "expected an unpublished outcome, got {outcome:?}"
+    );
+
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert!(
+        summary.readable_version_id.is_none(),
+        "malformed output must never become the readable guide"
+    );
+    let live = db.live_pr_review_guide_attempts_for_series(&series_id).unwrap();
+    assert!(
+        live.is_empty(),
+        "the attempt must have moved to a terminal (failed) status"
+    );
+}
