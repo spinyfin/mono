@@ -1405,6 +1405,8 @@ fn is_known_created_via_recognises_engine_trigger_prefixes() {
     assert!(is_known_created_via("ci-fix:crm_def456"));
     // Pre-existing prefix used by Source B
     assert!(is_known_created_via("pr-comment:owner/repo#42:comment_id"));
+    assert!(is_known_created_via("doc-comment:pr_doc:repo:main:doc.md"));
+    assert!(is_known_created_via("guide-comment:prgs_abc"));
 
     // Unknown values still return false
     assert!(!is_known_created_via("something_undocumented"));

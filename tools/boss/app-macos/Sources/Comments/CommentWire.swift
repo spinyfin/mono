@@ -271,6 +271,8 @@ enum ReviseDocOutcome: Equatable, Sendable {
     /// `resolve_doc_owner` found no design/investigation-owned task for this
     /// artifact — not eligible for routing at all.
     case notApplicable(reason: String)
+    /// Guide feedback whose canonical PR is merged, closed, or missing.
+    case prClosed(reason: String)
 }
 
 extension ReviseDocOutcome: Decodable {
@@ -304,6 +306,8 @@ extension ReviseDocOutcome: Decodable {
             self = .alreadyInFlight(taskId: try c.decode(String.self, forKey: .taskId))
         case "not_applicable":
             self = .notApplicable(reason: try c.decode(String.self, forKey: .reason))
+        case "pr_closed":
+            self = .prClosed(reason: try c.decode(String.self, forKey: .reason))
         case let other:
             throw DecodingError.dataCorruptedError(
                 forKey: .type, in: c, debugDescription: "unknown ReviseDocOutcome type: \(other)")

@@ -312,11 +312,11 @@ impl WorkDb {
     /// [`Self::answer_agent_driver_slug`] for why this must not fail.
     fn answer_agent_product_default_driver(&self, comment_id: &str) -> Option<String> {
         let comment = self.get_comment(comment_id).ok().flatten()?;
-        let doc_owner = self
-            .resolve_doc_owner(&comment.artifact_kind, &comment.artifact_id)
+        let target = self
+            .resolve_feedback_target(&comment.artifact_kind, &comment.artifact_id)
             .ok()
             .flatten()?;
-        let owner = self.get_work_item(&doc_owner.task_id).ok()?;
+        let owner = self.get_work_item(target.owner_task_id()).ok()?;
         self.get_product(owner.product_id()).ok().flatten()?.default_driver
     }
 }

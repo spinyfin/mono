@@ -271,8 +271,9 @@ pub struct DocOwner {
 /// §"2d. Banner state on the comment read path".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommentsBannerState {
-    /// True iff `doc_kind` is `Some` (a design/investigation-owned doc)
-    /// and `unresolved_count > 0`.
+    /// True iff a feedback target is eligible and `unresolved_count > 0`.
+    /// Document targets require a design/investigation owner; guide
+    /// targets require an open canonical PR.
     pub revisable: bool,
     /// `active` comments with `intent = revision` —
     /// the same candidate set `[Revise]` itself batches.
@@ -283,6 +284,11 @@ pub struct CommentsBannerState {
     /// The doc owner's kind (always `Design`/`Investigation` when
     /// present); `None` when `resolve_doc_owner` found no owner.
     pub doc_kind: Option<TaskKind>,
+    /// True when this is a `pr_review_guide` artifact whose canonical PR
+    /// is merged, closed, or missing — **Revise PR** is refused and the
+    /// sidebar explains that this PR can no longer be revised.
+    #[serde(default)]
+    pub pr_closed: bool,
 }
 
 /// A coarse, DB-only summary of a doc-owning task's PR lifecycle — derived
@@ -309,14 +315,15 @@ pub enum DocOwnerPrLifecycle {
 }
 
 /// Input to the `CommentsReviseDoc` RPC: batch-address every unaddressed
-/// `revision` comment on a `pr_doc` artifact. Design:
+/// `revision` comment on a `pr_doc` or `pr_review_guide` artifact. Design:
 /// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
-/// §"Engine RPC surface".
+/// §"Engine RPC surface" and `automatic-pr-review-guides.md`
+/// §"Comments target the implementation".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct ReviseDocInput {
-    /// `"pr_doc"` (v1). Any other value resolves to `NotApplicable` —
-    /// `resolve_doc_owner`'s scope guard returns `None` for it.
+    /// `"pr_doc"` (document target) or `"pr_review_guide"` (same-PR
+    /// implementation target). Any other value resolves to `NotApplicable`.
     pub artifact_kind: String,
     /// `pr_doc:<repo_remote_url>:<branch>:<path>`.
     pub artifact_id: String,
@@ -365,6 +372,9 @@ pub enum ReviseDocOutcome {
     /// `resolve_doc_owner` found no design/investigation-owned task for
     /// this artifact — not eligible for classification/routing at all.
     NotApplicable { reason: String },
+    /// Guide feedback whose canonical PR is merged, closed, or missing.
+    /// Comments are kept; no chore fallback is created (same-PR target).
+    PrClosed { reason: String },
 }
 
 /// Input to the `SetProjectDesignDoc` RPC: point a project at its

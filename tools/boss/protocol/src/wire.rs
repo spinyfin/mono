@@ -18,15 +18,16 @@ use crate::types::{
     CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
     CreateRevisionInput, CreateRunInput, CreateTaskInput, Decision, DeferredScopeAttention, DependencyFilter,
     DesignDocContent, DesignDocTreeState, DispatchAdmission, DriverQuotaSnapshot, DriverTrafficSplit, EditorialAction,
-    EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto, Idea, IdeaGraduationKind, IdeaPatch,
-    LinkExternalRefInput, ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation,
-    ProbeDeliveryState, ProbeInterruptOutcome, Product, Project, ProposalKind, ProposalState, ProposalSubmissionError,
-    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviewGuideAttempt,
-    ReviewGuideSummary, ReviewGuideVersion, ReviseDocInput, ReviseDocOutcome, SelectedProductState,
-    SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput,
-    Task, TaskRuntime, TranscriptSegment, WorkAttachment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem,
-    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle,
-    WorkerProposal, WorkerTierDenial,
+    EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto, GuideCommentDisposition, Idea,
+    IdeaGraduationKind, IdeaPatch, LinkExternalRefInput, ListDependenciesInput, PrBodyView, PrStatusView,
+    PrWorkItemMatch, ProbeDeliveryExpectation, ProbeDeliveryState, ProbeInterruptOutcome, Product, Project,
+    ProposalKind, ProposalState, ProposalSubmissionError, RemoveDependencyInput, RequestExecutionInput,
+    ResolveProjectDesignDocOutput, ResolvedComment, ReviewGuideAttempt, ReviewGuideSummary, ReviewGuideVersion,
+    ReviseDocInput, ReviseDocOutcome, SelectedProductState, SetProductEditorialRulesInput,
+    SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput, Task, TaskRuntime,
+    TranscriptSegment, WorkAttachment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
+    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle, WorkerProposal,
+    WorkerTierDenial,
 };
 
 /// Outcome of the live `getQueue` smoke check `boss engine trunk status`
@@ -417,6 +418,19 @@ pub enum FrontendRequest {
         author: String,
     },
 
+    /// Worker-callable: record a grounded per-comment outcome for a
+    /// guide-feedback revision. The target revision is the caller's own
+    /// `BOSS_RUN_ID` (`work_executions.id`); the comment must be claimed
+    /// by that revision. Replies with [`FrontendEvent::CommentResult`].
+    CommentsRecordGuideOutcome {
+        run_id: String,
+        comment_id: String,
+        disposition: GuideCommentDisposition,
+        body: String,
+        #[serde(default)]
+        request_regeneration: bool,
+    },
+
     /// Resolve every active comment on an artifact against the renderer's
     /// current plain-text projection. The engine runs the
     /// `TextQuoteSelector` resolver, persists fuzzy re-anchors (setting
@@ -434,12 +448,14 @@ pub enum FrontendRequest {
     },
 
     /// Batch-address every unaddressed `revision` comment
-    /// on a design/investigation-owned `pr_doc` artifact: creates a
-    /// revision (open PR) or chore (merged/closed/no-PR) — the
-    /// `[Revise]`-banner action. App-or-Boss tier. Replies with
+    /// on a design/investigation-owned `pr_doc` artifact or a
+    /// `pr_review_guide` series: creates a revision (open PR) or, for
+    /// documents only, a chore (merged/closed/no-PR) — the `[Revise]` /
+    /// **Revise PR** banner action. App-or-Boss tier. Replies with
     /// [`FrontendEvent::CommentsReviseDocResult`]. Design:
     /// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
-    /// §"Buckets 1 & 3".
+    /// §"Buckets 1 & 3" and `automatic-pr-review-guides.md`
+    /// §"Comments target the implementation".
     CommentsReviseDoc {
         #[serde(flatten)]
         input: ReviseDocInput,

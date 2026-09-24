@@ -326,23 +326,24 @@ pub use boss_protocol::{
     COMMENT_STATUS_ANSWERING, COMMENT_STATUS_AWAITING_FOLLOWUP, COMMENT_STATUS_DISMISSED, COMMENT_STATUS_IN_REVISION,
     COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED, CREATED_VIA_ATTENTION, CREATED_VIA_BOOTHBY_PREFIX,
     CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_DOC_COMMENT_PREFIX, CREATED_VIA_ENGINE_AUTO,
-    CREATED_VIA_IDEA_GRADUATION_PREFIX, CREATED_VIA_MERGE_CONFLICT_PREFIX, CREATED_VIA_PR_REVIEW_PREFIX,
-    CREATED_VIA_UNKNOWN, CiBudgetSnapshot, CiRemediation, CommentAnchor, CommentResolution, CommentThreadEntry,
-    CommentWithThread, CommentsBannerState, ConflictClassCount, ConflictFileFrequency, ConflictFilePairFrequency,
-    ConflictHotspotReport, ConflictResolution, CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput,
-    CreateChoreInput, CreateCommentInput, CreateDecisionInput, CreateExecutionInput, CreateIdeaInput,
-    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
-    CreateRunInput, CreateTaskInput, Decision, DecisionKind, DecisionStatus, DeferredScopeAttention,
-    DependencyDirection, DependencyEdge, DependencyFilter, DispatchAdmission, DispatchAdmissionBlocker,
-    DispatchPauseSnapshot, DocOwner, DocOwnerPrLifecycle, DriverTrafficSplit, EditorialAction, EditorialRules,
-    EffortLevel, EngineAttemptListEntry, ExecutionKind, ExecutionReconcileResult, ExecutionStatus,
-    FinishExecutionRunInput, FollowupMemberOverride, INTENT_QUESTION, INTENT_REVISION, Idea, IdeaGraduationKind,
-    IdeaPatch, IdeaStatus, LAST_STATUS_ACTOR_BOOTHBY, LAST_STATUS_ACTOR_HUMAN, ListDependenciesInput, PrWorkItemMatch,
-    Product, Project, ProjectDesignDocState, ProjectStatus, RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY,
-    RESOLVED_WITH_ORPHAN, ReasoningMode, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
-    ResolvedComment, ResolvedDesignDoc, ResolvedDesignDocKind, ReviewBatch, ReviewBatchMember, ReviewBatchMemberRole,
-    ReviewBatchMemberStatus, ReviewBatchPhase, ReviewBatchStatus, ReviewClassification, ReviseDocInput,
-    ReviseDocOutcome, SetProjectDesignDocInput, SetTaskDocPointerInput, StatusActor, THREAD_ENTRY_AUTHOR_ENGINE,
+    CREATED_VIA_GUIDE_COMMENT_PREFIX, CREATED_VIA_IDEA_GRADUATION_PREFIX, CREATED_VIA_MERGE_CONFLICT_PREFIX,
+    CREATED_VIA_PR_REVIEW_PREFIX, CREATED_VIA_UNKNOWN, CiBudgetSnapshot, CiRemediation, CommentAnchor,
+    CommentResolution, CommentThreadEntry, CommentWithThread, CommentsBannerState, ConflictClassCount,
+    ConflictFileFrequency, ConflictFilePairFrequency, ConflictHotspotReport, ConflictResolution, CreateAttentionInput,
+    CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateDecisionInput,
+    CreateExecutionInput, CreateIdeaInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput,
+    CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput, Decision, DecisionKind, DecisionStatus,
+    DeferredScopeAttention, DependencyDirection, DependencyEdge, DependencyFilter, DispatchAdmission,
+    DispatchAdmissionBlocker, DispatchPauseSnapshot, DocOwner, DocOwnerPrLifecycle, DriverTrafficSplit,
+    EditorialAction, EditorialRules, EffortLevel, EngineAttemptListEntry, ExecutionKind, ExecutionReconcileResult,
+    ExecutionStatus, FinishExecutionRunInput, FollowupMemberOverride, GuideCommentDisposition, GuideCommentOutcome,
+    INTENT_QUESTION, INTENT_REVISION, Idea, IdeaGraduationKind, IdeaPatch, IdeaStatus, LAST_STATUS_ACTOR_BOOTHBY,
+    LAST_STATUS_ACTOR_HUMAN, ListDependenciesInput, PrWorkItemMatch, Product, Project, ProjectDesignDocState,
+    ProjectStatus, RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN, ReasoningMode,
+    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ResolvedDesignDoc,
+    ResolvedDesignDocKind, ReviewBatch, ReviewBatchMember, ReviewBatchMemberRole, ReviewBatchMemberStatus,
+    ReviewBatchPhase, ReviewBatchStatus, ReviewClassification, ReviseDocInput, ReviseDocOutcome,
+    SetProjectDesignDocInput, SetTaskDocPointerInput, StatusActor, THREAD_ENTRY_AUTHOR_ENGINE,
     THREAD_ENTRY_KIND_ANSWER, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, Task, TaskKind, TaskRuntime, TaskStatus,
     WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
     WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree, comment_status_is_closed,
@@ -635,9 +636,12 @@ mod execution_bookmarks;
 mod execution_launch_config;
 mod execution_retention;
 mod executions_runs;
+mod feedback_target;
 mod github_api_usage_db;
 mod github_merge_intents;
+pub(crate) use feedback_target::FeedbackTarget;
 mod guide_comments;
+mod guide_feedback;
 mod host_reconcile_queries;
 mod ideas;
 mod insert_helpers;

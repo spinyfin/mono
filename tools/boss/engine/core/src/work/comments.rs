@@ -274,7 +274,7 @@ impl WorkDb {
     /// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
     /// §"2d. Banner state on the comment read path".
     pub fn comments_banner_state(&self, artifact_kind: &str, artifact_id: &str) -> Result<CommentsBannerState> {
-        let owner = self.resolve_doc_owner(artifact_kind, artifact_id)?;
+        let target = self.resolve_feedback_target(artifact_kind, artifact_id)?;
         let conn = self.connect()?;
         let revisable = revisable_comment_predicate();
         let unresolved_count: i64 = conn.query_row(
@@ -295,11 +295,22 @@ impl WorkDb {
             params![artifact_kind, artifact_id],
             |row| row.get(0),
         )?;
+        let (revisable_flag, pr_closed, doc_kind) = match target {
+            Some(super::feedback_target::FeedbackTarget::RepositoryDocument(owner)) => {
+                (unresolved_count > 0, false, Some(owner.task_kind))
+            }
+            Some(super::feedback_target::FeedbackTarget::PullRequestImplementation { pr_lifecycle, .. }) => {
+                let closed = pr_lifecycle != DocOwnerPrLifecycle::Open;
+                (!closed && unresolved_count > 0, closed, None)
+            }
+            None => (false, false, None),
+        };
         Ok(CommentsBannerState {
-            revisable: owner.is_some() && unresolved_count > 0,
+            revisable: revisable_flag,
             unresolved_count,
             in_revision_count,
-            doc_kind: owner.map(|o| o.task_kind),
+            doc_kind,
+            pr_closed,
         })
     }
 
@@ -1177,17 +1188,7 @@ pub(crate) fn reconcile_comments_for_task(
     now: &str,
 ) -> Result<usize> {
     let affected = match outcome {
-        CommentReconcileOutcome::Resolved => conn.execute(
-            &format!(
-                "UPDATE work_comments
-                 SET status = '{COMMENT_STATUS_RESOLVED}',
-                     status_actor = 'engine',
-                     updated_at = ?2,
-                     dismissed_at = ?2
-                 WHERE revise_task_id = ?1 AND status = '{COMMENT_STATUS_IN_REVISION}'"
-            ),
-            params![task_id, now],
-        )?,
+        CommentReconcileOutcome::Resolved => super::guide_feedback::resolve_guide_aware_comments(conn, task_id, now)?,
         CommentReconcileOutcome::Reopened { include_resolved } => {
             let status_filter = if include_resolved {
                 format!("status IN ('{COMMENT_STATUS_IN_REVISION}', '{COMMENT_STATUS_RESOLVED}')")

@@ -16,6 +16,58 @@ pub struct GuideCommentContext {
     pub head_sha: String,
 }
 
+/// Per-comment disposition recorded against a guide-feedback revision batch.
+/// Distinguishes a source change from a grounded no-code answer so a generic
+/// completed task or regenerated guide cannot resolve an implementation
+/// request by itself. Design: `automatic-pr-review-guides.md`
+/// §"Comments target the implementation".
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GuideCommentDisposition {
+    /// Implementation or tests were updated on the same PR.
+    SourceChanged,
+    /// The comment was answered in-thread without a code change.
+    Answered,
+    /// Investigated; current code already satisfies the request.
+    NoChange,
+}
+
+impl GuideCommentDisposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SourceChanged => "source_changed",
+            Self::Answered => "answered",
+            Self::NoChange => "no_change",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "source_changed" => Some(Self::SourceChanged),
+            "answered" => Some(Self::Answered),
+            "no_change" => Some(Self::NoChange),
+            _ => None,
+        }
+    }
+}
+
+/// Additive per-comment outcome for a guide-feedback revision. The grounded
+/// `response` is also stored as a `comment_thread_entries` answer so the
+/// sidebar shows why the comment resolved.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct GuideCommentOutcome {
+    pub comment_id: String,
+    pub disposition: GuideCommentDisposition,
+    pub response: String,
+    /// After a confirmed prose error, request regeneration through the
+    /// existing guide-reconciliation path. The generator never mutates
+    /// comments.
+    #[serde(default)]
+    #[builder(default)]
+    pub request_regeneration: bool,
+}
+
 // ===========================================================================
 // Comments in the markdown viewer (design:
 // tools/boss/docs/designs/comments-in-markdown-viewer.md). Phase 2 adds the

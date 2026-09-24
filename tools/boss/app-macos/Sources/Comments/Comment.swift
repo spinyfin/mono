@@ -306,10 +306,27 @@ struct CommentsBannerState: Codable, Equatable {
     let revisable: Bool
     let unresolvedCount: Int
     let inRevisionCount: Int
+    let prClosed: Bool
 
     enum CodingKeys: String, CodingKey {
         case revisable
         case unresolvedCount = "unresolved_count"
         case inRevisionCount = "in_revision_count"
+        case prClosed = "pr_closed"
+    }
+
+    init(revisable: Bool, unresolvedCount: Int, inRevisionCount: Int, prClosed: Bool = false) {
+        self.revisable = revisable
+        self.unresolvedCount = unresolvedCount
+        self.inRevisionCount = inRevisionCount
+        self.prClosed = prClosed
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        revisable = try c.decode(Bool.self, forKey: .revisable)
+        unresolvedCount = try c.decode(Int.self, forKey: .unresolvedCount)
+        inRevisionCount = try c.decode(Int.self, forKey: .inRevisionCount)
+        prClosed = try c.decodeIfPresent(Bool.self, forKey: .prClosed) ?? false
     }
 }

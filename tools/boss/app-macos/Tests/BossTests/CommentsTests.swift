@@ -603,6 +603,12 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertEqual(layer.reviseDocMessage, "Already being revised as rev_42.")
     }
 
+    func testApplyReviseDocOutcomePrClosedSetsMessage() {
+        let layer = CommentLayer()
+        layer.applyReviseDocOutcome(.prClosed(reason: "This PR can no longer be revised."))
+        XCTAssertEqual(layer.reviseDocMessage, "This PR can no longer be revised.")
+    }
+
     // MARK: - Bucket 2: answer agent (Phase 3d stub, unchanged behaviour)
 
     func testQuestionClassificationEntersAnsweringState() {

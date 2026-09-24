@@ -1490,6 +1490,23 @@ fn compose_revision_directive(
     out.push_str("- This is a **REVISION** task. Your deliverable is an update to an EXISTING pull request — typically a new commit on the PR branch, or a rebase if that is all that is needed. Do NOT open a new PR. The engine owns your `boss-recovery/exec_*` recovery bookmark; keep it advanced locally.\n");
     out.push_str(&format!("- The parent PR is #{pr_number} at {parent_pr_url}.\n"));
     out.push_str(&format!("- What this revision should change: {description}\n"));
+    if let WorkItem::Task(task) | WorkItem::Chore(task) = work_item
+        && task
+            .created_via
+            .starts_with(boss_protocol::CREATED_VIA_GUIDE_COMMENT_PREFIX)
+    {
+        out.push_str(
+            "\nThis revision was dispatched from review-guide feedback. \
+             Editing generated Markdown cannot satisfy an implementation request. \
+             An outdated quoted guide is context, not authority over the current code. \
+             Inspect the actual current PR, change implementation and tests, validate with \
+             the repository's normal workflow, and update that same PR. Do not open a new PR.\n\
+             Record a grounded per-comment outcome for every submitted comment with \
+             `boss comment guide-outcome --comment-id <id> --disposition source_changed|answered|no_change --body \"<response>\"`. \
+             Use `--regenerate` only after a confirmed prose error; regeneration goes through \
+             guide reconciliation and does not resolve the comment by itself.\n",
+        );
+    }
     out.push_str(&format!(
         "\n**`gh` requires `--repo` in this workspace:** This repo is `{repo_slug}`. \
          `gh` cannot auto-detect the repo in a jj workspace (there is no `.git` \

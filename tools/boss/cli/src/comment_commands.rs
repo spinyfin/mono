@@ -34,6 +34,9 @@ pub(crate) enum CommentCommand {
     /// comment. Post exactly one reply; a second call fails (the tracking
     /// run row is no longer `running`).
     Reply(CommentReplyArgs),
+    /// Record a grounded per-comment outcome for a guide-feedback revision.
+    /// The revision is the caller's own `BOSS_RUN_ID`.
+    GuideOutcome(CommentGuideOutcomeArgs),
 }
 
 /// Args for `boss task comment` / `boss chore comment` — post a top-level
@@ -151,4 +154,20 @@ pub(crate) struct CommentReplyArgs {
     /// contents into the thread).
     #[arg(long)]
     pub(crate) body: String,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CommentGuideOutcomeArgs {
+    /// Comment id (`cmt_…`) claimed by this revision.
+    #[arg(long)]
+    pub(crate) comment_id: String,
+    /// `source_changed` | `answered` | `no_change`.
+    #[arg(long)]
+    pub(crate) disposition: String,
+    /// Grounded response recorded on the comment thread.
+    #[arg(long)]
+    pub(crate) body: String,
+    /// Request guide regeneration after a confirmed prose error.
+    #[arg(long)]
+    pub(crate) regenerate: bool,
 }

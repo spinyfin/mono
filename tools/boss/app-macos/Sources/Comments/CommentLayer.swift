@@ -858,7 +858,6 @@ final class CommentLayer: NSObject, ObservableObject {
     /// simulates the same guarded `active` → `in_revision` batch transition
     /// locally, since there's no engine to persist it.
     func reviseDoc() {
-        guard guideVersionId == nil else { return }
         if let backend, isEngineBacked {
             backend.reviseDoc(artifactKind: artifactKind, artifactId: artifactId)
             return
@@ -900,6 +899,8 @@ final class CommentLayer: NSObject, ObservableObject {
             reviseDocMessage = "Already being revised as \(taskId)."
         case .notApplicable(let reason):
             reviseDocMessage = "Can't revise this document: \(reason)"
+        case .prClosed(let reason):
+            reviseDocMessage = reason
         }
         Task { @MainActor [weak self, message = reviseDocMessage] in
             try? await Task.sleep(for: .seconds(4))

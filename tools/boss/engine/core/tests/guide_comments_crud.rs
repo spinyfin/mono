@@ -75,6 +75,35 @@ async fn guide_comment_wire_round_trip_keeps_original_context() -> Result<()> {
             .await?
             .is_empty()
     );
+    let banner = client
+        .send_request(&FrontendRequest::CommentsBannerState {
+            artifact_kind: "pr_review_guide".into(),
+            artifact_id: "guide-series".into(),
+        })
+        .await?;
+    let FrontendEvent::CommentsBannerState { state, .. } = banner else {
+        return Err(unexpected("guide banner", banner));
+    };
+    assert!(!state.revisable);
+    let revise = client
+        .send_request(&FrontendRequest::CommentsReviseDoc {
+            input: boss_protocol::ReviseDocInput::builder()
+                .artifact_kind("pr_review_guide")
+                .artifact_id("guide-series")
+                .build(),
+        })
+        .await?;
+    let FrontendEvent::CommentsReviseDocResult { outcome } = revise else {
+        return Err(unexpected("guide revise", revise));
+    };
+    assert!(
+        matches!(
+            outcome,
+            boss_protocol::ReviseDocOutcome::NotApplicable { .. }
+                | boss_protocol::ReviseDocOutcome::NoUnresolvedComments
+        ),
+        "guide without a bound open PR must not create a chore, got {outcome:?}"
+    );
     assert_eq!(
         list_comments(&mut client, "pr_review_guide", "guide-series", true)
             .await?

@@ -17,7 +17,7 @@ struct CommentSidebar: View {
         VStack(spacing: 0) {
             header
             Divider()
-            if layer.guideVersionId == nil && (layer.bannerState.revisable || layer.bannerState.inRevisionCount > 0) {
+            if layer.bannerState.revisable || layer.bannerState.inRevisionCount > 0 {
                 ReviseBanner(layer: layer)
                 Divider()
             }
@@ -62,8 +62,8 @@ struct CommentSidebar: View {
                     }
                 }
             }
-            if layer.guideVersionId != nil {
-                Text("Comments are saved. Revise PR is not available yet.")
+            if layer.bannerState.prClosed {
+                Text("This PR can no longer be revised.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .padding(12)
@@ -142,11 +142,14 @@ private struct ReviseBanner: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Button("Revise") {
+                    Button(layer.guideVersionId == nil ? "Revise" : "Revise PR") {
                         layer.reviseDoc()
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
+                    .help(layer.guideVersionId == nil
+                          ? "Address these comments on the document"
+                          : "Changes the PR implementation and tests")
                 }
             }
             if state.inRevisionCount > 0 {

@@ -134,12 +134,12 @@ impl ExecutionCoordinator {
     /// finalise the run instead of doing PR detection.
     fn synthetic_answer_agent_work_item(&self, execution: &WorkExecution) -> Option<WorkItem> {
         let comment = self.work_db.get_comment(&execution.work_item_id).ok().flatten()?;
-        let doc_owner = self
+        let target = self
             .work_db
-            .resolve_doc_owner(&comment.artifact_kind, &comment.artifact_id)
+            .resolve_feedback_target(&comment.artifact_kind, &comment.artifact_id)
             .ok()
             .flatten()?;
-        let owner_item = self.work_db.get_work_item(&doc_owner.task_id).ok()?;
+        let owner_item = self.work_db.get_work_item(target.owner_task_id()).ok()?;
         let product_id = owner_item.product_id().to_string();
         let short_quote = if comment.body.chars().count() > 60 {
             format!("{}…", comment.body.chars().take(60).collect::<String>())

@@ -953,6 +953,7 @@ pub(crate) async fn run_comment_command(command: CommentCommand, ctx: &RunContex
             run_comment_create(&mut client, ctx, args).await
         }
         CommentCommand::Reply(args) => run_comment_reply(ctx, args).await,
+        CommentCommand::GuideOutcome(args) => run_comment_guide_outcome(ctx, args).await,
     }
 }
 
@@ -1357,6 +1358,46 @@ pub(crate) async fn run_comment_reply(ctx: &RunContext, args: CommentReplyArgs) 
             Err(CliError::application(message))
         }
         other => Err(unexpected_event("comment reply", &other)),
+    }
+}
+
+/// `boss comment guide-outcome` — revision worker records a grounded
+/// per-comment disposition for guide feedback. Reads `BOSS_RUN_ID`.
+pub(crate) async fn run_comment_guide_outcome(ctx: &RunContext, args: CommentGuideOutcomeArgs) -> Result<(), CliError> {
+    let run_id = std::env::var("BOSS_RUN_ID").map_err(|_| {
+        CliError::usage(
+            "BOSS_RUN_ID is not set — `boss comment guide-outcome` only works inside a Boss \
+             revision worker session.",
+        )
+    })?;
+    let disposition = boss_protocol::GuideCommentDisposition::parse(&args.disposition)
+        .ok_or_else(|| CliError::usage("--disposition must be source_changed, answered, or no_change"))?;
+    if args.body.trim().is_empty() {
+        return Err(CliError::usage("--body may not be empty"));
+    }
+    let mut client = connect_for_work(ctx).await?;
+    match client
+        .send_request(&FrontendRequest::CommentsRecordGuideOutcome {
+            run_id,
+            comment_id: args.comment_id,
+            disposition,
+            body: args.body,
+            request_regeneration: args.regenerate,
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::CommentResult { comment } => {
+            print_entity(ctx, &serde_json::json!({ "comment": comment }), || {
+                if !ctx.quiet {
+                    println!("Recorded guide outcome for comment {}.", comment.id);
+                }
+            })
+        }
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("comment guide-outcome", &other)),
     }
 }
 
