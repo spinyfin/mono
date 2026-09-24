@@ -62,7 +62,23 @@ pub const THREAD_REPLY_COMMAND: &str = "boss comment reply";
 /// PR-deliverable-oriented and would be actively wrong here) by
 /// [`crate::worker_setup::render_claude_md`] when
 /// `worker_kind == WorkerKind::AnswerAgent`.
-pub fn render_answer_agent_claude_md(lease_id: &str, workspace_path: &str) -> String {
+pub fn render_answer_agent_claude_md(
+    lease_id: &str,
+    workspace_path: &str,
+    checkout_positioned_on_pr_head: bool,
+) -> String {
+    let checkout_positioning_note = if checkout_positioned_on_pr_head {
+        "For a PR-guide question the leased checkout is the\n           \
+         current PR head — inspect that implementation, not only the quoted\n           \
+         guide."
+    } else {
+        "For a PR-guide question, if positioning the leased checkout on the\n           \
+         current PR head was possible the initial prompt says so explicitly; \
+         otherwise\n           \
+         the checkout is a fresh change off the default base, NOT the PR head — \
+         do not\n           \
+         assume it matches the PR, and say so in your reply if it matters."
+    };
     format!(
         "# Boss answer-agent rules\n\
          \n\
@@ -108,9 +124,7 @@ pub fn render_answer_agent_claude_md(lease_id: &str, workspace_path: &str) -> St
          ## What you can read\n\
          \n\
          - The commented-on document or review guide, the comment, and its\n\
-           full thread. For a PR-guide question the leased checkout is the\n\
-           current PR head — inspect that implementation, not only the quoted\n\
-           guide.\n\
+           full thread. {checkout_positioning_note}\n\
          - Product/project/task/execution/PR state via the coordinator's\n\
            read-only query layer.\n\
          - Code in your leased workspace — use `Read`, `Grep`, `Glob`, and\n\
@@ -137,6 +151,7 @@ pub fn render_answer_agent_claude_md(lease_id: &str, workspace_path: &str) -> St
         workspace_path = workspace_path,
         lease = lease_id,
         absolute_paths = crate::prompt_fragments::absolute_paths_fragment(),
+        checkout_positioning_note = checkout_positioning_note,
     )
 }
 
@@ -146,7 +161,7 @@ mod tests {
 
     #[test]
     fn claude_md_states_read_only_mandate_and_reply_command() {
-        let md = render_answer_agent_claude_md("lease-1", "/ws/path");
+        let md = render_answer_agent_claude_md("lease-1", "/ws/path", true);
         assert!(md.contains("Read-only mandate"));
         assert!(md.contains(THREAD_REPLY_COMMAND));
         assert!(md.contains("/ws/path"));
@@ -158,5 +173,17 @@ mod tests {
         assert!(md.contains("design/investigation document"));
         assert!(md.contains("PR review guide"));
         assert!(md.contains("current PR head"));
+    }
+
+    /// When the checkout was NOT positioned on the PR head (fresh
+    /// `cube change create` fallback), the CLAUDE.md must not claim
+    /// otherwise — the unconditional "current PR head" claim was the root
+    /// cause of an agent misattributing stale-checkout behaviour to the
+    /// current PR.
+    #[test]
+    fn claude_md_does_not_claim_pr_head_when_not_positioned() {
+        let md = render_answer_agent_claude_md("lease-1", "/ws/path", false);
+        assert!(!md.contains("the leased checkout is the"));
+        assert!(md.contains("fresh change off the default base"));
     }
 }

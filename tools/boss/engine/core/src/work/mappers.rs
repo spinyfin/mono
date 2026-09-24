@@ -162,6 +162,7 @@ pub(crate) fn map_answer_agent_run(row: &Row<'_>) -> rusqlite::Result<AnswerAgen
         error_kind: row.get::<_, Option<String>>(10)?.filter(|s| !s.is_empty()),
         created_at: row.get(11)?,
         completed_at: row.get::<_, Option<String>>(12)?.filter(|s| !s.is_empty()),
+        workspace_positioned: row.get::<_, Option<bool>>(13)?,
     })
 }
 

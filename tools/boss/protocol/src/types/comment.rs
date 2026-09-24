@@ -401,6 +401,16 @@ pub struct AnswerAgentRun {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
+
+    /// Whether `cube workspace goto --pr` actually positioned this run's
+    /// leased checkout on the PR head. `None` means no goto was attempted
+    /// (the comment's feedback target was not an open implementation PR, or
+    /// the run predates this column); `Some(false)` means goto was attempted
+    /// and failed, so the run fell back to a fresh `cube change create`
+    /// checkout instead — the prompt must not claim the checkout is
+    /// positioned on the PR head in that case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_positioned: Option<bool>,
 }
 
 // --- Comment thread entries (engine-authored answer / operator follow-up) ---
