@@ -326,13 +326,36 @@ mod tests {
             "prompt must carry the canonical current PR:\n{prompt}",
         );
         assert!(prompt.contains(&root), "prompt must carry the root task id:\n{prompt}",);
+        let ctx = comment
+            .guide_context
+            .as_ref()
+            .expect("seeded guide comment carries guide_context");
         assert!(
-            prompt.contains("Original guide version"),
-            "prompt must carry the version/comparison/head triple:\n{prompt}",
+            prompt.contains("## Original guide content (immutable quoted version)"),
+            "prompt must use the guide-content heading:\n{prompt}",
         );
         assert!(
-            prompt.contains("Original quote"),
-            "prompt must embed the guide markdown:\n{prompt}",
+            prompt.contains("# Guide"),
+            "prompt must embed the published guide markdown:\n{prompt}",
+        );
+        assert!(
+            !prompt.contains("Not available"),
+            "guide-content branch must not fall back:\n{prompt}",
+        );
+        assert!(
+            prompt.contains(&ctx.version_id),
+            "prompt must carry version_id {}:\n{prompt}",
+            ctx.version_id,
+        );
+        assert!(
+            prompt.contains(&ctx.comparison_id),
+            "prompt must carry comparison_id {}:\n{prompt}",
+            ctx.comparison_id,
+        );
+        assert!(
+            prompt.contains(&ctx.head_sha),
+            "prompt must carry head_sha {}:\n{prompt}",
+            ctx.head_sha,
         );
         assert!(
             prompt.contains("why does this retry forever?"),
@@ -344,9 +367,9 @@ mod tests {
     async fn guide_answer_prompt_falls_back_when_guide_version_missing() {
         let (_dir, db) = open_db();
         let (_root, mut comment) = seed_guide_comment(&db);
-        // Simulate an unresolvable guide version: the fallback branch at
-        // L217-L226 must still produce a diagnosable prompt, not an empty
-        // section.
+        // Simulate an unresolvable guide version: the missing-guide-version
+        // branch of `compose_guide_answer_prompt` must still produce a
+        // diagnosable prompt, not an empty section.
         if let Some(ctx) = comment.guide_context.as_mut() {
             ctx.version_id = "missing-version".to_owned();
         }

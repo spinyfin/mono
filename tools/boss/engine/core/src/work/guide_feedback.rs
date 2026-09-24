@@ -128,8 +128,14 @@ impl WorkDb {
     }
 
     /// Record a grounded per-comment outcome for a guide-feedback revision.
-    /// The comment must already be claimed by `revise_task_id`. If that task
-    /// has already completed, the comment resolves immediately.
+    /// The comment must already be claimed by `revise_task_id`. Load, claim
+    /// check, outcome upsert, thread-entry write, and optional resolve all
+    /// run in one IMMEDIATE transaction so a concurrent reopen/reclaim
+    /// cannot be overwritten by a stale caller. Re-recording the same
+    /// `(comment_id, revise_task_id)` updates the existing answer thread
+    /// entry in place rather than appending a duplicate. If the revision
+    /// has already been delivered successfully (`in_review`, or `done`/
+    /// `archived`), the comment resolves immediately.
     pub fn record_guide_comment_outcome(
         &self,
         revise_task_id: &str,
@@ -140,31 +146,31 @@ impl WorkDb {
             !outcome.response.trim().is_empty(),
             "guide comment outcome response may not be empty"
         );
-        let comment = self
-            .get_comment(&outcome.comment_id)?
-            .with_context(|| format!("unknown comment: {}", outcome.comment_id))?;
-        anyhow::ensure!(
-            comment.artifact_kind == "pr_review_guide",
-            "guide outcomes apply only to review-guide comments"
-        );
-        anyhow::ensure!(
-            comment.revise_task_id.as_deref() == Some(revise_task_id),
-            "comment {} is not claimed by revision {revise_task_id}",
-            comment.id
-        );
-        anyhow::ensure!(
-            comment.status == COMMENT_STATUS_IN_REVISION,
-            "comment {} is not in_revision",
-            comment.id
-        );
 
         let now = now_string();
         let request_regeneration = outcome.request_regeneration;
-        let series_id = comment.artifact_id.clone();
-        let comment_id = comment.id.clone();
+        let comment_id = outcome.comment_id.clone();
+        let series_id;
         {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let comment = super::comments::query_comment(&tx, &comment_id)?
+                .with_context(|| format!("unknown comment: {comment_id}"))?;
+            anyhow::ensure!(
+                comment.artifact_kind == "pr_review_guide",
+                "guide outcomes apply only to review-guide comments"
+            );
+            anyhow::ensure!(
+                comment.revise_task_id.as_deref() == Some(revise_task_id),
+                "comment {} is not claimed by revision {revise_task_id}",
+                comment.id
+            );
+            anyhow::ensure!(
+                comment.status == COMMENT_STATUS_IN_REVISION,
+                "comment {} is not in_revision",
+                comment.id
+            );
+            series_id = comment.artifact_id.clone();
             tx.execute(
                 "INSERT INTO guide_comment_outcomes
                  (comment_id, revise_task_id, disposition, response, request_regeneration, created_at)
@@ -224,7 +230,7 @@ impl WorkDb {
                     )?;
                 }
             }
-            if self.guide_revision_is_terminal_on(&tx, revise_task_id)? {
+            if self.guide_revision_was_delivered_successfully_on(&tx, revise_task_id)? {
                 tx.execute(
                     &format!(
                         "UPDATE work_comments
@@ -232,9 +238,11 @@ impl WorkDb {
                              status_actor = 'engine',
                              updated_at = ?2,
                              dismissed_at = ?2
-                         WHERE id = ?1 AND status = '{COMMENT_STATUS_IN_REVISION}'"
+                         WHERE id = ?1
+                           AND status = '{COMMENT_STATUS_IN_REVISION}'
+                           AND revise_task_id = ?3"
                     ),
-                    params![comment_id, now],
+                    params![comment_id, now, revise_task_id],
                 )?;
             }
             tx.commit()?;
@@ -256,11 +264,14 @@ impl WorkDb {
             .with_context(|| format!("missing comment after outcome: {comment_id}"))
     }
 
-    fn guide_revision_is_terminal_on(&self, conn: &Connection, task_id: &str) -> Result<bool> {
+    fn guide_revision_was_delivered_successfully_on(&self, conn: &Connection, task_id: &str) -> Result<bool> {
         let Some(task) = query_task(conn, task_id)? else {
             return Ok(false);
         };
-        Ok(task.status.is_terminal())
+        Ok(matches!(
+            task.status,
+            TaskStatus::InReview | TaskStatus::Done | TaskStatus::Archived
+        ))
     }
 }
 
@@ -444,13 +455,10 @@ mod tests {
         let (_dir, db) = open_db();
         let (_root, series, _) = seed_open_guide(&db);
 
-        // A guide comment that started as a `question`, got an answer-agent
-        // reply, then an operator follow-up that reclassified it into a
-        // revision — this PR is what wires `spawn_followup_classifier` to
-        // classify guide follow-ups against `ClassifierSubject::PullRequest`,
-        // so this bridge must reach the guide directive the same way it
-        // reaches the document directive (`revise_doc`'s
-        // `directive_includes_bridged_bucket2_context_when_present`).
+        // Guide follow-ups are classified as PullRequest, so a reclassified
+        // question must carry the prior answer and the operator follow-up
+        // into the guide directive — the same bridging
+        // `push_comment_directive_block` supplies for the document path.
         let c1 = make_guide_comment(&db, &series, "why retry?");
         db.set_comment_intent(&c1.id, "question", 0.9).unwrap();
         db.transition_comment_to_answering(&c1.id).unwrap();
@@ -844,5 +852,146 @@ mod tests {
         let closed = db.comments_banner_state("pr_review_guide", &series).unwrap();
         assert!(!closed.revisable);
         assert!(closed.pr_closed);
+    }
+
+    #[test]
+    fn stale_claimant_cannot_record_after_reopen_and_reclaim() {
+        let (_dir, db) = open_db();
+        let (_root, series, _) = seed_open_guide(&db);
+        let c1 = make_guide_comment(&db, &series, "fix retry");
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
+        let ReviseDocOutcome::Created {
+            task_id: first_task_id, ..
+        } = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_review_guide")
+                    .artifact_id(series.clone())
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap()
+        else {
+            panic!("expected Created");
+        };
+
+        db.set_comment_status(&c1.id, COMMENT_STATUS_ACTIVE, Some("user:test"))
+            .unwrap();
+        let ReviseDocOutcome::Created {
+            task_id: second_task_id,
+            ..
+        } = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_review_guide")
+                    .artifact_id(series)
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap()
+        else {
+            panic!("expected second Created after reopen");
+        };
+        assert_ne!(first_task_id, second_task_id);
+        db.update_work_item(
+            &first_task_id,
+            WorkItemPatch {
+                status: Some("done".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        let err = db
+            .record_guide_comment_outcome(
+                &first_task_id,
+                GuideCommentOutcome::builder()
+                    .comment_id(c1.id.clone())
+                    .disposition(GuideCommentDisposition::NoChange)
+                    .response("stale claimant must not write")
+                    .build(),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not claimed by revision"),
+            "stale claimant must fail the in-transaction claim check: {err}"
+        );
+
+        let reloaded = db.get_comment(&c1.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, COMMENT_STATUS_IN_REVISION);
+        assert_eq!(reloaded.revise_task_id.as_deref(), Some(second_task_id.as_str()));
+
+        {
+            let conn = db.connect().unwrap();
+            let outcome_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM guide_comment_outcomes WHERE comment_id = ?1",
+                    [&c1.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(outcome_count, 0, "stale claimant must not upsert an outcome row");
+        }
+        let answer_entries = db
+            .list_comment_thread_entries(&c1.id)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.entry_kind == THREAD_ENTRY_KIND_ANSWER)
+            .count();
+        assert_eq!(answer_entries, 0, "stale claimant must not write a thread answer");
+    }
+
+    #[test]
+    fn outcome_recorded_after_in_review_delivery_resolves_immediately() {
+        let (_dir, db) = open_db();
+        let (_root, series, _) = seed_open_guide(&db);
+        let c1 = make_guide_comment(&db, &series, "fix retry");
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
+        let ReviseDocOutcome::Created { task_id, .. } = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_review_guide")
+                    .artifact_id(series)
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap()
+        else {
+            panic!("expected Created");
+        };
+
+        db.update_work_item(
+            &task_id,
+            WorkItemPatch {
+                status: Some("in_review".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        {
+            let now = now_string();
+            let conn = db.connect().unwrap();
+            super::resolve_guide_aware_comments(&conn, &task_id, &now).unwrap();
+        }
+        assert_eq!(
+            db.get_comment(&c1.id).unwrap().unwrap().status,
+            COMMENT_STATUS_IN_REVISION,
+            "delivery without an outcome must leave the comment outstanding"
+        );
+
+        db.record_guide_comment_outcome(
+            &task_id,
+            GuideCommentOutcome::builder()
+                .comment_id(c1.id.clone())
+                .disposition(GuideCommentDisposition::SourceChanged)
+                .response("Switched retries to stop after 3 attempts.")
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_comment(&c1.id).unwrap().unwrap().status,
+            COMMENT_STATUS_RESOLVED,
+            "recording an outcome after in_review delivery must resolve immediately"
+        );
     }
 }

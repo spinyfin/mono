@@ -836,7 +836,8 @@ fn spawn_followup_classifier(
                 // The bucket-1&3 bridge: `awaiting_followup → active`, so
                 // the next `[Revise]` batch picks this comment up. The
                 // thread's answer-agent reply is carried into that batch's
-                // directive by `compose_doc_comment_directive` reading the
+                // directive by `revise_doc::push_comment_directive_block`
+                // (shared by the document and guide composers) reading the
                 // comment's thread/latest run directly — no extra column
                 // needed here (design §"Bridging a bucket-2 answer into a
                 // revision").
@@ -1489,8 +1490,10 @@ async fn end_answer_agent_on_thread_terminal(
 /// claimed `comment_id` (`WorkDb::record_guide_comment_outcome` enforces the
 /// claim). The caller cannot target a comment claimed by a different
 /// revision. On success: upserts the `guide_comment_outcomes` disposition,
-/// appends an `entry_kind = 'answer'` thread entry with the grounded
-/// response, and resolves the comment once its owning revision is terminal.
+/// writes the revision's single `entry_kind = 'answer'` thread entry
+/// (updating it in place on a re-record), and resolves the comment once
+/// its owning revision has been delivered successfully (`in_review`, or
+/// `done`/`archived`).
 /// No `authorize_rpc` gate — worker-callable RPCs (like
 /// `CreateAutomationTask`) run without a special tier, matching that
 /// precedent.
@@ -2744,8 +2747,9 @@ mod tests {
         let (comment_id, _execution_id) = seed_claimed_guide_comment(&work_db, 9);
 
         // A comment-artifact `answer_agent` execution — the wrong kind for
-        // this RPC's security boundary (worker-policy/src/policy.rs:276-279
-        // relies on the handler enforcing exactly this).
+        // this RPC's security boundary (the worker-policy allowlist for
+        // `boss comment guide-outcome` relies on the handler enforcing
+        // exactly this).
         let other = work_db
             .create_answer_agent_execution(&comment_id, "git@github.com:acme/widget.git")
             .unwrap();
