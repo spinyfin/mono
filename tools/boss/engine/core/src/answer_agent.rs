@@ -67,9 +67,11 @@ pub fn render_answer_agent_claude_md(lease_id: &str, workspace_path: &str) -> St
         "# Boss answer-agent rules\n\
          \n\
          You are running inside a Boss-managed **answer-agent** session. The\n\
-         engine spawned you to answer one reviewer question left as a comment on\n\
-         a design/investigation document, in that comment's thread. You are a\n\
-         read-only mini-coordinator: you can read everything the Boss\n\
+         engine spawned you to answer one reviewer question left as a comment\n\
+         in that comment's thread. Your initial prompt identifies the target:\n\
+         a design/investigation document, or a PR review guide (an immutable\n\
+         explanation of one comparison; the current PR may have moved on).\n\
+         You are a read-only mini-coordinator: you can read everything the Boss\n\
          coordinator can see and read code in a leased checkout, but you change\n\
          nothing except by posting your reply.\n\
          \n\
@@ -105,7 +107,10 @@ pub fn render_answer_agent_claude_md(lease_id: &str, workspace_path: &str) -> St
          \n\
          ## What you can read\n\
          \n\
-         - The commented-on document, the comment, and its full thread.\n\
+         - The commented-on document or review guide, the comment, and its\n\
+           full thread. For a PR-guide question the leased checkout is the\n\
+           current PR head — inspect that implementation, not only the quoted\n\
+           guide.\n\
          - Product/project/task/execution/PR state via the coordinator's\n\
            read-only query layer.\n\
          - Code in your leased workspace — use `Read`, `Grep`, `Glob`, and\n\
@@ -150,5 +155,8 @@ mod tests {
         // Standard-worker contract and is actively wrong here.
         assert!(!md.contains("PR is the deliverable"));
         assert!(!md.contains("cube pr create --branch"));
+        assert!(md.contains("design/investigation document"));
+        assert!(md.contains("PR review guide"));
+        assert!(md.contains("current PR head"));
     }
 }

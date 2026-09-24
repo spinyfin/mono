@@ -311,6 +311,16 @@ impl WorkDb {
             cascade_dependents_after_prereq_status_change(&mut pending, &tx, &task.id, new_status.as_str(), &now)?;
         }
 
+        // Mirror `record_worker_pr_completion`: a revision's claimed comments
+        // must reconcile when the run ends with no new commit. Guide comments
+        // resolve only when a disposition was recorded (the guide-aware
+        // predicate); document comments still resolve on completion. Without
+        // this, a no-code guide batch stays `in_revision` until the parent PR
+        // merges — or reopens if the PR closes unmerged.
+        if task.kind == TaskKind::Revision {
+            comments::reconcile_comments_for_task(&tx, &task.id, comments::CommentReconcileOutcome::Resolved, &now)?;
+        }
+
         tx.execute(
             "UPDATE work_executions
              SET status = 'completed',

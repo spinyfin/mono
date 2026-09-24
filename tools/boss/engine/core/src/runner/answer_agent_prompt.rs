@@ -193,6 +193,22 @@ async fn compose_guide_answer_prompt(
         "## The question\n\n\
          Current PR: `{canonical_pr}` (root task {root_task_id})\n"
     ));
+    if let Some(capture) = work_db
+        .get_latest_pr_review_guide_source_capture(root_task_id)
+        .ok()
+        .flatten()
+    {
+        let pr_number = boss_github::pr_url::pr_number_from_url(canonical_pr);
+        prompt.push_str(&format!(
+            "Current captured PR head SHA: `{head}` (comparison `{comparison}`",
+            head = capture.packet.head_sha,
+            comparison = capture.comparison_id,
+        ));
+        if let Some(n) = pr_number {
+            prompt.push_str(&format!(", pull request #{n}"));
+        }
+        prompt.push_str("). Your leased checkout is positioned on this PR head; inspect that code as current.\n");
+    }
     if let Some(ctx) = context {
         prompt.push_str(&format!(
             "Original guide version: `{version}` (comparison `{comparison}`, head `{head}`)\n\n",

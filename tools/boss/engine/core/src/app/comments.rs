@@ -1554,7 +1554,40 @@ pub(super) async fn handle_comments_record_guide_outcome(ctx: Dispatch, req: Fro
             .request_regeneration(request_regeneration)
             .build(),
     ) {
-        Ok(comment) => {
+        Ok(recorded) => {
+            match recorded.regeneration {
+                Some(crate::work::RetryReviewGuideOutcome::Created(_)) => {
+                    if let Some(root) = work_db
+                        .root_task_id_for_review_guide_series(&recorded.comment.artifact_id)
+                        .ok()
+                        .flatten()
+                    {
+                        crate::work::notify_review_guide_changed(
+                            &work_db,
+                            &server_state.publisher,
+                            &root,
+                            "review_guide_retry_queued",
+                        )
+                        .await;
+                    }
+                }
+                Some(crate::work::RetryReviewGuideOutcome::AlreadyRequested(_)) => {
+                    tracing::info!(
+                        comment_id = %recorded.comment.id,
+                        series_id = %recorded.comment.artifact_id,
+                        "guide outcome regeneration already queued for this revision"
+                    );
+                }
+                Some(crate::work::RetryReviewGuideOutcome::NoComparison) => {
+                    tracing::warn!(
+                        comment_id = %recorded.comment.id,
+                        series_id = %recorded.comment.artifact_id,
+                        "guide outcome requested regeneration but no source comparison exists"
+                    );
+                }
+                None => {}
+            }
+            let comment = recorded.comment;
             let revision = publish_comment_invalidation(
                 &server_state,
                 &session_id,
@@ -1992,6 +2025,61 @@ mod tests {
             "expected WorkError for a non-answer-agent run_id, got {:?}",
             envelope.payload
         );
+    }
+
+    #[tokio::test]
+    async fn record_guide_outcome_rejects_a_non_revision_execution() {
+        let (server_state, _dir) = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        let product = work_db
+            .create_product(
+                crate::work::CreateProductInput::builder()
+                    .name("Other")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .build(),
+            )
+            .unwrap();
+        let chore = work_db
+            .create_chore(
+                crate::work::CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Unrelated chore")
+                    .build(),
+            )
+            .unwrap();
+        let execution = work_db
+            .create_execution(
+                crate::work::CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(crate::work::ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+
+        handle_comments_record_guide_outcome(
+            dispatch_ctx(&server_state, &work_db, &sink),
+            FrontendRequest::CommentsRecordGuideOutcome {
+                run_id: execution.id,
+                comment_id: "cmt_x".to_owned(),
+                disposition: boss_protocol::GuideCommentDisposition::Answered,
+                body: "nope".to_owned(),
+                request_regeneration: false,
+            },
+        )
+        .await;
+
+        let envelope = sink
+            .next()
+            .await
+            .expect("a response envelope should have been enqueued");
+        match envelope.payload {
+            FrontendEvent::WorkError { message } => {
+                assert!(message.contains("not a revision execution"), "got {message}");
+            }
+            other => panic!("expected WorkError, got {other:?}"),
+        }
     }
 
     // --- Follow-up reclassification loop (P3c) ---
