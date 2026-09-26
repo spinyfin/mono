@@ -71,7 +71,7 @@ extension ChatViewModel {
         asyncMarkdownViewerVM.state = .loaded(title: title, markdown: content.markdown, artifact: .reviewGuide(seriesID: content.seriesId, versionID: content.id))
     }
 
-    /// Called only after the card's generation confirmation. Uses the same
+    /// Called directly from the card's generation menu action. Uses the same
     /// in-flight guard and queued/error replies as Retry.
     func generateReviewGuide(for task: WorkTask) {
         guard !retryingReviewGuideRootTaskIDs.contains(task.id) else { return }
