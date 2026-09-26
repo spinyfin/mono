@@ -247,6 +247,8 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::WorkItemCostReport { .. }
         | FrontendEvent::CostWindowReport { .. }
         | FrontendEvent::TopCostConsumers { .. }
+        | FrontendEvent::MetricCatalogResult { .. }
+        | FrontendEvent::MetricSeriesResult { .. }
         | FrontendEvent::PlannerRunsList { .. }
         | FrontendEvent::PlanProjectResult { .. }
         | FrontendEvent::ReleaseProjectResult { .. }

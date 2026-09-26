@@ -655,6 +655,24 @@ fn work_tree_strips_ideas_for_workers() {
 }
 
 #[test]
+fn metric_series_verbs_stay_closed() {
+    for request in [
+        FrontendRequest::GetMetricCatalog,
+        FrontendRequest::GetMetricSeries {
+            series: "execution_outcomes".into(),
+            since_epoch_s: 0,
+            until_epoch_s: 1,
+            bucket: None,
+            filters: vec![],
+            group_by: None,
+        },
+    ] {
+        let denial = assert_denied(request);
+        assert_eq!(denial.reason, WorkerTierDenialReason::CoordinatorOnly);
+    }
+}
+
+#[test]
 fn idea_verbs_stay_closed_and_get_work_tree_stays_allowed() {
     for request in [
         FrontendRequest::CreateIdea {
