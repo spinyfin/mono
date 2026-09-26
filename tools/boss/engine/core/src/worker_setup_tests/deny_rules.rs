@@ -358,3 +358,55 @@ fn hook_entry_runs_path_guard_matches_only_the_gate_script_entry() {
 fn review_guide_and_answer_agent_share_the_read_only_deny_body() {
     assert_eq!(review_guide_deny_rules(), answer_agent_deny_rules());
 }
+
+#[test]
+fn claude_review_guide_settings_allow_only_submission_and_wire_the_exact_command_guard() {
+    let mut input = sample_input();
+    input.worker_kind = WorkerKind::ReviewGuide;
+    let settings: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
+    assert_eq!(settings["permissions"]["defaultMode"], "dontAsk");
+    assert_eq!(
+        settings["permissions"]["allow"],
+        serde_json::json!(review_guide_allow_rules())
+    );
+    let hook = settings["hooks"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| {
+            entry["hooks"][0]["command"].as_str().is_some_and(|command| {
+                command.contains("REVIEW_GUIDE_COMMAND") || command.contains("def allowed(payload)")
+            })
+        })
+        .expect("guide guard must be wired into Claude hooks");
+    assert_eq!(hook["matcher"], ".*");
+    let command = hook["hooks"][0]["command"].as_str().unwrap();
+    for (tool, shell, expected) in [
+        ("Bash", "boss propose review-guide --body '# Guide'", "approve"),
+        ("Bash", "cat README.md", "block"),
+        ("Read", "", "block"),
+        ("Bash", "boss propose review-guide --body 'x'; touch /tmp/x", "block"),
+    ] {
+        use std::io::Write;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", command])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                serde_json::json!({"tool_name": tool, "tool_input": {"command": shell}})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(result.status.success());
+        let decision: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(decision["decision"], expected, "{shell}");
+    }
+}

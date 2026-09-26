@@ -127,6 +127,8 @@ pub(crate) enum ProposeCommand {
     /// Example: `boss propose review-report --batch-id rvb_abc --target-sha
     /// abc123 --body-file review.json`
     ReviewReport(ReviewReportArgs),
+    /// Submit the finished guide for this review-guide execution.
+    ReviewGuide(ReviewGuideArgs),
     /// Submit the supervisor's consolidated structured verdict for a batch.
     /// The verdict is validated and recorded immediately, completing the
     /// batch; it does not itself change the reviewed work item's state.
@@ -148,6 +150,13 @@ pub(crate) enum ProposeCommand {
     /// the PR with the md5 crate swap"` / `boss propose done --outcome
     /// no-changes-needed --summary "already on main; empty diff"`
     Done(RunDoneArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ReviewGuideArgs {
+    /// Finished Markdown guide. Use a single-quoted shell argument.
+    #[arg(long)]
+    body: String,
 }
 
 /// Shared `--idempotency-key` override, flattened into every kind's args.
@@ -387,6 +396,7 @@ pub(crate) enum ProposalKindArg {
     FollowupTask,
     AutomationOutcome,
     PrCreated,
+    ReviewGuide,
     ReviewReport,
     ReviewVerdict,
     RunDone,
@@ -402,6 +412,7 @@ impl From<ProposalKindArg> for ProposalKind {
             ProposalKindArg::FollowupTask => ProposalKind::FollowupTask,
             ProposalKindArg::AutomationOutcome => ProposalKind::AutomationOutcome,
             ProposalKindArg::PrCreated => ProposalKind::PrCreated,
+            ProposalKindArg::ReviewGuide => ProposalKind::ReviewGuide,
             ProposalKindArg::ReviewReport => ProposalKind::ReviewReport,
             ProposalKindArg::ReviewVerdict => ProposalKind::ReviewVerdict,
             ProposalKindArg::RunDone => ProposalKind::RunDone,
@@ -608,6 +619,14 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
             .map_err(CliError::internal)?,
             args.common.idempotency_key,
         ),
+        ProposeCommand::ReviewGuide(args) => (
+            ProposalKind::ReviewGuide,
+            serde_json::to_value(boss_protocol::ReviewGuideProposalPayload {
+                body_markdown: args.body,
+            })
+            .unwrap(),
+            None,
+        ),
         ProposeCommand::ReviewReport(args) => (
             ProposalKind::ReviewReport,
             serde_json::to_value(ReviewReportProposalPayload {
@@ -657,6 +676,15 @@ async fn run_propose_submit(ctx: &RunContext, command: ProposeCommand) -> Result
         })?;
 
     match response {
+        FrontendEvent::ProposalSubmitted { proposal, .. }
+            if kind == ProposalKind::ReviewGuide && proposal.state == ProposalState::Rejected =>
+        {
+            Err(CliError::application(
+                proposal
+                    .decision_reason
+                    .unwrap_or_else(|| "review-guide submission was rejected".to_owned()),
+            ))
+        }
         FrontendEvent::ProposalSubmitted {
             proposal,
             already_submitted,
@@ -766,6 +794,7 @@ fn flag_hint_for_field(kind: ProposalKind, field: &str) -> Option<&'static str> 
         (ProposalKind::AutomationOutcome, "reason") => Some("--reason"),
         (ProposalKind::PrCreated, "pr_url") => Some("--url"),
         (ProposalKind::PrCreated, "branch") => Some("--branch"),
+        (ProposalKind::ReviewGuide, "body_markdown") => Some("--body"),
         (ProposalKind::ReviewReport, "batch_id") => Some("--batch-id"),
         (ProposalKind::ReviewReport, "target_sha") => Some("--target-sha"),
         (ProposalKind::ReviewReport, "report") => Some("--body-file"),
@@ -945,6 +974,16 @@ mod tests {
             }
             other => panic!("expected PrCreated, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn review_guide_payload_uses_literal_markdown_without_an_execution_flag() {
+        let body = "# Guide\n## Problem\nA `code` example and an apostrophe.";
+        let (kind, payload, key) = payload_for(command_for(&["review-guide", "--body", body])).unwrap();
+        assert_eq!(kind, ProposalKind::ReviewGuide);
+        assert_eq!(payload["body_markdown"], body);
+        assert!(key.is_none());
+        assert!(Cli::try_parse_from(["boss", "propose", "review-guide", "--body", body, "--run-id", "other"]).is_err());
     }
 
     #[test]

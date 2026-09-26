@@ -1796,6 +1796,7 @@ fn duplication_finding_review_result_json(pr_url: &str) -> String {
     .to_string()
 }
 
+mod review_guide_submission;
 mod t01;
 mod t02;
 mod t03;

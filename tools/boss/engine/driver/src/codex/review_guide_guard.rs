@@ -1,77 +1,91 @@
-//! Codex-only `PreToolUse` guard enforcing the review-guide worker's
-//! no-tool-use mandate.
-//!
-//! A review-guide job ([`crate::WorkerKind::ReviewGuide`]) has exactly one
-//! legitimate action: read the immutable source packet the engine already
-//! embedded in its prompt, then answer with the finished Markdown guide as
-//! ordinary assistant prose. It never needs a tool call to do that — there is
-//! no leased implementation checkout to inspect (unlike
-//! [`crate::WorkerKind::Reviewer`], which reads a real PR diff and workspace),
-//! no file to write (the engine collects the guide from transcript text, not
-//! an artifact path), and no publish/reply command to invoke (unlike
-//! [`crate::WorkerKind::AnswerAgent`]'s single allowlisted
-//! `boss comment reply`).
-//!
-//! So, unlike every other Codex guard in this module (which parses a shell
-//! command or tool name to decide what to block), this one is a flat
-//! deny-by-default allowlist with an EMPTY allowlist: every `PreToolUse` call
-//! is blocked, regardless of tool name or arguments. This is strictly more
-//! conservative than [`super::reviewer_publish_guard`] (which still approves
-//! read-only `Bash`/`apply_patch` misses) or
-//! [`super::tool_surface_guard`] (which only closes the MCP/`write_stdin`
-//! gaps) — neither alone would stop a review-guide worker from reading
-//! arbitrary files in its leased workspace, which is not itself a mutation
-//! but does breach the "only ever reads the pinned packet" invariant the
-//! design requires.
-//!
-//! Armed only when `ToolUseInterceptionConfig::is_review_guide` is set (see
-//! `materialize_guards`), so no other worker kind is affected.
+//! One-command submission allowlist for review-guide workers.
+use super::guard_python::with_command_tokenizer;
 
-/// The Codex review-guide no-tool-use guard, materialised verbatim as an
-/// executable `.py`. Emits a Claude-compatible `{"decision": …}` object on
-/// stdout. Matcher `.*` (armed in `materialize_guards`): it must see every
-/// tool name, not just `Bash`.
+/// Shared by Codex materialization and Claude settings hooks.
+pub fn codex_review_guide_guard_script() -> String {
+    with_command_tokenizer(SCRIPT_TEMPLATE).replace("# REVIEW_GUIDE_COMMAND_FRAGMENT", REVIEW_GUIDE_COMMAND_PY)
+}
+
 const SCRIPT_TEMPLATE: &str = r#"#!/usr/bin/env python3
-"""Codex review-guide no-tool-use PreToolUse gate (Boss).
-
-A review-guide job's entire job is to read its prompt (which already embeds
-the immutable source packet) and answer with Markdown prose. It never needs a
-tool call, so every tool call is blocked outright -- an empty allowlist,
-enforced the way Codex enforces anything: a PreToolUse decision, not a
-declarative rule list.
-"""
 import json
+import os
+import re
+import shlex
 import sys
 
-BLOCK = (
-    "Blocked: review-guide workers must not call any tool (matched tool: {tool}). "
-    "Read the source material already embedded in your prompt and answer with "
-    "the finished Markdown guide as your response text -- no tool call is ever "
-    "needed or permitted for this job."
-)
+# COMMAND_TOKENIZER_FRAGMENT
+
+# REVIEW_GUIDE_COMMAND_FRAGMENT
 
 try:
     payload = json.load(sys.stdin)
 except Exception:
     payload = None
-
-tool = payload.get("tool_name") if isinstance(payload, dict) else None
-if not isinstance(tool, str) or not tool:
-    tool = "(unreadable payload)"
-
-print(json.dumps({"decision": "block", "reason": BLOCK.format(tool=tool)}))
-sys.exit(0)
+if allowed(payload):
+    print(json.dumps({"decision": "approve"}))
+else:
+    tool = payload.get("tool_name", "(unreadable payload)") if isinstance(payload, dict) else "(unreadable payload)"
+    print(json.dumps({"decision": "block", "reason": "Blocked: review-guide workers may only submit with boss propose review-guide --body followed by a single-quoted Markdown literal; all other tools and commands are forbidden (matched tool: " + str(tool) + ")."}))
 "#;
 
-/// Render the review-guide no-tool-use guard.
-pub fn codex_review_guide_guard_script() -> String {
-    SCRIPT_TEMPLATE.to_owned()
-}
+pub(super) const REVIEW_GUIDE_COMMAND_PY: &str = r#"
+def allowed(payload):
+    if not isinstance(payload, dict) or payload.get("tool_name") != "Bash":
+        return False
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return False
+    command = tool_input.get("command")
+    if not isinstance(command, str):
+        return False
+    # Require a literal single-quoted Markdown body (including the standard
+    # shell apostrophe escape). No expansion, redirects, wrappers, or chaining.
+    literal = r"'(?:[^']|'\"'\"'|'\\'')*'"
+    match = re.fullmatch(r"([\s\S]*?)[ \t]+--body[ \t]+(" + literal + r")[ \t\r\n]*", command)
+    if not match:
+        return False
+    prefix = match.group(1)
+    if prefix not in ('boss propose review-guide', '"$BOSS_BIN" propose review-guide', '"${BOSS_BIN}" propose review-guide'):
+        return False
+    # Tokenize the executable/verb shape through the shared guard tokenizer;
+    # the separately proven literal body may contain newlines or shell examples.
+    groups = command_groups(prefix + " --body 'literal'")
+    return len(groups) == 1 and groups[0][1:] == ["propose", "review-guide", "--body", "literal"]
+
+"#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    #[test]
+    fn permits_only_literal_guide_submission() {
+        for command in [
+            "boss propose review-guide --body '# Guide\n## Problem\nA `code` example: $(literal).'",
+            "\"$BOSS_BIN\" propose review-guide --body 'author'\"'\"'s guide'",
+            "boss propose review-guide --body 'author'\\''s guide'",
+        ] {
+            let payload = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}});
+            assert_eq!(decide(payload).0, "approve", "{command}");
+        }
+        for command in [
+            "boss propose review-guide --body \"$(cat secret)\"",
+            "boss propose review-guide --body 'x'; touch /tmp/x",
+            "boss propose review-guide --body 'x' > /tmp/x",
+            "boss propose review-guide --body-file /tmp/x",
+            "boss propose done --outcome delivered --summary x",
+            "env BOSS_RUN_ID=other boss propose review-guide --body 'x'",
+            "bash -c \"boss propose review-guide --body 'x'\"",
+            "boss propose review-guide --body 'x' && boss propose review-guide --body 'y'",
+        ] {
+            assert_eq!(
+                decide(serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}})).0,
+                "block",
+                "{command}"
+            );
+        }
+    }
 
     fn decide(payload: serde_json::Value) -> (String, String) {
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -108,7 +122,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_every_tool_call_regardless_of_shape() {
+    fn blocks_other_tools_and_commands() {
         for payload in [
             serde_json::json!({"tool_name": "apply_patch", "tool_input": {}}),
             serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "jj log"}}),
@@ -119,7 +133,7 @@ mod tests {
         ] {
             let (decision, reason) = decide(payload.clone());
             assert_eq!(decision, "block", "{payload:?} must be blocked, got reason={reason}");
-            assert!(reason.contains("must not call any tool"), "{reason}");
+            assert!(reason.contains("only submit"), "{reason}");
         }
     }
 

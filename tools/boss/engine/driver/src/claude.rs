@@ -1085,6 +1085,17 @@ impl AgentDriver for ClaudeDriver {
             }));
         }
 
+        if config.is_review_guide {
+            let command = format!(
+                "python3 -c {}",
+                shell_quote(&crate::codex::codex_review_guide_guard_script())
+            );
+            hooks.push(serde_json::json!({
+                "matcher": ".*",
+                "hooks": [{"type": "command", "command": command}],
+            }));
+        }
+
         ToolUseInterceptionWiring {
             pre_tool_use_hooks: hooks,
         }

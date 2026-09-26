@@ -99,6 +99,7 @@ pub fn apply_policy(kind: ProposalKind) -> ProposalApplyPolicy {
         | ProposalKind::DeferredScope
         | ProposalKind::AutomationOutcome
         | ProposalKind::PrCreated
+        | ProposalKind::ReviewGuide
         | ProposalKind::ReviewReport
         | ProposalKind::RunDone => ProposalApplyPolicy::AutoApply,
         // Staged at submission (member reported, batch → applying) but the
@@ -181,6 +182,7 @@ pub fn apply_in_transaction(
         ProposalKind::DeferredScope => apply_deferred_scope(tx, execution_id, payload_json).map(ApplyDecision::Applied),
         ProposalKind::AutomationOutcome => apply_automation_outcome(tx, execution_id, payload_json, proposal_id),
         ProposalKind::PrCreated => apply_pr_created(tx, execution_id, payload_json),
+        ProposalKind::ReviewGuide => super::review_guide_submission::accept(tx, execution_id),
         ProposalKind::ReviewReport => apply_review_report(tx, execution_id, payload_json, proposal_id),
         ProposalKind::RunDone => apply_run_done(tx, execution_id, payload_json, proposal_id),
         ProposalKind::ReviewVerdict => apply_review_verdict(tx, execution_id, payload_json, proposal_id),

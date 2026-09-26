@@ -208,6 +208,15 @@ fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
         });
     }
 
+    if config.is_review_guide {
+        out.push(Guard {
+            command: format!(
+                "python3 -c {}",
+                shell_quote(&crate::codex::codex_review_guide_guard_script())
+            ),
+            matcher: ".*",
+        });
+    }
     out
 }
 

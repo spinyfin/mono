@@ -209,7 +209,7 @@ If the PR merges/closes before feedback submission or dispatch, keep the comment
 
 ### Prompt contract
 
-Use the following exact template as `review-guide-v3`, stored in the implementation crate with a content hash. Substitute only the metadata placeholders; supply packet/broker context separately. The evaluated baseline is exactly the initial four-section request through the worked-example paragraph (with its grounding instruction now limited to supplied context). The remainder is the brief's unevaluated production addition, which the rollout validates. Revision-agent instructions above are a separate template.
+Use the following exact template as `review-guide-v4`, stored in the implementation crate with a content hash. Substitute only the metadata placeholders; supply packet/broker context separately. The evaluated baseline is exactly the initial four-section request through the worked-example paragraph (with its grounding instruction now limited to supplied context). The remainder is the brief's unevaluated production addition, which the rollout validates. Revision-agent instructions above are a separate template.
 
 ```text
 I want you to provide me a guided summary of the changes in {{PR_URL}}. The summary should break down as:
@@ -240,10 +240,10 @@ In the tests section, distinguish added, modified, and removed tests. Name the i
 
 Use the complete revised PR comparison if this is a regenerated guide. Do not describe only the latest incremental commit. Existing comments may provide context, but the explanation must match the actual current source revisions.
 
-Return only the finished Markdown guide, with a descriptive title and the four requested main sections. Put the worked example within the implementation walkthrough. Keep the guide as concise as the explanation permits while preserving useful reasoning and evidence. Do not include a chat preamble, model details, internal execution details, a merge recommendation, or an unsupported declaration that the PR is safe to merge. If essential context is absent from the supplied material, state the specific limitation rather than inventing behavior.
+Submit the finished Markdown guide using `boss propose review-guide --body '<finished Markdown guide>'`. This is the only permitted tool command. Pass the entire Markdown as a literal single-quoted shell argument (escape any apostrophe with the standard shell quote sequence); do not write a file, pipe input, use command substitution, or run any other command. The command is bound to your execution automatically. A final assistant message does not submit a guide. If submission fails, correct the reported error and retry the same command before ending. The guide must have a descriptive title and the four requested main sections. Put the worked example within the implementation walkthrough. Keep the guide as concise as the explanation permits while preserving useful reasoning and evidence. Do not include a chat preamble, model details, internal execution details, a merge recommendation, or an unsupported declaration that the PR is safe to merge. If essential context is absent from the supplied material, state the specific limitation rather than inventing behavior.
 ```
 
-Template SHA-256 (UTF-8, excluding the fence and terminal newline): `24dd027a410ef2f9ed40b171f70da1ddca518061a1cdb78995b2bf3df76ad2ac`.
+Template SHA-256 (UTF-8, excluding the fence and terminal newline): `2e250cf69d80036e8333243a4abdc3d4c8abee907a4671dacb1fb1d436883481`.
 
 ### Diagnostics
 

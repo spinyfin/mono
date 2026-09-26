@@ -1158,6 +1158,7 @@ async fn every_kind_can_be_submitted() {
             }
             ProposalKind::AutomationOutcome => json!({"outcome": "skip", "reason": "clean"}),
             ProposalKind::PrCreated => json!({"pr_url": "https://github.com/o/r/pull/1"}),
+            ProposalKind::ReviewGuide => json!({"body_markdown": "# Guide"}),
             ProposalKind::ReviewReport => {
                 json!({
                     "batch_id": "rvb_missing",
@@ -1741,4 +1742,98 @@ async fn listing_an_execution_with_no_proposals_is_empty_not_an_error() {
         .await,
     );
     assert!(proposals.is_empty());
+}
+
+#[tokio::test]
+async fn review_guide_submission_publishes_for_its_attributed_codex_execution() {
+    let (state, _dir) = test_server_state();
+    let db = &state.work_db;
+    let product = crate::test_support::create_product(db);
+    let root = crate::test_support::create_active_chore(db, &product, "guide producer");
+    let (series, comparison) = crate::test_support::seed_review_guide_series(db, &root);
+    let attempt = db
+        .create_pr_review_guide_attempt(&series, &comparison, boss_review_guide::PROMPT_VERSION)
+        .unwrap();
+    let execution = db.create_pr_review_guide_execution(&comparison, "acme/widget").unwrap();
+    db.bind_pr_review_guide_attempt_execution(&attempt.id, &execution.id)
+        .unwrap();
+    db.start_execution_run(&execution.id, "review-1", "mono", "lease-1", "ws-1", "/tmp/ws-1")
+        .unwrap();
+    db.record_execution_launch_config(&execution.id, "codex", "gpt-6-astra", None)
+        .unwrap();
+    let pid = std::process::id() as libc::pid_t;
+    state.worker_registry.register(pid, execution.id.clone());
+    let guide = "# Guide\n## Problem\n## Implementation\n## Example\n## Review";
+    let request = || {
+        submit_request(
+            &execution.id,
+            ProposalKind::ReviewGuide,
+            json!({"body_markdown": guide}),
+        )
+    };
+    let response = call_with_peer(&state, Some(pid), request()).await;
+    let FrontendEvent::ProposalSubmitted {
+        proposal,
+        already_submitted,
+    } = response
+    else {
+        panic!("{response:?}")
+    };
+    assert!(!already_submitted);
+    assert_eq!(proposal.state, ProposalState::Applied);
+    assert_eq!(proposal.applied_ref.as_deref(), Some(attempt.id.as_str()));
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert_eq!(summary.lifecycle, "ready");
+    let version = db
+        .get_pr_review_guide_version(&summary.readable_version_id.unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(version.markdown, guide);
+    assert!(db.get_execution(&execution.id).unwrap().status.is_terminal());
+    // The same command replays its durable proposal even after finalization.
+    state.worker_registry.register(pid, execution.id.clone());
+    let replay = call_with_peer(&state, Some(pid), request()).await;
+    assert!(matches!(
+        replay,
+        FrontendEvent::ProposalSubmitted {
+            already_submitted: true,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn review_guide_submission_cannot_bind_to_another_execution_or_a_chore() {
+    let fx = WorkerFixture::new();
+    let mismatched = call_with_peer(
+        &fx.server_state,
+        Some(fx.peer_pid),
+        submit_request(
+            "exec_other",
+            ProposalKind::ReviewGuide,
+            json!({"body_markdown": "# Guide"}),
+        ),
+    )
+    .await;
+    assert!(matches!(mismatched, FrontendEvent::ProposalRejected { .. }));
+    let response = call_with_peer(
+        &fx.server_state,
+        Some(fx.peer_pid),
+        submit_request(
+            &fx.execution_id,
+            ProposalKind::ReviewGuide,
+            json!({"body_markdown": "# Guide"}),
+        ),
+    )
+    .await;
+    let FrontendEvent::ProposalSubmitted { proposal, .. } = response else {
+        panic!("{response:?}")
+    };
+    assert_eq!(proposal.state, ProposalState::Rejected);
+    assert!(
+        proposal
+            .decision_reason
+            .unwrap()
+            .contains("no running review-guide attempt")
+    );
 }
