@@ -30,9 +30,11 @@ use tokio::time::Duration;
 
 use std::sync::Arc;
 
+use crate::coordinator::ExecutionCoordinator;
 use crate::driver::{AgentDriver, Capability, ProgressFidelity, ProgressIngress, ProgressObservationConfig};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::protocol::{AttachWorkerPaneInput, EngineToAppRequest, EngineToAppResponse, EnvVar};
+use crate::spawn_health::SpawnHealthTracker;
 use crate::work::WorkDb;
 use crate::worker_registry::WorkerRegistry;
 use crate::worker_setup::{WorkerKind, WorkerSetupInput, WrittenFiles, write_workspace_files};
@@ -601,6 +603,21 @@ pub trait WorkerSpawner: Send + Sync {
         None
     }
 
+    /// Spawn-capability breaker tracker. Implementations return `None`
+    /// from in-process tests that don't exercise the breaker; the spawn
+    /// flow then skips recording success / probe recovery. Production
+    /// `ServerState` always returns `Some`.
+    fn spawn_health(&self) -> Option<&SpawnHealthTracker> {
+        None
+    }
+
+    /// Collaborators needed to auto-resume a Breaker-origin pause after
+    /// a successful recovery-probe spawn. Default `None` skips the
+    /// resume. Production `ServerState` always returns `Some`.
+    fn spawn_health_recovery(&self) -> Option<SpawnHealthRecovery<'_>> {
+        None
+    }
+
     /// Hook called after `LiveWorkerStateRegistry` is updated so the
     /// caller can broadcast the snapshot on the worker live-state
     /// topic. Default no-op for tests.
@@ -657,6 +674,15 @@ pub trait WorkerSpawner: Send + Sync {
     /// real panes; production `ServerState` delegates to
     /// [`crate::app::ServerState::release_worker_pane`].
     async fn reap_worker_pane(&self, _run_id: &str) {}
+}
+
+/// Handles needed to auto-resume dispatch after a Breaker recovery probe
+/// spawn succeeds. Production [`crate::app::ServerState`] supplies these;
+/// test spawners omit them.
+pub struct SpawnHealthRecovery<'a> {
+    pub work_db: &'a WorkDb,
+    pub coordinator: &'a Arc<ExecutionCoordinator>,
+    pub dispatch_events: &'a dyn crate::dispatch_events::DispatchEventSink,
 }
 
 /// Render the worker-config files, start a detached tmux worker,
@@ -983,6 +1009,26 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         //    on `release_worker_pane`.
         spawner.start_live_status_slot(slot_id, &input.run_id, input.driver.clone());
     }
+    // A proven tmux pane pid is the spawn-capability breaker's success
+    // signal: the engine owns the pid, so this is the production caller
+    // of `record_probe_success`. Without it a half-open recovery canary
+    // that starts perfectly is scored as a stall-deadline failure.
+    if let Some(spawn_health) = spawner.spawn_health() {
+        spawn_health.record_success();
+        if spawn_health.record_probe_success(&input.run_id)
+            && let Some(recovery) = spawner.spawn_health_recovery()
+            && crate::spawn_health::resume_dispatch_after_breaker_recovery(
+                recovery.work_db,
+                recovery.coordinator,
+                recovery.dispatch_events,
+                Some(&input.run_id),
+                "tmux spawn reported a real shell pid",
+            )
+            .await
+        {
+            recovery.coordinator.kick();
+        }
+    }
     spawner.activate_progress_ingress(&input.run_id);
 
     Ok(StartedWorker {
@@ -1011,6 +1057,43 @@ mod tests {
         spawn_calls: Arc<AtomicUsize>,
         canned_response: Result<EngineToAppResponse, SendToAppError>,
         last_request: std::sync::Mutex<Option<EngineToAppRequest>>,
+    }
+
+    /// Spawner that feeds a proven tmux pane pid into the spawn-capability
+    /// breaker, so tests can assert a Breaker pause auto-resumes.
+    struct ProbeHealthSpawner {
+        inner: StubSpawner,
+        spawn_health: crate::spawn_health::SpawnHealthTracker,
+        work_db: std::sync::Arc<WorkDb>,
+        coordinator: std::sync::Arc<ExecutionCoordinator>,
+        dispatch_events: crate::dispatch_events::RecordingDispatchEventSink,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkerSpawner for ProbeHealthSpawner {
+        async fn send_to_app_request(
+            &self,
+            request: EngineToAppRequest,
+            timeout: Duration,
+        ) -> Result<EngineToAppResponse, SendToAppError> {
+            self.inner.send_to_app_request(request, timeout).await
+        }
+
+        fn worker_registry(&self) -> &WorkerRegistry {
+            self.inner.worker_registry()
+        }
+
+        fn spawn_health(&self) -> Option<&SpawnHealthTracker> {
+            Some(&self.spawn_health)
+        }
+
+        fn spawn_health_recovery(&self) -> Option<SpawnHealthRecovery<'_>> {
+            Some(SpawnHealthRecovery {
+                work_db: self.work_db.as_ref(),
+                coordinator: &self.coordinator,
+                dispatch_events: &self.dispatch_events,
+            })
+        }
     }
 
     #[async_trait::async_trait]
@@ -2084,6 +2167,56 @@ mod tests {
             .expect("a Claude spawn registers a LiveWorkerState");
         assert_eq!(state.run_id, "run-test");
         assert_eq!(state.pool.as_deref(), Some("main"));
+    }
+
+    /// Regression: the engine's tmux spawn path is the only production
+    /// caller of [`SpawnHealthTracker::record_probe_success`]. A canary
+    /// that comes up with a real pane pid must resolve the half-open
+    /// probe and auto-resume a Breaker-origin pause — otherwise every
+    /// successful canary is scored as a stall-deadline failure.
+    #[tokio::test]
+    async fn tmux_pane_pid_resumes_a_breaker_origin_pause_for_a_probe_execution() {
+        let (_dir, db) = crate::test_support::open_db_arc();
+        let coordinator = crate::test_support::make_coordinator(db.clone(), 1);
+        coordinator.pause_dispatch(
+            1000,
+            crate::coordinator::DispatchPauseOrigin::Breaker,
+            boss_protocol::PauseReason::new("test: breaker pause").unwrap(),
+        );
+
+        let spawn_health = crate::spawn_health::SpawnHealthTracker::new();
+        spawn_health.mark_probe_dispatched("run-test", 1000);
+        let dispatch_events = crate::dispatch_events::RecordingDispatchEventSink::new();
+        let workspace = TempDir::new().unwrap();
+        let spawner = ProbeHealthSpawner {
+            inner: ok_spawner_capturing(),
+            spawn_health,
+            work_db: db,
+            coordinator: coordinator.clone(),
+            dispatch_events: dispatch_events.clone(),
+        };
+
+        start_worker(
+            &spawner,
+            sample_input(&workspace, spawner.inner.tmux_runner.clone()),
+            StdDuration::from_secs(1),
+        )
+        .await
+        .expect("tmux spawn with a proven pane pid should succeed");
+
+        assert!(
+            !coordinator.is_dispatch_paused(),
+            "a proven tmux pane pid for the in-flight probe must auto-resume a Breaker pause"
+        );
+        assert!(
+            !spawner.spawn_health.is_probe_execution("run-test"),
+            "the probe must resolve as success rather than stall into failure"
+        );
+        let events = dispatch_events.events().await;
+        assert!(
+            events.iter().any(|e| e.stage == "spawn_capability_recovered"),
+            "expected spawn_capability_recovered, got: {events:?}"
+        );
     }
 
     fn ok_spawner_capturing() -> StubSpawner {

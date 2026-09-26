@@ -2773,19 +2773,27 @@ pub enum FrontendRequest {
     WorkspacePoolSummary,
 }
 
-/// The observed cause behind a dead worker pane. The distinction matters
-/// because surface creation, a child process exit, and a pre-write driver
-/// liveness check have different lifecycle guards and recovery semantics.
+/// The observed cause behind a dead worker pane.
+///
+/// Production currently produces only [`Self::DriverExited`]: a pre-write
+/// driver liveness check on the engine's tmux pane-delivery path. The other
+/// variants are retained for decoding old logs. No current producer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerPaneDeathReason {
+    /// Historical app-owned surface-creation failure, retained for decoding
+    /// old logs. No current producer: viewer surface failures are recorded
+    /// in the app's spawn JSONL, not as a worker-pane death.
     SurfaceCreationFailed,
+    /// Historical app-owned child-process exit, retained for decoding old
+    /// logs. No current producer: viewer closure is not worker death.
     ChildProcessExited,
     /// A pre-write foreground-process check found the driver's CLI had
     /// returned and a shell (or no process) owned the worker PTY instead.
+    /// This is the only variant a current producer constructs.
     DriverExited,
-    /// Compatibility value for reports from an app build that predates the
-    /// reason field. New senders must always choose a specific variant.
+    /// Historical value for reports from an app build that predated the
+    /// reason field, retained for decoding old logs. No current producer.
     #[default]
     Unknown,
 }
@@ -2797,7 +2805,7 @@ impl WorkerPaneDeathReason {
             Self::SurfaceCreationFailed => "surface creation failed before a child process attached",
             Self::ChildProcessExited => "attached child process exited",
             Self::DriverExited => "worker driver exited before the engine delivered pane input",
-            Self::Unknown => "app did not identify which pane-death callback fired",
+            Self::Unknown => "historical pane-death report did not identify which callback fired",
         }
     }
 

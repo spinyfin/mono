@@ -102,7 +102,7 @@ final class WorkersWorkspaceModel: ObservableObject {
         guard !request.tmuxSocketPath.isEmpty, request.tmuxSocketPath.hasPrefix("/") else {
             return .failure(.internalFailure("engine supplied an invalid tmux socket path"))
         }
-        let launch = EngineSpawnRequest(attaching: request)
+        let launch = WorkerViewerLaunch(attaching: request)
         switch hostAttachedPane(launch) {
         case .success:
             return .success
@@ -123,7 +123,7 @@ final class WorkersWorkspaceModel: ObservableObject {
     ///  - `.failure(.slotBusy)` if the requested slot already hosts
     ///    a session (engine and app disagree about what's free —
     ///    the engine should reconcile rather than retry blindly).
-    private func hostAttachedPane(_ request: EngineSpawnRequest) -> EngineSpawnResult {
+    private func hostAttachedPane(_ request: WorkerViewerLaunch) -> EngineSpawnResult {
         let requestedSlot = request.slotId
         let isAutomation = Self.automationSlotRange.contains(Int(requestedSlot))
         let isReview = reviewSlotRange.contains(Int(requestedSlot))
@@ -152,15 +152,14 @@ final class WorkersWorkspaceModel: ObservableObject {
 
         let launchSpec = TerminalLaunchSpec(
             fontSize: 10.0,
-            workingDirectory: request.workspacePath,
+            workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path,
             initialInput: request.initialInput,
-            env: request.env
+            env: []
         )
         let session = TerminalPaneSession(
             id: "run-\(request.runId)",
             role: .worker(slot: slotId),
-            launchSpec: launchSpec,
-            paneMonitorSpec: request.paneMonitor ?? .claudeDefault
+            launchSpec: launchSpec
         )
         if isReview {
             reviewSlots[index].session = session
@@ -453,23 +452,21 @@ struct WorkerSlot: Identifiable, Equatable {
     }
 }
 
-extension EngineSpawnRequest {
+extension WorkerViewerLaunch {
     /// Viewer-launch parameters derived from `AttachWorkerPane`.
     ///
-    /// `workspacePath` is the tmux client's working directory (the current
-    /// user's home), not the worker workspace — the attach RPC does not
-    /// carry that path. Spawn diagnostics must record `sessionName` and
-    /// `tmuxSocketPath` instead of treating this directory as `workspace_path`.
+    /// The tmux client's working directory (the current user's home) is
+    /// applied in `hostAttachedPane`, not carried here — the attach RPC
+    /// does not include a worker workspace path. Spawn diagnostics must
+    /// record `sessionName` and `tmuxSocketPath` instead of treating that
+    /// directory as `workspace_path`.
     init(attaching request: EngineAttachRequest) {
         self.init(
             runId: request.runId,
-            workspacePath: FileManager.default.homeDirectoryForCurrentUser.path,
             slotId: request.slotId,
             initialInput: "exec tmux -S \(bossShellQuote(request.tmuxSocketPath)) attach-session -t \(bossShellQuote(request.sessionName))\n",
-            env: [],
             summary: request.summary,
             taskTitle: request.taskTitle,
-            paneMonitor: .claudeDefault,
             sessionName: request.sessionName,
             tmuxSocketPath: request.tmuxSocketPath
         )
