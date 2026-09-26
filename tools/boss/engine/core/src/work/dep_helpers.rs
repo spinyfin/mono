@@ -86,9 +86,9 @@ pub(crate) fn format_short_id_ambiguous(input: &str, candidates: &[ShortIdCandid
     lines.join("\n")
 }
 
-/// If `id` looks like a friendly work-item selector (`T42`, `t42`, `P7`,
-/// `p7`, `#42`, bare `42`, or `slug/42`), query the DB by short_id and
-/// return the matching primary id.
+/// If `id` looks like a friendly work-item selector (letter prefix plus
+/// digits, `#` plus digits, a bare number, or `slug/` plus digits), query
+/// the DB by short_id and return the matching primary id.
 ///
 /// Returns:
 /// - `Ok(Some(primary))` when exactly one live row matches

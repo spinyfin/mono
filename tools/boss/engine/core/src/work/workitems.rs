@@ -933,7 +933,8 @@ impl WorkDb {
 
     /// Inverse of [`Self::delete_work_item`]: clear the `deleted_at`
     /// tombstone on a soft-deleted task so it becomes visible again.
-    /// Accepts a canonical `task_…` id or a friendly short id (`T43`);
+    /// Accepts a canonical `task_…` id or a friendly short id (letter
+    /// prefix plus digits, or a bare/slug-prefixed number);
     /// the friendly resolution deliberately includes soft-deleted rows
     /// so a tombstoned task is still findable. Idempotent — restoring a
     /// row that is already live succeeds as a no-op. Returns the now-live
@@ -1408,8 +1409,9 @@ impl WorkDb {
         }
     }
 
-    /// Look up a work item by canonical id or short-form (`T42`,
-    /// `t42`, `#42`, bare `42`, `slug/42`). Returns `Ok(None)` when no
+    /// Look up a work item by canonical id or short-form (letter prefix
+    /// plus digits, `#` plus digits, a bare number, or `slug/` plus
+    /// digits). Returns `Ok(None)` when no
     /// item matches, `Ok(Some(…))` on success. Canonical ids are passed
     /// straight to [`get_work_item`]; short-form ids are first resolved
     /// via [`resolve_friendly_work_item_id`] and then fetched by
@@ -1489,11 +1491,11 @@ impl WorkDb {
     /// and misclassified downstream by `classify_id`, and a typed id that
     /// names a tombstoned row is not mistaken for one that doesn't exist.
     ///
-    /// `id` may be a bare short id (`T5`) for the no-selected-product
-    /// fallback (ambiguity across products is a hard error, matching
-    /// [`Self::resolve_work_item_ref`]'s contract), an already
-    /// product-scoped selector (`{product_id}/{n}` or `slug/n`), or a
-    /// typed primary id.
+    /// `id` may be a bare short id (letter prefix plus digits) for the
+    /// no-selected-product fallback (ambiguity across products is a hard
+    /// error, matching [`Self::resolve_work_item_ref`]'s contract), an
+    /// already product-scoped selector (`{product_id}/{n}` or `slug/n`),
+    /// or a typed primary id.
     pub fn resolve_work_item_ref_including_deleted(&self, id: &str) -> Result<String> {
         let id = id.trim();
         if id.is_empty() {
@@ -1549,7 +1551,8 @@ impl WorkDb {
     /// execution + run on the rendered work item. The lookup never
     /// fails on missing executions: an untouched work item simply
     /// returns a `TaskRuntime` with every `Option` field set to
-    /// `None`. Friendly ids (`T42`, `boss/42`) are resolved to primary
+    /// `None`. Friendly ids (letter prefix plus digits, or a
+    /// slug-prefixed number) are resolved to primary
     /// ids before the query runs, matching `get_work_item`'s contract.
     pub fn get_task_runtime(&self, work_item_id: &str) -> Result<TaskRuntime> {
         let conn = self.connect()?;
