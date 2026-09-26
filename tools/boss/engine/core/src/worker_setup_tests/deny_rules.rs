@@ -382,15 +382,19 @@ fn claude_review_guide_settings_allow_only_submission_and_wire_the_exact_command
     assert_eq!(hook["matcher"], ".*");
     let command = hook["hooks"][0]["command"].as_str().unwrap();
     for (tool, shell, expected) in [
-        ("Bash", "boss propose review-guide --body '# Guide'", "approve"),
+        ("Bash", "\"$BOSS_BIN\" propose review-guide --body '# Guide'", "approve"),
         (
             "Bash",
-            "boss propose review-guide --body '# Guide\nswift run\nboss engine start\n'",
+            "\"$BOSS_BIN\" propose review-guide --body '# Guide\nswift run\nboss engine start\n'",
             "approve",
         ),
         ("Bash", "cat README.md", "block"),
         ("Read", "", "block"),
-        ("Bash", "boss propose review-guide --body 'x'; touch /tmp/x", "block"),
+        (
+            "Bash",
+            "\"$BOSS_BIN\" propose review-guide --body 'x'; touch /tmp/x",
+            "block",
+        ),
     ] {
         use std::io::Write;
         let mut child = std::process::Command::new("sh")
@@ -453,7 +457,7 @@ fn review_guide_hook_chain_masks_literal_body_and_still_rejects_wrappers() {
     );
 
     let body_command = format!(
-        "boss propose review-guide --body '# Guide\n\
+        "\"$BOSS_BIN\" propose review-guide --body '# Guide\n\
          ## Problem\n\
          Workers sometimes quote `swift run` and `boss engine start`.\n\
          Isolated engines use `bazel run //tools/boss/engine/core:engine` without a socket path in the prose.\n\
@@ -463,11 +467,17 @@ fn review_guide_hook_chain_masks_literal_body_and_still_rejects_wrappers() {
          ## Review\n'",
         data_dir.display()
     );
-    let payload = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": body_command}, "cwd": "/"});
-    for command in &commands {
-        let mut child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
+    let run = |hook: &str, command: &str, boss_bin: Option<&str>, path: Option<&str>| {
+        let payload = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": "/"});
+        let mut process = std::process::Command::new("sh");
+        process.args(["-c", hook]).env_remove("BOSS_BIN");
+        if let Some(bin) = boss_bin {
+            process.env("BOSS_BIN", bin);
+        }
+        if let Some(path) = path {
+            process.env("PATH", path);
+        }
+        let mut child = process
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -475,60 +485,70 @@ fn review_guide_hook_chain_masks_literal_body_and_still_rejects_wrappers() {
             .expect("sh must be available");
         child
             .stdin
-            .as_mut()
+            .take()
             .unwrap()
             .write_all(payload.to_string().as_bytes())
             .unwrap();
-        drop(child.stdin.take());
         let out = child.wait_with_output().unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let decision: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|err| {
-            panic!(
-                "guard produced invalid JSON: {err}\ncommand={command}\nstdout={stdout}\nstderr={}",
-                String::from_utf8_lossy(&out.stderr)
-            )
-        });
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
+    };
+    for hook in &commands {
+        let decision = run(hook, &body_command, Some("/usr/bin/true"), None);
         assert_eq!(
             decision["decision"], "approve",
-            "literal guide body must pass {command}: {decision}"
+            "literal guide body must pass {hook}: {decision}"
+        );
+    }
+    for (label, command) in [
+        (
+            "chaining",
+            r#""$BOSS_BIN" propose review-guide --body 'x' && boss engine start"#,
+        ),
+        (
+            "redirect",
+            r#""$BOSS_BIN" propose review-guide --body 'x' > /tmp/guide.md"#,
+        ),
+        (
+            "substitution",
+            r#""$BOSS_BIN" propose review-guide --body "$(cat secret)""#,
+        ),
+    ] {
+        let decisions: Vec<_> = commands
+            .iter()
+            .map(|hook| run(hook, command, Some("/usr/bin/true"), None))
+            .collect();
+        assert!(
+            decisions.iter().any(|d| d["decision"] == "block"),
+            "{label} must be rejected by the review-guide chain: {decisions:?} for {command}"
         );
     }
 
-    for (label, command) in [
-        ("chaining", "boss propose review-guide --body 'x' && boss engine start"),
-        ("redirect", "boss propose review-guide --body 'x' > /tmp/guide.md"),
-        ("substitution", "boss propose review-guide --body \"$(cat secret)\""),
+    // A valid literal body does not establish which executable the shell runs.
+    let repobin = script_dir.path().join("repobin");
+    std::fs::write(&repobin, b"#!/bin/sh\n").unwrap();
+    let boss = script_dir.path().join("boss");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&repobin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&repobin, &boss).unwrap();
+    }
+    let path = format!("{}:{}", script_dir.path().display(), std::env::var("PATH").unwrap());
+    for (command, bin, expected_reason) in [
+        (r#""$BOSS_BIN" propose review-guide --body 'guide'"#, None, "unset"),
+        (
+            r#""$BOSS_BIN" propose review-guide --body 'guide'"#,
+            boss.to_str(),
+            "repobin",
+        ),
+        ("boss propose review-guide --body 'guide'", None, "repobin"),
     ] {
-        let payload = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": "/"});
-        let decisions: Vec<String> = commands
-            .iter()
-            .map(|hook| {
-                let mut child = std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(hook)
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-                    .expect("sh must be available");
-                child
-                    .stdin
-                    .as_mut()
-                    .unwrap()
-                    .write_all(payload.to_string().as_bytes())
-                    .unwrap();
-                drop(child.stdin.take());
-                let out = child.wait_with_output().unwrap();
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                serde_json::from_str::<serde_json::Value>(stdout.trim())
-                    .ok()
-                    .and_then(|v| v["decision"].as_str().map(str::to_owned))
-                    .unwrap_or_else(|| "missing".to_owned())
-            })
-            .collect();
+        let decision = run(BOSS_LAUNCH_GUARD_COMMAND, command, bin, Some(&path));
+        assert_eq!(decision["decision"], "block", "{decision}");
         assert!(
-            decisions.iter().any(|d| d == "block"),
-            "{label} must be rejected by the review-guide chain: {decisions:?} for {command}"
+            decision["reason"].as_str().unwrap().contains(expected_reason),
+            "{decision}"
         );
     }
 }

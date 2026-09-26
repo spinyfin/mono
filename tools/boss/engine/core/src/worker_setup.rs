@@ -140,7 +140,7 @@ pub enum WorkerKind {
     AnswerAgent,
     /// PR review-guide generator on the fixed Codex Astra profile. Reads only
     /// the embedded source packet and submits Markdown with
-    /// `boss propose review-guide --body`. A shared PreToolUse allowlist
+    /// `"$BOSS_BIN" propose review-guide --body`. A shared PreToolUse allowlist
     /// blocks every other tool/command; Claude additionally uses dontAsk.
     ReviewGuide,
 }
@@ -1211,7 +1211,8 @@ const GUARD_SCRIPT_PRUNE_GRACE: Duration = Duration::from_secs(7 * 24 * 60 * 60)
 /// directories. Reading one specific file outside the workspace
 /// (`~/.gitconfig`, a bazel cache entry) is deliberately untouched: the defect
 /// is the breadth of the traversal, not the fact that a path is external.
-const PATH_GUARD_SCRIPT: &str = r#"#!/usr/bin/env python3
+const PATH_GUARD_SCRIPT: &str = boss_engine_driver::render_review_guide_guard!(
+    r#"#!/usr/bin/env python3
 """Deterministic Boss data-directory access gate (Claude Code PreToolUse hook).
 
 Blocks any tool call whose target path canonically resolves inside the Boss
@@ -1246,34 +1247,8 @@ import re
 import shlex
 import sys
 
-def review_guide_masked_command(command):
-    """If command is exactly the allowlisted review-guide submission, return
-    it with the proven --body literal replaced by a placeholder.
-
-    The proven body is data: it may mention launch commands or the Boss
-    data directory. Anything outside this exact shape is left unchanged
-    so existing checks still apply.
-    """
-    if not isinstance(command, str):
-        return None
-    q = chr(39)
-    dq = chr(34)
-    dl = chr(36)
-    bs = chr(92)
-    literal = q + "(?:[^" + q + "]|" + q + dq + q + dq + q + "|" + q + bs + bs + q + q + ")*" + q
-    match = re.fullmatch(r"([\s\S]*?)[ \t]+--body[ \t]+(" + literal + r")[ \t\r\n]*", command)
-    if not match:
-        return None
-    prefix = match.group(1)
-    prefixes = (
-        "boss propose review-guide",
-        dq + dl + "BOSS_BIN" + dq + " propose review-guide",
-        dq + dl + "{BOSS_BIN}" + dq + " propose review-guide",
-    )
-    if prefix not in prefixes:
-        return None
-    return prefix + " --body " + q + "literal" + q
-
+"#,
+    r#"
 
 MALFORMED = (
     "Blocked (fail-closed): the Boss data-directory gate could not read this "
@@ -1697,7 +1672,7 @@ def main():
             emit("block", MALFORMED)
         masked = review_guide_masked_command(command)
         if masked is not None:
-            emit("approve")
+            command = masked
         raw_command = command
         try:
             lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
@@ -1763,7 +1738,8 @@ def main():
 
 if __name__ == "__main__":
     main()
-"#;
+"#
+);
 
 /// Deterministic pre-push checkleft gate, run as a `PreToolUse` hook on
 /// every Bash tool call for a standard (implementation) worker.

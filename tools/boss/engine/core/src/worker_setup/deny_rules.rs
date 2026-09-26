@@ -151,7 +151,6 @@ pub fn answer_agent_deny_rules() -> Vec<String> {
 /// exact shell syntax and denies every other tool, including built-in reads.
 pub fn review_guide_allow_rules() -> Vec<String> {
     vec![
-        "Bash(boss propose review-guide:*)".to_owned(),
         r#"Bash("$BOSS_BIN" propose review-guide:*)"#.to_owned(),
         r#"Bash("${BOSS_BIN}" propose review-guide:*)"#.to_owned(),
     ]

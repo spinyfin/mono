@@ -578,7 +578,7 @@ mod tests {
         let approve = json!({
             "hookEventName": "pre_tool_use",
             "toolName": "run_terminal_command",
-            "toolInput": {"command": "boss propose review-guide --body '# Guide'"},
+            "toolInput": {"command": "\"$BOSS_BIN\" propose review-guide --body '# Guide'"},
         });
         let (code, stdout, _stderr) = run_adapter(&adapter_path, &guards[1].command, &approve, true);
         assert_eq!(code, 0);

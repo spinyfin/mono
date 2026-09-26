@@ -3,7 +3,12 @@ use super::guard_python::with_command_tokenizer;
 
 /// Shared by Codex materialization and Claude settings hooks.
 pub fn codex_review_guide_guard_script() -> String {
-    with_command_tokenizer(SCRIPT_TEMPLATE).replace("# REVIEW_GUIDE_COMMAND_FRAGMENT", REVIEW_GUIDE_COMMAND_PY)
+    with_review_guide_command(&with_command_tokenizer(SCRIPT_TEMPLATE))
+}
+
+/// Insert the submission recognizer into another guard without bypassing its checks.
+pub fn with_review_guide_command(template: &str) -> String {
+    template.replace("# REVIEW_GUIDE_COMMAND_FRAGMENT", REVIEW_GUIDE_COMMAND_PY)
 }
 
 const SCRIPT_TEMPLATE: &str = r#"#!/usr/bin/env python3
@@ -25,38 +30,41 @@ if allowed(payload):
     print(json.dumps({"decision": "approve"}))
 else:
     tool = payload.get("tool_name", "(unreadable payload)") if isinstance(payload, dict) else "(unreadable payload)"
-    print(json.dumps({"decision": "block", "reason": "Blocked: review-guide workers may only submit with boss propose review-guide --body followed by a single-quoted Markdown literal; all other tools and commands are forbidden (matched tool: " + str(tool) + ")."}))
+    print(json.dumps({"decision": "block", "reason": "Blocked: review-guide workers may only submit with the quoted BOSS_BIN executable and propose review-guide --body followed by a single-quoted Markdown literal; all other tools and commands are forbidden (matched tool: " + str(tool) + ")."}))
 "#;
 
-pub(super) const REVIEW_GUIDE_COMMAND_PY: &str = r#"
-def review_guide_masked_command(command):
-    """If command is exactly the allowlisted submission, return it with the
-    proven --body literal replaced by a placeholder. Otherwise return None.
-
-    Other guards call this before their own checks so a guide that quotes
-    `swift run` or the Boss data directory is not mistaken for a real
-    launch or path access. Anything outside this exact shape is unchanged.
-    """
-    if not isinstance(command, str):
+/// Render a guard around the shared literal-submission recognizer at compile time.
+/// The fragment avoids shell-sensitive quotes so Claude can embed it in python -c.
+#[macro_export]
+macro_rules! render_review_guide_guard {
+    ($before:literal, $after:literal) => {
+        concat!(
+            $before,
+            r#"def review_guide_masked_command(command):
+    if not isinstance(command,str):
         return None
-    q = chr(39)
-    dq = chr(34)
-    dl = chr(36)
-    bs = chr(92)
-    literal = q + "(?:[^" + q + "]|" + q + dq + q + dq + q + "|" + q + bs + bs + q + q + ")*" + q
-    match = re.fullmatch(r"([\s\S]*?)[ \t]+--body[ \t]+(" + literal + r")[ \t\r\n]*", command)
+    q=chr(39)
+    dq=chr(34)
+    dl=chr(36)
+    bs=chr(92)
+    literal=q+'(?:[^'+q+']|'+q+dq+q+dq+q+'|'+q+bs+bs+q+q+')*'+q
+    match=re.fullmatch(r'([\s\S]*?)[ \t]+--body[ \t]+('+literal+r')[ \t\r\n]*',command)
     if not match:
         return None
-    prefix = match.group(1)
-    prefixes = (
-        "boss propose review-guide",
-        dq + dl + "BOSS_BIN" + dq + " propose review-guide",
-        dq + dl + "{BOSS_BIN}" + dq + " propose review-guide",
-    )
+    prefix=match.group(1)
+    prefixes=(dq+dl+'BOSS_BIN'+dq+' propose review-guide',dq+dl+'{BOSS_BIN}'+dq+' propose review-guide')
     if prefix not in prefixes:
         return None
-    return prefix + " --body " + q + "literal" + q
+    return prefix+' --body '+q+'literal'+q
+"#,
+            $after
+        )
+    };
+}
 
+pub(super) const REVIEW_GUIDE_COMMAND_PY: &str = crate::render_review_guide_guard!(
+    "",
+    r#"
 
 def allowed(payload):
     if not isinstance(payload, dict) or payload.get("tool_name") != "Bash":
@@ -73,7 +81,8 @@ def allowed(payload):
     groups = command_groups(masked)
     return len(groups) == 1 and groups[0][1:] == ["propose", "review-guide", "--body", "literal"]
 
-"#;
+"#
+);
 
 #[cfg(test)]
 mod tests {
@@ -83,22 +92,23 @@ mod tests {
     #[test]
     fn permits_only_literal_guide_submission() {
         for command in [
-            "boss propose review-guide --body '# Guide\n## Problem\nA `code` example: $(literal).\nswift run\nboss engine start\nbazel run //tools/boss/engine/core:engine\n'",
+            "\"$BOSS_BIN\" propose review-guide --body '# Guide\n## Problem\nA `code` example: $(literal).\nswift run\nboss engine start\nbazel run //tools/boss/engine/core:engine\n'",
             "\"$BOSS_BIN\" propose review-guide --body 'author'\"'\"'s guide'",
-            "boss propose review-guide --body 'author'\\''s guide'",
+            "\"$BOSS_BIN\" propose review-guide --body 'author'\\''s guide'",
         ] {
             let payload = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}});
             assert_eq!(decide(payload).0, "approve", "{command}");
         }
         for command in [
-            "boss propose review-guide --body \"$(cat secret)\"",
-            "boss propose review-guide --body 'x'; touch /tmp/x",
-            "boss propose review-guide --body 'x' > /tmp/x",
-            "boss propose review-guide --body-file /tmp/x",
+            "boss propose review-guide --body 'guide'",
+            "\"$BOSS_BIN\" propose review-guide --body \"$(cat secret)\"",
+            "\"$BOSS_BIN\" propose review-guide --body 'x'; touch /tmp/x",
+            "\"$BOSS_BIN\" propose review-guide --body 'x' > /tmp/x",
+            "\"$BOSS_BIN\" propose review-guide --body-file /tmp/x",
             "boss propose done --outcome delivered --summary x",
-            "env BOSS_RUN_ID=other boss propose review-guide --body 'x'",
-            "bash -c \"boss propose review-guide --body 'x'\"",
-            "boss propose review-guide --body 'x' && boss propose review-guide --body 'y'",
+            "env BOSS_RUN_ID=other \"$BOSS_BIN\" propose review-guide --body 'x'",
+            "bash -c \"\"$BOSS_BIN\" propose review-guide --body 'x'\"",
+            "\"$BOSS_BIN\" propose review-guide --body 'x' && \"$BOSS_BIN\" propose review-guide --body 'y'",
         ] {
             assert_eq!(
                 decide(serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}})).0,

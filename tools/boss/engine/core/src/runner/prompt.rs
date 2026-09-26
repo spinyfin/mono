@@ -366,7 +366,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
             // keeps the generic composer sane and proposal-only if ever
             // reached.)
             prompt.push_str(
-                "Expected outcome for this run:\n- read the source material already in your prompt,\n- submit the finished Markdown via `boss propose review-guide --body '<literal>'`,\n- take no other action — that is the only permitted command.\n",
+                "Expected outcome for this run:\n- read the source material already in your prompt,\n- submit the finished Markdown via `\"$BOSS_BIN\" propose review-guide --body '<literal>'`,\n- take no other action — that is the only permitted command.\n",
             );
         }
         ExecutionKind::AutomationTriage

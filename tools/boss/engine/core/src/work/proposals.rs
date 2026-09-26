@@ -171,6 +171,8 @@ impl WorkDb {
         &self,
         input: SubmitWorkerProposalInput<'_>,
     ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
+        let prepared_guide = (input.kind == ProposalKind::ReviewGuide)
+            .then(|| super::review_guide_submission::prepare(self, input.execution_id, input.payload_json));
         // The transaction-holding half. Scoped to a block so the `conn`
         // guard (a lock over `WorkDb`'s single shared connection — see
         // `WorkDb::connect`'s docs) is dropped before the post-commit
@@ -254,7 +256,7 @@ impl WorkDb {
                     input.payload_json,
                     input.kind,
                     &id,
-                    self.path.parent().unwrap_or(std::path::Path::new("")),
+                    prepared_guide.as_ref(),
                 )?),
                 ProposalApplyPolicy::Gated => None,
             };

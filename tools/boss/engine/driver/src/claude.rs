@@ -205,26 +205,11 @@ macro_rules! python_command_guard {
         concat!(
             "python3 -c \"\n",
             "import json,os,sys,re,shlex\n",
-            // Proven `boss propose review-guide --body '<literal>'` submissions
+            // Proven `"$BOSS_BIN" propose review-guide --body '<literal>'` submissions
             // carry Markdown that may quote launch commands or the Boss data
             // dir. Mask only that exact shape so later checks see a placeholder
             // body; anything else is inspected unchanged.
-            "def review_guide_masked_command(command):\n",
-            "    if not isinstance(command,str):\n",
-            "        return None\n",
-            "    q=chr(39)\n",
-            "    dq=chr(34)\n",
-            "    dl=chr(36)\n",
-            "    bs=chr(92)\n",
-            "    literal=q+'(?:[^'+q+']|'+q+dq+q+dq+q+'|'+q+bs+bs+q+q+')*'+q\n",
-            "    match=re.fullmatch(r'([\\s\\S]*?)[ \\t]+--body[ \\t]+('+literal+r')[ \\t\\r\\n]*',command)\n",
-            "    if not match:\n",
-            "        return None\n",
-            "    prefix=match.group(1)\n",
-            "    prefixes=('boss propose review-guide',dq+dl+'BOSS_BIN'+dq+' propose review-guide',dq+dl+'{BOSS_BIN}'+dq+' propose review-guide')\n",
-            "    if prefix not in prefixes:\n",
-            "        return None\n",
-            "    return prefix+' --body '+q+'literal'+q\n",
+            crate::render_review_guide_guard!("", ""),
             "def _emit(d):\n",
             "    print(json.dumps(d))\n",
             "    sys.exit(0)\n",
@@ -252,7 +237,6 @@ macro_rules! python_command_guard {
             "_masked=review_guide_masked_command(cmd)\n",
             "if _masked is not None:\n",
             "    cmd=_masked\n",
-            "    _approve()\n",
             $($body),+,
             "\""
         )
@@ -1397,6 +1381,72 @@ fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     std::fs::write(&tmp, contents)?;
     std::fs::rename(&tmp, path)
 }
+#[cfg(test)]
+mod review_guide_recognizer_tests {
+    // The recognizer must render identically in shell-embedded and standalone guards.
+    use std::io::Write;
+
+    #[test]
+    fn review_guide_recognizers_agree_on_submission_corpus() {
+        let embedded = python_command_guard!("_emit(_masked)\n");
+        let shared = crate::codex::codex_review_guide_guard_script_for_test(
+            "import re,json,sys\n# REVIEW_GUIDE_COMMAND_FRAGMENT\np=json.load(sys.stdin)\nprint(json.dumps(review_guide_masked_command(p['tool_input']['command'])))\n",
+        );
+        let shared = format!("python3 -c {}", super::shell_quote(&shared));
+        let corpus = [
+            (r#""$BOSS_BIN" propose review-guide --body 'guide'"#, true),
+            (
+                r#""${BOSS_BIN}" propose review-guide --body 'author'"'"'s guide'"#,
+                true,
+            ),
+            (r#""$BOSS_BIN" propose review-guide --body 'author'\''s guide'"#, true),
+            (
+                "\"$BOSS_BIN\" propose review-guide --body '# Guide\nswift run\n$(literal)\n'",
+                true,
+            ),
+            ("boss propose review-guide --body 'guide'", false),
+            (r#"$BOSS_BIN propose review-guide --body 'guide'"#, false),
+            (r#""$BOSS_BIN" propose review-guide --body "$(cat secret)""#, false),
+            (r#""$BOSS_BIN" propose review-guide --body 'x'; touch /tmp/x"#, false),
+            (r#""$BOSS_BIN" propose review-guide --body 'x' > /tmp/x"#, false),
+            (r#""$BOSS_BIN" propose review-guide --body-file /tmp/x"#, false),
+            (r#"env "$BOSS_BIN" propose review-guide --body 'x'"#, false),
+            (r#"bash -c "\"$BOSS_BIN\" propose review-guide --body 'x'""#, false),
+            (r#""$BOSS_BIN" propose review-guide --body 'x' && true"#, false),
+            (r#""$BOSS_BIN" propose review-guide --body 'unfinished"#, false),
+            (
+                r#""$BOSS_BIN" propose review-guide --body 'x'$(touch /tmp/x)'y'"#,
+                false,
+            ),
+        ];
+        for (command, recognized) in corpus {
+            let payload = serde_json::json!({"tool_input": {"command": command}});
+            let mut results = Vec::new();
+            for script in [embedded, shared.as_str()] {
+                let mut child = std::process::Command::new("sh")
+                    .args(["-c", script])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(payload.to_string().as_bytes())
+                    .unwrap();
+                let output = child.wait_with_output().unwrap();
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(!result.is_null(), recognized, "{command}: {result}");
+                results.push(result);
+            }
+            assert_eq!(results[0], results[1], "{command}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

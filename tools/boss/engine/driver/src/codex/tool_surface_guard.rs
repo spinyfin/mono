@@ -260,8 +260,6 @@ def main():
     masked = review_guide_masked_command(command)
     if masked is not None:
         command = masked
-    if allowed(payload):
-        emit("approve", "")
     for group in command_groups(command):
         detail = stdin_channel_detail(group)
         if detail:
@@ -333,7 +331,7 @@ mod tests {
     #[test]
     fn guide_submission_literal_is_data_even_when_it_contains_shell_examples() {
         let (decision, reason) = bash(
-            "boss propose review-guide --body '# Guide\nExample:\npython3\nbash\nswift run\nboss engine start\n$(not executed)\n'",
+            "\"$BOSS_BIN\" propose review-guide --body '# Guide\nExample:\npython3\nbash\nswift run\nboss engine start\n$(not executed)\n'",
         );
         assert_eq!(decision, "approve", "{reason}");
     }

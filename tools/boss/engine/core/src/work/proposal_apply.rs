@@ -52,8 +52,6 @@
 //! `record_deferred_scope_item`'s existing precedent of treating the audit
 //! line as non-fatal.
 
-use std::path::Path;
-
 use rusqlite::{OptionalExtension, Transaction};
 
 use super::automations::query_automation;
@@ -168,13 +166,13 @@ pub enum ApplyDecision {
 /// stamped onto (allocated by the caller before this runs, so appliers that
 /// need to reference their own proposal — e.g. to supersede a predecessor —
 /// have it available before the `INSERT`).
-pub fn apply_in_transaction(
+pub(super) fn apply_in_transaction(
     tx: &Transaction<'_>,
     execution_id: &str,
     payload_json: &str,
     kind: ProposalKind,
     proposal_id: &str,
-    artifact_root: &Path,
+    prepared_guide: Option<&Result<super::review_guide_submission::PreparedGuide>>,
 ) -> Result<ApplyDecision> {
     match kind {
         ProposalKind::Attention => apply_attention(tx, execution_id, payload_json).map(ApplyDecision::Applied),
@@ -186,7 +184,7 @@ pub fn apply_in_transaction(
         ProposalKind::AutomationOutcome => apply_automation_outcome(tx, execution_id, payload_json, proposal_id),
         ProposalKind::PrCreated => apply_pr_created(tx, execution_id, payload_json),
         ProposalKind::ReviewGuide => {
-            super::review_guide_submission::accept(tx, execution_id, payload_json, artifact_root)
+            super::review_guide_submission::accept(tx, execution_id, prepared_guide.context("missing prepared guide")?)
         }
         ProposalKind::ReviewReport => apply_review_report(tx, execution_id, payload_json, proposal_id),
         ProposalKind::RunDone => apply_run_done(tx, execution_id, payload_json, proposal_id),
@@ -1309,7 +1307,7 @@ mod tests {
             "{}",
             ProposalKind::FollowupTask,
             "prp_missing",
-            std::path::Path::new(""),
+            None,
         )
         .expect_err("no applier exists for FollowupTask; this must be an error, not a panic");
         assert!(
