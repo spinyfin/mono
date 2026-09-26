@@ -103,13 +103,19 @@ closes that gap, once at boot and periodically thereafter, before
 `BOSS_SPAWN_TOKEN` (`show-environment`, never the `@boss_spawn_token` option
 mirror) against the non-terminal tmux-tracked `work_runs` rows, and rebuilds
 the pool slot claim, `WorkerRegistry` entry, `LiveWorkerState` entry, and
-live-status summarizer for every match. A session whose token instead
-resolves to a **terminal** execution is handed to `worker_readoption` exactly
-as above, via the trigger `tmux_session_sweep`, and emits
-`tmux_adopt` (rebuilt) or the usual `live_worker_readopted` /
-`husk_pane_reconcile` events (handed off) accordingly. A session whose token
-resolves to no row at all is left for `engine/core/src/husk_pane_sweep.rs`'s
-periodic two-pass reap instead of being handled here.
+live-status summarizer for every match. A matching session whose worker pane
+is dead (`#{pane_dead}=1`) is not a live worker: `remain-on-exit` keeps the
+session listed after the command has exited, and that is terminal evidence.
+The sweep records the pane exit status (and a pane-capture snippet when
+readable), terminalizes a still-live execution once, and does not hand the
+session to re-adoption — a dead pane must not disprove an inferred death.
+A session whose token instead resolves to a **terminal** execution and whose
+pane is still live is handed to `worker_readoption` exactly as above, via
+the trigger `tmux_session_sweep`, and emits `tmux_adopt` (rebuilt) or the
+usual `live_worker_readopted` / `husk_pane_reconcile` events (handed off)
+accordingly. A session whose token resolves to no row at all is left for
+`engine/core/src/husk_pane_sweep.rs`'s periodic two-pass reap instead of
+being handled here.
 
 ### Retained worker exits
 
@@ -124,6 +130,7 @@ its live `BOSS_SPAWN_TOKEN` exactly matches the durable run identity.
 
 ## Rules of thumb for future work here
 
+- **A dead pane is terminal evidence.** `remain-on-exit` keeps a tmux session listed after its worker command has exited. `#{pane_dead}=1` must not be treated as a live worker, and it must not disprove an inferred death.
 - **Never make a liveness decision from derived bookkeeping alone** when the decision is irreversible (killing a worker) or duplicating (spawning a second one). Corroborate with `work_runs.shell_pid` via `engine/core/src/durable_liveness.rs`.
 - **`Unknown` is not `Gone`.** A worker with no recorded pid is mid-spawn, not dead. `WorkerProcess::Unknown` and `PaneReleaseOutcome::NoLiveWorker` both exist to keep that case from being read as death — treating it as death reaps live-but-slow spawns and releases cube leases out from under workspaces a worker is about to occupy.
 - **`EPERM` means alive.** `kill(pid, 0)` returning `EPERM` proves the process exists.

@@ -62,7 +62,40 @@ use crate::work::WorkDb;
 /// lookup would lose markers that a raw parse can still recover.
 pub fn driver_for_execution(work_db: &WorkDb, execution_id: &str) -> Option<Arc<dyn AgentDriver>> {
     let slug = resolve_execution_driver_slug(work_db, execution_id)?;
-    match DriverRegistry::default().require(&slug) {
+    require_driver_slug(execution_id, &slug)
+}
+
+/// The driver frozen onto `execution_id` at spawn
+/// ([`WorkDb::launched_driver_slug`] / `work_executions.driver`).
+///
+/// Re-adoption and tmux session adoption must use this rather than
+/// [`driver_for_execution`]: the latter re-derives from the current worker
+/// id and pool policy, which can paint a Codex spawn as Claude Code after
+/// an engine restart. When the launch tuple was never written (a crash
+/// between pane start and the stamp), falls through to
+/// [`driver_for_execution`] so a still-unset column does not invent a
+/// driver from nothing.
+pub fn driver_for_spawned_execution(work_db: &WorkDb, execution_id: &str) -> Option<Arc<dyn AgentDriver>> {
+    match work_db.launched_driver_slug(execution_id) {
+        Ok(Some(slug)) if !slug.trim().is_empty() => {
+            if let Some(driver) = require_driver_slug(execution_id, &slug) {
+                return Some(driver);
+            }
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(
+                execution_id,
+                error = %format!("{err:#}"),
+                "driver transcript: launched-driver lookup failed; falling back to live resolution",
+            );
+        }
+    }
+    driver_for_execution(work_db, execution_id)
+}
+
+fn require_driver_slug(execution_id: &str, slug: &str) -> Option<Arc<dyn AgentDriver>> {
+    match DriverRegistry::default().require(slug) {
         Ok(driver) => Some(driver),
         Err(err) => {
             tracing::warn!(
@@ -398,6 +431,29 @@ mod tests {
         assert!(
             assistant_texts(&events).iter().any(|text| text.contains(marker)),
             "parse_execution_transcript must normalize through the execution's own driver",
+        );
+    }
+
+    /// A launch-config stamp is authoritative for re-adoption even when the
+    /// worker id would otherwise force the review-pool driver.
+    #[test]
+    fn spawned_driver_keeps_the_launch_stamp_over_a_review_pool_worker_id() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, &product.id, "codex chore");
+        let execution = create_ready_chore_execution(&db, &chore.id);
+        db.start_execution_run(&execution.id, "review-1", "mono", "lease-1", "ws-1", "/tmp/ws-1")
+            .unwrap();
+        db.record_execution_launch_config(&execution.id, "codex", "gpt-5.5-codex", None)
+            .unwrap();
+
+        let live = driver_for_execution(&db, &execution.id).expect("live resolution");
+        assert_eq!(live.descriptor().name, "claude");
+        let spawned = driver_for_spawned_execution(&db, &execution.id).expect("spawned driver");
+        assert_eq!(
+            spawned.descriptor().name,
+            "codex",
+            "re-adoption must keep the driver recorded at spawn",
         );
     }
 

@@ -41,6 +41,10 @@
 //!    session with a matching token is exactly the durable evidence that
 //!    write was only ever lost in-memory, not that the session never
 //!    happened.
+//!
+//!    A matching session whose worker pane is dead (`#{pane_dead}=1`) is
+//!    not a live worker (`remain-on-exit` keeps the session listed). See
+//!    [`dead_pane`].
 //! 4. Any live token that matched no adoptable row is looked up again with no
 //!    status filter at all
 //!    ([`crate::work::WorkDb::execution_id_for_tmux_spawn_token`]). If that
@@ -48,11 +52,9 @@
 //!    row the engine believes is dead — precisely the contradiction
 //!    [`crate::worker_readoption`] exists to resolve — so it is handed off
 //!    to that policy unchanged, via
-//!    [`LiveWorkerConvergence::converge_live_worker`]. A token that resolves
-//!    to nothing at all (or to a non-terminal execution this pass didn't
-//!    adopt for some other reason, e.g. a non-`local` host) is left alone:
-//!    the leaked/husk fan-out sweep across every enumerated session is a
-//!    separate, dependent pass.
+//!    [`LiveWorkerConvergence::converge_live_worker`], unless the worker
+//!    pane is dead (that must not disprove an inferred death). A token that
+//!    resolves to nothing at all is left for the husk sweep.
 //!
 //! Best-effort throughout, matching every other startup reconciler in this
 //! crate: a DB read that fails, or a single session's `show-environment` or
@@ -106,6 +108,7 @@ use crate::spawn_flow::{TMUX_SESSION_SCHEMA, WorkerSpawner};
 use crate::work::{TmuxRunHandle, WorkDb};
 use crate::worker_readoption::LiveWorkerConvergence;
 
+mod dead_pane;
 mod persist;
 pub(crate) use persist::persist_observed_pane_state;
 use persist::{PaneObservation, PersistedPanePid, adoption_pid_snapshot, persist_observed_pane_pid};
@@ -410,6 +413,11 @@ pub struct TmuxAdoptionOutcome {
     /// adopted or handed to contradiction convergence; the periodic husk
     /// sweep confirms and reaps them separately.
     pub untracked_sessions: Vec<UntrackedTmuxSession>,
+    /// Sessions whose worker pane was dead (`#{pane_dead} == 1`). Not
+    /// adopted and not handed to re-adoption: a dead pane is terminal
+    /// evidence. See [`dead_pane`].
+    #[builder(default)]
+    pub dead_panes: usize,
 }
 
 /// Run the startup invocation of [`run_adoption_pass`], adding the
@@ -815,6 +823,20 @@ async fn adopt_one<S>(
         return;
     };
 
+    if dead_pane::skip_if_not_live(
+        work_db,
+        tmux,
+        dispatch_events,
+        execution_id,
+        session_name,
+        &handle.tmux_spawn_token,
+        outcome,
+    )
+    .await
+    {
+        return;
+    }
+
     // A fresh read, not the possibly-stale `handle.tmux_pane_pid`: this is
     // both the adoption's proof of the current pid and the value every durable
     // liveness reader must see before this pass rebuilds in-memory state.
@@ -877,7 +899,7 @@ async fn adopt_one<S>(
         }
     };
 
-    let driver = crate::driver_transcript::driver_for_execution(work_db, execution_id).or_else(|| {
+    let driver = crate::driver_transcript::driver_for_spawned_execution(work_db, execution_id).or_else(|| {
         crate::driver::DriverRegistry::default()
             .require(crate::effort::ENGINE_DEFAULT_DRIVER)
             .ok()
@@ -986,6 +1008,21 @@ async fn classify_untracked_session<S>(
             return;
         }
     };
+
+    if dead_pane::skip_if_not_live(
+        work_db,
+        tmux,
+        dispatch_events,
+        &execution_id,
+        &session.session_name,
+        &session.spawn_token,
+        outcome,
+    )
+    .await
+    {
+        return;
+    }
+
     if execution.status.is_terminal() {
         let Some(schema_check) = schema_check else {
             // The schema itself could not be read; already logged where it
@@ -1550,6 +1587,13 @@ mod tests {
         schemas: HashMap<String, String>,
         /// `display-message #{pane_pid}` answer per session.
         pane_pids: HashMap<String, String>,
+        /// `display-message #{pane_dead}` answer per session. Absent entries
+        /// answer `"0"` (live pane), matching a healthy worker session.
+        pane_dead: HashMap<String, String>,
+        /// `display-message #{pane_dead_status}` answer per session.
+        pane_dead_status: HashMap<String, String>,
+        /// `capture-pane -p` answer per session.
+        pane_output: HashMap<String, String>,
         /// Server-scoped option store, seeded before the call and mutated by
         /// `set-option -s` during it. `None` means the option starts unset.
         server_options: StdMutex<HashMap<String, String>>,
@@ -1625,8 +1669,20 @@ mod tests {
                 Some("display-message") => {
                     assert_eq!(args[4], "-t");
                     let session = &args[5];
-                    let pid = self.pane_pids.get(session).cloned().unwrap_or_else(|| "0".to_owned());
-                    Ok(ok_output(format!("{pid}\n")))
+                    let field = args.get(6).map(String::as_str).unwrap_or("");
+                    let value = match field {
+                        "#{pane_pid}" => self.pane_pids.get(session).cloned().unwrap_or_else(|| "0".to_owned()),
+                        "#{pane_dead}" => self.pane_dead.get(session).cloned().unwrap_or_else(|| "0".to_owned()),
+                        "#{pane_dead_status}" => self.pane_dead_status.get(session).cloned().unwrap_or_default(),
+                        other => panic!("unexpected display-message field in test: {other:?} (full args={args:?})"),
+                    };
+                    Ok(ok_output(format!("{value}\n")))
+                }
+                Some("capture-pane") => {
+                    assert_eq!(args[3], "-p");
+                    assert_eq!(args[4], "-t");
+                    let session = &args[5];
+                    Ok(ok_output(self.pane_output.get(session).cloned().unwrap_or_default()))
                 }
                 Some("show-options") => {
                     assert_eq!(args[3], "-s", "tmux boot adoption never reads a session-scoped option");
@@ -1850,6 +1906,9 @@ mod tests {
 
     #[path = "tmux_adoption_semantic_progress_tests.rs"]
     mod semantic_progress_tests;
+
+    #[path = "tmux_adoption_dead_pane_tests.rs"]
+    mod dead_pane_tests;
 
     /// The cardinal case: engine restarts, the worker's tmux session (and its
     /// non-terminal execution row) survived. The pass must rebuild the slot

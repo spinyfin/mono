@@ -173,11 +173,22 @@ impl ServerState {
         // `persist_tmux_identity_after_observation`, so it must be probed
         // too — trusting the stored number unprobed would make this term
         // true exactly when the probed `observed_shell_pid` term says dead.
-        // Only a currently-alive process (by either pid), a live slot, or a
-        // mid-turn driver hook (never `session_end`) counts.
-        let process_live = observed_shell_pid.is_some()
-            || crate::durable_liveness::probe_recorded_pid(latest_tmux_observed_pid).is_alive()
-            || registry_slot.is_some();
+        // A token-verified `#{pane_dead}` observation is terminal evidence:
+        // a retained remain-on-exit session must not disprove an inferred
+        // death, even if a registry slot or a leftover pane pid is still
+        // recorded. Only a currently-alive process (by either pid), a live
+        // slot, or a mid-turn driver hook (never `session_end`) counts —
+        // and never when the pane itself is already known dead.
+        let recorded_pane_dead = self
+            .work_db
+            .tmux_pane_observation_for_execution(&execution.id)
+            .ok()
+            .flatten()
+            .is_some_and(|obs| obs.pane_dead == Some(true) || obs.kind == crate::work::TmuxPaneObservationKind::Dead);
+        let process_live = !recorded_pane_dead
+            && (observed_shell_pid.is_some()
+                || crate::durable_liveness::probe_recorded_pid(latest_tmux_observed_pid).is_alive()
+                || registry_slot.is_some());
         let hook_liveness = trigger != crate::worker_readoption::SESSION_END_TRIGGER
             && !crate::worker_readoption::NON_HOOK_TRIGGERS.contains(&trigger);
         let positive_liveness = process_live || hook_liveness;
@@ -314,15 +325,12 @@ impl ServerState {
         // them depends on the app hosting a pane. A run whose pane the app
         // cannot name still has a rollout to read.
         //
-        // Ask the resolved driver, rather than assume — the same
-        // derivation `spawn_flow` makes at spawn time. The driver is
-        // durably resolvable from the run's task/product precedence, so
-        // there is no reason for re-adoption to guess, and guessing is not
-        // cosmetic: `awaiting_input_capable` gates the `WaitingForInput`
-        // promotion in `live_worker_state`, so a hardcoded `true` would let
-        // `mark_stalled_spawns` paint a re-adopted non-Claude worker as
-        // awaiting input — the wrong-indicator class this path exists to
-        // end.
+        // Ask the driver frozen at spawn (`work_executions.driver`), not a
+        // live re-derivation from worker id or pool policy. Re-deriving is
+        // how a Codex spawn was labelled Claude Code after re-adoption.
+        // `awaiting_input_capable` gates the `WaitingForInput` promotion in
+        // `live_worker_state`, so the wrong driver here is the
+        // wrong-indicator class this path exists to end.
         //
         // The spawn-time *model* is not persisted, so the label is the
         // driver's, not a specific model: being vague about the model is
@@ -332,7 +340,7 @@ impl ServerState {
         // The slug not resolving at all (unknown execution, or a row with
         // no task) falls back to the engine default driver, so even the
         // degraded path states some driver's answer rather than a literal.
-        let driver = crate::driver_transcript::driver_for_execution(&self.work_db, run_id).or_else(|| {
+        let driver = crate::driver_transcript::driver_for_spawned_execution(&self.work_db, run_id).or_else(|| {
             crate::driver::DriverRegistry::default()
                 .require(boss_engine_effort::ENGINE_DEFAULT_DRIVER)
                 .ok()
