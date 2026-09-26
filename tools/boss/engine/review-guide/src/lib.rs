@@ -89,8 +89,45 @@ pub fn render_prompt(metadata: &PromptMetadata<'_>) -> String {
         .replace("{{HEAD_SHA}}", metadata.head_sha)
 }
 
-/// Render every changed file's pinned before/after content and diff hunk
-/// from the immutable packet into read-only Markdown context.
+/// Total byte budget for [`render_source_context`]'s rendered output (the
+/// whole embedded diff/before/after/omissions block, not the whole prompt).
+///
+/// Derivation: the review-guide worker runs on `gpt-6-astra` (see
+/// `resolve_review_guide_spawn_config` in `engine/core`'s `worker_spawn`),
+/// whose driver reports a 258,400-token context window. Reserving ~40,000
+/// tokens for the fixed prompt template, PR title/body, and the model's own
+/// output leaves ~218,400 tokens for source context. Diff- and code-heavy
+/// text tokenizes less efficiently than English prose, so this uses a
+/// conservative 3 bytes/token (rather than the ~4 typical for prose),
+/// giving a derived budget of 218,400 * 3 = 655,200 bytes. Rounded down to a
+/// clean, clearly-conservative constant.
+pub const MAX_TOTAL_SOURCE_CONTEXT_BYTES: usize = 600_000;
+
+/// [`render_source_context`] refused to render: even the mandatory part of
+/// the context (the comparison header, PR description, and every changed
+/// file's diff hunk — never omitted, since a reviewer without diffs has
+/// nothing to ground a guide in) already exceeds the total budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceContextBudgetExceeded {
+    pub required_bytes: usize,
+    pub budget_bytes: usize,
+}
+
+impl fmt::Display for SourceContextBudgetExceeded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "review-guide source context's mandatory diffs alone need {} bytes, exceeding the {}-byte total budget",
+            self.required_bytes, self.budget_bytes
+        )
+    }
+}
+
+impl std::error::Error for SourceContextBudgetExceeded {}
+
+/// Render every changed file's diff hunk, and as much of its pinned
+/// before/after content as fits [`MAX_TOTAL_SOURCE_CONTEXT_BYTES`], into
+/// read-only Markdown context.
 ///
 /// This is the review-guide worker's entire "source access": the worker has
 /// no interactive read tool (its guard
@@ -99,69 +136,176 @@ pub fn render_prompt(metadata: &PromptMetadata<'_>) -> String {
 /// can possibly cite must already be present here. The rendering is
 /// revision-aware by construction: it reads only the packet's already-pinned
 /// `before`/`after` content, never a live checkout or a moving branch.
-pub fn render_source_context(packet: &SourcePacket) -> String {
-    let mut out = String::new();
-    out.push_str("## Source context\n\n");
-    out.push_str(&format!(
+///
+/// Every changed file's diff hunk is always included in full — it is never
+/// cut to make room, and content is never truncated mid-file. Full
+/// before/after file content is included only while budget remains; a side
+/// that does not fit is instead listed as a named omission in the same
+/// "Collection omissions" section used for capture-time gaps, so the guide
+/// and its reader both know what was not seen. If the mandatory diffs alone
+/// exceed the budget, this returns [`SourceContextBudgetExceeded`] instead of
+/// silently sending a truncated prompt.
+pub fn render_source_context(packet: &SourcePacket) -> Result<String, SourceContextBudgetExceeded> {
+    render_source_context_with_budget(packet, MAX_TOTAL_SOURCE_CONTEXT_BYTES)
+}
+
+fn render_source_context_with_budget(
+    packet: &SourcePacket,
+    budget_bytes: usize,
+) -> Result<String, SourceContextBudgetExceeded> {
+    let mut header = String::new();
+    header.push_str("## Source context\n\n");
+    header.push_str(&format!(
         "Comparison: `{}` base `{}` (merge base `{}`) to head `{}`.\n\n",
         packet.canonical_pr_url, packet.observed_base_sha, packet.merge_base_sha, packet.head_sha
     ));
     if let Some(body) = &packet.body
         && !body.is_empty()
     {
-        out.push_str("### PR description\n\n");
-        out.push_str(body);
-        out.push_str("\n\n");
+        header.push_str("### PR description\n\n");
+        header.push_str(body);
+        header.push_str("\n\n");
     }
-    for file in &packet.files {
-        out.push_str(&format!("### `{}` ({:?})\n\n", file.path, file.change_kind));
-        if let Some(previous) = &file.previous_path {
-            out.push_str(&format!("Renamed from `{previous}`.\n\n"));
-        }
-        if let Some(patch) = &file.patch {
-            out.push_str("Diff hunk:\n\n```diff\n");
-            out.push_str(patch);
-            out.push_str("\n```\n\n");
-        }
-        render_pinned_side(&mut out, "Before (merge base)", file.before.as_ref());
-        render_pinned_side(&mut out, "After (head)", file.after.as_ref());
+
+    let mandatory_sections: Vec<String> = packet.files.iter().map(render_mandatory_file_section).collect();
+
+    // The "Collection omissions" section is itself part of the rendered
+    // budget (see `MAX_TOTAL_SOURCE_CONTEXT_BYTES`'s doc comment): its
+    // header/footer, plus a line for every capture-time omission the packet
+    // already carries, are reserved as mandatory up front, alongside the
+    // diffs. Any file with pinned before/after content could still fall back
+    // to a budget-driven omission below, so the section's fixed overhead is
+    // reserved whenever that is possible, even if no such fallback ends up
+    // happening — the alternative (reserving it lazily, only once a
+    // fallback is actually needed) can leave too little of the remaining
+    // budget to afford the section's own header/footer, silently losing the
+    // very omission note the section exists to report.
+    let static_omission_lines: Vec<String> = packet.omissions.iter().map(render_omission_line).collect();
+    let has_static_omissions = !static_omission_lines.is_empty();
+    let has_optional_content = packet
+        .files
+        .iter()
+        .any(|file| file.before.is_some() || file.after.is_some());
+    let needs_omissions_capacity = has_static_omissions || has_optional_content;
+    let omissions_overhead = OMISSIONS_HEADER.len() + OMISSIONS_FOOTER.len();
+
+    let mut required_bytes = header.len() + mandatory_sections.iter().map(String::len).sum::<usize>();
+    if needs_omissions_capacity {
+        required_bytes += omissions_overhead + static_omission_lines.iter().map(String::len).sum::<usize>();
     }
-    if !packet.omissions.is_empty() {
-        out.push_str("### Collection omissions\n\n");
-        out.push_str(
-            "The following source material could not be captured. Do not invent content for these; state the \
-             limitation instead.\n\n",
-        );
-        for omission in &packet.omissions {
-            let path = omission.path.as_deref().unwrap_or("(unknown path)");
-            let side = omission
-                .side
-                .map(|side| format!("{side:?}"))
-                .unwrap_or_else(|| "both".to_owned());
-            out.push_str(&format!("- `{path}` ({side}): {}\n", omission.reason));
-        }
-        out.push('\n');
+    if required_bytes > budget_bytes {
+        return Err(SourceContextBudgetExceeded {
+            required_bytes,
+            budget_bytes,
+        });
     }
-    out
+
+    let mut out = header;
+    let mut remaining_bytes = budget_bytes - required_bytes;
+    let mut budget_omissions = Vec::new();
+    for (file, section) in packet.files.iter().zip(mandatory_sections) {
+        out.push_str(&section);
+        for (label, side, source) in [
+            ("Before (merge base)", SourceSide::Before, file.before.as_ref()),
+            ("After (head)", SourceSide::After, file.after.as_ref()),
+        ] {
+            let Some(block) = render_pinned_side_block(label, source) else {
+                continue;
+            };
+            if block.len() <= remaining_bytes {
+                remaining_bytes -= block.len();
+                out.push_str(&block);
+                continue;
+            }
+
+            // Falling back to an omission still costs bytes — the entry's
+            // own rendered line, drawn from the same remaining budget as
+            // full content would have been. The section's header/footer
+            // were already reserved above, so only the line itself is
+            // charged here.
+            let omission = boss_pr_review_sources::SourceOmission {
+                path: Some(file.path.clone()),
+                side: Some(side),
+                reason: format!(
+                    "omitted to stay within the {budget_bytes}-byte total source-context budget \
+                     ({block_bytes} bytes needed)",
+                    block_bytes = block.len(),
+                ),
+                terminal: true,
+            };
+            let line = render_omission_line(&omission);
+            if line.len() <= remaining_bytes {
+                remaining_bytes -= line.len();
+                budget_omissions.push(omission);
+            }
+            // If even the omission line can't be afforded, this particular
+            // gap is silently dropped: budget_bytes is too tight to note
+            // every omission, and staying within budget takes priority.
+        }
+    }
+
+    if needs_omissions_capacity && (has_static_omissions || !budget_omissions.is_empty()) {
+        out.push_str(OMISSIONS_HEADER);
+        for line in &static_omission_lines {
+            out.push_str(line);
+        }
+        for omission in &budget_omissions {
+            out.push_str(&render_omission_line(omission));
+        }
+        out.push_str(OMISSIONS_FOOTER);
+    }
+    Ok(out)
 }
 
-fn render_pinned_side(out: &mut String, label: &str, source: Option<&boss_pr_review_sources::PinnedSource>) {
-    let Some(source) = source else { return };
-    out.push_str(&format!("**{label}** (`{}` @ `{}`)", source.path, source.sha));
+const OMISSIONS_HEADER: &str = "### Collection omissions\n\n\
+The following source material could not be captured. Do not invent content for these; state the limitation \
+instead.\n\n";
+const OMISSIONS_FOOTER: &str = "\n";
+
+fn render_omission_line(omission: &boss_pr_review_sources::SourceOmission) -> String {
+    let path = omission.path.as_deref().unwrap_or("(unknown path)");
+    let side = omission
+        .side
+        .map(|side| format!("{side:?}"))
+        .unwrap_or_else(|| "both".to_owned());
+    format!("- `{path}` ({side}): {}\n", omission.reason)
+}
+
+/// The part of a file's rendered section that is never subject to the
+/// budget: its heading, rename note, and diff hunk.
+fn render_mandatory_file_section(file: &boss_pr_review_sources::SourceFile) -> String {
+    let mut section = String::new();
+    section.push_str(&format!("### `{}` ({:?})\n\n", file.path, file.change_kind));
+    if let Some(previous) = &file.previous_path {
+        section.push_str(&format!("Renamed from `{previous}`.\n\n"));
+    }
+    if let Some(patch) = &file.patch {
+        section.push_str("Diff hunk:\n\n```diff\n");
+        section.push_str(patch);
+        section.push_str("\n```\n\n");
+    }
+    section
+}
+
+fn render_pinned_side_block(label: &str, source: Option<&boss_pr_review_sources::PinnedSource>) -> Option<String> {
+    let source = source?;
+    let mut block = String::new();
+    block.push_str(&format!("**{label}** (`{}` @ `{}`)", source.path, source.sha));
     match (&source.content, &source.omission) {
         (Some(content), _) => {
-            out.push_str(":\n\n```\n");
-            out.push_str(content);
+            block.push_str(":\n\n```\n");
+            block.push_str(content);
             if !content.ends_with('\n') {
-                out.push('\n');
+                block.push('\n');
             }
-            out.push_str("```\n\n");
+            block.push_str("```\n\n");
         }
         (None, Some(reason)) => {
-            out.push_str(&format!(" — omitted: {reason}\n\n"));
+            block.push_str(&format!(" — omitted: {reason}\n\n"));
         }
-        (None, None) => out.push_str(" — omitted: no content captured\n\n"),
+        (None, None) => block.push_str(" — omitted: no content captured\n\n"),
     }
+    Some(block)
 }
 
 /// A guide that passed structural and reference validation, ready to become
@@ -429,6 +573,48 @@ mod tests {
         }
     }
 
+    /// A packet with `file_count` files, each with its own diff hunk and
+    /// distinct before/after content, so budget apportionment across files
+    /// (not just within one file) can be exercised.
+    fn multi_file_packet(file_count: usize) -> SourcePacket {
+        let mut base = packet();
+        base.files = (0..file_count)
+            .map(|i| {
+                let before_content = format!("fn f_{i}() {{\n    old_{i}();\n}}\n");
+                let after_content = format!("fn f_{i}() {{\n    new_{i}();\n}}\n");
+                SourceFile {
+                    path: format!("src/file_{i}.rs"),
+                    previous_path: None,
+                    change_kind: ChangeKind::Modified,
+                    additions: 1,
+                    deletions: 1,
+                    patch: Some(format!("@@ -1,1 +1,1 @@\n-old_{i}\n+new_{i}")),
+                    before: Some(
+                        PinnedSource::builder()
+                            .repository("acme/widget")
+                            .sha("b".repeat(40))
+                            .path(format!("src/file_{i}.rs"))
+                            .content(before_content.clone())
+                            .content_hash(sha256_hex(&before_content))
+                            .byte_count(before_content.len() as u64)
+                            .build(),
+                    ),
+                    after: Some(
+                        PinnedSource::builder()
+                            .repository("acme/widget")
+                            .sha("c".repeat(40))
+                            .path(format!("src/file_{i}.rs"))
+                            .content(after_content.clone())
+                            .content_hash(sha256_hex(&after_content))
+                            .byte_count(after_content.len() as u64)
+                            .build(),
+                    ),
+                }
+            })
+            .collect();
+        base
+    }
+
     fn sha256_hex(text: &str) -> String {
         Sha256::digest(text.as_bytes())
             .iter()
@@ -501,11 +687,117 @@ mod tests {
 
     #[test]
     fn source_context_embeds_pinned_content_and_diff() {
-        let context = render_source_context(&packet());
+        let context = render_source_context(&packet()).expect("fits the default budget");
         assert!(context.contains("src/retry.rs"));
         assert!(context.contains("old();"));
         assert!(context.contains("new();"));
         assert!(context.contains("@@ -1,3 +1,3 @@"));
+    }
+
+    #[test]
+    fn budget_omits_full_content_but_keeps_diffs_and_names_the_omission() {
+        let packet = packet();
+        let file = &packet.files[0];
+        let before_block =
+            render_pinned_side_block("Before (merge base)", file.before.as_ref()).expect("fixture has before content");
+        let after_block =
+            render_pinned_side_block("After (head)", file.after.as_ref()).expect("fixture has after content");
+
+        // Enough for the header + diff hunk + the "Collection omissions"
+        // section's own overhead (measured via the too-small-budget error),
+        // plus one byte less than the smaller of the two content blocks —
+        // so neither side's full content can fit, but there is still room
+        // for both of their omission notes.
+        let mandatory_bytes = render_source_context_with_budget(&packet, 1)
+            .unwrap_err()
+            .required_bytes;
+        let budget = mandatory_bytes + before_block.len().min(after_block.len()) - 1;
+
+        let context =
+            render_source_context_with_budget(&packet, budget).expect("mandatory diff alone fits this budget");
+        assert!(context.contains("@@ -1,3 +1,3 @@"), "diff hunk must never be omitted");
+        assert!(!context.contains("old();"), "before content should not fit the budget");
+        assert!(!context.contains("new();"), "after content should not fit the budget");
+        assert!(context.contains("### Collection omissions"));
+        assert!(context.contains("src/retry.rs"));
+        assert!(context.contains("total source-context budget"));
+        assert!(
+            context.len() <= budget,
+            "rendered context ({}) must stay within budget ({budget})",
+            context.len()
+        );
+    }
+
+    #[test]
+    fn diffs_alone_over_budget_fails_loudly() {
+        let err = render_source_context_with_budget(&packet(), 10).unwrap_err();
+        assert!(err.required_bytes > 10);
+        assert_eq!(err.budget_bytes, 10);
+        assert!(err.to_string().contains("exceeding the 10-byte total budget"));
+    }
+
+    #[test]
+    fn budget_holds_across_many_omitted_files() {
+        let packet = multi_file_packet(20);
+        let mandatory_bytes = render_source_context_with_budget(&packet, 1)
+            .unwrap_err()
+            .required_bytes;
+
+        let file0 = &packet.files[0];
+        let before0 =
+            render_pinned_side_block("Before (merge base)", file0.before.as_ref()).expect("fixture has before");
+        let after0 = render_pinned_side_block("After (head)", file0.after.as_ref()).expect("fixture has after");
+
+        // The second file's "Before" omission line, sized against a
+        // placeholder budget of the same order of magnitude as the real one
+        // computed below (only its digit count affects the line's length).
+        let file1 = &packet.files[1];
+        let before1 =
+            render_pinned_side_block("Before (merge base)", file1.before.as_ref()).expect("fixture has before");
+        let placeholder_omission = boss_pr_review_sources::SourceOmission {
+            path: Some(file1.path.clone()),
+            side: Some(SourceSide::Before),
+            reason: format!(
+                "omitted to stay within the {mandatory_bytes}-byte total source-context budget ({} bytes needed)",
+                before1.len()
+            ),
+            terminal: true,
+        };
+        let before1_omission_line_len = render_omission_line(&placeholder_omission).len();
+
+        // Exactly enough for the first file's full before/after content,
+        // plus the second file's "Before" omission note — and not one byte
+        // more. That leaves every other block (the second file's "After",
+        // and all 18 remaining files) with no room at all, forcing many
+        // omissions while still proving full content and omission notes
+        // can coexist within one budget.
+        let budget = mandatory_bytes + before0.len() + after0.len() + before1_omission_line_len;
+
+        let context =
+            render_source_context_with_budget(&packet, budget).expect("mandatory diffs alone fit this budget");
+        assert!(
+            context.len() <= budget,
+            "rendered context ({}) must stay within budget ({budget}) even with many omissions",
+            context.len()
+        );
+        assert!(context.contains("### Collection omissions"));
+        for i in 0..20 {
+            assert!(
+                context.contains(&format!("src/file_{i}.rs")),
+                "every file's diff must always be present, including src/file_{i}.rs"
+            );
+        }
+        // Order-dependent apportionment: budget is spent on earlier files
+        // first, so the very first file should keep its full content while
+        // a later one is exhausted into an omission instead.
+        assert!(
+            context.contains("old_0();") && context.contains("new_0();"),
+            "first file should retain full content before budget runs out"
+        );
+        assert!(
+            !context.contains("old_19();") && !context.contains("new_19();"),
+            "last file's full content must be omitted once budget runs out"
+        );
     }
 
     #[test]
