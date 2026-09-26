@@ -1737,3 +1737,73 @@ fn post_merge_verdict_materialises_a_followup_despite_matching_the_prior_reviewe
     );
     assert_eq!(verdict.revision_task_id.as_deref(), Some(created.as_str()));
 }
+
+/// A follow-up minted from a `PostMerge` batch must be recognisable as such
+/// in both places an operator or a PR reader would look: the work-item
+/// title (kanban/list views) must be prefixed to identify it, and the
+/// follow-up's description (the brief the worker turns into its PR
+/// description) must explicitly name the post-merge review and link the
+/// origin PR — driven from the batch's own durable `pr_url`, not left to the
+/// reviewing worker to remember. `PreMerge` follow-ups are unaffected (see
+/// the ordinary merged-origin-at-apply-time coverage elsewhere in this
+/// file), since only a `PostMerge` batch takes this branch.
+#[test]
+fn post_merge_verdict_followup_states_title_and_origin_provenance() {
+    let db = WorkDb::open(temp_db_path("verdict-apply-post-merge-title-provenance")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    bind_merged_pr(&db, &cycle_root.id);
+
+    let merge_sha = "merge-commit-sha";
+    let post_merge_reviewer = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            post_merge_batch_input(cycle_root.id.clone(), merge_sha),
+            &[member(
+                ReviewBatchMemberRole::PostMergeReviewer,
+                Some(post_merge_reviewer.id.clone()),
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &post_merge_reviewer.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &post_merge_findings_verdict_payload(&batch.id, merge_sha),
+            idempotency_key: "post-merge-verdict-title-provenance",
+        })
+        .unwrap()
+        .unwrap();
+
+    let created = db
+        .apply_review_verdict_proposal(&outcome.proposal.id, &FakePrStateChecker::always(PrOpenState::Merged))
+        .unwrap()
+        .expect("a post-merge verdict's findings must materialise a follow-up");
+    let task = query_task(&db.connect().unwrap(), &created).unwrap().unwrap();
+    assert_eq!(task.kind, TaskKind::Followup);
+    assert!(
+        task.name.starts_with("Post-merge review findings: "),
+        "follow-up title must identify it as post-merge review findings; got {:?}",
+        task.name
+    );
+    assert!(
+        task.description.contains("found in post-merge review of"),
+        "follow-up description must state it was found in post-merge review; got {:?}",
+        task.description
+    );
+    assert!(
+        task.description.contains(PR_URL),
+        "follow-up description must link the origin PR; got {:?}",
+        task.description
+    );
+}

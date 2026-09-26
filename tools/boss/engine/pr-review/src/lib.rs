@@ -50,7 +50,8 @@ pub use parsing::{
 pub use post_merge_render::{render_post_merge_reviewer_claude_md, render_post_merge_reviewer_initial_prompt};
 pub use render::{
     REVISION_CLOSE_SENTENCE, ReviewOrigin, ReviewerReportDestination, render_batch_reviewer_initial_prompt,
-    render_reviewer_claude_md, render_reviewer_initial_prompt, render_revision_instructions, render_revision_title,
+    render_post_merge_followup_provenance, render_post_merge_followup_title, render_reviewer_claude_md,
+    render_reviewer_initial_prompt, render_revision_instructions, render_revision_title,
 };
 pub use supervisor_render::{SupervisorReportInput, render_supervisor_claude_md, render_supervisor_initial_prompt};
 pub use supervisor_types::{

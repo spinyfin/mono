@@ -185,8 +185,26 @@ impl WorkDb {
             task_short_id: origin_task.short_id,
             pr_number: Some(batch.pr_number),
         };
-        let instructions = crate::pr_review::render_revision_instructions(&review_result, origin);
-        let title = crate::pr_review::render_revision_title(origin, review_result.findings.len());
+        // A `PostMerge` batch's origin PR is already merged by the time its
+        // verdict is reviewed at all (the reviewer ran on the landed merge
+        // commit), so `materialize_review_findings` below always takes the
+        // `parent_no_longer_revisable` fallback into a standalone follow-up —
+        // never a live revision on an open PR. That follow-up's title and
+        // description must say so explicitly (title recognisable in the
+        // kanban; description carrying the origin-PR link so the resulting
+        // PR states its provenance), which the ordinary pre-merge rendering
+        // does not. `PreMerge`/legacy title and instructions are unchanged.
+        let (title, instructions) = if batch.phase == boss_protocol::ReviewBatchPhase::PostMerge {
+            let title = crate::pr_review::render_post_merge_followup_title(origin, review_result.findings.len());
+            let mut instructions = crate::pr_review::render_post_merge_followup_provenance(&batch.pr_url);
+            instructions.push_str(&crate::pr_review::render_revision_instructions(&review_result, origin));
+            (title, instructions)
+        } else {
+            (
+                crate::pr_review::render_revision_title(origin, review_result.findings.len()),
+                crate::pr_review::render_revision_instructions(&review_result, origin),
+            )
+        };
 
         // Prefer the existing materialisation keyed on this proposal. A reapply
         // after the cycle increment has landed would otherwise look like a
