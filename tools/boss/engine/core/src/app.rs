@@ -2544,6 +2544,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::RemoveHostTag { .. } => Box::pin(hosts::handle_remove_host_tag(ctx, r)),
             r @ FrontendRequest::ReorderProjectTasks { .. } => Box::pin(projects::handle_reorder_project_tasks(ctx, r)),
             r @ FrontendRequest::RequestExecution { .. } => Box::pin(executions::handle_request_execution(ctx, r)),
+            r @ FrontendRequest::ResolveWorkerRecoveryAttention { .. } => {
+                Box::pin(attentions::handle_resolve_worker_recovery_attention(ctx, r))
+            }
             r @ FrontendRequest::ResolveProjectDesignDoc { .. } => {
                 Box::pin(projects::handle_resolve_project_design_doc(ctx, r))
             }
