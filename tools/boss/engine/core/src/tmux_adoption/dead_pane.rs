@@ -128,6 +128,19 @@ pub(super) async fn reconcile_dead_worker_pane(
     persist_observed_pane_state(work_db, execution_id, spawn_token, session_name, &observation);
 
     let reason = dead_pane_reason(session_name, pane_dead_status.as_deref(), last_output.as_deref());
+    // Persist pane-capture diagnostics against the matched run even when
+    // this pass does not perform the terminal transition (dead-pid
+    // reconciliation commonly orphans the execution first). Killing the
+    // retained session below discards the pane contents, so the run row
+    // is the only place the snippet survives.
+    if let Err(err) = work_db.record_latest_run_failure_reason(execution_id, &reason) {
+        tracing::warn!(
+            execution_id,
+            session = session_name,
+            error = %format!("{err:#}"),
+            "tmux session sweep: dead pane observed but the run-row diagnostics could not be persisted",
+        );
+    }
     let execution = match work_db.get_execution(execution_id) {
         Ok(execution) => execution,
         Err(err) => {

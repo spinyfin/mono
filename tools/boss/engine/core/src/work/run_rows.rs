@@ -1366,6 +1366,29 @@ impl WorkDb {
         }))
     }
 
+    /// Stamp `reason` onto the latest run's `error_text` even when that
+    /// run is already closed or the execution is already terminal.
+    ///
+    /// The dead-pane sweep uses this so pane-capture diagnostics survive
+    /// when dead-pid reconciliation already orphaned the row with a
+    /// generic reason. Overwrites a prior `error_text`. Returns `false`
+    /// when no run row exists.
+    pub fn record_latest_run_failure_reason(&self, execution_id: &str, reason: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let updated = conn.execute(
+            "UPDATE work_runs
+             SET error_text = ?2
+             WHERE id = (
+                 SELECT id FROM work_runs
+                 WHERE execution_id = ?1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1
+             )",
+            params![execution_id, reason],
+        )?;
+        Ok(updated > 0)
+    }
+
     /// Token-verified pane observation for the latest run of `execution_id`,
     /// if its probe has written one. Does not require live identity columns —
     /// the point of this record is to remain queryable after reap. Never

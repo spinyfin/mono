@@ -185,13 +185,17 @@ impl ServerState {
             .ok()
             .flatten()
             .is_some_and(|obs| obs.pane_dead == Some(true) || obs.kind == crate::work::TmuxPaneObservationKind::Dead);
-        let process_live = !recorded_pane_dead
-            && (observed_shell_pid.is_some()
-                || crate::durable_liveness::probe_recorded_pid(latest_tmux_observed_pid).is_alive()
-                || registry_slot.is_some());
+        let process_live = observed_shell_pid.is_some()
+            || crate::durable_liveness::probe_recorded_pid(latest_tmux_observed_pid).is_alive()
+            || registry_slot.is_some();
         let hook_liveness = trigger != crate::worker_readoption::SESSION_END_TRIGGER
             && !crate::worker_readoption::NON_HOOK_TRIGGERS.contains(&trigger);
-        let positive_liveness = process_live || hook_liveness;
+        // A recorded Dead pane is terminal evidence that must not be
+        // disproven: a stray non-session_end hook after the pane has
+        // already exited must not count as positive liveness, or
+        // classify_contradiction would Readopt the execution this pass
+        // just terminalized.
+        let positive_liveness = !recorded_pane_dead && (process_live || hook_liveness);
         let verdict = classify_contradiction(
             &execution.status,
             work_item_terminal,

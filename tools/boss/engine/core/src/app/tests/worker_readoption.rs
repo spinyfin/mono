@@ -8,7 +8,7 @@
 use super::*;
 
 use crate::test_support::*;
-use crate::work::ExecutionStatus;
+use crate::work::{ExecutionStatus, TmuxPaneObservationKind, TmuxPaneObservationRecord};
 
 /// A pid guaranteed not to exist, so `kill(pid, 0)` returns `ESRCH`.
 fn dead_pid() -> i64 {
@@ -113,6 +113,66 @@ async fn a_hook_for_an_orphaned_execution_readopts_it() {
         status,
         boss_protocol::TaskStatus::Active,
         "the card must stay in Doing — a worker is genuinely working on it",
+    );
+}
+
+/// A token-verified Dead pane observation is terminal evidence. A stray
+/// non-session_end hook after that observation is on file must not
+/// restore the execution to running — that is the remain-on-exit flap
+/// this path exists to stop.
+#[tokio::test]
+async fn a_hook_for_an_orphaned_execution_with_a_dead_pane_does_not_readopt() {
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let (work_item_id, execution_id) = stranded_live_worker(&server_state, dead_pid(), "test: inferred death");
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(&execution_id, "boss", "boss-worker-1", "tok-dead")
+            .unwrap()
+    );
+    assert!(
+        db.record_tmux_session_created_for_execution(&execution_id, "tok-dead", dead_pid())
+            .unwrap()
+    );
+    db.record_tmux_pane_observation(
+        &execution_id,
+        "tok-dead",
+        &TmuxPaneObservationRecord {
+            kind: TmuxPaneObservationKind::Dead,
+            pane_dead: Some(true),
+            pane_dead_status: Some("127".to_owned()),
+            session_name: "boss-worker-1".to_owned(),
+            run_id: None,
+            observed_at: None,
+        },
+    )
+    .unwrap()
+    .expect("the spawned run must match the spawn token");
+
+    let converged = crate::app::worker_events::converge_terminal_execution_contradiction(
+        &server_state,
+        &execution_id,
+        "post_tool_use",
+    )
+    .await;
+    assert!(
+        converged,
+        "a hook for a terminal execution must still be handled, not dropped"
+    );
+
+    assert_eq!(
+        server_state.work_db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Orphaned,
+        "a recorded Dead pane must not be disproven by a stray driver hook",
+    );
+    let item = server_state.work_db.get_work_item(&work_item_id).unwrap();
+    let status = match &item {
+        boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t.status.clone(),
+        other => panic!("expected a chore, got {other:?}"),
+    };
+    assert_eq!(
+        status,
+        boss_protocol::TaskStatus::Active,
+        "precondition: the bound work item is still open, so classify_contradiction would Readopt without the Dead veto",
     );
 }
 

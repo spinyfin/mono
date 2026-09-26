@@ -11,9 +11,11 @@
 //! The cleanup handle is the opaque [`boss_protocol::DriverRuntimeState`]
 //! the driver returned from provision, reloaded from the execution row —
 //! never inferred from the engine environment or by scanning a shared
-//! provider home. The driver itself is resolved via the registry from
-//! the same `tasks.driver` → `products.default_driver` → engine-default
-//! precedence used at spawn time ([`WorkDb::get_execution_driver_slug`]).
+//! provider home. The driver itself is resolved from
+//! [`WorkDb::launched_driver_slug`] (`work_executions.driver` as stamped
+//! at spawn) first, falling back to live pin / pool-policy derivation
+//! ([`WorkDb::get_execution_driver_slug`]) only when no launch stamp
+//! exists.
 
 use std::path::Path;
 use std::time::Instant;
@@ -246,7 +248,7 @@ async fn resolve_and_teardown(
         }
     };
 
-    let driver_slug = match work_db.get_execution_driver_slug(execution_id) {
+    let driver_slug = match launched_or_live_teardown_slug(work_db, execution_id) {
         Ok(Some(slug)) => slug,
         Ok(None) => {
             // Unknown execution or no tasks row: nothing to resolve. A
@@ -299,6 +301,25 @@ async fn resolve_and_teardown(
         return (TeardownOutcome::DriverError, Some(driver_slug));
     }
     (TeardownOutcome::Ok, Some(driver_slug))
+}
+
+/// Driver slug for teardown: the spawn stamp first, live derivation only
+/// when that column was never written. A present-but-unregistered stamp
+/// is still returned so the caller reports `UnknownDriver` rather than
+/// tearing down as a different driver.
+fn launched_or_live_teardown_slug(work_db: &WorkDb, execution_id: &str) -> anyhow::Result<Option<String>> {
+    match work_db.launched_driver_slug(execution_id) {
+        Ok(Some(slug)) if !slug.trim().is_empty() => Ok(Some(slug)),
+        Ok(_) => work_db.get_execution_driver_slug(execution_id),
+        Err(err) => {
+            tracing::warn!(
+                execution_id,
+                error = %format!("{err:#}"),
+                "driver workspace teardown: launched-driver lookup failed; falling back to live resolution",
+            );
+            work_db.get_execution_driver_slug(execution_id)
+        }
+    }
 }
 
 /// Test-only call counter for [`teardown_driver_workspace`] — the entry
@@ -418,6 +439,50 @@ mod tests {
         // State survives teardown (idempotent; retention may still need it).
         let still = db.get_driver_runtime_state(&execution.id).unwrap();
         assert_eq!(still.as_ref().map(|s| s.as_value()), Some(state.as_value()));
+    }
+
+    #[tokio::test]
+    async fn teardown_uses_the_launch_stamp_not_live_pool_policy() {
+        let buffer = crate::test_support::log_capture::install();
+        let starting_offset = buffer.lock().len();
+
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, &product.id, "codex chore");
+        let execution = create_ready_chore_execution(&db, &chore.id);
+        db.start_execution_run(
+            &execution.id,
+            "review-1",
+            "mono",
+            "lease-1",
+            "mono-agent-001",
+            "/tmp/mono-agent-001",
+        )
+        .unwrap();
+        db.record_execution_launch_config(&execution.id, "codex", "gpt-5.5-codex", None)
+            .unwrap();
+        assert_eq!(
+            db.get_execution_driver_slug(&execution.id).unwrap().as_deref(),
+            Some("claude"),
+            "precondition: live policy for a review-pool slot resolves to Claude",
+        );
+        assert_eq!(
+            db.launched_driver_slug(&execution.id).unwrap().as_deref(),
+            Some("codex"),
+            "precondition: the spawn stamp is Codex",
+        );
+
+        teardown_driver_workspace(&db, &execution.id, None, TeardownReason::PaneLivenessReconcile).await;
+
+        let captured = String::from_utf8_lossy(&buffer.lock()[starting_offset..]).to_string();
+        let completed = captured
+            .lines()
+            .find(|line| line.contains(&execution.id) && line.contains("driver workspace teardown: completed"))
+            .unwrap_or_else(|| panic!("no teardown completed line for {}; got {captured}", execution.id));
+        assert!(
+            completed.contains("driver=\"codex\""),
+            "teardown must use the launch stamp, not the live Claude policy; got:\n{completed}",
+        );
     }
 
     #[tokio::test]

@@ -75,13 +75,26 @@ pub fn driver_for_execution(work_db: &WorkDb, execution_id: &str) -> Option<Arc<
 /// between pane start and the stamp), falls through to
 /// [`driver_for_execution`] so a still-unset column does not invent a
 /// driver from nothing.
+///
+/// A stamp that is present but unregistered (renamed, removed, or
+/// corrupted) is distinct from the unset-column case: this returns
+/// `None` rather than re-deriving from live policy, which would
+/// silently relabel the run as a different driver.
 pub fn driver_for_spawned_execution(work_db: &WorkDb, execution_id: &str) -> Option<Arc<dyn AgentDriver>> {
     match work_db.launched_driver_slug(execution_id) {
-        Ok(Some(slug)) if !slug.trim().is_empty() => {
-            if let Some(driver) = require_driver_slug(execution_id, &slug) {
-                return Some(driver);
+        Ok(Some(slug)) if !slug.trim().is_empty() => match DriverRegistry::default().require(&slug) {
+            Ok(driver) => return Some(driver),
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    driver = %slug,
+                    %err,
+                    "driver transcript: launched driver slug is present but unregistered; \
+                     not re-deriving from live worker-id or pool policy",
+                );
+                return None;
             }
-        }
+        },
         Ok(_) => {}
         Err(err) => {
             tracing::warn!(
@@ -454,6 +467,29 @@ mod tests {
             spawned.descriptor().name,
             "codex",
             "re-adoption must keep the driver recorded at spawn",
+        );
+    }
+
+    /// A launch stamp that no longer resolves in the registry must not
+    /// fall through to live worker-id / pool-policy re-derivation — that
+    /// is indistinguishable from the unset-column case and would relabel
+    /// a Codex spawn as Claude.
+    #[test]
+    fn spawned_driver_does_not_rederive_when_the_launch_slug_is_unregistered() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, &product.id, "codex chore");
+        let execution = create_ready_chore_execution(&db, &chore.id);
+        db.start_execution_run(&execution.id, "review-1", "mono", "lease-1", "ws-1", "/tmp/ws-1")
+            .unwrap();
+        db.record_execution_launch_config(&execution.id, "not-a-registered-driver", "gpt-5.5-codex", None)
+            .unwrap();
+
+        let live = driver_for_execution(&db, &execution.id).expect("live resolution");
+        assert_eq!(live.descriptor().name, "claude");
+        assert!(
+            driver_for_spawned_execution(&db, &execution.id).is_none(),
+            "an unresolvable launch stamp must not fall back to the live Claude driver",
         );
     }
 

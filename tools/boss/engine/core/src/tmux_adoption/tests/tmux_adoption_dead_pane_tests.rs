@@ -143,6 +143,16 @@ async fn orphaned_execution_with_dead_pane_is_not_readopted() {
         db.get_execution(&execution_id).unwrap().status,
         ExecutionStatus::Orphaned,
     );
+    let run = db.list_runs(&execution_id).unwrap().pop().expect("run row");
+    let recorded = run.error_text.or(run.result_summary).unwrap_or_default();
+    assert!(
+        recorded.contains("pane_dead_status=127"),
+        "already-orphaned run must still record the pane exit status, got {recorded:?}"
+    );
+    assert!(
+        recorded.contains("command not found: codex"),
+        "already-orphaned run must still record the dead pane last output, got {recorded:?}"
+    );
 }
 
 /// A Codex execution re-adopted after an engine restart keeps driver Codex,
