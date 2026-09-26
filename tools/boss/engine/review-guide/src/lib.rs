@@ -19,7 +19,7 @@ use boss_pr_review_sources::{SourcePacket, SourceSide, validate_pinned_reference
 /// version constant and prompt id — the desired-comparison key an attempt
 /// binds to includes the prompt version, so a prompt change never silently
 /// reinterprets an already-captured comparison's existing readable version.
-pub const PROMPT_VERSION: &str = "review-guide-v2";
+pub const PROMPT_VERSION: &str = "review-guide-v3";
 
 /// The exact production prompt template, byte-identical to the fenced block
 /// in `automatic-pr-review-guides.md`'s "Prompt contract" section. Only the
@@ -39,32 +39,32 @@ pub const PROMPT_TEMPLATE: &str = "I want you to provide me a guided summary of 
 
 This is meant to function as a human guide to code review, so it should reference and include code snippets, but not giant diffs.
 
-Make the core fix concrete with one worked example. Give the input and relevant state, trace the decisive old and new behavior, and show the observable result. Choose an example supported by the implementation or tests; label invented inputs as illustrative. Include a contrasting boundary or failure case only when it helps explain the changed contract. For changes without a runtime behavior, use an equivalent concrete before/after scenario. Check every step against the actual code.
+Make the core fix concrete with one worked example. Give the input and relevant state, trace the decisive old and new behavior, and show the observable result. Choose an example supported by the implementation or tests; label invented inputs as illustrative. Include a contrasting boundary or failure case only when it helps explain the changed contract. For changes without a runtime behavior, use an equivalent concrete before/after scenario. Ground every step in the supplied source context.
 
 Review context:
 - Repository: {{REPOSITORY}}
 - PR title: {{PR_TITLE}}
 - Merge-base revision: {{BASE_SHA}}
 - Head revision: {{HEAD_SHA}}
-- The accompanying source context and available read tools provide the PR description, diff, before/after files, related source and tests, and validated GitHub link targets.
+- Boss supplies the source context for this guide: the PR description, diff, captured before/after source and tests, and validated GitHub link targets. Use only this supplied context.
 
-Ground the guide in those revisions. Inspect relevant callers, helpers, types, and tests when they determine what the change actually does. Treat the PR description and code comments as statements to verify against the implementation. Distinguish enforced behavior from conventions, prompt instructions, and assumptions. Do not turn a conditional or local check into a broader guarantee.
+Ground the guide in those revisions. Explain relevant callers, helpers, types, and tests only to the extent they are present in the supplied context. When missing context limits an explanation, state the limitation. Treat the PR description and code comments as statements to verify against the implementation. Distinguish enforced behavior from conventions, prompt instructions, and assumptions. Do not turn a conditional or local check into a broader guarantee.
 
 Organize the walkthrough in a useful reading order through the core implementation. Explain why the important pieces fit together, not just which files changed. Prioritize details that help a reviewer understand or verify the fix. Use short faithful excerpts; clearly label condensed pseudocode. Avoid repetitive summaries and incidental cleanup unless it matters to the solution.
 
 Link the core fix, worked example, and important test changes to the supplied GitHub diff locations. Use revision-pinned source links for relevant unchanged context or lines outside the displayed diff. Reuse supplied URLs or validated reference mappings and check that each link targets the code being discussed. Do not invent diff anchors or imply that a mutable PR URL identifies an immutable revision. Where an exact diff link is unavailable, use the corresponding pinned source link.
 
-In the tests section, distinguish added, modified, and removed tests. Name the important scenarios and assertions; identify relevant fixture, helper, and build/configuration changes. Include counts only when verified and useful. Distinguish author-reported validation from checks you actually performed and from conclusions drawn by reading the tests. Do not claim to have run tests when you have not. State important coverage limits without producing an exhaustive speculative bug hunt.
+In the tests section, distinguish added, modified, and removed tests. Name the important scenarios and assertions; identify relevant fixture, helper, and build/configuration changes. Include counts only when supported by the supplied context and useful. Distinguish author-reported validation from conclusions supported by the supplied test source. Do not claim to have executed tests or performed independent validation. State important coverage limits without producing an exhaustive speculative bug hunt.
 
 Use the complete revised PR comparison if this is a regenerated guide. Do not describe only the latest incremental commit. Existing comments may provide context, but the explanation must match the actual current source revisions.
 
-Return only the finished Markdown guide, with a descriptive title and the four requested main sections. Put the worked example within the implementation walkthrough. Keep the guide as concise as the explanation permits while preserving useful reasoning and evidence. Do not include a chat preamble, model details, internal tool logs, a merge recommendation, or an unsupported declaration that the PR is safe to merge. If essential context cannot be obtained, state the specific limitation rather than inventing behavior.";
+Return only the finished Markdown guide, with a descriptive title and the four requested main sections. Put the worked example within the implementation walkthrough. Keep the guide as concise as the explanation permits while preserving useful reasoning and evidence. Do not include a chat preamble, model details, internal execution details, a merge recommendation, or an unsupported declaration that the PR is safe to merge. If essential context is absent from the supplied material, state the specific limitation rather than inventing behavior.";
 
 /// SHA-256 of [`PROMPT_TEMPLATE`] (UTF-8, excluding any fence/terminal
 /// newline) — matches the value recorded in the design doc, computed
 /// independently from the doc's own fenced block as a second source of
 /// truth. See `prompt_template_hash_is_pinned`.
-pub const PROMPT_TEMPLATE_SHA256: &str = "aeef2e1a0754d96a3680541daa1cddb62bb1f7bc56f45b13a316156a53527d80";
+pub const PROMPT_TEMPLATE_SHA256: &str = "24dd027a410ef2f9ed40b171f70da1ddca518061a1cdb78995b2bf3df76ad2ac";
 
 /// The metadata substituted into [`PROMPT_TEMPLATE`] for one comparison.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -456,6 +456,29 @@ mod tests {
             digest, PROMPT_TEMPLATE_SHA256,
             "PROMPT_TEMPLATE changed without updating PROMPT_TEMPLATE_SHA256 / PROMPT_VERSION",
         );
+    }
+
+    #[test]
+    fn prompt_uses_only_supplied_context_without_inviting_exploration() {
+        assert_eq!(PROMPT_VERSION, "review-guide-v3");
+        assert!(PROMPT_TEMPLATE.contains("Use only this supplied context."));
+        assert!(PROMPT_TEMPLATE.contains("Do not claim to have executed tests or performed independent validation."));
+        // Submission instructions may name a tool; source exploration may not.
+        let prompt = PROMPT_TEMPLATE.to_ascii_lowercase();
+        for invitation in [
+            "read tools",
+            "available tools",
+            "inspect",
+            "read files",
+            "open files",
+            "checks you actually performed",
+            "context cannot be obtained",
+        ] {
+            assert!(
+                !prompt.contains(invitation),
+                "prompt invites external action: {invitation}"
+            );
+        }
     }
 
     #[test]
