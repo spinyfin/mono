@@ -25,8 +25,7 @@ use super::prompt::{
 };
 use super::review_guide_prompt::compose_review_guide_prompt;
 use super::work_item::{
-    followup_pr_backlink_for_work_item, work_item_created_via, work_item_name, work_item_pr_url,
-    work_item_task_kind_enum,
+    followup_pr_backlink_for_work_item, work_item_created_via, work_item_pr_url, work_item_task_kind_enum,
 };
 
 /// Composed worker prompt + resolved effort/model config, the output of
@@ -803,11 +802,6 @@ pub(crate) async fn compose_worker_spawn(
             }
         }
     } else if execution.kind == ExecutionKind::PrReview {
-        let task_name = work_item_name(work_item);
-        let task_description = match work_item {
-            WorkItem::Task(task) | WorkItem::Chore(task) => task.description.as_str(),
-            _ => "",
-        };
         let pr_url = work_item_pr_url(work_item).unwrap_or_default();
         if pr_url.is_empty() {
             tracing::warn!(
@@ -924,6 +918,7 @@ pub(crate) async fn compose_worker_spawn(
             };
             let reviewer_repo_slug = crate::completion::parse_repo_slug(&execution.repo_remote_url)
                 .unwrap_or_else(|_| "<owner/repo>".to_owned());
+            let review_brief = super::review_brief::assemble_review_brief_packet(work_db, work_item, execution).await;
             // A member row existing is the same signal `finalize_pr_review_pass`
             // uses to take the batch branch unconditionally (it never falls
             // back to reading the legacy artifact once a member row exists).
@@ -981,8 +976,7 @@ pub(crate) async fn compose_worker_spawn(
                     let reports = load_batch_leaf_reports(work_db, &cycle_root_id, &destination.batch_id)
                         .context("loading accepted leaf reports for supervisor prompt")?;
                     crate::pr_review::render_supervisor_initial_prompt(
-                        task_name,
-                        task_description,
+                        &review_brief,
                         destination,
                         &reports,
                         &reviewer_repo_slug,
@@ -990,24 +984,21 @@ pub(crate) async fn compose_worker_spawn(
                 }
                 Some((ReviewBatchMemberRole::PostMergeReviewer, destination)) => {
                     crate::pr_review::render_post_merge_reviewer_initial_prompt(
-                        task_name,
-                        task_description,
+                        &review_brief,
                         destination,
                         scope,
                         &reviewer_repo_slug,
                     )
                 }
                 Some((_, destination)) => crate::pr_review::render_batch_reviewer_initial_prompt(
-                    task_name,
-                    task_description,
+                    &review_brief,
                     destination,
                     scope,
                     pr_review_context.as_ref(),
                     &reviewer_repo_slug,
                 ),
                 None => crate::pr_review::render_reviewer_initial_prompt(
-                    task_name,
-                    task_description,
+                    &review_brief,
                     pr_url,
                     &crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::ReviewResult),
                     scope,
@@ -1851,6 +1842,16 @@ mod compose_worker_spawn_tests {
             .embedded_output_path
             .expect("reviewer prompt must embed its output path");
         assert!(composed.prompt_text.contains(&path));
+        assert!(
+            composed.prompt_text.contains("Feature description."),
+            "reviewer prompt must embed the work-item brief:\n{}",
+            composed.prompt_text,
+        );
+        assert!(
+            composed.prompt_text.contains("Brief conformance — CRITICAL"),
+            "reviewer prompt must require the brief-conformance check:\n{}",
+            composed.prompt_text,
+        );
     }
 
     /// A non-`pr_review` execution kind (e.g. `ChoreImplementation`) must not

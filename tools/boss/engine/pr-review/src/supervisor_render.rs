@@ -2,6 +2,7 @@
 //! consolidating role that reads every reported leaf review for one batch and
 //! produces a single [`crate::supervisor_types::SupervisorVerdict`].
 
+use crate::brief::ReviewBriefPacket;
 use crate::render::ReviewerReportDestination;
 use crate::supervisor_types::SupervisorSourceRole;
 use crate::types::ReviewerReport;
@@ -106,8 +107,7 @@ fn render_leaf_report_block(input: &SupervisorReportInput) -> String {
 /// reporting) is named explicitly so the supervisor does not read silence as
 /// "that reviewer found nothing".
 pub fn render_supervisor_initial_prompt(
-    task_name: &str,
-    task_description: &str,
+    brief: &ReviewBriefPacket,
     destination: &ReviewerReportDestination,
     reports: &[SupervisorReportInput],
     repo_slug: &str,
@@ -142,6 +142,8 @@ pub fn render_supervisor_initial_prompt(
 
     let verdict_submission_block =
         crate::blocks::render_verdict_submission_block(&destination.batch_id, &destination.body_path);
+    let brief_block = crate::brief::render_brief_packet_block(brief);
+    let brief_conformance = crate::brief::render_brief_conformance_rubric();
 
     format!(
         "# PR review consolidation\n\
@@ -161,12 +163,13 @@ pub fn render_supervisor_initial_prompt(
          \n\
          ## PR under review\n\
          \n\
-         **Task:** {task_name}\n\
-         \n\
-         **Task description:**\n\
-         {task_description}\n\
-         \n\
+         {brief_block}\
          **PR:** {pr_url}\n\
+         \n\
+         {brief_conformance}\
+         Do not drop a leaf's brief-conformance / missing-deliverable / \
+         unresolved-input finding during consolidation — those are blocking, \
+         the same class as a correctness bug.\n\
          \n\
          {missing_block}\
          ## Leaf reviewer reports\n\
@@ -248,8 +251,8 @@ pub fn render_supervisor_initial_prompt(
          `\"supervisor\"`.\n",
         count = reports.len(),
         repo_slug = repo_slug,
-        task_name = task_name,
-        task_description = task_description,
+        brief_block = brief_block,
+        brief_conformance = brief_conformance,
         pr_url = destination.pr_url,
         missing_block = missing_block,
         leaf_reports_block = leaf_reports_block,
@@ -266,6 +269,21 @@ mod tests {
     use crate::types::{
         ReviewCoverage, ReviewFindingCategory, ReviewFindingConfidence, ReviewFindingSeverity, ReviewerReportFinding,
     };
+
+    fn render_supervisor_initial_prompt(
+        task_name: &str,
+        task_description: &str,
+        destination: &ReviewerReportDestination,
+        reports: &[SupervisorReportInput],
+        repo_slug: &str,
+    ) -> String {
+        super::render_supervisor_initial_prompt(
+            &ReviewBriefPacket::from_task(task_name, task_description),
+            destination,
+            reports,
+            repo_slug,
+        )
+    }
 
     fn sample_report(role: SupervisorSourceRole) -> SupervisorReportInput {
         SupervisorReportInput {
