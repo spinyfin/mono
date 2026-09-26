@@ -2289,7 +2289,7 @@ mod tests {
         // `undeclared_but_present_checkleft_launcher_is_not_exported_without_the_file`.
         std::fs::write(worker_bin_dir.path().join("checkleft"), b"#!/bin/sh\n").unwrap();
         let spawner = ok_spawner_capturing();
-        let mut input = sample_input(&workspace);
+        let mut input = sample_input(&workspace, spawner.tmux_runner.clone());
         input.extra_env = vec![(
             boss_engine_worker_bin::WORKER_BIN_DIR_ENV.into(),
             worker_bin_dir.path().display().to_string(),
@@ -2322,7 +2322,7 @@ mod tests {
         std::fs::write(workspace.path().join("REPOBIN.toml"), "[tools.checkleft]\n").unwrap();
         let worker_bin_dir = TempDir::new().unwrap();
         let spawner = ok_spawner_capturing();
-        let mut input = sample_input(&workspace);
+        let mut input = sample_input(&workspace, spawner.tmux_runner.clone());
         input.extra_env = vec![(
             boss_engine_worker_bin::WORKER_BIN_DIR_ENV.into(),
             worker_bin_dir.path().display().to_string(),
