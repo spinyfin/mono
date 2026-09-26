@@ -560,6 +560,7 @@ pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
     Ok(WorkExecution {
         id: row.get(0)?,
         work_item_id: row.get(1)?,
+        owning_task_id: None,
         kind,
         status,
         repo_remote_url: row.get(4)?,

@@ -1205,7 +1205,10 @@ impl WorkDb {
                  ORDER BY created_at ASC, id ASC",
             )?;
             let rows = stmt.query_map([work_item_id], map_execution)?;
-            return collect_rows(rows);
+            let mut executions = collect_rows(rows)?;
+            executions.extend(review_guide_executions_for_task(&conn, work_item_id)?);
+            executions.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+            return Ok(executions);
         }
 
         let mut stmt = conn.prepare(
@@ -1241,6 +1244,7 @@ impl WorkDb {
             )?;
             let rows = stmt.query_map([task_id], map_execution)?;
             all_executions.extend(collect_rows(rows)?);
+            all_executions.extend(review_guide_executions_for_task(&conn, task_id)?);
         }
         all_executions.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
         Ok(all_executions)
@@ -1794,6 +1798,38 @@ impl WorkDb {
             .optional()?;
         Ok(terminal_owner.map(|_| current_lease_id.to_owned()))
     }
+}
+
+/// Executions whose `kind` is `pr_review_guide` and whose comparison
+/// belongs to a review-guide series rooted at `task_id` — joined via
+/// `pr_review_guide_source_comparisons.series_id ->
+/// pr_review_guide_source_series.root_task_id`. A review-guide execution's
+/// own `work_item_id` is the comparison id (`prgc_…`), not `task_id`, so
+/// the plain `WHERE work_item_id = ?1` queries in [`WorkDb::list_executions`]
+/// and [`WorkDb::list_executions_for_chain`] never see it; both union this
+/// in per requested task so a review-guide run appears alongside the task/PR
+/// it reviewed instead of being reachable only by its opaque comparison id.
+/// Each returned row's `owning_task_id` is set to `task_id` for the
+/// caller's display grouping — the row's own `work_item_id` is left
+/// untouched as the comparison id, which remains the run's correct owner
+/// for dedup and finalize lookups.
+fn review_guide_executions_for_task(conn: &Connection, task_id: &str) -> Result<Vec<WorkExecution>> {
+    let mut stmt = conn.prepare(
+        "SELECT we.id, we.work_item_id, we.kind, we.status, we.repo_remote_url, we.cube_repo_id, we.cube_lease_id,
+                we.cube_workspace_id, we.workspace_path, we.priority, we.preferred_workspace_id,
+                we.created_at, we.started_at, we.finished_at,
+                we.pre_start_failure_count, we.dispatch_not_before, we.pr_url, we.pr_head_before, we.prefer_is_soft, we.worker_branch_prefix, we.transient_failure_count, we.allow_dirty, we.branch_naming, we.dispatch_wait_reason, we.dispatch_wait_since, we.driver_runtime_state, we.driver, we.model, we.effort_level, we.pr_head_after
+         FROM work_executions we
+         JOIN pr_review_guide_source_comparisons c ON c.id = we.work_item_id
+         JOIN pr_review_guide_source_series s ON s.id = c.series_id
+         WHERE we.kind = 'pr_review_guide' AND s.root_task_id = ?1",
+    )?;
+    let rows = stmt.query_map([task_id], map_execution)?;
+    let mut executions = collect_rows(rows)?;
+    for execution in &mut executions {
+        execution.owning_task_id = Some(task_id.to_owned());
+    }
+    Ok(executions)
 }
 
 /// Walk `work_item_id`'s revision chain and return every member id,

@@ -596,7 +596,10 @@ struct ExecutionVM: Identifiable, Hashable, RevisionChainItem {
     let id: String
     /// The task id that owns this execution. When a transcript viewer
     /// loads the full revision chain, executions from revision tasks
-    /// carry those tasks' ids here rather than the chain root's id.
+    /// carry those tasks' ids here rather than the chain root's id. For a
+    /// `pr_review_guide` run, whose wire `work_item_id` is a review
+    /// comparison id rather than a task id, this is the engine-resolved
+    /// owning task (see `owning_task_id` in `parseExecutionVM`).
     let workItemId: String
     let kind: String
     let status: String

@@ -222,6 +222,7 @@ pub(crate) fn repo_unresolved_kind_label(conn: &Connection, work_item_id: &str) 
         ItemKind::Project => "project",
         ItemKind::Product => "product",
         ItemKind::Comment => "comment",
+        ItemKind::Comparison => "comparison",
     })
 }
 

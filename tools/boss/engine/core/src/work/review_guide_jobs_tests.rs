@@ -59,6 +59,58 @@ fn attempt_then_execution_then_publish_advances_the_readable_pointer() {
     assert_eq!(fetched.markdown, version.markdown);
 }
 
+/// A review-guide run's `work_executions.work_item_id` is the comparison
+/// id, not the task it reviewed — the task-keyed transcripts/executions
+/// surface (`WorkDb::list_executions`) must still resolve the owning task
+/// via the comparison -> series -> root-task join and include the run,
+/// labelled by its own `kind`, rather than leaving it reachable only by
+/// its opaque comparison id.
+#[test]
+fn list_executions_for_task_includes_its_review_guide_runs() {
+    let (_dir, db) = open_db();
+    let (root, _series_id, comparison_id) = seeded_series(&db);
+    let execution = db
+        .create_pr_review_guide_execution(&comparison_id, "acme/widget")
+        .unwrap();
+
+    let executions = db.list_executions(Some(&root)).unwrap();
+    assert_eq!(executions.len(), 1);
+    assert_eq!(executions[0].id, execution.id);
+    assert_eq!(executions[0].work_item_id, comparison_id);
+    assert_eq!(executions[0].kind, boss_protocol::ExecutionKind::PrReviewGuide);
+    assert_eq!(executions[0].owning_task_id.as_deref(), Some(root.as_str()));
+
+    let chain_executions = db.list_executions_for_chain(&root).unwrap();
+    assert_eq!(chain_executions.len(), 1);
+    assert_eq!(chain_executions[0].id, execution.id);
+    assert_eq!(chain_executions[0].owning_task_id.as_deref(), Some(root.as_str()));
+
+    // An unrelated task's history must not pick up the guide run.
+    let other_root = create_active_chore(&db, &create_product(&db), "unrelated task");
+    assert!(db.list_executions(Some(&other_root)).unwrap().is_empty());
+}
+
+/// A `PrReviewGuide` execution's `work_item_id` is a comparison id
+/// (`prgc_…`), not a task/project/product/comment id. Every reconciliation
+/// path that classifies a bound `work_item_id` must recognise that shape
+/// instead of failing with "unknown work item id format" — the failure
+/// mode this test guards against.
+#[test]
+fn comparison_ids_are_a_recognised_work_item_id_kind() {
+    let (_dir, db) = open_db();
+    let (_root, _series_id, comparison_id) = seeded_series(&db);
+
+    // A comparison never has an independent open/closed lifecycle of its
+    // own (like a product or project), so this must resolve rather than
+    // bail with "unknown work item id format".
+    assert!(!db.is_bound_work_item_closed(&comparison_id).unwrap());
+    assert!(!db.work_item_row_missing(&comparison_id).unwrap());
+
+    // A genuinely unknown comparison id (never captured) is a confirmed
+    // miss, not a classification failure.
+    assert!(db.work_item_row_missing("prgc_never_captured").unwrap());
+}
+
 #[test]
 fn publish_for_a_superseded_comparison_does_not_advance_the_pointer() {
     let (_dir, db) = open_db();
