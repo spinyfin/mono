@@ -136,6 +136,28 @@ async fn manual_generation_captures_and_dispatches_with_both_flags_off() {
 }
 
 #[tokio::test]
+async fn manual_generation_uses_product_repository_without_task_override() {
+    let f = Fixture::new(false);
+    let db = &f.state.work_db;
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE products SET repo_remote_url = 'https://github.com/acme/widget' WHERE id = (SELECT product_id FROM tasks WHERE id = ?1)",
+            [&f.root],
+        )
+        .unwrap();
+        conn.execute("UPDATE tasks SET repo_remote_url = NULL WHERE id = ?1", [&f.root])
+            .unwrap();
+    }
+
+    let attempt = f.generate("product-repo", false).await;
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(attempt.status, "running");
+    let capture = db.get_latest_pr_review_guide_source_capture(&f.root).unwrap().unwrap();
+    assert_eq!(capture.trigger, "manual");
+}
+
+#[tokio::test]
 async fn existing_idle_comparison_is_refreshed_and_generated() {
     let f = Fixture::new(false);
     f.capture_idle();
@@ -252,6 +274,15 @@ async fn missing_pr_or_repository_is_an_explicit_error_before_capture() {
     for (column, expected) in [("pr_url", "no PR URL"), ("repo_remote_url", "no repository remote")] {
         for value in [None, Some(" ")] {
             let f = Fixture::new(false);
+            f.state
+                .work_db
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE products SET repo_remote_url = NULL WHERE id = (SELECT product_id FROM tasks WHERE id = ?1)",
+                    [&f.root],
+                )
+                .unwrap();
             f.state
                 .work_db
                 .connect()
