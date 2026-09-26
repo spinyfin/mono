@@ -824,13 +824,13 @@ impl ExecutionCoordinator {
 
     /// Return the pool that should handle `execution`.
     ///
-    /// `pr_review` executions always route to the review pool — this is
-    /// checked first so a reviewer of an automation-produced task still
-    /// lands in the review pool, not the automation pool.
-    /// `automation_triage` executions always route to the automation pool.
-    /// Regular task executions route to the automation pool when the owning
-    /// task has `source_automation_id IS NOT NULL` (it was produced by an
-    /// automation). All other executions go to the main pool.
+    /// `pr_review` and `pr_review_guide` executions always route to the
+    /// review pool — this is checked first so a reviewer (or guide) of an
+    /// automation-produced task still lands in the review pool, not the
+    /// automation pool. `automation_triage` executions always route to the
+    /// automation pool. Regular task executions route to the automation pool
+    /// when the owning task has `source_automation_id IS NOT NULL` (it was
+    /// produced by an automation). All other executions go to the main pool.
     pub(super) fn pool_for_execution<'a>(&'a self, execution: &WorkExecution) -> &'a WorkerPool {
         if self.execution_targets_review_pool(execution) {
             &self.review_pool
@@ -842,7 +842,10 @@ impl ExecutionCoordinator {
     }
 
     /// `true` when `execution` must run on the dedicated review pool —
-    /// i.e. it is a `pr_review` reviewer execution.
+    /// i.e. it is a `pr_review` reviewer execution or a `pr_review_guide`
+    /// generation execution. Guides are part of the PR review flow, not
+    /// automation-originated activity, so they are claimed under the same
+    /// pool and pause rules as reviews rather than the automation pool.
     ///
     /// `pub` rather than `pub(super)` because [`Self::dispatch_hold_for`] and
     /// [`crate::spawn_health::maybe_admit_recovery_probe`] must agree exactly
@@ -851,11 +854,15 @@ impl ExecutionCoordinator {
     /// Two independent notions of "is this a review" is precisely the drift
     /// that would reopen the hole.
     pub fn execution_targets_review_pool(&self, execution: &WorkExecution) -> bool {
-        execution.kind == ExecutionKind::PrReview
+        execution.kind == ExecutionKind::PrReview || execution.kind == ExecutionKind::PrReviewGuide
     }
 
+    /// `true` when `execution` targets the automation pool. `pr_review_guide`
+    /// is deliberately excluded — see [`Self::execution_targets_review_pool`]
+    /// — so it is never held by [`Self::is_automation_paused`] and never
+    /// counted as automation-originated by [`Self::attributed_pool_label`].
     pub(super) fn execution_targets_automation_pool(&self, execution: &WorkExecution) -> bool {
-        if execution.kind == ExecutionKind::AutomationTriage || execution.kind == ExecutionKind::PrReviewGuide {
+        if execution.kind == ExecutionKind::AutomationTriage {
             return true;
         }
         matches!(

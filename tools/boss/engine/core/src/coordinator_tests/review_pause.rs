@@ -737,3 +737,97 @@ async fn automation_pause_does_not_hold_main_pool_row() {
         "automation pause must not flip the independent dispatch-pause flag"
     );
 }
+
+/// A `pr_review_guide` execution is part of the PR review flow, not
+/// automation-originated activity: it must be claimed from the review pool
+/// (not the automation pool) and must NOT be held by an automation pause,
+/// while an automation-produced chore's execution — dispatched in the same
+/// pass — is still held by that same pause.
+#[tokio::test]
+async fn automation_pause_does_not_hold_pr_review_guide_but_holds_automation_row() {
+    use crate::work::CreateAutomationInput;
+
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_product(&db);
+
+    // A `pr_review_guide` execution, wired through the real source-capture
+    // path so `resolve_execution_work_item` can synthesize its work item.
+    // `create_test_chore_manual` (autostart off, default `todo` status) so
+    // `reconcile_product_executions` below does not also mint an ordinary
+    // main-pool execution for this root chore itself.
+    let root = create_test_chore_manual(&db, product.clone(), "Review guide root").id;
+    let (_series_id, comparison_id) = seed_review_guide_series(&db, &root);
+    let guide_execution = db
+        .create_pr_review_guide_execution(&comparison_id, "https://github.com/test/repo")
+        .unwrap();
+
+    // An automation-produced chore, whose execution targets the automation
+    // pool — mirrors `automation_pause_holds_automation_pool_row_until_resume`.
+    let automation = db
+        .create_automation(CreateAutomationInput {
+            product_id: product.clone(),
+            name: "Test automation".to_owned(),
+            repo_remote_url: None,
+            trigger: boss_protocol::AutomationTrigger::Schedule {
+                cron: "0 14 * * 1-5".to_owned(),
+                timezone: "UTC".to_owned(),
+            },
+            standing_instruction: "do maintenance".to_owned(),
+            open_task_limit: 1,
+            catch_up_window_secs: None,
+            enabled: true,
+            created_via: None,
+        })
+        .unwrap();
+    let auto_chore = create_test_chore(&db, product.clone(), "Automation chore");
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET source_automation_id = ?1 WHERE id = ?2",
+            rusqlite::params![automation.id, auto_chore.id],
+        )
+        .unwrap();
+    }
+    db.reconcile_product_executions(&product).unwrap();
+    let auto_execution_id = db.list_executions(Some(&auto_chore.id)).unwrap()[0].id.clone();
+
+    let cube = Arc::new(FakeCubeClient::default());
+    let runner = Arc::new(FakeExecutionRunner {
+        pending: true,
+        ..FakeExecutionRunner::default()
+    });
+    let mut coord = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone());
+    coord.set_review_pool(WorkerPool::new_review(1));
+    coord.set_automation_pool(WorkerPool::new_automation(1));
+    let coordinator = Arc::new(coord);
+
+    coordinator.pause_automation(0, PauseReason::new("test: automation pause").unwrap());
+    coordinator.kick();
+
+    wait_for_execution_status(db.as_ref(), &guide_execution.id, ExecutionStatus::Running).await;
+
+    let calls = runner.calls.lock().await;
+    assert_eq!(
+        calls.len(),
+        1,
+        "only the review-guide execution should have dispatched while automation is paused"
+    );
+    assert!(
+        calls[0].0.starts_with(REVIEW_WORKER_ID_PREFIX),
+        "pr_review_guide must claim a review-pool worker id, got {:?}",
+        calls[0].0
+    );
+    drop(calls);
+
+    assert_eq!(
+        db.get_execution(&auto_execution_id).unwrap().status,
+        ExecutionStatus::Ready,
+        "the automation-pool row must remain held while automation is paused"
+    );
+
+    coordinator.resume_automation();
+    coordinator.kick();
+    wait_for_execution_status(db.as_ref(), &auto_execution_id, ExecutionStatus::Running).await;
+}
