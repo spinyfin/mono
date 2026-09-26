@@ -1,18 +1,19 @@
-//! Restart-robust reconciler for executions whose worker pane died with its
-//! host app — the 2026-07-04 "app relaunch killed live panes" wedge.
+//! Restart-robust reconciler for executions whose worker pane died while no
+//! engine was watching — the durable-state counterpart to the 2026-07-04
+//! "live panes killed without a trace" wedge.
 //!
 //! ## Why this exists
 //!
-//! A libghostty worker pane is a child of the macOS app process. When the app
-//! relaunches (an update, a crash, an operator restart) every live worker's
-//! shell dies with it — but the engine's `work_executions` rows survive, and
-//! a pane worker parks in `waiting_human` the instant it spawns (the normal
-//! post-spawn state; the row only leaves it when the worker's `Stop` hook
-//! fires). A worker killed mid-run never fires `Stop`, so the row sits
-//! `waiting_human` forever. Every existing safety net is blind to this exact
-//! shape:
+//! A worker's shell runs inside a tmux session, which survives an engine
+//! restart on its own — but if the session (or the shell inside it) genuinely
+//! dies while the engine is down, the engine's `work_executions` row survives
+//! regardless, and a pane worker parks in `waiting_human` the instant it
+//! spawns (the normal post-spawn state; the row only leaves it when the
+//! worker's `Stop` hook fires). A worker killed mid-run never fires `Stop`,
+//! so the row sits `waiting_human` forever. Every existing safety net is
+//! blind to this exact shape:
 //!
-//! - The app never tells the engine a pane died — there is no pane-died RPC.
+//! - Nothing tells the engine a pane died — there is no pane-died RPC.
 //! - The cube lease stays green: the engine's own [`crate::cube_lease_heartbeat`]
 //!   DB-fallback sweep renews the lease of every in-flight row, so the
 //!   heartbeat-failure auto-reap (`cube_lease_auto_reap`) never fires for a
@@ -22,9 +23,8 @@
 //! - [`crate::dead_pid_sweep`] *could* catch it — it probes the shell pid with
 //!   `kill(pid, 0)` — but it is driven by the in-memory
 //!   [`crate::live_worker_state::LiveWorkerStateRegistry`], which is EMPTY
-//!   after an engine restart. An app relaunch that also restarts the engine
-//!   (e.g. an app update) therefore wipes the only signal `dead_pid_sweep`
-//!   has.
+//!   after an engine restart, so an engine restart wipes the only signal
+//!   `dead_pid_sweep` has.
 //! - The startup reconciler ([`crate::run_reconcile`]) only consults the cube
 //!   lease, which is still green → verdict `Live` → never reconciled. This is
 //!   why two clean engine restarts over the incident's zombies left them
@@ -72,15 +72,15 @@
 //!
 //! ## Safety — only ever acts on positive process evidence
 //!
-//! Every action requires a definitive probe result on a pid the app actually
+//! Every action requires a definitive probe result on a pid tmux actually
 //! reported. It never acts on absence of information:
 //!
 //! - **Host safety**: [`crate::work::WorkDb::latest_local_shell_pid_for_execution`]
 //!   returns a pid ONLY for a `host_id = 'local'` run — a local pid probe is
 //!   meaningless for a remote worker, so remote runs surface no pid and are
 //!   never touched here.
-//! - **No pid → skip**: an execution whose pid was never reported (surface
-//!   never attached, or a pre-fix spawn) yields `None` and is left alone.
+//! - **No pid → skip**: an execution whose pid was never reported (the tmux
+//!   pane never attached, or a pre-fix spawn) yields `None` and is left alone.
 //! - **Non-terminal rows require death**: only `Gone` (ESRCH) enters the orphan
 //!   path; every ambiguous result is skipped.
 //! - **Terminal rows require recent liveness**: only `Alive`, from a run inside
@@ -93,7 +93,7 @@
 //! ## Cadence
 //!
 //! Runs every 60 seconds and fires once immediately on boot (same pattern as
-//! the other sweeps), so a pane killed by an app/engine relaunch is
+//! the other sweeps), so a pane that died while the engine was down is
 //! reconciled — and its work resumed — within seconds of the next engine
 //! start, without any hand-editing of the DB.
 
@@ -115,9 +115,8 @@ use crate::worker_readoption::LiveWorkerConvergence;
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Grace period after `started_at` (epoch seconds) during which a dead pid is
-/// left alone. Comfortably above the app's shell-pid-report window (a single
-/// 250ms retry after the surface attaches) so a worker whose pid is merely
-/// still settling is never raced. Mirrors
+/// left alone. Comfortably above tmux's shell-pid-report window so a worker
+/// whose pid is merely still settling is never raced. Mirrors
 /// [`crate::dead_pid_sweep::DEAD_PID_GRACE_SECS`]'s intent with extra headroom.
 pub const PANE_DEATH_GRACE_SECS: i64 = 60;
 
@@ -302,7 +301,7 @@ pub(crate) async fn shell_pid_death_evidence(
         _ => return None,
     };
 
-    // The durable, restart-robust liveness signal: the shell pid the app
+    // The durable, restart-robust liveness signal: the shell pid tmux
     // reported, persisted to `work_runs.shell_pid`, probed through the shared
     // primitive so this sweep and the re-dispatch/re-adoption paths cannot
     // drift apart on what "the worker's process is gone" means.
@@ -426,7 +425,7 @@ pub async fn reconcile_if_pane_dead(
         dispatch_events,
         execution,
         &reason,
-        &format!("its worker shell pid {shell_pid} was gone (pane died with the host app)"),
+        &format!("its worker shell pid {shell_pid} was gone"),
         Stage::PaneDeathReconcile,
         serde_json::json!({
             "reason": "shell_pid_dead",

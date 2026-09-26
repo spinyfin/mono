@@ -301,6 +301,37 @@ async fn work_resumed_kinds_resolve_once_a_later_run_starts() {
     );
 }
 
+/// Regression: the now-deleted app-reattach pane-death reconcile used to
+/// file `crate::attention_lifecycle::LEGACY_PANE_DEATH_RECONCILE_ATTENTION_KIND`
+/// ("pane_death_reconcile"). Its producer and lifecycle entry were both
+/// deleted along with the app-hosted pane path, but a pre-upgrade engine can
+/// still have left an `open` row of that literal kind in the DB. A legacy
+/// `ClearedBy::WorkResumed` registration must still auto-clear it, or it
+/// would stay open forever with nothing left able to resolve it.
+#[tokio::test]
+async fn legacy_pane_death_reconcile_rows_still_resolve_once_a_later_run_starts() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id, "Pane died on relaunch, then resumed");
+
+    let attention = open_attention_for_work_item(
+        &db,
+        &chore.id,
+        crate::attention_lifecycle::LEGACY_PANE_DEATH_RECONCILE_ATTENTION_KIND,
+        1000,
+    );
+    start_run_at(&db, &chore.id, 1500);
+
+    let outcome = run_one_pass(&db).await;
+    assert_eq!(outcome.attentions_resolved, 1);
+    let (status, resolved_at) = attention_status(&db, &attention);
+    assert_eq!(status, "resolved");
+    assert!(
+        resolved_at.is_some(),
+        "a legacy row must resolve and stay inspectable, not stay open with nothing able to clear it",
+    );
+}
+
 #[tokio::test]
 async fn work_resumed_kinds_stay_open_when_the_only_run_predates_the_signal() {
     let (_dir, db) = open_db();
@@ -432,34 +463,31 @@ async fn a_condition_that_re_trips_after_resolution_shows_again() {
 /// while its first row is still `open` must not be cleared by evidence from
 /// before the current occurrence.
 ///
-/// Every filer dedups onto the open row rather than inserting a second one —
-/// `file_pane_death_attention_item` documents this explicitly ("It won't be
-/// re-filed for this chore while it stays open, even if further relaunches
-/// kill subsequent panes") — so `created_at` stays pinned to the first trip
-/// forever. The sequence below is the real one: pane dies, the orphan sweep
-/// redispatches and a run starts, that pane dies too. Anchored on
-/// `created_at` the sweep would accept the intervening run start and resolve
-/// a signal whose condition is live; anchored on `last_raised_at` it does
-/// not.
+/// Every filer dedups onto the open row rather than inserting a second one,
+/// so `created_at` stays pinned to the first trip forever. The sequence
+/// below is the real one: the guard parks the item, the redispatch's run
+/// start clears the first trip's condition, but the guard parks it again
+/// before this pass runs. Anchored on `created_at` the sweep would accept
+/// the intervening run start and resolve a signal whose condition is live;
+/// anchored on `last_raised_at` it does not.
 #[tokio::test]
 async fn a_condition_that_re_trips_onto_its_still_open_row_is_not_cleared_by_the_earlier_run() {
     let (_dir, db) = open_db();
     let product = create_test_product(&db);
-    let chore = create_test_chore(&db, product.id, "Pane keeps dying");
+    let chore = create_test_chore(&db, product.id, "Guard keeps re-parking");
 
     // First trip, then the redispatch's run start — the evidence that would
     // legitimately clear it if nothing else had happened.
-    let attention =
-        open_attention_for_work_item(&db, &chore.id, crate::dead_pid_sweep::PANE_DEATH_ATTENTION_KIND, 1000);
+    let attention = open_attention_for_work_item(&db, &chore.id, crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND, 1000);
     start_run_at(&db, &chore.id, 1500);
 
-    // The replacement pane dies too. The filer dedups onto the open row and
+    // The guard re-parks the item. The filer dedups onto the open row and
     // returns its id — no second row — but stamps the re-raise.
     let reraised = db
         .upsert_work_item_attention(
             &chore.id,
-            crate::dead_pid_sweep::PANE_DEATH_ATTENTION_KIND,
-            "App relaunch killed a worker pane",
+            crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND,
+            "Auto-redispatch paused",
             "body",
         )
         .unwrap();

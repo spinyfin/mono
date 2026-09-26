@@ -1496,9 +1496,9 @@ pub async fn serve_with_overrides(
     // just re-adopted but whose pane was never issued (the previous
     // process died between `run_started` and `spawn_requested`). Runs
     // with durable tmux identity can be decided from the adoption pass
-    // already above; app-hosted rows (no durable tmux identity) whose
-    // pane presence cannot be asked yet emit a loud diagnostic and are
-    // retried when the app session registers.
+    // already above; rows with no durable tmux identity yet (or a
+    // transient DB read failure) emit a loud diagnostic instead of
+    // guessing and are retried when the app session registers.
     server_state
         .reconcile_unspawned_running_panes(
             &tmux_adoption_report.adopted_execution_ids,

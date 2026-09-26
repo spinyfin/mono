@@ -205,34 +205,9 @@ async fn durable_state_scan_reclaims_a_live_pane_after_its_work_closes() {
         .await
     });
 
-    let hosted_lookup = sink.next().await.expect("hosted-pane lookup should be enqueued");
-    let lookup_id = match hosted_lookup.payload {
-        FrontendEvent::EngineRequest { request_id, request } => {
-            assert!(
-                matches!(request, EngineToAppRequest::ListHostedPanes(_)),
-                "expected ListHostedPanes, got {request:?}",
-            );
-            request_id
-        }
-        other => panic!("expected EngineRequest, got {other:?}"),
-    };
-    server_state
-        .deliver_app_response(
-            "session-app",
-            &lookup_id,
-            EngineToAppResponse::ListHostedPanes {
-                result: Ok(crate::protocol::ListHostedPanesResult {
-                    panes: vec![crate::protocol::HostedPaneEntry {
-                        slot_id: 1,
-                        run_id: execution_id.clone(),
-                        summary: None,
-                        task_title: None,
-                    }],
-                }),
-            },
-        )
-        .await;
-
+    // The slot this run's durable teardown resolves to comes straight from
+    // its recorded worker id (`worker-1` → slot 1, asserted above) — no
+    // `ListHostedPanes` round-trip is needed to find it.
     let release = sink.next().await.expect("pane release should be enqueued");
     let release_id = match release.payload {
         FrontendEvent::EngineRequest { request_id, request } => {
@@ -470,50 +445,24 @@ async fn readoption_derives_the_awaiting_input_capability_from_the_runs_driver()
     db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
     let execution = db.get_execution(&execution_id).unwrap();
 
-    // The live-state slot is only restored when the app can say which slot
-    // hosts the pane, so stand one up and answer the probe.
-    let sink = make_session_sink();
-    server_state
-        .register_app_session("session-app".into(), sink.clone())
-        .await;
-    let server_clone = server_state.clone();
-    let execution_clone = execution.clone();
-    let converge = tokio::spawn(async move {
-        server_clone
-            .converge_terminal_execution(&execution_clone, "hook_after_terminal")
-            .await
-    });
-
-    let envelope = sink.next().await.expect("an EngineRequest event should be enqueued");
-    let request_id = match envelope.payload {
-        FrontendEvent::EngineRequest { request_id, .. } => request_id,
-        other => panic!("expected EngineRequest, got {other:?}"),
-    };
-    server_state
-        .deliver_app_response(
-            "session-app",
-            &request_id,
-            EngineToAppResponse::ListHostedPanes {
-                result: Ok(crate::protocol::ListHostedPanesResult {
-                    panes: vec![crate::protocol::HostedPaneEntry {
-                        slot_id: 4,
-                        run_id: execution_id.clone(),
-                        summary: None,
-                        task_title: None,
-                    }],
-                }),
-            },
-        )
-        .await;
-    assert_eq!(converge.await.expect("converge task"), "readopt");
+    // The re-adopted slot is derived from the run's durable worker id
+    // (`create_spawned_execution` records `worker-1` → slot 1): no app
+    // round-trip is needed to find it, and here the pool confirms the
+    // derived slot is unclaimed, so the re-adoption proceeds.
+    assert_eq!(
+        server_state
+            .converge_terminal_execution(&execution, "hook_after_terminal")
+            .await,
+        "readopt"
+    );
 
     assert!(
-        !server_state.live_worker_states.awaiting_input_capable(4),
+        !server_state.live_worker_states.awaiting_input_capable(1),
         "a re-adopted Codex worker must not be paintable as awaiting input",
     );
     let state = server_state
         .live_worker_states
-        .get(4)
+        .get(1)
         .expect("the re-adopted slot must carry a live-state entry");
     assert_eq!(
         state.model, "OpenAI Codex",
@@ -530,11 +479,11 @@ async fn readoption_derives_the_awaiting_input_capability_from_the_runs_driver()
     // live worker; and the hook that triggered this convergence is genuine
     // driver-originated proof, so it is recorded rather than discarded.
     assert_eq!(
-        server_state.live_worker_states.driver_start_expectation(4),
+        server_state.live_worker_states.driver_start_expectation(1),
         Some(crate::live_worker_state::DriverStartExpectation::Readopted),
     );
     assert!(
-        server_state.live_worker_states.driver_signal_at(4).is_some(),
+        server_state.live_worker_states.driver_signal_at(1).is_some(),
         "the hook that triggered the re-adoption is driver-start proof",
     );
     assert!(
@@ -548,6 +497,75 @@ async fn readoption_derives_the_awaiting_input_capability_from_the_runs_driver()
             )
             .is_empty(),
         "a re-adopted worker must never be reaped as a driver that never started",
+    );
+}
+
+/// Regression for a slot re-adoption tries to restore onto but which has
+/// since been handed to a DIFFERENT, live execution — e.g. `pool_claim_sweep`
+/// reclaimed run A's leaked claim on `worker-1` and a later dispatch put run
+/// B there while A's terminal state was never corrected. When A finally
+/// hooks and re-adoption fires, `hosted_pane_slot_for_run` still derives slot
+/// 1 from A's own durable `work_runs.agent_id` — that lookup has no way to
+/// see B occupying it now. Re-adoption must refuse to touch worker-1's pool
+/// claim or live-state entry in that case: both belong to B, and B is still
+/// running.
+#[tokio::test]
+async fn readoption_does_not_overwrite_a_slot_held_by_a_different_live_execution() {
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+    // `create_spawned_execution` always records `worker-1` as the durable
+    // worker id, so execution A's derived slot is slot 1.
+    let execution_id = create_spawned_execution(db, &work_item_id, i64::from(std::process::id()));
+    db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
+
+    // Slot 1 has since been claimed and populated by a different, live
+    // execution B — the scenario the durable derivation cannot see, because
+    // it only reads A's own historical record.
+    let other_execution_id = "run-newer-occupant";
+    assert!(
+        server_state
+            .execution_coordinator
+            .reclaim_slot("worker-1", other_execution_id)
+            .await,
+        "the newer run must be able to claim the slot the stale run once held",
+    );
+    server_state.live_worker_states.register_spawn(
+        1,
+        other_execution_id.to_owned(),
+        "claude-opus-4-7",
+        std::process::id() as i32,
+        None,
+    );
+
+    // A's own hook arrives and triggers re-adoption.
+    crate::app::worker_events::converge_terminal_execution_contradiction(&server_state, &execution_id, "post_tool_use")
+        .await;
+
+    let after = db.get_execution(&execution_id).unwrap();
+    assert_eq!(
+        after.status,
+        ExecutionStatus::Running,
+        "the row must still come back — that is what stops the duplicate dispatch",
+    );
+
+    // B's slot must survive completely untouched: same pool claim, same
+    // live-state entry.
+    let claims = server_state.execution_coordinator.worker_pool().claims().await;
+    assert!(
+        claims
+            .iter()
+            .any(|claim| claim.worker_id == "worker-1" && claim.execution_id == other_execution_id),
+        "expected the newer run's pool claim to survive, got {claims:?}",
+    );
+    let state = server_state
+        .live_worker_states
+        .get(1)
+        .expect("the newer run's live-state entry must not be dropped");
+    assert_eq!(
+        state.run_id, other_execution_id,
+        "re-adopting the stale run must not overwrite the newer run's live-state entry",
     );
 }
 

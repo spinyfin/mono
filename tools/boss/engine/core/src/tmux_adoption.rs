@@ -5,13 +5,11 @@
 //! pid/slot map, and the [`crate::live_worker_state::LiveWorkerStateRegistry`]
 //! — even though the DB rows those structures were tracking may still be
 //! perfectly live (see `tools/boss/docs/worker-liveness-contract.md`'s three
-//! layers). For an app-hosted worker pane the app itself survives the engine
-//! restart and can be asked what it hosts
-//! ([`crate::app::readoption::ServerState::hosted_pane_slot_for_run`]). A
-//! tmux-hosted worker has no such oracle to ask — nothing but tmux itself
-//! knows the session is still there — so without this pass every tmux-hosted
-//! worker would sit invisible to `bossctl agents list` until it happened to
-//! hook or go terminal-and-get-reaped.
+//! layers). Tmux is the sole pane host and has no oracle to ask about what
+//! survived a restart — nothing but tmux itself knows a session is still
+//! there — so without this pass every worker would sit invisible to
+//! `bossctl agents list` until it happened to hook or go
+//! terminal-and-get-reaped.
 //!
 //! This module closes that gap. On every boot, before
 //! [`crate::run_reconcile`] gets a turn:
@@ -128,7 +126,7 @@ const ENGINE_OWNER_OPTION: &str = "@boss_engine_owner";
 /// version-skewed session. Registered in [`crate::attention_lifecycle`] as
 /// [`crate::attention_lifecycle::ClearedBy::WorkResumed`] — a later run
 /// starting on the same work item is direct evidence the item is moving
-/// again, the same shape as [`crate::dead_pid_sweep::PANE_DEATH_ATTENTION_KIND`].
+/// again.
 pub const TMUX_ADOPTION_SCHEMA_SKEW_ATTENTION_KIND: &str = "tmux_adoption_schema_skew";
 
 /// `work_attention_items.kind` filed when live sessions remain on the
