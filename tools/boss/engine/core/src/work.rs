@@ -666,6 +666,7 @@ mod review_batches;
 mod review_findings_followup;
 mod review_guide_jobs;
 mod review_guide_sources;
+mod review_guide_submission;
 mod review_verdict_apply;
 mod review_verdicts;
 mod revise_doc;

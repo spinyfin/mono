@@ -55,6 +55,7 @@ fn valid_payload_for(kind: ProposalKind) -> Value {
         }),
         ProposalKind::AutomationOutcome => json!({"outcome": "skip", "reason": "repo is clean"}),
         ProposalKind::PrCreated => json!({"pr_url": "https://github.com/o/r/pull/123"}),
+        ProposalKind::ReviewGuide => json!({"body_markdown": "# Guide"}),
         ProposalKind::ReviewReport => json!({
             "batch_id": "rvb_123",
             "target_sha": "head_123",

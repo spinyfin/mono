@@ -43,7 +43,9 @@ mod rollout_calls;
 mod tool_surface_guard;
 
 use guard_trace::{GUARD_TRACE_SHIM_FILENAME, GUARD_TRACE_SHIM_SCRIPT, guard_trace_path, wrapper_body};
-use review_guide_guard::codex_review_guide_guard_script;
+pub(crate) use review_guide_guard::codex_review_guide_guard_script;
+#[cfg(test)]
+pub(crate) use review_guide_guard::with_review_guide_command as codex_review_guide_guard_script_for_test;
 use reviewer_publish_guard::codex_reviewer_publish_guard_script;
 use tool_surface_guard::codex_tool_surface_guard_script;
 
@@ -1176,12 +1178,7 @@ fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> 
         });
     }
 
-    // 6. Review-guide no-tool-use guard — the entire enforced-read-only
-    // Astra mandate for this kind. Its job never needs a tool call (the
-    // source packet is already embedded in its prompt), so this blocks
-    // every `PreToolUse` call unconditionally rather than pattern-matching
-    // a publish/write shape. `.*` because it must see every tool name, not
-    // just `Bash`/`apply_patch`. See [`review_guide_guard`].
+    // Review guides may only submit their result through the proposal command.
     if config.is_review_guide {
         planned.push(Planned {
             name: "review_guide_guard",

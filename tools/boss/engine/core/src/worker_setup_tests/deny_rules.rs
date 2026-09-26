@@ -358,3 +358,197 @@ fn hook_entry_runs_path_guard_matches_only_the_gate_script_entry() {
 fn review_guide_and_answer_agent_share_the_read_only_deny_body() {
     assert_eq!(review_guide_deny_rules(), answer_agent_deny_rules());
 }
+
+#[test]
+fn claude_review_guide_settings_allow_only_submission_and_wire_the_exact_command_guard() {
+    let mut input = sample_input();
+    input.worker_kind = WorkerKind::ReviewGuide;
+    let settings: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
+    assert_eq!(settings["permissions"]["defaultMode"], "dontAsk");
+    assert_eq!(
+        settings["permissions"]["allow"],
+        serde_json::json!(review_guide_allow_rules())
+    );
+    let hook = settings["hooks"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| {
+            entry["hooks"][0]["command"].as_str().is_some_and(|command| {
+                command.contains("REVIEW_GUIDE_COMMAND") || command.contains("def allowed(payload)")
+            })
+        })
+        .expect("guide guard must be wired into Claude hooks");
+    assert_eq!(hook["matcher"], ".*");
+    let command = hook["hooks"][0]["command"].as_str().unwrap();
+    for (tool, shell, expected) in [
+        ("Bash", "\"$BOSS_BIN\" propose review-guide --body '# Guide'", "approve"),
+        (
+            "Bash",
+            "\"$BOSS_BIN\" propose review-guide --body '# Guide\nswift run\nboss engine start\n'",
+            "approve",
+        ),
+        ("Bash", "cat README.md", "block"),
+        ("Read", "", "block"),
+        (
+            "Bash",
+            "\"$BOSS_BIN\" propose review-guide --body 'x'; touch /tmp/x",
+            "block",
+        ),
+    ] {
+        use std::io::Write;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", command])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                serde_json::json!({"tool_name": tool, "tool_input": {"command": shell}})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(result.status.success());
+        let decision: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(decision["decision"], expected, "{shell}");
+    }
+}
+
+/// A review-guide worker's live PreToolUse chain (path + launch +
+/// review-guide) must treat a proven `--body` literal as data, including
+/// Markdown that quotes launch commands and the Boss data directory, while
+/// still rejecting chaining, redirects, and substitutions.
+#[test]
+fn review_guide_hook_chain_masks_literal_body_and_still_rejects_wrappers() {
+    use crate::driver::{AgentDriver, ToolUseInterceptionConfig};
+    use std::io::Write as _;
+
+    let data = TempDir::new().unwrap();
+    let data_dir = data.path();
+    let script_dir = TempDir::new().unwrap();
+    let script = script_dir.path().join(PATH_GUARD_SCRIPT_NAME);
+    std::fs::write(&script, PATH_GUARD_SCRIPT).unwrap();
+    let wiring = ClaudeDriver.tool_use_interception_wiring(&ToolUseInterceptionConfig {
+        data_dir: Some(data_dir.to_path_buf()),
+        path_guard_script: Some(script),
+        checkleft_guard_script: None,
+        is_revision: false,
+        is_standard_worker: false,
+        is_reviewer: false,
+        is_review_guide: true,
+        run_id: None,
+        workspace_path: None,
+    });
+    let commands: Vec<String> = wiring
+        .pre_tool_use_hooks
+        .iter()
+        .filter_map(|entry| entry["hooks"][0]["command"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(
+        commands.len(),
+        3,
+        "local review-guide worker must get path + launch + review-guide: {commands:?}"
+    );
+
+    let body_command = format!(
+        "\"$BOSS_BIN\" propose review-guide --body '# Guide\n\
+         ## Problem\n\
+         Workers sometimes quote `swift run` and `boss engine start`.\n\
+         Isolated engines use `bazel run //tools/boss/engine/core:engine` without a socket path in the prose.\n\
+         The data directory is {}.\n\
+         ## Implementation\n\
+         ## Example\n\
+         ## Review\n'",
+        data_dir.display()
+    );
+    let run = |hook: &str, command: &str, boss_bin: Option<&str>, path: Option<&str>| {
+        let payload = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": "/"});
+        let mut process = std::process::Command::new("sh");
+        process.args(["-c", hook]).env_remove("BOSS_BIN");
+        if let Some(bin) = boss_bin {
+            process.env("BOSS_BIN", bin);
+        }
+        if let Some(path) = path {
+            process.env("PATH", path);
+        }
+        let mut child = process
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("sh must be available");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
+    };
+    for hook in &commands {
+        let decision = run(hook, &body_command, Some("/usr/bin/true"), None);
+        assert_eq!(
+            decision["decision"], "approve",
+            "literal guide body must pass {hook}: {decision}"
+        );
+    }
+    for (label, command) in [
+        (
+            "chaining",
+            r#""$BOSS_BIN" propose review-guide --body 'x' && boss engine start"#,
+        ),
+        (
+            "redirect",
+            r#""$BOSS_BIN" propose review-guide --body 'x' > /tmp/guide.md"#,
+        ),
+        (
+            "substitution",
+            r#""$BOSS_BIN" propose review-guide --body "$(cat secret)""#,
+        ),
+    ] {
+        let decisions: Vec<_> = commands
+            .iter()
+            .map(|hook| run(hook, command, Some("/usr/bin/true"), None))
+            .collect();
+        assert!(
+            decisions.iter().any(|d| d["decision"] == "block"),
+            "{label} must be rejected by the review-guide chain: {decisions:?} for {command}"
+        );
+    }
+
+    // A valid literal body does not establish which executable the shell runs.
+    let repobin = script_dir.path().join("repobin");
+    std::fs::write(&repobin, b"#!/bin/sh\n").unwrap();
+    let boss = script_dir.path().join("boss");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&repobin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&repobin, &boss).unwrap();
+    }
+    let path = format!("{}:{}", script_dir.path().display(), std::env::var("PATH").unwrap());
+    for (command, bin, expected_reason) in [
+        (r#""$BOSS_BIN" propose review-guide --body 'guide'"#, None, "unset"),
+        (
+            r#""$BOSS_BIN" propose review-guide --body 'guide'"#,
+            boss.to_str(),
+            "repobin",
+        ),
+        ("boss propose review-guide --body 'guide'", None, "repobin"),
+    ] {
+        let decision = run(BOSS_LAUNCH_GUARD_COMMAND, command, bin, Some(&path));
+        assert_eq!(decision["decision"], "block", "{decision}");
+        assert!(
+            decision["reason"].as_str().unwrap().contains(expected_reason),
+            "{decision}"
+        );
+    }
+}

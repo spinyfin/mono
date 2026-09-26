@@ -32,6 +32,7 @@ pub enum ProposalKind {
     FollowupTask,
     AutomationOutcome,
     PrCreated,
+    ReviewGuide,
     ReviewReport,
     ReviewVerdict,
     RunDone,
@@ -46,6 +47,7 @@ impl ProposalKind {
         ProposalKind::FollowupTask,
         ProposalKind::AutomationOutcome,
         ProposalKind::PrCreated,
+        ProposalKind::ReviewGuide,
         ProposalKind::ReviewReport,
         ProposalKind::ReviewVerdict,
         ProposalKind::RunDone,
@@ -60,6 +62,7 @@ impl ProposalKind {
             ProposalKind::FollowupTask => "followup_task",
             ProposalKind::AutomationOutcome => "automation_outcome",
             ProposalKind::PrCreated => "pr_created",
+            ProposalKind::ReviewGuide => "review_guide",
             ProposalKind::ReviewReport => "review_report",
             ProposalKind::ReviewVerdict => "review_verdict",
             ProposalKind::RunDone => "run_done",
@@ -84,12 +87,13 @@ impl std::str::FromStr for ProposalKind {
             "followup_task" => Ok(ProposalKind::FollowupTask),
             "automation_outcome" => Ok(ProposalKind::AutomationOutcome),
             "pr_created" => Ok(ProposalKind::PrCreated),
+            "review_guide" => Ok(ProposalKind::ReviewGuide),
             "review_report" => Ok(ProposalKind::ReviewReport),
             "review_verdict" => Ok(ProposalKind::ReviewVerdict),
             "run_done" => Ok(ProposalKind::RunDone),
             other => Err(format!(
                 "unknown proposal kind `{other}`; expected one of: attention, effort_escalation, \
-                 blocked, deferred_scope, followup_task, automation_outcome, pr_created, review_report, \
+                 blocked, deferred_scope, followup_task, automation_outcome, pr_created, review_guide, review_report, \
                  review_verdict, run_done"
             )),
         }
@@ -622,3 +626,9 @@ pub const PROPOSAL_CAP_TOTAL_PER_EXECUTION: usize = 32;
 /// loop that is stuck re-proposing one thing without consuming the whole
 /// total budget, which would mask the pattern.
 pub const PROPOSAL_CAP_PER_KIND_PER_EXECUTION: usize = 8;
+
+/// The finished Markdown guide, submitted by its execution through SubmitProposal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewGuideProposalPayload {
+    pub body_markdown: String,
+}

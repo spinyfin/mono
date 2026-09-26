@@ -147,17 +147,15 @@ pub fn answer_agent_deny_rules() -> Vec<String> {
     read_only_worker_deny_rules()
 }
 
-/// The `permissions.deny` belt for [`WorkerKind::ReviewGuide`] — defense in
-/// depth only, mirroring [`answer_agent_deny_rules`], since this kind's real
-/// enforcement is the Codex `PreToolUse` guard
-/// (`review_guide_guard` in the driver crate) and it must never actually
-/// dispatch on the Claude/Grok drivers this file's `settings.json` governs.
-///
-/// Unlike [`WorkerKind::AnswerAgent`], there is no allowlist here at all: a
-/// review-guide worker has no allowlisted mutating command (it never edits,
-/// pushes, or posts anything — it just returns Markdown as ordinary assistant
-/// prose), so the forced `dontAsk` permission mode with an *empty*
-/// `permissions.allow` is itself the belt; this deny list is the second one.
+/// Review-guide workers can only submit their result; the shared hook checks
+/// exact shell syntax and denies every other tool, including built-in reads.
+pub fn review_guide_allow_rules() -> Vec<String> {
+    vec![
+        r#"Bash("$BOSS_BIN" propose review-guide:*)"#.to_owned(),
+        r#"Bash("${BOSS_BIN}" propose review-guide:*)"#.to_owned(),
+    ]
+}
+
 pub fn review_guide_deny_rules() -> Vec<String> {
     read_only_worker_deny_rules()
 }

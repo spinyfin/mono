@@ -1051,9 +1051,13 @@ pub(crate) async fn compose_worker_spawn(
                 .build(),
         )
     };
-    let bookmark_instructions = crate::execution_bookmark_recovery::worker_instructions(execution);
-    let (opening, rest) = prompt_text.split_once('\n').unwrap_or((&prompt_text, ""));
-    let prompt_text = format!("{opening}\n\n{bookmark_instructions}{rest}");
+    let prompt_text = if execution.kind == ExecutionKind::PrReviewGuide {
+        prompt_text
+    } else {
+        let bookmark_instructions = crate::execution_bookmark_recovery::worker_instructions(execution);
+        let (opening, rest) = prompt_text.split_once('\n').unwrap_or((&prompt_text, ""));
+        format!("{opening}\n\n{bookmark_instructions}{rest}")
+    };
     let prompt_text = match origin_pr_backlink {
         Some(backlink) => format!(
             "{prompt_text}\n\n## Origin PR backlink\n\n\
@@ -2327,6 +2331,43 @@ mod compose_worker_spawn_tests {
         .expect("codex pin must yield for CiRemediation");
 
         assert_eq!(composed.spawn_config.driver, "claude");
+    }
+
+    #[tokio::test]
+    async fn review_guide_prompt_omits_jj_recovery_bookmark_instructions() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let execution = WorkExecution::builder()
+            .id("exec_guide_01")
+            .work_item_id("cmp_missing")
+            .kind(ExecutionKind::PrReviewGuide)
+            .status(ExecutionStatus::Running)
+            .repo_remote_url("git@github.com:org/repo.git")
+            .workspace_path("/tmp/workspace")
+            .created_at("2026-05-15T00:00:00Z")
+            .build();
+        let work_item = task_without_pr("cmp_missing");
+        let composed = compose_worker_spawn(
+            &db,
+            "worker-1",
+            &execution,
+            &work_item,
+            workspace.path(),
+            None,
+            WorkerSpawnOpts::default(),
+        )
+        .await
+        .expect("review-guide spawn must compose");
+        assert!(
+            !composed.prompt_text.contains("jj bookmark set"),
+            "review-guide workers cannot run jj bookmark commands: {}",
+            composed.prompt_text
+        );
+        assert!(
+            !composed.prompt_text.contains("## Execution recovery bookmark"),
+            "{}",
+            composed.prompt_text
+        );
     }
 
     /// Unit coverage for the yield helper itself: a pin that clears the gate

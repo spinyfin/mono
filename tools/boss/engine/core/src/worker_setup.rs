@@ -77,7 +77,8 @@ use crate::ssh_transport::shell_quote;
 
 mod deny_rules;
 pub use deny_rules::{
-    answer_agent_allow_rules, answer_agent_deny_rules, review_guide_deny_rules, reviewer_deny_rules, triage_deny_rules,
+    answer_agent_allow_rules, answer_agent_deny_rules, review_guide_allow_rules, review_guide_deny_rules,
+    reviewer_deny_rules, triage_deny_rules,
 };
 
 // Re-export guard command constants so the test module (which uses `use
@@ -137,23 +138,10 @@ pub enum WorkerKind {
     /// task/comment/cube state, or take any action other than posting its one
     /// reply. See [`crate::answer_agent`] for the worker-facing surface.
     AnswerAgent,
-    /// Read-only PR review-guide generator (`ExecutionKind::PrReviewGuide`,
-    /// design `automatic-pr-review-guides.md`). Runs exclusively on the
-    /// Codex driver's fixed `gpt-6-astra`/`high` profile. Even more
-    /// restricted than [`Self::AnswerAgent`]: it has no leased checkout
-    /// content to publish from and no allowlisted mutating command at all —
-    /// its entire job is to read the engine-supplied immutable source
-    /// packet embedded in its prompt and return Markdown as ordinary
-    /// assistant prose. Arbitrary shell execution, file edits, VCS mutation,
-    /// GitHub mutation, and task/comment dispatch are all unavailable; there
-    /// is no model-callable publish/reply command. Claude/Grok enforcement
-    /// here is the same deny-everything belt as [`Self::AnswerAgent`]
-    /// ([`review_guide_deny_rules`]) — defense in depth only, since this
-    /// kind must never actually resolve to a driver other than `codex` (see
-    /// the spawn-time Astra pin assertion in `runner::worker_spawn`). Codex
-    /// enforcement is a dedicated `PreToolUse` guard
-    /// (`crate::driver::codex::review_guide_guard`), not this settings file,
-    /// mirroring [`Self::Reviewer`]'s Codex posture.
+    /// PR review-guide generator on the fixed Codex Astra profile. Reads only
+    /// the embedded source packet and submits Markdown with
+    /// `"$BOSS_BIN" propose review-guide --body`. A shared PreToolUse allowlist
+    /// blocks every other tool/command; Claude additionally uses dontAsk.
     ReviewGuide,
 }
 
@@ -996,7 +984,13 @@ fn pre_tool_use_array(hooks: &mut serde_json::Map<String, serde_json::Value>) ->
 ///   downgraded to `auto`/`--dangerously-skip-permissions`, which would defeat
 ///   the allowlist.
 fn permissions_value(input: &WorkerSetupInput, fence: DataDirFence) -> serde_json::Value {
-    if input.worker_kind == WorkerKind::AnswerAgent {
+    if input.worker_kind == WorkerKind::ReviewGuide {
+        serde_json::json!({
+            "defaultMode": "dontAsk",
+            "allow": review_guide_allow_rules(),
+            "deny": deny_rules(input, fence),
+        })
+    } else if input.worker_kind == WorkerKind::AnswerAgent {
         serde_json::json!({
             "defaultMode": "dontAsk",
             "allow": answer_agent_allow_rules(),
@@ -1217,7 +1211,8 @@ const GUARD_SCRIPT_PRUNE_GRACE: Duration = Duration::from_secs(7 * 24 * 60 * 60)
 /// directories. Reading one specific file outside the workspace
 /// (`~/.gitconfig`, a bazel cache entry) is deliberately untouched: the defect
 /// is the breadth of the traversal, not the fact that a path is external.
-const PATH_GUARD_SCRIPT: &str = r#"#!/usr/bin/env python3
+const PATH_GUARD_SCRIPT: &str = boss_engine_driver::render_review_guide_guard!(
+    r#"#!/usr/bin/env python3
 """Deterministic Boss data-directory access gate (Claude Code PreToolUse hook).
 
 Blocks any tool call whose target path canonically resolves inside the Boss
@@ -1248,8 +1243,12 @@ ordinary read of one specific file outside the workspace is untouched.
 """
 import json
 import os
+import re
 import shlex
 import sys
+
+"#,
+    r#"
 
 MALFORMED = (
     "Blocked (fail-closed): the Boss data-directory gate could not read this "
@@ -1671,6 +1670,9 @@ def main():
         command = tool_input.get("command")
         if not isinstance(command, str):
             emit("block", MALFORMED)
+        masked = review_guide_masked_command(command)
+        if masked is not None:
+            command = masked
         raw_command = command
         try:
             lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
@@ -1736,7 +1738,8 @@ def main():
 
 if __name__ == "__main__":
     main()
-"#;
+"#
+);
 
 /// Deterministic pre-push checkleft gate, run as a `PreToolUse` hook on
 /// every Bash tool call for a standard (implementation) worker.

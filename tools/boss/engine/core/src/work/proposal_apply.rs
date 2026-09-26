@@ -99,6 +99,7 @@ pub fn apply_policy(kind: ProposalKind) -> ProposalApplyPolicy {
         | ProposalKind::DeferredScope
         | ProposalKind::AutomationOutcome
         | ProposalKind::PrCreated
+        | ProposalKind::ReviewGuide
         | ProposalKind::ReviewReport
         | ProposalKind::RunDone => ProposalApplyPolicy::AutoApply,
         // Staged at submission (member reported, batch → applying) but the
@@ -165,12 +166,13 @@ pub enum ApplyDecision {
 /// stamped onto (allocated by the caller before this runs, so appliers that
 /// need to reference their own proposal — e.g. to supersede a predecessor —
 /// have it available before the `INSERT`).
-pub fn apply_in_transaction(
+pub(super) fn apply_in_transaction(
     tx: &Transaction<'_>,
     execution_id: &str,
     payload_json: &str,
     kind: ProposalKind,
     proposal_id: &str,
+    prepared_guide: Option<&Result<super::review_guide_submission::PreparedGuide>>,
 ) -> Result<ApplyDecision> {
     match kind {
         ProposalKind::Attention => apply_attention(tx, execution_id, payload_json).map(ApplyDecision::Applied),
@@ -181,6 +183,9 @@ pub fn apply_in_transaction(
         ProposalKind::DeferredScope => apply_deferred_scope(tx, execution_id, payload_json).map(ApplyDecision::Applied),
         ProposalKind::AutomationOutcome => apply_automation_outcome(tx, execution_id, payload_json, proposal_id),
         ProposalKind::PrCreated => apply_pr_created(tx, execution_id, payload_json),
+        ProposalKind::ReviewGuide => {
+            super::review_guide_submission::accept(tx, execution_id, prepared_guide.context("missing prepared guide")?)
+        }
         ProposalKind::ReviewReport => apply_review_report(tx, execution_id, payload_json, proposal_id),
         ProposalKind::RunDone => apply_run_done(tx, execution_id, payload_json, proposal_id),
         ProposalKind::ReviewVerdict => apply_review_verdict(tx, execution_id, payload_json, proposal_id),
@@ -1296,8 +1301,15 @@ mod tests {
         let mut conn = db.connect().unwrap();
         let tx = conn.transaction().unwrap();
 
-        let err = apply_in_transaction(&tx, "exec_missing", "{}", ProposalKind::FollowupTask, "prp_missing")
-            .expect_err("no applier exists for FollowupTask; this must be an error, not a panic");
+        let err = apply_in_transaction(
+            &tx,
+            "exec_missing",
+            "{}",
+            ProposalKind::FollowupTask,
+            "prp_missing",
+            None,
+        )
+        .expect_err("no applier exists for FollowupTask; this must be an error, not a panic");
         assert!(
             err.to_string().contains("followup_task"),
             "error should name the unhandled kind: {err}"

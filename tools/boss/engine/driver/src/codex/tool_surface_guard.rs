@@ -163,6 +163,7 @@ INLINE_PROGRAM_FLAGS = {
 SHELL_FLAG_CLUSTER = re.compile(r"^-[A-Za-z]+$")
 
 # COMMAND_TOKENIZER_FRAGMENT
+# REVIEW_GUIDE_COMMAND_FRAGMENT
 
 
 def emit(decision, reason=None):
@@ -256,6 +257,9 @@ def main():
     if not isinstance(command, str):
         emit("block", MALFORMED + "tool_input.command was not a string")
 
+    masked = review_guide_masked_command(command)
+    if masked is not None:
+        command = masked
     for group in command_groups(command):
         detail = stdin_channel_detail(group)
         if detail:
@@ -270,7 +274,10 @@ if __name__ == "__main__":
 
 /// Render the tool-surface guard with the shared shell-command tokenizer.
 pub fn codex_tool_surface_guard_script() -> String {
-    with_command_tokenizer(SCRIPT_TEMPLATE)
+    with_command_tokenizer(SCRIPT_TEMPLATE).replace(
+        "# REVIEW_GUIDE_COMMAND_FRAGMENT",
+        super::review_guide_guard::REVIEW_GUIDE_COMMAND_PY,
+    )
 }
 
 #[cfg(test)]
@@ -319,6 +326,14 @@ mod tests {
 
     fn bash(command: &str) -> (String, String) {
         decide(serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}}))
+    }
+
+    #[test]
+    fn guide_submission_literal_is_data_even_when_it_contains_shell_examples() {
+        let (decision, reason) = bash(
+            "\"$BOSS_BIN\" propose review-guide --body '# Guide\nExample:\npython3\nbash\nswift run\nboss engine start\n$(not executed)\n'",
+        );
+        assert_eq!(decision, "approve", "{reason}");
     }
 
     #[test]

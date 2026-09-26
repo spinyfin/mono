@@ -669,7 +669,7 @@ impl WorkDb {
         Ok(())
     }
 
-    fn artifact_root(&self) -> Result<PathBuf> {
+    pub(super) fn artifact_root(&self) -> Result<PathBuf> {
         self.path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -838,10 +838,14 @@ fn map_capture(row: &Row<'_>, artifact_root: &Path) -> rusqlite::Result<PrReview
 
 #[cfg(test)]
 thread_local! {
-    static BEFORE_PACKET_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    pub(super) static BEFORE_PACKET_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
-fn load_packet(artifact_root: &Path, packet_path: Option<&str>, expected_hash: &str) -> Result<SourcePacket> {
+pub(super) fn load_packet(
+    artifact_root: &Path,
+    packet_path: Option<&str>,
+    expected_hash: &str,
+) -> Result<SourcePacket> {
     #[cfg(test)]
     BEFORE_PACKET_READ.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {

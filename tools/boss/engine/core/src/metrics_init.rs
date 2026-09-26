@@ -228,6 +228,7 @@ mod tests {
             "worker_proposals.submitted.followup_task",
             "worker_proposals.submitted.automation_outcome",
             "worker_proposals.submitted.pr_created",
+            "worker_proposals.submitted.review_guide",
             "worker_proposals.validation_failed",
             "worker_proposals.rate_limited",
             "worker_proposals.channel_error",
@@ -301,11 +302,11 @@ mod tests {
         }
         assert_eq!(
             names.len(),
-            111,
+            112,
             "expected 6 answer_agent + 6 pr_url_capture + 6 worker_proposals fallback_hit + 3 cube_workspace_lease + \
              10 dispatcher + 15 merge_poller + 3 review_pool + 18 external_tracker + 2 speculative_conflict + \
              1 stacked_pr_structuring + 1 dispatch_metrics + 9 trunk_queue_poller + \
-             12 worker_proposals submit + 1 worker_proposals channel_error + \
+             13 worker_proposals submit + 1 worker_proposals channel_error + \
              5 github_api + 2 codex_unobserved_command + 2 codex_guard_trace + \
              4 work_attachments + 1 completion mid_turn_reap + 1 nudge_ladder + 3 run_done counters"
         );

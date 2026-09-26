@@ -361,12 +361,12 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
         }
         ExecutionKind::PrReviewGuide => {
             // Enforced read-only review-guide generator: no workspace, no
-            // PR, no tool calls at all. (The full review-guide prompt with
-            // the embedded source packet is composed by
-            // `compose_review_guide_prompt`; this arm keeps the generic
-            // composer sane and read-only if ever reached.)
+            // PR. (The full review-guide prompt with the embedded source
+            // packet is composed by `compose_review_guide_prompt`; this arm
+            // keeps the generic composer sane and proposal-only if ever
+            // reached.)
             prompt.push_str(
-                "Expected outcome for this run:\n- read the source material already in your prompt,\n- answer with the finished Markdown review guide,\n- take no other action — you have no tools and no workspace.\n",
+                "Expected outcome for this run:\n- read the source material already in your prompt,\n- submit the finished Markdown via `\"$BOSS_BIN\" propose review-guide --body '<literal>'`,\n- take no other action — that is the only permitted command.\n",
             );
         }
         ExecutionKind::AutomationTriage
