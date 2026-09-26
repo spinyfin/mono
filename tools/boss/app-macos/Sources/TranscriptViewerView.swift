@@ -107,6 +107,7 @@ struct ExecutionRow: View {
         case "revision_implementation": "Revision"
         case "ci_remediation": "CI Remediation"
         case "investigation": "Investigation"
+        case "pr_review_guide": "Review Guide"
         default: exec.kind.replacingOccurrences(of: "_", with: " ").capitalized
         }
     }

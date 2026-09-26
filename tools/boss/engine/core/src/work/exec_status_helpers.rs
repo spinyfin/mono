@@ -42,6 +42,9 @@ pub(crate) fn execution_kind_for_work_item(conn: &Connection, work_item_id: &str
         // `create_answer_agent_execution`, not `request_execution` — this
         // helper only maps product/project/task ids.
         ItemKind::Comment => bail!("comment ids do not map to a primary execution kind: {work_item_id}"),
+        // Review-guide executions are created via `insert_review_guide_execution`,
+        // not `request_execution` either — same rationale as comments.
+        ItemKind::Comparison => bail!("comparison ids do not map to a primary execution kind: {work_item_id}"),
     })
 }
 
@@ -330,6 +333,11 @@ pub(crate) fn product_id_for_work_item(conn: &Connection, work_item_id: &str) ->
         // an answer-agent execution resolve via the comment's doc owner
         // (`WorkDb::resolve_doc_owner`), not this helper.
         ItemKind::Comment => bail!("comment ids are not product-scoped work items: {work_item_id}"),
+        // Comparisons are not product-owned rows either. Callers that need a
+        // product for a review-guide execution resolve via the comparison's
+        // series root task (`WorkDb::root_task_id_for_review_guide_series`),
+        // not this helper.
+        ItemKind::Comparison => bail!("comparison ids are not product-scoped work items: {work_item_id}"),
     }
 }
 
@@ -354,6 +362,7 @@ pub(crate) fn product_id_for_work_item_including_deleted(conn: &Connection, work
             .map(|task| task.product_id)
             .with_context(|| format!("unknown task: {work_item_id}")),
         ItemKind::Comment => bail!("comment ids are not product-scoped work items: {work_item_id}"),
+        ItemKind::Comparison => bail!("comparison ids are not product-scoped work items: {work_item_id}"),
     }
 }
 

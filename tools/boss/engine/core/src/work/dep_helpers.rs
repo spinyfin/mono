@@ -28,6 +28,17 @@ pub(crate) enum ItemKind {
     /// that need the row use [`WorkDb::get_comment`]; closedness for recon
     /// uses [`WorkDb::is_bound_work_item_closed`].
     Comment,
+    /// A `pr_review_guide_source_comparisons` row id (`prgc_…`). A
+    /// `PrReviewGuide` execution binds the comparison it was generated from
+    /// into `work_executions.work_item_id` (see
+    /// `WorkDb::create_pr_review_guide_execution`), not a task, so
+    /// reconciliation must classify that id too rather than fail with
+    /// "unknown work item id format". Comparisons are not product/project/
+    /// task work items and have no independent closedness lifecycle —
+    /// callers that need the row use
+    /// [`WorkDb::get_pr_review_guide_comparison_by_id`], and the owning task
+    /// via [`WorkDb::root_task_id_for_review_guide_series`].
+    Comparison,
 }
 
 /// One candidate from a short-id lookup. Listed in full when a short id
@@ -75,9 +86,9 @@ pub(crate) fn format_short_id_ambiguous(input: &str, candidates: &[ShortIdCandid
     lines.join("\n")
 }
 
-/// If `id` looks like a friendly work-item selector (`T42`, `t42`, `P7`,
-/// `p7`, `#42`, bare `42`, or `slug/42`), query the DB by short_id and
-/// return the matching primary id.
+/// If `id` looks like a friendly work-item selector (letter prefix plus
+/// digits, `#` plus digits, a bare number, or `slug/` plus digits), query
+/// the DB by short_id and return the matching primary id.
 ///
 /// Returns:
 /// - `Ok(Some(primary))` when exactly one live row matches
@@ -227,6 +238,9 @@ pub(crate) fn classify_id(id: &str) -> Result<ItemKind> {
     if id.starts_with("cmt_") {
         return Ok(ItemKind::Comment);
     }
+    if id.starts_with("prgc_") {
+        return Ok(ItemKind::Comparison);
+    }
     bail!("unknown work item id format: {id}")
 }
 
@@ -259,6 +273,14 @@ pub(crate) fn typed_work_item_exists(conn: &Connection, id: &str) -> Result<bool
             .query_row("SELECT 1 FROM work_comments WHERE id = ?1", params![id], |_| Ok(()))
             .optional()?
             .is_some()),
+        ItemKind::Comparison => Ok(conn
+            .query_row(
+                "SELECT 1 FROM pr_review_guide_source_comparisons WHERE id = ?1",
+                params![id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()),
     }
 }
 
@@ -282,6 +304,14 @@ pub(crate) fn typed_work_item_exists_including_deleted(conn: &Connection, id: &s
             .is_some()),
         ItemKind::Comment => Ok(conn
             .query_row("SELECT 1 FROM work_comments WHERE id = ?1", params![id], |_| Ok(()))
+            .optional()?
+            .is_some()),
+        ItemKind::Comparison => Ok(conn
+            .query_row(
+                "SELECT 1 FROM pr_review_guide_source_comparisons WHERE id = ?1",
+                params![id],
+                |_| Ok(()),
+            )
             .optional()?
             .is_some()),
     }
@@ -973,6 +1003,7 @@ mod tests {
         assert!(matches!(classify_id("proj_abc").unwrap(), ItemKind::Project));
         assert!(matches!(classify_id("task_abc").unwrap(), ItemKind::Task));
         assert!(matches!(classify_id("cmt_abc").unwrap(), ItemKind::Comment));
+        assert!(matches!(classify_id("prgc_abc").unwrap(), ItemKind::Comparison));
     }
 
     #[test]

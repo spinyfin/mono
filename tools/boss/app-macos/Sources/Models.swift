@@ -402,9 +402,9 @@ enum WorkBlockedBadge {
 
     /// True when the "conflict cleared" badge may show: `cleared` is set
     /// AND the task is not simultaneously displaying an active "Merge
-    /// Conflict" blocked badge. The two badges are mutually exclusive states
-    /// (T795 / T626 analogue): if engine state is contradictory or empty,
-    /// the card shows neither rather than both.
+    /// Conflict" blocked badge. The two badges represent mutually exclusive
+    /// states: if engine state is contradictory or empty, the card shows
+    /// neither rather than both.
     static func conflictClearedVisible(forTask task: WorkTask, cleared: Bool, isResolvingConflicts: Bool) -> Bool {
         guard cleared else { return false }
         let activeConflict = !isResolvingConflicts
@@ -596,7 +596,10 @@ struct ExecutionVM: Identifiable, Hashable, RevisionChainItem {
     let id: String
     /// The task id that owns this execution. When a transcript viewer
     /// loads the full revision chain, executions from revision tasks
-    /// carry those tasks' ids here rather than the chain root's id.
+    /// carry those tasks' ids here rather than the chain root's id. For a
+    /// `pr_review_guide` run, whose wire `work_item_id` is a review
+    /// comparison id rather than a task id, this is the engine-resolved
+    /// owning task (see `owning_task_id` in `parseExecutionVM`).
     let workItemId: String
     let kind: String
     let status: String

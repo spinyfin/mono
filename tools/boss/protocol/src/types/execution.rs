@@ -673,6 +673,17 @@ pub struct RequestExecutionInput {
 pub struct WorkExecution {
     pub id: String,
     pub work_item_id: String,
+    /// The task this execution should be filed under in a task-scoped
+    /// executions/transcripts view, when that differs from `work_item_id`.
+    /// `None` means `work_item_id` already names the owning task (every
+    /// kind except [`ExecutionKind::PrReviewGuide`], whose `work_item_id`
+    /// is a `pr_review_guide_source_comparisons` id, not a task). Resolved
+    /// and populated only by read paths that join comparison -> series ->
+    /// root task (`WorkDb::list_executions`,
+    /// `WorkDb::list_executions_for_chain`); never persisted, and never the
+    /// canonical owner of the run — the comparison id remains that.
+    #[serde(default)]
+    pub owning_task_id: Option<String>,
     /// The agent driver that actually launched this execution. `None` means
     /// the execution predates launch-configuration recording or never made it
     /// as far as a worker spawn; it must not be presented as a default driver.

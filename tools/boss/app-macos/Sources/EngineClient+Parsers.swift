@@ -717,9 +717,15 @@ extension EngineClient {
         else {
             return nil
         }
+        // For most kinds `work_item_id` already names the owning task. A
+        // `pr_review_guide` run's `work_item_id` is a comparison id instead;
+        // the engine resolves the owning task via its comparison -> series
+        // -> root-task join and hands it back as `owning_task_id` so this
+        // row still groups under the right task's transcript list.
+        let owningTaskId = payload["owning_task_id"] as? String
         return ExecutionVM(
             id: id,
-            workItemId: workItemId,
+            workItemId: owningTaskId ?? workItemId,
             kind: kind,
             status: status,
             driver: payload["driver"] as? String,
