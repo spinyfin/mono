@@ -287,6 +287,17 @@ pub struct WorkerSetupInput {
     /// `is_review_supervisor`; ignored for every other worker kind.
     #[builder(default = false)]
     pub is_post_merge_reviewer: bool,
+    /// `true` when this [`WorkerKind::AnswerAgent`] execution's leased
+    /// checkout was actually positioned on its target PR's head via `cube
+    /// workspace goto --pr` (stamped by the coordinator right after the
+    /// goto attempt — see `set_answer_agent_run_positioning`). `false`
+    /// means the checkout is a fresh `cube change create` off the default
+    /// base — positioning either wasn't applicable (no open PR target) or
+    /// was attempted and failed. Selects the conditional "current PR head"
+    /// sentence in [`crate::answer_agent::render_answer_agent_claude_md`].
+    /// Ignored for every other worker kind.
+    #[builder(default)]
+    pub checkout_positioned_on_pr_head: bool,
 }
 
 /// Render the worker-facing agent-rules file (CLAUDE.md or equivalent).
@@ -336,6 +347,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
         return crate::answer_agent::render_answer_agent_claude_md(
             &input.lease_id,
             &input.workspace_path.display().to_string(),
+            input.checkout_positioned_on_pr_head,
         );
     }
     let workspace = input.workspace_path.display();

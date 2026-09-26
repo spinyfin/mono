@@ -791,7 +791,7 @@ fn spawn_followup_classifier(
 
     tokio::spawn(async move {
         let thread = work_db.list_comment_thread_entries(&comment.id).unwrap_or_default();
-        let result = crate::comment_classifier::classify_followup_for_subject(
+        let result = crate::comment_classifier::classify_followup(
             &call,
             &comment.body,
             &comment.anchor,
@@ -1476,18 +1476,12 @@ async fn end_answer_agent_on_thread_terminal(
     stand_down_answer_agent(server_state, work_db, &comment.id).await;
 }
 
-/// Worker-callable: post the answer agent's reply (P3b). `run_id` is the
-/// caller's own `BOSS_RUN_ID` — resolved to its bound `answer_agent`
-/// execution, then to that execution's comment, then to the comment's
-/// currently-`running` `answer_agent_runs` row. The caller cannot target any
-/// other comment or run: nothing in the request names one directly (see
-/// `boss comment reply`'s security note in `crate::answer_agent`).
-///
-/// On success: completes the run (`replied`), appends an
-/// `entry_kind = 'answer'` thread entry, and transitions the comment
-/// `answering → answered`. No `authorize_rpc` gate — worker-callable RPCs
-/// (like `CreateAutomationTask`) run without a special tier, matching that
-/// precedent.
+/// Worker-callable: record a grounded per-comment outcome for a
+/// guide-feedback revision. `run_id` is the caller's own `BOSS_RUN_ID` —
+/// resolved to a `revision_implementation` execution. The comment must
+/// already be claimed by that revision and still `in_revision`. Upserts the
+/// outcome row, appends (or replaces) an engine-authored answer thread
+/// entry, and optionally queues review-guide regeneration.
 pub(super) async fn handle_comments_record_guide_outcome(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -1543,7 +1537,57 @@ pub(super) async fn handle_comments_record_guide_outcome(ctx: Dispatch, req: Fro
             .request_regeneration(request_regeneration)
             .build(),
     ) {
-        Ok(comment) => {
+        Ok(recorded) => {
+            match recorded.regeneration {
+                Some(Ok(crate::work::RetryReviewGuideOutcome::Created(_))) => {
+                    if let Some(root) = work_db
+                        .root_task_id_for_review_guide_series(&recorded.comment.artifact_id)
+                        .ok()
+                        .flatten()
+                    {
+                        crate::work::notify_review_guide_changed(
+                            &work_db,
+                            &server_state.publisher,
+                            &root,
+                            "review_guide_retry_queued",
+                        )
+                        .await;
+                    }
+                }
+                Some(Ok(crate::work::RetryReviewGuideOutcome::AlreadyRequested(_))) => {
+                    tracing::info!(
+                        comment_id = %recorded.comment.id,
+                        series_id = %recorded.comment.artifact_id,
+                        "guide outcome regeneration already queued for this revision"
+                    );
+                }
+                Some(Ok(crate::work::RetryReviewGuideOutcome::NoComparison)) => {
+                    tracing::warn!(
+                        comment_id = %recorded.comment.id,
+                        series_id = %recorded.comment.artifact_id,
+                        "guide outcome requested regeneration but no source comparison exists"
+                    );
+                }
+                Some(Err(err)) => {
+                    // The outcome itself is already durably recorded (see
+                    // `RecordedGuideCommentOutcome::regeneration`'s doc) —
+                    // only the regeneration retry failed. Still publish the
+                    // comment invalidation and reply with success below;
+                    // surfacing this as a `WorkError` would tell the caller
+                    // the whole request failed when the disposition it
+                    // asked to record is sitting in the DB. Logged at `warn`
+                    // so the partial success is visible in engine logs; the
+                    // response has no field to carry it.
+                    tracing::warn!(
+                        comment_id = %recorded.comment.id,
+                        series_id = %recorded.comment.artifact_id,
+                        error = %err,
+                        "guide comment outcome recorded but its regeneration request failed"
+                    );
+                }
+                None => {}
+            }
+            let comment = recorded.comment;
             let revision = publish_comment_invalidation(
                 &server_state,
                 &session_id,
@@ -1559,6 +1603,18 @@ pub(super) async fn handle_comments_record_guide_outcome(ctx: Dispatch, req: Fro
     }
 }
 
+/// Worker-callable: post the answer agent's reply (P3b). `run_id` is the
+/// caller's own `BOSS_RUN_ID` — resolved to its bound `answer_agent`
+/// execution, then to that execution's comment, then to the comment's
+/// currently-`running` `answer_agent_runs` row. The caller cannot target any
+/// other comment or run: nothing in the request names one directly (see
+/// `boss comment reply`'s security note in `crate::answer_agent`).
+///
+/// On success: completes the run (`replied`), appends an
+/// `entry_kind = 'answer'` thread entry, and transitions the comment
+/// `answering → answered`. No `authorize_rpc` gate — worker-callable RPCs
+/// (like `CreateAutomationTask`) run without a special tier, matching that
+/// precedent.
 pub(super) async fn handle_comments_post_answer(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -1969,6 +2025,61 @@ mod tests {
             "expected WorkError for a non-answer-agent run_id, got {:?}",
             envelope.payload
         );
+    }
+
+    #[tokio::test]
+    async fn record_guide_outcome_rejects_a_non_revision_execution() {
+        let (server_state, _dir) = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        let product = work_db
+            .create_product(
+                crate::work::CreateProductInput::builder()
+                    .name("Other")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .build(),
+            )
+            .unwrap();
+        let chore = work_db
+            .create_chore(
+                crate::work::CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Unrelated chore")
+                    .build(),
+            )
+            .unwrap();
+        let execution = work_db
+            .create_execution(
+                crate::work::CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(crate::work::ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+
+        handle_comments_record_guide_outcome(
+            dispatch_ctx(&server_state, &work_db, &sink),
+            FrontendRequest::CommentsRecordGuideOutcome {
+                run_id: execution.id,
+                comment_id: "cmt_x".to_owned(),
+                disposition: boss_protocol::GuideCommentDisposition::Answered,
+                body: "nope".to_owned(),
+                request_regeneration: false,
+            },
+        )
+        .await;
+
+        let envelope = sink
+            .next()
+            .await
+            .expect("a response envelope should have been enqueued");
+        match envelope.payload {
+            FrontendEvent::WorkError { message } => {
+                assert!(message.contains("not a revision execution"), "got {message}");
+            }
+            other => panic!("expected WorkError, got {other:?}"),
+        }
     }
 
     // --- Follow-up reclassification loop (P3c) ---

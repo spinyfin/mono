@@ -998,6 +998,19 @@ impl ExecutionRunner for PaneSpawnRunner {
             execution_id: execution.id.clone(),
         });
 
+        // Whether the coordinator's earlier `cube workspace goto --pr`
+        // attempt for this `AnswerAgent` execution actually succeeded — see
+        // `set_answer_agent_run_positioning` in `coordinator/execution.rs`.
+        // `false` for every other worker kind (the field is ignored there).
+        let checkout_positioned_on_pr_head = matches!(worker_kind, crate::worker_setup::WorkerKind::AnswerAgent)
+            && self
+                .work_db
+                .get_answer_agent_run_by_execution(&execution.id)
+                .ok()
+                .flatten()
+                .and_then(|run| run.workspace_positioned)
+                .unwrap_or(false);
+
         // Attributed pool (not physical slot occupancy): automation that
         // spilled into Lower Decks still reports `"automation"`. Matches
         // `ExecutionCoordinator::attributed_pool_label`.
@@ -1056,6 +1069,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .automation_outcome_proposals_seam_enabled(automation_outcome_proposals_seam_enabled)
                 .is_review_supervisor(is_review_supervisor)
                 .is_post_merge_reviewer(is_post_merge_reviewer)
+                .checkout_positioned_on_pr_head(checkout_positioned_on_pr_head)
                 .build(),
             StdDuration::from_secs(30),
         )

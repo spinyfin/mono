@@ -4,10 +4,13 @@
 //! `tools/boss/docs/designs/comment-triggered-document-revisions.md`
 //! §"Buckets 1 & 3 — unified (revision)".
 
+use super::answer_agent_runs::latest_answer_agent_run_for_comment_on;
+use super::comment_thread_entries::list_comment_thread_entries_on;
 use super::*;
 
 /// Outcome of the guarded batch UPDATE that claims comments for a freshly
 /// created revision/chore. See [`WorkDb::claim_revisable_comments`].
+#[derive(Debug)]
 pub(super) enum ClaimOutcome {
     /// The comments actually claimed by this call's task (may be a subset
     /// of the candidates under a partial race).
@@ -41,20 +44,19 @@ impl WorkDb {
             });
         };
 
-        let candidates = {
-            let conn = self.connect()?;
-            comments::query_revisable_comments(
-                &conn,
-                &input.artifact_kind,
-                &input.artifact_id,
-                input.comment_ids.as_deref(),
-            )?
-        };
+        let conn = self.connect()?;
+        let candidates = comments::query_revisable_comments(
+            &conn,
+            &input.artifact_kind,
+            &input.artifact_id,
+            input.comment_ids.as_deref(),
+        )?;
         if candidates.is_empty() {
             return Ok(ReviseDocOutcome::NoUnresolvedComments);
         }
 
-        let directive = compose_doc_comment_directive(self, &input.artifact_id, &candidates);
+        let directive = compose_doc_comment_directive(&conn, &input.artifact_id, &candidates);
+        drop(conn);
         let name = format!(
             "Address {} reviewer comment{}",
             candidates.len(),
@@ -248,6 +250,46 @@ pub(super) fn claim_revisable_comments_in_tx(
     Ok(ClaimOutcome::Claimed(addressed))
 }
 
+/// Per-comment body shared by document and guide revision directives:
+/// quoted anchor, original body, replied answer-agent bridge, and operator
+/// follow-ups. Header and footer stay with each composer.
+///
+/// Reads thread context on `conn` so callers that already hold WorkDb's
+/// single pooled connection (an Immediate transaction) do not deadlock.
+pub(super) fn append_comment_directive_body(out: &mut String, conn: &Connection, comment: &WorkComment) {
+    out.push_str("Quoted section:\n> ");
+    out.push_str(&comment.anchor.exact);
+    out.push_str("\n\nComment:\n> ");
+    out.push_str(&comment.body);
+    out.push('\n');
+
+    // Only a genuinely `replied` run is bridge context. A run the operator
+    // stood down by reclassifying the comment (`superseded`) is a question
+    // they retracted — feeding its answer into the directive would put a
+    // stale answer to a withdrawn question in front of the worker. Guarding
+    // on the status rather than on `reply_body` being present keeps that
+    // true even if a future terminal state starts carrying a partial body.
+    let latest_run = latest_answer_agent_run_for_comment_on(conn, &comment.id).ok().flatten();
+    if let Some(run) = latest_run
+        && run.status == ANSWER_AGENT_RUN_STATUS_REPLIED
+        && let Some(reply) = run.reply_body.as_deref()
+    {
+        out.push_str("\nPrior answer-agent reply on this thread (bucket-2 bridge context):\n> ");
+        out.push_str(reply);
+        out.push('\n');
+    }
+    let entries = list_comment_thread_entries_on(conn, &comment.id).unwrap_or_default();
+    for entry in entries
+        .iter()
+        .filter(|e| e.entry_kind == THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP)
+    {
+        out.push_str("\nOperator follow-up on this thread:\n> ");
+        out.push_str(&entry.body);
+        out.push('\n');
+    }
+    out.push('\n');
+}
+
 /// Assemble the worker directive from every addressed comment: the doc's
 /// artifact id, each comment's quoted anchor, and its body (design
 /// §"Risks" — "directive assembly includes doc path, quoted anchors, and
@@ -258,7 +300,7 @@ pub(super) fn claim_revisable_comments_in_tx(
 /// and the operator's follow-up that asked for the change; comments that
 /// never went through bucket 2 simply have no thread entries and this is a
 /// no-op for them.
-fn compose_doc_comment_directive(db: &WorkDb, artifact_id: &str, comments: &[WorkComment]) -> String {
+fn compose_doc_comment_directive(conn: &Connection, artifact_id: &str, comments: &[WorkComment]) -> String {
     let mut out = format!(
         "Reviewer comment{} on `{artifact_id}` request{} the following change{}:\n\n",
         if comments.len() == 1 { "" } else { "s" },
@@ -266,37 +308,7 @@ fn compose_doc_comment_directive(db: &WorkDb, artifact_id: &str, comments: &[Wor
         if comments.len() == 1 { "" } else { "s" },
     );
     for comment in comments {
-        out.push_str("Quoted section:\n> ");
-        out.push_str(&comment.anchor.exact);
-        out.push_str("\n\nComment:\n> ");
-        out.push_str(&comment.body);
-        out.push('\n');
-
-        // Only a genuinely `replied` run is bridge context. A run the operator
-        // stood down by reclassifying the comment (`superseded`) is a question
-        // they retracted — feeding its answer into the directive would put a
-        // stale answer to a withdrawn question in front of the worker. Guarding
-        // on the status rather than on `reply_body` being present keeps that
-        // true even if a future terminal state starts carrying a partial body.
-        if let Ok(Some(run)) = db.latest_answer_agent_run_for_comment(&comment.id)
-            && run.status == ANSWER_AGENT_RUN_STATUS_REPLIED
-            && let Some(reply) = run.reply_body.as_deref()
-        {
-            out.push_str("\nPrior answer-agent reply on this thread (bucket-2 bridge context):\n> ");
-            out.push_str(reply);
-            out.push('\n');
-        }
-        if let Ok(entries) = db.list_comment_thread_entries(&comment.id) {
-            for entry in entries
-                .iter()
-                .filter(|e| e.entry_kind == THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP)
-            {
-                out.push_str("\nOperator follow-up on this thread:\n> ");
-                out.push_str(&entry.body);
-                out.push('\n');
-            }
-        }
-        out.push('\n');
+        append_comment_directive_body(&mut out, conn, comment);
     }
     out.push_str("Please update the document accordingly.");
     out

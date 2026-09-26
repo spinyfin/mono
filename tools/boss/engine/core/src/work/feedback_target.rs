@@ -85,7 +85,9 @@ impl WorkDb {
             DocOwnerPrLifecycle::Open
         };
         Ok(Some(FeedbackTarget::PullRequestImplementation {
-            root_task_id: root.id,
+            // Series owner (may be a revision). Distinct from `chain_root_id`,
+            // which is the PR-owning chain root the new revision parents to.
+            root_task_id,
             series_id: series_id.to_owned(),
             canonical_pr,
             chain_root_id,
