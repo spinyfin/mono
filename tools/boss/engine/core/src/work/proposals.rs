@@ -171,6 +171,8 @@ impl WorkDb {
         &self,
         input: SubmitWorkerProposalInput<'_>,
     ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
+        let prepared_guide = (input.kind == ProposalKind::ReviewGuide)
+            .then(|| super::review_guide_submission::prepare(self, input.execution_id, input.payload_json));
         // The transaction-holding half. Scoped to a block so the `conn`
         // guard (a lock over `WorkDb`'s single shared connection — see
         // `WorkDb::connect`'s docs) is dropped before the post-commit
@@ -254,6 +256,7 @@ impl WorkDb {
                     input.payload_json,
                     input.kind,
                     &id,
+                    prepared_guide.as_ref(),
                 )?),
                 ProposalApplyPolicy::Gated => None,
             };
@@ -747,6 +750,7 @@ mod tests {
             // auto-applies rather than being rejected on a repo-slug
             // mismatch.
             ProposalKind::PrCreated => format!(r#"{{"pr_url":"https://github.com/spinyfin/mono/pull/{}"}}"#, i + 1),
+            ProposalKind::ReviewGuide => format!(r#"{{"body_markdown":"Guide {i}"}}"#),
             ProposalKind::ReviewReport => {
                 format!(
                     r#"{{"batch_id":"rvb_missing","target_sha":"head_missing","report":{{"batch_id":"rvb_missing","pr_url":"https://github.com/spinyfin/mono/pull/1","target_sha":"head_missing","phase":"pre_merge","summary":"Clean {i}.","coverage":{{"files_inspected":[],"files_omitted":[],"limitations":[]}},"findings":[]}}}}"#

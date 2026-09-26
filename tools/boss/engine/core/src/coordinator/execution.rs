@@ -336,6 +336,15 @@ impl ExecutionCoordinator {
             // never a cube workspace or its lease lifetime.
             pinned = Some(record.host_id);
         }
+        if execution.kind == ExecutionKind::PrReviewGuide {
+            for host in [pinned.as_deref(), requested.as_deref()].into_iter().flatten() {
+                anyhow::ensure!(
+                    host == "local",
+                    "review-guide submissions require a local worker; SSH proposal attribution is unsupported"
+                );
+            }
+            return self.pick_host(work_item, Some("local".to_owned()), requested, Some("codex".to_owned()));
+        }
         // Resolved driver is a hard requirement. Prefer the claimed
         // worker's pool policy (review/automation) so placement matches
         // the driver spawn will actually launch; otherwise use the same

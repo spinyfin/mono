@@ -12,41 +12,6 @@ enum AssistantTurnRead {
     NoAssistantText { event_count: usize },
 }
 
-/// Prefer the last assistant turn containing a guide heading. Keep the full
-/// transcript for diagnostics and validation fallback when a guide spans turns.
-fn review_guide_publish_texts(turns: &[String]) -> Option<(String, String)> {
-    turns.first()?;
-    let raw = turns.join("\n");
-    let guide = turns
-        .iter()
-        .rev()
-        .find(|turn| turn.lines().any(|line| line.starts_with("# ")));
-    Some((guide.cloned().unwrap_or_else(|| raw.clone()), raw))
-}
-
-fn validate_review_guide_with_fallback(
-    markdown: &str,
-    raw_output: &str,
-    packet: &boss_pr_review_sources::SourcePacket,
-) -> Result<boss_review_guide::ValidatedGuide, Vec<boss_review_guide::GuideValidationIssue>> {
-    match boss_review_guide::validate_guide_output(markdown, packet) {
-        Ok(guide) => Ok(guide),
-        Err(preferred_issues) if markdown == raw_output => Err(preferred_issues),
-        Err(preferred_issues) => match boss_review_guide::validate_guide_output(raw_output, packet) {
-            Ok(guide) => Ok(guide),
-            Err(fallback_issues) => {
-                let mut issues = preferred_issues;
-                for issue in fallback_issues {
-                    if !issues.contains(&issue) {
-                        issues.push(issue);
-                    }
-                }
-                Err(issues)
-            }
-        },
-    }
-}
-
 /// Result of [`WorkerCompletionHandler::check_pure_rebase_skip`].
 /// `post_head` carries the PR's current head OID whenever the gate got as
 /// far as fetching it, regardless of whether the gate ultimately skipped —
@@ -81,6 +46,21 @@ impl PureRebaseGateOutcome {
 type AutomationTriageDecision = (&'static str, Option<String>, Option<String>);
 
 impl WorkerCompletionHandler {
+    /// Proposal acknowledgement is the delivery boundary; no transcript is read.
+    pub async fn finalize_submitted_review_guide(&self, execution_id: &str) -> StopOutcome {
+        let execution = match self.work_db.get_execution(execution_id) {
+            Ok(execution) => execution,
+            Err(_) => return StopOutcome::DbError,
+        };
+        if execution.status.is_terminal() {
+            return StopOutcome::AlreadyTerminal;
+        }
+        if execution.kind != ExecutionKind::PrReviewGuide {
+            return StopOutcome::DbError;
+        }
+        self.finalize_review_guide(&execution).await
+    }
+
     /// Common Fresh/Merged transition path shared by `on_stop_inner`
     /// and `recheck_for_pr`. Records the completion, releases the
     /// cube lease + pane, publishes invalidation events, and returns
@@ -699,9 +679,8 @@ impl WorkerCompletionHandler {
         StopOutcome::AnswerAgent { replied }
     }
 
-    /// Finalize a `pr_review_guide` execution: extract its final assistant
-    /// text (the driver never writes an artifact or calls a publish
-    /// command — its guard blocks every tool call), validate it against the
+    /// Finalize a `pr_review_guide` execution: consume its submitted
+    /// Markdown proposal, validate it against the
     /// comparison it was generated from, and durably publish or fail the
     /// bound attempt through the transactional fence in
     /// [`crate::work::WorkDb::publish_pr_review_guide_version`].
@@ -729,66 +708,68 @@ impl WorkerCompletionHandler {
         };
 
         let published = if let Some(attempt) = &attempt {
-            let (_driver, turns) = self.read_assistant_text_turns_with_driver(&execution.id).await;
-            match review_guide_publish_texts(&turns) {
-                None => {
-                    if let Err(err) = self
-                        .work_db
-                        .fail_pr_review_guide_attempt(&attempt.id, "the driver produced no assistant text")
-                    {
-                        tracing::warn!(execution_id = %execution.id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to record the no-text failure");
+            match self.work_db.submitted_review_guide(&execution.id, &attempt.id) {
+                Err(err) => {
+                    let reason = format!("could not load the submitted review guide: {err:#}");
+                    if let Err(error) = self.work_db.fail_pr_review_guide_attempt(&attempt.id, &reason) {
+                        tracing::error!(?error, execution_id = %execution.id, "failed to record guide submission lookup failure");
                     }
                     false
                 }
-                Some((markdown, raw_output)) => {
-                    match self.work_db.get_pr_review_guide_comparison_by_id(&comparison_id) {
-                        Ok(Some(capture)) => {
-                            match validate_review_guide_with_fallback(&markdown, &raw_output, &capture.packet) {
-                                Ok(validated) => {
-                                    match self.work_db.publish_pr_review_guide_version(
-                                        &attempt.id,
-                                        &validated.markdown,
-                                        &raw_output,
-                                    ) {
-                                        Ok(crate::work::PublishReviewGuideOutcome::Published(_)) => true,
-                                        Ok(other) => {
-                                            tracing::info!(execution_id = %execution.id, attempt_id = %attempt.id, ?other, "review-guide finalizer: attempt finished without publishing");
-                                            false
-                                        }
-                                        Err(err) => {
-                                            tracing::warn!(execution_id = %execution.id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to publish");
-                                            false
-                                        }
-                                    }
+                Ok(None) => {
+                    if let Err(err) = self.work_db.fail_pr_review_guide_attempt(
+                        &attempt.id,
+                        "run ended without submitting a guide via boss propose review-guide",
+                    ) {
+                        tracing::error!(execution_id = %execution.id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to record the missing-submission failure");
+                    }
+                    false
+                }
+                Ok(Some(raw_output)) => match self.work_db.get_pr_review_guide_comparison_by_id(&comparison_id) {
+                    Ok(Some(capture)) => match boss_review_guide::validate_guide_output(&raw_output, &capture.packet) {
+                        Ok(validated) => {
+                            match self.work_db.publish_pr_review_guide_version(
+                                &attempt.id,
+                                &validated.markdown,
+                                &raw_output,
+                            ) {
+                                Ok(crate::work::PublishReviewGuideOutcome::Published(_)) => true,
+                                Ok(other) => {
+                                    tracing::info!(execution_id = %execution.id, attempt_id = %attempt.id, ?other, "review-guide finalizer: attempt finished without publishing");
+                                    false
                                 }
-                                Err(issues) => {
-                                    let detail = issues
-                                        .iter()
-                                        .map(|issue| issue.to_string())
-                                        .collect::<Vec<_>>()
-                                        .join("; ");
-                                    if let Err(err) = self.work_db.fail_pr_review_guide_attempt(&attempt.id, &detail) {
-                                        tracing::warn!(execution_id = %execution.id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to record the validation failure");
-                                    }
+                                Err(err) => {
+                                    tracing::warn!(execution_id = %execution.id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to publish");
                                     false
                                 }
                             }
                         }
-                        Ok(None) => {
-                            if let Err(err) = self.work_db.fail_pr_review_guide_attempt(
-                                &attempt.id,
-                                "the comparison this attempt was generated from is gone",
-                            ) {
-                                tracing::warn!(execution_id = %execution.id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to record the missing-comparison failure");
+                        Err(issues) => {
+                            let detail = issues
+                                .iter()
+                                .map(|issue| issue.to_string())
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            if let Err(err) = self.work_db.fail_pr_review_guide_attempt(&attempt.id, &detail) {
+                                tracing::warn!(execution_id = %execution.id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to record the validation failure");
                             }
                             false
                         }
-                        Err(err) => {
-                            tracing::warn!(execution_id = %execution.id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to load the comparison for validation");
-                            false
+                    },
+                    Ok(None) => {
+                        if let Err(err) = self.work_db.fail_pr_review_guide_attempt(
+                            &attempt.id,
+                            "the comparison this attempt was generated from is gone",
+                        ) {
+                            tracing::warn!(execution_id = %execution.id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to record the missing-comparison failure");
                         }
+                        false
                     }
-                }
+                    Err(err) => {
+                        tracing::warn!(execution_id = %execution.id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to load the comparison for validation");
+                        false
+                    }
+                },
             }
         } else {
             false
@@ -1846,27 +1827,6 @@ impl WorkerCompletionHandler {
         (driver, transcript)
     }
 
-    /// Assistant-text turns from the transcript, in order. Review-guide
-    /// finalization uses the last turn as the published Markdown and the
-    /// joined blob as `raw_output`; triage keeps joining every turn because
-    /// its decision marker can land in any of them.
-    pub(super) async fn read_assistant_text_turns_with_driver(
-        &self,
-        execution_id: &str,
-    ) -> (Option<std::sync::Arc<dyn crate::driver::AgentDriver>>, Vec<String>) {
-        let driver = crate::driver_transcript::driver_for_execution(&self.work_db, execution_id);
-        let turns = match self
-            .read_assistant_text_turns_inner(execution_id, driver.as_deref())
-            .await
-        {
-            AssistantTurnRead::Turns(turns) => turns,
-            AssistantTurnRead::NoPath | AssistantTurnRead::Unreadable | AssistantTurnRead::NoAssistantText { .. } => {
-                Vec::new()
-            }
-        };
-        (driver, turns)
-    }
-
     async fn read_final_triage_message_inner(
         &self,
         execution_id: &str,
@@ -1931,9 +1891,7 @@ impl WorkerCompletionHandler {
             // Joining all turns mirrors `attentions_detector::extract_assistant_text`
             // and ensures the marker is found regardless of which turn contains it.
             // The "exactly one marker" contract still holds: `parse_triage_decision`
-            // enforces it across the combined text. Review-guide finalization
-            // prefers a guide turn, with a validated full-transcript fallback (see
-            // [`review_guide_publish_texts`]).
+            // enforces it across the combined text.
             let all_text: Vec<String> = events
                 .iter()
                 .filter_map(|e| match &e.kind {
@@ -2487,101 +2445,5 @@ impl WorkerCompletionHandler {
                 RemoteCollectionResult::NotAvailable
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod review_guide_publish_texts_tests {
-    use super::{review_guide_publish_texts, validate_review_guide_with_fallback};
-
-    fn packet(base: &str, head: &str) -> boss_pr_review_sources::SourcePacket {
-        boss_pr_review_sources::SourcePacket {
-            schema_version: 2,
-            canonical_pr_url: "https://github.com/acme/widget/pull/9".to_owned(),
-            pr_number: 9,
-            title: "Fix retry".to_owned(),
-            body: None,
-            base_repository: "acme/widget".to_owned(),
-            head_repository: "acme/widget".to_owned(),
-            observed_base_sha: base.to_owned(),
-            probe_base_sha: None,
-            merge_base_sha: base.to_owned(),
-            head_sha: head.to_owned(),
-            files: Vec::new(),
-            omissions: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn split_guide_falls_back_to_complete_transcript() {
-        let turns = vec![
-            "Preamble".to_owned(),
-            "# Guide\n## Problem\n## Implementation".to_owned(),
-            "## Example\n## Review".to_owned(),
-        ];
-        let (markdown, raw) = review_guide_publish_texts(&turns).unwrap();
-        let validated = validate_review_guide_with_fallback(&markdown, &raw, &packet("base", "head")).unwrap();
-        assert_eq!(validated.markdown, raw);
-    }
-
-    #[test]
-    fn valid_guide_turn_is_preferred_and_invalid_fallback_is_rejected() {
-        let guide = "# Guide\n## Problem\n## Implementation\n## Example\n## Review";
-        let raw = format!("Preamble\n{guide}\nNarration");
-        let packet = packet("base", "head");
-        assert_eq!(
-            validate_review_guide_with_fallback(guide, &raw, &packet)
-                .unwrap()
-                .markdown,
-            guide
-        );
-        assert!(validate_review_guide_with_fallback("# Guide", "# Guide\n## One", &packet).is_err());
-        assert!(validate_review_guide_with_fallback("No guide", "No guide", &packet).is_err());
-    }
-
-    #[test]
-    fn both_invalid_candidates_keep_preferred_and_fallback_issues() {
-        let packet = packet("base", "head");
-        let preferred = "## Problem\n## Implementation\n## Example\n## Review";
-        let fallback = "# Guide\n## One";
-        let issues = validate_review_guide_with_fallback(preferred, fallback, &packet).unwrap_err();
-        assert!(
-            issues.contains(&boss_review_guide::GuideValidationIssue::MissingTitle),
-            "preferred-guide issues must be retained when fallback also fails: {issues:?}"
-        );
-        assert!(
-            issues.contains(&boss_review_guide::GuideValidationIssue::TooFewSections { found: 1 }),
-            "fallback-transcript issues must be retained alongside preferred issues: {issues:?}"
-        );
-    }
-
-    #[test]
-    fn last_turn_is_the_published_markdown_and_joined_turns_are_raw() {
-        let (markdown, raw) = review_guide_publish_texts(&[
-            "preamble about the model".to_owned(),
-            "# Guide\n\n## Problem\n".to_owned(),
-        ])
-        .unwrap();
-        assert_eq!(markdown, "# Guide\n\n## Problem\n");
-        assert_eq!(raw, "preamble about the model\n# Guide\n\n## Problem\n");
-    }
-
-    #[test]
-    fn trailing_narration_does_not_discard_the_guide() {
-        let turns = vec![
-            "preamble".to_owned(),
-            "# Guide\n## Problem".to_owned(),
-            "I could not verify X".to_owned(),
-        ];
-        let (markdown, raw) = review_guide_publish_texts(&turns).unwrap();
-        assert_eq!(markdown, turns[1]);
-        assert_eq!(raw, turns.join("\n"));
-        let narration = vec!["first".to_owned(), "last".to_owned()];
-        assert_eq!(review_guide_publish_texts(&narration).unwrap().0, "first\nlast");
-    }
-
-    #[test]
-    fn empty_turns_yield_no_publish_texts() {
-        assert_eq!(review_guide_publish_texts(&[]), None);
     }
 }

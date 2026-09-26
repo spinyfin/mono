@@ -184,6 +184,13 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
                 branch,
             })
         }
+        ProposalKind::ReviewGuide => {
+            let body_markdown = reader.required_text("body_markdown", MAX_LONG_FIELD_CHARS);
+            reader.finish()?;
+            to_json(&boss_protocol::ReviewGuideProposalPayload {
+                body_markdown: body_markdown.unwrap_or_default(),
+            })
+        }
         ProposalKind::ReviewReport => {
             let batch_id = reader.required_text("batch_id", MAX_SHORT_FIELD_CHARS);
             let target_sha = reader.required_text("target_sha", MAX_SHORT_FIELD_CHARS);

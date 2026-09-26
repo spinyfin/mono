@@ -750,6 +750,7 @@ async fn automation_pause_does_not_hold_pr_review_guide_but_holds_automation_row
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     seed_local_claude_driver(&db);
+    crate::test_support::insert_host_capability(&db, "local", "driver=codex", "auto");
     let product = create_product(&db);
 
     // A `pr_review_guide` execution, wired through the real source-capture
@@ -830,4 +831,47 @@ async fn automation_pause_does_not_hold_pr_review_guide_but_holds_automation_row
     coordinator.resume_automation();
     coordinator.kick();
     wait_for_execution_status(db.as_ref(), &auto_execution_id, ExecutionStatus::Running).await;
+}
+
+#[tokio::test]
+async fn review_guide_refuses_an_explicit_remote_host_before_leasing() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    crate::test_support::insert_host_capability(&db, "local", "driver=codex", "auto");
+    let product = create_product(&db);
+    let root = create_test_chore_manual(&db, product, "Guide root").id;
+    let (_, comparison) = seed_review_guide_series(&db, &root);
+    let execution = db
+        .create_pr_review_guide_execution(&comparison, "https://github.com/test/repo")
+        .unwrap();
+    let cube = Arc::new(FakeCubeClient::default());
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let mut coord = ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        cube.clone(),
+        Arc::new(FakeExecutionRunner::default()),
+    )
+    .with_dispatch_events(recording.clone());
+    coord.set_review_pool(WorkerPool::new_review(1));
+    coord
+        .requested_host_ids
+        .lock()
+        .unwrap()
+        .insert(execution.id.clone(), "remote".to_owned());
+    let coordinator = Arc::new(coord);
+    coordinator.kick();
+    wait_for_execution_status(&db, &execution.id, ExecutionStatus::Cancelled).await;
+    let events = recording.events_for(&execution.id).await;
+    assert!(
+        events.iter().any(|event| event.stage == "host_selected"
+            && event.outcome == "error"
+            && event
+                .error_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("local worker")),
+        "{events:?}"
+    );
+    assert!(cube.lease_calls.lock().await.is_empty());
 }

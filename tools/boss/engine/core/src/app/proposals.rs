@@ -117,6 +117,12 @@ crate::register_counter!(
     "SubmitProposal rejected a submission for ProposalErrorCode::RateLimited (per-execution cap exhausted).",
 );
 
+crate::register_counter!(
+    PROPOSAL_SUBMITTED_REVIEW_GUIDE,
+    "worker_proposals.submitted.review_guide",
+    "SubmitProposal accepted a review-guide submission.",
+);
+
 /// Register every `SubmitProposal` counter handle with `registry`. Called
 /// from [`crate::metrics_init::init_all`] at engine startup.
 pub fn register_metrics(registry: &Registry) {
@@ -127,6 +133,7 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&PROPOSAL_SUBMITTED_FOLLOWUP_TASK);
     registry.register_counter(&PROPOSAL_SUBMITTED_AUTOMATION_OUTCOME);
     registry.register_counter(&PROPOSAL_SUBMITTED_PR_CREATED);
+    registry.register_counter(&PROPOSAL_SUBMITTED_REVIEW_GUIDE);
     registry.register_counter(&PROPOSAL_SUBMITTED_REVIEW_REPORT);
     registry.register_counter(&PROPOSAL_SUBMITTED_REVIEW_VERDICT);
     registry.register_counter(&PROPOSAL_SUBMITTED_RUN_DONE);
@@ -144,6 +151,7 @@ fn record_proposal_submitted(metrics: &Registry, kind: ProposalKind) {
         ProposalKind::FollowupTask => PROPOSAL_SUBMITTED_FOLLOWUP_TASK.inc(metrics),
         ProposalKind::AutomationOutcome => PROPOSAL_SUBMITTED_AUTOMATION_OUTCOME.inc(metrics),
         ProposalKind::PrCreated => PROPOSAL_SUBMITTED_PR_CREATED.inc(metrics),
+        ProposalKind::ReviewGuide => PROPOSAL_SUBMITTED_REVIEW_GUIDE.inc(metrics),
         ProposalKind::ReviewReport => PROPOSAL_SUBMITTED_REVIEW_REPORT.inc(metrics),
         ProposalKind::ReviewVerdict => PROPOSAL_SUBMITTED_REVIEW_VERDICT.inc(metrics),
         ProposalKind::RunDone => PROPOSAL_SUBMITTED_RUN_DONE.inc(metrics),
@@ -480,6 +488,8 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                 && kind == ProposalKind::ReviewVerdict
                 && proposal.state == boss_protocol::ProposalState::Proposed;
             let apply_proposal_id = apply_after_submit.then(|| proposal.id.clone());
+            let finalize_guide =
+                kind == ProposalKind::ReviewGuide && proposal.state == boss_protocol::ProposalState::Applied;
             let response_delivery = super::handler_helpers::send_response_awaiting_delivery(
                 &sink,
                 &request_id,
@@ -493,7 +503,19 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
             // tree, which can include the very `boss propose` client still
             // waiting on the response above — tearing down first can kill
             // that client before it ever observes the ack it is blocked on.
-            if finalize_reporting_member {
+            if finalize_guide {
+                let delivery = tokio::time::timeout(std::time::Duration::from_secs(10), response_delivery).await;
+                if !matches!(delivery, Ok(Ok(true))) {
+                    tracing::warn!(execution_id = %caller.execution_id, "guide acknowledgement was not delivered; finalizing the durable submission");
+                }
+                let outcome = Box::pin(
+                    server_state
+                        .completion_handler
+                        .finalize_submitted_review_guide(&caller.execution_id),
+                )
+                .await;
+                tracing::info!(execution_id = %caller.execution_id, ?outcome, "submitted review guide finalized");
+            } else if finalize_reporting_member {
                 match tokio::time::timeout(std::time::Duration::from_secs(10), response_delivery).await {
                     Ok(Ok(true)) => match server_state
                         .completion_handler

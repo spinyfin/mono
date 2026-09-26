@@ -546,10 +546,10 @@ impl WorkerCompletionHandler {
             return self.finalize_answer_agent(&execution).await;
         }
 
-        // A `pr_review_guide` execution never opens a PR either. Its
-        // enforced read-only guard blocks every tool call, so its raw
-        // Markdown output only ever exists as its final assistant text —
-        // the finalizer extracts, validates, and (fenced) publishes it.
+        // A `pr_review_guide` execution never opens a PR either. The
+        // finalizer publishes the applied `review_guide` proposal bound to
+        // this execution's attempt, or fails the attempt if the run ended
+        // without a submission.
         if execution.kind == ExecutionKind::PrReviewGuide {
             return self.finalize_review_guide(&execution).await;
         }

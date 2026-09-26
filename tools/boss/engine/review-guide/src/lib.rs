@@ -19,7 +19,7 @@ use boss_pr_review_sources::{SourcePacket, SourceSide, validate_pinned_reference
 /// version constant and prompt id — the desired-comparison key an attempt
 /// binds to includes the prompt version, so a prompt change never silently
 /// reinterprets an already-captured comparison's existing readable version.
-pub const PROMPT_VERSION: &str = "review-guide-v3";
+pub const PROMPT_VERSION: &str = "review-guide-v5";
 
 /// The exact production prompt template, byte-identical to the fenced block
 /// in `automatic-pr-review-guides.md`'s "Prompt contract" section. Only the
@@ -58,13 +58,13 @@ In the tests section, distinguish added, modified, and removed tests. Name the i
 
 Use the complete revised PR comparison if this is a regenerated guide. Do not describe only the latest incremental commit. Existing comments may provide context, but the explanation must match the actual current source revisions.
 
-Return only the finished Markdown guide, with a descriptive title and the four requested main sections. Put the worked example within the implementation walkthrough. Keep the guide as concise as the explanation permits while preserving useful reasoning and evidence. Do not include a chat preamble, model details, internal execution details, a merge recommendation, or an unsupported declaration that the PR is safe to merge. If essential context is absent from the supplied material, state the specific limitation rather than inventing behavior.";
+Submit the finished Markdown guide using `\"$BOSS_BIN\" propose review-guide --body '<finished Markdown guide>'`. This is the only permitted tool command. Pass the entire Markdown as a literal single-quoted shell argument (escape any apostrophe with the standard shell quote sequence); do not write a file, pipe input, use command substitution, or run any other command. The command is bound to your execution automatically. A final assistant message does not submit a guide. If submission fails, correct the reported error and retry the same command before ending. The guide must have a descriptive title and the four requested main sections. Put the worked example within the implementation walkthrough. Keep the guide as concise as the explanation permits while preserving useful reasoning and evidence. Do not include a chat preamble, model details, internal execution details, a merge recommendation, or an unsupported declaration that the PR is safe to merge. If essential context is absent from the supplied material, state the specific limitation rather than inventing behavior.";
 
 /// SHA-256 of [`PROMPT_TEMPLATE`] (UTF-8, excluding any fence/terminal
 /// newline) — matches the value recorded in the design doc, computed
 /// independently from the doc's own fenced block as a second source of
 /// truth. See `prompt_template_hash_is_pinned`.
-pub const PROMPT_TEMPLATE_SHA256: &str = "24dd027a410ef2f9ed40b171f70da1ddca518061a1cdb78995b2bf3df76ad2ac";
+pub const PROMPT_TEMPLATE_SHA256: &str = "cc4bddde22f1162c21484ff22aca69810215066a0eb0f27a281b25411cfa9911";
 
 /// The metadata substituted into [`PROMPT_TEMPLATE`] for one comparison.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,8 +93,8 @@ pub fn render_prompt(metadata: &PromptMetadata<'_>) -> String {
 /// from the immutable packet into read-only Markdown context.
 ///
 /// This is the review-guide worker's entire "source access": the worker has
-/// no leased checkout, no shell, and no interactive read tool (its guard
-/// blocks every `PreToolUse` call — see
+/// no interactive read tool (its guard
+/// allows only result submission — see
 /// `boss_engine_driver::codex::review_guide_guard`), so every pinned line it
 /// can possibly cite must already be present here. The rendering is
 /// revision-aware by construction: it reads only the packet's already-pinned
@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn prompt_uses_only_supplied_context_without_inviting_exploration() {
-        assert_eq!(PROMPT_VERSION, "review-guide-v3");
+        assert_eq!(PROMPT_VERSION, "review-guide-v5");
         assert!(PROMPT_TEMPLATE.contains("Use only this supplied context."));
         assert!(PROMPT_TEMPLATE.contains("Do not claim to have executed tests or performed independent validation."));
         // Submission instructions may name a tool; source exploration may not.
