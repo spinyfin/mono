@@ -899,11 +899,7 @@ async fn adopt_one<S>(
         }
     };
 
-    let driver = crate::driver_transcript::driver_for_spawned_execution(work_db, execution_id).or_else(|| {
-        crate::driver::DriverRegistry::default()
-            .require(crate::effort::ENGINE_DEFAULT_DRIVER)
-            .ok()
-    });
+    let driver = crate::driver_transcript::driver_for_spawned_execution(work_db, execution_id);
     crate::tmux_adoption_live_state::register_adopted_live_state(
         work_db,
         spawner,

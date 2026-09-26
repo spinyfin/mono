@@ -341,14 +341,10 @@ impl ServerState {
         // cosmetic; being wrong about it would put a false claim on the
         // pane titlebar.
         //
-        // The slug not resolving at all (unknown execution, or a row with
-        // no task) falls back to the engine default driver, so even the
-        // degraded path states some driver's answer rather than a literal.
-        let driver = crate::driver_transcript::driver_for_spawned_execution(&self.work_db, run_id).or_else(|| {
-            crate::driver::DriverRegistry::default()
-                .require(boss_engine_effort::ENGINE_DEFAULT_DRIVER)
-                .ok()
-        });
+        // Only an unstamped legacy run may degrade to the engine default.
+        // An unregistered launch stamp stays unresolved, including its
+        // progress ingress, capabilities, and visible label.
+        let driver = crate::driver_transcript::driver_for_spawned_execution(&self.work_db, run_id);
         let ingress_outcome = self.readopt_progress_ingress(&restored, driver.clone()).await;
         let slot_id = self.hosted_pane_slot_for_run(run_id).await;
         if let Some(slot_id) = slot_id {
@@ -382,7 +378,7 @@ impl ServerState {
             let model_label = driver
                 .as_ref()
                 .map(|driver| driver.descriptor().label.to_owned())
-                .unwrap_or_else(|| boss_engine_effort::ENGINE_DEFAULT_DRIVER.to_owned());
+                .unwrap_or_else(|| "Unknown driver".to_owned());
             let awaiting_input_capable = driver.is_some_and(|driver| {
                 driver
                     .capabilities()

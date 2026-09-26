@@ -503,6 +503,15 @@ async fn a_worker_whose_spawn_ack_was_lost_is_readopted_once_it_hooks() {
 /// which is the wrong-indicator class this whole path exists to end.
 #[tokio::test]
 async fn readoption_derives_the_awaiting_input_capability_from_the_runs_driver() {
+    assert_readoption_driver(None, "OpenAI Codex").await;
+}
+
+#[tokio::test]
+async fn readoption_does_not_substitute_an_unregistered_launch_driver() {
+    assert_readoption_driver(Some("removed-driver"), "Unknown driver").await;
+}
+
+async fn assert_readoption_driver(launch_driver: Option<&str>, expected_label: &str) {
     use crate::work::WorkItemPatch;
 
     let (server_state, _dir) = test_server_state();
@@ -527,6 +536,10 @@ async fn readoption_derives_the_awaiting_input_capability_from_the_runs_driver()
             rusqlite::params![&execution_id],
         )
         .unwrap();
+    if let Some(driver) = launch_driver {
+        db.record_execution_launch_config(&execution_id, driver, "test-model", None)
+            .unwrap();
+    }
     db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
     let execution = db.get_execution(&execution_id).unwrap();
 
@@ -576,7 +589,7 @@ async fn readoption_derives_the_awaiting_input_capability_from_the_runs_driver()
         .get(4)
         .expect("the re-adopted slot must carry a live-state entry");
     assert_eq!(
-        state.model, "OpenAI Codex",
+        state.model, expected_label,
         "the label must name the run's resolved driver, not a hardcoded `claude`",
     );
     assert_eq!(

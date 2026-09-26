@@ -73,8 +73,8 @@ pub fn driver_for_execution(work_db: &WorkDb, execution_id: &str) -> Option<Arc<
 /// id and pool policy, which can paint a Codex spawn as Claude Code after
 /// an engine restart. When the launch tuple was never written (a crash
 /// between pane start and the stamp), falls through to
-/// [`driver_for_execution`] so a still-unset column does not invent a
-/// driver from nothing.
+/// [`driver_for_execution`]. If live resolution also has no driver, uses
+/// the engine default for this unstamped legacy case only.
 ///
 /// A stamp that is present but unregistered (renamed, removed, or
 /// corrupted) is distinct from the unset-column case: this returns
@@ -104,7 +104,11 @@ pub fn driver_for_spawned_execution(work_db: &WorkDb, execution_id: &str) -> Opt
             );
         }
     }
-    driver_for_execution(work_db, execution_id)
+    driver_for_execution(work_db, execution_id).or_else(|| {
+        DriverRegistry::default()
+            .require(crate::effort::ENGINE_DEFAULT_DRIVER)
+            .ok()
+    })
 }
 
 fn require_driver_slug(execution_id: &str, slug: &str) -> Option<Arc<dyn AgentDriver>> {
@@ -550,6 +554,18 @@ mod tests {
             driver.descriptor().name,
             "codex",
             "a main-pool worker id must not override the row's own driver",
+        );
+    }
+
+    #[test]
+    fn unstamped_unknown_execution_uses_the_legacy_default_for_adoption() {
+        let (_dir, db) = open_db();
+        assert_eq!(
+            driver_for_spawned_execution(&db, "exec_missing")
+                .unwrap()
+                .descriptor()
+                .name,
+            crate::effort::ENGINE_DEFAULT_DRIVER,
         );
     }
 

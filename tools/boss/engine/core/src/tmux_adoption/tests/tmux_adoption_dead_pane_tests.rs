@@ -159,10 +159,19 @@ async fn orphaned_execution_with_dead_pane_is_not_readopted() {
 /// even when live resolution from worker id / pool policy would pick Claude.
 #[tokio::test]
 async fn codex_launch_config_survives_tmux_adoption() {
+    assert_adopted_driver("codex", "OpenAI Codex").await;
+}
+
+#[tokio::test]
+async fn unregistered_launch_config_is_not_relabelled_by_tmux_adoption() {
+    assert_adopted_driver("removed-driver", "Unknown driver").await;
+}
+
+async fn assert_adopted_driver(driver: &str, expected_label: &str) {
     let (_dir, db) = open_db_arc();
     let execution_id = start_local_run(&db, "worker-1");
     stamp_tmux_identity(&db, &execution_id, "tok-codex");
-    db.record_execution_launch_config(&execution_id, "codex", "gpt-5.5-codex", None)
+    db.record_execution_launch_config(&execution_id, driver, "test-model", None)
         .unwrap();
 
     let (tmux, _tmux_server) = fake_tmux(FakeTmuxServer {
@@ -190,12 +199,99 @@ async fn codex_launch_config_survives_tmux_adoption() {
     assert_eq!(outcome.adopted_execution_ids, HashSet::from([execution_id.clone()]));
     let live_state = spawner.live_states.get(1).expect("slot 1 must be registered");
     assert_eq!(
-        live_state.model, "OpenAI Codex",
+        live_state.model, expected_label,
         "tmux adoption must keep the driver recorded at spawn, got {}",
         live_state.model
     );
     assert!(
         !spawner.live_states.awaiting_input_capable(1),
         "a re-adopted Codex worker must not be paintable as awaiting input",
+    );
+}
+
+#[tokio::test]
+async fn completed_execution_keeps_its_diagnostics_when_retained_pane_is_dead() {
+    let (_dir, db) = open_db_arc();
+    let execution_id = start_local_run(&db, "worker-1");
+    stamp_tmux_identity(&db, &execution_id, "tok-completed");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            rusqlite::params![&execution_id],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET error_text = 'original diagnostic' WHERE execution_id = ?1",
+            rusqlite::params![&execution_id],
+        )
+        .unwrap();
+    let (tmux, _) = fake_tmux(dead_pane_server("tok-completed"));
+    let outcome = run_boot_time_adoption(
+        &db,
+        &tmux,
+        &coordinator_with_one_slot(db.clone()),
+        &RecordingSpawner::default(),
+        &NoopLiveWorkerConvergence,
+        &RecordingDispatchEventSink::new(),
+        &FixedEngineOwnerProbe(Some(true)),
+    )
+    .await;
+    assert_eq!(outcome.dead_panes, 1);
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Completed
+    );
+    assert_eq!(
+        db.list_runs(&execution_id).unwrap()[0].error_text.as_deref(),
+        Some("original diagnostic")
+    );
+}
+
+#[tokio::test]
+async fn older_dead_pane_diagnostics_only_update_the_token_matched_run() {
+    let (_dir, db) = open_db_arc();
+    let execution_id = start_local_run(&db, "worker-1");
+    stamp_tmux_identity(&db, &execution_id, "tok-old");
+    db.mark_execution_orphaned(&execution_id, "inferred death").unwrap();
+    let old_run_id = db.list_runs(&execution_id).unwrap()[0].id.clone();
+    db.connect().unwrap().execute(
+        "INSERT INTO work_runs (id, execution_id, agent_id, status, error_text, created_at, host_id, tmux_spawn_token)
+         VALUES ('run-newer', ?1, 'worker-1', 'failed', 'newer diagnostic', '9999999999', 'local', 'tok-new')",
+        rusqlite::params![&execution_id],
+    ).unwrap();
+    let (tmux, _) = fake_tmux(dead_pane_server("tok-old"));
+    let mut outcome = TmuxAdoptionOutcome::default();
+    super::super::dead_pane::reconcile_dead_worker_pane(
+        &db,
+        &tmux,
+        &RecordingDispatchEventSink::new(),
+        &execution_id,
+        "boss-worker-1",
+        "tok-old",
+        Some("127".into()),
+        Some("old pane output".into()),
+        &mut outcome,
+    )
+    .await;
+    let runs = db.list_runs(&execution_id).unwrap();
+    assert!(
+        runs.iter()
+            .find(|run| run.id == old_run_id)
+            .unwrap()
+            .error_text
+            .as_deref()
+            .unwrap()
+            .contains("old pane output")
+    );
+    assert_eq!(
+        runs.iter()
+            .find(|run| run.id == "run-newer")
+            .unwrap()
+            .error_text
+            .as_deref(),
+        Some("newer diagnostic")
     );
 }
