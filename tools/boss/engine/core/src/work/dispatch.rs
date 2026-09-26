@@ -5,7 +5,7 @@ impl WorkDb {
     /// Returns or creates a ready execution for `work_item_id`, applying any
     /// priority / preferred-workspace overrides from the request.
     ///
-    /// Friendly ids (`T3`, `P7`) are resolved to primary ids before any other
+    /// Friendly short ids are resolved to primary ids before any other
     /// processing, so callers do not need to pre-resolve them.
     ///
     /// If the most recent execution for this work item is still in flight
@@ -42,9 +42,8 @@ impl WorkDb {
         is_live: F,
     ) -> Result<WorkExecution> {
         let mut conn = self.connect()?;
-        // Resolve T42 / P7 friendly ids to primary ids before any other check,
-        // so callers like `bossctl work start T3` work without client-side
-        // resolution. Primary ids (task_*, proj_*, prod_*) pass through unchanged.
+        // Resolve friendly short ids to primary ids before any other check,
+        // so callers do not need client-side resolution. Primary ids (task_*, proj_*, prod_*) pass through unchanged.
         if let Some(resolved) = resolve_friendly_work_item_id(&conn, &input.work_item_id)? {
             input.work_item_id = resolved;
         }
@@ -59,7 +58,7 @@ impl WorkDb {
     /// Re-fire the automated review pipeline for `work_item_id`'s
     /// currently-open PR by enqueuing a fresh `pr_review` execution.
     ///
-    /// Accepts a friendly id (`T3`) or a primary `task_…` id. The single
+    /// Accepts a friendly short id or a primary `task_…` id. The single
     /// dispatch path shared by the dead-review auto-recovery sweep
     /// ([`crate::pr_review_recovery`]) and the operator-facing `bossctl
     /// review start --pr <n>` verb — see
@@ -83,7 +82,7 @@ impl WorkDb {
     /// PR) is itself the producing execution's completion, so a fresh
     /// live-execution check would spuriously trip on that very execution.
     /// It exists solely to make "does a non-terminal `pr_review` execution
-    /// already exist for this item" and "insert one" atomic (T366): two
+    /// already exist for this item" and "insert one" atomic: two
     /// independent PR-completion triggers (the Stop-hook path and the
     /// merge-poller's `pr_recheck` sweep) can each reach the reviewer-
     /// enqueue check around the same moment, before either has recorded its
@@ -1205,7 +1204,10 @@ impl WorkDb {
                  ORDER BY created_at ASC, id ASC",
             )?;
             let rows = stmt.query_map([work_item_id], map_execution)?;
-            return collect_rows(rows);
+            let mut executions = collect_rows(rows)?;
+            executions.extend(review_guide_executions_for_task(&conn, work_item_id)?);
+            executions.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+            return Ok(executions);
         }
 
         let mut stmt = conn.prepare(
@@ -1242,6 +1244,11 @@ impl WorkDb {
             let rows = stmt.query_map([task_id], map_execution)?;
             all_executions.extend(collect_rows(rows)?);
         }
+        // A review-guide series' `root_task_id` always resolves to the chain
+        // root, never an individual revision task, so this can only ever
+        // match once — look it up outside the loop rather than once per
+        // chain member.
+        all_executions.extend(review_guide_executions_for_task(&conn, chain_root_id)?);
         all_executions.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
         Ok(all_executions)
     }
@@ -1281,7 +1288,28 @@ impl WorkDb {
             let host_id: Option<String> = row.get(1)?;
             Ok((id, host_id.unwrap_or_else(|| "local".to_owned())))
         })?;
-        collect_rows(rows).map(|entries: Vec<(String, String)>| entries.into_iter().collect())
+        let mut hosts: HashMap<String, String> =
+            collect_rows(rows).map(|entries: Vec<(String, String)>| entries.into_iter().collect())?;
+
+        // `list_executions`/`list_executions_for_chain` union in review-guide
+        // executions owned by this task via the comparison -> series ->
+        // root-task join, keyed by the execution's own id even though its
+        // `work_item_id` is the comparison, not this task. Look those up by
+        // id too so `bossctl work executions` doesn't fall back to "local"
+        // for a review-guide run that actually executed on a remote host.
+        let mut guide_stmt = conn.prepare(&format!(
+            "SELECT we.id, we.host_id {REVIEW_GUIDE_EXECUTIONS_FOR_TASK_FROM}"
+        ))?;
+        let guide_rows = guide_stmt.query_map(params![work_item_id], |row| {
+            let id: String = row.get(0)?;
+            let host_id: Option<String> = row.get(1)?;
+            Ok((id, host_id.unwrap_or_else(|| "local".to_owned())))
+        })?;
+        for entry in collect_rows(guide_rows)? {
+            let (id, host_id): (String, String) = entry;
+            hosts.insert(id, host_id);
+        }
+        Ok(hosts)
     }
 
     /// Return true if `execution` is a stale prior occupant of a reused
@@ -1397,9 +1425,9 @@ impl WorkDb {
     /// This is the per-PR single-writer guard. Every task in a revision
     /// chain shares the chain root's PR branch, and cube co-locates same-PR
     /// workers on ONE shared jj backing store; two live executions anywhere
-    /// in the chain therefore rebase/rewrite each other's commits (the
-    /// T1577 / T1815 incident: a conflict-resolution revision rebased the
-    /// stack out from under a still-live implementation resume). Unlike
+    /// in the chain therefore rebase/rewrite each other's commits: a conflict-resolution
+    /// revision can rebase the stack out from under a still-live
+    /// implementation resume. Unlike
     /// [`Self::get_live_execution_for_work_item`], which keys on a single
     /// `work_item_id` and so cannot see a sibling revision's (or the chain
     /// root's) live worker, this walks the whole chain.
@@ -1534,8 +1562,7 @@ impl WorkDb {
     /// the singular form can return a root `pr_review` while masking a live
     /// writer further down the chain — exactly the gap that let a
     /// root-review bypass wrongly co-dispatch a second writer alongside a
-    /// still-live descendant writer (the T1577/T1815 hazard this guard
-    /// exists to prevent).
+    /// still-live descendant writer.
     pub fn live_executions_elsewhere_in_chain(&self, work_item_id: &str) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
         let member_ids = chain_member_ids_on(&conn, work_item_id)?;
@@ -1796,6 +1823,41 @@ impl WorkDb {
     }
 }
 
+// Shared ownership relation for task-scoped execution rows and host metadata.
+const REVIEW_GUIDE_EXECUTIONS_FOR_TASK_FROM: &str = "FROM work_executions we
+         JOIN pr_review_guide_source_comparisons c ON c.id = we.work_item_id
+         JOIN pr_review_guide_source_series s ON s.id = c.series_id
+         WHERE we.kind = 'pr_review_guide' AND s.root_task_id = ?1";
+
+/// Executions whose `kind` is `pr_review_guide` and whose comparison
+/// belongs to a review-guide series rooted at `task_id` — joined via
+/// `pr_review_guide_source_comparisons.series_id ->
+/// pr_review_guide_source_series.root_task_id`. A review-guide execution's
+/// own `work_item_id` is the comparison id (`prgc_…`), not `task_id`, so
+/// the plain `WHERE work_item_id = ?1` queries in [`WorkDb::list_executions`]
+/// and [`WorkDb::list_executions_for_chain`] never see it; both union this
+/// in per requested task so a review-guide run appears alongside the task/PR
+/// it reviewed instead of being reachable only by its opaque comparison id.
+/// Each returned row's `owning_task_id` is set to `task_id` for the
+/// caller's display grouping — the row's own `work_item_id` is left
+/// untouched as the comparison id, which remains the run's correct owner
+/// for dedup and finalize lookups.
+fn review_guide_executions_for_task(conn: &Connection, task_id: &str) -> Result<Vec<WorkExecution>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT we.id, we.work_item_id, we.kind, we.status, we.repo_remote_url, we.cube_repo_id, we.cube_lease_id,
+                we.cube_workspace_id, we.workspace_path, we.priority, we.preferred_workspace_id,
+                we.created_at, we.started_at, we.finished_at,
+                we.pre_start_failure_count, we.dispatch_not_before, we.pr_url, we.pr_head_before, we.prefer_is_soft, we.worker_branch_prefix, we.transient_failure_count, we.allow_dirty, we.branch_naming, we.dispatch_wait_reason, we.dispatch_wait_since, we.driver_runtime_state, we.driver, we.model, we.effort_level, we.pr_head_after
+         {REVIEW_GUIDE_EXECUTIONS_FOR_TASK_FROM}",
+    ))?;
+    let rows = stmt.query_map([task_id], map_execution)?;
+    let mut executions = collect_rows(rows)?;
+    for execution in &mut executions {
+        execution.owning_task_id = Some(task_id.to_owned());
+    }
+    Ok(executions)
+}
+
 /// Walk `work_item_id`'s revision chain and return every member id,
 /// chain-root first, including `work_item_id` itself.
 ///
@@ -1804,7 +1866,7 @@ impl WorkDb {
 /// poller detects the merge, but its execution isn't force-released until the
 /// poller's next step. A tombstone-filtered walk could miss that still-live
 /// execution during this window and let a second worker start on the same PR
-/// branch (the T1577/T1815 hazard the chain guard exists to prevent).
+/// branch.
 fn chain_member_ids_on(conn: &Connection, work_item_id: &str) -> Result<Vec<String>> {
     let root_id = chain_root(conn, work_item_id)?;
     let mut member_ids = Vec::with_capacity(4);

@@ -593,13 +593,14 @@ impl WorkDb {
         if execution.status.is_terminal() {
             return Ok(StallEscalation::Terminal);
         }
-        // `classify_id` also recognizes comments, but the dispatch-stall
-        // attention surface is intentionally limited to product, project,
-        // and task ids. An answer-agent comment (`cmt_…`), automation
-        // (`auto_…`), or other non-work-item id must stay a quiet skip.
+        // `classify_id` also recognizes comments and comparisons, but the
+        // dispatch-stall attention surface is intentionally limited to
+        // product, project, and task ids. An answer-agent comment (`cmt_…`),
+        // a review-guide comparison (`prgc_…`), automation (`auto_…`), or
+        // other non-work-item id must stay a quiet skip.
         match classify_id(&execution.work_item_id) {
             Ok(ItemKind::Product | ItemKind::Project | ItemKind::Task) => {}
-            Ok(ItemKind::Comment) | Err(_) => return Ok(StallEscalation::NotWorkItem),
+            Ok(ItemKind::Comment | ItemKind::Comparison) | Err(_) => return Ok(StallEscalation::NotWorkItem),
         }
         Ok(StallEscalation::Escalate {
             work_item_id: execution.work_item_id,
@@ -844,6 +845,7 @@ impl WorkDb {
             ItemKind::Project => self.update_project(id, patch, actor),
             ItemKind::Task => self.update_task(id, patch, actor),
             ItemKind::Comment => bail!("comment ids are not product/project/task work items: {id}"),
+            ItemKind::Comparison => bail!("comparison ids are not product/project/task work items: {id}"),
         }
     }
 
@@ -925,12 +927,14 @@ impl WorkDb {
             ItemKind::Product => bail!("product deletion is not supported; archive it instead"),
             ItemKind::Project => bail!("project deletion is not supported; archive it instead"),
             ItemKind::Comment => bail!("comment ids are not product/project/task work items: {id}"),
+            ItemKind::Comparison => bail!("comparison ids are not product/project/task work items: {id}"),
         }
     }
 
     /// Inverse of [`Self::delete_work_item`]: clear the `deleted_at`
     /// tombstone on a soft-deleted task so it becomes visible again.
-    /// Accepts a canonical `task_…` id or a friendly short id (`T43`);
+    /// Accepts a canonical `task_…` id or a friendly short id (letter
+    /// prefix plus digits, or a bare/slug-prefixed number);
     /// the friendly resolution deliberately includes soft-deleted rows
     /// so a tombstoned task is still findable. Idempotent — restoring a
     /// row that is already live succeeds as a no-op. Returns the now-live
@@ -1047,6 +1051,9 @@ impl WorkDb {
                 bail!("projects are archived, not soft-deleted; nothing to restore")
             }
             ItemKind::Comment => bail!("comment ids are not product/project/task work items: {canonical}"),
+            ItemKind::Comparison => {
+                bail!("comparison ids are not product/project/task work items: {canonical}")
+            }
         }
     }
 
@@ -1329,16 +1336,24 @@ impl WorkDb {
                 "comment id {id} is not a product/project/task work item; \
                  use get_comment / is_bound_work_item_closed"
             ),
+            ItemKind::Comparison => bail!(
+                "comparison id {id} is not a product/project/task work item; \
+                 use get_pr_review_guide_comparison_by_id / is_bound_work_item_closed"
+            ),
         }
     }
 
     /// Whether the entity bound by an execution's `work_item_id` is closed.
     ///
     /// Accepts the same id shapes as [`classify_id`]: `task_` / `prod_` /
-    /// `proj_` / `cmt_`. For tasks and chores this is
+    /// `proj_` / `cmt_` / `prgc_`. For tasks and chores this is
     /// [`TaskStatus::is_terminal`]; products and projects are never closed
     /// for this check; for comments it is
-    /// [`boss_protocol::comment_status_is_closed`].
+    /// [`boss_protocol::comment_status_is_closed`]. A review-guide
+    /// comparison is an immutable capture row with no independent
+    /// open/closed lifecycle of its own — like products and projects, it is
+    /// never closed for this check; the review-guide finalizer tracks the
+    /// attempt's own terminal state separately.
     ///
     /// Returns `Err` when the id format is unknown or the row cannot be
     /// loaded — callers that must distinguish "row gone" from "lookup
@@ -1346,7 +1361,7 @@ impl WorkDb {
     /// pattern as the pre-comment recon path.
     pub fn is_bound_work_item_closed(&self, id: &str) -> Result<bool> {
         match classify_id(id)? {
-            ItemKind::Product | ItemKind::Project => Ok(false),
+            ItemKind::Product | ItemKind::Project | ItemKind::Comparison => Ok(false),
             ItemKind::Task => Ok(matches!(
                 self.get_work_item(id)?,
                 WorkItem::Task(task) | WorkItem::Chore(task) if task.status.is_terminal()
@@ -1366,7 +1381,9 @@ impl WorkDb {
     /// Products and projects can't be deleted (`delete_work_item`
     /// rejects both), so this is always `Ok(false)` for them. Comments
     /// are hard-deleted when removed, so a missing `work_comments` row
-    /// is `Ok(true)`.
+    /// is `Ok(true)`. A review-guide comparison is likewise hard-deleted
+    /// by source retention pruning (`review_guide_source_retention.rs`),
+    /// so a missing `pr_review_guide_source_comparisons` row is `Ok(true)`.
     ///
     /// [`get_work_item`] collapses "row never existed" and "DB query
     /// failed" into the same generic `unknown …` error, which is fine
@@ -1388,11 +1405,13 @@ impl WorkDb {
             }
             ItemKind::Product | ItemKind::Project => Ok(false),
             ItemKind::Comment => Ok(self.get_comment(id)?.is_none()),
+            ItemKind::Comparison => Ok(self.get_pr_review_guide_comparison_by_id(id)?.is_none()),
         }
     }
 
-    /// Look up a work item by canonical id or short-form (`T42`,
-    /// `t42`, `#42`, bare `42`, `slug/42`). Returns `Ok(None)` when no
+    /// Look up a work item by canonical id or short-form (letter prefix
+    /// plus digits, `#` plus digits, a bare number, or `slug/` plus
+    /// digits). Returns `Ok(None)` when no
     /// item matches, `Ok(Some(…))` on success. Canonical ids are passed
     /// straight to [`get_work_item`]; short-form ids are first resolved
     /// via [`resolve_friendly_work_item_id`] and then fetched by
@@ -1472,11 +1491,11 @@ impl WorkDb {
     /// and misclassified downstream by `classify_id`, and a typed id that
     /// names a tombstoned row is not mistaken for one that doesn't exist.
     ///
-    /// `id` may be a bare short id (`T5`) for the no-selected-product
-    /// fallback (ambiguity across products is a hard error, matching
-    /// [`Self::resolve_work_item_ref`]'s contract), an already
-    /// product-scoped selector (`{product_id}/{n}` or `slug/n`), or a
-    /// typed primary id.
+    /// `id` may be a bare short id (letter prefix plus digits) for the
+    /// no-selected-product fallback (ambiguity across products is a hard
+    /// error, matching [`Self::resolve_work_item_ref`]'s contract), an
+    /// already product-scoped selector (`{product_id}/{n}` or `slug/n`),
+    /// or a typed primary id.
     pub fn resolve_work_item_ref_including_deleted(&self, id: &str) -> Result<String> {
         let id = id.trim();
         if id.is_empty() {
@@ -1532,7 +1551,8 @@ impl WorkDb {
     /// execution + run on the rendered work item. The lookup never
     /// fails on missing executions: an untouched work item simply
     /// returns a `TaskRuntime` with every `Option` field set to
-    /// `None`. Friendly ids (`T42`, `boss/42`) are resolved to primary
+    /// `None`. Friendly ids (letter prefix plus digits, or a
+    /// slug-prefixed number) are resolved to primary
     /// ids before the query runs, matching `get_work_item`'s contract.
     pub fn get_task_runtime(&self, work_item_id: &str) -> Result<TaskRuntime> {
         let conn = self.connect()?;

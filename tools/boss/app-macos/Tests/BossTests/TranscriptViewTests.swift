@@ -48,6 +48,34 @@ final class TranscriptViewTests: XCTestCase {
         XCTAssertNil(unknown?.effortLevel)
     }
 
+    /// A `pr_review_guide` run's wire `work_item_id` is a review comparison
+    /// id, not the task it reviewed. The engine resolves the owning task via
+    /// its comparison -> series -> root-task join and sends it as
+    /// `owning_task_id`; the parser must prefer that over the raw
+    /// `work_item_id` so the run still groups under the right task in the
+    /// transcript viewer instead of falling into an unnamed section.
+    func testExecutionVMPrefersOwningTaskIdOverComparisonWorkItemId() {
+        let client = EngineClient(socketPath: "/tmp/boss-transcript-owning-task-test.sock")
+        let guideRun = client.parseExecutionVM([
+            "id": "exec-guide",
+            "work_item_id": "prgc_abc123",
+            "owning_task_id": "task_root",
+            "kind": "pr_review_guide",
+            "status": "completed",
+        ])
+        XCTAssertEqual(guideRun?.workItemId, "task_root")
+
+        // Every other kind has no `owning_task_id` on the wire; the raw
+        // `work_item_id` (already a task id) must be left untouched.
+        let ordinaryRun = client.parseExecutionVM([
+            "id": "exec-ordinary",
+            "work_item_id": "task_root",
+            "kind": "task_implementation",
+            "status": "completed",
+        ])
+        XCTAssertEqual(ordinaryRun?.workItemId, "task_root")
+    }
+
     func testSegmentDecodesThinkingWithCollapseFlags() throws {
         let json = """
         {

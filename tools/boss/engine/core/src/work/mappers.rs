@@ -560,6 +560,7 @@ pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
     Ok(WorkExecution {
         id: row.get(0)?,
         work_item_id: row.get(1)?,
+        owning_task_id: None,
         kind,
         status,
         repo_remote_url: row.get(4)?,
@@ -727,8 +728,8 @@ pub struct ConflictResolutionInsertInput {
 
 /// Pre-insert payload for [`WorkDb::record_producer_side_conflict`] —
 /// the Layer 0 telemetry surface for the producer-side blind spot
-/// (`merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`
-/// T1). Supplied by a normal worker's `boss engine conflicts
+/// (`merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`).
+/// Supplied by a normal worker's `boss engine conflicts
 /// record-producer` call after its own `cube workspace rebase`
 /// reported `REBASED_WITH_CONFLICTS` and it resolved the conflict
 /// inline. `product_id` / `work_item_id` / any existing `pr_url` are
@@ -745,8 +746,8 @@ pub struct ProducerConflictInsertInput {
 
 /// Pre-insert payload for [`WorkDb::record_speculative_conflict_prediction`]
 /// — the Layer 4 telemetry surface for a *predicted* conflict
-/// (`merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`
-/// T10). Supplied by the merge poller's speculative-rebase sweep after a
+/// (`merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`).
+/// Supplied by the merge poller's speculative-rebase sweep after a
 /// throwaway, no-push `cube workspace rebase` against an in-review PR came
 /// back conflicted. Unlike [`ConflictResolutionInsertInput`], this never
 /// drives the parent task's `blocked` state or the escalation ladder — it

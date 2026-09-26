@@ -59,6 +59,42 @@ async fn execution_started_hook_skips_when_no_pr_bound() {
     );
 }
 
+#[tokio::test]
+async fn execution_started_hook_skips_review_guide_before_work_item_lookup() {
+    let logs = crate::test_support::log_capture::install();
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    // A comparison id cannot resolve as a task; reaching get_work_item would warn.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET kind = 'pr_review_guide', work_item_id = 'prgc_start_hook'
+             WHERE id = ?1",
+            [&execution_id],
+        )
+        .unwrap();
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let offset = logs.lock().len();
+
+    handler.on_execution_started(&execution_id).await;
+
+    assert_eq!(db.get_execution(&execution_id).unwrap().pr_head_before, None);
+    let captured = String::from_utf8_lossy(&logs.lock()[offset..]).into_owned();
+    let execution_lines: Vec<_> = captured.lines().filter(|line| line.contains(&execution_id)).collect();
+    assert!(
+        execution_lines
+            .iter()
+            .any(|line| line.contains("kind never has a bound PR")),
+        "review-guide execution must short-circuit before lookup; captured: {captured}"
+    );
+    assert!(
+        execution_lines
+            .iter()
+            .all(|line| !line.contains("work item lookup failed")),
+        "review-guide execution must not warn about its comparison id; captured: {captured}"
+    );
+}
+
 // ── Bug B: recheck_for_pr_late ─────────────────────────────────────────
 
 #[tokio::test]
