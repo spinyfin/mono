@@ -2024,3 +2024,46 @@ fn install_boss_event_to_stable_bin_no_op_when_already_stable() {
     assert!(result.is_ok());
     assert_eq!(result.unwrap(), stable);
 }
+
+#[tokio::test]
+async fn mismatched_guide_head_fails_attempt_without_spawning() {
+    use crate::work::{PrSourceCapturePersistOutcome, PrSourceCaptureTrigger};
+    use boss_engine_test_git::jj::JjRepo;
+
+    let workspace = TempDir::new().unwrap();
+    let repo = JjRepo::new(workspace.path());
+    let (spawner, weak, cfg, db) = spawn_test_env(&workspace);
+    let root = create_active_chore(&db, &create_product(&db), "Guide pin verification");
+    let packet = review_guide_source_packet(&"b".repeat(40), &"a".repeat(40));
+    let capture = db
+        .persist_pr_review_guide_source_capture(&root, 1, PrSourceCaptureTrigger::Creation, &packet)
+        .unwrap();
+    let PrSourceCapturePersistOutcome::Stored(capture) = capture else {
+        panic!("capture must persist")
+    };
+    let attempt = db
+        .create_pr_review_guide_attempt(&capture.series_id, &capture.comparison_id, "review-guide-v5")
+        .unwrap();
+    let execution = db
+        .create_pr_review_guide_execution(&capture.comparison_id, "acme/widget")
+        .unwrap();
+    db.bind_pr_review_guide_attempt_execution(&attempt.id, &execution.id)
+        .unwrap();
+    let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, db.clone(), flags);
+    bind_runner(&runner, weak, &spawner);
+    let error = runner
+        .run_execution("worker-1", &execution, &sample_chore(), &repo.worker, None)
+        .await
+        .expect_err("mismatched head must refuse launch");
+    assert!(error.to_string().contains("does not match pinned head"), "{error:#}");
+    assert!(spawner.last.lock().unwrap().is_none());
+    let failed = db
+        .pr_review_guide_attempt_for_execution(&execution.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed.status, "failed");
+    assert!(failed.error.unwrap().contains(&packet.head_sha));
+}

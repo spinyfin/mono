@@ -1,8 +1,13 @@
 //! Shared Claude/Grok/Codex source inspection grammar, composed with the shell tokenizer.
 pub(super) const SCRIPT: &str = r#"
+def guide_object_path(path):
+    return isinstance(path, str) and bool(path) and not path.startswith(('/', '-', ':')) and not any(
+        part in ('', '.', '..', '.git', '.jj', '.codex', '.claude') or any(c in part for c in '*?[]\\\x00')
+        for part in path.split('/'))
+
 def guide_path(path, cwd):
     root = os.environ.get('BOSS_REVIEW_GUIDE_WORKSPACE', '')
-    if not root or not isinstance(path, str) or not path or path.startswith('-'):
+    if not root or not isinstance(path, str) or not path or path.startswith('-') or '\x00' in path:
         return False
     root = os.path.realpath(root)
     candidate = os.path.realpath(os.path.join(cwd, path))
@@ -28,7 +33,7 @@ def guide_read_tool(payload):
         pattern = data.get('glob', data.get('pattern', ''))
         if tool == 'Glob' and (os.path.isabs(pattern) or '..' in pattern.split('/')):
             return False
-        if any(part in ('.git', '.jj', '.codex', '.claude') for part in pattern.split('/')):
+        if any(part in ('.git', '.jj', '.codex', '.claude') or (part.startswith('.') and any(c in part for c in '*?[')) for part in pattern.split('/')):
             return False
         return guide_path(data.get('path') or '.', cwd)
     return False
@@ -65,10 +70,10 @@ def guide_shell_read(payload):
             return bool(re.fullmatch('[0-9a-fA-F]{40}', value)) and value in revisions
         if len(args) == 2 and args[0] == 'show':
             sha, sep, path = args[1].partition(':')
-            return pinned(sha) and sep == ':' and guide_path(path, os.environ.get('BOSS_REVIEW_GUIDE_WORKSPACE', ''))
+            return pinned(sha) and sep == ':' and guide_object_path(path)
         if len(args) >= 5 and args[:3] == ['diff', '--no-ext-diff', '--no-textconv']:
             rest = args[5:]
-            return pinned(args[3]) and pinned(args[4]) and (not rest or (rest[0] == '--' and all(guide_path(p, cwd) for p in rest[1:])))
+            return pinned(args[3]) and pinned(args[4]) and (not rest or (rest[0] == '--' and all(guide_object_path(p) for p in rest[1:])))
         return False
     if prog == 'cat':
         if args and args[0] == '-n':

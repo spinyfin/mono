@@ -180,6 +180,7 @@ pub fn structural_deny_rules(
 
     if worker_kind == WorkerKind::ReviewGuide {
         rules.extend(["Edit(**)".into(), "NotebookEdit(**)".into()]);
+        rules.extend(crate::codex::review_guide_deny_rules());
     }
 
     // Both confirmed-enforced spellings (investigation §B3): the `cmd:*`
@@ -255,6 +256,9 @@ mod tests {
         let args = extra_args(WorkerKind::ReviewGuide, None, Path::new("/repo"), false);
         for rule in crate::codex::review_guide_allow_rules() {
             assert!(args.windows(2).any(|pair| pair == ["--allow", &rule]));
+        }
+        for rule in crate::codex::review_guide_deny_rules() {
+            assert!(args.windows(2).any(|pair| pair == ["--deny", &rule]));
         }
         assert!(args.windows(2).any(|pair| pair == ["--deny", "Edit(**)"]));
         assert!(args.windows(2).any(|pair| pair == ["--permission-mode", "dontAsk"]));

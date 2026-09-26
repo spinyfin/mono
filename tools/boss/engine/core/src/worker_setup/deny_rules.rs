@@ -154,7 +154,9 @@ pub fn review_guide_allow_rules() -> Vec<String> {
 }
 
 pub fn review_guide_deny_rules() -> Vec<String> {
-    read_only_worker_deny_rules()
+    let mut rules = read_only_worker_deny_rules();
+    rules.extend(crate::driver::codex::review_guide_deny_rules());
+    rules
 }
 
 /// Shared deny body for workers that must not write files, publish, or

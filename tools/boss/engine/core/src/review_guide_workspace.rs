@@ -77,7 +77,8 @@ pub(crate) fn verify(workspace: &Path, packet: &SourcePacket) -> Result<PathBuf>
 /// filters, hooks, a pager, credentials, or network fetching.
 fn range_exists(workspace: &Path, sha: &str, path: &str, start: u32, end: u32) -> Result<()> {
     require_sha(sha)?;
-    ensure!(start > 0 && end >= start, "invalid line range");
+    let whole_file = start == 0 && end == 0;
+    ensure!(whole_file || (start > 0 && end >= start), "invalid line range");
     ensure!(
         !path.is_empty()
             && path
@@ -96,7 +97,7 @@ fn range_exists(workspace: &Path, sha: &str, path: &str, start: u32, end: u32) -
     );
     let text = String::from_utf8(git(workspace, &["cat-file", "blob", &object])?)?;
     ensure!(
-        !text.contains('\0') && end as usize <= text.lines().count(),
+        !text.contains('\0') && (whole_file || end as usize <= text.lines().count()),
         "linked range does not exist in textual source"
     );
     Ok(())
@@ -107,8 +108,19 @@ pub(crate) fn validate(
     packet: &SourcePacket,
     raw: &str,
 ) -> Result<boss_review_guide::ValidatedGuide> {
+    let failures = std::cell::RefCell::new(Vec::new());
     boss_review_guide::validate_guide_output_with_resolver(raw, packet, |sha, path, start, end| {
-        range_exists(workspace, sha, path, start, end).is_ok()
+        match range_exists(workspace, sha, path, start, end) {
+            Ok(()) => true,
+            Err(error) => {
+                failures.borrow_mut().push(format!("{sha}:{path}: {error:#}"));
+                false
+            }
+        }
     })
-    .map_err(|issues| anyhow::anyhow!(issues.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")))
+    .map_err(|issues| {
+        let mut reasons = issues.iter().map(ToString::to_string).collect::<Vec<_>>();
+        reasons.extend(failures.into_inner());
+        anyhow::anyhow!(reasons.join("; "))
+    })
 }

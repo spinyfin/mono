@@ -9,15 +9,35 @@ pub fn review_guide_allow_rules() -> Vec<String> {
         "Read".to_owned(),
         "Grep".to_owned(),
         "Glob".to_owned(),
-        "Bash(git:*)".to_owned(),
+        "Bash(git show:*)".to_owned(),
+        "Bash(git --no-pager show:*)".to_owned(),
+        "Bash(git diff --no-ext-diff --no-textconv:*)".to_owned(),
+        "Bash(git --no-pager diff --no-ext-diff --no-textconv:*)".to_owned(),
         "Bash(cat:*)".to_owned(),
         "Bash(rg:*)".to_owned(),
         "Bash(head:*)".to_owned(),
         "Bash(tail:*)".to_owned(),
-        "Bash(sed:*)".to_owned(),
+        "Bash(sed -n:*)".to_owned(),
         r#"Bash("$BOSS_BIN" propose review-guide:*)"#.to_owned(),
         r#"Bash("${BOSS_BIN}" propose review-guide:*)"#.to_owned(),
     ]
+}
+
+/// Configuration-level defense against mutating and program-execution options.
+pub fn review_guide_deny_rules() -> Vec<String> {
+    [
+        "git fetch",
+        "git pull",
+        "git push",
+        "git config",
+        "git -c",
+        "sed -i",
+        "rg --pre",
+    ]
+    .into_iter()
+    .flat_map(|command| [format!("Bash({command}:*)"), format!("Bash({command}*)")])
+    .chain(["Bash(rg * --pre*)".into(), "Bash(sed * -i*)".into()])
+    .collect()
 }
 
 /// Shared by Codex materialization and Claude settings hooks.
@@ -46,9 +66,11 @@ import sys
 
 try:
     payload = json.load(sys.stdin)
+    approved = allowed(payload)
 except Exception:
     payload = None
-if allowed(payload):
+    approved = False
+if approved:
     print(json.dumps({"decision": "approve"}))
 else:
     tool = payload.get("tool_name", "(unreadable payload)") if isinstance(payload, dict) else "(unreadable payload)"
@@ -118,6 +140,27 @@ mod tests {
     use std::io::Write as _;
 
     #[test]
+    fn configuration_limits_shell_command_shapes() {
+        let allow = review_guide_allow_rules();
+        assert!(!allow.contains(&"Bash(git:*)".into()));
+        assert!(!allow.contains(&"Bash(sed:*)".into()));
+        assert!(allow.contains(&"Bash(git show:*)".into()));
+        assert!(allow.contains(&"Bash(sed -n:*)".into()));
+        let deny = review_guide_deny_rules();
+        for command in [
+            "git fetch",
+            "git pull",
+            "git push",
+            "git config",
+            "git -c",
+            "sed -i",
+            "rg --pre",
+        ] {
+            assert!(deny.contains(&format!("Bash({command}:*)")));
+        }
+    }
+
+    #[test]
     fn permits_only_literal_guide_submission() {
         for command in [
             "\"$BOSS_BIN\" propose review-guide --body '# Guide\n## Problem\nA `code` example: $(literal).\nswift run\nboss engine start\nbazel run //tools/boss/engine/core:engine\n'",
@@ -151,6 +194,10 @@ mod tests {
     }
 
     fn decide_with_source(payload: serde_json::Value, source: bool) -> (String, String) {
+        decide_at(payload, if source { "/repo" } else { "" })
+    }
+
+    fn decide_at(payload: serde_json::Value, root: &str) -> (String, String) {
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("boss-codex-review-guide-{0}-{seq}", std::process::id()));
@@ -158,7 +205,7 @@ mod tests {
         let script = dir.join("guard.py");
         std::fs::write(&script, codex_review_guide_guard_script()).unwrap();
         let mut child = std::process::Command::new("python3")
-            .env("BOSS_REVIEW_GUIDE_WORKSPACE", if source { "/repo" } else { "" })
+            .env("BOSS_REVIEW_GUIDE_WORKSPACE", root)
             .env("BOSS_REVIEW_GUIDE_HEAD_SHA", "a".repeat(40))
             .env("BOSS_REVIEW_GUIDE_BASE_SHA", "b".repeat(40))
             .arg(script)
@@ -254,6 +301,81 @@ mod tests {
                 .0,
                 expected,
                 "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_exceptions_and_metadata_wildcards() {
+        // A malformed cwd raises TypeError inside os.path.join, after JSON parsing.
+        assert_eq!(
+            decide_with_source(
+                serde_json::json!({"tool_name":"Read","cwd":["/repo"],"tool_input":{"file_path":"src/a.rs"}}),
+                true
+            )
+            .0,
+            "block"
+        );
+        assert_eq!(
+            decide_with_source(
+                serde_json::json!({"tool_name":"Read","tool_input":{"file_path":"/repo/a\u{0}b"}}),
+                true
+            )
+            .0,
+            "block"
+        );
+        for input in [
+            serde_json::json!({"pattern":".cl*/**"}),
+            serde_json::json!({"pattern":"**/.j?/**"}),
+        ] {
+            for tool in ["Read", "Glob", "Grep"] {
+                assert_eq!(
+                    decide_with_source(serde_json::json!({"tool_name":tool,"tool_input":input}), true).0,
+                    "block"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn immutable_object_paths_do_not_follow_head_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/outside", root.path().join("old.rs")).unwrap();
+        let root_path = root.path().to_str().unwrap();
+        for command in [
+            format!("git show {}:old.rs", "b".repeat(40)),
+            format!(
+                "git diff --no-ext-diff --no-textconv {} {} -- old.rs",
+                "b".repeat(40),
+                "a".repeat(40)
+            ),
+        ] {
+            assert_eq!(
+                decide_at(
+                    serde_json::json!({"tool_name":"Bash","tool_input":{"command":command}}),
+                    root_path
+                )
+                .0,
+                "approve"
+            );
+        }
+        assert_eq!(
+            decide_at(
+                serde_json::json!({"tool_name":"Read","tool_input":{"file_path":"old.rs"}}),
+                root_path
+            )
+            .0,
+            "block"
+        );
+        for path in ["../old.rs", "/old.rs", ".git/config", ":(top)old.rs"] {
+            let command = format!("git show '{}:{path}'", "b".repeat(40));
+            assert_eq!(
+                decide_at(
+                    serde_json::json!({"tool_name":"Bash","tool_input":{"command":command}}),
+                    root_path
+                )
+                .0,
+                "block"
             );
         }
     }

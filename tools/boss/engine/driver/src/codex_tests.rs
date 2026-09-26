@@ -3,10 +3,7 @@ use super::*;
 #[test]
 fn guide_sandbox_is_read_only_with_only_the_proposal_socket() {
     for enforced in [false, true] {
-        assert_eq!(
-            codex_sandbox_for_worker_kind(WorkerKind::ReviewGuide, enforced),
-            Some("read-only")
-        );
+        assert_eq!(codex_sandbox_for_worker_kind(WorkerKind::ReviewGuide, enforced), None);
         assert_eq!(
             codex_sandbox_extra_args(WorkerKind::ReviewGuide, enforced),
             ["--config", "default_permissions=\"review-guide\""]
@@ -1336,5 +1333,58 @@ fn codex_structured_output_fallback_empty_for_unimplemented_kinds() {
         driver
             .structured_output_fallback(StructuredOutputKind::PostmortemFollowups, text)
             .is_empty()
+    );
+}
+
+#[test]
+fn guide_permission_materialization_requires_socket_and_writes_named_profile() {
+    let tmp = TempDir::new().unwrap();
+    let _homes = crate::test_support::codex_homes_override(&tmp.path().join("homes"));
+    let home = codex_home_for_run("guide-materialization").unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let mut input = PermissionInput {
+        worker_kind: WorkerKind::ReviewGuide,
+        workspace_path: tmp.path().to_path_buf(),
+        events_socket_path: tmp.path().join("events.sock"),
+        frontend_socket_path: None,
+        boss_event_path: tmp.path().join("boss-event"),
+        run_id: "guide-materialization".into(),
+        lease_id: "guide-lease".into(),
+        execution_kind: "pr_review_guide".into(),
+        task_kind: None,
+        is_remote: false,
+        path_guard_script: None,
+        checkleft_guard_script: None,
+        codex_sandbox_enforced: false,
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let driver = CodexDriver::default();
+    let error = rt
+        .block_on(driver.write_permission_config(&input, tmp.path()))
+        .unwrap_err();
+    assert!(error.to_string().contains("requires a bound frontend socket"));
+    assert!(!home.join("config.toml").exists());
+    input.frontend_socket_path = Some(tmp.path().join("frontend.sock"));
+    // The sandbox forbids launching a live Codex process; materialization must
+    // finish before the separate hook-trust attestation reports that failure.
+    let result = rt.block_on(driver.write_permission_config(&input, tmp.path()));
+    if let Err(error) = result {
+        assert!(error.to_string().contains("hook-trust gate"), "{error:#}");
+    }
+    let config: toml::Value = toml::from_str(&fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
+    assert_eq!(
+        config["permissions"]["review-guide"]["extends"].as_str(),
+        Some(":read-only")
+    );
+    let sockets = config["permissions"]["review-guide"]["network"]["unix_sockets"]
+        .as_table()
+        .unwrap();
+    assert_eq!(sockets.len(), 1);
+    assert_eq!(
+        sockets[input.frontend_socket_path.unwrap().to_str().unwrap()].as_str(),
+        Some("allow")
     );
 }

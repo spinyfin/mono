@@ -634,7 +634,17 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .work_db
                 .get_pr_review_guide_comparison_by_id(&execution.work_item_id)?
                 .context("review-guide comparison missing before spawn")?;
-            Some(crate::review_guide_workspace::verify(workspace_path, &capture.packet)?)
+            match crate::review_guide_workspace::verify(workspace_path, &capture.packet) {
+                Ok(git_dir) => Some(git_dir),
+                Err(error) => {
+                    self.work_db.finish_pr_review_guide_attempt_for_terminal_execution(
+                        &execution.id,
+                        boss_protocol::ExecutionStatus::Failed,
+                        &format!("{error:#}"),
+                    )?;
+                    return Err(error);
+                }
+            }
         } else {
             None
         };

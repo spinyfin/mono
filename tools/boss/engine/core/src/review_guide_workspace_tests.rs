@@ -33,6 +33,9 @@ fn checkout_and_links_use_comparison_commits_despite_branch_and_working_file_cha
         )
     };
     assert!(validate(&repo.worker, &packet, &guide(&head, "caller.rs", "L1-L3")).is_ok());
+    let whole_file = guide(&head, "caller.rs", "L1").replace("#L1", "");
+    assert!(validate(&repo.worker, &packet, &whole_file).is_ok());
+    assert!(validate(&repo.worker, &packet, &whole_file.replace("caller.rs", "missing.rs")).is_err());
     assert!(validate(&repo.worker, &packet, &guide(&base, "base.txt", "L1")).is_ok());
     for (sha, path, lines) in [
         (&head, "caller.rs", "L4"),

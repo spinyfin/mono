@@ -38,7 +38,7 @@ pub mod guard_trace;
 mod pane_monitor;
 mod progress;
 mod review_guide_guard;
-pub use review_guide_guard::review_guide_allow_rules;
+pub use review_guide_guard::{review_guide_allow_rules, review_guide_deny_rules};
 mod reviewer_publish_guard;
 mod rollout_calls;
 mod tool_surface_guard;
@@ -499,7 +499,8 @@ pub fn codex_homes_root_and_home_for_run(run_id: &str) -> anyhow::Result<(PathBu
 pub fn codex_sandbox_for_worker_kind(worker_kind: WorkerKind, sandbox_enforced: bool) -> Option<&'static str> {
     match worker_kind {
         WorkerKind::Reviewer => None,
-        WorkerKind::ReviewGuide => Some("read-only"),
+        // Selected through default_permissions in codex_sandbox_extra_args.
+        WorkerKind::ReviewGuide => None,
         WorkerKind::Standard | WorkerKind::Triage | WorkerKind::AnswerAgent => {
             if sandbox_enforced {
                 Some("workspace-write")

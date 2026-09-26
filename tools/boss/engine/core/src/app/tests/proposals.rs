@@ -1846,7 +1846,7 @@ async fn review_guide_invented_link_is_rejected_and_a_corrected_resubmission_pub
             .decision_reason
             .as_deref()
             .unwrap_or_default()
-            .contains("does not resolve to any pinned source"),
+            .contains("does not resolve to source at the recorded head or merge-base revision"),
         "{:?}",
         proposal.decision_reason
     );
