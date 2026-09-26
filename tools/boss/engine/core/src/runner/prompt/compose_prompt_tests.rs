@@ -2554,3 +2554,46 @@ fn design_guidance_absent_from_non_design_execution_kind() {
         "a chore_implementation execution must not render the design guidance block:\n{prompt}",
     );
 }
+
+#[test]
+fn revision_directive_injects_guide_fragment_for_guide_created_revision() {
+    let work_item = revision_task_with_created_via(
+        None,
+        &format!("{}series-1", boss_protocol::CREATED_VIA_GUIDE_COMMENT_PREFIX),
+    );
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("This revision was dispatched from review-guide feedback."),
+        "guide-created revision must get the guide fragment:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("boss comment guide-outcome"),
+        "guide fragment must teach the guide-outcome command:\n{prompt}",
+    );
+}
+
+#[test]
+fn revision_directive_omits_guide_fragment_for_non_guide_revision() {
+    for created_via in ["operator", "merge-conflict:crz_frag_01", "ci-fix:crm_frag_01"] {
+        let work_item = revision_task_with_created_via(None, created_via);
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+                .work_item(&work_item)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
+        );
+        assert!(
+            !prompt.contains("This revision was dispatched from review-guide feedback."),
+            "non-guide revision ({created_via}) must not get the guide fragment:\n{prompt}",
+        );
+    }
+}

@@ -294,29 +294,10 @@ pub async fn classify(
 
 /// Make a classification call for an operator's follow-up reply (P3c), with
 /// the original comment and the thread's prior turns as context, retrying
-/// transient failures (see [`call_classifier_with_retries`]).
+/// transient failures (see [`call_classifier_with_retries`]). `subject`
+/// selects document- vs PR-flavoured prompt text, matching the fresh-comment
+/// classifier's [`classify`].
 pub async fn classify_followup(
-    call: &UtilityCall,
-    original_body: &str,
-    anchor: &CommentAnchor,
-    thread: &[CommentThreadEntry],
-    followup_body: &str,
-) -> Result<Classification, String> {
-    call_classifier_with_retries(
-        call,
-        build_followup_prompt(
-            original_body,
-            anchor,
-            thread,
-            followup_body,
-            ClassifierSubject::Document,
-        ),
-    )
-    .await
-}
-
-/// Follow-up classification with an explicit subject (document vs PR).
-pub async fn classify_followup_for_subject(
     call: &UtilityCall,
     original_body: &str,
     anchor: &CommentAnchor,
