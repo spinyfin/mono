@@ -897,6 +897,88 @@ fn reapplying_a_merged_followup_returns_the_same_work_item() {
     assert_eq!(first, second, "proposal id is the materialisation idempotency key");
 }
 
+/// A PostMerge follow-up minted by a pre-upgrade engine used
+/// `pr_review:<proposal_id>` (no `post_merge:` sub-prefix). Materialisation
+/// commits in its own transaction before `commit_applied_review_verdict`, so
+/// a crash between those two leaves the proposal `proposed` for retry with
+/// that old-key row already on disk. Retry on a build that computes
+/// `pr_review:post_merge:<proposal_id>` must still resolve to that row.
+#[test]
+fn reapplying_a_post_merge_followup_seeded_under_the_legacy_created_via_returns_the_same_work_item() {
+    let db = WorkDb::open(temp_db_path("verdict-apply-post-merge-legacy-created-via")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id.clone(), "review target");
+    bind_merged_pr(&db, &cycle_root.id);
+
+    let merge_sha = "merge-commit-sha";
+    let post_merge_reviewer = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            post_merge_batch_input(cycle_root.id.clone(), merge_sha),
+            &[member(
+                ReviewBatchMemberRole::PostMergeReviewer,
+                Some(post_merge_reviewer.id.clone()),
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &post_merge_reviewer.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &post_merge_findings_verdict_payload(&batch.id, merge_sha),
+            idempotency_key: "post-merge-legacy-created-via",
+        })
+        .unwrap()
+        .unwrap();
+    let proposal_id = outcome.proposal.id;
+
+    let seeded = db
+        .create_review_findings_followup(
+            ReviewFindingsFollowupInsert::builder()
+                .product_id(product.id)
+                .name("legacy post-merge follow-up")
+                .created_via(format!("{CREATED_VIA_PR_REVIEW_PREFIX}{proposal_id}"))
+                .description("Address ALL findings before closing this follow-up.")
+                .chain_root_id(cycle_root.id.clone())
+                .build(),
+        )
+        .unwrap();
+
+    let applied = db
+        .apply_review_verdict_proposal(&proposal_id, &FakePrStateChecker::always(PrOpenState::Merged))
+        .unwrap()
+        .expect("retry must recover the follow-up already materialised under the legacy created_via key");
+    assert_eq!(
+        applied, seeded.id,
+        "PostMerge retry after a created_via key change must return the existing work item"
+    );
+
+    let conn = db.connect().unwrap();
+    let new_key = format!("{CREATED_VIA_PR_REVIEW_POST_MERGE_PREFIX}{proposal_id}");
+    let legacy_key = format!("{CREATED_VIA_PR_REVIEW_PREFIX}{proposal_id}");
+    let materialisation_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE created_via IN (?1, ?2)",
+            rusqlite::params![new_key, legacy_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        materialisation_count, 1,
+        "upgrade recovery must not mint a second follow-up under the new created_via key"
+    );
+}
+
 /// Stage one clean verdict and one findings-warranting verdict (each its own
 /// cycle root / batch / proposal), plus one proposal already `applied`
 /// before the sweep runs, then drive the sweep entry point
@@ -1736,4 +1818,89 @@ fn post_merge_verdict_materialises_a_followup_despite_matching_the_prior_reviewe
         "gate_outcome must not be dropped_duplicate_head for a PostMerge batch"
     );
     assert_eq!(verdict.revision_task_id.as_deref(), Some(created.as_str()));
+}
+
+/// A follow-up minted from a `PostMerge` batch must be recognisable in the
+/// work-item title and in the description the worker uses to compose its PR
+/// body: the title is prefixed, and the description names the post-merge
+/// review and links the origin PR from the batch's durable `pr_url`, not left
+/// to the reviewing worker to remember. `PreMerge` follow-ups are unaffected
+/// (see the ordinary merged-origin-at-apply-time coverage elsewhere in this
+/// file), since only a `PostMerge` batch takes this branch.
+#[test]
+fn post_merge_verdict_followup_states_title_and_origin_provenance() {
+    let db = WorkDb::open(temp_db_path("verdict-apply-post-merge-title-provenance")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    bind_merged_pr(&db, &cycle_root.id);
+
+    let merge_sha = "merge-commit-sha";
+    let post_merge_reviewer = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            post_merge_batch_input(cycle_root.id.clone(), merge_sha),
+            &[member(
+                ReviewBatchMemberRole::PostMergeReviewer,
+                Some(post_merge_reviewer.id.clone()),
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &post_merge_reviewer.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &post_merge_findings_verdict_payload(&batch.id, merge_sha),
+            idempotency_key: "post-merge-verdict-title-provenance",
+        })
+        .unwrap()
+        .unwrap();
+
+    let created = db
+        .apply_review_verdict_proposal(&outcome.proposal.id, &FakePrStateChecker::always(PrOpenState::Merged))
+        .unwrap()
+        .expect("a post-merge verdict's findings must materialise a follow-up");
+    let task = query_task(&db.connect().unwrap(), &created).unwrap().unwrap();
+    assert_eq!(task.kind, TaskKind::Followup);
+    assert!(
+        task.name.starts_with("Post-merge review findings: "),
+        "follow-up title must identify it as post-merge review findings; got {:?}",
+        task.name
+    );
+    assert!(
+        task.description.contains("found in post-merge review of"),
+        "follow-up description must state it was found in post-merge review; got {:?}",
+        task.description
+    );
+    assert!(
+        task.description.contains(PR_URL),
+        "follow-up description must link the origin PR; got {:?}",
+        task.description
+    );
+    assert!(
+        task.created_via
+            .starts_with(boss_protocol::CREATED_VIA_PR_REVIEW_POST_MERGE_PREFIX),
+        "post-merge follow-up must carry the post_merge created_via sub-prefix so the worker-facing \
+         backlink can label it distinctly; got {:?}",
+        task.created_via
+    );
+    let leaked_short_id = cycle_root
+        .short_id
+        .map(|short_id| format!("T{short_id}"))
+        .filter(|marker| task.description.contains(marker.as_str()));
+    assert_eq!(
+        leaked_short_id, None,
+        "a post-merge follow-up's description must never embed a bare Boss work-item id \
+         (boss-ism/pr-text-leakage forbids it in worker-authored PR text); got {:?}",
+        task.description
+    );
 }

@@ -1580,6 +1580,42 @@ mod compose_worker_spawn_tests {
         }
     }
 
+    /// A follow-up minted from a `PostMerge` review batch carries a durable
+    /// `pr_review:post_merge:` created_via sub-prefix (see
+    /// `review_verdict_apply.rs`), which must reach the worker-facing
+    /// `## Origin PR backlink` block the worker is told to paste verbatim
+    /// into its PR body — not just the separate free-text provenance
+    /// paragraph in the task description.
+    #[tokio::test]
+    async fn post_merge_followup_gets_a_post_merge_specific_origin_backlink() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let execution = chore_execution();
+        let WorkItem::Chore(mut task) = task_without_pr("task-chore-1") else {
+            unreachable!();
+        };
+        task.kind = TaskKind::Followup;
+        task.created_via = "pr_review:post_merge:exec_source".into();
+        task.origin_pr_number = Some(2685);
+
+        let composed = compose_worker_spawn(
+            &db,
+            "worker-1",
+            &execution,
+            &WorkItem::Chore(task),
+            workspace.path(),
+            None,
+            WorkerSpawnOpts::default(),
+        )
+        .await
+        .unwrap();
+        let prompt = composed.prompt_text;
+        assert!(
+            prompt.contains("This `post-merge review findings` follow-up derives from [the origin PR](https://github.com/org/repo/pull/2685)."),
+            "{prompt}"
+        );
+    }
+
     /// A restricted-kind execution (here `PrReview`) never writes a PR body,
     /// so the origin-PR backlink instruction must not be appended even when
     /// the work item's static provenance (a `Followup` task with

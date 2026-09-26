@@ -73,6 +73,41 @@ pub fn render_revision_title(origin: ReviewOrigin, finding_count: usize) -> Stri
     }
 }
 
+/// Work-item title for a follow-up minted from a **post-merge** review
+/// batch (see `boss-engine-core`'s `merge_poller/post_merge_review.rs`). The
+/// `"Post-merge review findings: "` prefix over [`render_revision_title`]'s
+/// base form is deliberate — it is the only signal in the Boss kanban/list
+/// views that distinguishes this follow-up from an ordinary pre-merge
+/// findings revision, since a post-merge follow-up is never converted from a
+/// live revision and always starts life as a standalone `followup`/`chore`.
+pub fn render_post_merge_followup_title(origin: ReviewOrigin, finding_count: usize) -> String {
+    format!(
+        "Post-merge review findings: {}",
+        render_revision_title(origin, finding_count)
+    )
+}
+
+/// Provenance statement prepended to a post-merge-review follow-up's
+/// description (the work-item description a worker receives as its task
+/// instructions). States plainly, in engine-authored text rather than
+/// leaving it to the worker to remember, that these findings came from a
+/// post-merge review of `origin_pr_url` — and instructs the worker to carry
+/// that same statement, with the same link, into the PR description it
+/// opens for this follow-up. `origin_pr_url` must be a GitHub URL (never a
+/// Boss work-item id): the follow-up PR text is checked by
+/// `boss-ism/pr-text-leakage`, which forbids `T<n>`/`P<n>` shapes.
+pub fn render_post_merge_followup_provenance(origin_pr_url: &str) -> String {
+    format!(
+        "**Provenance:** these findings were found in post-merge review of {origin_pr_url}.\n\
+         \n\
+         The PR description you open for this follow-up MUST state explicitly that these \
+         findings were identified during a post-merge review of {origin_pr_url}, with a link \
+         to that PR, so a reader of the follow-up PR can tell where it came from. For example: \
+         \"Found in post-merge review of {origin_pr_url}.\"\n\
+         \n"
+    )
+}
+
 /// Render qualifying `ReviewResult` findings as human-readable revision
 /// instructions.
 ///
