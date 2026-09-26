@@ -1,4 +1,44 @@
 use super::*;
+
+#[test]
+fn guide_sandbox_is_read_only_with_only_the_proposal_socket() {
+    for enforced in [false, true] {
+        assert_eq!(
+            codex_sandbox_for_worker_kind(WorkerKind::ReviewGuide, enforced),
+            Some("read-only")
+        );
+        assert_eq!(
+            codex_sandbox_extra_args(WorkerKind::ReviewGuide, enforced),
+            ["--config", "default_permissions=\"review-guide\""]
+        );
+    }
+    let command = crate::apply_permission_extra_args(
+        "codex exec -c model_reasoning_effort=high",
+        &codex_sandbox_extra_args(WorkerKind::ReviewGuide, false),
+    );
+    assert!(command.contains("-c model_reasoning_effort=high"));
+    assert!(command.contains("default_permissions"));
+    let config: toml::Value = toml::from_str(&render_review_guide_config(
+        Path::new("/repo"),
+        Path::new("/tmp/guide.sock"),
+    ))
+    .unwrap();
+    assert_eq!(
+        config["permissions"]["review-guide"]["extends"].as_str(),
+        Some(":read-only")
+    );
+    assert!(config.get("sandbox_workspace_write").is_none());
+    assert_eq!(
+        config["features"]["network_proxy"]["domains"].as_table().unwrap().len(),
+        0
+    );
+    let sockets = config["permissions"]["review-guide"]["network"]["unix_sockets"]
+        .as_table()
+        .unwrap();
+    assert_eq!(sockets.len(), 1);
+    assert_eq!(sockets["/tmp/guide.sock"].as_str(), Some("allow"));
+    assert_eq!(config["web_search"].as_str(), Some("disabled"));
+}
 use crate::{AbsenceDisposition, Capability};
 use boss_protocol::{ReviewModelTier, StopReason};
 use tempfile::TempDir;

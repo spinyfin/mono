@@ -726,7 +726,11 @@ impl WorkerCompletionHandler {
                     false
                 }
                 Ok(Some(raw_output)) => match self.work_db.get_pr_review_guide_comparison_by_id(&comparison_id) {
-                    Ok(Some(capture)) => match boss_review_guide::validate_guide_output(&raw_output, &capture.packet) {
+                    Ok(Some(capture)) => match self.work_db.validate_review_guide_at_workspace(
+                        &execution.id,
+                        &raw_output,
+                        &capture.packet,
+                    ) {
                         Ok(validated) => {
                             match self.work_db.publish_pr_review_guide_version(
                                 &attempt.id,
@@ -745,11 +749,7 @@ impl WorkerCompletionHandler {
                             }
                         }
                         Err(issues) => {
-                            let detail = issues
-                                .iter()
-                                .map(|issue| issue.to_string())
-                                .collect::<Vec<_>>()
-                                .join("; ");
+                            let detail = issues.to_string();
                             if let Err(err) = self.work_db.fail_pr_review_guide_attempt(&attempt.id, &detail) {
                                 tracing::warn!(execution_id = %execution.id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to record the validation failure");
                             }

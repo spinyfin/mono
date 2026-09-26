@@ -26,3 +26,4 @@ tracing = { workspace = true }
 boss-pr-review = { path = "../pr-review" }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+toml = { workspace = true }

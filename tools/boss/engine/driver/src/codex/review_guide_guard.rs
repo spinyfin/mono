@@ -1,9 +1,29 @@
-//! One-command submission allowlist for review-guide workers.
+//! Read-only source inspection and literal submission allowlist for guide workers.
 use super::guard_python::with_command_tokenizer;
+#[path = "review_guide_reads.rs"]
+mod reads;
+
+/// Claude/Grok capability allowlist, narrowed by the shared command guard.
+pub fn review_guide_allow_rules() -> Vec<String> {
+    vec![
+        "Read".to_owned(),
+        "Grep".to_owned(),
+        "Glob".to_owned(),
+        "Bash(git:*)".to_owned(),
+        "Bash(cat:*)".to_owned(),
+        "Bash(rg:*)".to_owned(),
+        "Bash(head:*)".to_owned(),
+        "Bash(tail:*)".to_owned(),
+        "Bash(sed:*)".to_owned(),
+        r#"Bash("$BOSS_BIN" propose review-guide:*)"#.to_owned(),
+        r#"Bash("${BOSS_BIN}" propose review-guide:*)"#.to_owned(),
+    ]
+}
 
 /// Shared by Codex materialization and Claude settings hooks.
 pub fn codex_review_guide_guard_script() -> String {
     with_review_guide_command(&with_command_tokenizer(SCRIPT_TEMPLATE))
+        .replace("# REVIEW_GUIDE_READ_FRAGMENT", reads::SCRIPT)
 }
 
 /// Insert the submission recognizer into another guard without bypassing its checks.
@@ -20,6 +40,8 @@ import sys
 
 # COMMAND_TOKENIZER_FRAGMENT
 
+# REVIEW_GUIDE_READ_FRAGMENT
+
 # REVIEW_GUIDE_COMMAND_FRAGMENT
 
 try:
@@ -30,7 +52,7 @@ if allowed(payload):
     print(json.dumps({"decision": "approve"}))
 else:
     tool = payload.get("tool_name", "(unreadable payload)") if isinstance(payload, dict) else "(unreadable payload)"
-    print(json.dumps({"decision": "block", "reason": "Blocked: review-guide workers may only submit with the quoted BOSS_BIN executable and propose review-guide --body followed by a single-quoted Markdown literal; all other tools and commands are forbidden (matched tool: " + str(tool) + ")."}))
+    print(json.dumps({"decision": "block", "reason": "Blocked: review-guide workers may only submit a literal guide or inspect pinned source with read tools and restricted git commands; edits, writes, network and general shell are forbidden (matched tool: " + str(tool) + ")."}))
 "#;
 
 /// Render a guard around the shared literal-submission recognizer at compile time.
@@ -67,12 +89,18 @@ pub(super) const REVIEW_GUIDE_COMMAND_PY: &str = crate::render_review_guide_guar
     r#"
 
 def allowed(payload):
-    if not isinstance(payload, dict) or payload.get("tool_name") != "Bash":
+    if not isinstance(payload, dict):
+        return False
+    if guide_read_tool(payload):
+        return True
+    if payload.get("tool_name") != "Bash":
         return False
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
         return False
     command = tool_input.get("command")
+    if guide_shell_read(payload):
+        return True
     masked = review_guide_masked_command(command)
     if masked is None:
         return False
@@ -119,6 +147,10 @@ mod tests {
     }
 
     fn decide(payload: serde_json::Value) -> (String, String) {
+        decide_with_source(payload, false)
+    }
+
+    fn decide_with_source(payload: serde_json::Value, source: bool) -> (String, String) {
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("boss-codex-review-guide-{0}-{seq}", std::process::id()));
@@ -126,6 +158,9 @@ mod tests {
         let script = dir.join("guard.py");
         std::fs::write(&script, codex_review_guide_guard_script()).unwrap();
         let mut child = std::process::Command::new("python3")
+            .env("BOSS_REVIEW_GUIDE_WORKSPACE", if source { "/repo" } else { "" })
+            .env("BOSS_REVIEW_GUIDE_HEAD_SHA", "a".repeat(40))
+            .env("BOSS_REVIEW_GUIDE_BASE_SHA", "b".repeat(40))
             .arg(script)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -150,6 +185,77 @@ mod tests {
             output["decision"].as_str().unwrap().to_owned(),
             output["reason"].as_str().unwrap_or_default().to_owned(),
         )
+    }
+
+    #[test]
+    fn allows_pinned_reads_but_never_writes_shell_escapes_or_foreign_revisions() {
+        for (command, expected) in [
+            ("cat src/a.rs".to_owned(), "approve"),
+            ("rg -n 'fn caller' src".to_owned(), "approve"),
+            ("rg --files src".to_owned(), "approve"),
+            ("sed -n '3,12p' src/a.rs".to_owned(), "approve"),
+            (format!("git show {}:src/a.rs", "b".repeat(40)), "approve"),
+            (
+                format!(
+                    "git diff --no-ext-diff --no-textconv {} {}",
+                    "b".repeat(40),
+                    "a".repeat(40)
+                ),
+                "approve",
+            ),
+            (format!("git show {}:src/a.rs", "c".repeat(40)), "block"),
+            ("git show main:src/a.rs".to_owned(), "block"),
+            ("git fetch".to_owned(), "block"),
+            ("git -c alias.show=fetch show".to_owned(), "block"),
+            ("rg --pre malicious caller src".to_owned(), "block"),
+            ("cat /etc/passwd".to_owned(), "block"),
+            ("cat .codex/auth.json".to_owned(), "block"),
+            ("cat src/a.rs > src/b.rs".to_owned(), "block"),
+            ("cat src/a.rs; touch src/b.rs".to_owned(), "block"),
+            ("cat $(curl evil)".to_owned(), "block"),
+            ("env cat src/a.rs".to_owned(), "block"),
+            ("python3 -c 'print(1)'".to_owned(), "block"),
+            ("cat =python3".to_owned(), "block"),
+            ("cat src/*".to_owned(), "block"),
+            ("sed -i 's/a/b/' src/a.rs".to_owned(), "block"),
+        ] {
+            assert_eq!(
+                decide_with_source(
+                    serde_json::json!({"tool_name":"Bash", "cwd":"/repo", "tool_input":{"command":command}}),
+                    true
+                )
+                .0,
+                expected,
+                "{command}"
+            );
+        }
+        for (tool, input, expected) in [
+            ("Read", serde_json::json!({"file_path":"/repo/src/a.rs"}), "approve"),
+            (
+                "Grep",
+                serde_json::json!({"pattern":"caller", "path":"/repo/src"}),
+                "approve",
+            ),
+            (
+                "Glob",
+                serde_json::json!({"pattern":"**/*.rs", "path":"/repo"}),
+                "approve",
+            ),
+            ("Read", serde_json::json!({"file_path":"/repo/../secret"}), "block"),
+            ("Write", serde_json::json!({"file_path":"/repo/src/a.rs"}), "block"),
+            ("Edit", serde_json::json!({"file_path":"/repo/src/a.rs"}), "block"),
+            ("WebFetch", serde_json::json!({"url":"https://example.com"}), "block"),
+        ] {
+            assert_eq!(
+                decide_with_source(
+                    serde_json::json!({"tool_name":tool,"cwd":"/repo","tool_input":input}),
+                    true
+                )
+                .0,
+                expected,
+                "{tool}"
+            );
+        }
     }
 
     #[test]

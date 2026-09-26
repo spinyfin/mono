@@ -170,7 +170,7 @@ fn resolve_jj_repo_dir(workspace_path: &Path) -> std::io::Result<PathBuf> {
 ///
 /// Falls back to `<workspace_path>/.git` when `git_target` is absent,
 /// which covers colocated jj+git workspaces (test fixtures, dev-mode).
-fn resolve_git_dir(workspace_path: &Path) -> std::io::Result<PathBuf> {
+pub fn resolve_git_dir(workspace_path: &Path) -> std::io::Result<PathBuf> {
     let jj_repo_dir = resolve_jj_repo_dir(workspace_path)?;
     let git_target_file = jj_repo_dir.join("store").join("git_target");
 

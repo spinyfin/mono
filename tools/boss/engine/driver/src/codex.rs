@@ -38,6 +38,7 @@ pub mod guard_trace;
 mod pane_monitor;
 mod progress;
 mod review_guide_guard;
+pub use review_guide_guard::review_guide_allow_rules;
 mod reviewer_publish_guard;
 mod rollout_calls;
 mod tool_surface_guard;
@@ -497,12 +498,8 @@ pub fn codex_homes_root_and_home_for_run(run_id: &str) -> anyhow::Result<(PathBu
 /// sandbox policy (see [`build_codex_command`]).
 pub fn codex_sandbox_for_worker_kind(worker_kind: WorkerKind, sandbox_enforced: bool) -> Option<&'static str> {
     match worker_kind {
-        // Same no-OS-sandbox posture as `Reviewer`, for the same reason: a
-        // `--sandbox` value relocates the session's working root via `--cd`,
-        // desyncing hook `cwd` from the pane's real working directory. This
-        // kind's enforcement is `review_guide_guard` (a `PreToolUse` guard),
-        // not the OS sandbox.
-        WorkerKind::Reviewer | WorkerKind::ReviewGuide => None,
+        WorkerKind::Reviewer => None,
+        WorkerKind::ReviewGuide => Some("read-only"),
         WorkerKind::Standard | WorkerKind::Triage | WorkerKind::AnswerAgent => {
             if sandbox_enforced {
                 Some("workspace-write")
@@ -515,6 +512,11 @@ pub fn codex_sandbox_for_worker_kind(worker_kind: WorkerKind, sandbox_enforced: 
 
 /// CLI `extra_args` that encode sandbox policy for the spawn flow.
 pub fn codex_sandbox_extra_args(worker_kind: WorkerKind, sandbox_enforced: bool) -> Vec<String> {
+    if worker_kind == WorkerKind::ReviewGuide {
+        // Extends :read-only, adding only the attributed proposal socket.
+        // --sandbox would override the named profile and remove that exception.
+        return vec!["--config".into(), "default_permissions=\"review-guide\"".into()];
+    }
     codex_sandbox_for_worker_kind(worker_kind, sandbox_enforced)
         .map(|sandbox| vec!["--sandbox".into(), sandbox.into()])
         .unwrap_or_default()
@@ -690,6 +692,23 @@ pub fn render_base_config_toml(workspace: &Path) -> String {
 /// that bug.
 fn codex_hook_context(workspace: &Path) -> (String, PathBuf) {
     (render_base_config_toml(workspace), workspace.to_path_buf())
+}
+
+/// A read-only filesystem with a single Unix-socket exception. Codex only
+/// applies socket allowlists with its network proxy active. With no allowed
+/// domains the proxy rejects all IP destinations; Seatbelt also blocks direct
+/// IP connections. Never replace this with unrestricted network_access.
+fn render_review_guide_config(workspace: &Path, socket: &Path) -> String {
+    let mut config = String::from("web_search = \"disabled\"\n");
+    config.push_str(&render_config_toml(workspace, String::new()).replace(
+        "[features]\n",
+        "[features]\nnetwork_proxy = { enabled = true, domains = {}, allow_upstream_proxy = false, proxy_url = \"http://127.0.0.1:0\", socks_url = \"http://127.0.0.1:0\" }\n",
+    ));
+    config.push_str(&format!(
+        "\n[permissions.review-guide]\nextends = \":read-only\"\n[permissions.review-guide.network]\nenabled = true\ndomains = {{}}\nunix_sockets = {{ {} = \"allow\" }}\n",
+        toml_basic_string(&socket.display().to_string()),
+    ));
+    config
 }
 
 fn render_config_toml(workspace: &Path, sandbox_workspace_write: String) -> String {
@@ -1704,7 +1723,14 @@ impl AgentDriver for CodexDriver {
 
         // When path/checkleft scripts are supplied via PermissionInput they
         // win; otherwise leave those guards off (remote / early unit tests).
-        let (base_config, hook_cwd) = codex_hook_context(&input.workspace_path);
+        let (mut base_config, hook_cwd) = codex_hook_context(&input.workspace_path);
+        if input.worker_kind == WorkerKind::ReviewGuide {
+            let socket = input
+                .frontend_socket_path
+                .as_deref()
+                .context("review-guide requires a bound frontend socket")?;
+            base_config = render_review_guide_config(&input.workspace_path, socket);
+        }
         let codex_bin = resolve_codex_bin();
         write_hooks_and_attest(&codex_home, &hook_cwd, &base_config, &interception, &codex_bin)?;
 

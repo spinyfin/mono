@@ -629,6 +629,15 @@ impl ExecutionRunner for PaneSpawnRunner {
         workspace_path: &Path,
         cube_change_id: Option<&str>,
     ) -> Result<RunOutcome> {
+        let guide_git_dir = if execution.kind == ExecutionKind::PrReviewGuide {
+            let capture = self
+                .work_db
+                .get_pr_review_guide_comparison_by_id(&execution.work_item_id)?
+                .context("review-guide comparison missing before spawn")?;
+            Some(crate::review_guide_workspace::verify(workspace_path, &capture.packet)?)
+        } else {
+            None
+        };
         let weak = self
             .server_state
             .get()
@@ -921,6 +930,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             },
             workspace_path: workspace_path.to_path_buf(),
             events_socket_path: self.events_socket_path(),
+            frontend_socket_path: bound_frontend_socket_path(&self.cfg),
             boss_event_path: self.boss_event_binary(),
             run_id: execution.id.clone(),
             lease_id: lease_id.clone(),
@@ -963,8 +973,37 @@ impl ExecutionRunner for PaneSpawnRunner {
                     .push(crate::driver::EnvDirective::Set(key.clone(), value.clone()));
             }
         }
-        // Apply permission-policy CLI args (e.g. Codex's reviewer output-root
-        // sandbox). Must run after spawn_invocation so policy replaces any
+        if let Some(git_dir) = guide_git_dir {
+            use crate::driver::EnvDirective::{Set, Unset};
+            let packet = self
+                .work_db
+                .get_pr_review_guide_comparison_by_id(&execution.work_item_id)?
+                .context("review-guide comparison missing")?
+                .packet;
+            spawn_plan.env.extend([
+                Set(
+                    "BOSS_REVIEW_GUIDE_WORKSPACE".into(),
+                    workspace_path.display().to_string(),
+                ),
+                Set("BOSS_REVIEW_GUIDE_HEAD_SHA".into(), packet.head_sha),
+                Set("BOSS_REVIEW_GUIDE_BASE_SHA".into(), packet.merge_base_sha),
+                Set("GIT_DIR".into(), git_dir.display().to_string()),
+                Set("GIT_PAGER".into(), "cat".into()),
+                Set("RIPGREP_CONFIG_PATH".into(), "/dev/null".into()),
+                Set("GIT_NO_LAZY_FETCH".into(), "1".into()),
+                Set("GIT_TERMINAL_PROMPT".into(), "0".into()),
+                Set("GIT_OPTIONAL_LOCKS".into(), "0".into()),
+                Set("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
+                Set("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+                Unset("GH_TOKEN".into()),
+                Unset("GITHUB_TOKEN".into()),
+                Unset("SSH_AUTH_SOCK".into()),
+                Unset("GH_ENTERPRISE_TOKEN".into()),
+                Unset("GITHUB_ENTERPRISE_TOKEN".into()),
+                Unset("BOSS_ENGINE_CONTROL_TOKEN_PATH".into()),
+            ]);
+        }
+        // Apply permission-policy CLI args after spawn_invocation so policy replaces any
         // driver default flags rather than being ignored.
         spawn_plan.command =
             crate::driver::apply_permission_extra_args(&spawn_plan.command, &permission_artifacts.extra_args);
@@ -1066,7 +1105,11 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .workspace_path(workspace_path.to_path_buf())
                 .events_socket_path(self.events_socket_path())
                 .maybe_frontend_socket_path(bound_frontend_socket_path(&self.cfg))
-                .maybe_control_token_path(bound_control_token_path(&self.cfg))
+                .maybe_control_token_path(if execution.kind == ExecutionKind::PrReviewGuide {
+                    None
+                } else {
+                    bound_control_token_path(&self.cfg)
+                })
                 .boss_event_path(self.boss_event_binary())
                 .initial_input(initial_input)
                 .launch_command_bytes(estimated_launch_argv_bytes(&assembled_command, workspace_path))

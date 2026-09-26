@@ -131,11 +131,8 @@ impl std::error::Error for SourceContextBudgetExceeded {}
 /// before/after content as fits [`MAX_TOTAL_SOURCE_CONTEXT_BYTES`], into
 /// read-only Markdown context.
 ///
-/// This is the review-guide worker's entire "source access": the worker has
-/// no interactive read tool (its guard
-/// allows only result submission — see
-/// `boss_engine_driver::codex::review_guide_guard`), so every pinned line it
-/// can possibly cite must already be present here. The rendering is
+/// The inline packet remains available alongside the pinned read-only workspace.
+/// The rendering is
 /// revision-aware by construction: it reads only the packet's already-pinned
 /// `before`/`after` content, never a live checkout or a moving branch.
 ///
@@ -411,6 +408,24 @@ pub const MIN_SECTION_HEADINGS: usize = 4;
 /// model inspected or correctly understood every relevant line" (design,
 /// "Source acquisition at pinned revisions"). Human sampling covers that.
 pub fn validate_guide_output(raw: &str, packet: &SourcePacket) -> Result<ValidatedGuide, Vec<GuideValidationIssue>> {
+    validate_guide_output_with_resolver(raw, packet, |sha, path, start, end| {
+        [SourceSide::Before, SourceSide::After].into_iter().any(|side| {
+            let expected = match side {
+                SourceSide::Before => &packet.merge_base_sha,
+                SourceSide::After => &packet.head_sha,
+            };
+            sha == expected && validate_pinned_reference(packet, side, path, start, end).is_ok()
+        })
+    })
+}
+
+/// Engine callers resolve links from local git objects at the pinned comparison
+/// commits, including files absent from the inline packet.
+pub fn validate_guide_output_with_resolver(
+    raw: &str,
+    packet: &SourcePacket,
+    resolve: impl Fn(&str, &str, u32, u32) -> bool,
+) -> Result<ValidatedGuide, Vec<GuideValidationIssue>> {
     let mut issues = Vec::new();
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -427,7 +442,7 @@ pub fn validate_guide_output(raw: &str, packet: &SourcePacket) -> Result<Validat
     }
 
     for href in github_links(trimmed) {
-        if let Err(issue) = validate_reference(&href, packet) {
+        if let Err(issue) = validate_reference(&href, packet, &resolve) {
             issues.push(issue);
         }
     }
@@ -463,29 +478,29 @@ fn markdown_headings(text: &str) -> Vec<(u8, &str)> {
 /// Every `https://github.com/...` href inside a Markdown link or bare
 /// autolink in `text`.
 fn github_links(text: &str) -> Vec<String> {
-    let link_re = regex::Regex::new(r"\]\((https://github\.com/[^\s)]+)\)").expect("static regex");
-    let bare_re = regex::Regex::new(r"(?:^|[\s(])(https://github\.com/\S+)").expect("static regex");
+    let link_re = regex::Regex::new(r"(https://github\.com/[^\s<>\)\]]+)").expect("static regex");
     let mut hrefs: Vec<String> = link_re
         .captures_iter(text)
         .map(|caps| caps[1].trim_end_matches(['.', ',', ')']).to_owned())
         .collect();
-    for caps in bare_re.captures_iter(text) {
-        let href = caps[1].trim_end_matches(['.', ',', ')']).to_owned();
-        if !hrefs.contains(&href) {
-            hrefs.push(href);
-        }
-    }
+    hrefs.sort();
+    hrefs.dedup();
     hrefs
 }
 
 /// Classify and validate one extracted `github.com` href against the packet.
-fn validate_reference(href: &str, packet: &SourcePacket) -> Result<(), GuideValidationIssue> {
+fn validate_reference(
+    href: &str,
+    packet: &SourcePacket,
+    resolve: &impl Fn(&str, &str, u32, u32) -> bool,
+) -> Result<(), GuideValidationIssue> {
     if let Some(parsed) = parse_pinned_blob_href(href) {
         let (owner_repo, sha, path, start, end) = parsed;
         for side in [SourceSide::Before, SourceSide::After] {
-            if let Ok(reference) = validate_pinned_reference(packet, side, &path, start, end)
-                && reference.href == href
-                && reference_repository_matches(packet, side, &owner_repo, &sha)
+            if reference_repository_matches(packet, side, &owner_repo, &sha)
+                && start > 0
+                && end >= start
+                && resolve(&sha, &path, start, end)
             {
                 return Ok(());
             }
@@ -494,6 +509,9 @@ fn validate_reference(href: &str, packet: &SourcePacket) -> Result<(), GuideVali
     }
     if href.contains("/files#diff-") || href.contains("/compare/") {
         return Err(GuideValidationIssue::UnsupportedNavigation { href: href.to_owned() });
+    }
+    if href.contains("/blob/") {
+        return Err(GuideValidationIssue::InventedReference { href: href.to_owned() });
     }
     // A bare PR/issue/repo link with no line-anchored content claim (e.g. the
     // canonical `{{PR_URL}}` itself, restated in prose) makes no pinned-source
