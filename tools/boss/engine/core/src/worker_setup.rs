@@ -1242,8 +1242,38 @@ ordinary read of one specific file outside the workspace is untouched.
 """
 import json
 import os
+import re
 import shlex
 import sys
+
+def review_guide_masked_command(command):
+    """If command is exactly the allowlisted review-guide submission, return
+    it with the proven --body literal replaced by a placeholder.
+
+    The proven body is data: it may mention launch commands or the Boss
+    data directory. Anything outside this exact shape is left unchanged
+    so existing checks still apply.
+    """
+    if not isinstance(command, str):
+        return None
+    q = chr(39)
+    dq = chr(34)
+    dl = chr(36)
+    bs = chr(92)
+    literal = q + "(?:[^" + q + "]|" + q + dq + q + dq + q + "|" + q + bs + bs + q + q + ")*" + q
+    match = re.fullmatch(r"([\s\S]*?)[ \t]+--body[ \t]+(" + literal + r")[ \t\r\n]*", command)
+    if not match:
+        return None
+    prefix = match.group(1)
+    prefixes = (
+        "boss propose review-guide",
+        dq + dl + "BOSS_BIN" + dq + " propose review-guide",
+        dq + dl + "{BOSS_BIN}" + dq + " propose review-guide",
+    )
+    if prefix not in prefixes:
+        return None
+    return prefix + " --body " + q + "literal" + q
+
 
 MALFORMED = (
     "Blocked (fail-closed): the Boss data-directory gate could not read this "
@@ -1665,6 +1695,9 @@ def main():
         command = tool_input.get("command")
         if not isinstance(command, str):
             emit("block", MALFORMED)
+        masked = review_guide_masked_command(command)
+        if masked is not None:
+            emit("approve")
         raw_command = command
         try:
             lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")

@@ -257,6 +257,9 @@ def main():
     if not isinstance(command, str):
         emit("block", MALFORMED + "tool_input.command was not a string")
 
+    masked = review_guide_masked_command(command)
+    if masked is not None:
+        command = masked
     if allowed(payload):
         emit("approve", "")
     for group in command_groups(command):
@@ -329,8 +332,9 @@ mod tests {
 
     #[test]
     fn guide_submission_literal_is_data_even_when_it_contains_shell_examples() {
-        let (decision, reason) =
-            bash("boss propose review-guide --body '# Guide\nExample:\npython3\nbash\n$(not executed)\n'");
+        let (decision, reason) = bash(
+            "boss propose review-guide --body '# Guide\nExample:\npython3\nbash\nswift run\nboss engine start\n$(not executed)\n'",
+        );
         assert_eq!(decision, "approve", "{reason}");
     }
 

@@ -624,7 +624,7 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
             serde_json::to_value(boss_protocol::ReviewGuideProposalPayload {
                 body_markdown: args.body,
             })
-            .unwrap(),
+            .map_err(CliError::internal)?,
             None,
         ),
         ProposeCommand::ReviewReport(args) => (

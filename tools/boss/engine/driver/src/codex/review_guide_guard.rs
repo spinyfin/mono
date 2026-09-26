@@ -29,6 +29,35 @@ else:
 "#;
 
 pub(super) const REVIEW_GUIDE_COMMAND_PY: &str = r#"
+def review_guide_masked_command(command):
+    """If command is exactly the allowlisted submission, return it with the
+    proven --body literal replaced by a placeholder. Otherwise return None.
+
+    Other guards call this before their own checks so a guide that quotes
+    `swift run` or the Boss data directory is not mistaken for a real
+    launch or path access. Anything outside this exact shape is unchanged.
+    """
+    if not isinstance(command, str):
+        return None
+    q = chr(39)
+    dq = chr(34)
+    dl = chr(36)
+    bs = chr(92)
+    literal = q + "(?:[^" + q + "]|" + q + dq + q + dq + q + "|" + q + bs + bs + q + q + ")*" + q
+    match = re.fullmatch(r"([\s\S]*?)[ \t]+--body[ \t]+(" + literal + r")[ \t\r\n]*", command)
+    if not match:
+        return None
+    prefix = match.group(1)
+    prefixes = (
+        "boss propose review-guide",
+        dq + dl + "BOSS_BIN" + dq + " propose review-guide",
+        dq + dl + "{BOSS_BIN}" + dq + " propose review-guide",
+    )
+    if prefix not in prefixes:
+        return None
+    return prefix + " --body " + q + "literal" + q
+
+
 def allowed(payload):
     if not isinstance(payload, dict) or payload.get("tool_name") != "Bash":
         return False
@@ -36,20 +65,12 @@ def allowed(payload):
     if not isinstance(tool_input, dict):
         return False
     command = tool_input.get("command")
-    if not isinstance(command, str):
+    masked = review_guide_masked_command(command)
+    if masked is None:
         return False
-    # Require a literal single-quoted Markdown body (including the standard
-    # shell apostrophe escape). No expansion, redirects, wrappers, or chaining.
-    literal = r"'(?:[^']|'\"'\"'|'\\'')*'"
-    match = re.fullmatch(r"([\s\S]*?)[ \t]+--body[ \t]+(" + literal + r")[ \t\r\n]*", command)
-    if not match:
-        return False
-    prefix = match.group(1)
-    if prefix not in ('boss propose review-guide', '"$BOSS_BIN" propose review-guide', '"${BOSS_BIN}" propose review-guide'):
-        return False
-    # Tokenize the executable/verb shape through the shared guard tokenizer;
-    # the separately proven literal body may contain newlines or shell examples.
-    groups = command_groups(prefix + " --body 'literal'")
+    # Tokenize the real command with the proven body swapped for a
+    # placeholder so extra groups (chaining, wrappers) are still visible.
+    groups = command_groups(masked)
     return len(groups) == 1 and groups[0][1:] == ["propose", "review-guide", "--body", "literal"]
 
 "#;
@@ -62,7 +83,7 @@ mod tests {
     #[test]
     fn permits_only_literal_guide_submission() {
         for command in [
-            "boss propose review-guide --body '# Guide\n## Problem\nA `code` example: $(literal).'",
+            "boss propose review-guide --body '# Guide\n## Problem\nA `code` example: $(literal).\nswift run\nboss engine start\nbazel run //tools/boss/engine/core:engine\n'",
             "\"$BOSS_BIN\" propose review-guide --body 'author'\"'\"'s guide'",
             "boss propose review-guide --body 'author'\\''s guide'",
         ] {

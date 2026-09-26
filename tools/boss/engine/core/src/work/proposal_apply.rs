@@ -52,6 +52,8 @@
 //! `record_deferred_scope_item`'s existing precedent of treating the audit
 //! line as non-fatal.
 
+use std::path::Path;
+
 use rusqlite::{OptionalExtension, Transaction};
 
 use super::automations::query_automation;
@@ -172,6 +174,7 @@ pub fn apply_in_transaction(
     payload_json: &str,
     kind: ProposalKind,
     proposal_id: &str,
+    artifact_root: &Path,
 ) -> Result<ApplyDecision> {
     match kind {
         ProposalKind::Attention => apply_attention(tx, execution_id, payload_json).map(ApplyDecision::Applied),
@@ -182,7 +185,9 @@ pub fn apply_in_transaction(
         ProposalKind::DeferredScope => apply_deferred_scope(tx, execution_id, payload_json).map(ApplyDecision::Applied),
         ProposalKind::AutomationOutcome => apply_automation_outcome(tx, execution_id, payload_json, proposal_id),
         ProposalKind::PrCreated => apply_pr_created(tx, execution_id, payload_json),
-        ProposalKind::ReviewGuide => super::review_guide_submission::accept(tx, execution_id),
+        ProposalKind::ReviewGuide => {
+            super::review_guide_submission::accept(tx, execution_id, payload_json, artifact_root)
+        }
         ProposalKind::ReviewReport => apply_review_report(tx, execution_id, payload_json, proposal_id),
         ProposalKind::RunDone => apply_run_done(tx, execution_id, payload_json, proposal_id),
         ProposalKind::ReviewVerdict => apply_review_verdict(tx, execution_id, payload_json, proposal_id),
@@ -1298,8 +1303,15 @@ mod tests {
         let mut conn = db.connect().unwrap();
         let tx = conn.transaction().unwrap();
 
-        let err = apply_in_transaction(&tx, "exec_missing", "{}", ProposalKind::FollowupTask, "prp_missing")
-            .expect_err("no applier exists for FollowupTask; this must be an error, not a panic");
+        let err = apply_in_transaction(
+            &tx,
+            "exec_missing",
+            "{}",
+            ProposalKind::FollowupTask,
+            "prp_missing",
+            std::path::Path::new(""),
+        )
+        .expect_err("no applier exists for FollowupTask; this must be an error, not a panic");
         assert!(
             err.to_string().contains("followup_task"),
             "error should name the unhandled kind: {err}"

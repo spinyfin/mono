@@ -554,6 +554,49 @@ mod tests {
     }
 
     #[test]
+    fn review_guide_worker_gets_the_exact_command_guard() {
+        let config = interception_config(|c| {
+            c.is_standard_worker = false;
+            c.is_review_guide = true;
+        });
+        let guards = guard_commands(&config);
+        assert_eq!(guards.len(), 2, "launch + review-guide: {config:?}");
+        assert_eq!(guards[0].command, BOSS_LAUNCH_GUARD_COMMAND);
+        assert_eq!(guards[1].matcher, ".*");
+        assert!(
+            guards[1].command.contains("def allowed(payload)"),
+            "review-guide guard must be the exact-command allowlist: {}",
+            guards[1].command
+        );
+
+        if !python3_available() {
+            eprintln!("python3 not available; skipping adapter acceptance test");
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let adapter_path = write_adapter_script(tmp.path());
+        let approve = json!({
+            "hookEventName": "pre_tool_use",
+            "toolName": "run_terminal_command",
+            "toolInput": {"command": "boss propose review-guide --body '# Guide'"},
+        });
+        let (code, stdout, _stderr) = run_adapter(&adapter_path, &guards[1].command, &approve, true);
+        assert_eq!(code, 0);
+        let decision: serde_json::Value = serde_json::from_str(&stdout).expect(&stdout);
+        assert_eq!(decision["decision"], "allow", "literal submission must pass: {stdout}");
+
+        let blocked = json!({
+            "hookEventName": "pre_tool_use",
+            "toolName": "run_terminal_command",
+            "toolInput": {"command": "jj log"},
+        });
+        let (code, stdout, _stderr) = run_adapter(&adapter_path, &guards[1].command, &blocked, true);
+        assert_eq!(code, 0);
+        let decision: serde_json::Value = serde_json::from_str(&stdout).expect(&stdout);
+        assert_eq!(decision["decision"], "deny", "non-submission must be blocked: {stdout}");
+    }
+
+    #[test]
     fn reviewer_gets_the_shared_static_analysis_guard() {
         let config = interception_config(|c| {
             c.is_standard_worker = false;

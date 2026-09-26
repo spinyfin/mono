@@ -254,6 +254,7 @@ impl WorkDb {
                     input.payload_json,
                     input.kind,
                     &id,
+                    self.path.parent().unwrap_or(std::path::Path::new("")),
                 )?),
                 ProposalApplyPolicy::Gated => None,
             };
