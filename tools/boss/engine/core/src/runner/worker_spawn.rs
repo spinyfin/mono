@@ -1027,7 +1027,7 @@ pub(crate) async fn compose_worker_spawn(
         // (exact versioned template + embedded source packet) instead of
         // the ordinary implementer prompt. Its `work_item_id` is the
         // comparison id (see `WorkDb::create_pr_review_guide_execution`).
-        compose_review_guide_prompt(work_db, execution)
+        compose_review_guide_prompt(work_db, execution)?
     } else {
         compose_execution_prompt(
             ExecutionPromptParams::builder()

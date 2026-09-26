@@ -13,7 +13,7 @@ use crate::work::{WorkDb, WorkExecution};
 /// a task — so this loads the immutable packet directly rather than going
 /// through the generic work-item path. No async work: the packet is already
 /// durably stored, so there is nothing left to fetch over the network.
-pub(super) fn compose_review_guide_prompt(work_db: &WorkDb, execution: &WorkExecution) -> String {
+pub(super) fn compose_review_guide_prompt(work_db: &WorkDb, execution: &WorkExecution) -> anyhow::Result<String> {
     let comparison_id = &execution.work_item_id;
     let capture = match work_db.get_pr_review_guide_comparison_by_id(comparison_id) {
         Ok(Some(capture)) => capture,
@@ -23,9 +23,11 @@ pub(super) fn compose_review_guide_prompt(work_db: &WorkDb, execution: &WorkExec
                 comparison_id,
                 "review_guide execution: comparison not found; the run will have no source material",
             );
-            return "The engine could not load the source comparison for this review-guide run. \
+            return Ok(
+                "The engine could not load the source comparison for this review-guide run. \
                     State that essential context could not be obtained; do not invent content."
-                .to_owned();
+                    .to_owned(),
+            );
         }
         Err(err) => {
             tracing::warn!(
@@ -34,9 +36,11 @@ pub(super) fn compose_review_guide_prompt(work_db: &WorkDb, execution: &WorkExec
                 error = %err,
                 "review_guide execution: failed to load comparison",
             );
-            return "The engine could not load the source comparison for this review-guide run. \
+            return Ok(
+                "The engine could not load the source comparison for this review-guide run. \
                     State that essential context could not be obtained; do not invent content."
-                .to_owned();
+                    .to_owned(),
+            );
         }
     };
     let packet = capture.packet;
@@ -53,6 +57,15 @@ pub(super) fn compose_review_guide_prompt(work_db: &WorkDb, execution: &WorkExec
     };
     let mut prompt = boss_review_guide::render_prompt(&metadata);
     prompt.push_str("\n\n");
-    prompt.push_str(&boss_review_guide::render_source_context(&packet));
-    prompt
+    // A budget-exceeded packet fails the attempt loudly (see
+    // `boss_review_guide::render_source_context`) instead of silently
+    // sending a truncated prompt past the model's context window.
+    let source_context = boss_review_guide::render_source_context(&packet).map_err(|err| {
+        anyhow::anyhow!(
+            "review_guide execution {}: comparison {comparison_id}: {err}",
+            execution.id,
+        )
+    })?;
+    prompt.push_str(&source_context);
+    Ok(prompt)
 }
