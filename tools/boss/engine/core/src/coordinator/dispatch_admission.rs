@@ -473,11 +473,21 @@ impl ExecutionCoordinator {
             // `request_execution_with_live_check`, which then resolves it
             // to itself as a no-op.
             input.work_item_id = self.work_db.resolve_work_item_ref(&input.work_item_id)?;
+            // `list_executions` now unions in review-guide executions owned
+            // by this task via the comparison -> series -> root-task join,
+            // but those rows keep their own comparison `work_item_id`, not
+            // this task's — filter to rows actually keyed by the requested
+            // work item so a live, unrelated review-guide run can't block a
+            // `--host` launch for this task.
             let live_execution = self
                 .work_db
                 .list_executions(Some(&input.work_item_id))?
                 .into_iter()
-                .find(|execution| !execution.status.is_terminal() && live_states.is_run_live(&execution.id));
+                .find(|execution| {
+                    execution.work_item_id == input.work_item_id
+                        && !execution.status.is_terminal()
+                        && live_states.is_run_live(&execution.id)
+                });
             if let Some(execution) = live_execution {
                 bail!(
                     "{} already has a live execution {}; --host cannot move a running dispatch",

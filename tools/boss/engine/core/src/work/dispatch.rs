@@ -1244,8 +1244,12 @@ impl WorkDb {
             )?;
             let rows = stmt.query_map([task_id], map_execution)?;
             all_executions.extend(collect_rows(rows)?);
-            all_executions.extend(review_guide_executions_for_task(&conn, task_id)?);
         }
+        // A review-guide series' `root_task_id` always resolves to the chain
+        // root, never an individual revision task, so this can only ever
+        // match once — look it up outside the loop rather than once per
+        // chain member.
+        all_executions.extend(review_guide_executions_for_task(&conn, chain_root_id)?);
         all_executions.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
         Ok(all_executions)
     }
@@ -1285,7 +1289,31 @@ impl WorkDb {
             let host_id: Option<String> = row.get(1)?;
             Ok((id, host_id.unwrap_or_else(|| "local".to_owned())))
         })?;
-        collect_rows(rows).map(|entries: Vec<(String, String)>| entries.into_iter().collect())
+        let mut hosts: HashMap<String, String> =
+            collect_rows(rows).map(|entries: Vec<(String, String)>| entries.into_iter().collect())?;
+
+        // `list_executions`/`list_executions_for_chain` union in review-guide
+        // executions owned by this task via the comparison -> series ->
+        // root-task join, keyed by the execution's own id even though its
+        // `work_item_id` is the comparison, not this task. Look those up by
+        // id too so `bossctl work executions` doesn't fall back to "local"
+        // for a review-guide run that actually executed on a remote host.
+        let mut guide_stmt = conn.prepare(
+            "SELECT we.id, we.host_id FROM work_executions we
+             JOIN pr_review_guide_source_comparisons c ON c.id = we.work_item_id
+             JOIN pr_review_guide_source_series s ON s.id = c.series_id
+             WHERE we.kind = 'pr_review_guide' AND s.root_task_id = ?1",
+        )?;
+        let guide_rows = guide_stmt.query_map(params![work_item_id], |row| {
+            let id: String = row.get(0)?;
+            let host_id: Option<String> = row.get(1)?;
+            Ok((id, host_id.unwrap_or_else(|| "local".to_owned())))
+        })?;
+        for entry in collect_rows(guide_rows)? {
+            let (id, host_id): (String, String) = entry;
+            hosts.insert(id, host_id);
+        }
+        Ok(hosts)
     }
 
     /// Return true if `execution` is a stale prior occupant of a reused

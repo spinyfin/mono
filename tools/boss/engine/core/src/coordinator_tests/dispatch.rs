@@ -414,6 +414,57 @@ async fn requested_host_resolves_friendly_short_id() {
     assert!(err.to_string().contains("already has a live execution"), "got: {err}");
 }
 
+/// `list_executions` unions in review-guide executions owned by a task via
+/// the comparison -> series -> root-task join, but those rows keep their
+/// own comparison `work_item_id`, not the task's. The `--host` live-execution
+/// pre-check must not treat a live, unrelated review-guide run as a conflict
+/// for the task itself: a `--host` launch for the task must still proceed
+/// while only a comparison-owned guide run is live and no task-owned
+/// execution is.
+#[tokio::test]
+async fn requested_host_ignores_live_review_guide_run_owned_by_a_different_comparison() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    db.add_host("zakalwe", "user@zakalwe", 1, &[]).unwrap();
+    crate::test_support::insert_host_capability(&db, "zakalwe", "driver=claude", "auto");
+    let product = create_test_product(&db);
+    let root = create_active_chore(&db, &product.id, "Task under review");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET repo_remote_url = ?1 WHERE id = ?2",
+            rusqlite::params!["https://github.com/acme/widget.git", root],
+        )
+        .unwrap();
+    let (_series_id, comparison_id) = seed_review_guide_series(&db, &root);
+    let guide_execution = db
+        .create_pr_review_guide_execution(&comparison_id, "acme/widget")
+        .unwrap();
+
+    // The guide run is live, but it is keyed by the comparison id, not the
+    // task's id.
+    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+    live_states.register_spawn(1, &guide_execution.id, "test", 1, None);
+
+    let coordinator = ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeExecutionRunner::default()),
+    );
+
+    let execution = coordinator
+        .request_execution_via_db(
+            RequestExecutionInput::builder()
+                .work_item_id(root.clone())
+                .requested_host_id("zakalwe")
+                .build(),
+            live_states,
+        )
+        .unwrap();
+    assert_eq!(execution.work_item_id, root);
+}
+
 /// Host-adapter provider that fails the first `adapter_for` call for a
 /// chosen host id, then behaves like [`RecordingHostAdapterProvider`] for
 /// every call after — including the very next retry for the *same* host,

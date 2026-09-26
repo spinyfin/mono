@@ -2332,7 +2332,13 @@ impl ExecutionCoordinator {
                 let execution_id = execution.id.clone();
                 let work_item_id = execution.work_item_id.clone();
                 let status_str = execution.status.as_str();
-                let product_id = match self.work_db.get_work_item(&work_item_id) {
+                // Route through `resolve_execution_work_item` rather than a
+                // direct `get_work_item` call: `PrReviewGuide` (and
+                // `AutomationTriage`/`AnswerAgent`) bind to a non-task id
+                // that `get_work_item` can never resolve, so a direct call
+                // here would log a spurious warning on every one of these
+                // execution starts.
+                let product_id = match self.resolve_execution_work_item(&execution) {
                     Ok(item) => Some(item.product_id().to_string()),
                     Err(err) => {
                         tracing::warn!(

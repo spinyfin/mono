@@ -31,14 +31,15 @@ impl WorkerCompletionHandler {
                 return;
             }
         };
-        // `AutomationTriage`'s `work_item_id` is an automation id and
-        // `AnswerAgent`'s is a comment id — neither is a product/project/task,
-        // so `get_work_item` can never resolve them, and neither kind ever
-        // has a bound PR to snapshot a head SHA for. Skip before paying for
-        // (and warning on) a lookup that structurally cannot succeed.
+        // `AutomationTriage`'s `work_item_id` is an automation id,
+        // `AnswerAgent`'s is a comment id, and `PrReviewGuide`'s is a
+        // comparison id — none is a product/project/task, so `get_work_item`
+        // can never resolve them, and none of these kinds ever has a bound
+        // PR to snapshot a head SHA for. Skip before paying for (and warning
+        // on) a lookup that structurally cannot succeed.
         if matches!(
             execution.kind,
-            ExecutionKind::AutomationTriage | ExecutionKind::AnswerAgent
+            ExecutionKind::AutomationTriage | ExecutionKind::AnswerAgent | ExecutionKind::PrReviewGuide
         ) {
             tracing::debug!(
                 execution_id,
