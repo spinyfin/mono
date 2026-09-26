@@ -44,20 +44,19 @@ impl WorkDb {
             });
         };
 
-        let candidates = {
-            let conn = self.connect()?;
-            comments::query_revisable_comments(
-                &conn,
-                &input.artifact_kind,
-                &input.artifact_id,
-                input.comment_ids.as_deref(),
-            )?
-        };
+        let conn = self.connect()?;
+        let candidates = comments::query_revisable_comments(
+            &conn,
+            &input.artifact_kind,
+            &input.artifact_id,
+            input.comment_ids.as_deref(),
+        )?;
         if candidates.is_empty() {
             return Ok(ReviseDocOutcome::NoUnresolvedComments);
         }
 
-        let directive = compose_doc_comment_directive(self, &input.artifact_id, &candidates);
+        let directive = compose_doc_comment_directive(&conn, &input.artifact_id, &candidates);
+        drop(conn);
         let name = format!(
             "Address {} reviewer comment{}",
             candidates.len(),
@@ -301,20 +300,15 @@ pub(super) fn append_comment_directive_body(out: &mut String, conn: &Connection,
 /// and the operator's follow-up that asked for the change; comments that
 /// never went through bucket 2 simply have no thread entries and this is a
 /// no-op for them.
-fn compose_doc_comment_directive(db: &WorkDb, artifact_id: &str, comments: &[WorkComment]) -> String {
+fn compose_doc_comment_directive(conn: &Connection, artifact_id: &str, comments: &[WorkComment]) -> String {
     let mut out = format!(
         "Reviewer comment{} on `{artifact_id}` request{} the following change{}:\n\n",
         if comments.len() == 1 { "" } else { "s" },
         if comments.len() == 1 { "s" } else { "" },
         if comments.len() == 1 { "" } else { "s" },
     );
-    // `db.connect()` only fails if the pooled connection's mutex is
-    // poisoned by a prior panic elsewhere in the process — at that point the
-    // whole `WorkDb` is unusable, so there is no meaningful degraded mode to
-    // fall back to here.
-    let conn = db.connect().expect("WorkDb connection pool poisoned");
     for comment in comments {
-        append_comment_directive_body(&mut out, &conn, comment);
+        append_comment_directive_body(&mut out, conn, comment);
     }
     out.push_str("Please update the document accordingly.");
     out

@@ -1608,12 +1608,10 @@ impl ExecutionCoordinator {
                     // `pr_lifecycle == Open` this decision is based on can
                     // be stale (merged-on-GitHub-but-not-yet-polled, or
                     // closed-unmerged), and `cube workspace goto --pr` hard-
-                    // errors on a non-open PR. Before this fallback, that
-                    // hard error failed the whole run
-                    // (`cube_workspace_positioning_failed`) even though the
-                    // answer agent could perfectly well answer from a fresh
-                    // `cube change create` checkout instead — which is what
-                    // happened before positioning existed at all. Every
+                    // errors on a non-open PR. A failed goto is therefore
+                    // non-fatal for AnswerAgent: it continues from a fresh
+                    // `cube change create` checkout, and the prompt/CLAUDE.md
+                    // state that the checkout is not the PR head. Every
                     // other execution kind only reaches `goto` when its own
                     // PR is genuinely open (revision/PR-review target their
                     // own task's PR, not a DB snapshot of someone else's
@@ -2569,6 +2567,62 @@ mod tests {
             .build();
         let work_item = db.get_work_item(&root).unwrap();
         assert_eq!(pr_number_for_workspace_goto(&db, &execution, &work_item), Some(9));
+    }
+
+    #[test]
+    fn answer_agent_on_merged_guide_pr_does_not_position() {
+        let (_dir, db) = open_db();
+        let root = create_active_chore(&db, &create_product(&db), "impl");
+        db.update_work_item(
+            &root,
+            WorkItemPatch {
+                status: Some("done".to_owned()),
+                pr_url: Some("https://github.com/acme/widget/pull/9".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let (series, comparison) = seed_review_guide_series(&db, &root);
+        let attempt = db
+            .create_pr_review_guide_attempt(&series, &comparison, "review-guide-v1")
+            .unwrap();
+        let crate::work::PublishReviewGuideOutcome::Published(version) = db
+            .publish_pr_review_guide_version(&attempt.id, "# Guide\n\nquote", "raw")
+            .unwrap()
+        else {
+            panic!("expected published guide")
+        };
+        let comment = db
+            .create_comment_with_guide_version(
+                CreateCommentInput::builder()
+                    .artifact_kind("pr_review_guide")
+                    .artifact_id(series)
+                    .anchor(CommentAnchor {
+                        exact: "quote".into(),
+                        ..Default::default()
+                    })
+                    .body("why retry?")
+                    .author("user:test")
+                    .doc_version("hash")
+                    .plain_text_projection_version(1)
+                    .build(),
+                Some(&version.id),
+            )
+            .unwrap();
+        let execution = WorkExecution::builder()
+            .id("exec_answer_merged")
+            .work_item_id(comment.id)
+            .kind(ExecutionKind::AnswerAgent)
+            .status(ExecutionStatus::Ready)
+            .repo_remote_url("https://github.com/acme/widget")
+            .created_at("2026-01-01T00:00:00Z")
+            .build();
+        let work_item = db.get_work_item(&root).unwrap();
+        assert_eq!(
+            pr_number_for_workspace_goto(&db, &execution, &work_item),
+            None,
+            "a merged PR's target is never Open, so goto must not be attempted"
+        );
     }
 
     #[test]

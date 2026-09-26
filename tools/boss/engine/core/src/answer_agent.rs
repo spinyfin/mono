@@ -175,11 +175,8 @@ mod tests {
         assert!(md.contains("current PR head"));
     }
 
-    /// When the checkout was NOT positioned on the PR head (fresh
-    /// `cube change create` fallback), the CLAUDE.md must not claim
-    /// otherwise — the unconditional "current PR head" claim was the root
-    /// cause of an agent misattributing stale-checkout behaviour to the
-    /// current PR.
+    /// When the checkout is not positioned on the PR head (fresh
+    /// `cube change create` fallback), CLAUDE.md must not claim it is.
     #[test]
     fn claude_md_does_not_claim_pr_head_when_not_positioned() {
         let md = render_answer_agent_claude_md("lease-1", "/ws/path", false);

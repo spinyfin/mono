@@ -226,8 +226,9 @@ async fn compose_guide_answer_prompt(
         prompt.push_str(
             "Your leased checkout is a fresh change off the default base branch, NOT the PR head — \
              positioning onto the PR head was not possible (e.g. the PR is no longer open, or is not yet \
-             confirmed open). Do not assume your checkout matches the PR above; if you need the PR's actual \
-             code, fetch and inspect it explicitly rather than trusting your working copy.\n",
+             confirmed open). Do not assume your checkout matches the PR above, and do not treat it as \
+             current PR code. Answer from the quoted guide, the captured comparison above, and the thread \
+             below, and state explicitly in your reply that the current PR code was not available to you.\n",
         );
     }
     if let Some(ctx) = context {
@@ -271,11 +272,19 @@ async fn compose_guide_answer_prompt(
             );
         }
     }
+    let task_instruction = if checkout_positioned_on_pr_head {
+        "Answer the question above as thoroughly and accurately as you can. Inspect the \
+         current PR implementation, not only the quoted guide. If the guide describes \
+         behavior that the current code no longer has, say so."
+    } else {
+        "Answer the question above as thoroughly and accurately as you can, from the quoted \
+         guide, the captured comparison head above, and the prior thread. Your checkout is not \
+         the PR head, so do not inspect it as if it were current PR code; state in your reply \
+         that the current PR code was not available to you."
+    };
     prompt.push_str(&format!(
         "## Your task\n\n\
-         Answer the question above as thoroughly and accurately as you can. Inspect the \
-         current PR implementation, not only the quoted guide. If the guide describes \
-         behavior that the current code no longer has, say so. You may not edit, push, \
+         {task_instruction} You may not edit, push, \
          or mutate any state. When you have a complete answer, post it with:\n\n\
          ```\n{cmd} --body \"<your comprehensive answer>\"\n```\n\n\
          Post exactly one reply, then stop.\n",
@@ -501,6 +510,15 @@ mod tests {
         assert!(
             !prompt.contains("Your leased checkout is positioned on the current PR head"),
             "prompt must not claim positioning that never happened:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("fetch"),
+            "the answer agent has no tool to fetch PR code; the prompt must not tell it to:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("Inspect the current PR implementation"),
+            "when not positioned, the task block must not tell the agent to inspect its \
+             working copy as if it were current PR code:\n{prompt}"
         );
     }
 }

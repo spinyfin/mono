@@ -1,6 +1,7 @@
 //! Tests for [`super`]'s execution-coordinator dispatch pipeline, grouped by
 //! the concern each module exercises. Shared fixtures live in [`helpers`].
 
+mod answer_agent_positioning;
 mod automation;
 mod blocked_workspace;
 mod claimed_dispatch;

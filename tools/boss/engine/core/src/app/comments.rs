@@ -1575,12 +1575,9 @@ pub(super) async fn handle_comments_record_guide_outcome(ctx: Dispatch, req: Fro
                     // comment invalidation and reply with success below;
                     // surfacing this as a `WorkError` would tell the caller
                     // the whole request failed when the disposition it
-                    // asked to record is sitting in the DB. This is logged
-                    // at `warn` (not just `info`) so an operator scanning
-                    // engine logs for "guide outcome recorded but its
-                    // regeneration request failed" can follow up manually —
-                    // there is currently no other response channel back to
-                    // the caller for a partial-success outcome like this.
+                    // asked to record is sitting in the DB. Logged at `warn`
+                    // so the partial success is visible in engine logs; the
+                    // response has no field to carry it.
                     tracing::warn!(
                         comment_id = %recorded.comment.id,
                         series_id = %recorded.comment.artifact_id,
