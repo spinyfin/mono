@@ -431,15 +431,21 @@ extension EngineClient {
         ])
     }
 
+    /// Refresh the open guide's engine-owned findings and tracking state.
+    func sendGetReviewGuideSummary(rootTaskId: String) {
+        sendLine(["type": "get_review_guide_summary", "root_task_id": rootTaskId])
+    }
+
     /// Ask the engine to merge (or queue for merging) the PR associated
     /// with `workItemID`. The task must be `in_review` and carry a PR URL;
     /// any violation is surfaced as a `workError` event. On success the
     /// engine replies with a `mergeWhenReadyAccepted` event and kicks the
     /// PR-reconciler so the kanban state updates promptly.
-    func sendMergeWhenReady(workItemID: String) {
+    func sendMergeWhenReady(workItemID: String, confirmedRevisions: [OpenMergeRevision] = []) {
         sendLine([
             "type": "merge_when_ready",
             "work_item_id": workItemID,
+            "confirmed_revisions": confirmedRevisions.map(\.wirePayload),
         ])
     }
 

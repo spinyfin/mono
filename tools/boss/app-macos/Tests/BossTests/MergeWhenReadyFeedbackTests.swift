@@ -144,6 +144,42 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
         XCTAssertGreaterThan(hosting.fittingSize.height, 0)
     }
 
+    func testOpenRevisionConfirmationRequiresExplicitConsent() {
+        let model = makeModel()
+        let revisions = [OpenMergeRevision(id: "revision", label: "ID-test", status: "blocked")]
+        var decision: ((Bool) -> Void)?
+        var requests: [[String: Any]] = []
+        model.engine.outboundRecorder = { requests.append($0) }
+        model.mergeRevisionConfirmationPresenter = { presented, complete in
+            XCTAssertEqual(presented, revisions)
+            decision = complete
+        }
+        model.mergingWhenReadyIDs.insert("root")
+        model.applyEventForTest(.mergeConfirmationRequired(workItemID: "root", revisions: revisions))
+        XCTAssertTrue(requests.isEmpty)
+        XCTAssertNotNil(decision)
+        decision?(false)
+        XCTAssertTrue(requests.isEmpty)
+        XCTAssertFalse(model.mergingWhenReadyIDs.contains("root"))
+
+        model.mergingWhenReadyIDs.insert("root")
+        model.applyEventForTest(.mergeConfirmationRequired(workItemID: "root", revisions: revisions))
+        decision?(true)
+        XCTAssertEqual(requests.last?["type"] as? String, "merge_when_ready")
+        XCTAssertEqual(requests.last?["confirmed_revisions"] as? [[String: String]], revisions.map(\.wirePayload))
+        XCTAssertTrue(model.mergingWhenReadyIDs.contains("root"))
+    }
+
+    func testFindingsProjectionPreservesEngineTextAndOptionalCompatibility() {
+        XCTAssertNil(ReviewGuideFindings.parse(nil))
+        let state = ReviewGuideFindings.parse([
+            "status_text": "AI review found 1 issue; fixes complete",
+            "addendum_markdown": "## Addendum\n\n- [high] Check bounds — ID example (done)"
+        ])
+        XCTAssertEqual(state?.statusText, "AI review found 1 issue; fixes complete")
+        XCTAssertTrue(state?.addendumMarkdown.contains("Check bounds") == true)
+    }
+
     // MARK: - Helpers
 
     private func makeModel() -> ChatViewModel {

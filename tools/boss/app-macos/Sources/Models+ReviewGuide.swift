@@ -208,3 +208,27 @@ struct ReviewGuideViewerCurrentness: Equatable {
         )
     }
 }
+
+/// Engine-owned live supplement; the app does not interpret tracking status.
+struct ReviewGuideFindings: Codable, Equatable {
+    let statusText: String
+    let addendumMarkdown: String
+
+    enum CodingKeys: String, CodingKey {
+        case statusText = "status_text"
+        case addendumMarkdown = "addendum_markdown"
+    }
+
+    static func parse(_ payload: Any?) -> Self? {
+        guard let payload, let data = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
+        return try? JSONDecoder().decode(Self.self, from: data)
+    }
+}
+
+struct OpenMergeRevision: Codable, Equatable {
+    let id: String
+    let label: String
+    let status: String
+
+    var wirePayload: [String: String] { ["id": id, "label": label, "status": status] }
+}

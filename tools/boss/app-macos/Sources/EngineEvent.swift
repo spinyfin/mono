@@ -46,6 +46,8 @@ enum EngineEvent {
     /// per-project `ProjectDesignDocState` the kanban consumes to
     /// pick the right icon affordance and open dispatch.
     case projectDesignDocResolved(output: ResolveProjectDesignDocOutput)
+    /// Engine-owned live supplement returned by GetReviewGuideSummary.
+    case reviewGuideFindings(rootTaskId: String, findings: ReviewGuideFindings?)
     /// Engine reply to `GetReviewGuideContent`. `content` is `nil` when the
     /// version id is unknown (e.g. a stale open racing a history change).
     /// `versionId` is echoed from the request — the response-identity guard.
@@ -240,6 +242,8 @@ enum EngineEvent {
     /// The app should open a Ghostty terminal window rooted there; there
     /// is no lease to release when the window closes.
     case liveWorkspaceTerminalReady(workItemID: String, workspacePath: String)
+    /// No merge initiated; the operator must acknowledge these open revisions.
+    case mergeConfirmationRequired(workItemID: String, revisions: [OpenMergeRevision])
     /// Response to `merge_when_ready` — the engine has successfully
     /// initiated the merge process for the PR. `action` is
     /// `"merge_requested"` (GitHub accepted the request while its derived

@@ -1493,6 +1493,12 @@ pub enum FrontendEvent {
         work_item_id: String,
         workspace_path: String,
     },
+    /// No merge was initiated. Resend with these revisions only after the
+    /// operator explicitly confirms merging while fixes are outstanding.
+    MergeConfirmationRequired {
+        work_item_id: String,
+        revisions: Vec<crate::OpenMergeRevision>,
+    },
     /// Response to [`FrontendRequest::MergeWhenReady`]: the engine has
     /// successfully initiated the merge process for the PR. `action`
     /// identifies what happened: `"merge_requested"` (GitHub accepted the

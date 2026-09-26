@@ -531,6 +531,11 @@ final class EngineClient: @unchecked Sendable {
                     break
                 }
                 emit(.projectDesignDocResolved(output: output))
+            case "review_guide_summary":
+                if let summary = payload["summary"] as? [String: Any],
+                   let rootTaskId = summary["root_task_id"] as? String {
+                    emit(.reviewGuideFindings(rootTaskId: rootTaskId, findings: ReviewGuideFindings.parse(summary["findings"])))
+                }
             case "review_guide_content":
                 guard let versionId = payload["version_id"] as? String else {
                     emit(.error(message: "received invalid review_guide_content payload"))
@@ -899,6 +904,17 @@ final class EngineClient: @unchecked Sendable {
                         workspacePath: workspacePath
                     ))
                 }
+            case "merge_confirmation_required":
+                guard let workItemID = payload["work_item_id"] as? String,
+                      let raw = payload["revisions"],
+                      let data = try? JSONSerialization.data(withJSONObject: raw),
+                      let revisions = try? JSONDecoder().decode([OpenMergeRevision].self, from: data),
+                      !revisions.isEmpty
+                else {
+                    emit(.workError(message: "Invalid merge confirmation response", requestId: envelopeRequestId))
+                    break
+                }
+                emit(.mergeConfirmationRequired(workItemID: workItemID, revisions: revisions))
             case "merge_when_ready_accepted":
                 let workItemID = payload["work_item_id"] as? String ?? ""
                 let prURL = payload["pr_url"] as? String ?? ""

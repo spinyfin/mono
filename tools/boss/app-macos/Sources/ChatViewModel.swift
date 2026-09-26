@@ -1191,6 +1191,9 @@ final class ChatViewModel: ObservableObject {
     /// `nil` means no confirmation is showing.
     @Published var pendingPauseOverrideConfirmation: PauseOverrideConfirmation?
 
+    @Published var reviewGuideFindingsByRootID: [String: ReviewGuideFindings] = [:]
+    var mergeRevisionConfirmationPresenter: (([OpenMergeRevision], @escaping (Bool) -> Void) -> Void)?
+
     /// Inline confirmation banner shown on the card whose
     /// `merge_when_ready_accepted` reply just arrived (`MergeFeedbackNotice`)
     /// — for `trunk_enqueued` the engine's optimistic `merge_queue_state`

@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 /// Merge-when-ready and review/live-workspace terminal actions.
@@ -26,6 +27,34 @@ extension ChatViewModel {
         mergeErrorNoticesByTaskID.removeValue(forKey: task.id)
         mergingWhenReadyIDs.insert(task.id)
         engine.sendMergeWhenReady(workItemID: task.id)
+    }
+
+    func handleMergeConfirmation(workItemID: String, revisions: [OpenMergeRevision]) {
+        guard mergingWhenReadyIDs.contains(workItemID) else { return }
+        let complete: (Bool) -> Void = { [weak self] confirmed in
+            guard let self else { return }
+            if confirmed {
+                self.engine.sendMergeWhenReady(workItemID: workItemID, confirmedRevisions: revisions)
+            } else {
+                self.mergingWhenReadyIDs.remove(workItemID)
+            }
+        }
+        if let presenter = mergeRevisionConfirmationPresenter {
+            presenter(revisions, complete)
+            return
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Merge while revisions are open?"
+        alert.informativeText = revisions.map { "ID \($0.label) — \($0.status)" }.joined(separator: "\n")
+            + "\n\nThese revisions may still change this PR. Merge anyway?"
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Merge anyway")
+        if let window = NSApp.keyWindow {
+            alert.beginSheetModal(for: window) { complete($0 == .alertSecondButtonReturn) }
+        } else {
+            complete(alert.runModal() == .alertSecondButtonReturn)
+        }
     }
 
     /// Ask the engine to lease a workspace for the given Review-column

@@ -664,6 +664,7 @@ mod proposals;
 mod query_ensure;
 mod review_batches;
 mod review_findings_followup;
+mod review_guide_findings;
 mod review_guide_jobs;
 mod review_guide_sources;
 mod review_guide_submission;

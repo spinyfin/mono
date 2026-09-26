@@ -342,6 +342,7 @@ fn coordinator_verbs_stay_closed() {
             cap: None,
         },
         FrontendRequest::MergeWhenReady {
+            confirmed_revisions: vec![],
             work_item_id: "task_1".into(),
         },
         FrontendRequest::RecreateCoordinator {

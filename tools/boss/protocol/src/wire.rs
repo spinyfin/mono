@@ -999,8 +999,8 @@ pub enum FrontendRequest {
     },
 
     /// Series identity and current lifecycle for a PR's review guide, keyed
-    /// by the PR's revision-chain root task id — no Markdown content (see
-    /// [`Self::GetReviewGuideContent`] for that). Replies with
+    /// by the PR's revision-chain root task id. Includes the live findings
+    /// supplement; fetch the immutable guide with [`Self::GetReviewGuideContent`]. Replies with
     /// [`FrontendEvent::ReviewGuideSummary`] (`summary: None` when no
     /// comparison has been captured for this root task yet).
     GetReviewGuideSummary {
@@ -1721,6 +1721,10 @@ pub enum FrontendRequest {
     /// the PR-reconciler so the kanban reflects the new state promptly.
     MergeWhenReady {
         work_item_id: String,
+        /// Revisions explicitly acknowledged by the human. New revisions
+        /// or changed statuses require another confirmation.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        confirmed_revisions: Vec<crate::OpenMergeRevision>,
     },
 
     /// Bulk snapshot of every registered counter and gauge, bypassing

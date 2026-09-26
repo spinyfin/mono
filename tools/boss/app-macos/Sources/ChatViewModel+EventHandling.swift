@@ -379,6 +379,8 @@ extension ChatViewModel {
             applyProductDesignDocsList(productID: productID, state: state)
         case .productDesignDocContent(let ref, let content):
             applyProductDesignDocContent(ref: ref, content: content)
+        case .reviewGuideFindings(let rootTaskId, let findings):
+            reviewGuideFindingsByRootID[rootTaskId] = findings
         case .reviewGuideContent(let versionId, let content):
             applyReviewGuideContent(versionId: versionId, content: content)
         case .reviewGuideRetryQueued(let rootTaskId, _, _):
@@ -584,6 +586,8 @@ extension ChatViewModel {
             if reviewTerminalVM.windowIsOpen {
                 reviewTerminalVM.state = .ready(content)
             }
+        case .mergeConfirmationRequired(let workItemID, let revisions):
+            handleMergeConfirmation(workItemID: workItemID, revisions: revisions)
         case .mergeWhenReadyAccepted(let workItemID, _, let action):
             // Engine successfully initiated the merge. Clear the in-flight
             // guard so the button re-enables if the user wants to retry.

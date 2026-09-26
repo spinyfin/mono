@@ -1,4 +1,5 @@
 import SwiftUI
+import Textual
 
 /// Header bar shown above the document body in the async markdown viewer
 /// when it is displaying a PR review guide. Reads the live `WorkTask`
@@ -20,6 +21,7 @@ struct ReviewGuideViewerHeader: View {
     @ObservedObject var chatModel: ChatViewModel
     @ObservedObject private var drafts = GuideCommentDrafts.shared
     let rootTaskId: String
+    @State private var findingsExpanded = true
     /// The open version's generation timestamp (RFC 3339), or `nil` while
     /// still loading.
     let generatedAt: String?
@@ -64,12 +66,36 @@ struct ReviewGuideViewerHeader: View {
                         }
                     }
                 }
+                if let findings = chatModel.reviewGuideFindingsByRootID[rootTaskId] {
+                    Text(findings.statusText)
+                        .font(.caption)
+                        .accessibilityIdentifier("review-guide-findings-status")
+                    DisclosureGroup("AI review findings addendum", isExpanded: $findingsExpanded) {
+                        ScrollView {
+                            StructuredText(markdown: findings.addendumMarkdown)
+                                .bossMarkdown()
+                                .textual.textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(maxHeight: 200)
+                    }
+                    .font(.caption)
+                }
                 currentnessBanner(for: task)
                 mergeFeedbackRow(for: task)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
             .background(Color.secondary.opacity(0.06))
+            .task(id: rootTaskId) {
+                // The document window can remain open after the selected board
+                // changes. Refresh only its small engine-owned supplement.
+                while !Task.isCancelled {
+                    chatModel.engine.sendGetReviewGuideSummary(rootTaskId: rootTaskId)
+                    do { try await Task.sleep(for: .seconds(5)) }
+                    catch { return }
+                }
+            }
             Divider()
         }
     }

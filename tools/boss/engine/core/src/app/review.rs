@@ -15,7 +15,11 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::MergeWhenReady { work_item_id } = req else {
+    let FrontendRequest::MergeWhenReady {
+        work_item_id,
+        confirmed_revisions,
+    } = req
+    else {
         unreachable!()
     };
     let work_item_id = match server_state.resolve_work_item_id(&work_item_id).await {
@@ -74,6 +78,24 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 return;
             }
         };
+        match work_db.open_merge_revisions(&work_item_id) {
+            Ok(revisions) if revisions.iter().any(|revision| !confirmed_revisions.contains(revision)) => {
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::MergeConfirmationRequired {
+                        work_item_id,
+                        revisions,
+                    },
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                refuse_merge_when_ready(&sink, &request_id, &work_item_id, err.to_string());
+                return;
+            }
+        }
         let product = match work_db.get_product(&product_id) {
             Ok(Some(product)) => product,
             Ok(None) => {
@@ -959,6 +981,7 @@ mod trunk_queue_tests {
         handle_merge_when_ready(
             dispatch_ctx(&state, &sink),
             FrontendRequest::MergeWhenReady {
+                confirmed_revisions: vec![],
                 work_item_id: work_item_id.clone(),
             },
         )
@@ -1034,6 +1057,7 @@ mod trunk_queue_tests {
         handle_merge_when_ready(
             dispatch_ctx(&state, &sink),
             FrontendRequest::MergeWhenReady {
+                confirmed_revisions: vec![],
                 work_item_id: work_item_id.clone(),
             },
         )
@@ -1044,6 +1068,7 @@ mod trunk_queue_tests {
         handle_merge_when_ready(
             dispatch_ctx(&state, &sink),
             FrontendRequest::MergeWhenReady {
+                confirmed_revisions: vec![],
                 work_item_id: work_item_id.clone(),
             },
         )
@@ -1087,6 +1112,7 @@ mod trunk_queue_tests {
         handle_merge_when_ready(
             dispatch_ctx(&state, &sink),
             FrontendRequest::MergeWhenReady {
+                confirmed_revisions: vec![],
                 work_item_id: work_item_id.clone(),
             },
         )
@@ -1132,6 +1158,7 @@ mod trunk_queue_tests {
         handle_merge_when_ready(
             dispatch_ctx(&state, &sink),
             FrontendRequest::MergeWhenReady {
+                confirmed_revisions: vec![],
                 work_item_id: work_item_id.clone(),
             },
         )
@@ -1183,6 +1210,7 @@ mod trunk_queue_tests {
         handle_merge_when_ready(
             dispatch_ctx(&state, &sink),
             FrontendRequest::MergeWhenReady {
+                confirmed_revisions: vec![],
                 work_item_id: work_item_id.clone(),
             },
         )
@@ -1223,6 +1251,7 @@ mod trunk_queue_tests {
         handle_merge_when_ready(
             dispatch_ctx(&state, &sink),
             FrontendRequest::MergeWhenReady {
+                confirmed_revisions: vec![],
                 work_item_id: work_item_id.clone(),
             },
         )
@@ -1264,6 +1293,7 @@ mod trunk_queue_tests {
         handle_merge_when_ready(
             dispatch_ctx(&state, &sink),
             FrontendRequest::MergeWhenReady {
+                confirmed_revisions: vec![],
                 work_item_id: work_item_id.clone(),
             },
         )
@@ -1339,6 +1369,7 @@ mod trunk_queue_tests {
         handle_merge_when_ready(
             dispatch_ctx(&state, &sink),
             FrontendRequest::MergeWhenReady {
+                confirmed_revisions: vec![],
                 work_item_id: work_item_id.clone(),
             },
         )
@@ -1450,6 +1481,7 @@ mod trunk_queue_tests {
         handle_merge_when_ready(
             dispatch_ctx(&state, &sink),
             FrontendRequest::MergeWhenReady {
+                confirmed_revisions: vec![],
                 work_item_id: chore.id.clone(),
             },
         )
@@ -1527,6 +1559,7 @@ mod trunk_queue_tests {
         handle_merge_when_ready(
             dispatch_ctx(&state, &sink),
             FrontendRequest::MergeWhenReady {
+                confirmed_revisions: vec![],
                 work_item_id: chore.id.clone(),
             },
         )
@@ -1598,6 +1631,7 @@ mod trunk_queue_tests {
         handle_merge_when_ready(
             dispatch_ctx(&state, &sink),
             FrontendRequest::MergeWhenReady {
+                confirmed_revisions: vec![],
                 work_item_id: chore.id.clone(),
             },
         )
@@ -1681,6 +1715,7 @@ mod trunk_queue_tests {
         handle_merge_when_ready(
             dispatch_ctx(&state, &sink),
             FrontendRequest::MergeWhenReady {
+                confirmed_revisions: vec![],
                 work_item_id: chore.id.clone(),
             },
         )
@@ -1754,6 +1789,7 @@ mod trunk_queue_tests {
         handle_merge_when_ready(
             dispatch_ctx(&state, &sink),
             FrontendRequest::MergeWhenReady {
+                confirmed_revisions: vec![],
                 work_item_id: chore.id.clone(),
             },
         )
@@ -1820,6 +1856,7 @@ mod trunk_queue_tests {
         handle_merge_when_ready(
             dispatch_ctx(&state, &sink),
             FrontendRequest::MergeWhenReady {
+                confirmed_revisions: vec![],
                 work_item_id: chore.id.clone(),
             },
         )
@@ -1844,5 +1881,86 @@ mod trunk_queue_tests {
             "a corrupt mechanism must never create a trunk merge intent"
         );
         server.verify().await;
+    }
+    #[tokio::test]
+    async fn merge_confirmation_gate_rechecks_status_and_accepts_explicit_consent() {
+        let server = MockServer::start().await;
+        let (state, _temp) = test_server_state(trunk_client_for(server.uri()));
+        let pr_url = "https://github.com/brianduff/flunge/pull/978";
+        let (product, root) = seed_trunk_queue_chore(&state.work_db, "merge gate", pr_url);
+        seed_active_trunk_intent(&state.work_db, &root, pr_url, Some("testing"));
+        let revision = create_test_chore_manual(&state.work_db, product, "open revision");
+        state
+            .work_db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET kind = 'revision', parent_task_id = ?2, status = 'blocked' WHERE id = ?1",
+                rusqlite::params![revision.id, root],
+            )
+            .unwrap();
+        let sink = make_session_sink();
+        handle_merge_when_ready(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::MergeWhenReady {
+                work_item_id: root.clone(),
+                confirmed_revisions: vec![],
+            },
+        )
+        .await;
+        let FrontendEvent::MergeConfirmationRequired { revisions, .. } = sink.next().await.unwrap().payload else {
+            panic!("must prompt before the merge path");
+        };
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(revisions[0].id, revision.id);
+        assert_eq!(revisions[0].status, "blocked");
+        state
+            .work_db
+            .connect()
+            .unwrap()
+            .execute("UPDATE tasks SET status = 'active' WHERE id = ?1", [&revision.id])
+            .unwrap();
+        handle_merge_when_ready(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::MergeWhenReady {
+                work_item_id: root.clone(),
+                confirmed_revisions: revisions,
+            },
+        )
+        .await;
+        let FrontendEvent::MergeConfirmationRequired { revisions, .. } = sink.next().await.unwrap().payload else {
+            panic!("changed revision status must require fresh consent");
+        };
+        assert_eq!(revisions[0].status, "active");
+        handle_merge_when_ready(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::MergeWhenReady {
+                work_item_id: root.clone(),
+                confirmed_revisions: revisions,
+            },
+        )
+        .await;
+        assert!(matches!(
+            sink.next().await.unwrap().payload,
+            FrontendEvent::MergeWhenReadyAccepted { .. }
+        ));
+        state
+            .work_db
+            .connect()
+            .unwrap()
+            .execute("UPDATE tasks SET status = 'done' WHERE id = ?1", [&revision.id])
+            .unwrap();
+        handle_merge_when_ready(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::MergeWhenReady {
+                work_item_id: root,
+                confirmed_revisions: vec![],
+            },
+        )
+        .await;
+        assert!(matches!(
+            sink.next().await.unwrap().payload,
+            FrontendEvent::MergeWhenReadyAccepted { .. }
+        ));
     }
 }
