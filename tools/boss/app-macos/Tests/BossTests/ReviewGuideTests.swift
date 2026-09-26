@@ -23,9 +23,9 @@ final class ReviewGuideTests: XCTestCase {
         for status in ["in_review", "done"] {
             task.status = status
             task.reviewGuideReadableVersionId = nil
-            XCTAssertEqual(task.generateReviewGuideMenuTitle, "Generate Review Guide…")
+            XCTAssertEqual(task.generateReviewGuideMenuTitle, "Generate Review Guide")
             task.reviewGuideReadableVersionId = "old-guide"
-            XCTAssertEqual(task.generateReviewGuideMenuTitle, "Regenerate Review Guide…")
+            XCTAssertEqual(task.generateReviewGuideMenuTitle, "Regenerate Review Guide")
         }
     }
 

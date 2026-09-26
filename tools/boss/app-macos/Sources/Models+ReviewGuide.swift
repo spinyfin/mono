@@ -4,7 +4,7 @@ extension WorkTask {
     /// Available on root PR cards, including merged and closed work.
     var generateReviewGuideMenuTitle: String? {
         guard kind != "revision", let prURL, !prURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        return reviewGuideReadableVersionId == nil ? "Generate Review Guide…" : "Regenerate Review Guide…"
+        return reviewGuideReadableVersionId == nil ? "Generate Review Guide" : "Regenerate Review Guide"
     }
 }
 
