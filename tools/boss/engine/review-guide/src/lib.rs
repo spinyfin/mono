@@ -104,9 +104,11 @@ pub fn render_prompt(metadata: &PromptMetadata<'_>) -> String {
 pub const MAX_TOTAL_SOURCE_CONTEXT_BYTES: usize = 600_000;
 
 /// [`render_source_context`] refused to render: even the mandatory part of
-/// the context (the comparison header, PR description, and every changed
-/// file's diff hunk — never omitted, since a reviewer without diffs has
-/// nothing to ground a guide in) already exceeds the total budget.
+/// the context (the comparison header, PR description, every changed file's
+/// diff hunk, and a named omission note for every before/after side that
+/// might not fit as full content — never omitted, since a reviewer without
+/// diffs has nothing to ground a guide in, and a dropped side with no
+/// record would hide that a gap exists) already exceeds the total budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceContextBudgetExceeded {
     pub required_bytes: usize,
@@ -117,7 +119,7 @@ impl fmt::Display for SourceContextBudgetExceeded {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "review-guide source context's mandatory diffs alone need {} bytes, exceeding the {}-byte total budget",
+            "review-guide source context's mandatory diffs and omission notes need {} bytes, exceeding the {}-byte total budget",
             self.required_bytes, self.budget_bytes
         )
     }
@@ -142,8 +144,10 @@ impl std::error::Error for SourceContextBudgetExceeded {}
 /// before/after file content is included only while budget remains; a side
 /// that does not fit is instead listed as a named omission in the same
 /// "Collection omissions" section used for capture-time gaps, so the guide
-/// and its reader both know what was not seen. If the mandatory diffs alone
-/// exceed the budget, this returns [`SourceContextBudgetExceeded`] instead of
+/// and its reader both know what was not seen. Those fallback omission
+/// lines are reserved up front alongside the diffs: a gap is never dropped
+/// with no record. If the mandatory diffs plus those reserved notes exceed
+/// the budget, this returns [`SourceContextBudgetExceeded`] instead of
 /// silently sending a truncated prompt.
 pub fn render_source_context(packet: &SourcePacket) -> Result<String, SourceContextBudgetExceeded> {
     render_source_context_with_budget(packet, MAX_TOTAL_SOURCE_CONTEXT_BYTES)
@@ -171,27 +175,59 @@ fn render_source_context_with_budget(
 
     // The "Collection omissions" section is itself part of the rendered
     // budget (see `MAX_TOTAL_SOURCE_CONTEXT_BYTES`'s doc comment): its
-    // header/footer, plus a line for every capture-time omission the packet
-    // already carries, are reserved as mandatory up front, alongside the
-    // diffs. Any file with pinned before/after content could still fall back
-    // to a budget-driven omission below, so the section's fixed overhead is
-    // reserved whenever that is possible, even if no such fallback ends up
-    // happening — the alternative (reserving it lazily, only once a
-    // fallback is actually needed) can leave too little of the remaining
-    // budget to afford the section's own header/footer, silently losing the
-    // very omission note the section exists to report.
+    // header/footer, every capture-time omission the packet already carries,
+    // and a named fallback line for every pinned before/after side that
+    // might not fit as full content, are reserved as mandatory up front
+    // alongside the diffs. Remaining budget is then only spent on full
+    // before/after blocks; a side that does not fit reuses its already-
+    // reserved line rather than competing with later files for leftover
+    // bytes. Without that reservation, remaining_bytes can shrink below
+    // one omission line and stay there, so every subsequent dropped side
+    // would vanish with no record — including from this section.
     let static_omission_lines: Vec<String> = packet.omissions.iter().map(render_omission_line).collect();
     let has_static_omissions = !static_omission_lines.is_empty();
-    let has_optional_content = packet
+
+    struct OptionalSide {
+        block: String,
+        omission: boss_pr_review_sources::SourceOmission,
+        omission_line: String,
+    }
+    let optional_by_file: Vec<Vec<OptionalSide>> = packet
         .files
         .iter()
-        .any(|file| file.before.is_some() || file.after.is_some());
+        .map(|file| {
+            [
+                ("Before (merge base)", SourceSide::Before, file.before.as_ref()),
+                ("After (head)", SourceSide::After, file.after.as_ref()),
+            ]
+            .into_iter()
+            .filter_map(|(label, side, source)| {
+                let block = render_pinned_side_block(label, source)?;
+                let omission = budget_driven_omission(&file.path, side, budget_bytes, block.len());
+                let omission_line = render_omission_line(&omission);
+                Some(OptionalSide {
+                    block,
+                    omission,
+                    omission_line,
+                })
+            })
+            .collect()
+        })
+        .collect();
+    let has_optional_content = optional_by_file.iter().any(|sides| !sides.is_empty());
     let needs_omissions_capacity = has_static_omissions || has_optional_content;
     let omissions_overhead = OMISSIONS_HEADER.len() + OMISSIONS_FOOTER.len();
+    let potential_omission_bytes: usize = optional_by_file
+        .iter()
+        .flatten()
+        .map(|side| side.omission_line.len())
+        .sum();
 
     let mut required_bytes = header.len() + mandatory_sections.iter().map(String::len).sum::<usize>();
     if needs_omissions_capacity {
-        required_bytes += omissions_overhead + static_omission_lines.iter().map(String::len).sum::<usize>();
+        required_bytes += omissions_overhead
+            + static_omission_lines.iter().map(String::len).sum::<usize>()
+            + potential_omission_bytes;
     }
     if required_bytes > budget_bytes {
         return Err(SourceContextBudgetExceeded {
@@ -203,44 +239,20 @@ fn render_source_context_with_budget(
     let mut out = header;
     let mut remaining_bytes = budget_bytes - required_bytes;
     let mut budget_omissions = Vec::new();
-    for (file, section) in packet.files.iter().zip(mandatory_sections) {
+    for (section, sides) in mandatory_sections.into_iter().zip(optional_by_file) {
         out.push_str(&section);
-        for (label, side, source) in [
-            ("Before (merge base)", SourceSide::Before, file.before.as_ref()),
-            ("After (head)", SourceSide::After, file.after.as_ref()),
-        ] {
-            let Some(block) = render_pinned_side_block(label, source) else {
-                continue;
-            };
-            if block.len() <= remaining_bytes {
-                remaining_bytes -= block.len();
-                out.push_str(&block);
+        for side in sides {
+            if side.block.len() <= remaining_bytes {
+                // Include the full block and give back this side's unused
+                // omission reservation so later files can still spend it on
+                // content. Later sides keep their own reserved lines, so a
+                // subsequent gap is still named.
+                remaining_bytes -= side.block.len();
+                remaining_bytes += side.omission_line.len();
+                out.push_str(&side.block);
                 continue;
             }
-
-            // Falling back to an omission still costs bytes — the entry's
-            // own rendered line, drawn from the same remaining budget as
-            // full content would have been. The section's header/footer
-            // were already reserved above, so only the line itself is
-            // charged here.
-            let omission = boss_pr_review_sources::SourceOmission {
-                path: Some(file.path.clone()),
-                side: Some(side),
-                reason: format!(
-                    "omitted to stay within the {budget_bytes}-byte total source-context budget \
-                     ({block_bytes} bytes needed)",
-                    block_bytes = block.len(),
-                ),
-                terminal: true,
-            };
-            let line = render_omission_line(&omission);
-            if line.len() <= remaining_bytes {
-                remaining_bytes -= line.len();
-                budget_omissions.push(omission);
-            }
-            // If even the omission line can't be afforded, this particular
-            // gap is silently dropped: budget_bytes is too tight to note
-            // every omission, and staying within budget takes priority.
+            budget_omissions.push(side.omission);
         }
     }
 
@@ -269,6 +281,23 @@ fn render_omission_line(omission: &boss_pr_review_sources::SourceOmission) -> St
         .map(|side| format!("{side:?}"))
         .unwrap_or_else(|| "both".to_owned());
     format!("- `{path}` ({side}): {}\n", omission.reason)
+}
+
+fn budget_driven_omission(
+    path: &str,
+    side: SourceSide,
+    budget_bytes: usize,
+    block_bytes: usize,
+) -> boss_pr_review_sources::SourceOmission {
+    boss_pr_review_sources::SourceOmission {
+        path: Some(path.to_owned()),
+        side: Some(side),
+        reason: format!(
+            "omitted to stay within the {budget_bytes}-byte total source-context budget \
+             ({block_bytes} bytes needed)"
+        ),
+        terminal: true,
+    }
 }
 
 /// The part of a file's rendered section that is never subject to the
@@ -703,14 +732,10 @@ mod tests {
         let after_block =
             render_pinned_side_block("After (head)", file.after.as_ref()).expect("fixture has after content");
 
-        // Enough for the header + diff hunk + the "Collection omissions"
-        // section's own overhead (measured via the too-small-budget error),
-        // plus one byte less than the smaller of the two content blocks —
-        // so neither side's full content can fit, but there is still room
-        // for both of their omission notes.
-        let mandatory_bytes = render_source_context_with_budget(&packet, 1)
-            .unwrap_err()
-            .required_bytes;
+        // Mandatory reservation now includes both sides' named omission
+        // notes. Adding one byte less than the smaller content block leaves
+        // room for neither full side, so both fall back to those notes.
+        let mandatory_bytes = required_bytes_for(&packet);
         let budget = mandatory_bytes + before_block.len().min(after_block.len()) - 1;
 
         let context =
@@ -719,8 +744,10 @@ mod tests {
         assert!(!context.contains("old();"), "before content should not fit the budget");
         assert!(!context.contains("new();"), "after content should not fit the budget");
         assert!(context.contains("### Collection omissions"));
-        assert!(context.contains("src/retry.rs"));
-        assert!(context.contains("total source-context budget"));
+        let omissions = collection_omissions_section(&context);
+        assert!(omissions.contains("- `src/retry.rs` (Before):"));
+        assert!(omissions.contains("- `src/retry.rs` (After):"));
+        assert!(omissions.contains("total source-context budget"));
         assert!(
             context.len() <= budget,
             "rendered context ({}) must stay within budget ({budget})",
@@ -734,44 +761,63 @@ mod tests {
         assert!(err.required_bytes > 10);
         assert_eq!(err.budget_bytes, 10);
         assert!(err.to_string().contains("exceeding the 10-byte total budget"));
+        assert!(err.to_string().contains("mandatory diffs and omission notes"));
+    }
+
+    #[test]
+    fn diffs_plus_reserved_omission_notes_over_budget_fails_loudly() {
+        let packet = multi_file_packet(20);
+        let required = required_bytes_for(&packet);
+        let err = render_source_context_with_budget(&packet, required - 1).unwrap_err();
+        assert!(err.required_bytes > required - 1);
+        assert_eq!(err.budget_bytes, required - 1);
+    }
+
+    fn collection_omissions_section(context: &str) -> &str {
+        let idx = context
+            .find("### Collection omissions")
+            .expect("Collection omissions section must be present");
+        &context[idx..]
+    }
+
+    /// Smallest budget at which diffs plus reserved omission notes fit.
+    /// Omission-line length depends on the digit count of `budget_bytes`, so
+    /// a probe at 1 is not the size that will actually be required at that
+    /// size; this iterates until the two agree.
+    fn required_bytes_for(packet: &SourcePacket) -> usize {
+        let mut probe = 1usize;
+        for _ in 0..16 {
+            match render_source_context_with_budget(packet, probe) {
+                Err(err) => {
+                    assert!(
+                        err.required_bytes > probe,
+                        "budget {probe} failed with a non-larger required_bytes {}",
+                        err.required_bytes
+                    );
+                    probe = err.required_bytes;
+                }
+                Ok(_) => return probe,
+            }
+        }
+        panic!("required_bytes did not converge");
     }
 
     #[test]
     fn budget_holds_across_many_omitted_files() {
         let packet = multi_file_packet(20);
-        let mandatory_bytes = render_source_context_with_budget(&packet, 1)
-            .unwrap_err()
-            .required_bytes;
+        let mandatory_bytes = required_bytes_for(&packet);
 
         let file0 = &packet.files[0];
         let before0 =
             render_pinned_side_block("Before (merge base)", file0.before.as_ref()).expect("fixture has before");
         let after0 = render_pinned_side_block("After (head)", file0.after.as_ref()).expect("fixture has after");
 
-        // The second file's "Before" omission line, sized against a
-        // placeholder budget of the same order of magnitude as the real one
-        // computed below (only its digit count affects the line's length).
-        let file1 = &packet.files[1];
-        let before1 =
-            render_pinned_side_block("Before (merge base)", file1.before.as_ref()).expect("fixture has before");
-        let placeholder_omission = boss_pr_review_sources::SourceOmission {
-            path: Some(file1.path.clone()),
-            side: Some(SourceSide::Before),
-            reason: format!(
-                "omitted to stay within the {mandatory_bytes}-byte total source-context budget ({} bytes needed)",
-                before1.len()
-            ),
-            terminal: true,
-        };
-        let before1_omission_line_len = render_omission_line(&placeholder_omission).len();
-
-        // Exactly enough for the first file's full before/after content,
-        // plus the second file's "Before" omission note — and not one byte
-        // more. That leaves every other block (the second file's "After",
-        // and all 18 remaining files) with no room at all, forcing many
-        // omissions while still proving full content and omission notes
-        // can coexist within one budget.
-        let budget = mandatory_bytes + before0.len() + after0.len() + before1_omission_line_len;
+        // Enough for the first file's full before/after content on top of
+        // the reserved diffs, omissions header, and a named omission line
+        // for every side. Later files may pick up a little extra from the
+        // first file's reclaimed reservation; the last file still cannot
+        // fit as full content.
+        let budget = mandatory_bytes + before0.len() + after0.len();
 
         let context =
             render_source_context_with_budget(&packet, budget).expect("mandatory diffs alone fit this budget");
@@ -781,12 +827,39 @@ mod tests {
             context.len()
         );
         assert!(context.contains("### Collection omissions"));
+        let content_part = &context[..context.find("### Collection omissions").unwrap()];
+        let omissions = collection_omissions_section(&context);
+        let mut dropped_blocks = 0usize;
         for i in 0..20 {
+            let path = format!("src/file_{i}.rs");
             assert!(
-                context.contains(&format!("src/file_{i}.rs")),
-                "every file's diff must always be present, including src/file_{i}.rs"
+                content_part.contains(&format!("### `{path}`")),
+                "every file's diff heading must always be present, including {path}"
             );
+            let before_kept = content_part.contains(&format!("old_{i}();"));
+            let after_kept = content_part.contains(&format!("new_{i}();"));
+            for (kept, side) in [(before_kept, "Before"), (after_kept, "After")] {
+                let named = format!("- `{path}` ({side}):");
+                if kept {
+                    assert!(
+                        !omissions.contains(&named),
+                        "kept {side} side of {path} must not be listed as omitted"
+                    );
+                } else {
+                    assert!(
+                        omissions.contains(&named),
+                        "dropped {side} side of {path} must be named in Collection omissions"
+                    );
+                    dropped_blocks += 1;
+                }
+            }
         }
+        assert!(dropped_blocks > 0, "budget must actually force some omissions");
+        assert_eq!(
+            omissions.matches("- `src/file_").count(),
+            dropped_blocks,
+            "every dropped before/after block must appear as exactly one omission line"
+        );
         // Order-dependent apportionment: budget is spent on earlier files
         // first, so the very first file should keep its full content while
         // a later one is exhausted into an omission instead.
@@ -795,9 +868,34 @@ mod tests {
             "first file should retain full content before budget runs out"
         );
         assert!(
-            !context.contains("old_19();") && !context.contains("new_19();"),
+            !content_part.contains("old_19();") && !content_part.contains("new_19();"),
             "last file's full content must be omitted once budget runs out"
         );
+    }
+
+    #[test]
+    fn budget_equal_to_mandatory_names_every_omitted_side() {
+        let packet = multi_file_packet(20);
+        let mandatory_bytes = required_bytes_for(&packet);
+        let context = render_source_context_with_budget(&packet, mandatory_bytes)
+            .expect("diffs plus reserved omission notes must fit the mandatory size");
+        assert!(
+            context.len() <= mandatory_bytes,
+            "rendered context ({}) must stay within the mandatory reservation ({mandatory_bytes})",
+            context.len()
+        );
+        let content_part = &context[..context.find("### Collection omissions").unwrap()];
+        let omissions = collection_omissions_section(&context);
+        for i in 0..20 {
+            assert!(
+                !content_part.contains(&format!("old_{i}();")) && !content_part.contains(&format!("new_{i}();")),
+                "no full before/after content should fit at the mandatory reservation"
+            );
+            let path = format!("src/file_{i}.rs");
+            assert!(omissions.contains(&format!("- `{path}` (Before):")));
+            assert!(omissions.contains(&format!("- `{path}` (After):")));
+        }
+        assert_eq!(omissions.matches("- `src/file_").count(), 40);
     }
 
     #[test]
