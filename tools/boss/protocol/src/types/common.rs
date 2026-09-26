@@ -403,8 +403,8 @@ pub const CREATED_VIA_MERGE_CONFLICT_PREFIX: &str = "merge-conflict:";
 /// Prefix for engine-triggered revisions spawned by the CI-failure watcher:
 /// `ci-fix:<ci_remediations.id>`. Mirrors `CREATED_VIA_MERGE_CONFLICT_PREFIX`.
 pub const CREATED_VIA_CI_FIX_PREFIX: &str = "ci-fix:";
-/// Prefix for engine-triggered revisions spawned by the automated PR reviewer
-/// (P992): `pr_review:<pr_review_execution_id>`.
+/// Prefix for engine-triggered revisions spawned by the automated PR reviewer:
+/// `pr_review:<pr_review_execution_id>`.
 pub const CREATED_VIA_PR_REVIEW_PREFIX: &str = "pr_review:";
 /// Sub-prefix of [`CREATED_VIA_PR_REVIEW_PREFIX`] for a follow-up minted from
 /// a `PostMerge` review batch: `pr_review:post_merge:<proposal_id>`. Still

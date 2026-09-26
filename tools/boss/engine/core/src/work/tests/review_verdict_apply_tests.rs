@@ -897,6 +897,88 @@ fn reapplying_a_merged_followup_returns_the_same_work_item() {
     assert_eq!(first, second, "proposal id is the materialisation idempotency key");
 }
 
+/// A PostMerge follow-up minted by a pre-upgrade engine used
+/// `pr_review:<proposal_id>` (no `post_merge:` sub-prefix). Materialisation
+/// commits in its own transaction before `commit_applied_review_verdict`, so
+/// a crash between those two leaves the proposal `proposed` for retry with
+/// that old-key row already on disk. Retry on a build that computes
+/// `pr_review:post_merge:<proposal_id>` must still resolve to that row.
+#[test]
+fn reapplying_a_post_merge_followup_seeded_under_the_legacy_created_via_returns_the_same_work_item() {
+    let db = WorkDb::open(temp_db_path("verdict-apply-post-merge-legacy-created-via")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id.clone(), "review target");
+    bind_merged_pr(&db, &cycle_root.id);
+
+    let merge_sha = "merge-commit-sha";
+    let post_merge_reviewer = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            post_merge_batch_input(cycle_root.id.clone(), merge_sha),
+            &[member(
+                ReviewBatchMemberRole::PostMergeReviewer,
+                Some(post_merge_reviewer.id.clone()),
+                ReviewBatchMemberStatus::Pending,
+            )],
+        )
+        .unwrap();
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &post_merge_reviewer.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &post_merge_findings_verdict_payload(&batch.id, merge_sha),
+            idempotency_key: "post-merge-legacy-created-via",
+        })
+        .unwrap()
+        .unwrap();
+    let proposal_id = outcome.proposal.id;
+
+    let seeded = db
+        .create_review_findings_followup(
+            ReviewFindingsFollowupInsert::builder()
+                .product_id(product.id)
+                .name("legacy post-merge follow-up")
+                .created_via(format!("{CREATED_VIA_PR_REVIEW_PREFIX}{proposal_id}"))
+                .description("Address ALL findings before closing this follow-up.")
+                .chain_root_id(cycle_root.id.clone())
+                .build(),
+        )
+        .unwrap();
+
+    let applied = db
+        .apply_review_verdict_proposal(&proposal_id, &FakePrStateChecker::always(PrOpenState::Merged))
+        .unwrap()
+        .expect("retry must recover the follow-up already materialised under the legacy created_via key");
+    assert_eq!(
+        applied, seeded.id,
+        "PostMerge retry after a created_via key change must return the existing work item"
+    );
+
+    let conn = db.connect().unwrap();
+    let new_key = format!("{CREATED_VIA_PR_REVIEW_POST_MERGE_PREFIX}{proposal_id}");
+    let legacy_key = format!("{CREATED_VIA_PR_REVIEW_PREFIX}{proposal_id}");
+    let materialisation_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE created_via IN (?1, ?2)",
+            rusqlite::params![new_key, legacy_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        materialisation_count, 1,
+        "upgrade recovery must not mint a second follow-up under the new created_via key"
+    );
+}
+
 /// Stage one clean verdict and one findings-warranting verdict (each its own
 /// cycle root / batch / proposal), plus one proposal already `applied`
 /// before the sweep runs, then drive the sweep entry point

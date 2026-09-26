@@ -235,6 +235,8 @@ impl WorkDb {
         // Look this up *before* the tripwire so a retry that now holds the
         // cycle root can tombstone a revision minted on a prior pass that
         // failed open (then failed before `commit_applied_review_verdict`).
+        // PostMerge lookups also match a pre-upgrade `pr_review:<proposal_id>`
+        // row (see `existing_review_findings_work_item`).
         let existing = {
             let conn = self.connect()?;
             existing_review_findings_work_item(&conn, &created_via)?
