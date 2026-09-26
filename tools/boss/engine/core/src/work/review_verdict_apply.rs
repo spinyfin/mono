@@ -135,7 +135,17 @@ impl WorkDb {
         // `revision_warranted = false` cannot suppress a critical/high
         // finding or a category that already forces remediation.
         let original_revision_warranted = crate::pr_review::passes_severity_gate(&review_result);
-        let created_via = format!("{CREATED_VIA_PR_REVIEW_PREFIX}{}", proposal.id);
+        // A `PostMerge` batch's created_via carries its own durable
+        // `post_merge:` sub-prefix (still matching every
+        // `starts_with(CREATED_VIA_PR_REVIEW_PREFIX)` check elsewhere) so
+        // `followup_kind_label` can give the worker-facing PR-body backlink a
+        // post-merge-specific label instead of the generic "review findings"
+        // one, without relying on the worker to remember to say so.
+        let created_via = if batch.phase == boss_protocol::ReviewBatchPhase::PostMerge {
+            format!("{CREATED_VIA_PR_REVIEW_POST_MERGE_PREFIX}{}", proposal.id)
+        } else {
+            format!("{CREATED_VIA_PR_REVIEW_PREFIX}{}", proposal.id)
+        };
 
         // The duplicate-head guard exists to suppress a re-review of an
         // unchanged pre-merge head (e.g. a recovery retry that resubmits a
@@ -185,8 +195,39 @@ impl WorkDb {
             task_short_id: origin_task.short_id,
             pr_number: Some(batch.pr_number),
         };
-        let instructions = crate::pr_review::render_revision_instructions(&review_result, origin);
-        let title = crate::pr_review::render_revision_title(origin, review_result.findings.len());
+        // A `PostMerge` batch's origin PR is already merged by the time its
+        // verdict is reviewed at all (the reviewer ran on the landed merge
+        // commit), so `materialize_review_findings` below always takes the
+        // `parent_no_longer_revisable` fallback into a standalone follow-up —
+        // never a live revision on an open PR. That follow-up's title and
+        // description must say so explicitly (title recognisable in the
+        // kanban; description carrying the origin-PR link so the resulting
+        // PR states its provenance), which the ordinary pre-merge rendering
+        // does not. `PreMerge`/legacy title and instructions are unchanged.
+        let (title, instructions) = if batch.phase == boss_protocol::ReviewBatchPhase::PostMerge {
+            let title = crate::pr_review::render_post_merge_followup_title(origin, review_result.findings.len());
+            let mut instructions = crate::pr_review::render_post_merge_followup_provenance(&batch.pr_url);
+            // Strip the origin task's short id from the origin fed into the
+            // findings body: `ReviewOrigin::describe()` would otherwise emit
+            // a literal `T<short_id>` token into the very description text a
+            // PostMerge follow-up's PR body is built from, tripping
+            // `boss-ism/pr-text-leakage`. The title above is unaffected — a
+            // work-item title is never PR text.
+            let instructions_origin = crate::pr_review::ReviewOrigin {
+                task_short_id: None,
+                ..origin
+            };
+            instructions.push_str(&crate::pr_review::render_revision_instructions(
+                &review_result,
+                instructions_origin,
+            ));
+            (title, instructions)
+        } else {
+            (
+                crate::pr_review::render_revision_title(origin, review_result.findings.len()),
+                crate::pr_review::render_revision_instructions(&review_result, origin),
+            )
+        };
 
         // Prefer the existing materialisation keyed on this proposal. A reapply
         // after the cycle increment has landed would otherwise look like a
@@ -194,6 +235,8 @@ impl WorkDb {
         // Look this up *before* the tripwire so a retry that now holds the
         // cycle root can tombstone a revision minted on a prior pass that
         // failed open (then failed before `commit_applied_review_verdict`).
+        // PostMerge lookups also match a pre-upgrade `pr_review:<proposal_id>`
+        // row (see `existing_review_findings_work_item`).
         let existing = {
             let conn = self.connect()?;
             existing_review_findings_work_item(&conn, &created_via)?

@@ -4,7 +4,9 @@
 use anyhow::{Result, bail};
 
 use crate::work::{Project, Task, WorkItem};
-use boss_protocol::{CREATED_VIA_ATTENTION, CREATED_VIA_PR_REVIEW_PREFIX, TaskKind};
+use boss_protocol::{
+    CREATED_VIA_ATTENTION, CREATED_VIA_PR_REVIEW_POST_MERGE_PREFIX, CREATED_VIA_PR_REVIEW_PREFIX, TaskKind,
+};
 
 /// Render a human-meaningful follow-up kind label from a task's
 /// `created_via` provenance, for the backlink a worker writes on a derived PR.
@@ -12,8 +14,17 @@ use boss_protocol::{CREATED_VIA_ATTENTION, CREATED_VIA_PR_REVIEW_PREFIX, TaskKin
 /// the DB-level kind enum, not something a reader would recognize, so it is
 /// only used as the generic fallback for a `created_via` shape this function
 /// does not yet enumerate.
+///
+/// The `pr_review:post_merge:` sub-prefix is checked before the plain
+/// `pr_review:` prefix it falls under, so a follow-up minted from a
+/// `PostMerge` review batch gets a distinct label: this is the durable
+/// channel that makes the worker-facing `## Boss follow-up` backlink state
+/// its post-merge origin, rather than relying on the worker to remember to
+/// say so in prose.
 pub(crate) fn followup_kind_label(created_via: &str, task_kind: &TaskKind) -> String {
-    if created_via.starts_with(CREATED_VIA_PR_REVIEW_PREFIX) {
+    if created_via.starts_with(CREATED_VIA_PR_REVIEW_POST_MERGE_PREFIX) {
+        "post-merge review findings".to_owned()
+    } else if created_via.starts_with(CREATED_VIA_PR_REVIEW_PREFIX) {
         "review findings".to_owned()
     } else if created_via == CREATED_VIA_ATTENTION {
         "deferred scope".to_owned()
@@ -299,6 +310,26 @@ mod followup_pr_backlink_tests {
         .unwrap();
         assert!(prefix.contains("https://github.com/spinyfin/mono/pull/2710"));
         assert!(prefix.contains("`deferred scope`"));
+    }
+
+    #[test]
+    fn post_merge_review_findings_followup_gets_a_post_merge_specific_kind() {
+        let prefix = followup_pr_backlink(
+            &TaskKind::Followup,
+            "pr_review:post_merge:exec_test",
+            Some(2685),
+            "git@github.com:spinyfin/mono.git",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            prefix,
+            "## Boss follow-up\n\nThis `post-merge review findings` follow-up derives from [the origin PR](https://github.com/spinyfin/mono/pull/2685)."
+        );
+        assert_eq!(
+            followup_kind_label("pr_review:post_merge:exec_test", &TaskKind::Followup),
+            "post-merge review findings"
+        );
     }
 
     #[test]

@@ -72,10 +72,29 @@ pub(crate) fn plan_review_findings_followup(
 /// key, if any. Includes tombstoned and converted-to-followup rows so a
 /// retry remains a no-op after parent-close conversion or a merged-origin
 /// insert.
+///
+/// A `pr_review:post_merge:<proposal_id>` lookup also matches a row still
+/// keyed as `pr_review:<proposal_id>`. PostMerge follow-ups minted before
+/// [`CREATED_VIA_PR_REVIEW_POST_MERGE_PREFIX`] used that PreMerge-shaped
+/// key; `materialize_review_findings` commits in its own transaction before
+/// `commit_applied_review_verdict`, so a crash between those two leaves the
+/// proposal `proposed` for retry with the follow-up already on disk. Exact
+/// match on the new key would miss that row and mint a duplicate.
 pub(crate) fn existing_review_findings_work_item(conn: &Connection, created_via: &str) -> Result<Option<Task>> {
     if !created_via.starts_with(CREATED_VIA_PR_REVIEW_PREFIX) {
         return Ok(None);
     }
+    if let Some(task) = task_for_created_via(conn, created_via)? {
+        return Ok(Some(task));
+    }
+    if let Some(proposal_id) = created_via.strip_prefix(CREATED_VIA_PR_REVIEW_POST_MERGE_PREFIX) {
+        let legacy = format!("{CREATED_VIA_PR_REVIEW_PREFIX}{proposal_id}");
+        return task_for_created_via(conn, &legacy);
+    }
+    Ok(None)
+}
+
+fn task_for_created_via(conn: &Connection, created_via: &str) -> Result<Option<Task>> {
     let existing_id: Option<String> = conn
         .query_row(
             "SELECT id
