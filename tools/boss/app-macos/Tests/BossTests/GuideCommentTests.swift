@@ -9,7 +9,6 @@ final class GuideCommentTests: XCTestCase {
         let backend = GuideCommentBackend()
         layer.configure(source: "Original quote", baseURL: nil,
                         artifact: .reviewGuide(seriesID: "series", versionID: "old"), backend: backend)
-        defer { layer.discardGuideDraft() }
         layer.addComment(quoted: "Original quote", body: "Keep this behavior")
         XCTAssertEqual(backend.createdVersion, "old")
         XCTAssertEqual(backend.createdHash, CommentProjection.docVersion(forPlainText: "Original quote"))
@@ -67,7 +66,6 @@ final class GuideCommentTests: XCTestCase {
         let old = CommentLayer()
         old.configure(source: "Original quote", baseURL: nil,
                       artifact: .reviewGuide(seriesID: "series", versionID: "draft-old"), backend: backend)
-        defer { old.discardGuideDraft() }
         old.pendingQuotedText = "Original quote"
         old.pendingOccurrenceIndex = 2
         old.saveGuideDraft(body: "Unsaved feedback")
@@ -93,7 +91,6 @@ final class GuideCommentTests: XCTestCase {
         let layer = CommentLayer()
         layer.configure(source: "Original quote then Different quote", baseURL: nil,
                         artifact: .reviewGuide(seriesID: "series", versionID: "draft-sel"), backend: backend)
-        defer { layer.discardGuideDraft() }
         layer.pendingQuotedText = "Original quote"
         layer.pendingOccurrenceIndex = 0
         layer.saveGuideDraft(body: "Unsaved feedback")
@@ -121,7 +118,6 @@ final class GuideCommentTests: XCTestCase {
         let layer = CommentLayer()
         layer.configure(source: "Original quote then Different quote", baseURL: nil,
                         artifact: .reviewGuide(seriesID: "series", versionID: "draft-resume"), backend: backend)
-        defer { layer.discardGuideDraft() }
         layer.pendingQuotedText = "Original quote"
         layer.pendingOccurrenceIndex = 2
         layer.saveGuideDraft(body: "Unsaved feedback")
@@ -138,7 +134,6 @@ final class GuideCommentTests: XCTestCase {
         let old = CommentLayer()
         old.configure(source: "Guide prose", baseURL: nil,
                       artifact: .reviewGuide(seriesID: "series", versionID: "empty-quote-old"), backend: backend)
-        defer { old.discardGuideDraft() }
         old.pendingQuotedText = ""
         old.pendingOccurrenceIndex = 0
         old.saveGuideDraft(body: "General feedback")
@@ -171,32 +166,31 @@ final class GuideCommentTests: XCTestCase {
             createdAt: "1", guideContext: GuideCommentContext(versionId: "empty-quote-old",
                 comparisonId: "comparison", packetHash: "hash", baseSha: "base",
                 mergeBaseSha: "merge", headSha: "head"))
-        GuideCommentDrafts.shared.acknowledge(persisted)
+        backend.guideCommentDrafts!.acknowledge(persisted)
         XCTAssertNil(original.guideDraft)
     }
 
     func testFailedPresentationKeepsResumeIntent() {
         let layer = CommentLayer()
+        let backend = GuideCommentBackend()
         layer.configure(source: "Quote", baseURL: nil,
-                        artifact: .reviewGuide(seriesID: "series", versionID: "pending"), backend: GuideCommentBackend())
+                        artifact: .reviewGuide(seriesID: "series", versionID: "pending"), backend: backend)
         layer.pendingQuotedText = "Quote"
         layer.saveGuideDraft(body: "Feedback")
-        GuideCommentDrafts.shared.pendingResumeVersionId = "pending"
+        backend.guideCommentDrafts!.pendingResumeVersionId = "pending"
         defer {
             layer.cancelNewComment()
-            layer.discardGuideDraft()
-            GuideCommentDrafts.shared.pendingResumeVersionId = nil
         }
-        XCTAssertTrue(GuideCommentDrafts.shared.hasPendingResume(for: "pending"))
+        XCTAssertTrue(backend.guideCommentDrafts!.hasPendingResume(for: "pending"))
         XCTAssertFalse(layer.resumeGuideDraft(), "a guide without its host window cannot present")
-        XCTAssertTrue(GuideCommentDrafts.shared.hasPendingResume(for: "pending"))
+        XCTAssertTrue(backend.guideCommentDrafts!.hasPendingResume(for: "pending"))
         let host = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 200, height: 200),
             styleMask: [.borderless], backing: .buffered, defer: false)
         host.contentView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 200))
         layer.setHostWindow(host)
         XCTAssertFalse(
-            GuideCommentDrafts.shared.hasPendingResume(for: "pending"),
+            backend.guideCommentDrafts!.hasPendingResume(for: "pending"),
             "binding the host window must retry presentation and drain the intent")
     }
 
@@ -206,7 +200,6 @@ final class GuideCommentTests: XCTestCase {
         let listSource = "Embedded (built-in) checks — compiled into the binary"
         listLayer.configure(source: listSource, baseURL: nil,
                             artifact: .reviewGuide(seriesID: "series", versionID: "ack-list"), backend: backend)
-        defer { listLayer.discardGuideDraft() }
         listLayer.pendingQuotedText = "  • binary"
         listLayer.saveGuideDraft(body: "Keep binary")
         listLayer.addComment(quoted: "  • binary", body: "Keep binary")
@@ -214,7 +207,7 @@ final class GuideCommentTests: XCTestCase {
         let listAnchor = CommentLayer.captureAnchor(
             quoted: "  • binary", occurrenceIndex: 0, in: CommentProjection.plainText(for: listSource))
         XCTAssertEqual(listAnchor.exact, "binary")
-        GuideCommentDrafts.shared.acknowledge(WorkComment(
+        backend.guideCommentDrafts!.acknowledge(WorkComment(
             id: "list", artifactId: "series", anchor: CommentAnchor(exact: listAnchor.exact),
             artifactKind: WireArtifactKind.reviewGuide, author: "user:test", body: "Keep binary",
             createdAt: "1", guideContext: GuideCommentContext(versionId: "ack-list",
@@ -225,14 +218,13 @@ final class GuideCommentTests: XCTestCase {
         let wsLayer = CommentLayer()
         wsLayer.configure(source: "trailing quote", baseURL: nil,
                           artifact: .reviewGuide(seriesID: "series", versionID: "ack-ws"), backend: backend)
-        defer { wsLayer.discardGuideDraft() }
         wsLayer.pendingQuotedText = "quote   "
         wsLayer.saveGuideDraft(body: "Trim me")
         wsLayer.addComment(quoted: "quote   ", body: "Trim me")
         let wsAnchor = CommentLayer.captureAnchor(
             quoted: "quote   ", occurrenceIndex: 0, in: CommentProjection.plainText(for: "trailing quote"))
         XCTAssertEqual(wsAnchor.exact, "quote")
-        GuideCommentDrafts.shared.acknowledge(WorkComment(
+        backend.guideCommentDrafts!.acknowledge(WorkComment(
             id: "ws", artifactId: "series", anchor: CommentAnchor(exact: wsAnchor.exact),
             artifactKind: WireArtifactKind.reviewGuide, author: "user:test", body: "Trim me",
             createdAt: "1", guideContext: GuideCommentContext(versionId: "ack-ws",
@@ -246,7 +238,6 @@ final class GuideCommentTests: XCTestCase {
         let original = CommentLayer()
         original.configure(source: "Original quote then Different quote", baseURL: nil,
                            artifact: .reviewGuide(seriesID: "series", versionID: "two-composers"), backend: backend)
-        defer { original.discardGuideDraft() }
         original.pendingQuotedText = "Original quote"
         original.saveGuideDraft(body: "Parked A")
         original.liveSelectionProvider = { "Different quote" }
@@ -288,6 +279,7 @@ final class GuideCommentTests: XCTestCase {
 @MainActor
 private final class GuideCommentBackend: CommentBackend {
     let author = "user:test"
+    let guideCommentDrafts: GuideCommentDrafts? = GuideCommentDrafts(directory: nil)
     var createdVersion: String?
     var resolvedVersion: String?
     var createdHash: String?

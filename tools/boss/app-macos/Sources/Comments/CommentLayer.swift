@@ -67,6 +67,7 @@ final class CommentLayer: NSObject, ObservableObject {
     private var baseURL: URL? = nil
     /// The engine facade. `nil` ⇒ in-memory fallback.
     private weak var backend: (any CommentBackend)? = nil
+    var draftStore = GuideCommentDrafts(directory: nil)
 
     /// True when this layer is persisting through the engine.
     var isEngineBacked: Bool { backend != nil && !artifactId.isEmpty }
@@ -144,7 +145,7 @@ final class CommentLayer: NSObject, ObservableObject {
     /// falling back to matching any window's events.
     func setHostWindow(_ window: NSWindow?) {
         hostWindow = window
-        if window != nil, GuideCommentDrafts.shared.hasPendingResume(for: guideVersionId) {
+        if window != nil, draftStore.hasPendingResume(for: guideVersionId) {
             resumeGuideDraft()
         }
     }
@@ -334,8 +335,9 @@ final class CommentLayer: NSObject, ObservableObject {
         composerId = draft.composerId
         applyGuideDraft(draft)
         let presented = presentCommentPopover()
-        if presented, GuideCommentDrafts.shared.hasPendingResume(for: guideVersionId) {
-            GuideCommentDrafts.shared.pendingResumeVersionId = nil
+        if presented, draftStore.hasPendingResume(for: guideVersionId) {
+            draftStore.pendingResumeVersionId = nil
+            draftStore.pendingResumeComposerId = nil
         }
         return presented
     }
@@ -460,10 +462,10 @@ final class CommentLayer: NSObject, ObservableObject {
 
         if let version = guideVersionId {
             saveGuideDraft(body: body)
-            if let parked = GuideCommentDrafts.shared.drafts(for: version)
+            if let parked = draftStore.drafts(for: version)
                 .first(where: { $0.composerId == composerId })
             {
-                GuideCommentDrafts.shared.submitted[composerId] = parked.withQuote(anchor.exact)
+                draftStore.submitted[composerId] = parked.withQuote(anchor.exact)
             }
         }
         let ownedDraft = ownsGuideDraft
@@ -549,6 +551,7 @@ final class CommentLayer: NSObject, ObservableObject {
         self.artifactKind = artifact.kind
         self.artifactId = artifact.id
         self.backend = backend
+        if let store = backend.guideCommentDrafts { draftStore = store }
         backend.registerCommentLayer(self, artifactKind: artifact.kind, artifactId: artifact.id)
         reload()
     }
@@ -993,7 +996,7 @@ final class CommentLayer: NSObject, ObservableObject {
     /// when unbound (artifact-less unit tests, or the ⌘⇧K SwiftUI shortcut path, which
     /// SwiftUI only ever invokes while this layer's own window is already key).
     func hasCurrentSelection() -> Bool {
-        if let live = liveSelectionProvider?() { return !live.isEmpty }
+        if let provider = liveSelectionProvider { return !(provider()?.isEmpty ?? true) }
         guard let firstResponder = (hostWindow ?? NSApp.keyWindow)?.firstResponder else { return false }
         let copyItem = NSMenuItem(
             title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
@@ -1412,7 +1415,7 @@ struct WithCommentsModifier: ViewModifier {
         .onAppear {
             layer.openOriginalGuide = openOriginalGuide
             layer.configure(source: source, baseURL: baseURL, artifact: artifact, backend: commentBackend)
-            if GuideCommentDrafts.shared.hasPendingResume(for: layer.guideVersionId) {
+            if layer.draftStore.hasPendingResume(for: layer.guideVersionId) {
                 sidebarExpanded = true
                 layer.resumeGuideDraft()
             } else if layer.guideDraft != nil {
