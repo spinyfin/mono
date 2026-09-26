@@ -845,12 +845,7 @@ impl AgentDriver for ClaudeDriver {
             // single quote, so naive single-quoting is sufficient.
             cmd.push_str(&format!(" --settings '{}'", settings.display()));
         }
-        // Use the descriptor's config_dir and initial_prompt_filename so this
-        // stays in sync with provision_workspace's write location.
-        cmd.push_str(&format!(
-            " \"$(cat {}/{})\"\n",
-            CLAUDE_DESCRIPTOR.config_dir, CLAUDE_DESCRIPTOR.initial_prompt_filename,
-        ));
+        cmd.push('\n');
         SpawnPlan {
             // Claude must authenticate via OAuth credentials
             // (~/.claude/.credentials.json), not a stray ANTHROPIC_API_KEY
@@ -860,7 +855,11 @@ impl AgentDriver for ClaudeDriver {
             // engine needs the var in its own process for pane-summary LLM
             // calls, so this unset is scoped to the worker pane shell only.
             env: vec![EnvDirective::Unset("ANTHROPIC_API_KEY".to_owned())],
-            command: cmd,
+            command: super::wrap_spawn_command_to_feed_prompt(
+                &cmd,
+                CLAUDE_DESCRIPTOR.config_dir,
+                CLAUDE_DESCRIPTOR.initial_prompt_filename,
+            ),
         }
     }
 
@@ -885,6 +884,7 @@ impl AgentDriver for ClaudeDriver {
         let prompt_path = config_dir.join(CLAUDE_DESCRIPTOR.initial_prompt_filename);
         std::fs::write(&prompt_path, prompt_text)
             .with_context(|| format!("writing initial prompt to {}", prompt_path.display()))?;
+        crate::write_feed_prompt_script(workspace)?;
 
         let gitignore_path = config_dir.join(".gitignore");
         std::fs::write(&gitignore_path, CLAUDE_DIR_GITIGNORE)
@@ -2156,15 +2156,38 @@ mod tests {
     #[test]
     fn spawn_invocation_uses_descriptor_paths() {
         let plan = ClaudeDriver.spawn_invocation(spawn_request("sonnet"));
-        let expected_cat = format!(
-            "\"$(cat {}/{})\"\n",
+        let prompt_path = format!(
+            "{}/{}",
             CLAUDE_DESCRIPTOR.config_dir, CLAUDE_DESCRIPTOR.initial_prompt_filename,
         );
         assert!(
-            plan.command.contains(&expected_cat),
+            plan.command.contains("python3 .boss/feed-initial-prompt"),
+            "spawn must feed the prompt file via the PTY helper, not argv; got: {}",
+            plan.command,
+        );
+        assert!(
+            plan.command.contains(&prompt_path),
             "spawn invocation must read from descriptor paths; got: {}",
             plan.command,
         );
+        assert!(
+            !plan.command.contains("$(cat"),
+            "prompt must not be expanded onto argv; got: {}",
+            plan.command,
+        );
+    }
+
+    #[test]
+    fn spawn_command_stays_tiny_when_the_prompt_file_is_over_one_mib() {
+        let plan = ClaudeDriver.spawn_invocation(spawn_request("sonnet"));
+        assert!(
+            plan.command.len() < 4096,
+            "launch command must stay well under ARG_MAX even for a multi-MiB prompt file; got {} bytes: {}",
+            plan.command.len(),
+            plan.command,
+        );
+        assert!(!plan.command.contains("$(cat"));
+        assert!(plan.command.contains(".claude/initial-prompt.txt"));
     }
 
     #[test]

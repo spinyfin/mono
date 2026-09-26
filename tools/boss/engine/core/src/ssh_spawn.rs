@@ -605,7 +605,7 @@ mod tests {
             events_socket_path: "/tmp/boss-events-run-1.sock".into(),
             wrapper_path: "~/.boss-remote/bin/boss-remote-run".into(),
             driver_binary: "codex".into(),
-            driver_command: "codex -m gpt-6-astra \"$(cat .codex/initial-prompt.txt)\"".into(),
+            driver_command: "python3 .boss/feed-initial-prompt '.codex/initial-prompt.txt' codex -m gpt-6-astra".into(),
             driver_env: "export CODEX_HOME='/tmp/codex'; ".into(),
             structured_output_kind: Some("review-result".into()),
             pr_url_output: true,
@@ -617,7 +617,13 @@ mod tests {
         assert!(argv.contains(&"BOSS_LEASE_ID=lease-1".to_owned()));
         assert!(argv.contains(&"BOSS_WORKSPACE=/ws/mono-agent-007".to_owned()));
         assert!(argv.contains(&"BOSS_DRIVER=codex".to_owned()));
-        assert!(argv.iter().any(|arg| arg.starts_with("BOSS_DRIVER_COMMAND=codex -m")));
+        assert!(
+            argv.iter().any(
+                |arg| arg.starts_with("BOSS_DRIVER_COMMAND=python3 .boss/feed-initial-prompt")
+                    && arg.contains("codex -m")
+            ),
+            "driver command must feed the prompt file then exec codex; got {argv:?}"
+        );
         assert!(
             argv.iter()
                 .any(|arg| arg.starts_with("BOSS_DRIVER_ENV=export CODEX_HOME"))
@@ -639,7 +645,7 @@ mod tests {
             events_socket_path: "/tmp/s.sock".into(),
             wrapper_path: "wrapper".into(),
             driver_binary: "claude".into(),
-            driver_command: "claude --model opus \"$(cat .claude/initial-prompt.txt)\"".into(),
+            driver_command: "python3 .boss/feed-initial-prompt '.claude/initial-prompt.txt' claude --model opus".into(),
             driver_env: "unset ANTHROPIC_API_KEY; ".into(),
             structured_output_kind: None,
             pr_url_output: false,
@@ -874,7 +880,7 @@ mod tests {
             events_socket_path: remote_events_socket_path("run-1"),
             wrapper_path: "~/.boss-remote/bin/boss-remote-run".into(),
             driver_binary: "claude".into(),
-            driver_command: "claude --model opus \"$(cat .claude/initial-prompt.txt)\"".into(),
+            driver_command: "python3 .boss/feed-initial-prompt '.claude/initial-prompt.txt' claude --model opus".into(),
             driver_env: "unset ANTHROPIC_API_KEY; ".into(),
             structured_output_kind: Some("review-result".into()),
             pr_url_output: false,

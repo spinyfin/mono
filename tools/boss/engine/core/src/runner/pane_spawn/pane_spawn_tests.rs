@@ -433,7 +433,7 @@ async fn initial_input_types_a_short_fixed_line_sourcing_the_workspace_script() 
     // construction site.
     assert!(
         script.starts_with(&format!(
-            "{}{}unset ANTHROPIC_API_KEY; claude",
+            "{}{}unset ANTHROPIC_API_KEY; python3 .boss/feed-initial-prompt",
             path_prepend_clause("BOSS_BIN_DIR"),
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
         )),
@@ -582,9 +582,8 @@ async fn run_once_with_chore_inner(
 /// engine produces — minus the implicit `claude` model selection,
 /// plus an explicit `--model <engine-default-slug>`. No
 /// `--effort` flag, no prompt addendum. Design §Q2 / task spec
-/// regression test: "byte-equivalent to today's `claude
-/// "$(cat .claude/initial-prompt.txt)"` plus the explicit
-/// `--model <engine-default-slug>`."
+/// regression test: "byte-equivalent to today's Claude spawn
+/// plus the explicit `--model <engine-default-slug>`."
 ///
 /// Goes through [`run_once_with_unclassified_chore`] because "untagged" now
 /// has to mean untagged on *both* axes: every create path seeds a reasoning
@@ -610,7 +609,7 @@ async fn untagged_row_spawn_matches_engine_default() {
     assert_eq!(
         script,
         format!(
-            "{}{}unset ANTHROPIC_API_KEY; claude --model {} --disallowedTools=AskUserQuestion --permission-mode auto --settings '{}' \"$(cat .claude/initial-prompt.txt)\"\n",
+            "{}{}unset ANTHROPIC_API_KEY; python3 .boss/feed-initial-prompt '.claude/initial-prompt.txt' claude --model {} --disallowedTools=AskUserQuestion --permission-mode auto --settings '{}'\n",
             path_prepend_clause("BOSS_BIN_DIR"),
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
             crate::driver::ClaudeDriver.descriptor().model_menu.engine_default,
