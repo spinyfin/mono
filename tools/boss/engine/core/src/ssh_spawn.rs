@@ -294,6 +294,20 @@ pub struct RemoteLaunchOutcome {
     pub detail: Option<String>,
 }
 
+/// Validate the full launch plan against the remote host before creating a tunnel.
+pub(crate) async fn check_remote_launch_limits(exec: &dyn SshExec, plan: &RemoteSpawnPlan) -> Result<()> {
+    let out = exec.run_shell(crate::launch_limits::REMOTE_PROBE).await?;
+    anyhow::ensure!(out.success(), "remote ARG_MAX preflight failed: {}", out.stderr);
+    let numbers = out
+        .stdout
+        .split_whitespace()
+        .map(str::parse::<usize>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    anyhow::ensure!(numbers.len() == 2, "invalid remote ARG_MAX preflight response");
+    let command_bytes = build_remote_command(plan).iter().map(|arg| arg.len() + 1).sum();
+    crate::launch_limits::check(command_bytes, numbers[1], numbers[0], &plan.driver_binary)
+}
+
 /// Open the events tunnel and launch the detached remote worker.
 ///
 /// Sequence (all over the one master multiplex):
@@ -794,6 +808,13 @@ mod tests {
         }
         async fn run_shell(&self, script: &str) -> Result<SshOutput> {
             self.calls.lock().unwrap().push(Call::Run(vec![script.to_owned()]));
+            if script == crate::launch_limits::REMOTE_PROBE {
+                return Ok(SshOutput {
+                    status: 0,
+                    stdout: "65536 8192".to_owned(),
+                    stderr: String::new(),
+                });
+            }
             // The liveness probe (`kill -0`) reports its canned verdict.
             if script.contains("kill -0") {
                 return match self.liveness {
@@ -885,6 +906,22 @@ mod tests {
             structured_output_kind: Some("review-result".into()),
             pr_url_output: false,
         }
+    }
+
+    #[tokio::test]
+    async fn remote_preflight_uses_remote_limits_and_counts_driver_environment() {
+        let exec = FakeExec::new(0, "");
+        let mut plan = sample_plan();
+        check_remote_launch_limits(&exec, &plan).await.unwrap();
+        plan.driver_env = format!("export LARGE='{}'; ", "x".repeat(65536));
+        let error = check_remote_launch_limits(&exec, &plan).await.unwrap_err();
+        assert!(error.to_string().contains("ARG_MAX 65536 bytes"));
+        assert!(error.to_string().contains("environment 8192 bytes"));
+        assert_eq!(
+            exec.calls().len(),
+            2,
+            "preflight must never launch a worker or open a tunnel"
+        );
     }
 
     #[tokio::test]

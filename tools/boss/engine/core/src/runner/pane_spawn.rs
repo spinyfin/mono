@@ -447,11 +447,8 @@ fn check_initial_input_length(line: &str, driver_name: &str) -> Result<()> {
 /// macOS `getconf ARG_MAX` (and a conservative floor on Linux). Diagnosed
 /// pane death: a 2,673,511-byte prompt expanded onto argv and the shell
 /// reported `argument list too long` with pane status 127.
+#[cfg(test)]
 pub(crate) const PLATFORM_ARG_MAX_BYTES: usize = 1_048_576;
-
-/// Bytes reserved for the pane's inherited environment. Darwin counts
-/// argv+envp against `ARG_MAX` together.
-const ARG_MAX_ENV_RESERVE_BYTES: usize = 128 * 1024;
 
 /// Estimate the argv cost of `command` as the pane shell would exec it.
 ///
@@ -484,17 +481,12 @@ pub(crate) fn estimated_launch_argv_bytes(command: &str, workspace: &Path) -> us
 /// pane that dies with status 127 (`argument list too long`).
 pub(crate) fn check_launch_command_arg_max(command: &str, driver_name: &str, workspace: &Path) -> Result<()> {
     let estimated = estimated_launch_argv_bytes(command, workspace);
-    let budget = PLATFORM_ARG_MAX_BYTES.saturating_sub(ARG_MAX_ENV_RESERVE_BYTES);
-    if estimated > budget {
-        return Err(anyhow!(
-            "refusing to spawn {driver_name} worker: assembled launch command is {estimated} bytes \
-             (command text plus any $(cat …) expansions), which exceeds the platform argument \
-             limit of {PLATFORM_ARG_MAX_BYTES} bytes (ARG_MAX) minus a {ARG_MAX_ENV_RESERVE_BYTES}-byte \
-             environment reserve (budget {budget}); a pane started with this command would die \
-             immediately with status 127 (argument list too long)"
-        ));
-    }
-    Ok(())
+    crate::launch_limits::check(
+        estimated,
+        crate::launch_limits::environment_bytes(),
+        crate::launch_limits::local_arg_max()?,
+        driver_name,
+    )
 }
 
 /// Materialize the per-workspace launcher directory and return it, so the
@@ -989,7 +981,6 @@ impl ExecutionRunner for PaneSpawnRunner {
                 workspace_path.display(),
             )
         })?;
-        check_launch_command_arg_max(&spawn_plan.command, driver.descriptor().name, workspace_path)?;
         // The per-workspace launcher dir goes on *after* the BOSS_BIN_DIR
         // prepend so it ends up ahead of it. Its `boss` is pinned to an
         // absolute path, which is the only form that survives a login
@@ -1008,6 +999,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
             spawn_plan.command,
         );
+        check_launch_command_arg_max(&assembled_command, driver.descriptor().name, workspace_path)?;
         // Write the full assembled command to a workspace-relative script and
         // type only a short, fixed-length line that sources it — never the
         // command itself. See `MAX_CANON_LINE_BYTES` for why: the pty's tty
@@ -1083,6 +1075,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .maybe_control_token_path(bound_control_token_path(&self.cfg))
                 .boss_event_path(self.boss_event_binary())
                 .initial_input(initial_input)
+                .launch_command_bytes(estimated_launch_argv_bytes(&assembled_command, workspace_path))
                 .extra_env({
                     let mut env = structured_output_env;
                     if let Some(dir) = worker_bin_dir.as_ref() {

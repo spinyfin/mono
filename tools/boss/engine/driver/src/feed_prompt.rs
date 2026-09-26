@@ -33,8 +33,9 @@ import struct
 import sys
 import termios
 import time
+import tty
 
-READY_SECS = float(os.environ.get("BOSS_FEED_PROMPT_READY_SECS", "20"))
+READY_SECS = float(os.environ.get("BOSS_FEED_PROMPT_READY_SECS", "0"))
 CHUNK = 4096
 
 
@@ -70,8 +71,8 @@ def drain_to(dst, data):
 
 
 def wait_raw(master, pane_out, timeout):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    started = time.monotonic()
+    while timeout <= 0 or time.monotonic() - started < timeout:
         if not icanon(master):
             return True
         r, _, _ = select.select([master], [], [], 0.05)
@@ -134,7 +135,7 @@ def relay(master, pane_in, pane_out, pid):
                     pane_in = None
                 else:
                     try:
-                        os.write(master, data)
+                        drain_to(master, data)
                     except OSError:
                         break
         wpid, status = os.waitpid(pid, os.WNOHANG)
@@ -150,52 +151,91 @@ def main():
         return 2
     prompt_path = sys.argv[1]
     cli = sys.argv[2:]
+    # Recheck the actual shell environment at the final exec boundary too:
+    # login-shell rc files can add values after the engine's preflight.
+    argv_bytes = sum(len(os.fsencode(arg)) + 1 + struct.calcsize("P") for arg in cli)
+    env_bytes = sum(len(k) + len(v) + 2 + struct.calcsize("P") for k, v in os.environb.items())
+    limit = os.sysconf("SC_ARG_MAX")
+    if argv_bytes + env_bytes + 4096 > limit:
+        sys.stderr.write(
+            "feed-initial-prompt: refusing exec: argv %s bytes + environment %s bytes "
+            "+ 4096 launcher bytes exceeds ARG_MAX %s bytes\n" % (argv_bytes, env_bytes, limit)
+        )
+        return 126
     try:
         prompt = open(prompt_path, "rb").read()
     except OSError as err:
         sys.stderr.write("feed-initial-prompt: cannot read %s: %s\n" % (prompt_path, err))
         return 2
-    payload = prompt + b"\r"
+    payload = b"\x1b[200~" + prompt.replace(b"\r\n", b"\n") + b"\x1b[201~\r"
 
     pid, master = pty_fork()
     if pid == 0:
         os.execvp(cli[0], cli)
         os._exit(127)
 
+    def stop_child(sig):
+        # forkpty creates a separate session; teardown must reach the whole
+        # CLI group, including stdio servers which may ignore SIGHUP/TERM.
+        try:
+            os.killpg(pid, sig)
+            time.sleep(0.1)
+            # Darwin can return EPERM for killpg when its only member is
+            # a zombie. Reap an exited leader before escalating survivors.
+            os.waitpid(pid, os.WNOHANG)
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError as err:
+            raise RuntimeError("CLI group cleanup failed: %s" % err) from err
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+
+    def terminate(sig, _frame):
+        stop_child(sig)
+        raise SystemExit(128 + sig)
+
+    signal.signal(signal.SIGTERM, terminate)
+    signal.signal(signal.SIGHUP, terminate)
     pane_in = sys.stdin.fileno() if not sys.stdin.closed else None
     pane_out = sys.stdout.fileno() if not sys.stdout.closed else None
-    if pane_in is not None:
-        copy_winsize(pane_in, master)
-    if not wait_raw(master, pane_out, READY_SECS):
-        sys.stderr.write(
-            "feed-initial-prompt: timed out waiting for %s to enter raw mode; "
-            "not injecting the prompt (canonical mode would drop it past MAX_CANON)\n"
-            % cli[0]
-        )
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
-        os.waitpid(pid, 0)
-        return 125
-    if not write_prompt(master, payload, pane_out):
-        sys.stderr.write("feed-initial-prompt: CLI exited before the prompt was fully written\n")
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
-        os.waitpid(pid, 0)
-        return 125
-    status = relay(master, pane_in, pane_out, pid)
+    saved = None
+
+    def resize(_sig=None, _frame=None):
+        if pane_in is not None:
+            copy_winsize(pane_in, master)
+
+    signal.signal(signal.SIGWINCH, resize)
     try:
+        if pane_in is not None and os.isatty(pane_in):
+            saved = termios.tcgetattr(pane_in)
+            tty.setraw(pane_in)
+        resize()
+        started = time.monotonic()
+        if not wait_raw(master, pane_out, READY_SECS):
+            sys.stderr.write(
+                "feed-initial-prompt: %s did not enter raw mode after %.2fs "
+                "(exited or readiness timeout); prompt was not injected\n"
+                % (cli[0], time.monotonic() - started)
+            )
+            stop_child(signal.SIGTERM)
+            return 125
+        if not write_prompt(master, payload, pane_out):
+            sys.stderr.write("feed-initial-prompt: CLI exited before the prompt was fully written\n")
+            stop_child(signal.SIGTERM)
+            return 125
+        status = relay(master, pane_in, pane_out, pid)
+        if os.WIFEXITED(status):
+            return os.WEXITSTATUS(status)
+        if os.WIFSIGNALED(status):
+            return 128 + os.WTERMSIG(status)
+        return 1
+    finally:
+        if saved is not None:
+            termios.tcsetattr(pane_in, termios.TCSANOW, saved)
         os.close(master)
-    except OSError:
-        pass
-    if os.WIFEXITED(status):
-        return os.WEXITSTATUS(status)
-    if os.WIFSIGNALED(status):
-        return 128 + os.WTERMSIG(status)
-    return 1
 
 
 def pty_fork():
@@ -268,69 +308,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn feeder_delivers_a_prompt_larger_than_one_mib_without_putting_it_on_argv() {
+    fn feeder_terminal_contract() {
         let dir = TempDir::new().unwrap();
         let script = write_feed_prompt_script(dir.path()).unwrap();
-        let prompt_path = dir.path().join("prompt.txt");
-        // 1 MiB + 1, matching the diagnosed ARG_MAX failure (prompt > 1 MiB).
-        let mut prompt = "ARGMAX_FEED_MARKER\n".to_owned();
-        prompt.push_str(&"P".repeat(1_048_576 + 1 - prompt.len()));
-        assert!(prompt.len() > 1_048_576);
-        std::fs::write(&prompt_path, &prompt).unwrap();
-
-        let fake_cli = dir.path().join("fake-cli.py");
-        let received = dir.path().join("received.bin");
-        let argv_out = dir.path().join("argv.txt");
-        std::fs::write(
-            &fake_cli,
-            format!(
-                "#!/usr/bin/env python3\n\
-                 import os, sys, tty\n\
-                 tty.setraw(0)\n\
-                 buf = b''\n\
-                 while True:\n\
-                 \tchunk = os.read(0, 65536)\n\
-                 \tif not chunk:\n\
-                 \t\tbreak\n\
-                 \tbuf += chunk\n\
-                 \tif b'\\r' in buf:\n\
-                 \t\tbreak\n\
-                 open({received:?}, 'wb').write(buf.split(b'\\r')[0])\n\
-                 open({argv_out:?}, 'w').write('\\n'.join(sys.argv))\n"
-            ),
-        )
-        .unwrap();
-
-        let status = Command::new("python3")
+        let harness = dir.path().join("terminal-tests.py");
+        std::fs::write(&harness, include_str!("feed_prompt_tests.py")).unwrap();
+        let output = Command::new("python3")
+            .arg(&harness)
             .arg(&script)
-            .arg(&prompt_path)
-            .arg("python3")
-            .arg(&fake_cli)
-            .env("BOSS_FEED_PROMPT_READY_SECS", "5")
-            .current_dir(dir.path())
+            .arg(dir.path())
             .output()
-            .expect("run feeder");
+            .expect("run feeder terminal tests");
         assert!(
-            status.status.success(),
-            "feeder failed: status={} stdout={} stderr={}",
-            status.status,
-            String::from_utf8_lossy(&status.stdout),
-            String::from_utf8_lossy(&status.stderr),
+            output.status.success(),
+            "terminal tests failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         );
-
-        let got = std::fs::read(&received).unwrap_or_default();
-        assert_eq!(
-            got,
-            prompt.as_bytes(),
-            "CLI must receive the full prompt body (got {} bytes, expected {})",
-            got.len(),
-            prompt.len(),
-        );
-        let argv = std::fs::read_to_string(&argv_out).unwrap_or_default();
-        assert!(
-            !argv.contains("ARGMAX_FEED_MARKER"),
-            "prompt body must not appear on the CLI argv: {argv}"
-        );
-        assert!(argv.len() < 4096, "CLI argv must stay tiny, got {} bytes", argv.len());
     }
 }

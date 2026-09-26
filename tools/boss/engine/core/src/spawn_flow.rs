@@ -488,6 +488,10 @@ pub struct StartWorkerInput {
     pub control_token_path: Option<PathBuf>,
     pub boss_event_path: PathBuf,
     pub initial_input: String,
+    /// Size of the assembled command stored behind `initial_input`'s file
+    /// indirection, including driver environment directives.
+    #[builder(default)]
+    pub launch_command_bytes: usize,
     /// Extra env vars to thread to the worker on top of the ones the
     /// worker settings template injects (`BOSS_EVENTS_SOCKET`,
     /// `BOSS_SOCKET_PATH`, `BOSS_ENGINE_CONTROL_TOKEN_PATH`,
@@ -872,6 +876,18 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         );
     }
 
+    let added_environment_bytes: usize = env
+        .iter()
+        .map(|entry| entry.key.len() + entry.value.len() + 2 + std::mem::size_of::<usize>())
+        .sum();
+    crate::launch_limits::check(
+        input.launch_command_bytes.max(input.initial_input.len()),
+        crate::launch_limits::environment_bytes().saturating_add(added_environment_bytes),
+        crate::launch_limits::local_arg_max().map_err(StartWorkerError::Tmux)?,
+        input.driver.descriptor().name,
+    )
+    .map_err(StartWorkerError::Tmux)?;
+
     let slot_id = input.slot_id;
     let tmux_host = &input.tmux_host;
     let tmux_socket_path = tmux_host
@@ -1065,6 +1081,7 @@ mod tests {
             control_token_path: Some(PathBuf::from("/tmp/engine-control.token")),
             boss_event_path: PathBuf::from("/tmp/boss-event"),
             initial_input: "claude\n".into(),
+            launch_command_bytes: 0,
             extra_env: vec![],
             title_summary: None,
             task_title: None,

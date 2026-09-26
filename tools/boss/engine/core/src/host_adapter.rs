@@ -1143,6 +1143,7 @@ impl HostAdapter for SshHostAdapter {
             .build();
 
         let engine_socket = self.events_socket_path.display().to_string();
+        crate::ssh_spawn::check_remote_launch_limits(&self.transport, &plan).await?;
         let outcome = perform_remote_launch(&self.transport, &plan, &engine_socket).await?;
 
         if !outcome.launched {
