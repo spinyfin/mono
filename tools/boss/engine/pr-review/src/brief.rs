@@ -1,17 +1,12 @@
 //! Work-item brief + design-doc section packet for PR review.
 //!
-//! Reviewers previously received only the producing task's title and
-//! description. That was not enough to catch a PR that silently substituted
-//! a brief-named deliverable (the review-guide "revision-aware broker"
-//! incident: the brief required a broker; the PR inlined every source file
-//! instead; six reviews missed it).
-//!
 //! This module is the typed review-input packet and the pure helpers that
 //! locate a design-doc section and classify brief-named deliverables against
 //! a diff and declared deferred-scope proposals. The engine assembles a
 //! packet at spawn time (live GitHub fetch of the design doc; no mirrored
 //! copy) and the prompt renderers embed it.
 
+#[cfg(test)]
 use crate::types::{
     ReviewFinding, ReviewFindingCategory, ReviewFindingConfidence, ReviewFindingSeverity, ReviewResult,
 };
@@ -175,41 +170,14 @@ fn whole_doc(doc: &str, path: &str) -> DesignDocSection {
     }
 }
 
-struct Heading {
-    level: usize,
-    title: String,
-    start: usize,
-}
+// Heading tokenization (fence-aware, CommonMark ATX rules) is shared with
+// `boss-pr-template`'s required-heading extraction — see
+// `boss_pr_template::parse_all_headings` — so a fix to fence or indentation
+// handling never has to be made in two parsers that can drift.
+use boss_pr_template::{HeadingToken, parse_all_headings};
 
-fn parse_headings(doc: &str) -> Vec<Heading> {
-    let mut headings = Vec::new();
-    let mut offset = 0;
-    for line in doc.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\n', '\r']).trim();
-        if let Some((level, title)) = parse_heading_line(trimmed) {
-            headings.push(Heading {
-                level,
-                title,
-                start: offset,
-            });
-        }
-        offset += line.len();
-    }
-    headings
-}
-
-fn parse_heading_line(trimmed: &str) -> Option<(usize, String)> {
-    let rest = trimmed.strip_prefix('#')?;
-    let extra = rest.bytes().take_while(|&b| b == b'#').count();
-    let level = extra + 1;
-    if !(1..=6).contains(&level) {
-        return None;
-    }
-    let title = rest[extra..].trim();
-    if title.is_empty() {
-        return None;
-    }
-    Some((level, title.to_owned()))
+fn parse_headings(doc: &str) -> Vec<HeadingToken> {
+    parse_all_headings(doc)
 }
 
 fn normalize_text(s: &str) -> String {
@@ -228,8 +196,17 @@ fn normalize_text(s: &str) -> String {
 }
 
 /// How a brief-named deliverable landed in the PR.
+///
+/// Production classification of a deliverable is done by the reviewer LLM
+/// against [`render_brief_conformance_rubric`]'s procedure, not by this
+/// enum or the functions below — nothing in the engine calls them. They
+/// exist to pin down the severity-gate contract the rubric promises
+/// (`deferred_scope`/`high` forces a revision) with a fixture the rubric's
+/// wording can be checked against; keep them test-only (`#[cfg(test)]`)
+/// rather than a public production API nothing calls.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeliverableDisposition {
+enum DeliverableDisposition {
     Delivered,
     DeclaredDeferred,
     MissingOrSubstituted,
@@ -242,7 +219,8 @@ pub enum DeliverableDisposition {
 /// string contains the other (non-empty). Delivery is evidenced only by the
 /// diff (or a backtick-quoted identifier from the deliverable appearing in
 /// the diff) — never by the PR body.
-pub fn classify_deliverable(deliverable: &str, diff: &str, deferred_summaries: &[String]) -> DeliverableDisposition {
+#[cfg(test)]
+fn classify_deliverable(deliverable: &str, diff: &str, deferred_summaries: &[String]) -> DeliverableDisposition {
     let needle = normalize_text(deliverable);
     if needle.is_empty() {
         return DeliverableDisposition::Delivered;
@@ -264,6 +242,7 @@ pub fn classify_deliverable(deliverable: &str, diff: &str, deferred_summaries: &
     DeliverableDisposition::MissingOrSubstituted
 }
 
+#[cfg(test)]
 fn backtick_idents(text: &str) -> Vec<String> {
     let mut idents = Vec::new();
     let mut rest = text;
@@ -287,7 +266,8 @@ fn backtick_idents(text: &str) -> Vec<String> {
 /// deferred-scope declaration covers. Each finding is `deferred_scope` at
 /// `high` severity, which [`crate::passes_severity_gate`] treats as a
 /// revision-forcing result — the same class as a correctness bug.
-pub fn missing_deliverable_findings(
+#[cfg(test)]
+fn missing_deliverable_findings(
     deliverables: &[String],
     diff: &str,
     deferred_summaries: &[String],
@@ -319,7 +299,8 @@ pub fn missing_deliverable_findings(
 }
 
 /// True when [`missing_deliverable_findings`] would force a revision.
-pub fn missing_deliverables_are_blocking(findings: &[ReviewFinding]) -> bool {
+#[cfg(test)]
+fn missing_deliverables_are_blocking(findings: &[ReviewFinding]) -> bool {
     if findings.is_empty() {
         return false;
     }
@@ -457,7 +438,15 @@ pub fn render_brief_conformance_rubric() -> String {
           proposal or audit line in **Declared deferred scope** covers it, \
           or the PR body explicitly states the deferral AND a matching \
           engine-recorded declaration exists. PR-body claims alone do not \
-          count.\n\
+          count — **except** the same manual/interactive-verification \
+          carve-out as the Deferred-scope hygiene check below: a deliverable \
+          that is itself manual, interactive, or display-requiring \
+          verification a headless worker cannot perform (live GUI runs, \
+          screenshot-based checks, physical-device tests) needs no \
+          engine-recorded marker; a plain prose note is enough. That carve-out \
+          is narrow — infeasibility for a headless agent, not the word \
+          \"testing\" in general — and applies only to the deliverable being \
+          deferred, never to the deliverable being silently dropped.\n\
         - **missing / silently substituted** — the diff does not deliver it, \
           and no declared deferral covers it. Replacing the asked-for \
           approach with a different one without saying so (e.g. inlining \
@@ -593,6 +582,39 @@ diff --git a/tools/boss/engine/review-guide/src/lib.rs b/tools/boss/engine/revie
         assert_eq!(section.path, "docs/designs/guides.md");
     }
 
+    /// A `#`-prefixed line inside a fenced code block (a Rust `#[derive]`
+    /// attribute, or a shell `#` comment) must never be mistaken for a
+    /// markdown heading — the shared `boss_pr_template::parse_all_headings`
+    /// tokenizer tracks fences, so the matched section runs all the way to
+    /// the next REAL heading instead of being cut short at the fake one.
+    #[test]
+    fn locate_design_section_ignores_pseudo_headings_inside_fences() {
+        let doc = "# Design\n\n\
+                   ## Run durable Astra-high guide jobs\n\n\
+                   A revision-aware broker fetches callers.\n\n\
+                   ```rust\n\
+                   #[derive(Debug)]\n\
+                   pub struct Broker;\n\
+                   ```\n\n\
+                   More prose after the fence.\n\n\
+                   ```sh\n\
+                   # shell comment, not a heading\n\
+                   echo hi\n\
+                   ```\n\n\
+                   Still inside the same section.\n\n\
+                   ## Follow-up chores\n\nLater.\n";
+        let section = locate_design_section(doc, "Run durable Astra-high guide jobs", "docs/designs/guides.md");
+        assert_eq!(section.heading.as_deref(), Some("Run durable Astra-high guide jobs"));
+        assert!(section.body.contains("#[derive(Debug)]"));
+        assert!(section.body.contains("# shell comment, not a heading"));
+        assert!(section.body.contains("Still inside the same section."));
+        assert!(
+            !section.body.contains("Follow-up chores"),
+            "the real next heading must still end the section: {}",
+            section.body
+        );
+    }
+
     #[test]
     fn locate_design_section_falls_back_to_whole_doc_when_unmatched() {
         let doc = "# Design\n\n## Goals\n\nShip it.\n";
@@ -672,5 +694,16 @@ diff --git a/tools/boss/engine/review-guide/src/lib.rs b/tools/boss/engine/revie
         assert!(rubric.contains("Do **not** trust the PR body"));
         assert!(rubric.contains("category: \"deferred_scope\""));
         assert!(rubric.contains("revision-aware broker"));
+    }
+
+    #[test]
+    fn brief_conformance_rubric_carries_the_manual_verification_carve_out() {
+        let rubric = render_brief_conformance_rubric();
+        assert!(
+            rubric.contains("manual/interactive-verification"),
+            "rubric must reference the manual/interactive-verification carve-out so it does not \
+             contradict the Deferred-scope hygiene rubric's exception: {rubric}"
+        );
+        assert!(rubric.contains("headless worker cannot perform"));
     }
 }

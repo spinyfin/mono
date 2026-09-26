@@ -918,7 +918,6 @@ pub(crate) async fn compose_worker_spawn(
             };
             let reviewer_repo_slug = crate::completion::parse_repo_slug(&execution.repo_remote_url)
                 .unwrap_or_else(|_| "<owner/repo>".to_owned());
-            let review_brief = super::review_brief::assemble_review_brief_packet(work_db, work_item, execution).await;
             // A member row existing is the same signal `finalize_pr_review_pass`
             // uses to take the batch branch unconditionally (it never falls
             // back to reading the legacy artifact once a member row exists).
@@ -930,21 +929,9 @@ pub(crate) async fn compose_worker_spawn(
             // review the worker actually completed. Fail the dispatch instead
             // so the execution surfaces as a real failure rather than a
             // reviewer that appears to succeed but whose report vanishes.
-            let report_destination = match work_db.review_batch_member_for_execution(&execution.id) {
+            let member_and_batch = match work_db.review_batch_member_for_execution(&execution.id) {
                 Ok(Some(member)) => match work_db.review_batch(&member.batch_id) {
-                    Ok(Some(batch)) => Some((
-                        member.role,
-                        crate::pr_review::ReviewerReportDestination::builder()
-                            .batch_id(batch.id)
-                            .pr_url(batch.pr_url)
-                            .target_sha(batch.target_sha)
-                            .phase(batch.phase)
-                            .body_path(crate::structured_output::default_path_string(
-                                &execution.id,
-                                StructuredOutputKind::ReviewResult,
-                            ))
-                            .build(),
-                    )),
+                    Ok(Some(batch)) => Some((member, batch)),
                     Ok(None) => {
                         anyhow::bail!(
                             "pr_review execution {} has review-batch member for batch {} but the batch row is \
@@ -969,6 +956,51 @@ pub(crate) async fn compose_worker_spawn(
                         execution.id,
                     ));
                 }
+            };
+            // The batch's cycle root (`execution.work_item_id` in the batch
+            // path) is a revision's producing item collapsed for review-cycle
+            // accounting — see `pr_transition::review_batch_input_from_metadata`.
+            // Resolve the packet from the actual producing item (persisted as
+            // `producing_work_item_id`) so a revision's review still sees the
+            // revision ask and its own deferred-scope declarations, not just
+            // the chain-root brief the root's own work item carries.
+            let brief_work_item_id = member_and_batch
+                .as_ref()
+                .and_then(|(_, batch)| batch.producing_work_item_id.clone());
+            let brief_work_item_owned = match brief_work_item_id {
+                Some(ref id) if id != &execution.work_item_id => match work_db.get_work_item(id) {
+                    Ok(item) => Some(item),
+                    Err(err) => {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            producing_work_item_id = %id,
+                            error = %err,
+                            "pr_review: failed to load producing work item for revision brief; \
+                             falling back to the batch's cycle-root work item",
+                        );
+                        None
+                    }
+                },
+                _ => None,
+            };
+            let brief_work_item = brief_work_item_owned.as_ref().unwrap_or(work_item);
+            let review_brief =
+                super::review_brief::assemble_review_brief_packet(work_db, brief_work_item, execution).await;
+            let report_destination = match member_and_batch {
+                Some((member, batch)) => Some((
+                    member.role,
+                    crate::pr_review::ReviewerReportDestination::builder()
+                        .batch_id(batch.id)
+                        .pr_url(batch.pr_url)
+                        .target_sha(batch.target_sha)
+                        .phase(batch.phase)
+                        .body_path(crate::structured_output::default_path_string(
+                            &execution.id,
+                            StructuredOutputKind::ReviewResult,
+                        ))
+                        .build(),
+                )),
+                None => None,
             };
             match report_destination.as_ref() {
                 Some((ReviewBatchMemberRole::Supervisor, destination)) => {
@@ -1852,6 +1884,148 @@ mod compose_worker_spawn_tests {
             "reviewer prompt must require the brief-conformance check:\n{}",
             composed.prompt_text,
         );
+    }
+
+    fn batch_classification() -> boss_protocol::ReviewClassification {
+        boss_protocol::ReviewClassification::builder()
+            .changed_files(vec!["tools/boss/engine/pr-review/src/brief.rs".to_owned()])
+            .complexity_flags(vec![])
+            .has_production_code(true)
+            .metadata_missing(vec![])
+            .production_languages(vec![boss_protocol::ReviewLanguageBucket::Rust])
+            .profile(boss_protocol::ReviewProfile::Light)
+            .subsystem_buckets(vec!["tools/boss/engine".to_owned()])
+            .additions(12)
+            .deletions(3)
+            .build()
+    }
+
+    /// The normal pre-merge batch path creates reviewer executions on the
+    /// batch's `cycle_root_id` (the chain root a revision's review-cycle
+    /// accounting collapses to — see `pr_transition::review_batch_input_from_metadata`),
+    /// not on the revision itself. Before `producing_work_item_id` was
+    /// persisted and consulted here, `compose_worker_spawn` had no way back
+    /// to the revision: the rendered prompt carried only the chain root's
+    /// own description, never the revision ask or the revision's own
+    /// deferred-scope declarations. This is the fix's regression test: a
+    /// batch created from a completed revision must still render both.
+    #[tokio::test]
+    async fn batch_reviewer_prompt_for_a_revision_includes_revision_ask_and_chain_root_brief() {
+        use crate::test_support::{create_test_product, insert_host_capability};
+        use crate::work::{FakePrStateChecker, PrOpenState};
+        use boss_protocol::{CreateChoreInput, CreateRevisionInput, ReviewBatchPhase, WorkItemPatch};
+
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        insert_host_capability(&db, "local", "driver=claude", "auto");
+        let product = create_test_product(&db);
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Run durable Astra-high guide jobs")
+                    .description("Implement a revision-aware broker.")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        let pr_url = "https://github.com/spinyfin/mono/pull/3010";
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(pr_url.into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let revision = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(chore.id.clone())
+                    .description("Restore the broker the first pass inlined away.")
+                    .build(),
+                &FakePrStateChecker::always(PrOpenState::Open),
+            )
+            .unwrap();
+
+        let input = crate::work::ReviewBatchCreateInput::builder()
+            .cycle_root_id(chore.id.clone())
+            .base_sha("base-sha")
+            .classification(batch_classification())
+            .phase(ReviewBatchPhase::PreMerge)
+            .pr_number(3010)
+            .pr_url(pr_url)
+            .target_sha("target-sha")
+            .legacy_task_id(revision.id.clone())
+            .build();
+        let dispatch = db
+            .create_pre_merge_review_batch(input, "git@github.com:spinyfin/mono.git")
+            .unwrap();
+        let executions = match dispatch {
+            crate::work::ReviewBatchDispatch::Created { executions, .. } => executions,
+            other => panic!("expected a freshly created batch, got {other:?}"),
+        };
+        let leaf_execution = &executions[0];
+        assert_eq!(
+            leaf_execution.work_item_id, chore.id,
+            "leaf executions run on the cycle root"
+        );
+
+        let root_work_item = db.get_work_item(&chore.id).unwrap();
+        let composed = compose_worker_spawn(
+            &db,
+            "review-1",
+            leaf_execution,
+            &root_work_item,
+            workspace.path(),
+            None,
+            WorkerSpawnOpts::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            composed
+                .prompt_text
+                .contains("Restore the broker the first pass inlined away."),
+            "batch leaf reviewer prompt must include the revision ask, not just the chain root's \
+             own description:\n{}",
+            composed.prompt_text,
+        );
+        assert!(
+            composed.prompt_text.contains("Implement a revision-aware broker."),
+            "batch leaf reviewer prompt must still include the chain-root brief:\n{}",
+            composed.prompt_text,
+        );
+        assert!(composed.prompt_text.contains("Revision ask"));
+        assert!(composed.prompt_text.contains("Chain-root brief"));
+
+        // The other two leaves, and the consolidating supervisor once it is
+        // dispatched, are members of the same batch and go through the exact
+        // same `member_and_batch` → `producing_work_item_id` resolution in
+        // `compose_worker_spawn` before rendering diverges by role — so
+        // covering one leaf here covers the resolution fix for all of them.
+        for other_leaf in &executions[1..] {
+            let composed_other = compose_worker_spawn(
+                &db,
+                "review-1",
+                other_leaf,
+                &root_work_item,
+                workspace.path(),
+                None,
+                WorkerSpawnOpts::default(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                composed_other
+                    .prompt_text
+                    .contains("Restore the broker the first pass inlined away."),
+                "every leaf in the batch must resolve the same revision brief:\n{}",
+                composed_other.prompt_text,
+            );
+        }
     }
 
     /// A non-`pr_review` execution kind (e.g. `ChoreImplementation`) must not

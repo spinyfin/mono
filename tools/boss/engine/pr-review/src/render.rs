@@ -894,8 +894,9 @@ pub(crate) fn render_rubric_section(scope: &ReviewScope) -> String {
                finding, not an advisory suggestion.\n\
              - **Deferred-scope hygiene** *(first-class, explicit check)* — \
                compare the PR's delivered changes against the owning work \
-               item's brief (given above in **Task description**) and check \
-               for three distinct failure modes:\n\
+               item's brief (given above in **Task description** for an \
+               ordinary item, or **Chain-root brief** + **Revision ask** for \
+               a revision) and check for three distinct failure modes:\n\
                (1) **Undeclared deferral** — the brief asked for scope that \
                the diff does not deliver, and no `[deferred-scope] \
                summary=\"...\" reason=\"...\"` marker (recorded by the \

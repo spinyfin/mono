@@ -178,71 +178,113 @@ fn load_file(path: &Path, workspace_root: &Path) -> Option<PrTemplate> {
 // Heading parser
 // ---------------------------------------------------------------------------
 
-/// Extract H2 (`##`) and H3 (`###`) heading titles from markdown, skipping
+/// One fence-aware, CommonMark-ATX-conformant markdown heading: its level
+/// (1-6), title text, and the byte offset of the start of its line in the
+/// source document.
+///
+/// This is the single heading tokenizer shared by this crate's
+/// required-heading extraction (H2/H3 only) and `boss-pr-review`'s
+/// design-doc section locator (any level, plus the offset needed to slice
+/// out a section body). Keeping one tokenizer means a heading-detection fix
+/// — like the fence and indentation rules below — never has to be made
+/// twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadingToken {
+    pub level: usize,
+    pub title: String,
+    pub start: usize,
+}
+
+/// Extract every ATX heading (`#` through `######`) from markdown, skipping
 /// content inside fenced code blocks (``` or ~~~).
-fn parse_required_headings(text: &str) -> Vec<String> {
+///
+/// Follows CommonMark's ATX heading rule: the line may be indented by at
+/// most three spaces, and the hash run must be followed by a space/tab or
+/// the end of the line — `#[derive(Debug)]` and `# shell comment` are not
+/// headings, fenced or not, and a 4-space indent is treated as part of an
+/// indented code block rather than a heading candidate.
+pub fn parse_all_headings(text: &str) -> Vec<HeadingToken> {
     let mut headings = Vec::new();
     let mut in_fence = false;
     let mut fence_char = '`';
     let mut fence_min_len = 3usize;
+    let mut offset = 0usize;
 
-    for line in text.lines() {
-        let stripped = line.trim_start();
+    for line in text.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\n', '\r']);
+        let start = offset;
+        offset += line.len();
+
+        let leading_spaces = content.chars().take_while(|&c| c == ' ').count();
+        let unindented = &content[leading_spaces.min(content.len())..];
 
         if in_fence {
             // Closing fence: same character, at least as many as the opener,
             // with nothing else on the line (trailing spaces are fine).
-            let n = stripped.chars().take_while(|&c| c == fence_char).count();
-            if n >= fence_min_len && stripped[n..].trim().is_empty() {
+            let n = unindented.chars().take_while(|&c| c == fence_char).count();
+            if n >= fence_min_len && unindented[n..].trim().is_empty() {
                 in_fence = false;
             }
             continue;
         }
 
+        // Up to three leading spaces is still an ATX candidate per
+        // CommonMark; four or more is an indented code block, so neither a
+        // fence opener nor a heading can start there.
+        if leading_spaces > 3 {
+            continue;
+        }
+
         // Opening fence: at least three ``` or ~~~ characters.
-        if stripped.starts_with("```") || stripped.starts_with("~~~") {
-            fence_char = stripped.chars().next().unwrap();
-            fence_min_len = stripped.chars().take_while(|&c| c == fence_char).count().max(3);
+        if unindented.starts_with("```") || unindented.starts_with("~~~") {
+            fence_char = unindented.chars().next().unwrap();
+            fence_min_len = unindented.chars().take_while(|&c| c == fence_char).count().max(3);
             in_fence = true;
             continue;
         }
 
-        if let Some(title) = extract_h2_or_h3_title(stripped) {
-            headings.push(title);
+        if let Some((level, title)) = parse_atx_heading(unindented) {
+            headings.push(HeadingToken { level, title, start });
         }
     }
 
     headings
 }
 
-/// Return the title of an H2 (`##`) or H3 (`###`) ATX heading, or `None`.
+/// Return `(level, title)` for an ATX heading line, or `None`.
 ///
-/// The caller is responsible for passing a line with leading whitespace
-/// already stripped.  The `#` count must be exactly 2 or 3; deeper headings
-/// (H4+) are not included in the required-headings set per the design's
-/// "v1 only enforces H2/H3" rule.
-fn extract_h2_or_h3_title(line: &str) -> Option<String> {
-    if !line.starts_with("##") {
-        return None;
-    }
+/// The caller passes a line with any indentation already stripped. Requires
+/// a space/tab after the hash run, or end of line (a bare `#` heading with
+/// no title is not a required section and is skipped).
+fn parse_atx_heading(line: &str) -> Option<(usize, String)> {
     let hash_count = line.chars().take_while(|&c| c == '#').count();
-    if !(2..=3).contains(&hash_count) {
+    if !(1..=6).contains(&hash_count) {
         return None;
     }
     let rest = &line[hash_count..];
     let title = if rest.is_empty() {
         ""
-    } else if let Some(t) = rest.strip_prefix(' ') {
-        t.trim()
+    } else if rest.starts_with(' ') || rest.starts_with('\t') {
+        rest.trim()
     } else {
-        // Not a valid ATX heading (no space after hashes).
+        // Not a valid ATX heading (no space/tab after the hashes).
         return None;
     };
-    // Skip empty headings — a `##` with no title is not a required section.
     if title.is_empty() {
         return None;
     }
-    Some(title.to_owned())
+    Some((hash_count, title.to_owned()))
+}
+
+/// Extract H2 (`##`) and H3 (`###`) heading titles from markdown, skipping
+/// content inside fenced code blocks (``` or ~~~). Deeper headings (H4+) are
+/// not included per the design's "v1 only enforces H2/H3" rule.
+fn parse_required_headings(text: &str) -> Vec<String> {
+    parse_all_headings(text)
+        .into_iter()
+        .filter(|h| (2..=3).contains(&h.level))
+        .map(|h| h.title)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +345,60 @@ mod tests {
         // `##NoSpace` is not a valid ATX heading.
         let text = "##NoSpace\n## Valid\n";
         assert_eq!(parse_required_headings(text), vec!["Valid"]);
+    }
+
+    #[test]
+    fn parse_all_headings_covers_every_level_with_offsets() {
+        let text = "# One\n\n## Two\n\n###### Six\n";
+        let headings = parse_all_headings(text);
+        assert_eq!(
+            headings,
+            vec![
+                HeadingToken {
+                    level: 1,
+                    title: "One".to_owned(),
+                    start: 0
+                },
+                HeadingToken {
+                    level: 2,
+                    title: "Two".to_owned(),
+                    start: 7
+                },
+                HeadingToken {
+                    level: 6,
+                    title: "Six".to_owned(),
+                    start: 15
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pseudo_headings_inside_fences_are_not_headings() {
+        // A Rust `#[derive]` attribute and a shell `#` comment must never be
+        // mistaken for markdown headings when they appear inside a fence.
+        let text = "## Before\n\n```rust\n#[derive(Debug)]\npub struct Broker;\n```\n\n```sh\n# shell comment\necho hi\n```\n\n## After\n";
+        let headings: Vec<String> = parse_all_headings(text).into_iter().map(|h| h.title).collect();
+        assert_eq!(headings, vec!["Before", "After"]);
+    }
+
+    #[test]
+    fn four_space_indented_line_is_not_a_heading_or_fence_opener() {
+        // CommonMark: 4+ spaces of indentation makes a line part of an
+        // indented code block, not an ATX heading or fence opener.
+        let text = "## Real\n\n    ## Not a heading (indented code)\n\n## Also real\n";
+        let headings: Vec<String> = parse_all_headings(text).into_iter().map(|h| h.title).collect();
+        assert_eq!(headings, vec!["Real", "Also real"]);
+    }
+
+    #[test]
+    fn hash_without_space_or_eol_is_never_a_heading() {
+        // `#[derive(Debug)]` and `# comment` outside a fence must also not
+        // count — the space/tab-or-eol rule applies everywhere, not just
+        // inside fences.
+        let text = "#[derive(Debug)]\n## Real\n";
+        let headings: Vec<String> = parse_all_headings(text).into_iter().map(|h| h.title).collect();
+        assert_eq!(headings, vec!["Real"]);
     }
 
     #[test]

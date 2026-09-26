@@ -63,16 +63,48 @@ where
     let mut work_item_brief = nonempty_desc(&task.description);
     let mut revision_ask = None;
     let mut deferred_ids = vec![task.id.clone()];
+    // For a revision, design-doc lookup keys off the chain root's name (the
+    // heading it was originally named after), not the revision's own name —
+    // see the "revision packets look up the design section by the
+    // revision's name" fix below. `task.name` is still used for display.
+    let mut design_lookup_name = task.name.clone();
 
     if is_revision {
         revision_ask = nonempty_desc(&task.description);
         let root_id = work_db.review_cycle_root_id(&task.id);
-        if root_id != task.id {
-            deferred_ids.push(root_id.clone());
+        if root_id == task.id {
+            // `review_cycle_root_id` deliberately returns the input id when
+            // the chain root cannot be resolved (broken/missing parent
+            // pointer). Treat that the same as any other failed lookup —
+            // the chain-root brief is unresolved, not "this revision has no
+            // parent" (a revision always has one at creation time).
+            work_item_brief = None;
+        } else {
+            // Collect every revision belonging to this chain root (siblings
+            // included — `create_revision` parents new revisions directly to
+            // the chain root, so a chain is flat, not nested), so a
+            // deferred-scope declaration attached to an earlier revision of
+            // this same PR (root -> rev1, root -> rev2) is still seen when a
+            // later revision is reviewed, not just the current one's own.
+            match work_db
+                .connect()
+                .and_then(|conn| crate::work::collect_chain_revision_ids(&conn, &root_id))
+            {
+                Ok(revision_ids) => deferred_ids.extend(revision_ids),
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        root_id,
+                        error = %err,
+                        "pr_review: failed to collect sibling revisions for deferred-scope declarations",
+                    );
+                }
+            }
             match work_db.get_work_item(&root_id) {
                 Ok(root_item) => {
                     if let Some(root) = work_item_task(&root_item) {
                         work_item_brief = nonempty_desc(&root.description);
+                        design_lookup_name = root.name.clone();
                     } else {
                         work_item_brief = None;
                     }
@@ -118,8 +150,16 @@ where
 
     let mut design_section = None;
     if let Some(project_id) = task.project_id.as_deref() {
-        match attach_design_section(work_db, project_id, &task.name, &fetch).await {
-            DesignAttach::Section(section) => design_section = Some(section),
+        match attach_design_section(work_db, project_id, &design_lookup_name, &fetch).await {
+            DesignAttach::Section {
+                section,
+                truncated_reason,
+            } => {
+                design_section = Some(section);
+                if let Some(reason) = truncated_reason {
+                    unresolved.push(UnresolvedReviewInput::DesignSection { reason });
+                }
+            }
             DesignAttach::NoneExpected => {}
             DesignAttach::Unresolved(reason) => {
                 unresolved.push(UnresolvedReviewInput::DesignSection { reason });
@@ -138,7 +178,15 @@ where
 }
 
 enum DesignAttach {
-    Section(DesignDocSection),
+    Section {
+        section: DesignDocSection,
+        /// Set when the fetched section (or whole-doc fallback) had to be
+        /// cut down to [`MAX_SECTION_CHARS`]. This is loud input loss, not a
+        /// resolved input: the reviewer must raise a finding for it, since
+        /// deliverables named past the cutoff (often at the end of a design
+        /// doc) would otherwise silently drop out of the conformance check.
+        truncated_reason: Option<String>,
+    },
     NoneExpected,
     Unresolved(String),
 }
@@ -171,8 +219,24 @@ where
             {
                 DocFetchOutcome::Content(text) => {
                     let mut section = locate_design_section(&text, task_name, &resolved.path);
+                    let original_len = section.body.chars().count();
                     section.body = cap_section_body(section.body);
-                    DesignAttach::Section(section)
+                    let truncated_reason = (original_len > MAX_SECTION_CHARS).then(|| {
+                        format!(
+                            "design doc section (heading {heading:?}) fetched from `{path}` at ref `{git_ref}` in \
+                             `{repo}` is {original_len} chars, truncated to {MAX_SECTION_CHARS}; fetch `{path}` at \
+                             ref `{git_ref}` in `{repo}` directly to read the rest — the workspace checkout may be \
+                             on a different repo, branch, or revision than what was fetched here",
+                            heading = section.heading,
+                            path = resolved.path,
+                            git_ref = resolved.branch,
+                            repo = resolved.repo_remote_url,
+                        )
+                    });
+                    DesignAttach::Section {
+                        section,
+                        truncated_reason,
+                    }
                 }
                 DocFetchOutcome::DocMissing => DesignAttach::Unresolved(format!(
                     "design doc `{}` at ref `{}` in `{}` returned 404",
@@ -195,8 +259,8 @@ fn cap_section_body(body: String) -> String {
     }
     let truncated: String = body.chars().take(MAX_SECTION_CHARS).collect();
     format!(
-        "{truncated}\n\n…(truncated at {MAX_SECTION_CHARS} characters; read the file at the \
-         path above from the workspace if you need the rest)"
+        "{truncated}\n\n…(truncated at {MAX_SECTION_CHARS} characters; see the Unresolved review \
+         inputs section for where to fetch the rest)"
     )
 }
 
@@ -469,6 +533,281 @@ mod tests {
                 .iter()
                 .any(|u| matches!(u, UnresolvedReviewInput::DesignSection { .. })),
             "fetch failure must be unresolved: {:?}",
+            packet.unresolved
+        );
+    }
+
+    /// `review_cycle_root_id` deliberately returns the input id when the
+    /// chain root cannot be resolved (a broken/missing parent pointer).
+    /// Before this fix, that made the packet quietly treat the revision's
+    /// own description as both the revision ask AND the chain-root brief,
+    /// with nothing recorded as unresolved. It must instead surface as an
+    /// unresolved brief, same as any other failed lookup.
+    #[tokio::test]
+    async fn broken_revision_ancestry_is_unresolved_not_a_silent_skip() {
+        let (_dir, db) = open_db();
+        insert_host(&db);
+        let product = create_test_product(&db);
+        let chore = db
+            .create_chore(
+                boss_protocol::CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Run durable Astra-high guide jobs")
+                    .description("Implement a revision-aware broker.")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some("https://github.com/spinyfin/mono/pull/2969".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let revision = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(chore.id.clone())
+                    .description("Restore the broker the first pass inlined away.")
+                    .build(),
+                &FakePrStateChecker::always(PrOpenState::Open),
+            )
+            .unwrap();
+        // Simulate a broken parent pointer: hard-delete the chain root row so
+        // `review_cycle_root_id`'s walk cannot resolve past the revision
+        // itself (mirroring `chain_root`'s "candidate not found" case).
+        db.connect()
+            .unwrap()
+            .execute("DELETE FROM tasks WHERE id = ?1", rusqlite::params![chore.id])
+            .unwrap();
+
+        let item = db.get_work_item(&revision.id).unwrap();
+        let packet = assemble_with_doc_fetch(&db, &item, &execution_for(&revision.id), canned_missing).await;
+        assert_eq!(
+            packet.revision_ask.as_deref(),
+            Some("Restore the broker the first pass inlined away.")
+        );
+        assert!(
+            packet.work_item_brief.is_none(),
+            "unresolvable ancestry must not silently reuse the revision's own description as the \
+             chain-root brief: {:?}",
+            packet.work_item_brief
+        );
+        assert!(
+            packet.unresolved.iter().any(|u| matches!(
+                u,
+                UnresolvedReviewInput::Brief { reason } if reason.contains("chain-root brief could not be loaded")
+            )),
+            "broken ancestry must be a loud unresolved finding, not a silent skip: {:?}",
+            packet.unresolved
+        );
+    }
+
+    /// A deferred-scope declaration attached to an earlier revision of the
+    /// same chain (chain root -> rev1, chain root -> rev2 — `create_revision`
+    /// parents every revision directly to the chain root) must still be
+    /// collected when rev2 is reviewed, not just the root's own declarations
+    /// — otherwise rev2's reviewer sees an already-declared deferral as a
+    /// fresh, spurious missing-deliverable finding.
+    #[tokio::test]
+    async fn deferred_scope_on_an_intermediate_revision_is_collected_for_a_later_revision() {
+        let (_dir, db) = open_db();
+        insert_host(&db);
+        let product = create_test_product(&db);
+        let chore = db
+            .create_chore(
+                boss_protocol::CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Importer")
+                    .description("Implement the widget importer.")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some("https://github.com/spinyfin/mono/pull/3011".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let rev1 = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(chore.id.clone())
+                    .description(
+                        "Fix the importer's retry logic.\n\n\
+                         [deferred-scope] summary=\"revision-aware broker\" reason=\"needs a pipeline\"",
+                    )
+                    .build(),
+                &FakePrStateChecker::always(PrOpenState::Open),
+            )
+            .unwrap();
+        db.update_work_item(
+            &rev1.id,
+            WorkItemPatch {
+                status: Some("done".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let rev2 = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(chore.id.clone())
+                    .description("Address the second round of review findings.")
+                    .build(),
+                &FakePrStateChecker::always(PrOpenState::Open),
+            )
+            .unwrap();
+
+        let item = db.get_work_item(&rev2.id).unwrap();
+        let packet = assemble_with_doc_fetch(&db, &item, &execution_for(&rev2.id), canned_missing).await;
+        assert!(
+            packet
+                .deferred_scope_declarations
+                .iter()
+                .any(|d| d.contains("revision-aware broker")),
+            "rev2's packet must still see rev1's deferred-scope declaration: {:?}",
+            packet.deferred_scope_declarations
+        );
+    }
+
+    /// For a revision, the design-doc section must be located by the chain
+    /// root's name (the heading it was originally named after), not the
+    /// revision's own name — the revision's description-derived name never
+    /// matches a design-doc heading, so keying off it always falls back to
+    /// the whole document.
+    #[tokio::test]
+    async fn revision_design_section_is_located_by_the_chain_roots_name() {
+        let (_dir, db) = open_db();
+        insert_host(&db);
+        let product = create_test_product(&db);
+        let project = db
+            .create_project(
+                CreateProjectInput::builder()
+                    .product_id(product.id.clone())
+                    .name("review-guides")
+                    .no_design_task(true)
+                    .build(),
+            )
+            .unwrap();
+        db.set_project_design_doc(SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            unset: false,
+            design_doc_path: Some("tools/boss/docs/designs/automatic-pr-review-guides.md".into()),
+            design_doc_branch: Some("main".into()),
+            design_doc_repo_remote_url: None,
+        })
+        .unwrap();
+        let task = db
+            .create_task(
+                boss_protocol::CreateTaskInput::builder()
+                    .product_id(product.id.clone())
+                    .project_id(project.id.clone())
+                    .name("automatic-pr-review-guides.md")
+                    .description("Implement a revision-aware broker.")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        db.update_work_item(
+            &task.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some("https://github.com/spinyfin/mono/pull/2970".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let revision = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(task.id.clone())
+                    .description("Restore the broker the first pass inlined away.")
+                    .build(),
+                &FakePrStateChecker::always(PrOpenState::Open),
+            )
+            .unwrap();
+
+        let item = db.get_work_item(&revision.id).unwrap();
+        let packet = assemble_with_doc_fetch(&db, &item, &execution_for(&revision.id), canned_doc).await;
+        let section = packet.design_section.expect("design section must be present");
+        assert_eq!(
+            section.heading.as_deref(),
+            Some("automatic-pr-review-guides.md"),
+            "revision packet must locate the design section by the chain root's name, not fall back \
+             to the whole doc: {section:?}"
+        );
+    }
+
+    /// Truncation of a fetched design section (including the whole-doc
+    /// fallback) must never be silent: the reviewer still gets a (truncated)
+    /// section body, but the truncation itself is recorded as an unresolved
+    /// input naming where to fetch the rest.
+    #[tokio::test]
+    async fn oversized_design_section_is_truncated_loudly_not_silently() {
+        let (_dir, db) = open_db();
+        insert_host(&db);
+        let product = create_test_product(&db);
+        let project = db
+            .create_project(
+                CreateProjectInput::builder()
+                    .product_id(product.id.clone())
+                    .name("review-guides")
+                    .no_design_task(true)
+                    .build(),
+            )
+            .unwrap();
+        db.set_project_design_doc(SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            unset: false,
+            design_doc_path: Some("tools/boss/docs/designs/automatic-pr-review-guides.md".into()),
+            design_doc_branch: Some("main".into()),
+            design_doc_repo_remote_url: None,
+        })
+        .unwrap();
+        let task = db
+            .create_task(
+                boss_protocol::CreateTaskInput::builder()
+                    .product_id(product.id.clone())
+                    .project_id(project.id.clone())
+                    .name("automatic-pr-review-guides.md")
+                    .description("Implement a revision-aware broker.")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        let item = db.get_work_item(&task.id).unwrap();
+        async fn canned_oversized_doc(_repo: String, path: String, _git_ref: String) -> DocFetchOutcome {
+            let mut body = String::with_capacity(MAX_SECTION_CHARS * 2);
+            body.push_str(&format!("# {}\n\n", path.rsplit('/').next().unwrap_or("section")));
+            while body.len() <= MAX_SECTION_CHARS * 2 {
+                body.push_str("Filler line for the oversized design doc.\n");
+            }
+            DocFetchOutcome::Content(body)
+        }
+        let packet = assemble_with_doc_fetch(&db, &item, &execution_for(&task.id), canned_oversized_doc).await;
+        let section = packet
+            .design_section
+            .expect("truncated section must still be delivered");
+        assert!(
+            section.body.chars().count() <= MAX_SECTION_CHARS + 200,
+            "section body must actually be capped: {} chars",
+            section.body.chars().count()
+        );
+        assert!(
+            packet.unresolved.iter().any(|u| matches!(
+                u,
+                UnresolvedReviewInput::DesignSection { reason }
+                    if reason.contains("truncated") && reason.contains("automatic-pr-review-guides.md")
+            )),
+            "truncation must be a loud unresolved finding, not silent: {:?}",
             packet.unresolved
         );
     }

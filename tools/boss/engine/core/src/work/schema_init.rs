@@ -654,6 +654,10 @@ impl WorkDb {
         step!(timer, conn, migrate_pr_review_batches_tables)?;
         step!(timer, conn, migrate_pr_review_batch_generations)?;
         step!(timer, conn, migrate_pr_review_batch_explicit)?;
+        // `producing_work_item_id`: the task/revision id collapsed into the
+        // cycle root when the batch was created, so a revision's review can
+        // still resolve the revision's own brief instead of only the root's.
+        step!(timer, conn, migrate_pr_review_batch_producing_work_item)?;
         // Batch-verdict applier: one `pr_review_verdicts` row per batch,
         // keyed on the review-verdict proposal id so reapply is a no-op.
         step!(timer, conn, migrate_pr_review_verdicts_batch_columns)?;

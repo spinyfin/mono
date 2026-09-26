@@ -316,6 +316,12 @@ pub struct ReviewBatch {
     #[serde(default)]
     #[builder(default = false)]
     pub explicit: bool,
+    /// The task/revision id this batch's `cycle_root_id` was collapsed
+    /// from, when it differs from the root (set for a revision's PR).
+    /// `None` means the cycle root itself is the producing item — either
+    /// an ordinary task/chore, or a batch that predates this column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producing_work_item_id: Option<String>,
 }
 
 fn first_generation() -> i64 {
