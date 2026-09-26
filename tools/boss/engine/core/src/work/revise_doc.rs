@@ -4,8 +4,6 @@
 //! `tools/boss/docs/designs/comment-triggered-document-revisions.md`
 //! §"Buckets 1 & 3 — unified (revision)".
 
-use super::answer_agent_runs::latest_answer_agent_run_for_comment_on;
-use super::comment_thread_entries::list_comment_thread_entries_on;
 use super::*;
 
 /// Outcome of the guarded batch UPDATE that claims comments for a freshly
@@ -44,19 +42,18 @@ impl WorkDb {
             });
         };
 
-        let candidates = {
-            let conn = self.connect()?;
-            comments::query_revisable_comments(
-                &conn,
-                &input.artifact_kind,
-                &input.artifact_id,
-                input.comment_ids.as_deref(),
-            )?
-        };
+        let conn = self.connect()?;
+        let candidates = comments::query_revisable_comments(
+            &conn,
+            &input.artifact_kind,
+            &input.artifact_id,
+            input.comment_ids.as_deref(),
+        )?;
         if candidates.is_empty() {
             return Ok(ReviseDocOutcome::NoUnresolvedComments);
         }
 
+        drop(conn);
         let directive = compose_doc_comment_directive(self, &input.artifact_id, &candidates);
         let name = format!(
             "Address {} reviewer comment{}",
@@ -249,46 +246,6 @@ pub(super) fn claim_revisable_comments_in_tx(
     let mut stmt = conn.prepare(&select_sql)?;
     let addressed: Vec<String> = collect_rows(stmt.query_map(select_params.as_slice(), |row| row.get(0))?)?;
     Ok(ClaimOutcome::Claimed(addressed))
-}
-
-/// Per-comment body shared by document and guide revision directives:
-/// quoted anchor, original body, replied answer-agent bridge, and operator
-/// follow-ups. Header and footer stay with each composer.
-///
-/// Reads thread context on `conn` so callers that already hold WorkDb's
-/// single pooled connection (an Immediate transaction) do not deadlock.
-pub(super) fn append_comment_directive_body(out: &mut String, conn: &Connection, comment: &WorkComment) {
-    out.push_str("Quoted section:\n> ");
-    out.push_str(&comment.anchor.exact);
-    out.push_str("\n\nComment:\n> ");
-    out.push_str(&comment.body);
-    out.push('\n');
-
-    // Only a genuinely `replied` run is bridge context. A run the operator
-    // stood down by reclassifying the comment (`superseded`) is a question
-    // they retracted — feeding its answer into the directive would put a
-    // stale answer to a withdrawn question in front of the worker. Guarding
-    // on the status rather than on `reply_body` being present keeps that
-    // true even if a future terminal state starts carrying a partial body.
-    let latest_run = latest_answer_agent_run_for_comment_on(conn, &comment.id).ok().flatten();
-    if let Some(run) = latest_run
-        && run.status == ANSWER_AGENT_RUN_STATUS_REPLIED
-        && let Some(reply) = run.reply_body.as_deref()
-    {
-        out.push_str("\nPrior answer-agent reply on this thread (bucket-2 bridge context):\n> ");
-        out.push_str(reply);
-        out.push('\n');
-    }
-    let entries = list_comment_thread_entries_on(conn, &comment.id).unwrap_or_default();
-    for entry in entries
-        .iter()
-        .filter(|e| e.entry_kind == THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP)
-    {
-        out.push_str("\nOperator follow-up on this thread:\n> ");
-        out.push_str(&entry.body);
-        out.push('\n');
-    }
-    out.push('\n');
 }
 
 /// Assemble the worker directive from every addressed comment: the doc's

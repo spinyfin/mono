@@ -200,7 +200,7 @@ impl WorkDb {
                     comment_id,
                     revise_task_id,
                     disposition,
-                    response,
+                    outcome.response,
                     request_regeneration as i64,
                     now
                 ],
@@ -300,7 +300,9 @@ impl WorkDb {
                     None
                 }
             }
-        }
+        } else {
+            None
+        };
 
         let comment = self
             .get_comment(&comment_id)?

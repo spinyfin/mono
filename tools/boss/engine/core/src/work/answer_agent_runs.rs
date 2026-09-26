@@ -125,9 +125,14 @@ impl WorkDb {
         conn.query_row(&sql, [run_id], map_answer_agent_run).map_err(Into::into)
     }
 
-    /// Stamp the workspace lease on the run bound to an execution. Returning
-    /// `None` is expected for non-answer-agent executions and lets the
-    /// coordinator share its ordinary lease path without guessing by comment.
+    /// Stamp the workspace lease on the run bound to an execution, and clear
+    /// `workspace_positioned` so a stale positioning stamp from an earlier
+    /// lease on this run never carries over to the new one: a fresh lease
+    /// starts unpositioned until the coordinator's goto attempt (or its
+    /// absence) stamps `workspace_positioned` again for this lease.
+    /// Returning `None` is expected for non-answer-agent executions and lets
+    /// the coordinator share its ordinary lease path without guessing by
+    /// comment.
     pub fn set_answer_agent_execution_lease(
         &self,
         execution_id: &str,
@@ -135,7 +140,7 @@ impl WorkDb {
     ) -> Result<Option<AnswerAgentRun>> {
         let conn = self.connect()?;
         conn.execute(
-            "UPDATE answer_agent_runs SET workspace_lease_id = ?2 \
+            "UPDATE answer_agent_runs SET workspace_lease_id = ?2, workspace_positioned = NULL \
              WHERE execution_id = ?1 AND status = 'running'",
             params![execution_id, workspace_lease_id],
         )?;
@@ -631,6 +636,36 @@ mod tests {
             .expect("bound run should be found through the execution");
         assert_eq!(leased.workspace_lease_id.as_deref(), Some("lease-123"));
         assert_eq!(leased.execution_id.as_deref(), Some(execution.id.as_str()));
+    }
+
+    #[test]
+    fn re_leasing_clears_stale_positioning_stamp() {
+        let db = mem_db();
+        let comment = make_comment(&db, "t1");
+        let run = db
+            .create_answer_agent_run(&comment, "work_item", "t1", "v0", 0)
+            .unwrap();
+        let execution = db
+            .create_answer_agent_execution(&comment, "https://example.test/repo.git")
+            .unwrap();
+        db.bind_answer_agent_run_execution(&run.id, &execution.id).unwrap();
+        db.set_answer_agent_execution_lease(&execution.id, "lease-123").unwrap();
+
+        let positioned = db
+            .set_answer_agent_run_positioning(&execution.id, true)
+            .unwrap()
+            .expect("bound run should be found through the execution");
+        assert_eq!(positioned.workspace_positioned, Some(true));
+
+        // A retried dispatch takes a new lease on the same run without a
+        // fresh goto attempt (e.g. because the PR is no longer open); the
+        // earlier lease's `true` stamp must not carry over.
+        let re_leased = db
+            .set_answer_agent_execution_lease(&execution.id, "lease-456")
+            .unwrap()
+            .expect("bound run should be found through the execution");
+        assert_eq!(re_leased.workspace_lease_id.as_deref(), Some("lease-456"));
+        assert_eq!(re_leased.workspace_positioned, None);
     }
 
     #[test]
