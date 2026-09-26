@@ -406,6 +406,14 @@ pub const CREATED_VIA_CI_FIX_PREFIX: &str = "ci-fix:";
 /// Prefix for engine-triggered revisions spawned by the automated PR reviewer
 /// (P992): `pr_review:<pr_review_execution_id>`.
 pub const CREATED_VIA_PR_REVIEW_PREFIX: &str = "pr_review:";
+/// Sub-prefix of [`CREATED_VIA_PR_REVIEW_PREFIX`] for a follow-up minted from
+/// a `PostMerge` review batch: `pr_review:post_merge:<proposal_id>`. Still
+/// matches every `starts_with(CREATED_VIA_PR_REVIEW_PREFIX)` check (dispatch
+/// classification, moot-revision detection, the `pr_review` GLOB in
+/// `executions_runs.rs`, …), so this is purely additive durable provenance —
+/// it lets `followup_kind_label` give the worker-facing PR-body backlink a
+/// post-merge-specific label instead of the generic "review findings" one.
+pub const CREATED_VIA_PR_REVIEW_POST_MERGE_PREFIX: &str = "pr_review:post_merge:";
 /// Engine-triggered work spawned by actioning an attention group
 /// (`ActionAttentionGroup`): the revision / design task produced from a
 /// question group, or the batch of tasks/chores produced from a followup

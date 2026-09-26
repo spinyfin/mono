@@ -88,7 +88,7 @@ pub fn render_post_merge_followup_title(origin: ReviewOrigin, finding_count: usi
 }
 
 /// Provenance statement prepended to a post-merge-review follow-up's
-/// description (the work item brief a worker receives as its task
+/// description (the work-item description a worker receives as its task
 /// instructions). States plainly, in engine-authored text rather than
 /// leaving it to the worker to remember, that these findings came from a
 /// post-merge review of `origin_pr_url` — and instructs the worker to carry

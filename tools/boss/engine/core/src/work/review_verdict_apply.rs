@@ -135,7 +135,17 @@ impl WorkDb {
         // `revision_warranted = false` cannot suppress a critical/high
         // finding or a category that already forces remediation.
         let original_revision_warranted = crate::pr_review::passes_severity_gate(&review_result);
-        let created_via = format!("{CREATED_VIA_PR_REVIEW_PREFIX}{}", proposal.id);
+        // A `PostMerge` batch's created_via carries its own durable
+        // `post_merge:` sub-prefix (still matching every
+        // `starts_with(CREATED_VIA_PR_REVIEW_PREFIX)` check elsewhere) so
+        // `followup_kind_label` can give the worker-facing PR-body backlink a
+        // post-merge-specific label instead of the generic "review findings"
+        // one, without relying on the worker to remember to say so.
+        let created_via = if batch.phase == boss_protocol::ReviewBatchPhase::PostMerge {
+            format!("{CREATED_VIA_PR_REVIEW_POST_MERGE_PREFIX}{}", proposal.id)
+        } else {
+            format!("{CREATED_VIA_PR_REVIEW_PREFIX}{}", proposal.id)
+        };
 
         // The duplicate-head guard exists to suppress a re-review of an
         // unchanged pre-merge head (e.g. a recovery retry that resubmits a
@@ -197,7 +207,20 @@ impl WorkDb {
         let (title, instructions) = if batch.phase == boss_protocol::ReviewBatchPhase::PostMerge {
             let title = crate::pr_review::render_post_merge_followup_title(origin, review_result.findings.len());
             let mut instructions = crate::pr_review::render_post_merge_followup_provenance(&batch.pr_url);
-            instructions.push_str(&crate::pr_review::render_revision_instructions(&review_result, origin));
+            // Strip the origin task's short id from the origin fed into the
+            // findings body: `ReviewOrigin::describe()` would otherwise emit
+            // a literal `T<short_id>` token into the very description text a
+            // PostMerge follow-up's PR body is built from, tripping
+            // `boss-ism/pr-text-leakage`. The title above is unaffected — a
+            // work-item title is never PR text.
+            let instructions_origin = crate::pr_review::ReviewOrigin {
+                task_short_id: None,
+                ..origin
+            };
+            instructions.push_str(&crate::pr_review::render_revision_instructions(
+                &review_result,
+                instructions_origin,
+            ));
             (title, instructions)
         } else {
             (

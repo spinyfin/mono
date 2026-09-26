@@ -1738,14 +1738,12 @@ fn post_merge_verdict_materialises_a_followup_despite_matching_the_prior_reviewe
     assert_eq!(verdict.revision_task_id.as_deref(), Some(created.as_str()));
 }
 
-/// A follow-up minted from a `PostMerge` batch must be recognisable as such
-/// in both places an operator or a PR reader would look: the work-item
-/// title (kanban/list views) must be prefixed to identify it, and the
-/// follow-up's description (the brief the worker turns into its PR
-/// description) must explicitly name the post-merge review and link the
-/// origin PR — driven from the batch's own durable `pr_url`, not left to the
-/// reviewing worker to remember. `PreMerge` follow-ups are unaffected (see
-/// the ordinary merged-origin-at-apply-time coverage elsewhere in this
+/// A follow-up minted from a `PostMerge` batch must be recognisable in the
+/// work-item title and in the description the worker uses to compose its PR
+/// body: the title is prefixed, and the description names the post-merge
+/// review and links the origin PR from the batch's durable `pr_url`, not left
+/// to the reviewing worker to remember. `PreMerge` follow-ups are unaffected
+/// (see the ordinary merged-origin-at-apply-time coverage elsewhere in this
 /// file), since only a `PostMerge` batch takes this branch.
 #[test]
 fn post_merge_verdict_followup_states_title_and_origin_provenance() {
@@ -1804,6 +1802,23 @@ fn post_merge_verdict_followup_states_title_and_origin_provenance() {
     assert!(
         task.description.contains(PR_URL),
         "follow-up description must link the origin PR; got {:?}",
+        task.description
+    );
+    assert!(
+        task.created_via
+            .starts_with(boss_protocol::CREATED_VIA_PR_REVIEW_POST_MERGE_PREFIX),
+        "post-merge follow-up must carry the post_merge created_via sub-prefix so the worker-facing \
+         backlink can label it distinctly; got {:?}",
+        task.created_via
+    );
+    let leaked_short_id = cycle_root
+        .short_id
+        .map(|short_id| format!("T{short_id}"))
+        .filter(|marker| task.description.contains(marker.as_str()));
+    assert_eq!(
+        leaked_short_id, None,
+        "a post-merge follow-up's description must never embed a bare Boss work-item id \
+         (boss-ism/pr-text-leakage forbids it in worker-authored PR text); got {:?}",
         task.description
     );
 }
