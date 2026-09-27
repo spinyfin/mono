@@ -707,9 +707,6 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         .is_post_merge_reviewer(input.is_post_merge_reviewer)
         .build();
     let written = write_workspace_files(&setup, input.driver.as_ref()).map_err(StartWorkerError::WriteFiles)?;
-    spawner
-        .prepare_progress_ingress(&input.run_id, input.driver.clone(), progress_ingress)
-        .map_err(StartWorkerError::ProgressIngress)?;
 
     // 2. Build the tmux worker environment. Workers get a strict env
     //    allowlist (per `v2-design-risks.md` R3): a sanitized PATH
@@ -900,6 +897,9 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         })?
         .display()
         .to_string();
+    spawner
+        .prepare_progress_ingress(&input.run_id, input.driver.clone(), progress_ingress)
+        .map_err(StartWorkerError::ProgressIngress)?;
     let shell_pid = match start_tmux_worker(
         tmux_host,
         &pane_launch,
@@ -1986,6 +1986,37 @@ mod tests {
             .require("codex")
             .expect("codex driver is registered");
         input
+    }
+
+    #[test]
+    fn environment_limit_rejection_does_not_prepare_ingress_or_create_pane() {
+        let homes = TempDir::new().unwrap();
+        let _homes_env = codex_homes_override(homes.path());
+        let transcripts = TempDir::new().unwrap();
+        let _transcripts_env = transcript_store_override(transcripts.path());
+        let workspace = TempDir::new().unwrap();
+        let spawner = LiveStateSpawner::new(4);
+        let mut input = codex_input(&workspace, "exec-env-limit", 4, spawner.tmux_runner.clone());
+        let limit = crate::launch_limits::local_arg_max().unwrap();
+        crate::launch_limits::check(
+            input.initial_input.len(),
+            crate::launch_limits::environment_bytes(),
+            limit,
+            "codex",
+        )
+        .expect("command fits before worker environment is added");
+        input.extra_env.push(("CUBE_REPO".into(), "x".repeat(limit)));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(start_worker(&spawner, input, StdDuration::from_secs(1)))
+            .expect_err("injected environment must exceed ARG_MAX");
+        assert!(error.to_string().contains("ARG_MAX"), "{error}");
+        assert!(spawner.steps().is_empty(), "no ingress may be prepared");
+        assert!(spawner.tmux_runner.calls().is_empty(), "no tmux pane may be created");
+        assert_eq!(spawner.spawn_calls.load(Ordering::SeqCst), 0);
     }
 
     /// Regression — `bossctl agents list` renders the engine's

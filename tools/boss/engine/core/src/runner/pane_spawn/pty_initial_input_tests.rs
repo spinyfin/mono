@@ -6,8 +6,8 @@
 //! full structural `--deny` rule set).
 
 use super::{
-    MAX_CANON_LINE_BYTES, PLATFORM_ARG_MAX_BYTES, check_initial_input_length, check_launch_command_arg_max,
-    estimated_launch_argv_bytes, path_prepend_clause, render_env_directive, write_initial_input_script,
+    MAX_CANON_LINE_BYTES, check_initial_input_length, check_launch_command_arg_max, estimated_launch_argv_bytes,
+    path_prepend_clause, render_env_directive, write_initial_input_script,
 };
 use crate::driver::{
     AgentDriver, ClaudeDriver, CodexDriver, EnvDirective, GrokDriver, PermissionInput, SpawnRequest, WorkerKind,
@@ -15,6 +15,9 @@ use crate::driver::{
 };
 use std::path::PathBuf;
 use tempfile::TempDir;
+
+// Oversized-command fixture for the macOS launch-limit tests.
+const PLATFORM_ARG_MAX_BYTES: usize = 1_048_576;
 
 #[test]
 fn short_line_passes_the_guard() {

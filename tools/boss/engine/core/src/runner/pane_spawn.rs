@@ -444,12 +444,6 @@ fn check_initial_input_length(line: &str, driver_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// macOS `getconf ARG_MAX` (and a conservative floor on Linux). Diagnosed
-/// pane death: a 2,673,511-byte prompt expanded onto argv and the shell
-/// reported `argument list too long` with pane status 127.
-#[cfg(test)]
-pub(crate) const PLATFORM_ARG_MAX_BYTES: usize = 1_048_576;
-
 /// Estimate the argv cost of `command` as the pane shell would exec it.
 ///
 /// After the prompt-feed wrap, this is just the command text (a path and

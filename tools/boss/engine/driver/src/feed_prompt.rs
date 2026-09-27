@@ -8,7 +8,9 @@
 //! `codex exec -`) and would change the worker from a long-lived pane into
 //! a one-shot process. This helper keeps the TUI: it execs the CLI on a
 //! PTY (so `isatty(stdin)` stays true) and writes the prompt file into that
-//! PTY after the CLI disables canonical mode, then a `\r` to submit.
+//! PTY after the CLI disables canonical mode and enables bracketed paste.
+//! The prompt is a bracketed paste (CRLF normalized to LF), followed by a
+//! separate `\r` after a 500-ms settling interval to submit.
 //!
 //! The spawn command names this script and the prompt *path* only — never
 //! the prompt body — so `execve` stays well under `ARG_MAX`.
@@ -35,7 +37,7 @@ import termios
 import time
 import tty
 
-READY_SECS = float(os.environ.get("BOSS_FEED_PROMPT_READY_SECS", "0"))
+READY_SECS = float(os.environ.get("BOSS_FEED_PROMPT_READY_SECS", "120"))
 CHUNK = 4096
 
 
@@ -70,12 +72,21 @@ def drain_to(dst, data):
         off += n
 
 
-def wait_raw(master, pane_out, timeout):
+def wait_raw(master, pane_in, pane_out, timeout):
     started = time.monotonic()
-    while timeout <= 0 or time.monotonic() - started < timeout:
-        if not icanon(master):
+    output_tail = b""
+    paste_enabled = False
+    while time.monotonic() - started < timeout:
+        if paste_enabled and not icanon(master):
             return True
-        r, _, _ = select.select([master], [], [], 0.05)
+        fds = [master] + ([pane_in] if pane_in is not None else [])
+        r, _, _ = select.select(fds, [], [], 0.05)
+        if pane_in is not None and pane_in in r:
+            data = os.read(pane_in, 65536)
+            if data:
+                drain_to(master, data)
+            else:
+                pane_in = None
         if master in r:
             try:
                 data = os.read(master, 65536)
@@ -83,6 +94,12 @@ def wait_raw(master, pane_out, timeout):
                 return False
             if not data:
                 return False
+            output_tail += data
+            enabled = output_tail.rfind(b"\x1b[?2004h")
+            disabled = output_tail.rfind(b"\x1b[?2004l")
+            if max(enabled, disabled) >= 0:
+                paste_enabled = enabled > disabled
+            output_tail = output_tail[-7:]
             drain_to(pane_out, data)
     return False
 
@@ -167,7 +184,7 @@ def main():
     except OSError as err:
         sys.stderr.write("feed-initial-prompt: cannot read %s: %s\n" % (prompt_path, err))
         return 2
-    payload = b"\x1b[200~" + prompt.replace(b"\r\n", b"\n") + b"\x1b[201~\r"
+    payload = b"\x1b[200~" + prompt.replace(b"\r\n", b"\n") + b"\x1b[201~"
 
     pid, master = pty_fork()
     if pid == 0:
@@ -177,21 +194,27 @@ def main():
     def stop_child(sig):
         # forkpty creates a separate session; teardown must reach the whole
         # CLI group, including stdio servers which may ignore SIGHUP/TERM.
+        def signal_group(signum):
+            try:
+                os.killpg(pid, signum)
+            except OSError as err:
+                # Darwin reports EPERM for a zombie-only process group.
+                if err.errno not in (errno.EPERM, errno.ESRCH):
+                    raise
+
         try:
-            os.killpg(pid, sig)
-            time.sleep(0.1)
-            # Darwin can return EPERM for killpg when its only member is
-            # a zombie. Reap an exited leader before escalating survivors.
-            os.waitpid(pid, os.WNOHANG)
-            os.killpg(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except OSError as err:
-            raise RuntimeError("CLI group cleanup failed: %s" % err) from err
-        try:
-            os.waitpid(pid, 0)
-        except ChildProcessError:
-            pass
+            signal_group(sig)
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if os.waitpid(pid, os.WNOHANG)[0]:
+                    break
+                time.sleep(0.05)
+            signal_group(signal.SIGKILL)
+        finally:
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
 
     def terminate(sig, _frame):
         stop_child(sig)
@@ -214,9 +237,9 @@ def main():
             tty.setraw(pane_in)
         resize()
         started = time.monotonic()
-        if not wait_raw(master, pane_out, READY_SECS):
+        if not wait_raw(master, pane_in, pane_out, READY_SECS):
             sys.stderr.write(
-                "feed-initial-prompt: %s did not enter raw mode after %.2fs "
+                "feed-initial-prompt: %s did not enable raw mode and bracketed paste after %.2fs "
                 "(exited or readiness timeout); prompt was not injected\n"
                 % (cli[0], time.monotonic() - started)
             )
@@ -224,6 +247,12 @@ def main():
             return 125
         if not write_prompt(master, payload, pane_out):
             sys.stderr.write("feed-initial-prompt: CLI exited before the prompt was fully written\n")
+            stop_child(signal.SIGTERM)
+            return 125
+        # Let the TUI finish its paste/debounce handling before Enter arrives.
+        time.sleep(0.5)
+        if not write_prompt(master, b"\r", pane_out):
+            sys.stderr.write("feed-initial-prompt: CLI exited before prompt submission\n")
             stop_child(signal.SIGTERM)
             return 125
         status = relay(master, pane_in, pane_out, pid)
