@@ -81,8 +81,8 @@ async fn divergent_probe_collects_and_persists_rest_identity() {
     divergent_probe(false).await;
 }
 use crate::feature_flags::FeatureFlagsStore;
-use crate::test_support::{create_active_chore, create_product, open_db};
-use crate::work::{FakePrStateChecker, PrOpenState};
+use crate::test_support::{create_active_chore, create_product, open_db, source_capture_packet};
+use crate::work::{FakePrStateChecker, PrOpenState, PublishReviewGuideOutcome};
 use boss_protocol::{CreateExecutionInput, CreateRevisionInput, ExecutionKind, ExecutionStatus, WorkItemPatch};
 
 #[test]
@@ -371,4 +371,231 @@ fn enqueue_resolves_product_repository_and_task_override() {
         assert_eq!(execution.kind, ExecutionKind::PrReviewGuide);
         assert_eq!(execution.status, ExecutionStatus::Ready);
     }
+}
+
+#[tokio::test]
+async fn revision_completion_coalesces_from_published_head_and_failure_keeps_previous_version() {
+    for pre_captured in [false, true] {
+        let (dir, db) = open_db();
+        let db = Arc::new(db);
+        let product = create_product(&db);
+        let root = create_active_chore(&db, &product, "incremental guide");
+        let url = "https://github.com/acme/widget/pull/75";
+        db.update_work_item(
+            &root,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(url.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET repo_remote_url = 'https://github.com/acme/widget.git' WHERE id = ?1",
+                [&root],
+            )
+            .unwrap();
+        let packet = source_capture_packet(url, "base", "published-head");
+        let PrSourceCapturePersistOutcome::Stored(capture) = db
+            .persist_pr_review_guide_source_capture(&root, 0, PrSourceCaptureTrigger::Creation, &packet)
+            .unwrap()
+        else {
+            panic!("capture");
+        };
+        let first = db
+            .create_pr_review_guide_attempt(&capture.series_id, &capture.comparison_id, "test")
+            .unwrap();
+        let PublishReviewGuideOutcome::Published(version) = db
+            .publish_pr_review_guide_version(&first.id, "# Published explanation", "original")
+            .unwrap()
+        else {
+            panic!("publish");
+        };
+        let flags = Arc::new(FeatureFlagsStore::new(dir.path().join("flags.toml")));
+        flags.set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, true).unwrap();
+        flags.set(REVIEW_GUIDE_GENERATION_FLAG, true).unwrap();
+        let mut previous_execution: Option<String> = None;
+        let mut revision_execution = None;
+        for head in ["revision-one", "revision-two"] {
+            let revision = db
+                .create_revision(
+                    CreateRevisionInput::builder()
+                        .parent_task_id(&root)
+                        .description("fix finding")
+                        .build(),
+                    &FakePrStateChecker::always(PrOpenState::Open),
+                )
+                .unwrap();
+            let execution = db
+                .create_execution(
+                    CreateExecutionInput::builder()
+                        .work_item_id(&revision.id)
+                        .kind(ExecutionKind::RevisionImplementation)
+                        .status(ExecutionStatus::Completed)
+                        .build(),
+                )
+                .unwrap();
+            revision_execution = Some(execution.id.clone());
+            let packet = source_capture_packet(url, "base", head);
+            if pre_captured {
+                let sequence = db.allocate_pr_review_guide_source_observation_sequence().unwrap();
+                db.persist_pr_review_guide_source_capture(&root, sequence, PrSourceCaptureTrigger::Poller, &packet)
+                    .unwrap();
+            }
+            let output = packet.clone();
+            let collector = SourcePacketCollector::fixture(
+                Arc::new(move |_, _, _, _| {
+                    let packet = output.clone();
+                    Box::pin(async move { Ok(packet) })
+                }),
+                packet,
+            );
+            for _ in 0..2 {
+                reconcile_review_guide_source_for_execution_with_collector(
+                    db.clone(),
+                    flags.clone(),
+                    &execution.id,
+                    url,
+                    PrSourceCaptureTrigger::Completion,
+                    None,
+                    collector.clone(),
+                )
+                .unwrap()
+                .await
+                .unwrap();
+            }
+            let live = db.live_pr_review_guide_attempts_for_series(&capture.series_id).unwrap();
+            assert_eq!(live.len(), 1);
+            let attempt = &live[0];
+            assert_eq!(attempt.prompt_version, boss_review_guide::UPDATE_PROMPT_VERSION);
+            let guide_execution = attempt.execution_id.as_deref().unwrap();
+            assert_eq!(
+                db.review_guide_update_context(guide_execution).unwrap(),
+                Some(("published-head".into(), version.markdown.clone()))
+            );
+            assert_eq!(
+                db.get_execution(guide_execution).unwrap().status,
+                ExecutionStatus::Ready
+            );
+            if let Some(previous) = previous_execution {
+                assert_eq!(db.get_execution(&previous).unwrap().status, ExecutionStatus::Cancelled);
+            }
+            previous_execution = Some(guide_execution.to_owned());
+            let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+            assert_eq!(summary.readable_version_id.as_deref(), Some(version.id.as_str()));
+            let findings = db.review_guide_findings(&root, url).unwrap().unwrap();
+            assert!(findings.status_text.starts_with("Updating after revision "));
+            let item = db.get_work_item(&root).unwrap();
+            let boss_protocol::WorkItem::Chore(task) = item else {
+                panic!("chore");
+            };
+            assert_eq!(
+                task.review_guide_update_status.as_deref(),
+                Some(findings.status_text.as_str())
+            );
+        }
+        let live = db.live_pr_review_guide_attempts_for_series(&capture.series_id).unwrap();
+        db.fail_pr_review_guide_attempt(&live[0].id, "invalid new-head source link")
+            .unwrap();
+        let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+        assert_eq!(summary.lifecycle, "failed");
+        assert_eq!(summary.readable_version_id.as_deref(), Some(version.id.as_str()));
+        assert!(
+            db.review_guide_findings(&root, url)
+                .unwrap()
+                .unwrap()
+                .status_text
+                .contains("failed; previous guide retained")
+        );
+        assert_eq!(
+            db.get_pr_review_guide_version(&version.id).unwrap().unwrap().markdown,
+            version.markdown
+        );
+        let crate::work::RetryReviewGuideOutcome::Created(retry) = db
+            .retry_pr_review_guide(&root, None, boss_review_guide::PROMPT_VERSION)
+            .unwrap()
+        else {
+            panic!("retry");
+        };
+        assert_eq!(
+            db.review_guide_update_context(retry.execution_id.as_deref().unwrap())
+                .unwrap(),
+            Some(("published-head".into(), version.markdown.clone()))
+        );
+        db.publish_pr_review_guide_version(&retry.id, "# Updated guide", "updated")
+            .unwrap();
+        let status = db.review_guide_findings(&root, url).unwrap().unwrap().status_text;
+        assert!(status.starts_with("Updated for revision "), "{status}");
+        assert!(status.ends_with(" at revision-two"), "{status}");
+        // Model a poller finishing the guide before completion is recorded.
+        // Completion must attach its revision label without generating again.
+        db.connect()
+            .unwrap()
+            .execute(
+                "DELETE FROM pr_review_guide_revision_heads WHERE head_sha = 'revision-two'",
+                [],
+            )
+            .unwrap();
+        let packet = source_capture_packet(url, "base", "revision-two");
+        let output = packet.clone();
+        let collector = SourcePacketCollector::fixture(
+            Arc::new(move |_, _, _, _| {
+                let packet = output.clone();
+                Box::pin(async move { Ok(packet) })
+            }),
+            packet,
+        );
+        reconcile_review_guide_source_for_execution_with_collector(
+            db.clone(),
+            flags.clone(),
+            revision_execution.as_deref().unwrap(),
+            url,
+            PrSourceCaptureTrigger::Completion,
+            None,
+            collector,
+        )
+        .unwrap()
+        .await
+        .unwrap();
+        assert!(
+            db.live_pr_review_guide_attempts_for_series(&capture.series_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.review_guide_findings(&root, url).unwrap().unwrap().status_text,
+            status
+        );
+        assert_eq!(
+            db.get_pr_review_guide_version(&version.id).unwrap().unwrap().markdown,
+            version.markdown
+        );
+    }
+}
+
+#[test]
+fn updated_guide_links_validate_at_the_new_head_and_reject_stale_head_links() {
+    use crate::review_guide_workspace::{validate, verify_previous_head};
+    use boss_engine_test_git::jj::JjRepo;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = JjRepo::new(dir.path());
+    let old = JjRepo::run(&repo.repo, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    JjRepo::run(&repo.repo, &["new", &old]);
+    std::fs::write(repo.repo.join("new.rs"), "fn fixed() {}\n").unwrap();
+    JjRepo::run(&repo.repo, &["describe", "-m", "Fix caller"]);
+    let head = JjRepo::run(&repo.repo, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    let mut packet = crate::test_support::review_guide_source_packet(&old, &head);
+    // The previous head is an inspection endpoint, not a valid current-guide link.
+    packet.merge_base_sha = "a".repeat(40);
+    let markdown = format!(
+        "# Guide\n## Changed since the previous version\nThe caller now uses the fix.\n## Problem\n## Fix\n## Walkthrough\n[code](https://github.com/{}/blob/{head}/new.rs#L1)\n## Tests",
+        packet.head_repository
+    );
+    assert!(boss_review_guide::validate_update_section(&markdown).is_ok());
+    assert!(validate(&repo.worker, &packet, &markdown).is_ok());
+    assert!(validate(&repo.worker, &packet, &markdown.replace(&head, &old)).is_err());
+    assert!(verify_previous_head(&repo.worker, &old).is_ok());
+    assert!(verify_previous_head(&repo.worker, &"f".repeat(40)).is_err());
 }

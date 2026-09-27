@@ -968,6 +968,9 @@ pub struct Task {
     /// until a readable version exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_guide_stale_source: Option<bool>,
+    /// Engine-rendered incremental update status, scoped to this PR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_guide_update_status: Option<String>,
 
     /// Reviewer names for the review indicator tooltip. JSON-encoded list of
     /// login strings. For `"approved"`: the approving reviewers. For

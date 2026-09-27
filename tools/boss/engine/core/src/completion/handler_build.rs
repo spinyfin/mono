@@ -345,7 +345,7 @@ impl WorkerCompletionHandler {
         pr_url: &str,
         trigger: crate::work::PrSourceCaptureTrigger,
     ) -> Option<tokio::task::JoinHandle<()>> {
-        crate::review_guide_capture::reconcile_review_guide_source_for_execution_with_collector(
+        let capture = crate::review_guide_capture::reconcile_review_guide_source_for_execution_with_collector(
             self.work_db.clone(),
             self.feature_flags.clone(),
             execution_id,
@@ -353,7 +353,18 @@ impl WorkerCompletionHandler {
             trigger,
             None,
             self.source_packet_collector.clone(),
-        )
+        )?;
+        let db = self.work_db.clone();
+        let publisher = self.publisher.clone();
+        let execution_id = execution_id.to_owned();
+        Some(tokio::spawn(async move {
+            if let Err(error) = capture.await {
+                tracing::warn!(?error, "review-guide capture task failed");
+            }
+            if let Ok(root) = db.review_guide_source_root_for_execution(&execution_id) {
+                crate::work::notify_review_guide_changed(&db, &publisher, &root, "review_guide_revision_update").await;
+            }
+        }))
     }
 
     /// Queue a source capture from the merge poller's successful, already

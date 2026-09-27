@@ -171,6 +171,13 @@ pub(crate) struct SourceCaptureRequest {
     pub observed: Option<PinnedComparison>,
     pub expected_head_branch: Option<String>,
     pub observation_sequence: Option<i64>,
+    pub revision: Option<RevisionCapture>,
+}
+
+pub(crate) struct RevisionCapture {
+    task_id: String,
+    head_before: Option<String>,
+    head_after: Option<String>,
 }
 
 pub(crate) fn reconcile_review_guide_source_for_execution_with_collector(
@@ -223,6 +230,15 @@ pub(crate) fn reconcile_review_guide_source_for_execution_with_collector(
             .root_task_id(root_task_id)
             .pr_url(pr_url)
             .trigger(trigger)
+            .maybe_revision(
+                (execution.kind == boss_protocol::ExecutionKind::RevisionImplementation
+                    && trigger == PrSourceCaptureTrigger::Completion)
+                    .then_some(RevisionCapture {
+                        task_id: execution.work_item_id,
+                        head_before: execution.pr_head_before,
+                        head_after: execution.pr_head_after,
+                    }),
+            )
             .maybe_observed(observed)
             .maybe_expected_head_branch(expected_head_branch)
             .build(),
@@ -246,6 +262,7 @@ pub(crate) fn reconcile_review_guide_source_with_collector(
         observed,
         expected_head_branch,
         observation_sequence,
+        revision,
     } = request;
     let observation_sequence = match observation_sequence {
         Some(sequence) => sequence,
@@ -300,6 +317,16 @@ pub(crate) fn reconcile_review_guide_source_with_collector(
                 );
                 return;
             }
+            if let Some(revision) = &revision
+                && revision.head_before.as_deref() != Some(metadata.head_sha.as_str())
+                && revision.head_after.as_deref().is_none_or(|head| head == metadata.head_sha)
+                && let Err(error) = work_db.record_review_guide_revision_head(
+                    &root_task_id, &pr_url, &metadata.head_sha, &revision.task_id, observation_sequence,
+                )
+            {
+                record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
+                return;
+            }
             // Comparison identity is REST `base.sha` + head, not a GraphQL
             // `baseRefOid` that may track the live base tip.
             let rest_identity = PinnedComparison {
@@ -319,6 +346,19 @@ pub(crate) fn reconcile_review_guide_source_with_collector(
                     ) {
                         Ok(Some(guard)) => guard,
                         Ok(None) => {
+                            // A poll can capture this head before completion. Recover a
+                            // missing enqueue without retrying a failed or completed job.
+                            match work_db.get_latest_pr_review_guide_source_capture(&root_task_id) {
+                                Ok(Some(capture)) if capture.packet.canonical_pr_url == pr_url
+                                    && capture.packet.head_sha == rest_identity.head_sha => {
+                                        enqueue_review_guide_generation(&work_db, &feature_flags, &capture);
+                                    }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
+                                    return;
+                                }
+                            }
                             if let Some(probe) = &observed
                                 && let Err(error) = work_db.remember_pr_review_guide_probe(
                                     &pr_url,
@@ -419,6 +459,14 @@ fn enqueue_review_guide_generation(
     if !feature_flags.is_enabled(REVIEW_GUIDE_GENERATION_FLAG) {
         return;
     }
+    match work_db.review_guide_comparison_has_attempt(&capture.comparison_id) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(?error, "review-guide generation: could not check existing attempt");
+            return;
+        }
+    }
     match work_db.resolve_repo_for_task(&capture.root_task_id) {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -430,11 +478,7 @@ fn enqueue_review_guide_generation(
             return;
         }
     }
-    let attempt = match work_db.create_pr_review_guide_attempt(
-        &capture.series_id,
-        &capture.comparison_id,
-        boss_review_guide::PROMPT_VERSION,
-    ) {
+    let attempt = match work_db.create_automatic_pr_review_guide_attempt(&capture.series_id, &capture.comparison_id) {
         Ok(attempt) => attempt,
         Err(error) => {
             tracing::warn!(

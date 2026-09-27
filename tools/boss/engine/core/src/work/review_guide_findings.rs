@@ -78,10 +78,26 @@ fn query_findings(conn: &Connection, root_id: &str, pr_url: &str) -> Result<Opti
         if findings.is_empty() {
             continue;
         }
-        let label = boss_protocol::short_id_label(short_id).unwrap_or(id);
-        let status = if deleted_at.is_some() { "deleted" } else { &status };
+        let label = boss_protocol::short_id_label(short_id).unwrap_or_else(|| id.clone());
+        let resolved: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pr_review_guide_revision_heads r
+             JOIN pr_review_guide_source_series s ON s.root_task_id = r.root_task_id AND s.canonical_pr_url = r.pr_url
+             JOIN pr_review_guide_versions v ON v.id = s.readable_version_id
+             JOIN pr_review_guide_source_comparisons c ON c.id = v.comparison_id
+             WHERE r.revision_task_id = ?1 AND r.pr_url = ?2
+               AND (r.head_sha = c.head_sha OR r.observation_sequence <= c.observation_sequence))",
+            params![id, pr_url],
+            |row| row.get(0),
+        )?;
+        let status = if deleted_at.is_some() {
+            "deleted"
+        } else if resolved {
+            "resolved"
+        } else {
+            &status
+        };
         text.trackers.insert(format!("ID {label} ({status})"));
-        text.all_done &= status == "done";
+        text.all_done &= matches!(status, "done" | "resolved");
         for (severity, title) in findings {
             text.lines.push(format!(
                 "- [{}] {} — ID {} ({})",
@@ -92,7 +108,19 @@ fn query_findings(conn: &Connection, root_id: &str, pr_url: &str) -> Result<Opti
             ));
         }
     }
-    Ok((!text.lines.is_empty()).then(|| text.finish()))
+    let update = super::review_guide_jobs::updates::status(conn, root_id, pr_url)?;
+    let mut findings = (!text.lines.is_empty()).then(|| text.finish());
+    if let Some(update) = update {
+        if let Some(findings) = &mut findings {
+            findings.status_text = format!("{update} — {}", findings.status_text);
+        } else {
+            findings = Some(ReviewGuideFindings {
+                status_text: update,
+                addendum_markdown: String::new(),
+            });
+        }
+    }
+    Ok(findings)
 }
 
 struct FindingsText {

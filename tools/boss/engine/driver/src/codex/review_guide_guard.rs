@@ -198,6 +198,10 @@ mod tests {
     }
 
     fn decide_at(payload: serde_json::Value, root: &str) -> (String, String) {
+        decide_at_with_previous(payload, root, "")
+    }
+
+    fn decide_at_with_previous(payload: serde_json::Value, root: &str, previous: &str) -> (String, String) {
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("boss-codex-review-guide-{0}-{seq}", std::process::id()));
@@ -208,6 +212,7 @@ mod tests {
             .env("BOSS_REVIEW_GUIDE_WORKSPACE", root)
             .env("BOSS_REVIEW_GUIDE_HEAD_SHA", "a".repeat(40))
             .env("BOSS_REVIEW_GUIDE_BASE_SHA", "b".repeat(40))
+            .env("BOSS_REVIEW_GUIDE_PREVIOUS_HEAD_SHA", previous)
             .arg(script)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -232,6 +237,22 @@ mod tests {
             output["decision"].as_str().unwrap().to_owned(),
             output["reason"].as_str().unwrap_or_default().to_owned(),
         )
+    }
+
+    #[test]
+    fn update_reads_allow_only_the_additional_pinned_previous_head() {
+        let previous = "c".repeat(40);
+        for command in [
+            format!("git show {previous}:src/a.rs"),
+            format!("git diff --no-ext-diff --no-textconv {previous} {}", "a".repeat(40)),
+        ] {
+            let payload = serde_json::json!({"tool_name": "Bash", "cwd": "/repo", "tool_input": {"command": command}});
+            assert_eq!(
+                decide_at_with_previous(payload.clone(), "/repo", &previous).0,
+                "approve"
+            );
+            assert_eq!(decide_at(payload, "/repo").0, "block");
+        }
     }
 
     #[test]

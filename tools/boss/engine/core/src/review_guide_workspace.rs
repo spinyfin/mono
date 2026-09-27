@@ -17,6 +17,15 @@ fn require_sha(sha: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn verify_previous_head(workspace: &Path, sha: &str) -> Result<()> {
+    require_sha(sha)?;
+    ensure!(
+        git(workspace, &["cat-file", "-t", sha])? == b"commit\n",
+        "previous guide head is not a local commit"
+    );
+    Ok(())
+}
+
 fn git(workspace: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new("git")
         .args(args)

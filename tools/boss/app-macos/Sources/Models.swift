@@ -239,6 +239,7 @@ struct WorkTask: Identifiable, Hashable {
     /// moved since that version was produced, not merely a same-comparison
     /// prompt/prose retry. Mirrors `Task.review_guide_stale_source` on the
     /// wire. `nil` until a readable version exists.
+    var reviewGuideUpdateStatus: String? = nil
     var reviewGuideStaleSource: Bool? = nil
 
     /// Short id of the reviewed task that produced this follow-up.

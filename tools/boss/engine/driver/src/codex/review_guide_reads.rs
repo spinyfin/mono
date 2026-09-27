@@ -65,7 +65,7 @@ def guide_shell_read(payload):
     if prog == 'git':
         if args and args[0] == '--no-pager':
             args = args[1:]
-        revisions = {os.environ.get('BOSS_REVIEW_GUIDE_HEAD_SHA'), os.environ.get('BOSS_REVIEW_GUIDE_BASE_SHA')}
+        revisions = {os.environ.get('BOSS_REVIEW_GUIDE_HEAD_SHA'), os.environ.get('BOSS_REVIEW_GUIDE_BASE_SHA'), os.environ.get('BOSS_REVIEW_GUIDE_PREVIOUS_HEAD_SHA')}
         def pinned(value):
             return bool(re.fullmatch('[0-9a-fA-F]{40}', value)) and value in revisions
         if len(args) == 2 and args[0] == 'show':
