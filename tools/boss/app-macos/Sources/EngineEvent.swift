@@ -47,9 +47,9 @@ enum EngineEvent {
     /// pick the right icon affordance and open dispatch.
     case projectDesignDocResolved(output: ResolveProjectDesignDocOutput)
     /// Engine-owned live supplement returned by GetReviewGuideSummary.
-    /// `seriesId` is the summary's series id, echoed so the cache can be
-    /// scoped to it and a late response for an abandoned series never
-    /// clobbers a freshly opened one on the same root task.
+    /// `seriesId` is the summary's series id; the app caches findings by
+    /// that id so a late reply for another series cannot hide or replace
+    /// the on-screen series' status line.
     case reviewGuideFindings(rootTaskId: String, seriesId: String, findings: ReviewGuideFindings?)
     /// Engine reply to `GetReviewGuideContent`. `content` is `nil` when the
     /// version id is unknown (e.g. a stale open racing a history change).

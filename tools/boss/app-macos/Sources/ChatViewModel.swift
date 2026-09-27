@@ -719,6 +719,11 @@ final class ChatViewModel: ObservableObject {
     /// Guards against a duplicate tap while the engine is running the merge.
     var mergingWhenReadyIDs: Set<String> = []
 
+    /// Which surface initiated each in-flight merge, keyed by work item id.
+    /// Copied onto `MergeRevisionConfirmation.origin` when the engine asks
+    /// for open-revision consent, so the dialog presents on that surface.
+    var mergeRevisionConfirmationOrigins: [String: MergeRevisionConfirmationOrigin] = [:]
+
     let engine: EngineClient
     /// Routes engine comment RPC replies + `comments.artifact.*` invalidations
     /// to the open [`CommentLayer`]s. Injected into the markdown
@@ -1191,13 +1196,16 @@ final class ChatViewModel: ObservableObject {
     /// `nil` means no confirmation is showing.
     @Published var pendingPauseOverrideConfirmation: PauseOverrideConfirmation?
 
-    /// Keyed by root task id, but each entry also carries the series id it
-    /// was fetched for. `ReviewGuideViewerHeader` only reads an entry whose
-    /// `seriesId` matches the series actually on screen — otherwise a late
-    /// response for a series the viewer has since navigated away from would
-    /// silently overwrite (or transiently show under) the newly opened
-    /// series' findings, since both share the same root task id.
-    @Published var reviewGuideFindingsByRootID: [String: ReviewGuideFindingsEntry] = [:]
+    /// Live findings supplement keyed by PR series id. A late
+    /// `GetReviewGuideSummary` reply for another series (or an unscoped
+    /// poll) must not hide the on-screen series' status line; each series
+    /// keeps its own entry until a nil reply arrives for that same series.
+    @Published var reviewGuideFindingsBySeriesID: [String: ReviewGuideFindings] = [:]
+
+    /// True while the `"async-markdown-viewer"` window is in the hierarchy.
+    /// Viewer-origin merge confirmations fall back to the board when this
+    /// is false so a confirmation always has a window to present in.
+    @Published var isReviewGuideViewerWindowOpen = false
 
     /// Set once `MergeConfirmationRequired` reports open revisions blocking
     /// an in-flight merge attempt — see `MergeRevisionConfirmation`.

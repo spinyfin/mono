@@ -373,7 +373,7 @@ struct ContentView: View {
                 Text(confirmation.alertMessage)
             }
         )
-        .mergeRevisionConfirmationAlert(model: model)
+        .mergeRevisionConfirmationAlert(model: model, surface: .board)
         .sheet(item: $model.pendingWorkCreateRequest) { request in
             WorkCreateSheet(
                 request: request,

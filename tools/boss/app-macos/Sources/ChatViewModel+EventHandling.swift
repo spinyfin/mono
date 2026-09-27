@@ -238,6 +238,7 @@ extension ChatViewModel {
                 mergeErrorNoticesByTaskID[taskId] = message
             }
             mergingWhenReadyIDs.removeAll()
+            mergeRevisionConfirmationOrigins.removeAll()
             // Mirror the disconnect path, but only when this WorkError is
             // the in-flight `get_review_guide_content` envelope — the
             // generic reply's message is otherwise as likely to belong to
@@ -379,14 +380,11 @@ extension ChatViewModel {
             applyProductDesignDocsList(productID: productID, state: state)
         case .productDesignDocContent(let ref, let content):
             applyProductDesignDocContent(ref: ref, content: content)
-        case .reviewGuideFindings(let rootTaskId, let seriesId, let findings):
+        case .reviewGuideFindings(_, let seriesId, let findings):
             if let findings {
-                reviewGuideFindingsByRootID[rootTaskId] = ReviewGuideFindingsEntry(seriesId: seriesId, findings: findings)
-            } else if reviewGuideFindingsByRootID[rootTaskId]?.seriesId == seriesId {
-                // Only clear the cached entry when the "no findings" reply is
-                // for the series currently cached — never let a nil reply for
-                // an abandoned series wipe out a different series' entry.
-                reviewGuideFindingsByRootID.removeValue(forKey: rootTaskId)
+                reviewGuideFindingsBySeriesID[seriesId] = findings
+            } else {
+                reviewGuideFindingsBySeriesID.removeValue(forKey: seriesId)
             }
         case .reviewGuideContent(let versionId, let content):
             applyReviewGuideContent(versionId: versionId, content: content)
@@ -602,6 +600,7 @@ extension ChatViewModel {
             // WorkItemUpdated event carrying the new merge-queue / merged
             // state will arrive shortly.
             mergingWhenReadyIDs.remove(workItemID)
+            mergeRevisionConfirmationOrigins.removeValue(forKey: workItemID)
             mergeErrorNoticesByTaskID.removeValue(forKey: workItemID)
             mergeFeedbackNotice = MergeFeedbackNotice(
                 taskID: workItemID,

@@ -35,7 +35,9 @@ struct ReviewGuideViewerHeader: View {
                         .foregroundStyle(.secondary)
                     Spacer(minLength: 8)
                     if task.isMergeWhenReadyEligible {
-                        MergeWhenReadyControl(onConfirm: { chatModel.mergeWhenReady(for: task) })
+                        MergeWhenReadyControl(onConfirm: {
+                            chatModel.mergeWhenReady(for: task, origin: .reviewGuideViewer)
+                        })
                     }
                 }
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
@@ -66,9 +68,8 @@ struct ReviewGuideViewerHeader: View {
                         }
                     }
                 }
-                if let entry = chatModel.reviewGuideFindingsByRootID[rootTaskId],
-                   entry.seriesId == displayedSeriesId {
-                    let findings = entry.findings
+                if let seriesId = displayedSeriesId,
+                   let findings = chatModel.reviewGuideFindingsBySeriesID[seriesId] {
                     Text(findings.statusText)
                         .font(.caption)
                         .accessibilityIdentifier("review-guide-findings-status")
@@ -89,14 +90,13 @@ struct ReviewGuideViewerHeader: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
             .background(Color.secondary.opacity(0.06))
-            .task(id: rootTaskId) {
-                // The document window can remain open after the selected board
-                // changes. Refresh only its small engine-owned supplement.
-                // Scope every poll to the series actually on screen so a
-                // replacement PR opened on this root task cannot silently
-                // swap in a different PR's findings underneath this guide.
+            .task(id: "\(rootTaskId)|\(displayedSeriesId ?? "")") {
+                // Skip until the guide on screen has a series id, then
+                // re-poll immediately when that series changes (same root,
+                // replacement PR, or the artifact id arriving after load).
+                guard let seriesId = displayedSeriesId else { return }
                 while !Task.isCancelled {
-                    chatModel.engine.sendGetReviewGuideSummary(rootTaskId: rootTaskId, seriesId: displayedSeriesId)
+                    chatModel.engine.sendGetReviewGuideSummary(rootTaskId: rootTaskId, seriesId: seriesId)
                     do { try await Task.sleep(for: .seconds(5)) }
                     catch { return }
                 }

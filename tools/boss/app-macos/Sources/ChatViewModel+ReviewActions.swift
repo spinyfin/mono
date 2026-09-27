@@ -12,14 +12,23 @@ extension ChatViewModel {
         let message: String
     }
 
+    /// Window that initiated a merge-when-ready attempt. Recorded on
+    /// `mergeWhenReady(for:origin:)` and copied onto the confirmation so
+    /// each window's alert only presents the dialog it owns.
+    enum MergeRevisionConfirmationOrigin: Equatable {
+        case board
+        case reviewGuideViewer
+    }
+
     /// Set once `MergeConfirmationRequired` reports open revisions blocking
     /// an in-flight merge attempt — the confirmation dialog binds to this,
-    /// mirroring `pendingPauseOverrideConfirmation`'s declarative shape so
-    /// the dialog shows regardless of which view (card or review-guide
-    /// viewer) initiated the merge. `nil` means no confirmation is showing.
+    /// mirroring `pendingPauseOverrideConfirmation`'s declarative shape.
+    /// `origin` names the window that should present it. `nil` means no
+    /// confirmation is showing.
     struct MergeRevisionConfirmation: Equatable {
         let workItemID: String
         let revisions: [OpenMergeRevision]
+        let origin: MergeRevisionConfirmationOrigin
 
         var alertMessage: String {
             revisions.map { "ID \($0.label) — \($0.status)" }.joined(separator: "\n")
@@ -31,7 +40,9 @@ extension ChatViewModel {
     /// Review-column task. Guards against a duplicate tap while the RPC is
     /// in flight. The engine runs `gh pr merge --auto --squash` and kicks
     /// the PR-reconciler so the kanban state updates promptly on success.
-    func mergeWhenReady(for task: WorkTask) {
+    /// `origin` is the window whose merge control was used, so the
+    /// open-revision confirmation can present on that window.
+    func mergeWhenReady(for task: WorkTask, origin: MergeRevisionConfirmationOrigin = .board) {
         guard let prURL = task.prURL, !prURL.isEmpty else { return }
         _ = prURL  // consumed by the engine; kept here for the guard above
         guard !mergingWhenReadyIDs.contains(task.id) else { return }
@@ -40,6 +51,7 @@ extension ChatViewModel {
         // falls through to the stale error for the rest of the session.
         mergeErrorNoticesByTaskID.removeValue(forKey: task.id)
         mergingWhenReadyIDs.insert(task.id)
+        mergeRevisionConfirmationOrigins[task.id] = origin
         engine.sendMergeWhenReady(workItemID: task.id)
     }
 
@@ -47,11 +59,14 @@ extension ChatViewModel {
     /// rather than overwriting `pendingMergeRevisionConfirmation` — an
     /// overwrite would silently strand the first task's dialog: its entry in
     /// `mergingWhenReadyIDs` would never clear because neither
-    /// `confirmMergeRevision()` nor `cancelMergeRevisionConfirmation()` would
-    /// ever run for it.
+    /// `confirmMergeRevision(workItemID:)` nor
+    /// `cancelMergeRevisionConfirmation(workItemID:)` would ever run for it.
     func handleMergeConfirmation(workItemID: String, revisions: [OpenMergeRevision]) {
         guard mergingWhenReadyIDs.contains(workItemID) else { return }
-        let confirmation = MergeRevisionConfirmation(workItemID: workItemID, revisions: revisions)
+        let origin = mergeRevisionConfirmationOrigins[workItemID] ?? .board
+        let confirmation = MergeRevisionConfirmation(
+            workItemID: workItemID, revisions: revisions, origin: origin
+        )
         if pendingMergeRevisionConfirmation == nil {
             pendingMergeRevisionConfirmation = confirmation
         } else if pendingMergeRevisionConfirmation?.workItemID == workItemID {
@@ -63,21 +78,41 @@ extension ChatViewModel {
         }
     }
 
+    /// Whether `surface`'s alert should be on screen. Viewer-origin
+    /// confirmations present on the viewer while it is open, and fall back
+    /// to the board when it is not, so a confirmation always has a window.
+    func shouldPresentMergeRevisionConfirmation(on surface: MergeRevisionConfirmationOrigin) -> Bool {
+        guard let pending = pendingMergeRevisionConfirmation else { return false }
+        return presentingSurface(for: pending) == surface
+    }
+
+    /// The pending confirmation if `surface` is the one that should show it.
+    func mergeRevisionConfirmation(for surface: MergeRevisionConfirmationOrigin) -> MergeRevisionConfirmation? {
+        guard shouldPresentMergeRevisionConfirmation(on: surface) else { return nil }
+        return pendingMergeRevisionConfirmation
+    }
+
     /// User confirmed merging while revisions are open: resend the merge
-    /// request with the confirmed revisions attached.
-    func confirmMergeRevision() {
-        guard let confirmation = pendingMergeRevisionConfirmation else { return }
+    /// request with the confirmed revisions attached. Ignored when
+    /// `workItemID` is not the currently pending confirmation — a stale
+    /// click from another window must not confirm a different task.
+    func confirmMergeRevision(workItemID: String) {
+        guard let confirmation = pendingMergeRevisionConfirmation,
+              confirmation.workItemID == workItemID else { return }
         pendingMergeRevisionConfirmation = nil
         engine.sendMergeWhenReady(workItemID: confirmation.workItemID, confirmedRevisions: confirmation.revisions)
         presentNextQueuedMergeRevisionConfirmationIfNeeded()
     }
 
     /// User declined merging while revisions are open: drop the in-flight
-    /// guard so a fresh attempt can be made later.
-    func cancelMergeRevisionConfirmation() {
-        guard let confirmation = pendingMergeRevisionConfirmation else { return }
+    /// guard so a fresh attempt can be made later. Ignored when
+    /// `workItemID` is not the currently pending confirmation.
+    func cancelMergeRevisionConfirmation(workItemID: String) {
+        guard let confirmation = pendingMergeRevisionConfirmation,
+              confirmation.workItemID == workItemID else { return }
         pendingMergeRevisionConfirmation = nil
         mergingWhenReadyIDs.remove(confirmation.workItemID)
+        mergeRevisionConfirmationOrigins.removeValue(forKey: confirmation.workItemID)
         presentNextQueuedMergeRevisionConfirmationIfNeeded()
     }
 
@@ -88,12 +123,31 @@ extension ChatViewModel {
     /// false→true transition, so setting the property directly to the next
     /// value in the same call as clearing the old one would never surface a
     /// second dialog.
+    ///
+    /// The queued item stays in the array until this callback runs. If
+    /// `handleMergeConfirmation` installs a new pending confirmation in
+    /// between, the callback leaves the queue untouched rather than
+    /// overwriting that newer pending item (which would strand its
+    /// `mergingWhenReadyIDs` slot). Entries whose in-flight guard has
+    /// since been cleared (e.g. by a `workError`) are dropped.
     private func presentNextQueuedMergeRevisionConfirmationIfNeeded() {
         guard pendingMergeRevisionConfirmation == nil, !queuedMergeRevisionConfirmations.isEmpty else { return }
-        let next = queuedMergeRevisionConfirmations.removeFirst()
         DispatchQueue.main.async { [weak self] in
-            self?.pendingMergeRevisionConfirmation = next
+            guard let self else { return }
+            guard self.pendingMergeRevisionConfirmation == nil else { return }
+            self.queuedMergeRevisionConfirmations.removeAll {
+                !self.mergingWhenReadyIDs.contains($0.workItemID)
+            }
+            guard !self.queuedMergeRevisionConfirmations.isEmpty else { return }
+            self.pendingMergeRevisionConfirmation = self.queuedMergeRevisionConfirmations.removeFirst()
         }
+    }
+
+    private func presentingSurface(for confirmation: MergeRevisionConfirmation) -> MergeRevisionConfirmationOrigin {
+        if confirmation.origin == .reviewGuideViewer, isReviewGuideViewerWindowOpen {
+            return .reviewGuideViewer
+        }
+        return .board
     }
 
     /// Ask the engine to lease a workspace for the given Review-column

@@ -137,7 +137,7 @@ struct WorkBoardCardItem: View {
             return { model.openLiveWorkspaceTerminal(for: task) }
         }()
         let onMergeWhenReady: (() -> Void)? = snapshot.showsMergeWhenReady
-            ? { model.mergeWhenReady(for: task) }
+            ? { model.mergeWhenReady(for: task, origin: .board) }
             : nil
         let onOpenReviewGuide: (() -> Void)? = snapshot.reviewGuidePresentation?.showsDocumentButton == true
             ? { model.openReviewGuide(for: task) }
