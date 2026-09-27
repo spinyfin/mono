@@ -1,6 +1,7 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load(":codex_cli_version.bzl", "CODEX_CLI_VERSION")
 load(":engine_binary.bzl", "ENGINE_BINARY_BAZEL_RUN_COMMAND", "ENGINE_BINARY_NAME", "ENGINE_BINARY_TARGET")
 
 rust_library(
@@ -70,6 +71,11 @@ rust_library(
         # string did.
         "BOSS_ENGINE_BAZEL_RUN_COMMAND": ENGINE_BINARY_BAZEL_RUN_COMMAND,
         "BOSS_ENGINE_BAZEL_TARGET": ENGINE_BINARY_TARGET,
+        # Same source of truth as the codex_test_* http_archive stanzas in
+        # MODULE.bazel and the driver's config-compatibility test, so
+        # PINNED_CODEX_CLI_VERSION can never drift from the release the
+        # driver's test binaries are fetched from.
+        "CODEX_CLI_VERSION": CODEX_CLI_VERSION,
     },
     visibility = [
         "//tools/boss/bossctl:__pkg__",

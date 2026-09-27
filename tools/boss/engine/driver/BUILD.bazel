@@ -1,5 +1,6 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("//tools/boss/engine/core:codex_cli_version.bzl", "CODEX_CLI_VERSION")
 load("//tools/boss/engine/core:engine_binary.bzl", "ENGINE_BINARY_BAZEL_RUN_COMMAND")
 
 exports_files(["Cargo.toml"])
@@ -49,6 +50,13 @@ rust_test(
         proc_macro = True,
         proc_macro_dev = True,
     ),
+    rustc_env = {
+        # Same source of truth as the codex_test_* repos :codex_test_binary
+        # selects from (see codex_test_archives.bzl), so the assertion in
+        # config_compatibility_tests.rs can never drift from the pinned
+        # release the test binaries were fetched from.
+        "CODEX_CLI_VERSION": CODEX_CLI_VERSION,
+    },
     deps = [
         "//tools/boss/codex_auth",
         "//tools/boss/engine/codex-hook-trust",
