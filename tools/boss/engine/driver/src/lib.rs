@@ -1789,7 +1789,7 @@ pub struct SpawnPlan {
     /// `command` runs.
     pub env: Vec<EnvDirective>,
     /// The command line to run after `env` has been applied (e.g.
-    /// `python3 .boss/feed-initial-prompt .claude/initial-prompt.txt claude --model …\n`).
+    /// `claude --model … "$(cat …)"\n`).
     pub command: String,
 }
 
@@ -2323,7 +2323,6 @@ pub trait AgentDriver: Send + Sync {
 
 pub mod claude;
 pub mod codex;
-pub mod feed_prompt;
 pub mod grok;
 pub mod registry;
 
@@ -2331,9 +2330,6 @@ pub mod registry;
 pub use boss_protocol::DriverRuntimeState;
 pub use claude::ClaudeDriver;
 pub use codex::CodexDriver;
-pub use feed_prompt::{
-    FEED_PROMPT_SCRIPT, FEED_PROMPT_SCRIPT_REL_PATH, wrap_spawn_command_to_feed_prompt, write_feed_prompt_script,
-};
 pub use grok::GrokDriver;
 pub use registry::{DriverRegistry, UnknownDriverSlug};
 

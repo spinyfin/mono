@@ -19,7 +19,6 @@ use crate::driver::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, EnvDirective, ModelMenu,
     PermissionArtifacts, PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig, SpawnPlan,
     SpawnRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
-    wrap_spawn_command_to_feed_prompt,
 };
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
@@ -289,8 +288,8 @@ pub fn codex_reference_command() -> String {
         cmd.push(' ');
         cmd.push_str(flag);
     }
-    cmd.push_str(" --sandbox danger-full-access\n");
-    wrap_spawn_command_to_feed_prompt(&cmd, ".codex", "initial-prompt.txt")
+    cmd.push_str(" --sandbox danger-full-access \"$(cat .codex/initial-prompt.txt)\"\n");
+    cmd
 }
 
 /// Assert a [`SpawnPlan`] satisfies the Codex spawn contract.

@@ -985,9 +985,7 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
         model,
         claude_version.as_deref(),
     )?;
-    let quoted_model = boss_ssh_transport::shell_quote(model);
-    let cli = format!("claude --model {quoted_model} --permission-mode auto");
-    let launch = prepare_session_start_brief(work_db, working_directory, previous.as_ref(), reason, &cli)?;
+    let initial_prompt = prepare_session_start_brief(work_db, working_directory, previous.as_ref(), reason);
 
     let mut environment = BTreeMap::from([
         (SPAWN_TOKEN_ENV.to_owned(), spawn_token.clone()),
@@ -1000,8 +998,13 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
         environment.insert("BOSS_BIN".to_owned(), format!("{bin_dir}/boss"));
     }
     insert_color_environment(&mut environment);
+    let quoted_model = boss_ssh_transport::shell_quote(model);
+    // The brief rides along as `claude`'s positional initial prompt — the
+    // same shape worker panes use for `.claude/initial-prompt.txt` — so the
+    // incoming session consumes it on its first turn with no pane injection
+    // and no dependence on it choosing to read a file.
     let command = format!(
-        "{}unset ANTHROPIC_API_KEY; exec {launch}",
+        "{}unset ANTHROPIC_API_KEY; exec claude --model {quoted_model} --permission-mode auto {initial_prompt}",
         crate::runner::pane_spawn::path_prepend_clause("BOSS_BIN_DIR")
     );
     crate::tmux_session_options::prepare_server(tmux)
@@ -1050,22 +1053,20 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
 
 /// Compose the session-start handoff brief for a fresh coordinator
 /// session, persist it under the session directory, and return the shell
-/// command that feeds it to Claude through the shared PTY feeder.
+/// fragment that hands it to `claude` as the positional initial prompt.
 ///
-/// If the brief file cannot be written, the
+/// Never fails session creation. If the brief file cannot be written, the
 /// fragment is instead a short inline prompt that says so and points the
 /// session at `boss handoff show` — the incoming session must never start
 /// silently, as if there were nothing to hand off, because the engine hit
 /// a filesystem error. Every outcome is audited as
-/// `coordinator_handoff_brief`. Failure to install the feeder is propagated
-/// rather than creating a session with an undeliverable brief.
+/// `coordinator_handoff_brief`.
 fn prepare_session_start_brief(
     work_db: &WorkDb,
     working_directory: &Path,
     previous: Option<&PreviousSession>,
     reason: CoordinatorStartReason,
-    cli: &str,
-) -> Result<String> {
+) -> String {
     let state = work_db.coordinator_handoff_state();
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
     let transcript_dir = coordinator_handoff::existing_transcript_dir(working_directory);
@@ -1102,12 +1103,10 @@ fn prepare_session_start_brief(
                 start_reason = reason.audit_label(),
                 "coordinator handoff: session-start brief written for the incoming session"
             );
-            let feeder = crate::driver::write_feed_prompt_script(working_directory)?;
-            Ok(format!(
-                "python3 {} {} {cli}",
-                boss_ssh_transport::shell_quote(&feeder.to_string_lossy()),
+            format!(
+                "\"$(cat {})\"",
                 boss_ssh_transport::shell_quote(&path.to_string_lossy())
-            ))
+            )
         }
         Err(error) => {
             let error = format!("{error:#}");
@@ -1123,14 +1122,13 @@ fn prepare_session_start_brief(
                     "error": error,
                 }),
             );
-            let notice = boss_ssh_transport::shell_quote(&format!(
+            boss_ssh_transport::shell_quote(&format!(
                 "[Boss coordinator session start] The engine could not write your session-start handoff brief \
                  ({error}). Stored handoff state per the engine: {}. Run `boss handoff show` now to read the \
                  stored coordinator handoff, tell the operator in your first reply that the brief could not be \
                  written, and follow the \"Session handoff\" section of your instructions.",
                 state.audit_outcome()
-            ));
-            Ok(format!("{cli} {notice}"))
+            ))
         }
     }
 }
@@ -2180,7 +2178,7 @@ mod tests {
         assert!(
             record_line["relaunch_command"]
                 .as_str()
-                .is_some_and(|command| command.contains("claude --model"))
+                .is_some_and(|command| command.contains("exec claude"))
         );
     }
 
@@ -2220,7 +2218,7 @@ mod tests {
         assert!(
             new_session
                 .iter()
-                .any(|arg| arg.contains("claude --model") && arg.contains("sonnet")),
+                .any(|arg| arg.contains("exec claude --model") && arg.contains("sonnet")),
             "the replacement must launch the current claude binary with the requested model, got {new_session:?}"
         );
     }
@@ -2530,14 +2528,14 @@ mod tests {
             .path()
             .join(".claude")
             .join(coordinator_handoff::START_BRIEF_FILENAME);
-        assert!(
-            command.contains("exec python3")
-                && command.contains(".boss/feed-initial-prompt")
-                && command.contains(&boss_ssh_transport::shell_quote(&brief_path.to_string_lossy()))
-                && command.ends_with("claude --model 'opus' --permission-mode auto"),
-            "launch command must feed the brief without argv expansion, got {command:?}"
+        let expected_fragment = format!(
+            "--permission-mode auto \"$(cat {})\"",
+            boss_ssh_transport::shell_quote(&brief_path.to_string_lossy())
         );
-        assert!(!command.contains("$(cat"));
+        assert!(
+            command.ends_with(&expected_fragment),
+            "launch command must hand the brief to claude as its positional initial prompt, got {command:?}"
+        );
         let brief = start_brief(dir.path());
         assert!(
             brief.contains("NO HANDOFF: none is expected"),
