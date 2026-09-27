@@ -30,10 +30,15 @@ pub(crate) const LINUX_MAX_ARG_STRLEN_PAGES: usize = 32;
 /// 50% slop [`environment_bytes`] applies locally.
 pub(crate) const REMOTE_ENVIRONMENT_BYTES_FALLBACK: usize = (256 * 1024) + (128 * 1024);
 
-/// Fail-closed remote `ARG_MAX` used when the probe does not answer. Sized
-/// to the Linux per-argument cap so an unprobeable remote cannot accept a
-/// prompt that would overflow `MAX_ARG_STRLEN` on a typical Linux target.
-pub(crate) const FAIL_CLOSED_REMOTE_ARG_MAX: usize = 128 * 1024;
+/// Fail-closed remote aggregate `ARG_MAX` used when the probe does not
+/// answer. Typical Linux default is 2 MiB (`_STK_LIM / 4`). This is
+/// independent of the per-argument cap: a missing probe must still accept
+/// a small prompt whose environment footprint already exceeds 128 KiB.
+pub(crate) const FAIL_CLOSED_REMOTE_ARG_MAX: usize = 2 * 1024 * 1024;
+
+/// Linux-typical `MAX_ARG_STRLEN` (4 KiB pages × 32) used as the
+/// fail-closed per-argument cap when the remote probe does not answer.
+pub(crate) const FAIL_CLOSED_REMOTE_MAX_ARG_STRLEN: usize = 128 * 1024;
 
 /// Exec-time limits the preflight budgets against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,7 +65,7 @@ impl ExecArgLimits {
         Self {
             arg_max: FAIL_CLOSED_REMOTE_ARG_MAX,
             environment_bytes: REMOTE_ENVIRONMENT_BYTES_FALLBACK,
-            max_arg_strlen: Some(FAIL_CLOSED_REMOTE_ARG_MAX),
+            max_arg_strlen: Some(FAIL_CLOSED_REMOTE_MAX_ARG_STRLEN),
         }
     }
 }
@@ -327,6 +332,39 @@ mod tests {
     }
 
     #[test]
+    fn fail_closed_remote_limits_accept_a_small_prompt() {
+        let command = "claude --model opus \"$(cat .claude/initial-prompt.txt)\"\n";
+        check_launch_command_arg_max_for_bytes(
+            command,
+            "claude",
+            ".claude",
+            "initial-prompt.txt",
+            50_000,
+            ExecArgLimits::fail_closed_remote(),
+        )
+        .expect("a ~50KB prompt must pass fail-closed remote limits");
+    }
+
+    #[test]
+    fn fail_closed_remote_limits_refuse_a_200kb_prompt_on_max_arg_strlen() {
+        let command =
+            "codex --strict-config --no-alt-screen -a never -m 'gpt-5' \"$(cat .codex/initial-prompt.txt)\"\n";
+        let err = check_launch_command_arg_max_for_bytes(
+            command,
+            "codex",
+            ".codex",
+            "initial-prompt.txt",
+            200_000,
+            ExecArgLimits::fail_closed_remote(),
+        )
+        .expect_err("200KB exceeds fail-closed MAX_ARG_STRLEN");
+        let msg = err.to_string();
+        assert!(msg.contains("codex"), "{msg}");
+        assert!(msg.contains("MAX_ARG_STRLEN"), "{msg}");
+        assert!(!msg.contains("exceeds this host's ARG_MAX"), "{msg}");
+    }
+
+    #[test]
     fn fail_closed_remote_limits_refuse_a_600kb_prompt() {
         let command = "grok --model 'grok-4.6' \"$(cat .grok/initial-prompt.txt)\"\n";
         let err = check_launch_command_arg_max_for_bytes(
@@ -337,7 +375,10 @@ mod tests {
             600_000,
             ExecArgLimits::fail_closed_remote(),
         )
-        .expect_err("unprobeable remotes must fail closed");
-        assert!(err.to_string().contains("grok"), "{err}");
+        .expect_err("unprobeable remotes must fail closed on MAX_ARG_STRLEN");
+        let msg = err.to_string();
+        assert!(msg.contains("grok"), "{msg}");
+        assert!(msg.contains("MAX_ARG_STRLEN"), "{msg}");
+        assert!(!msg.contains("exceeds this host's ARG_MAX"), "{msg}");
     }
 }

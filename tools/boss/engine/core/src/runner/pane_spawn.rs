@@ -330,14 +330,14 @@ impl PaneSpawnRunner {
         }
     }
 
-    fn spawn_confirm_timeouts(&self) -> (StdDuration, StdDuration) {
+    fn spawn_confirm_timeouts(&self, driver: &dyn crate::driver::AgentDriver) -> (StdDuration, StdDuration) {
         #[cfg(test)]
         if let Some(timeout) = self.overrides.spawn_confirm_timeout.get() {
             return (*timeout, *timeout);
         }
         (
             super::spawn_confirmation::COMPOSER_READY_TIMEOUT,
-            super::spawn_confirmation::TURN_START_TIMEOUT,
+            super::spawn_confirmation::turn_start_timeout_for_driver(driver),
         )
     }
 
@@ -1204,44 +1204,15 @@ impl ExecutionRunner for PaneSpawnRunner {
         // cancellation, and signal the coordinator to release the lease
         // the cancel path left for us. Without this the worker survives
         // unreaped in a workspace the engine believes is free.
-        match self.work_db.get_execution(&execution.id) {
-            Ok(exec) if exec.status == ExecutionStatus::Cancelled => {
-                tracing::warn!(
-                    worker_id,
-                    execution_id = %execution.id,
-                    slot_id = started.slot_id,
-                    shell_pid = started.shell_pid,
-                    "spawn completed after the execution was cancelled mid-spawn; reaping the worker pane and releasing the deferred lease",
-                );
-                spawner.reap_worker_pane(&execution.id).await;
-                return Ok(RunOutcome {
-                    wait_state: RunWaitState::CancelledDuringSpawn,
-                    result_summary: Some(format!(
-                        "Execution cancelled during spawn; reaped worker pane in slot {} (shell pid {}).",
-                        started.slot_id, started.shell_pid,
-                    )),
-                    attention: None,
-                    // The pane is already torn down — don't ask the
-                    // coordinator to keep the pool slot claimed for it.
-                    slot_id: None,
-                    spawn_config: Some(spawn_config),
-                });
-            }
-            Ok(_) => {}
-            Err(err) => {
-                // A read failure here is non-fatal: fall through to the
-                // normal completion path. The worst case is the existing
-                // pre-fix behaviour, not a regression.
-                tracing::warn!(
-                    execution_id = %execution.id,
-                    ?err,
-                    "post-spawn cancel re-check failed; proceeding with normal completion",
-                );
-            }
+        if let Some(cancelled) = self
+            .take_cancelled_during_spawn(spawner.as_ref(), &execution.id, worker_id, &started, &spawn_config)
+            .await
+        {
+            return Ok(cancelled);
         }
 
         if !self.skip_spawn_confirm() {
-            let (composer_timeout, turn_timeout) = self.spawn_confirm_timeouts();
+            let (composer_timeout, turn_timeout) = self.spawn_confirm_timeouts(driver.as_ref());
             let confirm = confirm_local_spawn(
                 &tmux_host,
                 driver.as_ref(),
@@ -1251,6 +1222,12 @@ impl ExecutionRunner for PaneSpawnRunner {
                 turn_timeout,
             )
             .await;
+            if let Some(cancelled) = self
+                .take_cancelled_during_spawn(spawner.as_ref(), &execution.id, worker_id, &started, &spawn_config)
+                .await
+            {
+                return Ok(cancelled);
+            }
             if let Err(err) = confirm {
                 tracing::warn!(
                     worker_id,
@@ -1289,6 +1266,51 @@ impl ExecutionRunner for PaneSpawnRunner {
     }
 }
 
+impl PaneSpawnRunner {
+    /// If the execution was cancelled while spawn/confirmation was in
+    /// flight, reap the pane and return [`RunWaitState::CancelledDuringSpawn`].
+    async fn take_cancelled_during_spawn(
+        &self,
+        spawner: &dyn crate::spawn_flow::WorkerSpawner,
+        execution_id: &str,
+        worker_id: &str,
+        started: &crate::spawn_flow::StartedWorker,
+        spawn_config: &crate::effort::SpawnConfig,
+    ) -> Option<RunOutcome> {
+        match self.work_db.get_execution(execution_id) {
+            Ok(exec) if exec.status == ExecutionStatus::Cancelled => {
+                tracing::warn!(
+                    worker_id,
+                    execution_id,
+                    slot_id = started.slot_id,
+                    shell_pid = started.shell_pid,
+                    "spawn completed after the execution was cancelled mid-spawn; reaping the worker pane and releasing the deferred lease",
+                );
+                spawner.reap_worker_pane(execution_id).await;
+                Some(RunOutcome {
+                    wait_state: RunWaitState::CancelledDuringSpawn,
+                    result_summary: Some(format!(
+                        "Execution cancelled during spawn; reaped worker pane in slot {} (shell pid {}).",
+                        started.slot_id, started.shell_pid,
+                    )),
+                    attention: None,
+                    slot_id: None,
+                    spawn_config: Some(spawn_config.clone()),
+                })
+            }
+            Ok(_) => None,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    ?err,
+                    "post-spawn cancel re-check failed; proceeding with normal completion",
+                );
+                None
+            }
+        }
+    }
+}
+
 /// Bounded wait after prompt delivery: driver-specific PTY evidence that
 /// the CLI is up, then a driver hook/session event that the turn started.
 async fn confirm_local_spawn(
@@ -1299,50 +1321,28 @@ async fn confirm_local_spawn(
     composer_timeout: StdDuration,
     turn_timeout: StdDuration,
 ) -> Result<()> {
-    use super::spawn_confirmation::{
-        SPAWN_CONFIRM_POLL, composer_not_ready_error, pane_shows_driver_ready, turn_did_not_start_error,
-    };
+    use super::spawn_confirmation::{SPAWN_CONFIRM_POLL, confirm_spawn_started, pane_shows_driver_ready};
 
     let driver_name = driver.descriptor().name;
     let spec = driver.pane_monitor_spec();
-    let composer_start = tokio::time::Instant::now();
-    let mut composer_ready = false;
-    loop {
-        if let Ok(pane_text) = tmux_host.tmux().capture_pane(tmux_host.session_name()).await {
-            composer_ready = match spec.as_ref() {
+    confirm_spawn_started(
+        driver_name,
+        run_id,
+        composer_timeout,
+        turn_timeout,
+        SPAWN_CONFIRM_POLL,
+        || async {
+            let Ok(pane_text) = tmux_host.tmux().capture_pane(tmux_host.session_name()).await else {
+                return false;
+            };
+            match spec.as_ref() {
                 Some(spec) => pane_shows_driver_ready(&pane_text, spec),
                 None => !pane_text.trim().is_empty(),
-            };
-            if composer_ready {
-                break;
             }
-        }
-        if composer_start.elapsed() >= composer_timeout {
-            break;
-        }
-        let remaining = composer_timeout.saturating_sub(composer_start.elapsed());
-        tokio::time::sleep(SPAWN_CONFIRM_POLL.min(remaining)).await;
-    }
-    if !composer_ready {
-        return Err(composer_not_ready_error(driver_name, run_id, composer_timeout));
-    }
-    let turn_start = tokio::time::Instant::now();
-    let mut turn_started = false;
-    loop {
-        if live_states.is_some_and(|registry| registry.has_driver_signal_for_run(run_id)) {
-            turn_started = true;
-            break;
-        }
-        if turn_start.elapsed() >= turn_timeout {
-            break;
-        }
-        let remaining = turn_timeout.saturating_sub(turn_start.elapsed());
-        tokio::time::sleep(SPAWN_CONFIRM_POLL.min(remaining)).await;
-    }
-    if !turn_started {
-        return Err(turn_did_not_start_error(driver_name, run_id, turn_timeout));
-    }
-    Ok(())
+        },
+        || async { live_states.is_some_and(|registry| registry.has_driver_signal_for_run(run_id)) },
+    )
+    .await
 }
 
 /// The shell's background tier is inherited by drivers and build tools,

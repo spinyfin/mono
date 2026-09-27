@@ -496,6 +496,11 @@ pub struct SshHostAdapter {
     /// worker's hook events tunnel back to the same socket local workers
     /// write to.
     events_socket_path: PathBuf,
+    /// Same live-state registry the local spawn path keys turn-start on.
+    /// Remote hooks record `has_driver_signal_for_run` here after
+    /// `register_remote_worker_slot`; `None` in unit tests that never
+    /// stand up the registry.
+    live_worker_states: Option<Arc<crate::live_worker_state::LiveWorkerStateRegistry>>,
 }
 
 impl SshHostAdapter {
@@ -505,6 +510,7 @@ impl SshHostAdapter {
         cfg: Arc<RuntimeConfig>,
         non_opus_auto_mode: bool,
         events_socket_path: PathBuf,
+        live_worker_states: Option<Arc<crate::live_worker_state::LiveWorkerStateRegistry>>,
     ) -> Self {
         Self {
             transport,
@@ -513,6 +519,7 @@ impl SshHostAdapter {
             cfg,
             non_opus_auto_mode,
             events_socket_path,
+            live_worker_states,
         }
     }
 
@@ -735,16 +742,6 @@ async fn probe_remote_exec_arg_limits(transport: &SshTransport) -> crate::runner
             ExecArgLimits::fail_closed_remote()
         }
     }
-}
-
-fn execution_has_transcript_path(db: &WorkDb, execution_id: &str) -> bool {
-    db.list_runs(execution_id)
-        .ok()
-        .map(|runs| {
-            runs.iter()
-                .any(|run| run.transcript_path.as_deref().is_some_and(|path| !path.is_empty()))
-        })
-        .unwrap_or(false)
 }
 
 /// Prefer a command's trimmed stderr for a failure detail, falling back
@@ -1250,32 +1247,39 @@ impl HostAdapter for SshHostAdapter {
 
         // Composer readiness for argv delivery on the remote is the wrapper
         // actually launching the driver (remote_pid). Turn-start confirmation
-        // is the first hook that persists a transcript_path onto the run.
-        let turn_timeout = crate::runner::spawn_confirmation::TURN_START_TIMEOUT;
+        // is fresh evidence for *this* run: a driver signal on the live
+        // registry, or a transcript_path on the current work_runs row.
+        let turn_timeout = crate::runner::spawn_confirmation::turn_start_timeout_for_driver(driver.as_ref());
         let poll = crate::runner::spawn_confirmation::SPAWN_CONFIRM_POLL;
-        let turn_start = tokio::time::Instant::now();
-        let mut turn_started = false;
-        loop {
-            if execution_has_transcript_path(&self.work_db, &run_id) {
-                turn_started = true;
-                break;
-            }
-            if turn_start.elapsed() >= turn_timeout {
-                break;
-            }
-            let remaining = turn_timeout.saturating_sub(turn_start.elapsed());
-            tokio::time::sleep(poll.min(remaining)).await;
-        }
-        if !turn_started {
-            if let Some(pid) = outcome.remote_pid {
-                let _ = self.transport.run(&["kill", &pid.to_string()]).await;
-            }
-            return Err(crate::runner::spawn_confirmation::turn_did_not_start_error(
-                driver.descriptor().name,
-                &run_id,
-                turn_timeout,
-            ));
-        }
+        let remote_pid = outcome.remote_pid;
+        let work_db = Arc::clone(&self.work_db);
+        let live_worker_states = self.live_worker_states.clone();
+        let transport = self.transport.clone();
+        let wait_run_id = run_id.clone();
+        crate::runner::spawn_confirmation::confirm_turn_start_or_reap(
+            driver.descriptor().name,
+            &run_id,
+            turn_timeout,
+            poll,
+            || {
+                let work_db = Arc::clone(&work_db);
+                let live_worker_states = live_worker_states.clone();
+                let wait_run_id = wait_run_id.clone();
+                async move {
+                    crate::runner::spawn_confirmation::current_run_has_turn_start_evidence(
+                        &work_db,
+                        live_worker_states.as_deref(),
+                        &wait_run_id,
+                    )
+                }
+            },
+            || async {
+                if let Some(pid) = remote_pid {
+                    let _ = transport.run(&["kill", &pid.to_string()]).await;
+                }
+            },
+        )
+        .await?;
 
         // WorkerPaneAlive: the remote agent is up and working, so the
         // execution stays `running` (never `waiting_human` — nothing is
@@ -1655,6 +1659,9 @@ pub struct SshHostAdapterProvider {
     events_socket_path: PathBuf,
     /// Engine-owned directory holding the per-host `ControlMaster` sockets.
     control_socket_dir: PathBuf,
+    /// Live-state registry forwarded into each `SshHostAdapter` so remote
+    /// turn-start waits on the same driver-signal predicate as local spawn.
+    live_worker_states: Option<Arc<crate::live_worker_state::LiveWorkerStateRegistry>>,
     /// Lazily-built remote adapters, one per host id.
     #[builder(default = Mutex::new(HashMap::new()))]
     cache: Mutex<HashMap<String, Arc<dyn HostAdapter>>>,
@@ -1668,6 +1675,7 @@ impl SshHostAdapterProvider {
         non_opus_auto_mode: bool,
         events_socket_path: PathBuf,
         control_socket_dir: PathBuf,
+        live_worker_states: Option<Arc<crate::live_worker_state::LiveWorkerStateRegistry>>,
     ) -> Self {
         Self {
             local,
@@ -1676,6 +1684,7 @@ impl SshHostAdapterProvider {
             non_opus_auto_mode,
             events_socket_path,
             control_socket_dir,
+            live_worker_states,
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -1708,6 +1717,7 @@ impl HostAdapterProvider for SshHostAdapterProvider {
             Arc::clone(&self.cfg),
             self.non_opus_auto_mode,
             self.events_socket_path.clone(),
+            self.live_worker_states.clone(),
         ));
         cache.insert(host.id.clone(), Arc::clone(&adapter));
         Ok(adapter)
@@ -1969,7 +1979,7 @@ mod tests {
             .build();
         let cfg = Arc::new(RuntimeConfig::from_parts(work, None));
         let transport = SshTransport::new(host_id, ssh_target, &base);
-        SshHostAdapter::new(transport, Arc::new(db), cfg, false, base.join("events.sock"))
+        SshHostAdapter::new(transport, Arc::new(db), cfg, false, base.join("events.sock"), None)
     }
 
     #[test]

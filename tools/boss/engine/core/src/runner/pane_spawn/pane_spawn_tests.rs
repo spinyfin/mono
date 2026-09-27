@@ -33,6 +33,11 @@ struct CapturedSpawn {
 
 /// Records the spawn request the runner sent so tests can assert
 /// on env, initial_input, etc.
+///
+/// `#[cfg(test)]` is redundant under this file's test-module parent, but
+/// checkleft's `rust/giant-structs` parser reads each file in isolation
+/// and cannot see the ancestor `cfg(test)`.
+#[cfg(test)]
 struct CapturingSpawner {
     registry: WorkerRegistry,
     live_states: LiveWorkerStateRegistry,
@@ -40,8 +45,12 @@ struct CapturingSpawner {
     /// Run ids passed to `reap_worker_pane` — lets the mid-spawn
     /// cancel test assert the runner reaped the just-spawned pane.
     reaped: StdMutex<Vec<String>>,
-    /// When true, `capture-pane` returns Claude chrome and stamps a
-    /// driver-signal so spawn confirmation can succeed in tests.
+    /// When true, `capture-pane` returns Claude agent chrome. Independent of
+    /// [`Self::auto_confirm_turn`] so tests can drive composer-ready without
+    /// a hook, and vice versa.
+    pane_chrome: std::sync::atomic::AtomicBool,
+    /// When true, `capture-pane` stamps a driver-signal so the turn-start
+    /// wait can succeed in tests.
     auto_confirm_turn: std::sync::atomic::AtomicBool,
 }
 
@@ -52,6 +61,7 @@ impl CapturingSpawner {
             live_states: LiveWorkerStateRegistry::new(),
             last: StdMutex::new(None),
             reaped: StdMutex::new(Vec::new()),
+            pane_chrome: std::sync::atomic::AtomicBool::new(false),
             auto_confirm_turn: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -142,6 +152,8 @@ impl CommandRunner for CapturingSpawner {
                         self.live_states
                             .record_driver_signal(&state.run_id, crate::live_worker_state::DriverSignalKind::HookEvent);
                     }
+                }
+                if self.pane_chrome.load(std::sync::atomic::Ordering::SeqCst) {
                     "Claude Code\n"
                 } else {
                     ""
@@ -2106,12 +2118,38 @@ async fn spawn_confirmation_timeout_reaps_the_pane_and_fails_the_spawn() {
             Some("change-1"),
         )
         .await
-        .expect_err("absent turn-start evidence must fail the spawn");
+        .expect_err("absent composer chrome must fail the spawn");
     let msg = err.to_string();
-    assert!(
-        msg.contains("composer never became ready") || msg.contains("no driver hook or session event"),
-        "{msg}"
-    );
+    assert!(msg.contains("composer never became ready"), "{msg}");
+    assert!(msg.contains("failed spawn"), "{msg}");
+    assert_eq!(spawner.reaped_run_ids(), vec!["exec-test-1".to_string()]);
+}
+
+#[tokio::test]
+async fn spawn_confirmation_ready_chrome_without_a_hook_fails_turn_start_and_reaps() {
+    let workspace = TempDir::new().unwrap();
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    spawner.pane_chrome.store(true, std::sync::atomic::Ordering::SeqCst);
+    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db, flags);
+    bind_runner(&runner, weak, &spawner);
+    runner.set_skip_spawn_confirm(false);
+    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(40));
+
+    let err = runner
+        .run_execution(
+            "worker-1",
+            &sample_execution(workspace.path()),
+            &sample_chore(),
+            workspace.path(),
+            Some("change-1"),
+        )
+        .await
+        .expect_err("ready chrome without a driver hook must fail the spawn");
+    let msg = err.to_string();
+    assert!(msg.contains("no driver hook or session event"), "{msg}");
     assert!(msg.contains("failed spawn"), "{msg}");
     assert_eq!(spawner.reaped_run_ids(), vec!["exec-test-1".to_string()]);
 }
@@ -2120,6 +2158,7 @@ async fn spawn_confirmation_timeout_reaps_the_pane_and_fails_the_spawn() {
 async fn spawn_confirmation_passes_when_driver_chrome_and_hook_arrive() {
     let workspace = TempDir::new().unwrap();
     let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    spawner.pane_chrome.store(true, std::sync::atomic::Ordering::SeqCst);
     spawner
         .auto_confirm_turn
         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2142,4 +2181,54 @@ async fn spawn_confirmation_passes_when_driver_chrome_and_hook_arrive() {
         .await
         .expect("composer chrome plus a recorded hook must complete spawn");
     assert!(spawner.reaped_run_ids().is_empty());
+}
+
+#[tokio::test]
+async fn run_execution_reaps_and_signals_when_cancelled_during_confirmation() {
+    let workspace = TempDir::new().unwrap();
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    spawner.pane_chrome.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
+    let chore = create_test_chore(&work_db, product.id.clone(), "Cancel during confirm");
+    let ready = create_ready_chore_execution(&work_db, chore.id.clone());
+    let (execution, _run) = work_db
+        .start_execution_run(
+            &ready.id,
+            "worker-1",
+            "foo",
+            "lease-1",
+            "foo-agent-001",
+            workspace.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db.clone(), flags);
+    bind_runner(&runner, weak, &spawner);
+    runner.set_skip_spawn_confirm(false);
+    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(80));
+
+    let exec_id = execution.id.clone();
+    let db = work_db.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        db.cancel_running_execution(&exec_id).unwrap();
+    });
+
+    let chore_item = work_db.get_work_item(&chore.id).unwrap();
+    let outcome = runner
+        .run_execution("worker-1", &execution, &chore_item, workspace.path(), Some("change-1"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome.wait_state,
+        RunWaitState::CancelledDuringSpawn,
+        "a cancel that lands during confirmation must yield CancelledDuringSpawn",
+    );
+    assert!(outcome.slot_id.is_none());
+    assert_eq!(spawner.reaped_run_ids().as_slice(), [execution.id.as_str()]);
 }

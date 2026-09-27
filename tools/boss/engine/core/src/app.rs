@@ -1503,7 +1503,7 @@ impl ServerState {
             );
             execution_coordinator_inner.set_dispatch_events(dispatch_events);
             execution_coordinator_inner.set_metrics(metrics_for_coordinator);
-            execution_coordinator_inner.set_live_worker_states(live_worker_states_for_coordinator);
+            execution_coordinator_inner.set_live_worker_states(live_worker_states_for_coordinator.clone());
             // Explicitly seed the coordinator's single `EventBus` (design
             // doc: "One engine process, one bus") rather than letting it
             // fall through to its private `EventBus::new()` default. A
@@ -1552,6 +1552,7 @@ impl ServerState {
                         remote_non_opus_auto_mode,
                         provider_events_socket,
                         control_dir,
+                        Some(live_worker_states_for_coordinator.clone()),
                     ),
                 ));
             }
