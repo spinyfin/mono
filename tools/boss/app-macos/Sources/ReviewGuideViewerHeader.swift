@@ -1,4 +1,5 @@
 import SwiftUI
+import Textual
 
 /// Header bar shown above the document body in the async markdown viewer
 /// when it is displaying a PR review guide. Reads the live `WorkTask`
@@ -20,6 +21,7 @@ struct ReviewGuideViewerHeader: View {
     @ObservedObject var chatModel: ChatViewModel
     @ObservedObject private var drafts = GuideCommentDrafts.shared
     let rootTaskId: String
+    @State private var findingsExpanded = true
     /// The open version's generation timestamp (RFC 3339), or `nil` while
     /// still loading.
     let generatedAt: String?
@@ -33,7 +35,9 @@ struct ReviewGuideViewerHeader: View {
                         .foregroundStyle(.secondary)
                     Spacer(minLength: 8)
                     if task.isMergeWhenReadyEligible {
-                        MergeWhenReadyControl(onConfirm: { chatModel.mergeWhenReady(for: task) })
+                        MergeWhenReadyControl(onConfirm: {
+                            chatModel.mergeWhenReady(for: task, origin: .reviewGuideViewer)
+                        })
                     }
                 }
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
@@ -64,14 +68,53 @@ struct ReviewGuideViewerHeader: View {
                         }
                     }
                 }
+                if let seriesId = displayedSeriesId,
+                   let findings = chatModel.reviewGuideFindingsBySeriesID[seriesId] {
+                    Text(findings.statusText)
+                        .font(.caption)
+                        .accessibilityIdentifier("review-guide-findings-status")
+                    DisclosureGroup("AI review findings addendum", isExpanded: $findingsExpanded) {
+                        ScrollView {
+                            StructuredText(markdown: findings.addendumMarkdown)
+                                .bossMarkdown()
+                                .textual.textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(maxHeight: 200)
+                    }
+                    .font(.caption)
+                }
                 currentnessBanner(for: task)
                 mergeFeedbackRow(for: task)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
             .background(Color.secondary.opacity(0.06))
+            .task(id: "\(rootTaskId)|\(displayedSeriesId ?? "")") {
+                // Skip until the guide on screen has a series id, then
+                // re-poll immediately when that series changes (same root,
+                // replacement PR, or the artifact id arriving after load).
+                guard let seriesId = displayedSeriesId else { return }
+                while !Task.isCancelled {
+                    chatModel.engine.sendGetReviewGuideSummary(rootTaskId: rootTaskId, seriesId: seriesId)
+                    do { try await Task.sleep(for: .seconds(5)) }
+                    catch { return }
+                }
+            }
             Divider()
         }
+    }
+
+    /// The PR series id of the guide actually on screen, or `nil` while
+    /// still loading or if the shared viewer is showing something else
+    /// entirely (a design doc, a task description). Findings polling must
+    /// scope to this, not to `rootTaskId` alone, so a replacement PR on the
+    /// same root cannot swap findings under a still-open older guide.
+    private var displayedSeriesId: String? {
+        guard case .loaded(_, _, let artifact) = chatModel.asyncMarkdownViewerVM.state,
+              artifact?.kind == WireArtifactKind.reviewGuide
+        else { return nil }
+        return artifact?.id
     }
 
     /// Surfaces the same accept/error feedback the board card shows for a

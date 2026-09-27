@@ -89,17 +89,27 @@ pub(super) async fn handle_get_review_guide_summary(ctx: Dispatch, req: Frontend
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::GetReviewGuideSummary { root_task_id } = req else {
+    let FrontendRequest::GetReviewGuideSummary {
+        root_task_id,
+        series_id,
+    } = req
+    else {
         unreachable!()
     };
-    match work_db.get_pr_review_guide_summary_for_root(&root_task_id) {
-        Ok(summary) => send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::ReviewGuideSummary {
-                summary: summary.map(crate::work::to_wire_review_guide_summary),
-            },
-        ),
+    let result = work_db
+        .get_pr_review_guide_summary_for_root_scoped(&root_task_id, series_id.as_deref())
+        .and_then(|summary| {
+            summary
+                .map(|summary| {
+                    let findings = work_db.review_guide_findings(&summary.root_task_id, &summary.canonical_pr_url)?;
+                    let mut wire = crate::work::to_wire_review_guide_summary(summary);
+                    wire.findings = findings;
+                    Ok(wire)
+                })
+                .transpose()
+        });
+    match result {
+        Ok(summary) => send_response(&sink, &request_id, FrontendEvent::ReviewGuideSummary { summary }),
         Err(err) => send_work_error(&sink, &request_id, &err),
     }
 }

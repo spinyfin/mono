@@ -719,6 +719,11 @@ final class ChatViewModel: ObservableObject {
     /// Guards against a duplicate tap while the engine is running the merge.
     var mergingWhenReadyIDs: Set<String> = []
 
+    /// Which surface initiated each in-flight merge, keyed by work item id.
+    /// Copied onto `MergeRevisionConfirmation.origin` when the engine asks
+    /// for open-revision consent, so the dialog presents on that surface.
+    var mergeRevisionConfirmationOrigins: [String: MergeRevisionConfirmationOrigin] = [:]
+
     let engine: EngineClient
     /// Routes engine comment RPC replies + `comments.artifact.*` invalidations
     /// to the open [`CommentLayer`]s. Injected into the markdown
@@ -1190,6 +1195,28 @@ final class ChatViewModel: ObservableObject {
     /// pause and no other blocker — the confirmation dialog binds to this.
     /// `nil` means no confirmation is showing.
     @Published var pendingPauseOverrideConfirmation: PauseOverrideConfirmation?
+
+    /// Live findings supplement keyed by PR series id. A late
+    /// `GetReviewGuideSummary` reply for another series (or an unscoped
+    /// poll) must not hide the on-screen series' status line; each series
+    /// keeps its own entry until a nil reply arrives for that same series.
+    @Published var reviewGuideFindingsBySeriesID: [String: ReviewGuideFindings] = [:]
+
+    /// True while the `"async-markdown-viewer"` window is in the hierarchy.
+    /// Viewer-origin merge confirmations fall back to the board when this
+    /// is false so a confirmation always has a window to present in.
+    @Published var isReviewGuideViewerWindowOpen = false
+
+    /// Set once `MergeConfirmationRequired` reports open revisions blocking
+    /// an in-flight merge attempt — see `MergeRevisionConfirmation`.
+    @Published var pendingMergeRevisionConfirmation: MergeRevisionConfirmation?
+
+    /// Confirmations for other tasks that arrived while
+    /// `pendingMergeRevisionConfirmation` was already showing a different
+    /// task's dialog. Presented one at a time, FIFO, once the current
+    /// dialog is resolved — so a second concurrent merge attempt can never
+    /// silently overwrite (and thereby strand) the first task's dialog.
+    var queuedMergeRevisionConfirmations: [MergeRevisionConfirmation] = []
 
     /// Inline confirmation banner shown on the card whose
     /// `merge_when_ready_accepted` reply just arrived (`MergeFeedbackNotice`)

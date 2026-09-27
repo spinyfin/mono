@@ -1904,3 +1904,6 @@ fn post_merge_verdict_followup_states_title_and_origin_provenance() {
         task.description
     );
 }
+
+#[path = "review_guide_findings_tests.rs"]
+mod review_guide_findings_tests;

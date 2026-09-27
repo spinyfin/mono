@@ -1841,6 +1841,14 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "review_guide_retry_queued",
         },
         TagCase {
+            label: "MergeConfirmationRequired",
+            event: FrontendEvent::MergeConfirmationRequired {
+                work_item_id: "task_1".into(),
+                revisions: vec![],
+            },
+            expected_tag: "merge_confirmation_required",
+        },
+        TagCase {
             label: "MergeWhenReadyAccepted",
             event: FrontendEvent::MergeWhenReadyAccepted {
                 work_item_id: "task_1".into(),
@@ -2236,6 +2244,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::ReviewGuideRetryQueued { .. }
         | FrontendEvent::ReviewTerminalReady { .. }
         | FrontendEvent::LiveWorkspaceTerminalReady { .. }
+        | FrontendEvent::MergeConfirmationRequired { .. }
         | FrontendEvent::MergeWhenReadyAccepted { .. }
         | FrontendEvent::AutomationCreated { .. }
         | FrontendEvent::AutomationsList { .. }

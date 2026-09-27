@@ -819,5 +819,8 @@ struct AsyncMarkdownViewerView: View {
             }
         }
         .registeredInWindowMenu()
+        .onAppear { chatModel.isReviewGuideViewerWindowOpen = true }
+        .onDisappear { chatModel.isReviewGuideViewerWindowOpen = false }
+        .mergeRevisionConfirmationAlert(model: chatModel, surface: .reviewGuideViewer)
     }
 }

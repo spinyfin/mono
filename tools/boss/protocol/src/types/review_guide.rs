@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Series identity and current lifecycle, without any Markdown content.
+/// Series identity, lifecycle, and live findings, without the generated guide body.
 /// Returned by `GetReviewGuideSummary`; also what a card/task-detail reply
 /// embeds.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
@@ -28,6 +28,9 @@ pub struct ReviewGuideSummary {
     /// `GetReviewGuideContent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readable_version_id: Option<String>,
+    /// Deterministic live supplement, separate from immutable version content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings: Option<ReviewGuideFindings>,
 }
 
 /// One immutable, validated guide version's full content. Returned by
@@ -65,6 +68,21 @@ pub struct ReviewGuideAttempt {
     /// Absent categories remain absent; no usage observation is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_usage_json: Option<String>,
+}
+
+/// Live, deterministic supplement to the immutable generated explanation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewGuideFindings {
+    pub status_text: String,
+    pub addendum_markdown: String,
+}
+
+/// Engine-selected non-terminal revision requiring explicit merge consent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenMergeRevision {
+    pub id: String,
+    pub label: String,
+    pub status: String,
 }
 
 #[cfg(test)]

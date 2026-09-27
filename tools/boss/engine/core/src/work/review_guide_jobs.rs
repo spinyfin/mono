@@ -788,7 +788,22 @@ impl WorkDb {
     /// [`Self::get_latest_pr_review_guide_source_capture`] does.
     pub fn get_pr_review_guide_summary_for_root(&self, root_task_id: &str) -> Result<Option<PrReviewGuideSummary>> {
         let conn = self.connect()?;
-        query_pr_review_guide_summary_for_root(&conn, root_task_id, None).map_err(Into::into)
+        query_pr_review_guide_summary_for_root(&conn, root_task_id, None, None).map_err(Into::into)
+    }
+
+    /// Like [`Self::get_pr_review_guide_summary_for_root`], but when
+    /// `series_id` is set, scopes the lookup to that specific series instead
+    /// of whichever series on the root observed most recently. Used by the
+    /// `GetReviewGuideSummary` RPC so a viewer polling an already-open guide
+    /// keeps seeing that guide's own PR series even after a replacement PR
+    /// creates a newer series on the same root task.
+    pub fn get_pr_review_guide_summary_for_root_scoped(
+        &self,
+        root_task_id: &str,
+        series_id: Option<&str>,
+    ) -> Result<Option<PrReviewGuideSummary>> {
+        let conn = self.connect()?;
+        query_pr_review_guide_summary_for_root(&conn, root_task_id, None, series_id).map_err(Into::into)
     }
 
     /// One immutable version's full content, by id — the `GetReviewGuide`
@@ -851,7 +866,7 @@ impl WorkDb {
     ) -> Result<RetryReviewGuideOutcome> {
         let summary = {
             let conn = self.connect()?;
-            query_pr_review_guide_summary_for_root(&conn, root_task_id, pr_url)?
+            query_pr_review_guide_summary_for_root(&conn, root_task_id, pr_url, None)?
         };
         let Some(summary) = summary else {
             return Ok(RetryReviewGuideOutcome::NoComparison);
@@ -1020,13 +1035,14 @@ fn query_pr_review_guide_summary_for_root(
     conn: &Connection,
     root_task_id: &str,
     pr_url: Option<&str>,
+    series_id: Option<&str>,
 ) -> rusqlite::Result<Option<PrReviewGuideSummary>> {
     conn.query_row(
         "SELECT id, root_task_id, canonical_pr_url, guide_lifecycle, request_epoch, selected_comparison_id, readable_version_id
          FROM pr_review_guide_source_series
-         WHERE root_task_id = ?1 AND (?2 IS NULL OR canonical_pr_url = ?2)
+         WHERE root_task_id = ?1 AND (?2 IS NULL OR canonical_pr_url = ?2) AND (?3 IS NULL OR id = ?3)
          ORDER BY latest_observation_sequence DESC, id DESC LIMIT 1",
-        params![root_task_id, pr_url],
+        params![root_task_id, pr_url, series_id],
         |row| {
             Ok(PrReviewGuideSummary {
                 series_id: row.get(0)?,
