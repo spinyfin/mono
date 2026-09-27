@@ -1078,6 +1078,38 @@ impl HostAdapter for SshHostAdapter {
         let remote_home = remote_home_dir(&self.transport).await?;
         let remote_settings_dir = format!("{remote_home}/{REMOTE_SETTINGS_DIR}");
         let remote_settings_path = format!("{remote_settings_dir}/{run_id}.json");
+
+        // Resolve the driver's SpawnPlan and fail fast, before shipping
+        // anything to the remote host, if the initial prompt embedded via
+        // this driver's `"$(cat <config_dir>/<initial_prompt_filename>)"`
+        // command substitution would overflow ARG_MAX at the remote CLI's
+        // `execve()` — the exact same E2BIG failure mode
+        // `check_launch_command_arg_max` guards against on the local pane
+        // path, reached here through the identical argv-embedding
+        // mechanism (`driver.spawn_invocation` / `RemoteSpawnPlan::driver_command`,
+        // substituted by the remote wrapper in `ssh_spawn.rs`). Past that
+        // limit the remote shell's `exec` fails invisibly to the engine,
+        // which would otherwise just see the run sit `Spawning` until
+        // `spawn_ack_sweep` gives up and redispatches into the identical,
+        // identically-doomed command.
+        let worker_kind = settings_input.worker_kind;
+        let driver_binary = driver.descriptor().binary.to_owned();
+        let driver_spawn_plan = driver.spawn_invocation(crate::driver::SpawnRequest {
+            model: &spawn_config.model,
+            effort: spawn_config.effort_value,
+            settings_path: Some(std::path::Path::new(&remote_settings_path)),
+            non_opus_auto_mode: self.non_opus_auto_mode,
+            permission_mode_override: worker_kind.forced_permission_mode(),
+            run_id: Some(&run_id),
+        });
+        crate::runner::pane_spawn::check_launch_command_arg_max_for_bytes(
+            &driver_spawn_plan.command,
+            driver.descriptor().name,
+            driver.descriptor().config_dir,
+            driver.descriptor().initial_prompt_filename,
+            prompt_text.len(),
+        )?;
+
         self.ship_file(&remote_prompt_dir, &remote_prompt_path, &prompt_text, "prompt")
             .await?;
         self.ship_file(
@@ -1099,16 +1131,6 @@ impl HostAdapter for SshHostAdapter {
         // wrapper still re-checks PATH so a race between probe and
         // launch surfaces as `host_missing_driver` rather than a silent
         // substitute.
-        let worker_kind = settings_input.worker_kind;
-        let driver_binary = driver.descriptor().binary.to_owned();
-        let driver_spawn_plan = driver.spawn_invocation(crate::driver::SpawnRequest {
-            model: &spawn_config.model,
-            effort: spawn_config.effort_value,
-            settings_path: Some(std::path::Path::new(&remote_settings_path)),
-            non_opus_auto_mode: self.non_opus_auto_mode,
-            permission_mode_override: worker_kind.forced_permission_mode(),
-            run_id: Some(&run_id),
-        });
         let plan = RemoteSpawnPlan::builder()
             .run_id(run_id.clone())
             .lease_id(lease_id)

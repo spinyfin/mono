@@ -7,7 +7,8 @@
 
 use super::{
     MAX_CANON_LINE_BYTES, check_arg_max_budget, check_initial_input_length, check_launch_command_arg_max,
-    estimated_launch_argv_bytes, local_arg_max, path_prepend_clause, render_env_directive, write_initial_input_script,
+    check_launch_command_arg_max_for_bytes, estimated_launch_argv_bytes, local_arg_max, path_prepend_clause,
+    render_env_directive, write_initial_input_script,
 };
 use crate::driver::{
     AgentDriver, ClaudeDriver, CodexDriver, EnvDirective, GrokDriver, PermissionInput, SpawnRequest, WorkerKind,
@@ -348,6 +349,32 @@ fn check_launch_command_arg_max_fails_for_a_prompt_over_this_hosts_real_arg_max(
     let command = "grok --model 'grok-4.6' \"$(cat .grok/initial-prompt.txt)\"\n";
     let err = check_launch_command_arg_max(command, "grok", workspace.path(), ".grok", "initial-prompt.txt")
         .expect_err("must fail, not silently proceed with a doomed exec");
+    let msg = err.to_string();
+    assert!(msg.contains("grok"), "error must name the driver: {msg}");
+    assert!(msg.contains("ARG_MAX"), "{msg}");
+}
+
+// ---------------------------------------------------------------------------
+// `check_launch_command_arg_max_for_bytes`: the same preflight for the
+// remote spawn path (`host_adapter.rs`), which ships the initial prompt to
+// a remote host over SSH from an in-memory `String` rather than a
+// workspace-relative file this process can `stat` — so it takes the
+// prompt's byte length directly instead of reading it off disk.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn check_launch_command_arg_max_for_bytes_passes_for_a_600kb_prompt_on_this_host() {
+    let command = "codex --strict-config --no-alt-screen -a never -m 'gpt-5' \"$(cat .codex/initial-prompt.txt)\"\n";
+    check_launch_command_arg_max_for_bytes(command, "codex", ".codex", "initial-prompt.txt", 600_000)
+        .expect("a ~600KB prompt must fit under this host's real ARG_MAX");
+}
+
+#[test]
+fn check_launch_command_arg_max_for_bytes_fails_for_a_prompt_over_this_hosts_real_arg_max() {
+    let arg_max = local_arg_max().unwrap();
+    let command = "grok --model 'grok-4.6' \"$(cat .grok/initial-prompt.txt)\"\n";
+    let err = check_launch_command_arg_max_for_bytes(command, "grok", ".grok", "initial-prompt.txt", arg_max + 4096)
+        .expect_err("must fail, not silently proceed with a doomed remote exec");
     let msg = err.to_string();
     assert!(msg.contains("grok"), "error must name the driver: {msg}");
     assert!(msg.contains("ARG_MAX"), "{msg}");

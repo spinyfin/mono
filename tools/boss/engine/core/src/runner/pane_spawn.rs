@@ -463,16 +463,33 @@ fn local_arg_max() -> Result<usize> {
     Ok(limit as usize)
 }
 
+/// Extra slop applied on top of [`environment_bytes`]'s already-conservative
+/// estimate, as a fixed fraction of it, to absorb the gap between the
+/// engine process's own environment and a pane's real login-shell
+/// environment (which can carry a materially heavier profile — extra
+/// `PATH` entries, shell-framework state, etc.) that the engine has no way
+/// to inspect ahead of spawn. Widen this (or replace `environment_bytes`
+/// with a session-specific measurement) if this is ever seen to false-pass
+/// in practice.
+const ENVIRONMENT_ESTIMATE_SLOP_NUMERATOR: usize = 1;
+const ENVIRONMENT_ESTIMATE_SLOP_DENOMINATOR: usize = 2;
+
 /// Conservative proxy for the exec'd CLI's environment footprint: the
-/// engine's own environment. The pane's real environment is the tmux
-/// session's, which the engine cannot inspect ahead of spawn — a driver adds
-/// only a handful of small directives (`spawn_plan.env`) on top of whatever
-/// the pane shell already inherited, so this stays a reasonable estimate
-/// relative to the multi-hundred-KB prompt sizes this check guards against.
+/// engine's own environment, padded by
+/// [`ENVIRONMENT_ESTIMATE_SLOP_NUMERATOR`]`/`[`ENVIRONMENT_ESTIMATE_SLOP_DENOMINATOR`].
+/// The pane's real environment is the tmux session's, which the engine
+/// cannot inspect ahead of spawn — a driver adds only a handful of small
+/// directives (`spawn_plan.env`) on top of whatever the pane shell already
+/// inherited, so this stays a reasonable estimate relative to the
+/// multi-hundred-KB prompt sizes this check guards against, with the extra
+/// padding covering a heavier-than-the-engine's-own login-shell profile.
 fn environment_bytes() -> usize {
-    std::env::vars_os()
+    let measured: usize = std::env::vars_os()
         .map(|(key, value)| key.len() + value.len() + 2 + std::mem::size_of::<usize>())
-        .sum()
+        .sum();
+    measured.saturating_add(
+        measured.saturating_mul(ENVIRONMENT_ESTIMATE_SLOP_NUMERATOR) / ENVIRONMENT_ESTIMATE_SLOP_DENOMINATOR,
+    )
 }
 
 /// Estimate the exec-time argv byte count for `command` once its
@@ -489,13 +506,33 @@ fn estimated_launch_argv_bytes(
     config_dir: &str,
     initial_prompt_filename: &str,
 ) -> Result<usize> {
-    let placeholder = format!("\"$(cat {config_dir}/{initial_prompt_filename})\"");
     let prompt_path = workspace_path.join(config_dir).join(initial_prompt_filename);
     let prompt_bytes = std::fs::metadata(&prompt_path)
         .with_context(|| format!("reading size of initial prompt at {}", prompt_path.display()))?
         .len() as usize;
+    Ok(substitute_prompt_bytes(
+        command,
+        config_dir,
+        initial_prompt_filename,
+        prompt_bytes,
+    ))
+}
+
+/// Shared placeholder-substitution arithmetic behind
+/// [`estimated_launch_argv_bytes`] (which reads the prompt's size from a
+/// local on-disk file) and [`check_launch_command_arg_max_for_bytes`] (for
+/// callers, such as the remote spawn path, that already know the prompt's
+/// byte length without a file read — the remote host's copy of the file
+/// isn't reachable from here to `stat`).
+fn substitute_prompt_bytes(
+    command: &str,
+    config_dir: &str,
+    initial_prompt_filename: &str,
+    prompt_bytes: usize,
+) -> usize {
+    let placeholder = format!("\"$(cat {config_dir}/{initial_prompt_filename})\"");
     let static_bytes = command.len().saturating_sub(placeholder.len());
-    Ok(static_bytes.saturating_add(prompt_bytes))
+    static_bytes.saturating_add(prompt_bytes)
 }
 
 /// Fail loudly, before ever typing the pane's initial input, when the
@@ -516,6 +553,29 @@ fn check_launch_command_arg_max(
     initial_prompt_filename: &str,
 ) -> Result<()> {
     let argv_bytes = estimated_launch_argv_bytes(command, workspace_path, config_dir, initial_prompt_filename)?;
+    let arg_max = local_arg_max()?;
+    check_arg_max_budget(argv_bytes, environment_bytes(), arg_max, driver_name)
+}
+
+/// Same preflight as [`check_launch_command_arg_max`], for callers that
+/// already know the initial prompt's byte length in-process (the remote
+/// spawn path: the prompt text is shipped over SSH from an in-memory
+/// `String`, so there is no local file to `stat` the way the pane-spawn
+/// path does) instead of a workspace-relative file on this host.
+///
+/// This still checks against *this* (the engine's) host `ARG_MAX` and
+/// environment-size estimate rather than the remote host's, since the
+/// engine has no cheap way to probe either over the SSH transport ahead of
+/// spawn; it is a conservative proxy in the same spirit as
+/// [`environment_bytes`], not an exact remote-host measurement.
+pub(crate) fn check_launch_command_arg_max_for_bytes(
+    command: &str,
+    driver_name: &str,
+    config_dir: &str,
+    initial_prompt_filename: &str,
+    prompt_bytes: usize,
+) -> Result<()> {
+    let argv_bytes = substitute_prompt_bytes(command, config_dir, initial_prompt_filename, prompt_bytes);
     let arg_max = local_arg_max()?;
     check_arg_max_budget(argv_bytes, environment_bytes(), arg_max, driver_name)
 }
