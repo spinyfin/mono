@@ -57,15 +57,6 @@ pub(super) fn compose_review_guide_prompt(work_db: &WorkDb, execution: &WorkExec
     };
     let mut prompt = boss_review_guide::render_prompt(&metadata);
     prompt.push_str("\n\n");
-    // A budget-exceeded packet fails the attempt loudly (see
-    // `boss_review_guide::render_source_context`) instead of silently
-    // sending a truncated prompt past the model's context window.
-    let source_context = boss_review_guide::render_source_context(&packet).map_err(|err| {
-        anyhow::anyhow!(
-            "review_guide execution {}: comparison {comparison_id}: {err}",
-            execution.id,
-        )
-    })?;
-    prompt.push_str(&source_context);
+    prompt.push_str(&boss_review_guide::render_source_context(&packet));
     Ok(prompt)
 }
