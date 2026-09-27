@@ -90,14 +90,29 @@ struct ReviewGuideViewerHeader: View {
             .task(id: rootTaskId) {
                 // The document window can remain open after the selected board
                 // changes. Refresh only its small engine-owned supplement.
+                // Scope every poll to the series actually on screen so a
+                // replacement PR opened on this root task cannot silently
+                // swap in a different PR's findings underneath this guide.
                 while !Task.isCancelled {
-                    chatModel.engine.sendGetReviewGuideSummary(rootTaskId: rootTaskId)
+                    chatModel.engine.sendGetReviewGuideSummary(rootTaskId: rootTaskId, seriesId: displayedSeriesId)
                     do { try await Task.sleep(for: .seconds(5)) }
                     catch { return }
                 }
             }
             Divider()
         }
+    }
+
+    /// The PR series id of the guide actually on screen, or `nil` while
+    /// still loading or if the shared viewer is showing something else
+    /// entirely (a design doc, a task description). Findings polling must
+    /// scope to this, not to `rootTaskId` alone, so a replacement PR on the
+    /// same root cannot swap findings under a still-open older guide.
+    private var displayedSeriesId: String? {
+        guard case .loaded(_, _, let artifact) = chatModel.asyncMarkdownViewerVM.state,
+              artifact?.kind == WireArtifactKind.reviewGuide
+        else { return nil }
+        return artifact?.id
     }
 
     /// Surfaces the same accept/error feedback the board card shows for a

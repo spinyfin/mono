@@ -147,24 +147,23 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
     func testOpenRevisionConfirmationRequiresExplicitConsent() {
         let model = makeModel()
         let revisions = [OpenMergeRevision(id: "revision", label: "ID-test", status: "blocked")]
-        var decision: ((Bool) -> Void)?
         var requests: [[String: Any]] = []
         model.engine.outboundRecorder = { requests.append($0) }
-        model.mergeRevisionConfirmationPresenter = { presented, complete in
-            XCTAssertEqual(presented, revisions)
-            decision = complete
-        }
+
         model.mergingWhenReadyIDs.insert("root")
         model.applyEventForTest(.mergeConfirmationRequired(workItemID: "root", revisions: revisions))
         XCTAssertTrue(requests.isEmpty)
-        XCTAssertNotNil(decision)
-        decision?(false)
+        XCTAssertEqual(model.pendingMergeRevisionConfirmation?.workItemID, "root")
+        XCTAssertEqual(model.pendingMergeRevisionConfirmation?.revisions, revisions)
+        model.cancelMergeRevisionConfirmation()
         XCTAssertTrue(requests.isEmpty)
+        XCTAssertNil(model.pendingMergeRevisionConfirmation)
         XCTAssertFalse(model.mergingWhenReadyIDs.contains("root"))
 
         model.mergingWhenReadyIDs.insert("root")
         model.applyEventForTest(.mergeConfirmationRequired(workItemID: "root", revisions: revisions))
-        decision?(true)
+        model.confirmMergeRevision()
+        XCTAssertNil(model.pendingMergeRevisionConfirmation)
         XCTAssertEqual(requests.last?["type"] as? String, "merge_when_ready")
         XCTAssertEqual(requests.last?["confirmed_revisions"] as? [[String: String]], revisions.map(\.wirePayload))
         XCTAssertTrue(model.mergingWhenReadyIDs.contains("root"))

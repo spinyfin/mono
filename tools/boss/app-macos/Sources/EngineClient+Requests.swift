@@ -432,8 +432,14 @@ extension EngineClient {
     }
 
     /// Refresh the open guide's engine-owned findings and tracking state.
-    func sendGetReviewGuideSummary(rootTaskId: String) {
-        sendLine(["type": "get_review_guide_summary", "root_task_id": rootTaskId])
+    /// `seriesId`, when known, scopes the lookup to the PR series the caller
+    /// is actually displaying — passing it prevents a replacement PR opened
+    /// on the same root task from silently swapping in a different PR's
+    /// findings while the original guide is still on screen.
+    func sendGetReviewGuideSummary(rootTaskId: String, seriesId: String? = nil) {
+        var payload: [String: Any] = ["type": "get_review_guide_summary", "root_task_id": rootTaskId]
+        if let seriesId { payload["series_id"] = seriesId }
+        sendLine(payload)
     }
 
     /// Ask the engine to merge (or queue for merging) the PR associated

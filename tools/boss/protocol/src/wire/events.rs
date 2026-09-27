@@ -1493,8 +1493,9 @@ pub enum FrontendEvent {
         work_item_id: String,
         workspace_path: String,
     },
-    /// No merge was initiated. Resend with these revisions only after the
-    /// operator explicitly confirms merging while fixes are outstanding.
+    /// No merge was initiated. Resend with these revisions only after
+    /// explicit confirmation that merging should proceed while fixes are
+    /// outstanding.
     MergeConfirmationRequired {
         work_item_id: String,
         revisions: Vec<crate::OpenMergeRevision>,

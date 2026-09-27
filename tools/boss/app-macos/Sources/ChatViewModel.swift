@@ -1192,7 +1192,10 @@ final class ChatViewModel: ObservableObject {
     @Published var pendingPauseOverrideConfirmation: PauseOverrideConfirmation?
 
     @Published var reviewGuideFindingsByRootID: [String: ReviewGuideFindings] = [:]
-    var mergeRevisionConfirmationPresenter: (([OpenMergeRevision], @escaping (Bool) -> Void) -> Void)?
+
+    /// Set once `MergeConfirmationRequired` reports open revisions blocking
+    /// an in-flight merge attempt — see `MergeRevisionConfirmation`.
+    @Published var pendingMergeRevisionConfirmation: MergeRevisionConfirmation?
 
     /// Inline confirmation banner shown on the card whose
     /// `merge_when_ready_accepted` reply just arrived (`MergeFeedbackNotice`)

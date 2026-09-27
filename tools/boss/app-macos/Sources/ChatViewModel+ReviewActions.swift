@@ -1,4 +1,3 @@
-import AppKit
 import Foundation
 
 /// Merge-when-ready and review/live-workspace terminal actions.
@@ -11,6 +10,21 @@ extension ChatViewModel {
     struct MergeFeedbackNotice: Equatable {
         let taskID: String
         let message: String
+    }
+
+    /// Set once `MergeConfirmationRequired` reports open revisions blocking
+    /// an in-flight merge attempt — the confirmation dialog binds to this,
+    /// mirroring `pendingPauseOverrideConfirmation`'s declarative shape so
+    /// the dialog shows regardless of which view (card or review-guide
+    /// viewer) initiated the merge. `nil` means no confirmation is showing.
+    struct MergeRevisionConfirmation: Equatable {
+        let workItemID: String
+        let revisions: [OpenMergeRevision]
+
+        var alertMessage: String {
+            revisions.map { "ID \($0.label) — \($0.status)" }.joined(separator: "\n")
+                + "\n\nThese revisions may still change this PR. Merge anyway?"
+        }
     }
 
     /// Ask the engine to merge (or queue for merging) the PR for the given
@@ -31,30 +45,23 @@ extension ChatViewModel {
 
     func handleMergeConfirmation(workItemID: String, revisions: [OpenMergeRevision]) {
         guard mergingWhenReadyIDs.contains(workItemID) else { return }
-        let complete: (Bool) -> Void = { [weak self] confirmed in
-            guard let self else { return }
-            if confirmed {
-                self.engine.sendMergeWhenReady(workItemID: workItemID, confirmedRevisions: revisions)
-            } else {
-                self.mergingWhenReadyIDs.remove(workItemID)
-            }
-        }
-        if let presenter = mergeRevisionConfirmationPresenter {
-            presenter(revisions, complete)
-            return
-        }
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "Merge while revisions are open?"
-        alert.informativeText = revisions.map { "ID \($0.label) — \($0.status)" }.joined(separator: "\n")
-            + "\n\nThese revisions may still change this PR. Merge anyway?"
-        alert.addButton(withTitle: "Cancel")
-        alert.addButton(withTitle: "Merge anyway")
-        if let window = NSApp.keyWindow {
-            alert.beginSheetModal(for: window) { complete($0 == .alertSecondButtonReturn) }
-        } else {
-            complete(alert.runModal() == .alertSecondButtonReturn)
-        }
+        pendingMergeRevisionConfirmation = MergeRevisionConfirmation(workItemID: workItemID, revisions: revisions)
+    }
+
+    /// User confirmed merging while revisions are open: resend the merge
+    /// request with the confirmed revisions attached.
+    func confirmMergeRevision() {
+        guard let confirmation = pendingMergeRevisionConfirmation else { return }
+        pendingMergeRevisionConfirmation = nil
+        engine.sendMergeWhenReady(workItemID: confirmation.workItemID, confirmedRevisions: confirmation.revisions)
+    }
+
+    /// User declined merging while revisions are open: drop the in-flight
+    /// guard so a fresh attempt can be made later.
+    func cancelMergeRevisionConfirmation() {
+        guard let confirmation = pendingMergeRevisionConfirmation else { return }
+        pendingMergeRevisionConfirmation = nil
+        mergingWhenReadyIDs.remove(confirmation.workItemID)
     }
 
     /// Ask the engine to lease a workspace for the given Review-column

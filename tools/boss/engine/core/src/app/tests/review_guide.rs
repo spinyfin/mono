@@ -96,6 +96,34 @@ impl Fixture {
         reply.payload
     }
 
+    async fn request_summary(&self, series_id: Option<&str>) -> Option<boss_protocol::ReviewGuideSummary> {
+        let sink = make_session_sink();
+        let ctx = Dispatch::builder()
+            .server_state(self.state.clone())
+            .work_db(self.state.work_db.clone())
+            .sink(sink.clone())
+            .session_id("session")
+            .request_id("request")
+            .recv_instant(std::time::Instant::now())
+            .decode_ms(0.0)
+            .build();
+        crate::app::review_guide::handle_get_review_guide_summary(
+            ctx,
+            FrontendRequest::GetReviewGuideSummary {
+                root_task_id: self.root.clone(),
+                series_id: series_id.map(str::to_owned),
+            },
+        )
+        .await;
+        sink.close();
+        let reply = sink.next().await.unwrap();
+        assert!(sink.next().await.is_none());
+        let FrontendEvent::ReviewGuideSummary { summary } = reply.payload else {
+            panic!("expected summary reply: {:?}", reply.payload)
+        };
+        summary
+    }
+
     async fn generate(&self, token: &str, already: bool) -> boss_protocol::ReviewGuideAttempt {
         let reply = self.request(&self.root, token).await;
         let FrontendEvent::ReviewGuideRetryQueued {
@@ -374,6 +402,56 @@ async fn replaced_pr_captures_and_admits_the_current_pr_series() {
     assert_eq!(attempt.series_id, current.series_id);
     assert_ne!(attempt.series_id, retired.series_id);
     assert_eq!(Some(attempt.comparison_id), current.selected_comparison_id);
+}
+
+#[tokio::test]
+async fn get_summary_scoped_to_series_survives_a_pr_replacement() {
+    let f = Fixture::new(false);
+    let db = &f.state.work_db;
+    let retired_url = "https://github.com/acme/widget/pull/90";
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = ?1 WHERE id = ?2",
+            rusqlite::params![retired_url, f.root],
+        )
+        .unwrap();
+    db.persist_pr_review_guide_source_capture(
+        &f.root,
+        db.allocate_pr_review_guide_source_observation_sequence().unwrap(),
+        PrSourceCaptureTrigger::Creation,
+        &source_capture_packet(retired_url, "base", "retired"),
+    )
+    .unwrap();
+    let retired = db.get_pr_review_guide_summary_for_root(&f.root).unwrap().unwrap();
+
+    // A viewer opens the retired PR's guide, then the root gets a
+    // replacement PR while that guide stays on screen.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = ?1 WHERE id = ?2",
+            rusqlite::params![PR_URL, f.root],
+        )
+        .unwrap();
+    f.generate("replacement", false).await;
+    let current = db.get_pr_review_guide_summary_for_root(&f.root).unwrap().unwrap();
+    assert_ne!(current.series_id, retired.series_id);
+
+    // Unscoped (root-only) lookup now returns the *new* series — this is the
+    // behaviour a poll keyed only on root_task_id would silently pick up.
+    let unscoped = f.request_summary(None).await.unwrap();
+    assert_eq!(unscoped.series_id, current.series_id);
+
+    // Scoped to the retired series id, the RPC must keep returning that PR's
+    // own summary rather than switching to the replacement's.
+    let scoped = f.request_summary(Some(&retired.series_id)).await.unwrap();
+    assert_eq!(scoped.series_id, retired.series_id);
+    assert_eq!(scoped.canonical_pr_url, retired_url);
+
+    // A series id from a different root's guide must never leak this root's
+    // findings back to it.
+    assert!(f.request_summary(Some("not-a-real-series")).await.is_none());
 }
 
 #[tokio::test]

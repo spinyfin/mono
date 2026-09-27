@@ -242,7 +242,7 @@ enum EngineEvent {
     /// The app should open a Ghostty terminal window rooted there; there
     /// is no lease to release when the window closes.
     case liveWorkspaceTerminalReady(workItemID: String, workspacePath: String)
-    /// No merge initiated; the operator must acknowledge these open revisions.
+    /// No merge initiated; these open revisions must be acknowledged before merging.
     case mergeConfirmationRequired(workItemID: String, revisions: [OpenMergeRevision])
     /// Response to `merge_when_ready` — the engine has successfully
     /// initiated the merge process for the PR. `action` is

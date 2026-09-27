@@ -1003,8 +1003,16 @@ pub enum FrontendRequest {
     /// supplement; fetch the immutable guide with [`Self::GetReviewGuideContent`]. Replies with
     /// [`FrontendEvent::ReviewGuideSummary`] (`summary: None` when no
     /// comparison has been captured for this root task yet).
+    ///
+    /// `series_id`, when set, scopes the lookup to that specific PR series
+    /// rather than whichever series on the root observed most recently. A
+    /// caller polling an already-open guide must pass the series id it is
+    /// displaying, so a replacement PR opened on the same root task cannot
+    /// silently swap the findings shown for the guide still on screen.
     GetReviewGuideSummary {
         root_task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        series_id: Option<String>,
     },
 
     GetRun {
