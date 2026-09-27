@@ -173,6 +173,10 @@ fn merge_gate_reports_all_open_revisions_and_ignores_terminal_or_deleted_items()
             assert_eq!(open.len(), 1);
             assert_eq!(open[0].id, revision);
             assert_eq!(open[0].status, status);
+            assert_eq!(
+                open[0].status_label,
+                status.parse::<TaskStatus>().unwrap().display_label()
+            );
         } else {
             assert!(
                 open.is_empty(),
@@ -254,6 +258,18 @@ fn addendum_includes_followup_tracking_after_the_origin_merged() {
     let tracker = apply_findings(&db, &root.id, "head-one");
     let item = read_task(&db, &tracker);
     assert_eq!(item.kind, TaskKind::Followup);
+    for (status, counts) in [
+        ("in_review", "0 fixed on PR, 1 in progress, 0 open"),
+        ("done", "1 fixed on PR, 0 in progress, 0 open"),
+    ] {
+        raw(&db)
+            .execute("UPDATE tasks SET status = ?2 WHERE id = ?1", params![tracker, status])
+            .unwrap();
+        assert_eq!(
+            findings(&db, &root.id).unwrap().status_text,
+            format!("1 finding: {counts}")
+        );
+    }
     assert!(
         findings(&db, &root.id)
             .unwrap()
@@ -633,4 +649,34 @@ fn returning_to_an_earlier_head_enqueues_an_update_from_the_published_guide() {
     // The revision rewrites the PR back to head A: a fresh comparison for it.
     assert!(!db.review_guide_comparison_has_attempt(&a.comparison_id).unwrap());
     assert!(db.review_guide_comparison_has_attempt(&b.comparison_id).unwrap());
+}
+
+#[test]
+fn malformed_verdict_payloads_do_not_hide_valid_findings_or_summary() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id, "review target");
+    bind_open_pr(&db, &root.id);
+    db.persist_pr_review_guide_source_capture(
+        &root.id,
+        1,
+        PrSourceCaptureTrigger::Creation,
+        &crate::test_support::source_capture_packet(PR_URL, "base", "head"),
+    )
+    .unwrap();
+    let revision = apply_findings(&db, &root.id, "head-one");
+    apply_findings(&db, &root.id, "head-two");
+    for payload in ["not json", r#"{"batch_id":"historical","verdict": {"unknown": true}}"#] {
+        raw(&db).execute(
+            "UPDATE worker_proposals SET payload_json = ?2 WHERE id IN (SELECT proposal_id FROM pr_review_verdicts WHERE revision_task_id = ?1)",
+            params![revision, payload],
+        ).unwrap();
+        assert!(
+            db.get_pr_review_guide_summary_for_root_scoped(&root.id, None)
+                .unwrap()
+                .is_some()
+        );
+        let supplement = findings(&db, &root.id).unwrap();
+        assert!(supplement.status_text.starts_with("1 finding:"));
+    }
 }

@@ -260,6 +260,17 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
         XCTAssertFalse(confirmation.alertMessage.contains("todo"))
     }
 
+    func testConfirmationDisplaysVerbAndPreservesWireStatus() throws {
+        let data = Data(#"{"id":"revision","label":"fix","status":"active","status_label":"doing"}"#.utf8)
+        let revision = try JSONDecoder().decode(OpenMergeRevision.self, from: data)
+        let confirmation = ChatViewModel.MergeRevisionConfirmation(
+            workItemID: "root", revisions: [revision], origin: .board
+        )
+        XCTAssertTrue(confirmation.alertMessage.contains("fix — running"))
+        XCTAssertEqual(revision.wirePayload["status"], "active")
+        XCTAssertEqual(revision.wirePayload["status_label"], "doing")
+    }
+
     func testOpenRevisionConfirmationRequiresExplicitConsent() {
         let model = makeModel()
         model.engine.simulateConnectedForTesting = true
@@ -288,8 +299,8 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
 
     func testSecondConfirmationIsQueuedWhileFirstIsPending() {
         let model = makeModel()
-        let first = [OpenMergeRevision(id: "r1", label: "one", status: "open")]
-        let second = [OpenMergeRevision(id: "r2", label: "two", status: "blocked")]
+        let first = [OpenMergeRevision(id: "r1", label: "one", status: "open", statusLabel: "open")]
+        let second = [OpenMergeRevision(id: "r2", label: "two", status: "blocked", statusLabel: "blocked")]
         model.mergingWhenReadyIDs = ["task_a", "task_b"]
 
         model.applyEventForTest(.mergeConfirmationRequired(workItemID: "task_a", revisions: first))
@@ -329,8 +340,8 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
 
     func testCancellingFirstPromotesQueuedSecondWithoutSending() async {
         let model = makeModel()
-        let first = [OpenMergeRevision(id: "r1", label: "one", status: "open")]
-        let second = [OpenMergeRevision(id: "r2", label: "two", status: "blocked")]
+        let first = [OpenMergeRevision(id: "r1", label: "one", status: "open", statusLabel: "open")]
+        let second = [OpenMergeRevision(id: "r2", label: "two", status: "blocked", statusLabel: "blocked")]
         var requests: [[String: Any]] = []
         model.engine.outboundRecorder = { requests.append($0) }
         model.mergingWhenReadyIDs = ["task_a", "task_b"]
@@ -377,8 +388,8 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
 
     func testPromotionDropsQueuedConfirmationAfterInFlightGuardCleared() async {
         let model = makeModel()
-        let first = [OpenMergeRevision(id: "r1", label: "one", status: "open")]
-        let second = [OpenMergeRevision(id: "r2", label: "two", status: "blocked")]
+        let first = [OpenMergeRevision(id: "r1", label: "one", status: "open", statusLabel: "open")]
+        let second = [OpenMergeRevision(id: "r2", label: "two", status: "blocked", statusLabel: "blocked")]
         model.mergingWhenReadyIDs = ["task_a", "task_b"]
 
         model.applyEventForTest(.mergeConfirmationRequired(workItemID: "task_a", revisions: first))
@@ -396,7 +407,7 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
 
     func testMismatchedConfirmAndCancelAreIgnored() {
         let model = makeModel()
-        let revisions = [OpenMergeRevision(id: "r1", label: "one", status: "open")]
+        let revisions = [OpenMergeRevision(id: "r1", label: "one", status: "open", statusLabel: "open")]
         var requests: [[String: Any]] = []
         model.engine.outboundRecorder = { requests.append($0) }
         model.mergingWhenReadyIDs.insert("task_a")
@@ -419,7 +430,7 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
         model.mergeWhenReady(for: task, origin: .reviewGuideViewer)
         model.applyEventForTest(.mergeConfirmationRequired(
             workItemID: task.id,
-            revisions: [OpenMergeRevision(id: "r", label: "L", status: "open")]
+            revisions: [OpenMergeRevision(id: "r", label: "L", status: "open", statusLabel: "open")]
         ))
 
         XCTAssertEqual(model.pendingMergeRevisionConfirmation?.origin, .reviewGuideViewer)
@@ -444,7 +455,7 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
         model.mergeWhenReady(for: task, origin: .board)
         model.applyEventForTest(.mergeConfirmationRequired(
             workItemID: task.id,
-            revisions: [OpenMergeRevision(id: "r", label: "L", status: "open")]
+            revisions: [OpenMergeRevision(id: "r", label: "L", status: "open", statusLabel: "open")]
         ))
 
         XCTAssertEqual(model.pendingMergeRevisionConfirmation?.origin, .board)
@@ -459,7 +470,7 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
         model.mergeRevisionConfirmationOrigins["root"] = .reviewGuideViewer
         model.handleMergeConfirmation(
             workItemID: "root",
-            revisions: [OpenMergeRevision(id: "r", label: "L", status: "open")]
+            revisions: [OpenMergeRevision(id: "r", label: "L", status: "open", statusLabel: "open")]
         )
 
         let board = NSHostingView(

@@ -89,6 +89,7 @@ pub struct OpenMergeRevision {
     pub id: String,
     pub label: String,
     pub status: String,
+    pub status_label: String,
 }
 
 #[cfg(test)]
