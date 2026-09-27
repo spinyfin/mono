@@ -45,7 +45,7 @@ pub struct DesignDocSection {
     /// Matching heading text, or `None` when the whole doc is the fallback.
     pub heading: Option<String>,
     /// Section body (heading line through the next same-or-higher heading),
-    /// or the full document when no heading matched.
+    /// or the full document when no breakdown entry or heading matched.
     pub body: String,
 }
 
@@ -280,7 +280,8 @@ pub fn render_brief_packet_block(packet: &ReviewBriefPacket) -> String {
     match packet.design_section.as_ref() {
         Some(section) if section.is_whole_doc_fallback() => {
             out.push_str(&format!(
-                "**Design doc** (`{}`; no heading matched the work-item name, so the whole doc is included):\n\n",
+                "**Design doc** (`{}`; no breakdown entry or heading matched the work-item name, so the whole \
+                 doc is included):\n\n",
                 section.path
             ));
             out.push_str(&section.body);
@@ -381,8 +382,14 @@ pub fn render_brief_conformance_rubric() -> String {
      prompt instead; six reviews missed it; the feature shipped broken).\n\
      \n\
      Inputs are engine-supplied in **PR under review** above. Do not skip \
-     this check if an input is missing — raise a finding for the gap \
-     (see **Unresolved review inputs**).\n\
+     this check because a brief input (work-item description or revision \
+     ask) is missing — raise a finding for the gap (see **Unresolved \
+     review inputs**). An engine-side design-doc fetch/resolve failure is \
+     different: it is reported separately (see **Engine-side design-doc \
+     input**), an operator attention is already filed for it, and it must \
+     NOT become a `deferred_scope` or other high-severity finding — a \
+     revision cannot fix an engine-side fetch. Continue the check against \
+     whatever brief inputs did resolve.\n\
      \n\
      Procedure:\n\
      \n\

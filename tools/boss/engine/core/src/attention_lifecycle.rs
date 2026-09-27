@@ -331,7 +331,10 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         REVIEW_DESIGN_DOC_UNRESOLVED_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
         "Filed when assembling a review-brief packet cannot fetch or resolve the project's design \
-         doc. The assembler resolves it on the next successful fetch of that same work item; a later \
+         doc. Filed and cleared on the review-cycle chain root, not the reviewed revision, so an \
+         attention filed while reviewing revision N is cleared by a later successful fetch for \
+         revision N+1 or the post-merge review of the root, instead of staying open under N's own id \
+         forever. The assembler resolves it on the next successful fetch for that root; a later \
          unrelated run start does not mean GitHub auth, the pointer, or the missing file recovered.",
     ),
     entry(

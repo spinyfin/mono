@@ -40,7 +40,7 @@ use crate::work::{CREATED_VIA_ENGINE_AUTO, CreateTaskInput, WorkDb, WorkItem};
 /// Prefix marker appended to a postmortem task's `description` once this
 /// reconcile has run for it (successfully or with an error) — the
 /// idempotency guard against re-processing the same postmortem twice.
-const PROCESSED_MARKER: &str = "[postmortem-followups]";
+pub(crate) const PROCESSED_MARKER: &str = "[postmortem-followups]";
 
 /// One entry of the postmortem-followups JSON array. All three fields are
 /// required (no `#[serde(default)]`): a genuinely strict schema is the

@@ -153,7 +153,13 @@ where
 
     let mut design_section = None;
     if let Some(project_id) = task.project_id.as_deref() {
-        match attach_design_section(work_db, &task.id, project_id, &design_lookup_name, &fetch).await {
+        // File/clear the design-doc attention on the chain root, not this
+        // review's own item id — a revision-scoped id here means the
+        // attention filed while reviewing revision N is never cleared by a
+        // later successful fetch for revision N+1 or the post-merge review
+        // of the root, since neither reuses N's id (see
+        // docs/attention-lifecycle.md).
+        match attach_design_section(work_db, &root_id, project_id, &design_lookup_name, &fetch).await {
             DesignAttach::Section { section } => {
                 design_section = Some(section);
             }
@@ -624,6 +630,109 @@ mod tests {
         );
     }
 
+    /// A design-doc fetch failure while reviewing one revision must be
+    /// clearable by a later successful fetch anywhere in the same review
+    /// chain — the attention is filed and cleared on the chain root, not
+    /// the reviewed revision's own id, so it does not stay open forever
+    /// once the pointer/auth/rate-limit condition recovers.
+    #[tokio::test]
+    async fn design_doc_attention_filed_on_one_revision_clears_via_a_later_revision() {
+        let (_dir, db) = open_db();
+        insert_host(&db);
+        let product = create_test_product(&db);
+        let project = db
+            .create_project(
+                CreateProjectInput::builder()
+                    .product_id(product.id.clone())
+                    .name("review-guides")
+                    .no_design_task(true)
+                    .build(),
+            )
+            .unwrap();
+        db.set_project_design_doc(SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            unset: false,
+            design_doc_path: Some("tools/boss/docs/designs/automatic-pr-review-guides.md".into()),
+            design_doc_branch: Some("main".into()),
+            design_doc_repo_remote_url: None,
+        })
+        .unwrap();
+        let chore = db
+            .create_task(
+                boss_protocol::CreateTaskInput::builder()
+                    .product_id(product.id.clone())
+                    .project_id(project.id.clone())
+                    .name("Run durable Astra-high guide jobs")
+                    .description("Implement a revision-aware broker.")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some("https://github.com/spinyfin/mono/pull/2969".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let revision = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(chore.id.clone())
+                    .description("Restore the broker the first pass inlined away.")
+                    .build(),
+                &FakePrStateChecker::always(PrOpenState::Open),
+            )
+            .unwrap();
+
+        // Reviewing revision 1: the fetch fails, so an attention is filed —
+        // and it must land on the chain root's id, not the revision's own.
+        let rev_item = db.get_work_item(&revision.id).unwrap();
+        let packet = assemble_with_doc_fetch(&db, &rev_item, &execution_for(&revision.id), canned_missing).await;
+        assert!(
+            packet
+                .unresolved
+                .iter()
+                .any(|u| matches!(u, UnresolvedReviewInput::DesignSection { .. })),
+            "fetch failure must be unresolved: {:?}",
+            packet.unresolved
+        );
+        let attentions_on_root = db.list_attention_items_for_work_item(&chore.id).unwrap();
+        assert!(
+            attentions_on_root.iter().any(|a| {
+                a.kind == crate::attention_lifecycle::REVIEW_DESIGN_DOC_UNRESOLVED_ATTENTION_KIND && a.status == "open"
+            }),
+            "fetch failure during a revision review must file the attention on the chain root: \
+             {attentions_on_root:?}"
+        );
+        let attentions_on_revision = db.list_attention_items_for_work_item(&revision.id).unwrap();
+        assert!(
+            attentions_on_revision.is_empty(),
+            "the attention must not be filed on the revision's own id: {attentions_on_revision:?}"
+        );
+
+        // The pointer/auth/rate-limit condition recovers, and a later review
+        // in the same chain — the post-merge review of the root itself —
+        // fetches successfully. That must clear the root-keyed attention.
+        let root_item = db.get_work_item(&chore.id).unwrap();
+        let packet = assemble_with_doc_fetch(&db, &root_item, &execution_for(&chore.id), canned_doc).await;
+        assert!(
+            packet.design_section.is_some(),
+            "recovered fetch must produce a design section: {:?}",
+            packet.unresolved
+        );
+        let attentions_on_root = db.list_attention_items_for_work_item(&chore.id).unwrap();
+        assert!(
+            attentions_on_root.iter().all(|a| {
+                a.kind != crate::attention_lifecycle::REVIEW_DESIGN_DOC_UNRESOLVED_ATTENTION_KIND || a.status != "open"
+            }),
+            "a later successful fetch in the same chain must clear the root-keyed attention: \
+             {attentions_on_root:?}"
+        );
+    }
+
     /// `review_cycle_root_id` returns the input id when the chain root
     /// cannot be resolved (a broken/missing parent pointer). The packet
     /// then records an unresolved brief for the missing chain-root
@@ -1008,8 +1117,8 @@ mod tests {
 
     /// Engine audit lines appended onto an empty description must not count
     /// as a resolved brief. The in_review doc-detector writes one of these
-    /// on every typical code PR, which previously defeated empty-brief
-    /// detection.
+    /// on every typical code PR, so an audit-only description must still be
+    /// recorded as an unresolved Brief input.
     #[tokio::test]
     async fn empty_brief_with_engine_audit_lines_is_unresolved_not_a_silent_skip() {
         let (_dir, db) = open_db();
@@ -1042,6 +1151,43 @@ mod tests {
                 .iter()
                 .any(|u| matches!(u, UnresolvedReviewInput::Brief { .. })),
             "empty human brief with engine audit lines must be unresolved: {:?}",
+            packet.unresolved
+        );
+    }
+
+    /// A `[pr-review-skip]` line — appended by the pure-rebase skip gate to
+    /// the chain root (see `completion::finalize_passes::record_pure_rebase_skip`)
+    /// — is an engine audit line too. An empty human description plus one
+    /// must still be recorded as an unresolved Brief input, not treated as
+    /// resolved.
+    #[tokio::test]
+    async fn empty_brief_with_pr_review_skip_audit_line_is_unresolved() {
+        let (_dir, db) = open_db();
+        insert_host(&db);
+        let product = create_test_product(&db);
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Empty brief chore");
+        crate::reconcile_audit::append_description_line(
+            &db,
+            &chore.id,
+            "\n[pr-review-skip] epoch 1700000000: reason=pure_rebase created_via=cli \
+             pre_head=abc123 post_head=def456 — automated review skipped: the resolution's diff \
+             against its pre-resolution base is byte-identical before and after, i.e. nothing \
+             changed but the base.",
+        )
+        .unwrap();
+        let item = db.get_work_item(&chore.id).unwrap();
+        let packet = assemble_with_doc_fetch(&db, &item, &execution_for(&chore.id), canned_missing).await;
+        assert!(
+            packet.work_item_brief.is_none(),
+            "pr-review-skip-only description must not count as a brief: {:?}",
+            packet.work_item_brief
+        );
+        assert!(
+            packet
+                .unresolved
+                .iter()
+                .any(|u| matches!(u, UnresolvedReviewInput::Brief { .. })),
+            "empty human brief with a pr-review-skip audit line must be unresolved: {:?}",
             packet.unresolved
         );
     }

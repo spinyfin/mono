@@ -407,7 +407,11 @@ pub fn render_reviewer_claude_md(
 /// title and description (plus the chain-root brief for a revision), the
 /// live-fetched design-doc section when the item belongs to a project with
 /// a design doc, declared deferred-scope proposals, and any unresolved
-/// inputs the reviewer must raise as blocking findings rather than skip.
+/// inputs. A missing brief input (work-item description or revision ask) is
+/// one the reviewer must raise as a blocking finding rather than skip; an
+/// engine-side design-doc fetch/resolve failure is reported separately and
+/// must NOT become a blocking finding — an operator attention is already
+/// filed for it, and no revision can fix an engine-side fetch.
 ///
 /// `pr_url` is the PR to review.
 ///

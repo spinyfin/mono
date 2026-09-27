@@ -443,55 +443,34 @@ const BREAKDOWN_HEADINGS: &[&str] = &[
 ];
 
 /// Locate the breakdown section body (text after the matching `##` heading
-/// until the next `##` heading, or EOF). Returns `None` when no recognised
-/// breakdown heading is present.
+/// until the next `##`-or-shallower heading, or EOF). Returns `None` when no
+/// recognised breakdown heading is present.
+///
+/// Uses [`crate::pr_template::parse_all_headings`], which tracks fenced code
+/// blocks, so a `## `-prefixed line inside a fenced example (e.g. a Markdown
+/// snippet in the design doc) is never mistaken for a section boundary.
 pub fn extract_breakdown_section(doc: &str) -> Option<&str> {
-    // Walk line-by-line so we match only ATX headings, not prose mentions.
-    let all_lines: Vec<&str> = doc.lines().collect();
-    let mut section_start: Option<usize> = None;
-    for (idx, line) in all_lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("## ") {
-            let heading = rest.trim().to_ascii_lowercase();
-            if BREAKDOWN_HEADINGS.iter().any(|h| heading == *h) {
-                // Body starts on the next line.
-                section_start = Some(idx + 1);
-                break;
-            }
-        }
-    }
-    let start_line = section_start?;
-    let start_byte = line_byte_offset(doc, start_line);
-    // End at the next ## heading (not ###).
-    let mut end_byte = doc.len();
-    for (idx, line) in all_lines.iter().enumerate().skip(start_line) {
-        let trimmed = line.trim();
-        if trimmed.starts_with("## ") && !trimmed.starts_with("### ") {
-            end_byte = line_byte_offset(doc, idx);
-            break;
-        }
-    }
+    let headings = crate::pr_template::parse_all_headings(doc);
+    let heading_idx = headings.iter().position(|h| {
+        h.level == 2
+            && BREAKDOWN_HEADINGS
+                .iter()
+                .any(|b| h.title.trim().to_ascii_lowercase() == *b)
+    })?;
+    let heading = &headings[heading_idx];
+    let start_byte = doc[heading.start..]
+        .find('\n')
+        .map(|off| heading.start + off + 1)
+        .unwrap_or(doc.len());
+    let end_byte = headings[heading_idx + 1..]
+        .iter()
+        .find(|next| next.level <= heading.level)
+        .map(|next| next.start)
+        .unwrap_or(doc.len());
     if start_byte > end_byte {
         return None;
     }
     Some(doc.get(start_byte..end_byte).unwrap_or("").trim())
-}
-
-/// Byte offset of the start of line `line_idx` (0-based) in `doc`.
-fn line_byte_offset(doc: &str, line_idx: usize) -> usize {
-    if line_idx == 0 {
-        return 0;
-    }
-    let mut seen = 0usize;
-    for (byte_idx, ch) in doc.char_indices() {
-        if ch == '\n' {
-            seen += 1;
-            if seen == line_idx {
-                return byte_idx + 1;
-            }
-        }
-    }
-    doc.len()
 }
 
 /// Parse discrete breakdown entries from a design doc.
@@ -2179,6 +2158,40 @@ Just do the thing, no explicit entries here.\n\
 ";
         let entries = extract_breakdown_entries(doc);
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn breakdown_section_keeps_requirements_after_a_fenced_pseudo_heading() {
+        // A fenced Markdown example inside a breakdown entry can itself
+        // contain a `## ` line (e.g. a snippet showing another doc's
+        // heading). extract_breakdown_section must not treat that as the
+        // section's own end — regression test for the fence-unaware line
+        // scan this replaced.
+        let doc = "\
+## Proposed implementation task breakdown\n\
+\n\
+### Widget\n\
+Scope: build the widget.\n\
+\n\
+```markdown\n\
+## Example\n\
+Some fenced text that looks like a heading but isn't one.\n\
+```\n\
+\n\
+Dependencies: none\n\
+\n\
+## Open Questions\n\
+Not part of the breakdown.\n\
+";
+        let section = extract_breakdown_section(doc).expect("recognised breakdown heading");
+        assert!(
+            section.contains("Dependencies: none"),
+            "requirements after the fenced pseudo-heading must survive: {section}"
+        );
+        assert!(
+            !section.contains("Not part of the breakdown"),
+            "section must still end at the real Open Questions heading: {section}"
+        );
     }
 
     #[test]
