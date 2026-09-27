@@ -704,6 +704,49 @@ impl SshHostAdapter {
     }
 }
 
+/// Probe the remote host's `ARG_MAX` / page size / OS so the argv preflight
+/// budgets against the *target* kernel, including Linux `MAX_ARG_STRLEN`.
+/// A probe that does not answer fail-closes to Linux-shaped limits so a
+/// ~600 KB single argument cannot silently E2BIG on an unprobeable host.
+async fn probe_remote_exec_arg_limits(transport: &SshTransport) -> crate::runner::spawn_launch_limits::ExecArgLimits {
+    use crate::runner::spawn_launch_limits::{ExecArgLimits, parse_remote_exec_arg_limits_line};
+    match transport
+        .run_shell(r#"printf '%s %s %s\n' "$(uname -s)" "$(getconf ARG_MAX)" "$(getconf PAGE_SIZE)""#)
+        .await
+    {
+        Ok(output) if output.success() => {
+            parse_remote_exec_arg_limits_line(&output.stdout).unwrap_or_else(ExecArgLimits::fail_closed_remote)
+        }
+        Ok(output) => {
+            tracing::warn!(
+                host_id = %transport.host_id,
+                status = output.status,
+                stderr = %output.stderr,
+                "remote ARG_MAX probe failed; fail-closing to Linux MAX_ARG_STRLEN limits"
+            );
+            ExecArgLimits::fail_closed_remote()
+        }
+        Err(err) => {
+            tracing::warn!(
+                host_id = %transport.host_id,
+                ?err,
+                "remote ARG_MAX probe could not run; fail-closing to Linux MAX_ARG_STRLEN limits"
+            );
+            ExecArgLimits::fail_closed_remote()
+        }
+    }
+}
+
+fn execution_has_transcript_path(db: &WorkDb, execution_id: &str) -> bool {
+    db.list_runs(execution_id)
+        .ok()
+        .map(|runs| {
+            runs.iter()
+                .any(|run| run.transcript_path.as_deref().is_some_and(|path| !path.is_empty()))
+        })
+        .unwrap_or(false)
+}
+
 /// Prefer a command's trimmed stderr for a failure detail, falling back
 /// to a synthetic `exit N` so the message is never empty.
 fn non_empty(stderr: &str, status: i32) -> String {
@@ -1102,12 +1145,14 @@ impl HostAdapter for SshHostAdapter {
             permission_mode_override: worker_kind.forced_permission_mode(),
             run_id: Some(&run_id),
         });
-        crate::runner::pane_spawn::check_launch_command_arg_max_for_bytes(
+        let exec_limits = probe_remote_exec_arg_limits(&self.transport).await;
+        crate::runner::spawn_launch_limits::check_launch_command_arg_max_for_bytes(
             &driver_spawn_plan.command,
             driver.descriptor().name,
             driver.descriptor().config_dir,
             driver.descriptor().initial_prompt_filename,
             prompt_text.len(),
+            exec_limits,
         )?;
 
         self.ship_file(&remote_prompt_dir, &remote_prompt_path, &prompt_text, "prompt")
@@ -1202,6 +1247,35 @@ impl HostAdapter for SshHostAdapter {
             reasoning = spawn_config.reasoning.map(|mode| mode.as_str()).unwrap_or("unclassified"),
             "remote worker launched; awaiting Stop over the forwarded events socket",
         );
+
+        // Composer readiness for argv delivery on the remote is the wrapper
+        // actually launching the driver (remote_pid). Turn-start confirmation
+        // is the first hook that persists a transcript_path onto the run.
+        let turn_timeout = crate::runner::spawn_confirmation::TURN_START_TIMEOUT;
+        let poll = crate::runner::spawn_confirmation::SPAWN_CONFIRM_POLL;
+        let turn_start = tokio::time::Instant::now();
+        let mut turn_started = false;
+        loop {
+            if execution_has_transcript_path(&self.work_db, &run_id) {
+                turn_started = true;
+                break;
+            }
+            if turn_start.elapsed() >= turn_timeout {
+                break;
+            }
+            let remaining = turn_timeout.saturating_sub(turn_start.elapsed());
+            tokio::time::sleep(poll.min(remaining)).await;
+        }
+        if !turn_started {
+            if let Some(pid) = outcome.remote_pid {
+                let _ = self.transport.run(&["kill", &pid.to_string()]).await;
+            }
+            return Err(crate::runner::spawn_confirmation::turn_did_not_start_error(
+                driver.descriptor().name,
+                &run_id,
+                turn_timeout,
+            ));
+        }
 
         // WorkerPaneAlive: the remote agent is up and working, so the
         // execution stays `running` (never `waiting_human` — nothing is

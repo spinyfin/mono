@@ -234,11 +234,13 @@ mod pty_initial_input_tests;
 /// tmux worker, and registers its pid for hook-event correlation. The macOS
 /// app may attach a viewer after the worker starts.
 ///
-/// Returns `WorkerPaneAlive` immediately on a successful spawn — the
-/// tmux session stays alive with its agent working, and the
-/// workspace lease is retained until a follow-up flow concludes the
-/// run. Real lifecycle (the pane signaling "Stop" → run completes)
-/// lands once the events-socket consumer drives state transitions.
+/// Returns `WorkerPaneAlive` once the pane is up **and** spawn
+/// confirmation has seen driver-specific PTY evidence plus the first
+/// driver hook/session event. The tmux session stays alive with its
+/// agent working, and the workspace lease is retained until a
+/// follow-up flow concludes the run. Real lifecycle (the pane signaling
+/// "Stop" → run completes) lands once the events-socket consumer drives
+/// state transitions.
 pub struct PaneSpawnRunner {
     cfg: Arc<RuntimeConfig>,
     /// Backing store for the pane-titlebar summary cache. Looked up
@@ -263,6 +265,13 @@ struct PaneSpawnOverrides {
     boss_event_path: std::sync::OnceLock<PathBuf>,
     #[cfg(test)]
     tmux_host: std::sync::OnceLock<TmuxWorkerHost>,
+    /// When true, `run_execution` skips the composer-ready / turn-start
+    /// wait. Existing pane-spawn tests inject a stub tmux that never
+    /// paints driver chrome; they opt out via [`PaneSpawnRunner::set_skip_spawn_confirm`].
+    #[cfg(test)]
+    skip_spawn_confirm: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    spawn_confirm_timeout: std::sync::OnceLock<StdDuration>,
 }
 
 impl PaneSpawnRunner {
@@ -289,6 +298,47 @@ impl PaneSpawnRunner {
     #[cfg(test)]
     pub(crate) fn set_boss_event_path(&self, path: PathBuf) {
         let _ = self.overrides.boss_event_path.set(path);
+    }
+
+    /// Skip the spawn-time composer/turn-start wait. Stub tmux in the
+    /// existing pane-spawn tests never paints driver chrome.
+    #[cfg(test)]
+    pub(crate) fn set_skip_spawn_confirm(&self, skip: bool) {
+        self.overrides
+            .skip_spawn_confirm
+            .store(skip, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Override both confirmation waits (composer + turn-start) with a
+    /// short timeout so timeout-path tests do not sit on the production
+    /// 20s/45s windows.
+    #[cfg(test)]
+    pub(crate) fn set_spawn_confirm_timeout(&self, timeout: StdDuration) {
+        let _ = self.overrides.spawn_confirm_timeout.set(timeout);
+    }
+
+    fn skip_spawn_confirm(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.overrides
+                .skip_spawn_confirm
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    fn spawn_confirm_timeouts(&self) -> (StdDuration, StdDuration) {
+        #[cfg(test)]
+        if let Some(timeout) = self.overrides.spawn_confirm_timeout.get() {
+            return (*timeout, *timeout);
+        }
+        (
+            super::spawn_confirmation::COMPOSER_READY_TIMEOUT,
+            super::spawn_confirmation::TURN_START_TIMEOUT,
+        )
     }
 
     fn events_socket_path(&self) -> PathBuf {
@@ -445,158 +495,12 @@ fn check_initial_input_length(line: &str, driver_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// This host's real `ARG_MAX`, via `sysconf(_SC_ARG_MAX)`.
-///
-/// Every driver embeds its initial prompt into the CLI's own argv via a
-/// `"$(cat <config_dir>/<initial_prompt_filename>)"` command substitution
-/// (see each driver's `spawn_invocation`/`build_*_command`), expanded by the
-/// pane's shell when it sources [`write_initial_input_script`]'s output.
-/// Unlike [`MAX_CANON_LINE_BYTES`] — a pty line-discipline limit on what gets
-/// *typed* — this bounds what the kernel accepts at the driver CLI's
-/// `execve()`, after that expansion.
-fn local_arg_max() -> Result<usize> {
-    // sysconf has no pointer arguments and does not mutate process state.
-    let limit = unsafe { libc::sysconf(libc::_SC_ARG_MAX) };
-    if limit <= 0 {
-        return Err(anyhow!("cannot determine local ARG_MAX (sysconf returned {limit})"));
-    }
-    Ok(limit as usize)
-}
-
-/// Extra slop applied on top of [`environment_bytes`]'s already-conservative
-/// estimate, as a fixed fraction of it, to absorb the gap between the
-/// engine process's own environment and a pane's real login-shell
-/// environment (which can carry a materially heavier profile — extra
-/// `PATH` entries, shell-framework state, etc.) that the engine has no way
-/// to inspect ahead of spawn. Widen this (or replace `environment_bytes`
-/// with a session-specific measurement) if this is ever seen to false-pass
-/// in practice.
-const ENVIRONMENT_ESTIMATE_SLOP_NUMERATOR: usize = 1;
-const ENVIRONMENT_ESTIMATE_SLOP_DENOMINATOR: usize = 2;
-
-/// Conservative proxy for the exec'd CLI's environment footprint: the
-/// engine's own environment, padded by
-/// [`ENVIRONMENT_ESTIMATE_SLOP_NUMERATOR`]`/`[`ENVIRONMENT_ESTIMATE_SLOP_DENOMINATOR`].
-/// The pane's real environment is the tmux session's, which the engine
-/// cannot inspect ahead of spawn — a driver adds only a handful of small
-/// directives (`spawn_plan.env`) on top of whatever the pane shell already
-/// inherited, so this stays a reasonable estimate relative to the
-/// multi-hundred-KB prompt sizes this check guards against, with the extra
-/// padding covering a heavier-than-the-engine's-own login-shell profile.
-fn environment_bytes() -> usize {
-    let measured: usize = std::env::vars_os()
-        .map(|(key, value)| key.len() + value.len() + 2 + std::mem::size_of::<usize>())
-        .sum();
-    measured.saturating_add(
-        measured.saturating_mul(ENVIRONMENT_ESTIMATE_SLOP_NUMERATOR) / ENVIRONMENT_ESTIMATE_SLOP_DENOMINATOR,
-    )
-}
-
-/// Estimate the exec-time argv byte count for `command` once its
-/// `"$(cat <config_dir>/<initial_prompt_filename>)"` substitution is
-/// replaced by the real prompt file's bytes.
-///
-/// `command` is shell source, not real argv, so this is an estimate: shell
-/// syntax (quotes, `$()`, spaces) adds a few dozen bytes of overhead per
-/// argument that this does not model — [`check_launch_command_arg_max`]'s
-/// fixed margin absorbs that.
-fn estimated_launch_argv_bytes(
-    command: &str,
-    workspace_path: &Path,
-    config_dir: &str,
-    initial_prompt_filename: &str,
-) -> Result<usize> {
-    let prompt_path = workspace_path.join(config_dir).join(initial_prompt_filename);
-    let prompt_bytes = std::fs::metadata(&prompt_path)
-        .with_context(|| format!("reading size of initial prompt at {}", prompt_path.display()))?
-        .len() as usize;
-    Ok(substitute_prompt_bytes(
-        command,
-        config_dir,
-        initial_prompt_filename,
-        prompt_bytes,
-    ))
-}
-
-/// Shared placeholder-substitution arithmetic behind
-/// [`estimated_launch_argv_bytes`] (which reads the prompt's size from a
-/// local on-disk file) and [`check_launch_command_arg_max_for_bytes`] (for
-/// callers, such as the remote spawn path, that already know the prompt's
-/// byte length without a file read — the remote host's copy of the file
-/// isn't reachable from here to `stat`).
-fn substitute_prompt_bytes(
-    command: &str,
-    config_dir: &str,
-    initial_prompt_filename: &str,
-    prompt_bytes: usize,
-) -> usize {
-    let placeholder = format!("\"$(cat {config_dir}/{initial_prompt_filename})\"");
-    let static_bytes = command.len().saturating_sub(placeholder.len());
-    static_bytes.saturating_add(prompt_bytes)
-}
-
-/// Fail loudly, before ever typing the pane's initial input, when the
-/// argv-embedded initial prompt would exceed this host's `ARG_MAX` at the
-/// driver CLI's `execve()`.
-///
-/// Past `ARG_MAX` the shell's `exec` fails with `E2BIG` *inside the sourced
-/// script the pane runs on its own* — not anywhere the engine observes
-/// directly — so without this check the execution just sits `Spawning`
-/// until `spawn_ack_sweep`'s grace period gives up on it and redispatches,
-/// which retries the identical, identically-doomed command. Catching it
-/// here turns that into an immediate, attributed dispatch failure instead.
-fn check_launch_command_arg_max(
-    command: &str,
-    driver_name: &str,
-    workspace_path: &Path,
-    config_dir: &str,
-    initial_prompt_filename: &str,
-) -> Result<()> {
-    let argv_bytes = estimated_launch_argv_bytes(command, workspace_path, config_dir, initial_prompt_filename)?;
-    let arg_max = local_arg_max()?;
-    check_arg_max_budget(argv_bytes, environment_bytes(), arg_max, driver_name)
-}
-
-/// Same preflight as [`check_launch_command_arg_max`], for callers that
-/// already know the initial prompt's byte length in-process (the remote
-/// spawn path: the prompt text is shipped over SSH from an in-memory
-/// `String`, so there is no local file to `stat` the way the pane-spawn
-/// path does) instead of a workspace-relative file on this host.
-///
-/// This still checks against *this* (the engine's) host `ARG_MAX` and
-/// environment-size estimate rather than the remote host's, since the
-/// engine has no cheap way to probe either over the SSH transport ahead of
-/// spawn; it is a conservative proxy in the same spirit as
-/// [`environment_bytes`], not an exact remote-host measurement.
-pub(crate) fn check_launch_command_arg_max_for_bytes(
-    command: &str,
-    driver_name: &str,
-    config_dir: &str,
-    initial_prompt_filename: &str,
-    prompt_bytes: usize,
-) -> Result<()> {
-    let argv_bytes = substitute_prompt_bytes(command, config_dir, initial_prompt_filename, prompt_bytes);
-    let arg_max = local_arg_max()?;
-    check_arg_max_budget(argv_bytes, environment_bytes(), arg_max, driver_name)
-}
-
-/// The pure budget check behind [`check_launch_command_arg_max`], factored
-/// out so tests can exercise the arithmetic against fixed inputs instead of
-/// this host's real, environment-dependent `ARG_MAX` and environment size.
-fn check_arg_max_budget(argv_bytes: usize, environment_bytes: usize, arg_max: usize, driver_name: &str) -> Result<()> {
-    // 4096 bytes of slop for shell-syntax overhead (quotes, `$()`, spaces)
-    // this estimate does not model, plus the exec kernel's own bookkeeping.
-    let total = argv_bytes.saturating_add(environment_bytes).saturating_add(4096);
-    if total > arg_max {
-        return Err(anyhow!(
-            "refusing to spawn {driver_name} worker: estimated launch argv {argv_bytes} bytes (initial \
-             prompt embedded via command substitution) + environment {environment_bytes} bytes + 4096 \
-             estimation-slop bytes = {total} bytes exceeds this host's ARG_MAX {arg_max} bytes; the \
-             initial prompt is too large to deliver via argv on this host"
-        ));
-    }
-    Ok(())
-}
+use super::spawn_launch_limits::check_launch_command_arg_max;
+#[cfg(test)]
+pub(crate) use super::spawn_launch_limits::{
+    ExecArgLimits, check_arg_max_budget, check_launch_command_arg_max_for_bytes, estimated_launch_argv_bytes,
+    local_arg_max,
+};
 
 /// Materialize the per-workspace launcher directory and return it, so the
 /// caller can put it on the worker's `PATH`.
@@ -1265,7 +1169,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 // Same Arc resolved above for provision/spawn — settings
                 // wiring and live-state capability flags use it too.
                 .driver(driver.clone())
-                .tmux_host(tmux_host)
+                .tmux_host(tmux_host.clone())
                 .automation_outcome_proposals_seam_enabled(automation_outcome_proposals_seam_enabled)
                 .is_review_supervisor(is_review_supervisor)
                 .is_post_merge_reviewer(is_post_merge_reviewer)
@@ -1336,6 +1240,30 @@ impl ExecutionRunner for PaneSpawnRunner {
             }
         }
 
+        if !self.skip_spawn_confirm() {
+            let (composer_timeout, turn_timeout) = self.spawn_confirm_timeouts();
+            let confirm = confirm_local_spawn(
+                &tmux_host,
+                driver.as_ref(),
+                spawner.live_worker_state_registry(),
+                &execution.id,
+                composer_timeout,
+                turn_timeout,
+            )
+            .await;
+            if let Err(err) = confirm {
+                tracing::warn!(
+                    worker_id,
+                    execution_id = %execution.id,
+                    slot_id = started.slot_id,
+                    %err,
+                    "spawn confirmation failed; reaping the worker pane",
+                );
+                spawner.reap_worker_pane(&execution.id).await;
+                return Err(err);
+            }
+        }
+
         // The pane is up and its agent is working, so the execution stays in
         // `running` — for every kind, not just `pr_review`. Nobody is waiting
         // for a human at this instant, and writing `waiting_human` here (the
@@ -1359,6 +1287,62 @@ impl ExecutionRunner for PaneSpawnRunner {
             spawn_config: Some(spawn_config),
         })
     }
+}
+
+/// Bounded wait after prompt delivery: driver-specific PTY evidence that
+/// the CLI is up, then a driver hook/session event that the turn started.
+async fn confirm_local_spawn(
+    tmux_host: &TmuxWorkerHost,
+    driver: &dyn crate::driver::AgentDriver,
+    live_states: Option<&crate::live_worker_state::LiveWorkerStateRegistry>,
+    run_id: &str,
+    composer_timeout: StdDuration,
+    turn_timeout: StdDuration,
+) -> Result<()> {
+    use super::spawn_confirmation::{
+        SPAWN_CONFIRM_POLL, composer_not_ready_error, pane_shows_driver_ready, turn_did_not_start_error,
+    };
+
+    let driver_name = driver.descriptor().name;
+    let spec = driver.pane_monitor_spec();
+    let composer_start = tokio::time::Instant::now();
+    let mut composer_ready = false;
+    loop {
+        if let Ok(pane_text) = tmux_host.tmux().capture_pane(tmux_host.session_name()).await {
+            composer_ready = match spec.as_ref() {
+                Some(spec) => pane_shows_driver_ready(&pane_text, spec),
+                None => !pane_text.trim().is_empty(),
+            };
+            if composer_ready {
+                break;
+            }
+        }
+        if composer_start.elapsed() >= composer_timeout {
+            break;
+        }
+        let remaining = composer_timeout.saturating_sub(composer_start.elapsed());
+        tokio::time::sleep(SPAWN_CONFIRM_POLL.min(remaining)).await;
+    }
+    if !composer_ready {
+        return Err(composer_not_ready_error(driver_name, run_id, composer_timeout));
+    }
+    let turn_start = tokio::time::Instant::now();
+    let mut turn_started = false;
+    loop {
+        if live_states.is_some_and(|registry| registry.has_driver_signal_for_run(run_id)) {
+            turn_started = true;
+            break;
+        }
+        if turn_start.elapsed() >= turn_timeout {
+            break;
+        }
+        let remaining = turn_timeout.saturating_sub(turn_start.elapsed());
+        tokio::time::sleep(SPAWN_CONFIRM_POLL.min(remaining)).await;
+    }
+    if !turn_started {
+        return Err(turn_did_not_start_error(driver_name, run_id, turn_timeout));
+    }
+    Ok(())
 }
 
 /// The shell's background tier is inherited by drivers and build tools,

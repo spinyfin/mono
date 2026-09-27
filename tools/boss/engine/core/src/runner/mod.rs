@@ -5,6 +5,8 @@
 //!
 //! - [`pane_spawn`] — the [`PaneSpawnRunner`] `ExecutionRunner` impl plus the
 //!   boss-event shim install/resolve helpers.
+//! - [`spawn_launch_limits`] — ARG_MAX / MAX_ARG_STRLEN preflight.
+//! - [`spawn_confirmation`] — bounded composer-readiness and turn-start wait.
 //! - [`worker_spawn`] — worker-spawn composition ([`ComposedWorkerSpawn`],
 //!   [`compose_worker_spawn`], PR review/diff fetch).
 //! - [`prompt`] — worker prompt composition (the directive/fragment family).
@@ -29,6 +31,8 @@ pub(crate) mod pane_spawn;
 mod prompt;
 mod review_brief;
 mod review_guide_prompt;
+pub(crate) mod spawn_confirmation;
+pub(crate) mod spawn_launch_limits;
 pub(crate) mod work_item;
 mod worker_spawn;
 

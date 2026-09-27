@@ -40,6 +40,9 @@ struct CapturingSpawner {
     /// Run ids passed to `reap_worker_pane` — lets the mid-spawn
     /// cancel test assert the runner reaped the just-spawned pane.
     reaped: StdMutex<Vec<String>>,
+    /// When true, `capture-pane` returns Claude chrome and stamps a
+    /// driver-signal so spawn confirmation can succeed in tests.
+    auto_confirm_turn: std::sync::atomic::AtomicBool,
 }
 
 impl CapturingSpawner {
@@ -49,6 +52,7 @@ impl CapturingSpawner {
             live_states: LiveWorkerStateRegistry::new(),
             last: StdMutex::new(None),
             reaped: StdMutex::new(Vec::new()),
+            auto_confirm_turn: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -132,6 +136,17 @@ impl CommandRunner for CapturingSpawner {
                 ""
             }
             Some("display-message") => "4242",
+            Some("capture-pane") => {
+                if self.auto_confirm_turn.load(std::sync::atomic::Ordering::SeqCst) {
+                    for state in self.live_states.snapshot() {
+                        self.live_states
+                            .record_driver_signal(&state.run_id, crate::live_worker_state::DriverSignalKind::HookEvent);
+                    }
+                    "Claude Code\n"
+                } else {
+                    ""
+                }
+            }
             Some("-V") => "tmux 3.3",
             Some("start-server" | "set-option" | "show-options") => "",
             other => panic!("unexpected tmux command {other:?}: {args:?}"),
@@ -159,6 +174,7 @@ fn bind_runner(
     weak: Weak<dyn crate::spawn_flow::WorkerSpawner>,
     spawner: &Arc<CapturingSpawner>,
 ) {
+    runner.set_skip_spawn_confirm(true);
     runner.set_server_state(weak);
     let tmux = Tmux::with_runner_and_socket("/fake/tmux", spawner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap();
     assert!(
@@ -2067,4 +2083,63 @@ async fn mismatched_guide_head_fails_attempt_without_spawning() {
         .unwrap();
     assert_eq!(failed.status, "failed");
     assert!(failed.error.unwrap().contains(&packet.head_sha));
+}
+
+#[tokio::test]
+async fn spawn_confirmation_timeout_reaps_the_pane_and_fails_the_spawn() {
+    let workspace = TempDir::new().unwrap();
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db, flags);
+    bind_runner(&runner, weak, &spawner);
+    runner.set_skip_spawn_confirm(false);
+    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(40));
+
+    let err = runner
+        .run_execution(
+            "worker-1",
+            &sample_execution(workspace.path()),
+            &sample_chore(),
+            workspace.path(),
+            Some("change-1"),
+        )
+        .await
+        .expect_err("absent turn-start evidence must fail the spawn");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("composer never became ready") || msg.contains("no driver hook or session event"),
+        "{msg}"
+    );
+    assert!(msg.contains("failed spawn"), "{msg}");
+    assert_eq!(spawner.reaped_run_ids(), vec!["exec-test-1".to_string()]);
+}
+
+#[tokio::test]
+async fn spawn_confirmation_passes_when_driver_chrome_and_hook_arrive() {
+    let workspace = TempDir::new().unwrap();
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    spawner
+        .auto_confirm_turn
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db, flags);
+    bind_runner(&runner, weak, &spawner);
+    runner.set_skip_spawn_confirm(false);
+    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(200));
+
+    runner
+        .run_execution(
+            "worker-1",
+            &sample_execution(workspace.path()),
+            &sample_chore(),
+            workspace.path(),
+            Some("change-1"),
+        )
+        .await
+        .expect("composer chrome plus a recorded hook must complete spawn");
+    assert!(spawner.reaped_run_ids().is_empty());
 }

@@ -6,9 +6,9 @@
 //! full structural `--deny` rule set).
 
 use super::{
-    MAX_CANON_LINE_BYTES, check_arg_max_budget, check_initial_input_length, check_launch_command_arg_max,
-    check_launch_command_arg_max_for_bytes, estimated_launch_argv_bytes, local_arg_max, path_prepend_clause,
-    render_env_directive, write_initial_input_script,
+    ExecArgLimits, MAX_CANON_LINE_BYTES, check_arg_max_budget, check_initial_input_length,
+    check_launch_command_arg_max, check_launch_command_arg_max_for_bytes, estimated_launch_argv_bytes, local_arg_max,
+    path_prepend_clause, render_env_directive, write_initial_input_script,
 };
 use crate::driver::{
     AgentDriver, ClaudeDriver, CodexDriver, EnvDirective, GrokDriver, PermissionInput, SpawnRequest, WorkerKind,
@@ -319,6 +319,10 @@ fn estimated_launch_argv_bytes_errors_when_the_prompt_file_is_missing() {
 /// shell argument) would wrongly reject this.
 #[test]
 fn check_launch_command_arg_max_passes_for_a_600kb_prompt_on_this_host() {
+    if crate::runner::spawn_launch_limits::local_max_arg_strlen().is_some_and(|limit| 600_000 > limit) {
+        // Linux: 600KB exceeds MAX_ARG_STRLEN; covered by spawn_launch_limits tests.
+        return;
+    }
     let workspace = TempDir::new().unwrap();
     std::fs::create_dir_all(workspace.path().join(".codex")).unwrap();
     std::fs::write(
@@ -364,17 +368,34 @@ fn check_launch_command_arg_max_fails_for_a_prompt_over_this_hosts_real_arg_max(
 
 #[test]
 fn check_launch_command_arg_max_for_bytes_passes_for_a_600kb_prompt_on_this_host() {
+    if crate::runner::spawn_launch_limits::local_max_arg_strlen().is_some_and(|limit| 600_000 > limit) {
+        return;
+    }
     let command = "codex --strict-config --no-alt-screen -a never -m 'gpt-5' \"$(cat .codex/initial-prompt.txt)\"\n";
-    check_launch_command_arg_max_for_bytes(command, "codex", ".codex", "initial-prompt.txt", 600_000)
-        .expect("a ~600KB prompt must fit under this host's real ARG_MAX");
+    check_launch_command_arg_max_for_bytes(
+        command,
+        "codex",
+        ".codex",
+        "initial-prompt.txt",
+        600_000,
+        ExecArgLimits::local().unwrap(),
+    )
+    .expect("a ~600KB prompt must fit under this host's real ARG_MAX");
 }
 
 #[test]
 fn check_launch_command_arg_max_for_bytes_fails_for_a_prompt_over_this_hosts_real_arg_max() {
     let arg_max = local_arg_max().unwrap();
     let command = "grok --model 'grok-4.6' \"$(cat .grok/initial-prompt.txt)\"\n";
-    let err = check_launch_command_arg_max_for_bytes(command, "grok", ".grok", "initial-prompt.txt", arg_max + 4096)
-        .expect_err("must fail, not silently proceed with a doomed remote exec");
+    let err = check_launch_command_arg_max_for_bytes(
+        command,
+        "grok",
+        ".grok",
+        "initial-prompt.txt",
+        arg_max + 4096,
+        ExecArgLimits::local().unwrap(),
+    )
+    .expect_err("must fail, not silently proceed with a doomed remote exec");
     let msg = err.to_string();
     assert!(msg.contains("grok"), "error must name the driver: {msg}");
     assert!(msg.contains("ARG_MAX"), "{msg}");

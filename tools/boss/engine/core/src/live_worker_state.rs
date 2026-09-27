@@ -965,6 +965,16 @@ impl LiveWorkerStateRegistry {
         guard.get(&slot_id).and_then(|entry| entry.meta.driver_signal_at)
     }
 
+    /// Whether any live slot for `run_id` has recorded a driver-originated
+    /// signal. Spawn-time confirmation keys on the run rather than the slot
+    /// so a hook that won the race against slot fan-out still counts.
+    pub fn has_driver_signal_for_run(&self, run_id: &str) -> bool {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard
+            .values()
+            .any(|entry| entry.state.run_id == run_id && entry.meta.driver_signal_at.is_some())
+    }
+
     /// Record one `LivenessUndeterminable` reap outcome for `run_id`'s live
     /// slot, so [`crate::spawn_ack_sweep::reap_never_started_spawn`] can
     /// escalate a permanently-unreadable liveness answer instead of holding
