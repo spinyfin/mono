@@ -366,7 +366,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
             // `compose_review_guide_prompt`; this arm keeps the generic
             // composer sane and proposal-only if ever reached.)
             prompt.push_str(
-                "Expected outcome for this run:\n- read the source you need from your pinned read-only workspace,\n- submit the finished Markdown via `\"$BOSS_BIN\" propose review-guide --body '<literal>'`,\n- take no other action — that is the only permitted command.\n",
+                "Expected outcome for this run:\n- read the source you need from your pinned read-only workspace using Read/Grep/Glob or read-only git commands,\n- submit the finished Markdown via `\"$BOSS_BIN\" propose review-guide --body '<literal>'`,\n- submission is the only permitted write operation; read-only source exploration is permitted.\n",
             );
         }
         ExecutionKind::AutomationTriage

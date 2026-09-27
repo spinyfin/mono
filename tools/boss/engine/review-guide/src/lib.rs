@@ -133,9 +133,11 @@ pub fn render_source_context(packet: &SourcePacket) -> String {
     out
 }
 
-const OMISSIONS_HEADER: &str = "### Collection omissions\n\n\
-The following source material could not be captured. Do not invent content for these; state the limitation \
-instead.\n\n";
+const OMISSIONS_HEADER: &str = "### Capture diagnostics\n\n\
+These are capture-time packet diagnostics, not workspace source limitations. Notes that pinned source \
+was collected instead of an API patch describe capture provenance only. Try the pinned checkout with \
+Read/Grep/Glob or read-only git show/git diff first; state a source limitation only if that read fails. \
+Do not invent content.\n\n";
 const OMISSIONS_FOOTER: &str = "\n";
 
 fn render_omission_line(omission: &boss_pr_review_sources::SourceOmission) -> String {
@@ -633,15 +635,36 @@ mod tests {
             terminal: true,
         });
         let context = render_source_context(&packet);
-        assert!(context.contains("### Collection omissions"));
+        assert!(context.contains("### Capture diagnostics"));
         assert!(context.contains("vendor/blob.bin"));
         assert!(context.contains("binary content not captured"));
+        assert!(context.contains("Try the pinned checkout"));
+        assert!(context.contains("state a source limitation only if that read fails"));
+        assert!(!context.contains("source material could not be captured"));
+    }
+
+    #[test]
+    fn source_context_labels_missing_api_patch_as_capture_provenance() {
+        let mut packet = packet();
+        packet.omissions.push(boss_pr_review_sources::SourceOmission {
+            path: Some("src/retry.rs".to_owned()),
+            side: None,
+            reason: "GitHub omitted the API patch; pinned source was collected instead".to_owned(),
+            terminal: true,
+        });
+        let context = render_source_context(&packet);
+        assert!(context.contains("`src/retry.rs` (Modified, +3/-1)"));
+        assert!(context.contains("### Capture diagnostics"));
+        assert!(context.contains("describe capture provenance only"));
+        assert!(context.contains("read-only git show/git diff first"));
+        assert!(context.contains("pinned source was collected instead"));
+        assert!(!context.contains("### Collection omissions"));
     }
 
     #[test]
     fn source_context_omits_collection_omissions_section_when_none_recorded() {
         let context = render_source_context(&packet());
-        assert!(!context.contains("### Collection omissions"));
+        assert!(!context.contains("### Capture diagnostics"));
     }
 
     #[test]
