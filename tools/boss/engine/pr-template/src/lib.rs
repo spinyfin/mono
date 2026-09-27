@@ -200,9 +200,11 @@ pub struct HeadingToken {
 ///
 /// Follows CommonMark's ATX heading rule: the line may be indented by at
 /// most three spaces, and the hash run must be followed by a space/tab or
-/// the end of the line — `#[derive(Debug)]` and `# shell comment` are not
-/// headings, fenced or not, and a 4-space indent is treated as part of an
-/// indented code block rather than a heading candidate.
+/// the end of the line. `#[derive(Debug)]` (no space after the hash run) is
+/// never a heading, fenced or not. `# shell comment` is a valid H1 when
+/// unfenced; it is excluded only when it sits inside a fence. A 4-space
+/// indent is treated as part of an indented code block rather than a
+/// heading candidate.
 pub fn parse_all_headings(text: &str) -> Vec<HeadingToken> {
     let mut headings = Vec::new();
     let mut in_fence = false;
@@ -393,9 +395,10 @@ mod tests {
 
     #[test]
     fn hash_without_space_or_eol_is_never_a_heading() {
-        // `#[derive(Debug)]` and `# comment` outside a fence must also not
-        // count — the space/tab-or-eol rule applies everywhere, not just
-        // inside fences.
+        // `#[derive(...)]` (no space after the hash run) is never a heading.
+        // `# shell comment` is a valid H1 when unfenced; it is excluded only
+        // because it sits inside a fence (see
+        // `pseudo_headings_inside_fences_are_not_headings`).
         let text = "#[derive(Debug)]\n## Real\n";
         let headings: Vec<String> = parse_all_headings(text).into_iter().map(|h| h.title).collect();
         assert_eq!(headings, vec!["Real"]);

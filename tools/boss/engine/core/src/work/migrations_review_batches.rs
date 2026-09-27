@@ -132,11 +132,10 @@ pub(crate) fn migrate_pr_review_batch_explicit(conn: &Connection) -> Result<()> 
 }
 
 /// Add `producing_work_item_id`, the task/revision id a batch's cycle root
-/// was collapsed from (NULL when the root itself is the producing item). A
-/// plain `ALTER TABLE ... ADD COLUMN` suffices: the column has no
-/// constraint, and defaulting existing rows to NULL correctly marks every
-/// batch that predates this column as "root is the producing item", which
-/// was the only case that existed before revisions could reach this path.
+/// was collapsed from. NULL means the batch's cycle root is treated as the
+/// producing item; batches created before this column existed get NULL and
+/// fall back to the root's brief. A plain `ALTER TABLE ... ADD COLUMN`
+/// suffices: the column has no constraint.
 pub(crate) fn migrate_pr_review_batch_producing_work_item(conn: &Connection) -> Result<()> {
     if !super::table_has_column(conn, "pr_review_batches", "producing_work_item_id")? {
         conn.execute(

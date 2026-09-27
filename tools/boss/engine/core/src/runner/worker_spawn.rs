@@ -967,6 +967,7 @@ pub(crate) async fn compose_worker_spawn(
             let brief_work_item_id = member_and_batch
                 .as_ref()
                 .and_then(|(_, batch)| batch.producing_work_item_id.clone());
+            let mut producing_item_load_error: Option<(String, String)> = None;
             let brief_work_item_owned = match brief_work_item_id {
                 Some(ref id) if id != &execution.work_item_id => match work_db.get_work_item(id) {
                     Ok(item) => Some(item),
@@ -976,16 +977,25 @@ pub(crate) async fn compose_worker_spawn(
                             producing_work_item_id = %id,
                             error = %err,
                             "pr_review: failed to load producing work item for revision brief; \
-                             falling back to the batch's cycle-root work item",
+                             falling back to the batch's cycle-root work item and recording an \
+                             unresolved brief input",
                         );
+                        producing_item_load_error = Some((id.clone(), err.to_string()));
                         None
                     }
                 },
                 _ => None,
             };
             let brief_work_item = brief_work_item_owned.as_ref().unwrap_or(work_item);
-            let review_brief =
+            let mut review_brief =
                 super::review_brief::assemble_review_brief_packet(work_db, brief_work_item, execution).await;
+            if let Some((id, err)) = producing_item_load_error {
+                review_brief
+                    .unresolved
+                    .push(crate::pr_review::UnresolvedReviewInput::Brief {
+                        reason: format!("revision ask for producing work item {id} could not be loaded: {err}"),
+                    });
+            }
             let report_destination = match member_and_batch {
                 Some((member, batch)) => Some((
                     member.role,
@@ -1900,15 +1910,13 @@ mod compose_worker_spawn_tests {
             .build()
     }
 
-    /// The normal pre-merge batch path creates reviewer executions on the
-    /// batch's `cycle_root_id` (the chain root a revision's review-cycle
-    /// accounting collapses to — see `pr_transition::review_batch_input_from_metadata`),
-    /// not on the revision itself. Before `producing_work_item_id` was
-    /// persisted and consulted here, `compose_worker_spawn` had no way back
-    /// to the revision: the rendered prompt carried only the chain root's
-    /// own description, never the revision ask or the revision's own
-    /// deferred-scope declarations. This is the fix's regression test: a
-    /// batch created from a completed revision must still render both.
+    /// The pre-merge batch path creates reviewer executions on the batch's
+    /// `cycle_root_id` (the chain root a revision's review-cycle accounting
+    /// collapses to — see `pr_transition::review_batch_input_from_metadata`),
+    /// not on the revision itself. `compose_worker_spawn` resolves the
+    /// packet from the batch's persisted `producing_work_item_id`, so a
+    /// batch created from a completed revision still renders the revision
+    /// ask and the chain-root brief.
     #[tokio::test]
     async fn batch_reviewer_prompt_for_a_revision_includes_revision_ask_and_chain_root_brief() {
         use crate::test_support::{create_test_product, insert_host_capability};
@@ -2002,10 +2010,9 @@ mod compose_worker_spawn_tests {
         assert!(composed.prompt_text.contains("Chain-root brief"));
 
         // The other two leaves, and the consolidating supervisor once it is
-        // dispatched, are members of the same batch and go through the exact
-        // same `member_and_batch` → `producing_work_item_id` resolution in
-        // `compose_worker_spawn` before rendering diverges by role — so
-        // covering one leaf here covers the resolution fix for all of them.
+        // dispatched, are members of the same batch and go through the same
+        // `member_and_batch` → `producing_work_item_id` resolution in
+        // `compose_worker_spawn` before rendering diverges by role.
         for other_leaf in &executions[1..] {
             let composed_other = compose_worker_spawn(
                 &db,
@@ -2026,6 +2033,120 @@ mod compose_worker_spawn_tests {
                 composed_other.prompt_text,
             );
         }
+    }
+
+    /// When the batch's persisted `producing_work_item_id` cannot be loaded,
+    /// the cycle-root brief is still assembled as partial context and the
+    /// missing revision ask is recorded as an unresolved brief input.
+    #[tokio::test]
+    async fn batch_reviewer_prompt_records_unresolved_when_producing_item_cannot_be_loaded() {
+        use crate::test_support::{create_test_product, insert_host_capability};
+        use crate::work::{FakePrStateChecker, PrOpenState};
+        use boss_protocol::{CreateChoreInput, CreateRevisionInput, ReviewBatchPhase, WorkItemPatch};
+
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        insert_host_capability(&db, "local", "driver=claude", "auto");
+        let product = create_test_product(&db);
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Run durable Astra-high guide jobs")
+                    .description("Implement a revision-aware broker.")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        let pr_url = "https://github.com/spinyfin/mono/pull/3013";
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(pr_url.into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let revision = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(chore.id.clone())
+                    .description("Restore the broker the first pass inlined away.")
+                    .build(),
+                &FakePrStateChecker::always(PrOpenState::Open),
+            )
+            .unwrap();
+
+        let input = crate::work::ReviewBatchCreateInput::builder()
+            .cycle_root_id(chore.id.clone())
+            .base_sha("base-sha")
+            .classification(batch_classification())
+            .phase(ReviewBatchPhase::PreMerge)
+            .pr_number(3013)
+            .pr_url(pr_url)
+            .target_sha("target-sha")
+            .legacy_task_id(revision.id.clone())
+            .build();
+        let dispatch = db
+            .create_pre_merge_review_batch(input, "git@github.com:spinyfin/mono.git")
+            .unwrap();
+        let executions = match dispatch {
+            crate::work::ReviewBatchDispatch::Created { executions, .. } => executions,
+            other => panic!("expected a freshly created batch, got {other:?}"),
+        };
+        let leaf_execution = &executions[0];
+        assert_eq!(
+            leaf_execution.work_item_id, chore.id,
+            "leaf executions run on the cycle root"
+        );
+
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET deleted_at = '2026-01-01T00:00:00Z' WHERE id = ?1",
+                rusqlite::params![revision.id],
+            )
+            .unwrap();
+
+        let root_work_item = db.get_work_item(&chore.id).unwrap();
+        let composed = compose_worker_spawn(
+            &db,
+            "review-1",
+            leaf_execution,
+            &root_work_item,
+            workspace.path(),
+            None,
+            WorkerSpawnOpts::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            composed.prompt_text.contains("Implement a revision-aware broker."),
+            "cycle-root brief must still be present as partial context:\n{}",
+            composed.prompt_text,
+        );
+        assert!(
+            composed.prompt_text.contains("Unresolved review inputs"),
+            "missing producing item must render as an unresolved-input requirement:\n{}",
+            composed.prompt_text,
+        );
+        assert!(
+            composed.prompt_text.contains(&format!(
+                "revision ask for producing work item {} could not be loaded",
+                revision.id
+            )),
+            "unresolved reason must name the producing work item:\n{}",
+            composed.prompt_text,
+        );
+        assert!(
+            !composed
+                .prompt_text
+                .contains("Restore the broker the first pass inlined away."),
+            "deleted producing item must not silently supply a revision ask:\n{}",
+            composed.prompt_text,
+        );
     }
 
     /// A non-`pr_review` execution kind (e.g. `ChoreImplementation`) must not

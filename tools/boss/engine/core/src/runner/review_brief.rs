@@ -63,10 +63,9 @@ where
     let mut work_item_brief = nonempty_desc(&task.description);
     let mut revision_ask = None;
     let mut deferred_ids = vec![task.id.clone()];
-    // For a revision, design-doc lookup keys off the chain root's name (the
-    // heading it was originally named after), not the revision's own name —
-    // see the "revision packets look up the design section by the
-    // revision's name" fix below. `task.name` is still used for display.
+    // For a revision, design-doc lookup uses the chain root's name (the
+    // heading the originating item was named after); `task.name` is still
+    // used for display.
     let mut design_lookup_name = task.name.clone();
 
     if is_revision {
@@ -80,12 +79,14 @@ where
             // parent" (a revision always has one at creation time).
             work_item_brief = None;
         } else {
-            // Collect every revision belonging to this chain root (siblings
-            // included — `create_revision` parents new revisions directly to
-            // the chain root, so a chain is flat, not nested), so a
-            // deferred-scope declaration attached to an earlier revision of
-            // this same PR (root -> rev1, root -> rev2) is still seen when a
-            // later revision is reviewed, not just the current one's own.
+            // Collect the chain root plus every revision belonging to it
+            // (siblings included — `create_revision` parents new revisions
+            // directly to the chain root, so a chain is flat, not nested).
+            // `collect_chain_revision_ids` returns only child revisions, so
+            // the root id is pushed explicitly: a deferred-scope declaration
+            // on the originating item (or on an earlier revision of this
+            // same PR) is still seen when a later revision is reviewed.
+            deferred_ids.push(root_id.clone());
             match work_db
                 .connect()
                 .and_then(|conn| crate::work::collect_chain_revision_ids(&conn, &root_id))
@@ -537,12 +538,10 @@ mod tests {
         );
     }
 
-    /// `review_cycle_root_id` deliberately returns the input id when the
-    /// chain root cannot be resolved (a broken/missing parent pointer).
-    /// Before this fix, that made the packet quietly treat the revision's
-    /// own description as both the revision ask AND the chain-root brief,
-    /// with nothing recorded as unresolved. It must instead surface as an
-    /// unresolved brief, same as any other failed lookup.
+    /// `review_cycle_root_id` returns the input id when the chain root
+    /// cannot be resolved (a broken/missing parent pointer). The packet
+    /// then records an unresolved brief for the missing chain-root
+    /// description.
     #[tokio::test]
     async fn broken_revision_ancestry_is_unresolved_not_a_silent_skip() {
         let (_dir, db) = open_db();
@@ -674,6 +673,58 @@ mod tests {
                 .iter()
                 .any(|d| d.contains("revision-aware broker")),
             "rev2's packet must still see rev1's deferred-scope declaration: {:?}",
+            packet.deferred_scope_declarations
+        );
+    }
+
+    /// A deferred-scope marker on the chain root must appear in a later
+    /// revision's packet. `collect_chain_revision_ids` returns only child
+    /// revisions, so the assembler also includes the resolved root id.
+    #[tokio::test]
+    async fn deferred_scope_on_the_chain_root_is_collected_for_a_later_revision() {
+        let (_dir, db) = open_db();
+        insert_host(&db);
+        let product = create_test_product(&db);
+        let chore = db
+            .create_chore(
+                boss_protocol::CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Importer")
+                    .description(
+                        "Implement the widget importer.\n\n\
+                         [deferred-scope] summary=\"revision-aware broker\" reason=\"needs a pipeline\"",
+                    )
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some("https://github.com/spinyfin/mono/pull/3012".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let revision = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(chore.id.clone())
+                    .description("Address the review findings.")
+                    .build(),
+                &FakePrStateChecker::always(PrOpenState::Open),
+            )
+            .unwrap();
+
+        let item = db.get_work_item(&revision.id).unwrap();
+        let packet = assemble_with_doc_fetch(&db, &item, &execution_for(&revision.id), canned_missing).await;
+        assert!(
+            packet
+                .deferred_scope_declarations
+                .iter()
+                .any(|d| d.contains("revision-aware broker")),
+            "revision packet must still see the chain root's deferred-scope declaration: {:?}",
             packet.deferred_scope_declarations
         );
     }
