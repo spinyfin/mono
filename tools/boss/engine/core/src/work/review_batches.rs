@@ -249,6 +249,7 @@ fn map_review_batch(row: &Row<'_>) -> rusqlite::Result<ReviewBatch> {
         final_verdict_proposal_id: row.get(12)?,
         merge_sha: row.get(13)?,
         explicit: row.get(15)?,
+        producing_work_item_id: row.get(16)?,
     })
 }
 
@@ -439,8 +440,9 @@ fn create_review_batch_in_tx(
         "INSERT INTO pr_review_batches (
             id, cycle_root_id, base_sha, classification_json, created_at,
             phase, pr_number, pr_url, status, target_sha, updated_at,
-            completed_at, final_verdict_proposal_id, merge_sha, generation, explicit
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'collecting', ?9, ?5, NULL, NULL, ?10, ?11, ?12)",
+            completed_at, final_verdict_proposal_id, merge_sha, generation, explicit,
+            producing_work_item_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'collecting', ?9, ?5, NULL, NULL, ?10, ?11, ?12, ?13)",
         params![
             batch_id,
             input.cycle_root_id,
@@ -454,6 +456,7 @@ fn create_review_batch_in_tx(
             input.merge_sha,
             generation,
             explicit,
+            input.legacy_task_id,
         ],
     )?;
 
@@ -478,6 +481,7 @@ fn create_review_batch_in_tx(
             .target_sha(input.target_sha)
             .updated_at(now)
             .maybe_merge_sha(input.merge_sha)
+            .maybe_producing_work_item_id(input.legacy_task_id)
             .build(),
         members,
     ))
@@ -542,7 +546,7 @@ fn review_batch_for_target_in(
     conn.query_row(
         "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
                 phase, pr_number, pr_url, status, target_sha, updated_at,
-                completed_at, final_verdict_proposal_id, merge_sha, generation, explicit
+                completed_at, final_verdict_proposal_id, merge_sha, generation, explicit, producing_work_item_id
          FROM pr_review_batches WHERE cycle_root_id = ?1 AND phase = ?2 AND target_sha = ?3
          ORDER BY generation DESC LIMIT 1",
         params![cycle_root_id, phase.as_str(), target_sha],
@@ -577,7 +581,7 @@ fn review_batch_by_id_in(conn: &rusqlite::Connection, batch_id: &str) -> Result<
     conn.query_row(
         "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
                 phase, pr_number, pr_url, status, target_sha, updated_at,
-                completed_at, final_verdict_proposal_id, merge_sha, generation, explicit
+                completed_at, final_verdict_proposal_id, merge_sha, generation, explicit, producing_work_item_id
          FROM pr_review_batches WHERE id = ?1",
         params![batch_id],
         map_review_batch,
@@ -1381,7 +1385,7 @@ impl WorkDb {
         let mut statement = conn.prepare(
             "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
                     phase, pr_number, pr_url, status, target_sha, updated_at,
-                    completed_at, final_verdict_proposal_id, merge_sha, generation, explicit
+                    completed_at, final_verdict_proposal_id, merge_sha, generation, explicit, producing_work_item_id
              FROM pr_review_batches
              WHERE cycle_root_id = ?1
              ORDER BY created_at DESC, generation DESC, id DESC",
@@ -1403,7 +1407,7 @@ impl WorkDb {
         let mut statement = conn.prepare(
             "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
                     phase, pr_number, pr_url, status, target_sha, updated_at,
-                    completed_at, final_verdict_proposal_id, merge_sha, generation, explicit
+                    completed_at, final_verdict_proposal_id, merge_sha, generation, explicit, producing_work_item_id
              FROM pr_review_batches
              WHERE status NOT IN ('completed', 'failed')
              ORDER BY created_at ASC, id ASC

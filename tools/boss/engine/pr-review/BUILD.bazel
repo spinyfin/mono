@@ -16,6 +16,7 @@ rust_library(
         "//tools/boss/engine/proposal-validation:__pkg__",
     ],
     deps = [
+        "//tools/boss/engine/pr-template",
         "//tools/boss/engine/structured-output",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
@@ -31,6 +32,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//tools/boss/engine/pr-template",
         "//tools/boss/engine/structured-output",
         "//tools/boss/protocol",
     ] + all_crate_deps(

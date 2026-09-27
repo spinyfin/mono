@@ -2,6 +2,7 @@
 //! initial task prompt, the scope-specific rubric, and the revision
 //! instructions rendered from a [`ReviewResult`].
 
+use crate::brief::ReviewBriefPacket;
 use crate::types::*;
 
 /// Sentence instructing the worker to address every finding before the
@@ -402,9 +403,11 @@ pub fn render_reviewer_claude_md(
 
 /// Compose the initial-prompt for a `pr_review` execution (design §2, §12).
 ///
-/// `task_name` and `task_description` are the producing task's title and
-/// description — they tell the reviewer what the PR was *supposed* to do,
-/// which is the baseline for the regression/deletion check.
+/// `brief` is the engine-assembled work-item packet: the producing task's
+/// title and description (plus the chain-root brief for a revision), the
+/// live-fetched design-doc section when the item belongs to a project with
+/// a design doc, declared deferred-scope proposals, and any unresolved
+/// inputs the reviewer must raise as blocking findings rather than skip.
 ///
 /// `pr_url` is the PR to review.
 ///
@@ -429,8 +432,7 @@ pub fn render_reviewer_claude_md(
 /// artifact path). Batch reviewers use [`render_batch_reviewer_initial_prompt`]
 /// instead, which submits a typed report through `boss propose`.
 pub fn render_reviewer_initial_prompt(
-    task_name: &str,
-    task_description: &str,
+    brief: &ReviewBriefPacket,
     pr_url: &str,
     output_path: &str,
     scope: ReviewScope,
@@ -438,6 +440,8 @@ pub fn render_reviewer_initial_prompt(
     repo_slug: &str,
 ) -> String {
     let rubric = render_rubric_section(&scope);
+    let brief_block = crate::brief::render_brief_packet_block(brief);
+    let brief_conformance = crate::brief::render_brief_conformance_rubric();
 
     // Extended PR metadata block — only present when we have pre-fetched context.
     let pr_metadata_block = match ctx {
@@ -580,17 +584,14 @@ pub fn render_reviewer_initial_prompt(
          \n\
          ## PR under review\n\
          \n\
-         **Task:** {task_name}\n\
-         \n\
-         **Task description:**\n\
-         {task_description}\n\
-         \n\
+         {brief_block}\
          **PR:** {pr_url}\n\
          {pr_metadata_block}\n\
          {revision_context_block}\
          {merged_parent_deletion_block}\
          {supersession_flag_block}\
          {boss_construct_sweep_block}\
+         {brief_conformance}\
          ## Review steps\n\
          \n\
          1. Your workspace is already checked out to the PR head — read \
@@ -681,8 +682,8 @@ pub fn render_reviewer_initial_prompt(
            whole file).\n\
          - Do NOT post this JSON to GitHub or as a PR comment. It stays \
            inside Boss.\n",
-        task_name = task_name,
-        task_description = task_description,
+        brief_block = brief_block,
+        brief_conformance = brief_conformance,
         pr_url = pr_url,
         output_path = output_path,
         pr_metadata_block = pr_metadata_block,
@@ -703,16 +704,14 @@ pub fn render_reviewer_initial_prompt(
 /// context and rubric while replacing its artifact/transcript delivery
 /// section with the live `boss propose review-report` contract.
 pub fn render_batch_reviewer_initial_prompt(
-    task_name: &str,
-    task_description: &str,
+    brief: &ReviewBriefPacket,
     destination: &ReviewerReportDestination,
     scope: ReviewScope,
     ctx: Option<&PrReviewContext>,
     repo_slug: &str,
 ) -> String {
     let legacy = render_reviewer_initial_prompt(
-        task_name,
-        task_description,
+        brief,
         &destination.pr_url,
         &destination.body_path,
         scope,
@@ -895,8 +894,9 @@ pub(crate) fn render_rubric_section(scope: &ReviewScope) -> String {
                finding, not an advisory suggestion.\n\
              - **Deferred-scope hygiene** *(first-class, explicit check)* — \
                compare the PR's delivered changes against the owning work \
-               item's brief (given above in **Task description**) and check \
-               for three distinct failure modes:\n\
+               item's brief (given above in **Task description** for an \
+               ordinary item, or **Chain-root brief** + **Revision ask** for \
+               a revision) and check for three distinct failure modes:\n\
                (1) **Undeclared deferral** — the brief asked for scope that \
                the diff does not deliver, and no `[deferred-scope] \
                summary=\"...\" reason=\"...\"` marker (recorded by the \
@@ -1077,6 +1077,42 @@ pub(crate) fn render_rubric_section(scope: &ReviewScope) -> String {
 mod tests {
     use crate::*;
 
+    fn render_reviewer_initial_prompt(
+        task_name: &str,
+        task_description: &str,
+        pr_url: &str,
+        output_path: &str,
+        scope: ReviewScope,
+        ctx: Option<&PrReviewContext>,
+        repo_slug: &str,
+    ) -> String {
+        super::render_reviewer_initial_prompt(
+            &ReviewBriefPacket::from_task(task_name, task_description),
+            pr_url,
+            output_path,
+            scope,
+            ctx,
+            repo_slug,
+        )
+    }
+
+    fn render_batch_reviewer_initial_prompt(
+        task_name: &str,
+        task_description: &str,
+        destination: &ReviewerReportDestination,
+        scope: ReviewScope,
+        ctx: Option<&PrReviewContext>,
+        repo_slug: &str,
+    ) -> String {
+        super::render_batch_reviewer_initial_prompt(
+            &ReviewBriefPacket::from_task(task_name, task_description),
+            destination,
+            scope,
+            ctx,
+            repo_slug,
+        )
+    }
+
     /// The reviewer rules file is handed to every reviewer regardless of
     /// which delivery contract its task prompt actually uses (legacy
     /// artifact/transcript, or review-batch `boss propose review-report`),
@@ -1113,6 +1149,31 @@ mod tests {
         assert!(
             !rendered.contains("- `jj log`"),
             "reviewer CLAUDE.md must not offer a bare `jj log` as a recommended navigation command: {rendered}"
+        );
+    }
+
+    #[test]
+    fn reviewer_prompt_includes_brief_conformance_check() {
+        let prompt = render_reviewer_initial_prompt(
+            "Fix the auth bug",
+            "Auth middleware drops sessions on timeout.",
+            "https://github.com/org/repo/pull/99",
+            "/tmp/bwo/exec.json",
+            ReviewScope::Code,
+            None,
+            "org/repo",
+        );
+        assert!(
+            prompt.contains("Brief conformance — CRITICAL"),
+            "every reviewer prompt must require the brief-conformance check:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Auth middleware drops sessions on timeout."),
+            "work-item brief must be embedded:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Do **not** trust the PR body"),
+            "conformance check must forbid trusting the PR body:\n{prompt}"
         );
     }
 

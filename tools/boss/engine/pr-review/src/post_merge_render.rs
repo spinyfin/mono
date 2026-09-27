@@ -15,6 +15,7 @@
 //! its `sources` are always its own driver, never a claim of corroboration
 //! from an independently-reported leaf.
 
+use crate::brief::ReviewBriefPacket;
 use crate::render::{ReviewerReportDestination, render_rubric_section};
 use crate::types::ReviewScope;
 
@@ -84,13 +85,14 @@ pub fn render_post_merge_reviewer_claude_md(
 /// against it explicitly via `jj`/`gh` rather than trusting the ambient
 /// checkout.
 pub fn render_post_merge_reviewer_initial_prompt(
-    task_name: &str,
-    task_description: &str,
+    brief: &ReviewBriefPacket,
     destination: &ReviewerReportDestination,
     scope: ReviewScope,
     repo_slug: &str,
 ) -> String {
     let rubric = render_rubric_section(&scope);
+    let brief_block = crate::brief::render_brief_packet_block(brief);
+    let brief_conformance = crate::brief::render_brief_conformance_rubric();
     let merge_sha = destination.target_sha.as_str();
     let pr_ref = destination
         .pr_url
@@ -121,11 +123,7 @@ pub fn render_post_merge_reviewer_initial_prompt(
          \n\
          ## PR under review\n\
          \n\
-         **Task:** {task_name}\n\
-         \n\
-         **Task description:**\n\
-         {task_description}\n\
-         \n\
+         {brief_block}\
          **PR:** {pr_url} (already merged)\n\
          **Merge commit:** `{merge_sha}`\n\
          \n\
@@ -155,6 +153,7 @@ pub fn render_post_merge_reviewer_initial_prompt(
             against the real landed state.\n\
          4. Produce the `SupervisorVerdict` JSON (schema below).\n\
          \n\
+         {brief_conformance}\
          {rubric}\n\
          ## `revision_warranted`\n\
          \n\
@@ -197,8 +196,8 @@ pub fn render_post_merge_reviewer_initial_prompt(
          `[]` here — there is no second reviewer to disagree with. `sources` on every \
          finding must be exactly `[\"claude\"]`; omit `location` when it does not apply.\n",
         repo_slug = repo_slug,
-        task_name = task_name,
-        task_description = task_description,
+        brief_block = brief_block,
+        brief_conformance = brief_conformance,
         pr_url = destination.pr_url,
         merge_sha = merge_sha,
         pr_ref = pr_ref,
@@ -211,6 +210,21 @@ pub fn render_post_merge_reviewer_initial_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn render_post_merge_reviewer_initial_prompt(
+        task_name: &str,
+        task_description: &str,
+        destination: &ReviewerReportDestination,
+        scope: ReviewScope,
+        repo_slug: &str,
+    ) -> String {
+        super::render_post_merge_reviewer_initial_prompt(
+            &ReviewBriefPacket::from_task(task_name, task_description),
+            destination,
+            scope,
+            repo_slug,
+        )
+    }
 
     fn destination() -> ReviewerReportDestination {
         ReviewerReportDestination::builder()
