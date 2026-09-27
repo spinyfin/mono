@@ -25,7 +25,7 @@ use boss_pr_review_sources::{SourcePacket, SourceSide};
 /// version constant and prompt id — the desired-comparison key an attempt
 /// binds to includes the prompt version, so a prompt change never silently
 /// reinterprets an already-captured comparison's existing readable version.
-pub const PROMPT_VERSION: &str = "review-guide-v6";
+pub const PROMPT_VERSION: &str = "review-guide-v7";
 
 /// The exact production prompt template, byte-identical to the fenced block
 /// in `automatic-pr-review-guides.md`'s "Prompt contract" section. Only the
@@ -52,25 +52,25 @@ Review context:
 - PR title: {{PR_TITLE}}
 - Merge-base revision: {{BASE_SHA}}
 - Head revision: {{HEAD_SHA}}
-- You have a read-only checkout of the repository at the head revision in your working directory, plus immutable git access to the merge-base revision. Read changed files, related callers, helpers, types, and tests directly from the checkout. Read a file's merge-base (\"before\") content with `git show {{BASE_SHA}}:<path>`, and its diff with `git diff --no-ext-diff --no-textconv {{BASE_SHA}} {{HEAD_SHA}} -- <path>`. Boss also supplies the PR description, the changed-file manifest, and validated GitHub link targets below. Do not invent content you have not read.
+- You have a read-only checkout of the repository at the head revision in your working directory, plus immutable git access to the merge-base revision. Read changed files, related callers, helpers, types, and tests directly from the checkout. Read a file's merge-base (\"before\") content with `git show {{BASE_SHA}}:<path>`, and its diff with `git diff --no-ext-diff --no-textconv {{BASE_SHA}} {{HEAD_SHA}} -- <path>`. Boss also supplies the PR description and the changed-file manifest below. Do not invent content you have not read.
 
 Ground the guide in those revisions. Explain relevant callers, helpers, types, and tests only to the extent you can verify them by reading the checkout. When missing context limits an explanation, state the limitation. Treat the PR description and code comments as statements to verify against the implementation. Distinguish enforced behavior from conventions, prompt instructions, and assumptions. Do not turn a conditional or local check into a broader guarantee.
 
 Organize the walkthrough in a useful reading order through the core implementation. Explain why the important pieces fit together, not just which files changed. Prioritize details that help a reviewer understand or verify the fix. Use short faithful excerpts; clearly label condensed pseudocode. Avoid repetitive summaries and incidental cleanup unless it matters to the solution.
 
-Link the core fix, worked example, and important test changes to the supplied GitHub diff locations. Use revision-pinned source links for relevant unchanged context or lines outside the displayed diff. Reuse supplied URLs or validated reference mappings and check that each link targets the code being discussed. Do not invent diff anchors or imply that a mutable PR URL identifies an immutable revision. Where an exact diff link is unavailable, use the corresponding pinned source link.
+Link the core fix, worked example, important test changes, and relevant unchanged context to revision-pinned source lines you actually read. Construct links as `https://github.com/<owner>/<repo>/blob/<sha>/<path>#L<start>-L<end>` using the full head or merge-base SHA and the corresponding repository, path, and line numbers. Use `#L<line>` for a single line. Check that each link targets the code being discussed. Do not invent diff anchors or imply that a mutable PR URL identifies an immutable revision.
 
 In the tests section, distinguish added, modified, and removed tests. Name the important scenarios and assertions; identify relevant fixture, helper, and build/configuration changes. Include counts only when supported by what you read and useful. Distinguish author-reported validation from conclusions supported by the test source you read. Do not claim to have executed tests or performed independent validation. State important coverage limits without producing an exhaustive speculative bug hunt.
 
 Use the complete revised PR comparison if this is a regenerated guide. Do not describe only the latest incremental commit. Existing comments may provide context, but the explanation must match the actual current source revisions.
 
-Submit the finished Markdown guide using `\"$BOSS_BIN\" propose review-guide --body '<finished Markdown guide>'`. This is the only permitted tool command. Pass the entire Markdown as a literal single-quoted shell argument (escape any apostrophe with the standard shell quote sequence); do not write a file, pipe input, use command substitution, or run any other command. The command is bound to your execution automatically. A final assistant message does not submit a guide. If submission fails, correct the reported error and retry the same command before ending. The guide must have a descriptive title and the four requested main sections. Put the worked example within the implementation walkthrough. Keep the guide as concise as the explanation permits while preserving useful reasoning and evidence. Do not include a chat preamble, model details, internal execution details, a merge recommendation, or an unsupported declaration that the PR is safe to merge. If essential context is absent from what you can read, state the specific limitation rather than inventing behavior.";
+Submit the finished Markdown guide using `\"$BOSS_BIN\" propose review-guide --body '<finished Markdown guide>'`. Read-only source exploration through Read, Grep, Glob, and the pinned git commands above is permitted; submission is the only permitted write operation. Pass the entire Markdown as a literal single-quoted shell argument (escape any apostrophe with the standard shell quote sequence); do not write a file, pipe input, use command substitution, or run commands other than the permitted source reads and submission. The command is bound to your execution automatically. A final assistant message does not submit a guide. If submission fails, correct the reported error and retry the same command before ending. The guide must have a descriptive title and the four requested main sections. Put the worked example within the implementation walkthrough. Keep the guide as concise as the explanation permits while preserving useful reasoning and evidence. Do not include a chat preamble, model details, internal execution details, a merge recommendation, or an unsupported declaration that the PR is safe to merge. If essential context is absent from what you can read, state the specific limitation rather than inventing behavior.";
 
 /// SHA-256 of [`PROMPT_TEMPLATE`] (UTF-8, excluding any fence/terminal
 /// newline) — matches the value recorded in the design doc, computed
 /// independently from the doc's own fenced block as a second source of
 /// truth. See `prompt_template_hash_is_pinned`.
-pub const PROMPT_TEMPLATE_SHA256: &str = "243b4702e77fb27fafce3eb6bcdde779c27d05b70d65e4c73a5451148ea01514";
+pub const PROMPT_TEMPLATE_SHA256: &str = "18689e1139a83f9a152e1b5e2dec3725393d43ceacc78cc5bf6be75f47502cc5";
 
 /// The metadata substituted into [`PROMPT_TEMPLATE`] for one comparison.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -530,19 +530,36 @@ mod tests {
 
     #[test]
     fn prompt_directs_the_model_to_its_pinned_workspace() {
-        assert_eq!(PROMPT_VERSION, "review-guide-v6");
+        assert_eq!(PROMPT_VERSION, "review-guide-v7");
         assert!(PROMPT_TEMPLATE.contains("read-only checkout of the repository"));
         assert!(PROMPT_TEMPLATE.contains("git show {{BASE_SHA}}:<path>"));
         assert!(PROMPT_TEMPLATE.contains("git diff --no-ext-diff --no-textconv {{BASE_SHA}} {{HEAD_SHA}} -- <path>"));
         assert!(PROMPT_TEMPLATE.contains("Do not claim to have executed tests or performed independent validation."));
-        // The old "supplied context only" framing predates the pinned
-        // read-only workspace and must not resurface.
+        // Source exploration must remain permitted throughout the prompt.
         assert!(!PROMPT_TEMPLATE.contains("Use only this supplied context."));
+        assert!(PROMPT_TEMPLATE.contains("Read-only source exploration through Read, Grep, Glob"));
+        assert!(PROMPT_TEMPLATE.contains("submission is the only permitted write operation"));
+        assert!(!PROMPT_TEMPLATE.contains("only permitted tool command"));
+        assert!(!PROMPT_TEMPLATE.contains("run any other command"));
         assert!(
             !PROMPT_TEMPLATE
                 .to_ascii_lowercase()
                 .contains("checks you actually performed")
         );
+    }
+
+    #[test]
+    fn prompt_directs_citations_to_pinned_source_lines() {
+        assert!(PROMPT_TEMPLATE.contains("blob/<sha>/<path>#L<start>-L<end>"));
+        assert!(PROMPT_TEMPLATE.contains("source lines you actually read"));
+        assert!(PROMPT_TEMPLATE.contains("full head or merge-base SHA"));
+        for absent in [
+            "validated GitHub link targets",
+            "supplied GitHub diff locations",
+            "Reuse supplied URLs",
+        ] {
+            assert!(!PROMPT_TEMPLATE.contains(absent));
+        }
     }
 
     #[test]
@@ -574,6 +591,15 @@ mod tests {
     }
 
     #[test]
+    fn source_context_manifest_includes_previous_path_for_renames() {
+        let mut packet = packet();
+        packet.files[0].change_kind = ChangeKind::Renamed;
+        packet.files[0].previous_path = Some("old/path.rs".to_owned());
+        let context = render_source_context(&packet);
+        assert!(context.contains("- `src/retry.rs` (Renamed, +3/-1), renamed from `old/path.rs`\n"));
+    }
+
+    #[test]
     fn source_context_manifest_lists_every_changed_file_without_content_and_stays_small() {
         let packet = multi_file_packet(20);
         let context = render_source_context(&packet);
@@ -589,9 +615,7 @@ mod tests {
                 "after content for {path} must not be inlined"
             );
         }
-        // A manifest-only listing for 20 small files must stay a few hundred
-        // bytes, nowhere near the multi-hundred-kilobyte prompts the removed
-        // byte-budget machinery existed to cap.
+        // A 20-file manifest must stay small without embedding source content.
         assert!(
             context.len() < 4_000,
             "manifest-only context for 20 files must stay small, was {} bytes",
