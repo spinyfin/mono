@@ -94,9 +94,13 @@ fn live_addendum_tracks_findings_and_status_without_mutating_guide() {
     assert!(
         before
             .addendum_markdown
-            .contains(&format!("- [high] Unchecked index — ID {label} (todo)"))
+            .contains(&format!("- [high] Unchecked index — ID {label} (backlog)"))
     );
-    assert!(!before.status_text.contains("fixes complete"));
+    assert!(
+        before
+            .status_text
+            .contains(&format!("fixes in progress: ID {label} (backlog)"))
+    );
 
     for status in ["active", "blocked", "in_review", "archived", "done"] {
         db.connect()
@@ -104,15 +108,24 @@ fn live_addendum_tracks_findings_and_status_without_mutating_guide() {
             .execute("UPDATE tasks SET status = ?2 WHERE id = ?1", params![revision, status])
             .unwrap();
         let updated = findings(&db, &root.id).unwrap();
-        assert!(updated.addendum_markdown.contains(&format!("ID {label} ({status})")));
-        assert_eq!(updated.status_text.contains("fixes complete"), status == "done");
+        let display = status.parse::<TaskStatus>().unwrap().display_label();
+        assert!(updated.addendum_markdown.contains(&format!("ID {label} ({display})")));
+        assert_eq!(
+            updated.status_text.contains("fixes complete"),
+            matches!(status, "done" | "in_review")
+        );
     }
     let stored = db.get_pr_review_guide_version(&version.id).unwrap().unwrap();
     assert_eq!(stored.markdown, version.markdown);
     assert_eq!(stored.content_hash, version.content_hash);
     apply_findings(&db, &root.id, "head-two");
     let updated = findings(&db, &root.id).unwrap();
-    assert!(updated.status_text.starts_with("AI review found 2 issues;"));
+    assert!(
+        updated
+            .status_text
+            .starts_with("AI review found 2 issues; fixes in progress:")
+    );
+    assert!(!updated.status_text.contains(&format!("ID {label} (done)")));
     assert_eq!(
         updated
             .addendum_markdown
@@ -149,12 +162,16 @@ fn merge_gate_reports_all_open_revisions_and_ignores_terminal_or_deleted_items()
             .execute("UPDATE tasks SET status = ?2 WHERE id = ?1", params![revision, status])
             .unwrap();
         let open = db.open_merge_revisions(&root.id).unwrap();
-        if ["done", "archived"].contains(&status) {
+        if ["in_review", "done", "archived"].contains(&status) {
             assert!(open.is_empty());
         } else {
             assert_eq!(open.len(), 1);
             assert_eq!(open[0].id, revision);
             assert_eq!(open[0].status, status);
+            assert_eq!(
+                open[0].status_label,
+                status.parse::<TaskStatus>().unwrap().display_label()
+            );
         }
     }
     db.connect()
@@ -189,6 +206,16 @@ fn addendum_includes_followup_tracking_after_the_origin_merged() {
     let tracker = apply_findings(&db, &root.id, "head-one");
     let item = query_task(&db.connect().unwrap(), &tracker).unwrap().unwrap();
     assert_eq!(item.kind, TaskKind::Followup);
+    for status in ["in_review", "done"] {
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET status = ?2 WHERE id = ?1", params![tracker, status])
+            .unwrap();
+        assert_eq!(
+            findings(&db, &root.id).unwrap().status_text.contains("fixes complete"),
+            status == "done"
+        );
+    }
     assert!(
         findings(&db, &root.id)
             .unwrap()
@@ -220,4 +247,34 @@ fn legacy_verdict_uses_engine_rendered_revision_titles() {
     drop(conn);
     let text = findings(&db, &root.id).unwrap();
     assert!(text.addendum_markdown.contains("[high] Unchecked index"));
+}
+
+#[test]
+fn malformed_verdict_payloads_do_not_hide_valid_findings_or_summary() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id, "review target");
+    bind_open_pr(&db, &root.id);
+    db.persist_pr_review_guide_source_capture(
+        &root.id,
+        1,
+        PrSourceCaptureTrigger::Creation,
+        &crate::test_support::source_capture_packet(PR_URL, "base", "head"),
+    )
+    .unwrap();
+    let revision = apply_findings(&db, &root.id, "head-one");
+    apply_findings(&db, &root.id, "head-two");
+    for payload in ["not json", r#"{"batch_id":"historical","verdict": {"unknown": true}}"#] {
+        db.connect().unwrap().execute(
+            "UPDATE worker_proposals SET payload_json = ?2 WHERE id IN (SELECT proposal_id FROM pr_review_verdicts WHERE revision_task_id = ?1)",
+            params![revision, payload],
+        ).unwrap();
+        assert!(
+            db.get_pr_review_guide_summary_for_root_scoped(&root.id, None)
+                .unwrap()
+                .is_some()
+        );
+        let supplement = findings(&db, &root.id).unwrap();
+        assert!(supplement.status_text.starts_with("AI review found 1 issue;"));
+    }
 }

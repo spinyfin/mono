@@ -98,15 +98,17 @@ pub(super) async fn handle_get_review_guide_summary(ctx: Dispatch, req: Frontend
     };
     let result = work_db
         .get_pr_review_guide_summary_for_root_scoped(&root_task_id, series_id.as_deref())
-        .and_then(|summary| {
-            summary
-                .map(|summary| {
-                    let findings = work_db.review_guide_findings(&summary.root_task_id, &summary.canonical_pr_url)?;
+        .map(|summary| {
+            summary.map(|summary| {
+                    let findings = work_db.review_guide_findings(&summary.root_task_id, &summary.canonical_pr_url)
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(root_task_id = %summary.root_task_id, %error, "review guide findings unavailable");
+                            None
+                        });
                     let mut wire = crate::work::to_wire_review_guide_summary(summary);
                     wire.findings = findings;
-                    Ok(wire)
+                    wire
                 })
-                .transpose()
         });
     match result {
         Ok(summary) => send_response(&sink, &request_id, FrontendEvent::ReviewGuideSummary { summary }),

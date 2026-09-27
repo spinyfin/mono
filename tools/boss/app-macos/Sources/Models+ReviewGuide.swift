@@ -229,6 +229,12 @@ struct OpenMergeRevision: Codable, Equatable {
     let id: String
     let label: String
     let status: String
+    let statusLabel: String
 
-    var wirePayload: [String: String] { ["id": id, "label": label, "status": status] }
+    enum CodingKeys: String, CodingKey {
+        case id, label, status
+        case statusLabel = "status_label"
+    }
+
+    var wirePayload: [String: String] { ["id": id, "label": label, "status": status, "status_label": statusLabel] }
 }

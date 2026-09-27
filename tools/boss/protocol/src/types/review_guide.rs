@@ -77,12 +77,13 @@ pub struct ReviewGuideFindings {
     pub addendum_markdown: String,
 }
 
-/// Engine-selected non-terminal revision requiring explicit merge consent.
+/// Engine-selected undelivered revision requiring explicit merge consent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpenMergeRevision {
     pub id: String,
     pub label: String,
     pub status: String,
+    pub status_label: String,
 }
 
 #[cfg(test)]

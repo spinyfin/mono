@@ -18,12 +18,13 @@ impl WorkDb {
         for id in chain_helpers::collect_chain_revision_ids_including_deleted(&conn, &root)? {
             if let Some(task) = query_task(&conn, &id)?
                 && task.deleted_at.is_none()
-                && !task.status.is_terminal()
+                && matches!(task.status, TaskStatus::Todo | TaskStatus::Active | TaskStatus::Blocked)
             {
                 revisions.push(OpenMergeRevision {
                     label: boss_protocol::short_id_label(task.short_id).unwrap_or_else(|| id.clone()),
                     id,
                     status: task.status.to_string(),
+                    status_label: task.status.display_label().to_owned(),
                 });
             }
         }
@@ -41,7 +42,7 @@ fn query_findings(conn: &Connection, root_id: &str, pr_url: &str) -> Result<Opti
     reviewed_ids.push(root_id.to_owned());
     let placeholders = vec!["?"; reviewed_ids.len()].join(", ");
     let mut stmt = conn.prepare(&format!(
-        "SELECT p.payload_json, t.id, t.short_id, t.status, t.deleted_at, t.description
+        "SELECT p.payload_json, t.id, t.short_id, t.status, t.deleted_at, t.description, t.kind
          FROM pr_review_verdicts v
          LEFT JOIN worker_proposals p ON p.id = v.proposal_id
          LEFT JOIN pr_review_batches b ON b.id = v.batch_id
@@ -59,14 +60,22 @@ fn query_findings(conn: &Connection, root_id: &str, pr_url: &str) -> Result<Opti
             row.get::<_, String>(3)?,
             row.get::<_, Option<String>>(4)?,
             row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
         ))
     })?;
     let mut text = FindingsText::default();
     for row in rows {
-        let (payload, id, short_id, status, deleted_at, description) = row?;
+        let (payload, id, short_id, status, deleted_at, description, kind) = row?;
         let findings = if let Some(payload) = payload {
-            let payload: boss_protocol::ReviewVerdictProposalPayload = serde_json::from_str(&payload)?;
-            let verdict: boss_pr_review::SupervisorVerdict = serde_json::from_value(payload.verdict)?;
+            let verdict = serde_json::from_str::<boss_protocol::ReviewVerdictProposalPayload>(&payload)
+                .and_then(|payload| serde_json::from_value::<boss_pr_review::SupervisorVerdict>(payload.verdict));
+            let verdict = match verdict {
+                Ok(verdict) => verdict,
+                Err(error) => {
+                    tracing::warn!(tracker_id = %id, %error, "skipping unparseable review findings payload");
+                    continue;
+                }
+            };
             verdict
                 .findings
                 .into_iter()
@@ -79,9 +88,17 @@ fn query_findings(conn: &Connection, root_id: &str, pr_url: &str) -> Result<Opti
             continue;
         }
         let label = boss_protocol::short_id_label(short_id).unwrap_or(id);
-        let status = if deleted_at.is_some() { "deleted" } else { &status };
-        text.trackers.insert(format!("ID {label} ({status})"));
-        text.all_done &= status == "done";
+        let delivered = deleted_at.is_none() && (status == "done" || (kind == "revision" && status == "in_review"));
+        let parsed_status: TaskStatus = status.parse().map_err(anyhow::Error::msg)?;
+        let status = if deleted_at.is_some() {
+            "deleted"
+        } else {
+            parsed_status.display_label()
+        };
+        if !delivered {
+            text.trackers.insert(format!("ID {label} ({status})"));
+        }
+        text.all_delivered &= delivered;
         for (severity, title) in findings {
             text.lines.push(format!(
                 "- [{}] {} — ID {} ({})",
@@ -98,7 +115,7 @@ fn query_findings(conn: &Connection, root_id: &str, pr_url: &str) -> Result<Opti
 struct FindingsText {
     lines: Vec<String>,
     trackers: std::collections::BTreeSet<String>,
-    all_done: bool,
+    all_delivered: bool,
 }
 
 impl Default for FindingsText {
@@ -106,18 +123,18 @@ impl Default for FindingsText {
         Self {
             lines: Vec::new(),
             trackers: Default::default(),
-            all_done: true,
+            all_delivered: true,
         }
     }
 }
 
 impl FindingsText {
     fn finish(self) -> ReviewGuideFindings {
-        let tracking = if self.all_done {
+        let tracking = if self.all_delivered {
             "fixes complete".to_owned()
         } else {
             format!(
-                "fix tracking: {}",
+                "fixes in progress: {}",
                 self.trackers.into_iter().collect::<Vec<_>>().join(", ")
             )
         };
