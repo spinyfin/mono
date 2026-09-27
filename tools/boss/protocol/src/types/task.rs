@@ -969,6 +969,13 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_guide_stale_source: Option<bool>,
 
+    /// Engine-recorded reason the series is `"failed"`, taken from the
+    /// latest failed attempt's `error` (the pre-start / spawn / generation
+    /// text, not a client-inferred label). `None` when lifecycle is not
+    /// `"failed"` or the attempt stored no error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_guide_error: Option<String>,
+
     /// Reviewer names for the review indicator tooltip. JSON-encoded list of
     /// login strings. For `"approved"`: the approving reviewers. For
     /// `"changes_requested"`: the requesting reviewers. `None` otherwise.

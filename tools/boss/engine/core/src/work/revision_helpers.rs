@@ -947,7 +947,7 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
 }
 
 /// Resolve every derived `Task::review_guide_*` projection (`lifecycle`,
-/// `readable_version_id`, `selected_comparison_id`, `stale_source`) for
+/// `readable_version_id`, `selected_comparison_id`, `stale_source`, `error`) for
 /// every task/chore that carries a `pr_url`. Only a PR-bearing row can
 /// own a `pr_review_guide_source_series`, and the series is the one whose
 /// `canonical_pr_url` matches that row's current `pr_url` (see
@@ -977,6 +977,7 @@ pub(crate) fn attach_review_guide_state(conn: &Connection, tasks: &mut [Task], c
             task.review_guide_readable_version_id = state.readable_version_id.clone();
             task.review_guide_selected_comparison_id = state.selected_comparison_id.clone();
             task.review_guide_stale_source = state.stale_source;
+            task.review_guide_error = state.error.clone();
         }
     }
     Ok(())
@@ -998,6 +999,8 @@ struct ReviewGuideCardState {
     /// opposed to a same-comparison retry failure. `None` when there is no
     /// readable version to compare.
     stale_source: Option<bool>,
+    /// Latest failed attempt's stored error when `lifecycle` is `"failed"`.
+    error: Option<String>,
 }
 
 /// Batched `root_task_id -> ReviewGuideCardState` lookup for
@@ -1027,7 +1030,12 @@ fn query_review_guide_card_states(
         .join(", ");
     let sql = format!(
         "SELECT s.root_task_id, s.guide_lifecycle, s.readable_version_id,
-                s.selected_comparison_id, v.comparison_id
+                s.selected_comparison_id, v.comparison_id,
+                CASE WHEN s.guide_lifecycle = 'failed' THEN (
+                    SELECT a.error FROM pr_review_guide_attempts a
+                    WHERE a.series_id = s.id AND a.status = 'failed' AND a.error IS NOT NULL AND a.error != ''
+                    ORDER BY a.finished_at DESC, a.id DESC LIMIT 1
+                ) ELSE NULL END
          FROM pr_review_guide_source_series s
          LEFT JOIN pr_review_guide_versions v ON v.id = s.readable_version_id
          WHERE (s.root_task_id, s.canonical_pr_url) IN ({placeholders})
@@ -1046,11 +1054,12 @@ fn query_review_guide_card_states(
             row.get::<_, Option<String>>(2)?,
             row.get::<_, Option<String>>(3)?,
             row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
         ))
     })?;
     let mut result = std::collections::HashMap::new();
     for row in rows {
-        let (root_task_id, lifecycle, readable_version_id, selected_comparison_id, version_comparison_id) = row?;
+        let (root_task_id, lifecycle, readable_version_id, selected_comparison_id, version_comparison_id, error) = row?;
         let stale_source = readable_version_id
             .is_some()
             .then(|| selected_comparison_id != version_comparison_id);
@@ -1060,6 +1069,7 @@ fn query_review_guide_card_states(
             readable_version_id,
             selected_comparison_id,
             stale_source,
+            error,
         });
     }
     Ok(result)
@@ -1127,6 +1137,7 @@ fn copy_derived_projection_fields(dst: &mut Task, src: &Task) {
     dst.review_guide_readable_version_id = src.review_guide_readable_version_id.clone();
     dst.review_guide_selected_comparison_id = src.review_guide_selected_comparison_id.clone();
     dst.review_guide_stale_source = src.review_guide_stale_source;
+    dst.review_guide_error = src.review_guide_error.clone();
 }
 
 fn push_projection_row(task: Task, tasks: &mut Vec<Task>, chores: &mut Vec<Task>) {

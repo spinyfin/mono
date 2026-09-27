@@ -747,6 +747,7 @@ impl WorkDb {
         step!(timer, conn, guide_comments::migrate_guide_comments)?;
         step!(timer, conn, guide_feedback::migrate_guide_feedback_outcomes)?;
         step!(timer, conn, execution_bookmarks::migrate_execution_bookmarks)?;
+        step!(timer, conn, migrate_work_executions_last_error)?;
         step!(timer, conn, Self::stamp_schema_version)?;
         timer.finish();
         Ok(())

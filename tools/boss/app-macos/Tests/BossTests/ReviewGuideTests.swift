@@ -56,6 +56,55 @@ final class ReviewGuideTests: XCTestCase {
         XCTAssertNil(snapshot(.review).reviewGuidePresentation)
     }
 
+    func testFailedPresentationRendersEngineProvidedReason() {
+        let reason = "Codex refused to trust the session hooks.\nSee ~/.codex/logs."
+        let failed = ReviewGuideCardPresentation.from(
+            lifecycle: "failed",
+            readableVersionId: nil,
+            error: reason
+        )
+        XCTAssertEqual(failed?.kind, .failed)
+        XCTAssertEqual(failed?.error, reason)
+        XCTAssertEqual(failed?.errorSummary, "Codex refused to trust the session hooks.")
+        XCTAssertTrue(failed?.tooltip.contains("Codex refused to trust the session hooks.") ?? false)
+        XCTAssertTrue(failed?.accessibilityLabel.contains("Codex refused to trust the session hooks.") ?? false)
+
+        let refreshFailed = ReviewGuideCardPresentation.from(
+            lifecycle: "failed",
+            readableVersionId: "prgv_1",
+            error: reason
+        )
+        XCTAssertEqual(refreshFailed?.kind, .refreshFailed)
+        XCTAssertTrue(refreshFailed?.tooltip.contains(reason) ?? false)
+
+        var task = Self.makeTask(id: "root", readableVersionId: nil)
+        task.reviewGuideLifecycle = "failed"
+        task.reviewGuideError = reason
+        let model = makeModel()
+        let snapshot = model.workCardSnapshot(
+            for: task, column: .review, isSelected: false, isFrontierHighlighted: false,
+            boardStyle: .classic, liveState: nil
+        )
+        XCTAssertEqual(snapshot.reviewGuidePresentation?.error, reason)
+        XCTAssertEqual(
+            snapshot.reviewGuidePresentation?.errorSummary,
+            "Codex refused to trust the session hooks."
+        )
+
+        let viewer = ReviewGuideViewerCurrentness.from(
+            lifecycle: "failed",
+            readableVersionId: nil,
+            selectedComparisonId: nil,
+            displayedVersionId: nil,
+            displayedComparisonId: nil,
+            error: reason
+        )
+        guard case .failed(let viewerError) = viewer.status else {
+            return XCTFail("failed lifecycle with no readable version must surface the engine reason")
+        }
+        XCTAssertEqual(viewerError, reason)
+    }
+
     func testGeneratingPresentationKeepsProgressAndPriorDocument() {
         let initial = ReviewGuideCardPresentation.from(lifecycle: "generating", readableVersionId: nil)
         XCTAssertEqual(initial?.kind, .generating)
@@ -379,7 +428,7 @@ final class ReviewGuideTests: XCTestCase {
             currentness.showsOpenUpdatedGuide,
             "a different readable version must be offered even when the latest attempt failed"
         )
-        guard case .refreshFailed(let displayedStaleSource) = currentness.status else {
+        guard case .refreshFailed(let displayedStaleSource, _) = currentness.status else {
             return XCTFail("latest attempt failed, so the viewer still surfaces that failure")
         }
         XCTAssertTrue(

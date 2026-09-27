@@ -2324,6 +2324,8 @@ impl ExecutionCoordinator {
                 // (`pr_review`, `ci_remediation`, `conflict_resolution`)
                 // whose work item sits in `in_review`/`blocked` — bouncing
                 // those would erase review context.
+                self.notify_review_guide_pre_start_failure(&execution);
+
                 match self
                     .work_db
                     .bounce_dispatch_failed_to_backlog(&execution.work_item_id, attention_kind, &err)
@@ -2390,6 +2392,27 @@ impl ExecutionCoordinator {
     /// execution instead (leaving no residue queued behind an unpinned
     /// retry) and drop the constraint, matching how the ineligible-host
     /// case in [`Self::schedule_execution`] already behaves.
+    /// Refresh the owning review-guide card after a pre-start failure. The
+    /// attempt row is already terminal; this is the board-invalidation the
+    /// comparison-id `work_item_id` cannot provide on its own.
+    pub(super) fn notify_review_guide_pre_start_failure(&self, execution: &WorkExecution) {
+        if execution.kind != ExecutionKind::PrReviewGuide {
+            return;
+        }
+        let work_db = self.work_db.clone();
+        let publisher = self.publisher.clone();
+        let execution_id = execution.id.clone();
+        tokio::spawn(async move {
+            let Ok(Some(attempt)) = work_db.pr_review_guide_attempt_for_execution(&execution_id) else {
+                return;
+            };
+            let Ok(Some(root_task_id)) = work_db.root_task_id_for_review_guide_series(&attempt.series_id) else {
+                return;
+            };
+            crate::work::notify_review_guide_changed(&work_db, &publisher, &root_task_id, "review_guide_failed").await;
+        });
+    }
+
     fn cancel_requested_host_pre_start_failure(&self, execution: &WorkExecution, stage: &str, err: &anyhow::Error) {
         // Not retried, but must still be reported: a `--host` pre-start
         // failure never reaches `record_start_failure`'s permanent-failure

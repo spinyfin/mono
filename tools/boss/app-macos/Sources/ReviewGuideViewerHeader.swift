@@ -161,7 +161,8 @@ struct ReviewGuideViewerHeader: View {
             readableVersionId: task.reviewGuideReadableVersionId,
             selectedComparisonId: task.reviewGuideSelectedComparisonId,
             displayedVersionId: chatModel.pendingReviewGuideVersionId,
-            displayedComparisonId: chatModel.asyncMarkdownViewerVM.reviewGuideComparisonId
+            displayedComparisonId: chatModel.asyncMarkdownViewerVM.reviewGuideComparisonId,
+            error: task.reviewGuideError
         )
         if currentness.showsOpenUpdatedGuide {
             HStack(spacing: 8) {
@@ -180,22 +181,41 @@ struct ReviewGuideViewerHeader: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-        case .refreshFailed(let displayedStaleSource):
-            HStack(spacing: 8) {
-                Image(systemName: "exclamationmark.triangle")
-                    .foregroundStyle(.orange)
-                Text(
-                    displayedStaleSource
-                        ? "Explanation refresh failed \u{2014} this guide covers an older revision."
-                        : "Explanation refresh failed."
-                )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Button("Retry") { chatModel.retryReviewGuide(for: task) }
-                    .controlSize(.small)
-            }
+        case .refreshFailed(let displayedStaleSource, let error):
+            failedGuideBanner(
+                for: task,
+                headline: displayedStaleSource
+                    ? "Explanation refresh failed \u{2014} this guide covers an older revision."
+                    : "Explanation refresh failed.",
+                error: error
+            )
+        case .failed(let error):
+            failedGuideBanner(for: task, headline: "Review guide failed to generate.", error: error)
         case .none:
             EmptyView()
         }
+    }
+
+    @ViewBuilder
+    private func failedGuideBanner(for task: WorkTask, headline: String, error: String?) -> some View {
+        let summary = ReviewGuideCardPresentation.summaryLine(of: error)
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(headline)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let summary {
+                    Text(summary)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+            Button("Retry") { chatModel.retryReviewGuide(for: task) }
+                .controlSize(.small)
+        }
+        .help(error ?? headline)
     }
 }

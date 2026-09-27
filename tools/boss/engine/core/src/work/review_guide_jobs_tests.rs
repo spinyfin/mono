@@ -300,6 +300,49 @@ fn reconcile_finishes_a_running_attempt_whose_execution_is_already_terminal() {
 }
 
 #[test]
+fn reconcile_prefers_execution_last_error_over_generic_status_reason() {
+    let (_dir, db) = open_db();
+    let (root, series_id, comparison_id) = seeded_series(&db);
+    let attempt = db
+        .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
+        .unwrap();
+    let execution = db
+        .create_pr_review_guide_execution(&comparison_id, "https://github.com/acme/widget.git")
+        .unwrap();
+    db.bind_pr_review_guide_attempt_execution(&attempt.id, &execution.id)
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions
+             SET status = 'failed', finished_at = datetime('now'),
+                 last_error = 'Codex hook-trust gate refused the session'
+             WHERE id = ?1",
+            [&execution.id],
+        )
+        .unwrap();
+
+    let acted = db.reconcile_pr_review_guide_attempts().unwrap();
+    assert_eq!(acted, 1);
+    assert_eq!(attempt_status(&db, &attempt.id), "failed");
+    let stored: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT error FROM pr_review_guide_attempts WHERE id = ?1",
+            [&attempt.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, "Codex hook-trust gate refused the session");
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert_eq!(
+        summary.error.as_deref(),
+        Some("Codex hook-trust gate refused the session"),
+    );
+}
+
+#[test]
 fn admission_enforces_one_active_attempt_per_series() {
     let (_dir, db) = open_db();
     let (root, series_id, _first_comparison) = seeded_series(&db);

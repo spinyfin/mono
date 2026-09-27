@@ -123,6 +123,7 @@ pub struct PrReviewGuideSummary {
     pub request_epoch: i64,
     pub selected_comparison_id: Option<String>,
     pub readable_version_id: Option<String>,
+    pub error: Option<String>,
 }
 
 /// Outcome of [`WorkDb::publish_pr_review_guide_version`].
@@ -698,7 +699,11 @@ impl WorkDb {
             if let Some(execution_id) = &attempt.execution_id {
                 match self.get_execution(execution_id) {
                     Ok(execution) if execution.status.is_terminal() => {
-                        let reason = classified_review_guide_terminal_reason(&execution.status);
+                        let reason = execution
+                            .last_error
+                            .clone()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| classified_review_guide_terminal_reason(&execution.status));
                         if let Err(err) = self.finish_pr_review_guide_attempt_for_terminal_execution(
                             execution_id,
                             execution.status,
@@ -1038,10 +1043,16 @@ fn query_pr_review_guide_summary_for_root(
     series_id: Option<&str>,
 ) -> rusqlite::Result<Option<PrReviewGuideSummary>> {
     conn.query_row(
-        "SELECT id, root_task_id, canonical_pr_url, guide_lifecycle, request_epoch, selected_comparison_id, readable_version_id
-         FROM pr_review_guide_source_series
-         WHERE root_task_id = ?1 AND (?2 IS NULL OR canonical_pr_url = ?2) AND (?3 IS NULL OR id = ?3)
-         ORDER BY latest_observation_sequence DESC, id DESC LIMIT 1",
+        "SELECT s.id, s.root_task_id, s.canonical_pr_url, s.guide_lifecycle, s.request_epoch,
+                s.selected_comparison_id, s.readable_version_id,
+                CASE WHEN s.guide_lifecycle = 'failed' THEN (
+                    SELECT a.error FROM pr_review_guide_attempts a
+                    WHERE a.series_id = s.id AND a.status = 'failed' AND a.error IS NOT NULL AND a.error != ''
+                    ORDER BY a.finished_at DESC, a.id DESC LIMIT 1
+                ) ELSE NULL END
+         FROM pr_review_guide_source_series s
+         WHERE s.root_task_id = ?1 AND (?2 IS NULL OR s.canonical_pr_url = ?2) AND (?3 IS NULL OR s.id = ?3)
+         ORDER BY s.latest_observation_sequence DESC, s.id DESC LIMIT 1",
         params![root_task_id, pr_url, series_id],
         |row| {
             Ok(PrReviewGuideSummary {
@@ -1052,6 +1063,7 @@ fn query_pr_review_guide_summary_for_root(
                 request_epoch: row.get(4)?,
                 selected_comparison_id: row.get(5)?,
                 readable_version_id: row.get(6)?,
+                error: row.get(7)?,
             })
         },
     )
@@ -1068,6 +1080,7 @@ pub(crate) fn to_wire_review_guide_summary(summary: PrReviewGuideSummary) -> bos
         .request_epoch(summary.request_epoch)
         .maybe_selected_comparison_id(summary.selected_comparison_id)
         .maybe_readable_version_id(summary.readable_version_id)
+        .maybe_error(summary.error)
         .build()
 }
 

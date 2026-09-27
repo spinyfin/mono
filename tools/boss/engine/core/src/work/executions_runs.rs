@@ -677,7 +677,7 @@ impl WorkDb {
                     we.created_at, we.started_at, we.finished_at, \
                     we.pre_start_failure_count, we.dispatch_not_before, we.pr_url, we.pr_head_before, \
                     we.prefer_is_soft, we.worker_branch_prefix, we.transient_failure_count, we.allow_dirty, we.branch_naming, \
-                    we.dispatch_wait_reason, we.dispatch_wait_since, we.driver_runtime_state, we.driver, we.model, we.effort_level, we.pr_head_after \
+                    we.dispatch_wait_reason, we.dispatch_wait_since, we.driver_runtime_state, we.driver, we.model, we.effort_level, we.pr_head_after, we.last_error \
              FROM work_executions we \
              LEFT JOIN tasks t ON t.id = we.work_item_id \
              WHERE we.status = 'ready' \
@@ -768,7 +768,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
              FROM work_executions
              WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND cube_lease_id IS NOT NULL
@@ -798,7 +798,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
              FROM work_executions
              WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND workspace_path IS NOT NULL
@@ -827,7 +827,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
              FROM work_executions
              WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND EXISTS (
@@ -868,7 +868,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
                  FROM work_executions
                  WHERE work_item_id = ?1
                    AND kind = 'revision_implementation'
@@ -896,7 +896,7 @@ impl WorkDb {
                         e.pre_start_failure_count, e.dispatch_not_before, e.pr_url, e.pr_head_before,
                         e.prefer_is_soft, e.worker_branch_prefix, e.transient_failure_count,
                         e.allow_dirty, e.branch_naming, e.dispatch_wait_reason, e.dispatch_wait_since,
-                        e.driver_runtime_state, e.driver, e.model, e.effort_level, e.pr_head_after
+                        e.driver_runtime_state, e.driver, e.model, e.effort_level, e.pr_head_after, e.last_error
                  FROM work_executions e
                  JOIN tasks t ON t.id = e.work_item_id
                  WHERE t.kind IN ('chore', 'followup')
@@ -1148,7 +1148,8 @@ impl WorkDb {
                  workspace_path = ?5,
                  host_id = ?7,
                  started_at = COALESCE(started_at, ?6),
-                 finished_at = NULL
+                 finished_at = NULL,
+                 last_error = NULL
              WHERE id = ?1
                AND status IN ('ready', 'claimed')",
             params![
@@ -1406,7 +1407,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
              FROM work_executions
              WHERE driver_runtime_state IS NOT NULL
                AND driver_runtime_state != ''
@@ -1744,10 +1745,11 @@ impl WorkDb {
                      workspace_path = NULL,
                      started_at = NULL,
                      finished_at = NULL,
-                     dispatch_not_before = ?4
+                     dispatch_not_before = ?4,
+                     last_error = ?5
                  WHERE id = ?1
                    AND status IN ('ready', 'claimed')",
-                params![execution_id, new_count, cube_repo_id, dispatch_not_before],
+                params![execution_id, new_count, cube_repo_id, dispatch_not_before, error_text],
             )?;
             (PreStartFailureOutcome::Retry { delay }, None)
         } else {
@@ -1768,10 +1770,11 @@ impl WorkDb {
                      cube_lease_id = NULL,
                      cube_workspace_id = NULL,
                      workspace_path = NULL,
-                     finished_at = ?4
+                     finished_at = ?4,
+                     last_error = ?5
                  WHERE id = ?1
                    AND status IN ('ready', 'claimed')",
-                params![execution_id, new_count, cube_repo_id, now],
+                params![execution_id, new_count, cube_repo_id, now, error_text],
             )?;
             (PreStartFailureOutcome::PermanentFail, Some(run_id))
         };
@@ -1795,6 +1798,21 @@ impl WorkDb {
             stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
         }
         commit_and_publish(tx, pending, &self.event_bus)?;
+        drop(conn);
+        if matches!(outcome, PreStartFailureOutcome::PermanentFail)
+            && execution.kind == ExecutionKind::PrReviewGuide
+            && let Err(err) = self.finish_pr_review_guide_attempt_for_terminal_execution(
+                execution_id,
+                ExecutionStatus::Failed,
+                error_text,
+            )
+        {
+            tracing::warn!(
+                execution_id = %execution_id,
+                ?err,
+                "review-guide: recorded a permanent pre-start failure but failed to fail the bound attempt",
+            );
+        }
         Ok((execution, run, outcome))
     }
 
@@ -1862,6 +1880,10 @@ impl WorkDb {
         };
         let normalized_result_summary = normalize_optional_text(result_summary.map(str::to_owned));
         let normalized_error_text = normalize_optional_text(error_text.map(str::to_owned));
+        let fail_review_guide_attempt = increment_pre_start_failure_count
+            && execution.kind == ExecutionKind::PrReviewGuide
+            && execution_status.is_terminal()
+            && execution_status != ExecutionStatus::Completed;
 
         tx.execute(
             "UPDATE work_executions
@@ -1870,7 +1892,8 @@ impl WorkDb {
                  cube_workspace_id = CASE WHEN ?3 THEN NULL ELSE cube_workspace_id END,
                  workspace_path = CASE WHEN ?3 THEN NULL ELSE workspace_path END,
                  finished_at = ?4,
-                 pre_start_failure_count = pre_start_failure_count + CASE WHEN ?5 THEN 1 ELSE 0 END
+                 pre_start_failure_count = pre_start_failure_count + CASE WHEN ?5 THEN 1 ELSE 0 END,
+                 last_error = CASE WHEN ?5 THEN COALESCE(?6, last_error) ELSE last_error END
              WHERE id = ?1",
             params![
                 execution_id,
@@ -1878,6 +1901,7 @@ impl WorkDb {
                 clear_workspace_lease,
                 execution_finished_at,
                 increment_pre_start_failure_count,
+                normalized_error_text.as_deref(),
             ],
         )?;
 
@@ -1942,6 +1966,18 @@ impl WorkDb {
             stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
         }
         commit_and_publish(tx, pending, &self.event_bus)?;
+        drop(conn);
+        if fail_review_guide_attempt
+            && let Some(reason) = normalized_error_text.as_deref()
+            && let Err(err) =
+                self.finish_pr_review_guide_attempt_for_terminal_execution(execution_id, execution_status, reason)
+        {
+            tracing::warn!(
+                execution_id = %execution_id,
+                ?err,
+                "review-guide: finished the run as a pre-start failure but failed to fail the bound attempt",
+            );
+        }
         Ok((execution, run, attention_item))
     }
 

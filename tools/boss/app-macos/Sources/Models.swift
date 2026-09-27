@@ -240,6 +240,11 @@ struct WorkTask: Identifiable, Hashable {
     /// prompt/prose retry. Mirrors `Task.review_guide_stale_source` on the
     /// wire. `nil` until a readable version exists.
     var reviewGuideStaleSource: Bool? = nil
+    /// Engine-recorded reason the series is `"failed"`. Mirrors
+    /// `Task.review_guide_error` on the wire. The app renders this text;
+    /// it does not infer a cause. `nil` when lifecycle is not `"failed"`
+    /// or the attempt stored no error.
+    var reviewGuideError: String? = nil
 
     /// Short id of the reviewed task that produced this follow-up.
     /// `nil` for every task whose `kind` is not `"followup"`.

@@ -733,6 +733,14 @@ pub struct WorkExecution {
     #[builder(default)]
     pub pre_start_failure_count: i64,
 
+    /// Most recent pre-start / pane-spawn failure text the engine recorded
+    /// for this execution. Set at the same moment the engine logs
+    /// `spawn aborted` / `record_pre_start_failure`, including intermediate
+    /// retries that write no `work_runs` row. Cleared when a run actually
+    /// starts. `None` when this execution has never failed to start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+
     /// When `true`, the cube workspace preference (`preferred_workspace_id`)
     /// is treated as a warmth hint only: if the preferred workspace is
     /// unavailable or busy, the coordinator falls back silently to any free
