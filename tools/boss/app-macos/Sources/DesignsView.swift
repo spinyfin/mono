@@ -819,5 +819,6 @@ struct AsyncMarkdownViewerView: View {
             }
         }
         .registeredInWindowMenu()
+        .mergeRevisionConfirmationAlert(model: chatModel)
     }
 }

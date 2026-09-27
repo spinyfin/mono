@@ -225,6 +225,17 @@ struct ReviewGuideFindings: Codable, Equatable {
     }
 }
 
+/// A `ReviewGuideFindings` value tagged with the series it was fetched for.
+/// `ChatViewModel.reviewGuideFindingsByRootID` is keyed by root task id, but
+/// two different PR series can share a root task id over time (a replacement
+/// PR, or navigating back to an earlier series), so the series id travels
+/// alongside the findings to let a reader confirm it is looking at the right
+/// one before displaying it.
+struct ReviewGuideFindingsEntry: Equatable {
+    let seriesId: String
+    let findings: ReviewGuideFindings
+}
+
 struct OpenMergeRevision: Codable, Equatable {
     let id: String
     let label: String

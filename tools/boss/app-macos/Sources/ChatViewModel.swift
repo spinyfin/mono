@@ -1191,11 +1191,24 @@ final class ChatViewModel: ObservableObject {
     /// `nil` means no confirmation is showing.
     @Published var pendingPauseOverrideConfirmation: PauseOverrideConfirmation?
 
-    @Published var reviewGuideFindingsByRootID: [String: ReviewGuideFindings] = [:]
+    /// Keyed by root task id, but each entry also carries the series id it
+    /// was fetched for. `ReviewGuideViewerHeader` only reads an entry whose
+    /// `seriesId` matches the series actually on screen — otherwise a late
+    /// response for a series the viewer has since navigated away from would
+    /// silently overwrite (or transiently show under) the newly opened
+    /// series' findings, since both share the same root task id.
+    @Published var reviewGuideFindingsByRootID: [String: ReviewGuideFindingsEntry] = [:]
 
     /// Set once `MergeConfirmationRequired` reports open revisions blocking
     /// an in-flight merge attempt — see `MergeRevisionConfirmation`.
     @Published var pendingMergeRevisionConfirmation: MergeRevisionConfirmation?
+
+    /// Confirmations for other tasks that arrived while
+    /// `pendingMergeRevisionConfirmation` was already showing a different
+    /// task's dialog. Presented one at a time, FIFO, once the current
+    /// dialog is resolved — so a second concurrent merge attempt can never
+    /// silently overwrite (and thereby strand) the first task's dialog.
+    var queuedMergeRevisionConfirmations: [MergeRevisionConfirmation] = []
 
     /// Inline confirmation banner shown on the card whose
     /// `merge_when_ready_accepted` reply just arrived (`MergeFeedbackNotice`)

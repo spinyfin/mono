@@ -533,8 +533,13 @@ final class EngineClient: @unchecked Sendable {
                 emit(.projectDesignDocResolved(output: output))
             case "review_guide_summary":
                 if let summary = payload["summary"] as? [String: Any],
-                   let rootTaskId = summary["root_task_id"] as? String {
-                    emit(.reviewGuideFindings(rootTaskId: rootTaskId, findings: ReviewGuideFindings.parse(summary["findings"])))
+                   let rootTaskId = summary["root_task_id"] as? String,
+                   let seriesId = summary["series_id"] as? String {
+                    emit(.reviewGuideFindings(
+                        rootTaskId: rootTaskId,
+                        seriesId: seriesId,
+                        findings: ReviewGuideFindings.parse(summary["findings"])
+                    ))
                 }
             case "review_guide_content":
                 guard let versionId = payload["version_id"] as? String else {

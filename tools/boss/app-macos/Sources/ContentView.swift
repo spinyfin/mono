@@ -373,25 +373,7 @@ struct ContentView: View {
                 Text(confirmation.alertMessage)
             }
         )
-        .alert(
-            "Merge while revisions are open?",
-            isPresented: Binding(
-                get: { model.pendingMergeRevisionConfirmation != nil },
-                set: { newValue in
-                    if !newValue {
-                        model.cancelMergeRevisionConfirmation()
-                    }
-                }
-            ),
-            presenting: model.pendingMergeRevisionConfirmation,
-            actions: { _ in
-                Button("Cancel", role: .cancel) { model.cancelMergeRevisionConfirmation() }
-                Button("Merge anyway") { model.confirmMergeRevision() }
-            },
-            message: { confirmation in
-                Text(confirmation.alertMessage)
-            }
-        )
+        .mergeRevisionConfirmationAlert(model: model)
         .sheet(item: $model.pendingWorkCreateRequest) { request in
             WorkCreateSheet(
                 request: request,

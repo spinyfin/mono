@@ -43,9 +43,24 @@ extension ChatViewModel {
         engine.sendMergeWhenReady(workItemID: task.id)
     }
 
+    /// If a different task's confirmation is already showing, queue this one
+    /// rather than overwriting `pendingMergeRevisionConfirmation` — an
+    /// overwrite would silently strand the first task's dialog: its entry in
+    /// `mergingWhenReadyIDs` would never clear because neither
+    /// `confirmMergeRevision()` nor `cancelMergeRevisionConfirmation()` would
+    /// ever run for it.
     func handleMergeConfirmation(workItemID: String, revisions: [OpenMergeRevision]) {
         guard mergingWhenReadyIDs.contains(workItemID) else { return }
-        pendingMergeRevisionConfirmation = MergeRevisionConfirmation(workItemID: workItemID, revisions: revisions)
+        let confirmation = MergeRevisionConfirmation(workItemID: workItemID, revisions: revisions)
+        if pendingMergeRevisionConfirmation == nil {
+            pendingMergeRevisionConfirmation = confirmation
+        } else if pendingMergeRevisionConfirmation?.workItemID == workItemID {
+            // A repeat confirmation for the task already showing — refresh it.
+            pendingMergeRevisionConfirmation = confirmation
+        } else {
+            queuedMergeRevisionConfirmations.removeAll { $0.workItemID == workItemID }
+            queuedMergeRevisionConfirmations.append(confirmation)
+        }
     }
 
     /// User confirmed merging while revisions are open: resend the merge
@@ -54,6 +69,7 @@ extension ChatViewModel {
         guard let confirmation = pendingMergeRevisionConfirmation else { return }
         pendingMergeRevisionConfirmation = nil
         engine.sendMergeWhenReady(workItemID: confirmation.workItemID, confirmedRevisions: confirmation.revisions)
+        presentNextQueuedMergeRevisionConfirmationIfNeeded()
     }
 
     /// User declined merging while revisions are open: drop the in-flight
@@ -62,6 +78,22 @@ extension ChatViewModel {
         guard let confirmation = pendingMergeRevisionConfirmation else { return }
         pendingMergeRevisionConfirmation = nil
         mergingWhenReadyIDs.remove(confirmation.workItemID)
+        presentNextQueuedMergeRevisionConfirmationIfNeeded()
+    }
+
+    /// Presents the next queued confirmation (if any) on the next runloop
+    /// tick, after the current one has already cleared. Deferring is
+    /// required for the alert to re-present at all: SwiftUI's
+    /// `isPresented`/`presenting:` alert only triggers on a genuine
+    /// false→true transition, so setting the property directly to the next
+    /// value in the same call as clearing the old one would never surface a
+    /// second dialog.
+    private func presentNextQueuedMergeRevisionConfirmationIfNeeded() {
+        guard pendingMergeRevisionConfirmation == nil, !queuedMergeRevisionConfirmations.isEmpty else { return }
+        let next = queuedMergeRevisionConfirmations.removeFirst()
+        DispatchQueue.main.async { [weak self] in
+            self?.pendingMergeRevisionConfirmation = next
+        }
     }
 
     /// Ask the engine to lease a workspace for the given Review-column

@@ -379,8 +379,15 @@ extension ChatViewModel {
             applyProductDesignDocsList(productID: productID, state: state)
         case .productDesignDocContent(let ref, let content):
             applyProductDesignDocContent(ref: ref, content: content)
-        case .reviewGuideFindings(let rootTaskId, let findings):
-            reviewGuideFindingsByRootID[rootTaskId] = findings
+        case .reviewGuideFindings(let rootTaskId, let seriesId, let findings):
+            if let findings {
+                reviewGuideFindingsByRootID[rootTaskId] = ReviewGuideFindingsEntry(seriesId: seriesId, findings: findings)
+            } else if reviewGuideFindingsByRootID[rootTaskId]?.seriesId == seriesId {
+                // Only clear the cached entry when the "no findings" reply is
+                // for the series currently cached — never let a nil reply for
+                // an abandoned series wipe out a different series' entry.
+                reviewGuideFindingsByRootID.removeValue(forKey: rootTaskId)
+            }
         case .reviewGuideContent(let versionId, let content):
             applyReviewGuideContent(versionId: versionId, content: content)
         case .reviewGuideRetryQueued(let rootTaskId, _, _):

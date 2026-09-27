@@ -66,7 +66,9 @@ struct ReviewGuideViewerHeader: View {
                         }
                     }
                 }
-                if let findings = chatModel.reviewGuideFindingsByRootID[rootTaskId] {
+                if let entry = chatModel.reviewGuideFindingsByRootID[rootTaskId],
+                   entry.seriesId == displayedSeriesId {
+                    let findings = entry.findings
                     Text(findings.statusText)
                         .font(.caption)
                         .accessibilityIdentifier("review-guide-findings-status")
