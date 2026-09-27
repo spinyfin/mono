@@ -32,7 +32,8 @@
 //! ever searching `PATH`**, since a `PATH` search is precisely how the
 //! repobin shim wins — and materializes a tiny per-workspace launcher
 //! directory containing pinned `boss` and `cube` launchers, plus a repository
-//! `checkleft` launcher (see [`environment`]).
+//! `checkleft` launcher when the workspace's `REPOBIN.toml` declares that
+//! tool (see [`environment`]).
 //!
 //! Two properties are load-bearing:
 //!
@@ -116,7 +117,8 @@ const CUBE_CLI_RUNFILES_REL: &str = "tools/cube/cube";
 
 /// Every executable name the engine may write into the launcher directory.
 /// `boss` and `cube` are always thin execs of the bundled CLIs.
-/// `checkleft` dispatches through the engine-owned repobin.
+/// `checkleft` is written only when the workspace `REPOBIN.toml` declares it,
+/// and then dispatches through the engine-owned repobin.
 /// No entry exposes the Boss-tier `bossctl` control surface.
 ///
 /// The engine deliberately keeps `bossctl` off the worker `PATH`: it is

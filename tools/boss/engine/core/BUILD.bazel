@@ -213,6 +213,7 @@ rust_test(
     env = {
         "BOSS_EVENT_BIN": "/opt/boss/bin/boss-event",
         "BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)",
+        "BOSS_TEST_REPOBIN": "$(rootpath //tools/repobin)",
         "HOME": "/tmp",
     },
     experimental_enable_sharding = True,

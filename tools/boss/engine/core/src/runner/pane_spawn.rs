@@ -462,6 +462,12 @@ fn check_initial_input_length(line: &str, driver_name: &str) -> Result<()> {
 /// falling through to a repobin shim that spends ~30 seconds on `bazel build`
 /// before reporting anything.
 ///
+/// When the workspace root's `REPOBIN.toml` declares `checkleft` as a tool
+/// or pin, the directory also holds a `checkleft` launcher that `exec`s the
+/// engine-bundled repobin. Otherwise a leftover `checkleft` from a previous
+/// spawn is removed. A sibling `<dir>.environment` directory (`bash-env`,
+/// `.zshenv`) is written for [`boss_engine_worker_bin::environment::shell_environment_clause`].
+///
 /// `bossctl` is deliberately absent: this directory is prepended to the
 /// worker's `PATH`, and the Boss-tier control surface stays Boss-tier.
 ///
@@ -508,11 +514,10 @@ fn ensure_worker_bin_dir_for_engine(settings_dir: &Path, workspace_path: &Path, 
             );
         }
         Err(err) => {
-            tracing::warn!(
+            tracing::error!(
                 ?err,
                 dir = %dir.display(),
-                "could not write the worker `boss` launcher; the worker's PATH is unchanged and \
-                 a bare `boss` may resolve to a build-from-source shim",
+                "could not write the worker `boss` launcher; aborting spawn",
             );
             return None;
         }
@@ -545,33 +550,39 @@ fn ensure_worker_bin_dir_for_engine(settings_dir: &Path, workspace_path: &Path, 
             // silently run the prior worker's compose logic. Fail closed
             // exactly like the `boss` arm: don't hand back a launcher dir
             // whose `cube` entry we can't vouch for.
-            tracing::warn!(
+            tracing::error!(
                 ?err,
                 dir = %dir.display(),
-                "could not write the worker `cube` launcher; a bare `cube` may resolve to a \
-                 build-from-source shim, or to a stale compose wrapper left by a previous \
-                 worker in this workspace",
+                "could not write the worker `cube` launcher; aborting spawn so a stale compose \
+                 wrapper cannot remain on PATH",
             );
             return None;
         }
     }
-    let repobin = boss_engine_worker_bin::resolve_engine_binary(
-        "repobin",
-        "tools/repobin/repobin",
-        boss_engine_worker_bin::ResolvePaths {
-            engine_path,
-            workspace_dir: workspace_dir.as_deref(),
-            env_override: None,
-            boss_bin_dir: boss_bin_dir.as_deref(),
-            stable_bin_dir: None,
-        },
-        false,
-    );
+    let repobin = if boss_engine_worker_bin::environment::workspace_declares_repo_tool(workspace_path, "checkleft") {
+        boss_engine_worker_bin::resolve_engine_binary(
+            "repobin",
+            "tools/repobin/repobin",
+            boss_engine_worker_bin::ResolvePaths {
+                engine_path,
+                workspace_dir: workspace_dir.as_deref(),
+                env_override: None,
+                boss_bin_dir: boss_bin_dir.as_deref(),
+                stable_bin_dir: None,
+            },
+            false,
+        )
+    } else {
+        None
+    };
     let environment =
-        boss_engine_worker_bin::environment::write_repo_tool_launcher(&dir, "checkleft", repobin.as_deref())
+        boss_engine_worker_bin::environment::sync_checkleft_launcher(&dir, workspace_path, repobin.as_deref())
             .and_then(|_| boss_engine_worker_bin::environment::write_shell_environment(&dir));
     if let Err(err) = environment {
-        tracing::error!(?err, "could not materialize the worker tool environment");
+        tracing::error!(
+            ?err,
+            "could not materialize the worker tool environment; aborting spawn"
+        );
         return None;
     }
     Some(dir)
