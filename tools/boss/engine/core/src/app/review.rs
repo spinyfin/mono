@@ -1963,4 +1963,71 @@ mod trunk_queue_tests {
             FrontendEvent::MergeWhenReadyAccepted { .. }
         ));
     }
+    #[tokio::test]
+    async fn pushed_revision_merges_without_confirmation() {
+        let server = MockServer::start().await;
+        let (state, _temp) = test_server_state(trunk_client_for(server.uri()));
+        let pr_url = "https://github.com/brianduff/flunge/pull/979";
+        let (product, root) = seed_trunk_queue_chore(&state.work_db, "delivered fix", pr_url);
+        seed_active_trunk_intent(&state.work_db, &root, pr_url, Some("testing"));
+        let revision = create_test_chore_manual(&state.work_db, product, "pushed revision");
+        state
+            .work_db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET kind = 'revision', parent_task_id = ?2, status = 'in_review' WHERE id = ?1",
+                rusqlite::params![revision.id, root],
+            )
+            .unwrap();
+        let sink = make_session_sink();
+        handle_merge_when_ready(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::MergeWhenReady {
+                work_item_id: root,
+                confirmed_revisions: vec![],
+            },
+        )
+        .await;
+        assert!(matches!(
+            sink.next().await.unwrap().payload,
+            FrontendEvent::MergeWhenReadyAccepted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn findings_database_error_keeps_summary_rpc_available() {
+        let server = MockServer::start().await;
+        let (state, _temp) = test_server_state(trunk_client_for(server.uri()));
+        let pr_url = "https://github.com/brianduff/flunge/pull/980";
+        let (_, root) = seed_trunk_queue_chore(&state.work_db, "guide", pr_url);
+        state
+            .work_db
+            .persist_pr_review_guide_source_capture(
+                &root,
+                1,
+                crate::work::PrSourceCaptureTrigger::Creation,
+                &crate::test_support::source_capture_packet(pr_url, "base", "head"),
+            )
+            .unwrap();
+        state
+            .work_db
+            .connect()
+            .unwrap()
+            .execute("DROP TABLE pr_review_verdicts", [])
+            .unwrap();
+        let sink = make_session_sink();
+        super::super::review_guide::handle_get_review_guide_summary(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::GetReviewGuideSummary {
+                root_task_id: root,
+                series_id: None,
+            },
+        )
+        .await;
+        let FrontendEvent::ReviewGuideSummary { summary: Some(summary) } = sink.next().await.unwrap().payload else {
+            panic!("supplement failure must not become WorkError");
+        };
+        assert!(summary.findings.is_none());
+    }
 }

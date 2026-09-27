@@ -31,7 +31,7 @@ extension ChatViewModel {
         let origin: MergeRevisionConfirmationOrigin
 
         var alertMessage: String {
-            revisions.map { "ID \($0.label) — \($0.status)" }.joined(separator: "\n")
+            revisions.map { "ID \($0.label) — \($0.statusLabel)" }.joined(separator: "\n")
                 + "\n\nThese revisions may still change this PR. Merge anyway?"
         }
     }
