@@ -6,8 +6,8 @@
 //! full structural `--deny` rule set).
 
 use super::{
-    MAX_CANON_LINE_BYTES, check_initial_input_length, path_prepend_clause, render_env_directive,
-    write_initial_input_script,
+    MAX_CANON_LINE_BYTES, check_arg_max_budget, check_initial_input_length, check_launch_command_arg_max,
+    estimated_launch_argv_bytes, local_arg_max, path_prepend_clause, render_env_directive, write_initial_input_script,
 };
 use crate::driver::{
     AgentDriver, ClaudeDriver, CodexDriver, EnvDirective, GrokDriver, PermissionInput, SpawnRequest, WorkerKind,
@@ -263,4 +263,92 @@ fn grok_initial_input_stays_under_the_limit_with_long_workspace_path_and_full_de
         Some(v) => unsafe { std::env::set_var(GROK_SKIP_POSTURE_ASSERT_ENV, v) },
         None => unsafe { std::env::remove_var(GROK_SKIP_POSTURE_ASSERT_ENV) },
     }
+}
+
+// ---------------------------------------------------------------------------
+// ARG_MAX preflight (`check_launch_command_arg_max`): each driver embeds its
+// initial prompt into the CLI's own argv via `"$(cat <file>)"` command
+// substitution, expanded when the pane's shell sources
+// `write_initial_input_script`'s output — unlike the MAX_CANON guard above,
+// which bounds what gets *typed*, this bounds what the kernel accepts at
+// the driver CLI's own `execve()`, after that expansion.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn check_arg_max_budget_under_the_limit_passes() {
+    check_arg_max_budget(1000, 1000, 20000, "fake").unwrap();
+}
+
+#[test]
+fn check_arg_max_budget_environment_can_push_a_fitting_argv_over_the_limit() {
+    let err = check_arg_max_budget(1000, 20000, 20000, "fake").expect_err("must fail, not silently proceed");
+    let msg = err.to_string();
+    assert!(msg.contains("fake"), "error must name the driver: {msg}");
+    assert!(msg.contains("environment 20000 bytes"), "{msg}");
+    assert!(msg.contains("ARG_MAX 20000 bytes"), "{msg}");
+}
+
+#[test]
+fn estimated_launch_argv_bytes_substitutes_the_real_prompt_files_size_for_the_placeholder() {
+    let workspace = TempDir::new().unwrap();
+    std::fs::create_dir_all(workspace.path().join(".claude")).unwrap();
+    let prompt = "y".repeat(12_345);
+    std::fs::write(workspace.path().join(".claude").join("initial-prompt.txt"), &prompt).unwrap();
+
+    let command = "claude --model opus \"$(cat .claude/initial-prompt.txt)\"\n";
+    let placeholder_len = "\"$(cat .claude/initial-prompt.txt)\"".len();
+    let bytes = estimated_launch_argv_bytes(command, workspace.path(), ".claude", "initial-prompt.txt").unwrap();
+
+    assert_eq!(bytes, command.len() - placeholder_len + prompt.len());
+}
+
+#[test]
+fn estimated_launch_argv_bytes_errors_when_the_prompt_file_is_missing() {
+    let workspace = TempDir::new().unwrap();
+    let command = "claude --model opus \"$(cat .claude/initial-prompt.txt)\"\n";
+    let err = estimated_launch_argv_bytes(command, workspace.path(), ".claude", "initial-prompt.txt")
+        .expect_err("must fail, not silently proceed with an unknown size");
+    assert!(err.to_string().contains("initial-prompt.txt"), "{err}");
+}
+
+/// End-to-end against this host's real `ARG_MAX`: a ~600 KB prompt — the
+/// motivating large-prompt size from the regression report — must still
+/// fit comfortably. Regressing the estimate back to counting every argv
+/// byte as if it needed its own pointer (rather than one pointer per
+/// shell argument) would wrongly reject this.
+#[test]
+fn check_launch_command_arg_max_passes_for_a_600kb_prompt_on_this_host() {
+    let workspace = TempDir::new().unwrap();
+    std::fs::create_dir_all(workspace.path().join(".codex")).unwrap();
+    std::fs::write(
+        workspace.path().join(".codex").join("initial-prompt.txt"),
+        "z".repeat(600_000),
+    )
+    .unwrap();
+
+    let command = "codex --strict-config --no-alt-screen -a never -m 'gpt-5' \"$(cat .codex/initial-prompt.txt)\"\n";
+    check_launch_command_arg_max(command, "codex", workspace.path(), ".codex", "initial-prompt.txt")
+        .expect("a ~600KB prompt must fit under this host's real ARG_MAX");
+}
+
+/// A prompt sized to exceed this host's real, measured `ARG_MAX` must be
+/// refused before spawn — not left to fail silently inside the pane's
+/// sourced script as `execve`'s `E2BIG`.
+#[test]
+fn check_launch_command_arg_max_fails_for_a_prompt_over_this_hosts_real_arg_max() {
+    let workspace = TempDir::new().unwrap();
+    std::fs::create_dir_all(workspace.path().join(".grok")).unwrap();
+    let arg_max = local_arg_max().unwrap();
+    std::fs::write(
+        workspace.path().join(".grok").join("initial-prompt.txt"),
+        "w".repeat(arg_max + 4096),
+    )
+    .unwrap();
+
+    let command = "grok --model 'grok-4.6' \"$(cat .grok/initial-prompt.txt)\"\n";
+    let err = check_launch_command_arg_max(command, "grok", workspace.path(), ".grok", "initial-prompt.txt")
+        .expect_err("must fail, not silently proceed with a doomed exec");
+    let msg = err.to_string();
+    assert!(msg.contains("grok"), "error must name the driver: {msg}");
+    assert!(msg.contains("ARG_MAX"), "{msg}");
 }

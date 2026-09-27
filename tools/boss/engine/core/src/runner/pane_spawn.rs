@@ -445,6 +445,99 @@ fn check_initial_input_length(line: &str, driver_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// This host's real `ARG_MAX`, via `sysconf(_SC_ARG_MAX)`.
+///
+/// Every driver embeds its initial prompt into the CLI's own argv via a
+/// `"$(cat <config_dir>/<initial_prompt_filename>)"` command substitution
+/// (see each driver's `spawn_invocation`/`build_*_command`), expanded by the
+/// pane's shell when it sources [`write_initial_input_script`]'s output.
+/// Unlike [`MAX_CANON_LINE_BYTES`] — a pty line-discipline limit on what gets
+/// *typed* — this bounds what the kernel accepts at the driver CLI's
+/// `execve()`, after that expansion.
+fn local_arg_max() -> Result<usize> {
+    // sysconf has no pointer arguments and does not mutate process state.
+    let limit = unsafe { libc::sysconf(libc::_SC_ARG_MAX) };
+    if limit <= 0 {
+        return Err(anyhow!("cannot determine local ARG_MAX (sysconf returned {limit})"));
+    }
+    Ok(limit as usize)
+}
+
+/// Conservative proxy for the exec'd CLI's environment footprint: the
+/// engine's own environment. The pane's real environment is the tmux
+/// session's, which the engine cannot inspect ahead of spawn — a driver adds
+/// only a handful of small directives (`spawn_plan.env`) on top of whatever
+/// the pane shell already inherited, so this stays a reasonable estimate
+/// relative to the multi-hundred-KB prompt sizes this check guards against.
+fn environment_bytes() -> usize {
+    std::env::vars_os()
+        .map(|(key, value)| key.len() + value.len() + 2 + std::mem::size_of::<usize>())
+        .sum()
+}
+
+/// Estimate the exec-time argv byte count for `command` once its
+/// `"$(cat <config_dir>/<initial_prompt_filename>)"` substitution is
+/// replaced by the real prompt file's bytes.
+///
+/// `command` is shell source, not real argv, so this is an estimate: shell
+/// syntax (quotes, `$()`, spaces) adds a few dozen bytes of overhead per
+/// argument that this does not model — [`check_launch_command_arg_max`]'s
+/// fixed margin absorbs that.
+fn estimated_launch_argv_bytes(
+    command: &str,
+    workspace_path: &Path,
+    config_dir: &str,
+    initial_prompt_filename: &str,
+) -> Result<usize> {
+    let placeholder = format!("\"$(cat {config_dir}/{initial_prompt_filename})\"");
+    let prompt_path = workspace_path.join(config_dir).join(initial_prompt_filename);
+    let prompt_bytes = std::fs::metadata(&prompt_path)
+        .with_context(|| format!("reading size of initial prompt at {}", prompt_path.display()))?
+        .len() as usize;
+    let static_bytes = command.len().saturating_sub(placeholder.len());
+    Ok(static_bytes.saturating_add(prompt_bytes))
+}
+
+/// Fail loudly, before ever typing the pane's initial input, when the
+/// argv-embedded initial prompt would exceed this host's `ARG_MAX` at the
+/// driver CLI's `execve()`.
+///
+/// Past `ARG_MAX` the shell's `exec` fails with `E2BIG` *inside the sourced
+/// script the pane runs on its own* — not anywhere the engine observes
+/// directly — so without this check the execution just sits `Spawning`
+/// until `spawn_ack_sweep`'s grace period gives up on it and redispatches,
+/// which retries the identical, identically-doomed command. Catching it
+/// here turns that into an immediate, attributed dispatch failure instead.
+fn check_launch_command_arg_max(
+    command: &str,
+    driver_name: &str,
+    workspace_path: &Path,
+    config_dir: &str,
+    initial_prompt_filename: &str,
+) -> Result<()> {
+    let argv_bytes = estimated_launch_argv_bytes(command, workspace_path, config_dir, initial_prompt_filename)?;
+    let arg_max = local_arg_max()?;
+    check_arg_max_budget(argv_bytes, environment_bytes(), arg_max, driver_name)
+}
+
+/// The pure budget check behind [`check_launch_command_arg_max`], factored
+/// out so tests can exercise the arithmetic against fixed inputs instead of
+/// this host's real, environment-dependent `ARG_MAX` and environment size.
+fn check_arg_max_budget(argv_bytes: usize, environment_bytes: usize, arg_max: usize, driver_name: &str) -> Result<()> {
+    // 4096 bytes of slop for shell-syntax overhead (quotes, `$()`, spaces)
+    // this estimate does not model, plus the exec kernel's own bookkeeping.
+    let total = argv_bytes.saturating_add(environment_bytes).saturating_add(4096);
+    if total > arg_max {
+        return Err(anyhow!(
+            "refusing to spawn {driver_name} worker: estimated launch argv {argv_bytes} bytes (initial \
+             prompt embedded via command substitution) + environment {environment_bytes} bytes + 4096 \
+             estimation-slop bytes = {total} bytes exceeds this host's ARG_MAX {arg_max} bytes; the \
+             initial prompt is too large to deliver via argv on this host"
+        ));
+    }
+    Ok(())
+}
+
 /// Materialize the per-workspace launcher directory and return it, so the
 /// caller can put it on the worker's `PATH`.
 ///
@@ -981,6 +1074,13 @@ impl ExecutionRunner for PaneSpawnRunner {
         // driver default flags rather than being ignored.
         spawn_plan.command =
             crate::driver::apply_permission_extra_args(&spawn_plan.command, &permission_artifacts.extra_args);
+        check_launch_command_arg_max(
+            &spawn_plan.command,
+            driver.descriptor().name,
+            workspace_path,
+            driver.descriptor().config_dir,
+            driver.descriptor().initial_prompt_filename,
+        )?;
         // The per-workspace launcher dir goes on *after* the BOSS_BIN_DIR
         // prepend so it ends up ahead of it. Its `boss` is pinned to an
         // absolute path, which is the only form that survives a login
