@@ -48,10 +48,10 @@ fn golden_grok_pane_command_default_model_no_effort() {
     let command = build_grok_pane_command(&request, &golden_workspace(), GOLDEN_SESSION_ID);
     assert_eq!(
         command,
-        "grok --model 'grok-4.6' --no-alt-screen --always-approve --trust \
+        "python3 .boss/feed-initial-prompt '.grok/initial-prompt.txt' grok --model 'grok-4.6' --no-alt-screen --always-approve --trust \
          --session-id '019f974c-3d59-7533-b320-3963123c809b' \
          --cwd '/Users/brianduff/Documents/dev/workspaces/mono-agent-007' \
-         --no-subagents --no-memory \"$(cat .grok/initial-prompt.txt)\"\n",
+         --no-subagents --no-memory\n",
         "Grok pane spawn command (no effort) must match the pinned contract byte-for-byte",
     );
 }
@@ -69,10 +69,10 @@ fn golden_grok_pane_command_with_reasoning_effort() {
     let command = build_grok_pane_command(&request, &golden_workspace(), GOLDEN_SESSION_ID);
     assert_eq!(
         command,
-        "grok --model 'grok-4.6' --reasoning-effort 'high' --no-alt-screen --always-approve \
+        "python3 .boss/feed-initial-prompt '.grok/initial-prompt.txt' grok --model 'grok-4.6' --reasoning-effort 'high' --no-alt-screen --always-approve \
          --trust --session-id '019f974c-3d59-7533-b320-3963123c809b' \
          --cwd '/Users/brianduff/Documents/dev/workspaces/mono-agent-007' \
-         --no-subagents --no-memory \"$(cat .grok/initial-prompt.txt)\"\n",
+         --no-subagents --no-memory\n",
         "Grok pane spawn command (with --reasoning-effort) must match the pinned contract \
          byte-for-byte",
     );

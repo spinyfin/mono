@@ -1081,6 +1081,13 @@ impl HostAdapter for SshHostAdapter {
         self.ship_file(&remote_prompt_dir, &remote_prompt_path, &prompt_text, "prompt")
             .await?;
         self.ship_file(
+            &format!("{workspace}/.boss"),
+            &format!("{workspace}/{}", crate::driver::FEED_PROMPT_SCRIPT_REL_PATH),
+            crate::driver::FEED_PROMPT_SCRIPT,
+            "prompt-feed script",
+        )
+        .await?;
+        self.ship_file(
             &remote_prompt_dir,
             &remote_prompt_gitignore_path,
             driver.config_dir_gitignore(),
@@ -1136,6 +1143,7 @@ impl HostAdapter for SshHostAdapter {
             .build();
 
         let engine_socket = self.events_socket_path.display().to_string();
+        crate::ssh_spawn::check_remote_launch_limits(&self.transport, &plan).await?;
         let outcome = perform_remote_launch(&self.transport, &plan, &engine_socket).await?;
 
         if !outcome.launched {

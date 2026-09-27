@@ -206,14 +206,13 @@ mod apply_permission_extra_args_tests {
             "extras must land on the single typed line, not add a second: {merged}"
         );
         assert!(
-            merged.contains("\"$(cat .grok/initial-prompt.txt)\""),
-            "prompt substitution must survive composition: {merged}"
+            merged.contains("python3 .boss/feed-initial-prompt '.grok/initial-prompt.txt'"),
+            "prompt feeder must survive composition: {merged}"
         );
+        assert!(!merged.contains("$(cat"), "prompt must not expand onto argv: {merged}");
         // Newline-fallback: extras land right before the trailing '\n' —
-        // i.e. AFTER everything else, including the positional prompt
-        // substitution — confirmed safe by the work item's own CLI
-        // characterisation (flags placed after the positional prompt
-        // parse fine for the installed grok CLI).
+        // after the grok flags, still argv of the grok CLI (the feeder
+        // forwards them). Confirmed safe for the installed grok CLI.
         assert!(
             merged.trim_end().ends_with("'--deny' 'Bash(rm -rf *)'"),
             "extras must be appended after the rest of the command, not interleaved: {merged}"
@@ -445,6 +444,45 @@ fn check_initial_input_length(line: &str, driver_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Estimate the argv cost of `command` as the pane shell would exec it.
+///
+/// After the prompt-feed wrap, this is just the command text (a path and
+/// flags). If a future change reintroduces `$(cat <file>)`, the named
+/// file's size is added so the check still sees the expanded argv.
+pub(crate) fn estimated_launch_argv_bytes(command: &str, workspace: &Path) -> usize {
+    let mut bytes = command.len();
+    let mut rest = command;
+    while let Some(idx) = rest.find("$(cat ") {
+        rest = &rest[idx + "$(cat ".len()..];
+        let token = rest
+            .split(|c: char| c == ')' || c.is_whitespace() || c == '"')
+            .next()
+            .unwrap_or("");
+        if token.is_empty() {
+            continue;
+        }
+        let path = workspace.join(token);
+        if let Ok(meta) = std::fs::metadata(&path) {
+            bytes = bytes.saturating_add(meta.len() as usize);
+        }
+    }
+    bytes
+}
+
+/// Fail loudly before creating the pane when the assembled launch command
+/// would exceed the platform argument limit. The byte count is in the
+/// error so a dispatch-diagnose read names the size instead of leaving a
+/// pane that dies with status 127 (`argument list too long`).
+pub(crate) fn check_launch_command_arg_max(command: &str, driver_name: &str, workspace: &Path) -> Result<()> {
+    let estimated = estimated_launch_argv_bytes(command, workspace);
+    crate::launch_limits::check(
+        estimated,
+        crate::launch_limits::environment_bytes(),
+        crate::launch_limits::local_arg_max()?,
+        driver_name,
+    )
+}
+
 /// Materialize the per-workspace launcher directory and return it, so the
 /// caller can put it on the worker's `PATH`.
 ///
@@ -616,14 +654,12 @@ impl ExecutionRunner for PaneSpawnRunner {
             )
         })?;
 
-        // Compose the worker prompt and stash it on disk so the
-        // libghostty pane can `claude "$(cat .claude/initial-prompt.txt)"`
-        // — Claude Code's positional arg is treated as the first user
-        // message, which gets the worker working without us having to
-        // wait for a "Claude is ready" signal and then SendToPane.
-        // Going through a file (rather than embedding the prompt in
-        // the typed command) avoids shell quoting hell on multi-line,
-        // backtick-bearing markdown.
+        // Compose the worker prompt and stash it on disk so the pane
+        // feeder can deliver it as the CLI's first user message without
+        // putting the body on argv (`ARG_MAX`). Going through a file
+        // (rather than embedding the prompt in the typed command) also
+        // avoids shell quoting hell on multi-line, backtick-bearing
+        // markdown.
         //
         // Prompt composition + effort/model resolution live in the
         // shared `compose_worker_spawn` so the SSH-remote adapter
@@ -719,7 +755,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // Write the initial prompt (and gitignore + pre-trust) via the driver's
         // WorkspaceProvisioning capability. The driver's config_dir and
         // initial_prompt_filename (e.g. `.claude/initial-prompt.txt`) determine
-        // the exact path the spawn_invocation `$(cat ...)` reads from.
+        // the exact path the prompt-feed helper reads from.
         // Any opaque out-of-workspace runtime state the driver returns
         // (future Codex: Boss-owned CODEX_HOME / archive root) is persisted
         // on the execution so every teardown path can hand it back after
@@ -932,6 +968,13 @@ impl ExecutionRunner for PaneSpawnRunner {
         // driver default flags rather than being ignored.
         spawn_plan.command =
             crate::driver::apply_permission_extra_args(&spawn_plan.command, &permission_artifacts.extra_args);
+        crate::driver::write_feed_prompt_script(workspace_path).with_context(|| {
+            format!(
+                "writing prompt-feed script for execution {} in workspace {}",
+                execution.id,
+                workspace_path.display(),
+            )
+        })?;
         // The per-workspace launcher dir goes on *after* the BOSS_BIN_DIR
         // prepend so it ends up ahead of it. Its `boss` is pinned to an
         // absolute path, which is the only form that survives a login
@@ -950,6 +993,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
             spawn_plan.command,
         );
+        check_launch_command_arg_max(&assembled_command, driver.descriptor().name, workspace_path)?;
         // Write the full assembled command to a workspace-relative script and
         // type only a short, fixed-length line that sources it — never the
         // command itself. See `MAX_CANON_LINE_BYTES` for why: the pty's tty
@@ -1025,6 +1069,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .maybe_control_token_path(bound_control_token_path(&self.cfg))
                 .boss_event_path(self.boss_event_binary())
                 .initial_input(initial_input)
+                .launch_command_bytes(estimated_launch_argv_bytes(&assembled_command, workspace_path))
                 .extra_env({
                     let mut env = structured_output_env;
                     if let Some(dir) = worker_bin_dir.as_ref() {

@@ -6,19 +6,123 @@
 //! full structural `--deny` rule set).
 
 use super::{
-    MAX_CANON_LINE_BYTES, check_initial_input_length, path_prepend_clause, render_env_directive,
-    write_initial_input_script,
+    MAX_CANON_LINE_BYTES, check_initial_input_length, check_launch_command_arg_max, estimated_launch_argv_bytes,
+    path_prepend_clause, render_env_directive, write_initial_input_script,
 };
 use crate::driver::{
     AgentDriver, ClaudeDriver, CodexDriver, EnvDirective, GrokDriver, PermissionInput, SpawnRequest, WorkerKind,
-    apply_permission_extra_args, codex::codex_sandbox_extra_args,
+    apply_permission_extra_args, codex::codex_sandbox_extra_args, grok::build_grok_pane_command,
 };
 use std::path::PathBuf;
 use tempfile::TempDir;
 
+// Oversized-command fixture for the macOS launch-limit tests.
+const PLATFORM_ARG_MAX_BYTES: usize = 1_048_576;
+
 #[test]
 fn short_line_passes_the_guard() {
     check_initial_input_length(". .boss/initial-input.sh\n", "claude").unwrap();
+}
+
+#[test]
+fn assembled_command_under_arg_max_passes() {
+    let dir = TempDir::new().unwrap();
+    check_launch_command_arg_max(
+        "python3 .boss/feed-initial-prompt '.claude/initial-prompt.txt' claude --model opus\n",
+        "claude",
+        dir.path(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn assembled_command_over_arg_max_fails_with_byte_count_and_driver() {
+    let dir = TempDir::new().unwrap();
+    let huge = format!(
+        "python3 .boss/feed-initial-prompt '.claude/initial-prompt.txt' claude {}\n",
+        "X".repeat(PLATFORM_ARG_MAX_BYTES)
+    );
+    let err = check_launch_command_arg_max(&huge, "claude", dir.path()).expect_err("must fail, not silently proceed");
+    let msg = err.to_string();
+    assert!(msg.contains("claude"), "error must name the driver: {msg}");
+    assert!(
+        msg.contains(&(PLATFORM_ARG_MAX_BYTES).to_string()) || msg.contains("ARG_MAX"),
+        "error must name ARG_MAX / the byte budget: {msg}",
+    );
+    assert!(
+        msg.chars().any(|c| c.is_ascii_digit()),
+        "error must include the measured byte count: {msg}",
+    );
+}
+
+#[test]
+fn estimated_argv_bytes_adds_cat_expansion_size() {
+    let dir = TempDir::new().unwrap();
+    let prompt = dir.path().join(".claude").join("initial-prompt.txt");
+    std::fs::create_dir_all(prompt.parent().unwrap()).unwrap();
+    std::fs::write(&prompt, "P".repeat(2000)).unwrap();
+    let command = "claude --model opus \"$(cat .claude/initial-prompt.txt)\"\n";
+    let estimated = estimated_launch_argv_bytes(command, dir.path());
+    assert!(
+        estimated >= command.len() + 2000,
+        "must count the cat-expanded file, got {estimated} for command of {}",
+        command.len()
+    );
+}
+
+#[test]
+fn driver_launch_commands_stay_well_under_arg_max_with_a_multi_mib_prompt_file() {
+    // spawn_invocation never reads the prompt file — a 2 MiB file on disk
+    // must not change the launch command's argv cost.
+    let dir = TempDir::new().unwrap();
+
+    let claude = ClaudeDriver.spawn_invocation(SpawnRequest {
+        model: "sonnet",
+        effort: None,
+        settings_path: None,
+        non_opus_auto_mode: false,
+        permission_mode_override: None,
+        run_id: None,
+    });
+    let codex = CodexDriver::default().spawn_invocation(SpawnRequest {
+        model: "gpt-5.6-terra",
+        effort: Some("high"),
+        settings_path: None,
+        non_opus_auto_mode: false,
+        permission_mode_override: None,
+        run_id: Some("run-argmax-1"),
+    });
+    let grok_req = SpawnRequest {
+        model: "grok-4.6",
+        effort: Some("high"),
+        settings_path: None,
+        non_opus_auto_mode: false,
+        permission_mode_override: None,
+        run_id: None,
+    };
+    let grok = build_grok_pane_command(&grok_req, dir.path(), "11111111-2222-4333-8444-555555555555");
+
+    for (name, cmd) in [
+        ("claude", claude.command.as_str()),
+        ("codex", codex.command.as_str()),
+        ("grok", grok.as_str()),
+    ] {
+        assert!(
+            cmd.len() < 8192,
+            "{name} launch command must stay tiny, got {} bytes: {cmd}",
+            cmd.len()
+        );
+        assert!(
+            !cmd.contains("$(cat"),
+            "{name} must not expand the prompt onto argv: {cmd}"
+        );
+        check_launch_command_arg_max(cmd, name, dir.path()).unwrap();
+        let estimated = estimated_launch_argv_bytes(cmd, dir.path());
+        assert!(
+            estimated < PLATFORM_ARG_MAX_BYTES / 8,
+            "{name} estimated argv {estimated} must be well under ARG_MAX"
+        );
+    }
 }
 
 #[test]

@@ -294,6 +294,20 @@ pub struct RemoteLaunchOutcome {
     pub detail: Option<String>,
 }
 
+/// Validate the full launch plan against the remote host before creating a tunnel.
+pub(crate) async fn check_remote_launch_limits(exec: &dyn SshExec, plan: &RemoteSpawnPlan) -> Result<()> {
+    let out = exec.run_shell(crate::launch_limits::REMOTE_PROBE).await?;
+    anyhow::ensure!(out.success(), "remote ARG_MAX preflight failed: {}", out.stderr);
+    let numbers = out
+        .stdout
+        .split_whitespace()
+        .map(str::parse::<usize>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    anyhow::ensure!(numbers.len() == 2, "invalid remote ARG_MAX preflight response");
+    let command_bytes = build_remote_command(plan).iter().map(|arg| arg.len() + 1).sum();
+    crate::launch_limits::check(command_bytes, numbers[1], numbers[0], &plan.driver_binary)
+}
+
 /// Open the events tunnel and launch the detached remote worker.
 ///
 /// Sequence (all over the one master multiplex):
@@ -605,7 +619,7 @@ mod tests {
             events_socket_path: "/tmp/boss-events-run-1.sock".into(),
             wrapper_path: "~/.boss-remote/bin/boss-remote-run".into(),
             driver_binary: "codex".into(),
-            driver_command: "codex -m gpt-6-astra \"$(cat .codex/initial-prompt.txt)\"".into(),
+            driver_command: "python3 .boss/feed-initial-prompt '.codex/initial-prompt.txt' codex -m gpt-6-astra".into(),
             driver_env: "export CODEX_HOME='/tmp/codex'; ".into(),
             structured_output_kind: Some("review-result".into()),
             pr_url_output: true,
@@ -617,7 +631,13 @@ mod tests {
         assert!(argv.contains(&"BOSS_LEASE_ID=lease-1".to_owned()));
         assert!(argv.contains(&"BOSS_WORKSPACE=/ws/mono-agent-007".to_owned()));
         assert!(argv.contains(&"BOSS_DRIVER=codex".to_owned()));
-        assert!(argv.iter().any(|arg| arg.starts_with("BOSS_DRIVER_COMMAND=codex -m")));
+        assert!(
+            argv.iter().any(
+                |arg| arg.starts_with("BOSS_DRIVER_COMMAND=python3 .boss/feed-initial-prompt")
+                    && arg.contains("codex -m")
+            ),
+            "driver command must feed the prompt file then exec codex; got {argv:?}"
+        );
         assert!(
             argv.iter()
                 .any(|arg| arg.starts_with("BOSS_DRIVER_ENV=export CODEX_HOME"))
@@ -639,7 +659,7 @@ mod tests {
             events_socket_path: "/tmp/s.sock".into(),
             wrapper_path: "wrapper".into(),
             driver_binary: "claude".into(),
-            driver_command: "claude --model opus \"$(cat .claude/initial-prompt.txt)\"".into(),
+            driver_command: "python3 .boss/feed-initial-prompt '.claude/initial-prompt.txt' claude --model opus".into(),
             driver_env: "unset ANTHROPIC_API_KEY; ".into(),
             structured_output_kind: None,
             pr_url_output: false,
@@ -788,6 +808,13 @@ mod tests {
         }
         async fn run_shell(&self, script: &str) -> Result<SshOutput> {
             self.calls.lock().unwrap().push(Call::Run(vec![script.to_owned()]));
+            if script == crate::launch_limits::REMOTE_PROBE {
+                return Ok(SshOutput {
+                    status: 0,
+                    stdout: "65536 8192".to_owned(),
+                    stderr: String::new(),
+                });
+            }
             // The liveness probe (`kill -0`) reports its canned verdict.
             if script.contains("kill -0") {
                 return match self.liveness {
@@ -874,11 +901,27 @@ mod tests {
             events_socket_path: remote_events_socket_path("run-1"),
             wrapper_path: "~/.boss-remote/bin/boss-remote-run".into(),
             driver_binary: "claude".into(),
-            driver_command: "claude --model opus \"$(cat .claude/initial-prompt.txt)\"".into(),
+            driver_command: "python3 .boss/feed-initial-prompt '.claude/initial-prompt.txt' claude --model opus".into(),
             driver_env: "unset ANTHROPIC_API_KEY; ".into(),
             structured_output_kind: Some("review-result".into()),
             pr_url_output: false,
         }
+    }
+
+    #[tokio::test]
+    async fn remote_preflight_uses_remote_limits_and_counts_driver_environment() {
+        let exec = FakeExec::new(0, "");
+        let mut plan = sample_plan();
+        check_remote_launch_limits(&exec, &plan).await.unwrap();
+        plan.driver_env = format!("export LARGE='{}'; ", "x".repeat(65536));
+        let error = check_remote_launch_limits(&exec, &plan).await.unwrap_err();
+        assert!(error.to_string().contains("ARG_MAX 65536 bytes"));
+        assert!(error.to_string().contains("environment 8192 bytes"));
+        assert_eq!(
+            exec.calls().len(),
+            2,
+            "preflight must never launch a worker or open a tunnel"
+        );
     }
 
     #[tokio::test]

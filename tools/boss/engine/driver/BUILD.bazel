@@ -40,7 +40,10 @@ rust_library(
 rust_test(
     name = "driver_test",
     size = "small",
-    compile_data = glob(["src/grok/testdata/**"]) + ["src/codex-tmux.conf"],
+    compile_data = glob(["src/grok/testdata/**"]) + [
+        "src/codex-tmux.conf",
+        "src/feed_prompt_tests.py",
+    ],
     crate = ":driver",
     edition = "2024",
     proc_macro_deps = all_crate_deps(
