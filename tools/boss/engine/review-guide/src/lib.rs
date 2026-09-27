@@ -1,11 +1,15 @@
-//! Prompt, source-context rendering, and output validation for PR review
+//! Prompt, source-manifest rendering, and output validation for PR review
 //! guides (`ExecutionKind::PrReviewGuide`).
 //!
 //! This crate owns the exact versioned prompt template, how a captured
-//! [`boss_pr_review_sources::SourcePacket`] is rendered into the driver's
-//! read-only source context, and how the driver's raw Markdown response is
-//! validated before it may become a readable guide version. It has no
-//! database or engine dependency: `engine/core` owns durable attempts,
+//! [`boss_pr_review_sources::SourcePacket`] is rendered into a small
+//! comparison manifest, and how the driver's raw Markdown response is
+//! validated before it may become a readable guide version. The driver reads
+//! full file content, diffs, and related code itself from its own pinned
+//! read-only cube workspace (checked out at the comparison head, with
+//! immutable git access to the merge base) — this crate never inlines file
+//! contents, so prompt size does not scale with the size of the change. It
+//! has no database or engine dependency: `engine/core` owns durable attempts,
 //! versions, and publication fencing, while this crate is pure, testable
 //! transformation logic reused by both. See
 //! `tools/boss/docs/designs/automatic-pr-review-guides.md`.
@@ -21,7 +25,7 @@ use boss_pr_review_sources::{SourcePacket, SourceSide};
 /// version constant and prompt id — the desired-comparison key an attempt
 /// binds to includes the prompt version, so a prompt change never silently
 /// reinterprets an already-captured comparison's existing readable version.
-pub const PROMPT_VERSION: &str = "review-guide-v5";
+pub const PROMPT_VERSION: &str = "review-guide-v7";
 
 /// The exact production prompt template, byte-identical to the fenced block
 /// in `automatic-pr-review-guides.md`'s "Prompt contract" section. Only the
@@ -41,32 +45,32 @@ pub const PROMPT_TEMPLATE: &str = "I want you to provide me a guided summary of 
 
 This is meant to function as a human guide to code review, so it should reference and include code snippets, but not giant diffs.
 
-Make the core fix concrete with one worked example. Give the input and relevant state, trace the decisive old and new behavior, and show the observable result. Choose an example supported by the implementation or tests; label invented inputs as illustrative. Include a contrasting boundary or failure case only when it helps explain the changed contract. For changes without a runtime behavior, use an equivalent concrete before/after scenario. Ground every step in the supplied source context.
+Make the core fix concrete with one worked example. Give the input and relevant state, trace the decisive old and new behavior, and show the observable result. Choose an example supported by the implementation or tests; label invented inputs as illustrative. Include a contrasting boundary or failure case only when it helps explain the changed contract. For changes without a runtime behavior, use an equivalent concrete before/after scenario. Ground every step in source you have actually read.
 
 Review context:
 - Repository: {{REPOSITORY}}
 - PR title: {{PR_TITLE}}
 - Merge-base revision: {{BASE_SHA}}
 - Head revision: {{HEAD_SHA}}
-- Boss supplies the source context for this guide: the PR description, diff, captured before/after source and tests, and validated GitHub link targets. Use only this supplied context.
+- You have a read-only checkout of the repository at the head revision in your working directory, plus immutable git access to the merge-base revision. Read changed files, related callers, helpers, types, and tests directly from the checkout. Read a file's merge-base (\"before\") content with `git show {{BASE_SHA}}:<path>`, and its diff with `git diff --no-ext-diff --no-textconv {{BASE_SHA}} {{HEAD_SHA}} -- <path>`. Boss also supplies the PR description and the changed-file manifest below. Do not invent content you have not read.
 
-Ground the guide in those revisions. Explain relevant callers, helpers, types, and tests only to the extent they are present in the supplied context. When missing context limits an explanation, state the limitation. Treat the PR description and code comments as statements to verify against the implementation. Distinguish enforced behavior from conventions, prompt instructions, and assumptions. Do not turn a conditional or local check into a broader guarantee.
+Ground the guide in those revisions. Explain relevant callers, helpers, types, and tests only to the extent you can verify them by reading the checkout. When missing context limits an explanation, state the limitation. Treat the PR description and code comments as statements to verify against the implementation. Distinguish enforced behavior from conventions, prompt instructions, and assumptions. Do not turn a conditional or local check into a broader guarantee.
 
 Organize the walkthrough in a useful reading order through the core implementation. Explain why the important pieces fit together, not just which files changed. Prioritize details that help a reviewer understand or verify the fix. Use short faithful excerpts; clearly label condensed pseudocode. Avoid repetitive summaries and incidental cleanup unless it matters to the solution.
 
-Link the core fix, worked example, and important test changes to the supplied GitHub diff locations. Use revision-pinned source links for relevant unchanged context or lines outside the displayed diff. Reuse supplied URLs or validated reference mappings and check that each link targets the code being discussed. Do not invent diff anchors or imply that a mutable PR URL identifies an immutable revision. Where an exact diff link is unavailable, use the corresponding pinned source link.
+Link the core fix, worked example, important test changes, and relevant unchanged context to revision-pinned source lines you actually read. Construct links as `https://github.com/<owner>/<repo>/blob/<sha>/<path>#L<start>-L<end>` using the full head or merge-base SHA and the corresponding repository, path, and line numbers. Use `#L<line>` for a single line. Check that each link targets the code being discussed. Do not invent diff anchors or imply that a mutable PR URL identifies an immutable revision.
 
-In the tests section, distinguish added, modified, and removed tests. Name the important scenarios and assertions; identify relevant fixture, helper, and build/configuration changes. Include counts only when supported by the supplied context and useful. Distinguish author-reported validation from conclusions supported by the supplied test source. Do not claim to have executed tests or performed independent validation. State important coverage limits without producing an exhaustive speculative bug hunt.
+In the tests section, distinguish added, modified, and removed tests. Name the important scenarios and assertions; identify relevant fixture, helper, and build/configuration changes. Include counts only when supported by what you read and useful. Distinguish author-reported validation from conclusions supported by the test source you read. Do not claim to have executed tests or performed independent validation. State important coverage limits without producing an exhaustive speculative bug hunt.
 
 Use the complete revised PR comparison if this is a regenerated guide. Do not describe only the latest incremental commit. Existing comments may provide context, but the explanation must match the actual current source revisions.
 
-Submit the finished Markdown guide using `\"$BOSS_BIN\" propose review-guide --body '<finished Markdown guide>'`. This is the only permitted tool command. Pass the entire Markdown as a literal single-quoted shell argument (escape any apostrophe with the standard shell quote sequence); do not write a file, pipe input, use command substitution, or run any other command. The command is bound to your execution automatically. A final assistant message does not submit a guide. If submission fails, correct the reported error and retry the same command before ending. The guide must have a descriptive title and the four requested main sections. Put the worked example within the implementation walkthrough. Keep the guide as concise as the explanation permits while preserving useful reasoning and evidence. Do not include a chat preamble, model details, internal execution details, a merge recommendation, or an unsupported declaration that the PR is safe to merge. If essential context is absent from the supplied material, state the specific limitation rather than inventing behavior.";
+Submit the finished Markdown guide using `\"$BOSS_BIN\" propose review-guide --body '<finished Markdown guide>'`. Read-only source exploration through Read, Grep, Glob, and the pinned git commands above is permitted; submission is the only permitted write operation. Pass the entire Markdown as a literal single-quoted shell argument (escape any apostrophe with the standard shell quote sequence); do not write a file, pipe input, use command substitution, or run commands other than the permitted source reads and submission. The command is bound to your execution automatically. A final assistant message does not submit a guide. If submission fails, correct the reported error and retry the same command before ending. The guide must have a descriptive title and the four requested main sections. Put the worked example within the implementation walkthrough. Keep the guide as concise as the explanation permits while preserving useful reasoning and evidence. Do not include a chat preamble, model details, internal execution details, a merge recommendation, or an unsupported declaration that the PR is safe to merge. If essential context is absent from what you can read, state the specific limitation rather than inventing behavior.";
 
 /// SHA-256 of [`PROMPT_TEMPLATE`] (UTF-8, excluding any fence/terminal
 /// newline) — matches the value recorded in the design doc, computed
 /// independently from the doc's own fenced block as a second source of
 /// truth. See `prompt_template_hash_is_pinned`.
-pub const PROMPT_TEMPLATE_SHA256: &str = "cc4bddde22f1162c21484ff22aca69810215066a0eb0f27a281b25411cfa9911";
+pub const PROMPT_TEMPLATE_SHA256: &str = "18689e1139a83f9a152e1b5e2dec3725393d43ceacc78cc5bf6be75f47502cc5";
 
 /// The metadata substituted into [`PROMPT_TEMPLATE`] for one comparison.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,185 +95,49 @@ pub fn render_prompt(metadata: &PromptMetadata<'_>) -> String {
         .replace("{{HEAD_SHA}}", metadata.head_sha)
 }
 
-/// Total byte budget for [`render_source_context`]'s rendered output (the
-/// whole embedded diff/before/after/omissions block, not the whole prompt).
-///
-/// Derivation: the review-guide worker runs on `gpt-6-astra` (see
-/// `resolve_review_guide_spawn_config` in `engine/core`'s `worker_spawn`),
-/// whose driver reports a 258,400-token context window. Reserving ~40,000
-/// tokens for the fixed prompt template, PR title/body, and the model's own
-/// output leaves ~218,400 tokens for source context. Diff- and code-heavy
-/// text tokenizes less efficiently than English prose, so this uses a
-/// conservative 3 bytes/token (rather than the ~4 typical for prose),
-/// giving a derived budget of 218,400 * 3 = 655,200 bytes. Rounded down to a
-/// clean, clearly-conservative constant.
-pub const MAX_TOTAL_SOURCE_CONTEXT_BYTES: usize = 600_000;
-
-/// [`render_source_context`] refused to render: even the mandatory part of
-/// the context (the comparison header, PR description, every changed file's
-/// diff hunk, and a named omission note for every before/after side that
-/// might not fit as full content — never omitted, since a reviewer without
-/// diffs has nothing to ground a guide in, and a dropped side with no
-/// record would hide that a gap exists) already exceeds the total budget.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceContextBudgetExceeded {
-    pub required_bytes: usize,
-    pub budget_bytes: usize,
-}
-
-impl fmt::Display for SourceContextBudgetExceeded {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "review-guide source context's mandatory diffs and omission notes need {} bytes, exceeding the {}-byte total budget",
-            self.required_bytes, self.budget_bytes
-        )
-    }
-}
-
-impl std::error::Error for SourceContextBudgetExceeded {}
-
-/// Render every changed file's diff hunk, and as much of its pinned
-/// before/after content as fits [`MAX_TOTAL_SOURCE_CONTEXT_BYTES`], into
-/// read-only Markdown context.
-///
-/// The inline packet remains available alongside the pinned read-only workspace.
-/// Rendering is revision-aware by construction: it reads only the packet's already-pinned
-/// `before`/`after` content, never a live checkout or a moving branch.
-///
-/// Every changed file's diff hunk is always included in full — it is never
-/// cut to make room, and content is never truncated mid-file. Full
-/// before/after file content is included only while budget remains; a side
-/// that does not fit is instead listed as a named omission in the same
-/// "Collection omissions" section used for capture-time gaps, so the guide
-/// and its reader both know what was not seen. Those fallback omission
-/// lines are reserved up front alongside the diffs: a gap is never dropped
-/// with no record. If the mandatory diffs plus those reserved notes exceed
-/// the budget, this returns [`SourceContextBudgetExceeded`] instead of
-/// silently sending a truncated prompt.
-pub fn render_source_context(packet: &SourcePacket) -> Result<String, SourceContextBudgetExceeded> {
-    render_source_context_with_budget(packet, MAX_TOTAL_SOURCE_CONTEXT_BYTES)
-}
-
-fn render_source_context_with_budget(
-    packet: &SourcePacket,
-    budget_bytes: usize,
-) -> Result<String, SourceContextBudgetExceeded> {
-    let mut header = String::new();
-    header.push_str("## Source context\n\n");
-    header.push_str(&format!(
+/// Render the small read-only comparison manifest appended after
+/// [`render_prompt`]: the comparison identity, PR description, and a
+/// change-kind/line-count entry for every changed file. The driver reads full
+/// file content, diffs, and related code itself from its pinned read-only
+/// workspace (see [`PROMPT_TEMPLATE`]'s embedded git-read instructions) — this
+/// never inlines diff hunks or before/after file content, so its size never
+/// scales with the size of the change.
+pub fn render_source_context(packet: &SourcePacket) -> String {
+    let mut out = String::new();
+    out.push_str("## Source context\n\n");
+    out.push_str(&format!(
         "Comparison: `{}` base `{}` (merge base `{}`) to head `{}`.\n\n",
         packet.canonical_pr_url, packet.observed_base_sha, packet.merge_base_sha, packet.head_sha
     ));
     if let Some(body) = &packet.body
         && !body.is_empty()
     {
-        header.push_str("### PR description\n\n");
-        header.push_str(body);
-        header.push_str("\n\n");
+        out.push_str("### PR description\n\n");
+        out.push_str(body);
+        out.push_str("\n\n");
     }
 
-    let mandatory_sections: Vec<String> = packet.files.iter().map(render_mandatory_file_section).collect();
-
-    // The "Collection omissions" section is itself part of the rendered
-    // budget (see `MAX_TOTAL_SOURCE_CONTEXT_BYTES`'s doc comment): its
-    // header/footer, every capture-time omission the packet already carries,
-    // and a named fallback line for every pinned before/after side that
-    // might not fit as full content, are reserved as mandatory up front
-    // alongside the diffs. Remaining budget is then only spent on full
-    // before/after blocks; a side that does not fit reuses its already-
-    // reserved line rather than competing with later files for leftover
-    // bytes. Without that reservation, remaining_bytes can shrink below
-    // one omission line and stay there, so every subsequent dropped side
-    // would vanish with no record — including from this section.
-    let static_omission_lines: Vec<String> = packet.omissions.iter().map(render_omission_line).collect();
-    let has_static_omissions = !static_omission_lines.is_empty();
-
-    struct OptionalSide {
-        block: String,
-        omission: boss_pr_review_sources::SourceOmission,
-        omission_line: String,
+    out.push_str("### Changed files\n\n");
+    for file in &packet.files {
+        out.push_str(&render_file_manifest_line(file));
     }
-    let optional_by_file: Vec<Vec<OptionalSide>> = packet
-        .files
-        .iter()
-        .map(|file| {
-            [
-                ("Before (merge base)", SourceSide::Before, file.before.as_ref()),
-                ("After (head)", SourceSide::After, file.after.as_ref()),
-            ]
-            .into_iter()
-            .filter_map(|(label, side, source)| {
-                let block = render_pinned_side_block(label, source)?;
-                let omission = budget_driven_omission(&file.path, side, budget_bytes, block.len());
-                let omission_line = render_omission_line(&omission);
-                Some(OptionalSide {
-                    block,
-                    omission,
-                    omission_line,
-                })
-            })
-            .collect()
-        })
-        .collect();
-    let has_optional_content = optional_by_file.iter().any(|sides| !sides.is_empty());
-    let needs_omissions_capacity = has_static_omissions || has_optional_content;
-    let omissions_overhead = OMISSIONS_HEADER.len() + OMISSIONS_FOOTER.len();
-    let potential_omission_bytes: usize = optional_by_file
-        .iter()
-        .flatten()
-        .map(|side| side.omission_line.len())
-        .sum();
+    out.push('\n');
 
-    let mut required_bytes = header.len() + mandatory_sections.iter().map(String::len).sum::<usize>();
-    if needs_omissions_capacity {
-        required_bytes += omissions_overhead
-            + static_omission_lines.iter().map(String::len).sum::<usize>()
-            + potential_omission_bytes;
-    }
-    if required_bytes > budget_bytes {
-        return Err(SourceContextBudgetExceeded {
-            required_bytes,
-            budget_bytes,
-        });
-    }
-
-    let mut out = header;
-    let mut remaining_bytes = budget_bytes - required_bytes;
-    let mut budget_omissions = Vec::new();
-    for (section, sides) in mandatory_sections.into_iter().zip(optional_by_file) {
-        out.push_str(&section);
-        for side in sides {
-            if side.block.len() <= remaining_bytes {
-                // Include the full block and give back this side's unused
-                // omission reservation so later files can still spend it on
-                // content. Later sides keep their own reserved lines, so a
-                // subsequent gap is still named.
-                remaining_bytes -= side.block.len();
-                remaining_bytes += side.omission_line.len();
-                out.push_str(&side.block);
-                continue;
-            }
-            budget_omissions.push(side.omission);
-        }
-    }
-
-    if needs_omissions_capacity && (has_static_omissions || !budget_omissions.is_empty()) {
+    if !packet.omissions.is_empty() {
         out.push_str(OMISSIONS_HEADER);
-        for line in &static_omission_lines {
-            out.push_str(line);
-        }
-        for omission in &budget_omissions {
+        for omission in &packet.omissions {
             out.push_str(&render_omission_line(omission));
         }
         out.push_str(OMISSIONS_FOOTER);
     }
-    Ok(out)
+    out
 }
 
-const OMISSIONS_HEADER: &str = "### Collection omissions\n\n\
-The following source material could not be captured. Do not invent content for these; state the limitation \
-instead.\n\n";
+const OMISSIONS_HEADER: &str = "### Capture diagnostics\n\n\
+These are capture-time packet diagnostics, not workspace source limitations. Notes that pinned source \
+was collected instead of an API patch describe capture provenance only. Try the pinned checkout with \
+Read/Grep/Glob or read-only git show/git diff first; state a source limitation only if that read fails. \
+Do not invent content.\n\n";
 const OMISSIONS_FOOTER: &str = "\n";
 
 fn render_omission_line(omission: &boss_pr_review_sources::SourceOmission) -> String {
@@ -281,58 +149,20 @@ fn render_omission_line(omission: &boss_pr_review_sources::SourceOmission) -> St
     format!("- `{path}` ({side}): {}\n", omission.reason)
 }
 
-fn budget_driven_omission(
-    path: &str,
-    side: SourceSide,
-    budget_bytes: usize,
-    block_bytes: usize,
-) -> boss_pr_review_sources::SourceOmission {
-    boss_pr_review_sources::SourceOmission {
-        path: Some(path.to_owned()),
-        side: Some(side),
-        reason: format!(
-            "omitted to stay within the {budget_bytes}-byte total source-context budget \
-             ({block_bytes} bytes needed)"
-        ),
-        terminal: true,
-    }
-}
-
-/// The part of a file's rendered section that is never subject to the
-/// budget: its heading, rename note, and diff hunk.
-fn render_mandatory_file_section(file: &boss_pr_review_sources::SourceFile) -> String {
-    let mut section = String::new();
-    section.push_str(&format!("### `{}` ({:?})\n\n", file.path, file.change_kind));
+/// One line naming a changed file's path, change kind, added/removed line
+/// counts, and (for a rename) its previous path. Never includes diff hunks or
+/// before/after content — the driver reads those itself via `git show`/`git
+/// diff` in its pinned workspace.
+fn render_file_manifest_line(file: &boss_pr_review_sources::SourceFile) -> String {
+    let mut line = format!(
+        "- `{}` ({:?}, +{}/-{})",
+        file.path, file.change_kind, file.additions, file.deletions
+    );
     if let Some(previous) = &file.previous_path {
-        section.push_str(&format!("Renamed from `{previous}`.\n\n"));
+        line.push_str(&format!(", renamed from `{previous}`"));
     }
-    if let Some(patch) = &file.patch {
-        section.push_str("Diff hunk:\n\n```diff\n");
-        section.push_str(patch);
-        section.push_str("\n```\n\n");
-    }
-    section
-}
-
-fn render_pinned_side_block(label: &str, source: Option<&boss_pr_review_sources::PinnedSource>) -> Option<String> {
-    let source = source?;
-    let mut block = String::new();
-    block.push_str(&format!("**{label}** (`{}` @ `{}`)", source.path, source.sha));
-    match (&source.content, &source.omission) {
-        (Some(content), _) => {
-            block.push_str(":\n\n```\n");
-            block.push_str(content);
-            if !content.ends_with('\n') {
-                block.push('\n');
-            }
-            block.push_str("```\n\n");
-        }
-        (None, Some(reason)) => {
-            block.push_str(&format!(" — omitted: {reason}\n\n"));
-        }
-        (None, None) => block.push_str(" — omitted: no content captured\n\n"),
-    }
-    Some(block)
+    line.push('\n');
+    line
 }
 
 /// A guide that passed structural and reference validation, ready to become
@@ -630,8 +460,8 @@ mod tests {
     }
 
     /// A packet with `file_count` files, each with its own diff hunk and
-    /// distinct before/after content, so budget apportionment across files
-    /// (not just within one file) can be exercised.
+    /// distinct before/after content, so manifest rendering across many
+    /// files can be exercised.
     fn multi_file_packet(file_count: usize) -> SourcePacket {
         let mut base = packet();
         base.files = (0..file_count)
@@ -701,25 +531,36 @@ mod tests {
     }
 
     #[test]
-    fn prompt_uses_only_supplied_context_without_inviting_exploration() {
-        assert_eq!(PROMPT_VERSION, "review-guide-v5");
-        assert!(PROMPT_TEMPLATE.contains("Use only this supplied context."));
+    fn prompt_directs_the_model_to_its_pinned_workspace() {
+        assert_eq!(PROMPT_VERSION, "review-guide-v7");
+        assert!(PROMPT_TEMPLATE.contains("read-only checkout of the repository"));
+        assert!(PROMPT_TEMPLATE.contains("git show {{BASE_SHA}}:<path>"));
+        assert!(PROMPT_TEMPLATE.contains("git diff --no-ext-diff --no-textconv {{BASE_SHA}} {{HEAD_SHA}} -- <path>"));
         assert!(PROMPT_TEMPLATE.contains("Do not claim to have executed tests or performed independent validation."));
-        // Submission instructions may name a tool; source exploration may not.
-        let prompt = PROMPT_TEMPLATE.to_ascii_lowercase();
-        for invitation in [
-            "read tools",
-            "available tools",
-            "inspect",
-            "read files",
-            "open files",
-            "checks you actually performed",
-            "context cannot be obtained",
+        // Source exploration must remain permitted throughout the prompt.
+        assert!(!PROMPT_TEMPLATE.contains("Use only this supplied context."));
+        assert!(PROMPT_TEMPLATE.contains("Read-only source exploration through Read, Grep, Glob"));
+        assert!(PROMPT_TEMPLATE.contains("submission is the only permitted write operation"));
+        assert!(!PROMPT_TEMPLATE.contains("only permitted tool command"));
+        assert!(!PROMPT_TEMPLATE.contains("run any other command"));
+        assert!(
+            !PROMPT_TEMPLATE
+                .to_ascii_lowercase()
+                .contains("checks you actually performed")
+        );
+    }
+
+    #[test]
+    fn prompt_directs_citations_to_pinned_source_lines() {
+        assert!(PROMPT_TEMPLATE.contains("blob/<sha>/<path>#L<start>-L<end>"));
+        assert!(PROMPT_TEMPLATE.contains("source lines you actually read"));
+        assert!(PROMPT_TEMPLATE.contains("full head or merge-base SHA"));
+        for absent in [
+            "validated GitHub link targets",
+            "supplied GitHub diff locations",
+            "Reuse supplied URLs",
         ] {
-            assert!(
-                !prompt.contains(invitation),
-                "prompt invites external action: {invitation}"
-            );
+            assert!(!PROMPT_TEMPLATE.contains(absent));
         }
     }
 
@@ -742,187 +583,88 @@ mod tests {
     }
 
     #[test]
-    fn source_context_embeds_pinned_content_and_diff() {
-        let context = render_source_context(&packet()).expect("fits the default budget");
+    fn source_context_lists_changed_files_without_inlining_content() {
+        let context = render_source_context(&packet());
         assert!(context.contains("src/retry.rs"));
-        assert!(context.contains("old();"));
-        assert!(context.contains("new();"));
-        assert!(context.contains("@@ -1,3 +1,3 @@"));
+        assert!(context.contains("+3/-1"));
+        assert!(!context.contains("old();"), "before content must not be inlined");
+        assert!(!context.contains("new();"), "after content must not be inlined");
+        assert!(!context.contains("@@ -1,3 +1,3 @@"), "diff hunk must not be inlined");
     }
 
     #[test]
-    fn budget_omits_full_content_but_keeps_diffs_and_names_the_omission() {
-        let packet = packet();
-        let file = &packet.files[0];
-        let before_block =
-            render_pinned_side_block("Before (merge base)", file.before.as_ref()).expect("fixture has before content");
-        let after_block =
-            render_pinned_side_block("After (head)", file.after.as_ref()).expect("fixture has after content");
-
-        // Mandatory reservation now includes both sides' named omission
-        // notes. Adding one byte less than the smaller content block leaves
-        // room for neither full side, so both fall back to those notes.
-        let mandatory_bytes = required_bytes_for(&packet);
-        let budget = mandatory_bytes + before_block.len().min(after_block.len()) - 1;
-
-        let context =
-            render_source_context_with_budget(&packet, budget).expect("mandatory diff alone fits this budget");
-        assert!(context.contains("@@ -1,3 +1,3 @@"), "diff hunk must never be omitted");
-        assert!(!context.contains("old();"), "before content should not fit the budget");
-        assert!(!context.contains("new();"), "after content should not fit the budget");
-        assert!(context.contains("### Collection omissions"));
-        let omissions = collection_omissions_section(&context);
-        assert!(omissions.contains("- `src/retry.rs` (Before):"));
-        assert!(omissions.contains("- `src/retry.rs` (After):"));
-        assert!(omissions.contains("total source-context budget"));
-        assert!(
-            context.len() <= budget,
-            "rendered context ({}) must stay within budget ({budget})",
-            context.len()
-        );
+    fn source_context_manifest_includes_previous_path_for_renames() {
+        let mut packet = packet();
+        packet.files[0].change_kind = ChangeKind::Renamed;
+        packet.files[0].previous_path = Some("old/path.rs".to_owned());
+        let context = render_source_context(&packet);
+        assert!(context.contains("- `src/retry.rs` (Renamed, +3/-1), renamed from `old/path.rs`\n"));
     }
 
     #[test]
-    fn diffs_alone_over_budget_fails_loudly() {
-        let err = render_source_context_with_budget(&packet(), 10).unwrap_err();
-        assert!(err.required_bytes > 10);
-        assert_eq!(err.budget_bytes, 10);
-        assert!(err.to_string().contains("exceeding the 10-byte total budget"));
-        assert!(err.to_string().contains("mandatory diffs and omission notes"));
-    }
-
-    #[test]
-    fn diffs_plus_reserved_omission_notes_over_budget_fails_loudly() {
+    fn source_context_manifest_lists_every_changed_file_without_content_and_stays_small() {
         let packet = multi_file_packet(20);
-        let required = required_bytes_for(&packet);
-        let err = render_source_context_with_budget(&packet, required - 1).unwrap_err();
-        assert!(err.required_bytes > required - 1);
-        assert_eq!(err.budget_bytes, required - 1);
-    }
-
-    fn collection_omissions_section(context: &str) -> &str {
-        let idx = context
-            .find("### Collection omissions")
-            .expect("Collection omissions section must be present");
-        &context[idx..]
-    }
-
-    /// Smallest budget at which diffs plus reserved omission notes fit.
-    /// Omission-line length depends on the digit count of `budget_bytes`, so
-    /// a probe at 1 is not the size that will actually be required at that
-    /// size; this iterates until the two agree.
-    fn required_bytes_for(packet: &SourcePacket) -> usize {
-        let mut probe = 1usize;
-        for _ in 0..16 {
-            match render_source_context_with_budget(packet, probe) {
-                Err(err) => {
-                    assert!(
-                        err.required_bytes > probe,
-                        "budget {probe} failed with a non-larger required_bytes {}",
-                        err.required_bytes
-                    );
-                    probe = err.required_bytes;
-                }
-                Ok(_) => return probe,
-            }
-        }
-        panic!("required_bytes did not converge");
-    }
-
-    #[test]
-    fn budget_holds_across_many_omitted_files() {
-        let packet = multi_file_packet(20);
-        let mandatory_bytes = required_bytes_for(&packet);
-
-        let file0 = &packet.files[0];
-        let before0 =
-            render_pinned_side_block("Before (merge base)", file0.before.as_ref()).expect("fixture has before");
-        let after0 = render_pinned_side_block("After (head)", file0.after.as_ref()).expect("fixture has after");
-
-        // Enough for the first file's full before/after content on top of
-        // the reserved diffs, omissions header, and a named omission line
-        // for every side. Later files may pick up a little extra from the
-        // first file's reclaimed reservation; the last file still cannot
-        // fit as full content.
-        let budget = mandatory_bytes + before0.len() + after0.len();
-
-        let context =
-            render_source_context_with_budget(&packet, budget).expect("mandatory diffs alone fit this budget");
-        assert!(
-            context.len() <= budget,
-            "rendered context ({}) must stay within budget ({budget}) even with many omissions",
-            context.len()
-        );
-        assert!(context.contains("### Collection omissions"));
-        let content_part = &context[..context.find("### Collection omissions").unwrap()];
-        let omissions = collection_omissions_section(&context);
-        let mut dropped_blocks = 0usize;
+        let context = render_source_context(&packet);
         for i in 0..20 {
             let path = format!("src/file_{i}.rs");
+            assert!(context.contains(&format!("`{path}`")), "manifest must list {path}");
             assert!(
-                content_part.contains(&format!("### `{path}`")),
-                "every file's diff heading must always be present, including {path}"
+                !context.contains(&format!("old_{i}();")),
+                "before content for {path} must not be inlined"
             );
-            let before_kept = content_part.contains(&format!("old_{i}();"));
-            let after_kept = content_part.contains(&format!("new_{i}();"));
-            for (kept, side) in [(before_kept, "Before"), (after_kept, "After")] {
-                let named = format!("- `{path}` ({side}):");
-                if kept {
-                    assert!(
-                        !omissions.contains(&named),
-                        "kept {side} side of {path} must not be listed as omitted"
-                    );
-                } else {
-                    assert!(
-                        omissions.contains(&named),
-                        "dropped {side} side of {path} must be named in Collection omissions"
-                    );
-                    dropped_blocks += 1;
-                }
-            }
+            assert!(
+                !context.contains(&format!("new_{i}();")),
+                "after content for {path} must not be inlined"
+            );
         }
-        assert!(dropped_blocks > 0, "budget must actually force some omissions");
-        assert_eq!(
-            omissions.matches("- `src/file_").count(),
-            dropped_blocks,
-            "every dropped before/after block must appear as exactly one omission line"
-        );
-        // Order-dependent apportionment: budget is spent on earlier files
-        // first, so the very first file should keep its full content while
-        // a later one is exhausted into an omission instead.
+        // A 20-file manifest must stay small without embedding source content.
         assert!(
-            context.contains("old_0();") && context.contains("new_0();"),
-            "first file should retain full content before budget runs out"
-        );
-        assert!(
-            !content_part.contains("old_19();") && !content_part.contains("new_19();"),
-            "last file's full content must be omitted once budget runs out"
+            context.len() < 4_000,
+            "manifest-only context for 20 files must stay small, was {} bytes",
+            context.len()
         );
     }
 
     #[test]
-    fn budget_equal_to_mandatory_names_every_omitted_side() {
-        let packet = multi_file_packet(20);
-        let mandatory_bytes = required_bytes_for(&packet);
-        let context = render_source_context_with_budget(&packet, mandatory_bytes)
-            .expect("diffs plus reserved omission notes must fit the mandatory size");
-        assert!(
-            context.len() <= mandatory_bytes,
-            "rendered context ({}) must stay within the mandatory reservation ({mandatory_bytes})",
-            context.len()
-        );
-        let content_part = &context[..context.find("### Collection omissions").unwrap()];
-        let omissions = collection_omissions_section(&context);
-        for i in 0..20 {
-            assert!(
-                !content_part.contains(&format!("old_{i}();")) && !content_part.contains(&format!("new_{i}();")),
-                "no full before/after content should fit at the mandatory reservation"
-            );
-            let path = format!("src/file_{i}.rs");
-            assert!(omissions.contains(&format!("- `{path}` (Before):")));
-            assert!(omissions.contains(&format!("- `{path}` (After):")));
-        }
-        assert_eq!(omissions.matches("- `src/file_").count(), 40);
+    fn source_context_reports_capture_time_omissions() {
+        let mut packet = packet();
+        packet.omissions.push(boss_pr_review_sources::SourceOmission {
+            path: Some("vendor/blob.bin".to_owned()),
+            side: None,
+            reason: "binary content not captured".to_owned(),
+            terminal: true,
+        });
+        let context = render_source_context(&packet);
+        assert!(context.contains("### Capture diagnostics"));
+        assert!(context.contains("vendor/blob.bin"));
+        assert!(context.contains("binary content not captured"));
+        assert!(context.contains("Try the pinned checkout"));
+        assert!(context.contains("state a source limitation only if that read fails"));
+        assert!(!context.contains("source material could not be captured"));
+    }
+
+    #[test]
+    fn source_context_labels_missing_api_patch_as_capture_provenance() {
+        let mut packet = packet();
+        packet.omissions.push(boss_pr_review_sources::SourceOmission {
+            path: Some("src/retry.rs".to_owned()),
+            side: None,
+            reason: "GitHub omitted the API patch; pinned source was collected instead".to_owned(),
+            terminal: true,
+        });
+        let context = render_source_context(&packet);
+        assert!(context.contains("`src/retry.rs` (Modified, +3/-1)"));
+        assert!(context.contains("### Capture diagnostics"));
+        assert!(context.contains("describe capture provenance only"));
+        assert!(context.contains("read-only git show/git diff first"));
+        assert!(context.contains("pinned source was collected instead"));
+        assert!(!context.contains("### Collection omissions"));
+    }
+
+    #[test]
+    fn source_context_omits_collection_omissions_section_when_none_recorded() {
+        let context = render_source_context(&packet());
+        assert!(!context.contains("### Capture diagnostics"));
     }
 
     #[test]
