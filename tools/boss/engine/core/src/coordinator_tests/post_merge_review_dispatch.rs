@@ -123,3 +123,54 @@ async fn post_merge_review_batch_member_positions_via_goto_revision_not_pr() {
         "create_change must not be called when goto_workspace_revision positions the workspace"
     );
 }
+
+#[tokio::test]
+async fn review_guide_positions_at_frozen_comparison_head() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_test_product_named(&db, "GuideProduct");
+    let root = create_test_chore_manual(&db, product.id, "guide target");
+    let head = "b".repeat(40);
+    let packet = crate::test_support::review_guide_source_packet(&"a".repeat(40), &head);
+    let crate::work::PrSourceCapturePersistOutcome::Stored(capture) = db
+        .persist_pr_review_guide_source_capture(&root.id, 1, crate::work::PrSourceCaptureTrigger::Creation, &packet)
+        .unwrap()
+    else {
+        panic!("expected capture")
+    };
+    let attempt = db
+        .create_pr_review_guide_attempt(
+            &capture.series_id,
+            &capture.comparison_id,
+            boss_review_guide::PROMPT_VERSION,
+        )
+        .unwrap();
+    let execution = db
+        .create_pr_review_guide_execution(&capture.comparison_id, "acme/widget")
+        .unwrap();
+    db.bind_pr_review_guide_attempt_execution(&attempt.id, &execution.id)
+        .unwrap();
+    let cube = Arc::new(FakeCubeClient::default());
+    let runner = Arc::new(FakeExecutionRunner {
+        pending: true,
+        ..FakeExecutionRunner::default()
+    });
+    let mut coord = ExecutionCoordinator::new(db, WorkerPool::new(1), cube.clone(), runner);
+    coord.set_review_pool(WorkerPool::new_review(1));
+    let coordinator = Arc::new(coord);
+    let worker = coordinator
+        .pool_for_execution(&execution)
+        .claim_worker(&execution.id, None)
+        .await
+        .unwrap();
+    coordinator
+        .schedule_execution(&execution, &worker, DispatchAdmission::Queued)
+        .await
+        .unwrap();
+    let calls = cube.goto_revision_calls.lock().await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, head);
+    assert!(cube.goto_calls.lock().await.is_empty());
+    assert!(cube.create_calls.lock().await.is_empty());
+}

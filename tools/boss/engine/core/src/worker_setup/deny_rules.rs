@@ -147,17 +147,16 @@ pub fn answer_agent_deny_rules() -> Vec<String> {
     read_only_worker_deny_rules()
 }
 
-/// Review-guide workers can only submit their result; the shared hook checks
-/// exact shell syntax and denies every other tool, including built-in reads.
+/// Review-guide workers inspect pinned source and submit one result. The shared
+/// hook narrows Bash to literal reads and immutable git-object inspection.
 pub fn review_guide_allow_rules() -> Vec<String> {
-    vec![
-        r#"Bash("$BOSS_BIN" propose review-guide:*)"#.to_owned(),
-        r#"Bash("${BOSS_BIN}" propose review-guide:*)"#.to_owned(),
-    ]
+    crate::driver::codex::review_guide_allow_rules()
 }
 
 pub fn review_guide_deny_rules() -> Vec<String> {
-    read_only_worker_deny_rules()
+    let mut rules = read_only_worker_deny_rules();
+    rules.extend(crate::driver::codex::review_guide_deny_rules());
+    rules
 }
 
 /// Shared deny body for workers that must not write files, publish, or

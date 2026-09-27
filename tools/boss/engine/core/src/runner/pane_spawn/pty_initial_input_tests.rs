@@ -287,6 +287,7 @@ fn grok_initial_input_stays_under_the_limit_with_long_workspace_path_and_full_de
     // embeds this string twice, so a realistic length matters here too.
     let boss_data_dir = long_workspace_path.join("boss-events-socket-parent-dir-for-this-run");
     let permission_input = PermissionInput {
+        frontend_socket_path: None,
         worker_kind: WorkerKind::Standard,
         workspace_path: long_workspace_path.clone(),
         events_socket_path: boss_data_dir.join("events.sock"),

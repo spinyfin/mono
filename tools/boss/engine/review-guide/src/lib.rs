@@ -12,7 +12,9 @@
 
 use std::fmt;
 
-use boss_pr_review_sources::{SourcePacket, SourceSide, validate_pinned_reference};
+#[cfg(test)]
+use boss_pr_review_sources::validate_pinned_reference;
+use boss_pr_review_sources::{SourcePacket, SourceSide};
 
 /// The prompt contract version this crate implements. A change to
 /// [`PROMPT_TEMPLATE`] (or its substitution behavior) must land as a new
@@ -24,7 +26,7 @@ pub const PROMPT_VERSION: &str = "review-guide-v5";
 /// The exact production prompt template, byte-identical to the fenced block
 /// in `automatic-pr-review-guides.md`'s "Prompt contract" section. Only the
 /// five `{{PLACEHOLDER}}` tokens are substituted by [`render_prompt`]; the
-/// packet/broker context is supplied separately (see [`render_source_context`]).
+/// source context is supplied separately (see [`render_source_context`]).
 ///
 /// Do not hand-edit this string without also updating
 /// [`PROMPT_TEMPLATE_SHA256`] and bumping [`PROMPT_VERSION`] — the
@@ -77,7 +79,7 @@ pub struct PromptMetadata<'a> {
 }
 
 /// Substitute only the five metadata placeholders into [`PROMPT_TEMPLATE`].
-/// Packet/broker context is not part of this string — callers append
+/// Source context is not part of this string — callers append
 /// [`render_source_context`] separately, keeping "the guide task" and "the
 /// source material" visibly distinct in the rendered prompt.
 pub fn render_prompt(metadata: &PromptMetadata<'_>) -> String {
@@ -131,12 +133,8 @@ impl std::error::Error for SourceContextBudgetExceeded {}
 /// before/after content as fits [`MAX_TOTAL_SOURCE_CONTEXT_BYTES`], into
 /// read-only Markdown context.
 ///
-/// This is the review-guide worker's entire "source access": the worker has
-/// no interactive read tool (its guard
-/// allows only result submission — see
-/// `boss_engine_driver::codex::review_guide_guard`), so every pinned line it
-/// can possibly cite must already be present here. The rendering is
-/// revision-aware by construction: it reads only the packet's already-pinned
+/// The inline packet remains available alongside the pinned read-only workspace.
+/// Rendering is revision-aware by construction: it reads only the packet's already-pinned
 /// `before`/`after` content, never a live checkout or a moving branch.
 ///
 /// Every changed file's diff hunk is always included in full — it is never
@@ -358,13 +356,14 @@ pub enum GuideValidationIssue {
     /// a structured walkthrough.
     TooFewSections { found: usize },
     /// A `github.com` link the model wrote does not resolve to any pinned
-    /// source in the packet — an invented anchor, a stale/foreign SHA, or a
-    /// line range outside the captured content.
+    /// source at the recorded head or merge-base revision — an invented anchor,
+    /// a stale/foreign SHA, or a line range outside the source content.
     InventedReference { href: String },
     /// A `github.com` link uses a navigation shape this contract never hands
     /// out as validated (current-PR-diff `#diff-` fragments, repository
     /// `/compare/` pages) — see the design's "GitHub navigation contract".
-    /// Only the pinned-source `blob/{sha}/...#L..` shape is supported today.
+    /// Only pinned-source `blob/{sha}/...` links with optional line anchors
+    /// are supported.
     UnsupportedNavigation { href: String },
 }
 
@@ -382,7 +381,7 @@ impl fmt::Display for GuideValidationIssue {
             Self::InventedReference { href } => {
                 write!(
                     f,
-                    "reference `{href}` does not resolve to any pinned source in the packet"
+                    "reference `{href}` does not resolve to source at the recorded head or merge-base revision"
                 )
             }
             Self::UnsupportedNavigation { href } => {
@@ -410,7 +409,27 @@ pub const MIN_SECTION_HEADINGS: usize = 4;
 /// the explanation is *correct*: "Packet availability does not prove the
 /// model inspected or correctly understood every relevant line" (design,
 /// "Source acquisition at pinned revisions"). Human sampling covers that.
-pub fn validate_guide_output(raw: &str, packet: &SourcePacket) -> Result<ValidatedGuide, Vec<GuideValidationIssue>> {
+#[cfg(test)]
+fn validate_guide_output(raw: &str, packet: &SourcePacket) -> Result<ValidatedGuide, Vec<GuideValidationIssue>> {
+    validate_guide_output_with_resolver(raw, packet, |sha, path, start, end| {
+        [SourceSide::Before, SourceSide::After].into_iter().any(|side| {
+            let expected = match side {
+                SourceSide::Before => &packet.merge_base_sha,
+                SourceSide::After => &packet.head_sha,
+            };
+            sha == expected && validate_pinned_reference(packet, side, path, start, end).is_ok()
+        })
+    })
+}
+
+/// Engine callers resolve links from local git objects at the pinned comparison
+/// commits, including files absent from the inline packet. A (0, 0) range
+/// requests validation of the whole file, including an empty file.
+pub fn validate_guide_output_with_resolver(
+    raw: &str,
+    packet: &SourcePacket,
+    resolve: impl Fn(&str, &str, u32, u32) -> bool,
+) -> Result<ValidatedGuide, Vec<GuideValidationIssue>> {
     let mut issues = Vec::new();
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -427,7 +446,7 @@ pub fn validate_guide_output(raw: &str, packet: &SourcePacket) -> Result<Validat
     }
 
     for href in github_links(trimmed) {
-        if let Err(issue) = validate_reference(&href, packet) {
+        if let Err(issue) = validate_reference(&href, packet, &resolve) {
             issues.push(issue);
         }
     }
@@ -463,29 +482,29 @@ fn markdown_headings(text: &str) -> Vec<(u8, &str)> {
 /// Every `https://github.com/...` href inside a Markdown link or bare
 /// autolink in `text`.
 fn github_links(text: &str) -> Vec<String> {
-    let link_re = regex::Regex::new(r"\]\((https://github\.com/[^\s)]+)\)").expect("static regex");
-    let bare_re = regex::Regex::new(r"(?:^|[\s(])(https://github\.com/\S+)").expect("static regex");
+    let link_re = regex::Regex::new(r#"(https://github\.com/[^\s<>\)\]`*"']+)"#).expect("static regex");
     let mut hrefs: Vec<String> = link_re
         .captures_iter(text)
-        .map(|caps| caps[1].trim_end_matches(['.', ',', ')']).to_owned())
+        .map(|caps| caps[1].trim_end_matches(['.', ',', ')', ';', ':', '!', '?']).to_owned())
         .collect();
-    for caps in bare_re.captures_iter(text) {
-        let href = caps[1].trim_end_matches(['.', ',', ')']).to_owned();
-        if !hrefs.contains(&href) {
-            hrefs.push(href);
-        }
-    }
+    hrefs.sort();
+    hrefs.dedup();
     hrefs
 }
 
 /// Classify and validate one extracted `github.com` href against the packet.
-fn validate_reference(href: &str, packet: &SourcePacket) -> Result<(), GuideValidationIssue> {
+fn validate_reference(
+    href: &str,
+    packet: &SourcePacket,
+    resolve: &impl Fn(&str, &str, u32, u32) -> bool,
+) -> Result<(), GuideValidationIssue> {
     if let Some(parsed) = parse_pinned_blob_href(href) {
         let (owner_repo, sha, path, start, end) = parsed;
         for side in [SourceSide::Before, SourceSide::After] {
-            if let Ok(reference) = validate_pinned_reference(packet, side, &path, start, end)
-                && reference.href == href
-                && reference_repository_matches(packet, side, &owner_repo, &sha)
+            if reference_repository_matches(packet, side, &owner_repo, &sha)
+                && (start > 0 || (start == 0 && end == 0))
+                && end >= start
+                && resolve(&sha, &path, start, end)
             {
                 return Ok(());
             }
@@ -494,6 +513,9 @@ fn validate_reference(href: &str, packet: &SourcePacket) -> Result<(), GuideVali
     }
     if href.contains("/files#diff-") || href.contains("/compare/") {
         return Err(GuideValidationIssue::UnsupportedNavigation { href: href.to_owned() });
+    }
+    if href.contains("/blob/") {
+        return Err(GuideValidationIssue::InventedReference { href: href.to_owned() });
     }
     // A bare PR/issue/repo link with no line-anchored content claim (e.g. the
     // canonical `{{PR_URL}}` itself, restated in prose) makes no pinned-source
@@ -510,19 +532,24 @@ fn reference_repository_matches(packet: &SourcePacket, side: SourceSide, owner_r
 
 /// Parse a pinned-source blob URL of the shape
 /// `https://github.com/{owner}/{repo}/blob/{40-hex-sha}/{path}#L{n}` or
-/// `#L{start}-L{end}`, matching exactly what
-/// `boss_pr_review_sources::validate_pinned_reference` emits. Any other
-/// shape (no fragment, non-hex/short SHA, missing path) returns `None` and
+/// `#L{start}-L{end}`, matching what
+/// `boss_pr_review_sources::validate_pinned_reference` emits. An omitted
+/// fragment denotes the whole file and resolves with the (0, 0) range. Any other
+/// shape (non-hex/short SHA, missing path) returns `None` and
 /// is handled by the caller as an unsupported/unverifiable reference.
 fn parse_pinned_blob_href(href: &str) -> Option<(String, String, String, u32, u32)> {
-    let re =
-        regex::Regex::new(r"^https://github\.com/([^/]+/[^/]+)/blob/([0-9a-fA-F]{40})/([^#]+)#L(\d+)(?:-L(\d+))?$")
-            .expect("static regex");
+    let re = regex::Regex::new(
+        r"^https://github\.com/([^/]+/[^/]+)/blob/([0-9a-fA-F]{40})/([^#]+)(?:#L(\d+)(?:-L(\d+))?)?$",
+    )
+    .expect("static regex");
     let caps = re.captures(href)?;
     let owner_repo = caps[1].to_owned();
     let sha = caps[2].to_owned();
     let path = percent_decode(&caps[3]);
-    let start: u32 = caps[4].parse().ok()?;
+    let start: u32 = caps.get(4).map(|m| m.as_str().parse().ok()).unwrap_or(Some(0))?;
+    if caps.get(4).is_some() && start == 0 {
+        return None;
+    }
     let end: u32 = caps.get(5).map(|m| m.as_str().parse().ok()).unwrap_or(Some(start))?;
     Some((owner_repo, sha, path, start, end))
 }
@@ -907,6 +934,22 @@ mod tests {
         let link = format!("[the fix]({href})");
         let guide = validate_guide_output(&valid_guide_body(&link), &packet()).expect("must validate");
         assert!(guide.markdown.contains("Fix retry backoff"));
+    }
+
+    #[test]
+    fn formatted_links_and_whole_file_permalinks_pass() {
+        let href = format!("https://github.com/acme/widget/blob/{}/src/retry.rs", "c".repeat(40));
+        for link in [
+            format!("`{href}#L1`"),
+            format!("**{href}#L1**"),
+            format!("'{href}#L1';"),
+            format!("{href}!"),
+        ] {
+            validate_guide_output_with_resolver(&valid_guide_body(&link), &packet(), |sha, path, start, end| {
+                sha == "c".repeat(40) && path == "src/retry.rs" && ((start, end) == (1, 1) || (start, end) == (0, 0))
+            })
+            .unwrap();
+        }
     }
 
     #[test]

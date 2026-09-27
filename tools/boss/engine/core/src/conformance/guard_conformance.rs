@@ -532,6 +532,7 @@ fn run_one_model_probe(model: &str, codex_bin: &Path, auth_source: &Path) {
             .unwrap_or_else(|err| panic!("codex_home_for_run for {model}: {err}"));
 
         let input = PermissionInput {
+            frontend_socket_path: None,
             worker_kind: WorkerKind::Standard,
             workspace_path: workspace.clone(),
             events_socket_path: data_dir.join("events.sock"),

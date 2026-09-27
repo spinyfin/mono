@@ -89,6 +89,8 @@ pub struct PermissionInput {
     /// directory for sandbox deny globs and the deterministic path-guard hook.
     /// Ignored (no sandbox installed) when `is_remote = true`.
     pub events_socket_path: PathBuf,
+    /// Exact frontend socket allowed for a sandboxed guide's proposal submission.
+    pub frontend_socket_path: Option<PathBuf>,
     /// Absolute path to the `boss-event` shim binary. Baked into every hook
     /// command as the final argument so the shim fires regardless of `PATH`.
     pub boss_event_path: PathBuf,

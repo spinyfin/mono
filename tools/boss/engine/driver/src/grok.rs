@@ -1921,6 +1921,7 @@ mod tests {
         let _guard = env_for_provision(&homes, &auth, true);
 
         let input = PermissionInput {
+            frontend_socket_path: None,
             worker_kind: crate::WorkerKind::Standard,
             workspace_path: tmp.path().join("ws"),
             events_socket_path: tmp.path().join("events.sock"),
@@ -1968,6 +1969,7 @@ mod tests {
         fs::write(&checkleft_guard_script, "#!/usr/bin/env python3\n").unwrap();
 
         let input = PermissionInput {
+            frontend_socket_path: None,
             worker_kind: crate::WorkerKind::Standard,
             workspace_path: workspace.clone(),
             events_socket_path: tmp.path().join("boss-data").join("events.sock"),
@@ -2047,6 +2049,7 @@ mod tests {
 
         let boss_data_dir = tmp.path().join("boss-data");
         let input = PermissionInput {
+            frontend_socket_path: None,
             worker_kind: crate::WorkerKind::Standard,
             workspace_path: workspace.clone(),
             events_socket_path: boss_data_dir.join("events.sock"),
@@ -2159,6 +2162,7 @@ mod tests {
         driver.provision_workspace(&workspace, "hello", run_id).await.unwrap();
 
         let input = PermissionInput {
+            frontend_socket_path: None,
             worker_kind: crate::WorkerKind::Reviewer,
             workspace_path: workspace.clone(),
             events_socket_path: tmp.path().join("boss-data").join("events.sock"),
@@ -2232,6 +2236,7 @@ mod tests {
         driver.provision_workspace(&workspace, "hello", run_id).await.unwrap();
 
         let input = PermissionInput {
+            frontend_socket_path: None,
             worker_kind: crate::WorkerKind::Standard,
             workspace_path: workspace.clone(),
             events_socket_path: tmp.path().join("forwarded-events.sock"),
@@ -2354,6 +2359,7 @@ mod tests {
             .expect("provision must succeed");
 
         let input = PermissionInput {
+            frontend_socket_path: None,
             worker_kind: crate::WorkerKind::Reviewer,
             workspace_path: workspace.clone(),
             events_socket_path: scratch_root.join("boss-data").join("events.sock"),
@@ -2518,6 +2524,7 @@ mod tests {
             .expect("provision must succeed");
 
         let input = PermissionInput {
+            frontend_socket_path: None,
             worker_kind: crate::WorkerKind::Reviewer,
             workspace_path: workspace.clone(),
             events_socket_path: scratch_root.join("boss-data").join("events.sock"),
@@ -2638,6 +2645,7 @@ mod tests {
             .expect("provision must succeed");
 
         let input = PermissionInput {
+            frontend_socket_path: None,
             worker_kind: crate::WorkerKind::Standard,
             workspace_path: workspace.clone(),
             events_socket_path: scratch_root.join("boss-data").join("events.sock"),

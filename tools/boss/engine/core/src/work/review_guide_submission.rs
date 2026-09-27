@@ -18,9 +18,10 @@ pub(super) fn prepare(db: &WorkDb, execution_id: &str, payload_json: &str) -> Re
     };
     let packet = super::review_guide_sources::load_packet(&db.artifact_root()?, reference.1.as_deref(), &reference.2)?;
     let payload: boss_protocol::ReviewGuideProposalPayload = serde_json::from_str(payload_json)?;
-    let validation = boss_review_guide::validate_guide_output(&payload.body_markdown, &packet)
+    let validation = db
+        .validate_review_guide_at_workspace(execution_id, &payload.body_markdown, &packet)
         .map(|_| ())
-        .map_err(|issues| issues.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "));
+        .map_err(|error| error.to_string());
     Ok(PreparedGuide { reference, validation })
 }
 
@@ -93,6 +94,19 @@ pub(super) fn accept(
 }
 
 impl WorkDb {
+    pub(crate) fn validate_review_guide_at_workspace(
+        &self,
+        execution_id: &str,
+        raw: &str,
+        packet: &boss_pr_review_sources::SourcePacket,
+    ) -> Result<boss_review_guide::ValidatedGuide> {
+        let execution = self.get_execution(execution_id)?;
+        let path = execution
+            .workspace_path
+            .context("review-guide execution has no pinned workspace")?;
+        crate::review_guide_workspace::validate(std::path::Path::new(&path), packet, raw)
+    }
+
     pub(crate) fn submitted_review_guide(&self, execution_id: &str, attempt_id: &str) -> Result<Option<String>> {
         let proposals =
             self.list_worker_proposals_for_execution(execution_id, boss_protocol::ProposalKind::ReviewGuide)?;

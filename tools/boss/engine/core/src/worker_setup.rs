@@ -138,10 +138,10 @@ pub enum WorkerKind {
     /// task/comment/cube state, or take any action other than posting its one
     /// reply. See [`crate::answer_agent`] for the worker-facing surface.
     AnswerAgent,
-    /// PR review-guide generator on the fixed Codex Astra profile. Reads only
+    /// PR review-guide generator on the fixed Codex Astra profile. Reads its pinned, read-only workspace and
     /// the embedded source packet and submits Markdown with
     /// `"$BOSS_BIN" propose review-guide --body`. A shared PreToolUse allowlist
-    /// blocks every other tool/command; Claude additionally uses dontAsk.
+    /// allows only source reads and submission; Claude additionally uses dontAsk.
     ReviewGuide,
 }
 

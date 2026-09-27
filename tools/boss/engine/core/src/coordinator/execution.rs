@@ -1129,7 +1129,13 @@ impl ExecutionCoordinator {
         // PR. Resolved once here so both `pr_for_goto` below and the
         // post-lease positioning step special-case it via
         // `goto_workspace_revision` instead of `goto_workspace`.
-        let post_merge_target_sha: Option<String> = if execution.kind == ExecutionKind::PrReview {
+        let immutable_target_sha: Option<String> = if execution.kind == ExecutionKind::PrReviewGuide {
+            let capture = self
+                .work_db
+                .get_pr_review_guide_comparison_by_id(&execution.work_item_id)?
+                .ok_or_else(|| anyhow!("review-guide comparison is missing; cannot pin workspace"))?;
+            Some(capture.packet.head_sha)
+        } else if execution.kind == ExecutionKind::PrReview {
             let member = self
                 .work_db
                 .review_batch_member_for_execution(&execution.id)
@@ -1163,7 +1169,7 @@ impl ExecutionCoordinator {
 
         // PR number to pass to `cube workspace goto` after the lease.
         // Set for pr_review and revision_implementation executions that have a PR URL.
-        let pr_for_goto: Option<u64> = if post_merge_target_sha.is_some() {
+        let pr_for_goto: Option<u64> = if immutable_target_sha.is_some() {
             None
         } else {
             match execution.kind {
@@ -1456,7 +1462,7 @@ impl ExecutionCoordinator {
         // For PR-targeting executions, run `cube workspace goto --workspace <path>
         // --pr <n>` AFTER the lease to position the working copy on the PR branch
         // head; for a post-merge review batch member, position on the frozen
-        // merge commit via `--revision <sha>` instead (see `post_merge_target_sha`
+        // merge commit via `--revision <sha>` instead (see `immutable_target_sha`
         // above — the PR is MERGED by construction, which `--pr` refuses
         // outright). Both must happen before handing the workspace to the
         // worker. If positioning fails, abort dispatch with a diagnosable stage.
@@ -1481,7 +1487,7 @@ impl ExecutionCoordinator {
             }
         };
         let recovered_blocked = recovered.as_ref().is_some_and(|(_, has_work)| *has_work);
-        let goto_target = match (pr_for_goto, post_merge_target_sha.as_deref()) {
+        let goto_target = match (pr_for_goto, immutable_target_sha.as_deref()) {
             _ if recovered_blocked => None,
             (_, Some(sha)) => Some(GotoTarget::Revision(sha)),
             (Some(pr), None) => Some(GotoTarget::Pr(pr)),
@@ -1530,7 +1536,7 @@ impl ExecutionCoordinator {
                         GotoTarget::Revision(sha) => serde_json::json!({
                             "target_sha": sha,
                             "kind": execution.kind.as_str(),
-                            "post_merge": true,
+                            "post_merge": execution.kind == ExecutionKind::PrReview,
                         }),
                     };
                     self.dispatch_events
@@ -1592,7 +1598,7 @@ impl ExecutionCoordinator {
         // create_change (there is nothing to create; the worker edits or
         // reviews the branch/commit directly). For all other executions
         // create a fresh jj change via `cube change create`.
-        let keep_change = recovered_blocked || pr_for_goto.is_some() || post_merge_target_sha.is_some();
+        let keep_change = recovered_blocked || pr_for_goto.is_some() || immutable_target_sha.is_some();
         let change: Option<CubeChangeHandle> = if keep_change {
             None
         } else {

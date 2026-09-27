@@ -178,6 +178,11 @@ pub fn structural_deny_rules(
         rules.push(format!("Edit({workspace}/**)"));
     }
 
+    if worker_kind == WorkerKind::ReviewGuide {
+        rules.extend(["Edit(**)".into(), "NotebookEdit(**)".into()]);
+        rules.extend(crate::codex::review_guide_deny_rules());
+    }
+
     // Both confirmed-enforced spellings (investigation §B3): the `cmd:*`
     // suffix form and the bare-argument form.
     rules.push("Bash(rm -rf *)".to_owned());
@@ -229,6 +234,11 @@ pub fn extra_args(
         args.push("--deny".to_owned());
         args.push(rule);
     }
+    if worker_kind == WorkerKind::ReviewGuide {
+        for rule in crate::codex::review_guide_allow_rules() {
+            args.extend(["--allow".into(), rule]);
+        }
+    }
     if let Some(mode) = permission_mode_for_worker_kind(worker_kind) {
         args.push("--permission-mode".to_owned());
         args.push(mode.to_owned());
@@ -240,6 +250,19 @@ pub fn extra_args(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn guide_allows_source_reads_and_submission_and_denies_edits() {
+        let args = extra_args(WorkerKind::ReviewGuide, None, Path::new("/repo"), false);
+        for rule in crate::codex::review_guide_allow_rules() {
+            assert!(args.windows(2).any(|pair| pair == ["--allow", &rule]));
+        }
+        for rule in crate::codex::review_guide_deny_rules() {
+            assert!(args.windows(2).any(|pair| pair == ["--deny", &rule]));
+        }
+        assert!(args.windows(2).any(|pair| pair == ["--deny", "Edit(**)"]));
+        assert!(args.windows(2).any(|pair| pair == ["--permission-mode", "dontAsk"]));
+    }
 
     #[test]
     fn sandbox_profile_arg_local_uses_custom_profiles() {
