@@ -191,14 +191,10 @@ pub struct GrokDriver {
 ///
 /// Execution shape (design §Execution shape + T-03 pane mode):
 /// ```text
-/// python3 .boss/feed-initial-prompt .grok/initial-prompt.txt
-///   grok --model … --reasoning-effort … --no-alt-screen --always-approve
-///        --trust --session-id <uuid> --cwd <ws> --no-subagents --no-memory
+/// grok --model … --reasoning-effort … --no-alt-screen --always-approve
+///      --trust --session-id <uuid> --cwd <ws> --no-subagents --no-memory
+///      "$(cat .grok/initial-prompt.txt)"
 /// ```
-///
-/// The feeder writes the prompt file into the TUI over a PTY so the prompt
-/// body never lands on argv (`ARG_MAX`). Grok 1.0.41's `--prompt-file` is
-/// single-turn/headless and is not the worker shape.
 ///
 /// `GROK_HOME` / scoped `HOME` / `Unset(GROK_FOLDER_TRUST)` are env
 /// directives on the [`SpawnPlan`], not flags. Never emits `-w` /
@@ -265,12 +261,12 @@ pub fn build_grok_pane_command(request: &SpawnRequest<'_>, workspace: &Path, ses
     // investigation's "What would have to change" section.
     cmd.push_str(" --no-subagents");
     cmd.push_str(" --no-memory");
-    cmd.push('\n');
-    crate::wrap_spawn_command_to_feed_prompt(
-        &cmd,
-        GROK_DESCRIPTOR.config_dir,
-        GROK_DESCRIPTOR.initial_prompt_filename,
-    )
+    // Prompt from file via command substitution — briefs run to tens of KB.
+    cmd.push_str(&format!(
+        " \"$(cat {}/{})\"\n",
+        GROK_DESCRIPTOR.config_dir, GROK_DESCRIPTOR.initial_prompt_filename,
+    ));
+    cmd
 }
 
 #[async_trait]
@@ -1594,10 +1590,7 @@ mod tests {
         );
 
         let cmd = &plan.command;
-        assert!(
-            cmd.starts_with("python3 .boss/feed-initial-prompt") && cmd.contains(" grok "),
-            "command starts with the prompt feeder then grok: {cmd}"
-        );
+        assert!(cmd.starts_with("grok "), "command starts with grok: {cmd}");
         assert!(cmd.contains("--model "), "has --model: {cmd}");
         assert!(cmd.contains("grok-4.6"), "has model slug: {cmd}");
         assert!(cmd.contains("--reasoning-effort "), "has --reasoning-effort: {cmd}");
@@ -1622,20 +1615,14 @@ mod tests {
         assert!(cmd.contains("--no-subagents"), "has --no-subagents: {cmd}");
         assert!(cmd.contains("--no-memory"), "has --no-memory: {cmd}");
         assert!(
-            cmd.contains("python3 .boss/feed-initial-prompt '.grok/initial-prompt.txt'"),
-            "prompt via file feeder, not argv expansion: {cmd}"
+            cmd.contains("\"$(cat .grok/initial-prompt.txt)\""),
+            "prompt via cat substitution: {cmd}"
         );
-        assert!(!cmd.contains("$(cat"), "prompt must not expand onto argv: {cmd}");
         assert!(!cmd.contains("--worktree"), "forbids --worktree: {cmd}");
         assert!(!cmd.contains("--worktree-ref"), "forbids --worktree-ref: {cmd}");
         // Bare `-w` as a flag token (not part of another word).
         let tokens: Vec<&str> = cmd.split_whitespace().collect();
         assert!(!tokens.contains(&"-w"), "forbids bare -w: {cmd}");
-        assert!(
-            cmd.len() < 4096,
-            "launch command must stay well under ARG_MAX; got {} bytes: {cmd}",
-            cmd.len()
-        );
     }
 
     #[tokio::test]
@@ -2078,11 +2065,7 @@ mod tests {
                 "local macOS pane must launch without an outer Seatbelt: {}",
                 spawn.command
             );
-            assert!(
-                spawn.command.contains(" grok ") && spawn.command.starts_with("python3 .boss/feed-initial-prompt"),
-                "{}",
-                spawn.command
-            );
+            assert!(spawn.command.starts_with("grok "), "{}", spawn.command);
         } else {
             let sandbox_toml_path = grok_home.join("sandbox.toml");
             assert!(

@@ -999,7 +999,7 @@ mod tests {
         .unwrap();
         let claude_cmd = claude_cfg.spawn_command_in(&registry, false, None).unwrap();
         assert!(
-            claude_cmd.starts_with("python3 .boss/feed-initial-prompt") && claude_cmd.contains(" claude "),
+            claude_cmd.starts_with("claude"),
             "claude slug still routes to ClaudeDriver, got {claude_cmd:?}",
         );
     }
@@ -1252,7 +1252,7 @@ mod tests {
         let cfg = resolve_spawn_config(&SpawnResolutionInput::builder().build()).unwrap();
         assert_eq!(
             cfg.claude_invocation(false, None),
-            "python3 .boss/feed-initial-prompt '.claude/initial-prompt.txt' claude --model opus --disallowedTools=AskUserQuestion --permission-mode auto\n",
+            "claude --model opus --disallowedTools=AskUserQuestion --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
         );
     }
 
@@ -1270,14 +1270,10 @@ mod tests {
             "expected single-quoted --settings flag, got: {inv:?}",
         );
         let settings_at = inv.find("--settings").expect("--settings present");
+        let prompt_at = inv.find("\"$(cat").expect("prompt arg present");
         assert!(
-            inv.contains("python3 .boss/feed-initial-prompt '.claude/initial-prompt.txt'"),
-            "prompt must be fed from the file, not expanded onto argv; got: {inv:?}",
-        );
-        let claude_at = inv.find(" claude ").expect("claude binary present");
-        assert!(
-            settings_at > claude_at,
-            "--settings must be a claude flag after the binary: {inv:?}",
+            settings_at < prompt_at,
+            "--settings must come before the positional prompt arg: {inv:?}",
         );
     }
 
@@ -1293,7 +1289,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             cfg.claude_invocation(false, None),
-            "python3 .boss/feed-initial-prompt '.claude/initial-prompt.txt' claude --model sonnet --effort low --disallowedTools=AskUserQuestion --dangerously-skip-permissions\n",
+            "claude --model sonnet --effort low --disallowedTools=AskUserQuestion --dangerously-skip-permissions \"$(cat .claude/initial-prompt.txt)\"\n",
         );
     }
 
@@ -1309,7 +1305,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             cfg.claude_invocation(false, None),
-            "python3 .boss/feed-initial-prompt '.claude/initial-prompt.txt' claude --model opus --effort high --disallowedTools=AskUserQuestion --permission-mode auto\n",
+            "claude --model opus --effort high --disallowedTools=AskUserQuestion --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
         );
     }
 

@@ -1014,10 +1014,8 @@ fn toml_basic_string(s: &str) -> String {
 ///   either shape as anything but a hard error here.
 ///
 /// No `< /dev/null` stdin redirect: that existed so `codex exec` would not
-/// block reading stdin, and a TUI needs the tty to read typed input.
-/// The initial prompt is delivered by `.boss/feed-initial-prompt` (the CLI
-/// reads the file over a PTY); Codex 0.153.4's TUI has no `--prompt-file`
-/// and `codex exec -` is the headless shape, not this one.
+/// block reading stdin, and a TUI needs the tty to read typed input,
+/// including the pane's own initial-prompt line.
 pub fn build_codex_command(request: &SpawnRequest<'_>) -> String {
     let SpawnRequest {
         model,
@@ -1030,6 +1028,11 @@ pub fn build_codex_command(request: &SpawnRequest<'_>) -> String {
         permission_mode_override: _,
         run_id: _,
     } = request;
+
+    let prompt_cat = format!(
+        "\"$(cat {}/{})\"",
+        CODEX_DESCRIPTOR.config_dir, CODEX_DESCRIPTOR.initial_prompt_filename,
+    );
 
     // Sandbox policy is fully supplied by PermissionArtifacts::extra_args.
     // In particular, reviewers intentionally receive no `--sandbox` flag: the
@@ -1050,12 +1053,10 @@ pub fn build_codex_command(request: &SpawnRequest<'_>) -> String {
         cmd.push_str(" -c model_reasoning_effort=");
         cmd.push_str(&shell_quote(e));
     }
+    cmd.push(' ');
+    cmd.push_str(&prompt_cat);
     cmd.push('\n');
-    crate::wrap_spawn_command_to_feed_prompt(
-        &cmd,
-        CODEX_DESCRIPTOR.config_dir,
-        CODEX_DESCRIPTOR.initial_prompt_filename,
-    )
+    cmd
 }
 
 // ---------------------------------------------------------------------------
@@ -1604,7 +1605,6 @@ impl AgentDriver for CodexDriver {
         let prompt_path = config_dir.join(CODEX_DESCRIPTOR.initial_prompt_filename);
         fs::write(&prompt_path, prompt_text)
             .with_context(|| format!("writing initial prompt to {}", prompt_path.display()))?;
-        crate::write_feed_prompt_script(workspace)?;
         let gitignore_path = config_dir.join(".gitignore");
         fs::write(&gitignore_path, CODEX_DIR_GITIGNORE)
             .with_context(|| format!("writing gitignore to {}", gitignore_path.display()))?;

@@ -668,10 +668,8 @@ mod tests {
             run_id: None,
         });
         assert!(
-            claude_plan.command.starts_with("python3 .boss/feed-initial-prompt")
-                && claude_plan.command.contains(" claude "),
-            "claude slug must still resolve to ClaudeDriver, got {}",
-            claude_plan.command,
+            claude_plan.command.starts_with("claude"),
+            "claude slug must still resolve to ClaudeDriver",
         );
     }
 

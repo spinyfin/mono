@@ -354,22 +354,6 @@ fn spawn_invocation_meets_codex_tui_contract() {
         "must export CODEX_HOME for the run: {:?}",
         plan.env
     );
-    assert!(
-        plan.command.starts_with("python3 .boss/feed-initial-prompt") && plan.command.contains(" codex "),
-        "prompt must be fed from a file, not expanded onto argv: {}",
-        plan.command
-    );
-    assert!(
-        !plan.command.contains("$(cat"),
-        "prompt must not expand onto argv: {}",
-        plan.command
-    );
-    assert!(
-        plan.command.len() < 4096,
-        "launch command must stay well under ARG_MAX; got {} bytes: {}",
-        plan.command.len(),
-        plan.command
-    );
 }
 
 /// The pivot's opposite pane-launch invariant: unlike the retired
@@ -383,14 +367,8 @@ fn pane_launch_spec_does_not_use_shell_exec() {
     let plan = CodexDriver::default().spawn_invocation(spawn_request("gpt-6-astra", "run-pane-a"));
     let trimmed = plan.command.trim_start();
     assert!(
-        trimmed.starts_with("python3 .boss/feed-initial-prompt") && trimmed.contains(" codex "),
-        "pane launch must type a plain `codex` command line (fed via the prompt helper), \
-         not shell-exec into it; got: {}",
-        plan.command
-    );
-    assert!(
-        !trimmed.contains("$(cat"),
-        "prompt must not expand onto argv: {}",
+        trimmed.starts_with("codex "),
+        "pane launch must type a plain `codex` command line, not shell-exec into it; got: {}",
         plan.command
     );
     assert!(
