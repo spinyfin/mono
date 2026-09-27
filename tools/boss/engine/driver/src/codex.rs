@@ -700,7 +700,12 @@ fn codex_hook_context(workspace: &Path) -> (String, PathBuf) {
 /// domains the proxy rejects all IP destinations; Seatbelt also blocks direct
 /// IP connections. Never replace this with unrestricted network_access.
 fn render_review_guide_config(workspace: &Path, socket: &Path) -> String {
-    let mut config = String::from("web_search = \"disabled\"\n");
+    // Codex 0.153.4 requires a default whenever named permissions exist:
+    // https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/core/src/config/mod.rs#L3404-L3413
+    // The hook-trust app-server loads this file before the worker's CLI
+    // overrides exist, so selecting the profile only on the command line
+    // makes hooks/list reject the config and return no hooks.
+    let mut config = String::from("default_permissions = \"review-guide\"\nweb_search = \"disabled\"\n");
     config.push_str(&render_config_toml(workspace, String::new()).replace(
         "[features]\n",
         "[features]\nnetwork_proxy = { enabled = true, domains = {}, allow_upstream_proxy = false, proxy_url = \"http://127.0.0.1:0\", socks_url = \"http://127.0.0.1:0\" }\n",
@@ -2159,3 +2164,7 @@ fn resolve_auth_source_path() -> PathBuf {
 #[cfg(test)]
 #[path = "codex_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "codex/config_compatibility_tests.rs"]
+mod config_compatibility_tests;
