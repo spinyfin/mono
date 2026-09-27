@@ -39,6 +39,13 @@ struct ReviewGuideCardBadge: View {
                     .controlSize(.mini)
                     .accessibilityLabel(presentation.accessibilityLabel)
                     .help(presentation.tooltip)
+                if let status = presentation.updateStatus {
+                    Text(status)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .help(status)
+                }
             }
             if presentation.showsRetry {
                 Button("Retry", action: onRetry)

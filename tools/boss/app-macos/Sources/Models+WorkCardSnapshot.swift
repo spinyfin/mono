@@ -286,7 +286,8 @@ struct WorkCardSnapshot: Equatable {
                 lifecycle: context.reviewGuideRequestInFlight ? "generating" : task.reviewGuideLifecycle,
                 readableVersionId: task.reviewGuideReadableVersionId,
                 staleSource: task.reviewGuideStaleSource ?? false,
-                error: task.reviewGuideError
+                error: task.reviewGuideError,
+                updateStatus: task.reviewGuideUpdateStatus
             )
             : nil
         let mergeQueueState: String? = inMerging ? task.mergeQueueState : nil

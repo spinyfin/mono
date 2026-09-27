@@ -106,6 +106,7 @@ struct ReviewGuideCardPresentation: Equatable {
     /// as-is; the app does not infer a cause. `nil` unless `kind` is a
     /// failed state and the engine stored a reason.
     var error: String? = nil
+    var updateStatus: String? = nil
 
     var showsDocumentButton: Bool { readableVersionId != nil }
     var showsProgress: Bool { kind == .generating || kind == .refreshing }
@@ -118,6 +119,7 @@ struct ReviewGuideCardPresentation: Equatable {
     }
 
     var accessibilityLabel: String {
+        if let updateStatus { return updateStatus }
         switch kind {
         case .generating: return "Generating review guide"
         case .refreshing: return "Open older review guide; updating"
@@ -141,6 +143,7 @@ struct ReviewGuideCardPresentation: Equatable {
 
     var tooltip: String {
         let fullError = error?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let updateStatus { return updateStatus }
         switch kind {
         case .generating: return "Generating review guide\u{2026}"
         case .refreshing: return "Open older review guide; updating\u{2026}"
@@ -169,7 +172,8 @@ struct ReviewGuideCardPresentation: Equatable {
         lifecycle: String?,
         readableVersionId: String?,
         staleSource: Bool = false,
-        error: String? = nil
+        error: String? = nil,
+        updateStatus: String? = nil
     ) -> ReviewGuideCardPresentation? {
         guard let lifecycle else { return nil }
         let hasContent = readableVersionId != nil
@@ -177,16 +181,18 @@ struct ReviewGuideCardPresentation: Equatable {
         case "queued", "generating":
             return ReviewGuideCardPresentation(
                 kind: hasContent ? .refreshing : .generating,
-                readableVersionId: readableVersionId
+                readableVersionId: readableVersionId,
+                updateStatus: updateStatus
             )
         case "ready":
-            return ReviewGuideCardPresentation(kind: .ready, readableVersionId: readableVersionId)
+            return ReviewGuideCardPresentation(kind: .ready, readableVersionId: readableVersionId, updateStatus: updateStatus)
         case "failed":
             return ReviewGuideCardPresentation(
                 kind: hasContent ? .refreshFailed : .failed,
                 readableVersionId: readableVersionId,
                 staleSource: staleSource,
-                error: error
+                error: error,
+                updateStatus: updateStatus
             )
         default:
             return nil

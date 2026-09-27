@@ -317,3 +317,49 @@ fn untracked_and_deleted_findings_stay_open() {
     assert_eq!(untracked.status_text, "1 finding: 0 fixed on PR, 0 in progress, 1 open");
     assert!(untracked.addendum_markdown.ends_with("- [high] Unchecked index"));
 }
+
+#[test]
+fn updated_guide_marks_the_completed_revision_findings_resolved() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id, "updated findings");
+    bind_open_pr(&db, &root.id);
+    let revision = apply_findings(&db, &root.id, "head-one");
+    let capture = |head, sequence| {
+        let PrSourceCapturePersistOutcome::Stored(capture) = db
+            .persist_pr_review_guide_source_capture(
+                &root.id,
+                sequence,
+                PrSourceCaptureTrigger::Completion,
+                &crate::test_support::source_capture_packet(PR_URL, "base", head),
+            )
+            .unwrap()
+        else {
+            panic!("capture");
+        };
+        capture
+    };
+    let old = capture("head-one", 1);
+    let attempt = db
+        .create_pr_review_guide_attempt(&old.series_id, &old.comparison_id, "test")
+        .unwrap();
+    db.publish_pr_review_guide_version(&attempt.id, "# Previous", "raw")
+        .unwrap();
+    db.record_review_guide_revision_head(&root.id, PR_URL, "head-two", &revision, 2)
+        .unwrap();
+    let new = capture("head-two", 2);
+    let attempt = db
+        .create_pr_review_guide_attempt(&new.series_id, &new.comparison_id, "test")
+        .unwrap();
+    assert!(
+        !findings(&db, &root.id)
+            .unwrap()
+            .addendum_markdown
+            .contains("(resolved)")
+    );
+    db.publish_pr_review_guide_version(&attempt.id, "# Updated", "raw")
+        .unwrap();
+    let supplement = findings(&db, &root.id).unwrap();
+    assert!(supplement.addendum_markdown.contains("(resolved)"));
+    assert!(supplement.status_text.contains("fixes complete"));
+}

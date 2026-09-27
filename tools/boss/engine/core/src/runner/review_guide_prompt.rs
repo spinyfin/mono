@@ -55,7 +55,10 @@ pub(super) fn compose_review_guide_prompt(work_db: &WorkDb, execution: &WorkExec
         base_sha: &packet.merge_base_sha,
         head_sha: &packet.head_sha,
     };
-    let mut prompt = boss_review_guide::render_prompt(&metadata);
+    let mut prompt = match work_db.review_guide_update_context(&execution.id)? {
+        Some((old_head, previous)) => boss_review_guide::render_update_prompt(&metadata, &old_head, &previous),
+        None => boss_review_guide::render_prompt(&metadata),
+    };
     prompt.push_str("\n\n");
     prompt.push_str(&boss_review_guide::render_source_context(&packet));
     Ok(prompt)
