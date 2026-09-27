@@ -328,6 +328,13 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          the target). A later unrelated run start does not mean a review slot opened.",
     ),
     entry(
+        REVIEW_DESIGN_DOC_UNRESOLVED_ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "Filed when assembling a review-brief packet cannot fetch or resolve the project's design \
+         doc. The assembler resolves it on the next successful fetch of that same work item; a later \
+         unrelated run start does not mean GitHub auth, the pointer, or the missing file recovered.",
+    ),
+    entry(
         EXTERNAL_TRACKER_AUTH_FAILED_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
         "Product-scoped, not work-item-scoped: the reconcile loop resolves it on the next \
@@ -592,6 +599,10 @@ pub const EXTERNAL_TRACKER_PERMISSION_DENIED_ATTENTION_KIND: &str = "external_tr
 /// auto-clear via [`ClearedBy::WorkResumed`] instead of staying open
 /// forever.
 pub const LEGACY_PANE_DEATH_RECONCILE_ATTENTION_KIND: &str = "pane_death_reconcile";
+/// Work-item-scoped: the review-brief assembler could not fetch or resolve
+/// the project's design doc. Bound by `runner::review_brief`; resolved on
+/// the next successful fetch of that same work item.
+pub const REVIEW_DESIGN_DOC_UNRESOLVED_ATTENTION_KIND: &str = "review_design_doc_unresolved";
 
 /// The declared lifecycle for `kind`, or `None` when the kind is not
 /// registered. Callers treat `None` as "no automatic rule applies" — the
@@ -678,6 +689,7 @@ mod tests {
             crate::stale_worker_sweep::STALE_WORKER_ATTENTION_KIND,
             crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND,
             crate::work::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
+            REVIEW_DESIGN_DOC_UNRESOLVED_ATTENTION_KIND,
             crate::work::PR_REVIEW_BATCH_STALE_ATTENTION_KIND,
             crate::work::PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND,
             crate::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND,

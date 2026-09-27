@@ -541,47 +541,29 @@ fn is_fence_delimiter(line: &str) -> bool {
 /// Split a breakdown section on `###` headings into entries. Skips a leading
 /// `Breakdown size: N entries …` prose line (not an entry), and ignores
 /// anything inside a fenced code block.
+///
+/// Uses the shared fence-aware ATX tokenizer (`boss_pr_template::parse_all_headings`)
+/// so heading detection cannot drift from the review-brief section locator.
 fn parse_hash_entries(section: &str) -> Vec<BreakdownEntry> {
-    let mut entries = Vec::new();
-    let mut current_title: Option<String> = None;
-    let mut body_lines: Vec<&str> = Vec::new();
-    let mut in_fence = false;
-
-    for line in section.lines() {
-        if is_fence_delimiter(line) {
-            in_fence = !in_fence;
-            if current_title.is_some() {
-                body_lines.push(line);
-            }
-            continue;
-        }
-        if in_fence {
-            if current_title.is_some() {
-                body_lines.push(line);
-            }
-            continue;
-        }
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("### ") {
-            if let Some(title) = current_title.take() {
-                entries.push(BreakdownEntry {
-                    title,
-                    body: body_lines.join("\n"),
-                });
-                body_lines.clear();
-            }
-            current_title = Some(rest.trim().to_owned());
-            continue;
-        }
-        if current_title.is_some() {
-            body_lines.push(line);
-        }
-        // Lines before the first ### (e.g. Breakdown size: …) are ignored.
-    }
-    if let Some(title) = current_title {
+    let headings: Vec<_> = crate::pr_template::parse_all_headings(section)
+        .into_iter()
+        .filter(|heading| heading.level == 3)
+        .collect();
+    let mut entries = Vec::with_capacity(headings.len());
+    for (i, heading) in headings.iter().enumerate() {
+        let end = headings[i + 1..]
+            .iter()
+            .find(|next| next.level <= heading.level)
+            .map(|next| next.start)
+            .unwrap_or(section.len());
+        let after_heading = section[heading.start..end]
+            .find('\n')
+            .map(|n| heading.start + n + 1)
+            .unwrap_or(end);
+        let body = section.get(after_heading..end).unwrap_or("").to_owned();
         entries.push(BreakdownEntry {
-            title,
-            body: body_lines.join("\n"),
+            title: heading.title.clone(),
+            body,
         });
     }
     entries

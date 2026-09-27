@@ -9,7 +9,9 @@
 use boss_design_doc_fetcher::DocFetchOutcome;
 use boss_protocol::{DeferredScopeProposalPayload, ProjectDesignDocState, ProposalKind, TaskKind, WorkItem};
 
-use crate::pr_review::{DesignDocSection, ReviewBriefPacket, UnresolvedReviewInput, locate_design_section};
+use crate::pr_review::{
+    BreakdownSection, DesignDocSection, ReviewBriefPacket, UnresolvedReviewInput, locate_design_section_with_breakdown,
+};
 use crate::work::{WorkDb, WorkExecution};
 
 /// Assemble the review-input packet for `work_item`.
@@ -62,7 +64,30 @@ where
     let is_revision = task.kind == TaskKind::Revision;
     let mut work_item_brief = nonempty_desc(&task.description);
     let mut revision_ask = None;
-    let mut deferred_ids = vec![task.id.clone()];
+    // Always collect declarations from the chain root plus every revision
+    // on that root. Post-merge (and any root-keyed) review assembles the
+    // packet for the originating item, and revision workers record
+    // deferrals on the revision row — skipping the walk for a non-revision
+    // item would hide those declarations from the reviewer.
+    let root_id = work_db.review_cycle_root_id(&task.id);
+    let mut deferred_ids = vec![root_id.clone()];
+    match work_db
+        .connect()
+        .and_then(|conn| crate::work::collect_chain_revision_ids(&conn, &root_id))
+    {
+        Ok(revision_ids) => deferred_ids.extend(revision_ids),
+        Err(err) => {
+            tracing::warn!(
+                execution_id = %execution.id,
+                root_id,
+                error = %err,
+                "pr_review: failed to collect chain revisions for deferred-scope declarations",
+            );
+        }
+    }
+    if !deferred_ids.iter().any(|id| id == &task.id) {
+        deferred_ids.push(task.id.clone());
+    }
     // For a revision, design-doc lookup uses the chain root's name (the
     // heading the originating item was named after); `task.name` is still
     // used for display.
@@ -70,7 +95,6 @@ where
 
     if is_revision {
         revision_ask = nonempty_desc(&task.description);
-        let root_id = work_db.review_cycle_root_id(&task.id);
         if root_id == task.id {
             // `review_cycle_root_id` deliberately returns the input id when
             // the chain root cannot be resolved (broken/missing parent
@@ -79,28 +103,6 @@ where
             // parent" (a revision always has one at creation time).
             work_item_brief = None;
         } else {
-            // Collect the chain root plus every revision belonging to it
-            // (siblings included — `create_revision` parents new revisions
-            // directly to the chain root, so a chain is flat, not nested).
-            // `collect_chain_revision_ids` returns only child revisions, so
-            // the root id is pushed explicitly: a deferred-scope declaration
-            // on the originating item (or on an earlier revision of this
-            // same PR) is still seen when a later revision is reviewed.
-            deferred_ids.push(root_id.clone());
-            match work_db
-                .connect()
-                .and_then(|conn| crate::work::collect_chain_revision_ids(&conn, &root_id))
-            {
-                Ok(revision_ids) => deferred_ids.extend(revision_ids),
-                Err(err) => {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        root_id,
-                        error = %err,
-                        "pr_review: failed to collect sibling revisions for deferred-scope declarations",
-                    );
-                }
-            }
             match work_db.get_work_item(&root_id) {
                 Ok(root_item) => {
                     if let Some(root) = work_item_task(&root_item) {
@@ -151,15 +153,9 @@ where
 
     let mut design_section = None;
     if let Some(project_id) = task.project_id.as_deref() {
-        match attach_design_section(work_db, project_id, &design_lookup_name, &fetch).await {
-            DesignAttach::Section {
-                section,
-                truncated_reason,
-            } => {
+        match attach_design_section(work_db, &task.id, project_id, &design_lookup_name, &fetch).await {
+            DesignAttach::Section { section } => {
                 design_section = Some(section);
-                if let Some(reason) = truncated_reason {
-                    unresolved.push(UnresolvedReviewInput::DesignSection { reason });
-                }
             }
             DesignAttach::NoneExpected => {}
             DesignAttach::Unresolved(reason) => {
@@ -179,20 +175,18 @@ where
 }
 
 enum DesignAttach {
-    Section {
-        section: DesignDocSection,
-        /// Set when the fetched section (or whole-doc fallback) had to be
-        /// cut down to [`MAX_SECTION_CHARS`]. This is loud input loss, not a
-        /// resolved input: the reviewer must raise a finding for it, since
-        /// deliverables named past the cutoff (often at the end of a design
-        /// doc) would otherwise silently drop out of the conformance check.
-        truncated_reason: Option<String>,
-    },
+    Section { section: DesignDocSection },
     NoneExpected,
     Unresolved(String),
 }
 
-async fn attach_design_section<F, Fut>(work_db: &WorkDb, project_id: &str, task_name: &str, fetch: &F) -> DesignAttach
+async fn attach_design_section<F, Fut>(
+    work_db: &WorkDb,
+    work_item_id: &str,
+    project_id: &str,
+    task_name: &str,
+    fetch: &F,
+) -> DesignAttach
 where
     F: Fn(String, String, String) -> Fut,
     Fut: std::future::Future<Output = DocFetchOutcome>,
@@ -200,68 +194,134 @@ where
     let resolved = match work_db.resolve_project_design_doc(project_id, |_| None) {
         Ok(output) => output,
         Err(err) => {
-            return DesignAttach::Unresolved(format!(
-                "failed to resolve project {project_id} design-doc pointer: {err}"
-            ));
+            let reason = format!("failed to resolve project {project_id} design-doc pointer: {err}");
+            file_design_doc_attention(work_db, work_item_id, &reason);
+            return DesignAttach::Unresolved(reason);
         }
     };
     match resolved.state {
-        ProjectDesignDocState::NotSet => DesignAttach::NoneExpected,
+        ProjectDesignDocState::NotSet => {
+            clear_design_doc_attention(work_db, work_item_id);
+            DesignAttach::NoneExpected
+        }
         ProjectDesignDocState::Broken { reason } => {
-            DesignAttach::Unresolved(format!("project {project_id} design-doc pointer is broken: {reason}"))
+            let reason = format!("project {project_id} design-doc pointer is broken: {reason}");
+            file_design_doc_attention(work_db, work_item_id, &reason);
+            DesignAttach::Unresolved(reason)
         }
         ProjectDesignDocState::Resolved { resolved, .. } => {
-            match fetch(
+            let first = fetch(
                 resolved.repo_remote_url.clone(),
                 resolved.path.clone(),
                 resolved.branch.clone(),
             )
-            .await
-            {
-                DocFetchOutcome::Content(text) => {
-                    let mut section = locate_design_section(&text, task_name, &resolved.path);
-                    let original_len = section.body.chars().count();
-                    section.body = cap_section_body(section.body);
-                    let truncated_reason = (original_len > MAX_SECTION_CHARS).then(|| {
-                        format!(
-                            "design doc section (heading {heading:?}) fetched from `{path}` at ref `{git_ref}` in \
-                             `{repo}` is {original_len} chars, truncated to {MAX_SECTION_CHARS}; fetch `{path}` at \
-                             ref `{git_ref}` in `{repo}` directly to read the rest — the workspace checkout may be \
-                             on a different repo, branch, or revision than what was fetched here",
-                            heading = section.heading,
-                            path = resolved.path,
-                            git_ref = resolved.branch,
-                            repo = resolved.repo_remote_url,
-                        )
-                    });
-                    DesignAttach::Section {
-                        section,
-                        truncated_reason,
-                    }
+            .await;
+            let outcome = match first {
+                DocFetchOutcome::FetchFailed { reason } => {
+                    tracing::warn!(
+                        work_item_id,
+                        path = %resolved.path,
+                        git_ref = %resolved.branch,
+                        repo = %resolved.repo_remote_url,
+                        reason,
+                        "pr_review: design-doc fetch failed; retrying once at spawn"
+                    );
+                    fetch(
+                        resolved.repo_remote_url.clone(),
+                        resolved.path.clone(),
+                        resolved.branch.clone(),
+                    )
+                    .await
                 }
-                DocFetchOutcome::DocMissing => DesignAttach::Unresolved(format!(
-                    "design doc `{}` at ref `{}` in `{}` returned 404",
-                    resolved.path, resolved.branch, resolved.repo_remote_url
-                )),
-                DocFetchOutcome::FetchFailed { reason } => DesignAttach::Unresolved(format!(
-                    "fetch of `{}` at ref `{}` in `{}` failed: {reason}",
-                    resolved.path, resolved.branch, resolved.repo_remote_url
-                )),
+                other => other,
+            };
+            match outcome {
+                DocFetchOutcome::Content(text) => {
+                    clear_design_doc_attention(work_db, work_item_id);
+                    let entries = crate::planner::extract_breakdown_entries(&text);
+                    let breakdown: Vec<BreakdownSection<'_>> = entries
+                        .iter()
+                        .map(|entry| BreakdownSection {
+                            title: entry.title.as_str(),
+                            body: entry.body.as_str(),
+                        })
+                        .collect();
+                    let mut section =
+                        locate_design_section_with_breakdown(&text, task_name, &resolved.path, &breakdown);
+                    section.body = cap_section_body(
+                        section.body,
+                        &resolved.path,
+                        &resolved.branch,
+                        &resolved.repo_remote_url,
+                    );
+                    DesignAttach::Section { section }
+                }
+                DocFetchOutcome::DocMissing => {
+                    let reason = format!(
+                        "design doc `{}` at ref `{}` in `{}` returned 404",
+                        resolved.path, resolved.branch, resolved.repo_remote_url
+                    );
+                    file_design_doc_attention(work_db, work_item_id, &reason);
+                    DesignAttach::Unresolved(reason)
+                }
+                DocFetchOutcome::FetchFailed { reason } => {
+                    let reason = format!(
+                        "fetch of `{}` at ref `{}` in `{}` failed: {reason}",
+                        resolved.path, resolved.branch, resolved.repo_remote_url
+                    );
+                    file_design_doc_attention(work_db, work_item_id, &reason);
+                    DesignAttach::Unresolved(reason)
+                }
             }
         }
     }
 }
 
+fn file_design_doc_attention(work_db: &WorkDb, work_item_id: &str, reason: &str) {
+    if let Err(err) = work_db.upsert_work_item_attention(
+        work_item_id,
+        crate::attention_lifecycle::REVIEW_DESIGN_DOC_UNRESOLVED_ATTENTION_KIND,
+        "Review design-doc input could not be resolved",
+        &format!(
+            "The automated reviewer could not fetch or resolve the project's design-doc \
+             section while assembling this work item's review brief.\n\n\
+             {reason}\n\n\
+             A revision of the PR cannot fix this. Repair the design-doc pointer, \
+             GitHub auth, or rate limit, then re-run review."
+        ),
+    ) {
+        tracing::warn!(
+            work_item_id,
+            error = %err,
+            "pr_review: failed to file design-doc unresolved attention"
+        );
+    }
+}
+
+fn clear_design_doc_attention(work_db: &WorkDb, work_item_id: &str) {
+    if let Err(err) = work_db.resolve_external_tracker_attention(
+        work_item_id,
+        crate::attention_lifecycle::REVIEW_DESIGN_DOC_UNRESOLVED_ATTENTION_KIND,
+    ) {
+        tracing::warn!(
+            work_item_id,
+            error = %err,
+            "pr_review: failed to resolve design-doc unresolved attention after a successful fetch"
+        );
+    }
+}
+
 const MAX_SECTION_CHARS: usize = 80_000;
 
-fn cap_section_body(body: String) -> String {
+fn cap_section_body(body: String, path: &str, git_ref: &str, repo: &str) -> String {
     if body.chars().count() <= MAX_SECTION_CHARS {
         return body;
     }
     let truncated: String = body.chars().take(MAX_SECTION_CHARS).collect();
     format!(
-        "{truncated}\n\n…(truncated at {MAX_SECTION_CHARS} characters; see the Unresolved review \
-         inputs section for where to fetch the rest)"
+        "{truncated}\n\n…(truncated at {MAX_SECTION_CHARS} characters; fetch `{path}` at ref \
+         `{git_ref}` in `{repo}` to read the rest — the workspace checkout may be on a different \
+         repo, branch, or revision than what was fetched here)"
     )
 }
 
@@ -273,11 +333,12 @@ fn work_item_task(work_item: &WorkItem) -> Option<&crate::work::Task> {
 }
 
 fn nonempty_desc(description: &str) -> Option<String> {
-    let trimmed = description.trim();
+    let stripped = crate::reconcile_audit::strip_engine_audit_lines(description);
+    let trimmed = stripped.trim();
     if trimmed.is_empty() {
         None
     } else {
-        Some(description.to_owned())
+        Some(trimmed.to_owned())
     }
 }
 
@@ -293,11 +354,19 @@ fn deferred_declarations_for(work_db: &WorkDb, work_item_id: &str) -> Vec<String
     match work_db.list_worker_proposals_for_work_item(work_item_id, Some(ProposalKind::DeferredScope), None) {
         Ok(proposals) => {
             for proposal in proposals {
-                if let Ok(payload) = serde_json::from_str::<DeferredScopeProposalPayload>(&proposal.payload_json) {
-                    out.push(format!(
+                match serde_json::from_str::<DeferredScopeProposalPayload>(&proposal.payload_json) {
+                    Ok(payload) => out.push(format!(
                         "[deferred-scope] summary=\"{}\" reason=\"{}\"",
                         payload.summary, payload.reason
-                    ));
+                    )),
+                    Err(err) => {
+                        tracing::warn!(
+                            work_item_id,
+                            proposal_id = %proposal.id,
+                            error = %err,
+                            "pr_review: deferred-scope proposal payload did not parse; dropping from brief packet"
+                        );
+                    }
                 }
             }
         }
@@ -315,9 +384,14 @@ fn deferred_declarations_for(work_db: &WorkDb, work_item_id: &str) -> Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{create_test_chore_manual, create_test_product, insert_host_capability, open_db};
-    use crate::work::{FakePrStateChecker, PrOpenState};
-    use boss_protocol::{CreateProjectInput, CreateRevisionInput, SetProjectDesignDocInput, WorkItemPatch};
+    use crate::pr_review::render_brief_packet_block;
+    use crate::test_support::{
+        create_ready_chore_execution, create_test_chore_manual, create_test_product, insert_host_capability, open_db,
+    };
+    use crate::work::{FakePrStateChecker, PrOpenState, SubmitWorkerProposalInput};
+    use boss_protocol::{
+        CreateProjectInput, CreateRevisionInput, ProposalKind, SetProjectDesignDocInput, WorkItemPatch,
+    };
 
     fn insert_host(db: &WorkDb) {
         insert_host_capability(db, "local", "driver=claude", "auto");
@@ -535,6 +609,18 @@ mod tests {
                 .any(|u| matches!(u, UnresolvedReviewInput::DesignSection { .. })),
             "fetch failure must be unresolved: {:?}",
             packet.unresolved
+        );
+        let attentions = db.list_attention_items_for_work_item(&task.id).unwrap();
+        assert!(
+            attentions.iter().any(|a| {
+                a.kind == crate::attention_lifecycle::REVIEW_DESIGN_DOC_UNRESOLVED_ATTENTION_KIND && a.status == "open"
+            }),
+            "fetch failure must file operator attention: {attentions:?}"
+        );
+        let prompt = render_brief_packet_block(&packet);
+        assert!(
+            prompt.contains("Do **not** raise a `deferred_scope` finding"),
+            "engine-side fetch failure must not instruct a revision-forcing finding: {prompt}"
         );
     }
 
@@ -798,9 +884,9 @@ mod tests {
     }
 
     /// Truncation of a fetched design section (including the whole-doc
-    /// fallback) must never be silent: the reviewer still gets a (truncated)
-    /// section body, but the truncation itself is recorded as an unresolved
-    /// input naming where to fetch the rest.
+    /// fallback) must still deliver the capped body and name where to fetch
+    /// the rest, but it is the engine's own cap — not an unresolved input
+    /// that would force a revision the PR worker cannot act on.
     #[tokio::test]
     async fn oversized_design_section_is_truncated_loudly_not_silently() {
         let (_dir, db) = open_db();
@@ -847,19 +933,32 @@ mod tests {
         let section = packet
             .design_section
             .expect("truncated section must still be delivered");
-        assert!(
-            section.body.chars().count() <= MAX_SECTION_CHARS + 200,
-            "section body must actually be capped: {} chars",
-            section.body.chars().count()
+        let marker = "\n\n…(truncated at";
+        let prefix = section
+            .body
+            .split(marker)
+            .next()
+            .expect("truncated body must include the truncation marker");
+        assert_eq!(
+            prefix.chars().count(),
+            MAX_SECTION_CHARS,
+            "prefix before the truncation marker must be exactly {MAX_SECTION_CHARS} chars, got {}",
+            prefix.chars().count()
         );
         assert!(
-            packet.unresolved.iter().any(|u| matches!(
-                u,
-                UnresolvedReviewInput::DesignSection { reason }
-                    if reason.contains("truncated") && reason.contains("automatic-pr-review-guides.md")
-            )),
-            "truncation must be a loud unresolved finding, not silent: {:?}",
+            packet
+                .unresolved
+                .iter()
+                .all(|u| !matches!(u, UnresolvedReviewInput::DesignSection { .. })),
+            "engine truncation must not be an unresolved input that forces a revision: {:?}",
             packet.unresolved
+        );
+        assert!(
+            section.body.contains("truncated at")
+                && section.body.contains("automatic-pr-review-guides.md")
+                && section.body.contains("fetch"),
+            "truncated body must name where to fetch the rest: {}",
+            section.body
         );
     }
 
@@ -890,6 +989,392 @@ mod tests {
                 .any(|d| d.contains("revision-aware broker")),
             "declared deferrals: {:?}",
             packet.deferred_scope_declarations
+        );
+    }
+
+    fn submit_deferred_scope(db: &WorkDb, work_item_id: &str, summary: &str, reason: &str) {
+        let execution = create_ready_chore_execution(db, work_item_id);
+        let payload = format!(r#"{{"summary":"{summary}","reason":"{reason}"}}"#);
+        db.submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &execution.id,
+            work_item_id,
+            kind: ProposalKind::DeferredScope,
+            payload_json: &payload,
+            idempotency_key: &format!("ds-{work_item_id}"),
+        })
+        .unwrap()
+        .unwrap();
+    }
+
+    /// Engine audit lines appended onto an empty description must not count
+    /// as a resolved brief. The in_review doc-detector writes one of these
+    /// on every typical code PR, which previously defeated empty-brief
+    /// detection.
+    #[tokio::test]
+    async fn empty_brief_with_engine_audit_lines_is_unresolved_not_a_silent_skip() {
+        let (_dir, db) = open_db();
+        insert_host(&db);
+        let product = create_test_product(&db);
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Empty brief chore");
+        crate::reconcile_audit::append_description_line(
+            &db,
+            &chore.id,
+            "\n[doc-detector] no doc pointer auto-populated for this PR because it did not \
+             touch exactly one docs/designs|investigations|postmortems file.",
+        )
+        .unwrap();
+        crate::reconcile_audit::append_description_line(
+            &db,
+            &chore.id,
+            "\n[engine-reconcile] epoch 1700000000: worker pid 123 exited.",
+        )
+        .unwrap();
+        let item = db.get_work_item(&chore.id).unwrap();
+        let packet = assemble_with_doc_fetch(&db, &item, &execution_for(&chore.id), canned_missing).await;
+        assert!(
+            packet.work_item_brief.is_none(),
+            "audit-only description must not count as a brief: {:?}",
+            packet.work_item_brief
+        );
+        assert!(
+            packet
+                .unresolved
+                .iter()
+                .any(|u| matches!(u, UnresolvedReviewInput::Brief { .. })),
+            "empty human brief with engine audit lines must be unresolved: {:?}",
+            packet.unresolved
+        );
+    }
+
+    #[tokio::test]
+    async fn human_brief_survives_stripping_of_engine_audit_lines() {
+        let (_dir, db) = open_db();
+        insert_host(&db);
+        let product = create_test_product(&db);
+        let chore = db
+            .create_chore(
+                boss_protocol::CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Importer")
+                    .description("Implement the widget importer.")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        crate::reconcile_audit::append_description_line(
+            &db,
+            &chore.id,
+            "\n[doc-detector] no doc pointer auto-populated for this PR.",
+        )
+        .unwrap();
+        let item = db.get_work_item(&chore.id).unwrap();
+        let packet = assemble_with_doc_fetch(&db, &item, &execution_for(&chore.id), canned_missing).await;
+        assert_eq!(
+            packet.work_item_brief.as_deref(),
+            Some("Implement the widget importer.")
+        );
+        assert!(
+            packet
+                .unresolved
+                .iter()
+                .all(|u| !matches!(u, UnresolvedReviewInput::Brief { .. })),
+            "human brief must still resolve: {:?}",
+            packet.unresolved
+        );
+        assert!(
+            !packet
+                .work_item_brief
+                .as_deref()
+                .unwrap_or("")
+                .contains("[doc-detector]"),
+            "rendered brief must not include engine audit lines: {:?}",
+            packet.work_item_brief
+        );
+    }
+
+    /// A deferral declared on a revision must appear when the chain root
+    /// itself is reviewed (the post-merge path).
+    #[tokio::test]
+    async fn deferred_scope_on_a_revision_is_collected_when_assembling_the_chain_root() {
+        let (_dir, db) = open_db();
+        insert_host(&db);
+        let product = create_test_product(&db);
+        let chore = db
+            .create_chore(
+                boss_protocol::CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Importer")
+                    .description("Implement the widget importer.")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some("https://github.com/spinyfin/mono/pull/3013".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let revision = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(chore.id.clone())
+                    .description(
+                        "Fix the importer's retry logic.\n\n\
+                         [deferred-scope] summary=\"revision-aware broker\" reason=\"needs a pipeline\"",
+                    )
+                    .build(),
+                &FakePrStateChecker::always(PrOpenState::Open),
+            )
+            .unwrap();
+        let _ = revision;
+        let item = db.get_work_item(&chore.id).unwrap();
+        let packet = assemble_with_doc_fetch(&db, &item, &execution_for(&chore.id), canned_missing).await;
+        assert!(
+            packet
+                .deferred_scope_declarations
+                .iter()
+                .any(|d| d.contains("revision-aware broker")),
+            "chain-root packet must see the revision's deferred-scope declaration: {:?}",
+            packet.deferred_scope_declarations
+        );
+    }
+
+    /// Production deferred-scope read is `list_worker_proposals_for_work_item`
+    /// + payload parse, not the description marker. Submit a real proposal,
+    /// then strip the auto-applied audit line so only the proposal path can
+    /// populate the packet.
+    #[tokio::test]
+    async fn deferred_scope_worker_proposal_on_the_item_is_declared() {
+        let (_dir, db) = open_db();
+        insert_host(&db);
+        let product = create_test_product(&db);
+        let chore = db
+            .create_chore(
+                boss_protocol::CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Importer")
+                    .description("Implement the widget importer.")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        submit_deferred_scope(&db, &chore.id, "revision-aware broker", "needs a pipeline");
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                description: Some("Implement the widget importer.".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let item = db.get_work_item(&chore.id).unwrap();
+        let packet = assemble_with_doc_fetch(&db, &item, &execution_for(&chore.id), canned_missing).await;
+        assert!(
+            packet
+                .deferred_scope_declarations
+                .iter()
+                .any(|d| d.contains("[deferred-scope] summary=\"revision-aware broker\" reason=\"needs a pipeline\"")),
+            "proposal must populate deferred_scope_declarations: {:?}",
+            packet.deferred_scope_declarations
+        );
+        let prompt = render_brief_packet_block(&packet);
+        assert!(
+            prompt.contains("Declared deferred scope") && prompt.contains("revision-aware broker"),
+            "rendered prompt must list the proposal: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_scope_worker_proposal_on_a_revision_is_declared_for_the_chain_root() {
+        let (_dir, db) = open_db();
+        insert_host(&db);
+        let product = create_test_product(&db);
+        let chore = db
+            .create_chore(
+                boss_protocol::CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Importer")
+                    .description("Implement the widget importer.")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some("https://github.com/spinyfin/mono/pull/3014".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let revision = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(chore.id.clone())
+                    .description("Address the review findings.")
+                    .build(),
+                &FakePrStateChecker::always(PrOpenState::Open),
+            )
+            .unwrap();
+        submit_deferred_scope(&db, &revision.id, "revision-aware broker", "needs a pipeline");
+        db.update_work_item(
+            &revision.id,
+            WorkItemPatch {
+                description: Some("Address the review findings.".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let item = db.get_work_item(&chore.id).unwrap();
+        let packet = assemble_with_doc_fetch(&db, &item, &execution_for(&chore.id), canned_missing).await;
+        assert!(
+            packet
+                .deferred_scope_declarations
+                .iter()
+                .any(|d| d.contains("revision-aware broker")),
+            "chain-root packet must see the revision's deferred-scope proposal: {:?}",
+            packet.deferred_scope_declarations
+        );
+        let prompt = render_brief_packet_block(&packet);
+        assert!(
+            prompt.contains("Declared deferred scope") && prompt.contains("revision-aware broker"),
+            "rendered prompt must list the revision's proposal: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn numbered_breakdown_entry_is_located_instead_of_the_whole_doc() {
+        let (_dir, db) = open_db();
+        insert_host(&db);
+        let product = create_test_product(&db);
+        let project = db
+            .create_project(
+                CreateProjectInput::builder()
+                    .product_id(product.id.clone())
+                    .name("review-guides")
+                    .no_design_task(true)
+                    .build(),
+            )
+            .unwrap();
+        db.set_project_design_doc(SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            unset: false,
+            design_doc_path: Some("tools/boss/docs/designs/automatic-pr-review-guides.md".into()),
+            design_doc_branch: Some("main".into()),
+            design_doc_repo_remote_url: None,
+        })
+        .unwrap();
+        let task = db
+            .create_task(
+                boss_protocol::CreateTaskInput::builder()
+                    .product_id(product.id.clone())
+                    .project_id(project.id.clone())
+                    .name("Protocol types")
+                    .description("Add the contract.")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        async fn canned_numbered_doc(_repo: String, _path: String, _git_ref: String) -> DocFetchOutcome {
+            DocFetchOutcome::Content(
+                "# Design\n\n## Proposed implementation task breakdown\n\n\
+                 1. Protocol types. Add the contract.\n\
+                 Scope: protocol types only.\n\
+                 2. Engine handler. Depends on 1.\n\
+                 Scope: the handler, not the types.\n"
+                    .to_owned(),
+            )
+        }
+        let item = db.get_work_item(&task.id).unwrap();
+        let packet = assemble_with_doc_fetch(&db, &item, &execution_for(&task.id), canned_numbered_doc).await;
+        let section = packet.design_section.expect("design section must be present");
+        assert!(
+            !section.is_whole_doc_fallback(),
+            "numbered breakdown entry must match instead of falling back to the whole doc: {section:?}"
+        );
+        assert!(
+            section.body.contains("protocol types only"),
+            "matched entry body: {}",
+            section.body
+        );
+        assert!(
+            !section.body.contains("the handler, not the types"),
+            "must not include the sibling numbered entry: {}",
+            section.body
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_failed_retries_once_at_spawn() {
+        let (_dir, db) = open_db();
+        insert_host(&db);
+        let product = create_test_product(&db);
+        let project = db
+            .create_project(
+                CreateProjectInput::builder()
+                    .product_id(product.id.clone())
+                    .name("review-guides")
+                    .no_design_task(true)
+                    .build(),
+            )
+            .unwrap();
+        db.set_project_design_doc(SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            unset: false,
+            design_doc_path: Some("tools/boss/docs/designs/automatic-pr-review-guides.md".into()),
+            design_doc_branch: Some("main".into()),
+            design_doc_repo_remote_url: None,
+        })
+        .unwrap();
+        let task = db
+            .create_task(
+                boss_protocol::CreateTaskInput::builder()
+                    .product_id(product.id.clone())
+                    .project_id(project.id.clone())
+                    .name("automatic-pr-review-guides.md")
+                    .description("Implement a revision-aware broker.")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let attempts_for_fetch = attempts.clone();
+        let fetch = move |_repo: String, path: String, _git_ref: String| {
+            let attempts = attempts_for_fetch.clone();
+            async move {
+                let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    DocFetchOutcome::FetchFailed {
+                        reason: "HTTP 503: Service Unavailable".into(),
+                    }
+                } else {
+                    DocFetchOutcome::Content(format!(
+                        "# Automatic PR review guides\n\n## {name}\n\nA revision-aware broker.\n",
+                        name = path.rsplit('/').next().unwrap_or("section")
+                    ))
+                }
+            }
+        };
+        let item = db.get_work_item(&task.id).unwrap();
+        let packet = assemble_with_doc_fetch(&db, &item, &execution_for(&task.id), fetch).await;
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            packet.design_section.is_some(),
+            "retry must deliver the section: {:?}",
+            packet.unresolved
+        );
+        assert!(
+            packet
+                .unresolved
+                .iter()
+                .all(|u| !matches!(u, UnresolvedReviewInput::DesignSection { .. })),
+            "successful retry must not leave a design-section unresolved: {:?}",
+            packet.unresolved
         );
     }
 }

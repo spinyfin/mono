@@ -36,6 +36,36 @@ pub(crate) fn append_reconcile_audit(
     append_description_line(work_db, work_item_id, &audit_line)
 }
 
+/// Prefixes of engine-appended description lines. Shared by
+/// [`append_description_line`] writers and [`strip_engine_audit_lines`] so the
+/// vocabulary of audit lines lives in one place: a line whose trimmed text
+/// starts with one of these is engine-owned, not human-authored brief.
+const ENGINE_AUDIT_LINE_PREFIXES: &[&str] = &["[doc-detector]", "[engine-reconcile]", "[deferred-scope]"];
+
+/// True when `line` is an engine-appended audit line rather than
+/// human-authored brief text.
+pub(crate) fn is_engine_audit_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    ENGINE_AUDIT_LINE_PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+}
+
+/// Strip engine-appended audit lines from a work-item description so
+/// emptiness checks and reviewer-brief rendering see only the
+/// human-authored body.
+///
+/// `[deferred-scope]` lines are still collected into
+/// `deferred_scope_declarations` from the original description; this helper
+/// only removes them from the brief / revision-ask text.
+pub(crate) fn strip_engine_audit_lines(description: &str) -> String {
+    description
+        .lines()
+        .filter(|line| !is_engine_audit_line(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Append `line` verbatim to `work_item_id`'s description. Shared by
 /// [`append_reconcile_audit`] and [`crate::completion::WorkerCompletionHandler::record_deferred_scope_item`]
 /// (the `[deferred-scope]` audit trail) — both need the identical
@@ -218,5 +248,35 @@ mod tests {
         // Must not panic and must not propagate — a courtesy audit line
         // never blocks the resume it rides on.
         append_reconcile_audit_best_effort(&db, missing, EPOCH, "no such item");
+    }
+
+    #[test]
+    fn strip_engine_audit_lines_drops_doc_detector_reconcile_and_deferred_scope() {
+        let description = "Implement the widget importer.\n\
+             \n\
+             [doc-detector] no doc pointer auto-populated for this PR because it did not \
+             touch exactly one docs/designs|investigations|postmortems file.\n\
+             [engine-reconcile] epoch 1700000000: worker pid 123 exited.\n\
+             [deferred-scope] epoch 1700000001: summary=\"broker\" reason=\"needs a pipeline\"\n";
+        assert_eq!(
+            strip_engine_audit_lines(description).trim(),
+            "Implement the widget importer."
+        );
+    }
+
+    #[test]
+    fn strip_engine_audit_lines_treats_audit_only_description_as_empty() {
+        let description = "\n[doc-detector] no doc pointer auto-populated for this PR.\n\
+             [engine-reconcile] epoch 1700000000: resumed after transient error.\n";
+        assert!(strip_engine_audit_lines(description).trim().is_empty());
+    }
+
+    #[test]
+    fn is_engine_audit_line_matches_indented_prefixes() {
+        assert!(is_engine_audit_line("  [doc-detector] leftover"));
+        assert!(is_engine_audit_line("[engine-reconcile] epoch 1: x."));
+        assert!(is_engine_audit_line("[deferred-scope] summary=\"x\" reason=\"y\""));
+        assert!(!is_engine_audit_line("Implement the widget importer."));
+        assert!(!is_engine_audit_line("mentions [doc-detector] in prose"));
     }
 }

@@ -1,22 +1,21 @@
 //! Work-item brief + design-doc section packet for PR review.
 //!
 //! This module is the typed review-input packet and the pure helpers that
-//! locate a design-doc section and classify brief-named deliverables against
-//! a diff and declared deferred-scope proposals. The engine assembles a
-//! packet at spawn time (live GitHub fetch of the design doc; no mirrored
-//! copy) and the prompt renderers embed it.
-
-#[cfg(test)]
-use crate::types::{
-    ReviewFinding, ReviewFindingCategory, ReviewFindingConfidence, ReviewFindingSeverity, ReviewResult,
-};
+//! locate a design-doc section (planner breakdown entries, then ATX
+//! headings). The engine assembles a packet at spawn time (live GitHub
+//! fetch of the design doc; no mirrored copy) and the prompt renderers
+//! embed it.
 
 /// One required review input the engine could not resolve for a work-item PR.
-/// The reviewer must raise a blocking finding for each of these; skipping the
-/// brief-conformance check because an input is missing is forbidden.
+///
+/// [`Self::Brief`] is a real brief gap the reviewer must raise a blocking
+/// `deferred_scope`/`high` finding for. [`Self::DesignSection`] is an
+/// engine-side fetch/resolution failure the PR worker cannot fix by changing
+/// the PR; the prompt tells the reviewer about it and an operator attention
+/// item is filed, but it must not force a revision loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnresolvedReviewInput {
-    /// The work item has no usable description.
+    /// The work item has no usable (human-authored) description.
     Brief { reason: String },
     /// The work item belongs to a project with a design-doc pointer, but the
     /// section (or the doc itself) could not be fetched or resolved.
@@ -34,10 +33,11 @@ impl UnresolvedReviewInput {
 
 /// The design-doc excerpt a reviewer should check the PR against.
 ///
-/// Located by matching the work-item name against markdown headings in the
-/// fetched doc (case-insensitive, punctuation-stripped). When no heading
-/// matches, [`Self::heading`] is `None` and [`Self::body`] is the whole
-/// document — that fallback is success, not an unresolved input.
+/// Located by matching the work-item name against planner breakdown entries
+/// (ATX `###`, numbered list items, or `- **Name.**` bullets) first, then
+/// against markdown headings (case-insensitive, punctuation-stripped). When
+/// neither matches, [`Self::heading`] is `None` and [`Self::body`] is the
+/// whole document — that fallback is success, not an unresolved input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesignDocSection {
     /// Repo-relative path of the design doc (e.g. `tools/boss/docs/designs/foo.md`).
@@ -80,7 +80,8 @@ pub struct ReviewBriefPacket {
 impl ReviewBriefPacket {
     /// Build a packet from a task name + description. An empty description
     /// is recorded as an unresolved brief so the conformance check still
-    /// fires.
+    /// fires. Test-only: production packets are assembled by the engine.
+    #[cfg(test)]
     pub fn from_task(name: impl Into<String>, description: impl Into<String>) -> Self {
         let task_name = name.into();
         let description = description.into();
@@ -108,6 +109,14 @@ impl ReviewBriefPacket {
     }
 }
 
+/// One planner-parsed breakdown entry (`###` heading, numbered list item, or
+/// `- **Name.**` bullet) offered to [`locate_design_section_with_breakdown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BreakdownSection<'a> {
+    pub title: &'a str,
+    pub body: &'a str,
+}
+
 /// Locate the design-doc section that a work item derives from.
 ///
 /// Match strategy (first hit wins, highest score):
@@ -119,27 +128,34 @@ impl ReviewBriefPacket {
 /// Normalization lowercases and strips punctuation. The extracted body runs
 /// from the matching heading through the next heading of the same or higher
 /// level. No match → the whole document, with `heading: None`.
+///
+/// Callers that have planner breakdown entries should use
+/// [`locate_design_section_with_breakdown`] so numbered/bullet entries match
+/// before this heading scan falls back to the whole doc.
 pub fn locate_design_section(doc: &str, task_name: &str, path: &str) -> DesignDocSection {
+    locate_design_section_with_breakdown(doc, task_name, path, &[])
+}
+
+/// Same as [`locate_design_section`], but planner breakdown entries are
+/// scored first with the same normalization. A matching entry's title+body
+/// is returned; the heading scan runs only when no entry matches.
+pub fn locate_design_section_with_breakdown(
+    doc: &str,
+    task_name: &str,
+    path: &str,
+    breakdown: &[BreakdownSection<'_>],
+) -> DesignDocSection {
     let needle = normalize_text(task_name);
     if needle.is_empty() {
         return whole_doc(doc, path);
     }
+    if let Some(section) = best_breakdown_match(&needle, path, breakdown) {
+        return section;
+    }
     let headings = parse_headings(doc);
     let mut best: Option<(u8, usize)> = None;
     for (i, heading) in headings.iter().enumerate() {
-        let title = normalize_text(&heading.title);
-        if title.is_empty() {
-            continue;
-        }
-        let score = if title == needle {
-            3
-        } else if title.contains(&needle) {
-            2
-        } else if needle.contains(&title) && title.split_whitespace().count() >= 3 {
-            1
-        } else {
-            0
-        };
+        let score = title_match_score(&heading.title, &needle);
         if score > 0 && best.is_none_or(|(s, _)| score > s) {
             best = Some((score, i));
         }
@@ -162,6 +178,44 @@ pub fn locate_design_section(doc: &str, task_name: &str, path: &str) -> DesignDo
     }
 }
 
+fn best_breakdown_match(needle: &str, path: &str, breakdown: &[BreakdownSection<'_>]) -> Option<DesignDocSection> {
+    let mut best: Option<(u8, usize)> = None;
+    for (i, entry) in breakdown.iter().enumerate() {
+        let score = title_match_score(entry.title, needle);
+        if score > 0 && best.is_none_or(|(s, _)| score > s) {
+            best = Some((score, i));
+        }
+    }
+    best.map(|(_, i)| {
+        let entry = &breakdown[i];
+        let mut body = format!("### {}\n", entry.title);
+        if !entry.body.trim().is_empty() {
+            body.push('\n');
+            body.push_str(entry.body.trim());
+        }
+        DesignDocSection {
+            path: path.to_owned(),
+            heading: Some(entry.title.to_owned()),
+            body,
+        }
+    })
+}
+
+fn title_match_score(title: &str, needle: &str) -> u8 {
+    let title = normalize_text(title);
+    if title.is_empty() {
+        0
+    } else if title == needle {
+        3
+    } else if title.contains(needle) {
+        2
+    } else if needle.contains(&title) && title.split_whitespace().count() >= 3 {
+        1
+    } else {
+        0
+    }
+}
+
 fn whole_doc(doc: &str, path: &str) -> DesignDocSection {
     DesignDocSection {
         path: path.to_owned(),
@@ -171,9 +225,10 @@ fn whole_doc(doc: &str, path: &str) -> DesignDocSection {
 }
 
 // Heading tokenization (fence-aware, CommonMark ATX rules) is shared with
-// `boss-pr-template`'s required-heading extraction — see
-// `boss_pr_template::parse_all_headings` — so a fix to fence or indentation
-// handling never has to be made in two parsers that can drift.
+// `boss-pr-template`'s required-heading extraction and the planner's `###`
+// breakdown parser — see `boss_pr_template::parse_all_headings` — so a fix
+// to fence or indentation handling never has to be made in two parsers that
+// can drift.
 use boss_pr_template::{HeadingToken, parse_all_headings};
 
 fn parse_headings(doc: &str) -> Vec<HeadingToken> {
@@ -193,129 +248,6 @@ fn normalize_text(s: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-/// How a brief-named deliverable landed in the PR.
-///
-/// Production classification of a deliverable is done by the reviewer LLM
-/// against [`render_brief_conformance_rubric`]'s procedure, not by this
-/// enum or the functions below — nothing in the engine calls them. They
-/// exist to pin down the severity-gate contract the rubric promises
-/// (`deferred_scope`/`high` forces a revision) with a fixture the rubric's
-/// wording can be checked against; keep them test-only (`#[cfg(test)]`)
-/// rather than a public production API nothing calls.
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum DeliverableDisposition {
-    Delivered,
-    DeclaredDeferred,
-    MissingOrSubstituted,
-}
-
-/// Classify one brief-named deliverable against the PR diff and declared
-/// deferred-scope summaries.
-///
-/// A deferred-scope summary covers the deliverable when either normalized
-/// string contains the other (non-empty). Delivery is evidenced only by the
-/// diff (or a backtick-quoted identifier from the deliverable appearing in
-/// the diff) — never by the PR body.
-#[cfg(test)]
-fn classify_deliverable(deliverable: &str, diff: &str, deferred_summaries: &[String]) -> DeliverableDisposition {
-    let needle = normalize_text(deliverable);
-    if needle.is_empty() {
-        return DeliverableDisposition::Delivered;
-    }
-    for summary in deferred_summaries {
-        let hay = normalize_text(summary);
-        if !hay.is_empty() && (needle.contains(&hay) || hay.contains(&needle)) {
-            return DeliverableDisposition::DeclaredDeferred;
-        }
-    }
-    if normalize_text(diff).contains(&needle) {
-        return DeliverableDisposition::Delivered;
-    }
-    for ident in backtick_idents(deliverable) {
-        if diff.contains(&ident) {
-            return DeliverableDisposition::Delivered;
-        }
-    }
-    DeliverableDisposition::MissingOrSubstituted
-}
-
-#[cfg(test)]
-fn backtick_idents(text: &str) -> Vec<String> {
-    let mut idents = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find('`') {
-        rest = &rest[start + 1..];
-        match rest.find('`') {
-            Some(end) => {
-                let ident = &rest[..end];
-                if !ident.is_empty() && !ident.contains(char::is_whitespace) {
-                    idents.push(ident.to_owned());
-                }
-                rest = &rest[end + 1..];
-            }
-            None => break,
-        }
-    }
-    idents
-}
-
-/// Blocking findings for brief-named deliverables the diff omits and no
-/// deferred-scope declaration covers. Each finding is `deferred_scope` at
-/// `high` severity, which [`crate::passes_severity_gate`] treats as a
-/// revision-forcing result — the same class as a correctness bug.
-#[cfg(test)]
-fn missing_deliverable_findings(
-    deliverables: &[String],
-    diff: &str,
-    deferred_summaries: &[String],
-) -> Vec<ReviewFinding> {
-    deliverables
-        .iter()
-        .filter(|d| {
-            matches!(
-                classify_deliverable(d, diff, deferred_summaries),
-                DeliverableDisposition::MissingOrSubstituted
-            )
-        })
-        .map(|d| {
-            ReviewFinding::builder()
-                .severity(ReviewFindingSeverity::High)
-                .category(ReviewFindingCategory::DeferredScope)
-                .file("PR diff")
-                .title(format!("Missing brief deliverable: {d}"))
-                .detail(format!(
-                    "The work-item brief names `{d}` as a deliverable, but the PR diff does not \
-                     implement it and no deferred-scope proposal covers it. This is a silent \
-                     omission or substitution, not a declared deferral. Deliver the item or file \
-                     a `[deferred-scope]` proposal that names it."
-                ))
-                .confidence(ReviewFindingConfidence::High)
-                .build()
-        })
-        .collect()
-}
-
-/// True when [`missing_deliverable_findings`] would force a revision.
-#[cfg(test)]
-fn missing_deliverables_are_blocking(findings: &[ReviewFinding]) -> bool {
-    if findings.is_empty() {
-        return false;
-    }
-    let result = ReviewResult {
-        pr_url: "https://github.com/org/repo/pull/1".to_owned(),
-        head_sha: "deadbeef".to_owned(),
-        summary: "brief conformance".to_owned(),
-        revision_warranted: true,
-        findings: findings.to_vec(),
-        regression_check: crate::types::RegressionCheck {
-            performed: true,
-            suspected_deletions: Vec::new(),
-        },
-    };
-    crate::passes_severity_gate(&result)
 }
 
 /// Prompt block embedding the packet: task, briefs, design section, declared
@@ -368,7 +300,7 @@ pub fn render_brief_packet_block(packet: &ReviewBriefPacket) -> String {
             .iter()
             .any(|u| matches!(u, UnresolvedReviewInput::DesignSection { .. })) =>
         {
-            out.push_str("**Design doc section:** *(unresolved — see Unresolved review inputs)*\n\n");
+            out.push_str("**Design doc section:** *(unresolved — see Engine-side design-doc input)*\n\n");
         }
         None => {
             out.push_str(
@@ -391,7 +323,18 @@ pub fn render_brief_packet_block(packet: &ReviewBriefPacket) -> String {
         out.push('\n');
     }
 
-    if !packet.unresolved.is_empty() {
+    let brief_gaps: Vec<_> = packet
+        .unresolved
+        .iter()
+        .filter(|item| matches!(item, UnresolvedReviewInput::Brief { .. }))
+        .collect();
+    let design_gaps: Vec<_> = packet
+        .unresolved
+        .iter()
+        .filter(|item| matches!(item, UnresolvedReviewInput::DesignSection { .. }))
+        .collect();
+
+    if !brief_gaps.is_empty() {
         out.push_str("## Unresolved review inputs — CRITICAL\n\n");
         out.push_str(
             "The engine could not resolve the following required inputs for this work-item PR. \
@@ -400,7 +343,23 @@ pub fn render_brief_packet_block(packet: &ReviewBriefPacket) -> String {
              the brief-conformance check because an input is missing — that silent skip is \
              how a substituted deliverable ships.\n\n",
         );
-        for item in &packet.unresolved {
+        for item in brief_gaps {
+            out.push_str(&item.prompt_line());
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+
+    if !design_gaps.is_empty() {
+        out.push_str("## Engine-side design-doc input — operator attention filed\n\n");
+        out.push_str(
+            "The engine could not fetch or resolve the design-doc section for this work item. \
+             An operator attention item has been filed so the broken pointer, missing file, or \
+             auth/rate-limit problem can be fixed. Do **not** raise a `deferred_scope` finding \
+             for this gap — a revision cannot fix an engine-side fetch. Continue the \
+             brief-conformance check against the work-item brief (and revision ask, if any).\n\n",
+        );
+        for item in design_gaps {
             out.push_str(&item.prompt_line());
             out.push('\n');
         }
@@ -464,15 +423,9 @@ pub fn render_brief_conformance_rubric() -> String {
 mod tests {
     use super::*;
     use crate::passes_severity_gate;
-
-    const BROKER_DELIVERABLE: &str = "revision-aware broker that fetches callers and tests";
-    const INLINING_DIFF: &str = "\
-diff --git a/tools/boss/engine/review-guide/src/lib.rs b/tools/boss/engine/review-guide/src/lib.rs
-+++ b/tools/boss/engine/review-guide/src/lib.rs
-@@
-+// Inline every source file into the prompt so the model can read them.
-+prompt.push_str(&std::fs::read_to_string(path).unwrap());
-";
+    use crate::types::{
+        ReviewFinding, ReviewFindingCategory, ReviewFindingConfidence, ReviewFindingSeverity, ReviewResult,
+    };
 
     #[test]
     fn packet_from_task_embeds_brief_and_marks_empty_as_unresolved() {
@@ -564,8 +517,13 @@ diff --git a/tools/boss/engine/review-guide/src/lib.rs b/tools/boss/engine/revie
         assert!(block.contains("Unresolved review inputs — CRITICAL"));
         assert!(block.contains("blocking finding"));
         assert!(block.contains("Work-item brief"));
-        assert!(block.contains("Design doc section"));
         assert!(block.contains("Do **not** skip"));
+        assert!(block.contains("Engine-side design-doc input — operator attention filed"));
+        assert!(block.contains("Design doc section"));
+        assert!(
+            block.contains("Do **not** raise a `deferred_scope` finding"),
+            "engine-side design-doc gaps must not force a revision: {block}"
+        );
     }
 
     #[test]
@@ -624,21 +582,22 @@ diff --git a/tools/boss/engine/review-guide/src/lib.rs b/tools/boss/engine/revie
     }
 
     #[test]
-    fn omitted_deliverable_without_deferral_is_blocking() {
-        let findings = missing_deliverable_findings(&[BROKER_DELIVERABLE.to_owned()], INLINING_DIFF, &[]);
-        assert_eq!(findings.len(), 1, "inlining diff must not count as delivering a broker");
-        assert_eq!(findings[0].category, ReviewFindingCategory::DeferredScope);
-        assert_eq!(findings[0].severity, ReviewFindingSeverity::High);
-        assert!(
-            missing_deliverables_are_blocking(&findings),
-            "missing deliverable must pass the severity gate"
-        );
+    fn deferred_scope_high_finding_passes_the_severity_gate() {
         let result = ReviewResult {
             pr_url: "https://github.com/org/repo/pull/2969".to_owned(),
             head_sha: "abc".to_owned(),
-            summary: "substituted the broker".to_owned(),
+            summary: "missing brief deliverable".to_owned(),
             revision_warranted: true,
-            findings,
+            findings: vec![
+                ReviewFinding::builder()
+                    .severity(ReviewFindingSeverity::High)
+                    .category(ReviewFindingCategory::DeferredScope)
+                    .file("PR diff")
+                    .title("Missing brief deliverable: revision-aware broker")
+                    .detail("The work-item brief names a broker the diff does not implement.")
+                    .confidence(ReviewFindingConfidence::High)
+                    .build(),
+            ],
             regression_check: crate::types::RegressionCheck {
                 performed: true,
                 suspected_deletions: Vec::new(),
@@ -646,43 +605,51 @@ diff --git a/tools/boss/engine/review-guide/src/lib.rs b/tools/boss/engine/revie
         };
         assert!(
             passes_severity_gate(&result),
-            "a fixture PR whose diff omits a brief-named deliverable must yield a blocking finding"
+            "deferred_scope/high is the revision-forcing class the brief-conformance rubric uses"
         );
     }
 
     #[test]
-    fn omitted_deliverable_with_deferred_scope_proposal_is_not_blocking() {
-        let findings = missing_deliverable_findings(
-            &[BROKER_DELIVERABLE.to_owned()],
-            INLINING_DIFF,
-            &["revision-aware broker".to_owned()],
-        );
-        assert!(
-            findings.is_empty(),
-            "a deferred-scope proposal covering the deliverable must suppress the missing-deliverable finding, got {findings:?}"
-        );
-        assert!(!missing_deliverables_are_blocking(&findings));
+    fn locate_design_section_prefers_numbered_breakdown_entry_over_whole_doc() {
+        let doc = "# Design\n\n## Proposed implementation task breakdown\n\n\
+                   1. Protocol types. Add the contract.\n\
+                   2. Engine handler. Depends on 1.\n";
+        let entries = [
+            BreakdownSection {
+                title: "Protocol types. Add the contract.",
+                body: "",
+            },
+            BreakdownSection {
+                title: "Engine handler. Depends on 1.",
+                body: "",
+            },
+        ];
+        let section = locate_design_section_with_breakdown(doc, "Protocol types", "docs/designs/guides.md", &entries);
+        assert_eq!(section.heading.as_deref(), Some("Protocol types. Add the contract."));
+        assert!(section.body.contains("Protocol types"));
+        assert!(!section.is_whole_doc_fallback());
     }
 
     #[test]
-    fn deliverable_present_in_diff_is_delivered() {
-        let diff = "+// revision-aware broker that fetches callers and tests\n";
-        assert_eq!(
-            classify_deliverable(BROKER_DELIVERABLE, diff, &[]),
-            DeliverableDisposition::Delivered
-        );
-    }
-
-    #[test]
-    fn backtick_identifier_in_diff_counts_as_delivered() {
-        assert_eq!(
-            classify_deliverable(
-                "implement the `revision_aware_broker` module",
-                "mod revision_aware_broker { }",
-                &[]
-            ),
-            DeliverableDisposition::Delivered
-        );
+    fn locate_design_section_prefers_bullet_breakdown_entry_over_whole_doc() {
+        let doc = "# Design\n\n## Implementation plan\n\n\
+                   - **6f-4: protocol additions.** Adds RegisterAppSession.\n\
+                   - **6f-5: engine-side dispatch.** ServerState tracks sessions.\n";
+        let entries = [
+            BreakdownSection {
+                title: "6f-4: protocol additions",
+                body: "Adds RegisterAppSession.",
+            },
+            BreakdownSection {
+                title: "6f-5: engine-side dispatch",
+                body: "ServerState tracks sessions.",
+            },
+        ];
+        let section =
+            locate_design_section_with_breakdown(doc, "6f-4: protocol additions", "docs/designs/rpc.md", &entries);
+        assert_eq!(section.heading.as_deref(), Some("6f-4: protocol additions"));
+        assert!(section.body.contains("Adds RegisterAppSession"));
+        assert!(!section.body.contains("engine-side dispatch"));
     }
 
     #[test]
