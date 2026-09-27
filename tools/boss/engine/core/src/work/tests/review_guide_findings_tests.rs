@@ -149,12 +149,15 @@ fn merge_gate_reports_all_open_revisions_and_ignores_terminal_or_deleted_items()
             .execute("UPDATE tasks SET status = ?2 WHERE id = ?1", params![revision, status])
             .unwrap();
         let open = db.open_merge_revisions(&root.id).unwrap();
-        if ["done", "archived"].contains(&status) {
-            assert!(open.is_empty());
-        } else {
+        if ["todo", "active", "blocked"].contains(&status) {
             assert_eq!(open.len(), 1);
             assert_eq!(open[0].id, revision);
             assert_eq!(open[0].status, status);
+        } else {
+            assert!(
+                open.is_empty(),
+                "{status} cannot still add commits and must not block merge"
+            );
         }
     }
     db.connect()
@@ -178,6 +181,47 @@ fn merge_gate_reports_all_open_revisions_and_ignores_terminal_or_deleted_items()
     let open = db.open_merge_revisions(&root.id).unwrap();
     assert_eq!(open.len(), 1, "live nested revisions survive a deleted intermediary");
     assert_eq!(open[0].id, child.id);
+}
+
+#[test]
+fn merge_gate_reports_no_open_revisions_when_all_are_in_review_or_done() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id, "reviewed target");
+    bind_open_pr(&db, &root.id);
+    let first = apply_findings(&db, &root.id, "head-one");
+    let second = apply_findings(&db, &root.id, "head-two");
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET status = 'in_review' WHERE id = ?1", [&first])
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET status = 'done' WHERE id = ?1", [&second])
+        .unwrap();
+    assert!(
+        db.open_merge_revisions(&root.id).unwrap().is_empty(),
+        "in_review and done revisions have already published and must not prompt"
+    );
+}
+
+#[test]
+fn merge_gate_reports_a_running_or_queued_revision() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id, "live target");
+    bind_open_pr(&db, &root.id);
+    let revision = apply_findings(&db, &root.id, "head-one");
+    for status in ["todo", "active"] {
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET status = ?2 WHERE id = ?1", params![revision, status])
+            .unwrap();
+        let open = db.open_merge_revisions(&root.id).unwrap();
+        assert_eq!(open.len(), 1, "{status} can still add commits");
+        assert_eq!(open[0].id, revision);
+        assert_eq!(open[0].status, status);
+    }
 }
 
 #[test]

@@ -45,6 +45,13 @@ impl TaskStatus {
         matches!(self, Self::Done | Self::Archived)
     }
 
+    /// True when a revision can still push commits onto its parent PR.
+    /// `in_review` has already published its branch; `done` and `archived`
+    /// are closed. Used by the merge-when-ready confirmation gate.
+    pub fn can_still_change_pr(&self) -> bool {
+        matches!(self, Self::Todo | Self::Active | Self::Blocked)
+    }
+
     /// True for statuses that represent work in progress (engine-owned dispatch
     /// slot is live or a PR is open awaiting review).
     pub fn is_live(&self) -> bool {

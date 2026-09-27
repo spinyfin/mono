@@ -144,6 +144,25 @@ final class MergeWhenReadyFeedbackTests: XCTestCase {
         XCTAssertGreaterThan(hosting.fittingSize.height, 0)
     }
 
+    func testConfirmationAlertListsHumanStatusWithoutIdPrefix() {
+        let confirmation = ChatViewModel.MergeRevisionConfirmation(
+            workItemID: "root",
+            revisions: [
+                OpenMergeRevision(id: "r1", label: "rev-a", status: "active"),
+                OpenMergeRevision(id: "r2", label: "rev-b", status: "todo"),
+                OpenMergeRevision(id: "r3", label: "rev-c", status: "blocked"),
+            ],
+            origin: .board
+        )
+        XCTAssertEqual(
+            confirmation.alertMessage,
+            "rev-a — running\nrev-b — queued\nrev-c — blocked\n\nThese revisions may still change this PR. Merge anyway?"
+        )
+        XCTAssertFalse(confirmation.alertMessage.contains("ID "))
+        XCTAssertFalse(confirmation.alertMessage.contains("active"))
+        XCTAssertFalse(confirmation.alertMessage.contains("todo"))
+    }
+
     func testOpenRevisionConfirmationRequiresExplicitConsent() {
         let model = makeModel()
         let revisions = [OpenMergeRevision(id: "revision", label: "ID-test", status: "blocked")]

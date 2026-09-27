@@ -231,4 +231,18 @@ struct OpenMergeRevision: Codable, Equatable {
     let status: String
 
     var wirePayload: [String: String] { ["id": id, "label": label, "status": status] }
+
+    /// Dialog line: short id and a verb. The engine still sends the
+    /// canonical status string; this is display-only.
+    var confirmationLine: String { "\(label) — \(humanStatus)" }
+
+    var humanStatus: String {
+        switch status {
+        case "todo": "queued"
+        case "active": "running"
+        case "blocked": "blocked"
+        case "in_review": "in review"
+        default: status.replacingOccurrences(of: "_", with: " ")
+        }
+    }
 }

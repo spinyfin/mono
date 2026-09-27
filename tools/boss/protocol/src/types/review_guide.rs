@@ -77,7 +77,9 @@ pub struct ReviewGuideFindings {
     pub addendum_markdown: String,
 }
 
-/// Engine-selected non-terminal revision requiring explicit merge consent.
+/// Engine-selected revision that can still push commits to the PR and
+/// therefore requires explicit merge consent. `in_review` / `done` /
+/// `archived` never appear here.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpenMergeRevision {
     pub id: String,
