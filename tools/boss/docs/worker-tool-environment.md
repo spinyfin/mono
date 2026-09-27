@@ -50,13 +50,16 @@ A missing dispatcher exits 127 with a specific diagnostic. A failure to write
 the environment aborts spawn; it cannot quietly restore host-tool selection.
 
 After driver environment directives and launcher prepends, the spawn script
-captures the composed PATH in `BOSS_WORKER_PATH`. Worker-owned `BASH_ENV` and
+exports only the launcher directory and optional `BOSS_BIN_DIR` in
+`BOSS_WORKER_TOOL_PATH`. Worker-owned `BASH_ENV` and
 `ZDOTDIR/.zshenv` restore that value as the leading PATH segment in
 noninteractive Bash and zsh tool shells, and install a DEBUG trap that repeats
 the restore before later commands. That covers a driver which sources an
 `export PATH=...` snapshot after startup (Claude Code's Bash tool:
 `source <snapshot> && eval '<cmd>'`). Driver-added private helper directories
-remain available after that segment; they cannot shadow the composed tools.
+remain available after that segment. Project toolchain prepends (virtualenvs,
+node_modules, nvm, or rustup) still precede host tools; the restore never
+re-prepends the host PATH ahead of them.
 The zsh file disables further profile loading. Codex additionally disables
 login shells, shell snapshots and profile environment reconstruction through
 correctly scoped configuration. This affects new sessions; existing sessions
@@ -67,7 +70,7 @@ The order at the shell boundary is therefore:
 ```text
 before: shell profiles / driver login pass -> arbitrary host PATH order
 after:  worker launchers -> bundled binaries (when present) -> host tools
-        nested Bash and zsh tool shells restore this composed order,
+        nested Bash and zsh tool shells restore only the worker-owned prefix,
         including after a snapshot that re-exports PATH
 ```
 

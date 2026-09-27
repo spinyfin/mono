@@ -1,7 +1,7 @@
 //! Worker-owned repository tools and shell environment, applied after pane startup.
 //!
-//! The initial login shell discovers host tools. Once composed, that PATH has
-//! priority in tool shells: a second login/profile pass cannot shadow its tools.
+//! The initial login shell discovers host tools. Only the worker-owned prefix
+//! has priority in tool shells; project toolchains can still precede host tools.
 //! A DEBUG trap repeats the restore before later commands, so a driver that
 //! sources an `export PATH=...` snapshot after startup (Claude Code's Bash tool)
 //! cannot demote the launcher directory.
@@ -15,18 +15,18 @@ const REPOBIN_CONFIG_NAME: &str = "REPOBIN.toml";
 
 /// Restore snippet shared by bash-env and .zshenv. Drivers may add private
 /// helper directories after spawn (e.g. Codex's arg0 directory); those stay
-/// reachable behind the composed toolchain.
+/// reachable behind the worker-owned tools.
 const PATH_RESTORE: &str = "case \"$PATH\" in\n\
-    \"$BOSS_WORKER_PATH\"|\"$BOSS_WORKER_PATH\":*) ;;\n\
-    *) export PATH=\"$BOSS_WORKER_PATH:$PATH\" ;;\n\
+    \"$BOSS_WORKER_TOOL_PATH\"|\"$BOSS_WORKER_TOOL_PATH\":*) ;;\n\
+    *) export PATH=\"$BOSS_WORKER_TOOL_PATH:$PATH\" ;;\n\
     esac\n";
 
 /// Re-run the PATH restore before each subsequent command. Bash DEBUG fires
 /// before the command; zsh needs `DEBUG_BEFORE_CMD` for the same timing.
 /// Single-quoted so `$PATH` expands when the trap fires, not when it is set.
 const PATH_DEBUG_TRAP: &str = "trap 'case \"$PATH\" in\n\
-    \"$BOSS_WORKER_PATH\"|\"$BOSS_WORKER_PATH\":*) ;;\n\
-    *) export PATH=\"$BOSS_WORKER_PATH:$PATH\" ;;\n\
+    \"$BOSS_WORKER_TOOL_PATH\"|\"$BOSS_WORKER_TOOL_PATH\":*) ;;\n\
+    *) export PATH=\"$BOSS_WORKER_TOOL_PATH:$PATH\" ;;\n\
     esac' DEBUG\n";
 
 /// Install a repository tool using the engine's repobin dispatcher. Unlike the
@@ -98,44 +98,15 @@ fn toml_declares_tool(text: &str, name: &str) -> bool {
     if validate_repo_tool_name(name).is_err() {
         return false;
     }
-    let dotted_tools = format!("[tools.{name}]");
-    let dotted_pins = format!("[pins.{name}]");
-    let mut in_tools = false;
-    let mut in_pins = false;
-    for raw in text.lines() {
-        let line = strip_toml_comment(raw).trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            in_tools = line == "[tools]";
-            in_pins = line == "[pins]";
-            if line == dotted_tools || line == dotted_pins {
-                return true;
-            }
-            continue;
-        }
-        if (in_tools || in_pins) && assignment_key(line) == Some(name) {
-            return true;
-        }
+    #[derive(serde::Deserialize)]
+    struct ToolDeclarations {
+        #[serde(default)]
+        tools: std::collections::BTreeMap<String, toml::Value>,
+        #[serde(default)]
+        pins: std::collections::BTreeMap<String, toml::Value>,
     }
-    false
-}
-
-fn strip_toml_comment(line: &str) -> &str {
-    match line.find('#') {
-        Some(index) => &line[..index],
-        None => line,
-    }
-}
-
-fn assignment_key(line: &str) -> Option<&str> {
-    let (key, rest) = line.split_once('=')?;
-    let key = key.trim();
-    if key.is_empty() || rest.trim().is_empty() {
-        return None;
-    }
-    Some(key)
+    toml::from_str::<ToolDeclarations>(text)
+        .is_ok_and(|config| config.tools.contains_key(name) || config.pins.contains_key(name))
 }
 
 /// Materialize shell startup files next to (not inside) the executable directory.
@@ -155,13 +126,14 @@ pub fn write_shell_environment(bin_dir: &Path) -> io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Apply the same composed environment to every local driver. Capture PATH only
-/// after the pane's login setup and engine-owned launcher prepends have finished.
+/// Seal only the worker launcher and optional bundle directories for every driver.
+/// Host PATH entries remain behind project toolchain prepends.
 /// Existing driver auth/environment directives must be applied before this seal.
 pub fn shell_environment_clause(bin_dir: &Path) -> String {
     let dir = environment_dir(bin_dir);
     format!(
-        "export BOSS_WORKER_PATH=\"$PATH\"; export BASH_ENV={}; export ZDOTDIR={}; ",
+        "export BOSS_WORKER_TOOL_PATH={}\"${{BOSS_BIN_DIR:+:$BOSS_BIN_DIR}}\"; export BASH_ENV={}; export ZDOTDIR={}; ",
+        sh_quote(&bin_dir.to_string_lossy()),
         sh_quote(&dir.join("bash-env").to_string_lossy()),
         sh_quote(&dir.to_string_lossy()),
     )
@@ -172,6 +144,10 @@ fn environment_dir(bin_dir: &Path) -> PathBuf {
     name.push(".environment");
     PathBuf::from(name)
 }
+
+#[cfg(test)]
+#[path = "environment_regression_tests.rs"]
+mod regression_tests;
 
 #[cfg(test)]
 mod tests {
