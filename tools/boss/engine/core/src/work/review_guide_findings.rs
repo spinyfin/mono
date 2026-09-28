@@ -129,7 +129,8 @@ impl FindingsText {
                 self.lines.len(),
                 if self.lines.len() == 1 { "" } else { "s" }
             ),
-            addendum_markdown: format!("## AI review findings addendum\n\n{}", self.lines.join("\n")),
+            // The viewer supplies the title in its disclosure label.
+            addendum_markdown: self.lines.join("\n"),
         }
     }
 }

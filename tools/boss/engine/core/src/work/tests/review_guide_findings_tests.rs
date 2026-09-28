@@ -91,10 +91,9 @@ fn live_addendum_tracks_findings_and_status_without_mutating_guide() {
     let tracked = query_task(&db.connect().unwrap(), &revision).unwrap().unwrap();
     let label = boss_protocol::short_id_label(tracked.short_id).unwrap();
     assert!(before.status_text.starts_with("AI review found 1 issue;"));
-    assert!(
-        before
-            .addendum_markdown
-            .contains(&format!("- [high] Unchecked index — ID {label} (todo)"))
+    assert_eq!(
+        before.addendum_markdown,
+        format!("- [high] Unchecked index — ID {label} (todo)")
     );
     assert!(!before.status_text.contains("fixes complete"));
 
