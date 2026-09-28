@@ -4,22 +4,22 @@ use super::*;
 fn guide_sandbox_is_read_only_with_only_the_proposal_socket() {
     for enforced in [false, true] {
         assert_eq!(codex_sandbox_for_worker_kind(WorkerKind::ReviewGuide, enforced), None);
-        assert_eq!(
-            codex_sandbox_extra_args(WorkerKind::ReviewGuide, enforced),
-            ["--config", "default_permissions=\"review-guide\""]
-        );
+        // No CLI override: default_permissions is selected in the rendered
+        // config file instead, so the hook-trust observer (which only ever
+        // loads that file) sees the same profile as the real worker spawn.
+        assert!(codex_sandbox_extra_args(WorkerKind::ReviewGuide, enforced).is_empty());
     }
     let command = crate::apply_permission_extra_args(
         "codex exec -c model_reasoning_effort=high",
         &codex_sandbox_extra_args(WorkerKind::ReviewGuide, false),
     );
-    assert!(command.contains("-c model_reasoning_effort=high"));
-    assert!(command.contains("default_permissions"));
+    assert_eq!(command, "codex exec -c model_reasoning_effort=high");
     let config: toml::Value = toml::from_str(&render_review_guide_config(
         Path::new("/repo"),
         Path::new("/tmp/guide.sock"),
     ))
     .unwrap();
+    assert_eq!(config["default_permissions"].as_str(), Some("review-guide"));
     assert_eq!(
         config["permissions"]["review-guide"]["extends"].as_str(),
         Some(":read-only")

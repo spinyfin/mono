@@ -37,7 +37,7 @@ use boss_protocol::{EffortLevel, ReasoningMode};
 /// ids still use [`PINNED_CODEX_ITEM_ID_BASE`], and `error` items still
 /// carry operational warnings. The checked-in JSONL is unchanged because
 /// those invariants still hold.
-pub const PINNED_CODEX_CLI_VERSION: &str = "0.153.4";
+pub const PINNED_CODEX_CLI_VERSION: &str = env!("CODEX_CLI_VERSION");
 
 /// Item-id base observed on the pinned Codex CLI.
 ///

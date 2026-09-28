@@ -499,7 +499,9 @@ pub fn codex_homes_root_and_home_for_run(run_id: &str) -> anyhow::Result<(PathBu
 pub fn codex_sandbox_for_worker_kind(worker_kind: WorkerKind, sandbox_enforced: bool) -> Option<&'static str> {
     match worker_kind {
         WorkerKind::Reviewer => None,
-        // Selected through default_permissions in codex_sandbox_extra_args.
+        // Selected via default_permissions in the rendered config file
+        // (render_review_guide_config), not a CLI override — see
+        // codex_sandbox_extra_args's doc comment for why.
         WorkerKind::ReviewGuide => None,
         WorkerKind::Standard | WorkerKind::Triage | WorkerKind::AnswerAgent => {
             if sandbox_enforced {
@@ -512,12 +514,17 @@ pub fn codex_sandbox_for_worker_kind(worker_kind: WorkerKind, sandbox_enforced: 
 }
 
 /// CLI `extra_args` that encode sandbox policy for the spawn flow.
+///
+/// `ReviewGuide` deliberately has no `--sandbox`/`--config` override here: its
+/// `default_permissions = "review-guide"` profile (extends `:read-only`,
+/// adding only the attributed proposal socket) is selected in the rendered
+/// config file by [`render_review_guide_config`] instead, because the
+/// hook-trust app-server's own `codex app-server` invocation loads only that
+/// file and never sees a worker's CLI overrides — a CLI-only override here
+/// left the observer unable to see the profile. Keeping selection in exactly
+/// one place (the file) means the observer and the real worker spawn can
+/// never see different profiles.
 pub fn codex_sandbox_extra_args(worker_kind: WorkerKind, sandbox_enforced: bool) -> Vec<String> {
-    if worker_kind == WorkerKind::ReviewGuide {
-        // Extends :read-only, adding only the attributed proposal socket.
-        // --sandbox would override the named profile and remove that exception.
-        return vec!["--config".into(), "default_permissions=\"review-guide\"".into()];
-    }
     codex_sandbox_for_worker_kind(worker_kind, sandbox_enforced)
         .map(|sandbox| vec!["--sandbox".into(), sandbox.into()])
         .unwrap_or_default()

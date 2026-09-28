@@ -15,7 +15,10 @@ fn review_guide_config_arms_hooks_on_pinned_codex() {
         .unwrap();
     let version = Command::new(&binary).arg("--version").output().unwrap();
     assert!(version.status.success());
-    assert_eq!(String::from_utf8_lossy(&version.stdout).trim(), "codex-cli 0.153.4");
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout).trim(),
+        format!("codex-cli {}", env!("CODEX_CLI_VERSION")),
+    );
 
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();

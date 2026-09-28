@@ -198,33 +198,19 @@ use_repo(
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
 # Codex runtime compatibility tests must use the deployed CLI version, not
-# whatever happens to be installed on the CI host. Keep all platforms in sync.
-http_archive(
-    name = "codex_test_aarch64_macos",
-    build_file_content = 'filegroup(name = "codex", srcs = ["codex-aarch64-apple-darwin"], visibility = ["@//tools/boss/engine/driver:__pkg__"])',
-    sha256 = "8cf911ea676523bfb2121ec561848d2aba564890ad536db4d8a3353f2b9850b1",
-    urls = ["https://github.com/openai/codex/releases/download/rust-v0.153.4/codex-aarch64-apple-darwin.tar.gz"],
-)
-
-http_archive(
-    name = "codex_test_x86_64_macos",
-    build_file_content = 'filegroup(name = "codex", srcs = ["codex-x86_64-apple-darwin"], visibility = ["@//tools/boss/engine/driver:__pkg__"])',
-    sha256 = "d69200f0bf841b1d1a07f80b80cf742a2e4fc2bab91ae8a44b1042f8e8ca9fa4",
-    urls = ["https://github.com/openai/codex/releases/download/rust-v0.153.4/codex-x86_64-apple-darwin.tar.gz"],
-)
-
-http_archive(
-    name = "codex_test_x86_64_linux",
-    build_file_content = 'filegroup(name = "codex", srcs = ["codex-x86_64-unknown-linux-musl"], visibility = ["@//tools/boss/engine/driver:__pkg__"])',
-    sha256 = "f479424eca092484dc40d87ae28c44f4cc40234a60045d6131e493800d814a30",
-    urls = ["https://github.com/openai/codex/releases/download/rust-v0.153.4/codex-x86_64-unknown-linux-musl.tar.gz"],
-)
-
-http_archive(
-    name = "codex_test_aarch64_linux",
-    build_file_content = 'filegroup(name = "codex", srcs = ["codex-aarch64-unknown-linux-musl"], visibility = ["@//tools/boss/engine/driver:__pkg__"])',
-    sha256 = "5cda6182bd94c3a30f2eb63a495489ebf7f691fddb14d70f48c6c1a5071b6cde",
-    urls = ["https://github.com/openai/codex/releases/download/rust-v0.153.4/codex-aarch64-unknown-linux-musl.tar.gz"],
+# whatever happens to be installed on the CI host. Keep all platforms in
+# sync, and keep this in lockstep with PINNED_CODEX_CLI_VERSION — the actual
+# version and asset checksums live in codex_test_archives.bzl (which reads
+# CODEX_CLI_VERSION from codex_cli_version.bzl), since MODULE.bazel itself
+# cannot `load()` a `.bzl` file directly; see codex_cli_version.bzl's own
+# bump procedure.
+codex_test_archives = use_extension("//tools/boss/engine/core:codex_test_archives.bzl", "codex_test_archives")
+use_repo(
+    codex_test_archives,
+    "codex_test_aarch64_linux",
+    "codex_test_aarch64_macos",
+    "codex_test_x86_64_linux",
+    "codex_test_x86_64_macos",
 )
 
 # Hermetic, version-pinned wasm-tools binaries for the rust_wasm_component rule
