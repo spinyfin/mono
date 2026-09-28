@@ -90,28 +90,48 @@ fn live_addendum_tracks_findings_and_status_without_mutating_guide() {
     let before = findings(&db, &root.id).unwrap();
     let tracked = query_task(&db.connect().unwrap(), &revision).unwrap().unwrap();
     let label = boss_protocol::short_id_label(tracked.short_id).unwrap();
-    assert!(before.status_text.starts_with("AI review found 1 issue;"));
+    assert_eq!(before.status_text, "1 finding: 0 fixed on PR, 1 in progress, 0 open");
     assert_eq!(
         before.addendum_markdown,
-        format!("- [high] Unchecked index — ID {label} (todo)")
+        format!("- ◷ [high] Unchecked index — ID {label} — in progress")
     );
-    assert!(!before.status_text.contains("fixes complete"));
 
-    for status in ["active", "blocked", "in_review", "archived", "done"] {
+    for (status, marker, counts) in [
+        ("todo", "◷ ", "0 fixed on PR, 1 in progress, 0 open"),
+        ("active", "◷ ", "0 fixed on PR, 1 in progress, 0 open"),
+        ("blocked", "◷ ", "0 fixed on PR, 1 in progress, 0 open"),
+        ("in_review", "✓ ~~", "1 fixed on PR, 0 in progress, 0 open"),
+        ("archived", "", "0 fixed on PR, 0 in progress, 1 open"),
+        ("done", "✓ ~~", "1 fixed on PR, 0 in progress, 0 open"),
+    ] {
         db.connect()
             .unwrap()
             .execute("UPDATE tasks SET status = ?2 WHERE id = ?1", params![revision, status])
             .unwrap();
         let updated = findings(&db, &root.id).unwrap();
-        assert!(updated.addendum_markdown.contains(&format!("ID {label} ({status})")));
-        assert_eq!(updated.status_text.contains("fixes complete"), status == "done");
+        assert_eq!(updated.status_text, format!("1 finding: {counts}"), "{status}");
+        assert!(
+            updated
+                .addendum_markdown
+                .contains(&format!("- {marker}[high] Unchecked index")),
+            "{status}"
+        );
+        assert!(updated.addendum_markdown.contains(&format!("ID {label}")));
+        assert!(!updated.addendum_markdown.contains(&format!("({status})")));
+        if matches!(status, "in_review" | "done") {
+            assert!(
+                updated
+                    .addendum_markdown
+                    .ends_with(&format!("- ✓ ~~[high] Unchecked index~~ — ID {label}"))
+            );
+        }
     }
     let stored = db.get_pr_review_guide_version(&version.id).unwrap().unwrap();
     assert_eq!(stored.markdown, version.markdown);
     assert_eq!(stored.content_hash, version.content_hash);
     apply_findings(&db, &root.id, "head-two");
     let updated = findings(&db, &root.id).unwrap();
-    assert!(updated.status_text.starts_with("AI review found 2 issues;"));
+    assert_eq!(updated.status_text, "2 findings: 1 fixed on PR, 1 in progress, 0 open");
     assert_eq!(
         updated
             .addendum_markdown
@@ -263,4 +283,34 @@ fn legacy_verdict_uses_engine_rendered_revision_titles() {
     drop(conn);
     let text = findings(&db, &root.id).unwrap();
     assert!(text.addendum_markdown.contains("[high] Unchecked index"));
+}
+
+#[test]
+fn untracked_and_deleted_findings_stay_open() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id, "untracked findings");
+    bind_open_pr(&db, &root.id);
+    let revision = apply_findings(&db, &root.id, "head-one");
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE tasks SET status = 'done', deleted_at = 'now' WHERE id = ?1",
+        [&revision],
+    )
+    .unwrap();
+    drop(conn);
+    assert_eq!(
+        findings(&db, &root.id).unwrap().status_text,
+        "1 finding: 0 fixed on PR, 0 in progress, 1 open"
+    );
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_verdicts SET revision_task_id = NULL WHERE revision_task_id = ?1",
+            [&revision],
+        )
+        .unwrap();
+    let untracked = findings(&db, &root.id).unwrap();
+    assert_eq!(untracked.status_text, "1 finding: 0 fixed on PR, 0 in progress, 1 open");
+    assert!(untracked.addendum_markdown.ends_with("- [high] Unchecked index"));
 }

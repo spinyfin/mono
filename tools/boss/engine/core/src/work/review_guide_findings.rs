@@ -48,7 +48,7 @@ fn query_findings(conn: &Connection, root_id: &str, pr_url: &str) -> Result<Opti
          LEFT JOIN worker_proposals p ON p.id = v.proposal_id
          LEFT JOIN pr_review_batches b ON b.id = v.batch_id
          LEFT JOIN work_executions e ON e.id = v.execution_id
-         JOIN tasks t ON t.id = v.revision_task_id
+         LEFT JOIN tasks t ON t.id = v.revision_task_id
          WHERE COALESCE(b.pr_url, e.pr_url) = ? AND v.work_item_id IN ({placeholders})
          ORDER BY v.created_at, v.id"
     ))?;
@@ -56,11 +56,11 @@ fn query_findings(conn: &Connection, root_id: &str, pr_url: &str) -> Result<Opti
     let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
         Ok((
             row.get::<_, Option<String>>(0)?,
-            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(1)?,
             row.get::<_, Option<i64>>(2)?,
-            row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(3)?,
             row.get::<_, Option<String>>(4)?,
-            row.get::<_, String>(5)?,
+            row.get::<_, Option<String>>(5)?,
         ))
     })?;
     let mut text = FindingsText::default();
@@ -75,59 +75,61 @@ fn query_findings(conn: &Connection, root_id: &str, pr_url: &str) -> Result<Opti
                 .map(|finding| (finding.severity.as_str().to_owned(), finding.title))
                 .collect()
         } else {
-            legacy_finding_titles(&description)
+            legacy_finding_titles(description.as_deref().unwrap_or_default())
         };
         if findings.is_empty() {
             continue;
         }
-        let label = boss_protocol::short_id_label(short_id).unwrap_or(id);
-        let status = if deleted_at.is_some() { "deleted" } else { &status };
-        text.trackers.insert(format!("ID {label} ({status})"));
-        text.all_done &= status == "done";
+        let label = boss_protocol::short_id_label(short_id).or(id);
+        let status = if deleted_at.is_some() { None } else { status.as_deref() };
         for (severity, title) in findings {
-            text.lines.push(format!(
-                "- [{}] {} — ID {} ({})",
-                severity,
-                escape_markdown_line(&title),
-                escape_markdown_line(&label),
-                status,
-            ));
+            text.push(&severity, &title, label.as_deref(), status);
         }
     }
     Ok((!text.lines.is_empty()).then(|| text.finish()))
 }
 
+#[derive(Default)]
 struct FindingsText {
     lines: Vec<String>,
-    trackers: std::collections::BTreeSet<String>,
-    all_done: bool,
-}
-
-impl Default for FindingsText {
-    fn default() -> Self {
-        Self {
-            lines: Vec::new(),
-            trackers: Default::default(),
-            all_done: true,
-        }
-    }
+    fixed: usize,
+    in_progress: usize,
+    open: usize,
 }
 
 impl FindingsText {
-    fn finish(self) -> ReviewGuideFindings {
-        let tracking = if self.all_done {
-            "fixes complete".to_owned()
-        } else {
-            format!(
-                "fix tracking: {}",
-                self.trackers.into_iter().collect::<Vec<_>>().join(", ")
-            )
+    fn push(&mut self, severity: &str, title: &str, label: Option<&str>, status: Option<&str>) {
+        let finding = format!("[{}] {}", severity, escape_markdown_line(title));
+        let tracker = label
+            .map(|label| format!(" — ID {}", escape_markdown_line(label)))
+            .unwrap_or_default();
+        let line = match status {
+            Some("in_review" | "done") => {
+                self.fixed += 1;
+                format!("- ✓ ~~{finding}~~{tracker}")
+            }
+            // Task rows use todo/active; accept the queue/run vocabulary too.
+            Some("todo" | "active" | "queued" | "blocked" | "running") => {
+                self.in_progress += 1;
+                format!("- ◷ {finding}{tracker} — in progress")
+            }
+            _ => {
+                self.open += 1;
+                format!("- {finding}{tracker}")
+            }
         };
+        self.lines.push(line);
+    }
+
+    fn finish(self) -> ReviewGuideFindings {
         ReviewGuideFindings {
             status_text: format!(
-                "AI review found {} issue{}; {tracking}",
+                "{} finding{}: {} fixed on PR, {} in progress, {} open",
                 self.lines.len(),
-                if self.lines.len() == 1 { "" } else { "s" }
+                if self.lines.len() == 1 { "" } else { "s" },
+                self.fixed,
+                self.in_progress,
+                self.open,
             ),
             // The viewer supplies the title in its disclosure label.
             addendum_markdown: self.lines.join("\n"),
@@ -159,4 +161,26 @@ fn legacy_finding_titles(description: &str) -> Vec<(String, String)> {
             matches!(severity, "critical" | "high" | "medium" | "low").then(|| (severity.to_owned(), title.to_owned()))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FindingsText;
+
+    #[test]
+    fn status_mapping_covers_missing_and_execution_statuses() {
+        for (status, prefix, counts) in [
+            (Some("queued"), "- ◷ ", "0 fixed on PR, 1 in progress, 0 open"),
+            (Some("running"), "- ◷ ", "0 fixed on PR, 1 in progress, 0 open"),
+            (Some("failed"), "- [high]", "0 fixed on PR, 0 in progress, 1 open"),
+            (Some("cancelled"), "- [high]", "0 fixed on PR, 0 in progress, 1 open"),
+            (None, "- [high]", "0 fixed on PR, 0 in progress, 1 open"),
+        ] {
+            let mut text = FindingsText::default();
+            text.push("high", "Finding", None, status);
+            let result = text.finish();
+            assert_eq!(result.status_text, format!("1 finding: {counts}"));
+            assert!(result.addendum_markdown.lines().last().unwrap().starts_with(prefix));
+        }
+    }
 }
