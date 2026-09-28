@@ -599,3 +599,86 @@ fn updated_guide_links_validate_at_the_new_head_and_reject_stale_head_links() {
     assert!(verify_previous_head(&repo.worker, &old).is_ok());
     assert!(verify_previous_head(&repo.worker, &"f".repeat(40)).is_err());
 }
+
+#[tokio::test]
+async fn revision_metadata_failure_keeps_revision_status_and_published_guide() {
+    let (dir, db) = open_db();
+    let db = Arc::new(db);
+    let product = create_product(&db);
+    let root = create_active_chore(&db, &product, "revision metadata failure");
+    let url = "https://github.com/acme/widget/pull/76";
+    db.update_work_item(
+        &root,
+        WorkItemPatch {
+            status: Some("in_review".into()),
+            pr_url: Some(url.into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let packet = source_capture_packet(url, "base", "published-head");
+    let PrSourceCapturePersistOutcome::Stored(capture) = db
+        .persist_pr_review_guide_source_capture(&root, 0, PrSourceCaptureTrigger::Creation, &packet)
+        .unwrap()
+    else {
+        panic!("capture");
+    };
+    let first = db
+        .create_pr_review_guide_attempt(&capture.series_id, &capture.comparison_id, "test")
+        .unwrap();
+    let PublishReviewGuideOutcome::Published(version) = db
+        .publish_pr_review_guide_version(&first.id, "# Published explanation", "original")
+        .unwrap()
+    else {
+        panic!("publish");
+    };
+    let revision = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(&root)
+                .description("fix finding")
+                .build(),
+            &FakePrStateChecker::always(PrOpenState::Open),
+        )
+        .unwrap();
+    let flags = Arc::new(FeatureFlagsStore::new(dir.path().join("flags.toml")));
+    flags.set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, true).unwrap();
+    flags.set(REVIEW_GUIDE_GENERATION_FLAG, true).unwrap();
+    let mut collector = SourcePacketCollector::fixture(
+        Arc::new(|_, _, _, _| panic!("metadata failure must stop source collection")),
+        packet,
+    );
+    collector.metadata = Arc::new(|_, _| Box::pin(async { anyhow::bail!("metadata unavailable") }));
+    reconcile_review_guide_source_with_collector(
+        db.clone(),
+        flags,
+        SourceCaptureRequest::builder()
+            .root_task_id(&root)
+            .pr_url(url)
+            .trigger(PrSourceCaptureTrigger::Completion)
+            .revision(RevisionCapture {
+                task_id: revision.id.clone(),
+                head_before: Some("published-head".into()),
+                head_after: Some("revised-head".into()),
+            })
+            .build(),
+        collector,
+    )
+    .unwrap()
+    .await
+    .unwrap();
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert_eq!(summary.lifecycle, "failed");
+    assert_eq!(summary.readable_version_id.as_deref(), Some(version.id.as_str()));
+    let label = boss_protocol::short_id_label(revision.short_id).unwrap_or(revision.id);
+    assert_eq!(
+        db.review_guide_findings(&root, url).unwrap().unwrap().status_text,
+        format!("Update after revision {label} failed; previous guide retained")
+    );
+    assert_eq!(db.get_pr_review_guide_version(&version.id).unwrap().unwrap(), *version);
+    assert!(
+        db.live_pr_review_guide_attempts_for_series(&capture.series_id)
+            .unwrap()
+            .is_empty()
+    );
+}

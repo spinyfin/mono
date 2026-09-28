@@ -295,6 +295,18 @@ pub(crate) fn reconcile_review_guide_source_with_collector(
         // Own the guard before the future is polled, including cancellation.
         let guard = guard;
         boss_gh_telemetry::scope(boss_gh_telemetry::callers::REVIEW_GUIDE_SOURCE_CAPTURE, async move {
+            // Completion may already have pinned the delivered head. Preserve
+            // its attribution even when fetching fresh metadata fails.
+            if let Some(revision) = &revision
+                && let Some(head) = &revision.head_after
+                && revision.head_before.as_ref() != Some(head)
+                && let Err(error) = work_db.record_review_guide_revision_head(
+                    &root_task_id, &pr_url, head, &revision.task_id, observation_sequence,
+                )
+            {
+                record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
+                return;
+            }
             let metadata = match (collector.metadata)(pr_url.clone(), expected_head_branch.clone()).await {
                 Ok(metadata) => metadata,
                 Err(error) => {
