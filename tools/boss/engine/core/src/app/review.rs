@@ -1953,7 +1953,7 @@ mod trunk_queue_tests {
         handle_merge_when_ready(
             dispatch_ctx(&state, &sink),
             FrontendRequest::MergeWhenReady {
-                work_item_id: root,
+                work_item_id: root.clone(),
                 confirmed_revisions: vec![],
             },
         )
@@ -1962,5 +1962,26 @@ mod trunk_queue_tests {
             sink.next().await.unwrap().payload,
             FrontendEvent::MergeWhenReadyAccepted { .. }
         ));
+        state
+            .work_db
+            .connect()
+            .unwrap()
+            .execute("UPDATE tasks SET status = 'in_review' WHERE id = ?1", [&revision.id])
+            .unwrap();
+        handle_merge_when_ready(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::MergeWhenReady {
+                work_item_id: root,
+                confirmed_revisions: vec![],
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                sink.next().await.unwrap().payload,
+                FrontendEvent::MergeWhenReadyAccepted { .. }
+            ),
+            "in_review revisions have already published and must not prompt"
+        );
     }
 }

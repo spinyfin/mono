@@ -45,6 +45,13 @@ impl TaskStatus {
         matches!(self, Self::Done | Self::Archived)
     }
 
+    /// True when a revision can still push commits onto its parent PR.
+    /// `in_review` has already published its branch; `done` and `archived`
+    /// are closed. Used by the merge-when-ready confirmation gate.
+    pub fn can_still_change_pr(&self) -> bool {
+        matches!(self, Self::Todo | Self::Active | Self::Blocked)
+    }
+
     /// True for statuses that represent work in progress (engine-owned dispatch
     /// slot is live or a PR is open awaiting review).
     pub fn is_live(&self) -> bool {
@@ -130,7 +137,7 @@ pub struct CreateChoreInput {
     /// dispatched) while any prerequisite is unsatisfied. This closes
     /// the create→`depend add` race: there is no window where the chore
     /// autostarts before its gate exists. The caller (CLI) is
-    /// responsible for resolving selectors (`T42`) to canonical ids
+    /// responsible for resolving short selectors to canonical ids
     /// before sending — mirrors [`AddDependencyInput`]. Cross-product
     /// edges and cycles are rejected at insert time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

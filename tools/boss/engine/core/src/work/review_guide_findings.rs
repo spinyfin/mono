@@ -10,7 +10,9 @@ impl WorkDb {
     }
 
     /// Read at merge-click time, including revisions below legacy nested or
-    /// deleted parents. The client never infers this gate from cached cards.
+    /// deleted parents. Counts only revisions that can still add commits
+    /// (`todo` / `active` / `blocked`). The client never infers this gate
+    /// from cached cards.
     pub fn open_merge_revisions(&self, task_id: &str) -> Result<Vec<OpenMergeRevision>> {
         let conn = self.connect()?;
         let root = chain_root(&conn, task_id)?;
@@ -18,7 +20,7 @@ impl WorkDb {
         for id in chain_helpers::collect_chain_revision_ids_including_deleted(&conn, &root)? {
             if let Some(task) = query_task(&conn, &id)?
                 && task.deleted_at.is_none()
-                && !task.status.is_terminal()
+                && task.status.can_still_change_pr()
             {
                 revisions.push(OpenMergeRevision {
                     label: boss_protocol::short_id_label(task.short_id).unwrap_or_else(|| id.clone()),

@@ -1729,6 +1729,17 @@ fn task_status_is_terminal_marks_only_closed_states() {
 }
 
 #[test]
+fn task_status_can_still_change_pr_is_undispatched_or_running() {
+    use TaskStatus::*;
+    for status in [Todo, Active, Blocked] {
+        assert!(status.can_still_change_pr(), "{status} can still change a PR");
+    }
+    for status in [InReview, Done, Archived] {
+        assert!(!status.can_still_change_pr(), "{status} cannot still change a PR");
+    }
+}
+
+#[test]
 fn task_status_is_live_marks_only_in_progress_states() {
     use TaskStatus::*;
     for status in [Active, InReview] {
