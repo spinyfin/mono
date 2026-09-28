@@ -20,6 +20,9 @@ use super::query_ensure::RequireRow;
 use super::*;
 use crate::coordinator::ExecutionPublisher;
 
+#[path = "review_guide_updates.rs"]
+pub(super) mod updates;
+
 /// Lifecycle of one `pr_review_guide_attempts` row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrReviewGuideAttemptStatus {
@@ -208,6 +211,7 @@ pub(crate) fn migrate_pr_review_guide_job_tables(conn: &Connection) -> Result<()
             [],
         )?;
     }
+    updates::migrate(conn)?;
     // Additive lifecycle columns on the series table `review_guide_sources.rs`
     // owns the CREATE for. `selected_comparison_id` (already present) IS the
     // series' desired-comparison pointer; these three columns are the only
@@ -257,6 +261,7 @@ impl WorkDb {
     /// Admit a request for the selected comparison, reusing a live request
     /// for that comparison or atomically replacing an obsolete request.
     /// The durable queued attempt can be dispatched by enqueue or reconcile.
+    #[cfg(test)]
     pub(crate) fn create_pr_review_guide_attempt(
         &self,
         series_id: &str,
@@ -265,6 +270,21 @@ impl WorkDb {
     ) -> Result<PrReviewGuideAttempt> {
         self.admit_pr_review_guide_attempt(series_id, comparison_id, prompt_version, None, false)
             .map(|(attempt, _)| attempt)
+    }
+
+    pub(crate) fn create_automatic_pr_review_guide_attempt(
+        &self,
+        series_id: &str,
+        comparison_id: &str,
+    ) -> Result<PrReviewGuideAttempt> {
+        self.admit_pr_review_guide_attempt(
+            series_id,
+            comparison_id,
+            boss_review_guide::PROMPT_VERSION,
+            Some(&format!("automatic:{comparison_id}")),
+            false,
+        )
+        .map(|(attempt, _)| attempt)
     }
 
     #[cfg(test)]
@@ -300,10 +320,10 @@ impl WorkDb {
                 return Ok((existing, false));
             }
         }
-        let selected: Option<String> = tx.query_row(
-            "SELECT selected_comparison_id FROM pr_review_guide_source_series WHERE id = ?1",
+        let (selected, epoch): (Option<String>, i64) = tx.query_row(
+            "SELECT selected_comparison_id, request_epoch FROM pr_review_guide_source_series WHERE id = ?1",
             [series_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         ensure!(
             selected.as_deref() == Some(comparison_id),
@@ -316,7 +336,11 @@ impl WorkDb {
             stmt.query_map([series_id], map_pr_review_guide_attempt)?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        if !replace && let Some(existing) = live.iter().find(|a| a.comparison_id == comparison_id) {
+        if !replace
+            && let Some(existing) = live
+                .iter()
+                .find(|a| a.comparison_id == comparison_id && a.request_epoch == epoch)
+        {
             // Remember every coalesced click's token, so replay after this
             // attempt finishes still returns it instead of spending again.
             if let Some(token) = idempotency_token {
@@ -377,6 +401,7 @@ impl WorkDb {
                 now,
             ],
         )?;
+        updates::snapshot(&tx, &attempt_id, series_id, comparison_id)?;
         let attempt =
             query_pr_review_guide_attempt(&tx, &attempt_id).require("pr_review_guide_attempt", &attempt_id)?;
         commit_and_publish(tx, pending, &self.event_bus)?;
@@ -874,6 +899,16 @@ impl WorkDb {
         let Some(comparison_id) = summary.selected_comparison_id else {
             return Ok(RetryReviewGuideOutcome::NoComparison);
         };
+        let capture_error: Option<String> = self.connect()?.query_row(
+            "SELECT last_capture_error FROM pr_review_guide_source_series WHERE id = ?1",
+            [&summary.series_id],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            capture_error.is_none(),
+            "source capture failed: {}; use Generate Review Guide to recapture the current head before retrying",
+            capture_error.unwrap_or_default()
+        );
         let (attempt, created) = self.admit_pr_review_guide_attempt(
             &summary.series_id,
             &comparison_id,

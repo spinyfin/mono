@@ -13,6 +13,24 @@ final class ReviewGuideTests: XCTestCase {
 
     // MARK: - Opening
 
+    func testRevisionUpdateKeepsReadableGuideAndDisplaysEngineStatus() {
+        let status = "Updating after revision revision-one..."
+        let presentation = ReviewGuideCardPresentation.from(
+            lifecycle: "generating", readableVersionId: "previous", updateStatus: status
+        )
+        XCTAssertEqual(presentation?.readableVersionId, "previous")
+        XCTAssertEqual(presentation?.showsProgress, true)
+        XCTAssertEqual(presentation?.tooltip, status)
+        XCTAssertEqual(presentation?.accessibilityLabel, status)
+        let failed = ReviewGuideCardPresentation.from(
+            lifecycle: "failed", readableVersionId: "previous", staleSource: true,
+            updateStatus: "Update after revision revision-one failed; previous guide retained"
+        )
+        XCTAssertEqual(failed?.showsDocumentButton, true)
+        XCTAssertEqual(failed?.showsRetry, true)
+        XCTAssertEqual(failed?.readableVersionId, "previous")
+    }
+
     func testGenerateMenuVisibilityAndLabelIncludingDoneWork() {
         var task = Self.makeTask(id: "task_1", readableVersionId: nil)
         for url: String? in [nil, "", " "] {

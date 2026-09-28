@@ -67,6 +67,9 @@ impl WorkDb {
                   AND CAST(c.captured_at AS INTEGER) < ?1
                   AND CAST(v.generated_at AS INTEGER) < ?1
                   AND NOT EXISTS (SELECT 1 FROM work_comments w WHERE w.guide_version_id = v.id)
+                  AND NOT EXISTS (SELECT 1 FROM pr_review_guide_updates u
+                      JOIN pr_review_guide_attempts a ON a.id = u.attempt_id
+                      WHERE u.previous_version_id = v.id AND a.status IN ('queued', 'running'))
              )",
             [cutoff],
         )?;
@@ -80,6 +83,9 @@ impl WorkDb {
                   AND CAST(c.captured_at AS INTEGER) < ?1
                   AND CAST(v.generated_at AS INTEGER) < ?1
                   AND NOT EXISTS (SELECT 1 FROM work_comments w WHERE w.guide_version_id = v.id)
+                  AND NOT EXISTS (SELECT 1 FROM pr_review_guide_updates u
+                      JOIN pr_review_guide_attempts a ON a.id = u.attempt_id
+                      WHERE u.previous_version_id = v.id AND a.status IN ('queued', 'running'))
             )",
             [cutoff],
         )?;

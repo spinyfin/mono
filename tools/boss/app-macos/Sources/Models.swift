@@ -240,6 +240,8 @@ struct WorkTask: Identifiable, Hashable {
     /// prompt/prose retry. Mirrors `Task.review_guide_stale_source` on the
     /// wire. `nil` until a readable version exists.
     var reviewGuideStaleSource: Bool? = nil
+    /// Engine-rendered revision update status for the current PR.
+    var reviewGuideUpdateStatus: String? = nil
 
     /// Short id of the reviewed task that produced this follow-up.
     /// `nil` for every task whose `kind` is not `"followup"`.

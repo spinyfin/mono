@@ -100,6 +100,9 @@ impl WorkDb {
         raw: &str,
         packet: &boss_pr_review_sources::SourcePacket,
     ) -> Result<boss_review_guide::ValidatedGuide> {
+        if self.review_guide_update_context(execution_id)?.is_some() {
+            boss_review_guide::validate_update_section(raw).map_err(anyhow::Error::msg)?;
+        }
         let execution = self.get_execution(execution_id)?;
         let path = execution
             .workspace_path

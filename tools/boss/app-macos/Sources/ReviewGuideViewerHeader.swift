@@ -73,16 +73,18 @@ struct ReviewGuideViewerHeader: View {
                     Text(findings.statusText)
                         .font(.caption)
                         .accessibilityIdentifier("review-guide-findings-status")
-                    DisclosureGroup("AI review findings addendum", isExpanded: $findingsExpanded) {
-                        ScrollView {
-                            StructuredText(markdown: findings.addendumMarkdown)
-                                .bossMarkdown()
-                                .textual.textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                    if !findings.addendumMarkdown.isEmpty {
+                        DisclosureGroup("AI review findings addendum", isExpanded: $findingsExpanded) {
+                            ScrollView {
+                                StructuredText(markdown: findings.addendumMarkdown)
+                                    .bossMarkdown()
+                                    .textual.textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .frame(maxHeight: 200)
                         }
-                        .frame(maxHeight: 200)
+                        .font(.caption)
                     }
-                    .font(.caption)
                 }
                 currentnessBanner(for: task)
                 mergeFeedbackRow(for: task)

@@ -949,6 +949,14 @@ impl ExecutionRunner for PaneSpawnRunner {
         }
         if let Some(git_dir) = guide_git_dir {
             use crate::driver::EnvDirective::{Set, Unset};
+            if let Some((old_head, _)) = self.work_db.review_guide_update_context(&execution.id)? {
+                crate::review_guide_workspace::verify_previous_head(workspace_path, &old_head)?;
+                spawn_plan
+                    .env
+                    .push(Set("BOSS_REVIEW_GUIDE_PREVIOUS_HEAD_SHA".into(), old_head));
+            } else {
+                spawn_plan.env.push(Unset("BOSS_REVIEW_GUIDE_PREVIOUS_HEAD_SHA".into()));
+            }
             let packet = self
                 .work_db
                 .get_pr_review_guide_comparison_by_id(&execution.work_item_id)?

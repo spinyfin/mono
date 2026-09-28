@@ -471,7 +471,9 @@ impl WorkDb {
         }
         tx.execute(
             "UPDATE pr_review_guide_source_series
-             SET latest_observation_sequence = ?2, last_capture_error = ?3, updated_at = ?4
+             SET latest_observation_sequence = ?2, last_capture_error = ?3, updated_at = ?4,
+                 guide_lifecycle = CASE WHEN readable_version_id IS NOT NULL THEN 'failed' ELSE guide_lifecycle END,
+                 request_epoch = request_epoch + CASE WHEN readable_version_id IS NOT NULL THEN 1 ELSE 0 END
              WHERE id = ?1",
             params![series_id, observation_sequence, error, now],
         )?;
