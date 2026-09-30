@@ -24,6 +24,7 @@ struct ContentView: View {
     @StateObject private var workersWorkspace = WorkersWorkspaceModel()
     @StateObject private var bossPane = BossPaneModel()
     #endif
+    @StateObject private var updateQuitRequest = UpdateQuitRequest()
     @State private var isSearchExpanded: Bool = false
     @State private var workColumnVisibility: NavigationSplitViewVisibility = .all
     @State private var showCoordinatorResetConfirmFromBanner = false
@@ -463,8 +464,12 @@ struct ContentView: View {
         .sheet(isPresented: Binding(
             get: { updateModel.showUpdateSheet },
             set: { updateModel.showUpdateSheet = $0 }
-        )) {
-            UpdateResultSheet()
+        ), onDismiss: {
+            updateQuitRequest.didDismiss()
+        }) {
+            UpdateResultSheet(requestQuit: {
+                updateQuitRequest.request { updateModel.showUpdateSheet = false }
+            })
                 .environmentObject(updateModel)
         }
         .overlay(alignment: .topTrailing) {

@@ -5,6 +5,8 @@ import UpdateCore
 /// Sheet shown by "Check for Updates…" and (in a later task) by the chrome badge.
 /// Driven by `UpdateModel`; all state transitions happen there.
 struct UpdateResultSheet: View {
+    let requestQuit: () -> Void
+
     @EnvironmentObject private var updateModel: UpdateModel
     @Environment(\.dismiss) private var dismiss
 
@@ -177,13 +179,10 @@ struct UpdateResultSheet: View {
                 Button("Install & Relaunch") {
                     switch UpdateLifecycle.installStagedAndRelaunch() {
                     case .relaunchPending:
-                        // Swap applied; request the quit so the helper (armed at
-                        // terminate) relaunches us. If `terminate` returns, the quit was
-                        // vetoed (e.g. agents still working) — the swap is already on
-                        // disk and completes on the next quit, so reflect that instead
-                        // of leaving the button on "Install & Relaunch".
-                        NSApplication.shared.terminate(nil)
+                        // Persist the installed state before dismissing. A cancelled
+                        // quit can reopen the sheet and retry without swapping again.
                         updateModel.markInstalledPendingRelaunch(version: v, willRelaunch: true)
+                        requestQuit()
                     case .installedNoRelaunch:
                         // Swap applied but we can't reopen ourselves automatically. Not
                         // a failure — the user quits Boss to finish.
@@ -205,7 +204,7 @@ struct UpdateResultSheet: View {
                 // (which arms the relaunch helper, when available) rather than a second
                 // install.
                 Button("Quit to Finish") {
-                    NSApplication.shared.terminate(nil)
+                    requestQuit()
                 }
                 .keyboardShortcut(.defaultAction)
 
