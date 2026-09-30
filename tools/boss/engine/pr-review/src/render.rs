@@ -16,6 +16,17 @@ use crate::types::*;
 /// the dependency edge one-directional.
 pub const REVISION_CLOSE_SENTENCE: &str = "Address ALL findings before finalising this revision.";
 
+/// Heading text (without the `## ` marker) of the standing no-punting
+/// boilerplate section `render_revision_instructions` emits ahead of the
+/// findings. It is the structural marker the macOS app's document viewer
+/// keys on to collapse that section by default — for every description
+/// shape that carries it (a pre-merge revision brief and a post-merge
+/// follow-up with its provenance preamble alike), regardless of the work
+/// item's kind. Must stay byte-for-byte identical to
+/// `RevisionBriefCollapsibleHeadings.hardRule` in
+/// `tools/boss/app-macos/Sources/MarkdownDocumentChrome.swift`.
+pub const REVISION_HARD_RULE_HEADING: &str = "HARD RULE: no punting — do the actual work";
+
 /// Provenance of the PR + work item that produced a `ReviewResult`. Threaded
 /// into both the rendered revision instructions and the revision/follow-up
 /// card title so a row is never anonymous — including after
@@ -129,9 +140,14 @@ pub fn render_post_merge_followup_provenance(origin_pr_url: &str) -> String {
 /// itself may change presentationally without changing what the worker
 /// receives — the macOS app's document viewer instead collapses the
 /// `## HARD RULE: no punting — do the actual work` section by default
-/// purely in its own rendering, keyed on this exact heading text (see
+/// purely in its own rendering, keyed on that heading line being present in
+/// the description (`REVISION_HARD_RULE_HEADING`; see
 /// `RevisionBriefCollapsibleHeadings.hardRule` in
-/// `tools/boss/app-macos/Sources/MarkdownDocumentChrome.swift`). If this
+/// `tools/boss/app-macos/Sources/MarkdownDocumentChrome.swift`). The app
+/// detects the heading structurally rather than by work-item kind or by
+/// the surrounding prose, so a post-merge follow-up — whose description
+/// prepends `render_post_merge_followup_provenance` to this rendering and
+/// is a `followup`, not a `revision` — collapses the same way. If the
 /// heading's wording ever changes, that Swift constant must change with it
 /// or the collapse silently stops applying — it does not affect what a
 /// worker reads either way.
@@ -150,7 +166,7 @@ pub fn render_revision_instructions(result: &ReviewResult, origin: ReviewOrigin)
         "Automated PR review of {} found {} finding(s) requiring attention.\n\
          {REVISION_CLOSE_SENTENCE}\n\
          \n\
-         ## HARD RULE: no punting — do the actual work\n\
+         ## {REVISION_HARD_RULE_HEADING}\n\
          \n\
          Each finding below requires a real code change that resolves it.\n\
          The following are FORBIDDEN — they do NOT count as addressing a finding:\n\
@@ -2086,6 +2102,72 @@ mod tests {
         assert!(
             origin_pos < preamble_pos && short_id_pos < preamble_pos,
             "origin must open the description before the generic no-punting preamble: {instructions}"
+        );
+    }
+
+    /// The `## HARD RULE ...` heading is the structural marker the macOS
+    /// app keys on to collapse the boilerplate by default. It must survive
+    /// as its own heading line in BOTH description shapes the engine
+    /// produces: a pre-merge revision brief (the bare rendering) and a
+    /// post-merge follow-up (`render_post_merge_followup_provenance`
+    /// prepended, with the origin short id stripped as
+    /// `apply_review_verdict_proposal` does). The preamble must neither
+    /// swallow the heading nor displace it from the start of a line.
+    #[test]
+    fn hard_rule_heading_line_present_in_pre_merge_and_post_merge_descriptions() {
+        let result = ReviewResult {
+            pr_url: "https://github.com/org/repo/pull/117".to_owned(),
+            head_sha: String::new(),
+            summary: "Five issues.".to_owned(),
+            revision_warranted: true,
+            findings: vec![
+                ReviewFinding::builder()
+                    .severity(ReviewFindingSeverity::Medium)
+                    .category(ReviewFindingCategory::Correctness)
+                    .file("src/main.rs")
+                    .title("Off-by-one")
+                    .detail("Fix the bound.")
+                    .confidence(ReviewFindingConfidence::High)
+                    .build(),
+            ],
+            regression_check: RegressionCheck {
+                performed: true,
+                suspected_deletions: vec![],
+            },
+        };
+        let heading_line = format!("\n## {REVISION_HARD_RULE_HEADING}\n");
+
+        let pre_merge = render_revision_instructions(&result, test_origin());
+        let post_merge = {
+            let mut description = render_post_merge_followup_provenance("https://github.com/org/repo/pull/117");
+            description.push_str(&render_revision_instructions(
+                &result,
+                ReviewOrigin {
+                    task_short_id: None,
+                    ..test_origin()
+                },
+            ));
+            description
+        };
+
+        for (shape, description) in [
+            ("pre-merge revision", &pre_merge),
+            ("post-merge follow-up", &post_merge),
+        ] {
+            assert_eq!(
+                description.matches(&heading_line).count(),
+                1,
+                "{shape} description must carry the HARD RULE heading exactly once as its own \
+                 `## ` line, or the app's collapse-by-default silently stops applying:\n{description}"
+            );
+        }
+        assert!(
+            post_merge.starts_with("**Provenance:**"),
+            "post-merge shape under test must actually carry the provenance preamble:\n{post_merge}"
+        );
+        assert!(
+            post_merge.find("**Provenance:**") < post_merge.find(&heading_line),
+            "the provenance preamble precedes the boilerplate heading:\n{post_merge}"
         );
     }
 
