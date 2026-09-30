@@ -877,14 +877,10 @@ impl LiveWorkerStateRegistry {
     /// that gate.
     #[track_caller]
     pub fn release_slot_for_run(&self, run_id: &str) -> Option<u8> {
-        let slot_id = {
-            let guard = self.inner.lock().expect("registry mutex poisoned");
-            guard
-                .values()
-                .find(|entry| entry.state.run_id == run_id)
-                .map(|entry| entry.state.slot_id)
-        }?;
-        self.release_slot(slot_id);
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let slot_id = guard.values().find(|entry| entry.state.run_id == run_id)?.state.slot_id;
+        guard.remove(&slot_id);
+        tracing::info!(slot_id, run_id, cleared_by = %std::panic::Location::caller(), "live-state registry: matching run entry cleared");
         Some(slot_id)
     }
 

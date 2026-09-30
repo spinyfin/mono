@@ -246,7 +246,7 @@ pub(crate) async fn fetch_tmux_worker_statuses(client: &mut BossClient) -> Resul
 
 /// Fetch every pane the app hosts, classified against the engine's live
 /// registry and durable state (live / terminal-entry-with-live-process /
-/// husk) — see [`HostedPaneState`]. This is the durable-state fallback
+/// OccupancyInconclusive / husk) — see [`HostedPaneState`]. This is the durable-state fallback
 /// every `agents` verb consults once a plain live-registry lookup misses,
 /// so a crew name or slot id the operator can see in the app still
 /// resolves after the engine drops the live registry entry.
@@ -682,8 +682,8 @@ pub(crate) async fn agents_list_live(socket_path: &Option<String>, json: bool, a
                     ),
                     HostedPaneState::OccupancyInconclusive { evidence } => println!(
                         "slot {}  {}  run={}  OCCUPANCY INCONCLUSIVE ({evidence}) — \
-                         do not retire; live tmux could not corroborate this slot",
-                        pane.slot_id, pane.crew_name, pane.run_id,
+                         resolve the probe failure, or run `bossctl agents stop {}` then `bossctl agents retire-pane {}`",
+                        pane.slot_id, pane.crew_name, pane.run_id, pane.run_id, pane.slot_id,
                     ),
                     HostedPaneState::Husk => println!(
                         "slot {}  {}  run={}  HUSK (app-hosted, no engine-tracked run, no live process — \
@@ -1819,7 +1819,10 @@ fn print_hosted_pane_status(json: bool, pane: &HostedPaneStatus) {
         }
         HostedPaneState::OccupancyInconclusive { evidence } => {
             println!("  state: occupancy inconclusive ({evidence})");
-            println!("  live tmux could not corroborate this slot; retiring it would release claims blindly.");
+            println!(
+                "  resolve the probe failure, or run `bossctl agents stop {}` then `bossctl agents retire-pane {}`.",
+                pane.run_id, pane.slot_id
+            );
         }
         HostedPaneState::Husk => {
             println!("  state: husk (app-hosted, no engine-tracked run, no live process)");

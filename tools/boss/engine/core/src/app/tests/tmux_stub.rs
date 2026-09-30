@@ -18,6 +18,13 @@ use boss_tmux::{CommandOutput, CommandRunner, Tmux};
 pub(crate) struct StubRunner {
     outcomes: StdMutex<VecDeque<CommandOutput>>,
     calls: StdMutex<Vec<Vec<String>>>,
+    pause: StdMutex<Option<Arc<ProbePause>>>,
+}
+
+#[derive(Default)]
+pub(crate) struct ProbePause {
+    pub entered: tokio::sync::Notify,
+    pub resume: tokio::sync::Notify,
 }
 
 impl StubRunner {
@@ -25,11 +32,18 @@ impl StubRunner {
         Arc::new(Self {
             outcomes: StdMutex::new(replies.into_iter().collect()),
             calls: StdMutex::new(Vec::new()),
+            pause: StdMutex::new(None),
         })
     }
 
     pub(crate) fn calls(&self) -> Vec<Vec<String>> {
         self.calls.lock().unwrap().clone()
+    }
+
+    pub(crate) fn pause_next(&self) -> Arc<ProbePause> {
+        let pause = Arc::new(ProbePause::default());
+        *self.pause.lock().unwrap() = Some(pause.clone());
+        pause
     }
 }
 
@@ -37,6 +51,11 @@ impl StubRunner {
 impl CommandRunner for StubRunner {
     async fn run(&self, _program: &Path, args: &[OsString], cwd: Option<&Path>) -> std::io::Result<CommandOutput> {
         assert!(cwd.is_none());
+        let pause = self.pause.lock().unwrap().take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.resume.notified().await;
+        }
         self.calls
             .lock()
             .unwrap()

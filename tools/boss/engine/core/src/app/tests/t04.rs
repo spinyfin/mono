@@ -1,4 +1,5 @@
 use super::*;
+use crate::spawn_flow::WorkerSpawner;
 
 // Tests for `ServerState::retire_pane` / `ServerState::list_hosted_pane_statuses` —
 // the break-glass leftover-viewer path. Occupancy is resolved from live-state,
@@ -1028,6 +1029,123 @@ fn adopted_tmux_replies(session: &str, token: &str) -> Vec<boss_tmux::CommandOut
         ok("1776528000"),
         ok("claude"),
     ]
+}
+
+async fn assign_replacement(server: &ServerState) {
+    assert!(
+        server
+            .execution_coordinator
+            .reclaim_slot("worker-1", "replacement")
+            .await
+    );
+    server
+        .live_worker_states
+        .register_spawn(1, "replacement", "claude-opus-4-7", 0, None);
+    server.start_live_status_slot(1, "replacement", std::sync::Arc::new(crate::driver::ClaudeDriver));
+}
+
+async fn assert_replacement_survives(server: &ServerState) {
+    assert_eq!(
+        server.execution_coordinator.claim_holder("worker-1").await.as_deref(),
+        Some("replacement")
+    );
+    assert_eq!(server.live_worker_states.get(1).unwrap().run_id, "replacement");
+    assert!(server.live_status_manager.has_slot(1));
+    server.live_status_manager.stop_slot_for_run(1, "retired-run");
+    assert!(server.live_status_manager.has_slot(1));
+}
+
+#[tokio::test]
+async fn run_scoped_cleanup_removes_only_the_matching_occupant() {
+    let (server, _dir) = test_server_state();
+    assign_replacement(&server).await;
+    assert_eq!(server.live_worker_states.release_slot_for_run("retired-run"), None);
+    assert_replacement_survives(&server).await;
+    assert_eq!(server.live_worker_states.release_slot_for_run("replacement"), Some(1));
+    assert!(server.live_worker_states.get(1).is_none());
+    server.live_status_manager.stop_slot_for_run(1, "replacement");
+    assert!(!server.live_status_manager.has_slot(1));
+}
+
+#[tokio::test]
+async fn retire_preserves_replacement_assigned_during_tmux_probe() {
+    let (server, _dir) = test_server_state();
+    let run = super::tmux_stub::seed_teardown(&server);
+    corroborate_slot_tmux_adopted(&server, &run, 1);
+    server.work_db.mark_execution_orphaned(&run, "worker exited").unwrap();
+    let (tmux, runner) = super::tmux_stub::fake_tmux(adopted_tmux_replies("boss-1-occupancy", &format!("token-{run}")));
+    let pause = runner.pause_next();
+    *server.pane_delivery_tmux_override.write().unwrap() = Some(tmux);
+    let sink = make_session_sink();
+    server.register_app_session("session-app".into(), sink.clone()).await;
+    let task_server = server.clone();
+    let retire = tokio::spawn(async move { task_server.retire_pane(1).await });
+    tokio::time::timeout(Duration::from_secs(5), pause.entered.notified())
+        .await
+        .unwrap();
+    assign_replacement(&server).await;
+    pause.resume.notify_one();
+    assert!(matches!(
+        retire.await.unwrap(),
+        Err(RetirePaneError::LiveRunTracked { .. })
+    ));
+    assert_replacement_survives(&server).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), sink.next())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn retire_preserves_replacement_assigned_during_detach_ack() {
+    let (server, _dir) = test_server_state();
+    let sink = make_session_sink();
+    server.register_app_session("session-app".into(), sink.clone()).await;
+    let task_server = server.clone();
+    let retire = tokio::spawn(async move { task_server.retire_pane(1).await });
+    let envelope = sink.next().await.unwrap();
+    let FrontendEvent::EngineRequest {
+        request_id,
+        request: EngineToAppRequest::DetachWorkerPane(_),
+    } = envelope.payload
+    else {
+        panic!("expected detach")
+    };
+    assign_replacement(&server).await;
+    server
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::DetachWorkerPane {
+                result: Ok(crate::protocol::DetachWorkerPaneResult {}),
+            },
+        )
+        .await;
+    assert!(matches!(
+        retire.await.unwrap(),
+        Err(RetirePaneError::LiveRunTracked { .. })
+    ));
+    assert_replacement_survives(&server).await;
+}
+
+#[tokio::test]
+async fn missing_session_stop_clears_identity_and_allows_retirement() {
+    let (server, _dir) = test_server_state();
+    let run = super::tmux_stub::seed_teardown(&server);
+    corroborate_slot_tmux_adopted(&server, &run, 1);
+    server.work_db.mark_execution_orphaned(&run, "worker exited").unwrap();
+    let (tmux, _) = super::tmux_stub::fake_tmux([super::tmux_stub::ok("")]);
+    *server.pane_delivery_tmux_override.write().unwrap() = Some(tmux);
+    let error = server.retire_pane(1).await.unwrap_err().to_string();
+    assert!(error.contains(&format!("bossctl agents stop {run}")));
+    assert!(error.contains("bossctl agents retire-pane 1"));
+    let (tmux, _) = super::tmux_stub::fake_tmux([super::tmux_stub::failure("session not found")]);
+    server.set_tmux_override_for_test(tmux);
+    // Exercise the same completion entry point as `bossctl agents stop`.
+    server.completion_handler.force_stop_execution(&run).await;
+    assert!(server.work_db.tmux_identity_for_execution(&run).unwrap().is_none());
+    server.retire_pane(1).await.unwrap();
 }
 
 fn install_occupancy_tmux(server_state: &ServerState, replies: Vec<boss_tmux::CommandOutput>) {

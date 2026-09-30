@@ -180,12 +180,12 @@ pub enum RetirePaneError {
     /// Durable occupancy of this slot could not be corroborated against
     /// live tmux: the recorded identity is unparseable or names another
     /// slot, the live token does not match, the session is missing, or
-    /// the probe failed. Refusing here is required because the same
-    /// absence used to mean "empty slot", and retirement would then
-    /// release claims and detach the viewer.
+    /// the probe failed. Treating an uncorroborated slot as empty would
+    /// release claims and detach the viewer of a worker that may still be live.
     #[error(
         "slot {slot_id} occupancy is inconclusive ({reason}); refusing to retire \
-         — live tmux identity could not corroborate this slot"
+         — resolve the probe failure, or use `bossctl agents stop <run_id>` for the recorded run, \
+         then `bossctl agents retire-pane {slot_id}`"
     )]
     OccupancyInconclusive { slot_id: u8, reason: String },
     #[error("app reported error: {0:?}")]
@@ -533,7 +533,7 @@ impl ServerState {
         }
     }
 
-    /// Resolve `id` (short-form `T607` or canonical) to a work item
+    /// Resolve `id` (short-form or canonical) to a work item
     /// and ask the app to scroll the kanban to that card and play a
     /// short transient highlight. Returns the canonical id on success
     /// so `bossctl reveal` can confirm what was highlighted.
@@ -649,14 +649,13 @@ impl ServerState {
     /// the app's viewer teardown is already keyed purely by `slot_id`
     /// with zero dependency on engine run-tracking state, so this is
     /// the only signal a true husk (no run id, no session identity) can
-    /// give the app. Then defensively clears whatever
-    /// engine-side bookkeeping might still reference the slot; for a
-    /// genuine husk this is a no-op (the engine already dropped it),
-    /// but it fully reconciles a slot that straddled both states (a
-    /// stale `LiveWorkerState` entry a buggy terminal-fail path left
-    /// behind).
+    /// give the app. Ownership is rechecked before detaching and after
+    /// acknowledgement. Bookkeeping cleanup is scoped to the retiring
+    /// execution, so a replacement's claim, live-state and status task survive.
     pub async fn retire_pane(&self, slot_id: u8) -> Result<(), RetirePaneError> {
+        let mut retiring_run = None;
         if let Some(state) = self.live_worker_states.get(slot_id) {
+            retiring_run = Some(state.run_id.clone());
             // Guard 1 (bookkeeping): the engine still considers this run live.
             if !state.activity.is_terminal() {
                 return Err(RetirePaneError::LiveRunTracked {
@@ -689,6 +688,7 @@ impl ServerState {
         } else {
             match self.hosted_pane_run_for_slot(slot_id).await {
                 SlotOccupancy::Occupied(run_id) => {
+                    retiring_run = Some(run_id.clone());
                     if let Some(status) = self.durable_occupant_with_worker(&run_id) {
                         // Durable occupancy says a run that plausibly has a worker
                         // still holds this slot, even though live-state has nothing.
@@ -752,6 +752,7 @@ impl ServerState {
                 SlotOccupancy::Absent => {}
             }
         }
+        self.check_retiring_slot_owner(slot_id, retiring_run.as_deref()).await?;
         let request = EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id });
         match self.send_to_app(request, Duration::from_secs(5)).await {
             Ok(EngineToAppResponse::DetachWorkerPane { result: Ok(_) }) => {
@@ -776,13 +777,30 @@ impl ServerState {
             }
             Err(err) => return Err(RetirePaneError::Send(err)),
         }
-        let worker_id = crate::coordinator::worker_id_for_slot(slot_id);
-        self.execution_coordinator
-            .release_worker_and_kick(&worker_id, None)
-            .await;
-        self.live_worker_states.release_slot(slot_id);
-        self.live_status_manager.stop_slot(slot_id);
+        self.check_retiring_slot_owner(slot_id, retiring_run.as_deref()).await?;
+        if let Some(run_id) = retiring_run {
+            let worker_id = crate::coordinator::worker_id_for_slot(slot_id);
+            self.execution_coordinator
+                .release_pool_claim_if_execution(&worker_id, &run_id)
+                .await;
+            self.live_worker_states.release_slot_for_run(&run_id);
+            self.live_status_manager.stop_slot_for_run(slot_id, &run_id);
+        }
         self.broadcast_live_worker_states().await;
+        Ok(())
+    }
+
+    /// Refuse slot-scoped viewer operations if ownership changed during an await.
+    async fn check_retiring_slot_owner(&self, slot_id: u8, run_id: Option<&str>) -> Result<(), RetirePaneError> {
+        let worker_id = crate::coordinator::worker_id_for_slot(slot_id);
+        let holder = self.execution_coordinator.claim_holder(&worker_id).await;
+        let live = self.live_worker_states.get(slot_id);
+        if let Some(owner) = holder.filter(|owner| Some(owner.as_str()) != run_id).or_else(|| {
+            live.filter(|state| Some(state.run_id.as_str()) != run_id || !state.activity.is_terminal())
+                .map(|state| state.run_id)
+        }) {
+            return Err(RetirePaneError::LiveRunTracked { slot_id, run_id: owner });
+        }
         Ok(())
     }
 
@@ -791,7 +809,8 @@ impl ServerState {
     /// ([`Self::hosted_pane_run_for_slot`]) and
     /// [`Self::live_worker_states_snapshot`]: live,
     /// engine-lost-track-of-it-but-durably-alive (`LiveProcessNoRegistry`),
-    /// or a true husk. `ListHostedPanes` describes the viewer (summary,
+    /// uncorroborated occupancy (`OccupancyInconclusive`), or a true husk.
+    /// `ListHostedPanes` describes the viewer (summary,
     /// task title, which slots have a surface); it is not the occupancy
     /// oracle. Powers `bossctl agents list --all` and worker-reference
     /// resolution (crew name / slot id / run id) for every `agents` verb —
@@ -1075,7 +1094,12 @@ impl ServerState {
                     session_name = %identity.session_name,
                     "hosted_pane_run_for_slot: recorded tmux session is missing; occupancy inconclusive"
                 );
-                SlotOccupancy::inconclusive(Some(execution_id), "recorded tmux session is missing")
+                SlotOccupancy::inconclusive(
+                    Some(execution_id),
+                    format!(
+                        "recorded tmux session is missing; run `bossctl agents stop {execution_id}` to clear stale identity, then `bossctl agents retire-pane {slot_id}`"
+                    ),
+                )
             }
             boss_protocol::TmuxAdoptionState::ProbeUnavailable => {
                 tracing::debug!(
