@@ -108,10 +108,7 @@ final class RevisionBriefCollapsedHeadingsTests: XCTestCase {
         )
     }
 
-    /// The same post-merge description collapses regardless of the kind the
-    /// engine happens to store it under — the gate is the heading, not the
-    /// kind. `revision` and `followup` are the two shapes the engine emits
-    /// today; `chore` is the operator-facing label a follow-up can wear.
+    /// The same heading collapses for revision, followup, chore, and task kinds.
     func testHardRuleCollapseIsIndependentOfTaskKind() {
         for kind in ["revision", "followup", "chore", "task"] {
             let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
@@ -135,10 +132,9 @@ final class RevisionBriefCollapsedHeadingsTests: XCTestCase {
         XCTAssertTrue(model.asyncMarkdownViewerVM.collapsedByDefaultHeadings.isEmpty)
     }
 
-    /// A `revision` whose description lacks the boilerplate (an operator
-    /// rewrote it, or it was never engine-minted) has nothing to fold, so
-    /// it opts nothing in — and prose that merely *mentions* the heading
-    /// text, or a look-alike inside a fenced code block, doesn't count.
+    /// A `revision` whose description lacks the boilerplate (rewritten by
+    /// hand, or never engine-minted) has nothing to fold; prose mentions
+    /// and fenced-code look-alikes do not count.
     func testRevisionWithoutHardRuleHeadingDoesNotCollapseAnyHeading() {
         let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
         model.asyncMarkdownViewerOpener = {}
