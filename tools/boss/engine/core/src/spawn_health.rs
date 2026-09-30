@@ -71,7 +71,7 @@
 //! [`maybe_admit_recovery_probe`]. A real shell
 //! pid reported for that canary is proof the spawn path works again and
 //! auto-resumes dispatch ([`resume_dispatch_after_breaker_recovery`]); a
-//! reap of the canary (spawn-ack timeout or app NACK) backs off
+//! reap of the canary (driver-start timeout or app NACK) backs off
 //! exponentially before the next attempt. Dispatch also auto-resumes on a
 //! fresh app session registering — an app relaunch is the operator's
 //! natural recovery action after e.g. waking the display, so it clears the
@@ -140,10 +140,17 @@ pub const SPAWN_HEALTH_PROBE_BACKOFF_MAX_SECS: i64 = 900;
 /// deadline that leaves `in_flight` set forever, so `try_admit_probe` would
 /// refuse to admit a next canary and dispatch would stay Breaker-paused
 /// until a human ran `bossctl dispatch resume` — the exact latch this module
-/// exists to eliminate. 120s gives the normal driver-start reap path a
-/// full chance to resolve the probe first; this is strictly a last-resort
-/// backstop for the terminal-without-reap case.
-pub const SPAWN_HEALTH_PROBE_STALL_DEADLINE_SECS: i64 = 120;
+/// exists to eliminate.
+///
+/// The only reap path for a canary that reported a pid but never produced a
+/// driver signal is the driver-start check, which fires after
+/// [`crate::live_worker_state::DRIVER_START_GRACE_SECS`] and is observed on
+/// the next sweep tick. The deadline is that grace plus two sweep intervals
+/// (60s each) of slack, so the driver-start reap always resolves a live
+/// canary first and a second canary is never admitted while the first is
+/// still alive. This is strictly a last-resort backstop for the
+/// terminal-without-reap case.
+pub const SPAWN_HEALTH_PROBE_STALL_DEADLINE_SECS: i64 = crate::live_worker_state::DRIVER_START_GRACE_SECS + 120;
 
 /// Sentinel for [`SpawnHealthTracker::last_disabled_signal_at`] meaning "no
 /// disabled-mode signal has fired yet" — distinct from a real epoch-seconds
@@ -211,7 +218,7 @@ struct FailureWindowConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpawnFailureClass {
-    /// No shell ever came up for the pane: a spawn-ack timeout, an app
+    /// No shell ever came up for the pane: a dispatch-level spawn timeout, an app
     /// NACK, or a pane death before any proof of life. The app's
     /// pane-spawn path is the thing to look at.
     NoShell,
@@ -1348,6 +1355,14 @@ mod tests {
         let tracker = SpawnHealthTracker::with_config(3, 300);
         assert!(tracker.try_admit_probe(0));
     }
+
+    // One canary in flight: the stall backstop must not clear `in_flight`
+    // (and admit a second canary) before the driver-start reap can resolve
+    // the first, so the deadline has to outlast the driver-start grace.
+    const _: () = assert!(
+        SPAWN_HEALTH_PROBE_STALL_DEADLINE_SECS > crate::live_worker_state::DRIVER_START_GRACE_SECS,
+        "probe stall deadline must exceed the driver-start grace",
+    );
 
     #[test]
     fn mark_probe_dispatched_blocks_further_admission() {

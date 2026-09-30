@@ -418,6 +418,15 @@ async fn husk_panes_for(
     sink: &Arc<SessionSink>,
     panes: Vec<crate::protocol::HostedPaneEntry>,
 ) -> Vec<crate::protocol::HostedPaneStatus> {
+    husk_subset(all_pane_statuses_for(server_state, sink, panes).await)
+}
+
+/// Same round-trip as [`husk_panes_for`], returning every classified pane.
+async fn all_pane_statuses_for(
+    server_state: &Arc<ServerState>,
+    sink: &Arc<SessionSink>,
+    panes: Vec<crate::protocol::HostedPaneEntry>,
+) -> Vec<crate::protocol::HostedPaneStatus> {
     let server_clone = server_state.clone();
     let list = tokio::spawn(async move { server_clone.list_hosted_pane_statuses().await });
 
@@ -435,7 +444,7 @@ async fn husk_panes_for(
             },
         )
         .await;
-    husk_subset(list.await.expect("list task").expect("expected Ok"))
+    list.await.expect("list task").expect("expected Ok")
 }
 
 fn hosted(slot_id: u8, run_id: &str) -> crate::protocol::HostedPaneEntry {
@@ -843,4 +852,189 @@ async fn detach_untracked_viewer_does_not_clobber_a_slot_held_only_in_live_state
         !status.success(),
         "the retiring run's own untracked process tree must still go down",
     );
+}
+
+/// A `running` execution durably occupying a slot with no live-state entry is
+/// a worker the engine lost track of: the list must not call it a husk, and
+/// retire must refuse. Both paths share one predicate.
+#[tokio::test]
+async fn a_running_durable_occupant_with_no_live_state_is_not_a_husk_and_retire_refuses() {
+    use crate::test_support::*;
+
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+    // `create_spawned_execution` leaves the execution `running` on worker-1.
+    let execution_id = create_spawned_execution(db, &work_item_id, 4_194_303);
+    assert!(server_state.live_worker_states.get(1).is_none());
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+    let panes = all_pane_statuses_for(&server_state, &sink, vec![hosted(1, &execution_id)]).await;
+    assert_eq!(panes.len(), 1);
+    assert!(
+        matches!(
+            panes[0].state,
+            crate::protocol::HostedPaneState::LiveProcessNoRegistry { .. }
+        ),
+        "a running durable occupant must not be listed as a husk: {:?}",
+        panes[0].state,
+    );
+
+    match server_state.retire_pane(1).await {
+        Err(RetirePaneError::LiveRunTracked { slot_id, run_id }) => {
+            assert_eq!(slot_id, 1);
+            assert_eq!(run_id, execution_id);
+        }
+        other => panic!("expected LiveRunTracked, got {other:?}"),
+    }
+}
+
+/// An occupant parked in `waiting_review` has no worker by design: the list
+/// calls it a husk and retire detaches it instead of pointing at `agents stop`.
+#[tokio::test]
+async fn a_waiting_review_durable_occupant_is_a_husk_and_retire_detaches() {
+    use crate::test_support::*;
+
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+    let execution_id = create_spawned_execution(db, &work_item_id, 4_194_303);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'waiting_review' WHERE id = ?1",
+            rusqlite::params![&execution_id],
+        )
+        .unwrap();
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+    let husks = husk_panes_for(&server_state, &sink, vec![hosted(1, &execution_id)]).await;
+    assert_eq!(husks.iter().map(|pane| pane.slot_id).collect::<Vec<_>>(), vec![1]);
+
+    let server_clone = server_state.clone();
+    let retire = tokio::spawn(async move { server_clone.retire_pane(1).await });
+    let request = sink.next().await.expect("a DetachWorkerPane request");
+    match request.payload {
+        FrontendEvent::EngineRequest { request_id, request } => {
+            assert!(
+                matches!(request, EngineToAppRequest::DetachWorkerPane(_)),
+                "expected DetachWorkerPane, got {request:?}"
+            );
+            server_state
+                .deliver_app_response(
+                    "session-app",
+                    &request_id,
+                    EngineToAppResponse::DetachWorkerPane {
+                        result: Ok(crate::protocol::DetachWorkerPaneResult {}),
+                    },
+                )
+                .await;
+        }
+        other => panic!("expected EngineRequest, got {other:?}"),
+    }
+    let result = retire.await.expect("retire task");
+    assert!(result.is_ok(), "expected retirement to succeed, got {result:?}");
+}
+
+/// An orphaned execution whose newest run moved to another slot must not be
+/// attributed to its old slot, so retiring the old slot never reaps the
+/// worker now running in the new one.
+#[tokio::test]
+async fn retire_pane_does_not_reap_an_execution_that_resumed_onto_another_slot() {
+    use crate::test_support::*;
+
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+    let mut child = spawn_group_leader_sleeper();
+    let execution_id = create_spawned_execution(db, &work_item_id, 4_194_303);
+    // Resume onto worker-2: a newer run row on a different slot.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET created_at = '1000000000' WHERE execution_id = ?1",
+            rusqlite::params![&execution_id],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'ready' WHERE id = ?1",
+            rusqlite::params![&execution_id],
+        )
+        .unwrap();
+    db.start_execution_run(&execution_id, "worker-2", "repo-1", "lease-2", "ws-2", "/tmp/ws-2")
+        .unwrap();
+    assert!(
+        db.set_run_shell_pid_for_execution(&execution_id, i64::from(child.id()))
+            .unwrap()
+    );
+    db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
+
+    assert_eq!(server_state.hosted_pane_run_for_slot(1), None);
+    assert_eq!(
+        server_state.hosted_pane_run_for_slot(2).as_deref(),
+        Some(execution_id.as_str())
+    );
+
+    let result = server_state.retire_pane(1).await;
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+    assert!(
+        child.try_wait().expect("poll child").is_none(),
+        "retiring the old slot must not reap the worker that resumed on another slot",
+    );
+    child.kill().ok();
+    child.wait().ok();
+}
+
+/// A tmux identity that names a session hosted in a different slot makes the
+/// `agent_id` occupancy inconclusive: no reap.
+#[tokio::test]
+async fn retire_pane_does_not_reap_when_tmux_identity_names_a_different_slot() {
+    use crate::test_support::*;
+
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+    let mut child = spawn_group_leader_sleeper();
+    let execution_id = create_spawned_execution(db, &work_item_id, i64::from(child.id()));
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(&execution_id, boss_tmux::SERVER_LABEL, "boss-2-abcdef", "token-x")
+            .unwrap()
+    );
+    db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
+
+    assert_eq!(server_state.hosted_pane_run_for_slot(1), None);
+
+    let result = server_state.retire_pane(1).await;
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+    assert!(
+        child.try_wait().expect("poll child").is_none(),
+        "a tmux identity naming another slot must block the reap",
+    );
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+fn slot_from_tmux_session_name_parses_the_spawn_shape() {
+    assert_eq!(
+        super::super::pane_ops::slot_from_tmux_session_name("boss-3-abc123"),
+        Some(3)
+    );
+    assert_eq!(
+        super::super::pane_ops::slot_from_tmux_session_name("boss-test-worker"),
+        None
+    );
+    assert_eq!(super::super::pane_ops::slot_from_tmux_session_name("other-3-abc"), None);
 }

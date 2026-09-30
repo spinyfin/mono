@@ -268,7 +268,7 @@ struct SlotMeta {
     /// incident walked through untouched.
     driver_signal_at: Option<i64>,
     /// Whether this registration is a newly spawned pane or an adopted
-    /// existing worker. Used by the spawn-ack timeout, whose question only
+    /// existing worker. Used by driver-start verification, whose question only
     /// applies to a pane this engine process attempted to create. See
     /// [`DriverStartExpectation`].
     #[builder(default = DriverStartExpectation::EngineSpawned)]
@@ -308,8 +308,8 @@ struct SlotMeta {
 
 /// Whether the engine created this slot's current registration.
 ///
-/// The spawn-ack timeout asks whether a pane this engine process launched
-/// ever acknowledged. That question presupposes Boss launched a pane; a
+/// Driver-start verification asks whether a pane this engine process launched
+/// ever produced a driver signal. That question presupposes Boss launched a pane; a
 /// re-adoption registers a worker that was already running before this
 /// engine process began tracking it. Its `spawned_at` is therefore the
 /// moment the engine noticed, not the moment anything exec'd.
@@ -319,7 +319,7 @@ pub enum DriverStartExpectation {
     /// proof it came up. The normal spawn path.
     EngineSpawned,
     /// The registration re-adopted an already-running worker. The
-    /// spawn-ack timeout does not apply, because this engine process did not
+    /// driver-start timeout does not apply, because this engine process did not
     /// launch a pane. Driver-start verification still requires a
     /// driver-originated signal; a live login shell alone is not proof that
     /// the driver ever ran.
@@ -582,7 +582,7 @@ impl LiveWorkerStateRegistry {
     /// plus the three things re-adoption must not get wrong:
     ///
     /// 1. The entry is marked [`DriverStartExpectation::Readopted`], so
-    ///    the spawn-ack timeout does not mistake this engine process for
+    ///    the driver-start timeout does not mistake this engine process for
     ///    the pane's creator. Registration stamps `spawned_at` with the
     ///    current time — correct for a spawn, a fiction for a re-adoption.
     ///    Driver-start verification still applies after its ordinary grace

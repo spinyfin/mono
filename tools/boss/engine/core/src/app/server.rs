@@ -1498,9 +1498,9 @@ pub async fn serve_with_overrides(
     // with durable tmux identity can be decided from the adoption pass
     // already above; rows with no durable tmux identity yet (or a
     // transient DB read failure) emit a loud diagnostic instead of
-    // guessing. They are retried on a later reconcile pass that can
-    // re-read identity — app-session registration is one such trigger,
-    // not because the app answers occupancy.
+    // guessing. The only retry trigger is app-session registration
+    // (`retry_startup_pane_reconcile`); a headless engine never retries
+    // these rows, and the app does not answer occupancy.
     server_state
         .reconcile_unspawned_running_panes(
             &tmux_adoption_report.adopted_execution_ids,

@@ -148,7 +148,9 @@ pub enum OpenDocumentError {
 #[derive(Debug, thiserror::Error)]
 pub enum RetirePaneError {
     /// The engine's own `LiveWorkerStateRegistry` still shows a live,
-    /// non-terminal run in this slot — it is not a husk. Refusing here
+    /// non-terminal run in this slot, or (with no live-state entry) the
+    /// slot's durable occupant is in a status that plausibly has a worker
+    /// (`claimed` / `running` / `waiting_human`) — it is not a husk. Refusing here
     /// is the safety check the break-glass verb exists to have: a
     /// caller must go through `agents stop` to tear down a pane the
     /// engine still considers active.
@@ -584,9 +586,14 @@ impl ServerState {
     ///
     /// Refuses with [`RetirePaneError::LiveRunTracked`] when
     /// `LiveWorkerStateRegistry` still shows a live (non-terminal) run
-    /// in `slot_id` — that pane is not a husk, and tearing it down
-    /// would kill a pane the engine still considers active; the caller
-    /// must use `agents stop` instead. Also refuses with
+    /// in `slot_id`, or — when live-state has nothing — when the slot's
+    /// durable occupant ([`Self::hosted_pane_run_for_slot`]) is in a status
+    /// that plausibly has a worker (`claimed`, `running`, `waiting_human`;
+    /// see [`Self::durable_occupant_with_worker`]). That pane is not a husk,
+    /// and tearing it down would kill a pane the engine still considers
+    /// active; the caller must use `agents stop` instead. A durable
+    /// occupant parked in `waiting_review` / `waiting_merge` has no worker
+    /// by design, so it falls through to husk retirement. Also refuses with
     /// [`RetirePaneError::LiveProcessCorroborated`] when the registry
     /// has a *terminal* entry contradicted by the worker's own hook
     /// stream showing real recent activity — same reasoning, weaker
@@ -601,8 +608,7 @@ impl ServerState {
     /// engine lost track of takes, and the one `agents stop` reaches via
     /// its own durable fallback — this does not refuse: it performs that
     /// same durable-state teardown ([`Self::release_worker_pane`]) and
-    /// completes the retirement, so the verb the operator reached for
-    /// handles the case instead of redirecting to a second one.
+    /// completes the retirement.
     ///
     /// Otherwise (no live-state entry and no durable evidence at all —
     /// a genuine husk) sends a slot-keyed `DetachWorkerPane` request —
@@ -647,13 +653,18 @@ impl ServerState {
                 });
             }
         } else if let Some(run_id) = self.hosted_pane_run_for_slot(slot_id) {
-            if let Ok(execution) = self.work_db.get_execution(&run_id)
-                && !execution.status.is_terminal()
-            {
-                // Durable occupancy says a non-terminal run still holds this
-                // slot, even though live-state has nothing. Retiring it as a
-                // husk would tear down a worker the engine lost track of
-                // rather than a leftover viewer.
+            if let Some(status) = self.durable_occupant_with_worker(&run_id) {
+                // Durable occupancy says a run that plausibly has a worker
+                // still holds this slot, even though live-state has nothing.
+                // Retiring it as a husk would tear down a worker the engine
+                // lost track of rather than a leftover viewer.
+                tracing::warn!(
+                    slot_id,
+                    run_id = %run_id,
+                    %status,
+                    "retire_pane: refusing — no live-state entry, but the slot's durable occupant still \
+                     plausibly has a worker",
+                );
                 return Err(RetirePaneError::LiveRunTracked { slot_id, run_id });
             }
             if let Some(evidence) = self.durable_live_process_evidence(&run_id) {
@@ -665,24 +676,16 @@ impl ServerState {
                 // registry, then `work_runs.agent_id`), never from the app's
                 // hosted-pane inventory.
                 //
-                // Reconciled with `agents stop` (2026-08-01): this exact shape —
-                // no live registry entry, but durable state corroborating a
-                // still-alive process for an execution terminalized by
-                // inference (`orphaned`/`abandoned`) — is precisely what
-                // `release_worker_pane`'s durable fallback
-                // (`reap_untracked_worker_process`) already exists to reap. It
-                // used to dead-end here in a refusal that pointed the operator
-                // at a second command (`agents stop <run_id>`); now it performs
-                // that identical durable-state teardown directly and completes
-                // the retirement, so the verb the operator reached for handles
-                // this case instead of a two-verb dance. Guards 1 and 2 above are
-                // unrelated and still refuse outright: guard 1 is a run the
-                // engine actively considers live, and guard 2 is a bookkeeping-
-                // terminal entry contradicted by the worker's own hook stream
-                // showing real recent activity — both are cases where the
-                // evidence is ambiguous or points at genuine in-flight work, and
-                // only a human explicitly invoking `agents stop` should decide
-                // to kill that.
+                // This is the same shape `agents stop` reaps via
+                // `release_worker_pane` (tmux identity, then the recorded
+                // pid): an execution terminalized by inference
+                // (`orphaned`/`abandoned`) whose worker is still alive. The
+                // reap runs here directly and completes the retirement.
+                // Guards 1 and 2 refuse outright: guard 1 is a run the
+                // engine considers live, and guard 2 is a terminal entry
+                // contradicted by the worker's own hook stream. Both are
+                // ambiguous or in-flight work that only an explicit
+                // `agents stop` should kill.
                 tracing::warn!(
                     slot_id,
                     run_id = %run_id,
@@ -798,7 +801,11 @@ impl ServerState {
                 // No live-state (or live-state for a different run than
                 // occupancy). Classify from durable occupancy of THIS slot,
                 // never from the viewer's claimed `pane.run_id`.
-                (_, Some(run_id)) => match self.durable_live_process_evidence(run_id) {
+                (_, Some(run_id)) => match self
+                    .durable_occupant_with_worker(run_id)
+                    .map(|status| format!("durable occupant is `{status}` with no live-state entry"))
+                    .or_else(|| self.durable_live_process_evidence(run_id))
+                {
                     Some(evidence) => {
                         tracing::warn!(
                             slot_id = pane.slot_id,
@@ -829,19 +836,31 @@ impl ServerState {
         Ok(statuses)
     }
 
-    /// The run that currently occupies `slot_id`, resolved from durable
-    /// identity rather than the app's hosted-pane inventory. Inverse of
-    /// [`ServerState::hosted_pane_slot_for_run`] for occupancy (both sides
-    /// now read live-state / the worker registry / `work_runs.agent_id`).
-    /// Needed by `retire_pane`, whose input is a slot rather than a run.
+    /// Assess the current occupant of `slot_id` from durable identity
+    /// rather than the app's hosted-pane inventory. Needed by `retire_pane`
+    /// and `list_hosted_pane_statuses`, whose input is a slot rather than a
+    /// run. ([`ServerState::hosted_pane_slot_for_run`] is a different
+    /// question: it returns the slot a run was once recorded against, a
+    /// historical hint that may since have been reassigned.)
     ///
     /// Order: live-state registry, then worker registry, then the newest
-    /// local `work_runs` row whose `agent_id` maps to this slot via
-    /// [`crate::coordinator::slot_id_from_worker_id`]. A present tmux
-    /// identity is corroboration, not a requirement — inferred-terminal
-    /// rows may have had identity cleared while the pid column still
-    /// survives. `None` means the durable-liveness guard does not fire.
-    fn hosted_pane_run_for_slot(&self, slot_id: u8) -> Option<String> {
+    /// local `work_runs` row whose `agent_id` maps to this slot. A
+    /// `work_runs` candidate is accepted as the occupant only when it is
+    /// corroborated:
+    ///
+    /// - the execution's own newest run
+    ///   ([`crate::work::WorkDb::latest_run_agent_id_for_execution`]) is
+    ///   still on this slot's worker id, so an execution that resumed onto
+    ///   another slot is not attributed to this one; and
+    /// - its recorded tmux identity, when present, does not name a session
+    ///   hosted in a different slot ([`slot_from_tmux_session_name`]).
+    ///   Absent identity is tolerated — inferred-terminal rows may have had
+    ///   it cleared while the pid column still survives.
+    ///
+    /// `None` means no occupant could be established for this slot (or the
+    /// durable record contradicts the slot), so the durable-liveness guards
+    /// do not fire and no reap is attempted.
+    pub(super) fn hosted_pane_run_for_slot(&self, slot_id: u8) -> Option<String> {
         if let Some(state) = self.live_worker_states.get(slot_id) {
             return Some(state.run_id);
         }
@@ -849,38 +868,77 @@ impl ServerState {
             return Some(run_id);
         }
         let worker_id = crate::coordinator::worker_id_for_slot(slot_id);
-        match self.work_db.latest_local_execution_id_for_agent_id(&worker_id) {
-            Ok(Some(execution_id)) => {
-                match self.work_db.tmux_identity_for_execution(&execution_id) {
-                    Ok(Some(_)) => {}
-                    Ok(None) => {
-                        tracing::debug!(
-                            slot_id,
-                            execution_id,
-                            "hosted_pane_run_for_slot: local agent_id maps to this slot with no tmux identity"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::debug!(
-                            slot_id,
-                            execution_id,
-                            %err,
-                            "hosted_pane_run_for_slot: tmux identity read failed; using agent_id occupancy"
-                        );
-                    }
-                }
-                Some(execution_id)
-            }
-            Ok(None) => None,
+        let execution_id = match self.work_db.latest_local_execution_id_for_agent_id(&worker_id) {
+            Ok(Some(execution_id)) => execution_id,
+            Ok(None) => return None,
             Err(err) => {
                 tracing::debug!(
                     slot_id,
                     %err,
                     "hosted_pane_run_for_slot: could not read durable occupancy for this slot"
                 );
-                None
+                return None;
+            }
+        };
+        match self.work_db.latest_run_agent_id_for_execution(&execution_id) {
+            Ok(Some(current)) if current == worker_id => {}
+            Ok(current) => {
+                tracing::debug!(
+                    slot_id,
+                    execution_id,
+                    current_agent_id = ?current,
+                    "hosted_pane_run_for_slot: execution's newest run is no longer on this slot; \
+                     not its occupant"
+                );
+                return None;
+            }
+            Err(err) => {
+                tracing::debug!(
+                    slot_id,
+                    execution_id,
+                    %err,
+                    "hosted_pane_run_for_slot: could not read the execution's newest run; occupancy inconclusive"
+                );
+                return None;
             }
         }
+        match self.work_db.tmux_identity_for_execution(&execution_id) {
+            Ok(Some(identity)) => match slot_from_tmux_session_name(&identity.session_name) {
+                Some(hosted_slot) if hosted_slot != slot_id => {
+                    tracing::warn!(
+                        slot_id,
+                        execution_id,
+                        hosted_slot,
+                        session_name = %identity.session_name,
+                        "hosted_pane_run_for_slot: tmux identity names a different slot; occupancy inconclusive"
+                    );
+                    return None;
+                }
+                _ => {}
+            },
+            Ok(None) => {}
+            Err(err) => {
+                tracing::debug!(
+                    slot_id,
+                    execution_id,
+                    %err,
+                    "hosted_pane_run_for_slot: tmux identity read failed; occupancy inconclusive"
+                );
+                return None;
+            }
+        }
+        Some(execution_id)
+    }
+
+    /// `Some(status)` when `run_id`'s execution is in a status that
+    /// plausibly has a worker (`claimed`, `running`, `waiting_human`).
+    /// Statuses parked on review/merge (`waiting_review`, `waiting_merge`)
+    /// have no worker by design and are not included. Shared by
+    /// `retire_pane`'s refusal and `list_hosted_pane_statuses`'s non-husk
+    /// classification so the two cannot disagree.
+    fn durable_occupant_with_worker(&self, run_id: &str) -> Option<boss_protocol::ExecutionStatus> {
+        let status = self.work_db.get_execution(run_id).ok()?.status;
+        (status.is_live() || status == boss_protocol::ExecutionStatus::Claimed).then_some(status)
     }
 
     /// Restart-robust counterpart to
@@ -920,4 +978,13 @@ impl ServerState {
             execution.status,
         ))
     }
+}
+
+/// Slot id encoded in a worker tmux session name (`boss-{slot_id}-{short_execution_id}`,
+/// see `PaneSpawnRunner::tmux_worker_host`). `None` when the name does not
+/// follow that shape.
+pub(super) fn slot_from_tmux_session_name(session_name: &str) -> Option<u8> {
+    let rest = session_name.strip_prefix("boss-")?;
+    let (slot, _) = rest.split_once('-')?;
+    slot.parse().ok()
 }

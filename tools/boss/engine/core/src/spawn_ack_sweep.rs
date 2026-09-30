@@ -10,13 +10,6 @@
 //! Driver-start verification (below) still covers a slot that reported
 //! a pid but never produced a driver signal.
 //!
-//! ## Historical: the 2026-07-03/04 pid-less class
-//!
-//! App-owned spawning could return `pane_spawned/ok` before asynchronous
-//! libghostty surface creation completed, while no `claude` session — and
-//! in the worst case no shell at all — ever actually came up. That path
-//! is gone. The pid-less reap that existed to cover it is gone with it.
-//!
 //! ## The 2026-07-30 incident: a pane that DID have a shell, and no driver
 //!
 //! On 2026-07-30 the inverse shape appeared. `pane_spawned/ok` came back,
@@ -923,7 +916,7 @@ pub(crate) async fn reap_never_started_spawn(
         ctx.work_db,
         execution_id,
         execution.workspace_path.as_deref().map(std::path::Path::new),
-        crate::driver_teardown::TeardownReason::SpawnAckTimeout,
+        crate::driver_teardown::TeardownReason::DriverStartTimeout,
     )
     .await;
 
@@ -1037,8 +1030,8 @@ pub(crate) async fn reap_never_started_spawn(
     //
     // Driver-start timeouts feed it: a driver binary
     // that cannot exec on this host fails the same way for every work item
-    // routed to it, so it belongs in the aggregate. Pass 2's own
-    // per-execution attention item above is additional to this, not a
+    // routed to it, so it belongs in the aggregate. The per-execution
+    // attention item above is additional to this, not a
     // replacement for it — see the module doc.
     ctx.spawn_health.record_evidence(
         crate::spawn_health::SpawnFailureEvidence::builder()
@@ -1131,7 +1124,7 @@ fn raise_driver_start_attention(
     let title = format!("Worker spawned on slot {slot_id} but no driver signal was observed");
     let pane_observation = pane_observation(shell_pid);
     let body = format!(
-        "**Observed (driver-start timeout, sweep pass 2):** {pane_observation} for execution \
+        "**Observed (driver-start timeout):** {pane_observation} for execution \
          `{execution_id}` on slot {slot_id}, but no driver-originated signal — no hook \
          event, no `transcript_path`, no progress-ingress event — was observed within {grace_secs}s \
          (silent for {silent_secs}s).\n\n\
@@ -1470,7 +1463,7 @@ mod tests {
     }
 
     /// `unverified_driver_starts` is blind to `shell_pid` by construction, so
-    /// pass 2 can reach a candidate that never reported one at all. The
+    /// the driver-start check can reach a candidate that never reported one at all. The
     /// narrative must say so rather than asserting "a pane and shell came
     /// up" for a pid it never observed.
     #[test]
@@ -2040,7 +2033,7 @@ mod tests {
     }
 
     /// A slot `mark_stalled_spawns` has promoted out of `Spawning` must still
-    /// be reached. Pass 1 filters on `activity == Spawning`; if pass 2 shared
+    /// be reached. A `Spawning`-only filter would miss it; if the driver-start check shared
     /// that filter, the promotion would be an escape hatch.
     ///
     /// Also pins the reason the promotion is not itself proof of life: it
