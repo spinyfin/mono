@@ -1,175 +1,186 @@
 # Dynamic Agents pane layout: identity is the execution, position is never identity
 
-- **Date:** 2026-09-02
+- **Date:** 2026-09-30
 - **Status:** design proposal
 - **Project:** Dynamic Agents pane layout
 - **Provenance:** project-design execution; no implementation code
-- **Verified against:** `main` at `32f8a06c` (2026-09-02)
-- **Hard dependency:** [Tmux-only local worker panes](./make-tmux-the-only-pane-hosting-mode.md) (sibling project, in design)
-- **Direction notes this builds on:** [Fleet scaling, the slot model, and team semantics](./fleet-scaling-dynamic-panes-and-team-semantics.md)
+- **Verified against:** `main` at `3b4f038c1860` (2026-09-30), plus the reviewed diff of mono#3010, treated as landed per operator direction
+- **Baseline:** [Tmux-only local worker panes](./make-tmux-the-only-pane-hosting-mode.md); remaining sequencing constraints: **Delete app-mediated worker input and narrow hosting status** and **Enforce and verify the tmux-only local-pane invariant**
+- **Direction notes:** [Fleet scaling, the slot model, and team semantics](./fleet-scaling-dynamic-panes-and-team-semantics.md)
 - **Related contract:** [Worker liveness](../worker-liveness-contract.md)
 
-The contested property is that a worker's identity in the new Agents view is its **execution id**, that its **persona is an engine-allocated durable lease** rather than a slot-derived label, and that page, cell, and visual order are app-local presentation state that never reaches the wire. Everything else in this design (capacity, pagination, filtering, ordering) is derived from that split, and every alternative that put position, page, or slot back into identity was rejected on it.
+Worker identity in the Agents view is the **execution id**. Persona is an **engine-allocated durable lease**. Page, cell, and visual order are app-local presentation state that never reaches the wire. Capacity, pagination, filtering, and ordering follow that ownership split.
 
 ## TL;DR
 
-Replace the four pool tabs with one grid that shows exactly the workers the engine currently hosts a pane for, laid out in a uniform cell grid whose per-page capacity is computed from the window size against a minimum legible pane of 70 columns by 24 rows at the fixed 10pt worker font, capped at 16 panes per page. Pages appear only when occupied cells exceed capacity. Filters by project and type narrow the set before cells are assigned and are never persisted.
+Replace the four pool tabs with one grid of engine-reported local workers, including a status card for a worker without an attached viewer. Compute per-page capacity from the window size against a minimum legible pane of 70 columns by 24 rows at the fixed 10pt worker font, capped at 16 panes per page. Pages appear only when occupied cells exceed capacity. Project and type filters narrow membership before cells are assigned and reset on app launch.
 
-Identity moves off the slot: the engine allocates each run a unique persona from the 32-name roster (durable on `work_runs`, restored on re-adoption, overflowing to `Ensign N` rather than colliding or refusing dispatch), stamps an explicit agent type and project on `LiveWorkerState`, and keys the viewer-side pane RPCs by run id. Slots remain the engine's capacity handle and the bare-integer CLI address; they stop being what the app keys a pane on. Pools, slot ranges, and the admission-only concurrency cap do not change.
+The engine allocates a unique persona from the 40-name roster, durably records it on `work_runs`, and restores it on tmux adoption. Exhaustion produces a unique `Ensign N` rather than refusing dispatch. Engine metadata supplies agent type, project, host, and execution start time. Viewer detach/focus RPCs and the app collection use run id. Slots remain engine capacity handles and bare-integer CLI addresses; backend pools and the admission-only concurrency cap do not change.
 
 ## Goals
 
-- One Agents view that shows only running agents and adapts its grid to how many are active.
-- Remove the visible pools (Bridge Crew, Lower Decks, Automations, Reviewers); pagination selectors appear only when the window cannot fit every visible pane.
-- Derive per-page capacity from the Boss window size, using a minimum legible pane defined in terminal columns and rows.
-- Badge every pane with a general type (Coding, Design, Review, Automation, Answer) and render an unmapped kind as a loud Unknown, never omit it.
-- Keep Star Trek personas, with a guarantee that one persona is on at most one pane at a time.
-- Offer filtering by project and by type.
-- Leave backend pools, slot ranges, and the admission-only concurrency cap exactly as they are.
-- Guarantee that pagination and filtering are view-only: an agent that is not on screen keeps running, keeps streaming, and stays addressable by every CLI verb.
+- Show only engine-reported local workers in one Agents view, with a grid that adapts to the active set and available space.
+- Replace Bridge Crew, Lower Decks, Automations, and Reviewers tabs with pagination only when needed.
+- Badge every pane or status card as Coding, Design, Review, Automation, or Answer; render unrecognised values as a loud Unknown.
+- Keep unique Star Trek personas and support filtering by project and type.
+- Keep pagination and filtering independent of execution: hidden workers continue running, streaming, and accepting CLI commands.
+- Keep workers visible even when their viewer cannot attach.
 
 ## Non-goals
 
-- Changing `MAX_WORKER_POOL_SIZE` (16), `MAX_AUTOMATION_POOL_SIZE` (8), `DEFAULT_REVIEW_POOL_SIZE` (8), the slot ranges 1-16 / 17-24 / 25-32, `MAX_CONCURRENT_INTERACTIVE_WORKERS`, or the `is_main`-only admission gate in `coordinator/scheduler.rs`.
-- Re-keying the engine's `LiveWorkerStateRegistry`, `WorkerPool` claims, or `WorkerRegistry` away from slot id. Slot remains the engine's live capacity handle; the slot-model rethink in the fleet-scaling notes is a separate project.
-- Rendering remote SSH workers in the Agents view. They hold no local pane today and the tmux-only project keeps them on their detached lifecycle; persona uniqueness covers them, panes do not.
-- Growing the persona roster or adding portrait assets. The roster stays at 32 names and the eight TNG portraits stay as they are.
-- A user-facing preference for pane capacity, and automatic font shrinking to fit more panes. Capacity follows the window; legibility is not traded for count.
-- Persisting filters across app restarts (a decision, argued below, not an omission).
-- New CLI verbs. `bossctl agents focus` becomes the reveal path for panes; `bossctl reveal` stays a kanban verb.
-- A status filter (for example "needs input"). Waiting workers are surfaced through page indicators and the pane header, not by reordering or by a new filter.
-- Improving the app-hosted spawn path. The view renders both hosting modes during the overlap with the tmux-only project, but all new investment goes to the run-id/tmux identity.
+- Changing `MAX_WORKER_POOL_SIZE` (16), `MAX_AUTOMATION_POOL_SIZE` (8), `MAX_REVIEW_POOL_SIZE`/`DEFAULT_REVIEW_POOL_SIZE` (16), slot ranges 1–16 / 17–24 / 25–40, or the `is_main` admission gate in `coordinator/scheduler.rs`. `MAX_CONCURRENT_INTERACTIVE_WORKERS` remains the default 8; the runtime cap and explicit-launch semantics stay unchanged.
+- Re-keying the engine's `LiveWorkerStateRegistry`, `WorkerPool` claims, or `WorkerRegistry` away from slot id.
+- Rendering remote SSH workers locally. Their detached lifecycle is unchanged; persona uniqueness includes them, local view membership does not.
+- Growing the 40-name roster or adding portrait assets. Keep the existing eight TNG portraits.
+- Adding a pane-capacity preference, shrinking fonts to fit, persisting filters, or introducing a status filter.
+- Adding CLI verbs. `bossctl agents focus` reveals an agent; `bossctl reveal` retains its kanban meaning.
 
 ## Current state and findings
 
+Source references below name files under `tools/boss/` and describe the verified baseline, unless explicitly marked as proposed.
+
 ### Slot is identity in three layers at once
 
-`LiveWorkerState` is keyed by `slot_id` in `engine/core/src/live_worker_state.rs`, and `name` is computed by `boss_protocol::name_for_slot`, so slot 1 is always Riker and slot 25 is always Seven. The app mirrors the roster in `WorkerNames.swift`, and `WorkersWorkspaceModel` pre-allocates 16 + 8 + 8 `WorkerSlot` values and routes every engine RPC (`SpawnWorkerPane`, `AttachWorkerPane`, `DetachWorkerPane`, `FocusWorkerPane`, `SendToPane`, `InterruptWorkerPane`) by slot id. `WorkersDetailView` renders four permanently mounted grids and toggles opacity between them.
+`LiveWorkerStateRegistry` is slot-keyed, and protocol `name_for_slot` makes slot 1 Riker and slot 25 Seven. The app mirrors the 40-name roster in `WorkerNames.swift`. `WorkersWorkspaceModel` pre-allocates 16 + 8 + 16 `WorkerSlot` values by default; review count follows `EnginePoolConfig`. Attach, detach, and focus still route by slot. `WorkersDetailView` renders four permanently mounted grids and toggles opacity.
 
-The fleet-scaling notes already recorded that a slot conflates UI real estate, capacity control, and worker identity, and named the intended direction: "identities form a pool; a pane spawns, a crew member is assigned for the mission, and returns to the roster when the pane closes." No decision was ever recorded that persona should be slot-derived; the roster comment describes the modulo wrap as a defensive fallback that must never be exercised. That is a coincidence of the fixed grid, not a designed invariant, and this design treats it as such.
+The fleet-scaling notes already separate UI real estate, capacity, and worker identity, proposing a crew member assigned for a mission and returned to the roster on close. Slot-derived persona is a consequence of the fixed grid; the roster's modulo wrap is only a defensive fallback.
 
-### The pane surface is already keyed by run id
+### Surface and frontend focus identities are already run-based
 
-`TerminalPaneSession.id` is `"run-<runId>"` and `WorkerSlotView` pins SwiftUI identity to it precisely because a slot can be released and respawned into a new session within one update pass. The app therefore already has the right identity for the surface and the wrong identity for routing. Only the RPC keys and the grid need to move.
+`TerminalPaneSession.id` is `"run-<runId>"`, and `WorkerSlotView` pins SwiftUI identity to it so recycling a slot creates a distinct session. `FrontendRequest::FocusWorkerPane { run_id }` reaches `app/panes.rs`, and `pane_ops.rs::focus_worker_pane(run_id)` translates it to the app-facing `FocusWorkerPaneInput { slot_id }`.
 
-### The frontend focus request is already run-id keyed
+The CLI resolves live references by run id, numeric slot id, then case-insensitive crew name; its durable/hosted roster fallback uses the same identity forms. Slot- and roster-name-shaped misses cannot fall through to work-item selection. Preserve those rules when introducing overflow names.
 
-`FrontendRequest::FocusWorkerPane { run_id }` reaches `app/panes.rs` with a run id, and the engine maps it to a slot only to satisfy the app-facing `FocusWorkerPaneInput { slot_id }`. The CLI resolver in `bossctl/src/agents.rs` tries run id, then numeric slot id, then case-insensitive crew name, and refuses to fall through to a work-item selector for anything slot- or name-shaped. None of this needs to change shape.
+### Metadata exists in part
 
-### Attribution needed for badges and filters is engine state, and mostly on the wire already
+`LiveWorkerState` carries `kind`, attributed `pool`, work-item binding, and `held`; it has no general agent type, project, explicit host id, or execution start time. Attributed pool can be automation even when a worker spills into an interactive slot.
 
-`LiveWorkerState` already carries `kind` (an `ExecutionKind` string), `pool` (the attributed pool label from `attributed_pool_label`, which reports `automation` for automation-sourced rows regardless of the slot they spilled into), `work_item_id`, and `held`. It does not carry a project or a general type. `ExecutionKind` has eleven variants at `main`: `answer_agent`, `automation_triage`, `chore_implementation`, `ci_remediation`, `conflict_resolution`, `investigation_implementation`, `pr_review`, `product_design`, `project_design`, `revision_implementation`, `task_implementation`. Tasks carry `project_id`; chores may not.
+`protocol/src/types/execution.rs` now has twelve kinds: `answer_agent`, `automation_triage`, `chore_implementation`, `ci_remediation`, `conflict_resolution`, `investigation_implementation`, `pr_review`, `pr_review_guide`, `product_design`, `project_design`, `revision_implementation`, and `task_implementation`. Project attribution is absent for unfiled work and must not be guessed from pool.
 
-### Both hosting modes are live at `main`
+### Tmux-only hosting and progress recovery are the baseline
 
-The repository default is still app-hosted; the configured installation runs all three pools in tmux. Under tmux, the app's `attachWorkerPane` runs `tmux attach-session` inside a Ghostty surface and the worker process lives in the detached session regardless of the viewer. Under app hosting, the Ghostty surface owns the pty. The view must render both during the overlap.
+- Mono#2993 requires `TmuxWorkerHost` for local dispatch in `runner/pane_spawn.rs` and `StartWorkerInput`. Mono#2995 removed `TmuxHostingPools`, the hosting setting, dispatch hosting stamps, and the rollout badge.
+- Mono#2996 deleted `SpawnWorkerPane` and `ReleaseWorkerPane` from `EngineToAppRequest`. Every local surface uses `WorkersWorkspaceModel.swift`'s `tmux attach-session` command. The app owns viewer attachment and detachment, not the worker lifecycle.
+- Mono#2862 landed: `work/run_rows.rs::TMUX_RUN_ADOPTABLE_PREDICATE` tests durable local tmux identity and execution status, not the short-lived spawn row's `r.status`. Same-run `register_readoption` preserves live state and holds.
+- Semantic progress checkpoints also landed (mono#2871). `engine/core/src/live_worker_state.rs::seed_semantic_progress` restores driver-originated progress without treating shell survival as proof of activity. The Agents pane draws spawning neutrally; the Doing-card live-state path renders spawning as unknown. The persisted-status fallback still exists and is not a membership source for this design.
+- Mono#3010 is an assumed part of this baseline, per operator direction; it was still open when verified. Its startup/death/spawn-ack/husk cleanup makes the recovery slot lookup durable and guards current ownership before acting. It leaves two app process-evidence consumers: `retire_pane` Guard 3 (`hosted_pane_run_for_slot`) and `list_hosted_pane_statuses` in `app/pane_ops.rs`. They still depend on the app's slot-to-run report.
 
-### The two live defects have not landed
+### Viewer presence is not worker liveness
 
-- **Re-adoption wipes live state.** `TMUX_RUN_ADOPTABLE_PREDICATE` in `work/run_rows.rs` still selects `r.status = 'active'`, and the periodic tmux sweep rebuilds `LiveWorkerState` from scratch. PR #2862 ("Fix tmux worker re-adoption state") retains live state and holds on same-run re-adoption and is **open, not merged** at the verified commit. Any persona stored only in memory would be re-derived from the slot on every sweep until it lands, so persona durability is sequenced after it.
-- **Spawning renders as green.** In the Agents pane itself `WorkersDetailView.liveActivityColor` already draws `.spawning` in the neutral secondary colour. The green comes from the kanban Doing card: `AgentActivityState.init(runtime:)` maps `work_executions.status == "running"` to `.active` whenever no `LiveWorkerState` exists, which is exactly the window after a re-adoption wipe. PR #2862 also owns rendering a re-adopted spawning worker as unknown. This design builds on that rendering and does not restate the fix.
+`spawn_flow.rs` retains a successfully started tmux worker when viewer attachment fails; `viewer_error_does_not_fail_the_worker` tests this. An attached surface is therefore insufficient as the membership source.
 
-### Scrollback for an unseen pane is bounded, not unbounded
+A retained tmux session is also insufficient proof of liveness. `tmux_session_options.rs` already sets `remain-on-exit=on`. Mono#3023's `tmux_adoption/dead_pane.rs` probes `#{pane_dead}`, records terminal evidence, and performs token-verified cleanup instead of adopting a dead pane.
 
-The tmux-only design makes the private server's `history-limit=2000` explicit. A Ghostty surface keeps its own scrollback for as long as it is mounted. Today every live worker's surface stays mounted whether or not its tab is selected, which is the precedent this design keeps.
+### Scrollback is bounded
+
+`tmux_session_options.rs` sets `history-limit=2000`. Ghostty retains its own scrollback while its surface stays mounted. The existing pool grids keep all attached surfaces mounted across tab changes; this design preserves that behaviour. Driver transcripts are the durable record.
 
 ## Alternatives considered
 
-### Keep the fixed slot grids and hide idle cells
+### Keep fixed slot grids and hide idle cells
 
-The cheapest change: keep four grids, collapse unoccupied cells, and stop showing pool names. Rejected because the pages stay pool-shaped (a reviewer in slot 25 always lands on a "fourth page" even when it is the only agent running), per-page capacity cannot follow the window, and the app still keys every pane on a slot. It satisfies the letter of "show only running agents" while keeping position as identity.
+Rejected because grouping remains pool-shaped, capacity cannot follow the window, and slot remains the app collection key. A single reviewer should not inherit a fourth-page location from slot 25.
 
-### Let the app allocate personas as a view label
+### Allocate personas in the app
 
-Persona would be a display-only choice made by the app from the roster, with the engine's `name` ignored. Rejected because uniqueness across concurrently live workers is a cross-process invariant that the CLI (`bossctl agents focus Riker`), the coordinator (which refers to workers by name from `LiveWorkerState.name`), and any future remote viewer all consume, and only the engine sees every live worker including remote ones and those with no app attached. Today both sides derive the same name from the slot and it works only because the slot is unique per live worker; once the name is decoupled from the slot there must be one allocator, and it has to be the process that owns liveness.
+Rejected because the CLI, coordinator, local viewers, remote workers, and headless engine all need one unique name for the same execution. Only the engine sees every live worker and can own that lease.
 
-### Let the engine assign page and cell
+### Assign page and cell in the engine
 
-The engine would compute a stable layout and push `page`/`cell` on `LiveWorkerState`. Rejected because layout depends on window geometry only the app knows, and because putting a page number on the wire is precisely what turns position into an addressable identity. The ownership constraint is explicit: layout geometry stays out of the engine.
+Rejected because layout depends on app geometry. No page or cell belongs in an engine identity or CLI reference.
 
-### Reflow immediately on every arrival and exit
+### Reflow on every arrival and exit
 
-Simplest layout rule: recompute the optimal grid whenever the visible set changes. Rejected for the reason the operator gave: it moves panes under a reader's cursor. The chosen approach keeps this behaviour only when the Agents view is not on screen, where nobody is reading.
+Rejected while the view is on screen because it moves panes under a reader's cursor. Immediate reflow remains appropriate while the view is hidden.
 
 ### Detach the viewer for off-page panes
 
-Save resources by detaching the Ghostty surface from any pane not on the current page and re-attaching on page-in. Rejected: under app hosting there is no detach that does not kill the worker; under tmux it works but costs a fresh surface, loses the Ghostty-side scrollback, and shows a blank pane while tmux redraws. The established practice (four grids always mounted) already bounds resource cost by the number of live workers, at most 32 local, and this design keeps it.
+Detaching is non-destructive by the `DetachWorkerPaneInput` contract. Rejected as the pagination policy because reattachment creates a fresh surface, loses Ghostty-side scrollback, and can display a blank pane during tmux redraw. Tmux history does not restore viewer scrollback. Keeping successful attachments mounted follows current practice and bounds normal local surfaces at 40, independent of which page is selected.
 
 ### Refuse dispatch when the roster is exhausted
 
-Guarantee uniqueness by never spawning a 33rd named worker. Rejected outright: a label must never affect execution. Overflow gets a generic unique name instead.
+Rejected: a label cannot veto the 41st concurrent named worker. Allocate a unique overflow name instead.
 
-### Shrink the font to fit more panes
+### Shrink the font to fit
 
-Rejected because the operator's constraint is legibility. The worker font stays at the fixed 10pt in the launch spec, and capacity is what gives.
+Rejected because the constraint is legibility. Capacity changes; the fixed 10pt worker font does not.
 
 ## Chosen approach
 
 ### Identity
 
-| Concept                    | Owner  | Value                                                                                 | Where it appears                                                                                                         |
-| -------------------------- | ------ | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| Worker identity            | Engine | Execution id (`exec_…`), equal to `LiveWorkerState.run_id` today                      | Every RPC key, every CLI verb, the pane's SwiftUI identity                                                               |
-| Process-container identity | Engine | `work_runs.tmux_session_name` + `tmux_spawn_token` (tmux) or `shell_pid` (app-hosted) | Adoption, teardown, input delivery; never shown as identity in the view                                                  |
-| Capacity handle            | Engine | Slot id (1-32 local, 200+ remote)                                                     | `WorkerPool` claims, `LiveWorkerStateRegistry` key, `bossctl agents list` column, bare-integer CLI address, pane tooltip |
-| Persona                    | Engine | Durable lease from the roster, unique across live workers                             | Pane header, kanban card, `LiveWorkerState.name`, crew-name CLI address                                                  |
-| Cell, page, visual order   | App    | Ephemeral, per app session                                                            | Nowhere on the wire, never accepted by any CLI verb                                                                      |
+| Concept                    | Owner  | Value                                                                    | Uses                                                                         |
+| -------------------------- | ------ | ------------------------------------------------------------------------ | ---------------------------------------------------------------------------- |
+| Worker identity            | Engine | Execution id, equal to `LiveWorkerState.run_id` today                    | Viewer detach/focus key, CLI run reference, SwiftUI identity                 |
+| Process-container identity | Engine | `work_runs.tmux_server_label` + `tmux_session_name` + `tmux_spawn_token` | Adoption, teardown, input; never view identity                               |
+| Capacity handle            | Engine | Slot id: 1–40 local, 200+ remote                                         | Pool claims, engine registries, bare-integer CLI address, diagnostic tooltip |
+| Persona                    | Engine | Durable lease unique across live workers                                 | Pane/card header, kanban, `LiveWorkerState.name`, crew-name CLI address      |
+| Cell, page, visual order   | App    | Ephemeral per app session                                                | Presentation only                                                            |
 
-The invariant at the load-bearing level: **no engine state and no wire type carries a page number, a cell index, or a visual position, and no CLI reference form resolves through one.** A bare integer in a worker reference is a slot id today and stays a slot id. That holds not because the app declines to send a page number, but because there is no field to send it in.
+The vestigial `LiveWorkerState.shell_pid` is not process-container identity and the view must not read it. The view must also avoid `LiveWorkerState.tmux_hosted` and its `Models+WorkerActivity.swift` mirror: the remaining hosting-status cleanup changes their shape.
+
+**No engine state or wire type introduced by this project carries a page, cell, or visual position, and no CLI reference resolves through one.** A bare integer remains a slot id.
 
 ### Persona allocation
 
-Persona becomes an engine-side lease with these rules:
+- Allocate the lowest-index free roster name at spawn registration, alongside the pool/kind stamps, across local and remote workers.
+- Hold the lease until engine slot release, including terminal workers awaiting cleanup. Uniqueness is over concurrent leases, not history.
+- Persist a nullable `work_runs.persona` in the spawn-record transaction. On tmux adoption, restore existing leases before assigning missing personas to old rows, in `created_at, id` order. Same-run adoption preserves the lease alongside the already-preserved live state.
+- Retain the `" (Remote)"` display qualifier as a host marker; remote workers draw from the same persona pool.
+- When all 40 names are held, allocate `Ensign N` with the lowest free `N`, warn, and increment `persona_roster_exhausted`. Never refuse dispatch. With at most 40 local slots, overflow requires remote workers too.
+- Resolve `HostedPaneStatus.crew_name` and `bossctl agents list --all` from the durable persona by run id. `HostedPaneEntry` remains an app viewer report, not a persona allocator, and keeps reporting `slot_id` until the invariant task retires the app process oracle.
+- Migrate engine/UI consumers off slot-derived names, then remove `name_for_slot` and the duplicate Swift roster. CLI matching and miss handling must recognise overflow names without treating them as work-item selectors.
 
-- Allocated at spawn registration (the same point that stamps `pool` and `kind`), as the lowest-index roster name not held by any live worker, local or remote. Filling from Riker first keeps the familiar "bridge crew" feel when few agents run.
-- Held from allocation until the engine releases the worker's slot, so a finished-but-unreaped worker keeps its name until the reaper runs. Uniqueness is over live workers, not over history.
-- Durable: a new nullable `work_runs.persona` column is written in the same transaction as the spawn record, and tmux adoption restores it. This is why PR #2862 must land first: until same-run re-adoption preserves state, any in-memory lease would be lost on the next sweep.
-- Remote workers keep the `" (Remote)"` display qualifier; their persona is drawn from the same pool, so the qualifier is a host marker rather than a collision guard.
-- **Overflow policy:** when all 32 names are held, the engine allocates `Ensign N` with the lowest free `N`. It logs at warn level and increments a `persona_roster_exhausted` counter. Dispatch is never refused and no two live workers ever share a name. With 32 local slots this can only happen once remote workers are also live.
-- `name_for_slot` and the Swift roster are deleted. `HostedPaneEntry`/`bossctl agents list --all` report the durable persona. The CLI resolver keeps its order (run id, slot id, crew name) and matches names against the live `name` field, so `Ensign 3` resolves like `Riker`.
-
-The engine owns this because uniqueness is a liveness invariant; the app renders the string it is given and maps the eight portrait names to portraits by name rather than by slot.
+The app renders the engine name and maps the existing portrait assets by name. Persona restore extends tmux adoption only; no app-originated spawn-ack or husk restoration path is added.
 
 ### Badge type
 
-The engine stamps `agent_type` on `LiveWorkerState` from an exhaustive match, so adding an `ExecutionKind` variant is a compile error until the mapping is extended:
+The engine stamps `agent_type` with an exhaustive match over `ExecutionKind`, so new variants require a deliberate mapping.
 
 | Agent type | Execution kinds                                                                                                                                   |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Review     | `pr_review`                                                                                                                                       |
-| Automation | `automation_triage`, and any kind whose row is automation-sourced (the same precedence `attributed_pool_label` already uses)                      |
+| Review     | `pr_review`, `pr_review_guide`                                                                                                                    |
+| Automation | `automation_triage`, and automation-sourced rows using the existing attribution precedence                                                        |
 | Design     | `project_design`, `product_design`                                                                                                                |
 | Coding     | `task_implementation`, `chore_implementation`, `revision_implementation`, `investigation_implementation`, `ci_remediation`, `conflict_resolution` |
 | Answer     | `answer_agent`                                                                                                                                    |
 
-The app renders the string it receives. Anything outside that closed set, or a missing field from an older engine, renders as an **Unknown** badge in the warning colour with the raw value beside it ("Unknown: `foo_bar`"), appears under the "Unknown" option of the type filter, and is never dropped. Both layers are loud: the engine cannot ship an unmapped kind, and the app cannot hide a value it does not recognise.
+Review guides are review-related work, even if a particular execution has no local pane. The mapping does not manufacture membership. As in `attributed_pool_label`, `pr_review` and `pr_review_guide` take precedence over automation source; the remaining automation-sourced kinds receive Automation.
 
-### Project attribution
+Missing or unrecognised wire values render an **Unknown** warning badge with the raw value, participate in the Unknown filter, and are never dropped.
 
-The engine stamps `project_id` and `project_name` on `LiveWorkerState` at spawn from the work item. A chore or other row without a project stamps neither. The project filter is a multi-select over the projects that currently have a live worker plus an explicit "Unfiled" entry. Selecting only specific projects hides unfiled agents, and the filter bar always shows the hidden count ("3 hidden by filters"), so nothing is invisible without a visible reason.
+### Project, host, and ordering metadata
+
+Stamp `project_id` and `project_name` from the dispatched work item; absent project means Unfiled. The project multi-select lists projects with live members plus Unfiled.
+
+The same metadata projection supplies `host_id` from the durable run and `started_at` from the execution, at spawn and on adoption. Locality must be explicit rather than inferred from slot ranges or a hosting-mode boolean. These fields supply membership and ordering, not layout.
 
 ### What "only running agents" means
 
-A pane is shown for an execution exactly while the engine hosts a pane for it: from the app's acceptance of `SpawnWorkerPane`/`AttachWorkerPane` until the matching `ReleaseWorkerPane`/`DetachWorkerPane`. The app never infers membership from activity, from pane content, or from CLI polling; the engine's release is the only thing that removes a pane, which keeps the [liveness contract](../worker-liveness-contract.md) intact.
+Membership comes from the engine-pushed `LiveWorkerState` snapshot, keyed in the app by `run_id`, restricted to `host_id == "local"`. It begins when the engine publishes a registered run and ends when its authoritative snapshot releases that run. Remote SSH workers are excluded. A disconnected feed retains the last snapshot with an unavailable/stale indication; disconnection is not an empty snapshot.
 
-Consequences, by state:
+Viewer ownership is separate: a surface's lifetime is bounded only by accepted `AttachWorkerPane` and matching `DetachWorkerPane`. Attach failure, surface loss, or detach while a run remains in engine membership leaves its cell visible with persona, type, activity, and **"Viewer not attached"** in place of the terminal. It consumes capacity, participates in filters and waiting counts, and can be focused as a card. A later attach fills the same cell. Reuse the existing engine reattachment path; the app does not spawn workers or probe their liveness.
 
-- `spawning`, `working`, `idle`, `waiting_for_input`, `errored`: shown. `spawning` renders as a neutral "Starting" pill, never green, building on PR #2862.
-- `terminated` and finished-but-unreaped: shown with an "Exited" pill and dimmed header until the engine releases the slot. The scrollback stays readable for exactly as long as the engine keeps the worker on its books, which is bounded by the existing reaper cadence and, under tmux, by the `remain-on-exit` retention the tmux-only design adds. Hiding it earlier would make the app disagree with `bossctl agents list`.
-- `waiting_for_input`: not reordered. It is surfaced by the orange pill it already has, by a dot on the page selector for every page that contains a waiting worker, and by a "needs input" count in the header. Reordering would break ordering stability for the sake of a signal the header already carries.
+An attach that arrives before the live snapshot may be retained in the viewer map but cannot invent running membership. Conversely, a delayed detach after engine release cannot resurrect it. Continue reporting attached viewers honestly through `ListHostedPanes` until they are detached.
+
+- `spawning`, `working`, `idle`, `waiting_for_input`, and `errored` remain members. Spawning gets a neutral "Starting" pill.
+- Engine terminal state (`terminated`, or an engine terminal execution update while cleanup is pending) produces **"Exited"** and a dim header until engine release. Surface death never sets Exited. Dead panes can linger under `remain-on-exit`; the interval is controlled by engine dead-pane reconciliation and token-verified cleanup, not an app reaper or UI timer. Unreadable probes can delay cleanup, so this is not a fixed retention guarantee.
+- Waiting workers are not reordered. Their orange pill, page-selector dot, and needs-input count include cards without viewers.
+
+On engine release, only the epoch placeholder remains. Engine recovery owns gaps or contradictions in its live registry; the app must not reconstruct membership from terminal content, DB "running" fallbacks, app spawn acknowledgements, or CLI polling.
 
 ### Capacity computation
 
-Capacity is computed by the app from the size of the pane area and the terminal cell size libghostty reports for the fixed 10pt worker font. It is never guessed from pixels alone.
+Use the terminal cell size reported by libghostty at the fixed 10pt font and the available pane area. Expose that measurement to the layout model; the current `setCellSize` callback only writes a status string.
 
-| Constant             | Value    | Reason                                                                                                                                                                                                                                           |
-| -------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `MIN_COLS`           | 70       | Today's four-column laptop layout gives roughly 71 columns per pane, which the operator has been using daily and calls a reasonable limit. Nothing narrower has been validated as legible.                                                       |
-| `MIN_ROWS`           | 24       | Claude Code's composer box plus one screenful of tool output; today's laptop panes give about 36 rows, and three rows of panes at 24 is the next step down.                                                                                      |
-| `HEADER_PT`          | measured | The two-line pane header, taken from the rendered view rather than hard-coded.                                                                                                                                                                   |
-| `MAX_PANES_PER_PAGE` | 16       | A four-by-four grid is the most headers a glance can triage; local concurrency above 16 was measured as negative-sum in the saturation experiment, so a second page is the right home for it; and it bounds the surfaces re-laid out per resize. |
+| Constant             | Initial value | Rationale                                                                                                 |
+| -------------------- | ------------- | --------------------------------------------------------------------------------------------------------- |
+| `MIN_COLS`           | 70            | Starting estimate from the operator's existing four-column laptop layout; validate legibility in captures |
+| `MIN_ROWS`           | 24            | Space for the composer and useful output; validate against real content                                   |
+| `HEADER_PT`          | measured      | Measure the two-line rendered header                                                                      |
+| `MAX_PANES_PER_PAGE` | 16            | Bound the number of simultaneous headers and surfaces resized per page; excess workers get another page   |
 
-With cell size `(cw, ch)` and pane area `(W, H)`:
+For terminal cell size `(cw, ch)`, pane area `(W, H)`, and grid gap:
 
 ```text
 minPaneW = MIN_COLS * cw
@@ -179,171 +190,199 @@ rows     = max(1, floor((H + gap) / (minPaneH + gap)))
 capacity = min(cols * rows, MAX_PANES_PER_PAGE)
 ```
 
-Estimated at a 6pt by 13pt cell, this yields 8 on a 16-inch laptop maximized (4 by 2), which matches the operator's laptop figure, and 12 to 18 on large displays depending on their logical resolution, which is where the cap applies. The operator's "12 or 14" is therefore a consequence of the formula plus the cap, not an input to it, and the constants live in one `PaneCapacityPolicy` value so the validation task can tune them from real captures.
+A 6pt by 13pt cell gives an estimated 4-by-2, eight-pane maximized laptop layout; large-display capacity depends on logical resolution and hits the 16-pane cap when the formula permits more. These are estimates, not fresh measurements. Keep constants in one `PaneCapacityPolicy` and tune them through the capture task.
 
-For a page with `k` occupied cells (`k <= capacity`), the grid is chosen among all `(c, r)` with `c * r >= k` and `c <= cols`, `r <= rows`, by maximizing the balanced scale `min(paneW / minPaneW, paneH / minPaneH)`, then fewer empty cells, then more columns. This gives one full-size pane for one agent, side-by-side halves for two, two-by-two for four, and three-by-two for five or six on the laptop.
+For `k <= capacity` occupied cells, choose `(c, r)` with `c * r >= k`, `c <= cols`, and `r <= rows`, maximizing `min(paneW / minPaneW, paneH / minPaneH)`, then fewer empty cells, then more columns. This yields a full-size single pane, side-by-side pairs, and compact larger grids. A window below the minimum still renders one pane; the policy cannot promise minimum dimensions in less space.
 
 ### Ordering, cells, and layout epochs
 
-The stable ordering key is `(execution started_at, execution id)`: oldest first, which is also the order the engine re-attaches panes after an app restart (`list_adoptable_tmux_runs` orders by `created_at`).
+Sort by `(execution started_at, execution id)`, oldest first. Tmux adoption reads `list_adoptable_tmux_runs` in `work_runs.created_at, id` order and restores personas there. Viewer recovery re-sends `AttachWorkerPane`, but its current loop walks a live-state snapshot; the app must sort explicitly rather than infer order from RPC arrival.
 
-Cells are assigned by the app and are never on the wire. The rules while the Agents view is on screen:
+While Agents is on screen:
 
-1. A pane's cell never changes and the page grid never changes shape. This is a **layout epoch**.
-2. A new agent takes the lowest free cell across all pages. If none is free within the current grid, it opens the next page and the page selector appears.
-3. When the engine releases a pane, its cell becomes a dim placeholder ("Riker finished") rather than collapsing. Nothing else moves.
-4. The epoch ends, and the layout is recomputed against the ordering key with holes removed and the grid re-fitted, at a **layout boundary**: entering the Agents view, changing page, changing a filter, the end of a window resize, or pressing the small Tidy control in the header. The control is highlighted whenever a tidy would change something, so a stale layout is visible rather than silent.
+1. A cell stays put and its page grid stays the same shape for a **layout epoch**.
+2. Arrivals fill the lowest free cell; if none fits the current grid, open the next page.
+3. Engine release leaves a dim placeholder ("Riker finished"), not a collapsing grid.
+4. A **layout boundary** removes holes and refits: entering Agents, page change, filter change, resize end, or Tidy. Highlight Tidy when it would change the layout.
 
-When the Agents view is not on screen, every change applies immediately, so switching to it always shows a freshly tidied layout. This is the immediate-reflow alternative, kept only where no one is reading.
+While Agents is hidden, changes apply immediately. A persona on a finished placeholder is historical text, not an active lease or addressable worker.
 
-Because cells are view-local and reset at every boundary, they cannot become identity: the same agent may sit in a different cell after a tidy, and no verb, log line, or wire field ever refers to a cell.
+### Pagination selectors and resize
 
-### Pagination selectors
+Pages are fixed windows of `capacity` cells. Show selectors when an occupied cell is at or beyond the first page; remove them when release or tidy leaves all occupied cells on page one. Clamp the selected page to the highest occupied page so the operator moves only when the selected page empties. Each selector shows count and a waiting-worker dot.
 
-Pages are fixed windows of `capacity` cells over the cell index space. The selector is visible exactly when some occupied cell index is at or beyond `capacity`; it disappears when a tidy or a release brings every occupied cell within the first page. The current page index is clamped to the highest page that still has an occupied cell, so the operator is moved only when the page they were reading has nothing left on it. Each selector shows the page's count and a dot if it contains a waiting worker.
-
-### Live resize
-
-Panes resize continuously during a drag exactly as today (Ghostty geometry sync is already capped at 30 Hz). Capacity is recomputed only at the end of a live resize, or after 300 ms of geometric quiet for non-drag changes such as full screen or a split-view collapse, and with a 16pt dead band around each column and row threshold so divider jitter cannot flip a boundary. Because recomputation is itself a layout boundary, a resize re-fits the grid; the anchor pane, defined as the pane holding keyboard focus or else the first occupied cell on the current page, decides which page is shown afterwards, so the pane the operator was reading stays on screen. Thrashing is impossible mid-drag because nothing recomputes mid-drag; oscillation across a boundary can only be caused by the operator resizing across it repeatedly, which is their own action.
+Ghostty geometry sync is already capped at 30 Hz in `GhosttyTerminalView.swift`. Resize surfaces during a drag; recompute capacity only at drag end, or after 300 ms of geometric quiet for other geometry changes, with a 16pt dead band around row/column thresholds. Preserve the focused pane as anchor, or the first occupied cell on the selected page if none is focused. After refit, select its new page.
 
 ### Visibility never affects execution
 
-Every live worker has exactly one mounted Ghostty surface for the lifetime of its pane, whether it is on the current page, on another page, or filtered out. Off-screen panes are rendered in their own page's grid geometry at zero opacity with hit-testing disabled, which is the mechanism the four pool grids use today, so switching pages never resizes a terminal and never tears down a surface. Output is retained in the mounted surface's scrollback and, under tmux hosting, in the session's bounded 2,000-line history as well; the driver transcript remains the complete record either way. No pane is throttled, detached, or paused for being invisible, and `bossctl agents send`, `interrupt`, `stop`, `status`, and `probe` reach it by run id or slot id exactly as they do today.
+Keep exactly one mounted surface for each successfully attached local viewer until engine detach, regardless of page or filter. Off-screen viewers keep their page geometry at zero opacity with hit-testing disabled; page selection never recreates a surface. Output remains in Ghostty scrollback, bounded tmux history, and the driver transcript. A worker without a viewer has tmux history and transcript output and stays visible as a card.
+
+Filtering does not detach, pause, or throttle workers. CLI send, interrupt, stop, status, and probe continue using engine execution/slot resolution and durable tmux identity.
 
 ### Filtering semantics
 
-- Filters are applied to the engine's set of hosted panes before cells are assigned, so page count follows the filtered set.
-- Two filters: project (multi-select including "Unfiled") and type (multi-select over Coding, Design, Review, Automation, Answer, Unknown). Changing either is a layout boundary.
-- The hidden count is always shown in the filter bar when any filter is active.
-- Filters reset to "All" on app launch. After a restart the operator's first need is the full picture, and a persisted filter combined with pagination would hide a running agent at exactly the moment they are checking whether restart recovery worked. That is the reason, and it is a decision a reviewer may overturn.
+- Apply project and type filters to engine local membership, including cards without viewers, before cell assignment.
+- Project and type are multi-selects; include Unfiled and Unknown respectively.
+- Changing filters ends the epoch; always show the hidden count when a filter is active.
+- Reset to All on app launch so restart recovery opens with the full picture.
+- Waiting is surfaced by counts and dots, not a separate status filter.
 
 ### Focus as the reveal path
 
-`bossctl agents focus <ref>` and clicking a Doing card's agent icon both end at `FocusWorkerPaneInput`, which gains `run_id`. The app switches to the Agents mode if needed, clears any filter that hides the pane and shows a transient banner saying so, selects the pane's page, makes its surface first responder, and briefly outlines the pane. No new verb is needed and `bossctl reveal` keeps its kanban meaning.
+`bossctl agents focus <ref>` and the Doing-card agent icon use run-keyed `FocusWorkerPaneInput`. Switch to Agents, clear a hiding filter with a transient banner, select the page, and outline the cell. Focus the terminal if attached, otherwise focus the "Viewer not attached" card. No new CLI verb or worker launch is needed.
 
 ### Viewer RPCs keyed by run id
 
-`DetachWorkerPaneInput`, `FocusWorkerPaneInput`, `SendToPaneInput`, and `InterruptWorkerPaneInput` gain `run_id`, and the app keys its pane collection on it; `slot_id` stays in the payload for display and diagnostics. `AttachWorkerPaneInput` and `HostedPaneEntry` already carry both. The app no longer holds slot ranges, so `EnginePoolConfig` is used only for the pool occupancy strip. `SlotBusy` keeps its wire name but the app raises it only when a pane for the same run id is already hosted; the engine's existing slot-desync repair paths are untouched.
+Add `run_id` only to `DetachWorkerPaneInput` and `FocusWorkerPaneInput`; attach already carries it. Re-key `WorkersWorkspaceModel` by run id, retaining slot as capacity/diagnostic metadata. A delayed detach or focus for a prior run must never target the new occupant of its old slot.
 
-### Header, empty state, and the retained pool information
+Do not modify `SendToPaneInput` or `InterruptWorkerPaneInput`: **Delete app-mediated worker input and narrow hosting status** deletes them. Follow that task when editing shared protocol enums.
 
-Each pane header reads `[portrait] <Persona> is <gerund>` or `<Persona>: <task title>`, then the type badge, the activity pill, and the live-status eye toggle, with the subtitle line unchanged. The tooltip carries run id, slot id, pool, project, and hosting mode. The view header carries the filter bar, the page selector when needed, the Tidy control, the hidden and needs-input counts, and a pool occupancy strip ("Interactive 5/16 · Automation 2/8 · Review 1/8") built from `LiveWorkerState.pool` and the pool sizes the engine already pushes at session registration, so the fact that pools still exist stays visible after the tabs go. The legacy-hosting badge moves into this header until the tmux-only project removes it. The empty state is one line, "No agents running", plus a single idle flavour line from a random off-duty crew member.
+Before changing `SlotBusy` or dropping slot-indexed compatibility, **Enforce and verify the tmux-only local-pane invariant** must retire `retire_pane` Guard 3 and `list_hosted_pane_statuses`'s app process oracle. Until then, `ListHostedPanes`/`HostedPaneEntry` must report both `slot_id` and `run_id`, and `SlotBusy` keeps its slot-occupancy meaning. After that prerequisite, make same-run attach idempotent: preserve the existing surface and return success, with no surviving slot-desync caller interpreting a changed error contract. Retain slot in viewer reports for diagnostics; resolve personas in the engine by run id.
+
+### Header, empty state, and pool information
+
+Each header shows the engine persona and portrait, summary or task title, type badge, activity pill, live-status toggle, and existing subtitle. The tooltip carries run id, slot id, pool, and project.
+
+The view header has filters, conditional page selectors, Tidy, hidden and needs-input counts, and a pool strip such as "Interactive 5/16 · Automation 2/8 · Review 1/16". Use engine-pushed pool sizes; label counts as attributed workload from `LiveWorkerState.pool`, since automation spill means those counts are not physical slot occupancy. The empty state is "No agents running" plus an idle flavour line from the existing portrait crew.
 
 ### Dependency on the tmux-only project
 
-This project does not depend on tmux-only hosting landing. It depends on PR #2862 and on both hosting modes continuing to exist during the overlap. Where the two projects touch the same code, the order is:
+Tmux deletion work has mostly landed. This project forward-ports onto mono#2862, #2993, #2995, #2996, and the assumed mono#3010 baseline. It adds no dual-mode renderer, hosting badge, or app-owned worker lifecycle.
 
-- **PR #2862 lands before** the persona task here. Persona durability is built on the preserved re-adoption path.
-- **Tmux Phase 1 ("Persist the semantic worker-progress checkpoint")** and the persona column both add `work_runs` columns. They may land in either order; the later one forward-ports the migration list.
-- **This project's identity and view tasks land before tmux Phase 4** ("Delete app-owned worker lifecycle RPCs", "Delete app-mediated worker input and narrow hosting status", "Remove the hosting setting and rollout-only surfaces"). Those deletions edit `engine_app.rs`, `WorkersWorkspaceModel.swift`, `app/panes.rs`, and `Models+WorkerActivity.swift`, and they are gated on a seven-day soak that this project should not wait on. The deletion tasks forward-port the run-id keying and delete the `SpawnWorkerPane` arm from a collection that is already keyed by run id.
-- Under tmux hosting the durable `tmux_session_name`/`tmux_spawn_token` pair remains the process-container identity the engine reasons with. The view never resolves it; it is a better anchor than a slot for the engine, and the execution id is the right anchor for the app.
+1. **Delete app-mediated worker input and narrow hosting status** precedes **Key viewer pane RPCs by run id** (shared protocol enums) and **Replace the pool tabs with the dynamic Agents view** (shared `Models+WorkerActivity.swift` and `PlannerAffordances.swift`).
+2. **Enforce and verify the tmux-only local-pane invariant** follows that deletion and precedes both RPC re-keying and the view rewrite. Its acceptance must retire the remaining `ListHostedPanes` process oracle. This order preserves slot safety while the engine still needs it and avoids rewriting the same contracts twice.
+
+Persona, metadata, and the pure layout model can progress independently of this sequence. Coordinate persona's `pane_ops.rs` name projection with the invariant sweep if both edit it. Retain the slot report until that sweep actually removes its safety consumers; do not infer completion merely from mono#3010.
 
 ## Risks / open questions
 
-- **The capacity constants are derived from today's laptop layout, not measured on the large display.** The validation task captures both displays and tunes `PaneCapacityPolicy`; the risk is that 70 by 24 is too small on a high-density display and the cap, not the formula, ends up doing all the work.
-- **Layout epochs can leave a page stale for hours.** Mitigated by the highlighted Tidy control and by immediate reflow whenever the view is not on screen; if operators find the placeholder cells annoying, a shorter automatic tidy on quiescence could be added later without touching identity.
-- **Two migrations touch `work_runs` in parallel projects.** Incidental overlap; whichever lands second forward-ports.
-- **The app-hosted path is still the repository default.** The view supports it, but the identity work targets run id and tmux; an operator on the app-hosted default sees the same view with worse restart behaviour, which is the tmux-only project's problem to remove.
-- **`Ensign N` is a naming choice.** It is deliberately generic and unmistakably an overflow; a reviewer may prefer another rank or growing the roster.
-- **Finished-but-unreaped panes stay visible until release.** This keeps the view consistent with `bossctl agents list` but means "only running agents" includes an exited worker for up to a reaper interval.
-- **Filters do not persist.** Argued above; overturning it is a one-line change in the view model.
+- Capacity constants need real-display measurements; estimates do not establish legibility.
+- Epochs can leave holes for a long time; highlighted Tidy and refitting at boundaries make that state explicit.
+- `Ensign N` remains a proposed overflow naming choice.
+- Exited retention follows engine reconciliation; unreadable probes can delay it.
+- Membership follows engine bookkeeping, including recovery delays. Viewer errors must remain visible without pretending the app can establish process liveness.
+- Filters reset on restart by design; changing that choice requires updating restart tests as well as the model.
 
 ## Proposed implementation task breakdown
 
-Breakdown size: 8 entries (8 in-scope, 0 deferred) — the change has three engine/protocol seams (persona lease, type and project stamps, run-id-keyed viewer RPCs), one pure layout model, one view rewrite with a small focus follow-on, one invariant-pinning test sweep, and one capture-based validation of the capacity constants.
+Ten in-scope capabilities. Each entry targets no more than three major deliverables and a PR under roughly 1,500 changed lines / 25 files. Estimates below include tests; implementation should preserve these capability boundaries instead of recombining the view, filters, kanban migration, and operator documentation. The two tmux prerequisites above are existing external tasks, not new rows.
 
 ### Allocate personas in the engine as durable unique leases
 
-Scope: Add a nullable `work_runs.persona` column; allocate the lowest free roster name (or `Ensign N` on exhaustion, with a warn log and a `persona_roster_exhausted` counter) at spawn registration in the same transaction as the spawn record; hold it until slot release; restore it on tmux adoption; stamp it into `LiveWorkerState.name`; delete `name_for_slot` and derive `HostedPaneEntry`/`bossctl agents list --all` crew names from the durable column; keep the `" (Remote)"` qualifier as a host marker; make the CLI name tier match any live `name`. Tests cover uniqueness across local and remote, overflow naming, restart restoration, and release reuse. Starts only after PR #2862 has merged and must forward-port it.
+Scope: Implement the durable persona column and allocator, restore leases through tmux adoption, and migrate engine/CLI name consumers (including hosted-status projection) off slot-derived naming. Tests cover local/remote uniqueness, overflow, restoration of older rows, release reuse, and CLI resolution. Keep app slot reporting intact; removing duplicate Swift naming belongs to the UI migration below.
 
-Effort hint: `large`
+Effort hint: `large`. Estimated size: 900–1,400 lines / 12–20 files.
 
-Dependencies: none within this list (external prerequisite: PR #2862)
+Dependencies: none; mono#2862 and the progress checkpoint are already baseline.
 
 Scope: in-scope
 
-Parallelism: May run in parallel with **Key viewer pane RPCs by run id** and **Build the pane capacity and layout model**; their production file sets are distinct. **Stamp agent type and project on live worker state** must follow it because both edit `live_worker_state.rs` in protocol and engine and the `bossctl agents list` renderer.
+Parallelism: Can run beside the layout model and viewer RPC task. Coordinate `pane_ops.rs` overlap with the external invariant sweep; metadata follows persona because both edit live-state projection.
 
-### Stamp agent type and project on live worker state
+### Stamp agent type, project, and membership metadata on live worker state
 
-Scope: Add `agent_type`, `project_id`, and `project_name` to `LiveWorkerState`, computed by the engine at spawn registration: type from an exhaustive match over `ExecutionKind` with the automation-source precedence `attributed_pool_label` already uses, project from the dispatched work item (absent for unfiled rows). Render both in `bossctl agents list`/`status`. Tests pin the full kind-to-type table and the unfiled case.
+Scope: Add the exhaustive type mapping and project attribution, plus explicit host/start-time fields used by membership and ordering; populate at spawn and adoption and expose useful metadata in CLI list/status. Tests cover all twelve kinds, attribution precedence, Unfiled, local/remote distinction, and restart preservation.
 
-Effort hint: `medium`
+Effort hint: `medium`. Estimated size: 500–900 lines / 8–15 files.
 
 Dependencies: Allocate personas in the engine as durable unique leases
 
 Scope: in-scope
 
-Parallelism: May run in parallel with **Key viewer pane RPCs by run id** and **Build the pane capacity and layout model**.
+Parallelism: Can run beside the pure layout model and viewer RPC task; consumes the hosting-status cleanup's final shape if it has landed without reintroducing `tmux_hosted`.
 
 ### Key viewer pane RPCs by run id
 
-Scope: Add `run_id` to `DetachWorkerPaneInput`, `FocusWorkerPaneInput`, `SendToPaneInput`, and `InterruptWorkerPaneInput` in `boss-protocol`, populate it in the engine's `app/panes.rs`, `pane_delivery.rs`, `pane_ops.rs`, and `probe_interrupt.rs` handlers, and re-key `WorkersWorkspaceModel` on run id with `slot_id` retained as a display attribute. Keep the existing slot-array projections so the current `WorkersDetailView` keeps rendering until it is replaced. Narrow the app's `SlotBusy` to "a pane for this run id already exists". Protocol round-trip tests and app model tests cover attach, detach, focus, send, and interrupt by run id.
+Scope: Add run id to Detach and Focus, update engine dispatch and app handlers, and re-key the app viewer map. Preserve temporary slot-array projections for the old grid. Test same-run attach, delayed detach after slot reuse, focus, and truthful viewer reporting. Resolve duplicate-attach/error semantics only after the external invariant sweep has removed slot-based safety consumers. Do not touch deleted send/interrupt RPCs.
 
-Effort hint: `medium`
+Effort hint: `medium`. Estimated size: 700–1,200 lines / 10–20 files.
 
-Dependencies: none
+Dependencies: **Delete app-mediated worker input and narrow hosting status**; **Enforce and verify the tmux-only local-pane invariant** (external tmux tasks)
 
 Scope: in-scope
 
-Parallelism: May run in parallel with **Allocate personas in the engine as durable unique leases** and **Build the pane capacity and layout model**. **Replace the pool tabs with the dynamic Agents view** must follow it because both substantially edit `WorkersWorkspaceModel.swift`.
+Parallelism: Can run beside persona and layout work; the view rewrite follows because both edit `WorkersWorkspaceModel.swift`.
 
 ### Build the pane capacity and layout model
 
-Scope: Add a pure Swift `PaneCapacityPolicy` (the constants and the cols/rows/capacity formula from cell size and pane area, with the dead band) and `PaneLayoutModel` (stable ordering key, cell assignment, layout epochs and boundaries, hole placeholders, grid selection by balanced scale, pagination windows, selector visibility rule, page clamping, filter application before assignment, hidden counts, and anchor-pane page selection after a capacity change). No UI. Unit tests cover the laptop and large-display estimates, epoch stability under arrivals and exits, boundary re-fit, filter changes, and that no output of the model is ever an identity.
+Scope: Add pure Swift `PaneCapacityPolicy` and `PaneLayoutModel`: grid selection, stable cells, epochs, pagination, filter application, hidden/waiting counts, resize dead band, and anchor selection. Unit-test geometry, holes, boundaries, cards without viewers, filter changes, and stable run identity. No UI.
 
-Effort hint: `medium`
+Effort hint: `medium`. Estimated size: 700–1,100 lines / 4–8 files.
 
 Dependencies: none
 
 Scope: in-scope
 
-Parallelism: May run in parallel with the three engine/protocol entries above; it touches only new files.
+Parallelism: Independent of engine/protocol changes; new model and test files only.
 
 ### Replace the pool tabs with the dynamic Agents view
 
-Scope: Rewrite `WorkersDetailView` to render the layout model: one uniform grid per page, off-page and filtered panes mounted at zero opacity in their own page geometry, page selector with counts and waiting dots, project and type filter bar with hidden count, Tidy control, pool occupancy strip, needs-input count, relocated legacy-hosting badge, and the one-line empty state. Pane headers show the wire persona, portrait by name, the type badge with the loud Unknown fallback, the neutral "Starting" pill, and the "Exited" state for released-pending panes. Delete `WorkerNames.swift`, `TrekCharacter.forSlot`, and the slot-array projections; the kanban card reads the wire name. Recompute capacity at resize end with the debounce. Document the visibility predicate, filter semantics, and epoch rules in a short operator doc alongside the code.
+Scope: Connect engine membership and the separate viewer map to a uniform paginated grid; render persona/type/activity headers and viewer-missing cards; integrate measured cell size, resize boundaries, Tidy, page/waiting selectors, pool strip, and empty state. Keep all attached surfaces mounted across pages, delete slot-array projections, and test snapshot/attach/detach races and terminal-state rendering. Filters initially remain All; filter controls and kanban migration are separate capabilities.
 
-Effort hint: `large`
+Effort hint: `large`. Estimated size: 1,000–1,400 lines / 10–18 files.
 
-Dependencies: Allocate personas in the engine as durable unique leases; Stamp agent type and project on live worker state; Key viewer pane RPCs by run id; Build the pane capacity and layout model
+Dependencies: Stamp agent type, project, and membership metadata on live worker state; Key viewer pane RPCs by run id; Build the pane capacity and layout model; **Delete app-mediated worker input and narrow hosting status**; **Enforce and verify the tmux-only local-pane invariant**
 
 Scope: in-scope
 
-Parallelism: May run in parallel with **Pin backend pool geometry and the admission-only cap**; the latter touches only engine and CLI tests.
+Parallelism: Can run beside backend invariant tests and kanban persona migration. Shared `Models+WorkerActivity.swift` and `PlannerAffordances.swift` edits must build on the external input/status deletion.
 
-### Make focus bring a pane into view
+### Add project and type filtering to Agents
 
-Scope: On `FocusWorkerPaneInput` by run id and on Doing-card agent-icon click, switch to the Agents mode, clear any filter hiding the pane with a transient banner, select its page, make the surface first responder, and outline the pane briefly. Tests cover the filtered-out, other-page, and not-in-Agents-mode cases and that `bossctl agents focus` by run id, slot id, and persona all land on the same pane.
+Scope: Add the two filter controls and visible hidden count over the existing layout model, with Unfiled/Unknown and launch-reset semantics. Test membership, waiting indicators, and preservation of mounted viewers under filtering. Add a short operator document covering membership, missing viewers, filters, pagination, and epochs.
 
-Effort hint: `small`
+Effort hint: `medium`. Estimated size: 400–800 lines / 5–10 files.
 
 Dependencies: Replace the pool tabs with the dynamic Agents view
 
 Scope: in-scope
 
-Parallelism: May run in parallel with **Validate capacity constants on real displays**.
+Parallelism: Can run beside kanban persona migration and capacity validation; it does not change engine identity or viewer RPCs.
+
+### Render kanban agent names from the engine persona
+
+Scope: Migrate Doing-card names and portrait lookup to the engine persona, preserving the neutral/unknown spawning treatment. Test persona stability across slot reuse and missing metadata; remove slot-name helpers and the duplicate Swift roster after their last pane/card consumer migrates. Idle flavour can use the existing portrait crew without recreating a slot roster.
+
+Effort hint: `small`. Estimated size: 250–600 lines / 4–10 files.
+
+Dependencies: Allocate personas in the engine as durable unique leases
+
+Scope: in-scope
+
+Parallelism: Card work can run beside the view rewrite; coordinate final shared-helper deletion after both consumers migrate. No dependency on filters, pagination controls, or operator documentation.
+
+### Make focus bring an agent into view
+
+Scope: Handle run-keyed focus from CLI and Doing-card clicks: switch mode, clear hiding filters with a banner, select page, focus terminal or viewer-missing card, and outline it. Test hidden, off-page, absent-viewer, and non-Agents-mode cases, plus equivalent run/slot/persona CLI references.
+
+Effort hint: `small`. Estimated size: 250–500 lines / 4–8 files.
+
+Dependencies: Add project and type filtering to Agents
+
+Scope: in-scope
+
+Parallelism: Can run beside capacity validation and backend invariant tests.
 
 ### Pin backend pool geometry and the admission-only cap
 
-Scope: Add or confirm engine tests asserting `MAX_WORKER_POOL_SIZE`, `MAX_AUTOMATION_POOL_SIZE`, `DEFAULT_REVIEW_POOL_SIZE`, the 1-16 / 17-24 / 25-32 slot mapping in `slot_id_from_worker_id`, and that the interactive concurrency cap in `coordinator/scheduler.rs` gates only `is_main` rows while review dispatch proceeds at the cap; add CLI tests that a bare integer reference resolves to a slot id and that no `boss-protocol` type carries a page or cell field. Record the verified values in the test names so a later change to any of them is a deliberate edit.
+Scope: Confirm or add tests pinning interactive 16, automation 8, review max/default 16, slots 1–16 / 17–24 / 25–40, and the default interactive cap 8. Pin `is_main`-only admission with review dispatch still possible at the cap, and CLI bare integers resolving as slots. Protocol tests confirm no page/cell address is introduced by the new viewer messages.
 
-Effort hint: `small`
+Effort hint: `small`. Estimated size: 200–500 lines / 3–8 files.
 
-Dependencies: Allocate personas in the engine as durable unique leases; Stamp agent type and project on live worker state; Key viewer pane RPCs by run id
+Dependencies: Allocate personas in the engine as durable unique leases; Stamp agent type, project, and membership metadata on live worker state; Key viewer pane RPCs by run id
 
 Scope: in-scope
 
-Parallelism: May run in parallel with **Replace the pool tabs with the dynamic Agents view**.
+Parallelism: Engine/CLI tests can run beside the view and filter work.
 
 ### Validate capacity constants on real displays
 
-Scope: This is a validation of the chosen constants, not a comparison between layouts. Using the isolated capture instance, render the new view at one, four, eight, and capacity panes on the laptop display and on the large primary display, attach the captures to the work item, record measured cell size, computed capacity, and legibility observations in a dated repository report, and tune `MIN_COLS`, `MIN_ROWS`, or `MAX_PANES_PER_PAGE` in `PaneCapacityPolicy` if the captures show an illegible or wasteful result. A constant change updates the model tests in the same PR.
+Scope: Use an isolated capture instance at one, four, eight, and capacity agents on laptop and large-display geometries, including a viewer-missing card. Attach captures for operator inspection and record measured cell size, capacity, and legibility in a dated report. Tune policy constants with matching model tests if needed; state any display that could not actually be measured.
 
-Effort hint: `small`
+Effort hint: `small`. Estimated size: 100–300 lines / 2–5 files, excluding uncommitted capture artifacts.
 
 Dependencies: Replace the pool tabs with the dynamic Agents view
 
 Scope: in-scope
 
-Parallelism: May run in parallel with **Make focus bring a pane into view**.
+Parallelism: Can run beside filters, kanban migration, and focus work; this validates the chosen capacity policy.

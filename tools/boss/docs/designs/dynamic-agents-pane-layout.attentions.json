@@ -7,7 +7,7 @@
   },
   {
     "question_type": "multiple_choice",
-    "prompt": "Persona name when all 32 roster names are held by live workers (only reachable with remote workers live)? The doc proposes `Ensign N`.",
+    "prompt": "Persona name when all 40 roster names are held by live workers (only reachable with remote workers live)? The doc proposes `Ensign N`.",
     "choices": ["Ensign N", "Crewman N", "grow the roster instead"],
     "anchor": "persona-allocation"
   },
@@ -18,7 +18,7 @@
   },
   {
     "question_type": "yes_no",
-    "prompt": "Keep a finished-but-unreaped worker's pane visible with an Exited pill until the engine releases its slot, so the view never disagrees with `bossctl agents list`?",
+    "prompt": "Keep an engine-terminal worker visible with an Exited pill until engine release, including a status card when no viewer is attached?",
     "anchor": "what-only-running-agents-means"
   }
 ]
