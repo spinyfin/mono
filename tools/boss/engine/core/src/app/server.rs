@@ -247,13 +247,30 @@ impl crate::terminal_work_sweep::WorkerReaper for ServerState {
 #[async_trait::async_trait]
 impl crate::husk_pane_sweep::HuskPaneSweepSource for ServerState {
     async fn list_husk_candidates(&self) -> Option<Vec<crate::tmux_adoption::UntrackedTmuxSession>> {
-        let tmux = match self.resolve_tmux() {
+        #[cfg(test)]
+        let resolved = self
+            .tmux_override
+            .lock()
+            .unwrap()
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| self.resolve_tmux());
+        #[cfg(not(test))]
+        let resolved = self.resolve_tmux();
+        let tmux = match resolved {
             Ok(tmux) => tmux,
             Err(err) => {
                 tracing::debug!(?err, "husk-pane sweep: tmux resolution failed; skipping this pass");
                 return None;
             }
         };
+        let previously_live = self
+            .live_worker_states
+            .snapshot()
+            .into_iter()
+            .filter(|state| !state.activity.is_terminal())
+            .map(|state| state.run_id)
+            .collect();
         let outcome = crate::tmux_adoption::run_adoption_pass(
             self.work_db.as_ref(),
             &tmux,
@@ -263,7 +280,7 @@ impl crate::husk_pane_sweep::HuskPaneSweepSource for ServerState {
             self.dispatch_events.as_ref(),
         )
         .await;
-        self.reattach_after_adoption(&outcome).await;
+        self.reattach_after_adoption(&previously_live).await;
         Some(outcome.untracked_sessions)
     }
 
