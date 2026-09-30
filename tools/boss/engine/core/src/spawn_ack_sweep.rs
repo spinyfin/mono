@@ -694,18 +694,19 @@ fn reap_narrative_for_cause(cause: &ReapCause, execution_id: &str, shell_pid: i3
     }
 }
 
-/// Reap a `Spawning` slot that never produced a live shell: mark the execution
+/// Reap a slot that produced no driver-originated signal after
+/// [`crate::live_worker_state::DRIVER_START_GRACE_SECS`]: mark the execution
 /// orphaned, back up any uncommitted work, append an `[engine-reconcile]`
-/// audit line, tear down the (possibly ghost) app pane, release the pool slot,
-/// emit a dispatch event, and feed the spawn-capability circuit breaker —
-/// tripping it when too many DISTINCT work items fail in the window. Returns
-/// a [`ReapOutcome`]: `Reaped` when all of the above happened; `Vetoed` when
-/// the liveness veto refused the reap because a transcript proves the driver
-/// ran; `LivenessUndeterminable` when the veto's question could not be
-/// answered at all; `Skipped` when the execution was already terminal, or
-/// the orphan write failed.
+/// audit line, tear the pane down through tmux (`release_worker_pane`),
+/// release the pool slot, emit a dispatch event, and feed the spawn-capability
+/// circuit breaker — tripping it when too many DISTINCT work items fail in
+/// the window. Returns a [`ReapOutcome`]: `Reaped` when all of the above
+/// happened; `Vetoed` when the liveness veto refused the reap because a
+/// transcript proves the driver ran; `LivenessUndeterminable` when the veto's
+/// question could not be answered at all; `Skipped` when the execution was
+/// already terminal, or the orphan write failed.
 ///
-/// Called from [`run_one_pass`] (the 60s timeout path) for every
+/// Called from [`run_one_pass`]'s driver-start check for every
 /// [`ReapCause`] it can produce.
 ///
 /// ## The liveness veto

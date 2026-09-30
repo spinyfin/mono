@@ -268,9 +268,11 @@ struct SlotMeta {
     /// incident walked through untouched.
     driver_signal_at: Option<i64>,
     /// Whether this registration is a newly spawned pane or an adopted
-    /// existing worker. Used by driver-start verification, whose question only
-    /// applies to a pane this engine process attempted to create. See
-    /// [`DriverStartExpectation`].
+    /// existing worker. [`DriverStartExpectation::Readopted`] still subjects
+    /// the slot to the driver-start timeout
+    /// ([`LiveWorkerStateRegistry::unverified_driver_starts`]); it changes
+    /// the pid-less tmux-invariant diagnostic and starts a fresh grace
+    /// window from this registration. See [`DriverStartExpectation`].
     #[builder(default = DriverStartExpectation::EngineSpawned)]
     driver_start_expectation: DriverStartExpectation,
     /// Last **driver-originated** progress time, stamped only by
@@ -308,21 +310,24 @@ struct SlotMeta {
 
 /// Whether the engine created this slot's current registration.
 ///
-/// Driver-start verification asks whether a pane this engine process launched
-/// ever produced a driver signal. That question presupposes Boss launched a pane; a
-/// re-adoption registers a worker that was already running before this
-/// engine process began tracking it. Its `spawned_at` is therefore the
-/// moment the engine noticed, not the moment anything exec'd.
+/// Driver-start verification asks whether the current registration ever
+/// produced a driver signal. A re-adoption registers a worker that was
+/// already running before this engine process began tracking it, so
+/// `spawned_at` is the moment the engine noticed, not the moment anything
+/// exec'd — a fresh grace window, not an exemption from the timeout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverStartExpectation {
     /// The engine launched a driver for this registration and is owed
     /// proof it came up. The normal spawn path.
     EngineSpawned,
     /// The registration re-adopted an already-running worker. The
-    /// driver-start timeout does not apply, because this engine process did not
-    /// launch a pane. Driver-start verification still requires a
-    /// driver-originated signal; a live login shell alone is not proof that
-    /// the driver ever ran.
+    /// driver-start timeout still applies after a fresh grace window from
+    /// this registration; a shell-only re-adoption with no driver signal
+    /// must time out. What this mark changes is the pid-less tmux-invariant
+    /// diagnostic (a missing pane pid is legal for a worker this engine
+    /// process did not launch) and that grace window's start. Driver-start
+    /// verification still requires a driver-originated signal; a live login
+    /// shell alone is not proof that the driver ever ran.
     Readopted,
 }
 
@@ -582,11 +587,11 @@ impl LiveWorkerStateRegistry {
     /// plus the three things re-adoption must not get wrong:
     ///
     /// 1. The entry is marked [`DriverStartExpectation::Readopted`], so
-    ///    the driver-start timeout does not mistake this engine process for
-    ///    the pane's creator. Registration stamps `spawned_at` with the
-    ///    current time — correct for a spawn, a fiction for a re-adoption.
-    ///    Driver-start verification still applies after its ordinary grace
-    ///    window unless a real driver signal was observed for this run.
+    ///    the pid-less tmux-invariant diagnostic does not treat a missing
+    ///    pane pid as illegal, and `spawned_at` starts a fresh driver-start
+    ///    grace window. The driver-start timeout still applies: a
+    ///    shell-only re-adoption must time out unless a real driver signal
+    ///    was observed.
     /// 2. When the re-adoption was triggered by a worker hook
     ///    ([`ReadoptionEvidence::DriverHook`]) the driver signal is
     ///    recorded, because that hook *is* driver-originated proof and

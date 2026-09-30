@@ -26,6 +26,12 @@ pub enum HostedPaneState {
     /// worker the engine has lost track of takes: durably tracked, not
     /// live-tracked. `evidence` names the corroborating signal.
     LiveProcessNoRegistry { evidence: String },
+    /// Durable occupancy of this slot could not be corroborated against
+    /// live tmux (token mismatch, missing session, unparseable or
+    /// conflicting identity, or a failed probe). Not a husk: retiring
+    /// would release claims and detach the viewer on an unproven empty
+    /// slot. `evidence` names why the lookup refused to decide.
+    OccupancyInconclusive { evidence: String },
     /// No live registry entry and no corroborated live process — a true
     /// husk, safe to retire.
     Husk,

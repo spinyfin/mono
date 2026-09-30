@@ -1465,8 +1465,9 @@ pub enum FrontendRequest {
     /// Read-only query: every slot the app currently hosts a session in,
     /// classified against the engine's live registry AND its durable
     /// state — live, "engine lost track of it but durable state still
-    /// corroborates a running process" (`LiveProcessNoRegistry`), or a
-    /// true husk. Powers `bossctl agents list --all` and worker-reference
+    /// corroborates a running process" (`LiveProcessNoRegistry`),
+    /// occupancy that live tmux could not corroborate
+    /// (`OccupancyInconclusive`), or a true husk. Powers `bossctl agents list --all` and worker-reference
     /// resolution (crew name / slot id / run id) for every `agents` verb,
     /// both of which are otherwise structurally blind to a pane the live
     /// registry has dropped — `ListWorkerLiveStates` only reflects the

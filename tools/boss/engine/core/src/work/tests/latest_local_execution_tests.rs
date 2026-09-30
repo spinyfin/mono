@@ -62,3 +62,68 @@ fn latest_local_execution_id_for_agent_id_is_none_without_rows() {
     let db = WorkDb::open(temp_db_path("latest-local-exec-none")).unwrap();
     assert_eq!(db.latest_local_execution_id_for_agent_id("worker-9").unwrap(), None);
 }
+
+/// Occupancy's newest-run check must follow `created_at`, not the hook
+/// resolver that ranks `transcript_path IS NOT NULL` above recency.
+#[test]
+fn latest_local_agent_id_for_execution_follows_created_at_not_transcript() {
+    let db = WorkDb::open(temp_db_path("latest-local-agent-transcript")).unwrap();
+    let product = create_test_product_named(&db, "p");
+    let chore = create_test_chore_manual(&db, product.id, "transcript trap");
+    let execution = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    let (_exec, older) = db
+        .start_execution_run(&execution.id, "worker-1", "mono", "lease-1", "ws-1", "/tmp/ws-1")
+        .unwrap();
+    let older_run_id = older.id.clone();
+    db.set_run_transcript_path_if_unset(&execution.id, "/tmp/older.jsonl")
+        .unwrap();
+    db.finish_execution_run(
+        FinishExecutionRunInput::builder()
+            .execution_id(execution.id.clone())
+            .run_id(older.id)
+            .execution_status(ExecutionStatus::WaitingHuman)
+            .run_status("completed")
+            .clear_workspace_lease(false)
+            .build(),
+    )
+    .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET created_at = '1000000000' WHERE id = ?1",
+            rusqlite::params![&older_run_id],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'ready' WHERE id = ?1",
+            rusqlite::params![&execution.id],
+        )
+        .unwrap();
+    let (_exec, newer) = db
+        .start_execution_run(&execution.id, "worker-2", "mono", "lease-2", "ws-2", "/tmp/ws-2")
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET status = 'completed', finished_at = created_at WHERE id = ?1",
+            rusqlite::params![&newer.id],
+        )
+        .unwrap();
+
+    assert_eq!(
+        db.latest_run_agent_id_for_execution(&execution.id).unwrap().as_deref(),
+        Some("worker-1"),
+        "hook resolver prefers the older transcript-bearing row",
+    );
+    assert_eq!(
+        db.latest_local_agent_id_for_execution(&execution.id)
+            .unwrap()
+            .as_deref(),
+        Some("worker-2"),
+        "occupancy must follow the newest local row",
+    );
+}

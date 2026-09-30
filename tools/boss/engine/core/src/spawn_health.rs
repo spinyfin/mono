@@ -201,16 +201,19 @@ struct FailureWindowConfig {
     window_secs: i64,
 }
 
-/// Which of the two distinct failure shapes a never-started reap observed.
+/// Which failure shape a never-started reap observed — a pid-based split
+/// of the remaining driver-start reap, plus historical NACK and pane-death
+/// rows.
 ///
-/// [`crate::spawn_ack_sweep`] has two passes that ask different questions
-/// — "did a shell come up?" and "did the driver signal?" — and the app's
-/// own NACK and pane-death reports are the first kind. Until 2026-09-13
-/// every one of them fed the breaker as the same event and the breaker
-/// reported them all as "failed to spawn a worker shell". Four
-/// driver-start timeouts on panes whose shells had come up in 4–7 seconds
-/// were announced as a broken pane-spawn path, and the diagnosis went to
-/// the pane-spawn and task-policy subsystems, which were healthy.
+/// [`crate::spawn_ack_sweep`] now has a single driver-start reap. This
+/// class splits that reap on whether a shell pid was observed, and still
+/// names the historical app NACK / pane-death-before-start rows as
+/// [`Self::NoShell`]. Until 2026-09-13 every one of them fed the breaker
+/// as the same event and the breaker reported them all as "failed to spawn
+/// a worker shell". Four driver-start timeouts on panes whose shells had
+/// come up in 4–7 seconds were announced as a broken pane-spawn path, and
+/// the diagnosis went to the pane-spawn and task-policy subsystems, which
+/// were healthy.
 ///
 /// The class is what the breaker's pause reason and attention item are
 /// composed from, so the operator reads what was observed for each failure
@@ -269,8 +272,9 @@ pub struct SpawnFailureEvidence {
     pub epoch_secs: i64,
     /// Which failure shape the reap observed — see [`SpawnFailureClass`].
     pub class: SpawnFailureClass,
-    /// The dispatch stage of the reap (`spawn_ack_timeout`, `spawn_nack`,
-    /// `pane_death_before_start`, `driver_start_timeout`).
+    /// The dispatch stage of the reap (`driver_start_timeout` today;
+    /// historical rows may still say `spawn_ack_timeout`, `spawn_nack`,
+    /// or `pane_death_before_start`).
     pub cause: String,
     /// What the reap observed, in the reap's own words: the orphan reason
     /// it recorded, including its liveness-probe result.
@@ -971,7 +975,8 @@ pub async fn trip_spawn_capability_circuit(
     // The concrete failures that fed the trip — execution/work-item/slot ids,
     // shell pids, timestamps, and which failure class each was — so the trip
     // is diagnosable without separately grepping `spawn_nack` /
-    // `spawn_ack_timeout` / `driver_start_timeout` events out of the stream
+    // `driver_start_timeout` events (historical logs may still name
+    // `spawn_ack_timeout`) out of the stream
     // by hand, and so the reason text below can say what was observed.
     let triggering_events = spawn_health.evidence_in_window(now_epoch_secs);
     let composition = FailureComposition::of(&triggering_events);
@@ -1087,8 +1092,9 @@ pub async fn trip_spawn_capability_circuit(
             "{what_happened}\n\n\
              Dispatch has been **paused** (reviews included) to stop the engine from burning spawn \
              attempts against a path that is failing systemically. Each affected execution was reaped \
-             (see the `spawn_nack` / `spawn_ack_timeout` / `pane_death_before_start` / \
-             `driver_start_timeout` events in `dispatch-events/current.jsonl`).\n\n\
+             (see the `driver_start_timeout` events in `dispatch-events/current.jsonl`; \
+             historical logs may still name `spawn_ack_timeout` / `spawn_nack` / \
+             `pane_death_before_start`).\n\n\
              **Recovery is automatic:** the engine periodically force-dispatches a single queued \
              execution as a recovery probe (backing off between attempts) and auto-resumes dispatch \
              the moment one reports a real shell pid — see `spawn_capability_recovered` in \
@@ -1103,9 +1109,9 @@ pub async fn trip_spawn_capability_circuit(
              The spawn-capability breaker is **disabled by config** \
              (`BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER=false` is set; the breaker defaults on) — dispatch \
              was **NOT** paused; this item is observability only. Each affected execution was reaped and \
-             will be redispatched normally (see the `spawn_nack` / `spawn_ack_timeout` / \
-             `pane_death_before_start` / `driver_start_timeout` events in \
-             `dispatch-events/current.jsonl`).\n\n\
+             will be redispatched normally (see the `driver_start_timeout` events in \
+             `dispatch-events/current.jsonl`; historical logs may still name \
+             `spawn_ack_timeout` / `spawn_nack` / `pane_death_before_start`).\n\n\
              If this keeps happening, consider removing/unsetting `BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER=false` \
              so a systemic outage pauses dispatch (with automatic recovery) instead of relying on the \
              per-work-item churn guard alone."
@@ -1965,7 +1971,7 @@ mod tests {
             .epoch_secs(epoch_secs)
             .class(class)
             .cause(match class {
-                SpawnFailureClass::NoShell => "spawn_ack_timeout",
+                SpawnFailureClass::NoShell => "driver_start_timeout",
                 SpawnFailureClass::ShellWithoutDriverSignal => "driver_start_timeout",
             })
             .observed(format!("test observation for {execution_id}"))

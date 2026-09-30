@@ -317,6 +317,7 @@ fn pane_state_label(state: &HostedPaneState) -> &'static str {
     match state {
         HostedPaneState::Live => "live",
         HostedPaneState::LiveProcessNoRegistry { .. } => "terminal entry, live process",
+        HostedPaneState::OccupancyInconclusive { .. } => "occupancy inconclusive",
         HostedPaneState::Husk => "husk",
     }
 }
@@ -678,6 +679,11 @@ pub(crate) async fn agents_list_live(socket_path: &Option<String>, json: bool, a
                         "slot {}  {}  run={}  TERMINAL ENTRY, LIVE PROCESS ({evidence}) — \
                          `bossctl agents stop {}` or `bossctl agents retire-pane {}` to reap it",
                         pane.slot_id, pane.crew_name, pane.run_id, pane.run_id, pane.slot_id,
+                    ),
+                    HostedPaneState::OccupancyInconclusive { evidence } => println!(
+                        "slot {}  {}  run={}  OCCUPANCY INCONCLUSIVE ({evidence}) — \
+                         do not retire; live tmux could not corroborate this slot",
+                        pane.slot_id, pane.crew_name, pane.run_id,
                     ),
                     HostedPaneState::Husk => println!(
                         "slot {}  {}  run={}  HUSK (app-hosted, no engine-tracked run, no live process — \
@@ -1810,6 +1816,10 @@ fn print_hosted_pane_status(json: bool, pane: &HostedPaneStatus) {
                 "  `bossctl agents stop {}` or `bossctl agents retire-pane {}` will reap it.",
                 pane.run_id, pane.slot_id
             );
+        }
+        HostedPaneState::OccupancyInconclusive { evidence } => {
+            println!("  state: occupancy inconclusive ({evidence})");
+            println!("  live tmux could not corroborate this slot; retiring it would release claims blindly.");
         }
         HostedPaneState::Husk => {
             println!("  state: husk (app-hosted, no engine-tracked run, no live process)");

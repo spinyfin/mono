@@ -149,7 +149,7 @@ use process_signals::{
 // `SendInputError::NotAcceptingInput` to requeue; tests use the full set.
 use pane_ops::SendInputError;
 #[cfg(test)]
-use pane_ops::{FocusPaneError, InterruptPaneError, OpenDocumentError, RetirePaneError};
+use pane_ops::{FocusPaneError, InterruptPaneError, OpenDocumentError, RetirePaneError, SlotOccupancy};
 
 // Re-import worker event dispatch functions so child modules can access them via `use super::*`.
 use worker_events::{dispatch_probe_now, dispatch_worker_event_fanout};
