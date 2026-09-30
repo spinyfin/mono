@@ -241,15 +241,9 @@ async fn assert_incident_detected_and_released(fixture: &IncidentFixture, expect
 
     // ── Gate 1: dead_pid_sweep. `kill(pid, 0)` finds the shell alive. ────
     let sink = Arc::new(RecordingDispatchEventSink::new());
-    let dead_pid_outcome = crate::dead_pid_sweep::run_one_pass(
-        db.as_ref(),
-        live_states,
-        coordinator.clone(),
-        sink.as_ref(),
-        &NoopCube,
-        crate::dead_pid_sweep::DeadPidSweepMode::PeriodicSpeculative,
-    )
-    .await;
+    let dead_pid_outcome =
+        crate::dead_pid_sweep::run_one_pass(db.as_ref(), live_states, coordinator.clone(), sink.as_ref(), &NoopCube)
+            .await;
     assert_eq!(
         dead_pid_outcome.reaped, 0,
         "gate 1: the login shell is genuinely alive, so kill(pid, 0) cannot detect this",

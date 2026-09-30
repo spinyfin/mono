@@ -57,11 +57,12 @@ pub fn warn_if_lifecycle_undeclared(kind: &str) {
 /// entry per live condition, not one per occurrence. But it means
 /// `created_at` records the *first* occurrence forever, and the reconciler's
 /// "evidence must postdate the signal" rule would then accept evidence that
-/// predates the current occurrence. Concretely for `pane_death_reconcile`:
-/// the pane dies (t0); the orphan sweep redispatches and a run starts (t1);
-/// the replacement pane dies too (t2), no new row is written — and a sweep
-/// anchored on t0 accepts the t1 run start and resolves a signal whose
-/// condition is true right now.
+/// predates the current occurrence. Concretely for
+/// `remote_lease_reconcile::REMOTE_WORKER_DIED_ATTENTION_KIND`: the remote
+/// worker dies (t0); a redispatch starts a replacement run (t1); the
+/// replacement worker dies too (t2), deduplicating onto the same open row —
+/// and a sweep anchored on t0 accepts the t1 run start and resolves a signal
+/// whose condition is true right now.
 ///
 /// Stamping a separate `last_raised_at` (rather than mutating `created_at`)
 /// keeps the "open since" fact the surfaces already show intact, while

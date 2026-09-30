@@ -191,10 +191,11 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          repo — the condition cannot still hold.",
     ),
     entry(
-        crate::dead_pid_sweep::PANE_DEATH_ATTENTION_KIND,
+        LEGACY_PANE_DEATH_RECONCILE_ATTENTION_KIND,
         ClearedBy::WorkResumed,
-        "Records that the item's worker pane died and was reconciled. A later run start is the \
-         item working again; the dead pane is history, not current state.",
+        "Legacy: filed only by the deleted app-reattach reconcile, so nothing raises this any more. \
+         Kept so a row an older engine already persisted still auto-clears on the item's next run \
+         start instead of staying open forever after the upgrade.",
     ),
     entry(
         crate::remote_lease_reconcile::REMOTE_WORKER_DIED_ATTENTION_KIND,
@@ -583,6 +584,14 @@ pub const EXTERNAL_TRACKER_TRANSIENT_ERRORS_ATTENTION_KIND: &str = "external_tra
 pub const EXTERNAL_TRACKER_REMOVED_UPSTREAM_ATTENTION_KIND: &str = "external_tracker_removed_upstream";
 /// Product-scoped: the tracker refused a write for permission reasons.
 pub const EXTERNAL_TRACKER_PERMISSION_DENIED_ATTENTION_KIND: &str = "external_tracker_permission_denied";
+/// `work_attention_items.kind` filed by the now-deleted app-reattach
+/// pane-death reconcile (`dead_pid_sweep::reconcile_orphans_on_reattach`,
+/// removed with the app-hosted pane path). Nothing files this kind any
+/// more — kept only so an already-persisted "App relaunch killed a worker
+/// pane" row from a pre-upgrade engine still has a lifecycle entry and can
+/// auto-clear via [`ClearedBy::WorkResumed`] instead of staying open
+/// forever.
+pub const LEGACY_PANE_DEATH_RECONCILE_ATTENTION_KIND: &str = "pane_death_reconcile";
 
 /// The declared lifecycle for `kind`, or `None` when the kind is not
 /// registered. Callers treat `None` as "no automatic rule applies" — the
@@ -649,7 +658,7 @@ mod tests {
             crate::work::ATTENTION_KIND_RECOVERY_PERMANENT,
             crate::work::ATTENTION_KIND_RECOVERY_EXHAUSTED,
             crate::coordinator::CHAIN_SERIALIZED_STALL_ATTENTION_KIND,
-            crate::dead_pid_sweep::PANE_DEATH_ATTENTION_KIND,
+            LEGACY_PANE_DEATH_RECONCILE_ATTENTION_KIND,
             crate::remote_lease_reconcile::REMOTE_WORKER_DIED_ATTENTION_KIND,
             crate::tmux_adoption::TMUX_ADOPTION_SCHEMA_SKEW_ATTENTION_KIND,
             crate::tmux_adoption::TMUX_LEGACY_LABEL_SERVER_ATTENTION_KIND,

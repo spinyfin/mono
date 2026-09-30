@@ -4,7 +4,7 @@
 //! ## The failure this closes
 //!
 //! Boss launches each worker as an **interactive** `claude` session in
-//! a libghostty pane (`runner.rs`: `claude … "$(cat initial-prompt.txt)"`
+//! a tmux pane (`runner.rs`: `claude … "$(cat initial-prompt.txt)"`
 //! with no `--print`). When claude exhausts its own internal retries on
 //! a transient API error — "API Error: The socket connection was closed
 //! unexpectedly", `overloaded_error`, a 5xx, a 429, a request timeout —
@@ -167,23 +167,23 @@ pub trait WorkerNudger: Send + Sync {
     async fn broadcast_live_states(&self) {}
 }
 
-/// Tears down the app-hosted pane for a recovered worker and hands the
-/// pool slot back only when that teardown is confirmed.
+/// Tears down a recovered worker's tmux pane and hands the pool slot back
+/// only when that teardown is confirmed.
 ///
 /// Production wires this to [`crate::app::ServerState::release_worker_pane`],
 /// the same confirmed-teardown path completion / stale-worker / spawn-ack
 /// already use. Callers must **not** also
 /// [`ExecutionCoordinator::release_worker_and_kick`]: that is how this
-/// sweep used to advertise a slot free while the app still hosted the
-/// pane, poisoning it `SlotBusy` until restart. Confirmed release (or
-/// an already-released reply) frees the slot; a deadline expiry,
-/// transport error, unexpected response, or absent app session is
-/// unconfirmed and the claim stays held.
+/// sweep used to advertise a slot free while the tmux pane was still live,
+/// poisoning it `SlotBusy` until restart. Confirmed release (or an
+/// already-released reply) frees the slot; a deadline expiry, transport
+/// error, unexpected response, or absent app session is unconfirmed and
+/// the claim stays held.
 #[async_trait]
 pub trait TransientRecoveryReaper: Send + Sync {
-    /// Tear down the app pane (if any) for `execution_id` and release
-    /// resources only once that teardown is confirmed. Idempotent: a
-    /// slot with no pane is a no-op.
+    /// Tear down the worker's tmux pane (if any) for `execution_id` and
+    /// release resources only once that teardown is confirmed. Idempotent:
+    /// a slot with no pane is a no-op.
     async fn reap_worker(&self, execution_id: &str);
 }
 
