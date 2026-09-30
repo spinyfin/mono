@@ -62,7 +62,57 @@ use crate::work::WorkDb;
 /// lookup would lose markers that a raw parse can still recover.
 pub fn driver_for_execution(work_db: &WorkDb, execution_id: &str) -> Option<Arc<dyn AgentDriver>> {
     let slug = resolve_execution_driver_slug(work_db, execution_id)?;
-    match DriverRegistry::default().require(&slug) {
+    require_driver_slug(execution_id, &slug)
+}
+
+/// The driver frozen onto `execution_id` at spawn
+/// ([`WorkDb::launched_driver_slug`] / `work_executions.driver`).
+///
+/// Re-adoption and tmux session adoption must use this rather than
+/// [`driver_for_execution`]: the latter re-derives from the current worker
+/// id and pool policy, which can paint a Codex spawn as Claude Code after
+/// an engine restart. When the launch tuple was never written (a crash
+/// between pane start and the stamp), falls through to
+/// [`driver_for_execution`]. If live resolution also has no driver, uses
+/// the engine default for this unstamped legacy case only.
+///
+/// A stamp that is present but unregistered (renamed, removed, or
+/// corrupted) is distinct from the unset-column case: this returns
+/// `None` rather than re-deriving from live policy, which would
+/// silently relabel the run as a different driver.
+pub fn driver_for_spawned_execution(work_db: &WorkDb, execution_id: &str) -> Option<Arc<dyn AgentDriver>> {
+    match work_db.launched_driver_slug(execution_id) {
+        Ok(Some(slug)) if !slug.trim().is_empty() => match DriverRegistry::default().require(&slug) {
+            Ok(driver) => return Some(driver),
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    driver = %slug,
+                    %err,
+                    "driver transcript: launched driver slug is present but unregistered; \
+                     not re-deriving from live worker-id or pool policy",
+                );
+                return None;
+            }
+        },
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(
+                execution_id,
+                error = %format!("{err:#}"),
+                "driver transcript: launched-driver lookup failed; falling back to live resolution",
+            );
+        }
+    }
+    driver_for_execution(work_db, execution_id).or_else(|| {
+        DriverRegistry::default()
+            .require(crate::effort::ENGINE_DEFAULT_DRIVER)
+            .ok()
+    })
+}
+
+fn require_driver_slug(execution_id: &str, slug: &str) -> Option<Arc<dyn AgentDriver>> {
+    match DriverRegistry::default().require(slug) {
         Ok(driver) => Some(driver),
         Err(err) => {
             tracing::warn!(
@@ -401,6 +451,52 @@ mod tests {
         );
     }
 
+    /// A launch-config stamp is authoritative for re-adoption even when the
+    /// worker id would otherwise force the review-pool driver.
+    #[test]
+    fn spawned_driver_keeps_the_launch_stamp_over_a_review_pool_worker_id() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, &product.id, "codex chore");
+        let execution = create_ready_chore_execution(&db, &chore.id);
+        db.start_execution_run(&execution.id, "review-1", "mono", "lease-1", "ws-1", "/tmp/ws-1")
+            .unwrap();
+        db.record_execution_launch_config(&execution.id, "codex", "gpt-5.5-codex", None)
+            .unwrap();
+
+        let live = driver_for_execution(&db, &execution.id).expect("live resolution");
+        assert_eq!(live.descriptor().name, "claude");
+        let spawned = driver_for_spawned_execution(&db, &execution.id).expect("spawned driver");
+        assert_eq!(
+            spawned.descriptor().name,
+            "codex",
+            "re-adoption must keep the driver recorded at spawn",
+        );
+    }
+
+    /// A launch stamp that no longer resolves in the registry must not
+    /// fall through to live worker-id / pool-policy re-derivation — that
+    /// is indistinguishable from the unset-column case and would relabel
+    /// a Codex spawn as Claude.
+    #[test]
+    fn spawned_driver_does_not_rederive_when_the_launch_slug_is_unregistered() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, &product.id, "codex chore");
+        let execution = create_ready_chore_execution(&db, &chore.id);
+        db.start_execution_run(&execution.id, "review-1", "mono", "lease-1", "ws-1", "/tmp/ws-1")
+            .unwrap();
+        db.record_execution_launch_config(&execution.id, "not-a-registered-driver", "gpt-5.5-codex", None)
+            .unwrap();
+
+        let live = driver_for_execution(&db, &execution.id).expect("live resolution");
+        assert_eq!(live.descriptor().name, "claude");
+        assert!(
+            driver_for_spawned_execution(&db, &execution.id).is_none(),
+            "an unresolvable launch stamp must not fall back to the live Claude driver",
+        );
+    }
+
     /// A review-pool worker id (`review-N`) must override a codex-attributed
     /// row's own driver: the reviewer pane is always a Claude pane regardless
     /// of what the row under review carries. Mirrors
@@ -458,6 +554,18 @@ mod tests {
             driver.descriptor().name,
             "codex",
             "a main-pool worker id must not override the row's own driver",
+        );
+    }
+
+    #[test]
+    fn unstamped_unknown_execution_uses_the_legacy_default_for_adoption() {
+        let (_dir, db) = open_db();
+        assert_eq!(
+            driver_for_spawned_execution(&db, "exec_missing")
+                .unwrap()
+                .descriptor()
+                .name,
+            crate::effort::ENGINE_DEFAULT_DRIVER,
         );
     }
 

@@ -43,7 +43,7 @@ pub(crate) async fn register_adopted_live_state<S>(
     let model_label = driver
         .as_ref()
         .map(|driver| driver.descriptor().label.to_owned())
-        .unwrap_or_else(|| crate::effort::ENGINE_DEFAULT_DRIVER.to_owned());
+        .unwrap_or_else(|| "Unknown driver".to_owned());
     let awaiting_input_capable = driver.as_ref().is_some_and(|driver| {
         driver
             .capabilities()

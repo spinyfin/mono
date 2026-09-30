@@ -1366,6 +1366,20 @@ impl WorkDb {
         }))
     }
 
+    /// Preserve dead-pane diagnostics on the token-matched run after orphaning.
+    /// Decided terminal executions must retain their original diagnostics.
+    pub fn record_tmux_run_failure_reason(&self, execution_id: &str, spawn_token: &str, reason: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let updated = conn.execute(
+            "UPDATE work_runs SET error_text = ?3
+             WHERE execution_id = ?1 AND tmux_spawn_token = ?2
+               AND EXISTS (SELECT 1 FROM work_executions
+                           WHERE id = ?1 AND status = 'orphaned')",
+            params![execution_id, spawn_token, reason],
+        )?;
+        Ok(updated > 0)
+    }
+
     /// Token-verified pane observation for the latest run of `execution_id`,
     /// if its probe has written one. Does not require live identity columns —
     /// the point of this record is to remain queryable after reap. Never
