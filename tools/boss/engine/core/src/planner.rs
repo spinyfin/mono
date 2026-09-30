@@ -2165,8 +2165,8 @@ Just do the thing, no explicit entries here.\n\
         // A fenced Markdown example inside a breakdown entry can itself
         // contain a `## ` line (e.g. a snippet showing another doc's
         // heading). extract_breakdown_section must not treat that as the
-        // section's own end — regression test for the fence-unaware line
-        // scan this replaced.
+        // section's own end: section boundaries come from the fence-aware
+        // heading tokenizer.
         let doc = "\
 ## Proposed implementation task breakdown\n\
 \n\

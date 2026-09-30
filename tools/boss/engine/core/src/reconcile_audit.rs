@@ -312,12 +312,9 @@ mod tests {
         assert!(!is_engine_audit_line("mentions [doc-detector] in prose"));
     }
 
-    /// Every known `append_description_line` writer's marker must be
-    /// registered in [`ENGINE_AUDIT_LINE_PREFIXES`] — a writer that forgets
-    /// to register here would silently poison empty-brief detection (the
-    /// class of defect this module exists to prevent). Pin each writer's
-    /// marker constant against the list so a new, unregistered writer fails
-    /// this test instead of failing silently in production.
+    /// The explicitly listed writer markers must match the registered audit
+    /// prefixes. New writers must be added to both lists; this test does not
+    /// discover writers or detect unregistered markers elsewhere in the code.
     #[test]
     fn engine_audit_line_prefixes_cover_every_known_writer() {
         let known_writer_markers: &[&str] = &[

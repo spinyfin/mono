@@ -603,8 +603,9 @@ pub const EXTERNAL_TRACKER_PERMISSION_DENIED_ATTENTION_KIND: &str = "external_tr
 /// forever.
 pub const LEGACY_PANE_DEATH_RECONCILE_ATTENTION_KIND: &str = "pane_death_reconcile";
 /// Work-item-scoped: the review-brief assembler could not fetch or resolve
-/// the project's design doc. Bound by `runner::review_brief`; resolved on
-/// the next successful fetch of that same work item.
+/// the project's design doc. Filed and cleared by `runner::review_brief` on
+/// the review-cycle chain root, so a later successful fetch for any revision
+/// or the post-merge root review resolves it.
 pub const REVIEW_DESIGN_DOC_UNRESOLVED_ATTENTION_KIND: &str = "review_design_doc_unresolved";
 
 /// The declared lifecycle for `kind`, or `None` when the kind is not
