@@ -116,9 +116,8 @@ pub const SPAWN_CAPABILITY_ATTENTION_KIND: &str = "app_spawn_capability_unhealth
 
 /// Backoff before the first half-open recovery probe after a trip, and the
 /// base of the exponential backoff applied after each subsequent probe
-/// failure. 60s mirrors [`crate::spawn_ack_sweep::SPAWN_ACK_GRACE_SECS`] — a
-/// failed probe has usually already been reaped by the time the next one
-/// would be eligible anyway.
+/// failure. 60s is long enough that a failed probe has usually already
+/// been reaped by the time the next one would be eligible anyway.
 pub const SPAWN_HEALTH_PROBE_BACKOFF_BASE_SECS: i64 = 60;
 
 /// Ceiling on probe backoff so a long-lived outage still gets a recovery
@@ -141,10 +140,9 @@ pub const SPAWN_HEALTH_PROBE_BACKOFF_MAX_SECS: i64 = 900;
 /// deadline that leaves `in_flight` set forever, so `try_admit_probe` would
 /// refuse to admit a next canary and dispatch would stay Breaker-paused
 /// until a human ran `bossctl dispatch resume` — the exact latch this module
-/// exists to eliminate. Twice
-/// [`crate::spawn_ack_sweep::SPAWN_ACK_GRACE_SECS`] gives the normal reap
-/// path a full chance to resolve the probe first; this is strictly a
-/// last-resort backstop for the terminal-without-reap case.
+/// exists to eliminate. 120s gives the normal driver-start reap path a
+/// full chance to resolve the probe first; this is strictly a last-resort
+/// backstop for the terminal-without-reap case.
 pub const SPAWN_HEALTH_PROBE_STALL_DEADLINE_SECS: i64 = 120;
 
 /// Sentinel for [`SpawnHealthTracker::last_disabled_signal_at`] meaning "no

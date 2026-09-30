@@ -19,7 +19,7 @@ use crate::driver::ProgressFidelity;
 use crate::semantic_progress::{SemanticProgressCheckpoint, SemanticToolCondition, next_tool_condition};
 
 mod never_started_reap;
-pub use never_started_reap::{NeverStartedReapCommit, NeverStartedReapKind};
+pub use never_started_reap::NeverStartedReapCommit;
 
 /// Attributed worker-pool label for a live run (`"main"`, `"automation"`,
 /// or `"review"`). Matches
@@ -117,13 +117,12 @@ pub const STALLED_SPAWN_THRESHOLD_SECS: i64 = 30;
 ///
 /// ## Why this is a separate, longer window than the two above
 ///
-/// [`STALLED_SPAWN_THRESHOLD_SECS`] and
-/// [`crate::spawn_ack_sweep::SPAWN_ACK_GRACE_SECS`] both answer "did the
-/// *pane* come up?". This one answers the strictly stronger question
-/// "did the *driver binary* come up?" — the question no check in Boss
-/// asked before, and the one the 2026-07-30 incident turned on: a pane
-/// hosting nothing but an idle login shell reported `shell_pid=92697`
-/// and satisfied every pane-level check forever.
+/// [`STALLED_SPAWN_THRESHOLD_SECS`] answers "has this spawn been sitting
+/// in `Spawning` long enough to promote?". This one answers the strictly
+/// stronger question "did the *driver binary* come up?" — the question no
+/// check in Boss asked before, and the one the 2026-07-30 incident turned
+/// on: a pane hosting nothing but an idle login shell reported
+/// `shell_pid=92697` and satisfied every pane-level check forever.
 ///
 /// 300s is deliberately far above any real driver startup. A healthy
 /// driver's first hook (`SessionStart`) fires within seconds of exec.

@@ -646,48 +646,60 @@ impl ServerState {
                     evidence,
                 });
             }
-        } else if let Some(run_id) = self.hosted_pane_run_for_slot(slot_id).await
-            && let Some(evidence) = self.durable_live_process_evidence(&run_id)
-        {
-            // Guard 3 (reality, with NO bookkeeping at all): the engine has no
-            // live-state entry for this slot, so guards 1 and 2 both had
-            // nothing to read — which is the state a wrongly-terminalized
-            // worker is always in, since the terminal path clears the entry.
-            //
-            // Reconciled with `agents stop` (2026-08-01): this exact shape —
-            // no live registry entry, but durable state corroborating a
-            // still-alive process for an execution terminalized by
-            // inference (`orphaned`/`abandoned`) — is precisely what
-            // `release_worker_pane`'s durable fallback
-            // (`reap_untracked_worker_process`) already exists to reap. It
-            // used to dead-end here in a refusal that pointed the operator
-            // at a second command (`agents stop <run_id>`); now it performs
-            // that identical durable-state teardown directly and completes
-            // the retirement, so the verb the operator reached for handles
-            // this case instead of a two-verb dance. Guards 1 and 2 above are
-            // unrelated and still refuse outright: guard 1 is a run the
-            // engine actively considers live, and guard 2 is a bookkeeping-
-            // terminal entry contradicted by the worker's own hook stream
-            // showing real recent activity — both are cases where the
-            // evidence is ambiguous or points at genuine in-flight work, and
-            // only a human explicitly invoking `agents stop` should decide
-            // to kill that.
-            tracing::warn!(
-                slot_id,
-                run_id = %run_id,
-                %evidence,
-                "retire_pane: no live registry entry for this slot, but durable state shows an \
-                 inferred-terminal execution with a still-alive worker process — reaping it via the \
-                 same durable-state teardown `agents stop` uses, then completing the retirement",
-            );
-            let outcome = self.release_worker_pane(&run_id).await;
-            tracing::info!(
-                slot_id,
-                run_id = %run_id,
-                ?outcome,
-                "retire_pane: durable-state teardown completed for a terminal-entry-with-live-process pane",
-            );
-            return Ok(());
+        } else if let Some(run_id) = self.hosted_pane_run_for_slot(slot_id) {
+            if let Ok(execution) = self.work_db.get_execution(&run_id)
+                && !execution.status.is_terminal()
+            {
+                // Durable occupancy says a non-terminal run still holds this
+                // slot, even though live-state has nothing. Retiring it as a
+                // husk would tear down a worker the engine lost track of
+                // rather than a leftover viewer.
+                return Err(RetirePaneError::LiveRunTracked { slot_id, run_id });
+            }
+            if let Some(evidence) = self.durable_live_process_evidence(&run_id) {
+                // Guard 3 (reality, with NO bookkeeping at all): the engine has no
+                // live-state entry for this slot, so guards 1 and 2 both had
+                // nothing to read — which is the state a wrongly-terminalized
+                // worker is always in, since the terminal path clears the entry.
+                // Occupancy comes from durable identity (live-state, worker
+                // registry, then `work_runs.agent_id`), never from the app's
+                // hosted-pane inventory.
+                //
+                // Reconciled with `agents stop` (2026-08-01): this exact shape —
+                // no live registry entry, but durable state corroborating a
+                // still-alive process for an execution terminalized by
+                // inference (`orphaned`/`abandoned`) — is precisely what
+                // `release_worker_pane`'s durable fallback
+                // (`reap_untracked_worker_process`) already exists to reap. It
+                // used to dead-end here in a refusal that pointed the operator
+                // at a second command (`agents stop <run_id>`); now it performs
+                // that identical durable-state teardown directly and completes
+                // the retirement, so the verb the operator reached for handles
+                // this case instead of a two-verb dance. Guards 1 and 2 above are
+                // unrelated and still refuse outright: guard 1 is a run the
+                // engine actively considers live, and guard 2 is a bookkeeping-
+                // terminal entry contradicted by the worker's own hook stream
+                // showing real recent activity — both are cases where the
+                // evidence is ambiguous or points at genuine in-flight work, and
+                // only a human explicitly invoking `agents stop` should decide
+                // to kill that.
+                tracing::warn!(
+                    slot_id,
+                    run_id = %run_id,
+                    %evidence,
+                    "retire_pane: no live registry entry for this slot, but durable state shows an \
+                     inferred-terminal execution with a still-alive worker process — reaping it via the \
+                     same durable-state teardown `agents stop` uses, then completing the retirement",
+                );
+                let outcome = self.release_worker_pane(&run_id).await;
+                tracing::info!(
+                    slot_id,
+                    run_id = %run_id,
+                    ?outcome,
+                    "retire_pane: durable-state teardown completed for a terminal-entry-with-live-process pane",
+                );
+                return Ok(());
+            }
         }
         let request = EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id });
         match self.send_to_app(request, Duration::from_secs(5)).await {
@@ -723,17 +735,20 @@ impl ServerState {
         Ok(())
     }
 
-    /// Ask the app which slots it currently hosts a session in, then
-    /// classify each against [`Self::live_worker_states_snapshot`] and
-    /// durable state: live, engine-lost-track-of-it-but-durably-alive
-    /// (`LiveProcessNoRegistry`), or a true husk. Powers `bossctl agents
-    /// list --all` and worker-reference resolution (crew name / slot id
-    /// / run id) for every `agents` verb — both need to see a pane the
-    /// live registry has dropped, including `LiveProcessNoRegistry` panes
-    /// a husk-only view would hide.
+    /// Ask the app which slots currently have a Ghostty viewer attached,
+    /// then classify each against durable occupancy
+    /// ([`Self::hosted_pane_run_for_slot`]) and
+    /// [`Self::live_worker_states_snapshot`]: live,
+    /// engine-lost-track-of-it-but-durably-alive (`LiveProcessNoRegistry`),
+    /// or a true husk. `ListHostedPanes` describes the viewer (summary,
+    /// task title, which slots have a surface); it is not the occupancy
+    /// oracle. Powers `bossctl agents list --all` and worker-reference
+    /// resolution (crew name / slot id / run id) for every `agents` verb —
+    /// both need to see a pane the live registry has dropped, including
+    /// `LiveProcessNoRegistry` panes a husk-only view would hide.
     ///
     /// Returns an empty list (not an error) when no app session is
-    /// registered — there is nothing to diff, and an operator running
+    /// registered — there is nothing to describe, and an operator running
     /// `agents list --all` against a headless/test engine shouldn't see
     /// a hard failure for a query that is inherently best-effort.
     pub async fn list_hosted_pane_statuses(&self) -> Result<Vec<HostedPaneStatus>, RetirePaneError> {
@@ -756,24 +771,18 @@ impl ServerState {
 
         let mut statuses = Vec::with_capacity(hosted.len());
         for pane in hosted {
-            let state = match live_by_slot.get(&pane.slot_id) {
-                // The engine tracks a live run here.
-                Some(state) if !state.activity.is_terminal() => HostedPaneState::Live,
-                // A terminal entry for THIS run. The engine believes the run
-                // ended; before that belief is allowed to justify killing the
-                // pane's process, take a second opinion from the OS and the
-                // worker's own hook stream.
-                //
-                // The `run_id` match matters: if the entry names a different
-                // run, the slot was recycled and the app is hosting a pane
-                // for a run that really is gone — a genuine husk, and its
-                // liveness signals belong to the newer run, not this pane.
-                Some(state) if state.run_id == pane.run_id => {
+            let occupancy = self.hosted_pane_run_for_slot(pane.slot_id);
+            let display_run_id = occupancy.clone().unwrap_or_else(|| pane.run_id.clone());
+            let state = match (live_by_slot.get(&pane.slot_id), occupancy.as_deref()) {
+                // Durable occupancy (or live-state, which occupancy prefers)
+                // says a non-terminal run holds this slot.
+                (Some(state), _) if !state.activity.is_terminal() => HostedPaneState::Live,
+                (Some(state), Some(run_id)) if run_id == state.run_id.as_str() => {
                     match crate::husk_pane_sweep::live_process_evidence(state, now) {
                         Some(evidence) => {
                             tracing::warn!(
                                 slot_id = pane.slot_id,
-                                run_id = %pane.run_id,
+                                run_id = %state.run_id,
                                 activity = state.activity.as_str(),
                                 %evidence,
                                 "pane classification: slot has a TERMINAL live-state entry but the worker \
@@ -786,30 +795,14 @@ impl ServerState {
                         None => HostedPaneState::Husk,
                     }
                 }
-                // No entry at all, or an entry for a different run: the
-                // classic husk shape this sweep exists for.
-                //
-                // But "the engine has no live-state entry" is the WEAKEST
-                // possible evidence of death, because that entry is dropped
-                // unconditionally by `release_worker_pane` on every terminal
-                // path — including the ones that fire on a wrong inference.
-                // The corroboration above cannot help here: it reads a
-                // `LiveWorkerState` that by definition does not exist in this
-                // branch. So take the second opinion from durable state
-                // instead, which survives exactly the teardown that emptied
-                // the registry.
-                //
-                // Without this, the two halves of convergence fight: a worker
-                // that is alive but quiet (parked in a long build, emitting no
-                // hook to converge on) can be confirmed a husk across two
-                // passes and SIGTERMed before the re-adoption path — running
-                // on the same 60 s cadence — gets to it. Re-adoption and
-                // retirement must not race for the same pane.
-                _ => match self.durable_live_process_evidence(&pane.run_id) {
+                // No live-state (or live-state for a different run than
+                // occupancy). Classify from durable occupancy of THIS slot,
+                // never from the viewer's claimed `pane.run_id`.
+                (_, Some(run_id)) => match self.durable_live_process_evidence(run_id) {
                     Some(evidence) => {
                         tracing::warn!(
                             slot_id = pane.slot_id,
-                            run_id = %pane.run_id,
+                            run_id = %run_id,
                             %evidence,
                             "pane classification: the engine has no live-state entry for this slot, but the \
                              run's durably-recorded worker process is still alive; NOT a husk. This is a \
@@ -821,10 +814,12 @@ impl ServerState {
                     }
                     None => HostedPaneState::Husk,
                 },
+                // Viewer with no durable occupancy: leftover Ghostty surface.
+                (_, None) => HostedPaneState::Husk,
             };
             statuses.push(HostedPaneStatus {
                 slot_id: pane.slot_id,
-                run_id: pane.run_id,
+                run_id: display_run_id,
                 crew_name: boss_protocol::name_for_slot(pane.slot_id),
                 summary: pane.summary,
                 task_title: pane.task_title,
@@ -834,26 +829,54 @@ impl ServerState {
         Ok(statuses)
     }
 
-    /// The run id the app hosts a pane for in `slot_id`, or `None` when it
-    /// hosts none (or cannot be asked). The slot-keyed inverse of
-    /// [`ServerState::hosted_pane_slot_for_run`], needed by `retire_pane`,
-    /// whose input is a slot rather than a run.
+    /// The run that currently occupies `slot_id`, resolved from durable
+    /// identity rather than the app's hosted-pane inventory. Inverse of
+    /// [`ServerState::hosted_pane_slot_for_run`] for occupancy (both sides
+    /// now read live-state / the worker registry / `work_runs.agent_id`).
+    /// Needed by `retire_pane`, whose input is a slot rather than a run.
     ///
-    /// Best-effort: a `None` here means the durable-liveness guard simply does
-    /// not fire, leaving the pre-existing behaviour intact.
-    async fn hosted_pane_run_for_slot(&self, slot_id: u8) -> Option<String> {
-        let request = EngineToAppRequest::ListHostedPanes(ListHostedPanesInput {});
-        match self.send_to_app(request, Duration::from_secs(5)).await {
-            Ok(EngineToAppResponse::ListHostedPanes { result: Ok(result) }) => result
-                .panes
-                .into_iter()
-                .find(|pane| pane.slot_id == slot_id)
-                .map(|pane| pane.run_id),
-            other => {
+    /// Order: live-state registry, then worker registry, then the newest
+    /// local `work_runs` row whose `agent_id` maps to this slot via
+    /// [`crate::coordinator::slot_id_from_worker_id`]. A present tmux
+    /// identity is corroboration, not a requirement — inferred-terminal
+    /// rows may have had identity cleared while the pid column still
+    /// survives. `None` means the durable-liveness guard does not fire.
+    fn hosted_pane_run_for_slot(&self, slot_id: u8) -> Option<String> {
+        if let Some(state) = self.live_worker_states.get(slot_id) {
+            return Some(state.run_id);
+        }
+        if let Some(run_id) = self.worker_registry.run_for_slot(slot_id) {
+            return Some(run_id);
+        }
+        let worker_id = crate::coordinator::worker_id_for_slot(slot_id);
+        match self.work_db.latest_local_execution_id_for_agent_id(&worker_id) {
+            Ok(Some(execution_id)) => {
+                match self.work_db.tmux_identity_for_execution(&execution_id) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        tracing::debug!(
+                            slot_id,
+                            execution_id,
+                            "hosted_pane_run_for_slot: local agent_id maps to this slot with no tmux identity"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            slot_id,
+                            execution_id,
+                            %err,
+                            "hosted_pane_run_for_slot: tmux identity read failed; using agent_id occupancy"
+                        );
+                    }
+                }
+                Some(execution_id)
+            }
+            Ok(None) => None,
+            Err(err) => {
                 tracing::debug!(
                     slot_id,
-                    ?other,
-                    "retire_pane: app could not be asked what it hosts in this slot",
+                    %err,
+                    "hosted_pane_run_for_slot: could not read durable occupancy for this slot"
                 );
                 None
             }

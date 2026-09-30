@@ -301,13 +301,10 @@ async fn work_resumed_kinds_resolve_once_a_later_run_starts() {
     );
 }
 
-/// Regression: the now-deleted app-reattach pane-death reconcile used to
-/// file `crate::attention_lifecycle::LEGACY_PANE_DEATH_RECONCILE_ATTENTION_KIND`
-/// ("pane_death_reconcile"). Its producer and lifecycle entry were both
-/// deleted along with the app-hosted pane path, but a pre-upgrade engine can
-/// still have left an `open` row of that literal kind in the DB. A legacy
-/// `ClearedBy::WorkResumed` registration must still auto-clear it, or it
-/// would stay open forever with nothing left able to resolve it.
+/// Regression: `LEGACY_PANE_DEATH_RECONCILE_ATTENTION_KIND` has no producer,
+/// but a pre-upgrade engine may have persisted an `open` row of that kind.
+/// Its `ClearedBy::WorkResumed` registration must still auto-clear such a
+/// row once a later run starts; otherwise nothing could ever resolve it.
 #[tokio::test]
 async fn legacy_pane_death_reconcile_rows_still_resolve_once_a_later_run_starts() {
     let (_dir, db) = open_db();

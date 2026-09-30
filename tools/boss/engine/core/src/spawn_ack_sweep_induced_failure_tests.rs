@@ -21,12 +21,10 @@
 //! 2. [`crate::live_worker_state::LiveWorkerStateRegistry::mark_stalled_spawns`]
 //!    — declines to promote, because grok omits
 //!    `Capability::AwaitingInputSignal`.
-//! 3. [`crate::spawn_ack_sweep`] pass 1 — declines. On the slot this engine
-//!    spawned itself, it declines because a reported pid narrows pass 1's
-//!    question to "is what came up the driver?", a question pass 2 owns
-//!    (`skipped.has_pid`); on a re-adopted slot it declines because
-//!    re-adoption did not create a new pane awaiting acknowledgement
-//!    (`skipped.readopted`).
+//! 3. [`crate::spawn_ack_sweep`]'s tmux-invariant check — declines. A
+//!    reported pid is not a pid-less `Spawning` slot. On a re-adopted slot
+//!    the invariant also declines because re-adoption did not create a new
+//!    pane awaiting acknowledgement.
 //!
 //! Then pass 2 fires and the resources are actually returned. The point of
 //! asserting steps 1–3 rather than only step 4 is that a future change
@@ -45,7 +43,7 @@ use crate::live_worker_state::{
     DRIVER_START_GRACE_SECS, LiveSpawnRouting, LiveWorkerStateRegistry, ReadoptionEvidence,
     STALLED_SPAWN_THRESHOLD_SECS,
 };
-use crate::spawn_ack_sweep::{DRIVER_START_ATTENTION_KIND, SPAWN_ACK_GRACE_SECS, SpawnAckReaper, run_one_pass};
+use crate::spawn_ack_sweep::{DRIVER_START_ATTENTION_KIND, SpawnAckReaper, run_one_pass};
 use crate::spawn_health::SpawnHealthTracker;
 use crate::test_support::*;
 use crate::work::ExecutionStatus;
@@ -110,12 +108,10 @@ struct RecordingCube {
 /// DB row, and a `Spawning`, grok-modeled live-state entry with an aged
 /// `spawned_at` and no driver-originated signal.
 ///
-/// `readopted` selects which pass-1 decline this reproduction exercises:
-/// `true` re-adopts the slot (as tmux's periodic convergence pass would),
-/// so pass 1 declines via `skipped.readopted`; `false` leaves the slot as
-/// this engine spawned it, so pass 1 declines via `skipped.has_pid`
-/// instead — the original 2026-07-30 shape, still real OS process, still
-/// unexercised anywhere else in this file.
+/// `readopted` selects whether the slot is restored the way tmux's
+/// periodic convergence pass would (`true`) or left as this engine
+/// spawned it (`false`) — the original 2026-07-30 shape. Both must reach
+/// driver-start verification.
 struct IncidentFixture {
     shell: LiveShell,
     db: Arc<crate::work::WorkDb>,
@@ -213,10 +209,8 @@ fn setup_incident(readopted: bool) -> IncidentFixture {
 
 /// Runs gates 1-3 plus the fix against `fixture`, asserting the common
 /// downstream outcome (reap, lease release, attention item, dispatch
-/// event). `expect_has_pid` selects which pass-1 skip counter the caller
-/// expects: `true` for an engine-spawned pane (`skipped.has_pid`), `false`
-/// for a re-adopted one (`skipped.readopted`).
-async fn assert_incident_detected_and_released(fixture: &IncidentFixture, expect_has_pid: bool) {
+/// event).
+async fn assert_incident_detected_and_released(fixture: &IncidentFixture) {
     let IncidentFixture {
         shell,
         db,
@@ -262,7 +256,7 @@ async fn assert_incident_detected_and_released(fixture: &IncidentFixture, expect
     );
 
     // ── Gate 3 + the fix: spawn_ack_sweep. ───────────────────────────────
-    // Pass 1 still declines the slot; pass 2 is what fires.
+    // The tmux-invariant check declines a reported pid; driver-start fires.
     let reaper = Arc::new(RecordingReaper {
         reaped: std::sync::Mutex::new(Vec::new()),
     });
@@ -276,30 +270,13 @@ async fn assert_incident_detected_and_released(fixture: &IncidentFixture, expect
         reaper.as_ref(),
         &spawn_health,
         &cube,
-        SPAWN_ACK_GRACE_SECS,
         DRIVER_START_GRACE_SECS,
     )
     .await;
 
-    if expect_has_pid {
-        assert_eq!(
-            outcome.skipped.has_pid, 1,
-            "gate 3: pass 1 declines an engine-spawned pane with a reported pid via has_pid",
-        );
-        assert_eq!(outcome.skipped.readopted, 0, "gate 3: this slot was never re-adopted");
-    } else {
-        assert_eq!(
-            outcome.skipped.readopted, 1,
-            "gate 3: pass 1 still declines a slot this engine did not spawn",
-        );
-        assert_eq!(
-            outcome.skipped.has_pid, 0,
-            "gate 3: readopted skip takes precedence over has_pid"
-        );
-    }
     assert_eq!(
-        outcome.reaped, 0,
-        "gate 3: pass 1 must not be the thing that catches this",
+        outcome.tmux_invariant_pidless, 0,
+        "a reported pid is not a tmux-invariant pid-less slot",
     );
 
     // ── Detected, attention raised, both resources freed.
@@ -356,18 +333,15 @@ async fn assert_incident_detected_and_released(fixture: &IncidentFixture, expect
 #[tokio::test]
 async fn a_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released() {
     let fixture = setup_incident(true);
-    assert_incident_detected_and_released(&fixture, false).await;
+    assert_incident_detected_and_released(&fixture).await;
 }
 
 /// The same incident against a pane this engine spawned itself — never
-/// re-adopted — so pass 1 declines via `skipped.has_pid` rather than
-/// `skipped.readopted`. This is the original 2026-07-30 reproduction shape;
-/// nothing else in this file exercises `has_pid` end to end against a real
-/// OS process.
+/// re-adopted. This is the original 2026-07-30 reproduction shape.
 #[tokio::test]
 async fn an_engine_spawned_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released() {
     let fixture = setup_incident(false);
-    assert_incident_detected_and_released(&fixture, true).await;
+    assert_incident_detected_and_released(&fixture).await;
 }
 
 /// The control: the identical setup, with the one difference that the
@@ -424,13 +398,11 @@ async fn the_same_pane_with_a_driver_signal_is_left_completely_alone() {
         reaper.as_ref(),
         &spawn_health,
         &cube,
-        SPAWN_ACK_GRACE_SECS,
         DRIVER_START_GRACE_SECS,
     )
     .await;
 
     assert_eq!(outcome.driver_start_reaped, 0);
-    assert_eq!(outcome.reaped, 0);
     assert_eq!(
         db.get_execution(&execution_id).unwrap().status,
         ExecutionStatus::Running,
