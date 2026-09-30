@@ -25,42 +25,116 @@ pub struct CommandOutput {
 /// processes can inherit the pipe descriptors, so joining the readers after
 /// killing only the direct child could wait indefinitely for those descendants.
 pub fn output_blocking_timeout(command: &mut Command, timeout: Duration) -> std::io::Result<Output> {
+    output_bounded(command, timeout, false, |_| {})
+}
+
+/// Like [`output_blocking_timeout`], but the child leads its own process group
+/// and a timeout kills the whole group, so descendants the child spawned (a
+/// `git ls-remote` under `cube workspace status`, say) die with it instead of
+/// being orphaned and left holding the output pipes.
+///
+/// `on_spawn` receives the child's pid (which is also its process-group id) as
+/// soon as it exists, so a caller can track the subprocess while it runs and
+/// reap it with [`kill_process_group`] if it needs to be abandoned early.
+///
+/// The deadline also covers draining the output: a child that exits while a
+/// descendant still holds its pipe open is treated as timed out rather than
+/// waited on indefinitely.
+#[cfg(unix)]
+pub fn output_blocking_timeout_in_group(
+    command: &mut Command,
+    timeout: Duration,
+    on_spawn: impl FnOnce(u32),
+) -> std::io::Result<Output> {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+    output_bounded(command, timeout, true, on_spawn)
+}
+
+/// SIGKILL every process in the group led by `pgid`. Best-effort: a group that
+/// has already exited is not an error.
+#[cfg(unix)]
+pub fn kill_process_group(pgid: u32) {
+    if let Ok(pgid) = i32::try_from(pgid)
+        && pgid > 0
+    {
+        // SAFETY: killpg takes plain integers and has no memory-safety preconditions.
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+    }
+}
+
+fn output_bounded(
+    command: &mut Command,
+    timeout: Duration,
+    kill_group: bool,
+    on_spawn: impl FnOnce(u32),
+) -> std::io::Result<Output> {
     let program = command.get_program().to_string_lossy().into_owned();
     let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    on_spawn(child.id());
+    let kill = |child: &mut std::process::Child| {
+        #[cfg(unix)]
+        if kill_group {
+            kill_process_group(child.id());
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    let timed_out = || {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("{program} exceeded {timeout:?} timeout"),
+        )
+    };
     let mut stdout = child.stdout.take().expect("stdout piped");
     let mut stderr = child.stderr.take().expect("stderr piped");
-    let stdout_thread = std::thread::spawn(move || {
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
-        stdout.read_to_end(&mut buf).map(|_| buf)
+        let _ = stdout_tx.send(stdout.read_to_end(&mut buf).map(|_| buf));
     });
-    let stderr_thread = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
-        stderr.read_to_end(&mut buf).map(|_| buf)
+        let _ = stderr_tx.send(stderr.read_to_end(&mut buf).map(|_| buf));
     });
     let deadline = Instant::now() + timeout;
     let status = loop {
-        match child.try_wait()? {
-            Some(status) => break status,
-            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                drop(stdout_thread);
-                drop(stderr_thread);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("{program} exceeded {timeout:?} timeout"),
-                ));
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                kill(&mut child);
+                return Err(timed_out());
+            }
+            Err(err) => {
+                kill(&mut child);
+                return Err(err);
             }
         }
     };
-    let stdout = stdout_thread
-        .join()
-        .unwrap_or_else(|_| Err(std::io::Error::other("stdout reader panicked")))?;
-    let stderr = stderr_thread
-        .join()
-        .unwrap_or_else(|_| Err(std::io::Error::other("stderr reader panicked")))?;
-    Ok(Output { status, stdout, stderr })
+    let drain = |rx: &std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>| {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(result) => result,
+            Err(_) => Err(timed_out()),
+        }
+    };
+    let stdout = drain(&stdout_rx);
+    let stderr = drain(&stderr_rx);
+    match (stdout, stderr) {
+        (Ok(stdout), Ok(stderr)) => Ok(Output { status, stdout, stderr }),
+        (stdout, stderr) => {
+            // A descendant outlived the child holding its pipe; reap the group.
+            #[cfg(unix)]
+            if kill_group {
+                kill_process_group(child.id());
+            }
+            Err(stdout.err().or(stderr.err()).expect("one side failed"))
+        }
+    }
 }
 
 /// Process-spawning seam for components that construct commands.
@@ -331,5 +405,64 @@ mod tests {
             .await
             .expect("spawn shell");
         assert!(is_utf8_locale(&output.stdout), "child LC_CTYPE was {:?}", output.stdout);
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only probes for existence.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// A timeout must take the child's descendants down too: `cube workspace
+    /// status` hung for hours under a `git ls-remote` grandchild that a
+    /// direct-child kill left running.
+    #[cfg(unix)]
+    #[test]
+    fn group_timeout_kills_grandchildren() {
+        let pid_file = std::env::temp_dir().join(format!("boss-cmd-runner-grandchild-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pid_file);
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!("sleep 60 & echo $! > {}; wait", pid_file.display()));
+        let err = output_blocking_timeout_in_group(&mut command, Duration::from_millis(500), |_| {}).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        let grandchild: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        let _ = std::fs::remove_file(&pid_file);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_alive(grandchild) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !process_alive(grandchild),
+            "grandchild {grandchild} survived the timeout"
+        );
+    }
+
+    /// A child that exits while a descendant keeps its pipe open must not
+    /// block the caller past the deadline.
+    #[cfg(unix)]
+    #[test]
+    fn group_drain_is_bounded_when_a_descendant_holds_the_pipe() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 60 & exit 0");
+        let started = Instant::now();
+        let err = output_blocking_timeout_in_group(&mut command, Duration::from_millis(500), |_| {}).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_run_captures_output_and_reports_the_pid() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("echo out; echo err >&2");
+        let mut seen = None;
+        let output =
+            output_blocking_timeout_in_group(&mut command, Duration::from_secs(10), |pid| seen = Some(pid)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "out");
+        assert_eq!(String::from_utf8_lossy(&output.stderr).trim(), "err");
+        assert!(seen.is_some());
     }
 }

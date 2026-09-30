@@ -330,6 +330,7 @@ name = "boss-command-runner"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "libc",
  "tokio",
 ]
 
@@ -621,6 +622,7 @@ dependencies = [
  "async-trait",
  "bon",
  "boss-codex-auth",
+ "boss-command-runner",
  "boss-engine-codex-hook-trust",
  "boss-engine-codex-rollout",
  "boss-engine-structured-output",

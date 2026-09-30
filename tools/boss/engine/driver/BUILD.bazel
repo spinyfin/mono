@@ -27,6 +27,7 @@ rust_library(
     ],
     deps = [
         "//tools/boss/codex_auth",
+        "//tools/boss/command-runner",
         "//tools/boss/engine/codex-hook-trust",
         "//tools/boss/engine/codex-rollout",
         "//tools/boss/engine/ssh-transport",
@@ -59,6 +60,7 @@ rust_test(
     },
     deps = [
         "//tools/boss/codex_auth",
+        "//tools/boss/command-runner",
         "//tools/boss/engine/codex-hook-trust",
         "//tools/boss/engine/codex-rollout",
         "//tools/boss/engine/pr-review",
