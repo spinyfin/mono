@@ -334,17 +334,22 @@ extension ChatViewModel {
         asyncMarkdownViewerVM.staleReason = nil
         asyncMarkdownViewerVM.canRetry = false
         asyncMarkdownViewerVM.onRetry = nil
-        // Engine-minted revision briefs (`kind == "revision"`) always carry
-        // the standing "HARD RULE: no punting" boilerplate ahead of their
-        // findings (`render_revision_instructions` in
+        // Engine-minted review-findings briefs carry the standing "HARD
+        // RULE: no punting" boilerplate ahead of their findings
+        // (`render_revision_instructions` in
         // `tools/boss/engine/pr-review/src/render.rs`) — collapse it by
-        // default so the findings are immediately visible. This is purely
-        // presentational: the heading text matched here never changes what
-        // `task.description` itself contains, which is what the worker
-        // actually reads (see that Rust function's doc comment for the
-        // cross-language contract this string must stay in sync with).
+        // default so the findings are immediately visible. Detection keys
+        // on that heading being present in the description, not on
+        // `task.kind`: a pre-merge brief is a `revision`, but the post-merge
+        // follow-up the engine mints after a PR has merged is a `followup`
+        // carrying the same rendering behind a provenance preamble, and it
+        // must collapse identically. This is purely presentational: the
+        // heading text matched here never changes what `task.description`
+        // itself contains, which is what the worker actually reads (see
+        // that Rust function's doc comment for the cross-language contract
+        // this string must stay in sync with).
         asyncMarkdownViewerVM.collapsedByDefaultHeadings =
-            task.kind == "revision" ? [RevisionBriefCollapsibleHeadings.hardRule] : []
+            RevisionBriefCollapsibleHeadings.collapsedByDefault(in: task.description)
         asyncMarkdownViewerVM.state = .loaded(
             title: task.name,
             markdown: task.description,

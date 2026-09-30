@@ -178,9 +178,10 @@ struct MarkdownDocumentChrome: View {
     /// Empty (the default) still splits `source` into one `StructuredText`
     /// per heading so lazy layout can skip off-screen sections. Only a
     /// caller that recognizes a specific document shape (e.g.
-    /// `ChatViewModel.openTaskDescription`, which opts in for
-    /// `task.kind == "revision"`) passes a non-empty set to fold those
-    /// headings behind a disclosure.
+    /// `ChatViewModel.openTaskDescription`, which opts in when the
+    /// description carries the engine's `## HARD RULE ...` heading — see
+    /// `RevisionBriefCollapsibleHeadings.collapsedByDefault(in:)`) passes a
+    /// non-empty set to fold those headings behind a disclosure.
     var collapsedByDefaultHeadings: Set<String> = []
 
     var body: some View {
@@ -625,16 +626,36 @@ private struct MarkdownDocumentColumn: View {
 // MARK: - Collapsible sections
 
 /// Heading text(s) `ChatViewModel.openTaskDescription` passes as
-/// `MarkdownDocumentChrome.collapsedByDefaultHeadings` when opening a
-/// revision task's (`kind == "revision"`) description. Must stay byte-for-byte
-/// identical to the heading `render_revision_instructions` emits in
-/// `tools/boss/engine/pr-review/src/render.rs` (after stripping the `## `
-/// marker) — that Rust function's doc comment carries the matching half of
-/// this cross-language contract. A mismatch here doesn't corrupt anything a
+/// `MarkdownDocumentChrome.collapsedByDefaultHeadings` when opening a work
+/// item whose description carries the engine's review-findings boilerplate.
+/// `hardRule` must stay byte-for-byte identical to `REVISION_HARD_RULE_HEADING`
+/// in `tools/boss/engine/pr-review/src/render.rs` — the heading
+/// `render_revision_instructions` emits (after stripping the `## ` marker).
+/// That Rust constant's doc comment carries the matching half of this
+/// cross-language contract. A mismatch here doesn't corrupt anything a
 /// worker reads (this constant never touches `task.description`); it just
 /// silently stops the boilerplate from collapsing.
 enum RevisionBriefCollapsibleHeadings {
     static let hardRule = "HARD RULE: no punting — do the actual work"
+
+    /// The headings to fold by default for a work item whose description is
+    /// `markdown`: `[hardRule]` when the description contains that exact
+    /// heading as a real markdown heading line, otherwise empty.
+    ///
+    /// Detection is structural — the heading line itself, which both engine
+    /// producers emit through the same `render_revision_instructions`
+    /// template — and deliberately NOT keyed on `task.kind` or on the prose
+    /// around the heading. A pre-merge findings brief is a `revision`, but
+    /// the engine's post-merge follow-up (the same rendering behind a
+    /// provenance preamble) is a `followup`, and a kind gate is exactly what
+    /// left the latter rendering the boilerplate fully expanded. Keying on
+    /// the heading means any future producer that reuses the template
+    /// collapses the same way, and a description without the boilerplate
+    /// (a human-written chore, a revision with a rewritten description)
+    /// renders exactly as it always has.
+    static func collapsedByDefault(in markdown: String) -> Set<String> {
+        MarkdownHeadingSections.containsHeading(hardRule, in: markdown) ? [hardRule] : []
+    }
 }
 
 /// One chunk of a rendered markdown document: either ordinary content
@@ -717,6 +738,15 @@ enum MarkdownHeadingSections {
             chunks.append(.plain(String(source[cursor...])))
         }
         return chunks
+    }
+
+    /// Whether `source` contains a markdown ATX heading whose exact text
+    /// (level markers and surrounding whitespace stripped) is `text`. Uses
+    /// the same heading scan as `chunks(in:collapsibleHeadings:)`, so a
+    /// heading this reports present is one that scan will fold — and a
+    /// look-alike inside a fenced code block counts for neither.
+    static func containsHeading(_ text: String, in source: String) -> Bool {
+        headingLines(in: source).contains { $0.text == text }
     }
 
     private struct HeadingLine {

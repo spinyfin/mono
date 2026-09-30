@@ -2,21 +2,61 @@ import XCTest
 @testable import Boss
 
 /// Covers `ChatViewModel.openTaskDescription`'s collapsed-by-default wiring:
-/// only a `kind == "revision"` task's description opts the "HARD RULE"
-/// heading into `MarkdownDocumentChrome.collapsedByDefaultHeadings` — every
-/// other task/chore kind (and the design-doc fetch path) renders exactly as
-/// it always has. See `MarkdownDocumentChromeTests` for the chunking logic
-/// this wiring feeds into.
+/// a description that carries the engine's `## HARD RULE ...` boilerplate
+/// heading — whatever the work item's kind — opts that heading into
+/// `MarkdownDocumentChrome.collapsedByDefaultHeadings`; every other
+/// description (and the design-doc fetch path) renders exactly as it always
+/// has. Both engine-produced shapes are pinned here: the pre-merge revision
+/// brief and the post-merge follow-up with its provenance preamble. See
+/// `MarkdownDocumentChromeTests` for the chunking logic this wiring feeds
+/// into.
 @MainActor
 final class RevisionBriefCollapsedHeadingsTests: XCTestCase {
+    /// The pre-merge shape: `render_revision_instructions` output stored
+    /// verbatim as a `revision` task's description.
+    private static let preMergeRevisionBrief = """
+    Automated PR review of PR #117 found 5 finding(s) requiring attention.
+    Address ALL findings before finalising this revision.
+
+    ## HARD RULE: no punting — do the actual work
+
+    Each finding below requires a real code change that resolves it.
+
+    ### [medium] Off-by-one in the pager
+
+    **File:** `src/pager.rs`
+
+    Fix the bound.
+    """
+
+    /// The post-merge shape: `render_post_merge_followup_provenance`
+    /// prepended to the same rendering (with the origin work-item short id
+    /// stripped), stored as a `followup`. The preamble is ordinary prose
+    /// ahead of the boilerplate — it must not affect detection.
+    private static let postMergeFollowupBrief = """
+    **Provenance:** these findings were found in post-merge review of https://github.com/org/repo/pull/117.
+
+    The PR description you open for this follow-up MUST state explicitly that these findings were identified during a post-merge review of https://github.com/org/repo/pull/117, with a link to that PR, so a reader of the follow-up PR can tell where it came from. For example: "Found in post-merge review of https://github.com/org/repo/pull/117."
+
+    Automated PR review of PR #117 found 5 finding(s) requiring attention.
+    Address ALL findings before finalising this revision.
+
+    ## HARD RULE: no punting — do the actual work
+
+    Each finding below requires a real code change that resolves it.
+
+    ### [medium] Off-by-one in the pager
+
+    **File:** `src/pager.rs`
+
+    Fix the bound.
+    """
+
     func testRevisionTaskCollapsesHardRuleHeadingByDefault() {
         let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
         var windowOpens = 0
         model.asyncMarkdownViewerOpener = { windowOpens += 1 }
-        let task = makeTask(
-            kind: "revision",
-            description: "Automated PR review found 1 finding(s).\n\n## HARD RULE: no punting — do the actual work\n\n..."
-        )
+        let task = makeTask(kind: "revision", description: Self.preMergeRevisionBrief)
 
         model.openTaskDescription(task)
 
@@ -34,6 +74,57 @@ final class RevisionBriefCollapsedHeadingsTests: XCTestCase {
         }
     }
 
+    /// The engine's post-merge follow-up is a `followup` (never a
+    /// `revision`) whose description prepends a provenance preamble to the
+    /// same boilerplate. It must collapse exactly like the pre-merge brief:
+    /// detection keys on the heading line, not on kind or leading prose.
+    func testPostMergeFollowupWithProvenancePreambleCollapsesHardRuleHeadingByDefault() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        model.asyncMarkdownViewerOpener = {}
+        let task = makeTask(kind: "followup", description: Self.postMergeFollowupBrief)
+
+        model.openTaskDescription(task)
+
+        XCTAssertEqual(
+            model.asyncMarkdownViewerVM.collapsedByDefaultHeadings,
+            [RevisionBriefCollapsibleHeadings.hardRule]
+        )
+        let chunks = MarkdownHeadingSections.chunks(
+            in: task.description,
+            collapsibleHeadings: model.asyncMarkdownViewerVM.collapsedByDefaultHeadings
+        )
+        let folded = chunks.compactMap { chunk -> String? in
+            if case .collapsible(let heading, _) = chunk { return heading }
+            return nil
+        }
+        XCTAssertEqual(folded, [RevisionBriefCollapsibleHeadings.hardRule], "\(chunks)")
+        guard case .plain(let preamble) = chunks.first else {
+            return XCTFail("expected the provenance preamble as a leading .plain chunk; got \(chunks)")
+        }
+        XCTAssertTrue(preamble.hasPrefix("**Provenance:**"), "the preamble stays visible ahead of the fold")
+        XCTAssertTrue(
+            chunks.contains { if case .plain(let text) = $0 { return text.hasPrefix("### [medium]") } else { return false } },
+            "findings must never fold: \(chunks)"
+        )
+    }
+
+    /// The same post-merge description collapses regardless of the kind the
+    /// engine happens to store it under — the gate is the heading, not the
+    /// kind. `revision` and `followup` are the two shapes the engine emits
+    /// today; `chore` is the operator-facing label a follow-up can wear.
+    func testHardRuleCollapseIsIndependentOfTaskKind() {
+        for kind in ["revision", "followup", "chore", "task"] {
+            let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+            model.asyncMarkdownViewerOpener = {}
+            model.openTaskDescription(makeTask(kind: kind, description: Self.postMergeFollowupBrief))
+            XCTAssertEqual(
+                model.asyncMarkdownViewerVM.collapsedByDefaultHeadings,
+                [RevisionBriefCollapsibleHeadings.hardRule],
+                "kind \(kind) must collapse the boilerplate"
+            )
+        }
+    }
+
     func testNonRevisionTaskDoesNotCollapseAnyHeading() {
         let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
         model.asyncMarkdownViewerOpener = {}
@@ -44,13 +135,32 @@ final class RevisionBriefCollapsedHeadingsTests: XCTestCase {
         XCTAssertTrue(model.asyncMarkdownViewerVM.collapsedByDefaultHeadings.isEmpty)
     }
 
+    /// A `revision` whose description lacks the boilerplate (an operator
+    /// rewrote it, or it was never engine-minted) has nothing to fold, so
+    /// it opts nothing in — and prose that merely *mentions* the heading
+    /// text, or a look-alike inside a fenced code block, doesn't count.
+    func testRevisionWithoutHardRuleHeadingDoesNotCollapseAnyHeading() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        model.asyncMarkdownViewerOpener = {}
+        let description = """
+        Please rework the pager. Remember the HARD RULE: no punting — do the actual work.
+
+        ```
+        ## HARD RULE: no punting — do the actual work
+        ```
+        """
+        model.openTaskDescription(makeTask(kind: "revision", description: description))
+
+        XCTAssertTrue(model.asyncMarkdownViewerVM.collapsedByDefaultHeadings.isEmpty)
+    }
+
     /// The VM/window are a shared singleton across opens — a stale
     /// collapsed-heading set from a previously-viewed revision brief must
     /// not leak into a subsequently-viewed non-revision task's description.
     func testCollapsedHeadingsResetsWhenSwitchingFromRevisionToNonRevisionTask() {
         let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
         model.asyncMarkdownViewerOpener = {}
-        let revision = makeTask(kind: "revision", description: "## HARD RULE: no punting — do the actual work\n")
+        let revision = makeTask(kind: "revision", description: Self.preMergeRevisionBrief)
         model.openTaskDescription(revision)
         XCTAssertFalse(model.asyncMarkdownViewerVM.collapsedByDefaultHeadings.isEmpty)
 

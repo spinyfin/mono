@@ -286,6 +286,40 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         )
     }
 
+    /// `collapsedByDefault(in:)` is the structural gate `openTaskDescription`
+    /// uses: it reports the heading present only when it is a real heading
+    /// line — through the same scan `chunks(in:collapsibleHeadings:)` folds
+    /// with — so "detected" and "will fold" can never disagree.
+    func testCollapsedByDefaultKeysOnTheHeadingLineOnly() {
+        XCTAssertEqual(
+            RevisionBriefCollapsibleHeadings.collapsedByDefault(in: Self.revisionBrief),
+            [RevisionBriefCollapsibleHeadings.hardRule]
+        )
+        let withPreamble = "**Provenance:** found in post-merge review of https://example.test/pull/1.\n\n" + Self.revisionBrief
+        XCTAssertEqual(
+            RevisionBriefCollapsibleHeadings.collapsedByDefault(in: withPreamble),
+            [RevisionBriefCollapsibleHeadings.hardRule]
+        )
+        XCTAssertEqual(
+            RevisionBriefCollapsibleHeadings.collapsedByDefault(in: "   ## HARD RULE: no punting — do the actual work  \nbody"),
+            [RevisionBriefCollapsibleHeadings.hardRule],
+            "up to three leading spaces and trailing whitespace are still the same heading"
+        )
+        XCTAssertTrue(RevisionBriefCollapsibleHeadings.collapsedByDefault(in: "").isEmpty)
+        XCTAssertTrue(
+            RevisionBriefCollapsibleHeadings.collapsedByDefault(in: "Mind the HARD RULE: no punting — do the actual work.").isEmpty,
+            "prose mentioning the heading text is not a heading"
+        )
+        XCTAssertTrue(
+            RevisionBriefCollapsibleHeadings.collapsedByDefault(in: "## HARD RULE: no punting\n").isEmpty,
+            "a different heading text does not match"
+        )
+        XCTAssertTrue(
+            RevisionBriefCollapsibleHeadings.collapsedByDefault(in: "```\n## HARD RULE: no punting — do the actual work\n```\n").isEmpty,
+            "a look-alike inside a fenced code block is not a heading"
+        )
+    }
+
     /// An empty collapsible set still splits on every heading so each
     /// section is its own `StructuredText`. Concatenating the `.plain`
     /// chunks must reconstruct the source exactly.
