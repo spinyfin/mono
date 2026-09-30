@@ -52,6 +52,97 @@ struct EngineRestartPolicy: Equatable, Sendable {
     }
 }
 
+/// Bounded wait + escalation for stopping an already-running engine.
+/// Socket close is not proof the process has exited; the pid-exit wait
+/// is. SIGTERM then SIGKILL only run if the pid is still alive.
+struct EngineStopPolicy: Equatable, Sendable {
+    static let `default` = EngineStopPolicy(
+        socketCloseTimeout: 8,
+        pidExitTimeout: 5,
+        termWaitTimeout: 5,
+        killWaitTimeout: 3,
+        pollInterval: 0.1
+    )
+
+    let socketCloseTimeout: TimeInterval
+    let pidExitTimeout: TimeInterval
+    let termWaitTimeout: TimeInterval
+    let killWaitTimeout: TimeInterval
+    let pollInterval: TimeInterval
+
+    init(
+        socketCloseTimeout: TimeInterval = Self.default.socketCloseTimeout,
+        pidExitTimeout: TimeInterval = Self.default.pidExitTimeout,
+        termWaitTimeout: TimeInterval = Self.default.termWaitTimeout,
+        killWaitTimeout: TimeInterval = Self.default.killWaitTimeout,
+        pollInterval: TimeInterval = Self.default.pollInterval
+    ) {
+        self.socketCloseTimeout = max(0, socketCloseTimeout)
+        self.pidExitTimeout = max(0, pidExitTimeout)
+        self.termWaitTimeout = max(0, termWaitTimeout)
+        self.killWaitTimeout = max(0, killWaitTimeout)
+        self.pollInterval = max(0.01, pollInterval)
+    }
+}
+
+/// Process-table operations used by engine start/stop. Injected so tests
+/// can drive pid-exit waits and SIGTERM/SIGKILL without real processes.
+protocol EngineProcessObserving: Sendable {
+    func isRunning(_ pid: pid_t) -> Bool
+    func isLikelyEngine(_ pid: pid_t) -> Bool
+    func sendSignal(_ pid: pid_t, _ signal: Int32)
+}
+
+struct RealEngineProcessObserver: EngineProcessObserving {
+    func isRunning(_ pid: pid_t) -> Bool {
+        if kill(pid, 0) == 0 {
+            return true
+        }
+        return errno == EPERM
+    }
+
+    func isLikelyEngine(_ pid: pid_t) -> Bool {
+        guard let command = commandLine(for: pid) else {
+            return false
+        }
+        return command.contains(BossEngineBinary.bazelOutputPathFragment)
+            || command.contains(BossEngineBinary.bazelRunCommand)
+            || command.contains(BossEngineBinary.bundlePathFragment)
+    }
+
+    func sendSignal(_ pid: pid_t, _ signal: Int32) {
+        _ = kill(pid, signal)
+    }
+
+    private func commandLine(for pid: pid_t) -> String? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/ps")
+        proc.arguments = ["-p", "\(pid)", "-o", "command="]
+        let output = Pipe()
+        proc.standardOutput = output
+        proc.standardError = Pipe()
+
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch {
+            return nil
+        }
+
+        guard proc.terminationStatus == 0 else {
+            return nil
+        }
+
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        let text = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let text, !text.isEmpty {
+            return text
+        }
+        return nil
+    }
+}
+
 /// State sent to the app chrome while the controller is recovering from an
 /// unexpected engine exit. A manual restart resets the policy and returns to
 /// `.running` once a socket is reachable.
@@ -82,6 +173,8 @@ final class EngineProcessController: @unchecked Sendable {
     private var lastSupervisionState: EngineSupervisionState = .running
     private var lastLaunchError: String?
     private let socketControl: any EngineSocketControlling
+    private let processObserver: any EngineProcessObserving
+    private let stopPolicy: EngineStopPolicy
     private let bundledEnginePathOverride: String?
     private let launchHandler: (@Sendable (String, String?, String) throws -> pid_t)?
     private let supervisionStopLock = NSLock()
@@ -109,6 +202,8 @@ final class EngineProcessController: @unchecked Sendable {
         stopOnExit: Bool = ProcessInfo.processInfo.environment["BOSS_ENGINE_STOP_ON_EXIT"] == "1",
         restartPolicy: EngineRestartPolicy = .fromEnvironment(),
         socketControl: any EngineSocketControlling = EngineSocketControl(),
+        processObserver: any EngineProcessObserving = RealEngineProcessObserver(),
+        stopPolicy: EngineStopPolicy = .default,
         bundledEnginePathOverride: String? = nil,
         launchHandler: (@Sendable (String, String?, String) throws -> pid_t)? = nil,
         livenessProbe: (@Sendable () -> Bool)? = nil
@@ -121,6 +216,8 @@ final class EngineProcessController: @unchecked Sendable {
         self.restartPolicy = restartPolicy
         self.supervisor = EngineSupervisor(policy: restartPolicy)
         self.socketControl = socketControl
+        self.processObserver = processObserver
+        self.stopPolicy = stopPolicy
         self.bundledEnginePathOverride = bundledEnginePathOverride
         self.launchHandler = launchHandler
         self.livenessProbe = livenessProbe
@@ -566,7 +663,7 @@ final class EngineProcessController: @unchecked Sendable {
             if socketControl.isReachable(socketPath: socketPath, timeoutSeconds: 0.5) {
                 return childPID
             }
-            if !isProcessRunning(childPID) {
+            if !processObserver.isRunning(childPID) {
                 throw controllerError(
                     launchFailureMessage(
                         prefix: "engine process pid=\(childPID) exited before its socket became reachable",
@@ -651,12 +748,12 @@ final class EngineProcessController: @unchecked Sendable {
             return nil
         }
 
-        if !isProcessRunning(pid) {
+        if !processObserver.isRunning(pid) {
             clearPIDFileIfOwned(pid: pid, pidPath: pidPath)
             return nil
         }
 
-        guard isLikelyEngineProcess(pid) else {
+        guard processObserver.isLikelyEngine(pid) else {
             emit("[engine pid] pid file points to non-engine process pid=\(pid)")
             return nil
         }
@@ -683,100 +780,80 @@ final class EngineProcessController: @unchecked Sendable {
         try? FileManager.default.removeItem(atPath: pidPath)
     }
 
-    private func isProcessRunning(_ pid: pid_t) -> Bool {
-        if kill(pid, 0) == 0 {
-            return true
-        }
-        return errno == EPERM
-    }
-
-    private func isLikelyEngineProcess(_ pid: pid_t) -> Bool {
-        guard let command = commandLine(for: pid) else {
-            return false
-        }
-
-        return command.contains(BossEngineBinary.bazelOutputPathFragment)
-            || command.contains(BossEngineBinary.bazelRunCommand)
-            || command.contains(BossEngineBinary.bundlePathFragment)
-    }
-
-    private func commandLine(for pid: pid_t) -> String? {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/ps")
-        proc.arguments = ["-p", "\(pid)", "-o", "command="]
-        let output = Pipe()
-        proc.standardOutput = output
-        proc.standardError = Pipe()
-
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-        } catch {
-            return nil
-        }
-
-        guard proc.terminationStatus == 0 else {
-            return nil
-        }
-
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        let text = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if let text, !text.isEmpty {
-            return text
-        }
-        return nil
-    }
-
     private func stopRunningEngine(_ running: RunningEngine) throws {
         var fallbackPID = running.pid
         var rpcFailure: Error?
+        var socketClosed = false
         do {
             fallbackPID = try socketControl.shutdown(
                 socketPath: running.socketPath,
                 tokenPath: paths.controlTokenPath,
                 timeoutSeconds: 5
             ) ?? fallbackPID
-            if socketControl.waitForClose(socketPath: running.socketPath, timeoutSeconds: 8) {
-                if let fallbackPID {
-                    clearPIDFileIfOwned(pid: fallbackPID, pidPath: running.pidPath)
-                }
-                return
-            }
-            rpcFailure = controllerError(
-                "shutdown RPC was accepted, but socket \(running.socketPath) remained reachable after 8 seconds"
+            socketClosed = socketControl.waitForClose(
+                socketPath: running.socketPath,
+                timeoutSeconds: stopPolicy.socketCloseTimeout
             )
+            if !socketClosed {
+                rpcFailure = controllerError(
+                    "shutdown RPC was accepted, but socket \(running.socketPath) remained reachable after \(Int(stopPolicy.socketCloseTimeout)) seconds"
+                )
+            }
         } catch {
             rpcFailure = error
         }
 
         guard let pid = fallbackPID else {
             throw controllerError(
-                "engine is reachable at \(running.socketPath), but graceful shutdown failed and no pid is available: \(rpcFailure?.localizedDescription ?? "unknown error")"
-            )
-        }
-        guard isProcessRunning(pid), isLikelyEngineProcess(pid) else {
-            throw controllerError(
-                "engine is reachable at \(running.socketPath), but graceful shutdown failed and pid \(pid) is not a running Boss engine: \(rpcFailure?.localizedDescription ?? "unknown error")"
+                "engine at \(running.socketPath) \(socketClosed ? "closed its socket" : "is still reachable"), but no pid is available to confirm the process exited: \(rpcFailure?.localizedDescription ?? "unknown error")"
             )
         }
 
-        emit("[engine stop] rpc unavailable (\(rpcFailure?.localizedDescription ?? "unknown error")); falling back to SIGTERM pid=\(pid)")
-        _ = kill(pid, SIGTERM)
-        for _ in 0..<50 {
-            if !isProcessRunning(pid) {
-                break
+        if waitForProcessExit(pid: pid, timeout: stopPolicy.pidExitTimeout) {
+            clearPIDFileIfOwned(pid: pid, pidPath: running.pidPath)
+            return
+        }
+
+        guard processObserver.isRunning(pid) else {
+            clearPIDFileIfOwned(pid: pid, pidPath: running.pidPath)
+            return
+        }
+        guard processObserver.isLikelyEngine(pid) else {
+            throw controllerError(
+                "engine pid \(pid) is still alive after stop, but is not a running Boss engine: \(rpcFailure?.localizedDescription ?? "unknown error")"
+            )
+        }
+
+        emit("[engine stop] pid=\(pid) still alive after socket close; sending SIGTERM")
+        processObserver.sendSignal(pid, SIGTERM)
+        if waitForProcessExit(pid: pid, timeout: stopPolicy.termWaitTimeout) {
+            clearPIDFileIfOwned(pid: pid, pidPath: running.pidPath)
+            return
+        }
+
+        emit("[engine stop] pid=\(pid) still alive after SIGTERM; sending SIGKILL")
+        processObserver.sendSignal(pid, SIGKILL)
+        if waitForProcessExit(pid: pid, timeout: stopPolicy.killWaitTimeout) {
+            clearPIDFileIfOwned(pid: pid, pidPath: running.pidPath)
+            return
+        }
+
+        throw controllerError(
+            "engine pid \(pid) is still alive after SIGKILL; refusing to launch a replacement"
+        )
+    }
+
+    /// Poll until `pid` is gone or `timeout` elapses. Socket close is not
+    /// treated as process exit.
+    private func waitForProcessExit(pid: pid_t, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if !processObserver.isRunning(pid) {
+                return true
             }
-            Thread.sleep(forTimeInterval: 0.1)
+            Thread.sleep(forTimeInterval: stopPolicy.pollInterval)
         }
-        if isProcessRunning(pid) {
-            emit("[engine stop] pid=\(pid) still alive after 5s; sending SIGKILL")
-            _ = kill(pid, SIGKILL)
-        }
-        guard socketControl.waitForClose(socketPath: running.socketPath, timeoutSeconds: 3) else {
-            throw controllerError("engine socket \(running.socketPath) remained reachable after stopping pid=\(pid)")
-        }
-        clearPIDFileIfOwned(pid: pid, pidPath: running.pidPath)
+        return !processObserver.isRunning(pid)
     }
 
     private func describe(_ running: RunningEngine) -> String {

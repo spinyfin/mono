@@ -345,11 +345,13 @@ fn spawn_github_auth_forwarder(server_state: Arc<ServerState>) -> tokio::task::J
 ///
 /// `socket_path` is bound exclusively (the file is removed first if it exists).
 /// When `pid_file_path` is `Some`, the engine takes a non-blocking exclusive
-/// flock on that path, writes its pid, and holds both for the process
-/// lifetime (released and unlinked on shutdown). This happens *before*
-/// opening the state database so a slow `WorkDb::open` cannot look like an
-/// exited engine to the macOS app supervisor. A second process that loses
-/// the flock returns `Err` immediately with an `instance lock held`
+/// flock on a sibling of that path, writes its pid, and holds both for the
+/// process lifetime. The kernel releases the flock on process exit;
+/// `serve()` returning does not unlock or unlink the pid file, so a slow
+/// tokio runtime teardown cannot look like an exited engine. This happens
+/// *before* opening the state database so a slow `WorkDb::open` cannot look
+/// like an exited engine to the macOS app supervisor. A second process that
+/// loses the flock returns `Err` immediately with an `instance lock held`
 /// message and an `instance_lock_failed` audit record — it must not wait
 /// on SQLite. Pass `None` from in-process tests to avoid touching shared
 /// filesystem state. When `events_socket_path` is `Some`, the engine
@@ -564,11 +566,16 @@ pub async fn serve_with_overrides(
     // of racing SQLite setup. `nohup` reparents the engine to launchd, so ppid
     // is not enough to tell those launchers apart — see the `launched_by`
     // field on the audit `start` record.
-    let _pid_guard = match &pid_file_path {
-        Some(path) => match PidFileGuard::acquire(path) {
+    //
+    // The guard is leaked on purpose: Drop would release the flock and unlink
+    // the pid file at `serve()` return, which is before `#[tokio::main]`
+    // drops the runtime. A hung worker thread during that teardown is still
+    // this process; the singleton must hold until the kernel closes the fd.
+    if let Some(path) = &pid_file_path {
+        match PidFileGuard::acquire(path) {
             Ok(guard) => {
                 tracing::info!(pid = guard.pid, pid_file = %path.display(), "engine pid file is ready");
-                Some(guard)
+                guard.hold_until_process_exit();
             }
             Err(err) => {
                 if let super::pid_file::AcquireError::AlreadyHeld { holder_pid, .. } = &err {
@@ -576,9 +583,8 @@ pub async fn serve_with_overrides(
                 }
                 return Err(err.into());
             }
-        },
-        None => None,
-    };
+        }
+    }
 
     let (control_token, _control_token_guard) = match control_token_path {
         Some(path) => {
