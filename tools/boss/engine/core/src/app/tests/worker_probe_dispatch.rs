@@ -238,7 +238,7 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
         .unwrap();
 
     // Map the execution (via its exec_* id) to slot 1 so dispatch_probe_on_stop
-    // has a target for `SendToPane`. In production BOSS_RUN_ID carries
+    // has a pane to write into. In production BOSS_RUN_ID carries
     // execution.id (exec_*), not run.id (run_*). Park activity at Idle so
     // the Stop-path activity guard (fail closed) allows the write.
     register_idle_worker(&server_state, &execution.id, 1);
@@ -324,12 +324,11 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
     );
 }
 
-/// Safety guard: a probe on PostToolUse must **not** write to the
-/// pane when the run has no resolvable driver — `register_working_worker`
-/// registers a bare run id with no execution row behind it, so the mid-turn
-/// decision cannot establish what the foreground process does with stdin and
-/// fails closed. Injecting into a non-consuming foreground process is a safety
-/// issue (ghostty-codex-pane-viability Q2 Layer D), not hygiene.
+/// Safety guard: a probe on PostToolUse must **not** write to the pane when
+/// the worker is mid-turn on a driver that rejects stdin (`grok`). Live tmux
+/// delivery is installed so the posture guard is what refuses the write, not
+/// a missing transport. Injecting into a non-consuming foreground process is
+/// a safety issue (ghostty-codex-pane-viability Q2 Layer D), not hygiene.
 ///
 /// Note what this does *not* assert: that `Working` alone forbids the write.
 /// It does not — a mid-turn worker on a driver that buffers stdin is
@@ -345,8 +344,8 @@ async fn dispatch_probe_defers_when_worker_not_accepting_input() {
     use crate::protocol::WorkerEvent;
 
     let (server_state, _dir) = test_server_state();
-    let run_id = "run-urgent-refused";
-    register_working_worker(&server_state, run_id, 5);
+    let run_id = register_working_worker_with_driver(&server_state, 5, Some("grok"));
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 5, "boss-5");
 
     let watch_session_id = "session-probe-watch-refuse".to_owned();
     let watch_sink = make_session_sink();
@@ -356,10 +355,10 @@ async fn dispatch_probe_defers_when_worker_not_accepting_input() {
         .await;
     server_state
         .topic_broker
-        .subscribe(&watch_session_id, &[probe_topic(run_id)])
+        .subscribe(&watch_session_id, &[probe_topic(&run_id)])
         .await;
 
-    let probe_id = server_state.queue_probe(run_id.to_owned(), "what now?".into(), true);
+    let probe_id = server_state.queue_probe(run_id.clone(), "what now?".into(), true);
 
     let post_tool_use = crate::events_socket::IncomingHookEvent::for_test(
         WorkerEvent::PostToolUse {
@@ -368,17 +367,19 @@ async fn dispatch_probe_defers_when_worker_not_accepting_input() {
             tool_input: serde_json::json!({}),
             tool_response: serde_json::json!({}),
         },
-        Some(run_id.to_owned()),
+        Some(run_id.clone()),
         None,
     );
     dispatch_probe_on_post_tool_use(&server_state, &post_tool_use).await;
 
-    // Pre-write guard: no SendToPane was issued.
-    // Pane write refused: no tmux identity / no injectable posture, so no send-keys.
-    let _ = "deferred probe must not enqueue SendToPane";
+    assert!(
+        !runner.wrote_text(),
+        "deferred probe must not write into the pane; calls={:?}",
+        runner.calls(),
+    );
     // Probe remains queued (never popped) for Stop-boundary delivery.
     let still = server_state
-        .pop_pending_probe(run_id)
+        .pop_pending_probe(&run_id)
         .expect("deferred probe must remain queued for Stop boundary");
     assert_eq!(still.probe_id, probe_id);
     assert_eq!(
@@ -406,7 +407,18 @@ async fn dispatch_probe_on_idle_records_unconfirmed_without_redelivery() {
 
     let (server_state, _dir) = test_server_state();
     let run_id = register_idle_worker_with_driver(&server_state, 6, None);
-    let _tmux = install_live_tmux_delivery(&server_state, &run_id, 6, "boss-6");
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 6, "boss-6");
+
+    let watch_session_id = "session-probe-watch-unconfirmed".to_owned();
+    let watch_sink = make_session_sink();
+    server_state
+        .topic_broker
+        .register_session(&watch_session_id, watch_sink.clone())
+        .await;
+    server_state
+        .topic_broker
+        .subscribe(&watch_session_id, &[probe_topic(&run_id)])
+        .await;
 
     let probe_id = server_state.queue_probe(run_id.clone(), "what now?".into(), true);
 
@@ -429,6 +441,15 @@ async fn dispatch_probe_on_idle_records_unconfirmed_without_redelivery() {
     dispatch.await.expect("dispatch task");
 
     assert!(
+        runner.wrote_text(),
+        "the pane write itself must have gone out; calls={:?}",
+        runner.calls(),
+    );
+    assert!(
+        server_state.take_in_flight_probe(&run_id).is_some(),
+        "unconfirmed delivery keeps the in-flight slot so a later reply is still captured",
+    );
+    assert!(
         server_state.pop_pending_probe(&run_id).is_none(),
         "delivered probe must not be auto-redelivered",
     );
@@ -437,6 +458,26 @@ async fn dispatch_probe_on_idle_records_unconfirmed_without_redelivery() {
         Some(ProbeDeliveryState::Unconfirmed),
         "unconfirmed delivery must be recorded, not left unknown",
     );
+
+    let envelope = watch_sink
+        .next()
+        .await
+        .expect("unconfirmed delivery must publish ProbeDeliveryEscalated");
+    match envelope.payload {
+        FrontendEvent::ProbeDeliveryEscalated {
+            run_id: emitted_run,
+            probe_id: emitted_probe,
+            reason,
+        } => {
+            assert_eq!(emitted_run, run_id);
+            assert_eq!(emitted_probe, probe_id);
+            assert!(
+                reason.contains("unconfirmed"),
+                "escalation reason must name unconfirmed delivery, got {reason}"
+            );
+        }
+        other => panic!("expected ProbeDeliveryEscalated, got {other:?}"),
+    }
 }
 
 /// Regression: `dispatch_probe_now` must deliver a probe
@@ -494,12 +535,16 @@ async fn probe_queued_for_idle_worker_dispatches_immediately() {
         "precondition: worker must be idle",
     );
 
-    let _tmux = install_live_tmux_delivery(&server_state, &execution.id, 1, "boss-probe");
+    let runner = install_live_tmux_delivery(&server_state, &execution.id, 1, "boss-probe");
     // Queue the probe and call dispatch_probe_now directly.
     server_state.queue_probe(execution.id.clone(), "coordinator nudge".into(), false);
     dispatch_probe_now(&server_state, &execution.id).await;
 
-    // The app_responder task must have seen the SendToPane by now.
+    assert!(
+        runner.wrote_text(),
+        "idle immediate dispatch must write the probe into the pane; calls={:?}",
+        runner.calls(),
+    );
 
     // Probe must have been consumed (popped from pending_probes and
     // an in-flight entry recorded).
@@ -574,13 +619,17 @@ async fn probe_queued_for_waiting_for_input_worker_dispatches_immediately() {
         "precondition: worker must be parked in WaitingForInput",
     );
 
-    // Register a fake app session to receive the SendToPane.
-    let _tmux = install_live_tmux_delivery(&server_state, &execution.id, 1, "boss-probe");
+    let runner = install_live_tmux_delivery(&server_state, &execution.id, 1, "boss-probe");
 
     // Queue the probe and call dispatch_probe_now directly.
     server_state.queue_probe(execution.id.clone(), "coordinator nudge".into(), false);
     dispatch_probe_now(&server_state, &execution.id).await;
 
+    assert!(
+        runner.wrote_text(),
+        "WaitingForInput immediate dispatch must write the probe into the pane; calls={:?}",
+        runner.calls(),
+    );
     assert!(
         server_state.pop_pending_probe(&execution.id).is_none(),
         "probe must be consumed, not left in pending_probes",
@@ -629,8 +678,7 @@ async fn completion_probe_dispatched_on_same_stop_as_completion() {
     // BEFORE dispatch_probe_on_stop fires, to verify the dispatch picks it up.
     server_state.queue_probe(execution.id.clone(), "push your PR".into(), false);
 
-    // Register a fake app session to capture the SendToPane.
-    let _tmux = install_live_tmux_delivery(&server_state, &execution.id, 1, "boss-probe");
+    let runner = install_live_tmux_delivery(&server_state, &execution.id, 1, "boss-probe");
 
     // Fire the Stop event. With the new ordering, dispatch_probe_on_stop
     // runs after dispatch_completion_on_stop and sees the queued probe.
@@ -645,6 +693,11 @@ async fn completion_probe_dispatched_on_same_stop_as_completion() {
     );
     dispatch_probe_on_stop(&server_state, &stop).await;
 
+    assert!(
+        runner.wrote_text(),
+        "same-Stop completion probe must write into the pane; calls={:?}",
+        runner.calls(),
+    );
     assert!(
         server_state.pop_pending_probe(&execution.id).is_none(),
         "probe must be consumed by dispatch_probe_on_stop",
@@ -802,7 +855,7 @@ async fn probe_defers_through_fanout_then_delivers_on_stop() {
     // Grok rejects mid-turn stdin, but the execution still has a concrete
     // driver identity that the terminal Stop-boundary delivery can verify.
     let run_id = register_working_worker_with_driver(&server_state, 3, Some("grok"));
-    let _tmux = install_live_tmux_delivery(&server_state, &run_id, 3, "boss-3");
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 3, "boss-3");
 
     let probe_id = server_state.queue_probe(run_id.clone(), "please pivot".into(), true);
 
@@ -819,8 +872,11 @@ async fn probe_defers_through_fanout_then_delivers_on_stop() {
     );
     dispatch_worker_event_fanout(&server_state, &post_tool_use).await;
 
-    // Pane write refused: no tmux identity / no injectable posture, so no send-keys.
-    let _ = "fan-out PostToolUse while Working must not SendToPane";
+    assert!(
+        !runner.wrote_text(),
+        "fan-out PostToolUse while Working must not write into the pane; calls={:?}",
+        runner.calls(),
+    );
     // Peek without consuming for the Stop step: re-queue after assert.
     let still = server_state
         .pop_pending_probe(&run_id)
@@ -844,6 +900,11 @@ async fn probe_defers_through_fanout_then_delivers_on_stop() {
     dispatch_probe_on_stop(&server_state, &stop).await;
 
     assert!(
+        runner.wrote_text(),
+        "Stop after mid-turn deferral must write the probe into the pane; calls={:?}",
+        runner.calls(),
+    );
+    assert!(
         server_state.pop_pending_probe(&run_id).is_none(),
         "probe must be consumed on Stop after mid-turn deferral",
     );
@@ -861,10 +922,11 @@ async fn dispatch_probe_on_stop_refuses_when_live_state_missing() {
     use crate::protocol::WorkerEvent;
 
     let (server_state, _dir) = test_server_state();
-    let run_id = "run-stop-no-live";
-    server_state.worker_registry.register_run_slot(run_id, 2);
+    let run_id = execution_id_with_driver(&server_state, None);
+    server_state.worker_registry.register_run_slot(&run_id, 2);
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 2, "boss-2");
 
-    let probe_id = server_state.queue_probe(run_id.to_owned(), "hello?".into(), false);
+    let probe_id = server_state.queue_probe(run_id.clone(), "hello?".into(), false);
 
     let stop = crate::events_socket::IncomingHookEvent::for_test(
         WorkerEvent::Stop {
@@ -872,32 +934,89 @@ async fn dispatch_probe_on_stop_refuses_when_live_state_missing() {
             stop_hook_active: false,
             stop_reason: crate::protocol::StopReason::Completed,
         },
-        Some(run_id.to_owned()),
+        Some(run_id.clone()),
         None,
     );
     dispatch_probe_on_stop(&server_state, &stop).await;
 
-    // Pane write refused: no tmux identity / no injectable posture, so no send-keys.
-    let _ = "missing live state must fail closed — no SendToPane";
+    assert!(
+        !runner.wrote_text(),
+        "missing live state must fail closed with no pane write; calls={:?}",
+        runner.calls(),
+    );
     let still = server_state
-        .pop_pending_probe(run_id)
+        .pop_pending_probe(&run_id)
         .expect("probe must remain queued when Stop refuses");
     assert_eq!(still.probe_id, probe_id);
 }
 
 /// A pane write that succeeds after the slot mapping has already been
-/// cleared must settle orphaned, not consumed. With tmux delivery the
-/// write is synchronous, so the race is set up by dropping the mapping
-/// before `dispatch_probe_on_stop` records the outcome: identity is
-/// present for the transport check, then the slot is taken so
-/// `record_pane_write_outcome` sees no run.
+/// cleared must settle orphaned, not consumed. tmux delivery awaits
+/// `send_keys` and delivery confirmation, so teardown can still interleave:
+/// the runner hook drops the mapping while the text write is pending, and
+/// `record_pane_write_outcome` must recheck the slot after the write.
 #[tokio::test]
 async fn a_pane_write_raced_by_concurrent_teardown_settles_orphaned_not_consumed() {
     use crate::protocol::WorkerEvent;
 
     let (server_state, _dir) = test_server_state();
+    let run_id = register_idle_worker_with_driver(&server_state, 9, None);
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 9, "boss-9");
+    let probe_id = server_state.queue_probe(run_id.clone(), "status?".into(), false);
+
+    let take_state = server_state.clone();
+    let take_run = run_id.clone();
+    runner.set_on_text_write(move || {
+        take_state.worker_registry.take_slot_for_run(&take_run);
+    });
+
+    let stop = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
+            session_id: "sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Completed,
+        },
+        Some(run_id.clone()),
+        None,
+    );
+    let outcome = dispatch_probe_on_stop(&server_state, &stop).await;
+
+    assert!(
+        runner.wrote_text(),
+        "the race is post-write: bytes must have reached tmux before the mapping vanished; calls={:?}",
+        runner.calls(),
+    );
+    assert_eq!(
+        outcome,
+        ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Orphaned),
+        "a write whose pane was released before the outcome was recorded must settle orphaned",
+    );
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Orphaned),
+    );
+    let attentions = server_state
+        .work_db
+        .list_attention_items(&run_id)
+        .expect("attention items readable");
+    assert!(
+        attentions
+            .iter()
+            .any(|item| item.kind == crate::app::probes::PROBE_UNDELIVERED_ATTENTION_KIND),
+        "an orphaned post-write probe must file PROBE_UNDELIVERED attention",
+    );
+}
+
+/// Pre-write fail-closed: if the run already has no slot mapping,
+/// `dispatch_probe_on_stop` must not write and must leave the probe queued.
+#[tokio::test]
+async fn dispatch_probe_on_stop_refuses_when_slot_mapping_is_already_gone() {
+    use crate::protocol::WorkerEvent;
+
+    let (server_state, _dir) = test_server_state();
     let run_id = execution_id_with_driver(&server_state, None);
     register_idle_worker(&server_state, &run_id, 9);
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 9, "boss-9");
     let probe_id = server_state.queue_probe(run_id.clone(), "status?".into(), false);
     server_state.worker_registry.take_slot_for_run(&run_id);
 
@@ -912,6 +1031,11 @@ async fn a_pane_write_raced_by_concurrent_teardown_settles_orphaned_not_consumed
     );
     let outcome = dispatch_probe_on_stop(&server_state, &stop).await;
 
+    assert!(
+        !runner.wrote_text(),
+        "a missing slot mapping must not write; calls={:?}",
+        runner.calls(),
+    );
     assert_eq!(
         outcome,
         ProbeDispatchOutcome::NoSlotMapping,

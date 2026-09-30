@@ -52,7 +52,7 @@ fn post_tool_use(run_id: &str) -> crate::events_socket::IncomingHookEvent {
     )
 }
 
-fn last_tmux_paste(runner: &super::tmux_stub::AlivePaneRunner) -> String {
+fn last_tmux_paste(runner: &super::tmux_stub::RecordingPaneRunner) -> String {
     try_last_tmux_paste(runner).unwrap_or_else(|| {
         panic!(
             "expected a tmux pane write; calls={:?} stdin={:?}",
@@ -62,7 +62,7 @@ fn last_tmux_paste(runner: &super::tmux_stub::AlivePaneRunner) -> String {
     })
 }
 
-fn try_last_tmux_paste(runner: &super::tmux_stub::AlivePaneRunner) -> Option<String> {
+fn try_last_tmux_paste(runner: &super::tmux_stub::RecordingPaneRunner) -> Option<String> {
     if let Some(stdin) = runner.stdin().last()
         && !stdin.is_empty()
     {
@@ -80,7 +80,10 @@ fn try_last_tmux_paste(runner: &super::tmux_stub::AlivePaneRunner) -> Option<Str
     None
 }
 
-fn install_probe_tmux(server_state: &ServerState, run_id: &str) -> std::sync::Arc<super::tmux_stub::AlivePaneRunner> {
+fn install_probe_tmux(
+    server_state: &ServerState,
+    run_id: &str,
+) -> std::sync::Arc<super::tmux_stub::RecordingPaneRunner> {
     let slot = server_state
         .worker_registry
         .slot_for_run(run_id)

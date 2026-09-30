@@ -292,17 +292,6 @@ pub enum EngineToAppError {
     /// App-side failure with detail.
     #[error("app internal error: {message}")]
     Internal { message: String },
-    /// The app inspected the PTY immediately before input and found that the
-    /// run's driver was no longer foreground. This is terminal evidence for
-    /// the worker run, not a retryable pane-write error.
-    #[error(
-        "worker driver exited before pane input (expected {expected_driver_binary:?}, observed {observed_process:?})"
-    )]
-    DriverExited {
-        expected_driver_binary: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        observed_process: Option<String>,
-    },
 }
 
 #[cfg(test)]

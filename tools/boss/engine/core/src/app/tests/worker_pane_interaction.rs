@@ -1,182 +1,7 @@
 use super::*;
-use std::ffi::OsString;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use async_trait::async_trait;
-use boss_tmux::{CommandOutput, CommandRunner, Tmux};
-
-/// The mocked tmux facts a [`PaneDeliveryRunner`] answers with. Kept as its
-/// own type (rather than four fields directly on the runner) so the runner
-/// itself stays under the project's `#[derive(bon::Builder)]` field-count
-/// threshold.
-struct PaneMockState {
-    foreground_process: String,
-    session_name: String,
-    /// Whether `list-sessions` reports this pane's session as present. Real
-    /// death evidence — not a foreground-command mismatch — is what the
-    /// tmux pane-delivery boundary must key off; see
-    /// `send_input_refuses_a_dead_tmux_pane`.
-    session_present: bool,
-    /// Whether `#{pane_dead}` reports the pane as dead.
-    pane_dead: bool,
-    /// The `BOSS_SPAWN_TOKEN` `show-environment` reports for this session.
-    /// Must match the token seeded via `register_tmux_identity_for_test` for
-    /// the pane to read as alive; `spawn_token_mismatch` tests deliberately
-    /// mismatch it against the run row instead.
-    spawn_token: String,
-}
-
-struct PaneDeliveryRunner {
-    calls: Mutex<Vec<Vec<String>>>,
-    stdin: Mutex<Vec<Vec<u8>>>,
-    started: tokio::sync::Notify,
-    state: PaneMockState,
-}
-
-impl Default for PaneDeliveryRunner {
-    fn default() -> Self {
-        Self::alive("claude", "boss-1")
-    }
-}
-
-/// The spawn token every fixture that wants a *matching* token seeds via
-/// `register_tmux_identity_for_test` and the mock both use, so tests that
-/// aren't specifically about spawn-token mismatch don't have to thread it
-/// through.
-const TEST_SPAWN_TOKEN: &str = "tok-test";
-
-impl PaneDeliveryRunner {
-    fn new(
-        foreground_process: impl Into<String>,
-        session_name: impl Into<String>,
-        session_present: bool,
-        pane_dead: bool,
-    ) -> Self {
-        Self::with_spawn_token(
-            foreground_process,
-            session_name,
-            session_present,
-            pane_dead,
-            TEST_SPAWN_TOKEN,
-        )
-    }
-
-    fn with_spawn_token(
-        foreground_process: impl Into<String>,
-        session_name: impl Into<String>,
-        session_present: bool,
-        pane_dead: bool,
-        spawn_token: impl Into<String>,
-    ) -> Self {
-        Self {
-            calls: Mutex::new(Vec::new()),
-            stdin: Mutex::new(Vec::new()),
-            started: tokio::sync::Notify::new(),
-            state: PaneMockState {
-                foreground_process: foreground_process.into(),
-                session_name: session_name.into(),
-                session_present,
-                pane_dead,
-                spawn_token: spawn_token.into(),
-            },
-        }
-    }
-
-    /// A live pane whose session exists and is not reported dead —
-    /// `foreground_process` may or may not match the run's driver binary,
-    /// which by itself must never be treated as death evidence.
-    fn alive(foreground_process: impl Into<String>, session_name: impl Into<String>) -> Self {
-        Self::new(foreground_process, session_name, true, false)
-    }
-
-    /// A pane whose tmux session no longer exists at all.
-    fn session_gone(session_name: impl Into<String>) -> Self {
-        Self::new("", session_name, false, false)
-    }
-
-    /// A pane whose session exists but tmux itself reports `#{pane_dead}`.
-    fn pane_reported_dead(session_name: impl Into<String>) -> Self {
-        Self::new("", session_name, true, true)
-    }
-
-    /// A pane whose session name is present, but whose live spawn token no
-    /// longer matches the run row — the session was recycled and now
-    /// belongs to a different, later-spawned session.
-    fn spawn_token_mismatch(session_name: impl Into<String>) -> Self {
-        Self::with_spawn_token("claude", session_name, true, false, "tok-other")
-    }
-
-    fn calls(&self) -> Vec<Vec<String>> {
-        self.calls.lock().unwrap().clone()
-    }
-    fn stdin(&self) -> Vec<Vec<u8>> {
-        self.stdin.lock().unwrap().clone()
-    }
-
-    fn success(stdout: impl Into<String>) -> CommandOutput {
-        CommandOutput {
-            success: true,
-            code: Some(0),
-            stdout: stdout.into(),
-            stderr: String::new(),
-        }
-    }
-
-    fn response(&self, args: &[OsString]) -> CommandOutput {
-        let args = args.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>();
-        if args.iter().any(|arg| arg == "list-sessions") {
-            return Self::success(if self.state.session_present {
-                format!("{}\t\n", self.state.session_name)
-            } else {
-                String::new()
-            });
-        }
-        if args.iter().any(|arg| arg == "show-environment") {
-            return Self::success(format!("BOSS_SPAWN_TOKEN={}\n", self.state.spawn_token));
-        }
-        if args.iter().any(|arg| arg == "#{pane_current_command}") {
-            return Self::success(format!("{}\n", self.state.foreground_process));
-        }
-        if args.iter().any(|arg| arg == "#{pane_dead}") {
-            return Self::success(if self.state.pane_dead { "1\n" } else { "0\n" });
-        }
-        if args.iter().any(|arg| arg == "#{pane_dead_status}") {
-            return Self::success(if self.state.pane_dead { "1\n" } else { "" });
-        }
-        Self::success("")
-    }
-}
-
-#[async_trait]
-impl CommandRunner for PaneDeliveryRunner {
-    async fn run(&self, _program: &Path, args: &[OsString], cwd: Option<&Path>) -> std::io::Result<CommandOutput> {
-        assert!(cwd.is_none());
-        self.calls
-            .lock()
-            .unwrap()
-            .push(args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect());
-        self.started.notify_one();
-        Ok(self.response(args))
-    }
-
-    async fn run_with_stdin(
-        &self,
-        _program: &Path,
-        args: &[OsString],
-        cwd: Option<&Path>,
-        stdin: &[u8],
-    ) -> std::io::Result<CommandOutput> {
-        assert!(cwd.is_none());
-        self.calls
-            .lock()
-            .unwrap()
-            .push(args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect());
-        self.stdin.lock().unwrap().push(stdin.to_vec());
-        self.started.notify_one();
-        Ok(self.response(args))
-    }
-}
+use super::tmux_stub::{RecordingPaneRunner, TEST_SPAWN_TOKEN, tmux_with_runner};
 
 #[tokio::test]
 async fn focus_worker_pane_unknown_run_returns_unknown_run() {
@@ -308,7 +133,12 @@ async fn send_input_is_unaffected_by_a_driver_pin_change_after_launch() {
         )
         .unwrap();
 
-    let _tmux = install_live_tmux_delivery(&server_state, &run_id, 7, "boss-7");
+    server_state
+        .worker_registry
+        .register_tmux_run_slot(&run_id, 7, "boss-7");
+    register_tmux_identity_for_test(&server_state, &run_id, "boss-7", TEST_SPAWN_TOKEN);
+    let runner = Arc::new(RecordingPaneRunner::new("boss-7").echo_last_paste());
+    *server_state.pane_delivery_tmux_override.write().unwrap() = Some(tmux_with_runner(runner.clone()));
     assert_eq!(
         server_state
             .send_input_to_worker(&run_id, "/help\n".into())
@@ -326,9 +156,8 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
         .worker_registry
         .register_tmux_run_slot(&run_id, 7, "boss-tmux-send");
     register_tmux_identity_for_test(&server_state, &run_id, "boss-tmux-send", TEST_SPAWN_TOKEN);
-    let runner = Arc::new(PaneDeliveryRunner::alive("claude", "boss-tmux-send"));
-    *server_state.pane_delivery_tmux_override.write().unwrap() =
-        Some(Tmux::with_runner_and_socket("/usr/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap());
+    let runner = Arc::new(RecordingPaneRunner::alive("claude", "boss-tmux-send"));
+    *server_state.pane_delivery_tmux_override.write().unwrap() = Some(tmux_with_runner(runner.clone()));
 
     // No app session is registered. The runner notification proves the
     // waiter has been registered and the direct tmux path was selected before
@@ -457,9 +286,8 @@ async fn send_input_refuses_a_dead_tmux_pane() {
         .worker_registry
         .register_tmux_run_slot(&run_id, 1, "boss-tmux-driver-exited");
     register_tmux_identity_for_test(&server_state, &run_id, "boss-tmux-driver-exited", TEST_SPAWN_TOKEN);
-    let runner = Arc::new(PaneDeliveryRunner::session_gone("boss-tmux-driver-exited"));
-    *server_state.pane_delivery_tmux_override.write().unwrap() =
-        Some(Tmux::with_runner_and_socket("/usr/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap());
+    let runner = Arc::new(RecordingPaneRunner::session_gone("boss-tmux-driver-exited"));
+    *server_state.pane_delivery_tmux_override.write().unwrap() = Some(tmux_with_runner(runner.clone()));
 
     let (teardown, _) = super::tmux_stub::fake_tmux([super::tmux_stub::failure("session not found")]);
     server_state.set_tmux_override_for_test(teardown);
@@ -531,9 +359,8 @@ async fn send_input_refuses_a_tmux_pane_reported_dead() {
         .worker_registry
         .register_tmux_run_slot(&run_id, 1, "boss-tmux-pane-dead");
     register_tmux_identity_for_test(&server_state, &run_id, "boss-tmux-pane-dead", TEST_SPAWN_TOKEN);
-    let runner = Arc::new(PaneDeliveryRunner::pane_reported_dead("boss-tmux-pane-dead"));
-    *server_state.pane_delivery_tmux_override.write().unwrap() =
-        Some(Tmux::with_runner_and_socket("/usr/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap());
+    let runner = Arc::new(RecordingPaneRunner::pane_reported_dead("boss-tmux-pane-dead"));
+    *server_state.pane_delivery_tmux_override.write().unwrap() = Some(tmux_with_runner(runner.clone()));
 
     let err = server_state
         .send_input_to_worker(&run_id, "do not write this to a dead pane".into())
@@ -578,9 +405,8 @@ async fn mid_turn_probe_to_a_tmux_pane_running_a_foreground_child_is_not_orphane
         .worker_registry
         .register_tmux_run_slot(&run_id, 2, "boss-tmux-foreground-child");
     register_tmux_identity_for_test(&server_state, &run_id, "boss-tmux-foreground-child", TEST_SPAWN_TOKEN);
-    let runner = Arc::new(PaneDeliveryRunner::alive("bazel", "boss-tmux-foreground-child"));
-    *server_state.pane_delivery_tmux_override.write().unwrap() =
-        Some(Tmux::with_runner_and_socket("/usr/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap());
+    let runner = Arc::new(RecordingPaneRunner::alive("bazel", "boss-tmux-foreground-child"));
+    *server_state.pane_delivery_tmux_override.write().unwrap() = Some(tmux_with_runner(runner.clone()));
 
     let probe_id = server_state.queue_probe(run_id.clone(), "status update".into(), false);
     let post_tool_use = IncomingHookEvent::for_test(
@@ -637,9 +463,8 @@ async fn send_input_refuses_a_tmux_pane_whose_spawn_token_no_longer_matches() {
         .worker_registry
         .register_tmux_run_slot(&run_id, 1, "boss-tmux-recycled");
     register_tmux_identity_for_test(&server_state, &run_id, "boss-tmux-recycled", TEST_SPAWN_TOKEN);
-    let runner = Arc::new(PaneDeliveryRunner::spawn_token_mismatch("boss-tmux-recycled"));
-    *server_state.pane_delivery_tmux_override.write().unwrap() =
-        Some(Tmux::with_runner_and_socket("/usr/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap());
+    let runner = Arc::new(RecordingPaneRunner::spawn_token_mismatch("boss-tmux-recycled"));
+    *server_state.pane_delivery_tmux_override.write().unwrap() = Some(tmux_with_runner(runner.clone()));
 
     let err = server_state
         .send_input_to_worker(&run_id, "must not reach a foreign agent's pane".into())

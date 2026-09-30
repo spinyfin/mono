@@ -640,78 +640,66 @@ impl ServerState {
         text: &str,
     ) -> Result<(), PaneSendFailure> {
         let expected_driver_binary = self.expected_driver_binary(run_id)?;
-        let pane = self.worker_registry.pane_for_run(run_id);
-        match pane {
-            Some(pane) if pane.tmux_session_name.is_some() => {
-                let Some(session_name) = pane.tmux_session_name.filter(|name| !name.is_empty()) else {
-                    return Err(PaneSendFailure::Tmux(anyhow::anyhow!(
-                        "tmux-hosted pane has no session name"
-                    )));
-                };
-                let tmux = self.tmux_for_pane_delivery(run_id).map_err(PaneSendFailure::Tmux)?;
-                let expected_spawn_token = self
-                    .work_db
-                    .tmux_identity_for_execution(run_id)
-                    .map_err(|err| {
-                        PaneSendFailure::DriverLivenessUnavailable(format!("tmux identity lookup failed: {err:#}"))
-                    })?
-                    .ok_or_else(|| {
-                        PaneSendFailure::DriverLivenessUnavailable(
-                            "no durable tmux identity recorded for run".to_owned(),
-                        )
-                    })?
-                    .spawn_token;
-                match Self::tmux_pane_confirmed_dead(
-                    self.work_db.as_ref(),
-                    run_id,
-                    &tmux,
-                    &session_name,
-                    &expected_spawn_token,
-                )
-                .await
-                {
-                    Ok(Some(pane_dead_status)) => {
-                        self.reconcile_driver_exit(
-                            run_id,
-                            slot_id,
-                            &expected_driver_binary,
-                            pane_dead_status.as_deref(),
-                        )
-                        .await;
-                        return Err(PaneSendFailure::DriverExited {
-                            expected_driver_binary,
-                            observed_process: pane_dead_status,
-                        });
-                    }
-                    Ok(None) => {
-                        // The pane is alive: the session exists, its spawn
-                        // token matches the run row, and tmux does not
-                        // report the pane as dead. That the pane's
-                        // foreground command may differ from the driver
-                        // binary (e.g. the agent is running a foreground
-                        // `bazel build`) is expected and is NOT evidence the
-                        // driver exited — `TmuxWorkerTerminalInspector`
-                        // carries `#{pane_current_command}` as a diagnostic
-                        // only, and `classify_semantic_staleness` never
-                        // consults it for health. Only actual proof of
-                        // death (session absent or `#{pane_dead}`) may
-                        // terminalize the run.
-                    }
-                    Err(err) => {
-                        return Err(PaneSendFailure::DriverLivenessUnavailable(format!(
-                            "terminal liveness probe failed: {err:#}"
-                        )));
-                    }
-                }
-                // `send_keys` strips trailing newlines itself and submits
-                // with a separate Return, so the caller passes the payload
-                // verbatim here.
-                tmux.send_keys(&session_name, text).await.map_err(PaneSendFailure::Tmux)
-            }
-            _ => Err(PaneSendFailure::Tmux(anyhow::anyhow!(
+        let Some(pane) = self.worker_registry.pane_for_run(run_id) else {
+            return Err(PaneSendFailure::Tmux(anyhow::anyhow!(
+                "no worker pane mapped for that run id"
+            )));
+        };
+        let Some(session_name) = pane.tmux_session_name.filter(|name| !name.is_empty()) else {
+            return Err(PaneSendFailure::Tmux(anyhow::anyhow!(
                 "local worker has no tmux session identity"
-            ))),
+            )));
+        };
+        let tmux = self.tmux_for_pane_delivery(run_id).map_err(PaneSendFailure::Tmux)?;
+        let expected_spawn_token = self
+            .work_db
+            .tmux_identity_for_execution(run_id)
+            .map_err(|err| PaneSendFailure::DriverLivenessUnavailable(format!("tmux identity lookup failed: {err:#}")))?
+            .ok_or_else(|| {
+                PaneSendFailure::DriverLivenessUnavailable("no durable tmux identity recorded for run".to_owned())
+            })?
+            .spawn_token;
+        match Self::tmux_pane_confirmed_dead(
+            self.work_db.as_ref(),
+            run_id,
+            &tmux,
+            &session_name,
+            &expected_spawn_token,
+        )
+        .await
+        {
+            Ok(Some(pane_dead_status)) => {
+                self.reconcile_driver_exit(run_id, slot_id, &expected_driver_binary, pane_dead_status.as_deref())
+                    .await;
+                return Err(PaneSendFailure::DriverExited {
+                    expected_driver_binary,
+                    observed_process: pane_dead_status,
+                });
+            }
+            Ok(None) => {
+                // The pane is alive: the session exists, its spawn
+                // token matches the run row, and tmux does not
+                // report the pane as dead. That the pane's
+                // foreground command may differ from the driver
+                // binary (e.g. the agent is running a foreground
+                // `bazel build`) is expected and is NOT evidence the
+                // driver exited — `TmuxWorkerTerminalInspector`
+                // carries `#{pane_current_command}` as a diagnostic
+                // only, and `classify_semantic_staleness` never
+                // consults it for health. Only actual proof of
+                // death (session absent or `#{pane_dead}`) may
+                // terminalize the run.
+            }
+            Err(err) => {
+                return Err(PaneSendFailure::DriverLivenessUnavailable(format!(
+                    "terminal liveness probe failed: {err:#}"
+                )));
+            }
         }
+        // `send_keys` strips trailing newlines itself and submits
+        // with a separate Return, so the caller passes the payload
+        // verbatim here.
+        tmux.send_keys(&session_name, text).await.map_err(PaneSendFailure::Tmux)
     }
 
     /// Write `req.text` into `req.run_id`'s worker pane (`req.slot_id`) and

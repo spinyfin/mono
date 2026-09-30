@@ -2082,12 +2082,12 @@ fn active_chore_run_id_returns_none_when_no_live_worker() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn chore_update_notify_sends_message_to_live_worker() {
     // End-to-end smoke for the notification path: sets up a live
     // worker bound to an active chore, then simulates the
-    // UpdateWorkItem name-change flow and verifies a SendToPane
-    // message is enqueued toward the app session.
+    // UpdateWorkItem name-change flow and verifies the notice is
+    // written into the live worker pane.
     use boss_protocol::{RequestExecutionInput, WorkItemBinding, WorkItemPatch};
 
     let (server_state, _dir) = test_server_state();

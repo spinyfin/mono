@@ -194,25 +194,8 @@ pub(super) fn register_idle_worker_with_driver(
 /// tmux boundary now requires to validate a session before writing to it —
 /// mirroring what `spawn_flow` records in production before any pane input
 /// is possible. `session_name` must match what the test's mocked
-/// `PaneDeliveryRunner`/tmux stub reports for `list-sessions`/
+/// [`tmux_stub::RecordingPaneRunner`] reports for `list-sessions`/
 /// `show-environment` so the spawn-token comparison passes.
-pub(super) fn install_live_tmux_delivery(
-    server_state: &ServerState,
-    run_id: &str,
-    slot_id: u8,
-    session_name: &str,
-) -> std::sync::Arc<tmux_stub::AlivePaneRunner> {
-    server_state
-        .worker_registry
-        .register_tmux_run_slot(run_id, slot_id, session_name);
-    register_tmux_identity_for_test(server_state, run_id, session_name, tmux_stub::TEST_SPAWN_TOKEN);
-    let runner = tmux_stub::AlivePaneRunner::new(session_name);
-    *server_state.pane_delivery_tmux_override.write().unwrap() = Some(
-        boss_tmux::Tmux::with_runner_and_socket("/usr/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap(),
-    );
-    runner
-}
-
 pub(super) fn register_tmux_identity_for_test(
     server_state: &ServerState,
     execution_id: &str,
@@ -232,6 +215,24 @@ pub(super) fn register_tmux_identity_for_test(
         db.record_tmux_session_created_for_execution(execution_id, spawn_token, 4242)
             .expect("record_tmux_session_created_for_execution"),
     );
+}
+
+/// Point pane delivery at a live recording tmux session for `run_id` and
+/// persist the matching spawn-token identity. Capture-pane is empty, so
+/// parked writes settle unconfirmed unless the test confirms via a hook.
+pub(super) fn install_live_tmux_delivery(
+    server_state: &ServerState,
+    run_id: &str,
+    slot_id: u8,
+    session_name: &str,
+) -> std::sync::Arc<tmux_stub::RecordingPaneRunner> {
+    server_state
+        .worker_registry
+        .register_tmux_run_slot(run_id, slot_id, session_name);
+    register_tmux_identity_for_test(server_state, run_id, session_name, tmux_stub::TEST_SPAWN_TOKEN);
+    let runner = std::sync::Arc::new(tmux_stub::RecordingPaneRunner::new(session_name));
+    *server_state.pane_delivery_tmux_override.write().unwrap() = Some(tmux_stub::tmux_with_runner(runner.clone()));
+    runner
 }
 
 /// Like [`register_idle_worker`], but leaves activity at
