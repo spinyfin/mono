@@ -642,6 +642,55 @@ async fn readoption_does_not_overwrite_a_slot_held_by_a_different_live_execution
     );
 }
 
+/// The pool slot is free, but live-state already names a different run.
+/// Re-adoption must check live-state *before* `reclaim_slot`, which would
+/// otherwise write a claim onto the free slot and leave it behind when the
+/// live-state check then refuses to register.
+#[tokio::test]
+async fn readoption_does_not_claim_a_slot_whose_live_state_belongs_to_another_run() {
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+    let execution_id = create_spawned_execution(db, &work_item_id, i64::from(std::process::id()));
+    db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
+
+    let other_execution_id = "run-live-state-occupant";
+    server_state.live_worker_states.register_spawn(
+        1,
+        other_execution_id.to_owned(),
+        "claude-opus-4-7",
+        std::process::id() as i32,
+        None,
+    );
+    let claims_before = server_state.execution_coordinator.worker_pool().claims().await;
+    assert!(
+        claims_before.iter().all(|claim| claim.worker_id != "worker-1"),
+        "precondition: worker-1 must be unclaimed, got {claims_before:?}"
+    );
+
+    crate::app::worker_events::converge_terminal_execution_contradiction(&server_state, &execution_id, "post_tool_use")
+        .await;
+
+    let after = db.get_execution(&execution_id).unwrap();
+    assert_eq!(
+        after.status,
+        ExecutionStatus::Running,
+        "the row must still come back — that is what stops the duplicate dispatch",
+    );
+
+    let claims = server_state.execution_coordinator.worker_pool().claims().await;
+    assert!(
+        claims.iter().all(|claim| claim.worker_id != "worker-1"),
+        "re-adoption must not take a pool claim on a slot live-state still attributes to another run, got {claims:?}",
+    );
+    let state = server_state
+        .live_worker_states
+        .get(1)
+        .expect("the other run's live-state entry must not be dropped");
+    assert_eq!(state.run_id, other_execution_id);
+}
+
 // ─── progress-ingress readoption ────────────────────────────────────────────
 
 /// Read back the `progress_ingress` field the readoption stamped on its

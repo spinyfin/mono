@@ -1498,7 +1498,9 @@ pub async fn serve_with_overrides(
     // with durable tmux identity can be decided from the adoption pass
     // already above; rows with no durable tmux identity yet (or a
     // transient DB read failure) emit a loud diagnostic instead of
-    // guessing and are retried when the app session registers.
+    // guessing. The only retry trigger is app-session registration
+    // (`retry_startup_pane_reconcile`); a headless engine never retries
+    // these rows, and the app does not answer occupancy.
     server_state
         .reconcile_unspawned_running_panes(
             &tmux_adoption_report.adopted_execution_ids,
@@ -1939,15 +1941,13 @@ pub async fn serve_with_overrides(
         crate::envelope_watch::DEFAULT_RECONCILE_INTERVAL,
     );
 
-    // Periodic spawn-ack sweep: detects worker slots stuck in `Spawning`
-    // that never reported a shell pid AND never received a single hook
-    // event — proof no worker process ever came up at all, distinct from
-    // `mark_stalled_spawns` (which only ever promotes a slot that DOES
-    // have a pid, i.e. a real process blocked on the interactive
-    // directory-trust prompt). This is the fix for the 2026-07-03/04
-    // false-live incident, where such a slot instead sat at
-    // `activity=waiting_for_input, shell_pid=0` forever and had to be
-    // noticed and manually reaped. Runs every 60s and fires on boot.
+    // Periodic spawn-ack sweep: detects worker slots whose pane came up
+    // but never produced a driver-originated signal (the 2026-07-30
+    // login-shell class). Distinct from `mark_stalled_spawns`, which only
+    // ever promotes a slot that DOES have a pid. A pid-less `Spawning`
+    // slot is a tmux-invariant violation (spawn_flow refuses to register
+    // one) and is logged, not reaped as a timeout. Runs every 60s and
+    // fires on boot.
     let _spawn_ack_sweep_handle = crate::spawn_ack_sweep::spawn_loop(
         server_state.work_db.clone(),
         server_state.live_worker_states.clone(),
@@ -1957,7 +1957,6 @@ pub async fn serve_with_overrides(
         server_state.spawn_health.clone(),
         server_state.cube_client.clone(),
         Duration::from_secs(60),
-        crate::spawn_ack_sweep::SPAWN_ACK_GRACE_SECS,
         crate::live_worker_state::DRIVER_START_GRACE_SECS,
     );
 

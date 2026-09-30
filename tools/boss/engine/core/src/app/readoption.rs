@@ -368,26 +368,41 @@ impl ServerState {
         // that run's tracking alone rather than clobber it.
         let slot_id = match self.hosted_pane_slot_for_run(run_id) {
             Some(candidate_slot_id) => {
-                let worker_id = crate::coordinator::worker_id_for_slot(candidate_slot_id);
-                let reclaimed = self.execution_coordinator.reclaim_slot(&worker_id, run_id).await;
+                // Live-state is the occupancy oracle that `reclaim_slot` does
+                // not consult: that helper writes a claim onto a free pool
+                // slot. Check it first so a free pool + occupied live-state
+                // cannot leave a split claim behind when we then refuse to
+                // register.
                 let held_by_other_run = self
                     .live_worker_states
                     .get(candidate_slot_id)
                     .is_some_and(|state| state.run_id != run_id);
-                if reclaimed && !held_by_other_run {
-                    Some(candidate_slot_id)
-                } else {
+                if held_by_other_run {
                     tracing::warn!(
                         run_id,
                         slot_id = candidate_slot_id,
-                        reclaimed,
-                        held_by_other_run,
                         "readopt: the durably-derived slot is currently owned by a different live \
                          execution; skipping worker-registry and live-state registration so this \
                          readoption does not overwrite its tracking. The row is restored but \
                          re-dispatch protection rests on its status alone",
                     );
                     None
+                } else {
+                    let worker_id = crate::coordinator::worker_id_for_slot(candidate_slot_id);
+                    let reclaimed = self.execution_coordinator.reclaim_slot(&worker_id, run_id).await;
+                    if reclaimed {
+                        Some(candidate_slot_id)
+                    } else {
+                        tracing::warn!(
+                            run_id,
+                            slot_id = candidate_slot_id,
+                            "readopt: the durably-derived slot is currently claimed by a different \
+                             live execution; skipping worker-registry and live-state registration \
+                             so this readoption does not overwrite its tracking. The row is \
+                             restored but re-dispatch protection rests on its status alone",
+                        );
+                        None
+                    }
                 }
             }
             None => None,
@@ -785,13 +800,11 @@ impl ServerState {
     /// `ListHostedPanes` for viewer presentation — describing which slots
     /// already have a Ghostty viewer attached, so
     /// [`Self::reattach_worker_panes_to_registered_app`] does not send a
-    /// redundant `AttachWorkerPane` for one the app already holds. It is not
-    /// the *only* remaining use: `retire_pane`'s Guard 3
-    /// (`hosted_pane_run_for_slot`, `super::pane_ops`) and
-    /// `list_hosted_pane_statuses`'s husk classification still ask the app
-    /// which run occupies a slot as process evidence — converting those to
-    /// tmux inventory plus durable run identity is deliberately left for a
-    /// later pass.
+    /// redundant `AttachWorkerPane` for one the app already holds.
+    /// `retire_pane` Guard 3 and `list_hosted_pane_statuses` resolve slot
+    /// occupancy from live-state, the worker registry, and
+    /// `work_runs.agent_id`; they use `ListHostedPanes` only to describe
+    /// the viewer.
     async fn app_hosted_viewer_run_ids(&self) -> Result<HashSet<String>, String> {
         let request = EngineToAppRequest::ListHostedPanes(ListHostedPanesInput {});
         match self.send_to_app(request, Duration::from_secs(5)).await {
@@ -854,9 +867,10 @@ impl ServerState {
         }
     }
 
-    /// Retry only executions whose startup pass could not query the app.
-    /// Taking the cohort before awaiting makes rapid registrations harmless:
-    /// at most one registration can re-drive a particular startup row.
+    /// Retry executions whose startup pass could not establish durable tmux
+    /// identity (none recorded, or the identity read failed). Taking the
+    /// cohort before awaiting makes rapid registrations harmless: at most
+    /// one registration can re-drive a particular startup row.
     pub(crate) async fn retry_startup_pane_reconcile(&self) {
         let candidate_ids = std::mem::take(
             &mut *self

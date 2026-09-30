@@ -78,8 +78,9 @@ pub enum TeardownReason {
     RemoteLeaseReconcile,
     /// `stale_worker_sweep` — the worker is alive but wedged past threshold.
     StaleWorkerReconcile,
-    /// `spawn_ack_sweep` — no pid and no hook event ever arrived.
-    SpawnAckTimeout,
+    /// `spawn_ack_sweep` — driver-start verification found a pane with a
+    /// shell but no driver-originated signal within the grace window.
+    DriverStartTimeout,
 }
 
 impl TeardownReason {
@@ -105,7 +106,7 @@ impl TeardownReason {
             Self::CubeLeaseAutoReap => "cube_lease_auto_reap",
             Self::RemoteLeaseReconcile => "remote_lease_reconcile",
             Self::StaleWorkerReconcile => "stale_worker_reconcile",
-            Self::SpawnAckTimeout => "spawn_ack_timeout",
+            Self::DriverStartTimeout => "driver_start_timeout",
         }
     }
 

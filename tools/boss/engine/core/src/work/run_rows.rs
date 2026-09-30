@@ -596,6 +596,55 @@ impl WorkDb {
         Ok(agent_id)
     }
 
+    /// Newest local `work_runs` row whose `agent_id` is `agent_id`, or
+    /// `None` when no such row exists. Inverse of
+    /// [`Self::latest_local_agent_id_for_execution`] for occupancy lookups
+    /// keyed by pool slot (`worker-N` / `auto-worker-N` / `review-N`).
+    ///
+    /// Remote rows are excluded: a remote `agent_id` is never authoritative
+    /// for a local pane slot. When the same slot has been reused, the newest
+    /// local row is the current occupant.
+    pub fn latest_local_execution_id_for_agent_id(&self, agent_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT execution_id FROM work_runs
+             WHERE host_id = 'local' AND agent_id = ?1
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+            params![agent_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// `agent_id` of the newest local `work_runs` row for `execution_id`,
+    /// ordered by `created_at DESC, id DESC` — the same row
+    /// [`Self::latest_local_pane_pid_snapshot_for_execution`] reads.
+    ///
+    /// Occupancy's "is the newest run still on this slot?" check must use
+    /// this, not [`Self::latest_run_agent_id_for_execution`]: that helper
+    /// goes through [`resolve_run_id_for_execution_hooks`], which ranks
+    /// unfinished / non-failed / `transcript_path IS NOT NULL` above
+    /// recency, and can return an older worker id while the pid probe
+    /// follows the newer row.
+    pub fn latest_local_agent_id_for_execution(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT agent_id FROM work_runs
+             WHERE id = (
+                 SELECT id FROM work_runs
+                 WHERE execution_id = ?1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1
+             ) AND host_id = 'local'",
+            params![execution_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// Persist the remote worker pid onto the agent-session `work_runs` row
     /// for `execution_id`. The SSH spawn path captures the pid from the
     /// wrapper handshake (`parse_remote_pid`) and stamps it here so the

@@ -38,13 +38,16 @@
 //!
 //! [`crate::app::ServerState::list_hosted_pane_statuses`] and
 //! [`crate::app::ServerState::retire_pane`] remain as the manual,
-//! operator-invoked path (using `DetachWorkerPane` for viewer husks)
+//! operator-invoked path (using `DetachWorkerPane` for leftover viewers)
 //! via `bossctl agents list --all` /
-//! `bossctl agents retire-pane` over the app's own hosted-pane inventory.
-//! This sweep is the automatic backstop over the tmux server's inventory
-//! instead: once a leaked session has been reported untracked on two
-//! consecutive passes, it retires it (`tmux -S <state-root>/tmux.sock kill-session`),
-//! regardless of which terminal-transition site produced the divergence.
+//! `bossctl agents retire-pane`. Occupancy for those verbs is resolved
+//! from live-state, the worker registry, and `work_runs.agent_id`;
+//! `ListHostedPanes` only describes which slots still have a Ghostty
+//! viewer. This sweep is the automatic backstop over the tmux server's
+//! inventory instead: once a leaked session has been reported untracked
+//! on two consecutive passes, it retires it
+//! (`tmux -S <state-root>/tmux.sock kill-session`), regardless of which
+//! terminal-transition site produced the divergence.
 //!
 //! ## Two-pass confirmation
 //!
@@ -79,8 +82,8 @@
 //! The lesson is that a sweep whose action is irreversible must not take
 //! engine bookkeeping as its only input. [`live_process_evidence`] is the
 //! second, independent opinion: the OS (`kill(pid, 0)`) plus the worker's
-//! own hook stream. It backs the manual, app-hosted-pane break-glass path
-//! instead — `list_hosted_pane_statuses`'s own classification (so a live
+//! own hook stream. It backs the manual break-glass path instead —
+//! `list_hosted_pane_statuses`'s own classification (so a live
 //! worker is never flagged, never counted, and never appears in
 //! `bossctl agents list --all` as a husk) and again inside `retire_pane`'s
 //! guard (so the break-glass verb and any future caller inherit it too).

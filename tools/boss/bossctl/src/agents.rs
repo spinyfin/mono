@@ -246,7 +246,7 @@ pub(crate) async fn fetch_tmux_worker_statuses(client: &mut BossClient) -> Resul
 
 /// Fetch every pane the app hosts, classified against the engine's live
 /// registry and durable state (live / terminal-entry-with-live-process /
-/// husk) — see [`HostedPaneState`]. This is the durable-state fallback
+/// OccupancyInconclusive / husk) — see [`HostedPaneState`]. This is the durable-state fallback
 /// every `agents` verb consults once a plain live-registry lookup misses,
 /// so a crew name or slot id the operator can see in the app still
 /// resolves after the engine drops the live registry entry.
@@ -317,6 +317,7 @@ fn pane_state_label(state: &HostedPaneState) -> &'static str {
     match state {
         HostedPaneState::Live => "live",
         HostedPaneState::LiveProcessNoRegistry { .. } => "terminal entry, live process",
+        HostedPaneState::OccupancyInconclusive { .. } => "occupancy inconclusive",
         HostedPaneState::Husk => "husk",
     }
 }
@@ -677,6 +678,11 @@ pub(crate) async fn agents_list_live(socket_path: &Option<String>, json: bool, a
                     HostedPaneState::LiveProcessNoRegistry { evidence } => println!(
                         "slot {}  {}  run={}  TERMINAL ENTRY, LIVE PROCESS ({evidence}) — \
                          `bossctl agents stop {}` or `bossctl agents retire-pane {}` to reap it",
+                        pane.slot_id, pane.crew_name, pane.run_id, pane.run_id, pane.slot_id,
+                    ),
+                    HostedPaneState::OccupancyInconclusive { evidence } => println!(
+                        "slot {}  {}  run={}  OCCUPANCY INCONCLUSIVE ({evidence}) — \
+                         resolve the probe failure, or run `bossctl agents stop {}` then `bossctl agents retire-pane {}`",
                         pane.slot_id, pane.crew_name, pane.run_id, pane.run_id, pane.slot_id,
                     ),
                     HostedPaneState::Husk => println!(
@@ -1808,6 +1814,13 @@ fn print_hosted_pane_status(json: bool, pane: &HostedPaneStatus) {
             println!("  the engine has no live run tracked for this worker, but its process is still running.");
             println!(
                 "  `bossctl agents stop {}` or `bossctl agents retire-pane {}` will reap it.",
+                pane.run_id, pane.slot_id
+            );
+        }
+        HostedPaneState::OccupancyInconclusive { evidence } => {
+            println!("  state: occupancy inconclusive ({evidence})");
+            println!(
+                "  resolve the probe failure, or run `bossctl agents stop {}` then `bossctl agents retire-pane {}`.",
                 pane.run_id, pane.slot_id
             );
         }
