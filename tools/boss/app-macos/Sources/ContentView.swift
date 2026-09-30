@@ -329,7 +329,7 @@ struct ContentView: View {
             }
 
             ToolbarItem(placement: .primaryAction) {
-                UpdateBadgeToolbarButton(updateModel: updateModel)
+                UpdateBadgeToolbarButton(updateModel: updateModel, quitRequest: updateQuitRequest)
             }
         }
         .onChange(of: model.navigationMode) { _, newMode in
@@ -461,14 +461,27 @@ struct ContentView: View {
             // environment objects.
             .environmentObject(model)
         }
+        .onAppear {
+            UpdateQuitSurfaceBinding.bindQuitReturned(updateQuitRequest, updateModel: updateModel)
+        }
         .sheet(isPresented: Binding(
             get: { updateModel.showUpdateSheet },
-            set: { updateModel.showUpdateSheet = $0 }
+            set: { newValue in
+                if newValue {
+                    UpdateQuitSurfaceBinding.willPresent(updateQuitRequest)
+                }
+                updateModel.showUpdateSheet = newValue
+            }
         ), onDismiss: {
-            updateQuitRequest.didDismiss()
+            UpdateQuitSurfaceBinding.didDismiss(updateQuitRequest)
         }) {
             UpdateResultSheet(requestQuit: {
-                updateQuitRequest.request { updateModel.showUpdateSheet = false }
+                UpdateQuitSurfaceBinding.requestQuit(
+                    updateQuitRequest,
+                    isPresented: updateModel.showUpdateSheet
+                ) {
+                    updateModel.showUpdateSheet = false
+                }
             })
                 .environmentObject(updateModel)
         }

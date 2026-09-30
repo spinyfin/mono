@@ -564,11 +564,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// failed swap leaves the current bundle untouched and the startup path retries.
     func applicationWillTerminate(_ notification: Notification) {
         endAppNapActivityForApplicationLifetime()
-        if let plan = UpdateLifecycle.consumePendingRelaunch() {
-            UpdateLifecycle.armRelaunchHelper(for: plan)
-        } else {
-            UpdateLifecycle.applyQuitSwapIfNeeded()
-        }
+        UpdateLifecycle.handleConfirmedTermination()
     }
 
     /// Kept separate from the AppKit callbacks so the lifetime wiring can be

@@ -84,6 +84,20 @@ enum UpdateLifecycle {
         return pendingRelaunch
     }
 
+    /// Confirmed-quit hand-off used by `applicationWillTerminate`. Consumes a
+    /// parked relaunch plan when present; otherwise applies the automatic
+    /// swap-on-quit. Injected in tests so the helper is never spawned.
+    static func handleConfirmedTermination(
+        armRelaunch: (SwapPlan) -> Void = { _ = UpdateLifecycle.armRelaunchHelper(for: $0) },
+        applyQuitSwap: () -> Void = { UpdateLifecycle.applyQuitSwapIfNeeded() }
+    ) {
+        if let plan = consumePendingRelaunch() {
+            armRelaunch(plan)
+        } else {
+            applyQuitSwap()
+        }
+    }
+
     // MARK: Environment probes
 
     static var isAutomaticMode: Bool {

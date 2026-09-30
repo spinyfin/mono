@@ -140,85 +140,15 @@ struct UpdateResultSheet: View {
                 Button("Later") { dismiss() }
                     .keyboardShortcut(.cancelAction)
 
-                primaryActionButton(update: update, isDevBuild: isDevBuild)
-            }
-        }
-    }
-
-    // MARK: - Primary action (download / install)
-
-    /// The trailing call-to-action. Dev builds keep the manual browser download (the
-    /// updater never swaps over a dev build, per design non-goals). Release builds run
-    /// the in-app pipeline: **Download** stages the verified bundle, then the button
-    /// becomes **Install & Relaunch**, which swaps it in and relaunches.
-    @ViewBuilder
-    private func primaryActionButton(update: AvailableUpdate, isDevBuild: Bool) -> some View {
-        if isDevBuild {
-            Button("Download") {
-                NSWorkspace.shared.open(update.assetURL)
-                dismiss()
-            }
-            .keyboardShortcut(.defaultAction)
-        } else {
-            switch updateModel.downloadState {
-            case .downloading(let v, _) where v == update.version:
-                Button {
-                } label: {
-                    HStack(spacing: 6) {
-                        ProgressView().controlSize(.small)
-                        Text("Downloading…")
+                UpdatePrimaryActionButton(
+                    update: update,
+                    updateModel: updateModel,
+                    requestQuit: requestQuit,
+                    onDevDownload: {
+                        NSWorkspace.shared.open(update.assetURL)
+                        dismiss()
                     }
-                }
-                .disabled(true)
-
-            case .installFailed(let v, _) where v == update.version:
-                Button("Install Failed") {}
-                    .disabled(true)
-
-            case .readyToInstall(let v) where v == update.version:
-                Button("Install & Relaunch") {
-                    switch UpdateLifecycle.installStagedAndRelaunch() {
-                    case .relaunchPending:
-                        // Persist the installed state before dismissing. A cancelled
-                        // quit can reopen the sheet and retry without swapping again.
-                        updateModel.markInstalledPendingRelaunch(version: v, willRelaunch: true)
-                        requestQuit()
-                    case .installedNoRelaunch:
-                        // Swap applied but we can't reopen ourselves automatically. Not
-                        // a failure — the user quits Boss to finish.
-                        updateModel.markInstalledPendingRelaunch(version: v, willRelaunch: false)
-                    case .notInstalled:
-                        // Nothing changed — the live bundle is intact. Surface the
-                        // terminal error in the dialog; no browser fallback.
-                        updateModel.markInstallFailed(
-                            version: v,
-                            reason: "The app bundle could not be updated. Make sure Boss is installed in /Applications and try again."
-                        )
-                    }
-                    // Keep the sheet open so the resulting state is visible.
-                }
-                .keyboardShortcut(.defaultAction)
-
-            case .installedPendingRelaunch(let v, _) where v == update.version:
-                // Swap already applied; the update completes on quit. Offer the quit
-                // (which arms the relaunch helper, when available) rather than a second
-                // install.
-                Button("Quit to Finish") {
-                    requestQuit()
-                }
-                .keyboardShortcut(.defaultAction)
-
-            case .failed(let v, _) where v == update.version:
-                Button("Retry Download") {
-                    updateModel.downloadAvailableUpdate()
-                }
-                .keyboardShortcut(.defaultAction)
-
-            default:
-                Button("Download") {
-                    updateModel.downloadAvailableUpdate()
-                }
-                .keyboardShortcut(.defaultAction)
+                )
             }
         }
     }
@@ -241,6 +171,9 @@ struct UpdateResultSheet: View {
     /// One-line status under the release notes describing the current download/stage
     /// for `update`. `nil` when idle (the button text carries the affordance).
     private func downloadStatusNote(for update: AvailableUpdate) -> String? {
+        if let cancelled = updateModel.quitCancelledStatusNote(for: update.version) {
+            return cancelled
+        }
         switch updateModel.downloadState {
         case .downloading(let v, let progress) where v == update.version:
             switch progress {

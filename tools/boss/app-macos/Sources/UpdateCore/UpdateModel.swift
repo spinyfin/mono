@@ -150,6 +150,10 @@ public final class UpdateModel: ObservableObject {
     /// State of the in-app download/stage step. Drives the badge/sheet/Settings
     /// "downloading…" / "ready to install" affordances. See ``UpdateDownloadState``.
     @Published public private(set) var downloadState: UpdateDownloadState = .idle
+    /// Set when `NSApplication.terminate` returned without quitting after an
+    /// Install & Relaunch / Quit to Finish. The sheet is re-presented with a
+    /// status line so a cancelled or vetoed quit is never silent.
+    @Published public private(set) var quitReturnedWithoutTerminating: Bool = false
 
     // MARK: - Private
 
@@ -377,6 +381,25 @@ public final class UpdateModel: ObservableObject {
         modelLog.info(
             "update install: swap applied, awaiting relaunch version=\(version.description, privacy: .public) willRelaunch=\(willRelaunch, privacy: .public)")
         downloadState = .installedPendingRelaunch(version: version, willRelaunch: willRelaunch)
+    }
+
+    /// `terminate` returned without ending the process (live-worker Cancel, or
+    /// another veto). Re-present the sheet and explain that the install is
+    /// waiting on a confirmed quit.
+    public func markQuitReturnedWithoutTerminating() {
+        modelLog.info("update quit: terminate returned without quitting; re-presenting update sheet")
+        quitReturnedWithoutTerminating = true
+    }
+
+    public func clearQuitReturnedWithoutTerminating() {
+        quitReturnedWithoutTerminating = false
+    }
+
+    /// Status shown after a quit request returns without terminating, so the
+    /// user has a way through (Quit to Finish) instead of a silent close.
+    public func quitCancelledStatusNote(for version: VersionTuple) -> String? {
+        guard quitReturnedWithoutTerminating else { return nil }
+        return "Quit was cancelled. Boss \(version.description) is installed; quit when ready to finish the update."
     }
 
     /// User-initiated download of the currently-available update (the result sheet /
