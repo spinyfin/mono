@@ -320,7 +320,11 @@ impl TmuxWorkerHost {
         }
     }
 
-    fn session_name(&self) -> &str {
+    pub(crate) fn tmux(&self) -> &boss_tmux::Tmux {
+        &self.tmux
+    }
+
+    pub(crate) fn session_name(&self) -> &str {
         &self.session_name
     }
 
