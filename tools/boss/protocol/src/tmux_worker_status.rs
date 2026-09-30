@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TmuxAdoptionState {
-    /// The execution has no durable tmux identity (for example, a remote or
-    /// legacy app-hosted worker).
+    /// The execution has no durable tmux identity because it is a remote
+    /// SSH worker. Local workers without identity are
+    /// [`Self::ProbeUnavailable`], never this variant.
     NotTmuxHosted,
     /// The session exists and its authoritative spawn token matches the
     /// durable identity. This is the only state that is safe to adopt.

@@ -457,29 +457,11 @@ final class EngineClient: @unchecked Sendable {
                 case "detach_worker_pane":
                     let slotId = (request["slot_id"] as? NSNumber)?.intValue ?? 0
                     emit(.engineRequest(requestId: requestId, request: .detachWorkerPane(slotId: slotId)))
-                case "send_to_pane":
-                    let slotId = (request["slot_id"] as? NSNumber)?.intValue ?? 0
-                    let text = request["text"] as? String ?? ""
-                    let expectedDriverBinary = request["expected_driver_binary"] as? String ?? ""
-                    emit(.engineRequest(
-                        requestId: requestId,
-                        request: .sendToPane(
-                            slotId: slotId,
-                            text: text,
-                            expectedDriverBinary: expectedDriverBinary
-                        )
-                    ))
                 case "focus_worker_pane":
                     let slotId = (request["slot_id"] as? NSNumber)?.intValue ?? 0
                     emit(.engineRequest(
                         requestId: requestId,
                         request: .focusWorkerPane(slotId: slotId)
-                    ))
-                case "interrupt_worker_pane":
-                    let slotId = (request["slot_id"] as? NSNumber)?.intValue ?? 0
-                    emit(.engineRequest(
-                        requestId: requestId,
-                        request: .interruptWorkerPane(slotId: slotId)
                     ))
                 case "reveal_work_item":
                     let workItemId = request["work_item_id"] as? String ?? ""

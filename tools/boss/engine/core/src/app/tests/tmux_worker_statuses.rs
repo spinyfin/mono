@@ -52,20 +52,47 @@ async fn tmux_unavailable_is_probe_unavailable_and_issues_no_tmux_calls() {
 }
 
 #[tokio::test]
-async fn not_tmux_hosted_when_the_live_worker_has_no_durable_identity() {
+async fn local_missing_identity_is_probe_unavailable() {
     let (server_state, _dir) = test_server_state();
-    register_idle_worker(&server_state, "run-app-hosted", 2);
+    register_idle_worker(&server_state, "run-local-missing", 2);
     let (tmux, runner) = fake_tmux([ok("")]);
     *server_state.pane_delivery_tmux_override.write().unwrap() = Some(tmux);
 
     let statuses = server_state.tmux_worker_statuses().await;
     assert_eq!(statuses.len(), 1);
-    assert_eq!(statuses[0].execution_id, "run-app-hosted");
-    assert_eq!(statuses[0].adoption_state, TmuxAdoptionState::NotTmuxHosted);
+    assert_eq!(statuses[0].execution_id, "run-local-missing");
+    assert_eq!(statuses[0].adoption_state, TmuxAdoptionState::ProbeUnavailable);
     assert!(statuses[0].session_name.is_none());
     assert!(statuses[0].attach_command.is_none());
-    // No durable tmux identity means no tmux call is issued at all — see
-    // the doc comment on `tmux_worker_statuses`.
+    assert_eq!(runner.calls(), Vec::<Vec<&str>>::new());
+}
+
+#[tokio::test]
+async fn remote_worker_without_tmux_identity_is_not_tmux_hosted() {
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "remote status chore");
+    let execution_id = create_old_execution(db, &work_item_id);
+    db.start_execution_run_on_host(
+        &execution_id,
+        "worker-1",
+        "repo-1",
+        "lease-1",
+        "ws-1",
+        "/tmp/ws",
+        "zakalwe",
+    )
+    .unwrap();
+    register_idle_worker(&server_state, &execution_id, 2);
+    let (tmux, runner) = fake_tmux([ok("")]);
+    *server_state.pane_delivery_tmux_override.write().unwrap() = Some(tmux);
+
+    let statuses = server_state.tmux_worker_statuses().await;
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].execution_id, execution_id);
+    assert_eq!(statuses[0].adoption_state, TmuxAdoptionState::NotTmuxHosted);
+    assert!(statuses[0].session_name.is_none());
     assert_eq!(runner.calls(), Vec::<Vec<&str>>::new());
 }
 

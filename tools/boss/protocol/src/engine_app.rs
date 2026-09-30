@@ -145,27 +145,6 @@ pub struct ListHostedPanesResult {
     pub panes: Vec<HostedPaneEntry>,
 }
 
-/// Engine asks the app to write text into a worker pane's pty as if
-/// it were typed by the user. Used for probe-injection on `Stop`
-/// boundaries and for `bossctl agents send`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SendToPaneInput {
-    pub slot_id: u8,
-    pub text: String,
-    /// The driver executable this run launched with. The app does not match
-    /// it against the observed foreground process (a live agent is often
-    /// inside a foreground child, e.g. a `bazel build` a tool call shelled
-    /// out to); it refuses when no live process owns the PTY at all, and
-    /// echoes this value back in `DriverExited` for diagnostics. An empty
-    /// value is treated as a malformed request and refused non-terminally,
-    /// without concluding the driver exited.
-    pub expected_driver_binary: String,
-}
-
-/// App's reply when text injection succeeds. Empty for now.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SendToPaneResult {}
-
 /// Engine asks the app to bring a worker pane to the front: select
 /// the pane in the Workers grid, focus its surface so keystrokes go
 /// to that pty, and raise the app window to the front of the
@@ -179,19 +158,6 @@ pub struct FocusWorkerPaneInput {
 /// future fields (e.g., whether the window was already key).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FocusWorkerPaneResult {}
-
-/// Engine asks the app to deliver an Esc / interrupt key event to a
-/// worker pane's pty — equivalent to the human pressing Esc while
-/// the pane has keyboard focus. Used by `bossctl agents interrupt`
-/// to cancel a worker's in-flight turn without terminating the run.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct InterruptWorkerPaneInput {
-    pub slot_id: u8,
-}
-
-/// App's reply when interrupt delivery succeeds. Empty for now.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct InterruptWorkerPaneResult {}
 
 /// Engine asks the app to scroll the kanban to a specific work item
 /// and play a short transient highlight. `work_item_id` is the
@@ -230,9 +196,7 @@ pub enum EngineToAppRequest {
     AttachWorkerPane(AttachWorkerPaneInput),
     AttachCoordinatorPane(AttachCoordinatorPaneInput),
     DetachWorkerPane(DetachWorkerPaneInput),
-    SendToPane(SendToPaneInput),
     FocusWorkerPane(FocusWorkerPaneInput),
-    InterruptWorkerPane(InterruptWorkerPaneInput),
     RevealWorkItem(RevealWorkItemInput),
     OpenDocument(OpenDocumentInput),
     ListHostedPanes(ListHostedPanesInput),
@@ -257,14 +221,8 @@ pub enum EngineToAppResponse {
     DetachWorkerPane {
         result: Result<DetachWorkerPaneResult, EngineToAppError>,
     },
-    SendToPane {
-        result: Result<SendToPaneResult, EngineToAppError>,
-    },
     FocusWorkerPane {
         result: Result<FocusWorkerPaneResult, EngineToAppError>,
-    },
-    InterruptWorkerPane {
-        result: Result<InterruptWorkerPaneResult, EngineToAppError>,
     },
     RevealWorkItem {
         result: Result<RevealWorkItemResult, EngineToAppError>,
@@ -296,10 +254,9 @@ pub enum EngineToAppError {
     /// the engine claim path, not this RPC.
     #[error("no free worker slot (legacy app signal; engine-side claim already enforces concurrency)")]
     NoAvailableSlot,
-    /// `DetachWorkerPane` / `SendToPane` / `FocusWorkerPane` /
-    /// `InterruptWorkerPane` referred to a slot the app does not
-    /// recognise — already released, never allocated, or stale after
-    /// an app restart.
+    /// `DetachWorkerPane` / `FocusWorkerPane` referred to a slot the
+    /// app does not recognise — already released, never allocated, or
+    /// stale after an app restart.
     #[error("unknown worker slot")]
     UnknownSlot,
     /// Engine↔app **slot occupancy desync** — not capacity exhaustion.
@@ -335,17 +292,6 @@ pub enum EngineToAppError {
     /// App-side failure with detail.
     #[error("app internal error: {message}")]
     Internal { message: String },
-    /// The app inspected the PTY immediately before input and found that the
-    /// run's driver was no longer foreground. This is terminal evidence for
-    /// the worker run, not a retryable pane-write error.
-    #[error(
-        "worker driver exited before pane input (expected {expected_driver_binary:?}, observed {observed_process:?})"
-    )]
-    DriverExited {
-        expected_driver_binary: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        observed_process: Option<String>,
-    },
 }
 
 #[cfg(test)]
@@ -555,35 +501,6 @@ mod tests {
     #[test]
     fn focus_response_err_round_trips() {
         let original = EngineToAppResponse::FocusWorkerPane {
-            result: Err(EngineToAppError::UnknownSlot),
-        };
-        let json = serde_json::to_string(&original).unwrap();
-        let parsed: EngineToAppResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, original);
-    }
-
-    #[test]
-    fn interrupt_request_round_trips() {
-        let original = EngineToAppRequest::InterruptWorkerPane(InterruptWorkerPaneInput { slot_id: 7 });
-        let json = serde_json::to_string(&original).unwrap();
-        assert!(json.contains("interrupt_worker_pane"));
-        let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, original);
-    }
-
-    #[test]
-    fn interrupt_response_ok_round_trips() {
-        let original = EngineToAppResponse::InterruptWorkerPane {
-            result: Ok(InterruptWorkerPaneResult {}),
-        };
-        let json = serde_json::to_string(&original).unwrap();
-        let parsed: EngineToAppResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, original);
-    }
-
-    #[test]
-    fn interrupt_response_err_round_trips() {
-        let original = EngineToAppResponse::InterruptWorkerPane {
             result: Err(EngineToAppError::UnknownSlot),
         };
         let json = serde_json::to_string(&original).unwrap();

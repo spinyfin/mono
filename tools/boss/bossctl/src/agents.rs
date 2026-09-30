@@ -1884,7 +1884,7 @@ fn format_live_state_short(state: &LiveWorkerState, tmux: TmuxListEvidence<'_>) 
 
 fn tmux_adoption_state_label(state: TmuxAdoptionState) -> &'static str {
     match state {
-        TmuxAdoptionState::NotTmuxHosted => "not_tmux_hosted",
+        TmuxAdoptionState::NotTmuxHosted => "remote_detached",
         TmuxAdoptionState::Adopted => "adopted",
         TmuxAdoptionState::SessionMissing => "session_missing",
         TmuxAdoptionState::TokenMismatch => "token_mismatch",

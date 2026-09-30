@@ -120,9 +120,7 @@ fn request_kind(req: &EngineToAppRequest) -> &'static str {
         EngineToAppRequest::AttachWorkerPane(_) => "attach_worker_pane",
         EngineToAppRequest::AttachCoordinatorPane(_) => "attach_coordinator_pane",
         EngineToAppRequest::DetachWorkerPane(_) => "detach_worker_pane",
-        EngineToAppRequest::SendToPane(_) => "send_to_pane",
         EngineToAppRequest::FocusWorkerPane(_) => "focus_worker_pane",
-        EngineToAppRequest::InterruptWorkerPane(_) => "interrupt_worker_pane",
         EngineToAppRequest::RevealWorkItem(_) => "reveal_work_item",
         EngineToAppRequest::OpenDocument(_) => "open_document",
         EngineToAppRequest::ListHostedPanes(_) => "list_hosted_panes",
@@ -134,9 +132,7 @@ fn response_kind(resp: &EngineToAppResponse) -> &'static str {
         EngineToAppResponse::AttachWorkerPane { .. } => "attach_worker_pane",
         EngineToAppResponse::AttachCoordinatorPane { .. } => "attach_coordinator_pane",
         EngineToAppResponse::DetachWorkerPane { .. } => "detach_worker_pane",
-        EngineToAppResponse::SendToPane { .. } => "send_to_pane",
         EngineToAppResponse::FocusWorkerPane { .. } => "focus_worker_pane",
-        EngineToAppResponse::InterruptWorkerPane { .. } => "interrupt_worker_pane",
         EngineToAppResponse::RevealWorkItem { .. } => "reveal_work_item",
         EngineToAppResponse::OpenDocument { .. } => "open_document",
         EngineToAppResponse::ListHostedPanes { .. } => "list_hosted_panes",
@@ -149,9 +145,8 @@ mod tests {
     use crate::protocol::{
         AttachCoordinatorPaneInput, AttachCoordinatorPaneResult, AttachWorkerPaneInput, AttachWorkerPaneResult,
         DetachWorkerPaneInput, DetachWorkerPaneResult, EngineToAppResponse, FocusWorkerPaneInput,
-        FocusWorkerPaneResult, InterruptWorkerPaneInput, InterruptWorkerPaneResult, ListHostedPanesInput,
-        ListHostedPanesResult, OpenDocumentInput, OpenDocumentResult, RevealWorkItemInput, RevealWorkItemResult,
-        SendToPaneInput, SendToPaneResult,
+        FocusWorkerPaneResult, ListHostedPanesInput, ListHostedPanesResult, OpenDocumentInput, OpenDocumentResult,
+        RevealWorkItemInput, RevealWorkItemResult,
     };
 
     /// Every `EngineToAppRequest` variant must emit its documented
@@ -188,20 +183,8 @@ mod tests {
                 "detach_worker_pane",
             ),
             (
-                EngineToAppRequest::SendToPane(SendToPaneInput {
-                    slot_id: 1,
-                    text: "hi".into(),
-                    expected_driver_binary: "claude".into(),
-                }),
-                "send_to_pane",
-            ),
-            (
                 EngineToAppRequest::FocusWorkerPane(FocusWorkerPaneInput { slot_id: 1 }),
                 "focus_worker_pane",
-            ),
-            (
-                EngineToAppRequest::InterruptWorkerPane(InterruptWorkerPaneInput { slot_id: 1 }),
-                "interrupt_worker_pane",
             ),
             (
                 EngineToAppRequest::RevealWorkItem(RevealWorkItemInput {
@@ -251,22 +234,10 @@ mod tests {
                 "detach_worker_pane",
             ),
             (
-                EngineToAppResponse::SendToPane {
-                    result: Ok(SendToPaneResult {}),
-                },
-                "send_to_pane",
-            ),
-            (
                 EngineToAppResponse::FocusWorkerPane {
                     result: Ok(FocusWorkerPaneResult {}),
                 },
                 "focus_worker_pane",
-            ),
-            (
-                EngineToAppResponse::InterruptWorkerPane {
-                    result: Ok(InterruptWorkerPaneResult {}),
-                },
-                "interrupt_worker_pane",
             ),
             (
                 EngineToAppResponse::RevealWorkItem {
