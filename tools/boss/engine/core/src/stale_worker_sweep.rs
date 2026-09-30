@@ -461,6 +461,8 @@ pub fn resolve_stale_worker_attention(work_db: &WorkDb, execution_id: &str) {
 /// The stale-worker sweep already has the execution row, so using this
 /// variant avoids an extra execution lookup for every checked slot.
 pub fn resolve_stale_worker_attention_for_work_item(work_db: &WorkDb, work_item_id: &str) {
+    let work_item_id = work_db.owning_work_item_id_for_execution(work_item_id);
+    let work_item_id = work_item_id.as_str();
     if let Err(err) = work_db.resolve_external_tracker_attention(work_item_id, STALE_WORKER_ATTENTION_KIND) {
         tracing::warn!(
             work_item_id,
@@ -1150,12 +1152,15 @@ async fn upsert_attention_and_emit(
     verdict: &str,
     semantic_verdict: Option<&str>,
 ) {
-    if let Err(err) = ctx.work_db.upsert_external_tracker_attention(
-        &ctx.execution.work_item_id,
-        STALE_WORKER_ATTENTION_KIND,
-        title,
-        body,
-    ) {
+    // A review-guide execution's work item is a comparison id; raise the
+    // attention against the series root task so it surfaces on the board.
+    let attention_item_id = ctx
+        .work_db
+        .owning_work_item_id_for_execution(&ctx.execution.work_item_id);
+    if let Err(err) =
+        ctx.work_db
+            .upsert_external_tracker_attention(&attention_item_id, STALE_WORKER_ATTENTION_KIND, title, body)
+    {
         tracing::warn!(
             execution_id = %ctx.state.run_id,
             ?err,
@@ -1479,10 +1484,13 @@ async fn execute_auto_reap(
         return false;
     }
     resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
-    if let Some(work_item_id) = &state.work_item_id
+    if let Some(work_item_id) = state
+        .work_item_id
+        .as_deref()
+        .map(|id| work_db.owning_work_item_id_for_execution(id))
         && let Err(err) = crate::reconcile_audit::append_reconcile_audit(
             work_db,
-            work_item_id,
+            &work_item_id,
             now_epoch_secs,
             &format!(
                 "stale worker (exec {execution_id}) auto-reaped — tmux session {session_name} was confirmed \
@@ -1706,10 +1714,13 @@ async fn run_cadence_fallback(
     // Append [engine-reconcile] audit line to the task description so
     // a human inspecting the chore can see why it was reset (and
     // where to find the recovery patch, if one was captured).
-    if let Some(work_item_id) = &state.work_item_id
+    if let Some(work_item_id) = state
+        .work_item_id
+        .as_deref()
+        .map(|id| work_db.owning_work_item_id_for_execution(id))
         && let Err(err) = crate::reconcile_audit::append_reconcile_audit(
             work_db,
-            work_item_id,
+            &work_item_id,
             now_epoch_secs,
             &format!(
                 "stale worker (exec {execution_id}) detected — no transcript progress for > {stale_threshold_secs}s while working; chore reset to todo for redispatch"
