@@ -48,6 +48,16 @@ impl CommandRunner for StubRunner {
             .pop_front()
             .expect("stub runner received an unexpected tmux command"))
     }
+
+    async fn run_with_stdin(
+        &self,
+        program: &Path,
+        args: &[OsString],
+        cwd: Option<&Path>,
+        _stdin: &[u8],
+    ) -> std::io::Result<CommandOutput> {
+        self.run(program, args, cwd).await
+    }
 }
 
 pub(crate) fn ok(stdout: &str) -> CommandOutput {
@@ -65,6 +75,99 @@ pub(crate) fn failure(stderr: &str) -> CommandOutput {
         code: Some(1),
         stdout: String::new(),
         stderr: stderr.to_owned(),
+    }
+}
+
+/// Spawn token shared by live-delivery fixtures and `register_tmux_identity_for_test`.
+pub(crate) const TEST_SPAWN_TOKEN: &str = "tok-test";
+
+/// Always-alive tmux pane for delivery tests. Answers list-sessions, token,
+/// pane-dead, send-keys, and capture-pane (echoing the last paste so
+/// confirmation does not wait out the verify timeout).
+pub(crate) struct AlivePaneRunner {
+    session_name: String,
+    spawn_token: String,
+    session_present: bool,
+    calls: StdMutex<Vec<Vec<String>>>,
+    stdin: StdMutex<Vec<Vec<u8>>>,
+}
+
+impl AlivePaneRunner {
+    pub(crate) fn new(session_name: impl Into<String>) -> Arc<Self> {
+        Arc::new(Self {
+            session_name: session_name.into(),
+            spawn_token: TEST_SPAWN_TOKEN.to_owned(),
+            session_present: true,
+            calls: StdMutex::new(Vec::new()),
+            stdin: StdMutex::new(Vec::new()),
+        })
+    }
+
+    pub(crate) fn calls(&self) -> Vec<Vec<String>> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    pub(crate) fn stdin(&self) -> Vec<Vec<u8>> {
+        self.stdin.lock().unwrap().clone()
+    }
+
+    fn success(stdout: impl Into<String>) -> CommandOutput {
+        CommandOutput {
+            success: true,
+            code: Some(0),
+            stdout: stdout.into(),
+            stderr: String::new(),
+        }
+    }
+
+    fn response(&self, args: &[OsString]) -> CommandOutput {
+        let args = args.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>();
+        if args.iter().any(|arg| arg == "list-sessions") {
+            return Self::success(if self.session_present {
+                format!("{}\t\n", self.session_name)
+            } else {
+                String::new()
+            });
+        }
+        if args.iter().any(|arg| arg == "show-environment") {
+            return Self::success(format!("BOSS_SPAWN_TOKEN={}\n", self.spawn_token));
+        }
+        if args.iter().any(|arg| arg == "#{pane_dead}") {
+            return Self::success("0\n");
+        }
+        if args.iter().any(|arg| arg == "capture-pane") {
+            let last = self.stdin.lock().unwrap().last().cloned().unwrap_or_default();
+            return Self::success(String::from_utf8_lossy(&last).into_owned());
+        }
+        Self::success("")
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandRunner for AlivePaneRunner {
+    async fn run(&self, _program: &Path, args: &[OsString], cwd: Option<&Path>) -> std::io::Result<CommandOutput> {
+        assert!(cwd.is_none());
+        self.calls
+            .lock()
+            .unwrap()
+            .push(args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect());
+        Ok(self.response(args))
+    }
+
+    async fn run_with_stdin(
+        &self,
+        _program: &Path,
+        args: &[OsString],
+        cwd: Option<&Path>,
+        stdin: &[u8],
+    ) -> std::io::Result<CommandOutput> {
+        assert!(cwd.is_none());
+        self.calls
+            .lock()
+            .unwrap()
+            .push(args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect());
+        self.stdin.lock().unwrap().push(stdin.to_vec());
+        Ok(self.response(args))
     }
 }
 

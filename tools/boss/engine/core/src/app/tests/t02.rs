@@ -2117,7 +2117,7 @@ async fn chore_update_notify_sends_message_to_live_worker() {
         .request_execution(RequestExecutionInput::builder().work_item_id(chore_id.clone()).build())
         .expect("active chore needs an execution with a configured driver");
     let run_id = execution.id;
-    server_state.worker_registry.register_run_slot(&run_id, 4);
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 4, "boss-4");
     server_state.live_worker_states.register_spawn(
         4,
         &run_id,
@@ -2137,12 +2137,6 @@ async fn chore_update_notify_sends_message_to_live_worker() {
             stop_reason: crate::protocol::StopReason::Completed,
         },
     );
-
-    // Register an app session to capture the outgoing SendToPane.
-    let app_sink = make_session_sink();
-    server_state
-        .register_app_session("session-app".into(), app_sink.clone())
-        .await;
 
     // Simulate the pre-update snapshot.
     let chore_task = match &active_item {
@@ -2174,66 +2168,21 @@ async fn chore_update_notify_sends_message_to_live_worker() {
     let resolved_run = active_chore_run_id(&server_state, &updated_item)
         .expect("active chore with live worker should resolve a run_id");
 
-    let server_clone = server_state.clone();
-    let msg_clone = msg.clone();
-    let run_clone = resolved_run.clone();
-    let send = tokio::spawn(async move { server_clone.send_input_to_worker(&run_clone, msg_clone).await });
-
-    // Drain the app session: expect a SendToPane EngineRequest.
-    let envelope = app_sink
-        .next()
-        .await
-        .expect("SendToPane should be enqueued on the app sink");
-    let (request_id, request) = match envelope.payload {
-        FrontendEvent::EngineRequest { request_id, request } => (request_id, request),
-        other => panic!("expected EngineRequest, got {other:?}"),
-    };
-    match &request {
-        EngineToAppRequest::SendToPane(input) => {
-            assert_eq!(input.slot_id, 4);
-            assert_eq!(input.expected_driver_binary, "claude");
-            assert!(
-                input.text.contains("[chore-update]"),
-                "message must contain [chore-update] tag"
-            );
-            assert!(
-                input.text.contains("Updated chore name"),
-                "message must mention the new name"
-            );
-        }
-        other => panic!("expected SendToPane, got {other:?}"),
-    }
-
-    // Reply success so the spawned task can complete.
     server_state
-        .deliver_app_response(
-            "session-app",
-            &request_id,
-            EngineToAppResponse::SendToPane {
-                result: Ok(crate::protocol::SendToPaneResult {}),
-            },
-        )
-        .await;
+        .send_input_to_worker(&resolved_run, msg.clone())
+        .await
+        .expect("send ok");
 
-    // `send_input_to_worker` (the chore-update path) verifies the pane
-    // write against a follow-up `UserPromptSubmit` hook rather than
-    // trusting the app's ack alone — this is the fix for the incident
-    // where an identical chore-update notice silently vanished. Fire
-    // the confirming hook the way the worker's CLI would.
-    dispatch_live_worker_state(
-        &server_state,
-        &crate::events_socket::IncomingHookEvent::for_test(
-            crate::protocol::WorkerEvent::UserPromptSubmit {
-                session_id: "claude-sess-1".into(),
-                prompt: msg.clone(),
-            },
-            Some(resolved_run.clone()),
-            None,
-        ),
-    )
-    .await;
-
-    send.await.expect("send task").expect("send ok");
+    let pasted = String::from_utf8(runner.stdin().last().cloned().unwrap_or_default()).unwrap();
+    assert!(
+        pasted.contains("[chore-update]"),
+        "message must contain [chore-update] tag: {pasted:?} calls={:?}",
+        runner.calls()
+    );
+    assert!(
+        pasted.contains("Updated chore name"),
+        "message must mention the new name: {pasted:?}"
+    );
 }
 
 // ── executions.transcript tests ──────────────────────────────────────────

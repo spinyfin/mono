@@ -53,31 +53,19 @@ pub enum SendInputError {
     },
     #[error("worker driver liveness could not be established; no pane input was sent: {0}")]
     DriverLivenessUnavailable(String),
-    #[error("app reported error: {0:?}")]
-    App(EngineToAppError),
-    #[error(transparent)]
-    Send(#[from] SendToAppError),
     #[error("tmux pane delivery failed: {0:#}")]
     Tmux(#[source] anyhow::Error),
-    #[error("app returned unexpected response: {0}")]
-    ResponseKindMismatch(String),
 }
 
-/// Surfaced by [`ServerState::interrupt_worker_pane`]. Mirrors
-/// [`FocusPaneError`] — the same error tiers apply (resolution miss,
-/// app failure, transport, response shape).
+/// Surfaced by [`ServerState::interrupt_worker_pane`]. Distinguishes
+/// engine-side resolution failures (run id has no allocated slot)
+/// from tmux transport failures.
 #[derive(Debug, thiserror::Error)]
 pub enum InterruptPaneError {
     #[error("no worker pane mapped for that run id")]
     UnknownRun,
-    #[error("app reported error: {0:?}")]
-    App(EngineToAppError),
-    #[error(transparent)]
-    Send(#[from] SendToAppError),
     #[error("tmux pane delivery failed: {0:#}")]
     Tmux(#[source] anyhow::Error),
-    #[error("app returned unexpected response: {0}")]
-    ResponseKindMismatch(String),
 }
 
 /// Outcome of [`ServerState::interrupt_plan_lookup`].
@@ -201,9 +189,8 @@ impl ServerState {
         }
     }
 
-    /// Resolve `run_id → slot_id` and write `text` into that worker pane:
-    /// `tmux send-keys` for a tmux-backed session or the app's `SendToPane`
-    /// RPC for a legacy app-owned pane. Returns the
+    /// Resolve `run_id → slot_id` and write `text` into that worker pane
+    /// via `tmux send-keys`. Returns the
     /// resolved slot on success so `bossctl agents send` can echo back
     /// which pane was targeted (useful when the agent reference was a
     /// crew name). Mirrors [`focus_worker_pane`] in shape, but refuses
@@ -292,17 +279,11 @@ impl ServerState {
             PaneInjectOutcome::SendFailed(PaneSendFailure::DriverLivenessUnavailable(reason)) => {
                 Err(SendInputError::DriverLivenessUnavailable(reason))
             }
-            PaneInjectOutcome::SendFailed(PaneSendFailure::App(err)) => Err(SendInputError::App(err)),
-            PaneInjectOutcome::SendFailed(PaneSendFailure::Send(err)) => Err(SendInputError::Send(err)),
             PaneInjectOutcome::SendFailed(PaneSendFailure::Tmux(err)) => Err(SendInputError::Tmux(err)),
-            PaneInjectOutcome::SendFailed(PaneSendFailure::ResponseKindMismatch(msg)) => {
-                Err(SendInputError::ResponseKindMismatch(msg))
-            }
         }
     }
 
     /// Resolve `run_id → slot_id` and deliver an Esc keystroke through tmux
-    /// for a tmux-backed session or the app RPC for a legacy app-owned pane
     /// — equivalent to the human
     /// pressing Esc with the pane focused. The worker run stays
     /// alive; only the in-flight turn is cancelled. Returns the
@@ -452,52 +433,24 @@ impl ServerState {
         result
     }
 
-    /// One keypress into the run's pane, over whichever transport hosts it:
-    /// tmux `send-keys <key>` for a tmux-backed session, the app's
-    /// `InterruptWorkerPane` RPC for a legacy app-owned pane.
-    ///
-    /// The app transport sends `kVK_Escape` unconditionally, so a driver plan
-    /// naming any other key is only honoured on tmux-hosted panes. That is
-    /// recorded here rather than silently ignored: every registered driver's
-    /// plan names `Escape` today, and a future plan that does not must extend
-    /// the app RPC rather than assume this path carries it.
+    /// One keypress into the run's pane via tmux `send-keys <key>`.
+    /// Local workers without a tmux session identity fail closed.
     async fn send_interrupt_key(&self, run_id: &str, slot_id: u8, key: &str) -> Result<u8, InterruptPaneError> {
-        match self.worker_registry.pane_for_run(run_id) {
-            Some(pane) if pane.tmux_session_name.is_some() => {
-                match pane.tmux_session_name.filter(|name| !name.is_empty()) {
-                    Some(session_name) => match self.tmux_for_pane_delivery(run_id) {
-                        Ok(tmux) => tmux
-                            .send_key(&session_name, key)
-                            .await
-                            .map(|_| slot_id)
-                            .map_err(InterruptPaneError::Tmux),
-                        Err(err) => Err(InterruptPaneError::Tmux(err)),
-                    },
-                    None => Err(InterruptPaneError::Tmux(anyhow::anyhow!(
-                        "tmux-hosted pane has no session name"
-                    ))),
-                }
-            }
-            _ => {
-                if key != "Escape" {
-                    tracing::warn!(
-                        run_id,
-                        slot_id,
-                        key,
-                        "app-hosted pane transport only sends Escape; the driver's interrupt key is \
-                         being delivered as Escape",
-                    );
-                }
-                let request = EngineToAppRequest::InterruptWorkerPane(InterruptWorkerPaneInput { slot_id });
-                match self.send_to_app(request, Duration::from_secs(5)).await {
-                    Ok(EngineToAppResponse::InterruptWorkerPane { result: Ok(_) }) => Ok(slot_id),
-                    Ok(EngineToAppResponse::InterruptWorkerPane { result: Err(err) }) => {
-                        Err(InterruptPaneError::App(err))
-                    }
-                    Ok(other) => Err(InterruptPaneError::ResponseKindMismatch(format!("{other:?}"))),
-                    Err(err) => Err(InterruptPaneError::Send(err)),
-                }
-            }
+        let Some(pane) = self.worker_registry.pane_for_run(run_id) else {
+            return Err(InterruptPaneError::UnknownRun);
+        };
+        let Some(session_name) = pane.tmux_session_name.filter(|name| !name.is_empty()) else {
+            return Err(InterruptPaneError::Tmux(anyhow::anyhow!(
+                "local worker has no tmux session identity"
+            )));
+        };
+        match self.tmux_for_pane_delivery(run_id) {
+            Ok(tmux) => tmux
+                .send_key(&session_name, key)
+                .await
+                .map(|_| slot_id)
+                .map_err(InterruptPaneError::Tmux),
+            Err(err) => Err(InterruptPaneError::Tmux(err)),
         }
     }
 

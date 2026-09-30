@@ -1,8 +1,8 @@
 //! Verified pane-injection delivery.
 //!
-//! A pane write — `tmux send-keys` for a tmux-backed session or `SendToPane`
-//! through the app for a legacy app-owned pane — only proves the engine
-//! handed bytes to the worker's pty. It does not prove the foreground
+//! A pane write — `tmux send-keys` into the worker's durable session —
+//! only proves the engine handed bytes to the worker's pty. It does not
+//! prove the foreground
 //! process treated them as a pending user prompt. Text injected while
 //! the worker is idle at its prompt (the `Stop`-boundary probe path)
 //! has proven reliable. Text injected while the worker is actively
@@ -210,7 +210,7 @@ pub(crate) enum PaneInjectOutcome {
     /// "accepting"). Callers must surface this rather than silently drop the
     /// text or re-issue the write.
     NotAcceptingInput { activity: Option<WorkerActivity> },
-    /// The pane write itself failed at the transport or app layer.
+    /// The pane write itself failed at the tmux transport.
     /// Carries enough detail for callers that need a typed error
     /// (e.g. [`ServerState::send_input_to_worker`]'s `SendInputError`)
     /// to reconstruct it without re-issuing the write.
@@ -220,10 +220,7 @@ pub(crate) enum PaneInjectOutcome {
 /// Failure detail for [`PaneInjectOutcome::SendFailed`].
 #[derive(Debug)]
 pub(crate) enum PaneSendFailure {
-    App(EngineToAppError),
-    Send(SendToAppError),
     Tmux(anyhow::Error),
-    ResponseKindMismatch(String),
     /// The process that owned the pane immediately before delivery was not
     /// the run's driver. The text was never written; the run has been
     /// terminalized and its slot released before this error is returned.
@@ -351,8 +348,8 @@ impl ServerState {
     }
 
     /// Drop the delivery waiter identified by `token` (if it's still
-    /// present) without resolving it — used when the `SendToPane`
-    /// write itself failed, or when the verification window elapsed,
+    /// present) without resolving it — used when the pane write
+    /// itself failed, or when the verification window elapsed,
     /// so no confirmation will ever follow for this specific attempt.
     /// Only removes the matching token, leaving any other waiters for
     /// the same run untouched.
@@ -502,9 +499,8 @@ impl ServerState {
     }
 
     /// Persist and visibly reconcile a driver exit observed at the pane-input
-    /// boundary. The app-hosted exit leaves a login shell behind, so the
-    /// dead-worker reconciler alone is insufficient: after it terminalizes the
-    /// execution and frees the worker-pool claim, release the mapped pane too.
+    /// boundary. After terminalizing the execution and freeing the worker-pool
+    /// claim, release the mapped pane too.
     async fn reconcile_driver_exit(
         &self,
         run_id: &str,
@@ -620,22 +616,23 @@ impl ServerState {
     /// interrupting so a healthy worker does not lose its turn and then
     /// receive nothing.
     pub(super) fn pane_write_transport_ready(&self, run_id: &str) -> Result<(), String> {
-        let pane = self.worker_registry.pane_for_run(run_id);
-        match pane {
-            Some(pane) if pane.tmux_session_name.is_some() => match self.work_db.tmux_identity_for_execution(run_id) {
-                Ok(Some(_)) => Ok(()),
-                Ok(None) => Err("no durable tmux identity recorded for run".to_owned()),
-                Err(err) => Err(format!("tmux identity lookup failed: {err:#}")),
-            },
-            _ => Ok(()),
+        let Some(pane) = self.worker_registry.pane_for_run(run_id) else {
+            return Err("no worker pane mapped for that run id".to_owned());
+        };
+        if pane.tmux_session_name.as_ref().is_none_or(|name| name.is_empty()) {
+            return Err("local worker has no tmux session identity".to_owned());
+        }
+        match self.work_db.tmux_identity_for_execution(run_id) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err("no durable tmux identity recorded for run".to_owned()),
+            Err(err) => Err(format!("tmux identity lookup failed: {err:#}")),
         }
     }
 
     /// The only shared text-write primitive. Every caller first resolves a
     /// posture, then reaches this method immediately before it would invoke
-    /// `tmux send-keys` or app `SendToPane`. Both transports must prove that
-    /// the foreground process is the run's expected driver; a live pane or a
-    /// cached `Idle` activity is intentionally not sufficient.
+    /// `tmux send-keys`. Local workers without a tmux identity fail closed;
+    /// a live pane or a cached `Idle` activity is intentionally not sufficient.
     pub(super) async fn send_pane_text_checked(
         &self,
         run_id: &str,
@@ -711,38 +708,9 @@ impl ServerState {
                 // verbatim here.
                 tmux.send_keys(&session_name, text).await.map_err(PaneSendFailure::Tmux)
             }
-            _ => {
-                let request = EngineToAppRequest::SendToPane(SendToPaneInput {
-                    slot_id,
-                    text: text.to_owned(),
-                    expected_driver_binary: expected_driver_binary.clone(),
-                });
-                match self.send_to_app(request, Duration::from_secs(5)).await {
-                    Ok(EngineToAppResponse::SendToPane { result: Ok(_) }) => Ok(()),
-                    Ok(EngineToAppResponse::SendToPane {
-                        result:
-                            Err(EngineToAppError::DriverExited {
-                                expected_driver_binary,
-                                observed_process,
-                            }),
-                    }) => {
-                        self.reconcile_driver_exit(
-                            run_id,
-                            slot_id,
-                            &expected_driver_binary,
-                            observed_process.as_deref(),
-                        )
-                        .await;
-                        Err(PaneSendFailure::DriverExited {
-                            expected_driver_binary,
-                            observed_process,
-                        })
-                    }
-                    Ok(EngineToAppResponse::SendToPane { result: Err(err) }) => Err(PaneSendFailure::App(err)),
-                    Ok(other) => Err(PaneSendFailure::ResponseKindMismatch(format!("{other:?}"))),
-                    Err(err) => Err(PaneSendFailure::Send(err)),
-                }
-            }
+            _ => Err(PaneSendFailure::Tmux(anyhow::anyhow!(
+                "local worker has no tmux session identity"
+            ))),
         }
     }
 
@@ -805,9 +773,8 @@ impl ServerState {
             return PaneInjectOutcome::NotAcceptingInput { activity };
         }
 
-        // Match the app transport's submission plan for confirmation and
-        // tmux delivery, while preserving the legacy RPC payload verbatim so
-        // the app remains its single owner of app-pane normalization.
+        // Strip trailing newlines for confirmation matching the way
+        // `tmux send-keys` submits with a separate Return.
         let normalized_text = text.trim_end_matches(['\r', '\n']);
         let (token, waiter) = self.register_delivery_waiter(run_id, normalized_text);
         let send_result = self.send_pane_text_checked(run_id, slot_id, &text).await;
@@ -917,7 +884,7 @@ impl ServerState {
     /// True when a tmux capture of `run_id`'s pane contains `text`
     /// (whitespace-normalized). Fail-closed: no tmux session, a capture
     /// error, or a blank pane all answer false — the same class of mistake
-    /// as treating `SendToPane` Ok as proof of consumption.
+    /// as treating a successful `send-keys` as proof of consumption.
     async fn pane_shows_injected_text(&self, run_id: &str, text: &str) -> bool {
         let needle = normalize_ws(text.trim());
         if needle.is_empty() {

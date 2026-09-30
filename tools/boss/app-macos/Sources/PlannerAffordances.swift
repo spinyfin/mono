@@ -793,6 +793,11 @@ struct AgentActivityDot: View {
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(Color(nsColor: .tertiaryLabelColor))
                     .frame(width: 7, height: 7)
+            } else if case .errored(let reason) = state, reason == AgentActivityState.identityUnavailableReason {
+                Image(systemName: "exclamationmark.circle")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(Color.orange)
+                    .frame(width: 7, height: 7)
             } else {
                 Circle()
                     .fill(fillColor)
@@ -811,6 +816,8 @@ struct AgentActivityDot: View {
             return .yellow
         case .unknown:
             return Color(nsColor: .tertiaryLabelColor)
+        case .errored(let reason) where reason == AgentActivityState.identityUnavailableReason:
+            return .orange
         case .errored:
             return .red
         case .none:

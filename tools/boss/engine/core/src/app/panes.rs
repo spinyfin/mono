@@ -234,7 +234,7 @@ impl ServerState {
             let identity = match identity {
                 Ok(Some(identity)) => identity,
                 Ok(None) => {
-                    statuses.push(not_tmux_hosted_status(execution_id));
+                    statuses.push(status_for_missing_identity(self, execution_id));
                     continue;
                 }
                 Err(err) => {
@@ -306,6 +306,31 @@ fn tmux_status(
         .maybe_last_output_at(last_output_at)
         .maybe_attach_command(attach_command)
         .build()
+}
+
+fn status_for_missing_identity(server_state: &ServerState, execution_id: String) -> boss_protocol::TmuxWorkerStatus {
+    match server_state.work_db.latest_run_host_for_execution(&execution_id) {
+        Ok(Some(host)) if host != "local" => not_tmux_hosted_status(execution_id),
+        Ok(Some(_)) => {
+            tracing::warn!(execution_id, "agents list: local worker has no durable tmux identity");
+            probe_unavailable_status(execution_id, None)
+        }
+        Ok(None) => {
+            tracing::warn!(
+                execution_id,
+                "agents list: live worker has no run host and no durable tmux identity"
+            );
+            probe_unavailable_status(execution_id, None)
+        }
+        Err(err) => {
+            tracing::warn!(
+                execution_id,
+                error = %format!("{err:#}"),
+                "agents list: failed reading run host for missing tmux identity"
+            );
+            probe_unavailable_status(execution_id, None)
+        }
+    }
 }
 
 fn not_tmux_hosted_status(execution_id: String) -> boss_protocol::TmuxWorkerStatus {

@@ -117,17 +117,6 @@ enum CoordinatorRecreateReason: String {
     case operatorReset = "operator_reset"
 }
 
-enum EngineSendError: Sendable {
-    case unknownSlot
-    case driverExited(expectedDriverBinary: String, observedProcess: String?)
-    case internalFailure(String)
-}
-
-enum EngineSendResult: Sendable {
-    case success
-    case failure(EngineSendError)
-}
-
 enum EngineFocusError: Sendable {
     case unknownSlot
     case internalFailure(String)
@@ -136,16 +125,6 @@ enum EngineFocusError: Sendable {
 enum EngineFocusResult: Sendable {
     case success
     case failure(EngineFocusError)
-}
-
-enum EngineInterruptError: Sendable {
-    case unknownSlot
-    case internalFailure(String)
-}
-
-enum EngineInterruptResult: Sendable {
-    case success
-    case failure(EngineInterruptError)
 }
 
 enum EngineRevealError: Sendable {
@@ -180,9 +159,7 @@ enum EngineRequestKind: Sendable {
     case attachWorkerPane(EngineAttachRequest)
     case attachCoordinatorPane(EngineCoordinatorAttachRequest)
     case detachWorkerPane(slotId: Int)
-    case sendToPane(slotId: Int, text: String, expectedDriverBinary: String)
     case focusWorkerPane(slotId: Int)
-    case interruptWorkerPane(slotId: Int)
     case revealWorkItem(workItemId: String, productId: String)
     /// Engine asks the app to open a markdown document — the
     /// `bossctl open` path. `path` is an absolute, engine-validated

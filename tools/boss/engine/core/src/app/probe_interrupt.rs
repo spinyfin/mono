@@ -862,11 +862,11 @@ impl ServerState {
     /// evidence: the pane must show one of the driver's prompt prefixes *and*
     /// none of its busy markers. Answering `true` on an empty or unreadable
     /// capture is the same class of mistake as reporting a probe delivered
-    /// because `SendToPane` returned `Ok` — it would have the engine typing
-    /// into a turn that never stopped, which is exactly what confirming
-    /// exists to prevent. So every uncertainty answers `false`:
+    /// because a successful `send-keys` returned `Ok` — it would have the
+    /// engine typing into a turn that never stopped, which is exactly what
+    /// confirming exists to prevent. So every uncertainty answers `false`:
     ///
-    /// * a non-tmux (app-hosted) pane has no capture path here, so the
+    /// * a pane with no tmux identity has no capture path here, so the
     ///   live-activity signal decides alone;
     /// * a driver that declares no pane-monitor spec, no busy markers, or no
     ///   prompt prefixes — there is nothing to read positively;

@@ -44,7 +44,9 @@ struct WorkerLiveState {
     /// Whether this worker was actually dispatched onto the tmux-hosting
     /// path (`true`) or not (`false`), mirroring the engine's
     /// `LiveWorkerState.tmux_hosted`. `nil` when the engine hasn't
-    /// reported it (remote workers, or an older engine).
+    /// reported it — remote SSH workers, which remain valid without a
+    /// local tmux identity. `false` is a local invariant failure, not a
+    /// supported hosting mode.
     let tmuxHosted: Bool?
 
     /// False when two entries share a `runId` or a `slotId`. A snapshot
@@ -127,6 +129,9 @@ enum WorkerActivity: String, Hashable {
 }
 
 enum AgentActivityState: Equatable {
+    /// Reason used when a local worker is missing durable tmux identity.
+    static let identityUnavailableReason = "Worker pane identity unavailable"
+
     case active
     case waiting(reason: String)
     /// The worker occupies a slot but has not supplied a hook-derived state.
@@ -189,6 +194,10 @@ enum AgentActivityState: Equatable {
     /// rendering the same yellow `running` indicator.
     init(runtime: WorkTaskRuntime?, liveState: WorkerLiveState?) {
         if let liveState {
+            if liveState.tmuxHosted == false {
+                self = .errored(reason: Self.identityUnavailableReason)
+                return
+            }
             switch liveState.activity {
             case .working:
                 self = .active
@@ -221,21 +230,25 @@ enum AgentActivityState: Equatable {
     /// Precedence:
     /// 1. Dispatch-pending (status=todo, autostart, no slot free yet)
     ///    wins outright — the engine intends to run it but hasn't.
-    /// 2. A worker paused on a permission prompt
+    /// 2. A local worker stamped as not tmux-hosted is unavailable —
+    ///    missing identity is an invariant failure, never a supported
+    ///    local hosting mode. Remote workers (`tmuxHosted == nil`) skip
+    ///    this rule.
+    /// 3. A worker paused on a permission prompt
     ///    (`activity == .waitingForInput`) reads as *waiting*, not
     ///    active. Without this, the card shows a green "working" dot
     ///    while the run is actually stalled on an input prompt no one
     ///    is watching for. This must precede the bound-slot shortcut
     ///    below; it clears on its own once the worker resumes and the
     ///    activity flips back to `.working`.
-    /// 3. A slot-bound worker which has not reported a hook-derived state
+    /// 4. A slot-bound worker which has not reported a hook-derived state
     ///    reads as unknown rather than being guessed as active: after
     ///    re-adoption, `.spawning` means the engine knows the process exists
     ///    but not what it is doing.
-    /// 4. A bound live worker otherwise reads as active.
-    /// 5. Conflict / CI-remediation runs without a bound live worker
+    /// 5. A bound live worker otherwise reads as active.
+    /// 6. Conflict / CI-remediation runs without a bound live worker
     ///    read as their respective "resolving" waits.
-    /// 6. Fall back to the runtime+liveState mapping.
+    /// 7. Fall back to the runtime+liveState mapping.
     static func forDoingCard(
         runtime: WorkTaskRuntime?,
         liveState: WorkerLiveState?,
@@ -246,6 +259,9 @@ enum AgentActivityState: Equatable {
     ) -> AgentActivityState {
         if isDispatchPending {
             return .dispatchPending
+        }
+        if liveState?.tmuxHosted == false {
+            return .errored(reason: Self.identityUnavailableReason)
         }
         if liveState?.activity == .waitingForInput {
             return .waiting(reason: "Waiting on user input")

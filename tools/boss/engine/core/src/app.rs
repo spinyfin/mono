@@ -44,10 +44,9 @@ use crate::merge_when_ready;
 use crate::protocol::{
     DispatchAdmissionEntryPoint, EngineToAppError, EngineToAppRequest, EngineToAppResponse, FocusWorkerPaneInput,
     FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, GitHubAuthStateDto,
-    HostedPaneState, HostedPaneStatus, InterruptWorkerPaneInput, ListHostedPanesInput, OpenDocumentInput, OrgAuthState,
-    RequestExecutionInput, RevealWorkItemInput, SendToPaneInput, TOPIC_ENGINE_HEALTH, TOPIC_GITHUB_AUTH,
-    TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload, comment_topic, editorial_actions_topic,
-    execution_topic, probe_topic, work_product_topic,
+    HostedPaneState, HostedPaneStatus, ListHostedPanesInput, OpenDocumentInput, OrgAuthState, RequestExecutionInput,
+    RevealWorkItemInput, TOPIC_ENGINE_HEALTH, TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES,
+    TopicEventPayload, comment_topic, editorial_actions_topic, execution_topic, probe_topic, work_product_topic,
 };
 use crate::repo_slug;
 use crate::runner::ExecutionRunner;

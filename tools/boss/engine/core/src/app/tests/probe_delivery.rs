@@ -52,39 +52,40 @@ fn post_tool_use(run_id: &str) -> crate::events_socket::IncomingHookEvent {
     )
 }
 
-/// Register a fake app session, answer the first `SendToPane` it receives with
-/// success, and return the `(slot_id, text)` that reached the pane. Mirrors the
-/// responder in `worker_probe_dispatch`, but reports the payload back so tests
-/// can assert on what was actually written rather than only that *something*
-/// was.
-async fn app_session_capturing_one_send(
-    server_state: &Arc<ServerState>,
-) -> tokio::task::JoinHandle<Option<(u8, String)>> {
-    let app_sink = make_session_sink();
-    server_state
-        .register_app_session("session-app".into(), app_sink.clone())
-        .await;
-    let server_for_app = server_state.clone();
-    tokio::spawn(async move {
-        let envelope = app_sink.next().await?;
-        let (request_id, captured) = match &envelope.payload {
-            FrontendEvent::EngineRequest {
-                request_id,
-                request: EngineToAppRequest::SendToPane(input),
-            } => (request_id.clone(), (input.slot_id, input.text.clone())),
-            other => panic!("expected an EngineRequest carrying SendToPane, got {other:?}"),
-        };
-        server_for_app
-            .deliver_app_response(
-                "session-app",
-                &request_id,
-                EngineToAppResponse::SendToPane {
-                    result: Ok(crate::protocol::SendToPaneResult {}),
-                },
-            )
-            .await;
-        Some(captured)
+fn last_tmux_paste(runner: &super::tmux_stub::AlivePaneRunner) -> String {
+    try_last_tmux_paste(runner).unwrap_or_else(|| {
+        panic!(
+            "expected a tmux pane write; calls={:?} stdin={:?}",
+            runner.calls(),
+            runner.stdin()
+        )
     })
+}
+
+fn try_last_tmux_paste(runner: &super::tmux_stub::AlivePaneRunner) -> Option<String> {
+    if let Some(stdin) = runner.stdin().last()
+        && !stdin.is_empty()
+    {
+        return Some(String::from_utf8(stdin.clone()).expect("paste is utf-8"));
+    }
+    for call in runner.calls().iter().rev() {
+        if call.iter().any(|arg| arg == "send-keys")
+            && call.iter().any(|arg| arg == "-l")
+            && let Some(idx) = call.iter().position(|arg| arg == "--")
+            && let Some(text) = call.get(idx + 1)
+        {
+            return Some(text.clone());
+        }
+    }
+    None
+}
+
+fn install_probe_tmux(server_state: &ServerState, run_id: &str) -> std::sync::Arc<super::tmux_stub::AlivePaneRunner> {
+    let slot = server_state
+        .worker_registry
+        .slot_for_run(run_id)
+        .expect("probe fixture must have a registered slot");
+    install_live_tmux_delivery(server_state, run_id, slot, "boss-probe")
 }
 
 fn dispatch_for(state: &Arc<ServerState>, sink: &Arc<SessionSink>) -> Dispatch {
@@ -122,16 +123,12 @@ async fn sole_response(sink: &SessionSink) -> FrontendEvent {
 async fn probe_injects_mid_turn_for_a_working_claude_worker() {
     let (server_state, _dir) = test_server_state();
     let run_id = register_working_worker_with_driver(&server_state, 3, None);
-    let responder = app_session_capturing_one_send(&server_state).await;
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 3, "boss-3");
 
     let probe_id = server_state.queue_probe(run_id.clone(), "re-read the spec".into(), false);
     dispatch_probe_on_post_tool_use(&server_state, &post_tool_use(&run_id)).await;
 
-    let (slot, text) = responder
-        .await
-        .expect("app responder task")
-        .expect("a probe to a mid-turn Claude worker must issue a SendToPane");
-    assert_eq!(slot, 3);
+    let text = last_tmux_paste(&runner);
     assert_eq!(
         text, "[coordinator-nudge] re-read the spec",
         "mid-turn probes stay marked in the transcript so the worker and human readers can spot them",
@@ -158,16 +155,12 @@ async fn probe_injects_mid_turn_for_a_working_claude_worker() {
 async fn probe_injects_mid_turn_for_a_working_codex_worker() {
     let (server_state, _dir) = test_server_state();
     let run_id = register_working_worker_with_driver(&server_state, 3, Some("codex"));
-    let responder = app_session_capturing_one_send(&server_state).await;
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 3, "boss-3");
 
     let probe_id = server_state.queue_probe(run_id.clone(), "re-read the spec".into(), false);
     dispatch_probe_on_post_tool_use(&server_state, &post_tool_use(&run_id)).await;
 
-    let (slot, text) = responder
-        .await
-        .expect("app responder task")
-        .expect("a probe to a mid-turn Codex worker must issue a SendToPane");
-    assert_eq!(slot, 3);
+    let text = last_tmux_paste(&runner);
     assert_eq!(text, "[coordinator-nudge] re-read the spec");
     assert!(
         server_state.pop_pending_probe(&run_id).is_none(),
@@ -199,17 +192,13 @@ async fn probe_injects_mid_turn_for_a_working_codex_worker() {
 async fn probe_still_refused_mid_turn_for_a_driver_that_rejects_stdin() {
     let (server_state, _dir) = test_server_state();
     let run_id = register_working_worker_with_driver(&server_state, 4, Some("grok"));
-    let app_sink = make_session_sink();
-    server_state
-        .register_app_session("session-app".into(), app_sink.clone())
-        .await;
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 4, "boss-4");
 
     let probe_id = server_state.queue_probe(run_id.clone(), "re-read the spec".into(), false);
     dispatch_probe_on_post_tool_use(&server_state, &post_tool_use(&run_id)).await;
 
-    assert_eq!(
-        app_sink.queue_stats().depth,
-        0,
+    assert!(
+        runner.stdin().is_empty(),
         "a mid-turn write to a driver that does not consume stdin must never reach the pane",
     );
     let still = server_state
@@ -274,7 +263,7 @@ async fn parked_workers_are_injectable_regardless_of_driver() {
 async fn probe_run_steers_a_mid_turn_worker_without_any_boundary() {
     let (server_state, _dir) = test_server_state();
     let run_id = register_working_worker_with_driver(&server_state, 3, None);
-    let responder = app_session_capturing_one_send(&server_state).await;
+    let runner = install_probe_tmux(&server_state, &run_id);
 
     let sink = make_session_sink();
     executions::handle_probe_run(
@@ -293,27 +282,29 @@ async fn probe_run_steers_a_mid_turn_worker_without_any_boundary() {
         other => panic!("expected ProbeQueued, got {other:?}"),
     };
 
-    let (slot, text) = responder
-        .await
-        .expect("app responder task")
-        .expect("a probe to a mid-turn worker must be written during the call, not held for Stop");
-    assert_eq!(slot, 3);
-    assert_eq!(text, "[coordinator-nudge] stop — you are building the wrong target");
+    // The handler issues the write from a spawned task, so let the
+    // verification window elapse before reading the settled state.
+    let mut settled = None;
+    let mut text = None;
+    for _ in 0..20 {
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        if text.is_none() {
+            text = try_last_tmux_paste(&runner);
+        }
+        settled = server_state.probe_lifecycle_state(&probe_id);
+        if settled != Some(ProbeDeliveryState::Injected) && text.is_some() {
+            break;
+        }
+    }
+    assert_eq!(
+        text.as_deref(),
+        Some("[coordinator-nudge] stop — you are building the wrong target"),
+    );
     assert!(
         server_state.pop_pending_probe(&run_id).is_none(),
         "a probe written during the call must not also be left queued for a boundary",
     );
-    // The handler issues the write from a spawned task, so let the
-    // verification window elapse before reading the settled state.
-    let mut settled = None;
-    for _ in 0..20 {
-        tokio::time::advance(std::time::Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
-        settled = server_state.probe_lifecycle_state(&probe_id);
-        if settled != Some(ProbeDeliveryState::Injected) {
-            break;
-        }
-    }
     assert_eq!(
         settled,
         Some(ProbeDeliveryState::Buffered),
@@ -330,16 +321,13 @@ async fn probe_run_steers_a_mid_turn_worker_without_any_boundary() {
 async fn a_second_probe_waits_for_the_first_probes_reply_cycle() {
     let (server_state, _dir) = test_server_state();
     let run_id = register_working_worker_with_driver(&server_state, 3, None);
-    let responder = app_session_capturing_one_send(&server_state).await;
+    let runner = install_probe_tmux(&server_state, &run_id);
 
     let first = server_state.queue_probe(run_id.clone(), "first".into(), false);
     let second = server_state.queue_probe(run_id.clone(), "second".into(), false);
 
     dispatch_probe_on_post_tool_use(&server_state, &post_tool_use(&run_id)).await;
-    let (_, text) = responder
-        .await
-        .expect("app responder task")
-        .expect("the first probe must be written at the tool boundary");
+    let text = last_tmux_paste(&runner);
     assert_eq!(text, "[coordinator-nudge] first");
 
     // Second tool boundary while the first probe still owes a reply: no write.
@@ -367,12 +355,9 @@ async fn a_second_probe_waits_for_the_first_probes_reply_cycle() {
     assert_ne!(first, second);
 
     // Next tool boundary of the following turn delivers the second, in order.
-    let responder = app_session_capturing_one_send(&server_state).await;
+    let runner = install_probe_tmux(&server_state, &run_id);
     dispatch_probe_on_post_tool_use(&server_state, &post_tool_use(&run_id)).await;
-    let (_, text) = responder
-        .await
-        .expect("app responder task")
-        .expect("the second probe must be delivered once the reply cycle completed");
+    let text = last_tmux_paste(&runner);
     assert_eq!(text, "[coordinator-nudge] second");
 }
 
@@ -385,17 +370,13 @@ async fn a_second_probe_waits_for_the_first_probes_reply_cycle() {
 async fn effort_escalation_ack_reaches_a_parked_worker_immediately() {
     let (server_state, _dir) = test_server_state();
     let run_id = register_idle_worker_with_driver(&server_state, 8, None);
-    let responder = app_session_capturing_one_send(&server_state).await;
+    let runner = install_probe_tmux(&server_state, &run_id);
 
     let ack = "[effort-escalation-ack] approved: large. next_dispatch=true";
     let probe_id = server_state.queue_probe(run_id.clone(), ack.to_owned(), false);
     dispatch_probe_now(&server_state, &run_id).await;
 
-    let (slot, text) = responder
-        .await
-        .expect("app responder task")
-        .expect("a parked worker has no boundary coming, so the ack must be written immediately");
-    assert_eq!(slot, 8);
+    let text = last_tmux_paste(&runner);
     assert_eq!(text, ack, "the ack must reach the worker verbatim");
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
@@ -863,9 +844,6 @@ async fn clearing_a_stale_queued_probe_records_that_it_was_dropped_and_why() {
 async fn a_write_into_a_pane_whose_process_is_gone_is_not_recorded_as_consumed() {
     let (server_state, _dir) = test_server_state();
     let run_id = register_working_worker_with_driver(&server_state, 3, None);
-    // Park the worker so the Stop-path posture guard permits the write, then
-    // point its live state at a pid that is definitely gone — the pane is
-    // still there and still accepts bytes, but nothing is reading them.
     server_state.live_worker_states.apply_event(
         3,
         &WorkerEvent::Stop {
@@ -878,6 +856,7 @@ async fn a_write_into_a_pane_whose_process_is_gone_is_not_recorded_as_consumed()
         .live_worker_states
         .update_shell_pid(&run_id, a_definitely_dead_pid())
         .expect("fixture precondition: the run must have a live-state entry");
+    let _tmux = install_probe_tmux(&server_state, &run_id);
 
     let watch_session_id = "session-dead-pid-watch".to_owned();
     let watch_sink = make_session_sink();
@@ -890,14 +869,9 @@ async fn a_write_into_a_pane_whose_process_is_gone_is_not_recorded_as_consumed()
         .subscribe(&watch_session_id, &[probe_topic(&run_id)])
         .await;
 
-    let responder = app_session_capturing_one_send(&server_state).await;
     let probe_id = server_state.queue_probe(run_id.clone(), "anyone home?".into(), false);
     let outcome = dispatch_probe_on_stop(&server_state, &stop_event(&run_id)).await;
 
-    responder
-        .await
-        .expect("app responder task")
-        .expect("the write is still issued — the engine cannot know it is unread until it checks");
     assert_eq!(outcome, ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Orphaned));
     let state = server_state
         .probe_lifecycle_state(&probe_id)
@@ -968,11 +942,11 @@ async fn a_live_worker_still_records_consumed() {
         .update_shell_pid(&run_id, std::process::id() as i32)
         .expect("fixture precondition: the run must have a live-state entry");
 
-    let responder = app_session_capturing_one_send(&server_state).await;
+    let runner = install_probe_tmux(&server_state, &run_id);
     let probe_id = server_state.queue_probe(run_id.clone(), "still with me?".into(), false);
     let outcome = dispatch_probe_on_stop(&server_state, &stop_event(&run_id)).await;
 
-    responder.await.expect("app responder task").expect("SendToPane issued");
+    let _ = last_tmux_paste(&runner);
     assert_eq!(outcome, ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Consumed));
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
@@ -1128,13 +1102,10 @@ async fn a_folded_codex_turn_completes_the_probe_cycle_on_its_single_boundary() 
         .subscribe(&observer, &[probe_topic(&run_id)])
         .await;
 
-    let responder = app_session_capturing_one_send(&server_state).await;
+    let runner = install_probe_tmux(&server_state, &run_id);
     let probe_id = server_state.queue_probe(run_id.clone(), "what is your status?".into(), false);
     dispatch_probe_on_post_tool_use(&server_state, &post_tool_use(&run_id)).await;
-    responder
-        .await
-        .expect("app responder task")
-        .expect("the mid-turn probe must reach the pane");
+    let _ = last_tmux_paste(&runner);
     assert!(
         server_state.has_in_flight_probe(&run_id),
         "a delivered probe holds the run's single reply slot until a boundary clears it",
@@ -1228,11 +1199,11 @@ async fn stop_drain_reports_already_in_flight_when_another_path_holds_the_slot()
     );
 }
 
-/// A pane write that fails (no app session registered, so `SendToPane`
-/// errors immediately) must push the probe back to the front of the queue
-/// with its id intact and report `RequeuedAfterFailure`, rather than exiting
-/// silently — a probe that is popped and then lost is indistinguishable in
-/// the trace from one that was never queued.
+/// A pane write that fails (local worker with no tmux identity) must push
+/// the probe back to the front of the queue with its id intact and report
+/// `RequeuedAfterFailure`, rather than exiting silently — a probe that is
+/// popped and then lost is indistinguishable in the trace from one that
+/// was never queued.
 #[tokio::test]
 async fn stop_drain_requeues_after_a_failed_pane_write() {
     let (server_state, _dir) = test_server_state();
@@ -1245,8 +1216,8 @@ async fn stop_drain_requeues_after_a_failed_pane_write() {
             stop_reason: crate::protocol::StopReason::Completed,
         },
     );
-    // Deliberately no app session registered, so `SendToPane` fails fast
-    // with `SendToAppError::NotRegistered` instead of timing out.
+    // Deliberately no tmux identity, so the write fails closed instead of
+    // falling back to an app pane RPC.
     let probe_id = server_state.queue_probe(run_id.clone(), "still there?".into(), false);
 
     let outcome = dispatch_probe_on_stop(&server_state, &stop_event(&run_id)).await;
@@ -1369,7 +1340,7 @@ async fn a_probe_queued_at_a_turn_boundary_is_delivered_before_teardown_can_aban
         "precondition: a mid-turn probe on this driver cannot be written yet",
     );
 
-    let captured = app_session_capturing_one_send(&server_state).await;
+    let runner = install_probe_tmux(&server_state, &run_id);
     // Production fan-out order on a Stop: live-state apply parks the worker,
     // then the pre-completion probe pass runs.
     let stop = stop_event(&run_id);
@@ -1380,11 +1351,7 @@ async fn a_probe_queued_at_a_turn_boundary_is_delivered_before_teardown_can_aban
         ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Consumed),
         "the boundary the engine promised must be the boundary it delivers on",
     );
-    let (_, text) = tokio::time::timeout(Duration::from_secs(2), captured)
-        .await
-        .expect("timed out waiting for SendToPane")
-        .expect("app responder panicked")
-        .expect("the probe text must reach the pane");
+    let text = last_tmux_paste(&runner);
     assert!(text.contains("do not open the PR yet"));
 
     // Now the run ends, as it would have milliseconds later. The probe is
@@ -1576,15 +1543,11 @@ async fn the_turn_boundary_fanout_delivers_a_probe_queued_before_it() {
     let (server_state, _dir) = test_server_state();
     let run_id = register_working_worker_with_driver(&server_state, 8, Some("grok"));
     let probe_id = server_state.queue_probe(run_id.clone(), "hold the PR".into(), false);
-    let captured = app_session_capturing_one_send(&server_state).await;
+    let runner = install_probe_tmux(&server_state, &run_id);
 
     dispatch_worker_event_fanout(&server_state, &stop_event(&run_id)).await;
 
-    let (_, text) = tokio::time::timeout(Duration::from_secs(5), captured)
-        .await
-        .expect("timed out waiting for SendToPane")
-        .expect("app responder panicked")
-        .expect("the probe text must reach the pane");
+    let text = last_tmux_paste(&runner);
     assert!(text.contains("hold the PR"));
     assert!(
         server_state
