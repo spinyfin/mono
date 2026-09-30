@@ -691,6 +691,34 @@ async fn readoption_does_not_claim_a_slot_whose_live_state_belongs_to_another_ru
     assert_eq!(state.run_id, other_execution_id);
 }
 
+/// A readopted local tmux worker must be registered with its durable tmux
+/// session name: local pane writes, probes and interrupt route only on it, so
+/// a sessionless registration would fail them closed until the next adoption
+/// pass even though the worker is healthy.
+#[tokio::test]
+async fn readoption_registers_the_durable_tmux_session_name() {
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+    let execution_id = create_spawned_execution(db, &work_item_id, i64::from(std::process::id()));
+    register_tmux_identity_for_test(&server_state, &execution_id, "boss-1-readopt", "tok-readopt");
+    db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
+
+    crate::app::worker_events::converge_terminal_execution_contradiction(&server_state, &execution_id, "stop").await;
+
+    let pane = server_state
+        .worker_registry
+        .pane_for_run(&execution_id)
+        .expect("readoption must register the run's slot");
+    assert_eq!(
+        pane.tmux_session_name.as_deref(),
+        Some("boss-1-readopt"),
+        "the readopted slot must carry the durable tmux session name",
+    );
+    assert!(server_state.pane_write_transport_ready(&execution_id).is_ok());
+}
+
 // ─── progress-ingress readoption ────────────────────────────────────────────
 
 /// Read back the `progress_ingress` field the readoption stamped on its
