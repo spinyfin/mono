@@ -473,7 +473,7 @@ impl ServerState {
         };
         let Some(session_name) = pane.tmux_session_name.filter(|name| !name.is_empty()) else {
             return Err(InterruptPaneError::Tmux(anyhow::anyhow!(
-                "local worker has no tmux session identity"
+                super::pane_delivery::missing_session_identity_message(run_id, pane.slot_id)
             )));
         };
         match self.tmux_for_pane_delivery(run_id) {

@@ -1941,6 +1941,15 @@ mod tests {
     use super::*;
     use boss_protocol::{Product, Project, ProjectStatus, Task, TaskKind, TaskStatus};
 
+    #[test]
+    fn tmux_adoption_state_label_marks_not_tmux_hosted_as_remote_detached() {
+        assert_eq!(
+            tmux_adoption_state_label(TmuxAdoptionState::NotTmuxHosted),
+            "remote_detached"
+        );
+        assert_eq!(tmux_adoption_state_label(TmuxAdoptionState::Adopted), "adopted");
+    }
+
     /// Build a live-worker fixture with a caller-chosen slot id, run id, and
     /// crew name. Setting `name` explicitly (rather than deriving it from
     /// `slot_id` the way production does) lets the resolver tests target each

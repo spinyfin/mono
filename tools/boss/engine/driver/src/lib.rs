@@ -934,8 +934,8 @@ pub struct InterruptPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InterruptGesture {
     /// tmux key name delivered to the pane (`send-keys <key>`), e.g.
-    /// `"Escape"`. Named rather than a raw byte so the gesture stays
-    /// transport-neutral.
+    /// `"Escape"`. Named rather than a raw byte because tmux `send-keys` takes
+    /// key names.
     pub key: &'static str,
     /// How many presses of [`Self::key`] make up one attempt. One is enough
     /// for every driver measured so far; the field exists because a TUI that
