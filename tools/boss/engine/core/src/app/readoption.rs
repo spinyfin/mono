@@ -895,6 +895,20 @@ impl ServerState {
     /// and after boot-time tmux adoption when an app session is already
     /// registered (engine restart — every readopted run predates this
     /// engine process's own spawn history).
+    /// Give a registered app session a viewer for every worker an adoption
+    /// pass just (re)registered in live-state. Adoption registers live-state
+    /// but never sends `AttachWorkerPane`, so a pass that lands after the app
+    /// registered (the periodic sweep) would otherwise leave those workers
+    /// without a viewer. No-op when the pass adopted nothing or no app is
+    /// registered (the app's own `RegisterAppSession` covers that ordering);
+    /// workers the app already views are skipped by the reattach dedup.
+    pub(crate) async fn reattach_after_adoption(&self, outcome: &crate::tmux_adoption::TmuxAdoptionOutcome) {
+        if outcome.adopted_execution_ids.is_empty() || self.app_session.lock().await.is_none() {
+            return;
+        }
+        self.reattach_worker_panes_to_registered_app().await;
+    }
+
     pub(crate) async fn reattach_worker_panes_to_registered_app(&self) {
         let candidates: Vec<LiveWorkerState> = self
             .live_worker_states

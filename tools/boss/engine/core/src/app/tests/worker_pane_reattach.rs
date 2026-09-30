@@ -185,3 +185,52 @@ async fn skips_a_run_the_app_already_hosts() {
 
     pass.await.expect("reattach pass task panicked");
 }
+
+/// Registration ordering: the app registers first (nothing in live-state yet,
+/// so its own reattach finds no candidates), then the periodic adoption pass
+/// registers a worker. The engine must send that app an attach for it.
+#[tokio::test]
+async fn attaches_a_worker_registered_by_a_later_adoption_pass() {
+    let (server_state, _dir) = test_server_state();
+    install_tmux_override(&server_state);
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    let run_id = seed_tmux_hosted_live_run(&server_state, 5, "boss-5-reattach", "reattach-token-3");
+    let outcome = crate::tmux_adoption::TmuxAdoptionOutcome {
+        adopted_execution_ids: std::collections::HashSet::from([run_id.clone()]),
+        ..Default::default()
+    };
+
+    let state = server_state.clone();
+    let pass = tokio::spawn(async move {
+        state.reattach_after_adoption(&outcome).await;
+    });
+
+    answer_list_hosted_panes(&server_state, &sink, vec![]).await;
+
+    let envelope = sink.next().await.expect("AttachWorkerPane request");
+    let (request_id, input) = match &envelope.payload {
+        FrontendEvent::EngineRequest {
+            request_id,
+            request: EngineToAppRequest::AttachWorkerPane(input),
+        } => (request_id.clone(), input.clone()),
+        other => panic!("expected AttachWorkerPane EngineRequest, got {other:?}"),
+    };
+    assert_eq!(input.run_id, run_id);
+    assert_eq!(input.slot_id, 5);
+
+    server_state
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::AttachWorkerPane {
+                result: Ok(crate::protocol::AttachWorkerPaneResult {}),
+            },
+        )
+        .await;
+    pass.await.expect("reattach pass task panicked");
+}

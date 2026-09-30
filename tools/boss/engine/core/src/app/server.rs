@@ -254,18 +254,17 @@ impl crate::husk_pane_sweep::HuskPaneSweepSource for ServerState {
                 return None;
             }
         };
-        Some(
-            crate::tmux_adoption::run_adoption_pass(
-                self.work_db.as_ref(),
-                &tmux,
-                self.execution_coordinator.as_ref(),
-                self,
-                self,
-                self.dispatch_events.as_ref(),
-            )
-            .await
-            .untracked_sessions,
+        let outcome = crate::tmux_adoption::run_adoption_pass(
+            self.work_db.as_ref(),
+            &tmux,
+            self.execution_coordinator.as_ref(),
+            self,
+            self,
+            self.dispatch_events.as_ref(),
         )
+        .await;
+        self.reattach_after_adoption(&outcome).await;
+        Some(outcome.untracked_sessions)
     }
 
     fn tmux_operator_prefix(&self) -> String {
