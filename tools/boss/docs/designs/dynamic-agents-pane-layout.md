@@ -4,7 +4,7 @@
 - **Status:** design proposal
 - **Project:** Dynamic Agents pane layout
 - **Provenance:** project-design execution; no implementation code
-- **Verified against:** `main` at `3b4f038c1860` (2026-09-30), plus the reviewed diff of mono#3010, treated as landed per operator direction
+- **Verified against:** `main` at `2e351399284f` (2026-09-30), including merged mono#3010; source checkpoints below pin this revision
 - **Baseline:** [Tmux-only local worker panes](./make-tmux-the-only-pane-hosting-mode.md); remaining sequencing constraints: **Delete app-mediated worker input and narrow hosting status** and **Enforce and verify the tmux-only local-pane invariant**
 - **Direction notes:** [Fleet scaling, the slot model, and team semantics](./fleet-scaling-dynamic-panes-and-team-semantics.md)
 - **Related contract:** [Worker liveness](../worker-liveness-contract.md)
@@ -63,7 +63,7 @@ The CLI resolves live references by run id, numeric slot id, then case-insensiti
 - Mono#2996 deleted `SpawnWorkerPane` and `ReleaseWorkerPane` from `EngineToAppRequest`. Every local surface uses `WorkersWorkspaceModel.swift`'s `tmux attach-session` command. The app owns viewer attachment and detachment, not the worker lifecycle.
 - Mono#2862 landed: `work/run_rows.rs::TMUX_RUN_ADOPTABLE_PREDICATE` tests durable local tmux identity and execution status, not the short-lived spawn row's `r.status`. Same-run `register_readoption` preserves live state and holds.
 - Semantic progress checkpoints also landed (mono#2871). `engine/core/src/live_worker_state.rs::seed_semantic_progress` restores driver-originated progress without treating shell survival as proof of activity. The Agents pane draws spawning neutrally; the Doing-card live-state path renders spawning as unknown. The persisted-status fallback still exists and is not a membership source for this design.
-- Mono#3010 is an assumed part of this baseline, per operator direction; it was still open when verified. Its startup/death/spawn-ack/husk cleanup makes the recovery slot lookup durable and guards current ownership before acting. It leaves two app process-evidence consumers: `retire_pane` Guard 3 (`hosted_pane_run_for_slot`) and `list_hosted_pane_statuses` in `app/pane_ops.rs`. They still depend on the app's slot-to-run report.
+- Mono#3010 landed. Its startup/death/spawn-ack/husk cleanup makes the recovery slot lookup durable and guards current ownership before acting. It leaves two app process-evidence consumers: `retire_pane` Guard 3 (`hosted_pane_run_for_slot`) and `list_hosted_pane_statuses` in `app/pane_ops.rs`. They still depend on the app's slot-to-run report.
 
 ### Viewer presence is not worker liveness
 
@@ -74,6 +74,20 @@ A retained tmux session is also insufficient proof of liveness. `tmux_session_op
 ### Scrollback is bounded
 
 `tmux_session_options.rs` sets `history-limit=2000`. Ghostty retains its own scrollback while its surface stays mounted. The existing pool grids keep all attached surfaces mounted across tab changes; this design preserves that behaviour. Driver transcripts are the durable record.
+
+### Source checkpoints for the tmux-only baseline
+
+These links pin the verified main revision, independently of this design branch's older code base. The proposed membership projection and run-keyed app model below are implementation work, not claims that those changes already exist.
+
+| Boundary                                                                                          | Verified source                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Local dispatch requires tmux; a failed viewer attach leaves the worker running                    | [`PaneSpawnRunner`](https://github.com/spinyfin/mono/blob/2e351399284f3ba5fe0e0c200476a9ce302a6dc8/tools/boss/engine/core/src/runner/pane_spawn.rs#L1061) and [`start_worker`](https://github.com/spinyfin/mono/blob/2e351399284f3ba5fe0e0c200476a9ce302a6dc8/tools/boss/engine/core/src/spawn_flow.rs#L933)                                                                                                                                                                             |
+| App surfaces attach to tmux; detach is non-destructive; Focus and Detach still address slots      | [`WorkersWorkspaceModel`](https://github.com/spinyfin/mono/blob/2e351399284f3ba5fe0e0c200476a9ce302a6dc8/tools/boss/app-macos/Sources/Ghostty/WorkersWorkspaceModel.swift#L456) and [viewer protocol](https://github.com/spinyfin/mono/blob/2e351399284f3ba5fe0e0c200476a9ce302a6dc8/tools/boss/protocol/src/engine_app.rs#L106)                                                                                                                                                         |
+| Adoption ignores spawn-row status; same-run adoption retains state; semantic progress is restored | [adoptability predicate](https://github.com/spinyfin/mono/blob/2e351399284f3ba5fe0e0c200476a9ce302a6dc8/tools/boss/engine/core/src/work/run_rows.rs#L12) and [`register_readoption` / `seed_semantic_progress`](https://github.com/spinyfin/mono/blob/2e351399284f3ba5fe0e0c200476a9ce302a6dc8/tools/boss/engine/core/src/live_worker_state.rs#L611)                                                                                                                                     |
+| Retained dead panes require engine reconciliation and token-verified cleanup                      | [session options](https://github.com/spinyfin/mono/blob/2e351399284f3ba5fe0e0c200476a9ce302a6dc8/tools/boss/engine/core/src/tmux_session_options.rs#L12) and [dead-pane reconciliation](https://github.com/spinyfin/mono/blob/2e351399284f3ba5fe0e0c200476a9ce302a6dc8/tools/boss/engine/core/src/tmux_adoption/dead_pane.rs#L106)                                                                                                                                                       |
+| App slot-to-run reports still inform retirement and hosted-status classification after mono#3010  | [`retire_pane` Guard 3](https://github.com/spinyfin/mono/blob/2e351399284f3ba5fe0e0c200476a9ce302a6dc8/tools/boss/engine/core/src/app/pane_ops.rs#L649) and [`list_hosted_pane_statuses`](https://github.com/spinyfin/mono/blob/2e351399284f3ba5fe0e0c200476a9ce302a6dc8/tools/boss/engine/core/src/app/pane_ops.rs#L739)                                                                                                                                                                |
+| Creation-ordered adoption differs from viewer reattachment order                                  | [`list_adoptable_tmux_runs`](https://github.com/spinyfin/mono/blob/2e351399284f3ba5fe0e0c200476a9ce302a6dc8/tools/boss/engine/core/src/work/run_rows.rs#L1127), [slot-sorted snapshot](https://github.com/spinyfin/mono/blob/2e351399284f3ba5fe0e0c200476a9ce302a6dc8/tools/boss/engine/core/src/live_worker_state.rs#L889), and [viewer reattachment](https://github.com/spinyfin/mono/blob/2e351399284f3ba5fe0e0c200476a9ce302a6dc8/tools/boss/engine/core/src/app/readoption.rs#L899) |
+| Local pools total 40 slots; review max/default is 16; the roster has 40 names                     | [pool geometry](https://github.com/spinyfin/mono/blob/2e351399284f3ba5fe0e0c200476a9ce302a6dc8/tools/boss/engine/core/src/coordinator.rs#L179) and [roster](https://github.com/spinyfin/mono/blob/2e351399284f3ba5fe0e0c200476a9ce302a6dc8/tools/boss/protocol/src/worker_names.rs#L46)                                                                                                                                                                                                  |
 
 ## Alternatives considered
 
@@ -117,7 +131,7 @@ Rejected because the constraint is legibility. Capacity changes; the fixed 10pt 
 | Persona                    | Engine | Durable lease unique across live workers                                 | Pane/card header, kanban, `LiveWorkerState.name`, crew-name CLI address      |
 | Cell, page, visual order   | App    | Ephemeral per app session                                                | Presentation only                                                            |
 
-The vestigial `LiveWorkerState.shell_pid` is not process-container identity and the view must not read it. The view must also avoid `LiveWorkerState.tmux_hosted` and its `Models+WorkerActivity.swift` mirror: the remaining hosting-status cleanup changes their shape.
+The legacy `LiveWorkerState.shell_pid` field is not process-container identity and the view must not read it; engine recovery still maintains pid evidence internally. The view must also avoid `LiveWorkerState.tmux_hosted` and its `Models+WorkerActivity.swift` mirror: the remaining hosting-status cleanup changes their shape.
 
 **No engine state or wire type introduced by this project carries a page, cell, or visual position, and no CLI reference resolves through one.** A bare integer remains a slot id.
 
@@ -157,7 +171,7 @@ The same metadata projection supplies `host_id` from the durable run and `starte
 
 ### What "only running agents" means
 
-Membership comes from the engine-pushed `LiveWorkerState` snapshot, keyed in the app by `run_id`, restricted to `host_id == "local"`. It begins when the engine publishes a registered run and ends when its authoritative snapshot releases that run. Remote SSH workers are excluded. A disconnected feed retains the last snapshot with an unavailable/stale indication; disconnection is not an empty snapshot.
+Membership comes from the engine-pushed `LiveWorkerState` snapshot, keyed in the app by `run_id`, restricted to `host_id == "local"`. It begins when the engine publishes a registered run and ends when its authoritative snapshot releases that run. Remote SSH workers are excluded. A disconnected feed retains the last snapshot with an unavailable/stale indication; disconnection is not an empty snapshot. Preserve the existing rejection of duplicate run/slot ids before replacing that snapshot. Only an accepted authoritative snapshot can remove members; malformed or unavailable input must not clear the grid.
 
 Viewer ownership is separate: a surface's lifetime is bounded only by accepted `AttachWorkerPane` and matching `DetachWorkerPane`. Attach failure, surface loss, or detach while a run remains in engine membership leaves its cell visible with persona, type, activity, and **"Viewer not attached"** in place of the terminal. It consumes capacity, participates in filters and waiting counts, and can be focused as a card. A later attach fills the same cell. Reuse the existing engine reattachment path; the app does not spawn workers or probe their liveness.
 
@@ -247,7 +261,7 @@ The view header has filters, conditional page selectors, Tidy, hidden and needs-
 
 ### Dependency on the tmux-only project
 
-Tmux deletion work has mostly landed. This project forward-ports onto mono#2862, #2993, #2995, #2996, and the assumed mono#3010 baseline. It adds no dual-mode renderer, hosting badge, or app-owned worker lifecycle.
+Tmux deletion work has mostly landed. This project forward-ports onto merged mono#2862, #2993, #2995, #2996, and #3010. It adds no dual-mode renderer, hosting badge, or app-owned worker lifecycle.
 
 1. **Delete app-mediated worker input and narrow hosting status** precedes **Key viewer pane RPCs by run id** (shared protocol enums) and **Replace the pool tabs with the dynamic Agents view** (shared `Models+WorkerActivity.swift` and `PlannerAffordances.swift`).
 2. **Enforce and verify the tmux-only local-pane invariant** follows that deletion and precedes both RPC re-keying and the view rewrite. Its acceptance must retire the remaining `ListHostedPanes` process oracle. This order preserves slot safety while the engine still needs it and avoids rewriting the same contracts twice.
@@ -317,7 +331,7 @@ Parallelism: Independent of engine/protocol changes; new model and test files on
 
 ### Replace the pool tabs with the dynamic Agents view
 
-Scope: Connect engine membership and the separate viewer map to a uniform paginated grid; render persona/type/activity headers and viewer-missing cards; integrate measured cell size, resize boundaries, Tidy, page/waiting selectors, pool strip, and empty state. Keep all attached surfaces mounted across pages, delete slot-array projections, and test snapshot/attach/detach races and terminal-state rendering. Filters initially remain All; filter controls and kanban migration are separate capabilities.
+Scope: Connect engine membership and the separate viewer map to a uniform paginated grid; render persona/type/activity headers and viewer-missing cards; integrate measured cell size, resize boundaries, Tidy, page/waiting selectors, pool strip, and empty state. Keep all attached surfaces mounted across pages, delete slot-array projections, and test snapshot/attach/detach races, rejected snapshots, feed reconnection, and terminal-state rendering. Filters initially remain All; filter controls and kanban migration are separate capabilities.
 
 Effort hint: `large`. Estimated size: 1,000–1,400 lines / 10–18 files.
 
