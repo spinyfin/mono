@@ -105,7 +105,7 @@ Rejected because layout depends on app geometry. No page or cell belongs in an e
 
 ### Reflow on every arrival and exit
 
-Rejected while the view is on screen because it moves panes under a reader's cursor. Immediate reflow remains appropriate while the view is hidden.
+Rejected as the default while the view is on screen because it moves panes under a reader's cursor. The chosen epoch policy permits grid growth for arrivals and compaction when fewer pages suffice, preserving the reader's surviving run as anchor. Immediate reflow remains appropriate while the view is hidden.
 
 ### Detach the viewer for off-page panes
 
@@ -142,8 +142,8 @@ The legacy `LiveWorkerState.shell_pid` field is not process-container identity a
 - Persist a nullable `work_runs.persona` in the spawn-record transaction. On tmux adoption, restore existing leases before assigning missing personas to old rows, in `created_at, id` order. Same-run adoption preserves the lease alongside the already-preserved live state.
 - Retain the `" (Remote)"` display qualifier as a host marker; remote workers draw from the same persona pool.
 - When all 40 names are held, allocate `Ensign N` with the lowest free `N`, warn, and increment `persona_roster_exhausted`. Never refuse dispatch. With at most 40 local slots, overflow requires remote workers too.
-- Resolve `HostedPaneStatus.crew_name` and `bossctl agents list --all` from the durable persona by run id. `HostedPaneEntry` remains an app viewer report, not a persona allocator, and keeps reporting `slot_id` until the invariant task retires the app process oracle.
-- Migrate engine/UI consumers off slot-derived names, then remove `name_for_slot` and the duplicate Swift roster. CLI matching and miss handling must recognise overflow names without treating them as work-item selectors.
+- Resolve `HostedPaneStatus.crew_name` and `bossctl agents list --all` from the durable persona by run id. `HostedPaneEntry` remains an app viewer report, not a persona allocator. Its existing `slot_id` and `run_id` fields serve the safety contract through the invariant sweep, then viewer diagnostics; persona work preserves that report.
+- Migrate engine/UI consumers off slot-derived names; **Render kanban agent names from the engine persona** owns final deletion of `name_for_slot` and the duplicate Swift roster after the pane migration. CLI matching and miss handling must recognise overflow names without treating them as work-item selectors.
 
 The app renders the engine name and maps the existing portrait assets by name. Persona restore extends tmux adoption only; no app-originated spawn-ack or husk restoration path is added.
 
@@ -181,7 +181,7 @@ An attach that arrives before the live snapshot may be retained in the viewer ma
 - Engine terminal state (`terminated`, or an engine terminal execution update while cleanup is pending) produces **"Exited"** and a dim header until engine release. Surface death never sets Exited. Dead panes can linger under `remain-on-exit`; the interval is controlled by engine dead-pane reconciliation and token-verified cleanup, not an app reaper or UI timer. Unreadable probes can delay cleanup, so this is not a fixed retention guarantee.
 - Waiting workers are not reordered. Their orange pill, page-selector dot, and needs-input count include cards without viewers.
 
-On engine release, only the epoch placeholder remains. Engine recovery owns gaps or contradictions in its live registry; the app must not reconstruct membership from terminal content, DB "running" fallbacks, app spawn acknowledgements, or CLI polling.
+On engine release, an epoch placeholder can remain under the layout rules below; it never counts as occupied. Engine recovery owns gaps or contradictions in its live registry; the app must not reconstruct membership from terminal content, DB "running" fallbacks, app spawn acknowledgements, or CLI polling.
 
 ### Capacity computation
 
@@ -206,7 +206,9 @@ capacity = min(cols * rows, MAX_PANES_PER_PAGE)
 
 A 6pt by 13pt cell gives an estimated 4-by-2, eight-pane maximized laptop layout; large-display capacity depends on logical resolution and hits the 16-pane cap when the formula permits more. These are estimates, not fresh measurements. Keep constants in one `PaneCapacityPolicy` and tune them through the capture task.
 
-For `k <= capacity` occupied cells, choose `(c, r)` with `c * r >= k`, `c <= cols`, and `r <= rows`, maximizing `min(paneW / minPaneW, paneH / minPaneH)`, then fewer empty cells, then more columns. This yields a full-size single pane, side-by-side pairs, and compact larger grids. A window below the minimum still renders one pane; the policy cannot promise minimum dimensions in less space.
+Each page has `capacity` logical cell addresses; these are not pre-rendered empty panes. The rendered grid grows to cover the page's used span `k`: its highest occupied or retained-placeholder local index plus one. At a compacting boundary, `k` is simply that page's occupied count. Choose `(c, r)` with `c * r >= k`, `c <= cols`, and `r <= rows`, maximizing `min(paneW / minPaneW, paneH / minPaneH)`, then fewer empty cells, then more columns. Map logical cells row-major; spare rectangles do not increase logical capacity. This yields a full-size single pane, side-by-side pairs, and compact larger grids. A window below the minimum still renders one pane; the policy cannot promise minimum dimensions in less space.
+
+Capacity determines page assignment, independently of the current rendered shape. Arrivals may grow that shape within an epoch before another page is needed; placeholders may retain its size but never justify an extra page. For `N` filtered engine members, including viewer-missing cards and terminal members awaiting release, there are exactly `ceil(N / capacity)` nonempty pages, or the empty state when `N = 0`.
 
 ### Ordering, cells, and layout epochs
 
@@ -214,18 +216,25 @@ Sort by `(execution started_at, execution id)`, oldest first. Tmux adoption read
 
 While Agents is on screen:
 
-1. A cell stays put and its page grid stays the same shape for a **layout epoch**.
-2. Arrivals fill the lowest free cell; if none fits the current grid, open the next page.
-3. Engine release leaves a dim placeholder ("Riker finished"), not a collapsing grid.
-4. A **layout boundary** removes holes and refits: entering Agents, page change, filter change, resize end, or Tidy. Highlight Tidy when it would change the layout.
+1. A **layout epoch** preserves each run's logical cell index. Keep its page's rendered shape unless an arrival needs a larger span; this permitted growth changes pane geometry, not run identity or cell assignment.
+2. Arrivals fill the lowest free logical cell (including placeholders). Grow the receiving page's grid using the capacity policy if that cell falls outside its rendered shape. Open another page only after all `capacity` cells on every existing page are occupied, never because the rendered grid is full.
+3. Engine release normally leaves a dim placeholder ("Riker finished"). If fewer pages suffice after release (`ceil(N / capacity)` is below the current page count), immediately end the epoch and compact, even while Agents is visible. This also removes a trailing page containing only placeholders. Thus a drop to one page removes every overflow cell and hides selectors; a drop to zero removes all placeholders and shows the empty state.
+4. A **layout boundary** removes holes, packs members in the sort order above, and refits: entering Agents, page change, filter change, resize end, Tidy, or the forced compaction on release. Highlight Tidy when it would change the layout.
+
+For automatic growth or compaction, capture a surviving run as the reader's anchor: the focused run, otherwise the first surviving occupied cell on the selected page, otherwise the nearest survivor to that page's previous first occupied cell (by prior cell index, ties toward the lower index). Keep its surface mounted and focus intact; after refit select its new page. The anchor can change size or position, but remains visible. Explicit page navigation selects the requested destination after compaction and clamping instead.
 
 While Agents is hidden, changes apply immediately. A persona on a finished placeholder is historical text, not an active lease or addressable worker.
 
 ### Pagination selectors and resize
 
-Pages are fixed windows of `capacity` cells. Show selectors when an occupied cell is at or beyond the first page; remove them when release or tidy leaves all occupied cells on page one. Clamp the selected page to the highest occupied page so the operator moves only when the selected page empties. Each selector shows count and a waiting-worker dot.
+Pages are fixed windows of `capacity` logical cells, with zero-based indices. Show selectors only when an occupied cell falls past the first page (`index >= capacity`); hide them when release or Tidy leaves every occupied cell on page one. Apply forced compaction before computing visibility, so retained holes never keep selectors visible when `N <= capacity`. Select the anchor's page after automatic compaction and clamp to the highest occupied page if no anchor survives. Each selector shows occupied count and a waiting-worker dot; placeholders count toward neither.
 
-Ghostty geometry sync is already capped at 30 Hz in `GhosttyTerminalView.swift`. Resize surfaces during a drag; recompute capacity only at drag end, or after 300 ms of geometric quiet for other geometry changes, with a 16pt dead band around row/column thresholds. Preserve the focused pane as anchor, or the first occupied cell on the selected page if none is focused. After refit, select its new page.
+Worked examples at capacity 8:
+
+- **1 → 2 arrivals:** the first run occupies index 0 in a full-size 1-by-1 grid. The second takes index 1 on the same page; the grid grows to the policy's two-pane shape (2-by-1 in the estimated laptop geometry). The first run remains the anchor, with the same mounted surface and focus. Selectors stay hidden; indices 2–7 remain available without reserved visible panes.
+- **9 → 8 departure, reader on page 2:** runs occupy indices 0–8, and the reader is on the ninth run at index 8. A run on page 1 is released. Retaining that hole would leave an occupied index beyond capacity even though eight members fit on one page, so release forces compaction. The ninth run moves to index 7, the selected page becomes page 1, and selectors disappear; its surface and focus survive. If the ninth run itself is released instead, the nearest surviving run on page 1 becomes the anchor and selectors also disappear.
+
+Ghostty geometry sync is already capped at 30 Hz in `GhosttyTerminalView.swift`. Resize surfaces during a drag; recompute capacity only at drag end, or after 300 ms of geometric quiet for other geometry changes, with a 16pt dead band around row/column thresholds. Refit using the same surviving-run anchor rule; capacity changes also pack members before evaluating selector visibility.
 
 ### Visibility never affects execution
 
@@ -251,7 +260,7 @@ Add `run_id` only to `DetachWorkerPaneInput` and `FocusWorkerPaneInput`; attach 
 
 Do not modify `SendToPaneInput` or `InterruptWorkerPaneInput`: **Delete app-mediated worker input and narrow hosting status** deletes them. Follow that task when editing shared protocol enums.
 
-Before changing `SlotBusy` or dropping slot-indexed compatibility, **Enforce and verify the tmux-only local-pane invariant** must retire `retire_pane` Guard 3 and `list_hosted_pane_statuses`'s app process oracle. Until then, `ListHostedPanes`/`HostedPaneEntry` must report both `slot_id` and `run_id`, and `SlotBusy` keeps its slot-occupancy meaning. After that prerequisite, make same-run attach idempotent: preserve the existing surface and return success, with no surviving slot-desync caller interpreting a changed error contract. Retain slot in viewer reports for diagnostics; resolve personas in the engine by run id.
+**Enforce and verify the tmux-only local-pane invariant** lands first and retires `retire_pane` Guard 3 and `list_hosted_pane_statuses`'s app process oracle. `HostedPaneEntry` already carries both `slot_id` and `run_id`; its slot report and the existing `SlotBusy` safety contract remain intact through that prerequisite. The subsequent RPC task removes slot-based safety compatibility and makes same-run attach idempotent: preserve the existing surface and return success, with no surviving slot-desync caller interpreting a changed error contract. Retain both fields in viewer reports for diagnostics; resolve personas in the engine by run id. Temporary slot-array projections support only the old grid, not process safety.
 
 ### Header, empty state, and pool information
 
@@ -264,14 +273,14 @@ The view header has filters, conditional page selectors, Tidy, hidden and needs-
 Tmux deletion work has mostly landed. This project forward-ports onto merged mono#2862, #2993, #2995, #2996, and #3010. It adds no dual-mode renderer, hosting badge, or app-owned worker lifecycle.
 
 1. **Delete app-mediated worker input and narrow hosting status** precedes **Key viewer pane RPCs by run id** (shared protocol enums) and **Replace the pool tabs with the dynamic Agents view** (shared `Models+WorkerActivity.swift` and `PlannerAffordances.swift`).
-2. **Enforce and verify the tmux-only local-pane invariant** follows that deletion and precedes both RPC re-keying and the view rewrite. Its acceptance must retire the remaining `ListHostedPanes` process oracle. This order preserves slot safety while the engine still needs it and avoids rewriting the same contracts twice.
+2. **Enforce and verify the tmux-only local-pane invariant** follows that deletion and precedes both RPC re-keying and the view rewrite. Its acceptance retires the remaining `ListHostedPanes` process oracle; the existing slot report stays intact through this task. RPC re-keying therefore starts with those safety consumers gone and can remove their compatibility semantics directly, avoiding a transitional slot-safety implementation.
 
-Persona, metadata, and the pure layout model can progress independently of this sequence. Coordinate persona's `pane_ops.rs` name projection with the invariant sweep if both edit it. Retain the slot report until that sweep actually removes its safety consumers; do not infer completion merely from mono#3010.
+Persona, metadata, and the pure layout model can progress independently of this sequence. Coordinate persona's `pane_ops.rs` name projection with the invariant sweep if both edit it. Mono#3010 alone does not satisfy the sweep's acceptance; removal of the named safety consumers is a prerequisite to starting the RPC and view tasks.
 
 ## Risks / open questions
 
 - Capacity constants need real-display measurements; estimates do not establish legibility.
-- Epochs can leave holes for a long time; highlighted Tidy and refitting at boundaries make that state explicit.
+- Epochs can retain holes within the minimum page count; highlighted Tidy makes them explicit. Grid growth and forced page collapse can move the reader's pane, so both preserve its run as anchor.
 - `Ensign N` remains a proposed overflow naming choice.
 - Exited retention follows engine reconciliation; unreadable probes can delay it.
 - Membership follows engine bookkeeping, including recovery delays. Viewer errors must remain visible without pretending the app can establish process liveness.
@@ -283,7 +292,7 @@ Ten in-scope capabilities. Each entry targets no more than three major deliverab
 
 ### Allocate personas in the engine as durable unique leases
 
-Scope: Implement the durable persona column and allocator, restore leases through tmux adoption, and migrate engine/CLI name consumers (including hosted-status projection) off slot-derived naming. Tests cover local/remote uniqueness, overflow, restoration of older rows, release reuse, and CLI resolution. Keep app slot reporting intact; removing duplicate Swift naming belongs to the UI migration below.
+Scope: Implement the durable persona column and allocator, restore leases through tmux adoption, and migrate engine/CLI name consumers (including hosted-status projection) off slot-derived naming. Tests cover local/remote uniqueness, overflow, restoration of older rows, release reuse, and CLI resolution. Keep app slot reporting intact; final removal of `name_for_slot` and duplicate Swift naming belongs solely to **Render kanban agent names from the engine persona**.
 
 Effort hint: `large`. Estimated size: 900–1,400 lines / 12–20 files.
 
@@ -307,7 +316,7 @@ Parallelism: Can run beside the pure layout model and viewer RPC task; consumes 
 
 ### Key viewer pane RPCs by run id
 
-Scope: Add run id to Detach and Focus, update engine dispatch and app handlers, and re-key the app viewer map. Preserve temporary slot-array projections for the old grid. Test same-run attach, delayed detach after slot reuse, focus, and truthful viewer reporting. Resolve duplicate-attach/error semantics only after the external invariant sweep has removed slot-based safety consumers. Do not touch deleted send/interrupt RPCs.
+Scope: Add run id to Detach and Focus, update engine dispatch and app handlers, and re-key the app viewer map. Remove slot-based safety compatibility and make same-run attach idempotent on the completed invariant-sweep baseline. Preserve temporary slot-array projections solely for the old grid and both existing fields in viewer reports for diagnostics. Test same-run attach, delayed detach after slot reuse, focus, and truthful viewer reporting. Do not touch deleted send/interrupt RPCs.
 
 Effort hint: `medium`. Estimated size: 700–1,200 lines / 10–20 files.
 
@@ -319,7 +328,7 @@ Parallelism: Can run beside persona and layout work; the view rewrite follows be
 
 ### Build the pane capacity and layout model
 
-Scope: Add pure Swift `PaneCapacityPolicy` and `PaneLayoutModel`: grid selection, stable cells, epochs, pagination, filter application, hidden/waiting counts, resize dead band, and anchor selection. Unit-test geometry, holes, boundaries, cards without viewers, filter changes, and stable run identity. No UI.
+Scope: Add pure Swift `PaneCapacityPolicy` and `PaneLayoutModel`: grid selection, stable logical cells with within-epoch grid growth, forced page collapse, pagination, filter application, hidden/waiting counts, resize dead band, and anchor selection. Unit-test geometry, holes, boundaries, cards without viewers, filter changes, and stable run identity, including the capacity-8 1 → 2 and 9 → 8 examples and selector visibility after release. No UI.
 
 Effort hint: `medium`. Estimated size: 700–1,100 lines / 4–8 files.
 
@@ -331,7 +340,7 @@ Parallelism: Independent of engine/protocol changes; new model and test files on
 
 ### Replace the pool tabs with the dynamic Agents view
 
-Scope: Connect engine membership and the separate viewer map to a uniform paginated grid; render persona/type/activity headers and viewer-missing cards; integrate measured cell size, resize boundaries, Tidy, page/waiting selectors, pool strip, and empty state. Keep all attached surfaces mounted across pages, delete slot-array projections, and test snapshot/attach/detach races, rejected snapshots, feed reconnection, and terminal-state rendering. Filters initially remain All; filter controls and kanban migration are separate capabilities.
+Scope: Connect engine membership and the separate viewer map to a uniform paginated grid; render persona/type/activity headers and viewer-missing cards; integrate measured cell size, resize boundaries, Tidy, page/waiting selectors, pool strip, and empty state. Keep all attached surfaces mounted across pages, delete slot-array projections, and test snapshot/attach/detach races, rejected snapshots, feed reconnection, and terminal-state rendering. Filters initially remain All; filter controls and kanban migration are separate capabilities. Migrate pane naming consumers here, leaving final shared naming-helper and roster deletion to the dependent kanban task.
 
 Effort hint: `large`. Estimated size: 1,000–1,400 lines / 10–18 files.
 
@@ -339,7 +348,7 @@ Dependencies: Stamp agent type, project, and membership metadata on live worker 
 
 Scope: in-scope
 
-Parallelism: Can run beside backend invariant tests and kanban persona migration. Shared `Models+WorkerActivity.swift` and `PlannerAffordances.swift` edits must build on the external input/status deletion.
+Parallelism: Can run beside backend invariant tests; kanban persona migration follows this task. Shared `Models+WorkerActivity.swift` and `PlannerAffordances.swift` edits must build on the external input/status deletion.
 
 ### Add project and type filtering to Agents
 
@@ -355,15 +364,15 @@ Parallelism: Can run beside kanban persona migration and capacity validation; it
 
 ### Render kanban agent names from the engine persona
 
-Scope: Migrate Doing-card names and portrait lookup to the engine persona, preserving the neutral/unknown spawning treatment. Test persona stability across slot reuse and missing metadata; remove slot-name helpers and the duplicate Swift roster after their last pane/card consumer migrates. Idle flavour can use the existing portrait crew without recreating a slot roster.
+Scope: Migrate Doing-card names and portrait lookup to the engine persona, preserving the neutral/unknown spawning treatment. This task solely owns final deletion of `name_for_slot`, the Swift slot-name helpers, and the duplicate Swift roster, with engine/CLI and pane consumers already migrated by its prerequisites. Replace roster-mirroring tests with persona-consumer coverage; test stability across slot reuse and missing metadata, and verify no slot-name consumers remain. Idle flavour can use the existing portrait crew without recreating a slot roster.
 
 Effort hint: `small`. Estimated size: 250–600 lines / 4–10 files.
 
-Dependencies: Allocate personas in the engine as durable unique leases
+Dependencies: Allocate personas in the engine as durable unique leases; Replace the pool tabs with the dynamic Agents view
 
 Scope: in-scope
 
-Parallelism: Card work can run beside the view rewrite; coordinate final shared-helper deletion after both consumers migrate. No dependency on filters, pagination controls, or operator documentation.
+Parallelism: Follows the view rewrite and can run beside filters and capacity validation. No dependency on filter controls or operator documentation.
 
 ### Make focus bring an agent into view
 
