@@ -1402,10 +1402,20 @@ pub fn write_hooks_and_attest(
 }
 
 /// Resolve the `codex` binary used for live hook-trust observation.
+#[cfg(not(test))]
 fn resolve_codex_bin() -> PathBuf {
     which_codex().unwrap_or_else(|| PathBuf::from("codex"))
 }
 
+// Unit tests must use the Bazel-declared release, never an ambient installation.
+#[cfg(test)]
+fn resolve_codex_bin() -> PathBuf {
+    PathBuf::from(std::env::var_os("BOSS_TEST_CODEX").expect("Bazel must provide pinned Codex"))
+        .canonicalize()
+        .expect("Bazel pinned Codex binary must exist")
+}
+
+#[cfg(not(test))]
 fn which_codex() -> Option<PathBuf> {
     let output = Command::new("which").arg("codex").output().ok()?;
     if !output.status.success() {

@@ -1342,12 +1342,8 @@ fn guide_permission_materialization_requires_socket_and_writes_named_profile() {
     assert!(error.to_string().contains("requires a bound frontend socket"));
     assert!(!home.join("config.toml").exists());
     input.frontend_socket_path = Some(tmp.path().join("frontend.sock"));
-    // The sandbox forbids launching a live Codex process; materialization must
-    // finish before the separate hook-trust attestation reports that failure.
-    let result = rt.block_on(driver.write_permission_config(&input, tmp.path()));
-    if let Err(error) = result {
-        assert!(error.to_string().contains("hook-trust gate"), "{error:#}");
-    }
+    rt.block_on(driver.write_permission_config(&input, tmp.path()))
+        .expect("pinned Codex must load the guide config and arm its guards");
     let config: toml::Value = toml::from_str(&fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
     assert_eq!(
         config["permissions"]["review-guide"]["extends"].as_str(),
