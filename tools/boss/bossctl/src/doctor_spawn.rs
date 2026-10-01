@@ -64,7 +64,7 @@ const PROGRESS_INGRESS_MARKER: &str = "preparing progress ingress: ";
 /// do not grow the pool, retry, or reap panes" advice would be actively
 /// wrong for it. It takes the transport branch below instead, which hands
 /// off to SIG-B/SIG-E.
-const DETERMINISTIC_PRECONDITION_CLASSES: &[&str] = &["progress_ingress", "write_files"];
+const DETERMINISTIC_PRECONDITION_CLASSES: &[&str] = &["progress_ingress", "write_files", "progress_fidelity"];
 
 /// What the spawn step refused, as `(class, cause)`.
 ///
