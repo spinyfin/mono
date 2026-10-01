@@ -550,6 +550,15 @@ async fn requested_host_pre_start_failure_cancels_instead_of_retrying_elsewhere(
         db.execution_pinned_host(&execution.id).unwrap().is_none(),
         "cancel must not leave a durable pin behind",
     );
+    let cancelled = db.get_execution(&execution.id).unwrap();
+    assert!(
+        cancelled.last_error.as_deref().is_some_and(|err| {
+            err.contains("requested host dispatch failed during host adapter build")
+                && err.contains("simulated SSH-unreachable failure")
+        }),
+        "requested-host pre-start cancel must persist the full cause chain on last_error; got {:?}",
+        cancelled.last_error,
+    );
 }
 
 /// The interactive-pool concurrency cap

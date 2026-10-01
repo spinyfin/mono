@@ -144,6 +144,12 @@ struct WorkBoardCardItem: View {
         let onRetryReviewGuide: (() -> Void)? = snapshot.reviewGuidePresentation?.showsRetry == true
             ? { model.retryReviewGuide(for: task) }
             : nil
+        let reviewGuideMenuPresentation = ReviewGuideCardPresentation.from(
+            lifecycle: task.reviewGuideLifecycle,
+            readableVersionId: task.reviewGuideReadableVersionId,
+            staleSource: task.reviewGuideStaleSource ?? false,
+            error: task.reviewGuideError
+        )
         let onRevealAIReviewFindings: (() -> Void)? = snapshot.aiReviewFindingsRevisionId.map { revisionID in
             {
                 switch model.revealWorkCard(revisionID, productID: task.productID) {
@@ -234,17 +240,15 @@ struct WorkBoardCardItem: View {
                     openWindow(id: "transcript-viewer", value: TranscriptViewerRef(taskId: task.id))
                 }
                 if let title = task.generateReviewGuideMenuTitle {
+                    if let failureTitle = reviewGuideMenuPresentation?.contextMenuFailureTitle {
+                        Button(failureTitle) {}
+                            .disabled(true)
+                            .help(reviewGuideMenuPresentation?.tooltip ?? failureTitle)
+                    }
                     Button(title) {
                         model.generateReviewGuide(for: task)
                     }
-                    .help(
-                        ReviewGuideCardPresentation.from(
-                            lifecycle: task.reviewGuideLifecycle,
-                            readableVersionId: task.reviewGuideReadableVersionId,
-                            staleSource: task.reviewGuideStaleSource ?? false,
-                            error: task.reviewGuideError
-                        )?.tooltip ?? title
-                    )
+                    .help(reviewGuideMenuPresentation?.tooltip ?? title)
                 }
                 Divider()
                 Button("Delete", role: .destructive) {

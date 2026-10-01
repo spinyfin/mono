@@ -234,6 +234,18 @@ fn attempt_status(db: &WorkDb, attempt_id: &str) -> String {
         .unwrap()
 }
 
+fn attempt_error(db: &WorkDb, attempt_id: &str) -> String {
+    db.connect()
+        .unwrap()
+        .query_row(
+            "SELECT error FROM pr_review_guide_attempts WHERE id = ?1",
+            [attempt_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap()
+        .unwrap_or_default()
+}
+
 #[test]
 fn failing_a_stale_attempt_does_not_downgrade_a_newer_ready_series() {
     let (_dir, db) = open_db();
@@ -340,6 +352,66 @@ fn reconcile_prefers_execution_last_error_over_generic_status_reason() {
         summary.error.as_deref(),
         Some("Codex hook-trust gate refused the session"),
     );
+}
+
+#[test]
+fn record_pre_start_failure_fails_bound_review_guide_attempt_with_cause_chain() {
+    let (_dir, db) = open_db();
+    let (root, series_id, comparison_id) = seeded_series(&db);
+    let attempt = db
+        .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
+        .unwrap();
+    let execution = db
+        .create_pr_review_guide_execution(&comparison_id, "https://github.com/acme/widget.git")
+        .unwrap();
+    db.bind_pr_review_guide_attempt_execution(&attempt.id, &execution.id)
+        .unwrap();
+
+    let chained = anyhow::anyhow!("inner cause").context("outer label");
+    let (execution, _run, outcome) = db
+        .record_pre_start_failure(&execution.id, "worker-1", None, &format!("{chained:#}"), &[])
+        .unwrap();
+    assert!(matches!(outcome, PreStartFailureOutcome::PermanentFail));
+    assert!(
+        execution
+            .last_error
+            .as_deref()
+            .is_some_and(|err| err.contains("inner cause") && err.contains("outer label")),
+        "permanent pre-start failure must persist the full cause chain; got {:?}",
+        execution.last_error,
+    );
+    assert_eq!(attempt_status(&db, &attempt.id), "failed");
+    assert!(
+        attempt_error(&db, &attempt.id).contains("inner cause"),
+        "bound attempt error must carry the inner cause; got {:?}",
+        attempt_error(&db, &attempt.id),
+    );
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert_eq!(summary.lifecycle, "failed");
+    assert!(
+        summary.error.as_deref().is_some_and(|err| err.contains("inner cause")),
+        "summary error must carry the inner cause; got {:?}",
+        summary.error,
+    );
+}
+
+#[test]
+fn summary_projects_latest_cancelled_attempt_error_not_an_older_failure() {
+    let (_dir, db) = open_db();
+    let (root, series_id, comparison_id) = seeded_series(&db);
+    let first = db
+        .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
+        .unwrap();
+    db.fail_pr_review_guide_attempt(&first.id, "attempt A failed").unwrap();
+    let second = db
+        .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
+        .unwrap();
+    db.cancel_pr_review_guide_attempt(&second.id, "attempt B cancelled")
+        .unwrap();
+
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert_eq!(summary.lifecycle, "failed");
+    assert_eq!(summary.error.as_deref(), Some("attempt B cancelled"));
 }
 
 #[test]

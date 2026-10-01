@@ -2017,6 +2017,11 @@ fn cancel_execution_queued_only_accepts_ready_refuses_running() {
         )
         .unwrap();
     assert_eq!(cancelled.status, ExecutionStatus::Cancelled);
+    assert_eq!(
+        cancelled.last_error.as_deref(),
+        Some("moot after work completed elsewhere"),
+        "a never-started cancel with a reason must persist last_error",
+    );
 
     let running = db
         .create_execution(

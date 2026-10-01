@@ -999,7 +999,8 @@ struct ReviewGuideCardState {
     /// opposed to a same-comparison retry failure. `None` when there is no
     /// readable version to compare.
     stale_source: Option<bool>,
-    /// Latest failed attempt's stored error when `lifecycle` is `"failed"`.
+    /// Most recent terminal (`failed` or `cancelled`) attempt's stored error
+    /// when `lifecycle` is `"failed"`.
     error: Option<String>,
 }
 
@@ -1031,11 +1032,7 @@ fn query_review_guide_card_states(
     let sql = format!(
         "SELECT s.root_task_id, s.guide_lifecycle, s.readable_version_id,
                 s.selected_comparison_id, v.comparison_id,
-                CASE WHEN s.guide_lifecycle = 'failed' THEN (
-                    SELECT a.error FROM pr_review_guide_attempts a
-                    WHERE a.series_id = s.id AND a.status = 'failed' AND a.error IS NOT NULL AND a.error != ''
-                    ORDER BY a.finished_at DESC, a.id DESC LIMIT 1
-                ) ELSE NULL END
+                {REVIEW_GUIDE_LATEST_TERMINAL_ERROR_SQL}
          FROM pr_review_guide_source_series s
          LEFT JOIN pr_review_guide_versions v ON v.id = s.readable_version_id
          WHERE (s.root_task_id, s.canonical_pr_url) IN ({placeholders})

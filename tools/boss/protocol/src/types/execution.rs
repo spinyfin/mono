@@ -375,9 +375,17 @@ pub struct FinishExecutionRunInput {
     /// Increment the durable count of failures that occurred before a worker
     /// process became live. Pane-spawn and spawn-config failures happen after
     /// the run row starts, but still belong in this counter because no worker
-    /// ever received the prompt.
+    /// ever received the prompt. Independent of [`Self::record_last_error`]:
+    /// a `SlotBusy` rejection still records the reason without counting as a
+    /// retryable pre-start failure.
     #[builder(default)]
     pub increment_pre_start_failure_count: bool,
+    /// Write `error_text` onto `work_executions.last_error`. Decoupled from
+    /// [`Self::increment_pre_start_failure_count`] so every pre-pane failure
+    /// (including `SlotBusy`) persists the reason even when the counter is
+    /// left alone.
+    #[builder(default)]
+    pub record_last_error: bool,
     pub attention: Option<CreateAttentionItemInput>,
 }
 

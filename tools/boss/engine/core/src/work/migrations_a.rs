@@ -640,8 +640,8 @@ pub(crate) fn migrate_work_runs_cost_columns(conn: &Connection) -> Result<()> {
 /// Most recent pre-start / pane-spawn failure text on the execution row,
 /// so `boss task show --json` (and the review-guide card projection) can
 /// surface the reason without waiting for a terminal `work_runs` row.
-/// Intermediate retries previously stored nothing; only PermanentFail
-/// inserted a failed run. Idempotent.
+/// Intermediate pre-start retries write no `work_runs` row, so this column
+/// is the only durable record of their reason. Idempotent.
 pub(crate) fn migrate_work_executions_last_error(conn: &Connection) -> Result<()> {
     if !work_executions_has_column(conn, "last_error")? {
         conn.execute("ALTER TABLE work_executions ADD COLUMN last_error TEXT", [])?;

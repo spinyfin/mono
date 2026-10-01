@@ -1829,6 +1829,7 @@ impl WorkDb {
             error_text,
             clear_workspace_lease,
             increment_pre_start_failure_count,
+            record_last_error,
             attention,
         } = input;
         // Re-borrow the owned fields as the &str/Option<&str> shapes the
@@ -1880,7 +1881,7 @@ impl WorkDb {
         };
         let normalized_result_summary = normalize_optional_text(result_summary.map(str::to_owned));
         let normalized_error_text = normalize_optional_text(error_text.map(str::to_owned));
-        let fail_review_guide_attempt = increment_pre_start_failure_count
+        let fail_review_guide_attempt = record_last_error
             && execution.kind == ExecutionKind::PrReviewGuide
             && execution_status.is_terminal()
             && execution_status != ExecutionStatus::Completed;
@@ -1893,7 +1894,7 @@ impl WorkDb {
                  workspace_path = CASE WHEN ?3 THEN NULL ELSE workspace_path END,
                  finished_at = ?4,
                  pre_start_failure_count = pre_start_failure_count + CASE WHEN ?5 THEN 1 ELSE 0 END,
-                 last_error = CASE WHEN ?5 THEN COALESCE(?6, last_error) ELSE last_error END
+                 last_error = CASE WHEN ?7 THEN COALESCE(?6, last_error) ELSE last_error END
              WHERE id = ?1",
             params![
                 execution_id,
@@ -1902,6 +1903,7 @@ impl WorkDb {
                 execution_finished_at,
                 increment_pre_start_failure_count,
                 normalized_error_text.as_deref(),
+                record_last_error,
             ],
         )?;
 
@@ -2198,14 +2200,22 @@ pub(super) fn cancel_execution_in_tx(
             existing.status
         );
     }
-    let reason = normalize_optional_text(opts.reason).unwrap_or_else(|| "explicit cancel".to_owned());
+    let supplied_reason = normalize_optional_text(opts.reason);
+    let persist_last_error = existing.status.is_pre_run() && supplied_reason.is_some();
+    let reason = supplied_reason.clone().unwrap_or_else(|| "explicit cancel".to_owned());
     let now = now_string();
     tx.execute(
         "UPDATE work_executions
              SET status = 'cancelled',
-                 finished_at = ?2
+                 finished_at = ?2,
+                 last_error = CASE WHEN ?3 THEN ?4 ELSE last_error END
              WHERE id = ?1",
-        params![execution_id, now.as_str()],
+        params![
+            execution_id,
+            now.as_str(),
+            persist_last_error,
+            supplied_reason.as_deref().unwrap_or(""),
+        ],
     )?;
     // Live cancel only: demote active → todo when this execution is
     // still the work item's latest. Never-started cancels leave the

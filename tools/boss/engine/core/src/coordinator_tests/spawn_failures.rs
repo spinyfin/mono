@@ -908,6 +908,14 @@ async fn slot_busy_pane_spawn_failure_requeues_without_demoting_and_holds_slot()
              immediately re-select and repeat the rejection — pool_claim_sweep reclaims it later",
     );
 
+    let failed = db.get_execution(&first_execution_id).unwrap();
+    assert!(
+        failed.last_error.as_deref().is_some_and(|err| !err.is_empty()),
+        "SlotBusy pane-spawn failure must persist last_error even though it does not increment \
+         the pre-start failure counter; got {:?}",
+        failed.last_error,
+    );
+
     // The abort is still reported at the spawn-abort point (that is what
     // makes a genuine abort attributable), but a `SlotBusy` rejection is an
     // engine/app desync that self-heals via the requeue asserted above — it
@@ -1953,4 +1961,94 @@ async fn a_spawn_abort_never_terminalizes_driverless_without_a_recorded_reason()
              item; got {attention_items:#?}",
         );
     }
+}
+
+/// A pane-spawn failure of a `PrReviewGuide` execution must fail the bound
+/// attempt with the full anyhow cause chain (`{err:#}`), not just the
+/// outermost context. That is the path that paints `Task.review_guide_error`
+/// / `ReviewGuideSummary.error`.
+#[tokio::test]
+async fn pane_spawn_failure_fails_review_guide_attempt_with_cause_chain() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    crate::test_support::insert_host_capability(&db, "local", "driver=codex", "auto");
+    let product = create_product(&db);
+    let root = create_test_chore_manual(&db, product.clone(), "Review guide root").id;
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET repo_remote_url = ?1 WHERE id = ?2",
+            rusqlite::params!["https://github.com/acme/widget.git", root],
+        )
+        .unwrap();
+    let (series_id, comparison_id) = seed_review_guide_series(&db, &root);
+    let attempt = db
+        .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
+        .unwrap();
+    let execution = db
+        .create_pr_review_guide_execution(&comparison_id, "https://github.com/acme/widget.git")
+        .unwrap();
+    db.bind_pr_review_guide_attempt_execution(&attempt.id, &execution.id)
+        .unwrap();
+
+    let runner = Arc::new(FakeExecutionRunner {
+        fail: true,
+        fail_message: Some("inner cause".to_owned()),
+        fail_context: Some("outer label".to_owned()),
+        ..FakeExecutionRunner::default()
+    });
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            Arc::new(FakeCubeClient::default()),
+            runner,
+        )
+        .with_pre_start_retry_delays(vec![]),
+    );
+    coordinator.kick();
+    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Failed).await;
+
+    let failed = db.get_execution(&execution.id).unwrap();
+    assert!(
+        failed
+            .last_error
+            .as_deref()
+            .is_some_and(|err| err.contains("inner cause") && err.contains("outer label")),
+        "pane-spawn failure must persist the full cause chain on last_error; got {:?}",
+        failed.last_error,
+    );
+
+    let status: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status FROM pr_review_guide_attempts WHERE id = ?1",
+            [&attempt.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "failed");
+    let stored: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT error FROM pr_review_guide_attempts WHERE id = ?1",
+            [&attempt.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        stored.contains("inner cause"),
+        "bound attempt error must carry the inner cause; got {stored:?}"
+    );
+
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert_eq!(summary.lifecycle, "failed");
+    assert!(
+        summary.error.as_deref().is_some_and(|err| err.contains("inner cause")),
+        "summary error must carry the inner cause; got {:?}",
+        summary.error,
+    );
 }
