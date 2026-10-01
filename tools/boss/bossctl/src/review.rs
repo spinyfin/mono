@@ -54,7 +54,7 @@ pub(crate) enum ReviewAction {
     /// still answers even when the engine itself is wedged.
     Show {
         /// Work item id (task/chore). Accepts primary id or friendly
-        /// short id (`T42`); short ids resolve via the shared choke point.
+        /// short id; short ids resolve via the shared choke point.
         #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
         work_item: String,
         /// Override the Boss state-root directory.

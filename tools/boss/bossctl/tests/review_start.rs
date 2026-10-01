@@ -4,6 +4,8 @@ use boss_engine::work::PRE_MERGE_BATCH_RESERVATION_UNITS;
 use boss_protocol::{FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+const COLD_START_BOUND: std::time::Duration = std::time::Duration::from_secs(45);
+
 async fn review_start(response: FrontendEvent) -> std::process::Output {
     // Each invocation owns a distinct socket, including concurrent tests.
     let socket = std::env::temp_dir().join(format!("review-{}.sock", unique_id()));
@@ -46,16 +48,22 @@ async fn review_start(response: FrontendEvent) -> std::process::Output {
     command.kill_on_drop(true);
     let output = command.output();
     tokio::pin!(output);
-    // The deadline bounds the RPC exchange, so it starts when the client
-    // reaches the fixture rather than at spawn. The first exec of a freshly
-    // linked bossctl is an OS cold start that, on a host running many other
-    // fresh test binaries, has been measured above 15s before `main` runs;
-    // that latency is not the behaviour under test.
-    let exited_early = tokio::select! {
-        biased;
-        _ = &mut connected_rx => None,
-        result = &mut output => Some(result.unwrap()),
-    };
+    // The RPC deadline starts when the client reaches the fixture. The first
+    // exec of a freshly linked bossctl is an OS cold start that, on a host
+    // running many other fresh test binaries, has been measured above 15s
+    // before `main` runs; that latency is not the behaviour under test. The
+    // cold start still gets its own bound, below Bazel's 60s target timeout,
+    // so a client that never connects fails here with a located message
+    // instead of as a generic target timeout.
+    let exited_early = tokio::time::timeout(COLD_START_BOUND, async {
+        tokio::select! {
+            biased;
+            _ = &mut connected_rx => None,
+            result = &mut output => Some(result.unwrap()),
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("bossctl did not reach the fixture within {COLD_START_BOUND:?}"));
     let output = match exited_early {
         // The client exited without reaching the fixture; the caller's
         // assertions report its status and stderr.
