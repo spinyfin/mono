@@ -1,7 +1,6 @@
 // Pre-start spawn-failure streak alerts on the engine-health surface.
 //
-// The alert only helps if it reaches somewhere the operator looks. These
-// tests pin both halves of that: the health report (what `get_engine_health`
+// These tests verify active alerts reach both app-facing surfaces: the health report (what `get_engine_health`
 // and `bossctl state` read, as JSON) carries the alert, and a running app
 // receives it as an `engine.health` push on raise, update and resolve
 // without asking.

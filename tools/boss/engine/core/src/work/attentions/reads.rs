@@ -72,7 +72,14 @@ pub(in crate::work) fn list_items(conn: &Connection, work_item_id: &str) -> Resu
     let mut stmt = conn.prepare(
             "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at, converted_task_id
              FROM work_attention_items
-             WHERE work_item_id = ?1
+             WHERE work_item_id = ?1 OR (work_item_id IS NULL AND kind = 'pane_spawn_failed' AND (
+                 SELECT COALESCE(s.root_task_id, e.work_item_id)
+                 FROM work_executions e
+                 LEFT JOIN pr_review_guide_source_comparisons c
+                   ON e.kind = 'pr_review_guide' AND c.id = e.work_item_id
+                 LEFT JOIN pr_review_guide_source_series s ON s.id = c.series_id
+                 WHERE e.id = work_attention_items.execution_id
+             ) = ?1)
              ORDER BY created_at ASC, id ASC",
         )?;
     let rows = stmt.query_map([work_item_id], map_attention_item)?;
