@@ -574,6 +574,19 @@ final class UpdateModelTests: XCTestCase {
             model.downloadState, .installedPendingRelaunch(version: Self.mockVersion, willRelaunch: false))
     }
 
+    func testQuitReturnedWithoutTerminatingSurfacesRetryStatus() {
+        let model = makeModel(result: .upToDate)
+        XCTAssertNil(model.quitCancelledStatusNote(for: Self.mockVersion))
+        model.markQuitReturnedWithoutTerminating()
+        XCTAssertTrue(model.quitReturnedWithoutTerminating)
+        XCTAssertEqual(
+            model.quitCancelledStatusNote(for: Self.mockVersion),
+            "Quit was cancelled. Boss \(Self.mockVersion.description) is installed; quit when ready to finish the update.")
+        model.clearQuitReturnedWithoutTerminating()
+        XCTAssertFalse(model.quitReturnedWithoutTerminating)
+        XCTAssertNil(model.quitCancelledStatusNote(for: Self.mockVersion))
+    }
+
     // MARK: - Cancellation of in-flight staging
 
     /// A newer version superseding an in-flight download must cancel the older

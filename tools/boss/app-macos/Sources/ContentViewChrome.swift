@@ -577,21 +577,48 @@ struct NotificationsToolbarButton: View {
 
 struct UpdateBadgeToolbarButton: View {
     @ObservedObject var updateModel: UpdateModel
+    @ObservedObject var quitRequest: UpdateQuitRequest
     @State private var isPopoverPresented = false
+
+    private var popoverPresented: Binding<Bool> {
+        Binding(
+            get: { isPopoverPresented },
+            set: { newValue in
+                if newValue {
+                    UpdateQuitSurfaceBinding.willPresent(quitRequest)
+                }
+                let wasPresented = isPopoverPresented
+                isPopoverPresented = newValue
+                if wasPresented && !newValue {
+                    UpdateQuitSurfaceBinding.didDismiss(quitRequest)
+                }
+            }
+        )
+    }
 
     var body: some View {
         if let update = visibleUpdate {
             Button {
-                isPopoverPresented.toggle()
+                popoverPresented.wrappedValue.toggle()
             } label: {
                 Image(systemName: "arrow.down.circle.fill")
                     .foregroundStyle(Color.accentColor)
             }
             .help("Update available: Boss \(update.version.description)")
-            .popover(isPresented: $isPopoverPresented, arrowEdge: .bottom) {
-                UpdateBadgePopover(update: update, updateModel: updateModel) {
-                    isPopoverPresented = false
-                }
+            .popover(isPresented: popoverPresented, arrowEdge: .bottom) {
+                UpdateBadgePopover(
+                    update: update,
+                    updateModel: updateModel,
+                    requestQuit: {
+                        UpdateQuitSurfaceBinding.requestQuit(
+                            quitRequest,
+                            isPresented: isPopoverPresented
+                        ) {
+                            popoverPresented.wrappedValue = false
+                        }
+                    },
+                    onDismiss: { popoverPresented.wrappedValue = false }
+                )
             }
         }
     }
@@ -608,6 +635,7 @@ struct UpdateBadgeToolbarButton: View {
 private struct UpdateBadgePopover: View {
     let update: AvailableUpdate
     @ObservedObject var updateModel: UpdateModel
+    let requestQuit: () -> Void
     let onDismiss: () -> Void
 
     var body: some View {
@@ -668,85 +696,20 @@ private struct UpdateBadgePopover: View {
                 }
                 .keyboardShortcut(.cancelAction)
 
-                primaryActionButton
+                UpdatePrimaryActionButton(
+                    update: update,
+                    updateModel: updateModel,
+                    requestQuit: requestQuit,
+                    onDevDownload: {
+                        NSWorkspace.shared.open(releasePageURL ?? update.assetURL)
+                        onDismiss()
+                    }
+                )
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
         }
         .frame(minWidth: 300, maxWidth: 360)
-    }
-
-    /// Trailing call-to-action mirroring ``UpdateResultSheet``: dev builds keep the
-    /// manual browser download; release builds stage the bundle in-app and then offer
-    /// "Install & Relaunch".
-    @ViewBuilder
-    private var primaryActionButton: some View {
-        if updateModel.isDevBuild {
-            Button("Download") {
-                NSWorkspace.shared.open(releasePageURL ?? update.assetURL)
-                onDismiss()
-            }
-            .keyboardShortcut(.defaultAction)
-        } else {
-            switch updateModel.downloadState {
-            case .downloading(let v, _) where v == update.version:
-                Button {
-                } label: {
-                    HStack(spacing: 6) {
-                        ProgressView().controlSize(.small)
-                        Text("Downloading…")
-                    }
-                }
-                .disabled(true)
-
-            case .installFailed(let v, _) where v == update.version:
-                // A pre-swap install failure (live bundle intact). Terminal — mirror
-                // UpdateResultSheet: show the failure, no re-download affordance. The
-                // "Install failed:" reason is carried by `downloadStatusNote`.
-                Button("Install Failed") {}
-                    .disabled(true)
-
-            case .readyToInstall(let v) where v == update.version:
-                Button("Install & Relaunch") {
-                    switch UpdateLifecycle.installStagedAndRelaunch() {
-                    case .relaunchPending:
-                        // Swap applied; request the quit so the helper relaunches us. If
-                        // `terminate` returns, the quit was vetoed — the swap is already
-                        // on disk and completes on the next quit.
-                        NSApplication.shared.terminate(nil)
-                        updateModel.markInstalledPendingRelaunch(version: v, willRelaunch: true)
-                    case .installedNoRelaunch:
-                        updateModel.markInstalledPendingRelaunch(version: v, willRelaunch: false)
-                    case .notInstalled:
-                        // Nothing changed — the live bundle is intact. Surface the
-                        // terminal error; no browser fallback.
-                        updateModel.markInstallFailed(
-                            version: v,
-                            reason: "The app bundle could not be updated. Make sure Boss is installed in /Applications and try again.")
-                    }
-                    // Keep the popover open so the resulting state is visible.
-                }
-                .keyboardShortcut(.defaultAction)
-
-            case .installedPendingRelaunch(let v, _) where v == update.version:
-                Button("Quit to Finish") {
-                    NSApplication.shared.terminate(nil)
-                }
-                .keyboardShortcut(.defaultAction)
-
-            case .failed(let v, _) where v == update.version:
-                Button("Retry Download") {
-                    updateModel.downloadAvailableUpdate()
-                }
-                .keyboardShortcut(.defaultAction)
-
-            default:
-                Button("Download") {
-                    updateModel.downloadAvailableUpdate()
-                }
-                .keyboardShortcut(.defaultAction)
-            }
-        }
     }
 
     /// The download progress bar, shown only while `update` is actively
@@ -769,6 +732,9 @@ private struct UpdateBadgePopover: View {
     }
 
     private var downloadStatusNote: String? {
+        if let cancelled = updateModel.quitCancelledStatusNote(for: update.version) {
+            return cancelled
+        }
         switch updateModel.downloadState {
         case .downloading(let v, let progress) where v == update.version:
             switch progress {

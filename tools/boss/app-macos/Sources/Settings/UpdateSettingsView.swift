@@ -96,6 +96,9 @@ struct UpdateSettingsView: View {
         case .readyToInstall(let version):
             return "Boss \(version) downloaded — will install on quit or relaunch."
         case .installedPendingRelaunch(let version, let willRelaunch):
+            if let cancelled = model.quitCancelledStatusNote(for: version) {
+                return cancelled
+            }
             return willRelaunch
                 ? "Boss \(version) installed — quit to finish; it will relaunch on the new version."
                 : "Boss \(version) installed — quit and reopen to finish updating."

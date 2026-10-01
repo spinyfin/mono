@@ -24,6 +24,7 @@ struct ContentView: View {
     @StateObject private var workersWorkspace = WorkersWorkspaceModel()
     @StateObject private var bossPane = BossPaneModel()
     #endif
+    @StateObject private var updateQuitRequest = UpdateQuitRequest()
     @State private var isSearchExpanded: Bool = false
     @State private var workColumnVisibility: NavigationSplitViewVisibility = .all
     @State private var showCoordinatorResetConfirmFromBanner = false
@@ -318,7 +319,7 @@ struct ContentView: View {
             }
 
             ToolbarItem(placement: .primaryAction) {
-                UpdateBadgeToolbarButton(updateModel: updateModel)
+                UpdateBadgeToolbarButton(updateModel: updateModel, quitRequest: updateQuitRequest)
             }
         }
         .onChange(of: model.navigationMode) { _, newMode in
@@ -450,11 +451,28 @@ struct ContentView: View {
             // environment objects.
             .environmentObject(model)
         }
+        .onAppear {
+            UpdateQuitSurfaceBinding.bindQuitReturned(updateQuitRequest, updateModel: updateModel)
+        }
         .sheet(isPresented: Binding(
             get: { updateModel.showUpdateSheet },
-            set: { updateModel.showUpdateSheet = $0 }
-        )) {
-            UpdateResultSheet()
+            set: { newValue in
+                if newValue {
+                    UpdateQuitSurfaceBinding.willPresent(updateQuitRequest)
+                }
+                updateModel.showUpdateSheet = newValue
+            }
+        ), onDismiss: {
+            UpdateQuitSurfaceBinding.didDismiss(updateQuitRequest)
+        }) {
+            UpdateResultSheet(requestQuit: {
+                UpdateQuitSurfaceBinding.requestQuit(
+                    updateQuitRequest,
+                    isPresented: updateModel.showUpdateSheet
+                ) {
+                    updateModel.showUpdateSheet = false
+                }
+            })
                 .environmentObject(updateModel)
         }
         .overlay(alignment: .topTrailing) {
