@@ -7,7 +7,7 @@
 //! silently absent with every other test green.
 
 use super::*;
-use crate::test_support::{review_guide_source_packet, seed_review_guide_series};
+use crate::test_support::{review_guide_source_packet, seed_review_guide_series, seed_review_guide_series_for_pr};
 
 #[test]
 fn root_task_id_for_review_guide_series_resolves_the_seeded_root() {
@@ -133,18 +133,6 @@ fn publish_ready_guide(db: &WorkDb, series_id: &str, comparison_id: &str, markdo
         panic!("must publish")
     };
     version.id
-}
-
-fn seed_review_guide_series_for_pr(db: &WorkDb, root: &str, pr_url: &str, base: &str, head: &str) -> (String, String) {
-    let mut packet = review_guide_source_packet(base, head);
-    packet.canonical_pr_url = pr_url.to_owned();
-    let stored = db
-        .persist_pr_review_guide_source_capture(root, 1, PrSourceCaptureTrigger::Creation, &packet)
-        .unwrap();
-    let PrSourceCapturePersistOutcome::Stored(capture) = stored else {
-        panic!("capture must persist")
-    };
-    (capture.series_id, capture.comparison_id)
 }
 
 /// Replacing the card's PR attaches a new series and preserves the previous

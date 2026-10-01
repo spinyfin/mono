@@ -250,54 +250,12 @@ async fn compose_guide_answer_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{create_active_chore, create_product, open_db, seed_review_guide_series};
-    use crate::work::{ExecutionKind, ExecutionStatus, PublishReviewGuideOutcome};
-    use boss_protocol::{CommentAnchor, CreateCommentInput, WorkItemPatch};
+    use crate::test_support::{create_active_chore, create_product, open_db, seed_published_guide_comment};
+    use crate::work::{ExecutionKind, ExecutionStatus};
+    use boss_protocol::{CommentAnchor, CreateCommentInput};
 
     fn seed_guide_comment(db: &WorkDb) -> (String, boss_protocol::WorkComment) {
-        let root = create_active_chore(db, &create_product(db), "impl");
-        db.update_work_item(
-            &root,
-            WorkItemPatch {
-                status: Some("in_review".to_owned()),
-                pr_url: Some("https://github.com/acme/widget/pull/9".to_owned()),
-                ..WorkItemPatch::default()
-            },
-        )
-        .unwrap();
-        let (series, comparison) = seed_review_guide_series(db, &root);
-        let attempt = db
-            .create_pr_review_guide_attempt(&series, &comparison, "review-guide-v1")
-            .unwrap();
-        let PublishReviewGuideOutcome::Published(_) = db
-            .publish_pr_review_guide_version(&attempt.id, "# Guide\n\nOriginal quote", "raw")
-            .unwrap()
-        else {
-            panic!("expected published guide")
-        };
-        let version_id = db
-            .get_pr_review_guide_summary_for_root(&root)
-            .unwrap()
-            .expect("summary")
-            .readable_version_id
-            .expect("readable version");
-        let comment = db
-            .create_comment_with_guide_version(
-                CreateCommentInput::builder()
-                    .artifact_kind("pr_review_guide")
-                    .artifact_id(series)
-                    .anchor(CommentAnchor {
-                        exact: "Original quote".into(),
-                        ..Default::default()
-                    })
-                    .body("why does this retry forever?")
-                    .author("user:test")
-                    .doc_version("hash")
-                    .plain_text_projection_version(1)
-                    .build(),
-                Some(&version_id),
-            )
-            .unwrap();
+        let (root, _series, comment) = seed_published_guide_comment(db, 9, "why does this retry forever?");
         (root, comment)
     }
 

@@ -343,68 +343,21 @@ fn compose_guide_comment_directive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{create_active_chore, create_product, open_db, seed_review_guide_series};
+    use crate::test_support::open_db;
     use crate::work::{FakePrStateChecker, PrOpenState};
-    use boss_protocol::{
-        CommentAnchor, CreateCommentInput, GuideCommentDisposition, GuideCommentOutcome, TaskKind, WorkItem,
-        WorkItemPatch,
-    };
+    use boss_protocol::{GuideCommentDisposition, GuideCommentOutcome, TaskKind, WorkItem, WorkItemPatch};
 
     fn open_checker() -> FakePrStateChecker {
         FakePrStateChecker::always(PrOpenState::Open)
     }
 
     fn seed_open_guide(db: &WorkDb) -> (String, String, String) {
-        let root = create_active_chore(db, &create_product(db), "impl");
-        db.update_work_item(
-            &root,
-            WorkItemPatch {
-                status: Some("in_review".to_owned()),
-                pr_url: Some("https://github.com/acme/widget/pull/9".to_owned()),
-                ..WorkItemPatch::default()
-            },
-        )
-        .unwrap();
-        let (series, comparison) = seed_review_guide_series(db, &root);
-        let attempt = db
-            .create_pr_review_guide_attempt(&series, &comparison, "review-guide-v1")
-            .unwrap();
-        let PublishReviewGuideOutcome::Published(_) = db
-            .publish_pr_review_guide_version(&attempt.id, "# Guide\n\nOriginal quote", "raw")
-            .unwrap()
-        else {
-            panic!("expected published guide")
-        };
+        let (root, series) = crate::test_support::seed_published_guide(db, 9);
         (root, series, "https://github.com/acme/widget/pull/9".to_owned())
     }
 
     fn make_guide_comment(db: &WorkDb, series: &str, body: &str) -> WorkComment {
-        let version_id = db
-            .get_pr_review_guide_summary_for_root(
-                &db.root_task_id_for_review_guide_series(series)
-                    .unwrap()
-                    .expect("series root"),
-            )
-            .unwrap()
-            .expect("summary")
-            .readable_version_id
-            .expect("readable version");
-        db.create_comment_with_guide_version(
-            CreateCommentInput::builder()
-                .artifact_kind("pr_review_guide")
-                .artifact_id(series)
-                .anchor(CommentAnchor {
-                    exact: "Original quote".into(),
-                    ..Default::default()
-                })
-                .body(body)
-                .author("user:test")
-                .doc_version("hash")
-                .plain_text_projection_version(1)
-                .build(),
-            Some(&version_id),
-        )
-        .unwrap()
+        crate::test_support::add_guide_comment(db, series, body)
     }
 
     #[test]

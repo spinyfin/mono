@@ -22,11 +22,15 @@ use crate::coordinator::{
 };
 use crate::review_guide_capture::SourcePacketCollector;
 use crate::runner::{ExecutionRunner, RunOutcome, RunWaitState};
-use crate::work::{CreateChoreInput, PrSourceCapturePersistOutcome, PrSourceCaptureTrigger, WorkDb, WorkItemPatch};
+use crate::work::{
+    CreateChoreInput, PrSourceCapturePersistOutcome, PrSourceCaptureTrigger, PublishReviewGuideOutcome, WorkDb,
+    WorkItemPatch,
+};
 use boss_pr_review_sources::SourcePacket;
 use boss_protocol::{
-    Automation, AutomationTrigger, CreateAutomationInput, CreateExecutionInput, CreateProductInput, ExecutionKind,
-    ExecutionStatus, FinishExecutionRunInput, FrontendEvent, Product, RequestExecutionInput, Task, WorkExecution,
+    Automation, AutomationTrigger, CommentAnchor, CreateAutomationInput, CreateCommentInput, CreateExecutionInput,
+    CreateProductInput, ExecutionKind, ExecutionStatus, FinishExecutionRunInput, FrontendEvent, Product,
+    RequestExecutionInput, Task, WorkComment, WorkExecution,
 };
 
 /// Direct-DB fixtures must model the bookmark that dispatch creates before spawn.
@@ -152,21 +156,102 @@ pub(crate) fn review_guide_source_packet(base: &str, head: &str) -> SourcePacket
     }
 }
 
-/// Persist the first source capture for `root` and return
+/// Persist the first source capture for `root` on `pr_url` (its trailing
+/// `/pull/<n>` number is mirrored into `pr_number`) and return
 /// `(series_id, comparison_id)`.
-pub(crate) fn seed_review_guide_series(db: &WorkDb, root: &str) -> (String, String) {
+pub(crate) fn seed_review_guide_series_for_pr(
+    db: &WorkDb,
+    root: &str,
+    pr_url: &str,
+    base: &str,
+    head: &str,
+) -> (String, String) {
+    let mut packet = review_guide_source_packet(base, head);
+    packet.canonical_pr_url = pr_url.to_owned();
+    packet.pr_number = pr_url
+        .rsplit('/')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .expect("pr_url must end in /<number>");
     let stored = db
-        .persist_pr_review_guide_source_capture(
-            root,
-            1,
-            PrSourceCaptureTrigger::Creation,
-            &review_guide_source_packet("base", "head"),
-        )
+        .persist_pr_review_guide_source_capture(root, 1, PrSourceCaptureTrigger::Creation, &packet)
         .unwrap();
     let PrSourceCapturePersistOutcome::Stored(capture) = stored else {
         panic!("capture must persist")
     };
     (capture.series_id, capture.comparison_id)
+}
+
+/// Persist the first source capture for `root` (on `pull/9`) and return
+/// `(series_id, comparison_id)`.
+pub(crate) fn seed_review_guide_series(db: &WorkDb, root: &str) -> (String, String) {
+    seed_review_guide_series_for_pr(db, root, "https://github.com/acme/widget/pull/9", "base", "head")
+}
+
+/// Create an `in_review` chore on `pull/<pr_number>` with a published
+/// review guide (`"# Guide\n\nOriginal quote"`). Returns `(root, series)`.
+pub(crate) fn seed_published_guide(db: &WorkDb, pr_number: u32) -> (String, String) {
+    let root = create_active_chore(db, &create_product(db), "impl");
+    let pr_url = format!("https://github.com/acme/widget/pull/{pr_number}");
+    db.update_work_item(
+        &root,
+        WorkItemPatch {
+            status: Some("in_review".to_owned()),
+            pr_url: Some(pr_url.clone()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    let (series, comparison) = seed_review_guide_series_for_pr(db, &root, &pr_url, "base", "head");
+    let attempt = db
+        .create_pr_review_guide_attempt(&series, &comparison, "review-guide-v1")
+        .unwrap();
+    let PublishReviewGuideOutcome::Published(_) = db
+        .publish_pr_review_guide_version(&attempt.id, "# Guide\n\nOriginal quote", "raw")
+        .unwrap()
+    else {
+        panic!("expected published guide")
+    };
+    (root, series)
+}
+
+/// Add a comment anchored on `"Original quote"` to the published guide of
+/// `series` (see [`seed_published_guide`]).
+pub(crate) fn add_guide_comment(db: &WorkDb, series: &str, body: &str) -> WorkComment {
+    let root = db
+        .root_task_id_for_review_guide_series(series)
+        .unwrap()
+        .expect("series root");
+    let version_id = db
+        .get_pr_review_guide_summary_for_root(&root)
+        .unwrap()
+        .expect("summary")
+        .readable_version_id
+        .expect("readable version");
+    db.create_comment_with_guide_version(
+        CreateCommentInput::builder()
+            .artifact_kind("pr_review_guide")
+            .artifact_id(series)
+            .anchor(CommentAnchor {
+                exact: "Original quote".into(),
+                ..Default::default()
+            })
+            .body(body)
+            .author("user:test")
+            .doc_version("hash")
+            .plain_text_projection_version(1)
+            .build(),
+        Some(&version_id),
+    )
+    .unwrap()
+}
+
+/// [`seed_published_guide`] plus one anchored comment. Returns
+/// `(root, series, comment)`.
+pub(crate) fn seed_published_guide_comment(db: &WorkDb, pr_number: u32, body: &str) -> (String, String, WorkComment) {
+    let (root, series) = seed_published_guide(db, pr_number);
+    let comment = add_guide_comment(db, &series, body);
+    (root, series, comment)
 }
 
 /// Create a plain chore named `name` under `product_id` and return it.
