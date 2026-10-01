@@ -1,5 +1,6 @@
 import AppKit
 import CryptoKit
+import Darwin
 import XCTest
 
 @testable import Boss
@@ -249,6 +250,160 @@ final class EngineProcessControllerTests: XCTestCase {
 
         XCTAssertEqual(fixture.socketControl.shutdownRequests, [fixture.paths.legacySocketPath!])
         XCTAssertEqual(launchRecorder.socketPaths, [fixture.paths.socketPath])
+        XCTAssertTrue(fixture.processObserver.signals.isEmpty)
+    }
+
+    func testStopWaitsForPidExitBeforeLaunchingReplacement() throws {
+        let fixture = try Fixture(reachableSocket: .primary, runningFingerprint: "stale-engine")
+        fixture.processObserver.markRunning(fixture.runningPid)
+        fixture.processObserver.liveChecksBeforeDeath = 3
+        let launchRecorder = LaunchRecorder()
+        let controller = fixture.makeController(
+            stopPolicy: Fixture.fastStopPolicy
+        ) { _, _, socketPath in
+            launchRecorder.record(socketPath)
+            return 4242
+        }
+        defer { controller.stop() }
+
+        try controller.start()
+
+        XCTAssertEqual(fixture.socketControl.shutdownRequests, [fixture.paths.socketPath])
+        XCTAssertEqual(launchRecorder.socketPaths, [fixture.paths.socketPath])
+        XCTAssertTrue(fixture.processObserver.signals.isEmpty)
+    }
+
+    func testStopEscalatesSIGTERMThenSIGKILLWhenPidSurvivesSocketClose() throws {
+        let fixture = try Fixture(reachableSocket: .primary, runningFingerprint: "stale-engine")
+        fixture.processObserver.markRunning(fixture.runningPid)
+        fixture.processObserver.dieOnSignal = SIGKILL
+        let launchRecorder = LaunchRecorder()
+        let controller = fixture.makeController(
+            stopPolicy: Fixture.fastStopPolicy
+        ) { _, _, socketPath in
+            launchRecorder.record(socketPath)
+            return 4242
+        }
+        defer { controller.stop() }
+
+        try controller.start()
+
+        XCTAssertEqual(fixture.processObserver.signals, [
+            SignalRecord(pid: fixture.runningPid, signal: SIGTERM),
+            SignalRecord(pid: fixture.runningPid, signal: SIGKILL),
+        ])
+        XCTAssertEqual(launchRecorder.socketPaths, [fixture.paths.socketPath])
+    }
+
+    func testStopRefusesToLaunchWhenPidIsUnknown() throws {
+        let fixture = try Fixture(
+            reachableSocket: .primary,
+            runningFingerprint: "stale-engine",
+            announcePid: false
+        )
+        let launchRecorder = LaunchRecorder()
+        let controller = fixture.makeController { _, _, socketPath in
+            launchRecorder.record(socketPath)
+            return 4242
+        }
+        defer { controller.stop() }
+
+        XCTAssertThrowsError(try controller.start()) { error in
+            XCTAssertTrue(
+                error.localizedDescription.contains("no pid is available"),
+                "unexpected error: \(error.localizedDescription)"
+            )
+        }
+        XCTAssertTrue(launchRecorder.socketPaths.isEmpty)
+    }
+
+    func testStopRefusesToLaunchWhenPidSurvivesSIGKILL() throws {
+        let fixture = try Fixture(reachableSocket: .primary, runningFingerprint: "stale-engine")
+        fixture.processObserver.markRunning(fixture.runningPid)
+        let launchRecorder = LaunchRecorder()
+        let controller = fixture.makeController(
+            stopPolicy: Fixture.fastStopPolicy
+        ) { _, _, socketPath in
+            launchRecorder.record(socketPath)
+            return 4242
+        }
+        defer { controller.stop() }
+
+        XCTAssertThrowsError(try controller.start()) { error in
+            XCTAssertTrue(
+                error.localizedDescription.contains("still alive after SIGKILL"),
+                "unexpected error: \(error.localizedDescription)"
+            )
+        }
+        XCTAssertEqual(fixture.processObserver.signals, [
+            SignalRecord(pid: fixture.runningPid, signal: SIGTERM),
+            SignalRecord(pid: fixture.runningPid, signal: SIGKILL),
+        ])
+        XCTAssertTrue(launchRecorder.socketPaths.isEmpty)
+    }
+
+    func testClosedSocketWithLivePidFileNeverLaunchesWhileAlive() throws {
+        let fixture = try Fixture(reachableSocket: .none)
+        try "\(fixture.runningPid)\n".write(toFile: fixture.paths.pidPath, atomically: true, encoding: .utf8)
+        fixture.processObserver.markRunning(fixture.runningPid)
+        let launchRecorder = LaunchRecorder()
+        let controller = fixture.makeController(
+            stopPolicy: Fixture.fastStopPolicy
+        ) { _, _, socketPath in
+            launchRecorder.record(socketPath)
+            return 4242
+        }
+        defer { controller.stop() }
+
+        XCTAssertThrowsError(try controller.start()) { error in
+            XCTAssertTrue(
+                error.localizedDescription.contains("still alive after SIGKILL"),
+                "unexpected error: \(error.localizedDescription)"
+            )
+        }
+        XCTAssertEqual(fixture.processObserver.signals, [
+            SignalRecord(pid: fixture.runningPid, signal: SIGTERM),
+            SignalRecord(pid: fixture.runningPid, signal: SIGKILL),
+        ])
+        XCTAssertTrue(launchRecorder.socketPaths.isEmpty)
+    }
+
+    func testClosedSocketWithLivePidFileLaunchesOnceEngineIsKilled() throws {
+        let fixture = try Fixture(reachableSocket: .none)
+        try "\(fixture.runningPid)\n".write(toFile: fixture.paths.pidPath, atomically: true, encoding: .utf8)
+        fixture.processObserver.markRunning(fixture.runningPid)
+        fixture.processObserver.dieOnSignal = SIGKILL
+        let launchRecorder = LaunchRecorder()
+        let controller = fixture.makeController(
+            stopPolicy: Fixture.fastStopPolicy
+        ) { _, _, socketPath in
+            launchRecorder.record(socketPath)
+            return 4242
+        }
+        defer { controller.stop() }
+
+        try controller.restart()
+
+        XCTAssertEqual(launchRecorder.socketPaths, [fixture.paths.socketPath])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.paths.pidPath))
+    }
+
+    func testRetryAfterFailedStopDoesNotLaunchWhilePidAlive() throws {
+        let fixture = try Fixture(reachableSocket: .none)
+        try "\(fixture.runningPid)\n".write(toFile: fixture.paths.pidPath, atomically: true, encoding: .utf8)
+        fixture.processObserver.markRunning(fixture.runningPid)
+        let launchRecorder = LaunchRecorder()
+        let controller = fixture.makeController(
+            stopPolicy: Fixture.fastStopPolicy
+        ) { _, _, socketPath in
+            launchRecorder.record(socketPath)
+            return 4242
+        }
+        defer { controller.stop() }
+
+        XCTAssertThrowsError(try controller.restart())
+        XCTAssertThrowsError(try controller.restart())
+        XCTAssertTrue(launchRecorder.socketPaths.isEmpty)
     }
 
     func testUnresponsiveReachableEngineIsKeptWithoutReplacement() throws {
@@ -318,16 +473,23 @@ private extension EngineProcessControllerTests {
         case none
     }
 
+    struct SignalRecord: Equatable {
+        let pid: pid_t
+        let signal: Int32
+    }
+
     final class FakeSocketControl: EngineSocketControlling, @unchecked Sendable {
         private let lock = NSLock()
         private let reachableSocket: String
         private let expectedFingerprint: String?
+        private let runningPid: pid_t?
         private var requests: [String] = []
         private var shutdowns: [String] = []
 
-        init(reachableSocket: String, expectedFingerprint: String?) {
+        init(reachableSocket: String, expectedFingerprint: String?, runningPid: pid_t?) {
             self.reachableSocket = reachableSocket
             self.expectedFingerprint = expectedFingerprint
+            self.runningPid = runningPid
         }
 
         var fingerprintRequests: [String] {
@@ -342,8 +504,8 @@ private extension EngineProcessControllerTests {
             socketPath == reachableSocket
         }
 
-        func peerPID(socketPath _: String, timeoutSeconds _: Double) -> pid_t? {
-            nil
+        func peerPID(socketPath: String, timeoutSeconds _: Double) -> pid_t? {
+            socketPath == reachableSocket ? runningPid : nil
         }
 
         func fingerprint(socketPath: String, timeoutSeconds _: Double) -> String? {
@@ -353,11 +515,60 @@ private extension EngineProcessControllerTests {
 
         func shutdown(socketPath: String, tokenPath _: String, timeoutSeconds _: Double) throws -> pid_t? {
             lock.withLock { shutdowns.append(socketPath) }
-            return nil
+            return runningPid
         }
 
         func waitForClose(socketPath _: String, timeoutSeconds _: Double) -> Bool {
             true
+        }
+    }
+
+    final class FakeProcessObserver: EngineProcessObserving, @unchecked Sendable {
+        private let lock = NSLock()
+        private var alive: Set<pid_t> = []
+        private var recordedSignals: [SignalRecord] = []
+        /// After this many `isRunning` hits on a live pid, mark it dead.
+        /// Simulates the process exiting during the pid-exit wait.
+        var liveChecksBeforeDeath: Int?
+        var dieOnSignal: Int32?
+        private var liveChecks = 0
+
+        var signals: [SignalRecord] {
+            lock.withLock { recordedSignals }
+        }
+
+        func markRunning(_ pid: pid_t) {
+            lock.withLock { _ = alive.insert(pid) }
+        }
+
+        func markDead(_ pid: pid_t) {
+            lock.withLock { _ = alive.remove(pid) }
+        }
+
+        func isRunning(_ pid: pid_t) -> Bool {
+            lock.withLock {
+                guard alive.contains(pid) else { return false }
+                if let remaining = liveChecksBeforeDeath {
+                    liveChecks += 1
+                    if liveChecks >= remaining {
+                        alive.remove(pid)
+                    }
+                }
+                return alive.contains(pid)
+            }
+        }
+
+        func isLikelyEngine(_: pid_t) -> Bool {
+            true
+        }
+
+        func sendSignal(_ pid: pid_t, _ signal: Int32) {
+            lock.withLock {
+                recordedSignals.append(SignalRecord(pid: pid, signal: signal))
+                if dieOnSignal == signal {
+                    alive.remove(pid)
+                }
+            }
         }
     }
 
@@ -375,15 +586,27 @@ private extension EngineProcessControllerTests {
     }
 
     struct Fixture {
+        static let runningPid: pid_t = 4321
+        static let fastStopPolicy = EngineStopPolicy(
+            socketCloseTimeout: 0.2,
+            pidExitTimeout: 0.12,
+            termWaitTimeout: 0.12,
+            killWaitTimeout: 0.12,
+            pollInterval: 0.02
+        )
+
         let temp: URL
         let paths: BossEnginePaths
         let bundledEnginePath: String
         let socketControl: FakeSocketControl
+        let processObserver: FakeProcessObserver
+        let runningPid: pid_t
 
         init(
             reachableSocket: ReachableSocket,
             runningFingerprint: String? = nil,
-            fingerprintAvailable: Bool = true
+            fingerprintAvailable: Bool = true,
+            announcePid: Bool = true
         ) throws {
             let testRoot = ProcessInfo.processInfo.environment["TEST_TMPDIR"]
                 .map { URL(fileURLWithPath: $0, isDirectory: true) }
@@ -412,13 +635,17 @@ private extension EngineProcessControllerTests {
             case .legacy: reachablePath = legacySocket
             case .none: reachablePath = temp.appendingPathComponent("unreachable.sock").path
             }
+            runningPid = Self.runningPid
             socketControl = FakeSocketControl(
                 reachableSocket: reachablePath,
-                expectedFingerprint: fingerprintAvailable ? (runningFingerprint ?? fingerprint) : nil
+                expectedFingerprint: fingerprintAvailable ? (runningFingerprint ?? fingerprint) : nil,
+                runningPid: announcePid ? runningPid : nil
             )
+            processObserver = FakeProcessObserver()
         }
 
         func makeController(
+            stopPolicy: EngineStopPolicy = .default,
             launchHandler: (@Sendable (String, String?, String) throws -> pid_t)? = nil
         ) -> EngineProcessController {
             EngineProcessController(
@@ -428,6 +655,8 @@ private extension EngineProcessControllerTests {
                 stopOnExit: false,
                 restartPolicy: .default,
                 socketControl: socketControl,
+                processObserver: processObserver,
+                stopPolicy: stopPolicy,
                 bundledEnginePathOverride: bundledEnginePath,
                 launchHandler: launchHandler
             )

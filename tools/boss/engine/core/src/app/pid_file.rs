@@ -9,25 +9,35 @@
 //!
 //! [`PidFileGuard::acquire`] takes a non-blocking exclusive `flock` on a
 //! dedicated sibling lock file and writes this process's pid to the pid file.
-//! The flock is released when the guard (and its fd) is dropped. The lock must
-//! not live on the pid-file inode: consumers remove the pid file while
-//! stopping or cleaning up stale engines, and unlinking a locked path creates
-//! a new inode that would defeat mutual exclusion. A second engine that reaches
-//! this path while the first is still opening the database fails immediately
-//! with [`AcquireError::AlreadyHeld`] instead of racing SQLite.
+//! Production callers then [`PidFileGuard::hold_until_process_exit`]: the
+//! kernel releases the flock when this process actually exits, not when
+//! `serve()` returns. Dropping the guard releases the flock and unlinks the
+//! pid file, so production callers must call `hold_until_process_exit` to
+//! keep the singleton held through `serve()` return and tokio runtime
+//! teardown until the process actually exits.
+//!
+//! The lock must not live on the pid-file inode: consumers remove the pid
+//! file while stopping or cleaning up stale engines, and unlinking a locked
+//! path creates a new inode that would defeat mutual exclusion. A second
+//! engine that reaches this path while the first is still opening the
+//! database — or still tearing down — fails immediately with
+//! [`AcquireError::AlreadyHeld`] instead of racing SQLite.
 
 use fs4::fs_std::FileExt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-/// RAII guard that holds the instance lock and removes the pid file on drop
-/// when the file still names this process.
+/// RAII guard that holds the instance lock and, on drop, removes the pid
+/// file when the file still names this process.
+///
+/// Production startup must call [`Self::hold_until_process_exit`] so Drop
+/// never runs: the flock and pid file have to outlive `serve()`.
 #[derive(Debug)]
 pub(super) struct PidFileGuard {
     pub(super) path: String,
     pub(super) pid: u32,
-    /// Kept open so the exclusive flock lives for the process lifetime.
+    /// Kept open so the exclusive flock lives until process exit (or Drop).
     _lock_file: File,
 }
 
@@ -153,6 +163,22 @@ impl PidFileGuard {
             _lock_file: lock_file,
         })
     }
+
+    /// Keep the exclusive flock and pid file until this process exits.
+    ///
+    /// The kernel releases a flock when the holding fd is closed, which on
+    /// this path is process exit. Skipping Drop means `serve()` returning —
+    /// and the unbounded `#[tokio::main]` runtime teardown after `main`
+    /// returns — cannot free the singleton while this process is still
+    /// alive. The pid file keeps naming this pid for the same lifetime.
+    ///
+    /// Because Drop never runs, the pid file is not unlinked on exit and may
+    /// name a dead (possibly recycled) pid until the next engine overwrites
+    /// it; consumers must validate liveness before trusting it.
+    pub(super) fn hold_until_process_exit(self) {
+        static HELD: std::sync::Mutex<Vec<PidFileGuard>> = std::sync::Mutex::new(Vec::new());
+        HELD.lock().unwrap_or_else(|e| e.into_inner()).push(self);
+    }
 }
 
 impl Drop for PidFileGuard {
@@ -219,6 +245,26 @@ mod tests {
         let written: u32 = std::fs::read_to_string(&path).unwrap().trim().parse().unwrap();
         assert_eq!(written, std::process::id());
         drop(guard);
+    }
+
+    /// Forgetting the guard (the production `serve()` path) must leave both
+    /// the flock and the pid file in place so a second instance loses.
+    #[test]
+    fn hold_until_process_exit_blocks_a_second_acquire() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine.pid");
+        let guard = PidFileGuard::acquire(&path).expect("acquire");
+        let pid = guard.pid;
+        guard.hold_until_process_exit();
+        let written: u32 = std::fs::read_to_string(&path).unwrap().trim().parse().unwrap();
+        assert_eq!(written, pid, "pid file must still name the live process");
+        match PidFileGuard::acquire(&path) {
+            Err(AcquireError::AlreadyHeld { holder_pid, .. }) => {
+                assert_eq!(holder_pid, Some(pid));
+            }
+            Err(other) => panic!("unexpected acquire error: {other}"),
+            Ok(_) => panic!("leaked guard must still hold the instance flock"),
+        }
     }
 
     /// `flock` is associated with an open file description, so a second open

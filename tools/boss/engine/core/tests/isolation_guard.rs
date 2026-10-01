@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use boss_client::wait_for_socket;
 use boss_engine::app::isolation::{EnginePaths, IsolationOverrides, IsolationPaths};
 use boss_engine::app::{process_is_alive, run, serve};
@@ -756,5 +756,111 @@ async fn duplicate_pid_path_is_refused_before_opening_the_database() -> Result<(
     );
 
     live_join.abort();
+    Ok(())
+}
+
+/// `serve()` returning must not free the instance lock while this process
+/// is still alive. The pid file keeps naming this process, and a second
+/// `serve()` on the same pid path must lose immediately.
+///
+/// Uses a watched `sleep` parent so `serve()` takes the orphan-shutdown
+/// arm and actually returns, rather than being aborted mid-await.
+#[tokio::test]
+async fn instance_lock_survives_serve_return_while_process_is_alive() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pid_path = temp.path().join("engine.pid");
+    let live_socket = temp.path().join("live.sock");
+    let live_events = temp.path().join("live-events.sock");
+    let live_db = temp.path().join("live.db");
+
+    let mut parent_proc = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .map_err(|e| anyhow!("failed to spawn sleep: {e}"))?;
+    let parent_pid = parent_proc.id() as i32;
+
+    let live_work = WorkConfig::builder()
+        .cwd(temp.path().to_path_buf())
+        .db_path(live_db)
+        .build();
+    let live_cfg = Arc::new(RuntimeConfig::from_parts(live_work, None));
+    let live_sock_c = live_socket.clone();
+    let live_pid_c = pid_path.clone();
+    let live_events_c = live_events.clone();
+    let live_join = tokio::spawn(async move {
+        serve(
+            live_cfg,
+            live_sock_c,
+            Some(live_pid_c),
+            Some(live_events_c),
+            None,
+            Some(parent_pid),
+        )
+        .await
+    });
+    if !wait_for_socket(live_socket.to_str().unwrap(), STARTUP_TIMEOUT).await {
+        parent_proc.kill().ok();
+        parent_proc.wait().ok();
+        live_join.abort();
+        return Err(anyhow!("live engine never bound socket"));
+    }
+    let pid_before = std::fs::read_to_string(&pid_path)?;
+    assert_eq!(
+        pid_before.trim().parse::<u32>().ok(),
+        Some(std::process::id()),
+        "pid file must name this test process"
+    );
+
+    parent_proc
+        .kill()
+        .map_err(|e| anyhow!("failed to kill watched parent: {e}"))?;
+    parent_proc.wait().ok();
+
+    // The orphan watcher polls once a second.
+    let joined = tokio::time::timeout(Duration::from_secs(8), live_join)
+        .await
+        .map_err(|_| anyhow!("serve() did not return after watched parent died"))?
+        .map_err(|e| anyhow!("serve() task panicked: {e}"))?;
+    joined.context("serve() must return Ok after orphan shutdown")?;
+
+    assert_eq!(
+        std::fs::read_to_string(&pid_path)?,
+        pid_before,
+        "pid file must still name this process after serve() returns"
+    );
+
+    let second_socket = temp.path().join("second.sock");
+    let second_events = temp.path().join("second-events.sock");
+    let second_db = temp.path().join("second.db");
+    let second_work = WorkConfig::builder()
+        .cwd(temp.path().to_path_buf())
+        .db_path(second_db)
+        .build();
+    let second_cfg = Arc::new(RuntimeConfig::from_parts(second_work, None));
+    let started = Instant::now();
+    let second_result = serve(
+        second_cfg,
+        second_socket.clone(),
+        Some(pid_path.clone()),
+        Some(second_events),
+        None,
+        None,
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    let err = second_result.expect_err("must refuse a second engine after serve() returned");
+    assert!(
+        format!("{err:#}").contains("instance lock held"),
+        "unexpected error: {err:#}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "duplicate start must not wait on sqlite busy-timeout, took {elapsed:?}"
+    );
+    assert!(
+        !second_socket.exists(),
+        "refused start must not have bound a frontend socket"
+    );
     Ok(())
 }
