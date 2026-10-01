@@ -606,11 +606,9 @@ impl StartWorkerError {
     pub fn class(&self) -> &'static str {
         match self {
             Self::WriteFiles(_) => "write_files",
-            Self::Send(_) => "send_spawn_request",
-            Self::AppError(_) => "app_rejected",
-            Self::ResponseKindMismatch => "response_kind_mismatch",
             Self::ProgressIngress(_) => "progress_ingress",
             Self::Tmux(_) => "tmux_host",
+            Self::ProgressFidelity(_) => "progress_fidelity",
         }
     }
 
