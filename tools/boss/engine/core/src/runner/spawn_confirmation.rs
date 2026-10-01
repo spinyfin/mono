@@ -9,7 +9,9 @@
 //!    is actually up (`PaneMonitorSpec` agent markers), or a fresh driver signal.
 //!    For argv delivery this is the analog of "the composer can accept
 //!    input": the CLI has exec'd and rendered its surface, which is what
-//!    proves the sourced script did not die at `execve()`.
+//!    proves the sourced script did not die at `execve()`. A driver hook
+//!    or persisted `transcript_path` is strictly stronger than a scraped
+//!    pane marker, so turn-start evidence also satisfies this wait.
 //! 2. **Turn start** — fresh evidence for the **current** run: a driver
 //!    hook / session event (`LiveWorkerStateRegistry::has_driver_signal_for_run`)
 //!    or a `transcript_path` on the current `work_runs` row
@@ -19,6 +21,8 @@
 //! Either wait timing out fails the spawn immediately with a named error
 //! so the coordinator records `pane_spawn_failed` instead of leaving the
 //! execution `Spawning` for `spawn_ack_sweep`'s later generic reap.
+//! "Composer never became ready" is reported only when neither composer
+//! chrome nor turn-start evidence arrives.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -135,6 +139,10 @@ pub(crate) fn turn_did_not_start_error(driver_name: &str, run_id: &str, timeout:
 
 /// Run the two spawn-time waits against injected predicates so production
 /// (local pane spawn) and tests share one loop.
+///
+/// Phase 1 treats turn-start evidence as readiness: a driver hook is
+/// stronger proof the CLI exec'd than a scraped pane marker, so a spawn
+/// whose turn has already started is not reaped for missing chrome.
 pub(crate) async fn confirm_spawn_started<Ready, ReadyFut, Started, StartedFut>(
     driver_name: &str,
     run_id: &str,
@@ -377,6 +385,21 @@ mod tests {
         assert!(msg.contains("exec-missing-composer"), "{msg}");
         assert!(msg.contains("composer never became ready"), "{msg}");
         assert!(msg.contains("failed spawn"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn confirm_spawn_started_succeeds_when_turn_starts_without_composer_chrome() {
+        confirm_spawn_started(
+            "claude",
+            "exec-hook-without-chrome",
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+            || async { false },
+            || async { true },
+        )
+        .await
+        .expect("turn-start evidence must satisfy composer readiness");
     }
 
     #[tokio::test]

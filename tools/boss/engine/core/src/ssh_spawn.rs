@@ -418,6 +418,35 @@ pub async fn perform_remote_launch(
     }
 }
 
+/// Tear down a remote worker after spawn confirmation times out.
+///
+/// Always cancels the reverse events forward so it does not leak on the
+/// ControlMaster. When the wrapper handshake pid is known, kill that pid;
+/// when it is missing, locate the still-running driver by the `BOSS_RUN_ID`
+/// the wrapper exported so a slow-but-alive worker is not left in a
+/// workspace the coordinator is about to re-lease.
+pub async fn reap_failed_remote_turn(
+    exec: &dyn SshExec,
+    run_id: &str,
+    remote_pid: Option<i64>,
+    events_socket_path: &str,
+    engine_events_socket: &str,
+) {
+    if let Some(pid) = remote_pid {
+        let _ = exec.run(&["kill", &pid.to_string()]).await;
+    } else {
+        tracing::warn!(
+            run_id,
+            host_id = exec.host_id(),
+            "remote turn-start timeout with no handshake pid; locating the driver by BOSS_RUN_ID"
+        );
+        let _ = exec.run(&["pkill", "-f", &format!("BOSS_RUN_ID={run_id}")]).await;
+    }
+    let _ = exec
+        .cancel_reverse_unix_forward(events_socket_path, engine_events_socket)
+        .await;
+}
+
 /// Read a bounded tail of the remote worker log after a liveness probe proves
 /// the worker is gone. Unlike the transcript helper's normal UX path, a
 /// missing log is reported as a capture failure here: an immediate-death error
@@ -1153,5 +1182,67 @@ mod tests {
         assert!(!outcome.launched);
         assert_eq!(outcome.failure_reason, Some(REASON_WORKER_LAUNCH_FAILED));
         assert!(outcome.detail.unwrap().contains("forwarding request failed"));
+    }
+
+    #[tokio::test]
+    async fn reap_failed_remote_turn_kills_the_handshake_pid_and_cancels_the_forward() {
+        let exec = FakeExec::new(0, "");
+        reap_failed_remote_turn(
+            &exec,
+            "run-1",
+            Some(4242),
+            "/tmp/boss-events-run-1.sock",
+            "/engine.sock",
+        )
+        .await;
+        let calls = exec.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|call| matches!(call, Call::Run(argv) if argv == &["kill".to_owned(), "4242".to_owned()])),
+            "known handshake pid must be killed, got {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| matches!(call, Call::Run(argv) if argv.first().map(String::as_str) == Some("pkill"))),
+            "pkill is only for a missing handshake pid, got {calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, Call::CancelForward { .. }))
+                .count(),
+            1,
+            "turn-start timeout must cancel the reverse events forward, got {calls:?}"
+        );
+        assert!(calls.iter().any(|call| matches!(
+            call,
+            Call::CancelForward {
+                remote,
+                local
+            } if remote == "/tmp/boss-events-run-1.sock" && local == "/engine.sock"
+        )));
+    }
+
+    #[tokio::test]
+    async fn reap_failed_remote_turn_without_pid_locates_the_driver_by_run_id() {
+        let exec = FakeExec::new(0, "");
+        reap_failed_remote_turn(&exec, "run-1", None, "/tmp/boss-events-run-1.sock", "/engine.sock").await;
+        let calls = exec.calls();
+        assert!(
+            calls.iter().any(|call| matches!(
+                call,
+                Call::Run(argv) if argv == &["pkill".to_owned(), "-f".to_owned(), "BOSS_RUN_ID=run-1".to_owned()]
+            )),
+            "missing handshake pid must locate the driver by BOSS_RUN_ID, got {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| matches!(call, Call::Run(argv) if argv.first().map(String::as_str) == Some("kill"))),
+            "bare kill is only for a known handshake pid, got {calls:?}"
+        );
+        assert!(calls.iter().any(|call| matches!(call, Call::CancelForward { .. })));
     }
 }

@@ -3,12 +3,48 @@
 //! module split; see [`super`] for the struct and shared types.
 use super::*;
 
-/// Filed against a run when the worker pane never came up (tmux creation failure,
-/// viewer rejection, or prompt composition error). See
-/// [`crate::attention_lifecycle::ATTENTION_LIFECYCLES`] for its clearing
+/// Filed against a run when spawn or spawn confirmation failed (tmux creation
+/// failure, viewer rejection, prompt composition error, composer never ready,
+/// or no turn-start evidence). The pane may have come up and then been reaped.
+/// See [`crate::attention_lifecycle::ATTENTION_LIFECYCLES`] for its clearing
 /// rule: `ClearedBy::WorkResumed`, since a later run starting for the item
 /// is direct evidence the pane-spawn problem is no longer blocking it.
 pub const PANE_SPAWN_FAILED_ATTENTION_KIND: &str = "pane_spawn_failed";
+
+fn is_spawn_confirmation_failure(err_detail: &str) -> bool {
+    err_detail.contains("composer never became ready") || err_detail.contains("no driver hook or session event")
+}
+
+fn pane_spawn_failed_attention_body(
+    exec_id: &str,
+    workspace_id: &str,
+    err_detail: &str,
+    released: bool,
+    abort_unconfirmed: bool,
+) -> String {
+    let release_state = if released {
+        "released back to cube"
+    } else if abort_unconfirmed {
+        "intentionally retained because worker process teardown could not be confirmed. \
+         Manual recovery is required: confirm the worker has stopped, clean up its driver \
+         state, release the retained cube lease, and requeue the failed work item. \
+         The pool sweep only reclaims the slot; it does not perform workspace cleanup or requeue"
+    } else {
+        "still held by the engine (release failed — see the engine log)"
+    };
+    let lead = if is_spawn_confirmation_failure(err_detail) {
+        format!(
+            "Execution `{exec_id}` leased workspace `{workspace_id}` and the driver started, \
+             but spawn confirmation failed and the pane was reaped."
+        )
+    } else {
+        format!("Execution `{exec_id}` leased workspace `{workspace_id}` but the worker pane never came up.")
+    };
+    format!(
+        "{lead}\n\n**Error:** {err_detail}\n\nThe lease was {release_state}. Inspect \
+         `dispatch-events/executions/{exec_id}/dispatch.jsonl` for the full stage timeline."
+    )
+}
 
 impl ExecutionCoordinator {
     // `change` is `None` for `pr_review` executions that checked out the PR
@@ -314,7 +350,8 @@ impl ExecutionCoordinator {
                     cube_lease_id = %lease.lease_id,
                     cube_workspace_id = %lease.workspace_id,
                     error = %err_detail,
-                    "spawn aborted: tearing down and releasing the workspace",
+                    "spawn aborted: run_execution failed during spawn or spawn confirmation; \
+                     tearing down and releasing the workspace",
                 );
                 self.dispatch_events
                     .emit(
@@ -414,23 +451,12 @@ impl ExecutionCoordinator {
                     kind: PANE_SPAWN_FAILED_ATTENTION_KIND.to_owned(),
                     status: None,
                     title: "Worker pane failed to spawn".to_owned(),
-                    body_markdown: format!(
-                        "Execution `{exec_id}` leased workspace `{ws}` but the worker pane never came up.\n\n\
-                         **Error:** {err_detail}\n\n\
-                         The lease was {release_state}. Inspect \
-                         `dispatch-events/executions/{exec_id}/dispatch.jsonl` for the full stage timeline.",
-                        exec_id = execution.id,
-                        ws = lease.workspace_id,
-                        release_state = if released {
-                            "released back to cube"
-                        } else if abort_unconfirmed {
-                            "intentionally retained because worker process teardown could not be confirmed. \
-                             Manual recovery is required: confirm the worker has stopped, clean up its driver \
-                             state, release the retained cube lease, and requeue the failed work item. \
-                             The pool sweep only reclaims the slot; it does not perform workspace cleanup or requeue"
-                        } else {
-                            "still held by the engine (release failed — see the engine log)"
-                        },
+                    body_markdown: pane_spawn_failed_attention_body(
+                        &execution.id,
+                        &lease.workspace_id,
+                        &err_detail,
+                        released,
+                        abort_unconfirmed,
                     ),
                     resolved_at: None,
                 });
