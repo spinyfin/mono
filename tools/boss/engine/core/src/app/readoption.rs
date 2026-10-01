@@ -890,6 +890,25 @@ impl ServerState {
             .await;
     }
 
+    /// Attach viewers only for workers newly restored to live-state by the
+    /// periodic adoption pass, including terminal-handoff recoveries.
+    pub(crate) async fn reattach_after_adoption(&self, previously_live: &HashSet<String>) {
+        if self.app_session.lock().await.is_none() {
+            return;
+        }
+        let candidates = self
+            .live_worker_states
+            .snapshot()
+            .into_iter()
+            .filter(|state| {
+                !state.activity.is_terminal()
+                    && state.tmux_hosted == Some(true)
+                    && !previously_live.contains(&state.run_id)
+            })
+            .collect();
+        self.reattach_worker_pane_candidates(candidates).await;
+    }
+
     /// Re-send `AttachWorkerPane` for every live, tmux-hosted local run the
     /// currently registered app session has no viewer for.
     ///
@@ -909,6 +928,8 @@ impl ServerState {
     /// and after boot-time tmux adoption when an app session is already
     /// registered (engine restart — every readopted run predates this
     /// engine process's own spawn history).
+    /// The periodic sweep uses `reattach_after_adoption` to restrict this
+    /// same path to newly live workers.
     pub(crate) async fn reattach_worker_panes_to_registered_app(&self) {
         let candidates: Vec<LiveWorkerState> = self
             .live_worker_states
@@ -916,6 +937,10 @@ impl ServerState {
             .into_iter()
             .filter(|state| !state.activity.is_terminal() && state.tmux_hosted == Some(true))
             .collect();
+        self.reattach_worker_pane_candidates(candidates).await;
+    }
+
+    async fn reattach_worker_pane_candidates(&self, candidates: Vec<LiveWorkerState>) {
         if candidates.is_empty() {
             return;
         }
