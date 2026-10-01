@@ -246,3 +246,182 @@ async fn slot_busy_rejections_never_count_towards_a_streak() {
         coordinator.pre_start_streaks().active_alerts()
     );
 }
+
+#[tokio::test]
+async fn guide_refusals_remain_visible_after_a_failed_retry_and_reconcile() {
+    let (_dir, db, product) = review_guide_db();
+    let repo_dir = tempdir().unwrap();
+    let repo = boss_engine_test_git::jj::JjRepo::new(repo_dir.path());
+    let cube = Arc::new(FakeCubeClient {
+        workspace_root: Some(repo.worker.parent().unwrap().to_path_buf()),
+        next_workspace_id: Mutex::new(Some(repo.worker.file_name().unwrap().to_str().unwrap().to_owned())),
+        real_bookmarks: true,
+        ..FakeCubeClient::default()
+    });
+    let runner = Arc::new(FakeExecutionRunner {
+        fail_remaining: AtomicUsize::new(2),
+        fail_message: Some(HOOK_TRUST_REFUSAL.to_owned()),
+        ..FakeExecutionRunner::default()
+    });
+    let mut coordinator = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube, runner);
+    coordinator.set_review_pool(WorkerPool::new_review(1));
+    let coordinator = Arc::new(coordinator);
+    let first = run_guide(&coordinator, &db, &product, 10, ExecutionStatus::Failed).await;
+    let root: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT s.root_task_id FROM pr_review_guide_source_series s
+         JOIN pr_review_guide_source_comparisons c ON c.series_id = s.id WHERE c.id = ?1",
+            [&first.work_item_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let items = db.list_attention_items_for_work_item(&root).unwrap();
+    assert!(items.iter().any(|item| item.execution_id.as_deref() == Some(&first.id)
+        && item.kind == PANE_SPAWN_FAILED_ATTENTION_KIND
+        && item.status == "open"));
+
+    let retry = db
+        .create_pr_review_guide_execution(&first.work_item_id, "https://github.com/test/repo")
+        .unwrap();
+    coordinator
+        .force_dispatch(&retry.id, crate::coordinator::DispatchAdmission::Queued)
+        .await
+        .unwrap();
+    wait_for_execution_status(&db, &retry.id, ExecutionStatus::Failed).await;
+    // Runtime confirmation of the old predicate: the failed retry's run
+    // was started after the first refusal, despite never spawning a pane.
+    let old_evidence: bool = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_runs r JOIN work_executions e ON e.id = r.execution_id
+         JOIN work_attention_items a ON a.execution_id = ?1
+         WHERE e.work_item_id = ?2 AND r.execution_id != a.execution_id
+         AND CAST(r.started_at AS INTEGER) >= CAST(COALESCE(a.last_raised_at, a.created_at) AS INTEGER))",
+            [&first.id, &first.work_item_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        old_evidence,
+        "the former run-start predicate incorrectly accepted the failed retry"
+    );
+    db.reconcile_stale_attention_signals().unwrap();
+    let items = db.list_attention_items_for_work_item(&root).unwrap();
+    for execution in [&first, &retry] {
+        assert!(
+            items
+                .iter()
+                .any(|item| item.execution_id.as_deref() == Some(&execution.id)
+                    && item.kind == PANE_SPAWN_FAILED_ATTENTION_KIND
+                    && item.status == "open"),
+            "failed retry must not clear either refusal: {items:?}"
+        );
+    }
+
+    let success = db
+        .create_pr_review_guide_execution(&first.work_item_id, "https://github.com/test/repo")
+        .unwrap();
+    coordinator
+        .force_dispatch(&success.id, crate::coordinator::DispatchAdmission::Queued)
+        .await
+        .unwrap();
+    wait_for_execution_status(&db, &success.id, ExecutionStatus::Running).await;
+    // Running is set before spawn; wait for the spawn run's completion,
+    // which is the durable evidence the reconciler requires.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !db
+            .list_runs(&success.id)
+            .unwrap()
+            .iter()
+            .any(|run| run.status == "completed")
+        {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    db.reconcile_stale_attention_signals().unwrap();
+    assert!(
+        db.list_attention_items_for_work_item(&root)
+            .unwrap()
+            .iter()
+            .filter(|item| item.kind == PANE_SPAWN_FAILED_ATTENTION_KIND)
+            .all(|item| item.status == "resolved")
+    );
+}
+
+#[test]
+fn spawn_driver_resolution_covers_guides_pools_and_ordinary_workers() {
+    let (_dir, db, product) = review_guide_db();
+    let coordinator = coordinator_failing_first(&db, 0);
+    let guide = create_guide_execution(&db, &product, 11);
+    assert_eq!(
+        coordinator.resolve_spawn_driver(&guide, "review-1").unwrap().as_deref(),
+        Some("codex")
+    );
+    let chore = create_test_chore(&db, product, "ordinary worker");
+    db.reconcile_product_executions(&chore.product_id).unwrap();
+    let ordinary = db.list_executions(Some(&chore.id)).unwrap().remove(0);
+    assert_eq!(
+        coordinator.resolve_spawn_driver(&ordinary, "worker-1").unwrap(),
+        db.get_execution_driver_slug(&ordinary.id).unwrap()
+    );
+    for worker in ["review-1", "auto-worker-1"] {
+        assert_eq!(
+            coordinator.resolve_spawn_driver(&ordinary, worker).unwrap().as_deref(),
+            Some(
+                crate::coordinator::pool_dispatch_policy_for_worker_id(worker)
+                    .unwrap()
+                    .driver
+            )
+        );
+    }
+}
+
+#[test]
+fn batch_requested_driver_takes_precedence_over_pool_driver() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let coordinator = ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeExecutionRunner::default()),
+    );
+    let product = create_test_product(&db);
+    let root = create_test_chore_manual(&db, product.id, "driver precedence");
+    let classification = boss_protocol::ReviewClassification::builder()
+        .changed_files(vec!["src/lib.rs".to_owned()])
+        .complexity_flags(vec![])
+        .has_production_code(true)
+        .metadata_missing(vec![])
+        .production_languages(vec![boss_protocol::ReviewLanguageBucket::Rust])
+        .profile(boss_protocol::ReviewProfile::Light)
+        .subsystem_buckets(vec!["src".to_owned()])
+        .build();
+    let input = crate::work::ReviewBatchCreateInput::builder()
+        .cycle_root_id(root.id)
+        .base_sha("base")
+        .target_sha("head")
+        .classification(classification)
+        .phase(boss_protocol::ReviewBatchPhase::PreMerge)
+        .pr_number(42)
+        .pr_url("https://github.com/acme/widget/pull/42")
+        .build();
+    let crate::work::ReviewBatchDispatch::Created { executions, .. } = db
+        .create_pre_merge_review_batch(input, "https://github.com/acme/widget")
+        .unwrap()
+    else {
+        panic!("expected a new batch")
+    };
+    for execution in executions {
+        let member = db.review_batch_member_for_execution(&execution.id).unwrap().unwrap();
+        assert_eq!(
+            coordinator.resolve_spawn_driver(&execution, "review-1").unwrap(),
+            Some(member.requested_driver)
+        );
+    }
+}

@@ -827,22 +827,11 @@ impl ExecutionCoordinator {
         execution: &WorkExecution,
         worker_id: &str,
     ) -> crate::pre_start_streak::StreakKey {
-        let driver = if execution.kind == ExecutionKind::PrReviewGuide {
-            Some(crate::runner::REVIEW_GUIDE_DRIVER.to_owned())
-        } else {
-            let review_member_driver = if execution.kind == ExecutionKind::PrReview {
-                self.work_db
-                    .review_batch_member_for_execution(&execution.id)
-                    .ok()
-                    .flatten()
-                    .map(|member| member.requested_driver)
-            } else {
-                None
-            };
-            review_member_driver
-                .or_else(|| pool_dispatch_policy_for_worker_id(worker_id).map(|policy| policy.driver.to_owned()))
-                .or_else(|| self.work_db.get_execution_driver_slug(&execution.id).ok().flatten())
-        };
+        let driver = self.resolve_spawn_driver(execution, worker_id).unwrap_or_else(|err| {
+            tracing::warn!(execution_id = %execution.id, error = %format!("{err:#}"),
+                "streak tracking: failed to resolve spawn driver; treating as unknown");
+            None
+        });
         crate::pre_start_streak::StreakKey::for_execution(driver.as_deref(), &execution.kind)
     }
 
