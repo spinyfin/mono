@@ -471,6 +471,66 @@ fn parse_hooks_list_response_rejects_empty_data() {
 }
 
 #[test]
+fn parse_hooks_list_response_empty_hooks_includes_errors_array() {
+    let resp = serde_json::json!({
+        "id": 2,
+        "result": {
+            "data": [{
+                "cwd": "/tmp/repo",
+                "hooks": [],
+                "errors": [{
+                    "path": "/tmp/home/config.toml",
+                    "message": "config defines `[permissions]` profiles but does not set `default_permissions`"
+                }]
+            }]
+        }
+    });
+    let err = parse_hooks_list_response(&resp).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("hooks/list returned no hook entries"), "{text}");
+    assert!(text.contains("codex reported:"), "{text}");
+    assert!(text.contains("default_permissions"), "{text}");
+    assert!(
+        matches!(err, TrustGateError::ObservationFailed { .. }),
+        "gate must still refuse: {err:?}"
+    );
+}
+
+#[test]
+fn parse_hooks_list_response_empty_hooks_includes_config_warning() {
+    let resp = serde_json::json!({
+        "id": 2,
+        "result": {
+            "data": [{
+                "cwd": "/tmp/repo",
+                "hooks": []
+            }]
+        }
+    });
+    let err = parse_hooks_list_response_with_reports(
+        &resp,
+        &["config defines `[permissions]` profiles but does not set `default_permissions`".into()],
+        "",
+    )
+    .unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("hooks/list returned no hook entries"), "{text}");
+    assert!(text.contains("codex reported:"), "{text}");
+    assert!(text.contains("default_permissions"), "{text}");
+}
+
+#[test]
+fn parse_hooks_list_response_empty_hooks_includes_stderr_tail() {
+    let resp = serde_json::json!({
+        "id": 2,
+        "result": { "data": [{ "cwd": "/tmp/repo", "hooks": [] }] }
+    });
+    let err = parse_hooks_list_response_with_reports(&resp, &[], "loader: default_permissions missing").unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("stderr: loader: default_permissions missing"), "{text}");
+}
+
+#[test]
 fn parse_hooks_list_response_extracts_entries() {
     let resp = serde_json::json!({
         "id": 2,
