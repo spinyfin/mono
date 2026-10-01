@@ -153,6 +153,21 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
     let dispatch_paused = server_state.execution_coordinator.is_dispatch_paused();
     let mut issues: Vec<EngineHealthIssue> = Vec::new();
 
+    // Pre-start spawn-failure streaks: a (driver, worker kind) combination
+    // whose spawns keep failing before a pane exists, with no success in
+    // between. Listed first because the banner's headline is the first
+    // issue, and "a whole class of worker cannot start" is the one entry
+    // here that is actively losing work while it sits unread. The engine
+    // renders the text; the app shows it verbatim. See
+    // [`crate::pre_start_streak`].
+    let spawn_failure_streaks = server_state.execution_coordinator.pre_start_streaks().active_alerts();
+    let streak_now = boss_engine_utils::epoch_time::now_epoch_secs();
+    issues.extend(
+        spawn_failure_streaks
+            .iter()
+            .map(|alert| crate::pre_start_streak::health_issue_for(alert, streak_now)),
+    );
+
     if !anthropic_api_key_present {
         issues.push(EngineHealthIssue {
             kind: "missing_anthropic_api_key".to_owned(),
@@ -320,6 +335,7 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
         automation_paused,
         review_guide_reenqueue: server_state.review_guide_reenqueue_summary(),
         issues,
+        spawn_failure_streaks,
     }
 }
 

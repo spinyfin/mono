@@ -112,6 +112,7 @@ impl ExecutionCoordinator {
             refused_workspaces: Mutex::new(HashMap::new()),
             max_concurrent_interactive_workers: AtomicUsize::new(MAX_CONCURRENT_INTERACTIVE_WORKERS),
             pause_state_changed: tokio::sync::watch::channel(0).0,
+            pre_start_streaks: Arc::default(),
         }
     }
 
@@ -799,6 +800,50 @@ impl ExecutionCoordinator {
     /// needs the current state at startup reads it directly.
     pub fn subscribe_pause_state(&self) -> tokio::sync::watch::Receiver<u64> {
         self.pause_state_changed.subscribe()
+    }
+
+    /// The per-(driver, worker kind) pre-start failure streak tracker. The
+    /// engine health report reads its active alerts, and
+    /// `ServerState::spawn_spawn_streak_health_broadcaster` subscribes to
+    /// its changes. See [`crate::pre_start_streak`].
+    pub fn pre_start_streaks(&self) -> &Arc<crate::pre_start_streak::PreStartStreakTracker> {
+        &self.pre_start_streaks
+    }
+
+    /// The (driver, worker kind) combination a spawn of `execution` on
+    /// `worker_id` counts towards in [`Self::pre_start_streaks`].
+    ///
+    /// Resolved the same way host selection resolves the driver a spawn is
+    /// required to launch (see `select_host_for_execution`), so the label
+    /// names the driver that was actually attempted: review guides are
+    /// fixed to their one driver, a PR review uses its batch member's
+    /// requested driver, a pool worker uses its pool's driver, and
+    /// everything else uses the row / product / allocation resolution.
+    /// Resolved once, before the spawn, and used for both outcomes so a
+    /// failure and the success that ends its streak can never land on
+    /// different keys.
+    pub(super) fn pre_start_streak_key(
+        &self,
+        execution: &WorkExecution,
+        worker_id: &str,
+    ) -> crate::pre_start_streak::StreakKey {
+        let driver = if execution.kind == ExecutionKind::PrReviewGuide {
+            Some(crate::runner::REVIEW_GUIDE_DRIVER.to_owned())
+        } else {
+            let review_member_driver = if execution.kind == ExecutionKind::PrReview {
+                self.work_db
+                    .review_batch_member_for_execution(&execution.id)
+                    .ok()
+                    .flatten()
+                    .map(|member| member.requested_driver)
+            } else {
+                None
+            };
+            review_member_driver
+                .or_else(|| pool_dispatch_policy_for_worker_id(worker_id).map(|policy| policy.driver.to_owned()))
+                .or_else(|| self.work_db.get_execution_driver_slug(&execution.id).ok().flatten())
+        };
+        crate::pre_start_streak::StreakKey::for_execution(driver.as_deref(), &execution.kind)
     }
 
     /// The epoch-seconds timestamp at which automation was last paused, or

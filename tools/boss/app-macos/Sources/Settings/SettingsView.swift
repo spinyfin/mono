@@ -177,7 +177,9 @@ private struct EngineConfigPane: View {
 
             if !chatModel.engineHealthIssues.isEmpty {
                 Section {
-                    ForEach(chatModel.engineHealthIssues) { issue in
+                    // Keyed by position: several issues can share a kind
+                    // (one spawn-failure streak alert per combination).
+                    ForEach(Array(chatModel.engineHealthIssues.enumerated()), id: \.offset) { _, issue in
                         VStack(alignment: .leading, spacing: 4) {
                             HStack(spacing: 6) {
                                 Image(systemName: issue.severity == "error"
