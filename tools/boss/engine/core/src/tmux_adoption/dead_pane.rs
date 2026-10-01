@@ -138,7 +138,7 @@ pub(super) async fn reconcile_dead_worker_pane(
                 "tmux session sweep: dead pane observed but the execution row could not be loaded",
             );
             outcome.dead_panes += 1;
-            kill_retained_session(work_db, tmux, session_name, spawn_token, execution_id).await;
+            kill_retained_session(tmux, session_name, spawn_token, execution_id).await;
             return;
         }
     };
@@ -195,7 +195,7 @@ pub(super) async fn reconcile_dead_worker_pane(
         );
     }
 
-    kill_retained_session(work_db, tmux, session_name, spawn_token, execution_id).await;
+    kill_retained_session(tmux, session_name, spawn_token, execution_id).await;
     outcome.dead_panes += 1;
 }
 
@@ -237,19 +237,11 @@ fn truncate_pane_output(text: &str) -> String {
     format!("…{snippet}")
 }
 
-async fn kill_retained_session(
-    work_db: &WorkDb,
-    tmux: &Tmux,
-    session_name: &str,
-    spawn_token: &str,
-    execution_id: &str,
-) {
+async fn kill_retained_session(tmux: &Tmux, session_name: &str, spawn_token: &str, execution_id: &str) {
     match tmux.kill_session_verified(session_name, spawn_token).await {
-        Ok(boss_tmux::KillSessionOutcome::Killed | boss_tmux::KillSessionOutcome::Absent) => {
-            if let Err(err) = work_db.clear_tmux_identity_for_execution(execution_id, spawn_token) {
-                tracing::warn!(execution_id, %err, "failed clearing reaped dead-pane identity; pool sweep will retry");
-            }
-        }
+        // Owning teardown still needs the durable identity to confirm the absent
+        // session before detaching its viewer and releasing live state and pool.
+        Ok(boss_tmux::KillSessionOutcome::Killed | boss_tmux::KillSessionOutcome::Absent) => {}
         Err(err) => {
             tracing::warn!(
                 execution_id,

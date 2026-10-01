@@ -197,10 +197,32 @@ impl TeardownRetries {
         }
     }
 
-    fn recovered(&mut self, db: &WorkDb, execution_id: &str) {
-        self.failures.remove(execution_id);
-        if let Err(err) = db.resolve_attention_kind_for_execution(execution_id, TEARDOWN_ATTENTION_KIND) {
-            tracing::error!(execution_id, %err, "could not resolve pool teardown attention");
+    async fn reconcile(&mut self, db: &WorkDb, coordinator: &ExecutionCoordinator) {
+        let mut claimed = HashSet::new();
+        for pool in [
+            coordinator.worker_pool(),
+            coordinator.automation_worker_pool(),
+            coordinator.review_worker_pool(),
+        ] {
+            claimed.extend(pool.claims().await.into_iter().map(|claim| claim.execution_id));
+        }
+        self.failures.retain(|execution_id, _| claimed.contains(execution_id));
+        // Durable open items are the retry queue, even after restart or
+        // another teardown path has removed the in-memory claim.
+        let items = match db.list_open_attention_items_of_kind(TEARDOWN_ATTENTION_KIND) {
+            Ok(items) => items,
+            Err(err) => {
+                tracing::error!(%err, "could not inspect pool teardown attention");
+                return;
+            }
+        };
+        for item in items {
+            if let Some(execution_id) = item.execution_id
+                && !claimed.contains(&execution_id)
+                && let Err(err) = db.resolve_attention_kind_for_execution(&execution_id, TEARDOWN_ATTENTION_KIND)
+            {
+                tracing::error!(execution_id, %err, "could not resolve pool teardown attention; retrying next pass");
+            }
         }
     }
 }
@@ -424,7 +446,6 @@ pub async fn run_one_pass(
             continue;
         }
 
-        retries.recovered(work_db, &claim.execution_id);
         let released = coordinator
             .release_pool_claim_if_execution(&claim.worker_id, &claim.execution_id)
             .await;
@@ -452,6 +473,7 @@ pub async fn run_one_pass(
             .await;
     }
 
+    retries.reconcile(work_db, &coordinator).await;
     outcome
 }
 

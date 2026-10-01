@@ -3,6 +3,56 @@ use super::worker_pane_reattach::{answer_list_hosted_panes, install_tmux_overrid
 use super::*;
 use crate::spawn_flow::WorkerSpawner;
 
+#[tokio::test]
+async fn adoption_of_dead_registered_worker_preserves_owning_teardown() {
+    use super::tmux_stub::{failure, fake_tmux, ok};
+    let (state, _dir) = test_server_state();
+    let run = seed_tmux_hosted_live_run(&state, 1, "dead-session", "dead-token");
+    let pool = state.execution_coordinator.worker_pool();
+    assert_eq!(pool.claim_worker(&run, None).await.unwrap(), "worker-1");
+    state.worker_registry.register_tmux_run_slot(&run, 1, "dead-session");
+    let (tmux, runner) = fake_tmux([
+        ok("dead-session\t\n"),
+        ok("BOSS_SPAWN_TOKEN=dead-token\n"),
+        ok(&format!(
+            "BOSS_SESSION_SCHEMA={}\n",
+            crate::spawn_flow::TMUX_SESSION_SCHEMA
+        )),
+        ok("1"),
+        ok("127"),
+        ok("worker exited"),
+        ok("BOSS_SPAWN_TOKEN=dead-token\n"),
+        ok(""),
+        failure("can't find session: dead-session"),
+    ]);
+    state.set_tmux_override_for_test(tmux.clone());
+    let outcome = crate::tmux_adoption::run_adoption_pass(
+        &state.work_db,
+        &tmux,
+        &state.execution_coordinator,
+        state.as_ref(),
+        &crate::worker_readoption::NoopLiveWorkerConvergence,
+        &crate::dispatch_events::RecordingDispatchEventSink::new(),
+    )
+    .await;
+    assert_eq!(outcome.dead_panes, 1);
+    assert!(state.work_db.get_execution(&run).unwrap().status.is_terminal());
+    assert!(state.work_db.tmux_identity_for_execution(&run).unwrap().is_some());
+    assert!(state.live_worker_states.get(1).is_some());
+    assert_eq!(pool.claims().await.len(), 1);
+    let sink = make_session_sink();
+    state.register_app_session("session-app".into(), sink.clone()).await;
+    let releasing = state.clone();
+    let releasing_run = run.clone();
+    let release = tokio::spawn(async move { releasing.release_worker_pane(&releasing_run).await });
+    answer_detach(&state, &sink, 1).await;
+    assert_eq!(release.await.unwrap(), PaneReleaseOutcome::Reaped);
+    assert!(state.live_worker_states.get(1).is_none());
+    assert!(pool.claims().await.is_empty());
+    assert!(state.work_db.tmux_identity_for_execution(&run).unwrap().is_none());
+    assert_eq!(runner.calls().len(), 9);
+}
+
 pub(super) async fn answer_detach(state: &ServerState, sink: &SessionSink, slot: u8) {
     let envelope = tokio::time::timeout(Duration::from_secs(2), sink.next())
         .await

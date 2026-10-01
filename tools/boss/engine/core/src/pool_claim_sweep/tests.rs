@@ -9,6 +9,8 @@ use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::test_support::*;
 use crate::work::WorkDb;
 
+mod attention;
+
 struct NoViewers;
 
 #[async_trait::async_trait]
