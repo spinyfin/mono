@@ -805,7 +805,9 @@ dependencies = [
 name = "boss-engine-worker-bin"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "tempfile",
+ "toml",
 ]
 
 [[package]]

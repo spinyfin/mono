@@ -324,6 +324,7 @@ macos_application(
         "//tools/boss/bossctl:bossctl": "Resources/bin",
         "//tools/boss/event-shim:boss-event": "Resources/bin",
         "//tools/cube:cube": "Resources/bin",
+        "//tools/repobin:repobin": "Resources/bin",
         "//tools/boss/app-macos/Sources/Resources/TrekIcons:trek_icons": "Resources/TrekIcons",
         # relaunch-helper.sh: the detached swap/relaunch watchdog the app spawns
         # after UpdateInstaller (UpdateCore) stages the new bundle in-process.
