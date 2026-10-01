@@ -309,6 +309,7 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         review_guide_readable_version_id: None,
         review_guide_selected_comparison_id: None,
         review_guide_stale_source: None,
+        review_guide_error: None,
         // Followup provenance; populated by map_task_with_parent_and_provenance
         // and map_task_with_external_ref_parent_source_and_provenance when the
         // SELECT includes those columns. None in all standard query paths.
@@ -595,6 +596,7 @@ pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
             .map(|raw| parse_text_column(28, &raw))
             .transpose()?,
         pr_head_after: row.get(29)?,
+        last_error: row.get::<_, Option<String>>(30)?.filter(|s| !s.is_empty()),
     })
 }
 

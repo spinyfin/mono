@@ -478,7 +478,8 @@ struct WorkCardPopoverView: View {
         if let presentation = ReviewGuideCardPresentation.from(
             lifecycle: model.retryingReviewGuideRootTaskIDs.contains(task.id) ? "generating" : task.reviewGuideLifecycle,
             readableVersionId: task.reviewGuideReadableVersionId,
-            staleSource: task.reviewGuideStaleSource ?? false
+            staleSource: task.reviewGuideStaleSource ?? false,
+            error: task.reviewGuideError
         ) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Review guide")
@@ -513,6 +514,13 @@ struct WorkCardPopoverView: View {
                     }
                 }
                 .help(presentation.tooltip)
+                if presentation.showsRetry, let summary = presentation.errorSummary {
+                    Text(summary)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .help(presentation.tooltip)
+                }
             }
         }
     }

@@ -65,6 +65,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         "reviewGuideLifecycle",
         "reviewGuideReadableVersionId",
         "reviewGuideStaleSource",
+        "reviewGuideError",
     ]
 
     /// `WorkTask` fields the snapshot intentionally ignores. Changing any of
@@ -659,6 +660,23 @@ final class WorkCardSnapshotTests: XCTestCase {
                 },
                 mutate: {
                     var t = $0; t.reviewGuideStaleSource = true; return t
+                }
+            ),
+            Case(
+                name: "reviewGuideError",
+                context: review,
+                base: {
+                    var t = Self.makeTask(
+                        id: "task_1",
+                        status: "in_review",
+                        prURL: "https://github.com/x/y/pull/3"
+                    )
+                    t.reviewGuideLifecycle = "failed"
+                    t.reviewGuideError = "hook trust refused"
+                    return t
+                },
+                mutate: {
+                    var t = $0; t.reviewGuideError = "pane spawn failed"; return t
                 }
             ),
             Case(

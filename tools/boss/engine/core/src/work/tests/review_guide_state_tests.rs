@@ -226,3 +226,48 @@ fn attach_review_guide_state_is_none_until_current_pr_has_a_series() {
     assert_eq!(root_task.review_guide_selected_comparison_id, None);
     assert_eq!(root_task.review_guide_stale_source, None);
 }
+
+/// A failed attempt's stored error must appear on the card projection and
+/// the series summary so `boss task show --json` / the app retry state can
+/// render the engine's reason instead of a generic "failed".
+#[test]
+fn attach_review_guide_state_projects_failed_attempt_error() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let root = create_active_chore(&db, &product_id, "review guide failure reason");
+    let (series_id, comparison_id) = seed_review_guide_series(&db, &root);
+    let attempt = db
+        .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v1")
+        .unwrap();
+    db.fail_pr_review_guide_attempt(&attempt.id, "Codex hook-trust gate refused the session")
+        .unwrap();
+
+    let ts = "2026-05-14T00:00:00Z";
+    let mut tasks = vec![make_bare_task(
+        &root,
+        "chore",
+        None,
+        Some("https://github.com/acme/widget/pull/9"),
+        ts,
+    )];
+    let mut chores: Vec<Task> = vec![];
+    {
+        let conn = db.connect().unwrap();
+        attach_review_guide_state(&conn, &mut tasks, &mut chores).unwrap();
+    }
+    let root_task = &tasks[0];
+    assert_eq!(root_task.review_guide_lifecycle.as_deref(), Some("failed"));
+    assert_eq!(
+        root_task.review_guide_error.as_deref(),
+        Some("Codex hook-trust gate refused the session"),
+    );
+
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert_eq!(summary.lifecycle, "failed");
+    assert_eq!(
+        summary.error.as_deref(),
+        Some("Codex hook-trust gate refused the session"),
+    );
+    let wire = crate::work::to_wire_review_guide_summary(summary);
+    assert_eq!(wire.error.as_deref(), Some("Codex hook-trust gate refused the session"),);
+}

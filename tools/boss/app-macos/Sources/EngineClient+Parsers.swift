@@ -258,6 +258,7 @@ extension EngineClient {
             reviewGuideReadableVersionId: payload["review_guide_readable_version_id"] as? String,
             reviewGuideSelectedComparisonId: payload["review_guide_selected_comparison_id"] as? String,
             reviewGuideStaleSource: payload["review_guide_stale_source"] as? Bool,
+            reviewGuideError: payload["review_guide_error"] as? String,
             originTaskShortId: (payload["origin_task_short_id"] as? NSNumber)?.intValue,
             originPrNumber: (payload["origin_pr_number"] as? NSNumber)?.intValue,
             completedAt: payload["completed_at"] as? String,

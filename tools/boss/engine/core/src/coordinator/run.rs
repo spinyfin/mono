@@ -429,6 +429,9 @@ impl ExecutionCoordinator {
                         .build(),
                 ) {
                     Ok((execution, _run, _)) => {
+                        if !is_slot_busy {
+                            self.notify_review_guide_pre_start_failure(&execution);
+                        }
                         // Driver teardown for this termination path already
                         // ran unconditionally above, before the cube release.
                         // The execution is now durably `failed` in the DB —

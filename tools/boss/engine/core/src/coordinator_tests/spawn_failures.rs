@@ -165,6 +165,14 @@ async fn pane_spawn_failure_raises_attention_item_and_dispatch_event() {
         failed_execution.pre_start_failure_count, 1,
         "a spawn-config/pane failure happened before a worker became live and must increment the durable failure counter",
     );
+    assert!(
+        failed_execution
+            .last_error
+            .as_deref()
+            .is_some_and(|err| err.contains("worker prompt failed")),
+        "pane-spawn failure must persist the reason on the execution; got {:?}",
+        failed_execution.last_error,
+    );
     assert_eq!(
         failed_execution.transient_failure_count, 0,
         "a deterministic spawn refusal is not a transient worker failure",
@@ -1667,6 +1675,17 @@ async fn pre_start_failure_retries_then_permanently_fails() {
         runs.len()
     );
     assert_eq!(runs[0].status, "failed");
+    assert!(
+        execution.last_error.as_deref().is_some_and(|err| !err.is_empty()),
+        "permanent pre-start failure must persist the reason on the execution; got {:?}",
+        execution.last_error,
+    );
+    let json = serde_json::to_value(&execution).unwrap();
+    assert!(
+        json["last_error"].as_str().is_some_and(|err| !err.is_empty()),
+        "task-show JSON executions must include last_error; got {}",
+        json["last_error"],
+    );
 
     // Exactly one execution row — retries reuse the same row.
     let all_executions = db.list_executions(Some(&chore.id)).unwrap();

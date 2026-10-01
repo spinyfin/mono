@@ -237,6 +237,14 @@ struct WorkBoardCardItem: View {
                     Button(title) {
                         model.generateReviewGuide(for: task)
                     }
+                    .help(
+                        ReviewGuideCardPresentation.from(
+                            lifecycle: task.reviewGuideLifecycle,
+                            readableVersionId: task.reviewGuideReadableVersionId,
+                            staleSource: task.reviewGuideStaleSource ?? false,
+                            error: task.reviewGuideError
+                        )?.tooltip ?? title
+                    )
                 }
                 Divider()
                 Button("Delete", role: .destructive) {

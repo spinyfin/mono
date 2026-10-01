@@ -31,6 +31,10 @@ pub struct ReviewGuideSummary {
     /// Deterministic live supplement, separate from immutable version content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub findings: Option<ReviewGuideFindings>,
+    /// Engine-recorded reason the series is `"failed"`. `None` when
+    /// `lifecycle` is not `"failed"` or the attempt stored no error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// One immutable, validated guide version's full content. Returned by

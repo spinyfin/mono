@@ -11,10 +11,10 @@ extension WorkTask {
 // ===========================================================================
 // PR review-guide wire types and card/popover presentation.
 //
-// The card badge and popover row need only two scalar `WorkTask` fields
-// (`reviewGuideLifecycle` / `reviewGuideReadableVersionId`, mirroring
-// `Task.review_guide_lifecycle` / `Task.review_guide_readable_version_id`
-// on the wire) — they arrive on every normal task read/push, exactly like
+// The card badge and popover row need the scalar `WorkTask` fields
+// (`reviewGuideLifecycle` / `reviewGuideReadableVersionId` /
+// `reviewGuideError`, mirroring the `Task.review_guide_*` wire fields) —
+// they arrive on every normal task read/push, exactly like
 // `ciRequiredState`, so no separate summary fetch is needed to paint the
 // affordance. Only the async markdown viewer needs the version's full
 // Markdown, fetched on demand via `GetReviewGuideContent`.
@@ -102,31 +102,54 @@ struct ReviewGuideCardPresentation: Equatable {
     /// failure. Defaulted `false` for callers that only need the other four
     /// states, which never consult it.
     var staleSource: Bool = false
+    /// Engine-provided failure text (`WorkTask.reviewGuideError`). Rendered
+    /// as-is; the app does not infer a cause. `nil` unless `kind` is a
+    /// failed state and the engine stored a reason.
+    var error: String? = nil
 
     var showsDocumentButton: Bool { readableVersionId != nil }
     var showsProgress: Bool { kind == .generating || kind == .refreshing }
     var showsRetry: Bool { kind == .failed || kind == .refreshFailed }
+
+    /// First line of `error`, truncated for the summary chip. Full text
+    /// stays on `error` for hover/expand.
+    var errorSummary: String? {
+        Self.summaryLine(of: error)
+    }
 
     var accessibilityLabel: String {
         switch kind {
         case .generating: return "Generating review guide"
         case .refreshing: return "Open older review guide; updating"
         case .ready: return "Open review guide"
-        case .failed: return "Review guide failed to generate"
-        case .refreshFailed: return "Review guide refresh failed"
+        case .failed:
+            if let errorSummary { return "Review guide failed to generate: \(errorSummary)" }
+            return "Review guide failed to generate"
+        case .refreshFailed:
+            if let errorSummary { return "Review guide refresh failed: \(errorSummary)" }
+            return "Review guide refresh failed"
         }
     }
 
     var tooltip: String {
+        let fullError = error?.trimmingCharacters(in: .whitespacesAndNewlines)
         switch kind {
         case .generating: return "Generating review guide\u{2026}"
         case .refreshing: return "Open older review guide; updating\u{2026}"
         case .ready: return "Open review guide"
-        case .failed: return "Review guide failed to generate. Retry?"
+        case .failed:
+            if let fullError, !fullError.isEmpty {
+                return "Review guide failed to generate. \(fullError)"
+            }
+            return "Review guide failed to generate. Retry?"
         case .refreshFailed:
-            return staleSource
-                ? "Guide covers an older revision \u{2014} refresh failed. Retry?"
-                : "Explanation refresh failed. Retry?"
+            let prefix = staleSource
+                ? "Guide covers an older revision \u{2014} refresh failed."
+                : "Explanation refresh failed."
+            if let fullError, !fullError.isEmpty {
+                return "\(prefix) \(fullError)"
+            }
+            return "\(prefix) Retry?"
         }
     }
 
@@ -137,7 +160,8 @@ struct ReviewGuideCardPresentation: Equatable {
     static func from(
         lifecycle: String?,
         readableVersionId: String?,
-        staleSource: Bool = false
+        staleSource: Bool = false,
+        error: String? = nil
     ) -> ReviewGuideCardPresentation? {
         guard let lifecycle else { return nil }
         let hasContent = readableVersionId != nil
@@ -153,11 +177,21 @@ struct ReviewGuideCardPresentation: Equatable {
             return ReviewGuideCardPresentation(
                 kind: hasContent ? .refreshFailed : .failed,
                 readableVersionId: readableVersionId,
-                staleSource: staleSource
+                staleSource: staleSource,
+                error: error
             )
         default:
             return nil
         }
+    }
+
+    static func summaryLine(of error: String?, limit: Int = 120) -> String? {
+        guard let error else { return nil }
+        let first = error.split(whereSeparator: \.isNewline).first.map(String.init) ?? error
+        let trimmed = first.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.count <= limit { return trimmed }
+        return String(trimmed.prefix(limit - 1)) + "\u{2026}"
     }
 }
 
@@ -173,7 +207,8 @@ struct ReviewGuideViewerCurrentness: Equatable {
     enum Status: Equatable {
         case none
         case refreshing
-        case refreshFailed(displayedStaleSource: Bool)
+        case refreshFailed(displayedStaleSource: Bool, error: String?)
+        case failed(error: String?)
     }
 
     var showsOpenUpdatedGuide: Bool
@@ -184,7 +219,8 @@ struct ReviewGuideViewerCurrentness: Equatable {
         readableVersionId: String?,
         selectedComparisonId: String?,
         displayedVersionId: String?,
-        displayedComparisonId: String?
+        displayedComparisonId: String?,
+        error: String? = nil
     ) -> ReviewGuideViewerCurrentness {
         let showsOpenUpdatedGuide = readableVersionId != nil
             && readableVersionId != displayedVersionId
@@ -197,8 +233,8 @@ struct ReviewGuideViewerCurrentness: Equatable {
             status = readableVersionId != nil ? .refreshing : .none
         case "failed":
             status = readableVersionId != nil
-                ? .refreshFailed(displayedStaleSource: displayedStaleSource)
-                : .none
+                ? .refreshFailed(displayedStaleSource: displayedStaleSource, error: error)
+                : .failed(error: error)
         default:
             status = .none
         }
