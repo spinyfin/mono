@@ -744,7 +744,10 @@ pub struct WorkExecution {
     /// Most recent pre-start / pane-spawn failure text the engine recorded
     /// for this execution. Set at the same moment the engine logs
     /// `spawn aborted` / `record_pre_start_failure`, including intermediate
-    /// retries that write no `work_runs` row. Cleared when a run actually
+    /// retries that write no `work_runs` row, and by requested-host
+    /// pre-start cancels that opt into recording their failure reason.
+    /// Ordinary cancels (parent PR merged, pause-only refusal, explicit
+    /// `executions cancel`) leave this unset. Cleared when a run actually
     /// starts. `None` when this execution has never failed to start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,

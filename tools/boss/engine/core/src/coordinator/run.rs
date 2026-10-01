@@ -373,7 +373,8 @@ impl ExecutionCoordinator {
                 // attention body already use (`{err:#}`). `Display` without
                 // `#` would keep only the outermost context (e.g. pane_spawn's
                 // "writing permission/hook config…" wrapper) and drop the
-                // inner refusal the operator actually needs.
+                // underlying refusal reason that last_error, the card and the
+                // JSON must show.
                 let error_text = err_detail.clone();
 
                 // A `SlotBusy` app rejection means the engine and the app

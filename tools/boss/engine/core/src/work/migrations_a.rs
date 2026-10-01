@@ -641,7 +641,9 @@ pub(crate) fn migrate_work_runs_cost_columns(conn: &Connection) -> Result<()> {
 /// so `boss task show --json` (and the review-guide card projection) can
 /// surface the reason without waiting for a terminal `work_runs` row.
 /// Intermediate pre-start retries write no `work_runs` row, so this column
-/// is the only durable record of their reason. Idempotent.
+/// is the only durable record of their reason. Requested-host pre-start
+/// cancels may also write here when they opt in; ordinary cancels do not.
+/// Idempotent.
 pub(crate) fn migrate_work_executions_last_error(conn: &Connection) -> Result<()> {
     if !work_executions_has_column(conn, "last_error")? {
         conn.execute("ALTER TABLE work_executions ADD COLUMN last_error TEXT", [])?;

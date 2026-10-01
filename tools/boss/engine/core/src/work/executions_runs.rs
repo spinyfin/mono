@@ -18,6 +18,13 @@ pub struct CancelExecutionOpts {
     /// terminalize it. Live workers must be stopped via
     /// `bossctl agents stop` instead.
     pub queued_only: bool,
+    /// When true, a never-started cancel with a supplied reason writes that
+    /// reason onto `work_executions.last_error`. Opt-in so benign cancels
+    /// (parent PR merged, pause-only refusal, `bossctl executions cancel`)
+    /// do not stamp a pre-start failure onto a field that `boss task show`
+    /// and review-guide reconcile treat as one. Set by requested-host
+    /// pre-start failure and host-ineligible cancels.
+    pub record_failure_reason: bool,
 }
 
 impl WorkDb {
@@ -2201,7 +2208,7 @@ pub(super) fn cancel_execution_in_tx(
         );
     }
     let supplied_reason = normalize_optional_text(opts.reason);
-    let persist_last_error = existing.status.is_pre_run() && supplied_reason.is_some();
+    let persist_last_error = existing.status.is_pre_run() && opts.record_failure_reason && supplied_reason.is_some();
     let reason = supplied_reason.clone().unwrap_or_else(|| "explicit cancel".to_owned());
     let now = now_string();
     tx.execute(

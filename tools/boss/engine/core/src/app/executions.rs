@@ -953,6 +953,7 @@ pub(super) async fn handle_cancel_execution(ctx: Dispatch, req: FrontendRequest)
         let opts = crate::work::CancelExecutionOpts {
             reason: reason.clone(),
             queued_only,
+            record_failure_reason: false,
         };
         match server_state.work_db.cancel_execution_with(&execution_id, opts) {
             Ok(execution) => {

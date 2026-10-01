@@ -925,14 +925,16 @@ impl ExecutionCoordinator {
                     match self.work_db.cancel_execution_with(
                         &execution.id,
                         CancelExecutionOpts {
-                            reason: Some(format!("requested host became ineligible: {err}")),
+                            reason: Some(format!("requested host became ineligible: {err:#}")),
                             queued_only: true,
+                            record_failure_reason: true,
                         },
                     ) {
-                        Ok(_) => {
+                        Ok(cancelled) => {
                             // Terminal for this execution: drop the constraint so it
                             // cannot leak (selection no longer takes it itself).
                             self.take_requested_host(&execution.id);
+                            self.notify_review_guide_pre_start_failure(&cancelled);
                         }
                         Err(cancel_err) => {
                             // The cancel is what makes this row terminal. If it
@@ -2408,8 +2410,8 @@ impl ExecutionCoordinator {
     /// with a request-scoped `--host` constraint must not fall through to
     /// [`Self::record_start_failure`]'s ordinary retry: a retry re-enters
     /// host selection, and by then this constraint may already be the
-    /// last thing standing between "runs on the host the operator asked
-    /// for" and "runs on any eligible host with no notice" — exactly the
+    /// last thing standing between "runs on the explicitly requested host"
+    /// and "runs on any eligible host with no notice" — exactly the
     /// silent-misplacement class `--host` exists to eliminate. Cancel the
     /// execution instead (leaving no residue queued behind an unpinned
     /// retry) and drop the constraint, matching how the ineligible-host
@@ -2417,7 +2419,7 @@ impl ExecutionCoordinator {
     fn cancel_requested_host_pre_start_failure(&self, execution: &WorkExecution, stage: &str, err: &anyhow::Error) {
         // Not retried, but must still be reported: a `--host` pre-start
         // failure never reaches `record_start_failure`'s permanent-failure
-        // path, so without this the operator's requested-host dispatch can
+        // path, so without this a requested-host dispatch can
         // silently disappear as a `cancelled` row with no attention item —
         // exactly the case an SSH-unreachable remote host hits.
         let attention_body = format!(
@@ -2450,6 +2452,7 @@ impl ExecutionCoordinator {
             CancelExecutionOpts {
                 reason: Some(format!("requested host dispatch failed during {stage}: {err:#}")),
                 queued_only: true,
+                record_failure_reason: true,
             },
         ) {
             Ok(cancelled) => {
