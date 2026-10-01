@@ -24,7 +24,7 @@ use crate::test_support::*;
 /// only reads `Tmux::socket_path()`, which is a pure getter. A call into
 /// this stub means the code under test tried to shell out, which the
 /// re-attach path has no business doing.
-struct UnusedRunner;
+pub(super) struct UnusedRunner;
 
 #[async_trait]
 impl CommandRunner for UnusedRunner {
@@ -91,7 +91,7 @@ fn seed_durable_run(server_state: &ServerState, session_name: &str, spawn_token:
     execution_id
 }
 
-fn install_tmux_override(server_state: &ServerState) {
+pub(super) fn install_tmux_override(server_state: &ServerState) {
     *server_state.pane_delivery_tmux_override.write().unwrap() = Some(
         Tmux::with_runner_and_socket("/usr/bin/tmux", Arc::new(UnusedRunner), boss_tmux::TEST_SOCKET_PATH).unwrap(),
     );

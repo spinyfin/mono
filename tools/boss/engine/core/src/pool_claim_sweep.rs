@@ -59,8 +59,11 @@
 //!    a fresh dispatch has just re-claimed. The reconciler is a backstop
 //!    for claims stuck for a while, not the happy path.
 //! 5. Terminal execution + no live pane + past the grace = a leaked
-//!    claim. Confirm its app viewer is detached (retain and retry when
-//!    disconnected or unconfirmed), then release it via a compare-and-release
+//!    claim. If durable tmux identity is still recorded, retain the claim
+//!    — process teardown has not been confirmed. Otherwise confirm its
+//!    app viewer is detached (inventory once per pass, retain and retry
+//!    when disconnected or unconfirmed), then release it via a
+//!    compare-and-release
 //!    ([`ExecutionCoordinator::release_pool_claim_if_execution`]) so a
 //!    re-claim race can't yank a fresh, live claim, then emit a
 //!    `pool_claim_reconcile` dispatch event and kick the scheduler.
@@ -135,10 +138,13 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 /// every terminal path stamps it) is treated as past the grace.
 pub const LEAK_GRACE_SECS: i64 = 60;
 
-/// Confirms the app no longer hosts this run before its claim can be reused.
+/// Confirms the app no longer hosts these runs before their claims can be reused.
+///
+/// Implementations inventory hosted panes once per call and detach every
+/// matching occupant under a single lock hold.
 #[async_trait::async_trait]
 pub trait WorkerViewerDetach: Send + Sync {
-    async fn confirm_viewer_detached(&self, run_id: &str) -> Result<(), String>;
+    async fn confirm_viewers_detached(&self, run_ids: &[String]) -> Vec<Result<(), String>>;
 }
 
 /// Counts from one sweep pass; logged at `info` when any claim was
@@ -163,6 +169,10 @@ pub struct PoolClaimSweepOutcome {
     /// Unconfirmed viewer detach; the retained claim is retried next pass.
     #[builder(default)]
     pub viewer_detach_pending: usize,
+    /// Claims retained because durable tmux identity is still recorded,
+    /// so process teardown has not been confirmed.
+    #[builder(default)]
+    pub process_teardown_pending: usize,
 }
 
 impl crate::sweep_loop::SweepOutcome for PoolClaimSweepOutcome {
@@ -235,6 +245,15 @@ pub async fn run_one_pass(
     // its teardown path — leave it alone.
     let live_run_ids: HashSet<String> = live_states.snapshot().into_iter().map(|state| state.run_id).collect();
 
+    struct LeakedClaim {
+        worker_id: String,
+        execution_id: String,
+        work_item_id: String,
+        execution_status: String,
+        pool_name: &'static str,
+    }
+    let mut leaked = Vec::new();
+
     for (pool, pool_name) in [
         (coordinator.worker_pool(), "main"),
         (coordinator.automation_worker_pool(), "automation"),
@@ -288,6 +307,32 @@ pub async fn run_one_pass(
                 continue;
             }
 
+            match work_db.tmux_identity_for_execution(&claim.execution_id) {
+                Ok(Some(_)) => {
+                    tracing::warn!(
+                        worker_id = %claim.worker_id,
+                        execution_id = %claim.execution_id,
+                        pool = pool_name,
+                        "pool-claim sweep: durable tmux identity still recorded; \
+                         retaining claim until process teardown is confirmed",
+                    );
+                    outcome.process_teardown_pending += 1;
+                    continue;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        worker_id = %claim.worker_id,
+                        execution_id = %claim.execution_id,
+                        pool = pool_name,
+                        ?err,
+                        "pool-claim sweep: failed to look up tmux identity; skipping this pass",
+                    );
+                    outcome.lookup_failed_skipped += 1;
+                    continue;
+                }
+            }
+
             tracing::warn!(
                 worker_id = %claim.worker_id,
                 execution_id = %claim.execution_id,
@@ -297,39 +342,54 @@ pub async fn run_one_pass(
                  confirming viewer teardown before releasing leaked claim",
             );
 
-            if let Err(reason) = viewers.confirm_viewer_detached(&claim.execution_id).await {
-                tracing::warn!(execution_id = %claim.execution_id, %reason,
-                    "pool-claim sweep: viewer detach pending; retaining claim for retry");
-                outcome.viewer_detach_pending += 1;
-                continue;
-            }
-
-            let released = coordinator
-                .release_pool_claim_if_execution(&claim.worker_id, &claim.execution_id)
-                .await;
-
-            if !released {
-                // Lost the compare-and-release race: the slot was freed
-                // or re-claimed by a live execution between the snapshot
-                // and now. Benign — nothing to do.
-                outcome.race_skipped += 1;
-                continue;
-            }
-
-            outcome.released += 1;
-            dispatch_events
-                .emit(
-                    DispatchEvent::new(Stage::PoolClaimReconcile, Outcome::Ok, &claim.execution_id)
-                        .with_work_item(&execution.work_item_id)
-                        .with_worker(&claim.worker_id)
-                        .with_details(serde_json::json!({
-                            "pool": pool_name,
-                            "worker_id": claim.worker_id,
-                            "execution_status": execution.status,
-                        })),
-                )
-                .await;
+            leaked.push(LeakedClaim {
+                worker_id: claim.worker_id,
+                execution_id: claim.execution_id,
+                work_item_id: execution.work_item_id,
+                execution_status: execution.status.to_string(),
+                pool_name,
+            });
         }
+    }
+
+    let run_ids: Vec<String> = leaked.iter().map(|claim| claim.execution_id.clone()).collect();
+    let mut detach_results = viewers.confirm_viewers_detached(&run_ids).await.into_iter();
+    for claim in leaked {
+        let detach = detach_results
+            .next()
+            .unwrap_or_else(|| Err("viewer detach result missing".into()));
+        if let Err(reason) = detach {
+            tracing::warn!(execution_id = %claim.execution_id, %reason,
+                "pool-claim sweep: viewer detach pending; retaining claim for retry");
+            outcome.viewer_detach_pending += 1;
+            continue;
+        }
+
+        let released = coordinator
+            .release_pool_claim_if_execution(&claim.worker_id, &claim.execution_id)
+            .await;
+
+        if !released {
+            // Lost the compare-and-release race: the slot was freed
+            // or re-claimed by a live execution between the snapshot
+            // and now. Benign — nothing to do.
+            outcome.race_skipped += 1;
+            continue;
+        }
+
+        outcome.released += 1;
+        dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::PoolClaimReconcile, Outcome::Ok, &claim.execution_id)
+                    .with_work_item(&claim.work_item_id)
+                    .with_worker(&claim.worker_id)
+                    .with_details(serde_json::json!({
+                        "pool": claim.pool_name,
+                        "worker_id": claim.worker_id,
+                        "execution_status": claim.execution_status,
+                    })),
+            )
+            .await;
     }
 
     outcome
@@ -352,8 +412,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl WorkerViewerDetach for NoViewers {
-        async fn confirm_viewer_detached(&self, _run_id: &str) -> Result<(), String> {
-            Ok(())
+        async fn confirm_viewers_detached(&self, run_ids: &[String]) -> Vec<Result<(), String>> {
+            run_ids.iter().map(|_| Ok(())).collect()
         }
     }
 
@@ -645,5 +705,36 @@ mod tests {
             1,
             "no duplicate event on the idempotent pass"
         );
+    }
+
+    /// A SlotBusy-rejected spawn whose tmux teardown was unconfirmed still
+    /// has durable identity. Viewer absence is not proof the process is
+    /// gone, so the sweep must retain the claim.
+    #[tokio::test]
+    async fn retains_claim_when_tmux_identity_is_still_recorded() {
+        let (_dir, db) = open_db();
+        let db = Arc::new(db);
+        let (exec, _token) = start_tmux_run(&db);
+        let coordinator = make_coordinator(db.clone(), 2);
+        let pool = coordinator.worker_pool();
+        pool.claim_worker(&exec, None).await.unwrap();
+        db.mark_execution_orphaned(&exec, "viewer abort unconfirmed").unwrap();
+        age_finished_at(&db, &exec, 300);
+
+        let live_states = LiveWorkerStateRegistry::new();
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoViewers,
+        )
+        .await;
+
+        assert_eq!(outcome.released, 0);
+        assert_eq!(outcome.process_teardown_pending, 1);
+        assert_eq!(pool.idle_count().await, 1, "the unreaped claim must stay held");
+        assert!(sink.events().await.is_empty());
     }
 }

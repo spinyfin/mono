@@ -82,6 +82,10 @@ impl ExecutionCoordinator {
         // will never consider terminal would leak it forever — releasing
         // normally is the safe fallback there.
         let mut hold_slot_busy = false;
+        // Set when spawn teardown could not confirm the rejected worker
+        // is gone. A replacement dispatch would violate the single-worker
+        // invariant while that tmux process may still be alive.
+        let mut abort_unconfirmed = false;
 
         match run_outcome {
             // Mid-spawn cancel: the worker was cancelled while it
@@ -321,7 +325,7 @@ impl ExecutionCoordinator {
                 // A rejected viewer may already have a running tmux process.
                 // If verified teardown failed, preserve its workspace and driver
                 // state for recovery rather than leasing them to another worker.
-                let abort_unconfirmed = err.chain().any(|cause| {
+                abort_unconfirmed = err.chain().any(|cause| {
                     matches!(
                         cause.downcast_ref::<crate::spawn_flow::StartWorkerError>(),
                         Some(crate::spawn_flow::StartWorkerError::ViewerAbortFailed { .. })
@@ -592,7 +596,7 @@ impl ExecutionCoordinator {
                         // rather than waiting for the automation's next
                         // scheduled occurrence.
                         if execution.kind == ExecutionKind::AutomationTriage {
-                            if is_slot_busy {
+                            if is_slot_busy && !abort_unconfirmed {
                                 match self.work_db.create_automation_triage_execution(
                                     &execution.work_item_id,
                                     &execution.repo_remote_url,
@@ -640,6 +644,11 @@ impl ExecutionCoordinator {
                                         }
                                     }
                                 }
+                            } else if abort_unconfirmed {
+                                tracing::warn!(
+                                    execution_id = %execution.id,
+                                    "skipping automation triage replacement after unconfirmed spawn teardown",
+                                );
                             } else if let Err(finalize_err) = self.work_db.finalize_automation_triage_run(
                                 &execution.id,
                                 boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
@@ -695,9 +704,11 @@ impl ExecutionCoordinator {
                 // already frees exactly this shape of stuck claim — terminal
                 // execution, no live worker pane backing it — once its
                 // `LEAK_GRACE_SECS` grace period has passed and the engine
-                // has confirmed the old viewer is detached. Still rescan + kick
-                // so OTHER free slots pick up the work this failure just
-                // requeued.
+                // has confirmed both process teardown and viewer detach.
+                // Still rescan + kick so OTHER free slots pick up the work
+                // this failure just requeued — unless teardown of the
+                // rejected spawn was unconfirmed, in which case a replacement
+                // would run alongside the unreaped tmux process.
                 self.rescan_active_dispatch_after_release();
                 // `rescan_active_dispatch` only requeues items with
                 // `autostart = 1` — but `start_execution_run_on_host`
@@ -716,15 +727,19 @@ impl ExecutionCoordinator {
                 // `AnswerAgent` (synthetic work items with no `tasks` row
                 // — `AutomationTriage` already got its own fresh execution
                 // above; `AnswerAgent` is unhandled here, matching its
-                // pre-existing scope).
-                if !matches!(
-                    execution.kind,
-                    ExecutionKind::PrReview | ExecutionKind::AutomationTriage | ExecutionKind::AnswerAgent
-                ) && let Err(err) = self.work_db.request_execution(
-                    boss_protocol::RequestExecutionInput::builder()
-                        .work_item_id(execution.work_item_id.clone())
-                        .build(),
-                ) {
+                // pre-existing scope). Also excluded: unconfirmed abort
+                // of a SlotBusy-rejected spawn (`ViewerAbortFailed`).
+                if !abort_unconfirmed
+                    && !matches!(
+                        execution.kind,
+                        ExecutionKind::PrReview | ExecutionKind::AutomationTriage | ExecutionKind::AnswerAgent
+                    )
+                    && let Err(err) = self.work_db.request_execution(
+                        boss_protocol::RequestExecutionInput::builder()
+                            .work_item_id(execution.work_item_id.clone())
+                            .build(),
+                    )
+                {
                     tracing::warn!(
                         execution_id = %execution.id,
                         work_item_id = %execution.work_item_id,

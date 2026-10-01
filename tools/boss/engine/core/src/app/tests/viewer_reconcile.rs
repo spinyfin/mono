@@ -1,5 +1,5 @@
 //! Regression coverage for stale viewer cleanup and bounded SlotBusy recovery.
-use super::worker_pane_reattach::{answer_list_hosted_panes, seed_tmux_hosted_live_run};
+use super::worker_pane_reattach::{answer_list_hosted_panes, install_tmux_override, seed_tmux_hosted_live_run};
 use super::*;
 use crate::spawn_flow::WorkerSpawner;
 
@@ -163,10 +163,47 @@ async fn live_different_occupant_is_not_detached_and_returns_typed_failure() {
             .is_err()
     );
     assert_eq!(state.live_worker_states.get(3).unwrap().run_id, occupant);
-    let attentions = state.work_db.list_attention_items(&new_run).unwrap();
-    assert_eq!(attentions.len(), 1);
-    assert!(attentions[0].body_markdown.contains(&occupant));
-    assert_eq!(attentions[0].status, "open");
+    assert!(
+        state.work_db.list_attention_items(&new_run).unwrap().is_empty(),
+        "attach_worker_viewer must not file pane_spawn_failed; the spawn coordinator owns that"
+    );
+}
+
+#[tokio::test]
+async fn same_occupant_slot_busy_is_treated_as_already_attached() {
+    let (state, _dir) = test_server_state();
+    let occupant = seed_tmux_hosted_live_run(&state, 3, "live-session", "live-token");
+    let EngineToAppRequest::AttachWorkerPane(mut input) = attach_request() else {
+        unreachable!()
+    };
+    input.run_id = occupant.clone();
+    let sink = make_session_sink();
+    state.register_app_session("session-app".into(), sink.clone()).await;
+    let attaching = state.clone();
+    let pass = tokio::spawn(async move {
+        attaching
+            .send_to_app_request(EngineToAppRequest::AttachWorkerPane(input), Duration::from_secs(1))
+            .await
+    });
+    answer_attach(
+        &state,
+        &sink,
+        Err(EngineToAppError::SlotBusy {
+            occupying_run_id: Some(occupant.clone()),
+        }),
+    )
+    .await;
+    assert!(matches!(
+        pass.await.unwrap(),
+        Ok(EngineToAppResponse::AttachWorkerPane { result: Ok(_) })
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), sink.next())
+            .await
+            .is_err(),
+        "already-attached occupant must not be detached"
+    );
+    assert!(state.work_db.list_attention_items(&occupant).unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -212,4 +249,75 @@ async fn abort_reaps_only_the_new_process_without_detaching_the_occupant() {
             .await
             .is_err()
     );
+}
+
+async fn answer_detach_unconfirmed(state: &ServerState, sink: &SessionSink, slot: u8) {
+    let envelope = tokio::time::timeout(Duration::from_secs(2), sink.next())
+        .await
+        .unwrap()
+        .unwrap();
+    let request_id = match envelope.payload {
+        FrontendEvent::EngineRequest {
+            request_id,
+            request: EngineToAppRequest::DetachWorkerPane(input),
+        } => {
+            assert_eq!(input.slot_id, slot);
+            request_id
+        }
+        other => panic!("expected detach, got {other:?}"),
+    };
+    state
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::DetachWorkerPane {
+                result: Err(EngineToAppError::Timeout),
+            },
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn unconfirmed_stale_detach_still_attaches_other_live_workers() {
+    let (state, _dir) = test_server_state();
+    let live = seed_tmux_hosted_live_run(&state, 3, "live-session", "live-token");
+    let stale = seed_tmux_hosted_live_run(&state, 4, "stale-session", "stale-token");
+    state.work_db.mark_execution_orphaned(&stale, "finished").unwrap();
+    install_tmux_override(&state);
+    let sink = make_session_sink();
+    state.register_app_session("session-app".into(), sink.clone()).await;
+    let reconnecting = state.clone();
+    let pass = tokio::spawn(async move { reconnecting.reattach_worker_panes_to_registered_app().await });
+    answer_list_hosted_panes(&state, &sink, vec![(stale, 4)]).await;
+    answer_detach_unconfirmed(&state, &sink, 4).await;
+    answer_attach(&state, &sink, Ok(crate::protocol::AttachWorkerPaneResult {})).await;
+    pass.await.unwrap();
+    assert_eq!(state.live_worker_states.get(3).unwrap().run_id, live);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unconfirmed_stale_detach_retries_while_app_session_stays_registered() {
+    let (state, _dir) = test_server_state();
+    let stale = seed_tmux_hosted_live_run(&state, 4, "stale-session", "stale-token");
+    state.work_db.mark_execution_orphaned(&stale, "finished").unwrap();
+    let sink = make_session_sink();
+    state.register_app_session("session-app".into(), sink.clone()).await;
+    let reconnecting = state.clone();
+    let pass = tokio::spawn(async move { reconnecting.reattach_worker_panes_to_registered_app().await });
+    answer_list_hosted_panes(&state, &sink, vec![(stale.clone(), 4)]).await;
+    answer_detach_unconfirmed(&state, &sink, 4).await;
+    pass.await.unwrap();
+
+    let retrying = state.clone();
+    let retry_sink = sink.clone();
+    let retry_stale = stale.clone();
+    let retry = tokio::spawn(async move {
+        answer_list_hosted_panes(&retrying, &retry_sink, vec![(retry_stale, 4)]).await;
+        answer_detach_unconfirmed(&retrying, &retry_sink, 4).await;
+    });
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::time::timeout(Duration::from_secs(2), retry)
+        .await
+        .expect("retry must inventory again while the app session stays registered")
+        .unwrap();
 }

@@ -950,7 +950,7 @@ async fn viewer_abort_failure_retains_the_workspace_and_records_the_reason() {
     let cube = Arc::new(FakeCubeClient::default());
     let coordinator = Arc::new(ExecutionCoordinator::new(
         db.clone(),
-        WorkerPool::new(1),
+        WorkerPool::new(2),
         cube.clone(),
         Arc::new(FakeExecutionRunner {
             viewer_abort_failed: true,
@@ -963,12 +963,77 @@ async fn viewer_abort_failure_retains_the_workspace_and_records_the_reason() {
         cube.release_calls.lock().await.is_empty(),
         "unreaped worker must retain its workspace"
     );
-    assert_eq!(coordinator.worker_pool().idle_count().await, 0);
+    assert_eq!(
+        coordinator.worker_pool().idle_count().await,
+        1,
+        "one slot stays held for the unreaped spawn; the other remains free"
+    );
     let attention = db.list_attention_items(&execution_id).unwrap();
     assert!(
         attention
             .iter()
             .any(|item| item.body_markdown.contains("injected tmux teardown failure"))
+    );
+
+    for _ in 0..50 {
+        if db
+            .list_executions(Some(&chore.id))
+            .unwrap()
+            .iter()
+            .any(|execution| execution.id != execution_id)
+        {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    let executions = db.list_executions(Some(&chore.id)).unwrap();
+    assert_eq!(
+        executions.len(),
+        1,
+        "unconfirmed teardown must not request a replacement execution; got {executions:#?}"
+    );
+
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(&execution_id, "boss", "boss-unreaped", "tok-unreaped")
+            .unwrap(),
+        "failed spawn still has a work_runs row to attach identity to"
+    );
+    assert!(
+        db.record_tmux_session_created_for_execution(&execution_id, "tok-unreaped", 4242)
+            .unwrap()
+    );
+    {
+        let conn = db.connect().unwrap();
+        let epoch = boss_engine_utils::epoch_time::now_epoch_secs() - crate::pool_claim_sweep::LEAK_GRACE_SECS - 5;
+        conn.execute(
+            "UPDATE work_executions SET finished_at = ?2 WHERE id = ?1",
+            rusqlite::params![execution_id, epoch.to_string()],
+        )
+        .unwrap();
+    }
+
+    struct AllowViewerDetach;
+    #[async_trait]
+    impl crate::pool_claim_sweep::WorkerViewerDetach for AllowViewerDetach {
+        async fn confirm_viewers_detached(&self, run_ids: &[String]) -> Vec<Result<(), String>> {
+            run_ids.iter().map(|_| Ok(())).collect()
+        }
+    }
+
+    let outcome = crate::pool_claim_sweep::run_one_pass(
+        db.as_ref(),
+        &crate::live_worker_state::LiveWorkerStateRegistry::new(),
+        coordinator.clone(),
+        &crate::dispatch_events::RecordingDispatchEventSink::new(),
+        &AllowViewerDetach,
+    )
+    .await;
+    assert_eq!(outcome.released, 0);
+    assert_eq!(outcome.process_teardown_pending, 1);
+    assert_eq!(
+        coordinator.worker_pool().idle_count().await,
+        1,
+        "sweep must not release a claim whose process teardown is unconfirmed"
     );
 }
 

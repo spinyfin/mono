@@ -923,10 +923,11 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             return Err(err);
         }
     };
-    // The detached tmux session is now the worker's owner. Attaching a
-    // A missing app session permits headless operation until reconnect.
-    // SlotBusy is different: reconciliation has already tried to repair
-    // stale occupancy, so propagate the failure and reap our worker.
+    // The detached tmux session owns the worker, so a missing app session
+    // only means it runs without a viewer until the app reconnects. A
+    // SlotBusy rejection is different: reconciliation has already tried to
+    // clear stale occupancy, so the failure is propagated and the spawned
+    // worker is reaped.
     match spawner
         .send_to_app_request(
             EngineToAppRequest::AttachWorkerPane(AttachWorkerPaneInput {

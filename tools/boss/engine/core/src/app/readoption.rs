@@ -27,6 +27,11 @@ use crate::worker_readoption::{ContradictionVerdict, ReapReason, classify_contra
 /// the worker *is* alive. Only a human can.
 pub const PROGRESS_INGRESS_UNRECOVERABLE_ATTENTION_KIND: &str = "progress_ingress_unrecoverable";
 
+/// Bounded exponential backoff while the same app session stays registered.
+/// One failed stale detach must not wait for the next app relaunch.
+const VIEWER_REATTACH_RETRY_BASE: Duration = Duration::from_secs(2);
+const VIEWER_REATTACH_RETRY_MAX_ATTEMPTS: u32 = 4;
+
 /// Whether `driver` observes its worker by tailing a JSONL file, the same
 /// derivation `spawn_flow::start_worker` makes at spawn time.
 ///
@@ -925,19 +930,74 @@ impl ServerState {
         // refusal is app-side flow control, not something the engine
         // should lean on to avoid sending a request it can determine is
         // redundant up front.
-        let already_hosted = match self.reconcile_worker_viewers().await {
-            Ok(ids) => ids,
+        let outcome = match self.reconcile_worker_viewers().await {
+            Ok(outcome) => outcome,
             Err(err) => {
-                tracing::error!(error = %err, "worker pane reconciliation failed; retry on next registration");
+                tracing::error!(error = %err, "worker pane inventory failed; retrying while this app session stays registered");
+                self.schedule_worker_viewer_reattach_retry().await;
                 return;
             }
         };
+        if outcome.had_failures {
+            self.schedule_worker_viewer_reattach_retry().await;
+        } else {
+            self.viewer_reattach_retry_attempt.store(0, Ordering::Relaxed);
+        }
         for state in candidates {
-            if already_hosted.contains(&state.run_id) {
+            if outcome.live.contains(&state.run_id) || outcome.blocked_slots.contains(&state.slot_id) {
                 continue;
             }
             self.reattach_one_worker_pane(&state).await;
         }
+    }
+
+    async fn schedule_worker_viewer_reattach_retry(&self) {
+        let session_id = {
+            let guard = self.app_session.lock().await;
+            match guard.as_ref() {
+                Some(handle) => handle.session_id.clone(),
+                None => return,
+            }
+        };
+        self.spawn_worker_viewer_reattach_retry(session_id);
+    }
+
+    fn spawn_worker_viewer_reattach_retry(&self, session_id: String) {
+        let Some(state) = self._self_weak.upgrade() else {
+            return;
+        };
+        if self.viewer_reattach_retry_scheduled.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let attempt = self.viewer_reattach_retry_attempt.fetch_add(1, Ordering::Relaxed);
+        if attempt >= VIEWER_REATTACH_RETRY_MAX_ATTEMPTS {
+            self.viewer_reattach_retry_scheduled.store(false, Ordering::Relaxed);
+            tracing::warn!(
+                attempt,
+                "worker pane reconciliation retries exhausted for this app session"
+            );
+            return;
+        }
+        let epoch = self.viewer_reattach_epoch.load(Ordering::Relaxed);
+        let delay = VIEWER_REATTACH_RETRY_BASE.saturating_mul(1u32 << attempt.min(3));
+        tracing::info!(attempt, ?delay, "retrying worker pane reconciliation");
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            state.viewer_reattach_retry_scheduled.store(false, Ordering::Relaxed);
+            if state.viewer_reattach_epoch.load(Ordering::Relaxed) != epoch {
+                return;
+            }
+            let still_same_session = state
+                .app_session
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|handle| handle.session_id == session_id);
+            if !still_same_session {
+                return;
+            }
+            state.reattach_worker_panes_to_registered_app().await;
+        });
     }
 
     async fn reattach_one_worker_pane(&self, state: &LiveWorkerState) {

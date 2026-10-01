@@ -3,7 +3,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 use std::time::SystemTime;
@@ -943,6 +943,16 @@ struct ServerState {
     app_channel_health: Arc<AppChannelHealth>,
     /// Serialize app viewer allocation independently of tmux worker creation.
     attach_pane_lock: Arc<Mutex<()>>,
+    /// Bumped when the registered app session is replaced so an in-flight
+    /// viewer-reattach retry aborts instead of talking to a new session.
+    #[builder(default)]
+    viewer_reattach_epoch: AtomicU64,
+    /// True while a backed-off viewer reattach retry is sleeping.
+    #[builder(default)]
+    viewer_reattach_retry_scheduled: AtomicBool,
+    /// Consecutive failed reconcile passes for the current app session.
+    #[builder(default)]
+    viewer_reattach_retry_attempt: AtomicU32,
     /// Append-only JSONL log of every engine↔app IPC exchange. Each
     /// `send_to_app` call appends an `engine→app` record; each
     /// `deliver_app_response` call appends an `app→engine` record.
