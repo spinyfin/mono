@@ -653,6 +653,7 @@ async fn pool_claim_sweep_reconciles_the_claim_release_worker_pane_holds() {
         server_state.execution_coordinator.clone(),
         server_state.dispatch_events.as_ref(),
         server_state.as_ref(),
+        &mut crate::pool_claim_sweep::TeardownRetries::default(),
     )
     .await;
     assert_eq!(outcome.released, 0);
@@ -671,6 +672,7 @@ async fn pool_claim_sweep_reconciles_the_claim_release_worker_pane_holds() {
             state.execution_coordinator.clone(),
             state.dispatch_events.as_ref(),
             state.as_ref(),
+            &mut crate::pool_claim_sweep::TeardownRetries::default(),
         )
         .await
     });

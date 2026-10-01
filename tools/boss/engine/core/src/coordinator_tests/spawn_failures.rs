@@ -1015,6 +1015,10 @@ async fn viewer_abort_failure_retains_the_workspace_and_records_the_reason() {
     struct AllowViewerDetach;
     #[async_trait]
     impl crate::pool_claim_sweep::WorkerViewerDetach for AllowViewerDetach {
+        async fn confirm_process_torn_down(&self, _: &str) -> Result<(), String> {
+            Err("test teardown refused".into())
+        }
+
         async fn confirm_viewers_detached(&self, run_ids: &[String]) -> Vec<Result<(), String>> {
             run_ids.iter().map(|_| Ok(())).collect()
         }
@@ -1026,6 +1030,7 @@ async fn viewer_abort_failure_retains_the_workspace_and_records_the_reason() {
         coordinator.clone(),
         &crate::dispatch_events::RecordingDispatchEventSink::new(),
         &AllowViewerDetach,
+        &mut crate::pool_claim_sweep::TeardownRetries::default(),
     )
     .await;
     assert_eq!(outcome.released, 0);

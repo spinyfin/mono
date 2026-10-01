@@ -706,9 +706,7 @@ impl ExecutionCoordinator {
                 // `LEAK_GRACE_SECS` grace period has passed and the engine
                 // has confirmed both process teardown and viewer detach.
                 // Still rescan + kick so OTHER free slots pick up the work
-                // this failure just requeued — unless teardown of the
-                // rejected spawn was unconfirmed, in which case a replacement
-                // would run alongside the unreaped tmux process.
+                // this failure just requeued.
                 self.rescan_active_dispatch_after_release();
                 // `rescan_active_dispatch` only requeues items with
                 // `autostart = 1` — but `start_execution_run_on_host`
@@ -729,6 +727,7 @@ impl ExecutionCoordinator {
                 // above; `AnswerAgent` is unhandled here, matching its
                 // pre-existing scope). Also excluded: unconfirmed abort
                 // of a SlotBusy-rejected spawn (`ViewerAbortFailed`).
+                // Do not request a replacement while the rejected spawn may still run.
                 if !abort_unconfirmed
                     && !matches!(
                         execution.kind,

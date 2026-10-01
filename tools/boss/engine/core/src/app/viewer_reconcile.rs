@@ -151,6 +151,13 @@ impl ServerState {
 
 #[async_trait]
 impl crate::pool_claim_sweep::WorkerViewerDetach for ServerState {
+    async fn confirm_process_torn_down(&self, execution_id: &str) -> Result<(), String> {
+        match self.reap_tmux_worker(execution_id).await {
+            tmux_teardown::TmuxTeardownOutcome::Reaped => Ok(()),
+            outcome => Err(format!("tmux teardown unconfirmed: {outcome:?}")),
+        }
+    }
+
     async fn confirm_viewers_detached(&self, run_ids: &[String]) -> Vec<Result<(), String>> {
         if run_ids.is_empty() {
             return Vec::new();

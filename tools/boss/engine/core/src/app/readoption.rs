@@ -983,10 +983,10 @@ impl ServerState {
         tracing::info!(attempt, ?delay, "retrying worker pane reconciliation");
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            state.viewer_reattach_retry_scheduled.store(false, Ordering::Relaxed);
             if state.viewer_reattach_epoch.load(Ordering::Relaxed) != epoch {
                 return;
             }
+            state.viewer_reattach_retry_scheduled.store(false, Ordering::Relaxed);
             let still_same_session = state
                 .app_session
                 .lock()
@@ -1084,3 +1084,7 @@ impl ServerState {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "readoption_retry_tests.rs"]
+mod retry_tests;
