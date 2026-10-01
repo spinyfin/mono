@@ -663,6 +663,7 @@ impl WorkerCompletionHandler {
         self.build_wait_tracker.forget(execution_id);
         self.background_children_tracker.forget(execution_id);
         self.hold_registry.release(execution_id);
+        self.wait_registry.forget(execution_id);
         // Stop → pr_transition termination path: the call above just moved
         // the execution to `completed` (see `record_worker_pr_completion`),
         // so this path owns the whole teardown — pane, driver state, cube

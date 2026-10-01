@@ -81,6 +81,11 @@ fn probe_texts_name_the_no_op_marker() {
              asks for an answer no engine path can act on:\n{text}",
         );
         assert!(
+            text.contains("propose wait"),
+            "{label} must name the `propose wait` command so a worker waiting on a long-running \
+             job can declare it instead of answering in prose:\n{text}",
+        );
+        assert!(
             !crate::no_op_signal::transcript_signals_no_op(text),
             "{label} must keep the marker inline (backticked), never on a line of its own — the \
              engine's question must not be mistakable for the worker's answer:\n{text}",
@@ -452,4 +457,80 @@ async fn a_resumed_background_children_hold_is_still_retired_without_a_probe() {
         probes.snapshot().is_empty() && probes.deliver_snapshot().is_empty(),
         "a worker that is genuinely still working must be neither probed nor delivered to",
     );
+}
+
+#[tokio::test]
+async fn active_worker_wait_suppresses_nudge_and_never_touches_breaker() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    let detector = StubPrDetector::ok(None);
+    let TestHarness {
+        handler,
+        cube,
+        pane,
+        probes,
+        ..
+    } = TestHarness::new(db.clone(), detector);
+    let wait_registry = Arc::new(crate::wait_registry::WaitRegistry::new());
+    wait_registry
+        .declare(
+            &execution_id,
+            "bazel test still compiling".to_owned(),
+            None,
+            3600,
+            boss_engine_utils::epoch_time::now_epoch_secs(),
+        )
+        .unwrap();
+    let handler = handler
+        .with_max_unproductive_nudges(2)
+        .with_wait_registry(wait_registry);
+
+    for _ in 0..5 {
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::WorkerWaitPending { .. }),
+            "every Stop during an unexpired wait must be WorkerWaitPending; got {outcome:?}",
+        );
+    }
+
+    assert!(probes.snapshot().is_empty(), "an active wait must never be nudged");
+    assert!(
+        cube.release_calls.lock().await.is_empty(),
+        "an active wait must not release the lease",
+    );
+    assert!(
+        pane.calls.lock().await.is_empty(),
+        "an active wait must not tear down the pane",
+    );
+    let items = db.list_attention_items(&execution_id).unwrap();
+    assert!(
+        !items.iter().any(|i| i.kind == NUDGE_BREAKER_ATTENTION_KIND),
+        "a wait must not masquerade as a breaker trip",
+    );
+}
+
+#[tokio::test]
+async fn expired_worker_wait_resumes_normal_nudging() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+    let wait_registry = Arc::new(crate::wait_registry::WaitRegistry::new());
+    wait_registry
+        .declare(
+            &execution_id,
+            "bazel test".to_owned(),
+            None,
+            1,
+            boss_engine_utils::epoch_time::now_epoch_secs() - 10,
+        )
+        .unwrap();
+    let handler = handler.with_wait_registry(wait_registry);
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::AwaitingInput),
+        "an expired wait must resume the produce-a-PR nudge; got {outcome:?}",
+    );
+    assert_eq!(probes.snapshot().len(), 1);
 }

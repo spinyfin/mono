@@ -43,7 +43,9 @@
 use super::*;
 
 use boss_engine_proposal_validation::{derive_idempotency_key, validate_caller_idempotency_key, validate_payload};
-use boss_protocol::{ProposalErrorCode, ProposalKind, ProposalSubmissionError};
+use boss_protocol::{
+    ProposalErrorCode, ProposalFieldError, ProposalKind, ProposalSubmissionError, WaitProposalPayload,
+};
 
 use crate::metrics::Registry;
 use crate::work::{SubmitWorkerProposalInput, SubmitWorkerProposalOutcome};
@@ -107,6 +109,11 @@ crate::register_counter!(
     "SubmitProposal accepted a proposal of kind `run_done` — a worker declared its run finished.",
 );
 crate::register_counter!(
+    PROPOSAL_SUBMITTED_WAIT,
+    "worker_proposals.submitted.wait",
+    "SubmitProposal accepted a proposal of kind `wait` — a worker declared a time-bounded wait.",
+);
+crate::register_counter!(
     PROPOSAL_VALIDATION_FAILED,
     "worker_proposals.validation_failed",
     "SubmitProposal rejected a submission for ProposalErrorCode::ValidationFailed (payload schema).",
@@ -137,6 +144,7 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&PROPOSAL_SUBMITTED_REVIEW_REPORT);
     registry.register_counter(&PROPOSAL_SUBMITTED_REVIEW_VERDICT);
     registry.register_counter(&PROPOSAL_SUBMITTED_RUN_DONE);
+    registry.register_counter(&PROPOSAL_SUBMITTED_WAIT);
     registry.register_counter(&PROPOSAL_VALIDATION_FAILED);
     registry.register_counter(&PROPOSAL_RATE_LIMITED);
 }
@@ -155,6 +163,7 @@ fn record_proposal_submitted(metrics: &Registry, kind: ProposalKind) {
         ProposalKind::ReviewReport => PROPOSAL_SUBMITTED_REVIEW_REPORT.inc(metrics),
         ProposalKind::ReviewVerdict => PROPOSAL_SUBMITTED_REVIEW_VERDICT.inc(metrics),
         ProposalKind::RunDone => PROPOSAL_SUBMITTED_RUN_DONE.inc(metrics),
+        ProposalKind::Wait => PROPOSAL_SUBMITTED_WAIT.inc(metrics),
     }
 }
 
@@ -328,8 +337,64 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                 return send_rejection(&sink, &request_id, error);
             }
         },
+        None if kind == ProposalKind::Wait => {
+            // Each wait declaration is a new row so re-running renews.
+            // A caller-supplied `--idempotency-key` still replays.
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("auto:wait:{}:{nanos}", caller.execution_id)
+        }
         None => derive_idempotency_key(&caller.execution_id, kind, &validated.canonical_json),
     };
+
+    // Grant the wait before persisting the proposal row so a cap refusal
+    // never leaves an `applied` audit of a wait the registry did not take.
+    // If the insert then fails, the in-memory wait still holds the nudge
+    // ladder — the worker's intent is what matters, and the next successful
+    // submit records the audit.
+    if kind == ProposalKind::Wait {
+        match serde_json::from_str::<WaitProposalPayload>(&validated.canonical_json) {
+            Ok(payload) => {
+                let now = boss_engine_utils::epoch_time::now_epoch_secs();
+                if let Err(err) = server_state.wait_registry.declare(
+                    &caller.execution_id,
+                    payload.reason,
+                    payload.waiting_on,
+                    payload.duration_secs,
+                    now,
+                ) {
+                    let error = ProposalSubmissionError::validation(vec![ProposalFieldError::new(
+                        "duration_secs",
+                        err.to_string(),
+                    )]);
+                    tracing::info!(
+                        execution_id = %caller.execution_id,
+                        %err,
+                        "submit_proposal rejected: worker wait cap or duration refused"
+                    );
+                    return send_rejection(&sink, &request_id, error);
+                }
+                server_state.broadcast_live_worker_states().await;
+            }
+            Err(err) => {
+                tracing::error!(
+                    execution_id = %caller.execution_id,
+                    ?err,
+                    "submit_proposal: wait payload failed to deserialize after validation"
+                );
+                return send_rejection(
+                    &sink,
+                    &request_id,
+                    ProposalSubmissionError::new(
+                        ProposalErrorCode::Internal,
+                        format!("validated wait payload could not be deserialized: {err}"),
+                    ),
+                );
+            }
+        }
+    }
 
     let outcome = work_db.submit_worker_proposal(SubmitWorkerProposalInput {
         execution_id: &caller.execution_id,

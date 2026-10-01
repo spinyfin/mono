@@ -1255,6 +1255,12 @@ enum NudgeHold {
     /// the bounded nudge/park ladder advancing, leaving the execution live,
     /// idle, and holding its slot with nothing scheduled to look at it again.
     Debounced,
+    /// The nudge was suppressed because the worker declared an unexpired
+    /// `boss propose wait`. Like [`Self::Debounced`], this must not be
+    /// retired on hook activity: the worker is idle on a background job
+    /// that may emit no further Stop until we re-nudge after expiry. The
+    /// recurring recheck is what resumes the ladder once the wait ends.
+    WorkerWait,
 }
 
 // Six fields, so the project's builder convention applies. The three
@@ -1527,6 +1533,11 @@ pub struct WorkerCompletionHandler {
     /// pair. Shared via `Arc` so `app.rs`'s RPC handlers and both sweeps
     /// see the same holds.
     hold_registry: Arc<crate::hold_registry::HoldRegistry>,
+    /// Worker-declared waits (`boss propose wait`) that hold the produce-a-PR
+    /// nudge ladder until expiry. Shared with `app.rs`'s SubmitProposal
+    /// handler so a wait granted on the RPC is visible on the next Stop.
+    /// See [`crate::wait_registry`].
+    wait_registry: Arc<crate::wait_registry::WaitRegistry>,
     /// In-flight completion-teardown marks. Every path that terminalizes
     /// an execution marks it here BEFORE the terminalizing write and
     /// clears the mark once [`Self::finish_worker_teardown`] has released
@@ -1927,6 +1938,16 @@ pub const REMOTE_COLLECTION_FAILED_ATTENTION_KIND: &str = "remote_collection_fai
 /// the marker const by `probe_texts_name_the_no_op_marker`; the mention here
 /// is inline and backticked, so it can never itself satisfy the own-line
 /// match.
+/// Shared by the produce-a-PR and push-to-existing-PR probes: if the worker
+/// is legitimately waiting on a long-running job it must declare that with
+/// `boss propose wait` rather than answering in prose.
+pub const WORKER_WAIT_NUDGE_DIRECTIVE: &str = " If you are legitimately waiting on a \
+long-running job (a background build, test gate, or similar), do not reply in prose — run \
+`$BOSS_BIN propose wait --reason \"<what you are waiting on>\" --duration <bound>` \
+(for example `--duration 30m`; the engine caps a single wait at 2h). Re-running renews \
+the wait. An unexpired wait holds the produce-a-PR nudge ladder; it does not stop other \
+safety checks.";
+
 pub const PROBE_NO_PR: &str = "You stopped without producing a PR for this work. \
 If the work is complete, open the PR with `cube pr create --branch <bookmark>` (pushes the \
 branch and opens the PR in one step, jj-aware, no GIT_DIR needed). If a PR already exists \
@@ -1935,7 +1956,12 @@ do not open a duplicate. If you're blocked, explain what you need. If instead yo
 verified there is genuinely nothing left to change (`jj diff -r @` is empty because the work \
 is already done), do NOT answer in prose alone — prose is not a signal the engine can act on. \
 End your response with a line containing exactly `NO_CHANGES_NEEDED` and stop; that is the \
-sanctioned way to close this run with no PR.";
+sanctioned way to close this run with no PR. If you are legitimately waiting on a \
+long-running job (a background build, test gate, or similar), do not reply in prose — run \
+`$BOSS_BIN propose wait --reason \"<what you are waiting on>\" --duration <bound>` \
+(for example `--duration 30m`; the engine caps a single wait at 2h). Re-running renews \
+the wait. An unexpired wait holds the produce-a-PR nudge ladder; it does not stop other \
+safety checks.";
 
 /// Extract the set of required-check names a `ci_remediations` attempt
 /// was opened to fix, parsed from its `failed_checks` JSON snapshot
@@ -2048,7 +2074,7 @@ commits, push them to the existing PR's branch with `cube pr update --branch <bo
 changes are already pushed, or you have verified this work needs no further code change, do NOT \
 answer in prose alone — prose is not a signal the engine can act on, and it will re-prompt you. \
 End your response with a line containing exactly `NO_CHANGES_NEEDED` and stop; that is the \
-sanctioned way to close this run without another push."
+sanctioned way to close this run without another push.{WORKER_WAIT_NUDGE_DIRECTIVE}"
     )
 }
 
@@ -2193,6 +2219,12 @@ pub enum StopOutcome {
     /// the run ends. `reason` is the operator-supplied explanation, if
     /// any.
     Held { reason: Option<String> },
+    /// The worker declared a time-bounded wait via `boss propose wait`
+    /// that has not yet expired. The produce-a-PR auto-nudge is suppressed
+    /// and the circuit breaker is not consulted. `reason` is the worker's
+    /// free-text explanation; `expires_at_epoch` is when nudging resumes.
+    /// The 2-hour stale-worker reap and other safety checks keep firing.
+    WorkerWaitPending { reason: String, expires_at_epoch: i64 },
     /// The worker is a conflict-resolution or CI-failure revision that
     /// stopped without pushing, but the blocking signal was already
     /// cleared (conflict: PR `mergeable`; CI: required checks green)

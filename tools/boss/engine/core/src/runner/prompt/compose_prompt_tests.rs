@@ -746,6 +746,27 @@ fn bazel_gate_present_for_chore_on_bazel_workspace_seam_on() {
 }
 
 #[test]
+fn chore_prompt_teaches_propose_wait() {
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("\"$BOSS_BIN\" propose wait --reason"),
+        "chore prompt must teach `boss propose wait` so a worker waiting on a long-running job \
+         can declare it instead of answering in prose:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("## If you are waiting on a long-running job"),
+        "chore prompt must include the wait section:\n{prompt}",
+    );
+}
+
+#[test]
 fn bazel_gate_present_for_chore_on_bazel_workspace_seam_off() {
     // Flag off (the builder default, matching the registry default):
     // the gate must point failures at the legacy `[blocked]` marker, not
@@ -765,8 +786,9 @@ fn bazel_gate_present_for_chore_on_bazel_workspace_seam_off() {
         "bazel pre-push gate must fire for code chores on a Bazel workspace:\n{prompt}",
     );
     assert!(
-        !prompt.contains("\"$BOSS_BIN\" propose"),
-        "with the seam flag off, the gate must not mention $BOSS_BIN propose at all:\n{prompt}",
+        !prompt.contains("\"$BOSS_BIN\" propose blocked")
+            && !prompt.contains("\"$BOSS_BIN\" propose effort-escalation"),
+        "with the seam flag off, the gate must not teach the seam-gated propose verbs:\n{prompt}",
     );
     assert!(
         prompt.contains("[blocked] reason=\"...\""),
@@ -811,7 +833,8 @@ fn worker_escalation_directive_teaches_boss_propose_verbs_when_seam_is_on() {
 fn worker_escalation_directive_teaches_legacy_markers_when_seam_is_off() {
     // Flag off (builder default = registry default): the directive must
     // reproduce the pre-migration marker-only text byte-for-byte in
-    // spirit — no `"$BOSS_BIN" propose` verb anywhere, both markers taught.
+    // spirit — no seam-gated `"$BOSS_BIN" propose blocked` / `effort-escalation`
+    // verbs, both markers taught. `propose wait` is always available.
     let ws = tempfile::TempDir::new().unwrap();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
@@ -822,8 +845,9 @@ fn worker_escalation_directive_teaches_legacy_markers_when_seam_is_off() {
             .build(),
     );
     assert!(
-        !prompt.contains("\"$BOSS_BIN\" propose"),
-        "seam off: the directive must not mention $BOSS_BIN propose at all:\n{prompt}",
+        !prompt.contains("\"$BOSS_BIN\" propose blocked")
+            && !prompt.contains("\"$BOSS_BIN\" propose effort-escalation"),
+        "seam off: the escalation directive must not teach the seam-gated propose verbs:\n{prompt}",
     );
     assert!(
         prompt.contains("[effort-escalation] requested_level=<level> reason=\"<why>\""),
@@ -1272,8 +1296,9 @@ fn conflict_revision_gate_points_at_legacy_marker_when_seam_is_off() {
              sentence must direct a wedged build to the legacy [blocked] marker:\n{prompt}",
     );
     assert!(
-        !prompt.contains("\"$BOSS_BIN\" propose"),
-        "seam off: conflict-resolution gate must not mention $BOSS_BIN propose at all:\n{prompt}",
+        !prompt.contains("\"$BOSS_BIN\" propose blocked")
+            && !prompt.contains("\"$BOSS_BIN\" propose effort-escalation"),
+        "seam off: conflict-resolution gate must not teach the seam-gated propose verbs:\n{prompt}",
     );
 }
 
@@ -1965,8 +1990,9 @@ fn escalation_protocol_directive_present_for_revision_implementation_seam_off() 
         "revision prompt, seam off: escalation section must teach the legacy [blocked] marker:\n{prompt}",
     );
     assert!(
-        !prompt.contains("\"$BOSS_BIN\" propose"),
-        "revision prompt, seam off: escalation section must not mention $BOSS_BIN propose at all:\n{prompt}",
+        !prompt.contains("\"$BOSS_BIN\" propose blocked")
+            && !prompt.contains("\"$BOSS_BIN\" propose effort-escalation"),
+        "revision prompt, seam off: escalation section must not teach the seam-gated propose verbs:\n{prompt}",
     );
 }
 

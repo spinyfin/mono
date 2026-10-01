@@ -475,6 +475,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         prompt.push_str(&worker_escalation_protocol_directive(
             worker_signal_proposals_seam_enabled,
         ));
+        prompt.push_str(&worker_wait_protocol_directive());
         // Teach chore/task workers the `[deferred-scope]` marker so a
         // deliberate scope narrowing is recorded, not just claimed in prose
         // ("filed as a followup") that nothing actually tracks (root cause:
@@ -978,6 +979,25 @@ pub(crate) fn worker_escalation_protocol_directive(seam_enabled: bool) -> String
      work when `\"$BOSS_BIN\" propose` itself is down, so it carries both signal kinds rather than teaching \
      a second marker grammar back. Do not use it once `\"$BOSS_BIN\" propose` has already succeeded for this \
      signal; it is a last resort, not a second channel.\n"
+        .to_string()
+}
+
+/// Teach the worker the structured wait verb so a legitimate background
+/// build/test wait is declared instead of narrated in prose. The produce-a-PR
+/// nudge probe repeats the same command; this prompt copy is the earlier
+/// teaching so the worker can declare before the first Stop.
+fn worker_wait_protocol_directive() -> String {
+    "\n## If you are waiting on a long-running job\n\n\
+     If you are legitimately waiting on a background build, test gate, or similar job, \
+     run this command rather than ending the turn in prose:\n\n\
+     ```\n\
+     \"$BOSS_BIN\" propose wait --reason \"<what you are waiting on>\" --duration <bound>\n\
+     ```\n\n\
+     `--duration` is required (for example `30m` or `2h`; the engine caps a single wait at 2 hours). \
+     Optionally pass `--waiting-on <task-id|pid|file>`. Re-running renews the wait. An unexpired \
+     wait holds the produce-a-PR nudge ladder and the nudge circuit breaker; it does not pause \
+     the stale-worker reap or other safety checks. After expiry, normal nudging resumes. Total \
+     wait-extension per execution is also capped.\n"
         .to_string()
 }
 

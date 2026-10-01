@@ -240,6 +240,18 @@ pub struct LiveWorkerState {
     /// tolerant of payloads from older engines that omit the key.
     #[serde(default)]
     pub held: bool,
+    /// Reason the worker declared via `boss propose wait`, if an unexpired
+    /// wait is currently holding the produce-a-PR nudge ladder. Surfaced
+    /// on `bossctl agents list`/`status` and the app's agent status.
+    /// `skip_serializing_if` keeps older consumers' snapshots compact when
+    /// no wait is active; `serde(default)` keeps decode tolerant of
+    /// payloads from older engines that omit the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_reason: Option<String>,
+    /// ISO-8601 expiry of the active worker-declared wait, when one is
+    /// set. Same omit/default contract as [`Self::wait_reason`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_expires_at: Option<String>,
     /// `Some(true)` for a local worker hosted in a tmux session — stamped
     /// once, at spawn (or from the durable run row on re-adoption).
     /// `Some(false)` marks a local run whose durable tmux stamp is missing:
@@ -328,6 +340,8 @@ impl LiveWorkerState {
             pool,
             kind,
             held: false,
+            wait_reason: None,
+            wait_expires_at: None,
             tmux_hosted,
         }
     }
@@ -401,6 +415,8 @@ mod tests {
         assert!(state.live_status_at.is_none());
         assert!(state.recovery_status.is_none());
         assert!(!state.held);
+        assert!(state.wait_reason.is_none());
+        assert!(state.wait_expires_at.is_none());
     }
 
     #[test]
@@ -486,6 +502,8 @@ mod tests {
             pool: Some("main".into()),
             kind: Some("task_implementation".into()),
             held: false,
+            wait_reason: None,
+            wait_expires_at: None,
             tmux_hosted: Some(true),
         };
         let json = serde_json::to_string(&original).unwrap();
@@ -540,6 +558,8 @@ mod tests {
             pool: None,
             kind: None,
             held: false,
+            wait_reason: None,
+            wait_expires_at: None,
             tmux_hosted: None,
         };
         let json = serde_json::to_string(&original).unwrap();
