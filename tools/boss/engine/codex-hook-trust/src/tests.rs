@@ -798,3 +798,172 @@ fn which_codex() -> Option<PathBuf> {
     }
     None
 }
+
+// ── Diagnostics wiring ──────────────────────────────────────────────────────
+
+/// Write an executable fake `codex` that runs `body` as a shell script.
+fn fake_codex(body: &str) -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("codex");
+    fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    let mut perms = fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms).unwrap();
+    (tmp, path)
+}
+
+/// Shell prologue: answer `initialize`, swallow `initialized` and the request.
+const FAKE_HANDSHAKE: &str = r#"read l1
+echo '{"id":1,"result":{}}'
+read l2
+read l3
+echo '{"method":"configWarning","params":{"summary":"Invalid configuration","details":"WARN-DETAIL no default_permissions"}}'
+echo 'STDERR-LINE-1' >&2
+"#;
+
+fn observe_with_fake(script: &str) -> Result<Observation, TrustGateError> {
+    let (_tmp, bin) = fake_codex(script);
+    let home = tempfile::tempdir().unwrap();
+    CodexAppServerObserver { codex_bin: bin }.observe(home.path(), home.path())
+}
+
+#[test]
+fn observer_refusal_carries_warning_reply_errors_and_stderr() {
+    let err = observe_with_fake(&format!(
+        "{FAKE_HANDSHAKE}echo '{{\"id\":2,\"result\":{{\"data\":[{{\"cwd\":\"/tmp\",\"hooks\":[],\"errors\":[{{\"message\":\"LIST-ERROR\"}}]}}]}}}}'"
+    ))
+    .unwrap_err();
+    let text = err.to_string();
+    for needle in ["no hook entries", "WARN-DETAIL", "LIST-ERROR", "STDERR-LINE-1"] {
+        assert!(text.contains(needle), "missing {needle:?} in {text}");
+    }
+}
+
+#[test]
+fn observer_rpc_error_carries_warning_and_stderr() {
+    let err = observe_with_fake(&format!(
+        "{FAKE_HANDSHAKE}echo '{{\"id\":2,\"error\":{{\"message\":\"RPC-BOOM\"}}}}'"
+    ))
+    .unwrap_err();
+    assert!(matches!(err, TrustGateError::ObservationFailed { .. }), "{err:?}");
+    let text = err.to_string();
+    for needle in ["RPC-BOOM", "WARN-DETAIL", "STDERR-LINE-1"] {
+        assert!(text.contains(needle), "missing {needle:?} in {text}");
+    }
+}
+
+#[test]
+fn observer_closed_without_answer_carries_warning_and_stderr() {
+    let err = observe_with_fake(FAKE_HANDSHAKE).unwrap_err();
+    let text = err.to_string();
+    for needle in ["closed without answering", "WARN-DETAIL", "STDERR-LINE-1"] {
+        assert!(text.contains(needle), "missing {needle:?} in {text}");
+    }
+}
+
+fn short_timeout_server(bin: PathBuf, timeout: Duration) -> app_server::AppServer {
+    app_server::AppServer {
+        program: bin,
+        extra_env: Vec::new(),
+        cwd: None,
+        client_info: app_server::ClientInfo {
+            name: "test".into(),
+            title: None,
+            version: "0".into(),
+        },
+        timeout,
+    }
+}
+
+#[test]
+fn timeout_keeps_a_config_warning_read_before_the_stall() {
+    let (_tmp, bin) = fake_codex(&format!("{FAKE_HANDSHAKE}exec sleep 30"));
+    let err = short_timeout_server(bin, Duration::from_secs(3))
+        .request_session("hooks/list", serde_json::json!({}))
+        .unwrap_err();
+    let text = err.to_string();
+    for needle in ["timed out after 3s", "WARN-DETAIL", "STDERR-LINE-1"] {
+        assert!(text.contains(needle), "missing {needle:?} in {text}");
+    }
+}
+
+#[test]
+fn a_grandchild_holding_stderr_open_cannot_hang_the_session() {
+    // The backgrounded sleep inherits stderr and outlives the killed child.
+    let (_tmp, bin) = fake_codex(&format!("{FAKE_HANDSHAKE}sleep 20 &\nexec sleep 30"));
+    let started = std::time::Instant::now();
+    let err = short_timeout_server(bin, Duration::from_secs(3))
+        .request_session("hooks/list", serde_json::json!({}))
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "request_session blocked on the stderr drain: {:?}",
+        started.elapsed()
+    );
+    assert!(err.to_string().contains("STDERR-LINE-1"), "{err}");
+}
+
+struct DiagnosticObserver {
+    hooks: Vec<ObservedHook>,
+    diagnostics: Option<String>,
+}
+
+impl TrustObserver for DiagnosticObserver {
+    fn observe_hooks(&self, _codex_home: &Path, _cwd: &Path) -> Result<Vec<ObservedHook>, TrustGateError> {
+        Ok(self.hooks.clone())
+    }
+
+    fn observe(&self, _codex_home: &Path, _cwd: &Path) -> Result<Observation, TrustGateError> {
+        Ok(Observation {
+            hooks: self.hooks.clone(),
+            diagnostics: self.diagnostics.clone(),
+        })
+    }
+}
+
+#[test]
+fn post_observation_refusal_carries_codex_diagnostics_without_changing_the_decision() {
+    let fx = setup_fixture("#!/bin/sh\necho guard\n");
+    let hooks = standard_hooks(&fx);
+    let observed = hooks
+        .iter()
+        .map(|hook| ObservedHook {
+            key: hook_state_key(&fx.config_path, hook.event, hook.group_index, hook.handler_index),
+            trust_status: "untrusted".into(),
+            current_hash: expected_hash(&fx, hook.event, hook.matcher.as_deref()),
+            enabled: true,
+        })
+        .collect();
+    let req = ArmRequest {
+        codex_home: fx.codex_home.clone(),
+        config_path: fx.config_path.clone(),
+        cwd: fx.cwd.clone(),
+        hooks,
+        codex_bin: PathBuf::from("codex"),
+    };
+    let observer = DiagnosticObserver {
+        hooks: observed,
+        diagnostics: Some("codex reported: LOADER-CAUSE; stderr: STDERR-LINE".into()),
+    };
+    let err = arm_and_attest_with_observer(&req, &observer).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("trustStatus=untrusted"), "{text}");
+    assert!(text.contains("LOADER-CAUSE") && text.contains("STDERR-LINE"), "{text}");
+    match err {
+        TrustGateError::WithCodexContext { cause, .. } => {
+            assert!(matches!(*cause, TrustGateError::HookNotTrusted { .. }), "{cause:?}");
+        }
+        other => panic!("expected WithCodexContext, got {other:?}"),
+    }
+}
+
+#[test]
+fn stderr_in_a_refusal_is_a_bounded_single_line() {
+    let long: String = (0..2000).map(|i| format!("line-{i}\n")).collect();
+    let text = format_codex_reports(&[], &long).unwrap();
+    assert!(!text.contains('\n'), "{text}");
+    assert!(text.len() < STDERR_DISPLAY_BYTES + 64, "len={}", text.len());
+    assert!(text.ends_with("line-1999"), "{text}");
+    // The leading partial line is dropped, not shown mid-word.
+    assert!(text.starts_with("stderr: line-"), "{text}");
+}

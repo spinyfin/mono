@@ -5,47 +5,51 @@
 //! cannot block, and keep only the tail for refusal text.
 
 use std::io::Read;
+use std::sync::Mutex;
+use std::time::Duration;
 
 /// Bytes of stderr retained for a refusal. Older output is dropped.
 pub const STDERR_TAIL_BYTES: usize = 8 * 1024;
 
-/// Read `reader` to EOF, keeping only the last [`STDERR_TAIL_BYTES`] (or
-/// `cap`) bytes. Lossy UTF-8. A writer that outruns the cap cannot fill the
-/// pipe: this loop never stops consuming.
-pub fn drain_bounded_tail(mut reader: impl Read, cap: usize) -> String {
+/// How long the caller waits for the drain thread after killing the child.
+/// A descendant that inherited the stderr pipe can hold it open past the
+/// child's death, so the wait is bounded and the captured tail is used as-is.
+pub const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+/// Read `reader` to EOF, publishing the last `cap` bytes into `shared` as
+/// they arrive. A writer that outruns the cap cannot fill the pipe: this loop
+/// never stops consuming. Because the tail is published incrementally, a
+/// caller that gives up waiting for EOF still sees everything read so far.
+pub fn drain_into(mut reader: impl Read, shared: &Mutex<Vec<u8>>, cap: usize) {
     let cap = cap.max(1);
-    let mut tail = vec![0; cap];
-    let mut len = 0usize;
-    let mut wrapped = false;
     let mut chunk = [0u8; 1024];
     loop {
         match reader.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) | Err(_) => break,
             Ok(n) => {
-                for &byte in &chunk[..n] {
-                    if len == cap {
-                        wrapped = true;
-                    }
-                    tail[len % cap] = byte;
-                    len = len.saturating_add(1);
+                let mut tail = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                tail.extend_from_slice(&chunk[..n]);
+                if tail.len() > cap {
+                    let excess = tail.len() - cap;
+                    tail.drain(..excess);
                 }
             }
-            Err(_) => break,
         }
     }
-    let kept = if wrapped { cap } else { len.min(cap) };
-    if kept == 0 {
-        return String::new();
-    }
-    let mut bytes = Vec::with_capacity(kept);
-    if wrapped {
-        let start = len % cap;
-        bytes.extend_from_slice(&tail[start..]);
-        bytes.extend_from_slice(&tail[..start]);
-    } else {
-        bytes.extend_from_slice(&tail[..kept]);
-    }
-    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Lossy UTF-8 snapshot of what [`drain_into`] has published so far.
+pub fn snapshot(shared: &Mutex<Vec<u8>>) -> String {
+    let tail = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    String::from_utf8_lossy(&tail).into_owned()
+}
+
+#[cfg(test)]
+/// Read `reader` to EOF and return the last `cap` bytes (lossy UTF-8).
+pub fn drain_bounded_tail(reader: impl Read, cap: usize) -> String {
+    let shared = Mutex::new(Vec::new());
+    drain_into(reader, &shared, cap);
+    snapshot(&shared)
 }
 
 #[cfg(test)]
@@ -59,10 +63,11 @@ mod tests {
 
     #[test]
     fn drain_bounded_tail_keeps_the_last_bytes() {
-        let input = [b'a'; 200];
-        let tail = drain_bounded_tail(Cursor::new(input), 64);
-        assert_eq!(tail.len(), 64);
-        assert!(tail.bytes().all(|b| b == b'a'), "{tail:?}");
+        // Distinct, ASCII-only bytes (0..128 repeated) so a scrambled ring
+        // cannot pass; the tail must equal the last `cap` input bytes.
+        let input: Vec<u8> = (0..200usize).map(|i| (i % 128) as u8).collect();
+        let tail = drain_bounded_tail(Cursor::new(input.clone()), 64);
+        assert_eq!(tail.as_bytes(), &input[input.len() - 64..]);
     }
 
     #[test]
@@ -78,7 +83,7 @@ mod tests {
         // retain the marker at the end.
         let mut child = Command::new("/bin/sh")
             .arg("-c")
-            .arg("dd if=/dev/zero bs=1024 count=256 2>/dev/null >&2; printf 'TAIL-END-MARKER' >&2")
+            .arg("/bin/dd if=/dev/zero bs=1024 count=256 1>&2; printf 'TAIL-END-MARKER' >&2")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -103,6 +108,13 @@ mod tests {
             tail.ends_with("TAIL-END-MARKER"),
             "expected the retained tail to end with the marker, got {tail:?}"
         );
-        assert!(tail.len() <= 64, "tail exceeded cap: {} bytes", tail.len());
+        // The 256 KiB of zeros really reached the pipe: the tail is exactly
+        // the cap, a zero prefix followed by the marker.
+        let marker = "TAIL-END-MARKER";
+        assert_eq!(tail.len(), 64, "tail should be exactly the cap: {tail:?}");
+        assert!(
+            tail[..64 - marker.len()].bytes().all(|b| b == 0),
+            "expected a zero prefix, got {tail:?}"
+        );
     }
 }

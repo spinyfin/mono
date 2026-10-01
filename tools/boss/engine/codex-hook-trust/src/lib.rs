@@ -281,6 +281,10 @@ pub enum TrustGateError {
     AttestationStale { detail: String },
     /// Attestation re-check failed: required entry missing.
     AttestationIncomplete { detail: String },
+    /// A post-observation refusal annotated with what Codex itself reported
+    /// (hooks/list errors, configWarnings, stderr). The gate's decision is the
+    /// wrapped `cause`; `context` is display-only.
+    WithCodexContext { cause: Box<TrustGateError>, context: String },
 }
 
 impl std::fmt::Display for TrustGateError {
@@ -374,6 +378,7 @@ impl std::fmt::Display for TrustGateError {
             Self::AttestationIncomplete { detail } => {
                 write!(f, "Codex hook-trust gate: attestation incomplete: {detail}")
             }
+            Self::WithCodexContext { cause, context } => write!(f, "{cause}; {context}"),
         }
     }
 }
@@ -618,6 +623,23 @@ pub struct ObservedHook {
 /// Codex. Production uses [`CodexAppServerObserver`].
 pub trait TrustObserver {
     fn observe_hooks(&self, codex_home: &Path, cwd: &Path) -> Result<Vec<ObservedHook>, TrustGateError>;
+
+    /// Like [`Self::observe_hooks`], but also carries Codex's own diagnostics
+    /// (hooks/list errors, configWarnings, stderr) so the gate can attach them
+    /// to any later refusal. Observers with no diagnostics keep the default.
+    fn observe(&self, codex_home: &Path, cwd: &Path) -> Result<Observation, TrustGateError> {
+        self.observe_hooks(codex_home, cwd).map(|hooks| Observation {
+            hooks,
+            diagnostics: None,
+        })
+    }
+}
+
+/// Parsed `hooks/list` rows plus the Codex-reported cause text, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Observation {
+    pub hooks: Vec<ObservedHook>,
+    pub diagnostics: Option<String>,
 }
 
 /// Live observer: `codex app-server` over stdio, `hooks/list` RPC.
@@ -635,6 +657,10 @@ pub struct CodexAppServerObserver {
 
 impl TrustObserver for CodexAppServerObserver {
     fn observe_hooks(&self, codex_home: &Path, cwd: &Path) -> Result<Vec<ObservedHook>, TrustGateError> {
+        self.observe(codex_home, cwd).map(|observation| observation.hooks)
+    }
+
+    fn observe(&self, codex_home: &Path, cwd: &Path) -> Result<Observation, TrustGateError> {
         // Shared client: spawn + initialize + notifications/initialized +
         // method, under OBSERVE_TIMEOUT, then kill/reap. Never passes a
         // bypass-hook-trust flag or env.
@@ -653,7 +679,7 @@ impl TrustObserver for CodexAppServerObserver {
         .map_err(|err| TrustGateError::ObservationFailed {
             detail: err.to_string(),
         })?;
-        parse_hooks_list_response_with_reports(
+        parse_observation(
             &serde_json::json!({ "result": session.result }),
             &session.config_warnings,
             &session.stderr_tail,
@@ -666,11 +692,20 @@ fn parse_hooks_list_response(resp: &JsonValue) -> Result<Vec<ObservedHook>, Trus
     parse_hooks_list_response_with_reports(resp, &[], "")
 }
 
+#[cfg(test)]
 fn parse_hooks_list_response_with_reports(
     resp: &JsonValue,
     extra_reports: &[String],
     stderr_tail: &str,
 ) -> Result<Vec<ObservedHook>, TrustGateError> {
+    parse_observation(resp, extra_reports, stderr_tail).map(|observation| observation.hooks)
+}
+
+fn parse_observation(
+    resp: &JsonValue,
+    extra_reports: &[String],
+    stderr_tail: &str,
+) -> Result<Observation, TrustGateError> {
     let mut reports = Vec::new();
     for extra in extra_reports {
         push_unique_report(&mut reports, extra);
@@ -740,7 +775,10 @@ fn parse_hooks_list_response_with_reports(
             "hooks/list returned no hook entries — silence is not success".into(),
         ));
     }
-    Ok(out)
+    Ok(Observation {
+        hooks: out,
+        diagnostics: format_codex_reports(&reports, stderr_tail),
+    })
 }
 
 fn collect_hooks_list_reports(result: &JsonValue, reports: &mut Vec<String>) {
@@ -782,11 +820,40 @@ fn format_codex_reports(reports: &[String], stderr_tail: &str) -> Option<String>
     if !reports.is_empty() {
         parts.push(format!("codex reported: {}", reports.join("; ")));
     }
-    let stderr = stderr_tail.trim();
+    let stderr = display_stderr(stderr_tail);
     if !stderr.is_empty() {
         parts.push(format!("stderr: {stderr}"));
     }
     if parts.is_empty() { None } else { Some(parts.join("; ")) }
+}
+
+/// Bytes of stderr shown in a refusal. The capture buffer is larger; the
+/// text that lands in spawn-aborted records and failure reasons is not.
+const STDERR_DISPLAY_BYTES: usize = 2 * 1024;
+
+/// Last [`STDERR_DISPLAY_BYTES`] of `tail` on a single line: lines are
+/// joined with ` | `, and a leading partial line is dropped when the tail
+/// had to be cut.
+fn display_stderr(tail: &str) -> String {
+    const SEPARATOR: &str = " | ";
+    let joined = tail
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(SEPARATOR);
+    if joined.len() <= STDERR_DISPLAY_BYTES {
+        return joined;
+    }
+    let mut start = joined.len() - STDERR_DISPLAY_BYTES;
+    while !joined.is_char_boundary(start) {
+        start += 1;
+    }
+    let shown = &joined[start..];
+    match shown.find(SEPARATOR) {
+        Some(at) => shown[at + SEPARATOR.len()..].to_string(),
+        None => shown.to_string(),
+    }
 }
 
 fn extend_observation_detail(base: String, reports: &[String], stderr_tail: &str) -> String {
@@ -846,9 +913,11 @@ pub fn arm_and_attest_with_observer<O: TrustObserver>(
     let stamped_map: BTreeMap<String, String> = stamped.into_iter().collect();
 
     // 4. Observe — silence is not success.
-    let observed = observer.observe_hooks(&codex_home, &request.cwd)?;
+    let Observation { hooks: observed, diagnostics } = observer.observe(&codex_home, &request.cwd)?;
     let observed_map: BTreeMap<String, ObservedHook> = observed.into_iter().map(|h| (h.key.clone(), h)).collect();
 
+    // Every refusal below keeps its decision; Codex's own cause rides along.
+    let entries = (|| {
     let mut entries = Vec::with_capacity(request.hooks.len());
     for hook in &request.hooks {
         let command = resolve_absolute(&hook.command);
@@ -892,6 +961,15 @@ pub fn arm_and_attest_with_observer<O: TrustObserver>(
             observed_trust_status: obs.trust_status.clone(),
         });
     }
+    Ok(entries)
+    })()
+    .map_err(|err| match diagnostics {
+        Some(context) => TrustGateError::WithCodexContext {
+            cause: Box::new(err),
+            context,
+        },
+        None => err,
+    })?;
 
     let generated_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1189,7 +1267,7 @@ pub mod app_server {
     use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
     use std::process::{ChildStdin, ChildStdout, Command, Stdio};
-    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
     use std::time::Duration;
 
@@ -1370,7 +1448,7 @@ pub mod app_server {
     fn read_until_id(
         reader: &mut impl BufRead,
         want_id: u64,
-        warnings: &mut Vec<String>,
+        warnings: &Mutex<Vec<String>>,
     ) -> Result<serde_json::Value, Error> {
         let mut line = String::new();
         for _ in 0..200 {
@@ -1386,7 +1464,8 @@ pub mod app_server {
             match classify_line(line.trim(), want_id) {
                 ServerLine::Other => continue,
                 ServerLine::ConfigWarning(message) => {
-                    super::push_unique_report(warnings, &message);
+                    let mut warnings = warnings.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    super::push_unique_report(&mut warnings, &message);
                     continue;
                 }
                 ServerLine::Error(message) => {
@@ -1407,26 +1486,21 @@ pub mod app_server {
         })
     }
 
-    struct DriveOutput {
-        result: Result<serde_json::Value, Error>,
-        config_warnings: Vec<String>,
-    }
-
     fn drive_request(
         mut stdin: ChildStdin,
         stdout: ChildStdout,
         client_info: ClientInfo,
         method: String,
         params: serde_json::Value,
-    ) -> DriveOutput {
-        let mut warnings = Vec::new();
-        let result = (|| {
+        warnings: &Mutex<Vec<String>>,
+    ) -> Result<serde_json::Value, Error> {
+        (|| {
             let mut reader = BufReader::new(stdout);
             write_rpc_line(
                 &mut stdin,
                 &request_value(ID_INITIALIZE, "initialize", initialize_params(&client_info)),
             )?;
-            let _init = read_until_id(&mut reader, ID_INITIALIZE, &mut warnings).map_err(|err| match err {
+            let _init = read_until_id(&mut reader, ID_INITIALIZE, warnings).map_err(|err| match err {
                 Error::Rpc { message, .. } => Error::Rpc {
                     method: "initialize".into(),
                     message,
@@ -1435,16 +1509,12 @@ pub mod app_server {
             })?;
             write_rpc_line(&mut stdin, &initialized_notification())?;
             write_rpc_line(&mut stdin, &request_value(ID_REQUEST, &method, params))?;
-            read_until_id(&mut reader, ID_REQUEST, &mut warnings).map_err(|err| match err {
+            read_until_id(&mut reader, ID_REQUEST, warnings).map_err(|err| match err {
                 Error::Io { detail } if detail.contains("closed stdout") => Error::Closed { method },
                 Error::Rpc { message, .. } => Error::Rpc { method, message },
                 other => other,
             })
-        })();
-        DriveOutput {
-            result,
-            config_warnings: warnings,
-        }
+        })()
     }
 
     fn attach_session_diagnostics(err: Error, warnings: &[String], stderr_tail: &str) -> Error {
@@ -1517,45 +1587,51 @@ pub mod app_server {
             let stdout = child.stdout.take().ok_or_else(|| Error::Io {
                 detail: "app-server stdout not piped".into(),
             })?;
-            let stderr_thread = child.stderr.take().map(|stderr| {
+            let stderr_shared = Arc::new(Mutex::new(Vec::new()));
+            let (stderr_done_tx, stderr_done_rx) = mpsc::channel();
+            if let Some(stderr) = child.stderr.take() {
+                let shared = Arc::clone(&stderr_shared);
                 thread::spawn(move || {
-                    crate::stderr_tail::drain_bounded_tail(stderr, crate::stderr_tail::STDERR_TAIL_BYTES)
-                })
-            });
+                    crate::stderr_tail::drain_into(stderr, &shared, crate::stderr_tail::STDERR_TAIL_BYTES);
+                    let _ = stderr_done_tx.send(());
+                });
+            }
 
+            // Shared with the drive thread so warnings read before a stall
+            // survive the timeout / disconnect paths.
+            let warnings = Arc::new(Mutex::new(Vec::new()));
             let (tx, rx) = mpsc::channel();
             let client_info = self.client_info.clone();
             let method_owned = method.to_owned();
+            let drive_warnings = Arc::clone(&warnings);
             thread::spawn(move || {
-                let output = drive_request(stdin, stdout, client_info, method_owned, params);
+                let output = drive_request(stdin, stdout, client_info, method_owned, params, &drive_warnings);
                 let _ = tx.send(output);
             });
 
             let driven = match rx.recv_timeout(self.timeout) {
                 Ok(output) => output,
-                Err(mpsc::RecvTimeoutError::Timeout) => DriveOutput {
-                    result: Err(Error::Timeout { after: self.timeout }),
-                    config_warnings: Vec::new(),
-                },
-                Err(mpsc::RecvTimeoutError::Disconnected) => DriveOutput {
-                    result: Err(Error::Io {
-                        detail: "app-server observer thread disconnected before responding".into(),
-                    }),
-                    config_warnings: Vec::new(),
-                },
+                Err(mpsc::RecvTimeoutError::Timeout) => Err(Error::Timeout { after: self.timeout }),
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(Error::Io {
+                    detail: "app-server observer thread disconnected before responding".into(),
+                }),
             };
 
             let _ = child.kill();
             let _ = child.wait();
-            let stderr_tail = stderr_thread.and_then(|handle| handle.join().ok()).unwrap_or_default();
+            // A descendant can keep the stderr pipe open after the child dies,
+            // so never join: wait a short grace, then use what was captured.
+            let _ = stderr_done_rx.recv_timeout(crate::stderr_tail::STDERR_DRAIN_GRACE);
+            let stderr_tail = crate::stderr_tail::snapshot(&stderr_shared);
+            let config_warnings = warnings.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
 
-            match driven.result {
+            match driven {
                 Ok(result) => Ok(Session {
                     result,
-                    config_warnings: driven.config_warnings,
+                    config_warnings,
                     stderr_tail,
                 }),
-                Err(err) => Err(attach_session_diagnostics(err, &driven.config_warnings, &stderr_tail)),
+                Err(err) => Err(attach_session_diagnostics(err, &config_warnings, &stderr_tail)),
             }
         }
     }
@@ -1655,8 +1731,9 @@ pub mod app_server {
                 "\n",
             );
             let mut reader = BufReader::new(std::io::Cursor::new(stdout));
-            let mut warnings = Vec::new();
-            let result = read_until_id(&mut reader, ID_REQUEST, &mut warnings).expect("result");
+            let warnings = Mutex::new(Vec::new());
+            let result = read_until_id(&mut reader, ID_REQUEST, &warnings).expect("result");
+            let warnings = warnings.into_inner().unwrap();
             assert!(
                 warnings.iter().any(|w| w.contains("default_permissions")),
                 "warnings={warnings:?}"
