@@ -11,9 +11,10 @@
 //! dedicated sibling lock file and writes this process's pid to the pid file.
 //! Production callers then [`PidFileGuard::hold_until_process_exit`]: the
 //! kernel releases the flock when this process actually exits, not when
-//! `serve()` returns. Dropping the guard at `serve()` return used to unlink
-//! the pid file and free the flock while the process was still in tokio
-//! runtime teardown, which let a replacement engine start beside it.
+//! `serve()` returns. Dropping the guard releases the flock and unlinks the
+//! pid file, so production callers must call `hold_until_process_exit` to
+//! keep the singleton held through `serve()` return and tokio runtime
+//! teardown until the process actually exits.
 //!
 //! The lock must not live on the pid-file inode: consumers remove the pid
 //! file while stopping or cleaning up stale engines, and unlinking a locked
@@ -170,8 +171,13 @@ impl PidFileGuard {
     /// and the unbounded `#[tokio::main]` runtime teardown after `main`
     /// returns — cannot free the singleton while this process is still
     /// alive. The pid file keeps naming this pid for the same lifetime.
+    ///
+    /// Because Drop never runs, the pid file is not unlinked on exit and may
+    /// name a dead (possibly recycled) pid until the next engine overwrites
+    /// it; consumers must validate liveness before trusting it.
     pub(super) fn hold_until_process_exit(self) {
-        std::mem::forget(self);
+        static HELD: std::sync::Mutex<Vec<PidFileGuard>> = std::sync::Mutex::new(Vec::new());
+        HELD.lock().unwrap_or_else(|e| e.into_inner()).push(self);
     }
 }
 

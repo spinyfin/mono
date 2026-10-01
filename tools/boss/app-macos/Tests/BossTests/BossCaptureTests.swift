@@ -342,6 +342,70 @@ final class EngineProcessControllerTests: XCTestCase {
         XCTAssertTrue(launchRecorder.socketPaths.isEmpty)
     }
 
+    func testClosedSocketWithLivePidFileNeverLaunchesWhileAlive() throws {
+        let fixture = try Fixture(reachableSocket: .none)
+        try "\(fixture.runningPid)\n".write(toFile: fixture.paths.pidPath, atomically: true, encoding: .utf8)
+        fixture.processObserver.markRunning(fixture.runningPid)
+        let launchRecorder = LaunchRecorder()
+        let controller = fixture.makeController(
+            stopPolicy: Fixture.fastStopPolicy
+        ) { _, _, socketPath in
+            launchRecorder.record(socketPath)
+            return 4242
+        }
+        defer { controller.stop() }
+
+        XCTAssertThrowsError(try controller.start()) { error in
+            XCTAssertTrue(
+                error.localizedDescription.contains("still alive after SIGKILL"),
+                "unexpected error: \(error.localizedDescription)"
+            )
+        }
+        XCTAssertEqual(fixture.processObserver.signals, [
+            SignalRecord(pid: fixture.runningPid, signal: SIGTERM),
+            SignalRecord(pid: fixture.runningPid, signal: SIGKILL),
+        ])
+        XCTAssertTrue(launchRecorder.socketPaths.isEmpty)
+    }
+
+    func testClosedSocketWithLivePidFileLaunchesOnceEngineIsKilled() throws {
+        let fixture = try Fixture(reachableSocket: .none)
+        try "\(fixture.runningPid)\n".write(toFile: fixture.paths.pidPath, atomically: true, encoding: .utf8)
+        fixture.processObserver.markRunning(fixture.runningPid)
+        fixture.processObserver.dieOnSignal = SIGKILL
+        let launchRecorder = LaunchRecorder()
+        let controller = fixture.makeController(
+            stopPolicy: Fixture.fastStopPolicy
+        ) { _, _, socketPath in
+            launchRecorder.record(socketPath)
+            return 4242
+        }
+        defer { controller.stop() }
+
+        try controller.restart()
+
+        XCTAssertEqual(launchRecorder.socketPaths, [fixture.paths.socketPath])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.paths.pidPath))
+    }
+
+    func testRetryAfterFailedStopDoesNotLaunchWhilePidAlive() throws {
+        let fixture = try Fixture(reachableSocket: .none)
+        try "\(fixture.runningPid)\n".write(toFile: fixture.paths.pidPath, atomically: true, encoding: .utf8)
+        fixture.processObserver.markRunning(fixture.runningPid)
+        let launchRecorder = LaunchRecorder()
+        let controller = fixture.makeController(
+            stopPolicy: Fixture.fastStopPolicy
+        ) { _, _, socketPath in
+            launchRecorder.record(socketPath)
+            return 4242
+        }
+        defer { controller.stop() }
+
+        XCTAssertThrowsError(try controller.restart())
+        XCTAssertThrowsError(try controller.restart())
+        XCTAssertTrue(launchRecorder.socketPaths.isEmpty)
+    }
+
     func testUnresponsiveReachableEngineIsKeptWithoutReplacement() throws {
         let fixture = try Fixture(reachableSocket: .primary, fingerprintAvailable: false)
         let launchRecorder = LaunchRecorder()

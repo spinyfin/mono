@@ -302,6 +302,7 @@ final class EngineProcessController: @unchecked Sendable {
                 emit("[engine upgrade] old engine stopped — launching new engine from bundle")
             }
 
+            try ensureNoLiveEngineProcess()
             let (command, bossBinDir) = resolveEngineCommand(socketPath: socketPath)
 
             let pid = try launchEngine(command: command, bossBinDir: bossBinDir, socketPath: socketPath)
@@ -431,6 +432,7 @@ final class EngineProcessController: @unchecked Sendable {
                     try stopRunningEngine(running)
                 }
 
+                try ensureNoLiveEngineProcess()
                 let socketPath = paths.socketPath
                 let (command, bossBinDir) = resolveEngineCommand(socketPath: socketPath)
                 let pid = try launchEngine(command: command, bossBinDir: bossBinDir, socketPath: socketPath)
@@ -809,38 +811,62 @@ final class EngineProcessController: @unchecked Sendable {
             )
         }
 
+        try confirmProcessGone(pid: pid, pidPath: running.pidPath, failureContext: rpcFailure?.localizedDescription ?? "unknown error")
+    }
+
+    /// Wait for `pid` to exit, escalating SIGTERM then SIGKILL, and throw if
+    /// death cannot be confirmed so no replacement engine is launched.
+    private func confirmProcessGone(pid: pid_t, pidPath: String, failureContext: String) throws {
         if waitForProcessExit(pid: pid, timeout: stopPolicy.pidExitTimeout) {
-            clearPIDFileIfOwned(pid: pid, pidPath: running.pidPath)
+            clearPIDFileIfOwned(pid: pid, pidPath: pidPath)
             return
         }
 
         guard processObserver.isRunning(pid) else {
-            clearPIDFileIfOwned(pid: pid, pidPath: running.pidPath)
+            clearPIDFileIfOwned(pid: pid, pidPath: pidPath)
             return
         }
         guard processObserver.isLikelyEngine(pid) else {
             throw controllerError(
-                "engine pid \(pid) is still alive after stop, but is not a running Boss engine: \(rpcFailure?.localizedDescription ?? "unknown error")"
+                "engine pid \(pid) is still alive after stop, but is not a running Boss engine: \(failureContext)"
             )
         }
 
         emit("[engine stop] pid=\(pid) still alive after socket close; sending SIGTERM")
         processObserver.sendSignal(pid, SIGTERM)
         if waitForProcessExit(pid: pid, timeout: stopPolicy.termWaitTimeout) {
-            clearPIDFileIfOwned(pid: pid, pidPath: running.pidPath)
+            clearPIDFileIfOwned(pid: pid, pidPath: pidPath)
             return
         }
 
         emit("[engine stop] pid=\(pid) still alive after SIGTERM; sending SIGKILL")
         processObserver.sendSignal(pid, SIGKILL)
         if waitForProcessExit(pid: pid, timeout: stopPolicy.killWaitTimeout) {
-            clearPIDFileIfOwned(pid: pid, pidPath: running.pidPath)
+            clearPIDFileIfOwned(pid: pid, pidPath: pidPath)
             return
         }
 
         throw controllerError(
             "engine pid \(pid) is still alive after SIGKILL; refusing to launch a replacement"
         )
+    }
+
+    /// Before any replacement launch: an engine whose socket is already closed
+    /// (or whose earlier stop failed) can still be alive and named by its pid
+    /// file. Route a validated live pid through the bounded exit wait and
+    /// escalation, and throw if it cannot be confirmed gone.
+    private func ensureNoLiveEngineProcess() throws {
+        for endpoint in paths.endpointPaths {
+            guard let pid = currentEnginePID(pidPath: endpoint.pidPath) else {
+                continue
+            }
+            emit("[engine launch] pid=\(pid) from \(endpoint.pidPath) is still alive with no reachable socket; waiting for it to exit")
+            try confirmProcessGone(
+                pid: pid,
+                pidPath: endpoint.pidPath,
+                failureContext: "socket \(endpoint.socketPath) was not reachable"
+            )
+        }
     }
 
     /// Poll until `pid` is gone or `timeout` elapses. Socket close is not
