@@ -86,7 +86,7 @@ impl WorkDb {
             return Ok(ReviseDocOutcome::NoUnresolvedComments);
         }
 
-        let directive = compose_guide_comment_directive(self, &canonical_pr, &series_id, &candidates);
+        let directive = compose_guide_comment_directive(&tx, &canonical_pr, &series_id, &candidates);
         let name = format!(
             "Address {} reviewer comment{}",
             candidates.len(),
@@ -360,7 +360,7 @@ pub(crate) fn resolve_guide_aware_comments(conn: &Connection, task_id: &str, now
 /// branch (`runner/prompt.rs`), which fires for every dispatch of this
 /// revision, so keeping one copy avoids the two prose blocks drifting apart.
 fn compose_guide_comment_directive(
-    db: &WorkDb,
+    conn: &Connection,
     canonical_pr: &str,
     series_id: &str,
     comments: &[WorkComment],
@@ -378,7 +378,7 @@ fn compose_guide_comment_directive(
                 context.version_id, context.comparison_id, context.head_sha
             ));
         }
-        push_comment_directive_block(db, &mut out, comment);
+        push_comment_directive_block(conn, &mut out, comment);
     }
     out.push_str(
         "Please update the PR implementation and tests. Do not treat a regenerated guide as completing this work.",
@@ -392,9 +392,9 @@ mod tests {
     use crate::test_support::open_db;
     use crate::work::{FakePrStateChecker, PrOpenState, RetryReviewGuideOutcome, WorkerPrCompletionTarget};
     use boss_protocol::{
-        CreateExecutionInput, ExecutionKind, ExecutionStatus, FinishExecutionRunInput,
-        GuideCommentDisposition, GuideCommentOutcome, THREAD_ENTRY_KIND_ANSWER,
-        THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, TaskKind, WorkItem, WorkItemPatch,
+        CreateExecutionInput, ExecutionKind, ExecutionStatus, FinishExecutionRunInput, GuideCommentDisposition,
+        GuideCommentOutcome, THREAD_ENTRY_KIND_ANSWER, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, TaskKind, WorkItem,
+        WorkItemPatch,
     };
 
     fn open_checker() -> FakePrStateChecker {

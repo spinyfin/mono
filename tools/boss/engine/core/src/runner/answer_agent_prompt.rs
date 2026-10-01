@@ -305,9 +305,11 @@ async fn compose_guide_answer_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{create_active_chore, create_product, open_db, seed_published_guide_comment};
-    use crate::work::{ExecutionKind, ExecutionStatus};
-    use boss_protocol::{CommentAnchor, CreateCommentInput};
+    use crate::test_support::{
+        create_active_chore, create_product, open_db, seed_published_guide_comment, seed_review_guide_series,
+    };
+    use crate::work::{ExecutionKind, ExecutionStatus, PublishReviewGuideOutcome};
+    use boss_protocol::{CommentAnchor, CreateCommentInput, WorkItemPatch};
 
     fn seed_guide_comment(db: &WorkDb) -> (String, boss_protocol::WorkComment) {
         let (root, _series, comment) = seed_published_guide_comment(db, 9, "why does this retry forever?");
@@ -374,6 +376,19 @@ mod tests {
             prompt.contains("why does this retry forever?"),
             "prompt must carry the comment body:\n{prompt}",
         );
+        // No `AnswerAgentRun` was ever stamped `workspace_positioned = true`
+        // for this execution (the coordinator's dispatch/goto path never ran
+        // in this unit test), so the prompt must not claim the checkout is on
+        // the PR head — it would be a fresh `cube change create` checkout in
+        // production too, under the exact same "no run row" condition.
+        assert!(
+            !prompt.contains("Your leased checkout is positioned on the current PR head"),
+            "prompt must not claim PR-head positioning when it never happened:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Your leased checkout is a fresh change off the default base branch"),
+            "prompt must state the checkout is NOT on the PR head:\n{prompt}"
+        );
     }
 
     #[tokio::test]
@@ -435,19 +450,6 @@ mod tests {
         assert!(
             prompt.contains("could not resolve the comment this run was spawned for"),
             "non-PR-implementation target must produce a diagnosable fallback, not an empty prompt:\n{prompt}",
-        );
-        // No `AnswerAgentRun` was ever stamped `workspace_positioned = true`
-        // for this execution (the coordinator's dispatch/goto path never ran
-        // in this unit test), so the prompt must not claim the checkout is on
-        // the PR head — it would be a fresh `cube change create` checkout in
-        // production too, under the exact same "no run row" condition.
-        assert!(
-            !prompt.contains("Your leased checkout is positioned on the current PR head"),
-            "prompt must not claim PR-head positioning when it never happened:\n{prompt}"
-        );
-        assert!(
-            prompt.contains("Your leased checkout is a fresh change off the default base branch"),
-            "prompt must state the checkout is NOT on the PR head:\n{prompt}"
         );
     }
 
