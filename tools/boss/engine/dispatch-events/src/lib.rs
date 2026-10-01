@@ -385,23 +385,12 @@ pub enum Stage {
     /// (`host_disabled` / `host_removed`) so the re-route is diagnosable
     /// from `bossctl dispatch tail`.
     HostDrainReconcile,
-    /// The periodic spawn-ack sweep (`boss_engine::spawn_ack_sweep`) found a
-    /// slot stuck in `Spawning` that never reported a shell pid AND never
-    /// received a single hook event, past the grace window — proof no
-    /// worker process ever came up at all, not merely one blocked on the
-    /// interactive directory-trust prompt (which `mark_stalled_spawns`
-    /// still handles, and which always has a pid). The execution has been
-    /// marked `orphaned`, the app's pane torn down, the pool slot
-    /// released, and the work item will be redispatched by the orphan
-    /// sweep on the next tick. This is the fix for the 2026-07-03/04
-    /// false-live incident, where such a slot instead sat at
-    /// `activity=waiting_for_input, shell_pid=0` forever, requiring a
-    /// human to notice and manually reap it. Distinct from
-    /// `dead_pid_reconcile` (a pid WAS observed, then the process died)
-    /// and `stale_worker_reconcile` (a pid is alive but wedged after
-    /// reaching `working`) — here no pid was ever observed at all. The
-    /// `details` object carries `shell_pid` (always `0`) and the
-    /// `threshold_secs` grace window that elapsed.
+    /// Historical spawn-ack timeout stage, retained for decoding old logs.
+    /// No current producer: the engine's never-started reap now emits
+    /// [`Stage::DriverStartTimeout`]. Previously produced when the
+    /// periodic spawn-ack sweep found a slot stuck in `Spawning` that
+    /// never reported a shell pid AND never received a single hook event,
+    /// past the grace window.
     SpawnAckTimeout,
     /// A worker pane came up, but no **driver-originated** signal — a hook
     /// event or a `transcript_path` — ever arrived, so the driver binary
@@ -438,7 +427,8 @@ pub enum Stage {
     DispatchFailureRecoveryRedispatch,
     /// Historical app-owned spawn rejection, retained for decoding old logs.
     /// No current producer: viewer surface failures are recorded in the app's
-    /// spawn JSONL, while the engine's never-started reap uses SpawnAckTimeout.
+    /// spawn JSONL, while the engine's never-started reap emits
+    /// [`Stage::DriverStartTimeout`].
     SpawnNack,
     /// Historical app-owned pane death before proof of life, retained for
     /// decoding old logs. Engine-observed tmux driver death now uses the

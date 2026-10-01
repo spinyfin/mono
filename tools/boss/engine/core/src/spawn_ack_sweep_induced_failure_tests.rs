@@ -26,12 +26,12 @@
 //!    the invariant also declines because re-adoption did not create a new
 //!    pane awaiting acknowledgement.
 //!
-//! Then pass 2 fires and the resources are actually returned. The point of
-//! asserting steps 1–3 rather than only step 4 is that a future change
-//! which "fixes" this by loosening one of those three would be silently
-//! reintroducing the false positives each guard exists to prevent — this
-//! test makes that visible. Two `#[tokio::test]`s below share the same
-//! fixture, one for each pass-1 decline shape.
+//! Then driver-start verification fires and the resources are actually
+//! returned. The point of asserting steps 1–3 rather than only step 4 is
+//! that a future change which "fixes" this by loosening one of those three
+//! would be silently reintroducing the false positives each guard exists
+//! to prevent — this test makes that visible. Two `#[tokio::test]`s below
+//! share the same fixture, one engine-spawned, one re-adopted.
 
 use std::sync::Arc;
 

@@ -559,10 +559,9 @@ impl ServerState {
     }
 
     /// Break-glass release of a worker slot the engine has NO live run
-    /// tracked for — a "husk" pane: the app still hosts a session in
-    /// `slot_id`, but the engine has already terminal-failed or
-    /// forgotten the run that used to occupy it (crash, terminal-fail
-    /// path bug, spawn-ack timeout). `bossctl agents retire-pane`
+    /// tracked for — a leftover Ghostty viewer on a slot that has no
+    /// live-tracked run. The engine has already terminal-failed or
+    /// forgotten the run that used to occupy it. `bossctl agents retire-pane`
     /// resolves a crew name or run id to `slot_id` client-side before
     /// calling this — the wire request stays slot-keyed since that is
     /// what identifies a pane to the app.
@@ -642,19 +641,34 @@ impl ServerState {
             match self.hosted_pane_run_for_slot(slot_id).await {
                 SlotOccupancy::Occupied(run_id) => {
                     retiring_run = Some(run_id.clone());
-                    if let Some(status) = self.durable_occupant_with_worker(&run_id) {
-                        // Durable occupancy says a run that plausibly has a worker
-                        // still holds this slot, even though live-state has nothing.
-                        // Retiring it as a husk would tear down a worker the engine
-                        // lost track of rather than a leftover viewer.
-                        tracing::warn!(
-                            slot_id,
-                            run_id = %run_id,
-                            %status,
-                            "retire_pane: refusing — no live-state entry, but the slot's durable occupant still \
-                             plausibly has a worker",
-                        );
-                        return Err(RetirePaneError::LiveRunTracked { slot_id, run_id });
+                    match self.durable_occupant_with_worker(&run_id) {
+                        Ok(Some(status)) => {
+                            // Durable occupancy says a run that plausibly has a worker
+                            // still holds this slot, even though live-state has nothing.
+                            // Retiring it as a husk would tear down a worker the engine
+                            // lost track of rather than a leftover viewer.
+                            tracing::warn!(
+                                slot_id,
+                                run_id = %run_id,
+                                %status,
+                                "retire_pane: refusing — no live-state entry, but the slot's durable occupant still \
+                                 plausibly has a worker",
+                            );
+                            return Err(RetirePaneError::LiveRunTracked { slot_id, run_id });
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                slot_id,
+                                run_id = %run_id,
+                                error = %format!("{err:#}"),
+                                "retire_pane: refusing — durable occupancy of this slot could not be read",
+                            );
+                            return Err(RetirePaneError::OccupancyInconclusive {
+                                slot_id,
+                                reason: format!("could not read execution status: {err:#}"),
+                            });
+                        }
+                        Ok(None) => {}
                     }
                     if let Some(evidence) = self.durable_live_process_evidence(&run_id) {
                         // Guard 3 (reality, with NO bookkeeping at all): the engine has no
@@ -690,7 +704,13 @@ impl ServerState {
                             ?outcome,
                             "retire_pane: durable-state teardown completed for a terminal-entry-with-live-process pane",
                         );
-                        return Ok(());
+                        return match outcome {
+                            PaneReleaseOutcome::Reaped => Ok(()),
+                            PaneReleaseOutcome::NoLiveWorker => Err(RetirePaneError::OccupancyInconclusive {
+                                slot_id,
+                                reason: format!("durable pid is alive but tmux teardown was refused for {run_id}"),
+                            }),
+                        };
                     }
                 }
                 SlotOccupancy::Inconclusive { reason, .. } => {
@@ -762,6 +782,7 @@ impl ServerState {
     /// ([`Self::hosted_pane_run_for_slot`]) and
     /// [`Self::live_worker_states_snapshot`]: live,
     /// engine-lost-track-of-it-but-durably-alive (`LiveProcessNoRegistry`),
+    /// durable status says a worker should exist (`DurableOccupantNoRegistry`),
     /// uncorroborated occupancy (`OccupancyInconclusive`), or a true husk.
     /// `ListHostedPanes` describes the viewer (summary,
     /// task title, which slots have a surface); it is not the occupancy
@@ -827,25 +848,46 @@ impl ServerState {
                 // No live-state (or live-state for a different run than
                 // occupancy). Classify from durable occupancy of THIS slot,
                 // never from the viewer's claimed `pane.run_id`.
-                (_, SlotOccupancy::Occupied(run_id)) => match self
-                    .durable_occupant_with_worker(&run_id)
-                    .map(|status| format!("durable occupant is `{status}` with no live-state entry"))
-                    .or_else(|| self.durable_live_process_evidence(&run_id))
-                {
-                    Some(evidence) => {
+                (_, SlotOccupancy::Occupied(run_id)) => match self.durable_occupant_with_worker(&run_id) {
+                    Err(err) => {
                         tracing::warn!(
                             slot_id = pane.slot_id,
                             run_id = %run_id,
-                            %evidence,
-                            "pane classification: the engine has no live-state entry for this slot, but the \
-                             run's durably-recorded worker process is still alive; NOT a husk. This is a \
-                             re-adoption candidate for the sweep, and a `LiveProcessNoRegistry` pane for \
-                             `agents list --all` / worker-reference resolution — see \
-                             `boss_engine::worker_readoption`.",
+                            error = %format!("{err:#}"),
+                            "pane classification: durable occupancy of this slot could not be read; NOT a husk",
                         );
-                        HostedPaneState::LiveProcessNoRegistry { evidence }
+                        HostedPaneState::OccupancyInconclusive {
+                            evidence: format!("could not read execution status: {err:#}"),
+                        }
                     }
-                    None => HostedPaneState::Husk,
+                    Ok(Some(status)) => {
+                        tracing::warn!(
+                            slot_id = pane.slot_id,
+                            run_id = %run_id,
+                            %status,
+                            "pane classification: the engine has no live-state entry for this slot, but \
+                             durable status says a worker should exist; NOT a husk",
+                        );
+                        HostedPaneState::DurableOccupantNoRegistry {
+                            status: status.to_string(),
+                        }
+                    }
+                    Ok(None) => match self.durable_live_process_evidence(&run_id) {
+                        Some(evidence) => {
+                            tracing::warn!(
+                                slot_id = pane.slot_id,
+                                run_id = %run_id,
+                                %evidence,
+                                "pane classification: the engine has no live-state entry for this slot, but the \
+                                 run's durably-recorded worker process is still alive; NOT a husk. This is a \
+                                 re-adoption candidate for the sweep, and a `LiveProcessNoRegistry` pane for \
+                                 `agents list --all` / worker-reference resolution — see \
+                                 `boss_engine::worker_readoption`.",
+                            );
+                            HostedPaneState::LiveProcessNoRegistry { evidence }
+                        }
+                        None => HostedPaneState::Husk,
+                    },
                 },
                 (_, SlotOccupancy::Inconclusive { reason, .. }) => {
                     tracing::warn!(
@@ -1080,9 +1122,9 @@ impl ServerState {
     /// have no worker by design and are not included. Shared by
     /// `retire_pane`'s refusal and `list_hosted_pane_statuses`'s non-husk
     /// classification so the two cannot disagree.
-    fn durable_occupant_with_worker(&self, run_id: &str) -> Option<boss_protocol::ExecutionStatus> {
-        let status = self.work_db.get_execution(run_id).ok()?.status;
-        (status.is_live() || status == boss_protocol::ExecutionStatus::Claimed).then_some(status)
+    fn durable_occupant_with_worker(&self, run_id: &str) -> Result<Option<boss_protocol::ExecutionStatus>> {
+        let status = self.work_db.get_execution(run_id)?.status;
+        Ok((status.is_live() || status == boss_protocol::ExecutionStatus::Claimed).then_some(status))
     }
 
     /// Restart-robust counterpart to

@@ -68,14 +68,15 @@
 //! a [`Stage::BreakerRecoveryProbeAdmitted`] event, so it is distinguishable
 //! in `bossctl dispatch tail` from a pause that is not being honoured.
 //! `pr_review` rows are never eligible — see
-//! [`maybe_admit_recovery_probe`]. A real shell
-//! pid reported for that canary is proof the spawn path works again and
+//! [`maybe_admit_recovery_probe`]. A driver-originated
+//! signal for that canary (hook event or transcript path — not merely a
+//! pane pid) is proof the spawn path works again and
 //! auto-resumes dispatch ([`resume_dispatch_after_breaker_recovery`]); a
 //! reap of the canary (driver-start timeout or app NACK) backs off
 //! exponentially before the next attempt. Dispatch also auto-resumes on a
 //! fresh app session registering — an app relaunch is the operator's
 //! natural recovery action after e.g. waking the display, so it clears the
-//! breaker exactly like a real shell pid would. This recovery machinery is
+//! breaker exactly like a driver-originated signal would. This recovery machinery is
 //! self-gating: it only ever activates on top of a real Breaker-origin
 //! pause, and a real pause only happens when the flag is enabled, so no
 //! separate flag check is needed inside it.
@@ -131,25 +132,29 @@ pub const SPAWN_HEALTH_PROBE_BACKOFF_MAX_SECS: i64 = 900;
 /// [`SpawnHealthTracker::try_admit_probe`] itself.
 ///
 /// Both of those normal resolution paths assume the canary either reports a
-/// shell pid or gets reaped by [`crate::spawn_ack_sweep::reap_never_started_spawn`].
-/// But `force_dispatch` returns as soon as scheduling completes, and the
-/// actual pane spawn happens later in a detached task — if that task's
-/// `adapter.spawn_worker` call itself errors, the execution goes straight to
-/// terminal `failed` with no live slot, which both reap paths skip (a
-/// terminal execution isn't `Spawning` and isn't reap-eligible). Without this
-/// deadline that leaves `in_flight` set forever, so `try_admit_probe` would
-/// refuse to admit a next canary and dispatch would stay Breaker-paused
-/// until a human ran `bossctl dispatch resume` — the exact latch this module
-/// exists to eliminate.
+/// driver-originated signal ([`SpawnHealthTracker::record_probe_success`],
+/// called from the first driver-signal site) or is reaped by driver-start
+/// verification ([`SpawnHealthTracker::record_probe_failure`] from
+/// [`crate::spawn_ack_sweep::reap_never_started_spawn`]). A pane pid alone
+/// does not count: the breaker trips on driver-start timeouts, so recovery
+/// proof is the same class of evidence. But `force_dispatch` returns as soon
+/// as scheduling completes, and the actual pane spawn happens later in a
+/// detached task — if that task's `adapter.spawn_worker` call itself errors,
+/// the execution goes straight to terminal `failed` with no live slot, which
+/// both reap paths skip (a terminal execution isn't `Spawning` and isn't
+/// reap-eligible). Without this deadline that leaves `in_flight` set forever,
+/// so `try_admit_probe` would refuse to admit a next canary and dispatch
+/// would stay Breaker-paused until a human ran `bossctl dispatch resume` —
+/// the exact latch this module exists to eliminate.
 ///
-/// The only reap path for a canary that reported a pid but never produced a
-/// driver signal is the driver-start check, which fires after
-/// [`crate::live_worker_state::DRIVER_START_GRACE_SECS`] and is observed on
-/// the next sweep tick. The deadline is that grace plus two sweep intervals
-/// (60s each) of slack, so the driver-start reap always resolves a live
-/// canary first and a second canary is never admitted while the first is
-/// still alive. This is strictly a last-resort backstop for the
-/// terminal-without-reap case.
+/// A healthy canary is resolved by its first driver-originated signal, which
+/// clears `in_flight` so a second canary is never admitted while the first is
+/// still working. A canary that never produces that signal is resolved by
+/// the driver-start reap after
+/// [`crate::live_worker_state::DRIVER_START_GRACE_SECS`], observed on the
+/// next sweep tick. The deadline is that grace plus two sweep intervals
+/// (60s each) of slack, so the reap runs first for a silent canary. This is
+/// strictly a last-resort backstop for the terminal-without-reap case.
 pub const SPAWN_HEALTH_PROBE_STALL_DEADLINE_SECS: i64 = crate::live_worker_state::DRIVER_START_GRACE_SECS + 120;
 
 /// Sentinel for [`SpawnHealthTracker::last_disabled_signal_at`] meaning "no
@@ -659,7 +664,7 @@ impl SpawnHealthTracker {
         self.probe.lock().unwrap().consecutive_failures
     }
 
-    /// The in-flight probe failed (reaped by the spawn-ack-timeout sweep, an
+    /// The in-flight probe failed (reaped by driver-start verification, an
     /// app NACK, or a synchronous force-dispatch error) — clear it and back
     /// off exponentially before the next attempt. No-op when `execution_id`
     /// isn't the current in-flight probe, so an unrelated reap during the
@@ -674,9 +679,9 @@ impl SpawnHealthTracker {
         probe.next_attempt_at = now_epoch_secs + probe_backoff_secs(probe.consecutive_failures);
     }
 
-    /// The in-flight probe succeeded (a real shell pid was reported for
-    /// it): fully reset the probe state so the next outage's probing starts
-    /// fresh, with no inherited backoff. Returns `true` only when
+    /// The in-flight probe succeeded (a driver-originated signal arrived
+    /// for it): fully reset the probe state so the next outage's probing
+    /// starts fresh, with no inherited backoff. Returns `true` only when
     /// `execution_id` was in fact the in-flight probe — the caller uses
     /// this to decide whether to auto-resume dispatch.
     pub fn record_probe_success(&self, execution_id: &str) -> bool {
@@ -819,8 +824,8 @@ pub async fn maybe_admit_recovery_probe(
             tracing::info!(
                 execution_id = %candidate.id,
                 worker_id,
-                "spawn-capability breaker: recovery probe dispatched; awaiting a shell-pid \
-                 report (success) or a reap (failure, backs off)",
+                "spawn-capability breaker: recovery probe dispatched; awaiting a \
+                 driver-originated signal (success) or a reap (failure, backs off)",
             );
         }
         Err(err) => {
@@ -840,8 +845,8 @@ pub async fn maybe_admit_recovery_probe(
 
 /// Auto-resume dispatch after Breaker-origin evidence that the app's spawn
 /// path is healthy again — either the half-open recovery probe's canary
-/// reported a real shell pid, or a fresh app session registered (the
-/// operator's natural recovery action, e.g. relaunching the app after
+/// reported a driver-originated signal, or a fresh app session registered
+/// (the operator's natural recovery action, e.g. relaunching the app after
 /// waking the display).
 ///
 /// No-ops when dispatch isn't currently paused, and — critically — when the
@@ -908,6 +913,38 @@ pub async fn resume_dispatch_after_breaker_recovery(
         )
         .await;
     true
+}
+
+/// If `run_id` is the in-flight spawn-capability recovery canary, record that
+/// its driver started and auto-resume a Breaker-origin pause.
+///
+/// Call this from the first driver-originated signal site (hook, transcript
+/// path, correlated transcript). A pane pid is not proof: the breaker trips
+/// on driver-start timeouts. No-op when `run_id` is not the in-flight probe,
+/// when dispatch is not paused, or when the current pause is operator-origin.
+/// Returns `true` when dispatch was actually resumed.
+pub async fn maybe_resume_after_canary_driver_signal(
+    spawn_health: &SpawnHealthTracker,
+    work_db: &WorkDb,
+    coordinator: &Arc<ExecutionCoordinator>,
+    dispatch_events: &dyn DispatchEventSink,
+    run_id: &str,
+) -> bool {
+    if !spawn_health.record_probe_success(run_id) {
+        return false;
+    }
+    let resumed = resume_dispatch_after_breaker_recovery(
+        work_db,
+        coordinator,
+        dispatch_events,
+        Some(run_id),
+        "recovery probe reported a driver-originated signal",
+    )
+    .await;
+    if resumed {
+        coordinator.kick();
+    }
+    resumed
 }
 
 /// The failure that tripped the breaker, bundled so
@@ -1681,6 +1718,59 @@ mod tests {
         let resumed = resume_dispatch_after_breaker_recovery(&db, &coordinator, &sink, None, "test recovery").await;
 
         assert!(!resumed);
+    }
+
+    #[tokio::test]
+    async fn driver_signal_for_an_admitted_canary_clears_in_flight_and_resumes_breaker_pause() {
+        let (_dir, db) = open_db_arc();
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.pause_dispatch(
+            1000,
+            DispatchPauseOrigin::Breaker,
+            PauseReason::new("test: breaker pause").unwrap(),
+        );
+        let spawn_health = SpawnHealthTracker::new();
+        spawn_health.mark_probe_dispatched("exec-canary", 1000);
+        assert!(spawn_health.is_probe_execution("exec-canary"));
+
+        let sink = RecordingDispatchEventSink::new();
+        let resumed =
+            maybe_resume_after_canary_driver_signal(&spawn_health, &db, &coordinator, &sink, "exec-canary").await;
+
+        assert!(resumed);
+        assert!(!spawn_health.is_probe_execution("exec-canary"));
+        assert!(!coordinator.is_dispatch_paused());
+        let events = sink.events().await;
+        assert!(
+            events.iter().any(|e| e.stage == "spawn_capability_recovered"),
+            "expected a recovery event, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn driver_signal_for_a_non_canary_does_not_resume_breaker_pause() {
+        let (_dir, db) = open_db_arc();
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.pause_dispatch(
+            1000,
+            DispatchPauseOrigin::Breaker,
+            PauseReason::new("test: breaker pause").unwrap(),
+        );
+        let spawn_health = SpawnHealthTracker::new();
+        spawn_health.mark_probe_dispatched("exec-canary", 1000);
+
+        let resumed = maybe_resume_after_canary_driver_signal(
+            &spawn_health,
+            &db,
+            &coordinator,
+            &NoopDispatchEventSink,
+            "exec-other",
+        )
+        .await;
+
+        assert!(!resumed);
+        assert!(spawn_health.is_probe_execution("exec-canary"));
+        assert!(coordinator.is_dispatch_paused());
     }
 
     // ─── breaker flag: disabled mode observes but never pauses ────────────

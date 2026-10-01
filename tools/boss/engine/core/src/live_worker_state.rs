@@ -998,11 +998,12 @@ impl LiveWorkerStateRegistry {
         Some(should_raise)
     }
 
-    /// Whether `slot_id`'s current registration is owed spawn-ack proof
-    /// (`EngineSpawned`) or was re-adopted (`Readopted`) — see
-    /// [`DriverStartExpectation`]. Driver-start verification itself
-    /// applies to both cases; this only distinguishes which timeout
-    /// question is in play. `None` for a slot with no live entry.
+    /// Whether `slot_id`'s current registration is owed driver-start proof
+    /// for a pane this engine spawned (`EngineSpawned`) or was re-adopted
+    /// (`Readopted`) — see [`DriverStartExpectation`]. Driver-start
+    /// verification itself applies to both cases; this only distinguishes
+    /// which timeout question is in play. `None` for a slot with no live
+    /// entry.
     pub fn driver_start_expectation(&self, slot_id: u8) -> Option<DriverStartExpectation> {
         let guard = self.inner.lock().expect("registry mutex poisoned");
         guard.get(&slot_id).map(|entry| entry.meta.driver_start_expectation)
@@ -2623,7 +2624,7 @@ mod tests {
         assert_eq!(
             state.activity,
             WorkerActivity::Spawning,
-            "must remain Spawning — spawn_ack_sweep owns the pid-less timeout path"
+            "must remain Spawning — driver-start verification owns the pid-less timeout path"
         );
         assert_eq!(state.shell_pid, 0);
     }

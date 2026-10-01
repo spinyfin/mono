@@ -8,6 +8,23 @@ use crate::driver::{AgentDriver, Capability, ClaudeDriver};
 use crate::live_worker_state::DriverSignalKind;
 
 impl ServerState {
+    /// Stamp a driver-originated signal and, if this run is the in-flight
+    /// spawn-capability recovery canary, auto-resume a Breaker-origin pause.
+    pub(super) async fn record_driver_signal(&self, run_id: &str, kind: DriverSignalKind) -> Option<u8> {
+        let slot = self.live_worker_states.record_driver_signal(run_id, kind);
+        if slot.is_some() {
+            crate::spawn_health::maybe_resume_after_canary_driver_signal(
+                &self.spawn_health,
+                &self.work_db,
+                &self.execution_coordinator,
+                self.dispatch_events.as_ref(),
+                run_id,
+            )
+            .await;
+        }
+        slot
+    }
+
     /// First call for a given `execution_id` returns `true` (and remembers
     /// it); every subsequent call for the same id returns `false`. Used to
     /// downgrade the post-hoc-interception loss-of-guards warning from a
@@ -64,8 +81,23 @@ impl crate::stdout_progress::WorkerEventSink for Arc<ServerState> {
         // "the engine saw the rollout grow, or attached to it" is the same
         // fact, just observed earlier — before any record in it has been
         // parsed rather than alongside the first one.
-        self.live_worker_states
+        let slot = self
+            .live_worker_states
             .record_driver_signal(run_id, DriverSignalKind::TranscriptPath);
+        if slot.is_some() {
+            let server = Arc::clone(self);
+            let run_id = run_id.to_owned();
+            tokio::spawn(async move {
+                crate::spawn_health::maybe_resume_after_canary_driver_signal(
+                    &server.spawn_health,
+                    &server.work_db,
+                    &server.execution_coordinator,
+                    server.dispatch_events.as_ref(),
+                    &run_id,
+                )
+                .await;
+            });
+        }
     }
 
     async fn dispatch_worker_event(&self, incoming: crate::events_socket::IncomingHookEvent) {
@@ -490,8 +522,8 @@ pub(super) async fn dispatch_live_worker_state(
     // hosting nothing but an idle login shell. See
     // `LiveWorkerStateRegistry::unverified_driver_starts`.
     server_state
-        .live_worker_states
-        .record_driver_signal(run_id, DriverSignalKind::HookEvent);
+        .record_driver_signal(run_id, DriverSignalKind::HookEvent)
+        .await;
     // Resolve any outstanding pane-injection delivery waiter for this
     // run. A `UserPromptSubmit` hook is the CLI's own confirmation
     // that it enqueued *something* as the next prompt; when a probe
@@ -562,8 +594,8 @@ pub(super) async fn dispatch_live_worker_state(
         // learns a transcript path rather than depending on the two
         // staying adjacent.
         server_state
-            .live_worker_states
-            .record_driver_signal(run_id, DriverSignalKind::TranscriptPath);
+            .record_driver_signal(run_id, DriverSignalKind::TranscriptPath)
+            .await;
         // `run_id` here is the `_boss_run_id` from the hook payload,
         // which carries the **execution_id** (`exec_*`) — not a
         // `work_runs.id` (`run_*`). The setter joins on
@@ -744,8 +776,8 @@ pub(super) async fn dispatch_live_worker_state(
     // idempotent and first-write-wins — makes the record land for local and
     // remote runs alike, whichever side of registration the hook fell on.
     server_state
-        .live_worker_states
-        .record_driver_signal(run_id, DriverSignalKind::HookEvent);
+        .record_driver_signal(run_id, DriverSignalKind::HookEvent)
+        .await;
     let prior_activity = server_state.live_worker_states.get(slot_id).map(|s| s.activity);
     let changed = server_state.live_worker_states.apply_event(slot_id, &incoming.event);
     if changed {

@@ -523,6 +523,16 @@ impl ServerState {
                 ),
                 evidence,
             );
+            if evidence == crate::live_worker_state::ReadoptionEvidence::DriverHook {
+                crate::spawn_health::maybe_resume_after_canary_driver_signal(
+                    &self.spawn_health,
+                    &self.work_db,
+                    &self.execution_coordinator,
+                    self.dispatch_events.as_ref(),
+                    run_id,
+                )
+                .await;
+            }
             match self.work_db.get_run_semantic_progress_checkpoint(run_id) {
                 Ok(Some(checkpoint)) => self.live_worker_states.seed_semantic_progress(slot_id, &checkpoint),
                 Ok(None) => {}
@@ -768,21 +778,14 @@ impl ServerState {
     /// `detach_untracked_worker_viewer`.
     ///
     /// Host safety: a remote run never occupies a tmux/app-hosted local
-    /// slot, but it still records a `work_runs.agent_id` (e.g. a
-    /// re-adoption placeholder), and that id is never authoritative for a
-    /// local pool slot — so this returns `None` outright for anything but a
-    /// `host_id == "local"` run. `None` also covers "no run row recorded a
-    /// worker id" and "the recorded id does not parse as a pool slot".
+    /// slot. [`crate::work::WorkDb::latest_local_agent_id_for_execution`]
+    /// already returns `None` when the newest row is remote, so this reads
+    /// that same row the slot-to-run occupancy lookup uses rather than the
+    /// transcript-preferring hook resolver. `None` also covers "no local
+    /// run row recorded a worker id" and "the recorded id does not parse
+    /// as a pool slot".
     pub(super) fn hosted_pane_slot_for_run(&self, run_id: &str) -> Option<u8> {
-        match self.work_db.latest_run_host_for_execution(run_id) {
-            Ok(Some(host)) if host == "local" => {}
-            Ok(_) => return None,
-            Err(err) => {
-                tracing::debug!(run_id, %err, "readopt: could not read the durable run host for this run");
-                return None;
-            }
-        }
-        match self.work_db.latest_run_agent_id_for_execution(run_id) {
+        match self.work_db.latest_local_agent_id_for_execution(run_id) {
             Ok(Some(agent_id)) => crate::coordinator::slot_id_from_worker_id(&agent_id),
             Ok(None) => None,
             Err(err) => {

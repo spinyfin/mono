@@ -5,7 +5,7 @@
 //! Backs `bossctl agents list --all` and worker-reference resolution
 //! (crew name / slot id / run id) for every `agents` verb: a name or slot
 //! visible in the app must resolve even after the engine drops the live
-//! registry entry (crash, terminal-fail path, spawn-ack timeout). See
+//! registry entry (crash, terminal-fail path, leftover viewer). See
 //! `boss_engine::app::pane_ops::ServerState::list_hosted_pane_statuses`
 //! for how this is computed, and [`crate::HostedPaneEntry`] for the raw
 //! (unclassified) app report this is derived from.
@@ -22,10 +22,17 @@ pub enum HostedPaneState {
     Live,
     /// No live registry entry (or only a terminal one), but durable
     /// state — `work_runs.shell_pid` plus the execution's own row —
-    /// corroborates a still-running worker process. This is the shape a
-    /// worker the engine has lost track of takes: durably tracked, not
-    /// live-tracked. `evidence` names the corroborating signal.
+    /// corroborates a still-running worker process (pid probe or hook
+    /// stream). This is the shape a worker the engine has lost track of
+    /// takes: durably tracked, not live-tracked. `evidence` names the
+    /// corroborating signal.
     LiveProcessNoRegistry { evidence: String },
+    /// Durable execution status says a worker should exist (`claimed` /
+    /// `running` / `waiting_human`) but the live-state registry has no
+    /// entry. No process was probed. `status` is the durable
+    /// `work_executions.status` string. Use `bossctl agents stop <run>`
+    /// — `retire-pane` refuses this occupant.
+    DurableOccupantNoRegistry { status: String },
     /// Durable occupancy of this slot could not be corroborated against
     /// live tmux (token mismatch, missing session, unparseable or
     /// conflicting identity, or a failed probe). Not a husk: retiring

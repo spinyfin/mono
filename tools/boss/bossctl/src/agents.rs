@@ -246,7 +246,8 @@ pub(crate) async fn fetch_tmux_worker_statuses(client: &mut BossClient) -> Resul
 
 /// Fetch every pane the app hosts, classified against the engine's live
 /// registry and durable state (live / terminal-entry-with-live-process /
-/// OccupancyInconclusive / husk) — see [`HostedPaneState`]. This is the durable-state fallback
+/// durable-occupant-no-registry / OccupancyInconclusive / husk) — see
+/// [`HostedPaneState`]. This is the durable-state fallback
 /// every `agents` verb consults once a plain live-registry lookup misses,
 /// so a crew name or slot id the operator can see in the app still
 /// resolves after the engine drops the live registry entry.
@@ -317,6 +318,7 @@ fn pane_state_label(state: &HostedPaneState) -> &'static str {
     match state {
         HostedPaneState::Live => "live",
         HostedPaneState::LiveProcessNoRegistry { .. } => "terminal entry, live process",
+        HostedPaneState::DurableOccupantNoRegistry { .. } => "durable occupant, no live-state",
         HostedPaneState::OccupancyInconclusive { .. } => "occupancy inconclusive",
         HostedPaneState::Husk => "husk",
     }
@@ -665,7 +667,8 @@ pub(crate) async fn agents_list_live(socket_path: &Option<String>, json: bool, a
         // Panes already shown above via `states` are `Live`-classified here
         // too — only render the ones the primary live list can't show:
         // a worker the engine lost live-track of but durable state still
-        // corroborates (`LiveProcessNoRegistry`), and true husks.
+        // corroborates (`LiveProcessNoRegistry` / `DurableOccupantNoRegistry`),
+        // and true husks.
         let additional: Vec<&HostedPaneStatus> = hosted
             .iter()
             .filter(|p| !matches!(p.state, HostedPaneState::Live))
@@ -679,6 +682,11 @@ pub(crate) async fn agents_list_live(socket_path: &Option<String>, json: bool, a
                         "slot {}  {}  run={}  TERMINAL ENTRY, LIVE PROCESS ({evidence}) — \
                          `bossctl agents stop {}` or `bossctl agents retire-pane {}` to reap it",
                         pane.slot_id, pane.crew_name, pane.run_id, pane.run_id, pane.slot_id,
+                    ),
+                    HostedPaneState::DurableOccupantNoRegistry { status } => println!(
+                        "slot {}  {}  run={}  DURABLE OCCUPANT `{status}` WITH NO LIVE-STATE — \
+                         run `bossctl agents stop {}`",
+                        pane.slot_id, pane.crew_name, pane.run_id, pane.run_id,
                     ),
                     HostedPaneState::OccupancyInconclusive { evidence } => println!(
                         "slot {}  {}  run={}  OCCUPANCY INCONCLUSIVE ({evidence}) — \
@@ -1816,6 +1824,11 @@ fn print_hosted_pane_status(json: bool, pane: &HostedPaneStatus) {
                 "  `bossctl agents stop {}` or `bossctl agents retire-pane {}` will reap it.",
                 pane.run_id, pane.slot_id
             );
+        }
+        HostedPaneState::DurableOccupantNoRegistry { status } => {
+            println!("  state: durable occupant `{status}` with no live-state entry");
+            println!("  durable status says a worker should exist; no live-state entry.");
+            println!("  run `bossctl agents stop {}`.", pane.run_id);
         }
         HostedPaneState::OccupancyInconclusive { evidence } => {
             println!("  state: occupancy inconclusive ({evidence})");
