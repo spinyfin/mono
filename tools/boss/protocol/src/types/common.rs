@@ -621,6 +621,79 @@ pub enum PauseReasonError {
     Empty,
 }
 
+/// What a dispatch pause holds — chosen by the operator, separately from
+/// *who* paused (the engine's `DispatchPauseOrigin`), so the two stay
+/// independently visible.
+///
+/// An absent scope on the wire means [`Self::NewWork`], the long-standing
+/// default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchPauseScope {
+    /// New work is held; `pr_review` and review-guide executions are exempt
+    /// and keep dispatching — a review is the lifecycle of a change already
+    /// in flight, not new work.
+    #[default]
+    NewWork,
+    /// Every pool is held, PR reviews and review guides included. For use
+    /// when the spawn path itself is suspect, so dispatching anything — a
+    /// review included — would just burn an attempt against it.
+    AllSpawns,
+}
+
+impl DispatchPauseScope {
+    /// Stable string persisted to `state.db` and printed by `bossctl`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DispatchPauseScope::NewWork => "new_work",
+            DispatchPauseScope::AllSpawns => "all_spawns",
+        }
+    }
+
+    /// Parse a persisted value. `None` (never recorded) is the caller's
+    /// decision; an unrecognised value restores as the **stricter**
+    /// [`Self::AllSpawns`], because restoring an unknown scope as the more
+    /// permissive one could resume spawning into a path the operator held.
+    pub fn from_persisted(value: &str) -> Self {
+        match value {
+            "new_work" => DispatchPauseScope::NewWork,
+            _ => DispatchPauseScope::AllSpawns,
+        }
+    }
+
+    /// Whether this scope holds `pr_review` / review-guide executions.
+    pub fn holds_reviews(self) -> bool {
+        self == DispatchPauseScope::AllSpawns
+    }
+}
+
+#[cfg(test)]
+mod pause_scope_tests {
+    use super::*;
+
+    #[test]
+    fn persisted_round_trip_and_unknown_is_stricter() {
+        for scope in [DispatchPauseScope::NewWork, DispatchPauseScope::AllSpawns] {
+            assert_eq!(DispatchPauseScope::from_persisted(scope.as_str()), scope);
+        }
+        assert_eq!(
+            DispatchPauseScope::from_persisted("something_new"),
+            DispatchPauseScope::AllSpawns
+        );
+        assert_eq!(DispatchPauseScope::from_persisted(""), DispatchPauseScope::AllSpawns);
+    }
+
+    #[test]
+    fn serde_uses_snake_case_names_matching_as_str() {
+        for scope in [DispatchPauseScope::NewWork, DispatchPauseScope::AllSpawns] {
+            assert_eq!(
+                serde_json::to_string(&scope).unwrap(),
+                format!("\"{}\"", scope.as_str())
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod pause_reason_tests {
     use super::*;

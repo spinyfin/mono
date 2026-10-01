@@ -199,6 +199,7 @@ async fn operator_pause_rpc_still_pushes_engine_health() {
         FrontendRequest::SetDispatchPaused {
             paused: true,
             reason: Some("operator is rebooting the build host".to_owned()),
+            scope: None,
         },
     )
     .await;

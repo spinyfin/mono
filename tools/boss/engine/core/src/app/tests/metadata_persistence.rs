@@ -7,6 +7,7 @@
 
 use super::*;
 
+use crate::app::handler_helpers::load_dispatch_paused_state;
 use crate::coordinator::DispatchPauseOrigin;
 
 // ── live-status disabled-slot persistence ────────────────────────────────

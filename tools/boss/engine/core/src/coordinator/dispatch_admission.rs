@@ -194,7 +194,7 @@ impl ExecutionCoordinator {
         let mut pause = self.dispatch_pause_snapshot();
         if (facts.exempt_from_operator_pause || (facts.targets_main_pool && facts.is_critical)) && pause.overridable {
             // Reviews and critical main-pool work are exempt from operator
-            // pauses in the drain; neither needs a one-shot forced override.
+            // new-work pauses in the drain; neither needs a one-shot forced override.
             pause = DispatchPauseSnapshot::default();
         }
         let would_dispatch = !Self::has_hard_blocker(&blockers) && !pause.active;
@@ -213,23 +213,22 @@ impl ExecutionCoordinator {
     }
 
     /// The current global dispatch pause, as [`DispatchAdmission`] reports
-    /// it. `overridable` is derived from
-    /// [`Self::dispatch_pause_exempts_reviews`] — that flag is already
-    /// `true` iff the active pause is operator-originated (see
-    /// [`Self::pause_dispatch`]), so it doubles as the overridability
-    /// signal without a separate stored origin field.
+    /// it. `overridable` is [`DispatchPause::accepts_pause_bypass`] — an
+    /// operator pause that keeps the default scope.
     fn dispatch_pause_snapshot(&self) -> DispatchPauseSnapshot {
-        if !self.is_dispatch_paused() {
+        // One snapshot so origin, scope, reason and timestamp describe the
+        // same pause episode.
+        let Some(pause) = self.dispatch_pause() else {
             return DispatchPauseSnapshot::default();
-        }
-        let overridable = self.dispatch_pause_exempts_reviews();
-        DispatchPauseSnapshot {
-            active: true,
-            origin: Some(if overridable { "operator" } else { "breaker" }.to_string()),
-            reason: self.dispatch_paused_reason(),
-            paused_since_epoch_s: self.dispatch_paused_since_epoch_s(),
-            overridable,
-        }
+        };
+        DispatchPauseSnapshot::builder()
+            .active(true)
+            .origin(pause.origin.as_metadata_str())
+            .reason(pause.reason.clone())
+            .paused_since_epoch_s(pause.since_epoch_s)
+            .scope(pause.scope)
+            .overridable(pause.accepts_pause_bypass())
+            .build()
     }
 
     /// Mark `execution_id` exempt from `drain_ready_queue`'s pause gate for

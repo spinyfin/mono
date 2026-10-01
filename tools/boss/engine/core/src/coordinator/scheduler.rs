@@ -927,12 +927,13 @@ impl ExecutionCoordinator {
         // this is the cheap early exit that keeps a paused engine from
         // walking the queue and claiming slots it would only hand back.
         // `pr_review` executions are the lifecycle of a change already in
-        // flight, not new work, so an operator-originated pause exempts
-        // them — they keep draining into the review pool while
-        // main/automation rows are held. A breaker-originated pause (the
-        // engine's tmux spawn path itself is broken — see `spawn_health.rs`) exempts
+        // flight, not new work, so a pause with the default `new_work`
+        // scope exempts them — they keep draining into the review pool while
+        // main/automation rows are held. An `all_spawns` pause exempts
         // nothing, since dispatching a review would just burn another spawn
-        // attempt against the same dead path.
+        // attempt against a spawn path that is suspect: the breaker's pause
+        // always has that scope (the app's spawn path itself is broken — see
+        // `spawn_health.rs`), and an operator may choose it too.
         let pause = self.dispatch_pause();
         let paused = pause.is_some();
         let reviews_exempt_from_pause = pause.as_ref().is_some_and(|p| !p.reviews_held());
@@ -1043,7 +1044,7 @@ impl ExecutionCoordinator {
                 tracing::debug!(
                     held_count,
                     review_exempt_count = 0,
-                    "drain_ready_queue: dispatch is globally paused — skipping (breaker pause, no exemptions)",
+                    "drain_ready_queue: dispatch is globally paused — skipping (all-spawns scope, no exemptions)",
                 );
                 self.publish_dispatch_runtime_changed(&changed_waits, "dispatch_wait_changed")
                     .await;
@@ -1124,10 +1125,10 @@ impl ExecutionCoordinator {
 
             // Dispatch is paused and this row isn't exempt: leave it `ready`
             // for the next drain after resume. Reached only when
-            // `reviews_exempt_from_pause` is true (a non-exempt/breaker
-            // pause already returned above, before this loop, so a
-            // breaker pause can never reach the bypass check below —
-            // consistent with a breaker pause never being overridable),
+            // `reviews_exempt_from_pause` is true (an all-spawns pause —
+            // breaker or operator — already returned above, before this
+            // loop, so it can never reach the bypass check below —
+            // consistent with such a pause never being overridable),
             // so this holds every non-review row while review rows fall
             // through to normal dispatch below.
             //

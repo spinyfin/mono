@@ -715,7 +715,7 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::SetDispatchPaused { paused, reason } = req else {
+    let FrontendRequest::SetDispatchPaused { paused, reason, scope } = req else {
         unreachable!()
     };
     {
@@ -751,14 +751,18 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
         let paused_since_before = coordinator.dispatch_paused_since_epoch_s();
         let now_epoch_s = boss_engine_utils::epoch_time::now_epoch_secs() as u64;
         // A human toggling `bossctl dispatch pause` / the app's pause switch
-        // is always an operator-originated pause, so PR-review executions —
-        // the lifecycle of a change already in flight, not new work — stay
-        // exempt from it. See `DispatchPauseOrigin`.
+        // is always an operator-originated pause. What it holds is the
+        // operator's explicit choice: by default PR-review and review-guide
+        // executions — the lifecycle of a change already in flight, not new
+        // work — stay exempt; `all_spawns` holds them too. Origin and scope
+        // are recorded separately so who paused and what is held stay
+        // independently visible. See `DispatchPauseOrigin`.
         let origin = crate::coordinator::DispatchPauseOrigin::Operator;
+        let scope = scope.unwrap_or_default();
         let reason_str = if paused {
             let pause_reason = pause_reason.expect("validated above");
             let reason_str = pause_reason.as_str().to_owned();
-            coordinator.pause_dispatch(now_epoch_s, origin, pause_reason);
+            coordinator.pause_dispatch_scoped(now_epoch_s, origin, scope, pause_reason);
             Some(reason_str)
         } else {
             coordinator.resume_dispatch();
@@ -770,6 +774,7 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
                 .set_metadata(METADATA_KEY_DISPATCH_PAUSED, "1")
                 .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSED_SINCE, &now_epoch_s.to_string()))
                 .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSE_ORIGIN, origin.as_metadata_str()))
+                .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSE_SCOPE, scope.as_str()))
                 .and_then(|()| {
                     work_db.set_metadata(
                         METADATA_KEY_DISPATCH_PAUSE_REASON,
@@ -781,6 +786,7 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
                 .set_metadata(METADATA_KEY_DISPATCH_PAUSED, "0")
                 .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSED_SINCE, "0"))
                 .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSE_REASON, ""))
+                .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSE_SCOPE, ""))
         };
         if let Err(err) = db_result {
             tracing::warn!(
@@ -791,9 +797,18 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
             );
         }
         if paused {
+            // The line states the scope from the same pause value the
+            // admission gate reads (`scope_description`), so the words cannot
+            // drift from the behaviour.
+            let scope_description = coordinator
+                .dispatch_pause()
+                .map(|p| p.scope_description())
+                .unwrap_or_default();
             tracing::info!(
                 reason = reason_str.as_deref().unwrap_or_default(),
-                "dispatch: globally paused (operator) — PR-review executions remain exempt"
+                scope = scope.as_str(),
+                "dispatch: globally paused (operator, scope {}) — {scope_description}",
+                scope.as_str(),
             );
             server_state
                 .dispatch_events
@@ -807,8 +822,13 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
                         "origin": "operator",
                         "actor": "operator",
                         "paused_since_epoch_s": now_epoch_s,
-                        "reviews_held": false,
-                        "scope": ["dispatch"],
+                        "reviews_held": scope.holds_reviews(),
+                        "pause_scope": scope.as_str(),
+                        "scope": if scope.holds_reviews() {
+                            serde_json::json!(["dispatch", "reviews"])
+                        } else {
+                            serde_json::json!(["dispatch"])
+                        },
                         "reason": reason_str,
                     })),
                 )
@@ -862,6 +882,8 @@ fn dispatch_state_result(pause: Option<crate::coordinator::DispatchPause>) -> Fr
         paused_since_epoch_s: pause.as_ref().map(|p| p.since_epoch_s),
         reviews_exempt: pause.as_ref().is_some_and(|p| !p.reviews_held()),
         reason: pause.as_ref().map(|p| p.reason.clone()),
+        scope: pause.as_ref().map(|p| p.scope),
+        origin: pause.as_ref().map(|p| p.origin.as_metadata_str().to_owned()),
     }
 }
 

@@ -634,13 +634,16 @@ fn tag_cases() -> Vec<TagCase> {
                 admission: DispatchAdmission::builder()
                     .work_item_id("task_1")
                     .would_dispatch(false)
-                    .pause(DispatchPauseSnapshot {
-                        active: true,
-                        origin: Some("operator".into()),
-                        reason: Some("investigating worker failures".into()),
-                        paused_since_epoch_s: Some(1_700_000_000),
-                        overridable: true,
-                    })
+                    .pause(
+                        DispatchPauseSnapshot::builder()
+                            .active(true)
+                            .origin("operator")
+                            .reason("investigating worker failures")
+                            .paused_since_epoch_s(1_700_000_000)
+                            .scope(DispatchPauseScope::NewWork)
+                            .overridable(true)
+                            .build(),
+                    )
                     .blockers(vec![DispatchAdmissionBlocker {
                         code: "interactive_concurrency_cap".into(),
                         message: "interactive concurrency cap reached (12/12 workers live)".into(),
@@ -1722,6 +1725,8 @@ fn tag_cases() -> Vec<TagCase> {
                 paused_since_epoch_s: None,
                 reviews_exempt: false,
                 reason: None,
+                scope: None,
+                origin: None,
             },
             expected_tag: "dispatch_state_result",
         },

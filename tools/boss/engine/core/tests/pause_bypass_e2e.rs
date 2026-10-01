@@ -103,6 +103,7 @@ async fn evaluate_dispatch_admission_reports_active_operator_pause() -> Result<(
         .send_request(&FrontendRequest::SetDispatchPaused {
             paused: true,
             reason: Some("investigating worker failures".to_owned()),
+            scope: None,
         })
         .await?
     {
@@ -212,6 +213,7 @@ async fn board_drag_force_with_stale_pause_generation_refuses_without_activating
         .send_request(&FrontendRequest::SetDispatchPaused {
             paused: true,
             reason: Some("investigating worker failures".to_owned()),
+            scope: None,
         })
         .await?
     {

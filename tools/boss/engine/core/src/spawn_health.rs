@@ -94,8 +94,8 @@ use boss_protocol::{CreateAttentionItemInput, WorkExecution};
 use serde::Serialize;
 
 use crate::app::handler_helpers::{
-    METADATA_KEY_DISPATCH_PAUSE_ORIGIN, METADATA_KEY_DISPATCH_PAUSE_REASON, METADATA_KEY_DISPATCH_PAUSED,
-    METADATA_KEY_DISPATCH_PAUSED_SINCE,
+    METADATA_KEY_DISPATCH_PAUSE_ORIGIN, METADATA_KEY_DISPATCH_PAUSE_REASON, METADATA_KEY_DISPATCH_PAUSE_SCOPE,
+    METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE,
 };
 use crate::config::DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER;
 use crate::coordinator::{DispatchAdmission, DispatchPauseOrigin, ExecutionCoordinator};
@@ -841,6 +841,7 @@ pub async fn resume_dispatch_after_breaker_recovery(
         .set_metadata(METADATA_KEY_DISPATCH_PAUSED, "0")
         .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSED_SINCE, "0"))
         .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSE_REASON, ""))
+        .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSE_SCOPE, ""))
     {
         tracing::warn!(
             ?err,
@@ -935,7 +936,11 @@ pub struct TripSignal<'a> {
 /// otherwise keep dispatching into the dead path and keep tripping this
 /// function forever. In that case this still escalates: it re-pauses with
 /// [`DispatchPauseOrigin::Breaker`] (clearing the review exemption) and
-/// raises the attention item, rather than skipping as a duplicate.
+/// raises the attention item, rather than skipping as a duplicate. An
+/// *operator all-spawns* pause already holds reviews and is
+/// manual-resume-only, so it is never replaced: the trip raises the attention
+/// item (saying so) and leaves the pause, its origin and its persisted scope
+/// untouched.
 ///
 /// **Disabled:** idempotency instead comes from
 /// [`SpawnHealthTracker::mark_disabled_trip_signaled`] (dispatch is never
@@ -983,9 +988,17 @@ pub async fn trip_spawn_capability_circuit(
         composition.describe()
     );
 
+    // An operator pause with the `all_spawns` scope already holds everything
+    // the breaker would, and it is manual-resume-only. A trip must neither
+    // replace it with a Breaker pause (which the recovery probe could then
+    // auto-resume, lifting a hold the operator placed) nor stay silent about
+    // the spawn failures — so the trip still raises the attention item but
+    // leaves the operator's pause alone.
+    let mut operator_all_spawns_hold = false;
     if breaker_enabled {
-        if coordinator
-            .dispatch_pause()
+        let existing = coordinator.dispatch_pause();
+        if existing
+            .as_ref()
             .is_some_and(|p| p.origin == DispatchPauseOrigin::Breaker)
         {
             tracing::debug!(
@@ -994,6 +1007,15 @@ pub async fn trip_spawn_capability_circuit(
             );
             return;
         }
+        operator_all_spawns_hold = existing.is_some_and(|p| p.reviews_held());
+    }
+    if breaker_enabled && operator_all_spawns_hold {
+        tracing::debug!(
+            tripping_execution_id,
+            "spawn-capability breaker: operator all-spawns pause already holds dispatch; \
+             leaving it in place and raising attention only",
+        );
+    } else if breaker_enabled {
         let now_u64 = now_epoch_secs.max(0) as u64;
         // The breaker is a programmatic pauser — it must supply its own
         // specific reason describing what tripped, never a generic
@@ -1014,6 +1036,12 @@ pub async fn trip_spawn_capability_circuit(
                 work_db.set_metadata(
                     METADATA_KEY_DISPATCH_PAUSE_ORIGIN,
                     DispatchPauseOrigin::Breaker.as_metadata_str(),
+                )
+            })
+            .and_then(|()| {
+                work_db.set_metadata(
+                    METADATA_KEY_DISPATCH_PAUSE_SCOPE,
+                    DispatchPauseOrigin::Breaker.default_scope().as_str(),
                 )
             })
             .and_then(|()| {
@@ -1085,7 +1113,14 @@ pub async fn trip_spawn_capability_circuit(
          Per execution:\n{per_execution}",
         composition.diagnosis_hint(),
     );
-    let body = if breaker_enabled {
+    let body = if breaker_enabled && operator_all_spawns_hold {
+        format!(
+            "{what_happened}\n\n\
+             Dispatch is already held by an **operator all-spawns pause** (reviews included), so the \
+             breaker did not replace it and will not probe or auto-resume: that pause is \
+             manual-resume-only. Run `bossctl dispatch resume` once the spawn path is confirmed healthy."
+        )
+    } else if breaker_enabled {
         format!(
             "{what_happened}\n\n\
              Dispatch has been **paused** (reviews included) to stop the engine from burning spawn \
@@ -1160,7 +1195,7 @@ pub async fn trip_spawn_capability_circuit(
     // every trip after the first, and doesn't pause at all — see the module
     // docs' "breaker flag" section — so there is no pause episode to record
     // in that mode).
-    if breaker_enabled {
+    if breaker_enabled && !operator_all_spawns_hold {
         dispatch_events
             .emit(
                 DispatchEvent::new(Stage::DispatchPaused, Outcome::Ok, tripping_execution_id)

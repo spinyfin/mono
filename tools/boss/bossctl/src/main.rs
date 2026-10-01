@@ -192,6 +192,11 @@ enum Command {
         /// is `state`, since that verb only prints status.
         #[arg(long)]
         reason: Option<String>,
+        /// Dispatch only: hold every spawn, PR reviews and review guides
+        /// included — see `bossctl dispatch pause --all-spawns`. Rejected
+        /// when dispatch is not among the systems being paused.
+        #[arg(long)]
+        all_spawns: bool,
     },
     /// Resume one or more Boss systems in a single call. Defaults to
     /// every pausable system when no SYSTEMS are given. Symmetric with
@@ -527,6 +532,16 @@ enum DispatchAction {
         /// one.
         #[arg(long)]
         reason: String,
+        /// Hold every spawn, PR reviews and review guides included. By
+        /// default a dispatch pause holds new work only and lets PR
+        /// reviews and review guides keep dispatching (a review is the
+        /// lifecycle of a change already in flight). Use this when the
+        /// spawn path itself is suspect, so a review would only burn an
+        /// attempt against it. The scope is persisted with the pause and
+        /// survives an engine restart. Like every operator pause it is
+        /// manual-resume-only: no breaker recovery probe is admitted.
+        #[arg(long)]
+        all_spawns: bool,
     },
     /// Resume global dispatch. The engine immediately drains any executions
     /// that queued while paused and resumes normal dispatch. Idempotent —
@@ -1375,7 +1390,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     include_stalled,
                 },
         } => dispatch_ghost_active(cli.json, state_root, stalled_after_secs, include_stalled),
-        Command::Pause { systems, reason } => {
+        Command::Pause {
+            systems,
+            reason,
+            all_spawns,
+        } => {
             if systems.iter().any(|s| matches!(s, PauseArg::State)) {
                 if systems.len() > 1 {
                     bail!("`bossctl pause state` does not take additional systems");
@@ -1384,7 +1403,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
             } else {
                 let reason = pause::require_pause_reason(reason)?;
                 let targets = pause::pause_arg_targets(&systems);
-                pause::set_paused_for_systems(&cli.socket_path, cli.json, &targets, Some(reason)).await
+                if all_spawns && !targets.contains(&PauseSystem::Dispatch) {
+                    bail!("--all-spawns applies to dispatch only, but dispatch is not among the systems being paused");
+                }
+                let scope = pause::dispatch_pause_scope(all_spawns);
+                pause::set_paused_for_systems(&cli.socket_path, cli.json, &targets, Some(reason), scope).await
             }
         }
         Command::Resume { systems } => {
@@ -1393,15 +1416,23 @@ async fn dispatch(cli: Cli) -> Result<()> {
             } else {
                 systems
             };
-            pause::set_paused_for_systems(&cli.socket_path, cli.json, &targets, None).await
+            pause::set_paused_for_systems(&cli.socket_path, cli.json, &targets, None, Default::default()).await
         }
         Command::State => pause::unified_state(&cli.socket_path, cli.json).await,
         Command::Dispatch {
-            action: DispatchAction::Pause { reason },
-        } => pause::dispatch_set_paused(&cli.socket_path, cli.json, Some(reason)).await,
+            action: DispatchAction::Pause { reason, all_spawns },
+        } => {
+            pause::dispatch_set_paused(
+                &cli.socket_path,
+                cli.json,
+                Some(reason),
+                pause::dispatch_pause_scope(all_spawns),
+            )
+            .await
+        }
         Command::Dispatch {
             action: DispatchAction::Resume,
-        } => pause::dispatch_set_paused(&cli.socket_path, cli.json, None).await,
+        } => pause::dispatch_set_paused(&cli.socket_path, cli.json, None, Default::default()).await,
         Command::Dispatch {
             action: DispatchAction::State { history, n, state_root },
         } => {

@@ -2,7 +2,7 @@
 //! and the runs an execution is made of.
 
 use super::attention::CreateAttentionItemInput;
-use super::common::BranchNaming;
+use super::common::{BranchNaming, DispatchPauseScope};
 use serde::{Deserialize, Serialize};
 
 /// Opaque per-execution runtime state owned by an agent driver.
@@ -576,8 +576,10 @@ pub struct DispatchAdmissionBlocker {
 /// can tell a stale confirmation (the pause was lifted, or re-raised with a
 /// different reason) from a fresh one — see the design's "pause-generation
 /// race" handling.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct DispatchPauseSnapshot {
+    #[builder(default)]
     pub active: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
@@ -585,10 +587,15 @@ pub struct DispatchPauseSnapshot {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_since_epoch_s: Option<u64>,
-    /// `true` only when `active` and `origin == "operator"` — a
-    /// breaker-originated pause is never overridable, since it signals the
-    /// spawn path itself is unhealthy rather than an operator decision to
-    /// hold work back.
+    /// What the pause holds (`"new_work"` / `"all_spawns"`); see
+    /// [`DispatchPauseScope`]. `None` when not `active`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<DispatchPauseScope>,
+    /// `true` only when `active`, `origin == "operator"`, and `scope` is
+    /// `new_work` — a breaker-originated pause is never overridable, since
+    /// it signals the spawn path itself is unhealthy rather than an operator
+    /// decision to hold work back, and an operator `all_spawns` pause says
+    /// the same thing in the operator's own words.
     pub overridable: bool,
 }
 

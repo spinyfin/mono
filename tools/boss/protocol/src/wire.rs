@@ -17,7 +17,7 @@ use crate::types::{
     CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateDecisionInput,
     CreateExecutionInput, CreateIdeaInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput,
     CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput, Decision,
-    DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState, DispatchAdmission,
+    DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState, DispatchAdmission, DispatchPauseScope,
     DriverQuotaSnapshot, DriverTrafficSplit, EditorialAction, EngineAttemptListEntry, FollowupMemberOverride,
     GitHubAuthStateDto, GuideCommentDisposition, Idea, IdeaGraduationKind, IdeaPatch, LinkExternalRefInput,
     ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation, ProbeDeliveryState,
@@ -2436,10 +2436,19 @@ pub enum FrontendRequest {
     /// queueing and drain once dispatch resumes. Pausing dispatch never
     /// sets or implies the automation-pause flag, and vice versa. Replies
     /// with [`FrontendEvent::DispatchStateResult`].
+    ///
+    /// `scope` chooses what the pause holds (see [`DispatchPauseScope`]).
+    /// Absent means the default, [`DispatchPauseScope::NewWork`]: new work is
+    /// held and PR-review / review-guide executions stay exempt.
+    /// [`DispatchPauseScope::AllSpawns`] holds every pool, reviews included —
+    /// for when the spawn path itself is suspect. Ignored when
+    /// `paused = false`.
     SetDispatchPaused {
         paused: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<DispatchPauseScope>,
     },
 
     /// Set the driver traffic split: how eligible `standard`-reasoning
