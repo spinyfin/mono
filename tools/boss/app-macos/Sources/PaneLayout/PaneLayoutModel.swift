@@ -37,6 +37,9 @@ public struct PaneLayoutModel: Equatable, Sendable {
     public let policy: PaneCapacityPolicy
     public private(set) var geometry: PaneGeometry
     public private(set) var limits: GridLimits
+    /// Whether `limits` came from a real cell-size measurement. Hysteresis only
+    /// applies against measured limits, never the 1x1 unmeasured fallback.
+    private var limitsMeasured: Bool
     public private(set) var filter: PaneFilter = .all
     /// Whether Agents is on screen. While hidden every change applies at once,
     /// since there is no reader to disturb.
@@ -61,6 +64,7 @@ public struct PaneLayoutModel: Equatable, Sendable {
         self.policy = policy
         self.geometry = geometry
         self.limits = policy.limits(for: geometry)
+        self.limitsMeasured = geometry.isMeasured
         self.isVisible = isVisible
     }
 
@@ -107,6 +111,7 @@ public struct PaneLayoutModel: Equatable, Sendable {
         } else {
             syncShapes()
             anchorRunId = anchor
+            selectAnchorPage(anchor)
             clampSelectedPage()
         }
     }
@@ -123,12 +128,14 @@ public struct PaneLayoutModel: Equatable, Sendable {
     /// Applies a new area/cell-size measurement. A layout boundary: callers
     /// should invoke it at drag end or after the geometry has been quiet, not
     /// on every drag frame. Capacity only moves once the measurement clears the
-    /// policy's dead band; an identical measurement is a no-op.
+    /// policy's dead band; an identical or unmeasured (zero, negative, or
+    /// non-finite cell size) measurement is a no-op.
     public mutating func updateGeometry(_ newGeometry: PaneGeometry) {
-        guard newGeometry != geometry else { return }
+        guard newGeometry != geometry, newGeometry.isMeasured else { return }
         let anchor = automaticAnchor()
         geometry = newGeometry
-        limits = policy.stableLimits(previous: limits, for: newGeometry)
+        limits = policy.stableLimits(previous: limitsMeasured ? limits : nil, for: newGeometry)
+        limitsMeasured = true
         repack(anchor: anchor)
     }
 
@@ -378,10 +385,15 @@ public struct PaneLayoutModel: Equatable, Sendable {
         slots = packed.slots
         shapes = packed.shapes
         anchorRunId = anchor
+        selectAnchorPage(anchor)
+        clampSelectedPage()
+    }
+
+    /// Selects the page holding the anchor's logical cell, if it has one.
+    private mutating func selectAnchorPage(_ anchor: String?) {
         if let anchor, let index = slots.firstIndex(of: .run(anchor)) {
             selectedPage = index / capacity
         }
-        clampSelectedPage()
     }
 
     private mutating func clampSelectedPage() {

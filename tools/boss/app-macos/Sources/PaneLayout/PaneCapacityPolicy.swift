@@ -22,6 +22,11 @@ public struct PaneGeometry: Equatable, Sendable {
         self.area = area
         self.cell = cell
     }
+
+    /// Whether the cell size is a real measurement: finite and positive.
+    public var isMeasured: Bool {
+        cell.width.isFinite && cell.width > 0 && cell.height.isFinite && cell.height > 0
+    }
 }
 
 /// How many minimum-size panes fit across and down the available area. The
@@ -56,8 +61,8 @@ public struct GridShape: Equatable, Sendable {
 
 /// Capacity and grid-shape policy for the Agents pane.
 ///
-/// Every tunable lives here so the capture task can adjust them in one place.
-/// The defaults are estimates from the design doc, not measurements.
+/// Every tunable lives here so they can be tuned in one place against captures from
+/// real displays. The defaults are estimates, not measurements.
 public struct PaneCapacityPolicy: Equatable, Sendable {
     public static let standard = PaneCapacityPolicy()
 
@@ -65,8 +70,8 @@ public struct PaneCapacityPolicy: Equatable, Sendable {
     public var minColumns: Int
     /// Minimum legible terminal height, in rows.
     public var minRows: Int
-    /// Height of the two-line pane header, in points. An estimate until the
-    /// capture task measures the rendered header.
+    /// Height of the two-line pane header, in points. Estimated height of the
+    /// rendered two-line header; not yet measured.
     public var headerHeight: Double
     /// Upper bound on logical cells per page; excess workers get another page.
     public var maxPanesPerPage: Int
@@ -117,9 +122,7 @@ public struct PaneCapacityPolicy: Equatable, Sendable {
     public func stableLimits(previous: GridLimits?, for geometry: PaneGeometry) -> GridLimits {
         // A cell size of zero (or garbage) means the terminal has not been
         // measured yet. Do not read that as "unboundedly many panes fit".
-        guard geometry.cell.width.isFinite, geometry.cell.width > 0,
-              geometry.cell.height.isFinite, geometry.cell.height > 0
-        else {
+        guard geometry.isMeasured else {
             return previous ?? GridLimits(columns: 1, rows: 1)
         }
         let minPane = minPaneSize(cell: geometry.cell)
@@ -139,6 +142,8 @@ public struct PaneCapacityPolicy: Equatable, Sendable {
     /// pane, then fewer empty cells, then more columns. A window smaller than
     /// one minimum pane still yields a 1x1 shape.
     public func shape(forUsedSpan usedSpan: Int, limits: GridLimits, geometry: PaneGeometry) -> GridShape {
+        // Without a measurement every candidate scores alike; keep the limits.
+        guard geometry.isMeasured else { return GridShape(columns: limits.columns, rows: limits.rows) }
         let span = max(1, usedSpan)
         let minPane = minPaneSize(cell: geometry.cell)
         // An axis longer than the span is dominated by clamping it to the span:

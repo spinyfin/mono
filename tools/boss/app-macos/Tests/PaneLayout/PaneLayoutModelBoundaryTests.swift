@@ -323,6 +323,27 @@ final class PaneLayoutModelBoundaryTests: XCTestCase {
         XCTAssertEqual(model.capacity, 8)
     }
 
+    func testFirstMeasurementAfterAnUnmeasuredStartIsNotHeldByTheDeadBand() {
+        let zeroCell = PaneSize(width: 0, height: 0)
+        for area in [F.laptop.area, PaneSize(width: 0, height: 0)] {
+            var model = F.model(geometry: PaneGeometry(area: area, cell: zeroCell))
+            model.updateGeometry(F.laptop)
+            XCTAssertEqual(model.limits, GridLimits(columns: 4, rows: 2))
+            XCTAssertEqual(model.capacity, 8)
+        }
+    }
+
+    func testUnmeasuredCellUpdateLeavesShapeAndCellsUntouched() throws {
+        var model = F.model(geometry: geometry(1700, 720))
+        model.updateMembers(F.members(0...3))
+        let before = try XCTUnwrap(model.currentPage)
+        model.updateGeometry(PaneGeometry(area: F.laptop.area, cell: PaneSize(width: 0, height: 0)))
+        let after = try XCTUnwrap(model.currentPage)
+        XCTAssertEqual(after.shape, before.shape)
+        XCTAssertEqual(F.tokens(after), F.tokens(before))
+        XCTAssertEqual(model.geometry, geometry(1700, 720))
+    }
+
     func testWindowBelowTheMinimumStillRendersOnePane() throws {
         var model = F.model(geometry: geometry(300, 200))
         model.updateMembers(F.members(0...2))

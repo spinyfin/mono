@@ -388,4 +388,18 @@ final class PaneLayoutModelEpochTests: XCTestCase {
         XCTAssertEqual(model.selectedPage, 1)
         XCTAssertEqual(model.logicalCellIndex(ofRun: F.runId(9)), 8)
     }
+
+    func testGrowthWithoutCompactionSelectsTheAnchorsPage() throws {
+        var model = F.model()
+        model.updateMembers(F.members(0...8))
+        model.selectPage(1)
+        XCTAssertEqual(model.selectedPage, 1)
+
+        model.updateMembers(F.members(0...7) + [F.member(9), F.member(10)])
+        XCTAssertEqual(model.anchorRunId, F.runId(7))
+        XCTAssertEqual(model.selectedPage, 0)
+        XCTAssertEqual(model.logicalCellIndex(ofRun: F.runId(7)), 7)
+        XCTAssertEqual(model.logicalCellIndex(ofRun: F.runId(9)), 8)
+        XCTAssertEqual(model.logicalCellIndex(ofRun: F.runId(10)), 9)
+    }
 }
