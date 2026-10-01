@@ -83,6 +83,7 @@ fn valid_payload_for(kind: ProposalKind) -> Value {
             },
         }),
         ProposalKind::RunDone => json!({"outcome": "delivered", "summary": "opened the PR"}),
+        ProposalKind::Wait => json!({"reason": "bazel test still compiling", "duration_secs": 1800}),
     }
 }
 
@@ -658,4 +659,41 @@ fn run_done_requires_a_summary() {
         fields(&errors).contains(&"summary"),
         "a declaration with no summary must be rejected: {errors:?}"
     );
+}
+
+#[test]
+fn wait_rejects_duration_above_the_per_declaration_cap() {
+    let errors = errs(
+        ProposalKind::Wait,
+        json!({"reason": "bazel", "duration_secs": WAIT_MAX_DURATION_SECS + 1}),
+    );
+    assert!(
+        message_for(&errors, "duration_secs").contains("must be between"),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn wait_rejects_zero_and_non_integer_duration() {
+    let zero = errs(ProposalKind::Wait, json!({"reason": "bazel", "duration_secs": 0}));
+    assert!(
+        message_for(&zero, "duration_secs").contains("must be between"),
+        "{zero:?}"
+    );
+    let as_string = errs(ProposalKind::Wait, json!({"reason": "bazel", "duration_secs": "30m"}));
+    assert!(
+        message_for(&as_string, "duration_secs").contains("expected a non-negative integer"),
+        "{as_string:?}"
+    );
+}
+
+#[test]
+fn wait_accepts_optional_waiting_on() {
+    let canonical = ok(
+        ProposalKind::Wait,
+        json!({"reason": "bazel test", "duration_secs": 1800, "waiting_on": "pid:12"}),
+    );
+    let parsed: WaitProposalPayload = serde_json::from_str(&canonical).unwrap();
+    assert_eq!(parsed.waiting_on.as_deref(), Some("pid:12"));
+    assert_eq!(parsed.duration_secs, 1800);
 }

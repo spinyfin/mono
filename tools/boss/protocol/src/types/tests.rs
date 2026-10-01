@@ -2019,6 +2019,31 @@ fn run_done_payload_roundtrips() {
 }
 
 #[test]
+fn wait_payload_roundtrips_and_omits_waiting_on_when_none() {
+    let full = WaitProposalPayload {
+        duration_secs: 1800,
+        reason: "bazel test still compiling engine_lib_test".into(),
+        waiting_on: Some("task_abc".into()),
+    };
+    let raw = serde_json::to_value(&full).unwrap();
+    let back: WaitProposalPayload = serde_json::from_value(raw).unwrap();
+    assert_eq!(full, back);
+
+    let minimal = WaitProposalPayload {
+        duration_secs: 60,
+        reason: "background build".into(),
+        waiting_on: None,
+    };
+    let raw = serde_json::to_value(&minimal).unwrap();
+    assert!(
+        raw.get("waiting_on").is_none(),
+        "absent optional must be omitted: {raw}"
+    );
+    let back: WaitProposalPayload = serde_json::from_value(raw).unwrap();
+    assert_eq!(minimal, back);
+}
+
+#[test]
 fn attention_payload_roundtrips_and_omits_kind_when_none() {
     let full = AttentionProposalPayload {
         body_markdown: "please check this".into(),

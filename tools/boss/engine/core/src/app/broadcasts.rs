@@ -12,14 +12,22 @@ use super::*;
 impl ServerState {
     /// Snapshot of every allocated worker slot's live runtime state.
     pub fn live_worker_states_snapshot(&self) -> Vec<crate::protocol::LiveWorkerState> {
-        self.live_worker_states.snapshot()
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let mut states = self.live_worker_states.snapshot();
+        for state in &mut states {
+            if let Some(wait) = self.wait_registry.active(&state.run_id, now) {
+                state.wait_reason = Some(wait.reason);
+                state.wait_expires_at = Some(boss_engine_utils::iso8601::format_epoch_iso8601(wait.expires_at_epoch));
+            }
+        }
+        states
     }
 
     /// Push the current live-worker-state snapshot on the
     /// `worker.live_states` topic. Called whenever the events-socket
     /// consumer or the spawn flow mutates the registry.
     pub async fn broadcast_live_worker_states(&self) {
-        let states = self.live_worker_states.snapshot();
+        let states = self.live_worker_states_snapshot();
         let envelope = FrontendEventEnvelope::push(FrontendEvent::WorkerLiveStatesList { states });
         self.topic_broker.publish(TOPIC_WORKER_LIVE_STATES, envelope).await;
     }

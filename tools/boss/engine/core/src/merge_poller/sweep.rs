@@ -1175,6 +1175,7 @@ pub(crate) async fn sweep_pending_pr(
         // (it checks the operator hold registry), never from a
         // PR-detection recheck.
         | StopOutcome::Held { .. }
+        | StopOutcome::WorkerWaitPending { .. }
         // DriverTerminalError and RemoteCollectionFailed are only reachable
         // via `on_stop_inner`'s early gate or a kind finalizer, which `recheck_for_pr` never
         // receives (it has no live Stop event to read a reason from) —
@@ -1284,6 +1285,7 @@ pub(crate) async fn sweep_late_pr(
         // Held is only reachable via `nudge_or_park` on the on-Stop path,
         // never from a late-PR recheck.
         | StopOutcome::Held { .. }
+        | StopOutcome::WorkerWaitPending { .. }
         // DriverTerminalError and RemoteCollectionFailed are only reachable
         // from the on-Stop path, never from a late-PR recheck.
         | StopOutcome::DriverTerminalError { .. }

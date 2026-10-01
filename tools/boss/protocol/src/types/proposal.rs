@@ -36,6 +36,11 @@ pub enum ProposalKind {
     ReviewReport,
     ReviewVerdict,
     RunDone,
+    /// Worker-declared, time-bounded wait: the calling execution is
+    /// deliberately idle on a long-running job and the produce-a-PR nudge
+    /// ladder should hold until the wait expires. Re-running renews the
+    /// wait, subject to the per-declaration and per-execution caps.
+    Wait,
 }
 
 impl ProposalKind {
@@ -51,6 +56,7 @@ impl ProposalKind {
         ProposalKind::ReviewReport,
         ProposalKind::ReviewVerdict,
         ProposalKind::RunDone,
+        ProposalKind::Wait,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -66,6 +72,7 @@ impl ProposalKind {
             ProposalKind::ReviewReport => "review_report",
             ProposalKind::ReviewVerdict => "review_verdict",
             ProposalKind::RunDone => "run_done",
+            ProposalKind::Wait => "wait",
         }
     }
 }
@@ -91,10 +98,11 @@ impl std::str::FromStr for ProposalKind {
             "review_report" => Ok(ProposalKind::ReviewReport),
             "review_verdict" => Ok(ProposalKind::ReviewVerdict),
             "run_done" => Ok(ProposalKind::RunDone),
+            "wait" => Ok(ProposalKind::Wait),
             other => Err(format!(
                 "unknown proposal kind `{other}`; expected one of: attention, effort_escalation, \
                  blocked, deferred_scope, followup_task, automation_outcome, pr_created, review_guide, review_report, \
-                 review_verdict, run_done"
+                 review_verdict, run_done, wait"
             )),
         }
     }
@@ -463,6 +471,34 @@ pub struct RunDoneProposalPayload {
     pub outcome: RunDoneOutcome,
     pub summary: String,
 }
+
+/// Payload for [`ProposalKind::Wait`]. Auto-applies to a time-bounded
+/// wait on the calling execution: while unexpired, the produce-a-PR
+/// nudge ladder and its circuit breaker are held. The 2-hour stale-worker
+/// reap and every other safety check keep firing.
+///
+/// `duration_secs` is the requested extension, already converted from the
+/// CLI's `--duration` flag. The engine rejects a value above
+/// [`WAIT_MAX_DURATION_SECS`] and a cumulative total above
+/// [`WAIT_MAX_TOTAL_SECS_PER_EXECUTION`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WaitProposalPayload {
+    pub duration_secs: u64,
+    pub reason: String,
+    /// Optional handle for what the worker is waiting on: a background
+    /// task id, a pid, or a file path. Display-only; the engine does not
+    /// watch it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<String>,
+}
+
+/// Maximum duration of a single `wait` declaration, in seconds (2 hours).
+pub const WAIT_MAX_DURATION_SECS: u64 = 2 * 60 * 60;
+
+/// Maximum cumulative wait-extension granted to one execution, in seconds
+/// (4 hours). Each declaration's requested duration counts in full against
+/// this cap, including renewals, so overlapping waits cannot run forever.
+pub const WAIT_MAX_TOTAL_SECS_PER_EXECUTION: u64 = 4 * 60 * 60;
 
 // ---------------------------------------------------------------------------
 // Submission errors and rate caps (the `SubmitProposal` / `ListProposals` RPCs)

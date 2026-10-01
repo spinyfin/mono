@@ -123,6 +123,7 @@ impl WorkerCompletionHandler {
         self.build_wait_tracker.forget(&execution.id);
         self.background_children_tracker.forget(&execution.id);
         self.hold_registry.release(&execution.id);
+        self.wait_registry.forget(&execution.id);
         self.finish_worker_teardown(
             &execution.id,
             &completion.execution.work_item_id,
@@ -365,6 +366,7 @@ impl WorkerCompletionHandler {
         self.build_wait_tracker.forget(&execution.id);
         self.background_children_tracker.forget(&execution.id);
         self.hold_registry.release(&execution.id);
+        self.wait_registry.forget(&execution.id);
         crate::structured_output::clear_all(&self.structured_output_dir, &execution.id);
         // The driver reported its process already dead, but "already dead"
         // is the driver's claim, not the engine's observation — the pane is

@@ -1188,6 +1188,7 @@ async fn every_kind_can_be_submitted() {
                 },
             }),
             ProposalKind::RunDone => json!({"outcome": "delivered", "summary": "S"}),
+            ProposalKind::Wait => json!({"reason": "bazel test", "duration_secs": 60}),
         };
         let (proposal, _) = submitted(submit(&fx, kind, payload).await);
         assert_eq!(proposal.kind, kind);
