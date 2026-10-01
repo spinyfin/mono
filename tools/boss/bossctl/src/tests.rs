@@ -338,6 +338,38 @@ fn format_state_summary_reports_paused_with_and_without_since() {
     assert_eq!(pause::format_state_summary(false, None), "running");
 }
 
+#[test]
+fn format_spawn_failure_streak_lines_reports_none_when_healthy() {
+    assert_eq!(
+        pause::format_spawn_failure_streak_lines(&[]),
+        vec!["spawn alerts: none"]
+    );
+}
+
+#[test]
+fn format_spawn_failure_streak_lines_shows_count_and_full_latest_error() {
+    let streak = boss_protocol::SpawnFailureStreak::builder()
+        .driver("codex")
+        .worker_kind("review-guide")
+        .consecutive_failures(28)
+        .first_failure_epoch_s(1_790_494_560)
+        .latest_failure_epoch_s(1_790_607_235)
+        .latest_error("hook-trust gate refused the spawn\nno hook entries; silence is not success")
+        .latest_execution_id("exec_guide_28")
+        .build();
+    assert_eq!(
+        pause::format_spawn_failure_streak_lines(&[streak]),
+        vec![
+            "spawn alerts: 1 active",
+            "            codex review-guide: 28 consecutive pre-start failures, none succeeded",
+            "              first failure: epoch 1790494560; latest: epoch 1790607235 (exec_guide_28)",
+            "              latest error:",
+            "                hook-trust gate refused the spawn",
+            "                no hook entries; silence is not success",
+        ]
+    );
+}
+
 // ── metrics github: rate arithmetic ──────────────────────────────────────
 //
 // The rate is the whole reason this subcommand exists — GitHub's budget is

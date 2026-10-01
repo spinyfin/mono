@@ -361,6 +361,11 @@ pub(super) struct FakeExecutionRunner {
     /// inner cause under this outer context (`anyhow!(msg).context(ctx)`),
     /// so tests can assert `{err:#}` persistence of the cause chain.
     pub(super) fail_context: Option<String>,
+    /// Fail this many `run_execution` calls (with `fail_message`), then
+    /// behave as otherwise configured. Unlike the all-or-nothing `fail`, this lets one
+    /// runner model a spawn path that is broken and then recovers — the
+    /// shape a pre-start failure streak and its resolving success take.
+    pub(super) fail_remaining: std::sync::atomic::AtomicUsize,
     /// When `true`, `run_execution` fails with a `SlotBusy` app
     /// rejection (wrapped the same way `spawn_flow` wraps it) instead
     /// of the generic `fail` error, so tests can exercise the
@@ -408,6 +413,7 @@ impl Default for FakeExecutionRunner {
             fail: false,
             fail_message: None,
             fail_context: None,
+            fail_remaining: std::sync::atomic::AtomicUsize::new(0),
             slot_busy: false,
             viewer_abort_failed: false,
             pending: false,
@@ -439,6 +445,23 @@ impl ExecutionRunner for FakeExecutionRunner {
         ));
         if self.pending {
             pending::<()>().await;
+        }
+        // The failure budget is spent before any other configured outcome,
+        // so a runner can model "one genuine failure, then <whatever else
+        // this runner does>" — including `slot_busy`.
+        let fail_this_call = self
+            .fail_remaining
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok();
+        if fail_this_call {
+            return Err(anyhow!(
+                "{}",
+                self.fail_message.as_deref().unwrap_or("worker prompt failed")
+            ));
         }
         if self.viewer_abort_failed {
             return Err(

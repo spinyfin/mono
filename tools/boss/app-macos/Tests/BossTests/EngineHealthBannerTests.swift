@@ -328,6 +328,92 @@ final class EngineHealthBannerTests: XCTestCase {
         XCTAssertTrue(model.engineHealthIssues.isEmpty)
     }
 
+    /// A pre-start spawn-failure streak alert is engine-written text: the
+    /// banner must show the engine's title as its headline and the engine's
+    /// body (with the full latest error) when expanded, unchanged. The app
+    /// infers nothing — it has no idea what a "streak" is.
+    func testSpawnFailureStreakAlertRendersEngineProvidedText() {
+        let model = makeModel()
+        let alert = Self.streakIssue(
+            title: "codex review-guide workers are failing to start: 28 consecutive failures, "
+                + "none succeeded (first 1 day ago)",
+            body: "Latest error (2 minutes ago, execution exec_guide_28):\n"
+                + "codex hook-trust gate refused the spawn: hooks/list returned no hook entries"
+        )
+
+        model.applyEventForTest(.engineHealthResult(apiKeyPresent: true, issues: [alert]))
+
+        XCTAssertEqual(model.bannerHealthIssues, [alert], "the alert must be a banner issue")
+        XCTAssertEqual(EngineHealthBanner.headline(for: model.bannerHealthIssues), alert.title)
+        let expanded = EngineHealthBanner.accessibilityLabel(for: model.bannerHealthIssues)
+        XCTAssertTrue(expanded.contains(alert.title))
+        XCTAssertTrue(expanded.contains(alert.body), "the full latest error must be shown verbatim")
+    }
+
+    /// The engine lists the streak alert first, so it — not a lower-priority
+    /// warning sharing the banner — is the collapsed headline.
+    func testSpawnFailureStreakAlertIsTheHeadlineAheadOfOtherIssues() {
+        let model = makeModel()
+        let alert = Self.streakIssue(
+            title: "codex review-guide workers are failing to start: 2 consecutive failures, "
+                + "none succeeded (first 9 minutes ago)",
+            body: "Latest error (just now, execution exec_guide_2):\nrefused"
+        )
+        let paused = EngineHealthIssue(
+            kind: "dispatch_paused",
+            severity: "warning",
+            title: "Dispatch is globally paused",
+            body: "Run `bossctl dispatch resume` to restore normal dispatch."
+        )
+
+        model.applyEventForTest(.engineHealthResult(apiKeyPresent: true, issues: [alert, paused]))
+
+        XCTAssertEqual(
+            EngineHealthBanner.headline(for: model.bannerHealthIssues),
+            "\(alert.title) (1 more)"
+        )
+    }
+
+    /// An in-place update (the next failure) replaces the banner text with
+    /// the engine's new count, and the resolving report clears it.
+    func testSpawnFailureStreakAlertUpdatesInPlaceAndClears() {
+        let model = makeModel()
+        let second = Self.streakIssue(title: "codex review-guide: 2 consecutive failures", body: "refusal 2")
+        let third = Self.streakIssue(title: "codex review-guide: 3 consecutive failures", body: "refusal 3")
+
+        model.applyEventForTest(.engineHealthResult(apiKeyPresent: true, issues: [second]))
+        model.applyEventForTest(.engineHealthResult(apiKeyPresent: true, issues: [third]))
+        XCTAssertEqual(model.bannerHealthIssues, [third], "one alert, carrying the latest count and error")
+        XCTAssertEqual(EngineHealthBanner.headline(for: model.bannerHealthIssues), third.title)
+
+        model.applyEventForTest(.engineHealthResult(apiKeyPresent: true, issues: []))
+        XCTAssertTrue(model.bannerHealthIssues.isEmpty)
+    }
+
+    /// Two combinations can alert at once and share a `kind`; both must
+    /// survive into the banner's issue list as distinct entries.
+    func testTwoSpawnFailureStreakAlertsBothReachTheBanner() {
+        let model = makeModel()
+        let guide = Self.streakIssue(title: "codex review-guide: 4 consecutive failures", body: "guide refusal")
+        let standard = Self.streakIssue(title: "codex standard: 2 consecutive failures", body: "standard refusal")
+
+        model.applyEventForTest(.engineHealthResult(apiKeyPresent: true, issues: [guide, standard]))
+
+        XCTAssertEqual(model.bannerHealthIssues, [guide, standard])
+        let expanded = EngineHealthBanner.accessibilityLabel(for: model.bannerHealthIssues)
+        XCTAssertTrue(expanded.contains("guide refusal"))
+        XCTAssertTrue(expanded.contains("standard refusal"))
+    }
+
+    private static func streakIssue(title: String, body: String) -> EngineHealthIssue {
+        EngineHealthIssue(
+            kind: "pre_start_spawn_failure_streak",
+            severity: "error",
+            title: title,
+            body: body
+        )
+    }
+
     private func makeModel() -> ChatViewModel {
         ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
     }

@@ -2398,6 +2398,9 @@ pub async fn serve_with_overrides(
     // See `ServerState::spawn_pause_state_health_broadcaster` for why this
     // must not live in the individual pausers.
     let _pause_state_health_handle = server_state.spawn_pause_state_health_broadcaster();
+    // Same seam for pre-start spawn-failure streak alerts: raise, in-place
+    // update and resolve each push a fresh health snapshot to the app.
+    let _spawn_streak_health_handle = server_state.spawn_spawn_streak_health_broadcaster();
     if _dispatch_ready_subscriber_handle.is_some() {
         // Boot-time sanity check that the bus injected via `set_event_bus`
         // in `app.rs` is the same one the subscriber just attached to —
