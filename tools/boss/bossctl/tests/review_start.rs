@@ -8,10 +8,15 @@ async fn review_start(response: FrontendEvent) -> std::process::Output {
     // Each invocation owns a distinct socket, including concurrent tests.
     let socket = std::env::temp_dir().join(format!("review-{}.sock", unique_id()));
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let (connected_tx, mut connected_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
+        let mut connected_tx = Some(connected_tx);
         // Discovery first probes connectivity without writing a request.
         loop {
             let (stream, _) = listener.accept().await.unwrap();
+            if let Some(connected_tx) = connected_tx.take() {
+                let _ = connected_tx.send(());
+            }
             let (reader, mut writer) = stream.into_split();
             let Some(line) = BufReader::new(reader).lines().next_line().await.unwrap() else {
                 continue;
@@ -39,11 +44,34 @@ async fn review_start(response: FrontendEvent) -> std::process::Output {
         "example/repo",
     ]);
     command.kill_on_drop(true);
-    let output = tokio::time::timeout(std::time::Duration::from_secs(15), command.output())
-        .await
-        .unwrap()
-        .unwrap();
-    server.await.unwrap();
+    let output = command.output();
+    tokio::pin!(output);
+    // The deadline bounds the RPC exchange, so it starts when the client
+    // reaches the fixture rather than at spawn. The first exec of a freshly
+    // linked bossctl is an OS cold start that, on a host running many other
+    // fresh test binaries, has been measured above 15s before `main` runs;
+    // that latency is not the behaviour under test.
+    let exited_early = tokio::select! {
+        biased;
+        _ = &mut connected_rx => None,
+        result = &mut output => Some(result.unwrap()),
+    };
+    let output = match exited_early {
+        // The client exited without reaching the fixture; the caller's
+        // assertions report its status and stderr.
+        Some(output) => {
+            server.abort();
+            output
+        }
+        None => {
+            let output = tokio::time::timeout(std::time::Duration::from_secs(15), output)
+                .await
+                .unwrap()
+                .unwrap();
+            server.await.unwrap();
+            output
+        }
+    };
     std::fs::remove_file(socket).unwrap();
     output
 }
