@@ -729,7 +729,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // libghostty pane can `claude "$(cat .claude/initial-prompt.txt)"`
         // — Claude Code's positional arg is treated as the first user
         // message, which gets the worker working without us having to
-        // wait for a "Claude is ready" signal and then SendToPane.
+        // wait for a "Claude is ready" signal and then type into the pane.
         // Going through a file (rather than embedding the prompt in
         // the typed command) avoids shell quoting hell on multi-line,
         // backtick-bearing markdown.

@@ -841,8 +841,8 @@ impl MidTurnPaneInput {
 /// How the engine should deliver a probe (inject text) into a live worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeDelivery {
-    /// Write text into the worker pane as typed input — the interactive-TUI
-    /// path used by Claude today (`SendToPane`).
+    /// Write text into the worker pane as typed input via tmux `send-keys` —
+    /// the interactive-TUI path used by Claude today.
     PaneText,
     /// Driver does not support probing; the worker is fire-and-forget for
     /// this verb. Safe default for any driver that has not established a
@@ -853,7 +853,7 @@ pub enum ProbeDelivery {
 /// How the engine should interrupt an in-flight turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterruptDelivery {
-    /// Deliver an Esc keystroke into the pane (`InterruptWorkerPane`) —
+    /// Deliver an Esc keystroke into the tmux pane with `send-keys Escape` —
     /// Claude's interactive-TUI path today.
     PaneEsc,
     /// Driver does not support interrupt; the in-flight turn cannot be
@@ -2209,7 +2209,7 @@ pub trait AgentDriver: Send + Sync {
     }
 
     /// What this driver's foreground process does with pty bytes that arrive
-    /// while it is **mid-turn** — the `probe --urgent` / `SendToPane`
+    /// while it is **mid-turn** — the `probe --urgent` / typed pane-input
     /// injection point.
     ///
     /// Defaults to [`MidTurnPaneInput::Rejects`], the safe answer: a driver

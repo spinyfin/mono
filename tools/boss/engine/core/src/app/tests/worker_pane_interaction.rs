@@ -160,9 +160,8 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
     *server_state.pane_delivery_tmux_override.write().unwrap() = Some(tmux_with_runner(runner.clone()));
 
     // The runner notification proves the waiter has been registered and the
-    // tmux write has started before
-    // we emit the hook that makes this a confirmed (not merely unconfirmed)
-    // delivery.
+    // tmux write has started before we emit the hook that makes this a
+    // confirmed (not merely unconfirmed) delivery.
     let command_started = runner.started.notified();
     let server_clone = server_state.clone();
     let run_id_for_send = run_id.clone();

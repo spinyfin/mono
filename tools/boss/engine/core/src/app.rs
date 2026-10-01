@@ -851,8 +851,8 @@ struct ServerState {
     /// Pending probes per run, FIFO. Each entry is the engine-minted
     /// `probe_id` paired with the verbatim text the caller queued.
     /// The events-socket consumer pops one entry per `Stop` hook event
-    /// for the matching run and dispatches it as `SendToPane` to the
-    /// app.
+    /// for the matching run and types it into the worker pane via tmux
+    /// `send-keys`.
     pending_probes: StdMutex<HashMap<String, VecDeque<PendingProbe>>>,
     /// Probes that have been dispatched into a worker pane and are
     /// awaiting the *next* `Stop` boundary so the engine can extract
@@ -2004,7 +2004,7 @@ impl ServerState {
 }
 
 /// Enable the transient-recovery sweep to nudge a live idle worker via
-/// the same `SendToPane` path that `bossctl agents send` uses.
+/// the same tmux pane-input path that `bossctl agents send` uses.
 /// `Arc<ServerState>` can then be coerced to `Arc<dyn WorkerNudger>`.
 #[async_trait]
 impl crate::transient_recovery::WorkerNudger for ServerState {

@@ -1152,8 +1152,8 @@ pub(crate) fn parse_repo_slug(remote_url: &str) -> Result<String> {
 /// than dropped silently (see `dispatch_probe_on_stop` in `app.rs`).
 pub trait ProbeQueuer: Send + Sync {
     /// Push `text` onto the FIFO of probes for `run_id`. The engine
-    /// `SendToPane`'s it as if the human had typed it, at the earliest
-    /// point the worker's pane will take a write.
+    /// types it into the pane via tmux `send-keys` as if the human had
+    /// typed it, at the earliest point the worker's pane will take a write.
     ///
     /// For a completion-driven probe that point is always the `Stop`
     /// currently being handled: the completion handler runs inside the Stop
@@ -1192,8 +1192,8 @@ pub trait ProbeQueuer: Send + Sync {
     /// Drop every not-yet-delivered probe queued for `run_id`.
     ///
     /// Exists for the escalation/blocker suppression path: a probe
-    /// minted on an earlier Stop (e.g. a `PROBE_NO_PR` nudge whose
-    /// `SendToPane` failed and was requeued for retry — see
+    /// minted on an earlier Stop (e.g. a `PROBE_NO_PR` nudge whose pane
+    /// write failed and was requeued for retry — see
     /// `dispatch_probe_on_stop`) can still be sitting in the queue when
     /// a *later* Stop reveals the worker is blocked. `dispatch_probe_on_stop`
     /// pops whatever is queued for a run on every `Stop` regardless of
