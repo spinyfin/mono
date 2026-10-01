@@ -249,15 +249,9 @@ pub(super) fn claim_revisable_comments_in_tx(
 }
 
 /// Assemble the worker directive from every addressed comment: the doc's
-/// artifact id, each comment's quoted anchor, and its body (design
-/// §"Risks" — "directive assembly includes doc path, quoted anchors, and
-/// comment bodies"). Also appends, per comment, any bucket-2 bridge context
-/// (P3c §"Bridging a bucket-2 answer into a revision") — a comment that
-/// arrived here via a follow-up bridge (`awaiting_followup → active`,
-/// design §"Reclassifying follow-ups") carries a prior answer-agent reply
-/// and the operator's follow-up that asked for the change; comments that
-/// never went through bucket 2 simply have no thread entries and this is a
-/// no-op for them.
+/// artifact id, then each comment's block from [`push_comment_directive_block`]
+/// (design §"Risks" — "directive assembly includes doc path, quoted anchors,
+/// and comment bodies").
 fn compose_doc_comment_directive(db: &WorkDb, artifact_id: &str, comments: &[WorkComment]) -> String {
     let mut out = format!(
         "Reviewer comment{} on `{artifact_id}` request{} the following change{}:\n\n",
@@ -266,40 +260,54 @@ fn compose_doc_comment_directive(db: &WorkDb, artifact_id: &str, comments: &[Wor
         if comments.len() == 1 { "" } else { "s" },
     );
     for comment in comments {
-        out.push_str("Quoted section:\n> ");
-        out.push_str(&comment.anchor.exact);
-        out.push_str("\n\nComment:\n> ");
-        out.push_str(&comment.body);
-        out.push('\n');
-
-        // Only a genuinely `replied` run is bridge context. A run the operator
-        // stood down by reclassifying the comment (`superseded`) is a question
-        // they retracted — feeding its answer into the directive would put a
-        // stale answer to a withdrawn question in front of the worker. Guarding
-        // on the status rather than on `reply_body` being present keeps that
-        // true even if a future terminal state starts carrying a partial body.
-        if let Ok(Some(run)) = db.latest_answer_agent_run_for_comment(&comment.id)
-            && run.status == ANSWER_AGENT_RUN_STATUS_REPLIED
-            && let Some(reply) = run.reply_body.as_deref()
-        {
-            out.push_str("\nPrior answer-agent reply on this thread (bucket-2 bridge context):\n> ");
-            out.push_str(reply);
-            out.push('\n');
-        }
-        if let Ok(entries) = db.list_comment_thread_entries(&comment.id) {
-            for entry in entries
-                .iter()
-                .filter(|e| e.entry_kind == THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP)
-            {
-                out.push_str("\nOperator follow-up on this thread:\n> ");
-                out.push_str(&entry.body);
-                out.push('\n');
-            }
-        }
-        out.push('\n');
+        push_comment_directive_block(db, &mut out, comment);
     }
     out.push_str("Please update the document accordingly.");
     out
+}
+
+/// Render one comment's quoted section, body, and bridge context into a
+/// directive being assembled, shared by [`compose_doc_comment_directive`]
+/// and `guide_feedback::compose_guide_comment_directive` so the two targets
+/// cannot drift apart on what context a directive carries. Also appends, per
+/// comment, any bucket-2 bridge context (P3c §"Bridging a bucket-2 answer
+/// into a revision") — a comment that arrived here via a follow-up bridge
+/// (`awaiting_followup → active`, design §"Reclassifying follow-ups")
+/// carries a prior answer-agent reply and the operator's follow-up that
+/// asked for the change; comments that never went through bucket 2 simply
+/// have no thread entries and this is a no-op for them.
+pub(crate) fn push_comment_directive_block(db: &WorkDb, out: &mut String, comment: &WorkComment) {
+    out.push_str("Quoted section:\n> ");
+    out.push_str(&comment.anchor.exact);
+    out.push_str("\n\nComment:\n> ");
+    out.push_str(&comment.body);
+    out.push('\n');
+
+    // Only a genuinely `replied` run is bridge context. A run the operator
+    // stood down by reclassifying the comment (`superseded`) is a question
+    // they retracted — feeding its answer into the directive would put a
+    // stale answer to a withdrawn question in front of the worker. Guarding
+    // on the status rather than on `reply_body` being present keeps that
+    // true even if a future terminal state starts carrying a partial body.
+    if let Ok(Some(run)) = db.latest_answer_agent_run_for_comment(&comment.id)
+        && run.status == ANSWER_AGENT_RUN_STATUS_REPLIED
+        && let Some(reply) = run.reply_body.as_deref()
+    {
+        out.push_str("\nPrior answer-agent reply on this thread (bucket-2 bridge context):\n> ");
+        out.push_str(reply);
+        out.push('\n');
+    }
+    if let Ok(entries) = db.list_comment_thread_entries(&comment.id) {
+        for entry in entries
+            .iter()
+            .filter(|e| e.entry_kind == THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP)
+        {
+            out.push_str("\nOperator follow-up on this thread:\n> ");
+            out.push_str(&entry.body);
+            out.push('\n');
+        }
+    }
+    out.push('\n');
 }
 
 #[cfg(test)]
