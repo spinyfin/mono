@@ -2036,18 +2036,19 @@ impl AgentDriver for CodexDriver {
         WorkerErrorClass::Indeterminate
     }
 
-    /// Existing engine path: probes go through a tmux pane write, either at a turn
-    /// boundary or into a live composer mid-turn — the TUI buffers the latter
-    /// (see [`Self::mid_turn_pane_input`]), so there is no longer a refusal
-    /// case for this driver. This declares today's transport so the seam is
-    /// real without changing delivery.
+    /// Existing engine path: probes go through typed pane input via tmux
+    /// `send-keys`, either at a turn boundary or into a live composer
+    /// mid-turn — the TUI buffers the latter (see [`Self::mid_turn_pane_input`]),
+    /// so there is no longer a refusal case for this driver. This declares
+    /// today's transport so the seam is real without changing delivery.
     fn probe(&self) -> ProbeDelivery {
         ProbeDelivery::PaneText
     }
 
-    /// Existing engine path: Esc via `InterruptWorkerPane`. Esc semantics on
-    /// non-interactive `codex exec` are unvalidated; this declares the
-    /// transport the engine uses today rather than inventing a signal path.
+    /// Existing engine path: Esc delivered into the tmux pane with
+    /// `send-keys Escape`. Esc semantics on non-interactive `codex exec` are
+    /// unvalidated; this declares the transport the engine uses today rather
+    /// than inventing a signal path.
     fn interrupt(&self) -> InterruptDelivery {
         InterruptDelivery::PaneEsc
     }

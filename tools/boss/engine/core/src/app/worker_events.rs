@@ -1544,8 +1544,9 @@ pub(super) async fn dispatch_post_hoc_interception_on_post_tool_use(
 }
 
 /// On the driver's turn boundary, pop a pending probe for the run (if
-/// any) and write the text into the worker's tmux pane. The injection
-/// arrives at the pane just as the worker becomes idle, so the agent
+/// any) and type the text into the worker's pane via tmux `send-keys`.
+/// The injection arrives at the pane just as the worker becomes idle, so
+/// the agent
 /// treats it as the next user prompt. After a successful dispatch,
 /// records an in-flight entry (with the transcript path and current
 /// byte offset) so `dispatch_probe_reply_on_stop` can emit the
@@ -1652,8 +1653,8 @@ async fn dispatch_probe_on_stop_inner(
     deliver_probe_via_pane_write(server_state, run_id, slot_id, posture, "probe injected into pane").await
 }
 
-/// Claim the next queued probe for `run_id` and write it into the pane with a
-/// plain pane write, trusting a successful write.
+/// Claim the next queued probe for `run_id` and write it into the pane with
+/// tmux `send-keys`, trusting a successful write.
 ///
 /// The delivery mechanism for a pane the worker is *parked* at: the write
 /// becomes its next prompt, so nothing further needs to be observed to call
@@ -1960,7 +1961,7 @@ const MID_TURN_PROBE_VERIFY_TIMEOUT: Duration = Duration::from_secs(6);
 /// cycle" holds for a folding driver too, on one boundary rather than two.
 ///
 /// When the guard passes, the write is not trusted just because
-/// the pane write returned Ok: confirmation still requires a matching
+/// tmux `send-keys` returned Ok: confirmation still requires a matching
 /// `UserPromptSubmit` hook or a transcript scan (probe-6). On a
 /// tmux transport failure the probe is pushed back to the front
 /// so a later retry keeps the same id.
@@ -2360,7 +2361,7 @@ async fn dispatch_probe_now_inner(server_state: &Arc<ServerState>, run_id: &str)
         return inject_probe_mid_turn(server_state, run_id, slot_id, posture).await;
     }
     // Parked (Idle/WaitingForInput) is a reliable arrival point just like
-    // Stop, so a successful pane write here is treated as consumed —
+    // Stop, so a successful tmux `send-keys` here is treated as consumed —
     // provided the worker's process is actually still there to consume it.
     deliver_probe_via_pane_write(
         server_state,

@@ -1148,14 +1148,14 @@ impl AgentDriver for ClaudeDriver {
         }
     }
 
-    /// Probe is typed pane input (tmux `send-keys`) — Claude's interactive TUI
-    /// reads stdin as the next user message.
+    /// Probe is typed pane input via tmux `send-keys` — Claude's interactive
+    /// TUI reads stdin as the next user message.
     fn probe(&self) -> ProbeDelivery {
         ProbeDelivery::PaneText
     }
 
-    /// Interrupt is Esc into the pane (`InterruptWorkerPane`) — cancels the
-    /// in-flight turn; the process survives.
+    /// Interrupt is Esc delivered into the tmux pane with `send-keys Escape`
+    /// — cancels the in-flight turn; the process survives.
     fn interrupt(&self) -> InterruptDelivery {
         InterruptDelivery::PaneEsc
     }

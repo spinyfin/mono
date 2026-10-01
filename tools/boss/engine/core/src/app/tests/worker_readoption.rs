@@ -6,13 +6,38 @@
 //! a test that stubbed either half would assert the disagreement away.
 
 use super::*;
+use std::sync::Arc;
 
+use super::tmux_stub::{RecordingPaneRunner, tmux_with_runner};
+use crate::protocol::WorkerEvent;
 use crate::test_support::*;
 use crate::work::{ExecutionStatus, TmuxPaneObservationKind, TmuxPaneObservationRecord};
 
 /// A pid guaranteed not to exist, so `kill(pid, 0)` returns `ESRCH`.
 fn dead_pid() -> i64 {
     4_194_303
+}
+
+fn last_tmux_paste(runner: &RecordingPaneRunner) -> String {
+    if let Some(stdin) = runner.stdin().last()
+        && !stdin.is_empty()
+    {
+        return String::from_utf8(stdin.clone()).expect("paste is utf-8");
+    }
+    for call in runner.calls().iter().rev() {
+        if call.iter().any(|arg| arg == "send-keys")
+            && call.iter().any(|arg| arg == "-l")
+            && let Some(idx) = call.iter().position(|arg| arg == "--")
+            && let Some(text) = call.get(idx + 1)
+        {
+            return text.clone();
+        }
+    }
+    panic!(
+        "expected a tmux pane write; calls={:?} stdin={:?}",
+        runner.calls(),
+        runner.stdin()
+    )
 }
 
 /// Seed a chore with a worker in the post-spawn shape, then terminalize its
@@ -694,7 +719,10 @@ async fn readoption_does_not_claim_a_slot_whose_live_state_belongs_to_another_ru
 /// A readopted local tmux worker must be registered with its durable tmux
 /// session name: local pane writes, probes and interrupt route only on it, so
 /// a sessionless registration would fail them closed until the next adoption
-/// pass even though the worker is healthy.
+/// pass even though the worker is healthy. After that registration, typed
+/// input and interrupt must actually reach tmux for that session — a
+/// transport-ready registry entry is not enough if a later identity source
+/// or posture check still rejects the readopted worker.
 #[tokio::test]
 async fn readoption_registers_the_durable_tmux_session_name() {
     let (server_state, _dir) = test_server_state();
@@ -717,6 +745,57 @@ async fn readoption_registers_the_durable_tmux_session_name() {
         "the readopted slot must carry the durable tmux session name",
     );
     assert!(server_state.pane_write_transport_ready(&execution_id).is_ok());
+
+    // Readoption restores live-state via the spawn entry, which leaves
+    // activity at `Spawning`. Typed input is accepted only at Idle /
+    // WaitingForInput; the Stop hook that proved this worker is alive is
+    // the same promotion `register_idle_worker` uses so pane-write tests
+    // park at the prompt. Apply it here without touching the tmux slot
+    // registration readoption just created.
+    server_state.live_worker_states.apply_event(
+        pane.slot_id,
+        &WorkerEvent::Stop {
+            session_id: "readopt-sess".into(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Completed,
+        },
+    );
+
+    // Point pane delivery at a recording runner for the restored session
+    // without calling `register_tmux_run_slot` again — that would hide a
+    // regression in the registration readoption just performed.
+    let runner = Arc::new(RecordingPaneRunner::with_identity("boss-1-readopt", "tok-readopt").echo_last_paste());
+    *server_state.pane_delivery_tmux_override.write().unwrap() = Some(tmux_with_runner(runner.clone()));
+
+    server_state
+        .send_input_to_worker(&execution_id, "readopt-nudge\n".into())
+        .await
+        .expect("readopted worker must accept pane input");
+    assert!(
+        runner.wrote_text(),
+        "send_input_to_worker must reach tmux after readoption; calls={:?} stdin={:?}",
+        runner.calls(),
+        runner.stdin(),
+    );
+    let pasted = last_tmux_paste(&runner);
+    assert!(
+        pasted.contains("readopt-nudge"),
+        "the pasted text must be the input sent after readoption, got {pasted:?}"
+    );
+
+    server_state
+        .interrupt_worker_pane(&execution_id)
+        .await
+        .expect("readopted worker must accept interrupt");
+    assert!(
+        runner.calls().iter().any(|call| {
+            call.iter().any(|arg| arg == "send-keys")
+                && call.iter().any(|arg| arg == "boss-1-readopt")
+                && call.last().map(String::as_str) == Some("Escape")
+        }),
+        "interrupt_worker_pane must send-keys Escape for the restored session; calls={:?}",
+        runner.calls(),
+    );
 }
 
 // ─── progress-ingress readoption ────────────────────────────────────────────

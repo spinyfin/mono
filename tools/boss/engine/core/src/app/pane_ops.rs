@@ -486,10 +486,9 @@ impl ServerState {
         }
     }
 
-    /// Resolve `id` (short-form or canonical) to a work item
-    /// and ask the app to scroll the kanban to that card and play a
-    /// short transient highlight. Returns the canonical id on success
-    /// so `bossctl reveal` can confirm what was highlighted.
+    /// Resolve `id` (a short-form or canonical work-item identifier) to a
+    /// work item and ask the app to reveal its card. Returns the canonical
+    /// id on success so `bossctl reveal` can confirm what was highlighted.
     pub async fn reveal_work_item(&self, id: &str) -> Result<String, RevealItemError> {
         let canonical_id = self
             .resolve_work_item_id(id)
