@@ -6,7 +6,7 @@ use super::*;
 /// Filed against a run when the worker pane never came up (libghostty IPC
 /// drop, slot busy, prompt composition error). See
 /// [`crate::attention_lifecycle::ATTENTION_LIFECYCLES`] for its clearing
-/// rule: `ClearedBy::WorkResumed`, since a later run starting for the item
+/// rule: `ClearedBy::WorkResumed`, since a later spawn completing for the item
 /// is direct evidence the pane-spawn problem is no longer blocking it.
 pub const PANE_SPAWN_FAILED_ATTENTION_KIND: &str = "pane_spawn_failed";
 
@@ -505,13 +505,9 @@ impl ExecutionCoordinator {
                             released_workspace = released,
                             "execution run failed"
                         );
-                        // Say that the attention item was filed, and where.
-                        // It is execution-scoped, and for executions whose
-                        // work item is not a task row (a review guide binds
-                        // a source-comparison id) no board or work-item
-                        // listing reaches it — so without this line and the
-                        // `attention_item_id` on the event below, the trace
-                        // gives no sign the item exists at all.
+                        // Keep the dispatch trace linked to the attention item,
+                        // which the work-item listing resolves through the execution
+                        // and, for review guides, its source series' root task.
                         let attention_item_id = attention_item.as_ref().map(|item| item.id.clone());
                         tracing::info!(
                             execution_id = %execution.id,

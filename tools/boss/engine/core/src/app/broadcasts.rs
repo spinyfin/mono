@@ -114,7 +114,7 @@ impl ServerState {
     /// The companion of [`Self::spawn_pause_state_health_broadcaster`] for
     /// [`crate::pre_start_streak`], built the same way and for the same
     /// reason: the alert is only worth anything if it reaches the app's
-    /// banner without the operator asking, so the push is keyed to the
+    /// banner without a poll or RPC, so the push is keyed to the
     /// tracker's own change notifier rather than to the code that happens
     /// to record a failure. Every in-place update pushes too, so the banner
     /// shows the live count and latest error rather than the values from

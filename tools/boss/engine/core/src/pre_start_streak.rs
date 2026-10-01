@@ -5,8 +5,8 @@
 //!
 //! Incident 008: for 31 hours every Codex review-guide spawn was refused by
 //! the hook-trust gate before a pane existed — 28 consecutive identical
-//! failures across 26 work items, zero successes — and nothing told the
-//! operator. Each refusal was handled correctly *per execution* (an ERROR
+//! failures across 26 work items, zero successes — and no fleet-level
+//! alert was raised. Each refusal was handled correctly *per execution* (an ERROR
 //! log line, a `spawn_failed` dispatch event, an execution-scoped
 //! `pane_spawn_failed` attention item), but nothing looked *across*
 //! executions, so a combination that had stopped working entirely looked
@@ -78,7 +78,7 @@ pub const PRE_START_FAILURE_STREAK_ISSUE_KIND: &str = "pre_start_spawn_failure_s
 /// case this tracker exists for.
 pub const UNRESOLVED_DRIVER_LABEL: &str = "unknown";
 
-/// Operator-facing label for a [`WorkerKind`]. Exhaustive (no `_` arm) so a
+/// Display label for a [`WorkerKind`] in alerts and bossctl output. Exhaustive (no `_` arm) so a
 /// new kind must pick its label rather than silently sharing a streak with
 /// another kind.
 pub fn worker_kind_label(kind: WorkerKind) -> &'static str {
