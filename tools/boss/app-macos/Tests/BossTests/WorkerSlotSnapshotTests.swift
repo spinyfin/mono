@@ -83,6 +83,8 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         "lastToolEndedAt",
         "liveStatusAt",
         "tmuxHosted",
+        "waitReason",
+        "waitExpiresAt",
     ]
 
     func testWorkerLiveStateStoredPropertyClassificationIsExhaustive() {
@@ -148,6 +150,8 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             Self.makeLiveState(lastToolEndedAt: "2026-09-01T00:00:00Z"),
             Self.makeLiveState(liveStatusAt: "2026-09-01T00:00:00Z"),
             Self.makeLiveState(tmuxHosted: true),
+            Self.makeLiveState(waitReason: "CI build"),
+            Self.makeLiveState(waitExpiresAt: "2026-09-01T00:00:00Z"),
         ]
         for other in variants {
             let otherSnap = WorkerSlotSnapshot.build(
@@ -511,7 +515,9 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         liveStatus: String? = "Building",
         liveStatusAt: String? = "t",
         recoveryStatus: String? = nil,
-        tmuxHosted: Bool? = nil
+        tmuxHosted: Bool? = nil,
+        waitReason: String? = nil,
+        waitExpiresAt: String? = nil
     ) -> WorkerLiveState {
         WorkerLiveState(
             name: name,
@@ -526,7 +532,9 @@ final class WorkerSlotSnapshotTests: XCTestCase {
             liveStatus: liveStatus,
             liveStatusAt: liveStatusAt,
             recoveryStatus: recoveryStatus,
-            tmuxHosted: tmuxHosted
+            tmuxHosted: tmuxHosted,
+            waitReason: waitReason,
+            waitExpiresAt: waitExpiresAt
         )
     }
 }
