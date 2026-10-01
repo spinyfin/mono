@@ -160,10 +160,11 @@ impl WorkDb {
         collect_rows(rows)
     }
 
-    /// List the sticky, pre-dispatch attention items attached to a
-    /// work item (i.e. `work_item_id IS NOT NULL`). Used by the
-    /// `repo_unresolved` surface and any future work-item-scoped
-    /// attention flows. Errors if the work item id is unknown so
+    /// List attention items attached directly to a work item, plus
+    /// pane-spawn failures attached through one of its executions. Review-guide executions resolve through
+    /// their source comparison to the series' root task, so even a single
+    /// refused guide spawn appears in the task's attention listing.
+    /// Errors if the work item id is unknown so
     /// callers can't accidentally silently no-op on a typo. Deliberately
     /// permissive of tombstoned tasks (e.g. an archived-and-tombstoned
     /// moot revision) so the `revision_archived` attention item raised at
