@@ -263,9 +263,9 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
         crate::coordinator::PANE_SPAWN_FAILED_ATTENTION_KIND,
         ClearedBy::WorkResumed,
-        "Asserts the worker pane for a run never came up. A later run starting for the same item is \
-         direct evidence the pane-spawn problem is no longer blocking it — the same reasoning as \
-         `driver_terminal_error`, one stage earlier in the run's lifecycle.",
+        "Asserts the worker pane for a run never came up. A later completed spawn run for the same \
+         item proves the pane-spawn problem is no longer blocking it; inserting a run before a \
+         spawn attempt does not.",
     ),
     entry(
         crate::coordinator::ANSWER_AGENT_READY_AGE_ATTENTION_KIND,

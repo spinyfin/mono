@@ -158,10 +158,11 @@ impl WorkDb {
         collect_rows(rows)
     }
 
-    /// List the sticky, pre-dispatch attention items attached to a
-    /// work item (i.e. `work_item_id IS NOT NULL`). Used by the
-    /// `repo_unresolved` surface and any future work-item-scoped
-    /// attention flows. Errors if the work item id is unknown so
+    /// List attention items attached directly to a work item, plus
+    /// pane-spawn failures attached through one of its executions. Review-guide executions resolve through
+    /// their source comparison to the series' root task, so even a single
+    /// refused guide spawn appears in the task's attention listing.
+    /// Errors if the work item id is unknown so
     /// callers can't accidentally silently no-op on a typo. Deliberately
     /// permissive of tombstoned tasks (e.g. an archived-and-tombstoned
     /// moot revision) so the `revision_archived` attention item raised at
@@ -189,7 +190,14 @@ impl WorkDb {
         let mut stmt = conn.prepare(
             "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at, converted_task_id
              FROM work_attention_items
-             WHERE work_item_id = ?1
+             WHERE work_item_id = ?1 OR (work_item_id IS NULL AND kind = 'pane_spawn_failed' AND (
+                 SELECT COALESCE(s.root_task_id, e.work_item_id)
+                 FROM work_executions e
+                 LEFT JOIN pr_review_guide_source_comparisons c
+                   ON e.kind = 'pr_review_guide' AND c.id = e.work_item_id
+                 LEFT JOIN pr_review_guide_source_series s ON s.id = c.series_id
+                 WHERE e.id = work_attention_items.execution_id
+             ) = ?1)
              ORDER BY created_at ASC, id ASC",
         )?;
         let rows = stmt.query_map([work_item_id], map_attention_item)?;
