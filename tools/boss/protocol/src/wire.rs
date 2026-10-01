@@ -907,13 +907,14 @@ pub enum FrontendRequest {
     GetEngineHealth,
 
     /// Ask the engine to identify itself. Replies with
-    /// [`FrontendEvent::EngineVersionResult`] carrying the build SHA,
-    /// build time, and binary-content fingerprint of the running
-    /// engine binary. Used by the macOS app on attach to detect
-    /// whether the running engine matches the app's bundled engine; if
-    /// they differ the app stops the old engine and spawns the new one
-    /// from the bundle, ensuring the user always gets the version that
-    /// shipped with the app they launched.
+    /// [`FrontendEvent::EngineVersionResult`] carrying the stamped
+    /// Boss version, build SHA, build time, and binary-content
+    /// fingerprint of the running engine binary. Used by the macOS app
+    /// on attach to detect whether the running engine matches the
+    /// app's bundled engine; if they differ the app stops the old
+    /// engine and spawns the new one from the bundle, ensuring the
+    /// user always gets the version that shipped with the app they
+    /// launched.
     GetEngineVersion,
 
     GetExecution {

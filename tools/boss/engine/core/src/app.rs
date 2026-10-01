@@ -1173,6 +1173,7 @@ impl ServerState {
         crate::build_info::init();
         timeline.mark("build_info_init");
         tracing::info!(
+            engine_version = crate::build_info::version(),
             engine_build_sha = crate::build_info::git_sha(),
             engine_build_dirty = crate::build_info::git_dirty(),
             engine_build_time = crate::build_info::build_time(),

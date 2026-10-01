@@ -1,5 +1,6 @@
-//! Engine build provenance: the actual commit sha, working-tree dirty
-//! flag, and build wall-clock time, stamped at Bazel build time.
+//! Engine build provenance: the stamped release version, commit sha,
+//! working-tree dirty flag, and build wall-clock time, stamped at Bazel
+//! build time.
 //!
 //! Kept as its own crate — rather than a module inside `engine/core`,
 //! where `boss_engine::build_info` lives — for a normal crate-boundary
@@ -34,6 +35,13 @@ mod stamp {
     include!(env!("BOSS_BUILD_PROVENANCE_RS"));
 }
 
+/// Stamped Boss version: `1.0.N` on a release tag, `1.0.N-dev-<sha>`
+/// otherwise, or `"unknown"` on a Cargo (non-Bazel) build. Never the
+/// Cargo-crate placeholder `0.0.0`.
+pub fn version() -> &'static str {
+    stamp::VERSION
+}
+
 /// Full git commit sha the running engine was built from, or
 /// `"unknown"` on a Cargo (non-Bazel) build. Long enough to feed
 /// directly to `git merge-base --is-ancestor <sha> main`.
@@ -65,6 +73,8 @@ mod tests {
 
     #[test]
     fn provenance_values_are_non_empty() {
+        assert!(!version().is_empty());
+        assert_ne!(version(), "0.0.0");
         assert!(!git_sha().is_empty());
         assert!(!build_time().is_empty());
         // git_dirty() is a plain bool; just confirm the call compiles

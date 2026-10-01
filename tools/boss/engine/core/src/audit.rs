@@ -93,7 +93,11 @@ pub fn set_audit_path(path: PathBuf) {
 
 /// Snapshot of the values that [`record_start`] writes. Built from the
 /// running process's argv, env, and any optional fields the caller
-/// wants to attach (engine version, socket paths, db path).
+/// wants to attach (engine version override, socket paths, db path).
+/// `engine_version` is optional so tests can stamp a unique marker;
+/// when unset, empty, or the Cargo-crate placeholder `0.0.0`,
+/// [`record_start`] writes [`crate::build_info::version`] instead.
+/// `git_sha` and `git_dirty` always come from `build_info`.
 ///
 /// `ppid` / `parent_command` are not enough to name the launcher: the
 /// macOS app detaches the engine with `nohup`, so both app-spawned and
@@ -133,9 +137,13 @@ pub fn record_start(ctx: StartContext) {
     if let Some(parent) = ctx.parent_command {
         fields.insert("parent_command".into(), Value::String(parent));
     }
-    if let Some(version) = ctx.engine_version {
-        fields.insert("engine_version".into(), Value::String(version));
-    }
+    let version = ctx
+        .engine_version
+        .filter(|v| !v.is_empty() && v != "0.0.0")
+        .unwrap_or_else(|| crate::build_info::version().to_owned());
+    fields.insert("engine_version".into(), Value::String(version));
+    fields.insert("git_sha".into(), Value::String(crate::build_info::git_sha().to_owned()));
+    fields.insert("git_dirty".into(), json!(crate::build_info::git_dirty()));
     if !ctx.socket_paths.is_empty() {
         let strs: Vec<String> = ctx.socket_paths.iter().map(|p| p.display().to_string()).collect();
         fields.insert("socket_paths".into(), json!(strs));
@@ -619,6 +627,11 @@ mod tests {
         assert_eq!(start["launched_by"], "app");
         assert_eq!(start["app_pid"], 99);
         assert_eq!(start["exe_path"], "/tmp/engine");
+        // Identity fields are always taken from the build stamp even when
+        // `engine_version` is overridden as a test marker.
+        assert_eq!(start["git_sha"], crate::build_info::git_sha());
+        assert_eq!(start["git_dirty"], crate::build_info::git_dirty());
+        assert_ne!(start["engine_version"], "0.0.0");
 
         let shutdown = parsed
             .iter()
@@ -629,6 +642,38 @@ mod tests {
         // Re-arm SHUTDOWN_EMITTED so we don't poison sibling tests if
         // the runner schedules them after this one.
         SHUTDOWN_EMITTED.store(false, Ordering::SeqCst);
+    }
+
+    /// Production path: when `engine_version` is unset, the start record
+    /// must carry the stamped Boss version and git SHA from `build_info`,
+    /// never the Cargo-crate placeholder `0.0.0`.
+    #[test]
+    fn start_record_carries_stamped_build_identity() {
+        let _globals = lock_globals();
+        SHUTDOWN_EMITTED.store(false, Ordering::SeqCst);
+
+        record_start(StartContext {
+            argv: vec!["engine-stamp-identity-probe".into()],
+            engine_version: None,
+            socket_paths: vec![],
+            state_db_path: None,
+            prior_state_db_size: None,
+            parent_command: None,
+            launched_by: Some("standalone".into()),
+            app_pid: None,
+            exe_path: None,
+        });
+
+        let path = default_audit_log_path().expect("a test process always resolves its isolated audit path");
+        let parsed = parse_lines(&path);
+        let start = parsed
+            .iter()
+            .find(|v| v["event"] == "start" && v["argv"][0] == "engine-stamp-identity-probe")
+            .expect("expected this test's own start record");
+        assert_eq!(start["engine_version"], crate::build_info::version());
+        assert_ne!(start["engine_version"], "0.0.0");
+        assert_eq!(start["git_sha"], crate::build_info::git_sha());
+        assert_eq!(start["git_dirty"], crate::build_info::git_dirty());
     }
 
     #[test]

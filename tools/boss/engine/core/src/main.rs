@@ -268,9 +268,7 @@ async fn main() -> Result<()> {
 fn build_start_context(isolation: &IsolationPaths) -> StartContext {
     let argv: Vec<String> = std::env::args().collect();
     let parent_command = parent_command_line();
-    let engine_version = std::env::var("BOSS_ENGINE_VERSION")
-        .ok()
-        .or_else(|| option_env!("CARGO_PKG_VERSION").map(|s| s.to_owned()));
+    let engine_version = Some(build_info::version().to_owned());
     // Prefer the isolation-derived db path so a fixture's audit `start` row
     // names the db it actually opened, not production's — otherwise this
     // record is actively misleading in exactly the forensic scenario the

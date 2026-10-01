@@ -10,8 +10,20 @@ use serde::{Deserialize, Serialize};
 /// extensible: the chore notes other required config (engine socket
 /// path, etc.) "likely also applies", so the shape is "report a list
 /// of named problems" rather than a one-off boolean.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct EngineHealthReport {
+    /// Stamped Boss version of the running engine (`1.0.N` on a
+    /// release tag, `1.0.N-dev-<sha>` otherwise, or `unknown` if
+    /// unstamped). Same string as `EngineVersionResult.version`.
+    #[serde(default)]
+    #[builder(default)]
+    pub engine_version: String,
+    /// Full git commit sha of the running engine (or `unknown`). Same
+    /// string as `EngineVersionResult.git_sha`.
+    #[serde(default)]
+    #[builder(default)]
+    pub engine_git_sha: String,
     /// True iff the engine's agent config had an `ANTHROPIC_API_KEY`
     /// at startup. Surfaced as a top-level bit (rather than only via
     /// the `issues` list) so a CLI consumer doing

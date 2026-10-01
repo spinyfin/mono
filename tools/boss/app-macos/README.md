@@ -176,9 +176,10 @@ Every engine process appends one JSON line per lifecycle transition to
   `argv`, `parent_command` (best-effort `ps -o command=` of the
   parent), `launched_by` (`app` if `BOSS_APP_PID` is set, else
   `standalone`), `app_pid` (the value of `BOSS_APP_PID` when set),
-  `exe_path` (`std::env::current_exe()`), `engine_version`,
-  `socket_paths` (the frontend and events sockets the engine
-  _intends_ to bind), `state_db_path`, and `prior_state_db_size`.
+  `exe_path` (`std::env::current_exe()`), `engine_version` (stamped
+  Boss version; `unknown` if unstamped, never `0.0.0`), `git_sha`,
+  `git_dirty`, `socket_paths` (the frontend and events sockets the
+  engine _intends_ to bind), `state_db_path`, and `prior_state_db_size`.
   `parent_command` is often `/sbin/launchd` because the app detaches
   the engine with `nohup`; `launched_by` / `app_pid` are the
   launcher, not the reparented ppid.

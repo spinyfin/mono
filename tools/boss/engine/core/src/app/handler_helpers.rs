@@ -313,6 +313,8 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
     }
 
     EngineHealthReport {
+        engine_version: crate::build_info::version().to_owned(),
+        engine_git_sha: crate::build_info::git_sha().to_owned(),
         anthropic_api_key_present,
         dispatch_paused,
         automation_paused,
@@ -323,7 +325,7 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
 /// Build the per-slot diagnostic snapshot the `live-status debug`
 /// verb returns. Reads the manager's debug store, joins with the
 /// per-slot live state (for transcript_path lookup via WorkDb), and
-/// stamps engine-level facts (build SHA, API key presence). No
+/// stamps engine-level facts (version, build SHA, API key presence). No
 /// blocking IO is acceptable here — this verb is called interactively
 /// and must return promptly even when the engine is busy.
 pub(super) fn build_live_status_debug_report(
@@ -404,6 +406,7 @@ pub(super) fn build_live_status_debug_report(
     };
 
     LiveStatusDebugReport {
+        engine_version: crate::build_info::version().to_owned(),
         engine_build_sha: crate::build_info::git_sha().to_owned(),
         engine_build_dirty: crate::build_info::git_dirty(),
         engine_build_time: crate::build_info::build_time().to_owned(),

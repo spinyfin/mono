@@ -20,6 +20,9 @@ async fn engine_health_report_flags_missing_anthropic_api_key() {
     );
 
     let report = build_engine_health_report(&state);
+    assert_eq!(report.engine_version, crate::build_info::version());
+    assert_ne!(report.engine_version, "0.0.0");
+    assert_eq!(report.engine_git_sha, crate::build_info::git_sha());
     assert!(!report.anthropic_api_key_present);
     assert_eq!(report.issues.len(), 1, "issues: {:?}", report.issues);
     let issue = &report.issues[0];
@@ -363,7 +366,13 @@ async fn get_engine_version_response_matches_swift_app_parser() {
         .as_str()
         .expect("binary_fingerprint must be a string");
     assert!(!fp.is_empty());
-    assert!(parsed["payload"]["git_sha"].is_string());
+    let version = parsed["payload"]["version"].as_str().expect("version must be a string");
+    assert_eq!(version, crate::build_info::version());
+    assert_ne!(version, "0.0.0");
+    assert_eq!(
+        parsed["payload"]["git_sha"].as_str().expect("git_sha must be a string"),
+        crate::build_info::git_sha()
+    );
     assert!(parsed["payload"]["build_time"].is_string());
 
     // Drop the writer so the engine-side reader unblocks and the

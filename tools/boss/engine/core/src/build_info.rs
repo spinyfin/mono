@@ -56,9 +56,27 @@ mod build_info_stamp {
 
 /// Format the canonical `--version` string for a bundled Boss binary.
 ///
-/// Output: `<name> <version>`, e.g. `boss-engine 1.0.4-dev-f3be785`.
+/// Output: `<name> <version>`, e.g. `boss-engine 1.0.4`. The numeric
+/// tag-derived base version is cache-stable (see `build_info_rs`); the
+/// full `1.0.N-dev-<sha>` identity is [`version`].
 pub fn version_string(binary_name: &str) -> String {
     format!("{binary_name} {}", build_info_stamp::BOSS_VERSION)
+}
+
+/// Stamped Boss version for forensic surfaces: `1.0.N` on a release
+/// tag (`boss-v1.0.N`), `1.0.N-dev-<sha>` otherwise. `"unknown"` when
+/// the binary is unstamped (Cargo) or the stamp is the Cargo-crate
+/// placeholder `0.0.0`. Never returns `"0.0.0"`.
+pub fn version() -> &'static str {
+    stamped_or_unknown(boss_build_provenance::version())
+}
+
+fn stamped_or_unknown(raw: &str) -> &str {
+    if raw.is_empty() || raw == "0.0.0" {
+        "unknown"
+    } else {
+        raw
+    }
 }
 
 /// Full git commit sha the engine binary was built from — long enough to
@@ -233,6 +251,23 @@ pub fn process_started_at() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stamped_or_unknown_never_returns_cargo_pkg_placeholder() {
+        assert_eq!(stamped_or_unknown(""), "unknown");
+        assert_eq!(stamped_or_unknown("0.0.0"), "unknown");
+        assert_eq!(stamped_or_unknown("unknown"), "unknown");
+        assert_eq!(stamped_or_unknown("1.0.694"), "1.0.694");
+        assert_eq!(stamped_or_unknown("1.0.694-dev-abc"), "1.0.694-dev-abc");
+    }
+
+    #[test]
+    fn version_is_stamped_and_never_cargo_pkg_placeholder() {
+        let s = version();
+        assert!(!s.is_empty());
+        assert_ne!(s, "0.0.0");
+        assert_eq!(s, boss_build_provenance::version());
+    }
 
     #[test]
     fn git_sha_returns_non_empty_string() {

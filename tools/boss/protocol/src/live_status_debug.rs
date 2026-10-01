@@ -23,6 +23,10 @@ use serde::{Deserialize, Serialize};
 /// user's machine was stale relative to a recently-merged PR.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LiveStatusDebugReport {
+    /// Stamped Boss version of the running engine (`1.0.N` on a
+    /// release tag, `1.0.N-dev-<sha>` otherwise, or `unknown` if
+    /// unstamped). Never the Cargo-crate placeholder `0.0.0`.
+    pub engine_version: String,
     /// Full git commit sha (or `unknown`) of the engine binary, baked
     /// in at compile time — long enough to feed directly to
     /// `git merge-base --is-ancestor <sha> main` to check whether the
@@ -231,6 +235,7 @@ mod tests {
     #[test]
     fn report_round_trips_through_serde() {
         let original = LiveStatusDebugReport {
+            engine_version: "1.0.4-dev-abc1234".into(),
             engine_build_sha: "abc1234".into(),
             engine_build_dirty: false,
             engine_build_time: "2026-05-11T20:00:00Z".into(),
@@ -284,6 +289,7 @@ mod tests {
         // key names so a refactor of the struct doesn't silently
         // rename them.
         let report = LiveStatusDebugReport {
+            engine_version: "1.0.4-dev-deadbeef".into(),
             engine_build_sha: "deadbeef".into(),
             engine_build_dirty: false,
             engine_build_time: "2026-05-11T20:00:00Z".into(),
@@ -296,6 +302,7 @@ mod tests {
             slots: vec![],
         };
         let text = serde_json::to_string(&report).unwrap();
+        assert!(text.contains("\"engine_version\":\"1.0.4-dev-deadbeef\""), "{text}");
         assert!(text.contains("\"engine_build_sha\":\"deadbeef\""), "{text}");
         assert!(text.contains("\"engine_build_dirty\":false"), "{text}");
         assert!(text.contains("\"engine_binary_fingerprint\":\"cafebabe\""), "{text}");
@@ -351,6 +358,7 @@ mod tests {
         // operator-facing `bossctl live-status debug --json | jq …`
         // command the chore brief calls out.
         let full = LiveStatusDebugReport {
+            engine_version: "1.0.4-dev-deadbeef".into(),
             engine_build_sha: "deadbeef".into(),
             engine_build_dirty: false,
             engine_build_time: "2026-05-12T20:00:00Z".into(),
