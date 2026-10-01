@@ -191,12 +191,12 @@ impl WorkDb {
         Ok(task.id)
     }
 
-    /// Map an execution's `work_item_id` to the board item that owns it for
-    /// attention/audit purposes. A review-guide execution's work item is a
-    /// `prgc_` comparison id, which is not a product-scoped work item; it
-    /// resolves to the comparison series' root task. Every other id (and a
-    /// comparison id that no longer resolves) is returned unchanged.
-    pub fn owning_work_item_id_for_execution(&self, work_item_id: &str) -> String {
+    /// Map a work-item id to the board item that owns it for attention/audit
+    /// purposes. A review-guide comparison id (`prgc_`) is not a
+    /// product-scoped work item; it resolves to the comparison series' root
+    /// task. Every other id (and a comparison id that no longer resolves) is
+    /// returned unchanged.
+    pub fn owning_work_item_id(&self, work_item_id: &str) -> String {
         if !matches!(classify_id(work_item_id), Ok(ItemKind::Comparison)) {
             return work_item_id.to_owned();
         }

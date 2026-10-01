@@ -670,6 +670,26 @@ fn revision_execution_resolves_to_the_canonical_pr_root() {
     assert_eq!(db.review_guide_source_root_for_execution(&execution.id).unwrap(), root);
 }
 
+#[test]
+fn owning_work_item_id_maps_comparison_ids_to_the_series_root() {
+    let (_dir, db) = open_db();
+    let product = create_product(&db);
+    let root = create_active_chore(&db, &product, "owning work item");
+    let PrSourceCapturePersistOutcome::Stored(capture) = db
+        .persist_pr_review_guide_source_capture(&root, 1, PrSourceCaptureTrigger::Creation, &packet("base", "head"))
+        .unwrap()
+    else {
+        panic!("first capture must persist")
+    };
+    assert_eq!(db.owning_work_item_id(&capture.comparison_id), root);
+    assert_eq!(db.owning_work_item_id(&root), root);
+    assert_eq!(
+        db.owning_work_item_id("prgc_missing"),
+        "prgc_missing",
+        "an unresolved comparison id is returned unchanged"
+    );
+}
+
 fn artifact_count(root: &Path) -> usize {
     let dir = root.join(PACKET_ARTIFACT_DIR);
     let Ok(shards) = fs::read_dir(dir) else {
