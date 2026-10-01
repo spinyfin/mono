@@ -1741,6 +1741,7 @@ pub async fn serve_with_overrides(
         server_state.execution_coordinator.clone(),
         server_state.dispatch_events.clone(),
         crate::pool_claim_sweep::DEFAULT_INTERVAL,
+        server_state.clone(),
     );
 
     // Periodic terminal-work reconciler: reaps a LIVE worker pane whose

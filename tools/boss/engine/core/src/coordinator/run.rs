@@ -287,43 +287,21 @@ impl ExecutionCoordinator {
                 // config, the initial-input script, or tmux session creation).
                 let err_detail = format!("{err:#}");
                 let slot_id = slot_id_from_worker_id(&worker_id);
-                // A `SlotBusy` rejection is a benign, self-healing engine/app
-                // desync (see the longer note at the `is_slot_busy` binding
-                // below), and it is common enough that logging it at ERROR
-                // would bury the genuine aborts this line exists to surface.
-                // Report it, but at WARN, and tag every abort with
-                // `slot_busy` so the two classes stay filterable either way.
+                // Reconciliation already retried stale occupants. A remaining
+                // rejection must be recorded as a spawn failure.
                 let slot_busy = slot_busy_occupant(&err).is_some();
-                let abort_message = "spawn aborted: ExecutionRunner::run_execution returned an \
-                                     error before any pane existed; tearing down and releasing \
-                                     the workspace";
-                if slot_busy {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        work_item_id = %execution.work_item_id,
-                        run_id = %run.id,
-                        worker_id = %worker_id,
-                        slot_id,
-                        slot_busy,
-                        cube_lease_id = %lease.lease_id,
-                        cube_workspace_id = %lease.workspace_id,
-                        error = %err_detail,
-                        "{abort_message}",
-                    );
-                } else {
-                    tracing::error!(
-                        execution_id = %execution.id,
-                        work_item_id = %execution.work_item_id,
-                        run_id = %run.id,
-                        worker_id = %worker_id,
-                        slot_id,
-                        slot_busy,
-                        cube_lease_id = %lease.lease_id,
-                        cube_workspace_id = %lease.workspace_id,
-                        error = %err_detail,
-                        "{abort_message}",
-                    );
-                }
+                tracing::error!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    run_id = %run.id,
+                    worker_id = %worker_id,
+                    slot_id,
+                    slot_busy,
+                    cube_lease_id = %lease.lease_id,
+                    cube_workspace_id = %lease.workspace_id,
+                    error = %err_detail,
+                    "spawn aborted: tearing down and releasing the workspace",
+                );
                 self.dispatch_events
                     .emit(
                         DispatchEvent::new(Stage::SpawnFailed, DispatchOutcome::Error, &execution.id)
@@ -340,33 +318,46 @@ impl ExecutionCoordinator {
                     )
                     .await;
 
-                // Pane-spawn-failure termination path: the run is
-                // unconditionally terminal from here (marked `failed`
-                // below regardless of whether the cube release below
-                // succeeds), so tear down any driver-owned state outside
-                // the workspace now — before the cube release, matching
-                // `force_release`'s ordering, so a driver that derives
-                // out-of-workspace state from the workspace path never
-                // races a concurrent re-lease of the same workspace once
-                // cube has it back.
-                crate::driver_teardown::teardown_driver_workspace(
-                    &self.work_db,
-                    &execution.id,
-                    Some(&lease.workspace_path),
-                    crate::driver_teardown::TeardownReason::SpawnFailed,
-                )
-                .await;
-                let released = match adapter.release_workspace(&lease.lease_id).await {
-                    Ok(()) => true,
-                    Err(release_err) => {
-                        tracing::error!(
-                            ?release_err,
-                            execution_id = %execution.id,
-                            run_id = %run.id,
-                            lease_id = %lease.lease_id,
-                            "failed to release workspace after run failure"
-                        );
-                        false
+                // A rejected viewer may already have a running tmux process.
+                // If verified teardown failed, preserve its workspace and driver
+                // state for recovery rather than leasing them to another worker.
+                let abort_unconfirmed = err.chain().any(|cause| {
+                    matches!(
+                        cause.downcast_ref::<crate::spawn_flow::StartWorkerError>(),
+                        Some(crate::spawn_flow::StartWorkerError::ViewerAbortFailed { .. })
+                    )
+                });
+                let released = if abort_unconfirmed {
+                    false
+                } else {
+                    // Pane-spawn-failure termination path: the run is
+                    // unconditionally terminal from here (marked `failed`
+                    // below regardless of whether the cube release below
+                    // succeeds), so tear down any driver-owned state outside
+                    // the workspace now — before the cube release, matching
+                    // `force_release`'s ordering, so a driver that derives
+                    // out-of-workspace state from the workspace path never
+                    // races a concurrent re-lease of the same workspace once
+                    // cube has it back.
+                    crate::driver_teardown::teardown_driver_workspace(
+                        &self.work_db,
+                        &execution.id,
+                        Some(&lease.workspace_path),
+                        crate::driver_teardown::TeardownReason::SpawnFailed,
+                    )
+                    .await;
+                    match adapter.release_workspace(&lease.lease_id).await {
+                        Ok(()) => true,
+                        Err(release_err) => {
+                            tracing::error!(
+                                ?release_err,
+                                execution_id = %execution.id,
+                                run_id = %run.id,
+                                lease_id = %lease.lease_id,
+                                "failed to release workspace after run failure"
+                            );
+                            false
+                        }
                     }
                 };
                 // Persist the same full cause chain the abort log and
@@ -703,9 +694,8 @@ impl ExecutionCoordinator {
                 // pool-claim reconciler (`pool_claim_sweep::run_one_pass`)
                 // already frees exactly this shape of stuck claim — terminal
                 // execution, no live worker pane backing it — once its
-                // `LEAK_GRACE_SECS` grace period has passed, by which point
-                // the app side has normally torn the stray pane down itself
-                // or the husk-pane sweep has retired it. Still rescan + kick
+                // `LEAK_GRACE_SECS` grace period has passed and the engine
+                // has confirmed the old viewer is detached. Still rescan + kick
                 // so OTHER free slots pick up the work this failure just
                 // requeued.
                 self.rescan_active_dispatch_after_release();

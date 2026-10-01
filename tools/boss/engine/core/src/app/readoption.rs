@@ -792,33 +792,6 @@ impl ServerState {
         }
     }
 
-    /// Run ids the app currently hosts a *viewer* for. `Err` when the app
-    /// could not be asked — callers must not treat that as "no viewers".
-    ///
-    /// Tmux, not the app, is the sole worker-*process* oracle
-    /// ([`Self::hosted_pane_slot_for_run`]); this is a legitimate use of
-    /// `ListHostedPanes` for viewer presentation — describing which slots
-    /// already have a Ghostty viewer attached, so
-    /// [`Self::reattach_worker_panes_to_registered_app`] does not send a
-    /// redundant `AttachWorkerPane` for one the app already holds.
-    /// `retire_pane` Guard 3 and `list_hosted_pane_statuses` resolve slot
-    /// occupancy from live-state, the worker registry, and
-    /// `work_runs.agent_id`; they use `ListHostedPanes` only to describe
-    /// the viewer.
-    async fn app_hosted_viewer_run_ids(&self) -> Result<HashSet<String>, String> {
-        let request = EngineToAppRequest::ListHostedPanes(ListHostedPanesInput {});
-        match self.send_to_app(request, Duration::from_secs(5)).await {
-            Ok(EngineToAppResponse::ListHostedPanes { result: Ok(result) }) => {
-                Ok(result.panes.into_iter().map(|pane| pane.run_id).collect())
-            }
-            Ok(EngineToAppResponse::ListHostedPanes { result: Err(err) }) => {
-                Err(format!("app rejected list_hosted_panes: {err}"))
-            }
-            Ok(other) => Err(format!("unexpected list_hosted_panes response: {other:?}")),
-            Err(err) => Err(err.to_string()),
-        }
-    }
-
     /// Re-drive pane spawn for `running` executions whose cube lease was
     /// re-adopted across the restart but whose pane was never issued.
     /// See [`crate::startup_pane_reconcile`].
@@ -896,7 +869,7 @@ impl ServerState {
         if self.app_session.lock().await.is_none() {
             return;
         }
-        let candidates = self
+        let candidates: Vec<LiveWorkerState> = self
             .live_worker_states
             .snapshot()
             .into_iter()
@@ -906,10 +879,16 @@ impl ServerState {
                     && !previously_live.contains(&state.run_id)
             })
             .collect();
+        // Unlike registration, a steady-state adoption pass need not inventory
+        // viewers when it restored no workers.
+        if candidates.is_empty() {
+            return;
+        }
         self.reattach_worker_pane_candidates(candidates).await;
     }
 
-    /// Re-send `AttachWorkerPane` for every live, tmux-hosted local run the
+    /// Detach terminal/unknown viewers, then re-send `AttachWorkerPane`
+    /// for every live, tmux-hosted local run the
     /// currently registered app session has no viewer for.
     ///
     /// `AttachWorkerPane` is sent from exactly one production site
@@ -941,24 +920,16 @@ impl ServerState {
     }
 
     async fn reattach_worker_pane_candidates(&self, candidates: Vec<LiveWorkerState>) {
-        if candidates.is_empty() {
-            return;
-        }
         // Never attach into a slot the app already hosts a live session
         // for — `hostAttachedPane` refuses those with `SlotBusy`, but that
         // refusal is app-side flow control, not something the engine
         // should lean on to avoid sending a request it can determine is
         // redundant up front.
-        let already_hosted = match self.app_hosted_viewer_run_ids().await {
+        let already_hosted = match self.reconcile_worker_viewers().await {
             Ok(ids) => ids,
             Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "worker pane reattach: app could not be asked what it already hosts; \
-                     proceeding without dedup (the app still refuses a slot it already \
-                     occupies)",
-                );
-                HashSet::new()
+                tracing::error!(error = %err, "worker pane reconciliation failed; retry on next registration");
+                return;
             }
         };
         for state in candidates {
@@ -971,6 +942,9 @@ impl ServerState {
 
     async fn reattach_one_worker_pane(&self, state: &LiveWorkerState) {
         let run_id = state.run_id.as_str();
+        if !matches!(self.work_db.find_execution(run_id), Ok(Some(run)) if !run.status.is_terminal()) {
+            return;
+        }
         let identity = match self.work_db.tmux_identity_for_execution(run_id) {
             Ok(Some(identity)) => identity,
             Ok(None) => {
@@ -1010,15 +984,15 @@ impl ServerState {
             return;
         };
         match self
-            .send_to_app(
-                EngineToAppRequest::AttachWorkerPane(AttachWorkerPaneInput {
+            .attach_worker_viewer(
+                AttachWorkerPaneInput {
                     run_id: run_id.to_owned(),
                     slot_id: state.slot_id,
                     session_name: identity.session_name.clone(),
                     tmux_socket_path,
                     summary: None,
                     task_title: state.work_item_name.clone(),
-                }),
+                },
                 Duration::from_secs(5),
             )
             .await

@@ -59,7 +59,8 @@
 //!    a fresh dispatch has just re-claimed. The reconciler is a backstop
 //!    for claims stuck for a while, not the happy path.
 //! 5. Terminal execution + no live pane + past the grace = a leaked
-//!    claim. Release it via a compare-and-release
+//!    claim. Confirm its app viewer is detached (retain and retry when
+//!    disconnected or unconfirmed), then release it via a compare-and-release
 //!    ([`ExecutionCoordinator::release_pool_claim_if_execution`]) so a
 //!    re-claim race can't yank a fresh, live claim, then emit a
 //!    `pool_claim_reconcile` dispatch event and kick the scheduler.
@@ -94,13 +95,10 @@
 //! gone — it may still be genuinely up, which is precisely what step 1
 //! above is written to avoid racing ("Releasing it here would let a
 //! fresh dispatch hit `AttachWorkerPane` `SlotBusy` against a pane that
-//! is still up"). What makes releasing it anyway acceptable once
-//! `LEAK_GRACE_SECS` has passed is that all three known producers are
-//! terminal-execution-only and self-limiting: a genuine leak (no
-//! teardown owns the slot) must be reclaimed eventually, and an
-//! unconfirmed-but-actually-alive pane loses at most one dispatch to
-//! `SlotBusy` before this sweep frees it — the cost this whole module
-//! exists to bound, not eliminate.
+//! is still up"). The grace period does not prove viewer teardown. Before
+//! handback this sweep inventories app viewers and confirms the claimed
+//! run's detach. A disconnected app leaves the claim pending until a later
+//! pass can confirm it; registration also reconciles stale viewers.
 //!
 //! The tmux adoption and husk sweeps independently reconcile physical
 //! sessions by durable spawn identity; releasing a claim is not proof that
@@ -137,6 +135,12 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 /// every terminal path stamps it) is treated as past the grace.
 pub const LEAK_GRACE_SECS: i64 = 60;
 
+/// Confirms the app no longer hosts this run before its claim can be reused.
+#[async_trait::async_trait]
+pub trait WorkerViewerDetach: Send + Sync {
+    async fn confirm_viewer_detached(&self, run_id: &str) -> Result<(), String>;
+}
+
 /// Counts from one sweep pass; logged at `info` when any claim was
 /// released.
 #[derive(Debug, Default, bon::Builder)]
@@ -156,6 +160,9 @@ pub struct PoolClaimSweepOutcome {
     /// Claims that lost the compare-and-release race (freed or re-claimed
     /// by a live execution between snapshot and release). Benign.
     pub race_skipped: usize,
+    /// Unconfirmed viewer detach; the retained claim is retried next pass.
+    #[builder(default)]
+    pub viewer_detach_pending: usize,
 }
 
 impl crate::sweep_loop::SweepOutcome for PoolClaimSweepOutcome {
@@ -184,8 +191,10 @@ pub fn spawn_loop(
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: Arc<dyn DispatchEventSink>,
     interval: Duration,
+    viewers: Arc<dyn WorkerViewerDetach>,
 ) -> tokio::task::JoinHandle<()> {
     crate::sweep_loop::spawn_sweep_loop(interval, move || {
+        let viewers = Arc::clone(&viewers);
         let work_db = Arc::clone(&work_db);
         let live_states = Arc::clone(&live_states);
         let coordinator = Arc::clone(&coordinator);
@@ -196,6 +205,7 @@ pub fn spawn_loop(
                 live_states.as_ref(),
                 coordinator.clone(),
                 dispatch_events.as_ref(),
+                viewers.as_ref(),
             )
             .await
         }
@@ -212,6 +222,7 @@ pub async fn run_one_pass(
     live_states: &LiveWorkerStateRegistry,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: &dyn DispatchEventSink,
+    viewers: &dyn WorkerViewerDetach,
 ) -> PoolClaimSweepOutcome {
     let mut outcome = PoolClaimSweepOutcome::default();
 
@@ -283,8 +294,15 @@ pub async fn run_one_pass(
                 pool = pool_name,
                 execution_status = %execution.status,
                 "pool-claim sweep: slot claimed by terminal execution with no live worker pane; \
-                 releasing leaked claim",
+                 confirming viewer teardown before releasing leaked claim",
             );
+
+            if let Err(reason) = viewers.confirm_viewer_detached(&claim.execution_id).await {
+                tracing::warn!(execution_id = %claim.execution_id, %reason,
+                    "pool-claim sweep: viewer detach pending; retaining claim for retry");
+                outcome.viewer_detach_pending += 1;
+                continue;
+            }
 
             let released = coordinator
                 .release_pool_claim_if_execution(&claim.worker_id, &claim.execution_id)
@@ -329,6 +347,15 @@ mod tests {
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::test_support::*;
     use crate::work::WorkDb;
+
+    struct NoViewers;
+
+    #[async_trait::async_trait]
+    impl WorkerViewerDetach for NoViewers {
+        async fn confirm_viewer_detached(&self, _run_id: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
 
     fn create_execution(db: &WorkDb, work_item_id: &str) -> String {
         use boss_protocol::RequestExecutionInput;
@@ -420,7 +447,14 @@ mod tests {
         let live_states = LiveWorkerStateRegistry::new();
         let sink = Arc::new(RecordingDispatchEventSink::new());
 
-        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoViewers,
+        )
+        .await;
 
         assert_eq!(outcome.released, 3, "all three leaked claims must be freed");
         assert_eq!(outcome.live_backed_skipped, 0);
@@ -463,7 +497,14 @@ mod tests {
         let live_states = LiveWorkerStateRegistry::new();
         let sink = Arc::new(RecordingDispatchEventSink::new());
 
-        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoViewers,
+        )
+        .await;
 
         assert_eq!(outcome.released, 0);
         assert_eq!(outcome.non_terminal_skipped, 1);
@@ -500,7 +541,14 @@ mod tests {
         register_live_pane(&live_states, slot, &exec);
         let sink = Arc::new(RecordingDispatchEventSink::new());
 
-        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoViewers,
+        )
+        .await;
 
         assert_eq!(outcome.released, 0, "live-backed claim must not be released");
         assert_eq!(outcome.live_backed_skipped, 1);
@@ -533,7 +581,14 @@ mod tests {
         let live_states = LiveWorkerStateRegistry::new();
         let sink = Arc::new(RecordingDispatchEventSink::new());
 
-        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoViewers,
+        )
+        .await;
 
         assert_eq!(outcome.released, 0, "fresh terminal claim must wait out the grace");
         assert_eq!(outcome.grace_skipped, 1);
@@ -564,12 +619,26 @@ mod tests {
         let live_states = LiveWorkerStateRegistry::new();
         let sink = Arc::new(RecordingDispatchEventSink::new());
 
-        let first = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let first = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoViewers,
+        )
+        .await;
         assert_eq!(first.released, 1);
         assert_eq!(pool.idle_count().await, 2, "main pool fully idle after release");
 
         // Second pass: nothing left to release.
-        let second = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let second = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoViewers,
+        )
+        .await;
         assert_eq!(second.released, 0);
         assert_eq!(
             sink.events().await.len(),

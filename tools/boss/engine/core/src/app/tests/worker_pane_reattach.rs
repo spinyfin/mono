@@ -36,7 +36,12 @@ impl CommandRunner for UnusedRunner {
 /// Seed a real, running, tmux-hosted execution and its durable tmux
 /// identity, then register a matching live-state entry for `slot_id`.
 /// Returns the execution id.
-fn seed_tmux_hosted_live_run(server_state: &ServerState, slot_id: u8, session_name: &str, spawn_token: &str) -> String {
+pub(super) fn seed_tmux_hosted_live_run(
+    server_state: &ServerState,
+    slot_id: u8,
+    session_name: &str,
+    spawn_token: &str,
+) -> String {
     let execution_id = seed_durable_run(server_state, session_name, spawn_token);
     server_state.live_worker_states.register_spawn_with_capabilities(
         slot_id,
@@ -94,7 +99,11 @@ fn install_tmux_override(server_state: &ServerState) {
 
 /// Drain the app-bound `ListHostedPanes` request `reattach_worker_panes_to_registered_app`
 /// issues first (its dedup query) and answer it with `hosted`.
-async fn answer_list_hosted_panes(server_state: &ServerState, sink: &SessionSink, hosted: Vec<(String, u8)>) {
+pub(super) async fn answer_list_hosted_panes(
+    server_state: &ServerState,
+    sink: &SessionSink,
+    hosted: Vec<(String, u8)>,
+) {
     let envelope = tokio::time::timeout(Duration::from_secs(10), sink.next())
         .await
         .expect("ListHostedPanes request timed out")
