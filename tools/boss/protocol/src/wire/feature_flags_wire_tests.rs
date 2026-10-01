@@ -5,7 +5,7 @@
 //! `wire`, so every item these tests reach is unchanged.
 
 use super::*;
-use crate::health_wire::{EngineHealthIssue, EngineHealthReport};
+use crate::health_wire::{EngineHealthIssue, EngineHealthReport, SpawnFailureStreak};
 use crate::metrics_wire::MetricLiveEntry;
 
 #[test]
@@ -284,6 +284,7 @@ fn engine_health_result_event_round_trips_healthy() {
             automation_paused: false,
             review_guide_reenqueue: None,
             issues: Vec::new(),
+            spawn_failure_streaks: Vec::new(),
         },
     };
     let json = serde_json::to_string(&original).unwrap();
@@ -323,6 +324,7 @@ fn engine_health_result_event_round_trips_with_issue() {
             automation_paused: false,
             review_guide_reenqueue: None,
             issues: vec![issue.clone()],
+            spawn_failure_streaks: Vec::new(),
         },
     };
     let json = serde_json::to_string(&original).unwrap();
@@ -336,4 +338,46 @@ fn engine_health_result_event_round_trips_with_issue() {
         }
         other => panic!("unexpected variant: {other:?}"),
     }
+}
+
+#[test]
+fn engine_health_result_event_round_trips_spawn_failure_streaks() {
+    // `bossctl state --json` and any `jq` consumer read the structured
+    // streak, so every field must survive the wire — in particular the
+    // full multi-line error text and the live count.
+    let streak = SpawnFailureStreak::builder()
+        .driver("codex")
+        .worker_kind("review-guide")
+        .consecutive_failures(28)
+        .first_failure_epoch_s(1_790_494_560)
+        .latest_failure_epoch_s(1_790_607_235)
+        .latest_error("hook-trust gate refused the spawn:\nno hook entries; silence is not success")
+        .latest_execution_id("exec_guide_28")
+        .build();
+    let original = FrontendEvent::EngineHealthResult {
+        report: EngineHealthReport {
+            anthropic_api_key_present: true,
+            dispatch_paused: false,
+            automation_paused: false,
+            issues: Vec::new(),
+            spawn_failure_streaks: vec![streak.clone()],
+        },
+    };
+    let json = serde_json::to_string(&original).unwrap();
+    assert!(json.contains("\"consecutive_failures\":28"), "{json}");
+    let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
+    match parsed {
+        FrontendEvent::EngineHealthResult { report } => {
+            assert_eq!(report.spawn_failure_streaks, vec![streak]);
+        }
+        other => panic!("unexpected variant: {other:?}"),
+    }
+}
+
+#[test]
+fn engine_health_report_without_streak_field_still_deserializes() {
+    // A report from an engine that predates the field must still parse
+    // (as "no active streaks") rather than failing the whole health read.
+    let report: EngineHealthReport = serde_json::from_str(r#"{"anthropic_api_key_present":true,"issues":[]}"#).unwrap();
+    assert!(report.spawn_failure_streaks.is_empty());
 }

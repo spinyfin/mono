@@ -408,6 +408,11 @@ pub(super) struct FakeExecutionRunner {
     /// this error (so the coordinator can downcast it) instead of a
     /// string-only `fail_message`.
     pub(super) fail_source: Option<crate::runner::spawn_confirmation::SpawnConfirmationError>,
+    /// Fail this many `run_execution` calls (with `fail_message`), then
+    /// behave as otherwise configured. Unlike the all-or-nothing `fail`, this lets one
+    /// runner model a spawn path that is broken and then recovers — the
+    /// shape a pre-start failure streak and its resolving success take.
+    pub(super) fail_remaining: std::sync::atomic::AtomicUsize,
     /// When `true`, `run_execution` fails with a `SlotBusy` viewer
     /// rejection (wrapped the same way `spawn_flow` wraps it) instead
     /// of the generic `fail` error, so tests can exercise the
@@ -452,6 +457,7 @@ impl Default for FakeExecutionRunner {
             fail_message: None,
             fail_context: None,
             fail_source: None,
+            fail_remaining: std::sync::atomic::AtomicUsize::new(0),
             slot_busy: false,
             viewer_abort_failed: false,
             pending: false,
@@ -482,6 +488,23 @@ impl ExecutionRunner for FakeExecutionRunner {
         ));
         if self.pending {
             pending::<()>().await;
+        }
+        // The failure budget is spent before any other configured outcome,
+        // so a runner can model "one genuine failure, then <whatever else
+        // this runner does>" — including `slot_busy`.
+        let fail_this_call = self
+            .fail_remaining
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok();
+        if fail_this_call {
+            return Err(anyhow!(
+                "{}",
+                self.fail_message.as_deref().unwrap_or("worker prompt failed")
+            ));
         }
         if self.viewer_abort_failed {
             return Err(

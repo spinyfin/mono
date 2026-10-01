@@ -401,7 +401,12 @@ impl ExecutionCoordinator {
                     "review-guide submissions require a local worker; SSH proposal attribution is unsupported"
                 );
             }
-            return self.pick_host(work_item, Some("local".to_owned()), requested, Some("codex".to_owned()));
+            return self.pick_host(
+                work_item,
+                Some("local".to_owned()),
+                requested,
+                Some(crate::runner::REVIEW_GUIDE_DRIVER.to_owned()),
+            );
         }
         // Resolved driver is a hard requirement. Prefer the claimed
         // worker's pool policy (review/automation) so placement matches
