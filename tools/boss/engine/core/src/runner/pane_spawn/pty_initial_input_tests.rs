@@ -120,9 +120,8 @@ fn codex_initial_input_stays_under_the_limit_for_reviewer() {
     );
 }
 
-/// The motivating worst case from the regression report: a long
-/// workspace path (embedded in `--cwd` and in `GROK_HOME`/`HOME`) plus
-/// the FULL structural `--deny` rule set (design T-17) pushed the
+/// A long workspace path (embedded in `--cwd` and in `GROK_HOME`/`HOME`)
+/// plus the FULL structural `--deny` rule set (design T-17) pushed the
 /// previous typed-line-inline behaviour to ~1150-1177 bytes — past
 /// MAX_CANON. Confirms the fix holds even here.
 #[test]
@@ -312,11 +311,11 @@ fn estimated_launch_argv_bytes_errors_when_the_prompt_file_is_missing() {
     assert!(err.to_string().contains("initial-prompt.txt"), "{err}");
 }
 
-/// End-to-end against this host's real `ARG_MAX`: a ~600 KB prompt — the
-/// motivating large-prompt size from the regression report — must still
-/// fit comfortably. Regressing the estimate back to counting every argv
-/// byte as if it needed its own pointer (rather than one pointer per
-/// shell argument) would wrongly reject this.
+/// End-to-end against this host's real `ARG_MAX`: a ~600 KB prompt, the
+/// size of the largest review-guide prompts, must still fit comfortably
+/// under this host's ARG_MAX. Regressing the estimate back to counting
+/// every argv byte as if it needed its own pointer (rather than one
+/// pointer per shell argument) would wrongly reject this.
 #[test]
 fn check_launch_command_arg_max_passes_for_a_600kb_prompt_on_this_host() {
     let workspace = TempDir::new().unwrap();
@@ -406,65 +405,188 @@ fn check_launch_command_arg_max_for_bytes_fails_for_a_prompt_over_this_hosts_rea
     assert!(msg.contains("ARG_MAX"), "{msg}");
 }
 
-/// Small and ~600 KB prompts, per driver: write the argv-delivery script,
-/// run the ARG_MAX / MAX_ARG_STRLEN preflight, then confirm composer +
-/// turn-start against that driver's agent chrome.
+/// Rename the driver binary in a real `spawn_invocation` command so the
+/// hermetic sandbox can exec the stub (it denies `claude` / `codex` by name).
+fn rename_driver_binary(command: &str, from: &str, to: &str) -> String {
+    let Some(rest) = command.strip_prefix(from) else {
+        panic!("spawn_invocation command must start with {from:?}, got {command:?}");
+    };
+    assert!(
+        rest.starts_with(' ') || rest.starts_with('\t'),
+        "driver binary must be a whole first word in spawn_invocation, got {command:?}"
+    );
+    format!("{to}{rest}")
+}
+
+fn write_driver_stub(stub_dir: &std::path::Path) {
+    std::fs::create_dir_all(stub_dir).unwrap();
+    let stub_path = stub_dir.join("boss-driver-stub");
+    std::fs::write(
+        &stub_path,
+        r#"#!/bin/sh
+eval "last=\${$#}"
+printf '%s' "${#last}" > "$BOSS_STUB_RECORD/last_argv_len"
+printf '%s' "$last" > "$BOSS_STUB_RECORD/last_argv"
+printf '%s\n' "$BOSS_STUB_CHROME"
+: > "$BOSS_STUB_RECORD/turn_started"
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+fn grok_spawn_plan_for_delivery_test(run_id: &str, workspace_path: &std::path::Path) -> crate::driver::SpawnPlan {
+    use crate::driver::grok::{
+        GROK_HOMES_ENV_TEST_LOCK, GROK_HOMES_ROOT_ENV, GROK_SKIP_POSTURE_ASSERT_ENV, grok_home_for_run,
+    };
+    let _lock = GROK_HOMES_ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let prior_homes_env = std::env::var_os(GROK_HOMES_ROOT_ENV);
+    let prior_skip_env = std::env::var_os(GROK_SKIP_POSTURE_ASSERT_ENV);
+    let homes_root = TempDir::new().unwrap();
+    // SAFETY: serialised by `_lock`, restored before this helper returns.
+    unsafe {
+        std::env::set_var(GROK_HOMES_ROOT_ENV, homes_root.path());
+        std::env::set_var(GROK_SKIP_POSTURE_ASSERT_ENV, "1");
+    }
+    let grok_home = grok_home_for_run(run_id).unwrap();
+    std::fs::create_dir_all(&grok_home).unwrap();
+    std::fs::write(
+        grok_home.join("boss-session-id"),
+        "11111111-2222-4333-8444-555555555555\n",
+    )
+    .unwrap();
+    std::fs::write(
+        grok_home.join("boss-workspace-path"),
+        format!("{}\n", workspace_path.display()),
+    )
+    .unwrap();
+    let plan = GrokDriver::default().spawn_invocation(SpawnRequest {
+        model: "grok-4.6",
+        effort: Some("high"),
+        settings_path: None,
+        non_opus_auto_mode: false,
+        permission_mode_override: None,
+        run_id: Some(run_id),
+    });
+    match prior_homes_env {
+        Some(v) => unsafe { std::env::set_var(GROK_HOMES_ROOT_ENV, v) },
+        None => unsafe { std::env::remove_var(GROK_HOMES_ROOT_ENV) },
+    }
+    match prior_skip_env {
+        Some(v) => unsafe { std::env::set_var(GROK_SKIP_POSTURE_ASSERT_ENV, v) },
+        None => unsafe { std::env::remove_var(GROK_SKIP_POSTURE_ASSERT_ENV) },
+    }
+    plan
+}
+
+/// Small and ~600 KB prompts, per driver: take the real `spawn_invocation`
+/// command, rewrite the binary to a stub the sandbox can exec, write the
+/// actual `.boss/initial-input.sh`, source it from `/bin/sh`, and assert
+/// the stub received the prompt intact as a single argument and emitted
+/// the turn-start signal confirmation consumes.
 #[tokio::test]
-async fn per_driver_small_and_large_prompts_go_through_script_preflight_and_confirmation() {
+async fn per_driver_small_and_large_prompts_are_delivered_and_start_the_turn() {
     use crate::runner::spawn_confirmation::{confirm_spawn_started, pane_shows_driver_ready};
     use std::time::Duration;
 
     struct Case {
         driver_name: &'static str,
+        binary: &'static str,
         config_dir: &'static str,
         filename: &'static str,
-        command: &'static str,
         chrome: &'static str,
         spec: boss_protocol::PaneMonitorSpec,
+        spawn: fn(&str) -> crate::driver::SpawnPlan,
     }
 
     let cases = [
         Case {
             driver_name: "claude",
+            binary: "claude",
             config_dir: ".claude",
             filename: "initial-prompt.txt",
-            command: "claude --model opus \"$(cat .claude/initial-prompt.txt)\"\n",
             chrome: "Claude Code 2.1.283\nauto mode on\n❯ ",
             spec: ClaudeDriver.pane_monitor_spec().expect("claude spec"),
+            spawn: |run_id| {
+                ClaudeDriver.spawn_invocation(SpawnRequest {
+                    model: "opus",
+                    effort: Some("high"),
+                    settings_path: None,
+                    non_opus_auto_mode: false,
+                    permission_mode_override: Some("auto"),
+                    run_id: Some(run_id),
+                })
+            },
         },
         Case {
             driver_name: "codex",
+            binary: "codex",
             config_dir: ".codex",
             filename: "initial-prompt.txt",
-            command: "codex --strict-config --no-alt-screen -a never -m 'gpt-5' \"$(cat .codex/initial-prompt.txt)\"\n",
             chrome: ">_ OpenAI Codex (v0.15)\n• Working (1s • esc to interrupt)",
             spec: CodexDriver::default().pane_monitor_spec().expect("codex spec"),
+            spawn: |run_id| {
+                CodexDriver::default().spawn_invocation(SpawnRequest {
+                    model: "gpt-5.6-terra",
+                    effort: Some("high"),
+                    settings_path: None,
+                    non_opus_auto_mode: false,
+                    permission_mode_override: None,
+                    run_id: Some(run_id),
+                })
+            },
         },
         Case {
             driver_name: "grok",
+            binary: "grok",
             config_dir: ".grok",
             filename: "initial-prompt.txt",
-            command: "grok --model 'grok-4.6' \"$(cat .grok/initial-prompt.txt)\"\n",
             chrome: "Grok 4.6  Shift+Tab:mode  always-approve\n│ ❯ ",
             spec: GrokDriver::default().pane_monitor_spec().expect("grok spec"),
+            spawn: |run_id| {
+                GrokDriver::default().spawn_invocation(SpawnRequest {
+                    model: "grok-4.6",
+                    effort: Some("high"),
+                    settings_path: None,
+                    non_opus_auto_mode: false,
+                    permission_mode_override: None,
+                    run_id: Some(run_id),
+                })
+            },
         },
     ];
 
     for case in cases {
         for prompt_bytes in [20_000usize, 600_000] {
             let workspace = TempDir::new().unwrap();
+            let run_id = format!("run-{}-{prompt_bytes}", case.driver_name);
+            let mut plan = if case.driver_name == "grok" {
+                grok_spawn_plan_for_delivery_test(&run_id, workspace.path())
+            } else {
+                (case.spawn)(&run_id)
+            };
             std::fs::create_dir_all(workspace.path().join(case.config_dir)).unwrap();
-            std::fs::write(
-                workspace.path().join(case.config_dir).join(case.filename),
-                "p".repeat(prompt_bytes),
-            )
-            .unwrap();
-            let typed = write_initial_input_script(workspace.path(), case.command).unwrap();
+            let prompt = "p".repeat(prompt_bytes);
+            std::fs::write(workspace.path().join(case.config_dir).join(case.filename), &prompt).unwrap();
+
+            plan.command = rename_driver_binary(&plan.command, case.binary, "boss-driver-stub");
+            let env_prefix: String = plan.env.iter().map(render_env_directive).collect();
+            let assembled = format!(
+                "{}{}{env_prefix}{}",
+                path_prepend_clause("BOSS_BIN_DIR"),
+                path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
+                plan.command,
+            );
+            let typed = write_initial_input_script(workspace.path(), &assembled).unwrap();
             check_initial_input_length(&typed, case.driver_name).unwrap();
             assert_eq!(typed, ". .boss/initial-input.sh\n");
 
             let preflight = check_launch_command_arg_max(
-                case.command,
+                &plan.command,
                 case.driver_name,
                 workspace.path(),
                 case.config_dir,
@@ -475,34 +597,92 @@ async fn per_driver_small_and_large_prompts_go_through_script_preflight_and_conf
                 let msg = err.to_string();
                 assert!(msg.contains("MAX_ARG_STRLEN"), "{msg}");
                 assert!(msg.contains(case.driver_name), "{msg}");
-            } else {
-                preflight.unwrap_or_else(|err| {
-                    panic!(
-                        "{} {}-byte prompt must pass this host's preflight: {err}",
-                        case.driver_name, prompt_bytes
-                    )
-                });
+                continue;
             }
+            preflight.unwrap_or_else(|err| {
+                panic!(
+                    "{} {}-byte prompt must pass this host's preflight: {err}",
+                    case.driver_name, prompt_bytes
+                )
+            });
 
+            let stub_root = TempDir::new().unwrap();
+            write_driver_stub(stub_root.path());
+            let record_dir = stub_root.path().join("record");
+            std::fs::create_dir_all(&record_dir).unwrap();
+            let path = format!("{}:/usr/bin:/bin", stub_root.path().display());
+            let output = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(". .boss/initial-input.sh")
+                .current_dir(workspace.path())
+                .env("PATH", &path)
+                .env_remove("BOSS_BIN_DIR")
+                .env_remove(boss_engine_worker_bin::WORKER_BIN_DIR_ENV)
+                .env("BOSS_STUB_RECORD", &record_dir)
+                .env("BOSS_STUB_CHROME", case.chrome)
+                .output()
+                .expect("sh must be able to source the launch script");
             assert!(
-                pane_shows_driver_ready(case.chrome, &case.spec),
-                "{} chrome must count as composer-ready: {}",
+                output.status.success(),
+                "{} {}-byte prompt must exec without E2BIG; status={} stderr={}",
                 case.driver_name,
-                case.chrome
+                prompt_bytes,
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let last_len: usize = std::fs::read_to_string(record_dir.join("last_argv_len"))
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "{} stub did not record last argv length: {err}; stderr={}",
+                        case.driver_name,
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                })
+                .parse()
+                .unwrap();
+            assert_eq!(
+                last_len, prompt_bytes,
+                "{} stub must receive the prompt as one argv element",
+                case.driver_name
+            );
+            let received = std::fs::read_to_string(record_dir.join("last_argv")).unwrap();
+            assert_eq!(
+                received, prompt,
+                "{} stub must receive the prompt intact",
+                case.driver_name
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            assert!(
+                pane_shows_driver_ready(&stdout, &case.spec),
+                "{} stub stdout must count as composer-ready: {stdout}",
+                case.driver_name
+            );
+            assert!(
+                record_dir.join("turn_started").exists(),
+                "{} stub must emit the turn-start signal confirmation consumes",
+                case.driver_name
             );
             confirm_spawn_started(
                 case.driver_name,
-                "exec-launch-path",
+                &run_id,
                 Duration::from_millis(20),
                 Duration::from_millis(20),
                 Duration::from_millis(5),
-                || async { pane_shows_driver_ready(case.chrome, &case.spec) },
-                || async { true },
+                || {
+                    let stdout = stdout.clone();
+                    let spec = case.spec.clone();
+                    async move { pane_shows_driver_ready(&stdout, &spec) }
+                },
+                || {
+                    let marker = record_dir.join("turn_started");
+                    async move { marker.exists() }
+                },
             )
             .await
             .unwrap_or_else(|err| {
                 panic!(
-                    "{} confirmation must pass for a {}-byte prompt: {err}",
+                    "{} confirmation must observe the stub's turn-start for a {}-byte prompt: {err}",
                     case.driver_name, prompt_bytes
                 )
             });

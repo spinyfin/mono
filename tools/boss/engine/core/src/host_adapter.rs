@@ -41,7 +41,8 @@ use crate::runner::{
     compose_worker_spawn, work_item_name, work_item_task_kind,
 };
 use crate::ssh_spawn::{
-    REASON_WORKER_LAUNCH_FAILED, RemoteSpawnPlan, perform_remote_launch, remote_events_socket_path,
+    REASON_WORKER_LAUNCH_FAILED, RemoteSpawnPlan, perform_remote_launch, reap_failed_remote_turn,
+    remote_events_socket_path,
 };
 use crate::ssh_transport::SshTransport;
 use crate::work::{WorkDb, WorkExecution, WorkItem};
@@ -1256,6 +1257,9 @@ impl HostAdapter for SshHostAdapter {
         let live_worker_states = self.live_worker_states.clone();
         let transport = self.transport.clone();
         let wait_run_id = run_id.clone();
+        let reap_run_id = run_id.clone();
+        let reap_remote_socket = plan.events_socket_path.clone();
+        let reap_engine_socket = engine_socket.clone();
         crate::runner::spawn_confirmation::confirm_turn_start_or_reap(
             driver.descriptor().name,
             &run_id,
@@ -1274,9 +1278,14 @@ impl HostAdapter for SshHostAdapter {
                 }
             },
             || async {
-                if let Some(pid) = remote_pid {
-                    let _ = transport.run(&["kill", &pid.to_string()]).await;
-                }
+                reap_failed_remote_turn(
+                    &transport,
+                    &reap_run_id,
+                    remote_pid,
+                    &reap_remote_socket,
+                    &reap_engine_socket,
+                )
+                .await;
             },
         )
         .await?;

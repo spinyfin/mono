@@ -275,6 +275,11 @@ async fn missing_turn_start_evidence_persists_pane_spawn_failed_status_and_reaso
         "attention body must carry the turn-start reason; got {:?}",
         first.body_markdown,
     );
+    assert!(
+        first.body_markdown.contains("the driver started") && first.body_markdown.contains("the pane was reaped"),
+        "confirmation failure must not claim the pane never came up; got {:?}",
+        first.body_markdown,
+    );
 
     let events = recording.events_for(&execution_id).await;
     let pane_event = events

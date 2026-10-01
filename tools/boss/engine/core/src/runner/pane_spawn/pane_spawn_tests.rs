@@ -2155,6 +2155,49 @@ async fn spawn_confirmation_ready_chrome_without_a_hook_fails_turn_start_and_rea
 }
 
 #[tokio::test]
+async fn spawn_confirmation_passes_when_transcript_path_is_set_without_a_registry_signal() {
+    let workspace = TempDir::new().unwrap();
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    spawner.pane_chrome.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
+    let chore = create_test_chore(&work_db, product.id.clone(), "Transcript path turn start");
+    let ready = create_ready_chore_execution(&work_db, chore.id.clone());
+    let (execution, _run) = work_db
+        .start_execution_run(
+            &ready.id,
+            "worker-1",
+            "foo",
+            "lease-1",
+            "foo-agent-001",
+            workspace.path().to_str().unwrap(),
+        )
+        .unwrap();
+    work_db
+        .set_run_transcript_path_if_unset(&execution.id, "/tmp/session.jsonl")
+        .unwrap();
+
+    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db.clone(), flags);
+    bind_runner(&runner, weak, &spawner);
+    runner.set_skip_spawn_confirm(false);
+    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(200));
+
+    let chore_item = work_db.get_work_item(&chore.id).unwrap();
+    runner
+        .run_execution("worker-1", &execution, &chore_item, workspace.path(), Some("change-1"))
+        .await
+        .expect("a persisted transcript_path must complete spawn without a registry signal");
+    assert!(
+        !spawner.live_states.has_driver_signal_for_run(&execution.id),
+        "fixture must not record a registry driver signal"
+    );
+    assert!(spawner.reaped_run_ids().is_empty());
+}
+
+#[tokio::test]
 async fn spawn_confirmation_passes_when_driver_chrome_and_hook_arrive() {
     let workspace = TempDir::new().unwrap();
     let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
