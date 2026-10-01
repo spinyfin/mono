@@ -18,6 +18,10 @@ rust_test(
     name = "worker-bin_test",
     size = "small",
     crate = ":worker-bin",
+    data = select({
+        "@platforms//os:macos": ["@worker_zsh//:zsh"],
+        "//conditions:default": [],
+    }),
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,

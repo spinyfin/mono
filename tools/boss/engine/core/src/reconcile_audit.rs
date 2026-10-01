@@ -32,8 +32,66 @@ pub(crate) fn append_reconcile_audit(
         Some(path) => format!(" Uncommitted work backed up to {}.", path.display()),
         None => String::new(),
     };
-    let audit_line = format!("\n[engine-reconcile] epoch {now_epoch_secs}: {reason}.{recovery_note}");
+    let audit_line = format!("\n{ENGINE_RECONCILE_MARKER} epoch {now_epoch_secs}: {reason}.{recovery_note}");
     append_description_line(work_db, work_item_id, &audit_line)
+}
+
+/// `[engine-reconcile]` audit-line marker, shared with
+/// [`ENGINE_AUDIT_LINE_PREFIXES`].
+pub(crate) const ENGINE_RECONCILE_MARKER: &str = "[engine-reconcile]";
+
+/// `[doc-detector]` audit-line marker, shared with
+/// [`ENGINE_AUDIT_LINE_PREFIXES`].
+pub(crate) const DOC_DETECTOR_MARKER: &str = "[doc-detector]";
+
+/// `[pr-review-skip]` audit-line marker appended by
+/// [`crate::completion::finalize_passes`]'s pure-rebase skip gate, shared
+/// with [`ENGINE_AUDIT_LINE_PREFIXES`] so that gate's audit line is also
+/// stripped before brief / emptiness checks see it.
+pub(crate) const PR_REVIEW_SKIP_MARKER: &str = "[pr-review-skip]";
+
+/// Prefixes of engine-appended description lines. Shared by
+/// [`append_description_line`] writers and [`strip_engine_audit_lines`] so the
+/// vocabulary of audit lines lives in one place: a line whose trimmed text
+/// starts with one of these is engine-owned, not human-authored brief.
+///
+/// Every `append_description_line` writer's marker must appear here — this
+/// list is the single source of truth for what counts as an engine audit
+/// line rather than human-authored brief text. See
+/// `engine_audit_line_prefixes_cover_every_known_writer` below, which pins
+/// each writer's marker constant against this list so a new writer that
+/// forgets to register here fails a test instead of silently poisoning
+/// empty-brief detection.
+const ENGINE_AUDIT_LINE_PREFIXES: &[&str] = &[
+    DOC_DETECTOR_MARKER,
+    ENGINE_RECONCILE_MARKER,
+    crate::deferred_scope::DEFERRED_SCOPE_MARKER,
+    PR_REVIEW_SKIP_MARKER,
+    crate::postmortem_followups::PROCESSED_MARKER,
+];
+
+/// True when `line` is an engine-appended audit line rather than
+/// human-authored brief text.
+pub(crate) fn is_engine_audit_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    ENGINE_AUDIT_LINE_PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+}
+
+/// Strip engine-appended audit lines from a work-item description so
+/// emptiness checks and reviewer-brief rendering see only the
+/// human-authored body.
+///
+/// `[deferred-scope]` lines are still collected into
+/// `deferred_scope_declarations` from the original description; this helper
+/// only removes them from the brief / revision-ask text.
+pub(crate) fn strip_engine_audit_lines(description: &str) -> String {
+    description
+        .lines()
+        .filter(|line| !is_engine_audit_line(line))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Append `line` verbatim to `work_item_id`'s description. Shared by
@@ -218,5 +276,64 @@ mod tests {
         // Must not panic and must not propagate — a courtesy audit line
         // never blocks the resume it rides on.
         append_reconcile_audit_best_effort(&db, missing, EPOCH, "no such item");
+    }
+
+    #[test]
+    fn strip_engine_audit_lines_drops_doc_detector_reconcile_and_deferred_scope() {
+        let description = "Implement the widget importer.\n\
+             \n\
+             [doc-detector] no doc pointer auto-populated for this PR because it did not \
+             touch exactly one docs/designs|investigations|postmortems file.\n\
+             [engine-reconcile] epoch 1700000000: worker pid 123 exited.\n\
+             [deferred-scope] epoch 1700000001: summary=\"broker\" reason=\"needs a pipeline\"\n";
+        assert_eq!(
+            strip_engine_audit_lines(description).trim(),
+            "Implement the widget importer."
+        );
+    }
+
+    #[test]
+    fn strip_engine_audit_lines_treats_audit_only_description_as_empty() {
+        let description = "\n[doc-detector] no doc pointer auto-populated for this PR.\n\
+             [engine-reconcile] epoch 1700000000: resumed after transient error.\n";
+        assert!(strip_engine_audit_lines(description).trim().is_empty());
+    }
+
+    #[test]
+    fn is_engine_audit_line_matches_indented_prefixes() {
+        assert!(is_engine_audit_line("  [doc-detector] leftover"));
+        assert!(is_engine_audit_line("[engine-reconcile] epoch 1: x."));
+        assert!(is_engine_audit_line("[deferred-scope] summary=\"x\" reason=\"y\""));
+        assert!(is_engine_audit_line("[pr-review-skip] epoch 1: reason=pure_rebase"));
+        assert!(is_engine_audit_line(
+            "[postmortem-followups] review surfaced no uncompleted work."
+        ));
+        assert!(!is_engine_audit_line("Implement the widget importer."));
+        assert!(!is_engine_audit_line("mentions [doc-detector] in prose"));
+    }
+
+    /// The explicitly listed writer markers must match the registered audit
+    /// prefixes. New writers must be added to both lists; this test does not
+    /// discover writers or detect unregistered markers elsewhere in the code.
+    #[test]
+    fn engine_audit_line_prefixes_cover_every_known_writer() {
+        let known_writer_markers: &[&str] = &[
+            DOC_DETECTOR_MARKER,
+            ENGINE_RECONCILE_MARKER,
+            crate::deferred_scope::DEFERRED_SCOPE_MARKER,
+            PR_REVIEW_SKIP_MARKER,
+            crate::postmortem_followups::PROCESSED_MARKER,
+        ];
+        for marker in known_writer_markers {
+            assert!(
+                ENGINE_AUDIT_LINE_PREFIXES.contains(marker),
+                "writer marker {marker:?} is missing from ENGINE_AUDIT_LINE_PREFIXES"
+            );
+        }
+        assert_eq!(
+            ENGINE_AUDIT_LINE_PREFIXES.len(),
+            known_writer_markers.len(),
+            "ENGINE_AUDIT_LINE_PREFIXES has an entry with no corresponding pinned writer marker"
+        );
     }
 }

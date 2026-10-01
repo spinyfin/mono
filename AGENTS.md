@@ -51,6 +51,10 @@ root-cause rule as the section below.
   writes, how the incoming one is briefed, and the three states it can
   report):
   [`tools/boss/docs/coordinator-session-handoff.md`](tools/boss/docs/coordinator-session-handoff.md)
+- Worker tool environment (why bare `checkleft` resolves to the repo's
+  Bazel build in a worker, how the composed `PATH` is sealed across
+  driver tool shells, and what that seal does not cover):
+  [`tools/boss/docs/worker-tool-environment.md`](tools/boss/docs/worker-tool-environment.md)
 - Operator runbooks:
   [`tools/boss/docs/runbooks/`](tools/boss/docs/runbooks/)
 

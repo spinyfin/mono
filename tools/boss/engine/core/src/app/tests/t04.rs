@@ -1,13 +1,12 @@
 use super::*;
+use crate::spawn_flow::WorkerSpawner;
 
 // Tests for `ServerState::retire_pane` / `ServerState::list_hosted_pane_statuses` —
-// the break-glass "husk pane" path. A husk is a pane the app still hosts
-// a session in that the engine has NO live-tracked run for (crash,
-// terminal-fail path bug, spawn-ack timeout); neither `stop_run` nor
-// `reap_run` can reach it since both resolve through a run id the
-// engine no longer maps to a slot. The classifier lives on
-// `list_hosted_pane_statuses` (`bossctl agents list --all`); `retire_pane`
-// is the operator verb that acts on a slot.
+// the break-glass leftover-viewer path. Occupancy is resolved from live-state,
+// the worker registry, and `work_runs.agent_id`; `ListHostedPanes` only
+// describes which slots still have a Ghostty viewer. `list_hosted_pane_statuses`
+// powers `bossctl agents list --all`; `retire_pane` is the operator verb
+// that acts on a slot.
 
 #[tokio::test]
 async fn retire_pane_refuses_when_live_run_tracked_in_slot() {
@@ -83,31 +82,8 @@ async fn retire_pane_sends_slot_keyed_detach_request_with_no_run_id_resolution()
     let server_clone = server_state.clone();
     let retire = tokio::spawn(async move { server_clone.retire_pane(7).await });
 
-    // With no live-state entry for the slot, the durable-liveness guard runs
-    // first: it asks the app which run occupies slot 7 so it can probe that
-    // run's recorded pid. Answering "nothing hosted" leaves the guard inert
-    // and the retirement proceeds, which is the path this test is about.
-    let probe = sink.next().await.expect("an EngineRequest event should be enqueued");
-    let probe_id = match probe.payload {
-        FrontendEvent::EngineRequest { request_id, request } => {
-            assert!(
-                matches!(request, EngineToAppRequest::ListHostedPanes(_)),
-                "expected the liveness probe first, got {request:?}"
-            );
-            request_id
-        }
-        other => panic!("expected EngineRequest, got {other:?}"),
-    };
-    server_state
-        .deliver_app_response(
-            "session-app",
-            &probe_id,
-            EngineToAppResponse::ListHostedPanes {
-                result: Ok(crate::protocol::ListHostedPanesResult { panes: vec![] }),
-            },
-        )
-        .await;
-
+    // Occupancy is resolved from durable identity, not ListHostedPanes.
+    // Slot 7 has none, so Guard 3 is inert and retirement proceeds as a husk.
     let envelope = sink.next().await.expect("an EngineRequest event should be enqueued");
     let (request_id, request) = match envelope.payload {
         FrontendEvent::EngineRequest { request_id, request } => (request_id, request),
@@ -365,11 +341,10 @@ async fn list_hosted_pane_statuses_does_not_flag_a_terminal_slot_whose_worker_is
 }
 
 #[tokio::test]
-async fn list_hosted_pane_statuses_flags_a_recycled_slot_even_though_its_entry_looks_alive() {
-    // The `run_id` match in the classifier. The app is hosting a pane for
-    // `run-old`, but the engine's entry for that slot belongs to `run-new`.
-    // The slot was recycled: `run-new`'s liveness signals say nothing about
-    // `run-old`'s stray pane, which is a genuine husk and must be reported.
+async fn list_hosted_pane_statuses_classifies_occupancy_not_the_viewers_claimed_run() {
+    // Occupancy comes from live-state / durable identity, not the viewer's
+    // claimed run_id. Slot 5 is occupied by `run-new` (terminal bookkeeping,
+    // live process) even if the Ghostty viewer still labels itself `run-old`.
     let (server_state, _dir) = test_server_state();
     drive_spurious_session_end_mid_tool(&server_state, 5, "run-new");
 
@@ -404,12 +379,16 @@ async fn list_hosted_pane_statuses_flags_a_recycled_slot_even_though_its_entry_l
         )
         .await;
 
-    let panes = husk_subset(list.await.expect("list task").expect("expected Ok"));
-    assert_eq!(
-        panes.iter().map(|pane| pane.run_id.as_str()).collect::<Vec<_>>(),
-        vec!["run-old"],
-        "a stray pane for a recycled run is still a husk: {panes:?}"
+    let statuses = list.await.expect("list task").expect("expected Ok");
+    assert!(
+        husk_subset(statuses.clone()).is_empty(),
+        "durable occupancy is run-new with a live process, so the slot is not a husk: {statuses:?}"
     );
+    assert_eq!(statuses[0].run_id, "run-new");
+    assert!(matches!(
+        statuses[0].state,
+        crate::protocol::HostedPaneState::LiveProcessNoRegistry { .. }
+    ));
 }
 
 // ─── 2026-07-28 regression: no live-state entry is not proof of death either ──
@@ -440,6 +419,15 @@ async fn husk_panes_for(
     sink: &Arc<SessionSink>,
     panes: Vec<crate::protocol::HostedPaneEntry>,
 ) -> Vec<crate::protocol::HostedPaneStatus> {
+    husk_subset(all_pane_statuses_for(server_state, sink, panes).await)
+}
+
+/// Same round-trip as [`husk_panes_for`], returning every classified pane.
+async fn all_pane_statuses_for(
+    server_state: &Arc<ServerState>,
+    sink: &Arc<SessionSink>,
+    panes: Vec<crate::protocol::HostedPaneEntry>,
+) -> Vec<crate::protocol::HostedPaneStatus> {
     let server_clone = server_state.clone();
     let list = tokio::spawn(async move { server_clone.list_hosted_pane_statuses().await });
 
@@ -457,7 +445,7 @@ async fn husk_panes_for(
             },
         )
         .await;
-    husk_subset(list.await.expect("list task").expect("expected Ok"))
+    list.await.expect("list task").expect("expected Ok")
 }
 
 fn hosted(slot_id: u8, run_id: &str) -> crate::protocol::HostedPaneEntry {
@@ -490,7 +478,8 @@ async fn list_hosted_pane_statuses_spares_an_untracked_slot_whose_durable_proces
         .register_app_session("session-app".into(), sink.clone())
         .await;
 
-    let panes = husk_panes_for(&server_state, &sink, vec![hosted(4, &execution_id)]).await;
+    // Slot 1 matches `create_spawned_execution`'s durable `worker-1`.
+    let panes = husk_panes_for(&server_state, &sink, vec![hosted(1, &execution_id)]).await;
     assert!(
         panes.is_empty(),
         "a slot the engine forgot, whose execution was orphaned by INFERENCE and whose recorded \
@@ -515,10 +504,10 @@ async fn list_hosted_pane_statuses_still_retires_an_untracked_slot_whose_process
         .register_app_session("session-app".into(), sink.clone())
         .await;
 
-    let panes = husk_panes_for(&server_state, &sink, vec![hosted(4, &execution_id)]).await;
+    let panes = husk_panes_for(&server_state, &sink, vec![hosted(1, &execution_id)]).await;
     assert_eq!(
         panes.iter().map(|pane| pane.slot_id).collect::<Vec<_>>(),
-        vec![4],
+        vec![1],
         "the guard must not disable the sweep: a dead process is still a husk",
     );
 }
@@ -544,10 +533,10 @@ async fn list_hosted_pane_statuses_still_retires_a_lingering_shell_under_a_cance
         .register_app_session("session-app".into(), sink.clone())
         .await;
 
-    let panes = husk_panes_for(&server_state, &sink, vec![hosted(4, &execution_id)]).await;
+    let panes = husk_panes_for(&server_state, &sink, vec![hosted(1, &execution_id)]).await;
     assert_eq!(
         panes.iter().map(|pane| pane.slot_id).collect::<Vec<_>>(),
-        vec![4],
+        vec![1],
         "a lingering shell under a DECIDED terminal status is a husk even though its pid is alive",
     );
 }
@@ -577,6 +566,7 @@ async fn retire_pane_reaps_an_untracked_slot_whose_durable_process_is_alive() {
     let pid = child.id() as i32;
     let execution_id = create_spawned_execution(db, &work_item_id, i64::from(pid));
     super::tmux_stub::install_teardown(&server_state, &execution_id, i64::from(child.id()));
+    corroborate_slot_tmux_adopted(&server_state, &execution_id, 1);
     db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
 
     let sink = make_session_sink();
@@ -586,39 +576,13 @@ async fn retire_pane_reaps_an_untracked_slot_whose_durable_process_is_alive() {
 
     let server_clone = server_state.clone();
     // Slot 1: `create_spawned_execution`'s durable run row always records
-    // worker id `worker-1`, and the durable reverse lookup below resolves
-    // the slot from that id — so the scenario's slot number must agree
-    // with it rather than being arbitrary.
+    // worker id `worker-1`, and occupancy is resolved from that id — no
+    // ListHostedPanes round-trip.
     let retire = tokio::spawn(async move { server_clone.retire_pane(1).await });
 
-    // Guard 3's own liveness probe: "what does the app host in slot 1?"
-    let probe = sink.next().await.expect("an EngineRequest event should be enqueued");
-    match probe.payload {
-        FrontendEvent::EngineRequest { request_id, request } => {
-            assert!(
-                matches!(request, EngineToAppRequest::ListHostedPanes(_)),
-                "expected the liveness probe, got {request:?}"
-            );
-            server_state
-                .deliver_app_response(
-                    "session-app",
-                    &request_id,
-                    EngineToAppResponse::ListHostedPanes {
-                        result: Ok(crate::protocol::ListHostedPanesResult {
-                            panes: vec![hosted(1, &execution_id)],
-                        }),
-                    },
-                )
-                .await;
-        }
-        other => panic!("expected EngineRequest, got {other:?}"),
-    }
-
-    // The durable teardown's own reverse lookup ("which slot hosts this
-    // run?", shared with `agents stop`'s fallback) reads the durable worker
-    // id off the run row directly — no second app round-trip — and the
-    // worker pool confirms nothing else claims that slot, so the teardown
-    // proceeds. Then the actual slot-keyed teardown request.
+    // The durable teardown proceeds because occupancy is worker-1 and the
+    // worker pool confirms nothing else claims that slot. Then the
+    // slot-keyed viewer detach.
     let release = sink
         .next()
         .await
@@ -683,6 +647,7 @@ async fn retire_pane_does_not_clobber_a_slot_reclaimed_by_a_newer_run() {
     // slot actually hosts it today.
     let execution_id = create_spawned_execution(db, &work_item_id, i64::from(pid));
     super::tmux_stub::install_teardown(&server_state, &execution_id, i64::from(child.id()));
+    corroborate_slot_tmux_adopted(&server_state, &execution_id, 1);
     db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
 
     // Slot `worker-1` has since been claimed by a DIFFERENT, live execution —
@@ -705,29 +670,7 @@ async fn retire_pane_does_not_clobber_a_slot_reclaimed_by_a_newer_run() {
     let server_clone = server_state.clone();
     let retire = tokio::spawn(async move { server_clone.retire_pane(1).await });
 
-    // Guard 3's own liveness probe: "what does the app host in slot 1?"
-    let probe = sink.next().await.expect("an EngineRequest event should be enqueued");
-    match probe.payload {
-        FrontendEvent::EngineRequest { request_id, request } => {
-            assert!(
-                matches!(request, EngineToAppRequest::ListHostedPanes(_)),
-                "expected the liveness probe, got {request:?}"
-            );
-            server_state
-                .deliver_app_response(
-                    "session-app",
-                    &request_id,
-                    EngineToAppResponse::ListHostedPanes {
-                        result: Ok(crate::protocol::ListHostedPanesResult {
-                            panes: vec![hosted(1, &execution_id)],
-                        }),
-                    },
-                )
-                .await;
-        }
-        other => panic!("expected EngineRequest, got {other:?}"),
-    }
-
+    // Occupancy is resolved from durable identity (worker-1), not the app.
     // No `DetachWorkerPane` must follow: the derived slot is owned by a
     // different live execution, so `detach_untracked_worker_viewer` must
     // refuse to act on it.
@@ -757,4 +700,684 @@ async fn retire_pane_does_not_clobber_a_slot_reclaimed_by_a_newer_run() {
         !status.success(),
         "the retiring run's own untracked process tree must still go down",
     );
+}
+
+/// The same clobbering shape on a `review-N` worker id. Occupancy of
+/// review slots is resolved through `slot_id_from_worker_id`, but the
+/// ownership guard must look at the review pool — the main pool has no
+/// `review-1` claim, so a main-pool-only check would always skip the
+/// guard and DetachWorkerPane / stop_slot a newer reviewer.
+#[tokio::test]
+async fn retire_pane_does_not_clobber_a_review_slot_reclaimed_by_a_newer_run() {
+    use crate::test_support::*;
+
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+
+    let mut child = spawn_group_leader_sleeper();
+    let pid = child.id() as i32;
+    let execution_id = create_old_execution(db, &work_item_id);
+    let (_exec, run) = db
+        .start_execution_run(&execution_id, "review-1", "repo-1", "lease-1", "ws-1", "/tmp/ws")
+        .unwrap();
+    assert!(
+        db.set_run_shell_pid_for_execution(&execution_id, i64::from(pid))
+            .unwrap(),
+        "the run row must exist before a shell pid can be recorded against it",
+    );
+    finish_run_worker_pane_alive(db, &execution_id, &run.id, Some("Spawned worker pane on review-1."));
+    super::tmux_stub::install_teardown(&server_state, &execution_id, i64::from(child.id()));
+    let slot_id = crate::coordinator::slot_id_from_worker_id("review-1").expect("review-1 maps to a slot");
+    corroborate_slot_tmux_adopted(&server_state, &execution_id, slot_id);
+    db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
+
+    let other_execution_id = "run-newer-reviewer";
+    assert!(
+        server_state
+            .execution_coordinator
+            .reclaim_slot("review-1", other_execution_id)
+            .await,
+        "the newer reviewer must be able to claim review-1",
+    );
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    let server_clone = server_state.clone();
+    let retire = tokio::spawn(async move { server_clone.retire_pane(slot_id).await });
+
+    let no_further_request = tokio::time::timeout(std::time::Duration::from_millis(200), sink.next()).await;
+    assert!(
+        no_further_request.is_err(),
+        "expected no DetachWorkerPane for a review slot claimed by a newer run, got {no_further_request:?}",
+    );
+
+    let result = retire.await.expect("retire task");
+    assert!(result.is_ok(), "expected retirement to succeed, got {result:?}");
+
+    let holder = server_state.execution_coordinator.claim_holder("review-1").await;
+    assert_eq!(
+        holder.as_deref(),
+        Some(other_execution_id),
+        "expected the newer reviewer's pool claim to survive, got {holder:?}"
+    );
+
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .expect("join wait task")
+        .expect("wait on child");
+    assert!(
+        !status.success(),
+        "the retiring run's own untracked process tree must still go down",
+    );
+}
+
+/// `ListHostedPanes` describes the viewer. Occupancy of slot 4 is not
+/// the viewer's claimed run_id: that run lives on worker-1 (slot 1).
+#[tokio::test]
+async fn list_hosted_pane_statuses_does_not_treat_the_viewers_run_id_as_occupancy() {
+    use crate::test_support::*;
+
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+    let execution_id = create_spawned_execution(db, &work_item_id, i64::from(std::process::id()));
+    db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    let panes = husk_panes_for(&server_state, &sink, vec![hosted(4, &execution_id)]).await;
+    assert_eq!(
+        panes.iter().map(|pane| pane.slot_id).collect::<Vec<_>>(),
+        vec![4],
+        "a viewer in a slot with no durable occupancy is a husk even if it claims a live orphaned run: {panes:?}"
+    );
+}
+
+/// `detach_untracked_worker_viewer` must skip slot-scoped effects when
+/// live-state names a different run, even if the pool slot is free.
+#[tokio::test]
+async fn detach_untracked_viewer_does_not_clobber_a_slot_held_only_in_live_state() {
+    use crate::test_support::*;
+
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+
+    let mut child = spawn_group_leader_sleeper();
+    let pid = child.id() as i32;
+    let execution_id = create_spawned_execution(db, &work_item_id, i64::from(pid));
+    super::tmux_stub::install_teardown(&server_state, &execution_id, i64::from(child.id()));
+    db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
+
+    let other_execution_id = "run-live-state-occupant";
+    server_state.live_worker_states.register_spawn(
+        1,
+        other_execution_id.to_owned(),
+        "claude-opus-4-7",
+        std::process::id() as i32,
+        None,
+    );
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    let outcome = server_state.release_worker_pane(&execution_id).await;
+    assert_eq!(outcome, PaneReleaseOutcome::Reaped);
+
+    let no_detach = tokio::time::timeout(std::time::Duration::from_millis(200), sink.next()).await;
+    assert!(
+        no_detach.is_err(),
+        "expected no DetachWorkerPane when live-state names a different run, got {no_detach:?}",
+    );
+
+    let state = server_state
+        .live_worker_states
+        .get(1)
+        .expect("the other run's live-state entry must survive");
+    assert_eq!(state.run_id, other_execution_id);
+
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .expect("join wait task")
+        .expect("wait on child");
+    assert!(
+        !status.success(),
+        "the retiring run's own untracked process tree must still go down",
+    );
+}
+
+/// A `running` execution durably occupying a slot with no live-state entry is
+/// a worker the engine lost track of: the list must not call it a husk, and
+/// retire must refuse. Both paths share one predicate.
+#[tokio::test]
+async fn a_running_durable_occupant_with_no_live_state_is_not_a_husk_and_retire_refuses() {
+    use crate::test_support::*;
+
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+    // `create_spawned_execution` leaves the execution `running` on worker-1.
+    let execution_id = create_spawned_execution(db, &work_item_id, 4_194_303);
+    assert!(server_state.live_worker_states.get(1).is_none());
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+    let panes = all_pane_statuses_for(&server_state, &sink, vec![hosted(1, &execution_id)]).await;
+    assert_eq!(panes.len(), 1);
+    assert!(
+        matches!(
+            panes[0].state,
+            crate::protocol::HostedPaneState::LiveProcessNoRegistry { .. }
+        ),
+        "a running durable occupant must not be listed as a husk: {:?}",
+        panes[0].state,
+    );
+
+    match server_state.retire_pane(1).await {
+        Err(RetirePaneError::LiveRunTracked { slot_id, run_id }) => {
+            assert_eq!(slot_id, 1);
+            assert_eq!(run_id, execution_id);
+        }
+        other => panic!("expected LiveRunTracked, got {other:?}"),
+    }
+}
+
+/// An occupant parked in `waiting_review` has no worker by design: the list
+/// calls it a husk and retire detaches it instead of pointing at `agents stop`.
+#[tokio::test]
+async fn a_waiting_review_durable_occupant_is_a_husk_and_retire_detaches() {
+    use crate::test_support::*;
+
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+    let execution_id = create_spawned_execution(db, &work_item_id, 4_194_303);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'waiting_review' WHERE id = ?1",
+            rusqlite::params![&execution_id],
+        )
+        .unwrap();
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+    let husks = husk_panes_for(&server_state, &sink, vec![hosted(1, &execution_id)]).await;
+    assert_eq!(husks.iter().map(|pane| pane.slot_id).collect::<Vec<_>>(), vec![1]);
+
+    let server_clone = server_state.clone();
+    let retire = tokio::spawn(async move { server_clone.retire_pane(1).await });
+    let request = sink.next().await.expect("a DetachWorkerPane request");
+    match request.payload {
+        FrontendEvent::EngineRequest { request_id, request } => {
+            assert!(
+                matches!(request, EngineToAppRequest::DetachWorkerPane(_)),
+                "expected DetachWorkerPane, got {request:?}"
+            );
+            server_state
+                .deliver_app_response(
+                    "session-app",
+                    &request_id,
+                    EngineToAppResponse::DetachWorkerPane {
+                        result: Ok(crate::protocol::DetachWorkerPaneResult {}),
+                    },
+                )
+                .await;
+        }
+        other => panic!("expected EngineRequest, got {other:?}"),
+    }
+    let result = retire.await.expect("retire task");
+    assert!(result.is_ok(), "expected retirement to succeed, got {result:?}");
+}
+
+/// An orphaned execution whose newest run moved to another slot must not be
+/// attributed to its old slot, so retiring the old slot never reaps the
+/// worker now running in the new one.
+#[tokio::test]
+async fn retire_pane_does_not_reap_an_execution_that_resumed_onto_another_slot() {
+    use crate::test_support::*;
+
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+    let mut child = spawn_group_leader_sleeper();
+    let execution_id = create_spawned_execution(db, &work_item_id, 4_194_303);
+    // Resume onto worker-2: a newer run row on a different slot.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET created_at = '1000000000' WHERE execution_id = ?1",
+            rusqlite::params![&execution_id],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'ready' WHERE id = ?1",
+            rusqlite::params![&execution_id],
+        )
+        .unwrap();
+    db.start_execution_run(&execution_id, "worker-2", "repo-1", "lease-2", "ws-2", "/tmp/ws-2")
+        .unwrap();
+    assert!(
+        db.set_run_shell_pid_for_execution(&execution_id, i64::from(child.id()))
+            .unwrap()
+    );
+    db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
+
+    assert_eq!(server_state.hosted_pane_run_for_slot(1).await, SlotOccupancy::Absent);
+    assert_eq!(
+        server_state.hosted_pane_run_for_slot(2).await,
+        SlotOccupancy::Occupied(execution_id.clone())
+    );
+
+    let result = server_state.retire_pane(1).await;
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+    assert!(
+        child.try_wait().expect("poll child").is_none(),
+        "retiring the old slot must not reap the worker that resumed on another slot",
+    );
+    child.kill().ok();
+    child.wait().ok();
+}
+
+/// Rewrite `install_teardown`'s unparseable session name to this slot's
+/// spawn shape and script an adopted live-tmux corroboration on the
+/// pane-delivery override (independent of teardown's `tmux_override`).
+fn corroborate_slot_tmux_adopted(server_state: &ServerState, execution_id: &str, slot_id: u8) {
+    let session = format!("boss-{slot_id}-occupancy");
+    let token = format!("token-{execution_id}");
+    server_state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET tmux_session_name = ?1 WHERE execution_id = ?2",
+            rusqlite::params![&session, execution_id],
+        )
+        .unwrap();
+    let replies = adopted_tmux_replies(&session, &token);
+    let (tmux, _) = super::tmux_stub::fake_tmux(replies);
+    *server_state.pane_delivery_tmux_override.write().unwrap() = Some(tmux);
+}
+
+fn adopted_tmux_replies(session: &str, token: &str) -> Vec<boss_tmux::CommandOutput> {
+    use super::tmux_stub::ok;
+    vec![
+        ok(&format!("{session}\t\n")),
+        ok(&format!("BOSS_SPAWN_TOKEN={token}\n")),
+        ok("0"),
+        ok("1776528000"),
+        ok("claude"),
+    ]
+}
+
+async fn assign_replacement(server: &ServerState) {
+    assert!(
+        server
+            .execution_coordinator
+            .reclaim_slot("worker-1", "replacement")
+            .await
+    );
+    server
+        .live_worker_states
+        .register_spawn(1, "replacement", "claude-opus-4-7", 0, None);
+    server.start_live_status_slot(1, "replacement", std::sync::Arc::new(crate::driver::ClaudeDriver));
+}
+
+async fn assert_replacement_survives(server: &ServerState) {
+    assert_eq!(
+        server.execution_coordinator.claim_holder("worker-1").await.as_deref(),
+        Some("replacement")
+    );
+    assert_eq!(server.live_worker_states.get(1).unwrap().run_id, "replacement");
+    assert!(server.live_status_manager.has_slot(1));
+    server.live_status_manager.stop_slot_for_run(1, "retired-run");
+    assert!(server.live_status_manager.has_slot(1));
+}
+
+#[tokio::test]
+async fn run_scoped_cleanup_removes_only_the_matching_occupant() {
+    let (server, _dir) = test_server_state();
+    assign_replacement(&server).await;
+    assert_eq!(server.live_worker_states.release_slot_for_run("retired-run"), None);
+    assert_replacement_survives(&server).await;
+    assert_eq!(server.live_worker_states.release_slot_for_run("replacement"), Some(1));
+    assert!(server.live_worker_states.get(1).is_none());
+    server.live_status_manager.stop_slot_for_run(1, "replacement");
+    assert!(!server.live_status_manager.has_slot(1));
+}
+
+#[tokio::test]
+async fn retire_preserves_replacement_assigned_during_tmux_probe() {
+    let (server, _dir) = test_server_state();
+    let run = super::tmux_stub::seed_teardown(&server);
+    corroborate_slot_tmux_adopted(&server, &run, 1);
+    server.work_db.mark_execution_orphaned(&run, "worker exited").unwrap();
+    let (tmux, runner) = super::tmux_stub::fake_tmux(adopted_tmux_replies("boss-1-occupancy", &format!("token-{run}")));
+    let pause = runner.pause_next();
+    *server.pane_delivery_tmux_override.write().unwrap() = Some(tmux);
+    let sink = make_session_sink();
+    server.register_app_session("session-app".into(), sink.clone()).await;
+    let task_server = server.clone();
+    let retire = tokio::spawn(async move { task_server.retire_pane(1).await });
+    tokio::time::timeout(Duration::from_secs(5), pause.entered.notified())
+        .await
+        .unwrap();
+    assign_replacement(&server).await;
+    pause.resume.notify_one();
+    assert!(matches!(
+        retire.await.unwrap(),
+        Err(RetirePaneError::LiveRunTracked { .. })
+    ));
+    assert_replacement_survives(&server).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), sink.next())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn retire_preserves_replacement_assigned_during_detach_ack() {
+    let (server, _dir) = test_server_state();
+    let sink = make_session_sink();
+    server.register_app_session("session-app".into(), sink.clone()).await;
+    let task_server = server.clone();
+    let retire = tokio::spawn(async move { task_server.retire_pane(1).await });
+    let envelope = sink.next().await.unwrap();
+    let FrontendEvent::EngineRequest {
+        request_id,
+        request: EngineToAppRequest::DetachWorkerPane(_),
+    } = envelope.payload
+    else {
+        panic!("expected detach")
+    };
+    assign_replacement(&server).await;
+    server
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::DetachWorkerPane {
+                result: Ok(crate::protocol::DetachWorkerPaneResult {}),
+            },
+        )
+        .await;
+    assert!(matches!(
+        retire.await.unwrap(),
+        Err(RetirePaneError::LiveRunTracked { .. })
+    ));
+    assert_replacement_survives(&server).await;
+}
+
+#[tokio::test]
+async fn missing_session_stop_clears_identity_and_allows_retirement() {
+    let (server, _dir) = test_server_state();
+    let run = super::tmux_stub::seed_teardown(&server);
+    corroborate_slot_tmux_adopted(&server, &run, 1);
+    server.work_db.mark_execution_orphaned(&run, "worker exited").unwrap();
+    let (tmux, _) = super::tmux_stub::fake_tmux([super::tmux_stub::ok("")]);
+    *server.pane_delivery_tmux_override.write().unwrap() = Some(tmux);
+    let error = server.retire_pane(1).await.unwrap_err().to_string();
+    assert!(error.contains(&format!("bossctl agents stop {run}")));
+    assert!(error.contains("bossctl agents retire-pane 1"));
+    let (tmux, _) = super::tmux_stub::fake_tmux([super::tmux_stub::failure("session not found")]);
+    server.set_tmux_override_for_test(tmux);
+    // Exercise the same completion entry point as `bossctl agents stop`.
+    server.completion_handler.force_stop_execution(&run).await;
+    assert!(server.work_db.tmux_identity_for_execution(&run).unwrap().is_none());
+    server.retire_pane(1).await.unwrap();
+}
+
+fn install_occupancy_tmux(server_state: &ServerState, replies: Vec<boss_tmux::CommandOutput>) {
+    // Three copies: hosted_pane_run_for_slot, list_hosted_pane_statuses, and
+    // retire_pane each probe live tmux once.
+    let first = replies.clone();
+    let second = replies.clone();
+    let triple = first.into_iter().chain(second).chain(replies);
+    let (tmux, _) = super::tmux_stub::fake_tmux(triple);
+    *server_state.pane_delivery_tmux_override.write().unwrap() = Some(tmux);
+}
+
+async fn seed_orphaned_slot1_with_identity(
+    server_state: &ServerState,
+    session_name: &str,
+    token: &str,
+) -> (String, std::process::Child) {
+    use crate::test_support::*;
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+    let child = spawn_group_leader_sleeper();
+    let execution_id = create_spawned_execution(db, &work_item_id, i64::from(child.id()));
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(&execution_id, boss_tmux::SERVER_LABEL, session_name, token)
+            .unwrap()
+    );
+    db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
+    assert!(
+        server_state
+            .execution_coordinator
+            .reclaim_slot("worker-1", &execution_id)
+            .await,
+        "the occupancy tests pin a pool claim so a refused retire can prove bookkeeping is untouched",
+    );
+    (execution_id, child)
+}
+
+async fn assert_inconclusive_and_untouched(
+    server_state: &std::sync::Arc<ServerState>,
+    slot_id: u8,
+    execution_id: &str,
+    reason_needle: &str,
+    child: &mut std::process::Child,
+) {
+    match server_state.hosted_pane_run_for_slot(slot_id).await {
+        SlotOccupancy::Inconclusive { run_id, reason } => {
+            assert_eq!(run_id.as_deref(), Some(execution_id));
+            assert!(
+                reason.contains(reason_needle),
+                "expected reason to contain {reason_needle:?}, got {reason}"
+            );
+        }
+        other => panic!("expected Inconclusive, got {other:?}"),
+    }
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+    let panes = all_pane_statuses_for(server_state, &sink, vec![hosted(slot_id, execution_id)]).await;
+    assert_eq!(panes.len(), 1);
+    assert!(
+        matches!(
+            &panes[0].state,
+            crate::protocol::HostedPaneState::OccupancyInconclusive { .. }
+        ),
+        "inconclusive occupancy must not be listed as a husk: {:?}",
+        panes[0].state,
+    );
+
+    match server_state.retire_pane(slot_id).await {
+        Err(RetirePaneError::OccupancyInconclusive { slot_id: got, reason }) => {
+            assert_eq!(got, slot_id);
+            assert!(
+                reason.contains(reason_needle),
+                "expected reason to contain {reason_needle:?}, got {reason}"
+            );
+        }
+        other => panic!("expected OccupancyInconclusive, got {other:?}"),
+    }
+
+    let no_detach = tokio::time::timeout(std::time::Duration::from_millis(200), sink.next()).await;
+    assert!(
+        no_detach.is_err(),
+        "a refused retire must not detach the viewer, got {no_detach:?}",
+    );
+    let holder = server_state.execution_coordinator.claim_holder("worker-1").await;
+    assert_eq!(
+        holder.as_deref(),
+        Some(execution_id),
+        "refusing occupancy must leave the pool claim untouched, got {holder:?}"
+    );
+    assert!(
+        server_state.live_worker_states.get(slot_id).is_none(),
+        "refusing occupancy must not synthesize a live-state entry"
+    );
+    assert!(
+        child.try_wait().expect("poll child").is_none(),
+        "inconclusive occupancy must not reap the worker process",
+    );
+}
+
+/// A tmux identity that names a session hosted in a different slot is
+/// inconclusive: list reports a non-husk, retire refuses without mutating
+/// slot bookkeeping.
+#[tokio::test]
+async fn conflicting_slot_identity_is_inconclusive_and_retire_does_not_mutate() {
+    let (server_state, _dir) = test_server_state();
+    let (execution_id, mut child) = seed_orphaned_slot1_with_identity(&server_state, "boss-2-abcdef", "token-x").await;
+    // A live matching session on the *wrong* name must not flip this to Occupied.
+    install_occupancy_tmux(&server_state, adopted_tmux_replies("boss-2-abcdef", "token-x"));
+    assert_inconclusive_and_untouched(&server_state, 1, &execution_id, "names slot 2", &mut child).await;
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[tokio::test]
+async fn token_mismatch_is_inconclusive_and_retire_does_not_mutate() {
+    use super::tmux_stub::ok;
+    let (server_state, _dir) = test_server_state();
+    let (execution_id, mut child) =
+        seed_orphaned_slot1_with_identity(&server_state, "boss-1-abcdef", "token-ours").await;
+    install_occupancy_tmux(
+        &server_state,
+        vec![ok("boss-1-abcdef\t\n"), ok("BOSS_SPAWN_TOKEN=token-someone-elses\n")],
+    );
+    assert_inconclusive_and_untouched(
+        &server_state,
+        1,
+        &execution_id,
+        "spawn token does not match",
+        &mut child,
+    )
+    .await;
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[tokio::test]
+async fn missing_session_is_inconclusive_and_retire_does_not_mutate() {
+    use super::tmux_stub::ok;
+    let (server_state, _dir) = test_server_state();
+    let (execution_id, mut child) =
+        seed_orphaned_slot1_with_identity(&server_state, "boss-1-abcdef", "token-ours").await;
+    install_occupancy_tmux(&server_state, vec![ok("other-session\t\n")]);
+    assert_inconclusive_and_untouched(&server_state, 1, &execution_id, "session is missing", &mut child).await;
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[tokio::test]
+async fn probe_failure_is_inconclusive_and_retire_does_not_mutate() {
+    use super::tmux_stub::failure;
+    let (server_state, _dir) = test_server_state();
+    let (execution_id, mut child) =
+        seed_orphaned_slot1_with_identity(&server_state, "boss-1-abcdef", "token-ours").await;
+    install_occupancy_tmux(&server_state, vec![failure("error connecting to server")]);
+    assert_inconclusive_and_untouched(&server_state, 1, &execution_id, "inventory unavailable", &mut child).await;
+    child.kill().ok();
+    child.wait().ok();
+}
+
+/// The pid probe reads the newest local row by `created_at`. An older
+/// worker-1 run with a transcript must not credit that execution to slot 1
+/// when a newer worker-2 run has no transcript yet.
+#[tokio::test]
+async fn older_transcript_run_does_not_credit_occupancy_to_the_old_slot() {
+    use crate::test_support::*;
+
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+    let execution_id = create_spawned_execution(db, &work_item_id, 4_194_303);
+    db.set_run_transcript_path_if_unset(&execution_id, "/tmp/older-worker-1.jsonl")
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET created_at = '1000000000' WHERE execution_id = ?1",
+            rusqlite::params![&execution_id],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'ready' WHERE id = ?1",
+            rusqlite::params![&execution_id],
+        )
+        .unwrap();
+    let (_exec, newer_run) = db
+        .start_execution_run(&execution_id, "worker-2", "repo-1", "lease-2", "ws-2", "/tmp/ws-2")
+        .unwrap();
+    // Both runs finished: unfinished-first no longer prefers worker-2, so the
+    // hook resolver's transcript tie-break would name worker-1.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET status = 'completed', finished_at = created_at WHERE id = ?1",
+            rusqlite::params![&newer_run.id],
+        )
+        .unwrap();
+
+    assert_eq!(
+        db.latest_run_agent_id_for_execution(&execution_id).unwrap().as_deref(),
+        Some("worker-1"),
+        "precondition: the transcript-preferring resolver still names worker-1",
+    );
+    assert_eq!(
+        db.latest_local_agent_id_for_execution(&execution_id)
+            .unwrap()
+            .as_deref(),
+        Some("worker-2"),
+        "the occupancy query must follow created_at, not the transcript resolver",
+    );
+    assert_eq!(server_state.hosted_pane_run_for_slot(1).await, SlotOccupancy::Absent);
+    assert_eq!(
+        server_state.hosted_pane_run_for_slot(2).await,
+        SlotOccupancy::Occupied(execution_id)
+    );
+}
+
+#[test]
+fn slot_from_tmux_session_name_parses_the_spawn_shape() {
+    assert_eq!(
+        super::super::pane_ops::slot_from_tmux_session_name("boss-3-abc123"),
+        Some(3)
+    );
+    assert_eq!(
+        super::super::pane_ops::slot_from_tmux_session_name("boss-test-worker"),
+        None
+    );
+    assert_eq!(super::super::pane_ops::slot_from_tmux_session_name("other-3-abc"), None);
 }

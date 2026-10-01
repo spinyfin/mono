@@ -71,7 +71,7 @@
 //! [`maybe_admit_recovery_probe`]. A real shell
 //! pid reported for that canary is proof the spawn path works again and
 //! auto-resumes dispatch ([`resume_dispatch_after_breaker_recovery`]); a
-//! reap of the canary (spawn-ack timeout or app NACK) backs off
+//! reap of the canary (driver-start timeout or app NACK) backs off
 //! exponentially before the next attempt. Dispatch also auto-resumes on a
 //! fresh app session registering — an app relaunch is the operator's
 //! natural recovery action after e.g. waking the display, so it clears the
@@ -116,9 +116,8 @@ pub const SPAWN_CAPABILITY_ATTENTION_KIND: &str = "app_spawn_capability_unhealth
 
 /// Backoff before the first half-open recovery probe after a trip, and the
 /// base of the exponential backoff applied after each subsequent probe
-/// failure. 60s mirrors [`crate::spawn_ack_sweep::SPAWN_ACK_GRACE_SECS`] — a
-/// failed probe has usually already been reaped by the time the next one
-/// would be eligible anyway.
+/// failure. 60s is long enough that a failed probe has usually already
+/// been reaped by the time the next one would be eligible anyway.
 pub const SPAWN_HEALTH_PROBE_BACKOFF_BASE_SECS: i64 = 60;
 
 /// Ceiling on probe backoff so a long-lived outage still gets a recovery
@@ -141,11 +140,17 @@ pub const SPAWN_HEALTH_PROBE_BACKOFF_MAX_SECS: i64 = 900;
 /// deadline that leaves `in_flight` set forever, so `try_admit_probe` would
 /// refuse to admit a next canary and dispatch would stay Breaker-paused
 /// until a human ran `bossctl dispatch resume` — the exact latch this module
-/// exists to eliminate. Twice
-/// [`crate::spawn_ack_sweep::SPAWN_ACK_GRACE_SECS`] gives the normal reap
-/// path a full chance to resolve the probe first; this is strictly a
-/// last-resort backstop for the terminal-without-reap case.
-pub const SPAWN_HEALTH_PROBE_STALL_DEADLINE_SECS: i64 = 120;
+/// exists to eliminate.
+///
+/// The only reap path for a canary that reported a pid but never produced a
+/// driver signal is the driver-start check, which fires after
+/// [`crate::live_worker_state::DRIVER_START_GRACE_SECS`] and is observed on
+/// the next sweep tick. The deadline is that grace plus two sweep intervals
+/// (60s each) of slack, so the driver-start reap always resolves a live
+/// canary first and a second canary is never admitted while the first is
+/// still alive. This is strictly a last-resort backstop for the
+/// terminal-without-reap case.
+pub const SPAWN_HEALTH_PROBE_STALL_DEADLINE_SECS: i64 = crate::live_worker_state::DRIVER_START_GRACE_SECS + 120;
 
 /// Sentinel for [`SpawnHealthTracker::last_disabled_signal_at`] meaning "no
 /// disabled-mode signal has fired yet" — distinct from a real epoch-seconds
@@ -196,16 +201,19 @@ struct FailureWindowConfig {
     window_secs: i64,
 }
 
-/// Which of the two distinct failure shapes a never-started reap observed.
+/// Which failure shape a never-started reap observed — a pid-based split
+/// of the remaining driver-start reap, plus historical NACK and pane-death
+/// rows.
 ///
-/// [`crate::spawn_ack_sweep`] has two passes that ask different questions
-/// — "did a shell come up?" and "did the driver signal?" — and the app's
-/// own NACK and pane-death reports are the first kind. Until 2026-09-13
-/// every one of them fed the breaker as the same event and the breaker
-/// reported them all as "failed to spawn a worker shell". Four
-/// driver-start timeouts on panes whose shells had come up in 4–7 seconds
-/// were announced as a broken pane-spawn path, and the diagnosis went to
-/// the pane-spawn and task-policy subsystems, which were healthy.
+/// [`crate::spawn_ack_sweep`] now has a single driver-start reap. This
+/// class splits that reap on whether a shell pid was observed, and still
+/// names the historical app NACK / pane-death-before-start rows as
+/// [`Self::NoShell`]. Until 2026-09-13 every one of them fed the breaker
+/// as the same event and the breaker reported them all as "failed to spawn
+/// a worker shell". Four driver-start timeouts on panes whose shells had
+/// come up in 4–7 seconds were announced as a broken pane-spawn path, and
+/// the diagnosis went to the pane-spawn and task-policy subsystems, which
+/// were healthy.
 ///
 /// The class is what the breaker's pause reason and attention item are
 /// composed from, so the operator reads what was observed for each failure
@@ -213,7 +221,7 @@ struct FailureWindowConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpawnFailureClass {
-    /// No shell ever came up for the pane: a spawn-ack timeout, an app
+    /// No shell ever came up for the pane: a dispatch-level spawn timeout, an app
     /// NACK, or a pane death before any proof of life. The app's
     /// pane-spawn path is the thing to look at.
     NoShell,
@@ -264,8 +272,9 @@ pub struct SpawnFailureEvidence {
     pub epoch_secs: i64,
     /// Which failure shape the reap observed — see [`SpawnFailureClass`].
     pub class: SpawnFailureClass,
-    /// The dispatch stage of the reap (`spawn_ack_timeout`, `spawn_nack`,
-    /// `pane_death_before_start`, `driver_start_timeout`).
+    /// The dispatch stage of the reap (`driver_start_timeout` today;
+    /// historical rows may still say `spawn_ack_timeout`, `spawn_nack`,
+    /// or `pane_death_before_start`).
     pub cause: String,
     /// What the reap observed, in the reap's own words: the orphan reason
     /// it recorded, including its liveness-probe result.
@@ -966,7 +975,8 @@ pub async fn trip_spawn_capability_circuit(
     // The concrete failures that fed the trip — execution/work-item/slot ids,
     // shell pids, timestamps, and which failure class each was — so the trip
     // is diagnosable without separately grepping `spawn_nack` /
-    // `spawn_ack_timeout` / `driver_start_timeout` events out of the stream
+    // `driver_start_timeout` events (historical logs may still name
+    // `spawn_ack_timeout`) out of the stream
     // by hand, and so the reason text below can say what was observed.
     let triggering_events = spawn_health.evidence_in_window(now_epoch_secs);
     let composition = FailureComposition::of(&triggering_events);
@@ -1082,8 +1092,9 @@ pub async fn trip_spawn_capability_circuit(
             "{what_happened}\n\n\
              Dispatch has been **paused** (reviews included) to stop the engine from burning spawn \
              attempts against a path that is failing systemically. Each affected execution was reaped \
-             (see the `spawn_nack` / `spawn_ack_timeout` / `pane_death_before_start` / \
-             `driver_start_timeout` events in `dispatch-events/current.jsonl`).\n\n\
+             (see the `driver_start_timeout` events in `dispatch-events/current.jsonl`; \
+             historical logs may still name `spawn_ack_timeout` / `spawn_nack` / \
+             `pane_death_before_start`).\n\n\
              **Recovery is automatic:** the engine periodically force-dispatches a single queued \
              execution as a recovery probe (backing off between attempts) and auto-resumes dispatch \
              the moment one reports a real shell pid — see `spawn_capability_recovered` in \
@@ -1098,9 +1109,9 @@ pub async fn trip_spawn_capability_circuit(
              The spawn-capability breaker is **disabled by config** \
              (`BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER=false` is set; the breaker defaults on) — dispatch \
              was **NOT** paused; this item is observability only. Each affected execution was reaped and \
-             will be redispatched normally (see the `spawn_nack` / `spawn_ack_timeout` / \
-             `pane_death_before_start` / `driver_start_timeout` events in \
-             `dispatch-events/current.jsonl`).\n\n\
+             will be redispatched normally (see the `driver_start_timeout` events in \
+             `dispatch-events/current.jsonl`; historical logs may still name \
+             `spawn_ack_timeout` / `spawn_nack` / `pane_death_before_start`).\n\n\
              If this keeps happening, consider removing/unsetting `BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER=false` \
              so a systemic outage pauses dispatch (with automatic recovery) instead of relying on the \
              per-work-item churn guard alone."
@@ -1350,6 +1361,14 @@ mod tests {
         let tracker = SpawnHealthTracker::with_config(3, 300);
         assert!(tracker.try_admit_probe(0));
     }
+
+    // One canary in flight: the stall backstop must not clear `in_flight`
+    // (and admit a second canary) before the driver-start reap can resolve
+    // the first, so the deadline has to outlast the driver-start grace.
+    const _: () = assert!(
+        SPAWN_HEALTH_PROBE_STALL_DEADLINE_SECS > crate::live_worker_state::DRIVER_START_GRACE_SECS,
+        "probe stall deadline must exceed the driver-start grace",
+    );
 
     #[test]
     fn mark_probe_dispatched_blocks_further_admission() {
@@ -1952,7 +1971,7 @@ mod tests {
             .epoch_secs(epoch_secs)
             .class(class)
             .cause(match class {
-                SpawnFailureClass::NoShell => "spawn_ack_timeout",
+                SpawnFailureClass::NoShell => "driver_start_timeout",
                 SpawnFailureClass::ShellWithoutDriverSignal => "driver_start_timeout",
             })
             .observed(format!("test observation for {execution_id}"))

@@ -227,6 +227,70 @@ async fn pane_spawn_failure_raises_attention_item_and_dispatch_event() {
     assert_eq!(demote.details["reason"], "pane_spawn_failure");
 }
 
+/// Coordinator persistence for a spawn that the runner refused because
+/// no turn-start evidence arrived: the execution is `failed`, the
+/// attention item is `pane_spawn_failed`, and the recorded reason names
+/// the missing driver hook.
+#[tokio::test]
+async fn missing_turn_start_evidence_persists_pane_spawn_failed_status_and_reason() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+    db.reconcile_product_executions(&product.id).unwrap();
+
+    let fail_message = crate::runner::spawn_confirmation::turn_did_not_start_error(
+        "claude",
+        "exec-silent-turn",
+        std::time::Duration::from_secs(45),
+    )
+    .to_string();
+    let cube = Arc::new(FakeCubeClient::default());
+    let runner = Arc::new(FakeExecutionRunner {
+        fail: true,
+        fail_message: Some(fail_message.clone()),
+        ..FakeExecutionRunner::default()
+    });
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+            .with_dispatch_events(recording.clone()),
+    );
+    let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+    coordinator.kick();
+    wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
+
+    let failed = db.get_execution(&execution_id).unwrap();
+    assert_eq!(failed.status, ExecutionStatus::Failed);
+    assert_eq!(failed.pre_start_failure_count, 1);
+
+    let attention_items = db.list_attention_items(&execution_id).unwrap();
+    let first = attention_items
+        .first()
+        .expect("missing turn-start evidence must raise pane_spawn_failed");
+    assert_eq!(first.kind, "pane_spawn_failed");
+    assert!(
+        first.body_markdown.contains("no driver hook or session event"),
+        "attention body must carry the turn-start reason; got {:?}",
+        first.body_markdown,
+    );
+
+    let events = recording.events_for(&execution_id).await;
+    let pane_event = events
+        .iter()
+        .find(|event| event.stage == "pane_spawned" && event.outcome == "error")
+        .unwrap_or_else(|| panic!("expected pane_spawned:error for {execution_id}; got {events:#?}"));
+    assert!(
+        pane_event
+            .error_message
+            .as_deref()
+            .is_some_and(|msg| msg.contains("no driver hook or session event")),
+        "pane_spawned event must include the turn-start reason; got {:?}",
+        pane_event.error_message,
+    );
+}
+
 /// Poll `recording` until an event for `execution_id` matches `predicate`,
 /// returning it. Used by the spawn-abort tests below, which have to assert on
 /// what is visible at a specific instant *while the cube release is still

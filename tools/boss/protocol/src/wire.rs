@@ -1186,11 +1186,10 @@ pub enum FrontendRequest {
 
     /// Boss-tier RPC: interrupt the worker pane hosting `run_id` —
     /// equivalent to the human pressing Esc inside that pane.
-    /// Resolves `run_id → slot_id` and forwards an
-    /// `InterruptWorkerPane` engine→app request. Cancels the worker's
-    /// in-flight turn without killing the run. Used by `bossctl
-    /// agents interrupt`. Returns a `WorkError` if the run is unknown
-    /// or has no allocated pane.
+    /// Resolves `run_id → slot_id` and delivers Esc through tmux.
+    /// Cancels the worker's in-flight turn without killing the run.
+    /// Used by `bossctl agents interrupt`. Returns a `WorkError` if
+    /// the run is unknown or has no tmux-hosted pane.
     InterruptWorkerPane {
         run_id: String,
     },
@@ -1465,8 +1464,9 @@ pub enum FrontendRequest {
     /// Read-only query: every slot the app currently hosts a session in,
     /// classified against the engine's live registry AND its durable
     /// state — live, "engine lost track of it but durable state still
-    /// corroborates a running process" (`LiveProcessNoRegistry`), or a
-    /// true husk. Powers `bossctl agents list --all` and worker-reference
+    /// corroborates a running process" (`LiveProcessNoRegistry`),
+    /// occupancy that live tmux could not corroborate
+    /// (`OccupancyInconclusive`), or a true husk. Powers `bossctl agents list --all` and worker-reference
     /// resolution (crew name / slot id / run id) for every `agents` verb,
     /// both of which are otherwise structurally blind to a pane the live
     /// registry has dropped — `ListWorkerLiveStates` only reflects the
@@ -2233,11 +2233,9 @@ pub enum FrontendRequest {
 
     /// Boss-tier RPC: write `text` into the worker pane hosting
     /// `run_id` as if the user typed it. Resolves `run_id → slot_id`
-    /// via the worker registry and forwards a `SendToPane` engine→app
-    /// request, which the app routes through the same libghostty
-    /// surface a real keystroke takes. Used by `bossctl agents send`.
-    /// Returns `WorkError` if the run is unknown, has no allocated
-    /// pane, or the app rejects the injection.
+    /// via the worker registry and delivers through tmux `send-keys`.
+    /// Used by `bossctl agents send`. Returns `WorkError` if the run
+    /// is unknown, has no tmux-hosted pane, or the write is refused.
     SendInputToWorker {
         run_id: String,
         text: String,

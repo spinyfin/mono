@@ -4,8 +4,8 @@
 //! its whole process group, and a timeout is a loud preflight failure naming
 //! the command — never a silent pass. These calls run synchronously, so the
 //! caller ([`super::GrokDriver::provision_workspace`]) must keep them off the
-//! async worker threads with `spawn_blocking`; an unbounded call here once
-//! pinned two runtime threads for hours and stopped the engine from exiting.
+//! async worker threads with `spawn_blocking` so synchronous waits cannot
+//! stall the async runtime or its shutdown.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -50,8 +50,8 @@ impl InFlight {
 static IN_FLIGHT: InFlight = InFlight(Mutex::new(BTreeMap::new()));
 
 /// Kill every preflight subprocess still running and return their command
-/// lines. Called when the engine gives up waiting for blocking tasks at
-/// shutdown, so abandoned probes do not outlive the engine as orphans.
+/// lines. Called before the runtime shutdown grace period so blocking waits
+/// can finish and the probes do not outlive the engine as orphans.
 pub fn abandon_in_flight_preflight_commands() -> Vec<String> {
     IN_FLIGHT.abandon()
 }
@@ -677,8 +677,7 @@ mod tests {
         assert!(registry.map().is_empty(), "timed-out command must leave the registry");
     }
 
-    /// The real hang: a child wedged on a grandchild (`cube` → `git ls-remote`)
-    /// must not leave that grandchild behind.
+    /// A timeout must kill descendants as well as the direct child.
     #[test]
     fn a_timeout_kills_the_grandchild_too() {
         let pid_file = std::env::temp_dir().join(format!("boss-preflight-grandchild-{}", std::process::id()));

@@ -484,6 +484,7 @@ pub trait TranscriptPathResolver: Send + Sync {
 /// Per-slot handle stored on the manager. Dropping the sender closes
 /// the channel; the task receives `None` from `recv()` and exits.
 struct SlotHandle {
+    run_id: String,
     sender: mpsc::UnboundedSender<Trigger>,
     join: Option<JoinHandle<()>>,
 }
@@ -684,7 +685,7 @@ impl LiveStatusManager {
         });
         let cfg = SlotConfig {
             slot_id,
-            run_id,
+            run_id: run_id.clone(),
             driver,
             utility,
             registry,
@@ -698,6 +699,7 @@ impl LiveStatusManager {
         guard.insert(
             slot_id,
             SlotHandle {
+                run_id,
                 sender,
                 join: Some(join),
             },
@@ -709,7 +711,20 @@ impl LiveStatusManager {
     /// the JoinHandle is dropped on the floor so a stuck summarizer
     /// HTTP call cannot block `release_worker_pane`.
     pub fn stop_slot(&self, slot_id: u8) {
-        let handle = self.slots.lock().expect("manager mutex poisoned").remove(&slot_id);
+        self.stop_matching_slot(slot_id, None);
+    }
+
+    /// Stop only the summarizer belonging to this execution.
+    pub fn stop_slot_for_run(&self, slot_id: u8, run_id: &str) {
+        self.stop_matching_slot(slot_id, Some(run_id));
+    }
+
+    fn stop_matching_slot(&self, slot_id: u8, run_id: Option<&str>) {
+        let mut slots = self.slots.lock().expect("manager mutex poisoned");
+        if run_id.is_some_and(|run_id| slots.get(&slot_id).is_some_and(|h| h.run_id != run_id)) {
+            return;
+        }
+        let handle = slots.remove(&slot_id);
         if let Some(mut h) = handle {
             tracing::info!(slot_id, "live_status: stop_slot — tearing down per-slot task");
             // Best-effort: send Shutdown, then drop the sender so the

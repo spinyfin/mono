@@ -238,7 +238,7 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
         .unwrap();
 
     // Map the execution (via its exec_* id) to slot 1 so dispatch_probe_on_stop
-    // has a target for `SendToPane`. In production BOSS_RUN_ID carries
+    // has a pane to write into. In production BOSS_RUN_ID carries
     // execution.id (exec_*), not run.id (run_*). Park activity at Idle so
     // the Stop-path activity guard (fail closed) allows the write.
     register_idle_worker(&server_state, &execution.id, 1);
@@ -256,35 +256,7 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
         .subscribe(&session_id, &[probe_topic(&execution.id)])
         .await;
 
-    // Register a fake "app session" to receive the SendToPane that
-    // dispatch_probe_on_stop emits, and reply success to it on a
-    // background task. Without this round-trip the dispatch errors
-    // out, the probe text gets requeued, and no in-flight entry
-    // is recorded.
-    let app_sink = make_session_sink();
-    server_state
-        .register_app_session("session-app".into(), app_sink.clone())
-        .await;
-    let server_for_app = server_state.clone();
-    let app_responder = tokio::spawn(async move {
-        let envelope = app_sink
-            .next()
-            .await
-            .expect("SendToPane EngineRequest should be enqueued");
-        let request_id = match &envelope.payload {
-            FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
-            other => panic!("expected EngineRequest, got {other:?}"),
-        };
-        server_for_app
-            .deliver_app_response(
-                "session-app",
-                &request_id,
-                EngineToAppResponse::SendToPane {
-                    result: Ok(crate::protocol::SendToPaneResult {}),
-                },
-            )
-            .await;
-    });
+    let _tmux = install_live_tmux_delivery(&server_state, &execution.id, 1, "boss-probe");
 
     // Queue a probe and pull the minted probe_id back out of the
     // queue head so we can assert it threads through to ProbeReplied.
@@ -305,7 +277,6 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
     );
     dispatch_probe_reply_on_stop(&server_state, &first_stop).await;
     dispatch_probe_on_stop(&server_state, &first_stop).await;
-    app_responder.await.expect("app responder task");
 
     // Append an assistant turn — the worker has now "replied".
     {
@@ -353,12 +324,11 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
     );
 }
 
-/// Safety guard: a probe on PostToolUse must **not** write to the
-/// pane when the run has no resolvable driver — `register_working_worker`
-/// registers a bare run id with no execution row behind it, so the mid-turn
-/// decision cannot establish what the foreground process does with stdin and
-/// fails closed. Injecting into a non-consuming foreground process is a safety
-/// issue (ghostty-codex-pane-viability Q2 Layer D), not hygiene.
+/// Safety guard: a probe on PostToolUse must **not** write to the pane when
+/// the worker is mid-turn on a driver that rejects stdin (`grok`). Live tmux
+/// delivery is installed so the posture guard is what refuses the write, not
+/// a missing transport. Injecting into a non-consuming foreground process is
+/// a safety issue (ghostty-codex-pane-viability Q2 Layer D), not hygiene.
 ///
 /// Note what this does *not* assert: that `Working` alone forbids the write.
 /// It does not — a mid-turn worker on a driver that buffers stdin is
@@ -374,13 +344,8 @@ async fn dispatch_probe_defers_when_worker_not_accepting_input() {
     use crate::protocol::WorkerEvent;
 
     let (server_state, _dir) = test_server_state();
-    let run_id = "run-urgent-refused";
-    register_working_worker(&server_state, run_id, 5);
-
-    let app_sink = make_session_sink();
-    server_state
-        .register_app_session("session-app".into(), app_sink.clone())
-        .await;
+    let run_id = register_working_worker_with_driver(&server_state, 5, Some("grok"));
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 5, "boss-5");
 
     let watch_session_id = "session-probe-watch-refuse".to_owned();
     let watch_sink = make_session_sink();
@@ -390,10 +355,10 @@ async fn dispatch_probe_defers_when_worker_not_accepting_input() {
         .await;
     server_state
         .topic_broker
-        .subscribe(&watch_session_id, &[probe_topic(run_id)])
+        .subscribe(&watch_session_id, &[probe_topic(&run_id)])
         .await;
 
-    let probe_id = server_state.queue_probe(run_id.to_owned(), "what now?".into(), true);
+    let probe_id = server_state.queue_probe(run_id.clone(), "what now?".into(), true);
 
     let post_tool_use = crate::events_socket::IncomingHookEvent::for_test(
         WorkerEvent::PostToolUse {
@@ -402,20 +367,19 @@ async fn dispatch_probe_defers_when_worker_not_accepting_input() {
             tool_input: serde_json::json!({}),
             tool_response: serde_json::json!({}),
         },
-        Some(run_id.to_owned()),
+        Some(run_id.clone()),
         None,
     );
     dispatch_probe_on_post_tool_use(&server_state, &post_tool_use).await;
 
-    // Pre-write guard: no SendToPane was issued.
-    assert_eq!(
-        app_sink.queue_stats().depth,
-        0,
-        "deferred probe must not enqueue SendToPane"
+    assert!(
+        !runner.wrote_text(),
+        "deferred probe must not write into the pane; calls={:?}",
+        runner.calls(),
     );
     // Probe remains queued (never popped) for Stop-boundary delivery.
     let still = server_state
-        .pop_pending_probe(run_id)
+        .pop_pending_probe(&run_id)
         .expect("deferred probe must remain queued for Stop boundary");
     assert_eq!(still.probe_id, probe_id);
     assert_eq!(
@@ -443,13 +407,9 @@ async fn dispatch_probe_on_idle_records_unconfirmed_without_redelivery() {
 
     let (server_state, _dir) = test_server_state();
     let run_id = register_idle_worker_with_driver(&server_state, 6, None);
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 6, "boss-6");
 
-    let app_sink = make_session_sink();
-    server_state
-        .register_app_session("session-app".into(), app_sink.clone())
-        .await;
-
-    let watch_session_id = "session-probe-watch".to_owned();
+    let watch_session_id = "session-probe-watch-unconfirmed".to_owned();
     let watch_sink = make_session_sink();
     server_state
         .topic_broker
@@ -459,27 +419,6 @@ async fn dispatch_probe_on_idle_records_unconfirmed_without_redelivery() {
         .topic_broker
         .subscribe(&watch_session_id, &[probe_topic(&run_id)])
         .await;
-
-    let server_for_app = server_state.clone();
-    let app_responder = tokio::spawn(async move {
-        let envelope = app_sink
-            .next()
-            .await
-            .expect("SendToPane must be enqueued for the parked worker's probe");
-        let request_id = match &envelope.payload {
-            FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
-            other => panic!("expected EngineRequest, got {other:?}"),
-        };
-        server_for_app
-            .deliver_app_response(
-                "session-app",
-                &request_id,
-                EngineToAppResponse::SendToPane {
-                    result: Ok(crate::protocol::SendToPaneResult {}),
-                },
-            )
-            .await;
-    });
 
     let probe_id = server_state.queue_probe(run_id.clone(), "what now?".into(), true);
 
@@ -498,36 +437,44 @@ async fn dispatch_probe_on_idle_records_unconfirmed_without_redelivery() {
         async move { dispatch_probe_on_post_tool_use(&server_state, &post_tool_use).await }
     });
 
-    app_responder.await.expect("app responder task");
     tokio::time::advance(Duration::from_secs(10)).await;
     dispatch.await.expect("dispatch task");
 
     assert!(
+        runner.wrote_text(),
+        "the pane write itself must have gone out; calls={:?}",
+        runner.calls(),
+    );
+    assert!(
+        server_state.take_in_flight_probe(&run_id).is_some(),
+        "unconfirmed delivery keeps the in-flight slot so a later reply is still captured",
+    );
+    assert!(
         server_state.pop_pending_probe(&run_id).is_none(),
-        "unconfirmed probe must not be auto-redelivered",
+        "delivered probe must not be auto-redelivered",
     );
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
         Some(ProbeDeliveryState::Unconfirmed),
         "unconfirmed delivery must be recorded, not left unknown",
     );
-    assert!(
-        server_state.take_in_flight_probe(&run_id).is_some(),
-        "unconfirmed probe must still be tracked in-flight for reply capture",
-    );
 
     let envelope = watch_sink
         .next()
         .await
-        .expect("ProbeDeliveryEscalated should be published on the probe topic");
+        .expect("unconfirmed delivery must publish ProbeDeliveryEscalated");
     match envelope.payload {
         FrontendEvent::ProbeDeliveryEscalated {
             run_id: emitted_run,
             probe_id: emitted_probe,
-            ..
+            reason,
         } => {
             assert_eq!(emitted_run, run_id);
             assert_eq!(emitted_probe, probe_id);
+            assert!(
+                reason.contains("unconfirmed"),
+                "escalation reason must name unconfirmed delivery, got {reason}"
+            );
         }
         other => panic!("expected ProbeDeliveryEscalated, got {other:?}"),
     }
@@ -588,38 +535,16 @@ async fn probe_queued_for_idle_worker_dispatches_immediately() {
         "precondition: worker must be idle",
     );
 
-    // Register a fake app session to receive the SendToPane.
-    let app_sink = make_session_sink();
-    server_state
-        .register_app_session("session-app".into(), app_sink.clone())
-        .await;
-    let server_for_app = server_state.clone();
-    let app_responder = tokio::spawn(async move {
-        let envelope = app_sink.next().await.expect("SendToPane must arrive for idle worker");
-        let request_id = match &envelope.payload {
-            FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
-            other => panic!("expected EngineRequest, got {other:?}"),
-        };
-        server_for_app
-            .deliver_app_response(
-                "session-app",
-                &request_id,
-                EngineToAppResponse::SendToPane {
-                    result: Ok(crate::protocol::SendToPaneResult {}),
-                },
-            )
-            .await;
-    });
-
+    let runner = install_live_tmux_delivery(&server_state, &execution.id, 1, "boss-probe");
     // Queue the probe and call dispatch_probe_now directly.
     server_state.queue_probe(execution.id.clone(), "coordinator nudge".into(), false);
     dispatch_probe_now(&server_state, &execution.id).await;
 
-    // The app_responder task must have seen the SendToPane by now.
-    tokio::time::timeout(Duration::from_secs(2), app_responder)
-        .await
-        .expect("timed out waiting for SendToPane round-trip")
-        .expect("app_responder panicked");
+    assert!(
+        runner.wrote_text(),
+        "idle immediate dispatch must write the probe into the pane; calls={:?}",
+        runner.calls(),
+    );
 
     // Probe must have been consumed (popped from pending_probes and
     // an in-flight entry recorded).
@@ -694,41 +619,17 @@ async fn probe_queued_for_waiting_for_input_worker_dispatches_immediately() {
         "precondition: worker must be parked in WaitingForInput",
     );
 
-    // Register a fake app session to receive the SendToPane.
-    let app_sink = make_session_sink();
-    server_state
-        .register_app_session("session-app".into(), app_sink.clone())
-        .await;
-    let server_for_app = server_state.clone();
-    let app_responder = tokio::spawn(async move {
-        let envelope = app_sink
-            .next()
-            .await
-            .expect("SendToPane must arrive for waiting-for-input worker");
-        let request_id = match &envelope.payload {
-            FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
-            other => panic!("expected EngineRequest, got {other:?}"),
-        };
-        server_for_app
-            .deliver_app_response(
-                "session-app",
-                &request_id,
-                EngineToAppResponse::SendToPane {
-                    result: Ok(crate::protocol::SendToPaneResult {}),
-                },
-            )
-            .await;
-    });
+    let runner = install_live_tmux_delivery(&server_state, &execution.id, 1, "boss-probe");
 
     // Queue the probe and call dispatch_probe_now directly.
     server_state.queue_probe(execution.id.clone(), "coordinator nudge".into(), false);
     dispatch_probe_now(&server_state, &execution.id).await;
 
-    tokio::time::timeout(Duration::from_secs(2), app_responder)
-        .await
-        .expect("timed out waiting for SendToPane round-trip")
-        .expect("app_responder panicked");
-
+    assert!(
+        runner.wrote_text(),
+        "WaitingForInput immediate dispatch must write the probe into the pane; calls={:?}",
+        runner.calls(),
+    );
     assert!(
         server_state.pop_pending_probe(&execution.id).is_none(),
         "probe must be consumed, not left in pending_probes",
@@ -777,31 +678,7 @@ async fn completion_probe_dispatched_on_same_stop_as_completion() {
     // BEFORE dispatch_probe_on_stop fires, to verify the dispatch picks it up.
     server_state.queue_probe(execution.id.clone(), "push your PR".into(), false);
 
-    // Register a fake app session to capture the SendToPane.
-    let app_sink = make_session_sink();
-    server_state
-        .register_app_session("session-app".into(), app_sink.clone())
-        .await;
-    let server_for_app = server_state.clone();
-    let app_responder = tokio::spawn(async move {
-        let envelope = app_sink
-            .next()
-            .await
-            .expect("SendToPane must arrive on the same Stop that completion queued it");
-        let request_id = match &envelope.payload {
-            FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
-            other => panic!("expected EngineRequest, got {other:?}"),
-        };
-        server_for_app
-            .deliver_app_response(
-                "session-app",
-                &request_id,
-                EngineToAppResponse::SendToPane {
-                    result: Ok(crate::protocol::SendToPaneResult {}),
-                },
-            )
-            .await;
-    });
+    let runner = install_live_tmux_delivery(&server_state, &execution.id, 1, "boss-probe");
 
     // Fire the Stop event. With the new ordering, dispatch_probe_on_stop
     // runs after dispatch_completion_on_stop and sees the queued probe.
@@ -815,11 +692,12 @@ async fn completion_probe_dispatched_on_same_stop_as_completion() {
         None,
     );
     dispatch_probe_on_stop(&server_state, &stop).await;
-    tokio::time::timeout(Duration::from_secs(2), app_responder)
-        .await
-        .expect("timed out waiting for SendToPane from completion probe")
-        .expect("app_responder panicked");
 
+    assert!(
+        runner.wrote_text(),
+        "same-Stop completion probe must write into the pane; calls={:?}",
+        runner.calls(),
+    );
     assert!(
         server_state.pop_pending_probe(&execution.id).is_none(),
         "probe must be consumed by dispatch_probe_on_stop",
@@ -841,29 +719,8 @@ async fn probe_on_stop_records_buffered_for_a_mid_turn_write() {
     // `Working`, which in production the fan-out would have cleared to
     // `Idle` before this dispatcher runs.
     let run_id = register_working_worker_with_driver(&server_state, 6, None);
+    let _tmux = install_live_tmux_delivery(&server_state, &run_id, 6, "boss-6");
     let probe_id = server_state.queue_probe(run_id.clone(), "status?".into(), false);
-
-    let app_sink = make_session_sink();
-    server_state
-        .register_app_session("session-app".into(), app_sink.clone())
-        .await;
-    let server_for_app = server_state.clone();
-    let app_responder = tokio::spawn(async move {
-        let envelope = app_sink.next().await.expect("SendToPane must be enqueued");
-        let request_id = match &envelope.payload {
-            FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
-            other => panic!("expected EngineRequest, got {other:?}"),
-        };
-        server_for_app
-            .deliver_app_response(
-                "session-app",
-                &request_id,
-                EngineToAppResponse::SendToPane {
-                    result: Ok(crate::protocol::SendToPaneResult {}),
-                },
-            )
-            .await;
-    });
 
     let stop = crate::events_socket::IncomingHookEvent::for_test(
         WorkerEvent::Stop {
@@ -875,10 +732,6 @@ async fn probe_on_stop_records_buffered_for_a_mid_turn_write() {
         None,
     );
     dispatch_probe_on_stop(&server_state, &stop).await;
-    tokio::time::timeout(Duration::from_secs(2), app_responder)
-        .await
-        .expect("timed out waiting for SendToPane")
-        .expect("app_responder panicked");
 
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
@@ -1002,11 +855,7 @@ async fn probe_defers_through_fanout_then_delivers_on_stop() {
     // Grok rejects mid-turn stdin, but the execution still has a concrete
     // driver identity that the terminal Stop-boundary delivery can verify.
     let run_id = register_working_worker_with_driver(&server_state, 3, Some("grok"));
-
-    let app_sink = make_session_sink();
-    server_state
-        .register_app_session("session-app".into(), app_sink.clone())
-        .await;
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 3, "boss-3");
 
     let probe_id = server_state.queue_probe(run_id.clone(), "please pivot".into(), true);
 
@@ -1023,10 +872,10 @@ async fn probe_defers_through_fanout_then_delivers_on_stop() {
     );
     dispatch_worker_event_fanout(&server_state, &post_tool_use).await;
 
-    assert_eq!(
-        app_sink.queue_stats().depth,
-        0,
-        "fan-out PostToolUse while Working must not SendToPane"
+    assert!(
+        !runner.wrote_text(),
+        "fan-out PostToolUse while Working must not write into the pane; calls={:?}",
+        runner.calls(),
     );
     // Peek without consuming for the Stop step: re-queue after assert.
     let still = server_state
@@ -1036,26 +885,6 @@ async fn probe_defers_through_fanout_then_delivers_on_stop() {
     server_state.requeue_probe_front(run_id.clone(), still);
 
     // Turn ends: Stop flips activity to Idle, then probe dispatches.
-    let server_for_app = server_state.clone();
-    let app_responder = tokio::spawn(async move {
-        let envelope = app_sink
-            .next()
-            .await
-            .expect("SendToPane must arrive on Stop after mid-turn deferral");
-        let request_id = match &envelope.payload {
-            FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
-            other => panic!("expected EngineRequest, got {other:?}"),
-        };
-        server_for_app
-            .deliver_app_response(
-                "session-app",
-                &request_id,
-                EngineToAppResponse::SendToPane {
-                    result: Ok(crate::protocol::SendToPaneResult {}),
-                },
-            )
-            .await;
-    });
 
     let stop = crate::events_socket::IncomingHookEvent::for_test(
         WorkerEvent::Stop {
@@ -1070,11 +899,11 @@ async fn probe_defers_through_fanout_then_delivers_on_stop() {
     dispatch_live_worker_state(&server_state, &stop).await;
     dispatch_probe_on_stop(&server_state, &stop).await;
 
-    tokio::time::timeout(Duration::from_secs(2), app_responder)
-        .await
-        .expect("timed out waiting for Stop-boundary SendToPane")
-        .expect("app_responder panicked");
-
+    assert!(
+        runner.wrote_text(),
+        "Stop after mid-turn deferral must write the probe into the pane; calls={:?}",
+        runner.calls(),
+    );
     assert!(
         server_state.pop_pending_probe(&run_id).is_none(),
         "probe must be consumed on Stop after mid-turn deferral",
@@ -1093,15 +922,11 @@ async fn dispatch_probe_on_stop_refuses_when_live_state_missing() {
     use crate::protocol::WorkerEvent;
 
     let (server_state, _dir) = test_server_state();
-    let run_id = "run-stop-no-live";
-    server_state.worker_registry.register_run_slot(run_id, 2);
+    let run_id = execution_id_with_driver(&server_state, None);
+    server_state.worker_registry.register_run_slot(&run_id, 2);
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 2, "boss-2");
 
-    let app_sink = make_session_sink();
-    server_state
-        .register_app_session("session-app".into(), app_sink.clone())
-        .await;
-
-    let probe_id = server_state.queue_probe(run_id.to_owned(), "hello?".into(), false);
+    let probe_id = server_state.queue_probe(run_id.clone(), "hello?".into(), false);
 
     let stop = crate::events_socket::IncomingHookEvent::for_test(
         WorkerEvent::Stop {
@@ -1109,68 +934,91 @@ async fn dispatch_probe_on_stop_refuses_when_live_state_missing() {
             stop_hook_active: false,
             stop_reason: crate::protocol::StopReason::Completed,
         },
-        Some(run_id.to_owned()),
+        Some(run_id.clone()),
         None,
     );
     dispatch_probe_on_stop(&server_state, &stop).await;
 
-    assert_eq!(
-        app_sink.queue_stats().depth,
-        0,
-        "missing live state must fail closed — no SendToPane"
+    assert!(
+        !runner.wrote_text(),
+        "missing live state must fail closed with no pane write; calls={:?}",
+        runner.calls(),
     );
     let still = server_state
-        .pop_pending_probe(run_id)
+        .pop_pending_probe(&run_id)
         .expect("probe must remain queued when Stop refuses");
     assert_eq!(still.probe_id, probe_id);
 }
 
-/// A pane write can be in flight (`Injected`) while a concurrent teardown —
-/// completion, `bossctl agents stop`, a dead-pid sweep — releases the same
-/// run's pane. `orphan_in_flight_probe_for_terminated_run` declines to touch
-/// an `Injected` probe because the write task "records its own outcome", so
-/// that recording must itself notice the pane is gone rather than claiming
-/// `Consumed` for text nobody was left to read. Simulated here by having the
-/// `SendToPane` responder release the worker's pane *before* acknowledging
-/// the write, so `record_pane_write_outcome` runs after the slot mapping is
-/// already gone.
+/// A pane write that succeeds after the slot mapping has already been
+/// cleared must settle orphaned, not consumed. tmux delivery awaits
+/// `send_keys` and delivery confirmation, so teardown can still interleave:
+/// the runner hook drops the mapping while the text write is pending, and
+/// `record_pane_write_outcome` must recheck the slot after the write.
 #[tokio::test]
 async fn a_pane_write_raced_by_concurrent_teardown_settles_orphaned_not_consumed() {
     use crate::protocol::WorkerEvent;
 
     let (server_state, _dir) = test_server_state();
-    let run_id = execution_id_with_driver(&server_state, None);
-    register_idle_worker(&server_state, &run_id, 9);
+    let run_id = register_idle_worker_with_driver(&server_state, 9, None);
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 9, "boss-9");
     let probe_id = server_state.queue_probe(run_id.clone(), "status?".into(), false);
 
-    let app_sink = make_session_sink();
-    server_state
-        .register_app_session("session-app".into(), app_sink.clone())
-        .await;
-    let server_for_app = server_state.clone();
-    let run_id_for_app = run_id.to_owned();
-    let app_responder = tokio::spawn(async move {
-        let envelope = app_sink.next().await.expect("SendToPane must arrive");
-        let request_id = match &envelope.payload {
-            FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
-            other => panic!("expected EngineRequest, got {other:?}"),
-        };
-        // Teardown wins the race: the run's slot mapping is cleared — the
-        // exact side effect `release_worker_pane` performs, isolated from
-        // its probe-draining steps so this test targets only the recheck
-        // `record_pane_write_outcome` itself must perform — while the write
-        // is still in flight, before the engine acknowledges it.
-        server_for_app.worker_registry.take_slot_for_run(&run_id_for_app);
-        server_for_app
-            .deliver_app_response(
-                "session-app",
-                &request_id,
-                EngineToAppResponse::SendToPane {
-                    result: Ok(crate::protocol::SendToPaneResult {}),
-                },
-            )
-            .await;
+    let take_state = server_state.clone();
+    let take_run = run_id.clone();
+    runner.set_on_text_write(move || {
+        take_state.worker_registry.take_slot_for_run(&take_run);
     });
+
+    let stop = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
+            session_id: "sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Completed,
+        },
+        Some(run_id.clone()),
+        None,
+    );
+    let outcome = dispatch_probe_on_stop(&server_state, &stop).await;
+
+    assert!(
+        runner.wrote_text(),
+        "the race is post-write: bytes must have reached tmux before the mapping vanished; calls={:?}",
+        runner.calls(),
+    );
+    assert_eq!(
+        outcome,
+        ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Orphaned),
+        "a write whose pane was released before the outcome was recorded must settle orphaned",
+    );
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Orphaned),
+    );
+    let attentions = server_state
+        .work_db
+        .list_attention_items(&run_id)
+        .expect("attention items readable");
+    assert!(
+        attentions
+            .iter()
+            .any(|item| item.kind == crate::app::probes::PROBE_UNDELIVERED_ATTENTION_KIND),
+        "an orphaned post-write probe must file PROBE_UNDELIVERED attention",
+    );
+}
+
+/// Pre-write fail-closed: if the run already has no slot mapping,
+/// `dispatch_probe_on_stop` must not write and must leave the probe queued.
+#[tokio::test]
+async fn dispatch_probe_on_stop_refuses_when_slot_mapping_is_already_gone() {
+    use crate::protocol::WorkerEvent;
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = execution_id_with_driver(&server_state, None);
+    register_idle_worker(&server_state, &run_id, 9);
+    let runner = install_live_tmux_delivery(&server_state, &run_id, 9, "boss-9");
+    let probe_id = server_state.queue_probe(run_id.clone(), "status?".into(), false);
+    server_state.worker_registry.take_slot_for_run(&run_id);
 
     let stop = crate::events_socket::IncomingHookEvent::for_test(
         WorkerEvent::Stop {
@@ -1182,33 +1030,21 @@ async fn a_pane_write_raced_by_concurrent_teardown_settles_orphaned_not_consumed
         None,
     );
     let outcome = dispatch_probe_on_stop(&server_state, &stop).await;
-    tokio::time::timeout(Duration::from_secs(2), app_responder)
-        .await
-        .expect("timed out waiting for the racing teardown + SendToPane ack")
-        .expect("app_responder panicked");
 
+    assert!(
+        !runner.wrote_text(),
+        "a missing slot mapping must not write; calls={:?}",
+        runner.calls(),
+    );
     assert_eq!(
         outcome,
-        ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Orphaned),
-        "a write raced by a concurrent teardown must settle orphaned, not report a delivery \
-         nobody was left to act on",
+        ProbeDispatchOutcome::NoSlotMapping,
+        "a local run whose pane mapping is already gone must fail closed",
     );
-    assert_eq!(
-        server_state.probe_lifecycle_state(&probe_id),
-        Some(ProbeDeliveryState::Orphaned),
-        "the lifecycle record must not read consumed forever",
-    );
-
-    let items = server_state
-        .work_db
-        .list_attention_items(&run_id)
-        .expect("the execution's attention items must be readable");
-    assert!(
-        items
-            .iter()
-            .any(|item| item.kind == crate::app::probes::PROBE_UNDELIVERED_ATTENTION_KIND),
-        "an orphaned-by-race probe must also be surfaced, not just recorded",
-    );
+    let still = server_state
+        .pop_pending_probe(&run_id)
+        .expect("probe stays queued when there is no pane to write into");
+    assert_eq!(still.probe_id, probe_id);
 }
 
 // ── The effort-escalation acknowledgement asymmetry ─────────────────────────

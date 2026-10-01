@@ -1,12 +1,9 @@
 //! Bounded shutdown of the engine's tokio runtime.
 //!
-//! Dropping a multi-thread runtime blocks until every `spawn_blocking` task
-//! returns. One blocking task wedged on a hung subprocess therefore kept a
-//! process alive for hours *after* it had logged `engine shutdown complete`,
-//! still holding the tmux `@boss_engine_owner` claim that the next engine's
-//! adoption refuses to override. The engine shuts its runtime down through
-//! [`shutdown_runtime`] instead, which gives blocking work a grace period and
-//! then abandons it so `main` can return and the process exit.
+//! In-flight preflight process groups are killed before the runtime grace
+//! period so their blocking waits can finish. Any remaining blocking tasks
+//! are abandoned at the deadline so the engine can exit and release its
+//! tmux ownership claim.
 
 use std::time::{Duration, Instant};
 
@@ -20,33 +17,33 @@ pub const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct RuntimeShutdown {
     /// Blocking tasks were still running at the deadline and were abandoned.
     pub abandoned_blocking_tasks: bool,
-    /// Subprocesses the caller reaped because their tasks were abandoned.
+    /// In-flight subprocesses reaped before waiting for blocking tasks.
     pub abandoned_commands: Vec<String>,
 }
 
 /// Shut `runtime` down, waiting at most `timeout` for blocking tasks.
 ///
-/// When the deadline passes with work still running, `reap` is called to
-/// terminate and name whatever that work was waiting on (subprocesses the
-/// abandoned threads would otherwise leave behind), and the outcome is logged.
+/// Reap and report in-flight commands first, allowing their blocking waits
+/// to finish during the grace period. Report remaining tasks at the deadline.
 pub fn shutdown_runtime(runtime: Runtime, timeout: Duration, reap: impl FnOnce() -> Vec<String>) -> RuntimeShutdown {
+    let abandoned_commands = reap();
+    if !abandoned_commands.is_empty() {
+        tracing::warn!(
+            abandoned_commands = ?abandoned_commands,
+            "reaped in-flight preflight commands before runtime shutdown"
+        );
+    }
     let started = Instant::now();
     runtime.shutdown_timeout(timeout);
-    // `shutdown_timeout` returns `()` either way; running out the full grace
-    // period is the only signal that blocking work was left behind.
+    // Tokio returns no completion status; elapsed time is a best-effort
+    // indication that the grace period was exhausted.
     let abandoned_blocking_tasks = started.elapsed() >= timeout;
-    if !abandoned_blocking_tasks {
-        return RuntimeShutdown {
-            abandoned_blocking_tasks,
-            abandoned_commands: Vec::new(),
-        };
+    if abandoned_blocking_tasks {
+        tracing::warn!(
+            timeout_secs = timeout.as_secs_f64(),
+            "runtime shutdown timed out; abandoned blocking tasks still running so the process can exit"
+        );
     }
-    let abandoned_commands = reap();
-    tracing::warn!(
-        timeout_secs = timeout.as_secs_f64(),
-        abandoned_commands = ?abandoned_commands,
-        "runtime shutdown timed out; abandoned blocking tasks still running so the process can exit"
-    );
     RuntimeShutdown {
         abandoned_blocking_tasks,
         abandoned_commands,
@@ -98,13 +95,38 @@ mod tests {
     }
 
     #[test]
+    fn reaping_releases_blocking_work_during_the_grace_period() {
+        let runtime = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+        let (release, waiting) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        runtime.spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            waiting.recv().unwrap();
+            finished_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let outcome = shutdown_runtime(runtime, Duration::from_secs(10), || {
+            release.send(()).unwrap();
+            vec!["preflight command".to_owned()]
+        });
+
+        assert!(!outcome.abandoned_blocking_tasks);
+        assert_eq!(outcome.abandoned_commands, ["preflight command"]);
+        finished_rx
+            .try_recv()
+            .expect("blocking work finished before shutdown returned");
+    }
+
+    #[test]
     fn a_clean_runtime_shuts_down_without_abandoning_anything() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
         runtime.spawn_blocking(|| {});
-        let outcome = shutdown_runtime(runtime, Duration::from_secs(30), || panic!("nothing to reap"));
+        let outcome = shutdown_runtime(runtime, Duration::from_secs(30), Vec::new);
         assert!(!outcome.abandoned_blocking_tasks);
         assert!(outcome.abandoned_commands.is_empty());
     }

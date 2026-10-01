@@ -45,8 +45,8 @@ mod types;
 
 pub use blocks::{render_boss_construct_sweep_block, render_supersession_flag_block};
 pub use brief::{
-    DesignDocSection, ReviewBriefPacket, UnresolvedReviewInput, locate_design_section, render_brief_conformance_rubric,
-    render_brief_packet_block,
+    BreakdownSection, DesignDocSection, ReviewBriefPacket, UnresolvedReviewInput, locate_design_section,
+    locate_design_section_with_breakdown, render_brief_conformance_rubric, render_brief_packet_block,
 };
 pub use parsing::{
     PrReviewMetadata, classify_changed_files, classify_pr_review_metadata, extract_review_result,

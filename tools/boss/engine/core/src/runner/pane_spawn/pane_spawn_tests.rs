@@ -33,6 +33,11 @@ struct CapturedSpawn {
 
 /// Records the spawn request the runner sent so tests can assert
 /// on env, initial_input, etc.
+///
+/// `#[cfg(test)]` is redundant under this file's test-module parent, but
+/// checkleft's `rust/giant-structs` parser reads each file in isolation
+/// and cannot see the ancestor `cfg(test)`.
+#[cfg(test)]
 struct CapturingSpawner {
     registry: WorkerRegistry,
     live_states: LiveWorkerStateRegistry,
@@ -40,6 +45,13 @@ struct CapturingSpawner {
     /// Run ids passed to `reap_worker_pane` — lets the mid-spawn
     /// cancel test assert the runner reaped the just-spawned pane.
     reaped: StdMutex<Vec<String>>,
+    /// When true, `capture-pane` returns Claude agent chrome. Independent of
+    /// [`Self::auto_confirm_turn`] so tests can drive composer-ready without
+    /// a hook, and vice versa.
+    pane_chrome: std::sync::atomic::AtomicBool,
+    /// When true, `capture-pane` stamps a driver-signal so the turn-start
+    /// wait can succeed in tests.
+    auto_confirm_turn: std::sync::atomic::AtomicBool,
 }
 
 impl CapturingSpawner {
@@ -49,6 +61,8 @@ impl CapturingSpawner {
             live_states: LiveWorkerStateRegistry::new(),
             last: StdMutex::new(None),
             reaped: StdMutex::new(Vec::new()),
+            pane_chrome: std::sync::atomic::AtomicBool::new(false),
+            auto_confirm_turn: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -132,6 +146,19 @@ impl CommandRunner for CapturingSpawner {
                 ""
             }
             Some("display-message") => "4242",
+            Some("capture-pane") => {
+                if self.auto_confirm_turn.load(std::sync::atomic::Ordering::SeqCst) {
+                    for state in self.live_states.snapshot() {
+                        self.live_states
+                            .record_driver_signal(&state.run_id, crate::live_worker_state::DriverSignalKind::HookEvent);
+                    }
+                }
+                if self.pane_chrome.load(std::sync::atomic::Ordering::SeqCst) {
+                    "Claude Code\n"
+                } else {
+                    ""
+                }
+            }
             Some("-V") => "tmux 3.3",
             Some("start-server" | "set-option" | "show-options") => "",
             other => panic!("unexpected tmux command {other:?}: {args:?}"),
@@ -159,6 +186,7 @@ fn bind_runner(
     weak: Weak<dyn crate::spawn_flow::WorkerSpawner>,
     spawner: &Arc<CapturingSpawner>,
 ) {
+    runner.set_skip_spawn_confirm(true);
     runner.set_server_state(weak);
     let tmux = Tmux::with_runner_and_socket("/fake/tmux", spawner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap();
     assert!(
@@ -433,9 +461,14 @@ async fn initial_input_types_a_short_fixed_line_sourcing_the_workspace_script() 
     // construction site.
     assert!(
         script.starts_with(&format!(
-            "{}{}unset ANTHROPIC_API_KEY; claude",
+            "{}{}unset ANTHROPIC_API_KEY; {}claude",
             path_prepend_clause("BOSS_BIN_DIR"),
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
+            boss_engine_worker_bin::environment::shell_environment_clause(
+                &crate::worker_setup::worker_settings_dir()
+                    .join("bin")
+                    .join(workspace.path().file_name().unwrap()),
+            ),
         )),
         "expected the initial-input script to re-prepend BOSS_BIN_DIR then the worker launcher \
              dir, unset ANTHROPIC_API_KEY, and invoke claude, got: {script:?}",
@@ -610,9 +643,14 @@ async fn untagged_row_spawn_matches_engine_default() {
     assert_eq!(
         script,
         format!(
-            "{}{}unset ANTHROPIC_API_KEY; claude --model {} --disallowedTools=AskUserQuestion --permission-mode auto --settings '{}' \"$(cat .claude/initial-prompt.txt)\"\n",
+            "{}{}unset ANTHROPIC_API_KEY; {}claude --model {} --disallowedTools=AskUserQuestion --permission-mode auto --settings '{}' \"$(cat .claude/initial-prompt.txt)\"\n",
             path_prepend_clause("BOSS_BIN_DIR"),
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
+            boss_engine_worker_bin::environment::shell_environment_clause(
+                &crate::worker_setup::worker_settings_dir()
+                    .join("bin")
+                    .join(workspace.path().file_name().unwrap()),
+            ),
             crate::driver::ClaudeDriver.descriptor().model_menu.engine_default,
             settings_path.display(),
         ),
@@ -1880,7 +1918,8 @@ fn path_prepend_clauses_compose_with_the_last_one_winning() {
 /// behind, even when nothing resolves — an unresolved launcher that
 /// fails loudly beats letting the worker PATH-resolve a build-from-source
 /// shim. `bossctl` stays Boss-tier. The dir is keyed by workspace name
-/// so concurrent spawns do not share a path.
+/// so concurrent spawns do not share a path. A workspace with no
+/// `REPOBIN.toml` must not get a `checkleft` launcher.
 #[test]
 fn ensure_worker_bin_dir_writes_boss_and_cube_never_bossctl() {
     let dir = TempDir::new().unwrap();
@@ -1897,8 +1936,97 @@ fn ensure_worker_bin_dir_writes_boss_and_cube_never_bossctl() {
     assert_eq!(
         entries,
         vec!["boss".to_owned(), "cube".to_owned()],
-        "workers get `boss` and `cube` launchers; `bossctl` is Boss-tier",
+        "workers get `boss` and `cube` launchers; `bossctl` is Boss-tier; checkleft requires REPOBIN.toml",
     );
+}
+
+#[test]
+fn ensure_worker_bin_dir_omits_checkleft_when_workspace_has_no_repobin_toml() {
+    let dir = TempDir::new().unwrap();
+    let workspace = dir.path().join("workspaces/checkleft-sandbox");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let bin_dir = dir.path().join("bin").join("checkleft-sandbox");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::write(bin_dir.join("checkleft"), "#!/bin/sh\nexit 92\n").unwrap();
+
+    let out = ensure_worker_bin_dir(dir.path(), &workspace).expect("launcher dir must be written");
+    assert_eq!(out, bin_dir);
+    assert!(
+        !bin_dir.join("checkleft").exists(),
+        "a leftover checkleft launcher must be removed when the workspace has no REPOBIN.toml"
+    );
+}
+
+#[test]
+fn ensure_worker_bin_dir_writes_checkleft_when_repobin_toml_declares_it() {
+    let dir = TempDir::new().unwrap();
+    let workspace = dir.path().join("workspaces/mono-agent-009");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        workspace.join("REPOBIN.toml"),
+        "version = 1\n[tools.checkleft]\ntarget = \"//tools/checkleft:checkleft\"\n",
+    )
+    .unwrap();
+    let bin_dir = ensure_worker_bin_dir(dir.path(), &workspace).expect("launcher dir must be written");
+    let launcher = std::fs::read_to_string(bin_dir.join("checkleft")).expect("checkleft launcher");
+    assert!(
+        launcher.contains(" exec 'checkleft'") || launcher.contains("refusing a host PATH fallback"),
+        "declared checkleft must write a launcher, got:\n{launcher}"
+    );
+
+    std::fs::write(
+        workspace.join("REPOBIN.toml"),
+        "version = 1\n[pins.checkleft]\nrepo = \"https://example.invalid/mono.git\"\ntag = \"v1\"\n",
+    )
+    .unwrap();
+    let again = ensure_worker_bin_dir(dir.path(), &workspace).expect("pin rewrite");
+    assert!(again.join("checkleft").is_file());
+}
+
+/// Export the spawn-path launchers as Bazel artifacts for validation in a
+/// leased checkout without starting an agent. Repository builds must run
+/// outside the test sandbox. The dispatcher path comes from
+/// `BOSS_TEST_REPOBIN` (`$(rootpath //tools/repobin)`), not from the
+/// rules_rust test-wrapper filename.
+#[test]
+fn worker_environment_probe_artifacts_use_the_bundled_dispatcher() {
+    let output = PathBuf::from(std::env::var_os("TEST_UNDECLARED_OUTPUTS_DIR").unwrap());
+    let workspace = output.join("probe-workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        workspace.join("REPOBIN.toml"),
+        "version = 1\n[tools.checkleft]\ntarget = \"//tools/checkleft:checkleft\"\n",
+    )
+    .unwrap();
+    let test_repobin = PathBuf::from(
+        std::env::var("BOSS_TEST_REPOBIN").expect("BOSS_TEST_REPOBIN must be $(rootpath //tools/repobin)"),
+    );
+    let engine_dir = output.join("probe-engine");
+    std::fs::create_dir_all(&engine_dir).unwrap();
+    let dispatcher = engine_dir.join("repobin");
+    std::fs::copy(&test_repobin, &dispatcher).expect("copy rust_test-provided repobin beside the fake engine");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&dispatcher).unwrap().permissions();
+        perms.set_mode(perms.mode() | 0o111);
+        std::fs::set_permissions(&dispatcher, perms).unwrap();
+    }
+    let engine_path = engine_dir.join("engine");
+    std::fs::write(&engine_path, b"").unwrap();
+    let bin = ensure_worker_bin_dir_for_engine(&output, &workspace, &engine_path).unwrap();
+    let launcher = std::fs::read_to_string(bin.join("checkleft")).unwrap();
+    let quoted = format!("'{}'", dispatcher.display().to_string().replace('\'', r"'\''"));
+    assert!(
+        launcher.contains(&format!("exec {quoted} exec 'checkleft'")),
+        "launcher must exec the rust_test-provided repobin at {dispatcher:?}: {launcher}"
+    );
+    let activate = format!(
+        "export PATH={}:\"$PATH\"; {}\n",
+        crate::ssh_transport::shell_quote(&bin.display().to_string()),
+        boss_engine_worker_bin::environment::shell_environment_clause(&bin),
+    );
+    std::fs::write(output.join("activate-worker-environment.sh"), activate).unwrap();
 }
 
 /// A non-derived spawn must still call `write_cube_launcher` so a stale
@@ -2067,4 +2195,140 @@ async fn mismatched_guide_head_fails_attempt_without_spawning() {
         .unwrap();
     assert_eq!(failed.status, "failed");
     assert!(failed.error.unwrap().contains(&packet.head_sha));
+}
+
+#[tokio::test]
+async fn spawn_confirmation_timeout_reaps_the_pane_and_fails_the_spawn() {
+    let workspace = TempDir::new().unwrap();
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db, flags);
+    bind_runner(&runner, weak, &spawner);
+    runner.set_skip_spawn_confirm(false);
+    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(40));
+
+    let err = runner
+        .run_execution(
+            "worker-1",
+            &sample_execution(workspace.path()),
+            &sample_chore(),
+            workspace.path(),
+            Some("change-1"),
+        )
+        .await
+        .expect_err("absent composer chrome must fail the spawn");
+    let msg = err.to_string();
+    assert!(msg.contains("composer never became ready"), "{msg}");
+    assert!(msg.contains("failed spawn"), "{msg}");
+    assert_eq!(spawner.reaped_run_ids(), vec!["exec-test-1".to_string()]);
+}
+
+#[tokio::test]
+async fn spawn_confirmation_ready_chrome_without_a_hook_fails_turn_start_and_reaps() {
+    let workspace = TempDir::new().unwrap();
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    spawner.pane_chrome.store(true, std::sync::atomic::Ordering::SeqCst);
+    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db, flags);
+    bind_runner(&runner, weak, &spawner);
+    runner.set_skip_spawn_confirm(false);
+    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(40));
+
+    let err = runner
+        .run_execution(
+            "worker-1",
+            &sample_execution(workspace.path()),
+            &sample_chore(),
+            workspace.path(),
+            Some("change-1"),
+        )
+        .await
+        .expect_err("ready chrome without a driver hook must fail the spawn");
+    let msg = err.to_string();
+    assert!(msg.contains("no driver hook or session event"), "{msg}");
+    assert!(msg.contains("failed spawn"), "{msg}");
+    assert_eq!(spawner.reaped_run_ids(), vec!["exec-test-1".to_string()]);
+}
+
+#[tokio::test]
+async fn spawn_confirmation_passes_when_driver_chrome_and_hook_arrive() {
+    let workspace = TempDir::new().unwrap();
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    spawner.pane_chrome.store(true, std::sync::atomic::Ordering::SeqCst);
+    spawner
+        .auto_confirm_turn
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db, flags);
+    bind_runner(&runner, weak, &spawner);
+    runner.set_skip_spawn_confirm(false);
+    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(200));
+
+    runner
+        .run_execution(
+            "worker-1",
+            &sample_execution(workspace.path()),
+            &sample_chore(),
+            workspace.path(),
+            Some("change-1"),
+        )
+        .await
+        .expect("composer chrome plus a recorded hook must complete spawn");
+    assert!(spawner.reaped_run_ids().is_empty());
+}
+
+#[tokio::test]
+async fn run_execution_reaps_and_signals_when_cancelled_during_confirmation() {
+    let workspace = TempDir::new().unwrap();
+    let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
+    spawner.pane_chrome.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
+    let chore = create_test_chore(&work_db, product.id.clone(), "Cancel during confirm");
+    let ready = create_ready_chore_execution(&work_db, chore.id.clone());
+    let (execution, _run) = work_db
+        .start_execution_run(
+            &ready.id,
+            "worker-1",
+            "foo",
+            "lease-1",
+            "foo-agent-001",
+            workspace.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        workspace.path().join("feature-flags.toml"),
+    ));
+    let runner = PaneSpawnRunner::new(cfg, work_db.clone(), flags);
+    bind_runner(&runner, weak, &spawner);
+    runner.set_skip_spawn_confirm(false);
+    runner.set_spawn_confirm_timeout(std::time::Duration::from_millis(80));
+
+    let exec_id = execution.id.clone();
+    let db = work_db.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        db.cancel_running_execution(&exec_id).unwrap();
+    });
+
+    let chore_item = work_db.get_work_item(&chore.id).unwrap();
+    let outcome = runner
+        .run_execution("worker-1", &execution, &chore_item, workspace.path(), Some("change-1"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome.wait_state,
+        RunWaitState::CancelledDuringSpawn,
+        "a cancel that lands during confirmation must yield CancelledDuringSpawn",
+    );
+    assert!(outcome.slot_id.is_none());
+    assert_eq!(spawner.reaped_run_ids().as_slice(), [execution.id.as_str()]);
 }

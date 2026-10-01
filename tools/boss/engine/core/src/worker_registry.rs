@@ -145,6 +145,19 @@ impl WorkerRegistry {
             .map(|pane| pane.slot_id)
     }
 
+    /// Inverse of [`Self::slot_for_run`]: the run currently registered in
+    /// `slot_id`, if any. A slot maps to at most one run; if two registrations
+    /// somehow share a slot, the first match in iteration order wins.
+    pub fn run_for_slot(&self, slot_id: u8) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("registry poisoned")
+            .run_to_slot
+            .iter()
+            .find(|(_, pane)| pane.slot_id == slot_id)
+            .map(|(run_id, _)| run_id.clone())
+    }
+
     /// Look up the complete pane registration for `run_id`. Input and
     /// interrupt delivery need the tmux session name, while focus still only
     /// needs the app-facing slot id.
@@ -376,6 +389,16 @@ mod tests {
         assert_eq!(reg.len(), 2);
         reg.unregister(1);
         assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn run_for_slot_is_the_inverse_of_slot_for_run() {
+        let reg = WorkerRegistry::new();
+        reg.register_run_slot("run-x", 4);
+        assert_eq!(reg.run_for_slot(4).as_deref(), Some("run-x"));
+        assert_eq!(reg.run_for_slot(5), None);
+        assert_eq!(reg.take_slot_for_run("run-x"), Some(4));
+        assert_eq!(reg.run_for_slot(4), None);
     }
 
     #[test]

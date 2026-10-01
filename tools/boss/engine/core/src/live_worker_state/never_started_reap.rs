@@ -2,17 +2,6 @@
 
 use super::LiveWorkerStateRegistry;
 
-/// Which never-started reap is asking the registry to re-assert eligibility
-/// after the liveness probe. Each variant restates the cause-specific
-/// predicate [`crate::spawn_ack_sweep`] evaluated before the probe await.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NeverStartedReapKind {
-    /// Pass 1: still this execution, no driver signal, `shell_pid <= 0`.
-    SpawnAckTimeout,
-    /// Pass 2: still this execution, no driver signal (a pid may exist).
-    DriverStartTimeout,
-}
-
 /// Outcome of [`LiveWorkerStateRegistry::confirm_never_started_reap`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NeverStartedReapCommit {
@@ -28,26 +17,19 @@ pub enum NeverStartedReapCommit {
     /// execution, but a later driver signal must not be accepted until
     /// the fence is released or the slot is re-registered.
     AlreadyCommitted,
-    /// Pass 1: a shell pid was reported while the probe was in flight.
-    SpawnAckNowHasPid { shell_pid: i32 },
 }
 
 impl LiveWorkerStateRegistry {
     /// Re-read `slot_id` under the registry mutex and, if it is still
-    /// eligible for a never-started reap of `kind` for `execution_id`,
-    /// commit the reap so a concurrent [`Self::record_driver_signal`]
-    /// cannot accept evidence the orphan would then destroy.
+    /// eligible for a never-started reap for `execution_id` (same run,
+    /// no driver signal, not already committed), commit the reap so a
+    /// concurrent [`Self::record_driver_signal`] cannot accept evidence
+    /// the orphan would then destroy.
     ///
     /// Called after the liveness probe returns and immediately before
     /// `mark_execution_orphaned`. The probe is a bounded directory walk on
-    /// the blocking pool; a hook or pid report that lands while it is
-    /// queued must win.
-    pub fn confirm_never_started_reap(
-        &self,
-        slot_id: u8,
-        execution_id: &str,
-        kind: NeverStartedReapKind,
-    ) -> NeverStartedReapCommit {
+    /// the blocking pool; a hook that lands while it is queued must win.
+    pub fn confirm_never_started_reap(&self, slot_id: u8, execution_id: &str) -> NeverStartedReapCommit {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         let Some(entry) = guard.get_mut(&slot_id) else {
             return NeverStartedReapCommit::SlotGone;
@@ -60,16 +42,6 @@ impl LiveWorkerStateRegistry {
         }
         if entry.meta.driver_signal_at.is_some() {
             return NeverStartedReapCommit::DriverSignalled;
-        }
-        match kind {
-            NeverStartedReapKind::SpawnAckTimeout => {
-                if entry.state.shell_pid > 0 {
-                    return NeverStartedReapCommit::SpawnAckNowHasPid {
-                        shell_pid: entry.state.shell_pid,
-                    };
-                }
-            }
-            NeverStartedReapKind::DriverStartTimeout => {}
         }
         entry.meta.reap_committed = true;
         NeverStartedReapCommit::Committed {

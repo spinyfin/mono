@@ -37,9 +37,9 @@ pub fn output_blocking_timeout(command: &mut Command, timeout: Duration) -> std:
 /// soon as it exists, so a caller can track the subprocess while it runs and
 /// reap it with [`kill_process_group`] if it needs to be abandoned early.
 ///
-/// The deadline also covers draining the output: a child that exits while a
-/// descendant still holds its pipe open is treated as timed out rather than
-/// waited on indefinitely.
+/// Output draining shares the command deadline, with at least 100ms of grace
+/// after child exit for reader threads to deliver their buffers. A descendant
+/// holding a pipe beyond that bounded grace is treated as timed out.
 #[cfg(unix)]
 pub fn output_blocking_timeout_in_group(
     command: &mut Command,
@@ -115,26 +115,36 @@ fn output_bounded(
             }
         }
     };
-    let drain = |rx: &std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>| {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(remaining) {
-            Ok(result) => result,
-            Err(_) => Err(timed_out()),
-        }
-    };
-    let stdout = drain(&stdout_rx);
-    let stderr = drain(&stderr_rx);
-    match (stdout, stderr) {
-        (Ok(stdout), Ok(stderr)) => Ok(Output { status, stdout, stderr }),
-        (stdout, stderr) => {
+    match drain_output(stdout_rx, stderr_rx, deadline) {
+        Ok((stdout, stderr)) => Ok(Output { status, stdout, stderr }),
+        Err(err) => {
             // A descendant outlived the child holding its pipe; reap the group.
             #[cfg(unix)]
             if kill_group {
                 kill_process_group(child.id());
             }
-            Err(stdout.err().or(stderr.err()).expect("one side failed"))
+            if err.kind() == std::io::ErrorKind::TimedOut {
+                Err(timed_out())
+            } else {
+                Err(err)
+            }
         }
     }
+}
+
+fn drain_output(
+    stdout: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    stderr: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    deadline: Instant,
+) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    // Both readers share one grace period so delayed delivery at child exit
+    // is tolerated without allowing descendants to hold pipes indefinitely.
+    let deadline = deadline.max(Instant::now() + Duration::from_millis(100));
+    let drain = |rx: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>| {
+        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "output drain timed out"))?
+    };
+    Ok((drain(stdout)?, drain(stderr)?))
 }
 
 /// Process-spawning seam for components that construct commands.
@@ -413,9 +423,23 @@ mod tests {
         unsafe { libc::kill(pid, 0) == 0 }
     }
 
-    /// A timeout must take the child's descendants down too: `cube workspace
-    /// status` hung for hours under a `git ls-remote` grandchild that a
-    /// direct-child kill left running.
+    #[test]
+    fn readers_can_deliver_after_the_child_exit_deadline() {
+        let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+        let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+        let deadline = Instant::now();
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            stdout_tx.send(Ok(b"out".to_vec())).unwrap();
+            stderr_tx.send(Ok(b"err".to_vec())).unwrap();
+        });
+        let (stdout, stderr) = drain_output(stdout_rx, stderr_rx, deadline).unwrap();
+        reader.join().unwrap();
+        assert_eq!(stdout, b"out");
+        assert_eq!(stderr, b"err");
+    }
+
+    /// A timeout must kill descendants as well as the direct child.
     #[cfg(unix)]
     #[test]
     fn group_timeout_kills_grandchildren() {
@@ -440,7 +464,7 @@ mod tests {
     }
 
     /// A child that exits while a descendant keeps its pipe open must not
-    /// block the caller past the deadline.
+    /// block the caller past the bounded drain grace period.
     #[cfg(unix)]
     #[test]
     fn group_drain_is_bounded_when_a_descendant_holds_the_pipe() {

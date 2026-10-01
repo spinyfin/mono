@@ -19,7 +19,7 @@ use crate::driver::ProgressFidelity;
 use crate::semantic_progress::{SemanticProgressCheckpoint, SemanticToolCondition, next_tool_condition};
 
 mod never_started_reap;
-pub use never_started_reap::{NeverStartedReapCommit, NeverStartedReapKind};
+pub use never_started_reap::NeverStartedReapCommit;
 
 /// Attributed worker-pool label for a live run (`"main"`, `"automation"`,
 /// or `"review"`). Matches
@@ -117,13 +117,12 @@ pub const STALLED_SPAWN_THRESHOLD_SECS: i64 = 30;
 ///
 /// ## Why this is a separate, longer window than the two above
 ///
-/// [`STALLED_SPAWN_THRESHOLD_SECS`] and
-/// [`crate::spawn_ack_sweep::SPAWN_ACK_GRACE_SECS`] both answer "did the
-/// *pane* come up?". This one answers the strictly stronger question
-/// "did the *driver binary* come up?" — the question no check in Boss
-/// asked before, and the one the 2026-07-30 incident turned on: a pane
-/// hosting nothing but an idle login shell reported `shell_pid=92697`
-/// and satisfied every pane-level check forever.
+/// [`STALLED_SPAWN_THRESHOLD_SECS`] answers "has this spawn been sitting
+/// in `Spawning` long enough to promote?". This one answers the strictly
+/// stronger question "did the *driver binary* come up?" — the question no
+/// check in Boss asked before, and the one the 2026-07-30 incident turned
+/// on: a pane hosting nothing but an idle login shell reported
+/// `shell_pid=92697` and satisfied every pane-level check forever.
 ///
 /// 300s is deliberately far above any real driver startup. A healthy
 /// driver's first hook (`SessionStart`) fires within seconds of exec.
@@ -269,9 +268,11 @@ struct SlotMeta {
     /// incident walked through untouched.
     driver_signal_at: Option<i64>,
     /// Whether this registration is a newly spawned pane or an adopted
-    /// existing worker. Used by the spawn-ack timeout, whose question only
-    /// applies to a pane this engine process attempted to create. See
-    /// [`DriverStartExpectation`].
+    /// existing worker. [`DriverStartExpectation::Readopted`] still subjects
+    /// the slot to the driver-start timeout
+    /// ([`LiveWorkerStateRegistry::unverified_driver_starts`]); it changes
+    /// the pid-less tmux-invariant diagnostic and starts a fresh grace
+    /// window from this registration. See [`DriverStartExpectation`].
     #[builder(default = DriverStartExpectation::EngineSpawned)]
     driver_start_expectation: DriverStartExpectation,
     /// Last **driver-originated** progress time, stamped only by
@@ -309,21 +310,24 @@ struct SlotMeta {
 
 /// Whether the engine created this slot's current registration.
 ///
-/// The spawn-ack timeout asks whether a pane this engine process launched
-/// ever acknowledged. That question presupposes Boss launched a pane; a
-/// re-adoption registers a worker that was already running before this
-/// engine process began tracking it. Its `spawned_at` is therefore the
-/// moment the engine noticed, not the moment anything exec'd.
+/// Driver-start verification asks whether the current registration ever
+/// produced a driver signal. A re-adoption registers a worker that was
+/// already running before this engine process began tracking it, so
+/// `spawned_at` is the moment the engine noticed, not the moment anything
+/// exec'd — a fresh grace window, not an exemption from the timeout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverStartExpectation {
     /// The engine launched a driver for this registration and is owed
     /// proof it came up. The normal spawn path.
     EngineSpawned,
     /// The registration re-adopted an already-running worker. The
-    /// spawn-ack timeout does not apply, because this engine process did not
-    /// launch a pane. Driver-start verification still requires a
-    /// driver-originated signal; a live login shell alone is not proof that
-    /// the driver ever ran.
+    /// driver-start timeout still applies after a fresh grace window from
+    /// this registration; a shell-only re-adoption with no driver signal
+    /// must time out. What this mark changes is the pid-less tmux-invariant
+    /// diagnostic (a missing pane pid is legal for a worker this engine
+    /// process did not launch) and that grace window's start. Driver-start
+    /// verification still requires a driver-originated signal; a live login
+    /// shell alone is not proof that the driver ever ran.
     Readopted,
 }
 
@@ -583,11 +587,11 @@ impl LiveWorkerStateRegistry {
     /// plus the three things re-adoption must not get wrong:
     ///
     /// 1. The entry is marked [`DriverStartExpectation::Readopted`], so
-    ///    the spawn-ack timeout does not mistake this engine process for
-    ///    the pane's creator. Registration stamps `spawned_at` with the
-    ///    current time — correct for a spawn, a fiction for a re-adoption.
-    ///    Driver-start verification still applies after its ordinary grace
-    ///    window unless a real driver signal was observed for this run.
+    ///    the pid-less tmux-invariant diagnostic does not treat a missing
+    ///    pane pid as illegal, and `spawned_at` starts a fresh driver-start
+    ///    grace window. The driver-start timeout still applies: a
+    ///    shell-only re-adoption must time out unless a real driver signal
+    ///    was observed.
     /// 2. When the re-adoption was triggered by a worker hook
     ///    ([`ReadoptionEvidence::DriverHook`]) the driver signal is
     ///    recorded, because that hook *is* driver-originated proof and
@@ -873,14 +877,10 @@ impl LiveWorkerStateRegistry {
     /// that gate.
     #[track_caller]
     pub fn release_slot_for_run(&self, run_id: &str) -> Option<u8> {
-        let slot_id = {
-            let guard = self.inner.lock().expect("registry mutex poisoned");
-            guard
-                .values()
-                .find(|entry| entry.state.run_id == run_id)
-                .map(|entry| entry.state.slot_id)
-        }?;
-        self.release_slot(slot_id);
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let slot_id = guard.values().find(|entry| entry.state.run_id == run_id)?.state.slot_id;
+        guard.remove(&slot_id);
+        tracing::info!(slot_id, run_id, cleared_by = %std::panic::Location::caller(), "live-state registry: matching run entry cleared");
         Some(slot_id)
     }
 
@@ -963,6 +963,16 @@ impl LiveWorkerStateRegistry {
     pub fn driver_signal_at(&self, slot_id: u8) -> Option<i64> {
         let guard = self.inner.lock().expect("registry mutex poisoned");
         guard.get(&slot_id).and_then(|entry| entry.meta.driver_signal_at)
+    }
+
+    /// Whether any live slot for `run_id` has recorded a driver-originated
+    /// signal. Spawn-time confirmation keys on the run rather than the slot
+    /// so a hook that won the race against slot fan-out still counts.
+    pub fn has_driver_signal_for_run(&self, run_id: &str) -> bool {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard
+            .values()
+            .any(|entry| entry.state.run_id == run_id && entry.meta.driver_signal_at.is_some())
     }
 
     /// Record one `LivenessUndeterminable` reap outcome for `run_id`'s live

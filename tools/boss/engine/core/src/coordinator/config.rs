@@ -310,6 +310,21 @@ impl ExecutionCoordinator {
         false
     }
 
+    /// Execution currently claiming `worker_id` in the pool that owns that
+    /// id (main, automation, or review), or `None` if the slot is free.
+    ///
+    /// Routes through [`Self::pool_for_worker_id`] so a `review-N` or
+    /// `auto-worker-N` id is not silently treated as unclaimed just because
+    /// the main interactive pool has no matching slot.
+    pub async fn claim_holder(&self, worker_id: &str) -> Option<String> {
+        self.pool_for_worker_id(worker_id)
+            .claims()
+            .await
+            .into_iter()
+            .find(|claim| claim.worker_id == worker_id)
+            .map(|claim| claim.execution_id)
+    }
+
     /// Wire the execution-started hook. Production installs the
     /// `WorkerCompletionHandler` here so it can snapshot the bound
     /// chore PR's head SHA into `work_executions.pr_head_before`

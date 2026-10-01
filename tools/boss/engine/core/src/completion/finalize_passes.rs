@@ -2246,8 +2246,9 @@ fn record_pure_rebase_skip(
     post_head: &str,
 ) {
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let marker = crate::reconcile_audit::PR_REVIEW_SKIP_MARKER;
     let line = format!(
-        "\n[pr-review-skip] epoch {now}: reason=pure_rebase created_via={created_via} \
+        "\n{marker} epoch {now}: reason=pure_rebase created_via={created_via} \
          pre_head={pre_head} post_head={post_head} — automated review skipped: the resolution's \
          diff against its pre-resolution base is byte-identical before and after, i.e. nothing \
          changed but the base.",

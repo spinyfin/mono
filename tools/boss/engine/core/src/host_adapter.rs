@@ -496,6 +496,11 @@ pub struct SshHostAdapter {
     /// worker's hook events tunnel back to the same socket local workers
     /// write to.
     events_socket_path: PathBuf,
+    /// Same live-state registry the local spawn path keys turn-start on.
+    /// Remote hooks record `has_driver_signal_for_run` here after
+    /// `register_remote_worker_slot`; `None` in unit tests that never
+    /// stand up the registry.
+    live_worker_states: Option<Arc<crate::live_worker_state::LiveWorkerStateRegistry>>,
 }
 
 impl SshHostAdapter {
@@ -505,6 +510,7 @@ impl SshHostAdapter {
         cfg: Arc<RuntimeConfig>,
         non_opus_auto_mode: bool,
         events_socket_path: PathBuf,
+        live_worker_states: Option<Arc<crate::live_worker_state::LiveWorkerStateRegistry>>,
     ) -> Self {
         Self {
             transport,
@@ -513,6 +519,7 @@ impl SshHostAdapter {
             cfg,
             non_opus_auto_mode,
             events_socket_path,
+            live_worker_states,
         }
     }
 
@@ -701,6 +708,39 @@ impl SshHostAdapter {
             );
         }
         Ok(())
+    }
+}
+
+/// Probe the remote host's `ARG_MAX` / page size / OS so the argv preflight
+/// budgets against the *target* kernel, including Linux `MAX_ARG_STRLEN`.
+/// A probe that does not answer fail-closes to Linux-shaped limits so a
+/// ~600 KB single argument cannot silently E2BIG on an unprobeable host.
+async fn probe_remote_exec_arg_limits(transport: &SshTransport) -> crate::runner::spawn_launch_limits::ExecArgLimits {
+    use crate::runner::spawn_launch_limits::{ExecArgLimits, parse_remote_exec_arg_limits_line};
+    match transport
+        .run_shell(r#"printf '%s %s %s\n' "$(uname -s)" "$(getconf ARG_MAX)" "$(getconf PAGE_SIZE)""#)
+        .await
+    {
+        Ok(output) if output.success() => {
+            parse_remote_exec_arg_limits_line(&output.stdout).unwrap_or_else(ExecArgLimits::fail_closed_remote)
+        }
+        Ok(output) => {
+            tracing::warn!(
+                host_id = %transport.host_id,
+                status = output.status,
+                stderr = %output.stderr,
+                "remote ARG_MAX probe failed; fail-closing to Linux MAX_ARG_STRLEN limits"
+            );
+            ExecArgLimits::fail_closed_remote()
+        }
+        Err(err) => {
+            tracing::warn!(
+                host_id = %transport.host_id,
+                ?err,
+                "remote ARG_MAX probe could not run; fail-closing to Linux MAX_ARG_STRLEN limits"
+            );
+            ExecArgLimits::fail_closed_remote()
+        }
     }
 }
 
@@ -1078,6 +1118,40 @@ impl HostAdapter for SshHostAdapter {
         let remote_home = remote_home_dir(&self.transport).await?;
         let remote_settings_dir = format!("{remote_home}/{REMOTE_SETTINGS_DIR}");
         let remote_settings_path = format!("{remote_settings_dir}/{run_id}.json");
+
+        // Resolve the driver's SpawnPlan and fail fast, before shipping
+        // anything to the remote host, if the initial prompt embedded via
+        // this driver's `"$(cat <config_dir>/<initial_prompt_filename>)"`
+        // command substitution would overflow ARG_MAX at the remote CLI's
+        // `execve()` — the exact same E2BIG failure mode
+        // `check_launch_command_arg_max` guards against on the local pane
+        // path, reached here through the identical argv-embedding
+        // mechanism (`driver.spawn_invocation` / `RemoteSpawnPlan::driver_command`,
+        // substituted by the remote wrapper in `ssh_spawn.rs`). Past that
+        // limit the remote shell's `exec` fails invisibly to the engine,
+        // which would otherwise just see the run sit `Spawning` until
+        // `spawn_ack_sweep` gives up and redispatches into the identical,
+        // identically-doomed command.
+        let worker_kind = settings_input.worker_kind;
+        let driver_binary = driver.descriptor().binary.to_owned();
+        let driver_spawn_plan = driver.spawn_invocation(crate::driver::SpawnRequest {
+            model: &spawn_config.model,
+            effort: spawn_config.effort_value,
+            settings_path: Some(std::path::Path::new(&remote_settings_path)),
+            non_opus_auto_mode: self.non_opus_auto_mode,
+            permission_mode_override: worker_kind.forced_permission_mode(),
+            run_id: Some(&run_id),
+        });
+        let exec_limits = probe_remote_exec_arg_limits(&self.transport).await;
+        crate::runner::spawn_launch_limits::check_launch_command_arg_max_for_bytes(
+            &driver_spawn_plan.command,
+            driver.descriptor().name,
+            driver.descriptor().config_dir,
+            driver.descriptor().initial_prompt_filename,
+            prompt_text.len(),
+            exec_limits,
+        )?;
+
         self.ship_file(&remote_prompt_dir, &remote_prompt_path, &prompt_text, "prompt")
             .await?;
         self.ship_file(
@@ -1099,16 +1173,6 @@ impl HostAdapter for SshHostAdapter {
         // wrapper still re-checks PATH so a race between probe and
         // launch surfaces as `host_missing_driver` rather than a silent
         // substitute.
-        let worker_kind = settings_input.worker_kind;
-        let driver_binary = driver.descriptor().binary.to_owned();
-        let driver_spawn_plan = driver.spawn_invocation(crate::driver::SpawnRequest {
-            model: &spawn_config.model,
-            effort: spawn_config.effort_value,
-            settings_path: Some(std::path::Path::new(&remote_settings_path)),
-            non_opus_auto_mode: self.non_opus_auto_mode,
-            permission_mode_override: worker_kind.forced_permission_mode(),
-            run_id: Some(&run_id),
-        });
         let plan = RemoteSpawnPlan::builder()
             .run_id(run_id.clone())
             .lease_id(lease_id)
@@ -1180,6 +1244,42 @@ impl HostAdapter for SshHostAdapter {
             reasoning = spawn_config.reasoning.map(|mode| mode.as_str()).unwrap_or("unclassified"),
             "remote worker launched; awaiting Stop over the forwarded events socket",
         );
+
+        // Composer readiness for argv delivery on the remote is the wrapper
+        // actually launching the driver (remote_pid). Turn-start confirmation
+        // is fresh evidence for *this* run: a driver signal on the live
+        // registry, or a transcript_path on the current work_runs row.
+        let turn_timeout = crate::runner::spawn_confirmation::turn_start_timeout_for_driver(driver.as_ref());
+        let poll = crate::runner::spawn_confirmation::SPAWN_CONFIRM_POLL;
+        let remote_pid = outcome.remote_pid;
+        let work_db = Arc::clone(&self.work_db);
+        let live_worker_states = self.live_worker_states.clone();
+        let transport = self.transport.clone();
+        let wait_run_id = run_id.clone();
+        crate::runner::spawn_confirmation::confirm_turn_start_or_reap(
+            driver.descriptor().name,
+            &run_id,
+            turn_timeout,
+            poll,
+            || {
+                let work_db = Arc::clone(&work_db);
+                let live_worker_states = live_worker_states.clone();
+                let wait_run_id = wait_run_id.clone();
+                async move {
+                    crate::runner::spawn_confirmation::current_run_has_turn_start_evidence(
+                        &work_db,
+                        live_worker_states.as_deref(),
+                        &wait_run_id,
+                    )
+                }
+            },
+            || async {
+                if let Some(pid) = remote_pid {
+                    let _ = transport.run(&["kill", &pid.to_string()]).await;
+                }
+            },
+        )
+        .await?;
 
         // WorkerPaneAlive: the remote agent is up and working, so the
         // execution stays `running` (never `waiting_human` — nothing is
@@ -1559,6 +1659,9 @@ pub struct SshHostAdapterProvider {
     events_socket_path: PathBuf,
     /// Engine-owned directory holding the per-host `ControlMaster` sockets.
     control_socket_dir: PathBuf,
+    /// Live-state registry forwarded into each `SshHostAdapter` so remote
+    /// turn-start waits on the same driver-signal predicate as local spawn.
+    live_worker_states: Option<Arc<crate::live_worker_state::LiveWorkerStateRegistry>>,
     /// Lazily-built remote adapters, one per host id.
     #[builder(default = Mutex::new(HashMap::new()))]
     cache: Mutex<HashMap<String, Arc<dyn HostAdapter>>>,
@@ -1572,6 +1675,7 @@ impl SshHostAdapterProvider {
         non_opus_auto_mode: bool,
         events_socket_path: PathBuf,
         control_socket_dir: PathBuf,
+        live_worker_states: Option<Arc<crate::live_worker_state::LiveWorkerStateRegistry>>,
     ) -> Self {
         Self {
             local,
@@ -1580,6 +1684,7 @@ impl SshHostAdapterProvider {
             non_opus_auto_mode,
             events_socket_path,
             control_socket_dir,
+            live_worker_states,
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -1612,6 +1717,7 @@ impl HostAdapterProvider for SshHostAdapterProvider {
             Arc::clone(&self.cfg),
             self.non_opus_auto_mode,
             self.events_socket_path.clone(),
+            self.live_worker_states.clone(),
         ));
         cache.insert(host.id.clone(), Arc::clone(&adapter));
         Ok(adapter)
@@ -1873,7 +1979,7 @@ mod tests {
             .build();
         let cfg = Arc::new(RuntimeConfig::from_parts(work, None));
         let transport = SshTransport::new(host_id, ssh_target, &base);
-        SshHostAdapter::new(transport, Arc::new(db), cfg, false, base.join("events.sock"))
+        SshHostAdapter::new(transport, Arc::new(db), cfg, false, base.join("events.sock"), None)
     }
 
     #[test]

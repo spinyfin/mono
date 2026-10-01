@@ -63,6 +63,35 @@ final class AwaitingInputKanbanTests: XCTestCase {
         }
     }
 
+    func testLocalMissingTmuxIdentitySurfacesAsErrored() {
+        let live = makeLiveState(activity: .working, tmuxHosted: false)
+        let state = AgentActivityState.forDoingCard(
+            runtime: makeRuntime(),
+            liveState: live,
+            isDispatchPending: false,
+            isResolvingConflicts: false,
+            isRemediatingCI: false
+        )
+        guard case let .errored(reason) = state else {
+            return XCTFail("expected .errored for a local worker missing tmux identity; got \(state)")
+        }
+        XCTAssertEqual(reason, AgentActivityState.identityUnavailableReason)
+    }
+
+    func testRemoteNilTmuxHostedWorkingWorkerStaysActive() {
+        let live = makeLiveState(activity: .working, tmuxHosted: nil)
+        let state = AgentActivityState.forDoingCard(
+            runtime: makeRuntime(),
+            liveState: live,
+            isDispatchPending: false,
+            isResolvingConflicts: false,
+            isRemediatingCI: false
+        )
+        guard case .active = state else {
+            return XCTFail("expected .active for a remote worker with nil tmuxHosted; got \(state)")
+        }
+    }
+
     func testSpawningBoundWorkerSurfacesAsUnknownNotActive() {
         let live = makeLiveState(activity: .spawning)
         let state = AgentActivityState.forDoingCard(
@@ -113,7 +142,8 @@ final class AwaitingInputKanbanTests: XCTestCase {
 
     private func makeLiveState(
         slotId: Int = 1,
-        activity: WorkerActivity
+        activity: WorkerActivity,
+        tmuxHosted: Bool? = nil
     ) -> WorkerLiveState {
         WorkerLiveState(
             slotId: slotId,
@@ -127,7 +157,7 @@ final class AwaitingInputKanbanTests: XCTestCase {
             liveStatus: "Waiting for user input",
             liveStatusAt: "2026-06-01T00:00:00Z",
             recoveryStatus: nil,
-            tmuxHosted: nil
+            tmuxHosted: tmuxHosted
         )
     }
 

@@ -63,6 +63,13 @@ jj_test_repository = use_repo_rule("//tools/boss/engine/recovery:jj_repository.b
 
 jj_test_repository(name = "jj_test_tools")
 
+worker_zsh_repository = use_repo_rule(
+    "//tools/boss/engine/worker-bin:host_shell.bzl",
+    "worker_zsh_repository",
+)
+
+worker_zsh_repository(name = "worker_zsh")
+
 # Zig-based hermetic CC toolchain used for musl cross-compilation.
 # Provides @zig_sdk//libc_aware/toolchain:linux_amd64_musl (and arm64 variant)
 # which cross-compile C/C++ code from any host to a fully-static musl binary.

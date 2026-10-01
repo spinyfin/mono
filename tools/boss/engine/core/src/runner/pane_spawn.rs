@@ -234,11 +234,13 @@ mod pty_initial_input_tests;
 /// tmux worker, and registers its pid for hook-event correlation. The macOS
 /// app may attach a viewer after the worker starts.
 ///
-/// Returns `WorkerPaneAlive` immediately on a successful spawn — the
-/// tmux session stays alive with its agent working, and the
-/// workspace lease is retained until a follow-up flow concludes the
-/// run. Real lifecycle (the pane signaling "Stop" → run completes)
-/// lands once the events-socket consumer drives state transitions.
+/// Returns `WorkerPaneAlive` once the pane is up **and** spawn
+/// confirmation has seen driver-specific PTY evidence plus the first
+/// driver hook/session event. The tmux session stays alive with its
+/// agent working, and the workspace lease is retained until a
+/// follow-up flow concludes the run. Real lifecycle (the pane signaling
+/// "Stop" → run completes) lands once the events-socket consumer drives
+/// state transitions.
 pub struct PaneSpawnRunner {
     cfg: Arc<RuntimeConfig>,
     /// Backing store for the pane-titlebar summary cache. Looked up
@@ -263,6 +265,13 @@ struct PaneSpawnOverrides {
     boss_event_path: std::sync::OnceLock<PathBuf>,
     #[cfg(test)]
     tmux_host: std::sync::OnceLock<TmuxWorkerHost>,
+    /// When true, `run_execution` skips the composer-ready / turn-start
+    /// wait. Existing pane-spawn tests inject a stub tmux that never
+    /// paints driver chrome; they opt out via [`PaneSpawnRunner::set_skip_spawn_confirm`].
+    #[cfg(test)]
+    skip_spawn_confirm: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    spawn_confirm_timeout: std::sync::OnceLock<StdDuration>,
 }
 
 impl PaneSpawnRunner {
@@ -289,6 +298,47 @@ impl PaneSpawnRunner {
     #[cfg(test)]
     pub(crate) fn set_boss_event_path(&self, path: PathBuf) {
         let _ = self.overrides.boss_event_path.set(path);
+    }
+
+    /// Skip the spawn-time composer/turn-start wait. Stub tmux in the
+    /// existing pane-spawn tests never paints driver chrome.
+    #[cfg(test)]
+    pub(crate) fn set_skip_spawn_confirm(&self, skip: bool) {
+        self.overrides
+            .skip_spawn_confirm
+            .store(skip, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Override both confirmation waits (composer + turn-start) with a
+    /// short timeout so timeout-path tests do not sit on the production
+    /// 20s/45s windows.
+    #[cfg(test)]
+    pub(crate) fn set_spawn_confirm_timeout(&self, timeout: StdDuration) {
+        let _ = self.overrides.spawn_confirm_timeout.set(timeout);
+    }
+
+    fn skip_spawn_confirm(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.overrides
+                .skip_spawn_confirm
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    fn spawn_confirm_timeouts(&self, driver: &dyn crate::driver::AgentDriver) -> (StdDuration, StdDuration) {
+        #[cfg(test)]
+        if let Some(timeout) = self.overrides.spawn_confirm_timeout.get() {
+            return (*timeout, *timeout);
+        }
+        (
+            super::spawn_confirmation::COMPOSER_READY_TIMEOUT,
+            super::spawn_confirmation::turn_start_timeout_for_driver(driver),
+        )
     }
 
     fn events_socket_path(&self) -> PathBuf {
@@ -445,6 +495,13 @@ fn check_initial_input_length(line: &str, driver_name: &str) -> Result<()> {
     Ok(())
 }
 
+use super::spawn_launch_limits::check_launch_command_arg_max;
+#[cfg(test)]
+pub(crate) use super::spawn_launch_limits::{
+    ExecArgLimits, check_arg_max_budget, check_launch_command_arg_max_for_bytes, estimated_launch_argv_bytes,
+    local_arg_max,
+};
+
 /// Materialize the per-workspace launcher directory and return it, so the
 /// caller can put it on the worker's `PATH`.
 ///
@@ -462,20 +519,29 @@ fn check_initial_input_length(line: &str, driver_name: &str) -> Result<()> {
 /// falling through to a repobin shim that spends ~30 seconds on `bazel build`
 /// before reporting anything.
 ///
+/// When the workspace root's `REPOBIN.toml` declares `checkleft` as a tool
+/// or pin, the directory also holds a `checkleft` launcher that `exec`s the
+/// engine-bundled repobin. Otherwise a leftover `checkleft` from a previous
+/// spawn is removed. A sibling `<dir>.environment` directory (`bash-env`,
+/// `.zshenv`) is written for [`boss_engine_worker_bin::environment::shell_environment_clause`].
+///
 /// `bossctl` is deliberately absent: this directory is prepended to the
 /// worker's `PATH`, and the Boss-tier control surface stays Boss-tier.
 ///
-/// Returns `None` if the directory could not be written at all. That is
-/// logged, not fatal — the worker simply keeps today's `PATH` behaviour
-/// rather than losing its spawn over a temp-dir failure.
+/// Returns `None` if the directory or shell environment could not be written.
+/// The caller aborts spawn rather than falling back to host tool resolution.
 fn ensure_worker_bin_dir(settings_dir: &Path, workspace_path: &Path) -> Option<PathBuf> {
     let engine_path = std::env::current_exe().unwrap_or_default();
+    ensure_worker_bin_dir_for_engine(settings_dir, workspace_path, &engine_path)
+}
+
+fn ensure_worker_bin_dir_for_engine(settings_dir: &Path, workspace_path: &Path, engine_path: &Path) -> Option<PathBuf> {
     let workspace_dir = std::env::var_os("BUILD_WORKSPACE_DIRECTORY").map(PathBuf::from);
     let env_override = std::env::var_os(boss_engine_worker_bin::BOSS_CLI_BIN_ENV).map(PathBuf::from);
     let boss_bin_dir = std::env::var_os("BOSS_BIN_DIR").map(PathBuf::from);
 
     let resolved = boss_engine_worker_bin::resolve_boss_cli(
-        &engine_path,
+        engine_path,
         workspace_dir.as_deref(),
         env_override.as_deref(),
         boss_bin_dir.as_deref(),
@@ -505,11 +571,10 @@ fn ensure_worker_bin_dir(settings_dir: &Path, workspace_path: &Path) -> Option<P
             );
         }
         Err(err) => {
-            tracing::warn!(
+            tracing::error!(
                 ?err,
                 dir = %dir.display(),
-                "could not write the worker `boss` launcher; the worker's PATH is unchanged and \
-                 a bare `boss` may resolve to a build-from-source shim",
+                "could not write the worker `boss` launcher; aborting spawn",
             );
             return None;
         }
@@ -517,7 +582,7 @@ fn ensure_worker_bin_dir(settings_dir: &Path, workspace_path: &Path) -> Option<P
 
     let cube_override = std::env::var_os(boss_engine_worker_bin::CUBE_CLI_BIN_ENV).map(PathBuf::from);
     let cube_resolved = boss_engine_worker_bin::resolve_cube_cli(
-        &engine_path,
+        engine_path,
         workspace_dir.as_deref(),
         cube_override.as_deref(),
         boss_bin_dir.as_deref(),
@@ -542,15 +607,40 @@ fn ensure_worker_bin_dir(settings_dir: &Path, workspace_path: &Path) -> Option<P
             // silently run the prior worker's compose logic. Fail closed
             // exactly like the `boss` arm: don't hand back a launcher dir
             // whose `cube` entry we can't vouch for.
-            tracing::warn!(
+            tracing::error!(
                 ?err,
                 dir = %dir.display(),
-                "could not write the worker `cube` launcher; a bare `cube` may resolve to a \
-                 build-from-source shim, or to a stale compose wrapper left by a previous \
-                 worker in this workspace",
+                "could not write the worker `cube` launcher; aborting spawn so a stale compose \
+                 wrapper cannot remain on PATH",
             );
             return None;
         }
+    }
+    let repobin = if boss_engine_worker_bin::environment::workspace_declares_repo_tool(workspace_path, "checkleft") {
+        boss_engine_worker_bin::resolve_engine_binary(
+            "repobin",
+            "tools/repobin/repobin",
+            boss_engine_worker_bin::ResolvePaths {
+                engine_path,
+                workspace_dir: workspace_dir.as_deref(),
+                env_override: None,
+                boss_bin_dir: boss_bin_dir.as_deref(),
+                stable_bin_dir: None,
+            },
+            false,
+        )
+    } else {
+        None
+    };
+    let environment =
+        boss_engine_worker_bin::environment::sync_checkleft_launcher(&dir, workspace_path, repobin.as_deref())
+            .and_then(|_| boss_engine_worker_bin::environment::write_shell_environment(&dir));
+    if let Err(err) = environment {
+        tracing::error!(
+            ?err,
+            "could not materialize the worker tool environment; aborting spawn"
+        );
+        return None;
     }
     Some(dir)
 }
@@ -981,20 +1071,29 @@ impl ExecutionRunner for PaneSpawnRunner {
         // driver default flags rather than being ignored.
         spawn_plan.command =
             crate::driver::apply_permission_extra_args(&spawn_plan.command, &permission_artifacts.extra_args);
+        check_launch_command_arg_max(
+            &spawn_plan.command,
+            driver.descriptor().name,
+            workspace_path,
+            driver.descriptor().config_dir,
+            driver.descriptor().initial_prompt_filename,
+        )?;
         // The per-workspace launcher dir goes on *after* the BOSS_BIN_DIR
         // prepend so it ends up ahead of it. Its `boss` is pinned to an
         // absolute path, which is the only form that survives a login
         // shell rebuilding PATH; BOSS_BIN_DIR's own prepend is a bare
         // directory and is a no-op in dev mode, where the user's `~/bin`
         // repobin shim was winning.
-        let worker_bin_dir = ensure_worker_bin_dir(&settings_dir, workspace_path);
+        let worker_bin_dir = ensure_worker_bin_dir(&settings_dir, workspace_path)
+            .context("materializing the worker tool environment")?;
+        let environment_clause = boss_engine_worker_bin::environment::shell_environment_clause(&worker_bin_dir);
         let env_prefix: String = spawn_plan.env.iter().map(render_env_directive).collect();
         // All local pools, including review and automation, share this
         // tmux worker assembly. Read state.db at each
         // spawn so changes take effect without restarting the engine.
         let priority_clause = worker_background_priority_clause(&self.work_db)?;
         let assembled_command = format!(
-            "{priority_clause}{}{}{env_prefix}{}",
+            "{priority_clause}{}{}{env_prefix}{environment_clause}{}",
             path_prepend_clause("BOSS_BIN_DIR"),
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
             spawn_plan.command,
@@ -1080,12 +1179,10 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .initial_input(initial_input)
                 .extra_env({
                     let mut env = structured_output_env;
-                    if let Some(dir) = worker_bin_dir.as_ref() {
-                        env.push((
-                            boss_engine_worker_bin::WORKER_BIN_DIR_ENV.to_owned(),
-                            dir.display().to_string(),
-                        ));
-                    }
+                    env.push((
+                        boss_engine_worker_bin::WORKER_BIN_DIR_ENV.to_owned(),
+                        worker_bin_dir.display().to_string(),
+                    ));
                     env
                 })
                 .maybe_title_summary(title_summary)
@@ -1105,7 +1202,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 // Same Arc resolved above for provision/spawn — settings
                 // wiring and live-state capability flags use it too.
                 .driver(driver.clone())
-                .tmux_host(tmux_host)
+                .tmux_host(tmux_host.clone())
                 .automation_outcome_proposals_seam_enabled(automation_outcome_proposals_seam_enabled)
                 .is_review_supervisor(is_review_supervisor)
                 .is_post_merge_reviewer(is_post_merge_reviewer)
@@ -1140,39 +1237,40 @@ impl ExecutionRunner for PaneSpawnRunner {
         // cancellation, and signal the coordinator to release the lease
         // the cancel path left for us. Without this the worker survives
         // unreaped in a workspace the engine believes is free.
-        match self.work_db.get_execution(&execution.id) {
-            Ok(exec) if exec.status == ExecutionStatus::Cancelled => {
+        if let Some(cancelled) = self
+            .take_cancelled_during_spawn(spawner.as_ref(), &execution.id, worker_id, &started, &spawn_config)
+            .await
+        {
+            return Ok(cancelled);
+        }
+
+        if !self.skip_spawn_confirm() {
+            let (composer_timeout, turn_timeout) = self.spawn_confirm_timeouts(driver.as_ref());
+            let confirm = confirm_local_spawn(
+                &tmux_host,
+                driver.as_ref(),
+                spawner.live_worker_state_registry(),
+                &execution.id,
+                composer_timeout,
+                turn_timeout,
+            )
+            .await;
+            if let Some(cancelled) = self
+                .take_cancelled_during_spawn(spawner.as_ref(), &execution.id, worker_id, &started, &spawn_config)
+                .await
+            {
+                return Ok(cancelled);
+            }
+            if let Err(err) = confirm {
                 tracing::warn!(
                     worker_id,
                     execution_id = %execution.id,
                     slot_id = started.slot_id,
-                    shell_pid = started.shell_pid,
-                    "spawn completed after the execution was cancelled mid-spawn; reaping the worker pane and releasing the deferred lease",
+                    %err,
+                    "spawn confirmation failed; reaping the worker pane",
                 );
                 spawner.reap_worker_pane(&execution.id).await;
-                return Ok(RunOutcome {
-                    wait_state: RunWaitState::CancelledDuringSpawn,
-                    result_summary: Some(format!(
-                        "Execution cancelled during spawn; reaped worker pane in slot {} (shell pid {}).",
-                        started.slot_id, started.shell_pid,
-                    )),
-                    attention: None,
-                    // The pane is already torn down — don't ask the
-                    // coordinator to keep the pool slot claimed for it.
-                    slot_id: None,
-                    spawn_config: Some(spawn_config),
-                });
-            }
-            Ok(_) => {}
-            Err(err) => {
-                // A read failure here is non-fatal: fall through to the
-                // normal completion path. The worst case is the existing
-                // pre-fix behaviour, not a regression.
-                tracing::warn!(
-                    execution_id = %execution.id,
-                    ?err,
-                    "post-spawn cancel re-check failed; proceeding with normal completion",
-                );
+                return Err(err);
             }
         }
 
@@ -1199,6 +1297,85 @@ impl ExecutionRunner for PaneSpawnRunner {
             spawn_config: Some(spawn_config),
         })
     }
+}
+
+impl PaneSpawnRunner {
+    /// If the execution was cancelled while spawn/confirmation was in
+    /// flight, reap the pane and return [`RunWaitState::CancelledDuringSpawn`].
+    async fn take_cancelled_during_spawn(
+        &self,
+        spawner: &dyn crate::spawn_flow::WorkerSpawner,
+        execution_id: &str,
+        worker_id: &str,
+        started: &crate::spawn_flow::StartedWorker,
+        spawn_config: &crate::effort::SpawnConfig,
+    ) -> Option<RunOutcome> {
+        match self.work_db.get_execution(execution_id) {
+            Ok(exec) if exec.status == ExecutionStatus::Cancelled => {
+                tracing::warn!(
+                    worker_id,
+                    execution_id,
+                    slot_id = started.slot_id,
+                    shell_pid = started.shell_pid,
+                    "spawn completed after the execution was cancelled mid-spawn; reaping the worker pane and releasing the deferred lease",
+                );
+                spawner.reap_worker_pane(execution_id).await;
+                Some(RunOutcome {
+                    wait_state: RunWaitState::CancelledDuringSpawn,
+                    result_summary: Some(format!(
+                        "Execution cancelled during spawn; reaped worker pane in slot {} (shell pid {}).",
+                        started.slot_id, started.shell_pid,
+                    )),
+                    attention: None,
+                    slot_id: None,
+                    spawn_config: Some(spawn_config.clone()),
+                })
+            }
+            Ok(_) => None,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    ?err,
+                    "post-spawn cancel re-check failed; proceeding with normal completion",
+                );
+                None
+            }
+        }
+    }
+}
+
+/// Bounded wait after prompt delivery: driver-specific PTY evidence that
+/// the CLI is up, then a driver hook/session event that the turn started.
+async fn confirm_local_spawn(
+    tmux_host: &TmuxWorkerHost,
+    driver: &dyn crate::driver::AgentDriver,
+    live_states: Option<&crate::live_worker_state::LiveWorkerStateRegistry>,
+    run_id: &str,
+    composer_timeout: StdDuration,
+    turn_timeout: StdDuration,
+) -> Result<()> {
+    use super::spawn_confirmation::{SPAWN_CONFIRM_POLL, confirm_spawn_started, pane_shows_driver_ready};
+
+    let driver_name = driver.descriptor().name;
+    let spec = driver.pane_monitor_spec();
+    confirm_spawn_started(
+        driver_name,
+        run_id,
+        composer_timeout,
+        turn_timeout,
+        SPAWN_CONFIRM_POLL,
+        || async {
+            let Ok(pane_text) = tmux_host.tmux().capture_pane(tmux_host.session_name()).await else {
+                return false;
+            };
+            match spec.as_ref() {
+                Some(spec) => pane_shows_driver_ready(&pane_text, spec),
+                None => !pane_text.trim().is_empty(),
+            }
+        },
+        || async { live_states.is_some_and(|registry| registry.has_driver_signal_for_run(run_id)) },
+    )
+    .await
 }
 
 /// The shell's background tier is inherited by drivers and build tools,

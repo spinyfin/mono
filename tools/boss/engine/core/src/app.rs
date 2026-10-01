@@ -44,10 +44,9 @@ use crate::merge_when_ready;
 use crate::protocol::{
     DispatchAdmissionEntryPoint, EngineToAppError, EngineToAppRequest, EngineToAppResponse, FocusWorkerPaneInput,
     FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, GitHubAuthStateDto,
-    HostedPaneState, HostedPaneStatus, InterruptWorkerPaneInput, ListHostedPanesInput, OpenDocumentInput, OrgAuthState,
-    RequestExecutionInput, RevealWorkItemInput, SendToPaneInput, TOPIC_ENGINE_HEALTH, TOPIC_GITHUB_AUTH,
-    TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload, comment_topic, editorial_actions_topic,
-    execution_topic, probe_topic, work_product_topic,
+    HostedPaneState, HostedPaneStatus, ListHostedPanesInput, OpenDocumentInput, OrgAuthState, RequestExecutionInput,
+    RevealWorkItemInput, TOPIC_ENGINE_HEALTH, TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES,
+    TopicEventPayload, comment_topic, editorial_actions_topic, execution_topic, probe_topic, work_product_topic,
 };
 use crate::repo_slug;
 use crate::runner::ExecutionRunner;
@@ -149,7 +148,7 @@ use process_signals::{
 // `SendInputError::NotAcceptingInput` to requeue; tests use the full set.
 use pane_ops::SendInputError;
 #[cfg(test)]
-use pane_ops::{FocusPaneError, InterruptPaneError, OpenDocumentError, RetirePaneError};
+use pane_ops::{FocusPaneError, InterruptPaneError, OpenDocumentError, RetirePaneError, SlotOccupancy};
 
 // Re-import worker event dispatch functions so child modules can access them via `use super::*`.
 use worker_events::{dispatch_probe_now, dispatch_worker_event_fanout};
@@ -1503,7 +1502,7 @@ impl ServerState {
             );
             execution_coordinator_inner.set_dispatch_events(dispatch_events);
             execution_coordinator_inner.set_metrics(metrics_for_coordinator);
-            execution_coordinator_inner.set_live_worker_states(live_worker_states_for_coordinator);
+            execution_coordinator_inner.set_live_worker_states(live_worker_states_for_coordinator.clone());
             // Explicitly seed the coordinator's single `EventBus` (design
             // doc: "One engine process, one bus") rather than letting it
             // fall through to its private `EventBus::new()` default. A
@@ -1552,6 +1551,7 @@ impl ServerState {
                         remote_non_opus_auto_mode,
                         provider_events_socket,
                         control_dir,
+                        Some(live_worker_states_for_coordinator.clone()),
                     ),
                 ));
             }
@@ -1952,25 +1952,27 @@ impl ServerState {
     /// [`Self::hosted_pane_slot_for_run`] returns the slot this run was once
     /// given, not necessarily the slot it holds now — a leaked pool claim can
     /// have been reclaimed and reused by a different run in between. Every
-    /// slot-scoped effect below is therefore conditioned on the worker pool
-    /// still agreeing the slot is either unowned or owned by `run_id`: acting
-    /// unconditionally would tear down a newer occupant's viewer, pool claim
-    /// and live state out from under it.
+    /// slot-scoped effect below is therefore conditioned on both occupancy
+    /// oracles agreeing the slot is either unowned or owned by `run_id`: the
+    /// pool that owns `worker_id` (main, automation, or review) and
+    /// live-state. Acting unconditionally would tear down a newer occupant's
+    /// viewer, pool claim and live state out from under it.
     async fn detach_untracked_worker_viewer(&self, run_id: &str) -> PaneReleaseOutcome {
         if let Some(slot_id) = self.hosted_pane_slot_for_run(run_id) {
             let worker_id = crate::coordinator::worker_id_for_slot(slot_id);
-            let owned_by_other_run = self
-                .execution_coordinator
-                .worker_pool()
-                .claims()
-                .await
-                .into_iter()
-                .any(|claim| claim.worker_id == worker_id && claim.execution_id != run_id);
-            if owned_by_other_run {
+            let pool_holder = self.execution_coordinator.claim_holder(&worker_id).await;
+            let pool_held_by_other = pool_holder.as_deref().is_some_and(|holder| holder != run_id);
+            let live_held_by_other = self
+                .live_worker_states
+                .get(slot_id)
+                .is_some_and(|state| state.run_id != run_id);
+            if pool_held_by_other || live_held_by_other {
                 tracing::warn!(
                     run_id,
                     slot_id,
-                    "detach_untracked_worker_viewer: the derived slot is claimed by a different \
+                    pool_held_by_other,
+                    live_held_by_other,
+                    "detach_untracked_worker_viewer: the derived slot is occupied by a different \
                      live execution; skipping teardown so its viewer, pool claim and live state \
                      are left untouched",
                 );

@@ -876,9 +876,8 @@ final class GhosttyTerminalHostView: NSView {
     }
 
     /// Type `text` into the surface and submit it, as if the user had
-    /// pasted the body and then pressed Return. Used by engine→app
-    /// `SendToPane` requests (probe injection, `bossctl agents send`,
-    /// the macOS intervene affordance).
+    /// pasted the body and then pressed Return. Used by Ideas
+    /// "Send to Coordinator" (`ChatViewModel.sendIdeaDraftToCoordinator`).
     ///
     /// The submit step is essential: Claude Code's TUI reads input
     /// through libghostty's bracketed-paste path, which delivers the
@@ -903,7 +902,7 @@ final class GhosttyTerminalHostView: NSView {
         }
     }
 
-    /// Pure helper that decides how to break a `SendToPane` payload
+    /// Pure helper that decides how to break a submitted payload
     /// into (a) the body that should be pasted via
     /// `ghostty_surface_text` and (b) whether a Return keystroke
     /// should follow. Factored out so the trailing-newline stripping
@@ -922,13 +921,12 @@ final class GhosttyTerminalHostView: NSView {
         return PaneSubmissionPlan(body: String(scalars), sendReturn: true)
     }
 
-    /// Synthesise a Return keypress on the surface. Mirrors
-    /// `sendInterrupt` in shape (programmatic `ghostty_surface_key`
-    /// call with the macOS hardware keycode and the unshifted code
-    /// point) so libghostty's keymap path produces the same byte
-    /// sequence the TUI sees from a real keystroke. `ghostty_surface_text`
-    /// is the paste pathway and intentionally drops control characters,
-    /// so it cannot stand in for a real Enter.
+    /// Synthesise a Return keypress on the surface (programmatic
+    /// `ghostty_surface_key` call with the macOS hardware keycode and
+    /// the unshifted code point) so libghostty's keymap path produces
+    /// the same byte sequence the TUI sees from a real keystroke.
+    /// `ghostty_surface_text` is the paste pathway and intentionally
+    /// drops control characters, so it cannot stand in for a real Enter.
     private func sendReturnKey() {
         guard let surface else { return }
         var keyEvent = ghostty_input_key_s()
@@ -941,34 +939,6 @@ final class GhosttyTerminalHostView: NSView {
         keyEvent.composing = false
         // 0x0D is carriage return — what a TUI sees from a real Enter.
         keyEvent.unshifted_codepoint = 0x0D
-        _ = ghostty_surface_key(surface, keyEvent)
-    }
-
-    /// Synthesise an Esc keypress on the surface — the same key path
-    /// used by `keyDown(with:)`, just sourced from a programmatic
-    /// caller instead of an NSEvent. libghostty translates the
-    /// keycode and writes the ESC byte sequence to the pty so the
-    /// child process (Claude) sees it as a real Esc. Used by the
-    /// engine→app `InterruptWorkerPane` request (`bossctl agents
-    /// interrupt`).
-    ///
-    /// `ghostty_surface_text` is *not* viable here — its docstring
-    /// is explicit that it's the paste pathway and intentionally
-    /// drops escape sequences.
-    func sendInterrupt() {
-        guard let surface else { return }
-        var keyEvent = ghostty_input_key_s()
-        keyEvent.action = GHOSTTY_ACTION_PRESS
-        keyEvent.mods = GHOSTTY_MODS_NONE
-        keyEvent.consumed_mods = GHOSTTY_MODS_NONE
-        // macOS hardware keycode for Escape (kVK_Escape = 0x35).
-        // libghostty's embedded apprt looks up the physical key by
-        // matching its native-keycode table, so passing the raw
-        // macOS keycode is the same shape `keyDown(with:)` produces.
-        keyEvent.keycode = 0x35
-        keyEvent.text = nil
-        keyEvent.composing = false
-        keyEvent.unshifted_codepoint = 0x1B
         _ = ghostty_surface_key(surface, keyEvent)
     }
 

@@ -337,6 +337,10 @@ pub(super) type RunnerCall = (String, String, String, Option<String>);
 pub(super) struct FakeExecutionRunner {
     pub(super) calls: Mutex<Vec<RunnerCall>>,
     pub(super) fail: bool,
+    /// When `fail` is set, the error text `run_execution` returns.
+    /// Defaults to `"worker prompt failed"` so existing spawn-failure
+    /// tests keep their original message.
+    pub(super) fail_message: Option<String>,
     /// When `true`, `run_execution` fails with a `SlotBusy` app
     /// rejection (wrapped the same way `spawn_flow` wraps it) instead
     /// of the generic `fail` error, so tests can exercise the
@@ -381,6 +385,7 @@ impl Default for FakeExecutionRunner {
         Self {
             calls: Mutex::new(Vec::new()),
             fail: false,
+            fail_message: None,
             slot_busy: false,
             pending: false,
             slot_id: None,
@@ -419,7 +424,10 @@ impl ExecutionRunner for FakeExecutionRunner {
             return Err(anyhow::Error::new(root).context("failed to spawn worker pane"));
         }
         if self.fail {
-            return Err(anyhow!("worker prompt failed"));
+            return Err(anyhow!(
+                "{}",
+                self.fail_message.as_deref().unwrap_or("worker prompt failed")
+            ));
         }
 
         if self.cancelled_during_spawn {

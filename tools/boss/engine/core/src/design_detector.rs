@@ -72,9 +72,12 @@ pub async fn on_design_pr_detected(work_db: &WorkDb, task_id: &str, product_id: 
         if let Err(err) = crate::reconcile_audit::append_description_line(
             work_db,
             task_id,
-            "\n[doc-detector] no design-doc pointer auto-populated for this PR — zero or ambiguous \
+            &format!(
+                "\n{} no design-doc pointer auto-populated for this PR — zero or ambiguous \
              docs/designs/*.md or docs/design-docs/*.md matches among the changed files. Add/rename \
              the doc file and re-push, or set the pointer manually with `boss project set-design-doc`.",
+                crate::reconcile_audit::DOC_DETECTOR_MARKER,
+            ),
         ) {
             tracing::warn!(
                 task_id,
@@ -363,10 +366,13 @@ pub async fn on_task_doc_pr_detected(work_db: &WorkDb, task_id: &str, product_id
         if let Err(err) = crate::reconcile_audit::append_description_line(
             work_db,
             task_id,
-            "\n[doc-detector] no doc pointer auto-populated for this PR — zero or ambiguous \
+            &format!(
+                "\n{} no doc pointer auto-populated for this PR — zero or ambiguous \
              docs/designs/*.md, docs/design-docs/*.md, docs/investigations/*.md, or \
              docs/postmortems/*.md matches among the changed files. Add/rename the doc file and \
              re-push, or set the pointer manually with `boss task set-doc`.",
+                crate::reconcile_audit::DOC_DETECTOR_MARKER,
+            ),
         ) {
             tracing::warn!(
                 task_id,

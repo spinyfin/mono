@@ -244,7 +244,6 @@ async fn absent_transcript_reaps_and_the_record_states_what_was_checked() {
         reaper.as_ref(),
         &spawn_health,
         &cube,
-        SPAWN_ACK_GRACE_SECS,
         DRIVER_START_GRACE_SECS,
     )
     .await;
@@ -362,7 +361,12 @@ async fn a_transcript_path_recorded_before_this_spawn_does_not_veto() {
         &execution,
         1,
         0,
-        ReapCause::SpawnAckTimeout { grace_secs: 60 },
+        ReapCause::DriverStartTimeout {
+            grace_secs: DRIVER_START_GRACE_SECS,
+            silent_secs: DRIVER_START_GRACE_SECS + 60,
+            activity: "spawning",
+            file_ingress: None,
+        },
         now + 2000,
     )
     .await;
@@ -405,7 +409,6 @@ async fn a_driver_that_signalled_is_never_reaped() {
     let (outcome, sink) = run_pass(&db, &live_states, &coordinator, &cube).await;
 
     assert_eq!(outcome.driver_start_reaped, 0, "a started driver must never be reaped");
-    assert_eq!(outcome.reaped, 0);
     assert_eq!(
         db.get_execution(&execution_id).unwrap().status,
         ExecutionStatus::Running,
@@ -487,11 +490,6 @@ async fn a_readopted_worker_with_durable_driver_proof_is_not_reaped() {
         outcome.driver_start_reaped, 0,
         "a re-adopted worker with durable driver proof must not be reaped",
     );
-    assert_eq!(outcome.reaped, 0);
-    assert_eq!(
-        outcome.skipped.readopted, 1,
-        "the readopted skip must be counted, not silently dropped from the accounting",
-    );
     assert_eq!(
         db.get_execution(&execution_id).unwrap().status,
         ExecutionStatus::Running,
@@ -542,11 +540,11 @@ async fn driver_start_verification_respects_its_grace_window() {
     );
 }
 
-/// Pass 1's proof-of-life test is now the driver signal, not
-/// `last_event_at`. A zero-pid slot carrying only a synthesized
-/// `last_event_at` must still be reaped rather than skipped.
+/// A synthesized `last_event_at` is not a driver signal. A pid-less
+/// `Spawning` slot with only that timestamp is still a tmux-invariant
+/// violation, not a healthy spawn.
 #[tokio::test]
-async fn pass_one_no_longer_treats_a_synthesized_timestamp_as_proof_of_life() {
+async fn synthesized_timestamp_does_not_count_as_driver_signal() {
     let (_dir, db) = open_db();
     let product_id = create_product(&db);
     let work_item_id = create_active_chore(&db, &product_id, "test chore");
@@ -555,7 +553,6 @@ async fn pass_one_no_longer_treats_a_synthesized_timestamp_as_proof_of_life() {
     let execution_id = create_old_execution(&db, &work_item_id);
     let live_states = Arc::new(LiveWorkerStateRegistry::new());
     register_slot_zero_pid(&live_states, 1, &execution_id, &work_item_id);
-    // An engine-written timestamp with no driver behind it.
     live_states.set_last_event_at_for_test(1, "2026-07-30T05:47:45Z");
     assert!(live_states.driver_signal_at(1).is_none());
 
@@ -566,10 +563,10 @@ async fn pass_one_no_longer_treats_a_synthesized_timestamp_as_proof_of_life() {
     let (outcome, _sink) = run_pass(&db, &live_states, &coordinator, &cube).await;
 
     assert_eq!(
-        outcome.reaped, 1,
-        "only a driver-originated signal may suppress the spawn-ack reap",
+        outcome.tmux_invariant_pidless, 1,
+        "only a driver-originated signal may suppress the pid-less invariant",
     );
-    assert_eq!(outcome.skipped.has_driver_signal, 0);
+    assert_eq!(outcome.driver_start_reaped, 0);
 }
 
 /// A hook that lands while the liveness probe is parked must veto the
@@ -612,7 +609,12 @@ async fn a_hook_during_the_probe_await_vetoes_the_reap() {
             &execution,
             1,
             0,
-            ReapCause::SpawnAckTimeout { grace_secs: 60 },
+            ReapCause::DriverStartTimeout {
+                grace_secs: DRIVER_START_GRACE_SECS,
+                silent_secs: DRIVER_START_GRACE_SECS + 60,
+                activity: "spawning",
+                file_ingress: None,
+            },
             now,
         ) => outcome,
         _ = async {
@@ -653,76 +655,6 @@ async fn a_hook_during_the_probe_await_vetoes_the_reap() {
             .await
             .contains(&execution_id),
         "the slot must stay claimed",
-    );
-}
-
-/// Pass 1 must skip a pid that arrived during the probe, not orphan the
-/// worker that just reported a shell.
-#[tokio::test]
-async fn a_pid_during_the_probe_await_skips_a_spawn_ack_reap() {
-    let (_dir, db) = open_db();
-    let product_id = create_product(&db);
-    let work_item_id = create_active_chore(&db, &product_id, "test chore");
-    let db = Arc::new(db);
-
-    let execution_id = create_old_execution(&db, &work_item_id);
-    let execution = db.get_execution(&execution_id).unwrap();
-    let live_states = LiveWorkerStateRegistry::new();
-    register_slot_zero_pid(&live_states, 1, &execution_id, &work_item_id);
-
-    let coordinator = make_coordinator(db.clone(), 1);
-    coordinator.worker_pool().claim_worker(&execution_id, None).await;
-    let spawn_health = SpawnHealthTracker::new();
-    let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
-    let sink = Arc::new(RecordingDispatchEventSink::new());
-    let cube = RecordingCube::default();
-    let ctx = SpawnReapCtx::builder()
-        .work_db(db.as_ref())
-        .live_states(&live_states)
-        .coordinator(coordinator.clone())
-        .dispatch_events(sink.as_ref())
-        .reaper(reaper.as_ref())
-        .spawn_health(&spawn_health)
-        .cube_client(&cube)
-        .build();
-
-    let hold = super::super::probe_hold::ProbeHold::new();
-    super::super::probe_hold::arm(&execution_id, Arc::clone(&hold));
-    let now = boss_engine_utils::epoch_time::now_epoch_secs();
-    let signal_id = execution_id.clone();
-    let outcome = tokio::select! {
-        outcome = reap_never_started_spawn(
-            &ctx,
-            &execution,
-            1,
-            0,
-            ReapCause::SpawnAckTimeout { grace_secs: 60 },
-            now,
-        ) => outcome,
-        _ = async {
-            tokio::task::spawn_blocking({
-                let hold = Arc::clone(&hold);
-                move || hold.wait_for_entry()
-            })
-            .await
-            .unwrap();
-            live_states.update_shell_pid(&signal_id, 4242);
-            hold.release();
-            std::future::pending::<()>().await
-        } => unreachable!(),
-    };
-    super::super::probe_hold::disarm(&execution_id);
-
-    assert_eq!(outcome, ReapOutcome::Skipped);
-    assert_ne!(
-        db.get_execution(&execution_id).unwrap().status,
-        ExecutionStatus::Orphaned
-    );
-    assert!(reaper.reaped().is_empty());
-    assert!(
-        spawn_health
-            .evidence_in_window(boss_engine_utils::epoch_time::now_epoch_secs())
-            .is_empty()
     );
 }
 
@@ -773,7 +705,12 @@ async fn a_reregistered_slot_during_the_probe_await_skips_the_reap() {
             &execution,
             1,
             0,
-            ReapCause::SpawnAckTimeout { grace_secs: 60 },
+            ReapCause::DriverStartTimeout {
+                grace_secs: DRIVER_START_GRACE_SECS,
+                silent_secs: DRIVER_START_GRACE_SECS + 60,
+                activity: "spawning",
+                file_ingress: None,
+            },
             now,
         ) => outcome,
         _ = async {
@@ -832,7 +769,12 @@ async fn a_committed_reap_refuses_a_later_driver_signal() {
         &execution,
         1,
         0,
-        ReapCause::SpawnAckTimeout { grace_secs: 60 },
+        ReapCause::DriverStartTimeout {
+            grace_secs: DRIVER_START_GRACE_SECS,
+            silent_secs: DRIVER_START_GRACE_SECS + 60,
+            activity: "spawning",
+            file_ingress: None,
+        },
         now,
     )
     .await;
@@ -885,7 +827,12 @@ async fn a_failed_orphan_write_releases_the_reap_fence() {
             &execution,
             1,
             0,
-            ReapCause::SpawnAckTimeout { grace_secs: 60 },
+            ReapCause::DriverStartTimeout {
+                grace_secs: DRIVER_START_GRACE_SECS,
+                silent_secs: DRIVER_START_GRACE_SECS + 60,
+                activity: "spawning",
+                file_ingress: None,
+            },
             now,
         ) => outcome,
         _ = async {
@@ -912,7 +859,7 @@ async fn a_failed_orphan_write_releases_the_reap_fence() {
         "the fence must be released so a recovering hook is still accepted",
     );
 
-    // The signal above would skip a later pass-1 reap. Clear it by
+    // The signal above would skip a later reap. Clear it by
     // re-registering so the retry can actually orphan.
     register_slot_zero_pid(&live_states, 1, &execution_id, &work_item_id);
     let later = reap_never_started_spawn(
@@ -920,7 +867,12 @@ async fn a_failed_orphan_write_releases_the_reap_fence() {
         &db.get_execution(&execution_id).unwrap(),
         1,
         0,
-        ReapCause::SpawnAckTimeout { grace_secs: 60 },
+        ReapCause::DriverStartTimeout {
+            grace_secs: DRIVER_START_GRACE_SECS,
+            silent_secs: DRIVER_START_GRACE_SECS + 60,
+            activity: "spawning",
+            file_ingress: None,
+        },
         now,
     )
     .await;
@@ -957,9 +909,9 @@ async fn zero_pid_driver_start_timeout_is_classed_no_shell() {
     let execution_id = create_spawned_execution(&db, &work_item_id, 0);
     let _bookmark_store = crate::test_support::seed_empty_execution_bookmark(&db, &execution_id).await;
     let live_states = Arc::new(LiveWorkerStateRegistry::new());
-    // Pass 1 skips re-adopted slots; pass 2 still verifies driver start and
-    // can reap a pid-less registration. `mark_stalled_spawns` will not
-    // promote a pid-less slot out of Spawning.
+    // The tmux-invariant check skips re-adopted slots; driver-start still
+    // verifies and can reap a pid-less registration. `mark_stalled_spawns`
+    // will not promote a pid-less slot out of Spawning.
     live_states.register_readoption(
         1,
         &execution_id,
@@ -993,13 +945,11 @@ async fn zero_pid_driver_start_timeout_is_classed_no_shell() {
         reaper.as_ref(),
         &spawn_health,
         &cube,
-        SPAWN_ACK_GRACE_SECS,
         DRIVER_START_GRACE_SECS,
     )
     .await;
 
     assert_eq!(outcome.driver_start_reaped, 1);
-    assert_eq!(outcome.reaped, 0);
     let events = sink.events().await;
     let reap = events
         .iter()
@@ -1055,14 +1005,13 @@ async fn undeterminable_liveness_is_counted_once_per_sweep() {
         reaper.as_ref(),
         &spawn_health,
         &cube,
-        SPAWN_ACK_GRACE_SECS,
         DRIVER_START_GRACE_SECS,
     )
     .await;
 
     assert_eq!(
         outcome.liveness_undeterminable, 1,
-        "pass 2 must not re-probe an execution pass 1 already examined"
+        "driver-start verification must probe a pid-less slot once"
     );
 }
 
@@ -1120,7 +1069,6 @@ async fn undeterminable_attention_clears_when_a_later_probe_finds_the_transcript
             reaper.as_ref(),
             &spawn_health,
             cube,
-            SPAWN_ACK_GRACE_SECS,
             DRIVER_START_GRACE_SECS,
         )
         .await
@@ -1167,6 +1115,10 @@ async fn undeterminable_attention_clears_when_the_execution_goes_terminal() {
 
     let live_states = Arc::new(LiveWorkerStateRegistry::new());
     register_slot_zero_pid(&live_states, 1, &execution_id, &work_item_id);
+    live_states.set_spawn_time_for_test(
+        1,
+        boss_engine_utils::epoch_time::now_epoch_secs() - (DRIVER_START_GRACE_SECS + 60),
+    );
     let coordinator = make_coordinator(db.clone(), 1);
     coordinator.worker_pool().claim_worker(&execution_id, None).await;
     let cube = RecordingCube::default();
@@ -1183,7 +1135,6 @@ async fn undeterminable_attention_clears_when_the_execution_goes_terminal() {
             reaper.as_ref(),
             &spawn_health,
             &cube,
-            SPAWN_ACK_GRACE_SECS,
             DRIVER_START_GRACE_SECS,
         )
         .await;
@@ -1204,7 +1155,6 @@ async fn undeterminable_attention_clears_when_the_execution_goes_terminal() {
         reaper.as_ref(),
         &spawn_health,
         &cube,
-        SPAWN_ACK_GRACE_SECS,
         DRIVER_START_GRACE_SECS,
     )
     .await;
@@ -1250,7 +1200,6 @@ async fn undeterminable_attention_clears_when_the_worker_recovers_into_working()
             reaper.as_ref(),
             &spawn_health,
             &cube,
-            SPAWN_ACK_GRACE_SECS,
             DRIVER_START_GRACE_SECS,
         )
         .await;
@@ -1275,12 +1224,11 @@ async fn undeterminable_attention_clears_when_the_worker_recovers_into_working()
         reaper.as_ref(),
         &spawn_health,
         &cube,
-        SPAWN_ACK_GRACE_SECS,
         DRIVER_START_GRACE_SECS,
     )
     .await;
     assert_eq!(outcome.liveness_undeterminable, 0);
-    assert_eq!(outcome.skipped.not_spawning, 1);
+    assert_eq!(outcome.tmux_invariant_pidless, 0);
     assert_eq!(db.list_attention_items(&execution_id).unwrap()[0].status, "resolved");
 }
 
@@ -1305,6 +1253,10 @@ async fn undeterminable_attention_clears_after_terminal_status_and_slot_removal(
 
     let live_states = Arc::new(LiveWorkerStateRegistry::new());
     register_slot_zero_pid(&live_states, 1, &execution_id, &work_item_id);
+    live_states.set_spawn_time_for_test(
+        1,
+        boss_engine_utils::epoch_time::now_epoch_secs() - (DRIVER_START_GRACE_SECS + 60),
+    );
     let coordinator = make_coordinator(db.clone(), 1);
     coordinator.worker_pool().claim_worker(&execution_id, None).await;
     let cube = RecordingCube::default();
@@ -1321,7 +1273,6 @@ async fn undeterminable_attention_clears_after_terminal_status_and_slot_removal(
             reaper.as_ref(),
             &spawn_health,
             &cube,
-            SPAWN_ACK_GRACE_SECS,
             DRIVER_START_GRACE_SECS,
         )
         .await;
@@ -1343,7 +1294,6 @@ async fn undeterminable_attention_clears_after_terminal_status_and_slot_removal(
         reaper.as_ref(),
         &spawn_health,
         &cube,
-        SPAWN_ACK_GRACE_SECS,
         DRIVER_START_GRACE_SECS,
     )
     .await;

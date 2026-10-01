@@ -1,31 +1,16 @@
 //! Periodic reconciler that detects and reaps worker slots whose spawn
-//! never produced any evidence of a real process — the "false-live"
-//! failure class from the 2026-07-03/04 incidents.
+//! never produced a driver-originated signal — the "false-live"
+//! failure class from the 2026-07-30 incident (a pane hosting only a
+//! login shell) and the 2026-09-13 liveness-veto follow-on.
 //!
-//! ## The incident this guards against
+//! Local workers are created in tmux. [`crate::spawn_flow::start_tmux_worker`]
+//! treats a missing or zero pane pid as a spawn failure, so a `Spawning`
+//! slot with `shell_pid == 0` is a tmux-invariant violation, not a
+//! timeout: this sweep logs it and does not reap on that evidence.
+//! Driver-start verification (below) still covers a slot that reported
+//! a pid but never produced a driver signal.
 //!
-//! Historically, app-owned spawning could return `pane_spawned/ok`
-//! before asynchronous libghostty surface creation completed, while
-//! no `claude` session — and in the worst case no shell at all — ever
-//! actually comes up. Three occurrences on the same slot within about
-//! 90 minutes on 2026-07-03/04 showed the pattern: `bossctl agents
-//! transcript` reported "engine has not yet received a hook event
-//! carrying transcript_path" indefinitely, `agents status` showed
-//! `shell_pid: 0` forever, and — because [`LiveWorkerStateRegistry::mark_stalled_spawns`]
-//! unconditionally promoted any never-hooked `Spawning` slot to
-//! `WaitingForInput` (assuming the worker was merely blocked on the
-//! interactive directory-trust prompt) — the slot presented as "needs a
-//! human" when there was nothing for a human to attach to and answer. A
-//! coordinator had to notice and manually reap it each time.
-//!
-//! [`crate::dead_pid_sweep`] cannot catch this: it only probes slots
-//! with `shell_pid > 0` — a slot that never reported a pid has nothing
-//! to `kill(pid, 0)` against. [`crate::stale_worker_sweep`] only looks
-//! at `activity == Working`. Neither sweep's failure class matches "the
-//! app accepted the spawn but no process, and thus no pid and no hook,
-//! ever manifested at all."
-//!
-//! ## The second incident: a pane that DID have a shell, and no driver
+//! ## The 2026-07-30 incident: a pane that DID have a shell, and no driver
 //!
 //! On 2026-07-30 the inverse shape appeared. `pane_spawned/ok` came back,
 //! `onSurfaceAttached` reported a real foreground pid (92697), and the
@@ -49,26 +34,22 @@
 //!
 //! The common root: **nothing validated the driver process.** Boss
 //! validated the pane surface and the shell hosting it, and treated that
-//! as proof of a working worker. So this module now reaps on two
-//! independent causes.
+//! as proof of a working worker. This module reaps on driver-start
+//! silence, and logs a tmux-invariant violation if a local slot is
+//! `Spawning` with no pane pid at all.
 //!
 //! ## Algorithm
 //!
-//! ### Pass 1 — spawn-ack timeout (the 2026-07-03/04 class)
+//! ### Tmux-invariant check (pid-less `Spawning`)
 //!
-//! Snapshot [`LiveWorkerStateRegistry`]; for each slot:
+//! Snapshot [`LiveWorkerStateRegistry`]. A `Spawning` slot with
+//! `shell_pid == 0`, no driver signal, and not a re-adoption is illegal
+//! under tmux-only spawn: [`crate::spawn_flow`] refuses to register a
+//! local worker without `#{pane_pid}`. Log it; do not reap on that
+//! evidence. Remote virtual slots record a driver signal before they
+//! register; readopted slots are skipped.
 //!
-//! 1. Skip unless `activity == Spawning`.
-//! 2. Skip if a driver-originated signal was ever recorded
-//!    ([`LiveWorkerStateRegistry::driver_signal_at`]) — the driver is
-//!    running, whatever else is wrong.
-//! 3. Skip if `shell_pid > 0`. **This is a scope split, not a health
-//!    verdict** — a slot with a pid is pass 2's, on a longer window,
-//!    because the pid means the app really did host something and the
-//!    question narrows to "is that something the driver?".
-//! 4. Age guard against the DB `started_at` ([`SPAWN_ACK_GRACE_SECS`]).
-//!
-//! ### Pass 2 — driver-start timeout (the 2026-07-30 class)
+//! ### Driver-start timeout (the 2026-07-30 class)
 //!
 //! [`LiveWorkerStateRegistry::unverified_driver_starts`] returns every
 //! live slot past [`crate::live_worker_state::DRIVER_START_GRACE_SECS`] with no driver-originated
@@ -78,53 +59,46 @@
 //! sees a slot `mark_stalled_spawns` has promoted out of `Spawning` just
 //! as well as one still sitting in it.
 //!
-//! Both passes funnel into [`reap_never_started_spawn`], which first
+//! Candidates funnel into [`reap_never_started_spawn`], which first
 //! consults the liveness veto (below), then marks the
 //! execution `orphaned`, appends an `[engine-reconcile]` audit line,
 //! reaps the pane through the same `release_worker_pane` teardown
 //! `bossctl agents stop` uses, releases the pool slot, force-releases the
 //! cube workspace lease, emits a dispatch event, and kicks the
 //! coordinator so the orphan sweep redispatches the never-started work.
-//! Pass 2 additionally raises an attention item (see below).
+//! Driver-start reaps additionally raise an attention item (see below).
 //!
 //! ## False-positive guards
 //!
-//! [`SPAWN_ACK_GRACE_SECS`] (60s) is deliberately well above the app's
-//! shell-pid-propagation retry window (a single 250ms retry after
-//! `onSurfaceAttached`) so a merely-slow-but-real spawn is never reaped.
-//!
-//! [`crate::live_worker_state::DRIVER_START_GRACE_SECS`] (300s) is five times that, and an order of
+//! [`crate::live_worker_state::DRIVER_START_GRACE_SECS`] (300s) is an order of
 //! magnitude above real driver startup — a healthy driver's `SessionStart`
 //! hook fires within seconds of exec. See that constant's doc for why
 //! claude's folder-trust dialog, the one historically legitimate
 //! multi-minute pre-hook wait, cannot produce a false positive here.
 //!
 //! A slot that produces a single driver signal before its window elapses
-//! is left alone by both passes, permanently: `driver_signal_at` is
+//! is left alone permanently: `driver_signal_at` is
 //! first-write-wins and is never cleared for the life of the run.
 //!
-//! ## Why pass 2 raises an attention item and pass 1 does not
+//! ## Why driver-start raises an attention item
 //!
-//! Both passes feed [`crate::spawn_health`] — the reap is shared, so every
+//! Reaps feed [`crate::spawn_health`] — the reap is shared, so every
 //! cause records evidence, records a failure against the work item, and can
 //! trip the spawn-capability breaker that pauses dispatch once enough
 //! DISTINCT work items fail inside the window. That is deliberate for a
-//! driver-start timeout too: a driver binary that cannot exec on this host
+//! driver-start timeout: a driver binary that cannot exec on this host
 //! fails identically for every work item routed to it, which is exactly the
 //! systemic shape the breaker exists to stop, and the alternative — reaping
 //! and redispatching forever without ever pausing — is the churn the breaker
 //! was built to end.
 //!
-//! What differs is *visibility*. Pass 1's failure is "the app's spawn path
-//! is misbehaving", and the breaker's one loud attention item on trip is a
-//! faithful summary of it. Pass 2's failure is different in kind: a pane
-//! genuinely came up and a live process was left holding a workspace with
-//! no driver in it. A single aggregate item cannot name which workspace is
-//! still held, and a lone occurrence — the 2026-07-30 incident was one — is
-//! below any aggregate threshold and would surface nowhere at all. So pass 2
-//! additionally raises its own per-execution item
-//! ([`DRIVER_START_ATTENTION_KIND`]) on top of the aggregation, rather than
-//! instead of it.
+//! Visibility is separate. A pane genuinely came up and a live process was
+//! left holding a workspace with no driver in it. A single aggregate item
+//! cannot name which workspace is still held, and a lone occurrence — the
+//! 2026-07-30 incident was one — is below any aggregate threshold and would
+//! surface nowhere at all. So a driver-start reap additionally raises its
+//! own per-execution item ([`DRIVER_START_ATTENTION_KIND`]) on top of the
+//! aggregation, rather than instead of it.
 //!
 //! ## The third incident: live workers reaped as driver-start timeouts
 //!
@@ -150,12 +124,12 @@
 //! **The liveness veto.** [`reap_never_started_spawn`] — the one reap every
 //! cause funnels through — now asks
 //! [`crate::transcript_liveness::probe_transcript_liveness`] before it does
-//! anything. [`ReapCause::SpawnAckTimeout`] and [`ReapCause::DriverStartTimeout`]
-//! are the two causes the periodic sweep infers from silence, and a
-//! transcript for the execution on disk (a rollout newer than the pre-spawn
-//! baseline under the run's ingress root, or the run row's recorded
-//! transcript path scoped to this incarnation) is driver-originated evidence
-//! in its own right: the reap records it as a driver signal
+//! anything. [`ReapCause::DriverStartTimeout`] is the cause this sweep
+//! infers from silence. A transcript for the execution on disk (a rollout
+//! newer than the pre-spawn baseline under the run's ingress root, or the
+//! run row's recorded transcript path scoped to this incarnation) is
+//! driver-originated evidence in its own right: the reap records it as a
+//! driver signal
 //! ([`crate::live_worker_state::DriverSignalKind::CorrelatedTranscript`] or
 //! [`crate::live_worker_state::DriverSignalKind::CorrelatedTranscriptUnattachable`],
 //! permanent, first-write-wins) and returns [`ReapOutcome::Vetoed`]. An
@@ -167,22 +141,20 @@
 //! reap proceed, and the probe's summary then becomes part of the orphan
 //! reason so the record says what was checked.
 //!
-//! **The failure class.** Pass 1 and pass 2 observe different things.
-//! Every reap records its [`crate::spawn_health::SpawnFailureClass`] on
-//! the breaker evidence, and the pause reason and attention item are
-//! composed from the classes actually observed. Pass 2's own wording — the
-//! log line, the orphan reason, the per-execution attention item — states
-//! what was observed (a pane and shell came up; no driver-originated
-//! signal arrived; what the liveness probe found) rather than the
-//! inference "the driver binary never started", which the incident showed
-//! can be false.
+//! **The failure class.** Every reap records its
+//! [`crate::spawn_health::SpawnFailureClass`] on the breaker evidence, and
+//! the pause reason and attention item are composed from the classes
+//! actually observed. Driver-start wording — the log line, the orphan
+//! reason, the per-execution attention item — states what was observed
+//! (a pane and shell came up; no driver-originated signal arrived; what
+//! the liveness probe found) rather than the inference "the driver binary
+//! never started", which the incident showed can be false.
 //!
 //! ## Cadence
 //!
 //! Runs every 60 seconds and fires once immediately on boot (same
 //! pattern as [`crate::dead_pid_sweep`] / [`crate::stale_worker_sweep`]).
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -192,7 +164,7 @@ use crate::agent_jsonl_progress::{DiscoveryVerdict, IngressCheckpoint, IngressCh
 use crate::coordinator::{CubeClient, ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::{
-    DriverSignalKind, DriverStartExpectation, LiveWorkerStateRegistry, NeverStartedReapCommit, NeverStartedReapKind,
+    DriverSignalKind, DriverStartExpectation, LiveWorkerStateRegistry, NeverStartedReapCommit,
 };
 use crate::spawn_health::{
     SpawnFailureClass, SpawnHealthTracker, maybe_admit_recovery_probe, trip_spawn_capability_circuit,
@@ -224,25 +196,13 @@ pub const LIVENESS_UNDETERMINABLE_ATTENTION_KIND: &str = "worker_liveness_undete
 /// before this existed.
 pub const UNDETERMINABLE_LIVENESS_ATTENTION_THRESHOLD: u32 = 5;
 
-/// Grace period after `started_at` (epoch seconds) during which a
-/// pid-less, hook-less `Spawning` slot is left alone. Comfortably above
-/// the app's shell-pid-report retry window (one 250ms retry) and above
-/// [`crate::live_worker_state::STALLED_SPAWN_THRESHOLD_SECS`] (30s) so
-/// this sweep never races a spawn that is merely slow but genuinely
-/// alive — by the time this threshold elapses with zero pid and zero
-/// hook, nothing reported in at all.
-pub const SPAWN_ACK_GRACE_SECS: i64 = 60;
-
-/// Reaps a confirmed spawn-ack-timeout slot's (possibly ghost) tmux pane
-/// and process tree, mirroring [`crate::stale_worker_sweep::StaleWorkerReaper`].
-/// A pid-less spawn has nothing for a direct `kill(pid, 0)` to act on,
-/// but tmux may still be holding a session for the slot (the pane was
-/// created but never produced a live shell) — tearing it down through
-/// `release_worker_pane` is what lets the next dispatch reuse the slot
-/// instead of `SlotBusy` rejecting the respawn.
+/// Reaps a confirmed never-started spawn's tmux pane and process tree,
+/// mirroring [`crate::stale_worker_sweep::StaleWorkerReaper`]. Tearing the
+/// session down through `release_worker_pane` is what lets the next
+/// dispatch reuse the slot instead of `SlotBusy` rejecting the respawn.
 #[async_trait::async_trait]
 pub trait SpawnAckReaper: Send + Sync {
-    /// Tear down the app pane (if any) and release resources for
+    /// Tear down the worker pane (if any) and release resources for
     /// `execution_id`. Idempotent: a slot with no real pane at all is a
     /// no-op.
     async fn reap_worker(&self, execution_id: &str);
@@ -252,57 +212,36 @@ pub trait SpawnAckReaper: Send + Sync {
 /// occurs.
 #[derive(Debug, Default)]
 pub struct SpawnAckSweepOutcome {
-    /// Reaped by pass 1 — nothing reported in at all.
-    pub reaped: usize,
-    /// Reaped by pass 2 — a pane came up but no driver ever signalled.
+    /// `Spawning` slots with `shell_pid == 0` that are not a re-adoption
+    /// and have no driver signal — illegal under tmux-only spawn, logged
+    /// and not reaped on that evidence.
+    pub tmux_invariant_pidless: usize,
+    /// Reaped by driver-start verification — a pane came up but no driver
+    /// ever signalled.
     pub driver_start_reaped: usize,
-    /// Reaps (either pass) refused because a transcript for the execution
-    /// exists on disk — see the module doc's liveness veto. Each of these
-    /// is a worker that would have been killed alive.
+    /// Reaps refused because a transcript for the execution exists on
+    /// disk — see the module doc's liveness veto. Each of these is a
+    /// worker that would have been killed alive.
     pub vetoed: usize,
-    /// Reaps (either pass) refused because liveness could not be
-    /// established. Logged at error level with the reason; the slot is
-    /// re-examined next pass.
+    /// Reaps refused because liveness could not be established. Logged at
+    /// error level with the reason; the slot is re-examined next pass.
     pub liveness_undeterminable: usize,
-    /// Why pass 1 passed over the slots it did not reap.
-    pub skipped: SpawnAckSkipCounts,
-}
-
-/// Pass 1's per-reason skip tallies, grouped so the outcome distinguishes
-/// what the sweep *did* from why it declined — and so adding a reason
-/// doesn't widen the outcome struct.
-#[derive(Debug, Default)]
-pub struct SpawnAckSkipCounts {
-    /// Slot reported a pid, so it belongs to pass 2's longer window.
-    pub has_pid: usize,
-    /// A driver-originated signal was recorded: a hook or transcript path
-    /// proving the driver runs, NOT merely "some event timestamp exists".
-    pub has_driver_signal: usize,
-    /// Slot has already left `Spawning`.
-    pub not_spawning: usize,
-    /// Execution is still inside [`SPAWN_ACK_GRACE_SECS`].
-    pub grace: usize,
-    /// Slot pre-dates this engine process (readopted at boot or after a
-    /// terminal-execution contradiction), so it is not a new spawn awaiting
-    /// an ack and pass 1's ack-timeout question does not apply to it.
-    pub readopted: usize,
 }
 
 impl crate::sweep_loop::SweepOutcome for SpawnAckSweepOutcome {
     fn has_activity(&self) -> bool {
-        self.reaped > 0 || self.driver_start_reaped > 0 || self.vetoed > 0 || self.liveness_undeterminable > 0
+        self.tmux_invariant_pidless > 0
+            || self.driver_start_reaped > 0
+            || self.vetoed > 0
+            || self.liveness_undeterminable > 0
     }
 
     fn log(&self) {
         tracing::info!(
-            reaped = self.reaped,
+            tmux_invariant_pidless = self.tmux_invariant_pidless,
             driver_start_reaped = self.driver_start_reaped,
             vetoed = self.vetoed,
             liveness_undeterminable = self.liveness_undeterminable,
-            has_pid_skipped = self.skipped.has_pid,
-            has_driver_signal_skipped = self.skipped.has_driver_signal,
-            grace_skipped = self.skipped.grace,
-            readopted_skipped = self.skipped.readopted,
             "spawn-ack sweep: pass complete",
         );
     }
@@ -322,7 +261,6 @@ pub fn spawn_loop(
     spawn_health: Arc<SpawnHealthTracker>,
     cube_client: Arc<dyn CubeClient>,
     interval: Duration,
-    grace_secs: i64,
     driver_start_grace_secs: i64,
 ) -> tokio::task::JoinHandle<()> {
     crate::sweep_loop::spawn_sweep_loop(interval, move || {
@@ -342,7 +280,6 @@ pub fn spawn_loop(
                 reaper.as_ref(),
                 spawn_health.as_ref(),
                 cube_client.as_ref(),
-                grace_secs,
                 driver_start_grace_secs,
             )
             .await
@@ -365,16 +302,13 @@ pub async fn run_one_pass(
     reaper: &dyn SpawnAckReaper,
     spawn_health: &SpawnHealthTracker,
     cube_client: &dyn CubeClient,
-    grace_secs: i64,
     driver_start_grace_secs: i64,
 ) -> SpawnAckSweepOutcome {
     let mut outcome = SpawnAckSweepOutcome::default();
-    let mut examined: HashSet<String> = HashSet::new();
     reconcile_liveness_undeterminable_attention(work_db, live_states);
     let snapshot = live_states.snapshot();
 
     let now_epoch_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
-    let grace_cutoff = now_epoch_secs - grace_secs;
     let ctx = SpawnReapCtx::builder()
         .work_db(work_db)
         .live_states(live_states)
@@ -385,120 +319,34 @@ pub async fn run_one_pass(
         .cube_client(cube_client)
         .build();
 
-    for state in snapshot {
-        // Only total-silence `Spawning` slots are candidates. Anything
-        // else — `WaitingForInput`, `Working`, `Idle` — has already
-        // shown some sign of life and belongs to a different sweep.
-        //
-        // NOTE this filter is NOT what covers the driver-never-started
-        // class: `mark_stalled_spawns` can promote such a slot out of
-        // `Spawning`, and it would escape here. Pass 2 below deliberately
-        // ignores `activity` for exactly that reason.
+    // Tmux-invariant: a local slot cannot be registered with pid 0
+    // (`spawn_flow` treats a missing/zero pane pid as a spawn failure).
+    // A `Spawning` slot with no pid, no driver signal, and not a
+    // re-adoption is therefore a bookkeeping bug, not a timeout.
+    for state in &snapshot {
         if state.activity != WorkerActivity::Spawning {
-            outcome.skipped.not_spawning += 1;
             continue;
         }
-
-        // A re-adopted slot represents a worker that existed before this
-        // engine process. It is not a new spawn awaiting its first ack, even
-        // when its durable shell-pid probe could not produce a positive pid.
         if live_states.driver_start_expectation(state.slot_id) == Some(DriverStartExpectation::Readopted) {
-            outcome.skipped.readopted += 1;
             continue;
         }
-
-        // A driver-originated signal — a hook, or a transcript path —
-        // is the ONLY thing that proves the driver binary is running.
-        // Checked before the pid split below so that a slot whose driver
-        // is demonstrably alive is never a candidate for either pass.
-        //
-        // Replaces the old `last_event_at.is_some()` test, which was
-        // forgeable: `mark_stalled_spawns` and `mark_errored` both write
-        // that timestamp from engine-side inference, so the engine's own
-        // guess could vouch for a driver that never ran.
         if live_states.driver_signal_at(state.slot_id).is_some() {
-            resolve_liveness_undeterminable_attention(work_db, &state.run_id);
-            outcome.skipped.has_driver_signal += 1;
             continue;
         }
-
-        // A reported pid means the app really did host something for
-        // this slot. That narrows the question from "did anything come
-        // up?" to "is what came up the driver?" — a different question
-        // on a longer window, owned by pass 2 below.
-        //
-        // This is a scope split between the two passes, NOT a health
-        // verdict: before pass 2 existed, this `continue` was the end of
-        // the line, and a pane hosting an idle login shell rode it to an
-        // indefinite hold on a slot and a cube lease.
-        if state.shell_pid > 0 {
-            outcome.skipped.has_pid += 1;
-            continue;
-        }
-
-        let execution_id = &state.run_id;
-
-        let Some(execution) = crate::sweep_loop::lookup_execution_or_warn(
-            work_db,
-            execution_id,
-            "spawn-ack sweep: failed to look up execution; skipping slot",
-        ) else {
-            continue;
-        };
-
-        // Skip executions already in a terminal DB state (completion
-        // path may have raced the sweep).
-        if execution.status.is_terminal() {
-            resolve_liveness_undeterminable_attention(work_db, execution_id);
-            continue;
-        }
-
-        // Grace-period guard: skip executions whose `started_at` is
-        // within `grace_secs` or not yet recorded.
-        let started_epoch = execution.started_epoch();
-        match started_epoch {
-            None => {
-                outcome.skipped.grace += 1;
-                continue;
-            }
-            Some(t) if t >= grace_cutoff => {
-                outcome.skipped.grace += 1;
-                continue;
-            }
-            _ => {}
-        }
-
-        tracing::info!(
-            execution_id,
-            work_item_id = %execution.work_item_id,
-            slot_id = state.slot_id,
-            "spawn-ack sweep: no shell pid and no hook event since spawn; reaping execution and releasing slot",
-        );
-
-        examined.insert(execution_id.to_owned());
-        match reap_never_started_spawn(
-            &ctx,
-            &execution,
-            state.slot_id,
-            state.shell_pid,
-            ReapCause::SpawnAckTimeout { grace_secs },
-            now_epoch_secs,
-        )
-        .await
-        {
-            ReapOutcome::Reaped => outcome.reaped += 1,
-            ReapOutcome::Vetoed => outcome.vetoed += 1,
-            ReapOutcome::LivenessUndeterminable => outcome.liveness_undeterminable += 1,
-            ReapOutcome::Skipped => {}
+        if state.shell_pid == 0 {
+            tracing::error!(
+                execution_id = %state.run_id,
+                slot_id = state.slot_id,
+                "spawn-ack sweep: tmux-invariant violation: a Spawning slot has no pane pid; \
+                 spawn_flow refuses to register a local worker without a tmux pane pid"
+            );
+            outcome.tmux_invariant_pidless += 1;
         }
     }
 
-    // ─── Pass 2: driver-start verification ──────────────────────────────
-    //
-    // Everything above answers "did a pane come up?". This answers the
-    // question no check in Boss asked before 2026-07-30: "did the DRIVER
-    // come up?" — the one a pane hosting an idle login shell fails while
-    // satisfying every pane-level check indefinitely.
+    // Driver-start verification: did the DRIVER come up? A pane hosting
+    // an idle login shell fails this while satisfying every pane-level
+    // check indefinitely.
     //
     // `unverified_driver_starts` reads only `driver_signal_at` and
     // `spawned_at`. It is blind to `shell_pid`, to `activity`, and to the
@@ -506,9 +354,6 @@ pub async fn run_one_pass(
     // specific path through it and no way to opt a driver out.
     for candidate in live_states.unverified_driver_starts(now_epoch_secs, driver_start_grace_secs) {
         let execution_id = &candidate.run_id;
-        if examined.contains(execution_id) {
-            continue;
-        }
 
         let Some(execution) = crate::sweep_loop::lookup_execution_or_warn(
             work_db,
@@ -638,15 +483,12 @@ pub(crate) struct SpawnReapCtx<'a> {
 /// Why a never-started spawn is being reaped. Selects the orphan reason text,
 /// the `[engine-reconcile]` audit note, and the dispatch stage emitted.
 pub(crate) enum ReapCause {
-    /// The periodic sweep found total silence past the grace window.
-    SpawnAckTimeout { grace_secs: i64 },
     /// A pane came up — possibly with a live shell pid — and no
     /// driver-originated signal was observed within the window. That is
     /// what was seen; whether the driver never executed or its signal never
     /// reached the engine is what the liveness veto in
-    /// [`reap_never_started_spawn`] decides. Unlike the one above, this one
-    /// also raises a per-execution attention item: nothing else in Boss
-    /// surfaces it.
+    /// [`reap_never_started_spawn`] decides. This cause also raises a
+    /// per-execution attention item: nothing else in Boss surfaces it.
     DriverStartTimeout {
         grace_secs: i64,
         silent_secs: i64,
@@ -754,7 +596,6 @@ impl ReapCause {
     /// purely on the variant: a pid-less driver-start timeout is `NoShell`.
     pub(crate) fn failure_class(&self, shell_pid: i32) -> SpawnFailureClass {
         match self {
-            ReapCause::SpawnAckTimeout { .. } => SpawnFailureClass::NoShell,
             ReapCause::DriverStartTimeout { .. } => {
                 if shell_pid > 0 {
                     SpawnFailureClass::ShellWithoutDriverSignal
@@ -822,15 +663,6 @@ fn reap_narrative(
 
 fn reap_narrative_for_cause(cause: &ReapCause, execution_id: &str, shell_pid: i32) -> (String, String, Stage) {
     match &cause {
-        ReapCause::SpawnAckTimeout { grace_secs } => (
-            format!(
-                "spawn-ack-timeout: no shell pid reported and no hook event received within {grace_secs}s of spawn; worker process never came up"
-            ),
-            format!(
-                "spawn-ack timeout (exec {execution_id}) detected — no shell pid or hook event within {grace_secs}s of spawn; chore reset to todo for redispatch."
-            ),
-            Stage::SpawnAckTimeout,
-        ),
         ReapCause::DriverStartTimeout {
             grace_secs,
             silent_secs,
@@ -838,10 +670,10 @@ fn reap_narrative_for_cause(cause: &ReapCause, execution_id: &str, shell_pid: i3
             ..
         } => {
             // `unverified_driver_starts` is deliberately blind to
-            // `shell_pid` (see the module doc), so pass 2 can reap a
-            // candidate that never reported one (a readopted slot, or one
-            // pass 1 skipped). The narrative asserts "a pane and shell came
-            // up" only when a pid was actually reported.
+            // `shell_pid` (see the module doc), so driver-start can reap a
+            // candidate that never reported one (a readopted slot). The
+            // narrative asserts "a pane and shell came up" only when a pid
+            // was actually reported.
             let pane_observation = pane_observation(shell_pid);
             let reading = driver_start_reading(file_ingress.as_ref());
             (
@@ -862,18 +694,19 @@ fn reap_narrative_for_cause(cause: &ReapCause, execution_id: &str, shell_pid: i3
     }
 }
 
-/// Reap a `Spawning` slot that never produced a live shell: mark the execution
+/// Reap a slot that produced no driver-originated signal after
+/// [`crate::live_worker_state::DRIVER_START_GRACE_SECS`]: mark the execution
 /// orphaned, back up any uncommitted work, append an `[engine-reconcile]`
-/// audit line, tear down the (possibly ghost) app pane, release the pool slot,
-/// emit a dispatch event, and feed the spawn-capability circuit breaker —
-/// tripping it when too many DISTINCT work items fail in the window. Returns
-/// a [`ReapOutcome`]: `Reaped` when all of the above happened; `Vetoed` when
-/// the liveness veto refused the reap because a transcript proves the driver
-/// ran; `LivenessUndeterminable` when the veto's question could not be
-/// answered at all; `Skipped` when the execution was already terminal, or
-/// the orphan write failed.
+/// audit line, tear the pane down through tmux (`release_worker_pane`),
+/// release the pool slot, emit a dispatch event, and feed the spawn-capability
+/// circuit breaker — tripping it when too many DISTINCT work items fail in
+/// the window. Returns a [`ReapOutcome`]: `Reaped` when all of the above
+/// happened; `Vetoed` when the liveness veto refused the reap because a
+/// transcript proves the driver ran; `LivenessUndeterminable` when the veto's
+/// question could not be answered at all; `Skipped` when the execution was
+/// already terminal, or the orphan write failed.
 ///
-/// Called from [`run_one_pass`] (the 60s timeout path) for every
+/// Called from [`run_one_pass`]'s driver-start check for every
 /// [`ReapCause`] it can produce.
 ///
 /// ## The liveness veto
@@ -1011,14 +844,7 @@ pub(crate) async fn reap_never_started_spawn(
         TranscriptLiveness::Absent { .. } => {}
     }
 
-    let reap_kind = match &cause {
-        ReapCause::SpawnAckTimeout { .. } => NeverStartedReapKind::SpawnAckTimeout,
-        ReapCause::DriverStartTimeout { .. } => NeverStartedReapKind::DriverStartTimeout,
-    };
-    let shell_pid = match ctx
-        .live_states
-        .confirm_never_started_reap(slot_id, execution_id, reap_kind)
-    {
+    let shell_pid = match ctx.live_states.confirm_never_started_reap(slot_id, execution_id) {
         NeverStartedReapCommit::Committed { shell_pid } => shell_pid,
         NeverStartedReapCommit::DriverSignalled => {
             tracing::info!(
@@ -1030,17 +856,6 @@ pub(crate) async fn reap_never_started_spawn(
             );
             resolve_liveness_undeterminable_attention(ctx.work_db, execution_id);
             return ReapOutcome::Vetoed;
-        }
-        NeverStartedReapCommit::SpawnAckNowHasPid { shell_pid } => {
-            tracing::info!(
-                execution_id,
-                work_item_id,
-                slot_id,
-                shell_pid,
-                "never-started-spawn reap: a shell pid was reported while the liveness probe was in \
-                 flight; abandoning this pass-1 reap (pass 2 owns a pid-bearing slot)",
-            );
-            return ReapOutcome::Skipped;
         }
         NeverStartedReapCommit::SlotGone => {
             tracing::info!(
@@ -1102,7 +917,7 @@ pub(crate) async fn reap_never_started_spawn(
         ctx.work_db,
         execution_id,
         execution.workspace_path.as_deref().map(std::path::Path::new),
-        crate::driver_teardown::TeardownReason::SpawnAckTimeout,
+        crate::driver_teardown::TeardownReason::DriverStartTimeout,
     )
     .await;
 
@@ -1126,10 +941,10 @@ pub(crate) async fn reap_never_started_spawn(
         );
     }
 
-    // Tear down the (possibly ghost) app pane BEFORE the pool slot is
-    // released, mirroring the stale-worker sweep's ordering — otherwise a
-    // redispatch to the same slot could hit `SlotBusy` if the app is still
-    // holding a `TerminalPaneSession` whose surface never produced a shell.
+    // Tear down the tmux pane BEFORE the pool slot is released, mirroring
+    // the stale-worker sweep's ordering — otherwise a redispatch to the
+    // same slot could hit `SlotBusy` if tmux is still holding a session
+    // for the slot.
     ctx.reaper.reap_worker(execution_id).await;
 
     // Release the worker pool slot so the orphan sweep detects the chore and
@@ -1173,9 +988,6 @@ pub(crate) async fn reap_never_started_spawn(
         "recovery_patch": recovery_patch.as_deref().map(|p| p.display().to_string()),
     });
     match &cause {
-        ReapCause::SpawnAckTimeout { grace_secs } => {
-            details["threshold_secs"] = serde_json::json!(grace_secs);
-        }
         ReapCause::DriverStartTimeout {
             grace_secs,
             silent_secs,
@@ -1217,10 +1029,10 @@ pub(crate) async fn reap_never_started_spawn(
     // cannot catch; when enough DISTINCT items fail in the window the breaker
     // pauses dispatch and raises one loud attention item.
     //
-    // Both causes feed it, driver-start timeouts included: a driver binary
+    // Driver-start timeouts feed it: a driver binary
     // that cannot exec on this host fails the same way for every work item
-    // routed to it, so it belongs in the aggregate. Pass 2's own
-    // per-execution attention item above is additional to this, not a
+    // routed to it, so it belongs in the aggregate. The per-execution
+    // attention item above is additional to this, not a
     // replacement for it — see the module doc.
     ctx.spawn_health.record_evidence(
         crate::spawn_health::SpawnFailureEvidence::builder()
@@ -1313,7 +1125,7 @@ fn raise_driver_start_attention(
     let title = format!("Worker spawned on slot {slot_id} but no driver signal was observed");
     let pane_observation = pane_observation(shell_pid);
     let body = format!(
-        "**Observed (driver-start timeout, sweep pass 2):** {pane_observation} for execution \
+        "**Observed (driver-start timeout):** {pane_observation} for execution \
          `{execution_id}` on slot {slot_id}, but no driver-originated signal — no hook \
          event, no `transcript_path`, no progress-ingress event — was observed within {grace_secs}s \
          (silent for {silent_secs}s).\n\n\
@@ -1652,7 +1464,7 @@ mod tests {
     }
 
     /// `unverified_driver_starts` is blind to `shell_pid` by construction, so
-    /// pass 2 can reach a candidate that never reported one at all. The
+    /// the driver-start check can reach a candidate that never reported one at all. The
     /// narrative must say so rather than asserting "a pane and shell came
     /// up" for a pid it never observed.
     #[test]
@@ -1684,12 +1496,11 @@ mod tests {
         );
     }
 
-    /// The core invariant: a `Spawning` slot with `shell_pid == 0` and no
-    /// hook events, past the grace window, has its execution orphaned,
-    /// its pane reaped, its pool slot released, and a `spawn_ack_timeout`
-    /// dispatch event emitted.
+    /// A `Spawning` slot with `shell_pid == 0` is a tmux-invariant
+    /// violation (`spawn_flow` refuses to register a local worker without
+    /// `#{pane_pid}`). It is logged, not reaped as a spawn-ack timeout.
     #[tokio::test]
-    async fn silent_zero_pid_spawn_is_reaped() {
+    async fn pidless_spawning_slot_is_a_tmux_invariant_violation_not_a_reap() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
@@ -1701,13 +1512,6 @@ mod tests {
 
         let coordinator = make_coordinator(db.clone(), 1);
         coordinator.worker_pool().claim_worker(&execution_id, None).await;
-        assert!(
-            coordinator
-                .worker_pool()
-                .claimed_execution_ids()
-                .await
-                .contains(&execution_id)
-        );
 
         let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
         let sink = Arc::new(RecordingDispatchEventSink::new());
@@ -1720,34 +1524,28 @@ mod tests {
             reaper.as_ref(),
             &spawn_health,
             &NoopCube,
-            SPAWN_ACK_GRACE_SECS,
             DRIVER_START_GRACE_SECS,
         )
         .await;
 
-        assert_eq!(outcome.reaped, 1, "silent zero-pid spawn must be reaped");
-
-        let exec = db.get_execution(&execution_id).unwrap();
-        assert_eq!(exec.status, ExecutionStatus::Orphaned);
-
-        let claimed_after = coordinator.worker_pool().claimed_execution_ids().await;
-        assert!(!claimed_after.contains(&execution_id), "pool slot must be released");
-
-        // Reap ran before the slot/lease was released.
-        assert_eq!(reaper.reaped(), vec![(execution_id.clone(), true)]);
-
-        let events = sink.events().await;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].stage, "spawn_ack_timeout");
-        assert_eq!(events[0].outcome, "ok");
-        assert_eq!(events[0].work_item_id.as_deref(), Some(work_item_id.as_str()));
-
-        let item = db.get_work_item(&work_item_id).unwrap();
-        let desc = match &item {
-            boss_protocol::WorkItem::Chore(t) | boss_protocol::WorkItem::Task(t) => t.description.clone(),
-            _ => panic!("expected chore"),
-        };
-        assert!(desc.contains("[engine-reconcile]"), "got: {desc:?}");
+        assert_eq!(
+            outcome.tmux_invariant_pidless, 1,
+            "a pid-less Spawning slot is a tmux-invariant violation"
+        );
+        assert_eq!(
+            outcome.driver_start_reaped, 0,
+            "fresh spawned_at is inside the driver-start window"
+        );
+        assert!(reaper.reaped().is_empty());
+        assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
+        assert!(
+            coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&execution_id),
+            "pool slot must stay claimed — this is not a reap"
+        );
     }
 
     /// A slot that reported a real shell pid is never reaped by this
@@ -1788,13 +1586,15 @@ mod tests {
             reaper.as_ref(),
             &spawn_health,
             &NoopCube,
-            SPAWN_ACK_GRACE_SECS,
             DRIVER_START_GRACE_SECS,
         )
         .await;
 
-        assert_eq!(outcome.reaped, 0, "a slot with a reported pid must not be reaped here");
-        assert_eq!(outcome.skipped.has_pid, 1);
+        assert_eq!(
+            outcome.driver_start_reaped, 0,
+            "a fresh pid-bearing slot is inside the driver-start window"
+        );
+        assert_eq!(outcome.tmux_invariant_pidless, 0);
         assert!(sink.events().await.is_empty());
         assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
     }
@@ -1845,56 +1645,22 @@ mod tests {
             reaper.as_ref(),
             &spawn_health,
             &NoopCube,
-            SPAWN_ACK_GRACE_SECS,
             DRIVER_START_GRACE_SECS,
         )
         .await;
 
-        assert_eq!(outcome.reaped, 0, "a slot with any hook event must not be reaped");
+        assert_eq!(
+            outcome.driver_start_reaped, 0,
+            "a slot with any hook event must not be reaped"
+        );
+        assert_eq!(outcome.tmux_invariant_pidless, 0);
         assert!(sink.events().await.is_empty());
         assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
     }
 
-    /// A silent zero-pid slot whose execution started within the grace
-    /// window is left alone — guards against racing a fresh dispatch
-    /// whose app-side surface is still asynchronously coming up.
-    #[tokio::test]
-    async fn recent_started_at_is_skipped() {
-        let (_dir, db) = open_db();
-        let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id, "test chore");
-        let db = Arc::new(db);
-
-        let execution_id = create_execution_started_now(&db, &work_item_id);
-
-        let live_states = Arc::new(LiveWorkerStateRegistry::new());
-        register_slot_zero_pid(&live_states, 1, &execution_id, &work_item_id);
-
-        let coordinator = make_coordinator(db.clone(), 1);
-        coordinator.worker_pool().claim_worker(&execution_id, None).await;
-
-        let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
-        let sink = Arc::new(RecordingDispatchEventSink::new());
-        let spawn_health = SpawnHealthTracker::new();
-        let outcome = run_one_pass(
-            db.as_ref(),
-            &live_states,
-            coordinator.clone(),
-            sink.as_ref(),
-            reaper.as_ref(),
-            &spawn_health,
-            &NoopCube,
-            SPAWN_ACK_GRACE_SECS,
-            DRIVER_START_GRACE_SECS,
-        )
-        .await;
-
-        assert_eq!(outcome.reaped, 0, "grace period must prevent reaping fresh dispatches");
-        assert_eq!(outcome.skipped.grace, 1);
-    }
-
-    /// A slot already past `Spawning` (e.g. `Working`) is never a
-    /// candidate for this sweep, regardless of pid/hook state.
+    /// A slot already past `Spawning` (e.g. `Working`) is not a
+    /// tmux-invariant pid-less candidate. A fresh `spawned_at` also keeps
+    /// it out of driver-start verification.
     #[tokio::test]
     async fn non_spawning_activity_is_skipped() {
         let (_dir, db) = open_db();
@@ -1927,13 +1693,12 @@ mod tests {
             reaper.as_ref(),
             &spawn_health,
             &NoopCube,
-            SPAWN_ACK_GRACE_SECS,
             DRIVER_START_GRACE_SECS,
         )
         .await;
 
-        assert_eq!(outcome.reaped, 0);
-        assert_eq!(outcome.skipped.not_spawning, 1);
+        assert_eq!(outcome.driver_start_reaped, 0);
+        assert_eq!(outcome.tmux_invariant_pidless, 0);
     }
 
     /// The post-wake systemic failure: several DIFFERENT work items each have
@@ -1947,13 +1712,13 @@ mod tests {
         let product_id = create_product(&db);
         let db = Arc::new(db);
 
-        // Four distinct chores, each with a silent zero-pid spawn in its slot.
+        // Four distinct chores, each with a pane that came up and no driver.
         let mut execution_ids = Vec::new();
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
         for slot in 1u8..=4 {
             let work_item_id = create_active_chore(&db, &product_id, &format!("chore {slot}"));
             let execution_id = create_old_execution(&db, &work_item_id);
-            register_slot_zero_pid(&live_states, slot, &execution_id, &work_item_id);
+            register_slot_with_live_shell(&live_states, slot, &execution_id, &work_item_id, 4242, false);
             execution_ids.push(execution_id);
         }
 
@@ -1995,12 +1760,11 @@ mod tests {
             reaper.as_ref(),
             &spawn_health,
             &AlwaysSucceedsCube,
-            SPAWN_ACK_GRACE_SECS,
             DRIVER_START_GRACE_SECS,
         )
         .await;
 
-        assert_eq!(outcome.reaped, 4, "every silent spawn is reaped");
+        assert_eq!(outcome.driver_start_reaped, 4, "every silent driver-start is reaped");
         assert!(
             coordinator.is_dispatch_paused(),
             "breaker must pause dispatch once the distinct-work-item threshold is crossed",
@@ -2049,7 +1813,7 @@ mod tests {
         for slot in 1u8..=3 {
             let work_item_id = create_active_chore(&db, &product_id, &format!("chore {slot}"));
             let execution_id = create_old_execution(&db, &work_item_id);
-            register_slot_zero_pid(&live_states, slot, &execution_id, &work_item_id);
+            register_slot_with_live_shell(&live_states, slot, &execution_id, &work_item_id, 4242, false);
             execution_ids.push(execution_id);
         }
 
@@ -2089,12 +1853,11 @@ mod tests {
             reaper.as_ref(),
             &spawn_health,
             &AlwaysSucceedsCube,
-            SPAWN_ACK_GRACE_SECS,
             DRIVER_START_GRACE_SECS,
         )
         .await;
 
-        assert_eq!(outcome.reaped, 3, "every silent spawn is reaped");
+        assert_eq!(outcome.driver_start_reaped, 3, "every silent driver-start is reaped");
         assert!(coordinator.is_dispatch_paused(), "dispatch remains paused");
         assert!(
             !coordinator.dispatch_pause_exempts_reviews(),
@@ -2135,7 +1898,6 @@ mod tests {
             reaper.as_ref(),
             &spawn_health,
             cube,
-            SPAWN_ACK_GRACE_SECS,
             DRIVER_START_GRACE_SECS,
         )
         .await;
@@ -2177,8 +1939,8 @@ mod tests {
             "a pane with a live shell pid and no driver signal must be reaped",
         );
         assert_eq!(
-            outcome.reaped, 0,
-            "pass 1 must not also claim it — the pid routes it to pass 2",
+            outcome.tmux_invariant_pidless, 0,
+            "a reported pid is not a tmux-invariant pid-less slot",
         );
 
         assert_eq!(
@@ -2272,7 +2034,7 @@ mod tests {
     }
 
     /// A slot `mark_stalled_spawns` has promoted out of `Spawning` must still
-    /// be reached. Pass 1 filters on `activity == Spawning`; if pass 2 shared
+    /// be reached. A `Spawning`-only filter would miss it; if the driver-start check shared
     /// that filter, the promotion would be an escape hatch.
     ///
     /// Also pins the reason the promotion is not itself proof of life: it
