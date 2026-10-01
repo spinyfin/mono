@@ -2624,64 +2624,8 @@ mod tests {
     fn seed_claimed_guide_comment(work_db: &Arc<WorkDb>, pr_number: u32) -> (String, String) {
         use crate::work::{CreateExecutionInput, FakePrStateChecker, PrOpenState};
 
-        let product = crate::test_support::create_product(work_db);
-        let root = crate::test_support::create_active_chore(work_db, &product, "impl");
-        work_db
-            .update_work_item(
-                &root,
-                boss_protocol::WorkItemPatch {
-                    status: Some("in_review".to_owned()),
-                    pr_url: Some(format!("https://github.com/acme/widget/pull/{pr_number}")),
-                    ..boss_protocol::WorkItemPatch::default()
-                },
-            )
-            .unwrap();
-        // `seed_review_guide_series` hardcodes canonical_pr_url to pull/9
-        // (via `review_guide_source_packet`), which would collide with a
-        // second call at a different `pr_number` — build the packet
-        // directly so each call's series stays on its own canonical PR.
-        let mut packet = crate::test_support::review_guide_source_packet("base", "head");
-        packet.canonical_pr_url = format!("https://github.com/acme/widget/pull/{pr_number}");
-        packet.pr_number = pr_number as u64;
-        let stored = work_db
-            .persist_pr_review_guide_source_capture(&root, 1, crate::work::PrSourceCaptureTrigger::Creation, &packet)
-            .unwrap();
-        let crate::work::PrSourceCapturePersistOutcome::Stored(capture) = stored else {
-            panic!("capture must persist")
-        };
-        let (series, comparison) = (capture.series_id, capture.comparison_id);
-        let attempt = work_db
-            .create_pr_review_guide_attempt(&series, &comparison, "review-guide-v1")
-            .unwrap();
-        let crate::work::PublishReviewGuideOutcome::Published(_) = work_db
-            .publish_pr_review_guide_version(&attempt.id, "# Guide\n\nOriginal quote", "raw")
-            .unwrap()
-        else {
-            panic!("expected published guide")
-        };
-        let version_id = work_db
-            .get_pr_review_guide_summary_for_root(&root)
-            .unwrap()
-            .expect("summary")
-            .readable_version_id
-            .expect("readable version");
-        let comment = work_db
-            .create_comment_with_guide_version(
-                boss_protocol::CreateCommentInput::builder()
-                    .artifact_kind("pr_review_guide")
-                    .artifact_id(series.clone())
-                    .anchor(boss_protocol::CommentAnchor {
-                        exact: "Original quote".into(),
-                        ..Default::default()
-                    })
-                    .body("fix retry")
-                    .author("user:test")
-                    .doc_version("hash")
-                    .plain_text_projection_version(1)
-                    .build(),
-                Some(&version_id),
-            )
-            .unwrap();
+        let (_root, series, comment) =
+            crate::test_support::seed_published_guide_comment(work_db, pr_number, "fix retry");
         work_db.set_comment_intent(&comment.id, INTENT_REVISION, 0.9).unwrap();
 
         let outcome = work_db
