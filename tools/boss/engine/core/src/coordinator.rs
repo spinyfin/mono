@@ -26,6 +26,7 @@ use crate::host_registry::Host;
 use crate::host_scheduling::{self, ChoreRequirements, HostSlot};
 use crate::metrics::Registry;
 use crate::runner::{ExecutionRunner, RunOutcome, RunWaitState};
+use crate::spawn_flow::StartWorkerError;
 use crate::work::{
     CreateAttentionItemInput, DispatchClaimOutcome, DispatchClass, FinishExecutionRunInput, PreStartFailureOutcome,
     WorkDb, WorkExecution, WorkItem, WorkRun,
