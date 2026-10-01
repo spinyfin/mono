@@ -534,3 +534,81 @@ async fn expired_worker_wait_resumes_normal_nudging() {
     );
     assert_eq!(probes.snapshot().len(), 1);
 }
+
+/// The production path from the incident: Stop under an active wait, then the
+/// worker goes idle and only the sweep can act. While the wait is unexpired
+/// the sweep must hold without probing or counting; once it lapses the sweep
+/// must resume the ladder — and keep driving it to the breaker terminal,
+/// rather than dropping the intent after the first post-expiry probe.
+#[tokio::test]
+async fn worker_wait_hold_is_held_by_the_sweep_then_resumes_ladder_to_the_terminal_after_expiry() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    let detector = StubPrDetector::ok(None);
+    let TestHarness {
+        handler, cube, probes, ..
+    } = TestHarness::new(db.clone(), detector);
+    let probe = ToggleWatermarkProbe::new(0, Some("wm-frozen"));
+    let clock = ManualClock::new();
+    let wait_registry = Arc::new(crate::wait_registry::WaitRegistry::new());
+    wait_registry
+        .declare(
+            &execution_id,
+            "bazel test".to_owned(),
+            None,
+            2,
+            boss_engine_utils::epoch_time::now_epoch_secs(),
+        )
+        .unwrap();
+    let handler = handler
+        .with_background_activity_probe(probe)
+        .with_now_fn(clock.now_fn())
+        .with_wait_registry(wait_registry);
+
+    assert!(matches!(
+        handler.on_stop(&execution_id).await,
+        StopOutcome::WorkerWaitPending { .. }
+    ));
+    assert!(
+        handler.pending_background_nudge_execution_ids().contains(&execution_id),
+        "a held wait must stay registered so the sweep can resume it after expiry",
+    );
+    let held = handler.recheck_background_nudge(&execution_id).await;
+    assert!(
+        matches!(held, Some(StopOutcome::WorkerWaitPending { .. })),
+        "an unexpired wait must hold the sweep too; got {held:?}",
+    );
+    assert!(probes.snapshot().is_empty(), "no probe while the wait is active");
+
+    // Let the wait lapse, then drive sweeps to the breaker terminal.
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    clock.advance_past_debounce();
+    let first = handler.recheck_background_nudge(&execution_id).await;
+    assert!(
+        matches!(first, Some(StopOutcome::AwaitingInput)),
+        "the first post-expiry sweep must nudge; got {first:?}",
+    );
+    let queued = probes.snapshot();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].1, PROBE_NO_PR);
+    assert_eq!(probes.deliver_snapshot(), [execution_id.as_str()]);
+    assert!(
+        handler.pending_background_nudge_execution_ids().contains(&execution_id),
+        "the intent must be retained after the post-expiry probe so later sweeps advance the ladder",
+    );
+
+    let mut terminal = None;
+    for _ in 0..(crate::nudge_breaker::ABSOLUTE_MAX_NUDGES + 2) {
+        clock.advance_past_debounce();
+        let outcome = handler.recheck_background_nudge(&execution_id).await;
+        if matches!(outcome, Some(StopOutcome::NudgeBreakerParked { .. })) {
+            terminal = outcome;
+            break;
+        }
+    }
+    assert!(
+        terminal.is_some(),
+        "the ladder must reach the breaker terminal after a wait expires"
+    );
+    assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+}

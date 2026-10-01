@@ -740,8 +740,13 @@ fn bazel_gate_present_for_chore_on_bazel_workspace_seam_on() {
             && prompt.contains("FOREGROUND")
             && prompt.contains("keep polling that session until it returns `exit_code`")
             && prompt.contains("backgrounded/asynchronous invocation")
+            && prompt.contains("MUST run `\"$BOSS_BIN\" propose wait --reason")
             && prompt.contains("global process-name matches"),
-        "gate must define foreground session polling and prohibit ambiguous global-process attribution:\n{prompt}",
+        "gate must define foreground session polling, require a declared wait when backgrounding, and prohibit ambiguous global-process attribution:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("Do NOT background one") && !prompt.contains("Do NOT background it and idle in a wait-loop"),
+        "the blanket background prohibition must be gone:\n{prompt}",
     );
 }
 

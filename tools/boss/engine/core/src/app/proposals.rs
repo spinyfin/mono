@@ -349,22 +349,17 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
         None => derive_idempotency_key(&caller.execution_id, kind, &validated.canonical_json),
     };
 
-    // Grant the wait before persisting the proposal row so a cap refusal
-    // never leaves an `applied` audit of a wait the registry did not take.
-    // If the insert then fails, the in-memory wait still holds the nudge
-    // ladder — the worker's intent is what matters, and the next successful
-    // submit records the audit.
-    if kind == ProposalKind::Wait {
+    // Validate the wait read-only first so a duration/cap refusal never
+    // leaves an `applied` audit row. The grant itself is committed only after
+    // the row is freshly accepted (below): a replayed idempotency key or a
+    // refused/failed insert must neither renew the wait nor charge the budget.
+    let wait_payload = if kind == ProposalKind::Wait {
         match serde_json::from_str::<WaitProposalPayload>(&validated.canonical_json) {
             Ok(payload) => {
-                let now = boss_engine_utils::epoch_time::now_epoch_secs();
-                if let Err(err) = server_state.wait_registry.declare(
-                    &caller.execution_id,
-                    payload.reason,
-                    payload.waiting_on,
-                    payload.duration_secs,
-                    now,
-                ) {
+                if let Err(err) = server_state
+                    .wait_registry
+                    .check(&caller.execution_id, payload.duration_secs)
+                {
                     let error = ProposalSubmissionError::validation(vec![ProposalFieldError::new(
                         "duration_secs",
                         err.to_string(),
@@ -376,7 +371,7 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                     );
                     return send_rejection(&sink, &request_id, error);
                 }
-                server_state.broadcast_live_worker_states().await;
+                Some(payload)
             }
             Err(err) => {
                 tracing::error!(
@@ -394,7 +389,9 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                 );
             }
         }
-    }
+    } else {
+        None
+    };
 
     let outcome = work_db.submit_worker_proposal(SubmitWorkerProposalInput {
         execution_id: &caller.execution_id,
@@ -412,6 +409,37 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
             review_batch_quorum_outcome,
         })) => {
             record_proposal_submitted(&server_state.metrics, kind);
+            if let Some(payload) = wait_payload
+                && !already_submitted
+            {
+                let now = boss_engine_utils::epoch_time::now_epoch_secs();
+                match server_state.wait_registry.declare(
+                    &caller.execution_id,
+                    payload.reason,
+                    payload.waiting_on,
+                    payload.duration_secs,
+                    now,
+                ) {
+                    Ok(record) => {
+                        server_state.broadcast_live_worker_states().await;
+                        // Expiry is observed lazily and emits no event, and an
+                        // idle worker fires no hooks, so push one more
+                        // snapshot just after the deadline to clear the app's
+                        // "Waiting" caption.
+                        let state = server_state.clone();
+                        let delay = (record.expires_at_epoch - now).max(0) as u64 + 1;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                            state.broadcast_live_worker_states().await;
+                        });
+                    }
+                    Err(err) => tracing::warn!(
+                        execution_id = %caller.execution_id,
+                        %err,
+                        "submit_proposal: wait row accepted but the registry refused the grant"
+                    ),
+                }
+            }
             tracing::info!(
                 proposal_id = %proposal.id,
                 execution_id = %caller.execution_id,
