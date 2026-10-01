@@ -20,6 +20,10 @@ let package = Package(
             path: "Sources/UpdateCore"
         ),
         .target(
+            name: "PaneLayout",
+            path: "Sources/PaneLayout"
+        ),
+        .target(
             name: "CrashWatchdog",
             path: "Sources/CrashWatchdog"
         ),
@@ -32,7 +36,7 @@ let package = Package(
                 "CrashWatchdog",
             ],
             path: "Sources",
-            exclude: ["UpdateCore", "CrashWatchdog"],
+            exclude: ["UpdateCore", "CrashWatchdog", "PaneLayout"],
             resources: [
                 .copy("Resources/TrekIcons"),
             ],
@@ -51,6 +55,11 @@ let package = Package(
             name: "BossTests",
             dependencies: ["Boss"],
             path: "Tests/BossTests"
+        ),
+        .testTarget(
+            name: "PaneLayoutTests",
+            dependencies: ["PaneLayout"],
+            path: "Tests/PaneLayout"
         ),
         .testTarget(
             name: "UpdateTests",
