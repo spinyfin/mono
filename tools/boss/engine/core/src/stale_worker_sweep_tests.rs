@@ -474,6 +474,105 @@ async fn stuck_tmux_worker_raises_attention_without_reaping() {
     );
 }
 
+/// A review-guide execution (`work_item_id` = comparison id) aged past the
+/// sweep grace windows. Uses the dedicated constructor because the generic
+/// `request_execution` path rejects comparison ids.
+fn create_old_review_guide_execution(db: &WorkDb, comparison_id: &str) -> String {
+    let execution = db
+        .create_pr_review_guide_execution(comparison_id, "https://github.com/test/repo")
+        .unwrap();
+    let started_at = boss_engine_utils::epoch_time::now_epoch_secs() - 300;
+    db.force_started_at_for_test(&execution.id, started_at).unwrap();
+    execution.id
+}
+
+/// A stuck review-guide execution's work item is a `prgc_` comparison id. The
+/// attention must land on the series root task, exactly as for a task run.
+#[tokio::test]
+async fn stuck_review_guide_worker_raises_attention_on_series_root_task() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let root = create_active_chore(&db, &product_id, "guide root");
+    let (_series_id, comparison_id) = seed_review_guide_series(&db, &root);
+    assert!(comparison_id.starts_with("prgc_"), "got {comparison_id}");
+    let db = Arc::new(db);
+    let execution_id = create_old_review_guide_execution(&db, &comparison_id);
+    let live_states = Arc::new(LiveWorkerStateRegistry::new());
+    register_slot(&live_states, 1, &execution_id, &comparison_id);
+    drive_to_working_idle(&live_states, 1);
+
+    let coordinator = make_coordinator(db.clone(), 1);
+    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+    let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let inspector = StaticTerminalInspector(live_terminal(0));
+    let hold_registry = HoldRegistry::new();
+    let outcome = run_one_pass_with_terminal(
+        db.as_ref(),
+        &live_states,
+        Some(&inspector),
+        coordinator.clone(),
+        sink.as_ref(),
+        StaleWorkerSweepControls {
+            reaper: reaper.as_ref(),
+            hold_registry: &hold_registry,
+            cube_client: &NoopCube,
+        },
+        StaleWorkerThresholds {
+            stale_threshold_secs: ALWAYS_STALE,
+            auto_reap_threshold_secs: NEVER_STALE,
+        },
+    )
+    .await;
+
+    assert_eq!(outcome.genuinely_stuck, 1);
+    assert!(
+        db.list_attention_items_for_work_item(&root)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == STALE_WORKER_ATTENTION_KIND),
+        "stuck review-guide run must raise a stale_worker attention on its series root task",
+    );
+}
+
+/// The reap's audit line for a review-guide execution lands on the series
+/// root task's description rather than failing on the comparison id.
+#[tokio::test]
+async fn stale_review_guide_worker_reap_appends_audit_to_series_root_task() {
+    let (_dir, db) = open_db();
+    let product_id = create_product(&db);
+    let root = create_active_chore(&db, &product_id, "guide root");
+    let (_series_id, comparison_id) = seed_review_guide_series(&db, &root);
+    let db = Arc::new(db);
+    let execution_id = create_old_review_guide_execution(&db, &comparison_id);
+    let live_states = Arc::new(LiveWorkerStateRegistry::new());
+    register_slot(&live_states, 1, &execution_id, &comparison_id);
+    drive_to_working_idle(&live_states, 1);
+
+    let coordinator = make_coordinator(db.clone(), 1);
+    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+    let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+    let sink = Arc::new(RecordingDispatchEventSink::new());
+    let outcome = run_one_pass(
+        db.as_ref(),
+        &live_states,
+        coordinator.clone(),
+        sink.as_ref(),
+        reaper.as_ref(),
+        &HoldRegistry::new(),
+        ALWAYS_STALE,
+    )
+    .await;
+
+    assert_eq!(outcome.reaped, 1);
+    let desc = match db.get_work_item(&root).unwrap() {
+        boss_protocol::WorkItem::Chore(t) | boss_protocol::WorkItem::Task(t) => t.description,
+        _ => panic!("expected chore"),
+    };
+    assert!(desc.contains("[engine-reconcile]"), "got: {desc:?}");
+    assert!(desc.contains(&execution_id), "got: {desc:?}");
+}
+
 /// A live tmux pane whose driver is below `Rich` fidelity raises the
 /// degraded-evidence attention and never reaps.
 #[tokio::test]

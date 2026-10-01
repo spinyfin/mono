@@ -1528,7 +1528,7 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client = RobinhoodClient::with_http_client_and_identity_base(Client::new(), &base_url, &identity_url)
+        let client = RobinhoodClient::with_http_client_and_identity_base(test_http_client(), &base_url, &identity_url)
             .expect("construct client");
 
         let error = client
