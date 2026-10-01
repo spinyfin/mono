@@ -187,6 +187,7 @@ impl WorkDb {
             ],
         )?;
         if let Some(context) = guide_context {
+            // The new row has NULL guide_version_id, so the trigger permits this stamp; the transaction makes insert-plus-stamp atomic.
             conn.execute(
                 "UPDATE work_comments SET guide_version_id = ?2, guide_context_json = ?3 WHERE id = ?1",
                 params![id, context.version_id, serde_json::to_string(&context)?],

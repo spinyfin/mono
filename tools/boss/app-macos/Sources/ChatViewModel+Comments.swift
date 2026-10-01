@@ -10,6 +10,7 @@ import Foundation
 protocol CommentBackend: AnyObject {
     /// Author identity stamped on created comments (`user:<name>`).
     var author: String { get }
+    var guideCommentDrafts: GuideCommentDrafts? { get }
 
     /// Begin backing `layer` with the engine's comments for the given artifact:
     /// subscribe to the comment topic and kick an initial list. Idempotent.
@@ -34,6 +35,10 @@ protocol CommentBackend: AnyObject {
     func reviseDoc(artifactKind: String, artifactId: String)
 }
 
+extension CommentBackend {
+    var guideCommentDrafts: GuideCommentDrafts? { nil }
+}
+
 /// Current comment author identity. Best-effort from the macOS login name until
 /// the app carries a real account/email; the engine stores it verbatim for the
 /// audit trail (`work_comments.author`).
@@ -50,6 +55,8 @@ enum CommentAuthor {
 final class CommentEngineBridge: CommentBackend {
     private let engine: EngineClient
     let author: String
+    let draftStore: GuideCommentDrafts
+    var guideCommentDrafts: GuideCommentDrafts? { draftStore }
 
     /// Active registrations keyed by the layer's identity. Weak layer refs so a
     /// closed viewer deallocates; stale entries are pruned lazily on routing.
@@ -68,7 +75,8 @@ final class CommentEngineBridge: CommentBackend {
     /// to the oldest still-pending call.
     private var pendingReviseDocArtifacts: [(kind: String, id: String)] = []
 
-    init(engine: EngineClient, author: String = CommentAuthor.current) {
+    init(engine: EngineClient, author: String = CommentAuthor.current, draftStore: GuideCommentDrafts = GuideCommentDrafts()) {
+        self.draftStore = draftStore
         self.engine = engine
         self.author = author
     }
@@ -171,6 +179,7 @@ final class CommentEngineBridge: CommentBackend {
     // MARK: Event routing (called from ChatViewModel.handle)
 
     func handleCommentsList(artifactKind: String, artifactId: String, comments: [CommentWithThread]) {
+        for comment in comments { draftStore.acknowledge(comment.comment) }
         forEachLayer(kind: artifactKind, id: artifactId) { $0.applyList(comments) }
     }
 
@@ -182,7 +191,7 @@ final class CommentEngineBridge: CommentBackend {
     /// own topic invalidation, so reload the owning artifact's layer(s) here to
     /// stay fresh after a self-initiated create/dismiss.
     func handleCommentResult(_ comment: WorkComment) {
-        GuideCommentDrafts.shared.acknowledge(comment)
+        draftStore.acknowledge(comment)
         forEachLayer(kind: comment.artifactKind, id: comment.artifactId) { $0.reload() }
     }
 

@@ -60,12 +60,14 @@ pub(super) async fn handle_comments_create(ctx: Dispatch, req: FrontendRequest) 
                 .await;
 
                 // Classifier is NOT on the create request's critical path
-                // (comment-triggered-document-revisions.md § "The classifier
-                // (P1 — foundation)"): spawn it detached, mirroring the
+                // (comment-triggered-document-revisions.md § "The classifier"):
+                // spawn it detached, mirroring the
                 // magic-wand dispatch pattern. The comment starts with
                 // `intent` NULL — the transient `classifying` state — until
                 // this completes and publishes on `comment_topic`.
-                spawn_comment_classifier(&server_state, &work_db, &session_id, &request_id, &comment);
+                if comment.guide_context.is_none() {
+                    spawn_comment_classifier(&server_state, &work_db, &session_id, &request_id, &comment);
+                }
 
                 send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment });
             }
