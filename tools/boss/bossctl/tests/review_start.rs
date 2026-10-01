@@ -4,14 +4,21 @@ use boss_engine::work::PRE_MERGE_BATCH_RESERVATION_UNITS;
 use boss_protocol::{FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+const COLD_START_BOUND: std::time::Duration = std::time::Duration::from_secs(45);
+
 async fn review_start(response: FrontendEvent) -> std::process::Output {
     // Each invocation owns a distinct socket, including concurrent tests.
     let socket = std::env::temp_dir().join(format!("review-{}.sock", unique_id()));
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let (connected_tx, mut connected_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
+        let mut connected_tx = Some(connected_tx);
         // Discovery first probes connectivity without writing a request.
         loop {
             let (stream, _) = listener.accept().await.unwrap();
+            if let Some(connected_tx) = connected_tx.take() {
+                let _ = connected_tx.send(());
+            }
             let (reader, mut writer) = stream.into_split();
             let Some(line) = BufReader::new(reader).lines().next_line().await.unwrap() else {
                 continue;
@@ -39,11 +46,40 @@ async fn review_start(response: FrontendEvent) -> std::process::Output {
         "example/repo",
     ]);
     command.kill_on_drop(true);
-    let output = tokio::time::timeout(std::time::Duration::from_secs(15), command.output())
-        .await
-        .unwrap()
-        .unwrap();
-    server.await.unwrap();
+    let output = command.output();
+    tokio::pin!(output);
+    // The RPC deadline starts when the client reaches the fixture. The first
+    // exec of a freshly linked bossctl is an OS cold start that, on a host
+    // running many other fresh test binaries, has been measured above 15s
+    // before `main` runs; that latency is not the behaviour under test. The
+    // cold start still gets its own bound, below Bazel's 60s target timeout,
+    // so a client that never connects fails here with a located message
+    // instead of as a generic target timeout.
+    let exited_early = tokio::time::timeout(COLD_START_BOUND, async {
+        tokio::select! {
+            biased;
+            _ = &mut connected_rx => None,
+            result = &mut output => Some(result.unwrap()),
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("bossctl did not reach the fixture within {COLD_START_BOUND:?}"));
+    let output = match exited_early {
+        // The client exited without reaching the fixture; the caller's
+        // assertions report its status and stderr.
+        Some(output) => {
+            server.abort();
+            output
+        }
+        None => {
+            let output = tokio::time::timeout(std::time::Duration::from_secs(15), output)
+                .await
+                .unwrap()
+                .unwrap();
+            server.await.unwrap();
+            output
+        }
+    };
     std::fs::remove_file(socket).unwrap();
     output
 }
