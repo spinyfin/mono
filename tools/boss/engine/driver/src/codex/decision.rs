@@ -294,44 +294,20 @@ mod tests {
     /// The model above is a description of a specific CLI. If Codex changes
     /// its accepted vocabulary, the description goes stale silently and Boss
     /// resumes shipping a fail-open — exactly the failure mode that produced
-    /// this module. Cross-check it against the binary's own strings when one
-    /// is reachable.
-    ///
-    /// `codex` is not on the sandboxed `PATH` a `bazel test` runs under, so
-    /// this check does not fire there. Point [`CODEX_BINARY_ENV`] at a codex
-    /// binary to run it — set-but-unreadable is a failure, not a skip, so a
-    /// typo'd path cannot look like a pass. When it is unset, the test prints a
-    /// skip line, visible under `--test_output=all`, and the rest of this
-    /// module still covers the logic.
+    /// this module. Always cross-check against the Bazel-supplied pinned
+    /// binary; missing or unreadable test data is a failure.
     #[test]
     fn the_model_matches_the_shipping_binarys_own_rejection_list() {
-        let Some(binary) = codex_binary() else {
-            println!(
-                "skipped: no codex binary to check the contract against. Run it with \
-                 `bazel test //tools/boss/engine/driver:driver_test \
-                 --test_env={CODEX_BINARY_ENV}=$(command -v codex) --test_output=all`."
-            );
-            return;
-        };
-        let explicit = std::env::var_os(CODEX_BINARY_ENV).is_some_and(|value| !value.is_empty());
-        let bytes = match std::fs::read(&binary) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                assert!(
-                    !explicit,
-                    "{CODEX_BINARY_ENV} points at {} which cannot be read: {error}",
-                    binary.display()
-                );
-                println!("skipped: codex at {} is unreadable: {error}", binary.display());
-                return;
-            }
-        };
-        // Search the bytes directly: the binary is tens of megabytes and a
-        // lossy `String` copy of it buys nothing for an ASCII needle.
+        let binary = super::super::resolve_codex_bin();
+        let bytes = std::fs::read(&binary).expect("Bazel pinned Codex binary must be readable");
+        // Lossy decoding preserves these ASCII literals and lets us use the
+        // standard library's efficient substring search. Repeated byte-window
+        // scans exceed the test deadline in unoptimized builds.
+        let text = String::from_utf8_lossy(&bytes);
         let missing: Vec<&str> = BINARY_REJECTION_STRINGS
             .iter()
             .copied()
-            .filter(|needle| !bytes.windows(needle.len()).any(|window| window == needle.as_bytes()))
+            .filter(|needle| !text.contains(needle))
             .collect();
         assert!(
             missing.is_empty(),
@@ -339,19 +315,5 @@ mod tests {
              was measured against a different CLI and must be re-measured before it is trusted",
             binary.display()
         );
-    }
-
-    /// Names a codex binary to run the conformance check against.
-    const CODEX_BINARY_ENV: &str = "BOSS_CODEX_BINARY";
-
-    /// The codex binary to check, from [`CODEX_BINARY_ENV`] or `PATH`.
-    fn codex_binary() -> Option<std::path::PathBuf> {
-        if let Some(explicit) = std::env::var_os(CODEX_BINARY_ENV).filter(|value| !value.is_empty()) {
-            return Some(std::path::PathBuf::from(explicit));
-        }
-        let path = std::env::var_os("PATH")?;
-        std::env::split_paths(&path)
-            .map(|dir| dir.join("codex"))
-            .find(|candidate| candidate.is_file())
     }
 }

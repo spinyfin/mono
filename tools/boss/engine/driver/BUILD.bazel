@@ -73,7 +73,7 @@ rust_test(
     ),
 )
 
-# Only the driver compatibility test consumes these release binaries.
+# Driver config and hook-decision contract tests require these release binaries.
 config_setting(
     name = "aarch64_macos",
     constraint_values = [
