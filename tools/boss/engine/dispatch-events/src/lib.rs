@@ -461,8 +461,8 @@ pub enum Stage {
     /// Dispatch auto-resumed after Breaker-origin evidence that the app's
     /// spawn path recovered — either the half-open recovery probe's canary
     /// (see `boss_engine::spawn_health::maybe_admit_recovery_probe`) reported a
-    /// real shell pid, or a fresh app session registered (an app relaunch,
-    /// the operator's natural recovery action). Never fired for an
+    /// driver-originated signal, or a fresh app session registered (including
+    /// after an app relaunch). Never fired for an
     /// operator-originated pause, which stays manual-resume-only. The
     /// `details` object carries the human-readable `reason`; the event's
     /// `execution_id` is the canary's id when the probe succeeded, or the

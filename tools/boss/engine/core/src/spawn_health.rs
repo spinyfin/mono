@@ -73,10 +73,9 @@
 //! pane pid) is proof the spawn path works again and
 //! auto-resumes dispatch ([`resume_dispatch_after_breaker_recovery`]); a
 //! reap of the canary (driver-start timeout or app NACK) backs off
-//! exponentially before the next attempt. Dispatch also auto-resumes on a
-//! fresh app session registering — an app relaunch is the operator's
-//! natural recovery action after e.g. waking the display, so it clears the
-//! breaker exactly like a driver-originated signal would. This recovery machinery is
+//! exponentially before the next attempt. Dispatch also auto-resumes when a
+//! fresh app session registers, including after an app relaunch, which
+//! clears the breaker exactly like a driver-originated signal would. This recovery machinery is
 //! self-gating: it only ever activates on top of a real Breaker-origin
 //! pause, and a real pause only happens when the flag is enabled, so no
 //! separate flag check is needed inside it.
@@ -589,8 +588,8 @@ impl SpawnHealthTracker {
             .collect()
     }
 
-    /// Reset the breaker. Called when a spawn provably worked (a real shell
-    /// pid was reported) or a fresh app session registered, so stale
+    /// Reset the breaker. Called when a spawn provably worked (a
+    /// driver-originated signal was reported) or a fresh app session registered, so stale
     /// pre-recovery failures no longer count toward a trip.
     ///
     /// Deliberately does NOT clear the disabled-mode signal window
@@ -846,8 +845,7 @@ pub async fn maybe_admit_recovery_probe(
 /// Auto-resume dispatch after Breaker-origin evidence that the app's spawn
 /// path is healthy again — either the half-open recovery probe's canary
 /// reported a driver-originated signal, or a fresh app session registered
-/// (the operator's natural recovery action, e.g. relaunching the app after
-/// waking the display).
+/// after an app relaunch.
 ///
 /// No-ops when dispatch isn't currently paused, and — critically — when the
 /// current pause is [`DispatchPauseOrigin::Operator`]: a human pause stays
@@ -933,6 +931,9 @@ pub async fn maybe_resume_after_canary_driver_signal(
     if !spawn_health.record_probe_success(run_id) {
         return false;
     }
+    // Clear the trip window too, or the next never-started reap inside the
+    // window re-trips the breaker immediately.
+    spawn_health.record_success();
     let resumed = resume_dispatch_after_breaker_recovery(
         work_db,
         coordinator,
@@ -1729,8 +1730,10 @@ mod tests {
             DispatchPauseOrigin::Breaker,
             PauseReason::new("test: breaker pause").unwrap(),
         );
-        let spawn_health = SpawnHealthTracker::new();
-        spawn_health.mark_probe_dispatched("exec-canary", 1000);
+        let spawn_health = SpawnHealthTracker::with_config(2, 300);
+        assert_eq!(spawn_health.record_failure("wi-a", 1000), None);
+        assert_eq!(spawn_health.record_failure("wi-b", 1001), Some(2));
+        spawn_health.mark_probe_dispatched("exec-canary", 1002);
         assert!(spawn_health.is_probe_execution("exec-canary"));
 
         let sink = RecordingDispatchEventSink::new();
@@ -1738,6 +1741,11 @@ mod tests {
             maybe_resume_after_canary_driver_signal(&spawn_health, &db, &coordinator, &sink, "exec-canary").await;
 
         assert!(resumed);
+        assert_eq!(
+            spawn_health.record_failure("wi-c", 1003),
+            None,
+            "recovery must clear the trip window so one new failure does not re-trip"
+        );
         assert!(!spawn_health.is_probe_execution("exec-canary"));
         assert!(!coordinator.is_dispatch_paused());
         let events = sink.events().await;

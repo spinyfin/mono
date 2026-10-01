@@ -897,6 +897,29 @@ async fn a_running_durable_occupant_with_no_live_state_is_not_a_husk_and_retire_
     }
 }
 
+/// A slot occupied by a run whose execution row cannot be read must be listed
+/// as inconclusive, never as a husk.
+#[tokio::test]
+async fn an_unreadable_durable_occupant_row_is_listed_as_occupancy_inconclusive() {
+    let (server_state, _dir) = test_server_state();
+    server_state.worker_registry.register_run_slot("exec-with-no-row", 1);
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+    let panes = all_pane_statuses_for(&server_state, &sink, vec![hosted(1, "exec-with-no-row")]).await;
+    assert_eq!(panes.len(), 1);
+    assert!(
+        matches!(
+            panes[0].state,
+            crate::protocol::HostedPaneState::OccupancyInconclusive { .. }
+        ),
+        "an unreadable occupant row must not be listed as a husk: {:?}",
+        panes[0].state,
+    );
+}
+
 /// An occupant parked in `waiting_review` has no worker by design: the list
 /// calls it a husk and retire detaches it instead of pointing at `agents stop`.
 #[tokio::test]
